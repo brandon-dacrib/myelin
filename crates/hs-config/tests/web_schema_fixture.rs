@@ -2,7 +2,8 @@
 //!
 //! `web/src/test/fixtures/hs-config-schema.json` is what the web's "every setting has a real
 //! control" test walks (`web/src/lib/config-model.real-schema.test.ts`). It is meant to be
-//! `schemars::schema_for!(hs_config::Config)` verbatim -- exactly what `GET /api/v1/config/schema`
+//! `hs_config::schema::json_schema()` verbatim (the derived schema plus each setting's
+//! `x-applies`) -- exactly what `GET /api/v1/config/schema`
 //! serves as its `schema` member -- and it drifted once already: a setting added here
 //! (`media.scanning.icap.preview`) reached the server without the web's test ever seeing it, so a
 //! shape the interface could not render went unnoticed. This test fails the moment the two
@@ -25,8 +26,9 @@ fn fixture_path() -> PathBuf {
 }
 
 fn current_schema() -> serde_json::Value {
-    serde_json::to_value(schemars::schema_for!(hs_config::Config))
-        .expect("a derived JSON Schema is always representable as JSON")
+    // The derived schema with each setting's `x-applies` (`hs_config::schema`), which is what the
+    // admin API serves.
+    hs_config::schema::json_schema().clone()
 }
 
 #[test]
@@ -50,7 +52,7 @@ fn the_web_fixture_is_the_configuration_schema() {
     if fixture != schema {
         let differing = differing_pointers(&fixture, &schema, String::new());
         panic!(
-            "web/src/test/fixtures/hs-config-schema.json differs from schema_for!(Config) at {} \
+            "web/src/test/fixtures/hs-config-schema.json differs from hs_config::schema::json_schema() at {} \
              place(s), first: {:?}.\nRegenerate it with \
              `HS_UPDATE_WEB_SCHEMA_FIXTURE=1 cargo test -p hs-config --test web_schema_fixture`, \
              then run `npm run check` in web/ to see whether the interface renders the change.",

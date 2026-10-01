@@ -1438,6 +1438,12 @@ pub struct ConfigSectionInfo {
     pub source: String,
 }
 
+/// What [`ConfigSettingInfo::applies`] reads as when an older server left it out: the answer that
+/// is never wrong about a running server.
+fn default_applies() -> String {
+    "restart".to_owned()
+}
+
 /// One setting's metadata in [`ConfigSchema`], keyed by whole-configuration JSON Pointer so it
 /// lines up with both [`ConfigSection::origins`] and the `schema` member's own structure.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1448,8 +1454,14 @@ pub struct ConfigSettingInfo {
     pub origin: String,
     /// Whether this setting's value is a secret and is therefore served redacted.
     pub secret: bool,
-    /// Whether changing it takes effect without a restart.
+    /// Whether changing it takes effect without a restart (`applies` is `hot`).
     pub reloadable: bool,
+    /// When a change to it takes effect: `bootstrap` (set at install, never stored), `hot`
+    /// (applied to the running server at once) or `restart` (stored, read at the next start).
+    /// From `hs_config::reload::SETTINGS`, the one table the schema's `x-applies` and
+    /// `docs/config.md` are generated from too.
+    #[serde(default = "default_applies")]
+    pub applies: String,
     /// Whether `config.update` would accept a change to it. False for a bootstrap setting and
     /// for anything an `HS__` environment variable pins, so the interface can show the field
     /// read-only with a reason instead of offering an edit that would be refused.

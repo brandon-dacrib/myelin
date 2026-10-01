@@ -3754,14 +3754,16 @@ fn config_schema_document(sections: &[ConfigSection]) -> ConfigSchema {
         for (pointer, origin) in &section.origins {
             let bootstrap =
                 section.bootstrap || hs_config::bootstrap::is_bootstrap_pointer(pointer);
+            // Per setting, from the reload boundary's table (`hs_config::reload::SETTINGS`): a
+            // section can hold hot, restart and bootstrap settings side by side.
+            let applies = hs_config::reload::applies(pointer);
             settings.push(ConfigSettingInfo {
                 pointer: pointer.clone(),
                 section: section.name.clone(),
                 origin: origin.clone(),
                 secret: secrets.is_secret(pointer),
-                // Per setting: a section can hold hot settings without every setting in it
-                // being one (`hs_config::reload::HOT_SETTINGS`).
-                reloadable: section.reloadable || hs_config::reload::is_hot_setting(pointer),
+                reloadable: applies == hs_config::reload::Applies::Hot,
+                applies: applies.as_str().to_owned(),
                 editable: !bootstrap && origin != "environment",
                 bootstrap,
             });
@@ -8134,6 +8136,16 @@ mod tests {
             "the federation client reads its timeout once, at startup"
         );
         assert!(setting("/rate_limits/message/burst_count").reloadable);
+        // Each setting says when a change to it applies, from the one table.
+        assert_eq!(pinned.applies, "restart");
+        assert_eq!(setting("/rate_limits/message/burst_count").applies, "hot");
+        assert_eq!(setting("/server/server_name").applies, "bootstrap");
+        assert!(
+            !setting("/server/server_name").reloadable,
+            "a bootstrap setting in an otherwise hot section is not reloadable"
+        );
+        assert_eq!(setting("/auth/enable_registration").applies, "hot");
+        assert_eq!(setting("/auth/session_secret").applies, "restart");
 
         let bootstrap = setting("/storage/data_dir");
         assert!(!bootstrap.editable);
@@ -8220,28 +8232,41 @@ mod tests {
     #[tokio::test]
     async fn config_validate_accepts_a_good_change_and_says_what_needs_a_restart() {
         let (router, _manifest) = build_router(config_state());
-        let response = router
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/config/validate")
-                    .header("authorization", "Bearer admin-token")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"server":{"public_baseurl":"https://matrix.example.org"}}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let report: crate::model::ConfigValidateReport =
-            serde_json::from_slice(&body_bytes(response).await).unwrap();
+        let validate = |body: &'static str| {
+            let router = router.clone();
+            async move {
+                let response = router
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/api/v1/config/validate")
+                            .header("authorization", "Bearer admin-token")
+                            .header("content-type", "application/json")
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                serde_json::from_slice::<crate::model::ConfigValidateReport>(
+                    &body_bytes(response).await,
+                )
+                .unwrap()
+            }
+        };
+        let report = validate(r#"{"federation":{"client_timeout":"45s"}}"#).await;
         assert!(report.valid);
         assert_eq!(
             report.requires_restart,
-            vec!["server".to_string()],
-            "the server section is read once at startup"
+            vec!["federation".to_string()],
+            "the federation client reads its timeout once, at startup"
+        );
+        let report =
+            validate(r#"{"server":{"public_baseurl":"https://matrix.example.org"}}"#).await;
+        assert!(report.valid);
+        assert!(
+            report.requires_restart.is_empty(),
+            "the public base URL is read per request"
         );
     }
 
@@ -8271,7 +8296,7 @@ mod tests {
                 .reloaded_sections
                 .contains(&"rate_limits".to_string())
         );
-        assert!(!report.reloaded_sections.contains(&"server".to_string()));
+        assert!(!report.reloaded_sections.contains(&"federation".to_string()));
 
         let event = tokio::time::timeout(Duration::from_millis(200), rx.recv())
             .await

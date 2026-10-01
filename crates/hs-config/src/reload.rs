@@ -1,71 +1,452 @@
-//! The reload boundary: which settings a running server takes on when they change, and which
-//! wait for a restart.
+//! The reload boundary: when each setting takes effect.
 //!
-//! This is a statement about what `hs serve` actually does, not about what would be possible:
-//! a setting is listed in [`HOT_SETTINGS`] only when something in the running process re-reads
-//! it after a change (`hs_cli::live_config` is where each one is wired). Everything else is read
-//! once at startup, and a change to it is reported as needing a restart.
+//! Every setting in [`Config`] is exactly one of three kinds, listed in [`SETTINGS`] (decision
+//! 0016, amended 2026-10-01):
 //!
-//! # Hot
+//! - **bootstrap** -- read before the database is open, from the bootstrap file, `HS__`
+//!   variables or the command line only, never stored in the database (decision 0010; the same
+//!   pointers as [`crate::bootstrap::BOOTSTRAP_SETTINGS`]). The admin API refuses a write to one.
+//! - **hot** -- something in the running process re-reads it, so a change applies at once
+//!   (`hs_cli::live_config` is where each one is wired). A save reports its section as
+//!   `reloaded`.
+//! - **restart** -- read once, at startup, into something that cannot be re-pointed safely
+//!   while it runs. A save stores it and reports its section as `requires_restart`.
 //!
-//! - `rate_limits` — the whole section. The server-wide `message` limit (the bucket this server
-//!   enforces, on sending, state and redaction) is swapped into the room layer's limiter the
-//!   moment it changes; senders keep what is left of their bucket, clamped to the new burst.
-//!   The other buckets are not enforced anywhere yet, so a change to them has nothing to wait
-//!   for either.
-//! - `migration` — read when a migration from Synapse starts, never at startup.
-//! - `federation.domain_allowlist`, `federation.ip_range_blocklist` and
-//!   `federation.ip_range_allowlist` — the outbound client checks both lists on every request,
-//!   through shared handles the running server replaces. (Only with federation enabled: a server
-//!   that booted without it has no client to change.)
-//! - `telemetry.logging.level` — the log filter sits behind a reload layer and is replaced.
-//!   (Unless `RUST_LOG` set it at startup, which outranks the configuration: then a change is
-//!   reported as waiting for a restart.)
+//! This is a statement about what `hs serve` actually does, not about what would be possible: a
+//! setting is hot only when the change that makes it hot also wires something to re-read it.
+//! The schema-walk test below fails the moment a setting is added without a classification.
 //!
-//! # Restart required
+//! # Read by nothing yet
 //!
-//! - `server` — `server_name` is burned into every event and identifier the
-//!   process has already produced; `signing_key_path` is read once into
-//!   memory at startup.
-//! - `listeners` — sockets are bound at startup; changing ports or TLS
-//!   material needs a new bind.
-//! - `storage` — the backend holds an open connection pool or an embedded
-//!   database handle that is not safely swappable underneath in-flight
-//!   transactions.
-//! - `media` — the storage backend variant has the same problem as
-//!   `storage`; even for `local`, in-flight uploads reference the old path.
-//! - `auth` — session-signing secrets are cached in every issued token;
-//!   rotating them without a coordinated restart would invalidate sessions
-//!   unpredictably rather than on a controlled boundary.
-//! - `cluster` — shard counts and mesh identity are agreed with every other
-//!   replica; changing them locally without a coordinated rolling restart
-//!   would fragment ownership.
-//! - The rest of `federation` (enabling it, timeouts, certificates), the rest of `telemetry`
-//!   (log format, tracing export, metrics, Sentry), and `appservices` — built into the
-//!   federation client, the logging layer and the appservice scheduler once, at startup.
+//! A few settings are declared but nothing in the server reads them at all. Those that are
+//! plain data a future reader would look up per operation are classified hot
+//! (`server.admin_contact`, `server.report_stats`, `media.remote_media_retention`, and
+//! `rate_limits.third_party_id_validation`, whose route is not served); those whose
+//! reader would be built at startup are classified restart (`auth.enable_legacy_login`,
+//! `auth.password.enabled`, `auth.session_secret`, `appservices.enabled`). Either way a change
+//! has no effect today; `docs/status/13-config-compat-and-migration.md` lists them.
+//!
+//! # What stays restart, and why
+//!
+//! - `media.storage`, `media.scanning` -- an open object store and a scan engine with its
+//!   verdict cache and provider connections; in-flight uploads hold the old ones.
+//! - `media.allow_legacy_unauthenticated_media` -- the legacy routes are mounted or not.
+//! - `federation.enabled`, the TLS trust settings, `client_timeout`, `max_retry_backoff`,
+//!   `max_queued_pdus_per_destination` -- built into the federation client and sender, whose
+//!   connection pools and queues are in use.
+//! - `auth.session_secret`, `auth.oidc_providers`, `auth.mas_delegation` -- issued sessions and
+//!   upstream clients depend on them; changing them under a running server would invalidate
+//!   sessions on an uncontrolled boundary.
+//! - `telemetry` other than the log level -- the subscriber, exporters and Sentry client are
+//!   installed once per process.
+//! - `cluster.room_shards`, `user_shards` (fixed at cluster creation), `heartbeat_interval`,
+//!   `lease_ttl` (agreed with every replica; a coordinated rolling restart changes them).
+
+use std::sync::LazyLock;
 
 use serde_json::Value;
 
 use crate::Config;
 
-/// The settings a running server re-reads when they change, as JSON Pointers into the whole
-/// configuration. A pointer covers everything beneath it: `/rate_limits` is the whole section.
-pub const HOT_SETTINGS: &[&str] = &[
-    "/rate_limits",
-    "/migration",
-    "/federation/domain_allowlist",
-    "/federation/ip_range_blocklist",
-    "/federation/ip_range_allowlist",
-    "/telemetry/logging/level",
+/// When a change to a setting takes effect. See the module docs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Applies {
+    /// Per process, from the bootstrap file and environment only; never stored in the database.
+    Bootstrap,
+    /// Applied by the running server as soon as it changes.
+    Hot,
+    /// Stored at once, read at the next start.
+    Restart,
+}
+
+impl Applies {
+    /// The name the schema's `x-applies` and the admin API use.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Applies::Bootstrap => "bootstrap",
+            Applies::Hot => "hot",
+            Applies::Restart => "restart",
+        }
+    }
+}
+
+/// One classified setting: a JSON Pointer into the whole configuration (everything beneath it
+/// shares its classification), when a change to it applies, and what reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Setting {
+    /// The setting (`/rate_limits/login`). No entry lies beneath another.
+    pub pointer: &'static str,
+    /// When a change applies.
+    pub applies: Applies,
+    /// What reads it, in a few words: why it is hot, or why it waits for a restart.
+    pub reader: &'static str,
+}
+
+const fn hot(pointer: &'static str, reader: &'static str) -> Setting {
+    Setting {
+        pointer,
+        applies: Applies::Hot,
+        reader,
+    }
+}
+
+const fn restart(pointer: &'static str, reader: &'static str) -> Setting {
+    Setting {
+        pointer,
+        applies: Applies::Restart,
+        reader,
+    }
+}
+
+const fn bootstrap(pointer: &'static str, reader: &'static str) -> Setting {
+    Setting {
+        pointer,
+        applies: Applies::Bootstrap,
+        reader,
+    }
+}
+
+/// Every setting's classification. Every setting the schema declares lies at or beneath exactly
+/// one entry (the tests walk the schema to make sure), and no entry lies beneath another.
+pub const SETTINGS: &[Setting] = &[
+    // server
+    bootstrap(
+        "/server/server_name",
+        "fixed at the first start and recorded as the database's identity",
+    ),
+    bootstrap(
+        "/server/signing_key_path",
+        "a path on this process's own filesystem, read at startup",
+    ),
+    hot(
+        "/server/public_baseurl",
+        "the client .well-known document, the recovery link and bridge files read it per use",
+    ),
+    hot(
+        "/server/well_known_server",
+        "the server .well-known document reads it per request",
+    ),
+    hot("/server/admin_contact", "read by nothing yet"),
+    hot("/server/report_stats", "read by nothing yet"),
+    hot(
+        "/server/unstable_features",
+        "GET /versions reads it per request",
+    ),
+    // listeners, storage
+    bootstrap("/listeners", "sockets this process binds at startup"),
+    bootstrap("/storage", "where the database is, read before it is open"),
+    // media
+    restart(
+        "/media/storage",
+        "the object store is opened once; in-flight uploads hold it",
+    ),
+    hot(
+        "/media/max_upload_size",
+        "the media repository checks every upload and remote fetch against it",
+    ),
+    hot(
+        "/media/thumbnail_sizes",
+        "the media repository reads it per thumbnail request",
+    ),
+    hot(
+        "/media/url_preview_enabled",
+        "the media repository reads it per preview request",
+    ),
+    hot(
+        "/media/url_preview_ip_range_blocklist",
+        "the media repository reads it per preview and remote fetch",
+    ),
+    hot(
+        "/media/remote_media_retention",
+        "read by nothing yet (nothing evicts remote media on a schedule)",
+    ),
+    restart(
+        "/media/allow_legacy_unauthenticated_media",
+        "the legacy media routes are mounted or not at startup",
+    ),
+    hot(
+        "/media/url_preview_timeout",
+        "the media repository reads it per preview request",
+    ),
+    hot(
+        "/media/url_preview_max_fetch_size",
+        "the media repository reads it per preview request",
+    ),
+    hot(
+        "/media/url_preview_cache_lifetime",
+        "the media repository reads it per preview request",
+    ),
+    restart(
+        "/media/scanning",
+        "the scan engine, its provider connections and verdict cache are built once",
+    ),
+    // federation
+    restart(
+        "/federation/enabled",
+        "the federation routes and client are mounted or not at startup",
+    ),
+    hot(
+        "/federation/domain_allowlist",
+        "the federation client checks it on every request",
+    ),
+    hot(
+        "/federation/ip_range_blocklist",
+        "the federation client checks it on every request",
+    ),
+    hot(
+        "/federation/ip_range_allowlist",
+        "the federation client checks it on every request",
+    ),
+    restart(
+        "/federation/verify_certificates",
+        "built into the federation client's TLS configuration",
+    ),
+    restart(
+        "/federation/custom_ca_certificates",
+        "built into the federation client's TLS configuration",
+    ),
+    restart(
+        "/federation/trust_os_root_store",
+        "built into the federation client's TLS configuration",
+    ),
+    restart(
+        "/federation/client_timeout",
+        "built into the federation client",
+    ),
+    restart(
+        "/federation/max_retry_backoff",
+        "built into the federation client's backoff",
+    ),
+    restart(
+        "/federation/max_queued_pdus_per_destination",
+        "built into the federation sender's queues",
+    ),
+    hot(
+        "/federation/allow_public_rooms_over_federation",
+        "the federation routes read it per request",
+    ),
+    hot(
+        "/federation/allow_device_name_lookup_over_federation",
+        "the federation routes read it per request",
+    ),
+    // rate_limits
+    hot(
+        "/rate_limits/enabled",
+        "every rate-limit bucket reads it on its next check",
+    ),
+    hot(
+        "/rate_limits/message",
+        "the room layer's send limiter, on sending, state and redaction",
+    ),
+    hot(
+        "/rate_limits/registration",
+        "POST /register, per client address",
+    ),
+    hot("/rate_limits/login", "POST /login, per client address"),
+    hot(
+        "/rate_limits/joins_local",
+        "joins to rooms this server hosts, per user",
+    ),
+    hot(
+        "/rate_limits/joins_remote",
+        "joins through another server, per user",
+    ),
+    hot(
+        "/rate_limits/admin_redaction",
+        "redactions by server administrators, per user",
+    ),
+    hot(
+        "/rate_limits/federation",
+        "inbound federation transactions, per origin server",
+    ),
+    hot(
+        "/rate_limits/third_party_id_validation",
+        "nothing yet: no 3PID requestToken route is served, so there is nothing to limit",
+    ),
+    // auth
+    hot(
+        "/auth/enable_registration",
+        "POST /register reads it per request",
+    ),
+    hot(
+        "/auth/registration_shared_secret",
+        "shared-secret registration and login read it per request",
+    ),
+    hot(
+        "/auth/registration_shared_secret_file",
+        "shared-secret registration and login read it per request",
+    ),
+    hot(
+        "/auth/user_directory_search_all_users",
+        "the user directory reads it per search",
+    ),
+    restart(
+        "/auth/enable_legacy_login",
+        "read by nothing yet; the legacy routes are mounted at startup",
+    ),
+    restart(
+        "/auth/session_secret",
+        "issued sessions depend on it; rotated on a controlled boundary",
+    ),
+    restart(
+        "/auth/session_secret_file",
+        "issued sessions depend on it; rotated on a controlled boundary",
+    ),
+    hot("/auth/access_token_lifetime", "read when a token is issued"),
+    hot(
+        "/auth/refresh_token_lifetime",
+        "read when a token is issued",
+    ),
+    restart(
+        "/auth/password/enabled",
+        "read by nothing yet; the login flows are built at startup",
+    ),
+    hot("/auth/password/pepper", "read when a password is checked"),
+    hot(
+        "/auth/password/pepper_file",
+        "read when a password is checked",
+    ),
+    hot("/auth/password/policy", "read when a password is set"),
+    restart(
+        "/auth/oidc_providers",
+        "upstream OIDC clients are built at startup",
+    ),
+    restart(
+        "/auth/mas_delegation",
+        "delegation replaces the native issuer at startup",
+    ),
+    // appservices
+    restart(
+        "/appservices/enabled",
+        "read by nothing yet; delivery starts at startup",
+    ),
+    bootstrap(
+        "/appservices/registration_files",
+        "imported once into the registry at startup",
+    ),
+    hot(
+        "/appservices/tracking_failure_threshold",
+        "the appservice registry reads it per health check",
+    ),
+    // telemetry
+    restart(
+        "/telemetry/metrics",
+        "the metrics registry and exporter are installed once",
+    ),
+    restart(
+        "/telemetry/tracing",
+        "the tracing exporter is installed once",
+    ),
+    hot(
+        "/telemetry/logging/level",
+        "the log filter sits behind a reload layer (unless RUST_LOG set it)",
+    ),
+    restart(
+        "/telemetry/logging/json",
+        "the log format is installed once",
+    ),
+    restart("/telemetry/sentry", "the Sentry client is installed once"),
+    // cluster
+    bootstrap(
+        "/cluster/single_node",
+        "this replica's own role, read at startup",
+    ),
+    restart("/cluster/room_shards", "fixed at cluster creation"),
+    restart("/cluster/user_shards", "fixed at cluster creation"),
+    bootstrap("/cluster/mesh", "this replica's own mesh identity"),
+    restart(
+        "/cluster/heartbeat_interval",
+        "agreed with every replica; changed by a rolling restart",
+    ),
+    restart(
+        "/cluster/lease_ttl",
+        "agreed with every replica; changed by a rolling restart",
+    ),
+    // migration
+    hot(
+        "/migration/synapse",
+        "read when a migration starts, never at startup",
+    ),
 ];
 
-/// Top-level [`Config`] field names whose every setting is hot (see [`HOT_SETTINGS`]): a change
-/// anywhere in them takes effect without a restart. A section with only some hot settings is
-/// not listed; [`is_hot_setting`] answers for those one setting at a time.
-pub const RELOADABLE_SECTIONS: &[&str] = &["rate_limits", "migration"];
+/// True when `pointer` is `ancestor` or lies beneath it.
+fn is_within(pointer: &str, ancestor: &str) -> bool {
+    pointer == ancestor
+        || pointer
+            .strip_prefix(ancestor)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
 
-/// True when every setting in `section` (a top-level `Config` field name) takes effect without
-/// a restart.
+/// The classified setting `pointer` (a whole-configuration JSON Pointer) is, or lies beneath.
+/// `None` for a section or structure whose settings are classified one by one
+/// (`/telemetry/logging`), and for anything that is not a setting.
+#[must_use]
+pub fn setting(pointer: &str) -> Option<&'static Setting> {
+    SETTINGS
+        .iter()
+        .find(|setting| is_within(pointer, setting.pointer))
+}
+
+/// When a change to the setting at `pointer` takes effect. A structure whose settings are
+/// classified one by one counts as hot only when every one of them is, and as bootstrap only
+/// when every one is; anything unclassified counts as restart, which is never wrong about a
+/// running server.
+#[must_use]
+pub fn applies(pointer: &str) -> Applies {
+    if let Some(setting) = setting(pointer) {
+        return setting.applies;
+    }
+    let mut beneath = SETTINGS
+        .iter()
+        .filter(|setting| is_within(setting.pointer, pointer))
+        .map(|setting| setting.applies)
+        .peekable();
+    let Some(first) = beneath.peek().copied() else {
+        return Applies::Restart;
+    };
+    if beneath.all(|applies| applies == first) {
+        first
+    } else {
+        Applies::Restart
+    }
+}
+
+/// The settings a running server re-reads when they change, as JSON Pointers into the whole
+/// configuration: every [`Applies::Hot`] entry of [`SETTINGS`]. A pointer covers everything
+/// beneath it.
+pub static HOT_SETTINGS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+    SETTINGS
+        .iter()
+        .filter(|setting| setting.applies == Applies::Hot)
+        .map(|setting| setting.pointer)
+        .collect()
+});
+
+/// Top-level [`Config`] field names in which every administered setting is hot: a change
+/// anywhere in them that the admin API accepts takes effect without a restart. A section with
+/// only some hot settings is not listed; [`is_hot_setting`] answers for those one setting at a
+/// time.
+pub static RELOADABLE_SECTIONS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+    SECTION_NAMES
+        .iter()
+        .copied()
+        .filter(|section| {
+            let prefix = format!("/{section}");
+            let mut administered = SETTINGS
+                .iter()
+                .filter(|setting| is_within(setting.pointer, &prefix))
+                .filter(|setting| setting.applies != Applies::Bootstrap)
+                .peekable();
+            administered.peek().is_some()
+                && administered.all(|setting| setting.applies == Applies::Hot)
+        })
+        .collect()
+});
+
+/// True when every administered setting in `section` (a top-level `Config` field name) takes
+/// effect without a restart.
 pub fn is_reloadable(section: &str) -> bool {
     RELOADABLE_SECTIONS.contains(&section)
 }
@@ -74,12 +455,18 @@ pub fn is_reloadable(section: &str) -> bool {
 /// `/rate_limits/message/burst_count`) takes effect without a restart: it is, or is beneath,
 /// one of [`HOT_SETTINGS`].
 pub fn is_hot_setting(pointer: &str) -> bool {
-    HOT_SETTINGS.iter().any(|hot| {
-        pointer == *hot
-            || pointer
-                .strip_prefix(hot)
-                .is_some_and(|rest| rest.starts_with('/'))
-    })
+    setting(pointer).is_some_and(|setting| setting.applies == Applies::Hot)
+}
+
+/// The hot settings (entries of [`HOT_SETTINGS`]) whose value differs between `old` and `new`,
+/// as whole configurations' JSON. What a running server on `old` applies, setting by setting.
+#[must_use]
+pub fn hot_settings_changed(old: &Value, new: &Value) -> Vec<&'static str> {
+    HOT_SETTINGS
+        .iter()
+        .copied()
+        .filter(|pointer| old.pointer(pointer) != new.pointer(pointer))
+        .collect()
 }
 
 /// `config` as a JSON object, or `None` if it does not serialize (a `Config` always does).
@@ -90,7 +477,7 @@ fn as_object(config: &Config) -> Option<Value> {
 /// `whole` with every hot setting taken out, so that what is left compares equal exactly when
 /// nothing that needs a restart changed.
 fn without_hot(mut whole: Value) -> Value {
-    for pointer in HOT_SETTINGS {
+    for pointer in HOT_SETTINGS.iter() {
         let Some((parent, key)) = pointer.rsplit_once('/') else {
             continue;
         };
@@ -130,18 +517,21 @@ pub fn hot_sections_changed(old: &Config, new: &Config) -> Vec<&'static str> {
         return Vec::new();
     };
     let mut out: Vec<&'static str> = Vec::new();
-    for pointer in HOT_SETTINGS {
-        if old.pointer(pointer) != new.pointer(pointer)
-            && let Some(section) = SECTION_NAMES
-                .iter()
-                .copied()
-                .find(|name| crate::document::section_of(pointer) == Some(*name))
+    for pointer in hot_settings_changed(&old, &new) {
+        if let Some(section) = section_name(pointer)
             && !out.contains(&section)
         {
             out.push(section);
         }
     }
     out
+}
+
+/// The top-level section `pointer` lies in, as one of [`SECTION_NAMES`].
+#[must_use]
+pub fn section_name(pointer: &str) -> Option<&'static str> {
+    let section = crate::document::section_of(pointer)?;
+    SECTION_NAMES.iter().copied().find(|name| *name == section)
 }
 
 /// Every top-level `Config` field name, reloadable or not. Kept in sync
@@ -179,10 +569,88 @@ mod tests {
         );
     }
 
+    /// The test the classification exists for: walk every setting the schema declares and
+    /// require each to be classified exactly once -- at or beneath one entry of [`SETTINGS`], or
+    /// a structure whose every setting is. A setting added to the schema without a line in
+    /// [`SETTINGS`] fails here, naming itself.
+    #[test]
+    fn every_setting_in_the_schema_is_classified_exactly_once() {
+        let fields = crate::schema::field_pointers();
+        let mut unclassified = Vec::new();
+        for field in &fields {
+            let covering: Vec<&Setting> = SETTINGS
+                .iter()
+                .filter(|setting| is_within(field, setting.pointer))
+                .collect();
+            match covering.len() {
+                1 => {}
+                0 => {
+                    // A structure split into classified settings is fine; its settings are
+                    // each checked in their own right.
+                    let split = SETTINGS
+                        .iter()
+                        .any(|setting| is_within(setting.pointer, field));
+                    if !split {
+                        unclassified.push(field.clone());
+                    }
+                }
+                _ => panic!(
+                    "{field} is classified more than once: {:?}",
+                    covering.iter().map(|s| s.pointer).collect::<Vec<_>>()
+                ),
+            }
+        }
+        assert!(
+            unclassified.is_empty(),
+            "settings with no classification in hs_config::reload::SETTINGS (add each as \
+             bootstrap, hot or restart): {unclassified:#?}"
+        );
+        // And every entry names a real setting.
+        for setting in SETTINGS {
+            assert!(
+                fields.contains(setting.pointer),
+                "{} is not a setting",
+                setting.pointer
+            );
+        }
+    }
+
+    #[test]
+    fn no_entry_lies_beneath_another() {
+        for a in SETTINGS {
+            for b in SETTINGS {
+                if a.pointer != b.pointer {
+                    assert!(
+                        !is_within(a.pointer, b.pointer),
+                        "{} lies beneath {}",
+                        a.pointer,
+                        b.pointer
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_bootstrap_entries_are_the_bootstrap_settings() {
+        let mut classified: Vec<&str> = SETTINGS
+            .iter()
+            .filter(|s| s.applies == Applies::Bootstrap)
+            .map(|s| s.pointer)
+            .collect();
+        let mut bootstrap: Vec<&str> = crate::bootstrap::BOOTSTRAP_SETTINGS
+            .iter()
+            .map(|s| s.pointer)
+            .collect();
+        classified.sort_unstable();
+        bootstrap.sort_unstable();
+        assert_eq!(classified, bootstrap);
+    }
+
     #[test]
     fn every_hot_setting_names_a_real_setting() {
         let whole = serde_json::to_value(Config::default()).unwrap();
-        for pointer in HOT_SETTINGS {
+        for pointer in HOT_SETTINGS.iter() {
             let section = crate::document::section_of(pointer).unwrap();
             assert!(SECTION_NAMES.contains(&section), "{pointer}");
             // Optional settings serialize as `null` when unset, and still exist.
@@ -191,9 +659,36 @@ mod tests {
                 "{pointer} is not a setting"
             );
         }
-        for section in RELOADABLE_SECTIONS {
-            assert!(HOT_SETTINGS.contains(&format!("/{section}").as_str()));
+        for section in RELOADABLE_SECTIONS.iter() {
+            assert!(
+                SETTINGS
+                    .iter()
+                    .any(|s| s.pointer.starts_with(&format!("/{section}/")))
+            );
         }
+    }
+
+    #[test]
+    fn applies_answers_for_settings_structures_and_unknowns() {
+        assert_eq!(applies("/rate_limits/login/per_second"), Applies::Hot);
+        assert_eq!(applies("/rate_limits"), Applies::Hot);
+        assert_eq!(applies("/storage/data_dir"), Applies::Bootstrap);
+        assert_eq!(applies("/listeners"), Applies::Bootstrap);
+        assert_eq!(applies("/telemetry/logging/level"), Applies::Hot);
+        assert_eq!(applies("/telemetry/logging"), Applies::Restart, "mixed");
+        assert_eq!(applies("/media/storage/path"), Applies::Restart);
+        assert_eq!(applies("/no/such/setting"), Applies::Restart);
+        assert_eq!(
+            applies("/auth/oidc_providers/0/client_id"),
+            Applies::Restart
+        );
+    }
+
+    #[test]
+    fn the_reloadable_sections_are_those_with_only_hot_administered_settings() {
+        let mut sections = RELOADABLE_SECTIONS.clone();
+        sections.sort_unstable();
+        assert_eq!(sections, vec!["migration", "rate_limits", "server"]);
     }
 
     #[test]
@@ -204,7 +699,8 @@ mod tests {
         assert!(sections_requiring_restart(&old, &new).is_empty());
         assert_eq!(hot_sections_changed(&old, &new), vec!["rate_limits"]);
         assert!(is_hot_setting("/rate_limits/message/burst_count"));
-        assert!(is_hot_setting("/rate_limits"));
+        assert!(is_hot_setting("/rate_limits/login"));
+        assert!(!is_hot_setting("/rate_limits"), "a section is no setting");
         assert!(!is_hot_setting("/rate_limits_other"));
     }
 
@@ -219,11 +715,10 @@ mod tests {
     }
 
     #[test]
-    fn a_section_nothing_rereads_requires_restart() {
+    fn a_setting_nothing_rereads_requires_restart() {
         let old = Config::default();
         let mut new = old.clone();
-        new.federation.allow_public_rooms_over_federation =
-            !old.federation.allow_public_rooms_over_federation;
+        new.federation.client_timeout = crate::Duration::from_secs(45);
         assert_eq!(sections_requiring_restart(&old, &new), vec!["federation"]);
         assert!(!is_reloadable("federation"));
     }
@@ -234,6 +729,7 @@ mod tests {
         let mut new = old.clone();
         new.federation.domain_allowlist = Some(vec!["friend.example".to_owned()]);
         new.federation.ip_range_blocklist = Vec::new();
+        new.federation.allow_public_rooms_over_federation = true;
         assert!(sections_requiring_restart(&old, &new).is_empty());
         assert_eq!(hot_sections_changed(&old, &new), vec!["federation"]);
         assert!(is_hot_setting("/federation/domain_allowlist"));
@@ -243,6 +739,23 @@ mod tests {
         new.federation.client_timeout = crate::Duration::from_secs(45);
         assert_eq!(sections_requiring_restart(&old, &new), vec!["federation"]);
         assert_eq!(hot_sections_changed(&old, &new), vec!["federation"]);
+    }
+
+    #[test]
+    fn hot_settings_changed_names_each_setting() {
+        let old = Config::default();
+        let mut new = old.clone();
+        new.auth.enable_registration = true;
+        new.media.max_upload_size = crate::ByteSize::bytes(10);
+        new.media.storage = crate::media::MediaStorageBackend::default();
+        let changed = hot_settings_changed(
+            &serde_json::to_value(&old).unwrap(),
+            &serde_json::to_value(&new).unwrap(),
+        );
+        assert_eq!(
+            changed,
+            vec!["/media/max_upload_size", "/auth/enable_registration"]
+        );
     }
 
     #[test]

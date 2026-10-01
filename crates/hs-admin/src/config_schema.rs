@@ -433,11 +433,9 @@ fn escape_token(token: &str) -> String {
 /// from — types, defaults, enums, descriptions and all — which is why no field name appears
 /// anywhere in this crate.
 pub fn config_json_schema() -> &'static Value {
-    static SCHEMA: OnceLock<Value> = OnceLock::new();
-    SCHEMA.get_or_init(|| {
-        serde_json::to_value(schemars::schema_for!(hs_config::Config))
-            .expect("a derived JSON Schema is always representable as JSON")
-    })
+    // With each setting's `x-applies` (bootstrap, hot or restart), from the reload boundary's
+    // one table (`hs_config::reload::SETTINGS`).
+    hs_config::schema::json_schema()
 }
 
 /// The secret settings of [`hs_config::Config`], derived once per process from

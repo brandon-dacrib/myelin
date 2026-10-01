@@ -2846,6 +2846,11 @@ export interface components {
             to: components["schemas"]["ConfigSettingValue"];
         };
         ConfigSettingInfo: {
+            /**
+             * @description When a change to it takes effect: bootstrap (set at install in the bootstrap file, HS__ variables or Helm values, never stored), hot (applied to the running server at once) or restart (stored at once, read at the next start). The same classification the schema member carries as x-applies on each setting (decision 0016).
+             * @enum {string}
+             */
+            applies?: "bootstrap" | "hot" | "restart";
             /** @description Whether this is a bootstrap setting (decision 0010) -- where the database is, a listener, this replica's cluster identity, a local path, the server name, or registration files imported once. Set at install in the bootstrap file, an HS__ environment variable or the Helm values, and never stored in the database; the reason editable is false, when it is. */
             bootstrap?: boolean;
             /** @description Whether config.update would accept a change to it. False for a bootstrap setting and for anything an HS__ environment variable pins, so the interface can show the field read-only with a reason rather than offering an edit that would be refused. */
@@ -2854,6 +2859,7 @@ export interface components {
             origin?: "default" | "file" | "database" | "environment";
             /** @description A whole-configuration JSON Pointer (/auth/enable_registration). An array is one setting, not one per element. */
             pointer?: string;
+            /** @description Whether a change to it takes effect without a restart (applies is hot). */
             reloadable?: boolean;
             /** @description Whether this setting's value is served redacted. */
             secret?: boolean;

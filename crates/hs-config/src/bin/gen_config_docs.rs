@@ -1,4 +1,5 @@
-//! Generates `docs/config.md` from the [`hs_config::Config`] JSON Schema,
+//! Generates `docs/config.md` from the [`hs_config::Config`] JSON Schema
+//! (`hs_config::schema::json_schema`, which carries each setting's `x-applies`),
 //! so the reference stays in sync with the schema without hand-maintenance.
 //! `schemars` embeds each field's `serde(default = ...)` value straight
 //! into the schema, so this walks the schema alone — no separate
@@ -11,9 +12,8 @@
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
-use hs_config::Config;
-use hs_config::bootstrap::{is_bootstrap_pointer, is_bootstrap_section};
-use hs_config::reload::RELOADABLE_SECTIONS;
+use hs_config::bootstrap::is_bootstrap_section;
+use hs_config::reload::{Applies, RELOADABLE_SECTIONS, SETTINGS};
 use serde_json::{Map, Value};
 
 /// Section order matches `Config`'s field declaration order, kept in sync
@@ -33,8 +33,9 @@ const SECTIONS: &[&str] = &[
 ];
 
 fn main() {
-    let schema = schemars::schema_for!(Config);
-    let schema_value = serde_json::to_value(&schema).expect("schema serializes");
+    // The annotated schema (`x-applies` on every classified setting), which is also what the
+    // admin API serves.
+    let schema_value = hs_config::schema::json_schema().clone();
     let defs = schema_value
         .get("$defs")
         .and_then(Value::as_object)
@@ -99,18 +100,43 @@ fn render_header(out: &mut String) {
          database, and are shown read-only in the interface. A file's administered settings seed \
          the database on the first start and are outranked by it after that.\n\n",
     );
-    out.push_str("## Reload boundary\n\n");
+    out.push_str("## When a change takes effect\n\n");
+    let count = |kind: Applies| SETTINGS.iter().filter(|s| s.applies == kind).count();
     let _ = writeln!(
         out,
-        "Sections not listed here require a process restart to change; see the doc comment on \
-         `hs_config::reload` for why each one does or does not. Currently reloadable without a \
-         restart: {}.\n",
+        "Every setting is one of three kinds (decision 0016; `hs_config::reload::SETTINGS` is the \
+         table, and the schema the admin API serves carries it as `x-applies` on each setting):\n\n\
+         - **bootstrap** ({}): set at install, per process, never stored in the database;\n\
+         - **hot** ({}): applies to the running server at once -- a save reports it as reloaded;\n\
+         - **restart** ({}): stored at once, read at the next start -- a save reports it as \
+         waiting for a restart.\n\n\
+         The **Applies** column below gives each setting's kind and what reads it. Sections in \
+         which every administered setting is hot: {}.\n",
+        count(Applies::Bootstrap),
+        count(Applies::Hot),
+        count(Applies::Restart),
         RELOADABLE_SECTIONS
             .iter()
             .map(|s| format!("`{s}`"))
             .collect::<Vec<_>>()
             .join(", ")
     );
+}
+
+/// The Applies column for the field at `pointer`: its kind and reader, or, for a structure
+/// whose settings are classified one by one, each of those.
+fn applies_cell(pointer: &str) -> String {
+    if let Some(setting) = hs_config::reload::setting(pointer) {
+        return format!("{} ({})", setting.applies.as_str(), setting.reader);
+    }
+    SETTINGS
+        .iter()
+        .filter_map(|setting| {
+            let rest = setting.pointer.strip_prefix(pointer)?.strip_prefix('/')?;
+            Some(format!("`{rest}`: {}", setting.applies.as_str()))
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Resolves a `$ref` against `defs`, one level (schemas here are not
@@ -143,6 +169,10 @@ fn render_section(out: &mut String, section: &str, schema: &Value, defs: &Map<St
         let _ = writeln!(out, "{desc}\n");
     }
     let reloadable = RELOADABLE_SECTIONS.contains(&section);
+    let prefix = format!("/{section}/");
+    let some_hot = SETTINGS
+        .iter()
+        .any(|s| s.pointer.starts_with(&prefix) && s.applies == Applies::Hot);
     let _ = writeln!(
         out,
         "**{}**\n",
@@ -150,7 +180,10 @@ fn render_section(out: &mut String, section: &str, schema: &Value, defs: &Map<St
             "Bootstrap: set at install (bootstrap file, `HS__` variables, command line or Helm \
              values), never stored in the database."
         } else if reloadable {
-            "Reloadable without a restart."
+            "Every administered setting here applies to the running server at once."
+        } else if some_hot {
+            "Some settings here apply to the running server at once; the rest at the next \
+             restart (see Applies)."
         } else {
             "Restart required to change."
         }
@@ -190,8 +223,8 @@ fn render_field_table(out: &mut String, section: &str, schema: &Value, defs: &Ma
         .map(|a| a.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default();
 
-    out.push_str("| Field | Type | Default | Description |\n");
-    out.push_str("|---|---|---|---|\n");
+    out.push_str("| Field | Type | Default | Applies | Description |\n");
+    out.push_str("|---|---|---|---|---|\n");
 
     for (name, field_schema) in properties {
         if name == "backend" {
@@ -216,16 +249,18 @@ fn render_field_table(out: &mut String, section: &str, schema: &Value, defs: &Ma
             None => "—".to_owned(),
         };
         let secret_note = if is_secret { " *(secret)*" } else { "" };
+        let pointer = format!("/{section}/{name}");
         let bootstrap_note = if !is_bootstrap_section(section)
-            && is_bootstrap_pointer(&format!("/{section}/{name}"))
+            && hs_config::reload::applies(&pointer) == Applies::Bootstrap
         {
             " *(bootstrap)*"
         } else {
             ""
         };
+        let applies = applies_cell(&pointer);
         let _ = writeln!(
             out,
-            "| `{name}`{secret_note}{bootstrap_note} | {type_str} | {default_str} | {desc} |"
+            "| `{name}`{secret_note}{bootstrap_note} | {type_str} | {default_str} | {applies} | {desc} |"
         );
     }
     out.push('\n');

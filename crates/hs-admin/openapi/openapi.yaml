@@ -8612,6 +8612,14 @@ components:
           description: Whether this setting's value is served redacted.
         reloadable:
           type: boolean
+          description: Whether a change to it takes effect without a restart (applies is hot).
+        applies:
+          type: string
+          enum:
+          - bootstrap
+          - hot
+          - restart
+          description: 'When a change to it takes effect: bootstrap (set at install in the bootstrap file, HS__ variables or Helm values, never stored), hot (applied to the running server at once) or restart (stored at once, read at the next start). The same classification the schema member carries as x-applies on each setting (decision 0016).'
         editable:
           type: boolean
           description: Whether config.update would accept a change to it. False for a bootstrap setting and for anything an HS__ environment variable pins, so the interface can show the field read-only with a reason rather than offering an edit that would be refused.

@@ -37,7 +37,8 @@
             "x_forwarded": false
           }
         ]
-      }
+      },
+      "x-applies": "bootstrap"
     },
     "storage": {
       "description": "Storage backend selection.",
@@ -45,7 +46,8 @@
       "default": {
         "backend": "embedded",
         "data_dir": "./data"
-      }
+      },
+      "x-applies": "bootstrap"
     },
     "media": {
       "description": "Media repository.",
@@ -284,7 +286,8 @@
       "properties": {
         "server_name": {
           "description": "The domain in `@user:server_name`, room aliases and event origins.\nCorresponds to Synapse's `server_name`. Changing it after any room\nexists is not supported by any Matrix homeserver, including this\none.",
-          "type": "string"
+          "type": "string",
+          "x-applies": "bootstrap"
         },
         "public_baseurl": {
           "description": "The externally reachable base URL for clients, if different from\n`https://{server_name}`. Corresponds to Synapse's `public_baseurl`.",
@@ -292,7 +295,8 @@
             "string",
             "null"
           ],
-          "default": null
+          "default": null,
+          "x-applies": "hot"
         },
         "well_known_server": {
           "description": "The value this server advertises at `GET /.well-known/matrix/server`:\nthe `host[:port]` a remote server should actually connect to for\nfederation, when that differs from `server_name`. Corresponds to\nSynapse's `serve_server_wellknown` plus the document Synapse serves\nfrom it, collapsed into one field: `None` (the default) means the\nroute is not served at all — a deployment that does not delegate\nshould 404 there, not serve a document pointing at itself, since a\nwell-known that names the server name itself is indistinguishable\nfrom no delegation and only adds a failure mode\n(`crates/hs-federation/src/discovery.rs` implements the resolution\norder this feeds).",
@@ -300,12 +304,14 @@
             "string",
             "null"
           ],
-          "default": null
+          "default": null,
+          "x-applies": "hot"
         },
         "signing_key_path": {
           "description": "Directory holding this server's Ed25519 signing keys. Corresponds to\nSynapse's `signing_key_path` (a file here; a directory in our\nlayout because multiple active keys are normal during rotation).",
           "type": "string",
-          "default": "./signing-keys"
+          "default": "./signing-keys",
+          "x-applies": "bootstrap"
         },
         "admin_contact": {
           "description": "Contact address advertised for abuse reports and shown to operators\nof other servers. Corresponds to Synapse's `admin_contact`.",
@@ -313,12 +319,14 @@
             "string",
             "null"
           ],
-          "default": null
+          "default": null,
+          "x-applies": "hot"
         },
         "report_stats": {
           "description": "Whether this server opts in to the anonymised statistics-reporting\nendpoint. Corresponds to Synapse's `report_stats`.",
           "type": "boolean",
-          "default": false
+          "default": false,
+          "x-applies": "hot"
         },
         "unstable_features": {
           "description": "Extra `unstable_features` flags advertised by `GET /_matrix/client/versions`, by MSC\nidentifier (`org.matrix.msc3202: true`). Merged over the server's built-in set, which is\nempty: every flag gates a feature a client or bridge will then use, so advertise one only\nfor a feature this server serves. `false` suppresses a built-in flag.",
@@ -326,7 +334,8 @@
           "additionalProperties": {
             "type": "boolean"
           },
-          "default": {}
+          "default": {},
+          "x-applies": "hot"
         }
       },
       "additionalProperties": false,
@@ -653,12 +662,14 @@
           "default": {
             "backend": "local",
             "path": "./media-store"
-          }
+          },
+          "x-applies": "restart"
         },
         "max_upload_size": {
           "description": "Maximum accepted upload size. Corresponds to Synapse's\n`max_upload_size`.",
           "$ref": "#/$defs/ByteSize",
-          "default": "50M"
+          "default": "50M",
+          "x-applies": "hot"
         },
         "thumbnail_sizes": {
           "description": "Thumbnail sizes to pre-generate/serve on demand. Corresponds to\nSynapse's `thumbnail_sizes`.",
@@ -692,12 +703,14 @@
               "height": 600,
               "method": "scale"
             }
-          ]
+          ],
+          "x-applies": "hot"
         },
         "url_preview_enabled": {
           "description": "Enable `GET /_matrix/media/*/preview_url`. Corresponds to Synapse's\n`url_preview_enabled`.",
           "type": "boolean",
-          "default": false
+          "default": false,
+          "x-applies": "hot"
         },
         "url_preview_ip_range_blocklist": {
           "description": "IP ranges URL previews must not fetch from (SSRF protection).\nCorresponds to Synapse's `url_preview_ip_range_blacklist`.",
@@ -715,7 +728,8 @@
             "::1/128",
             "fe80::/10",
             "fc00::/7"
-          ]
+          ],
+          "x-applies": "hot"
         },
         "remote_media_retention": {
           "description": "How long to keep cached copies of remote media. `None` means keep\nforever. Corresponds to Synapse's\n`media_retention.remote_media_lifetime`.",
@@ -727,27 +741,32 @@
               "type": "null"
             }
           ],
-          "default": null
+          "default": null,
+          "x-applies": "hot"
         },
         "allow_legacy_unauthenticated_media": {
           "description": "Serve the pre-authentication-media (legacy, unauthenticated)\nendpoints alongside the authenticated ones. Corresponds to\nSynapse's `enable_authenticated_media` (inverted: this flag adds\nthe legacy endpoints rather than removing the new ones, since\nauthenticated media is not optional here).",
           "type": "boolean",
-          "default": true
+          "default": true,
+          "x-applies": "restart"
         },
         "url_preview_timeout": {
           "description": "Per-request timeout for a `preview_url` fetch (each redirect hop is\ntimed separately). Synapse has no config knob for this — it hardcodes\na 30-second body-read timeout in its HTTP client\n(`refs/synapse/synapse/http/client.py`'s `get_file`, `timeout_deferred(...,\ntimeout=30, ...)`); this project exposes it as a real setting instead.\nSee `docs/rfcs/0006-url-previews.md` section 4.5 and\n`hs_media::preview::FetchLimits::timeout`, which this field is meant\nto populate (`hs-media` cannot depend on this crate's consumer wiring\n— see that crate's status file for the one-line change needed).",
           "$ref": "#/$defs/Duration",
-          "default": "30s"
+          "default": "30s",
+          "x-applies": "hot"
         },
         "url_preview_max_fetch_size": {
           "description": "Maximum response body size accepted for a `preview_url` page fetch or\nits `og:image` fetch (each capped independently at this value).\nCorresponds to Synapse's `max_spider_size`, whose own default is\n`\"10M\"` (`refs/synapse/synapse/config/repository.py`:\n`self.max_spider_size = self.parse_size(config.get(\"max_spider_size\",\n\"10M\"))`). See `hs_media::preview::FetchLimits::max_body_bytes`.",
           "$ref": "#/$defs/ByteSize",
-          "default": "10M"
+          "default": "10M",
+          "x-applies": "hot"
         },
         "url_preview_cache_lifetime": {
           "description": "How long a `preview_url` response is cached before it is fetched\nagain. Synapse has no config knob for this either — it hardcodes a\none-hour cache lifetime (`refs/synapse/synapse/media/url_previewer.py`:\n`ONE_HOUR = 60 * 60 * 1000`, used as both the in-memory and the\non-disk `url_cache` expiry); this project exposes it as a real\nsetting instead. See `hs_media::preview::DEFAULT_PREVIEW_CACHE_TTL_MS`,\nwhich this field is meant to replace.",
           "$ref": "#/$defs/Duration",
-          "default": "1h"
+          "default": "1h",
+          "x-applies": "hot"
         },
         "scanning": {
           "description": "Content scanning of uploads (RFC 0008): when to scan, with which provider, and what to do\nwhen the scanner cannot answer. Off by default. See [`crate::scanning`].",
@@ -774,7 +793,8 @@
             },
             "icap": null,
             "http": null
-          }
+          },
+          "x-applies": "restart"
         }
       },
       "additionalProperties": false
@@ -1307,7 +1327,8 @@
         "enabled": {
           "description": "Master switch for outbound and inbound federation traffic.\nCorresponds to Synapse's `federation_domain_whitelist` being\nunset/set combined with the general notion of \"federation off\".",
           "type": "boolean",
-          "default": true
+          "default": true,
+          "x-applies": "restart"
         },
         "domain_allowlist": {
           "description": "If set, federation traffic is restricted to exactly these server\nnames. Corresponds to Synapse's `federation_domain_whitelist`.\nChecked on every outbound request; a change applies to the running\nserver at once.",
@@ -1318,7 +1339,8 @@
           "items": {
             "type": "string"
           },
-          "default": null
+          "default": null,
+          "x-applies": "hot"
         },
         "ip_range_blocklist": {
           "description": "IP ranges (CIDR) federation requests must not be sent to.\nCorresponds to Synapse's `federation_ip_range_blacklist`.\nA change applies to the running server at once.",
@@ -1336,7 +1358,8 @@
             "::1/128",
             "fe80::/10",
             "fc00::/7"
-          ]
+          ],
+          "x-applies": "hot"
         },
         "ip_range_allowlist": {
           "description": "IP ranges exempted from `ip_range_blocklist` (for federating with a\ndeliberately private deployment). Corresponds to Synapse's\n`federation_ip_range_whitelist`. A change applies to the running\nserver at once.",
@@ -1344,12 +1367,14 @@
           "items": {
             "type": "string"
           },
-          "default": []
+          "default": [],
+          "x-applies": "hot"
         },
         "verify_certificates": {
           "description": "Verify TLS certificates on outbound federation requests.\nCorresponds to Synapse's `federation_verify_certificates`.\n\nLeave this `true` in production: setting it `false` makes outbound federation TLS accept\n*any* certificate, which is trivially machine-in-the-middled. It exists for test\ndeployments and conformance harnesses (Complement and similar) that terminate TLS with a\ncertificate this server has no other way to trust yet. The outbound client logs a\nprominent startup warning whenever this is `false`, precisely so it cannot go unnoticed in\na real deployment. Prefer [`Self::custom_ca_certificates`] instead, if the actual goal is\nfederating with one specific server whose certificate chains to a CA this server does not\nalready trust — that trusts exactly the named CA, not every certificate on the internet.",
           "type": "boolean",
-          "default": true
+          "default": true,
+          "x-applies": "restart"
         },
         "custom_ca_certificates": {
           "description": "Paths to additional PEM-encoded CA certificate files trusted for outbound federation TLS,\non top of (never instead of) the ~140 public root CAs this server trusts by default.\nCorresponds to Synapse's `federation_custom_ca_list`. This is the answer to \"how do I\nfederate with a server whose certificate was issued by a CA that is not one of the public\nroots\" without resorting to [`Self::verify_certificates`], which would trust every\ncertificate rather than just the one CA actually meant: name the CA's certificate file\nhere. A conformance harness's generated CA (Complement) and an internal deployment's\nprivate CA are both meant to be configured this way.",
@@ -1357,39 +1382,46 @@
           "items": {
             "type": "string"
           },
-          "default": []
+          "default": [],
+          "x-applies": "restart"
         },
         "trust_os_root_store": {
           "description": "Whether outbound federation TLS also trusts whatever CA store the *operating system*\ntrusts, in addition to this server's bundled public root CAs. Defaults to `false`.\n\nTrusting the OS store is the right choice for some deployments: an administrator who runs\n`update-ca-certificates` (or the platform equivalent) to add a corporate or internal CA\nreasonably expects every TLS client on that machine, including this one, to honour it\nautomatically, and it is what many other pieces of server software do by default. It is\nthe wrong choice as this *server's* unconditional default, though: outbound federation\ntraffic authenticates events between servers that never agreed on a shared root of trust\nahead of time (unlike, say, an internal service mesh with its own CA hierarchy), so\nsilently broadening federation's trust to include every CA some unrelated piece of\ninstalled software, corporate TLS-inspecting proxy, or forgotten test certificate has\nadded to the OS store is a real, if quiet, security regression for exactly the traffic\nthis setting controls — and it is a regression the operator of *this* server may not even\nhave chosen (the OS store can be broadened by anyone with root on the machine, for reasons\nhaving nothing to do with running a homeserver). Defaulting to `false` and pairing it with\n[`Self::custom_ca_certificates`] for the explicit, narrow case (name exactly the CA meant\nto be trusted) keeps that choice with the person configuring federation, not with whoever\nlast ran an unrelated `update-ca-certificates`.",
           "type": "boolean",
-          "default": false
+          "default": false,
+          "x-applies": "restart"
         },
         "client_timeout": {
           "description": "Per-request timeout for outbound federation HTTP calls. Corresponds\nto Synapse's `federation_client_timeout`.",
           "$ref": "#/$defs/Duration",
-          "default": "30s"
+          "default": "30s",
+          "x-applies": "restart"
         },
         "max_retry_backoff": {
           "description": "Cap on the exponential backoff between retries of a failed\nfederation destination. Corresponds to Synapse's\n`destination_min_retry_interval` family, simplified to one ceiling.",
           "$ref": "#/$defs/Duration",
-          "default": "1h"
+          "default": "1h",
+          "x-applies": "restart"
         },
         "max_queued_pdus_per_destination": {
           "description": "How many events the outbound queue holds for one destination before it is dropped and\nthe destination, once it answers again, is caught up with the latest event of each room\nit is behind in instead (it fetches the rest itself). Bounds what a server that is down\nfor days costs this one's database. Corresponds to Synapse's catch-up mode\n(`destination_rooms`), which Synapse enters on the first failure; Synapse has no\nsetting for it. At least 1.",
           "type": "integer",
           "format": "uint32",
           "minimum": 0,
-          "default": 10000
+          "default": 10000,
+          "x-applies": "restart"
         },
         "allow_public_rooms_over_federation": {
           "description": "Advertise this room's public directory over federation. Corresponds\nto Synapse's `allow_public_rooms_over_federation`.",
           "type": "boolean",
-          "default": false
+          "default": false,
+          "x-applies": "hot"
         },
         "allow_device_name_lookup_over_federation": {
           "description": "Answer remote servers' `/_matrix/federation/*/user/devices/*`\nqueries for device display names. Corresponds to Synapse's\n`allow_device_name_lookup_over_federation`.",
           "type": "boolean",
-          "default": false
+          "default": false,
+          "x-applies": "hot"
         }
       },
       "additionalProperties": false
@@ -1401,7 +1433,8 @@
         "enabled": {
           "description": "Master switch; when false, no limiter runs (tests and benchmarking\nonly — never recommended in production).",
           "type": "boolean",
-          "default": true
+          "default": true,
+          "x-applies": "hot"
         },
         "message": {
           "description": "Per-user event sending: messages, state and redactions. Corresponds to Synapse's\n`rc_message`. A `per_second` of `0` limits nobody. Appservices that registered with\n`rate_limited: false` are exempt.",
@@ -1409,7 +1442,8 @@
           "default": {
             "per_second": 0.2,
             "burst_count": 10
-          }
+          },
+          "x-applies": "hot"
         },
         "registration": {
           "description": "`POST /register`. Corresponds to Synapse's `rc_registration`.",
@@ -1417,7 +1451,8 @@
           "default": {
             "per_second": 0.17,
             "burst_count": 3
-          }
+          },
+          "x-applies": "hot"
         },
         "login": {
           "description": "`POST /login`. Corresponds to Synapse's `rc_login.address`.",
@@ -1425,7 +1460,8 @@
           "default": {
             "per_second": 0.17,
             "burst_count": 3
-          }
+          },
+          "x-applies": "hot"
         },
         "joins_local": {
           "description": "Local room joins. Corresponds to Synapse's `rc_joins.local`.",
@@ -1433,7 +1469,8 @@
           "default": {
             "per_second": 0.1,
             "burst_count": 10
-          }
+          },
+          "x-applies": "hot"
         },
         "joins_remote": {
           "description": "Joins to rooms on remote servers. Corresponds to Synapse's\n`rc_joins.remote`.",
@@ -1441,7 +1478,8 @@
           "default": {
             "per_second": 0.01,
             "burst_count": 10
-          }
+          },
+          "x-applies": "hot"
         },
         "admin_redaction": {
           "description": "Admin-triggered redactions. Corresponds to Synapse's\n`rc_admin_redaction`.",
@@ -1449,7 +1487,8 @@
           "default": {
             "per_second": 1.0,
             "burst_count": 50
-          }
+          },
+          "x-applies": "hot"
         },
         "federation": {
           "description": "Inbound federation transactions per origin server. Corresponds to\nSynapse's `rc_federation`.",
@@ -1457,7 +1496,8 @@
           "default": {
             "per_second": 10.0,
             "burst_count": 100
-          }
+          },
+          "x-applies": "hot"
         },
         "third_party_id_validation": {
           "description": "`POST /account/3pid/*/requestToken`. Corresponds to Synapse's\n`rc_3pid_validation`.",
@@ -1465,7 +1505,8 @@
           "default": {
             "per_second": 0.003,
             "burst_count": 5
-          }
+          },
+          "x-applies": "hot"
         }
       },
       "additionalProperties": false
@@ -1499,12 +1540,14 @@
         "enable_registration": {
           "description": "Allow `POST /register`. Corresponds to Synapse's\n`enable_registration`.",
           "type": "boolean",
-          "default": false
+          "default": false,
+          "x-applies": "hot"
         },
         "registration_shared_secret": {
           "description": "Inline shared secret for the `/_synapse/mk_admin_user`-equivalent\nshared-secret registration protocol (see `hs-compat`). Prefer\n`registration_shared_secret_file`. Corresponds to Synapse's\n`registration_shared_secret`.",
           "$ref": "#/$defs/SecretString",
-          "default": null
+          "default": null,
+          "x-applies": "hot"
         },
         "registration_shared_secret_file": {
           "description": "Path to a file containing the shared-secret-registration secret.",
@@ -1512,22 +1555,26 @@
             "string",
             "null"
           ],
-          "default": null
+          "default": null,
+          "x-applies": "hot"
         },
         "user_directory_search_all_users": {
           "description": "Let the user directory (`POST /user_directory/search`, the box a client's invite dialog\nsearches) find every account on this server. Off by default: a search then finds only\nthe people the searcher shares a room with and the members of public rooms, which is\nwhat the Matrix specification requires and no more. Turning it on lets people find\nsomebody they have not met yet -- convenient on a small server where everyone knows\neveryone -- at the cost that any account can list every other account's name,\nincluding the accounts a bridge creates for other people's contacts. Corresponds to\nSynapse's `user_directory.search_all_users`.",
           "type": "boolean",
-          "default": false
+          "default": false,
+          "x-applies": "hot"
         },
         "enable_legacy_login": {
           "description": "Serve the legacy `/login` and user-interactive-auth flows in\naddition to the native OAuth 2.0 issuer. Needed for older clients,\nbridges and `m.login.application_service`.",
           "type": "boolean",
-          "default": true
+          "default": true,
+          "x-applies": "restart"
         },
         "session_secret": {
           "description": "Inline key signing issued access/refresh tokens and session\ncookies. Prefer `session_secret_file`. Corresponds to Synapse's\n`macaroon_secret_key`.",
           "$ref": "#/$defs/SecretString",
-          "default": null
+          "default": null,
+          "x-applies": "restart"
         },
         "session_secret_file": {
           "description": "Path to a file containing the session-signing secret.",
@@ -1535,12 +1582,14 @@
             "string",
             "null"
           ],
-          "default": null
+          "default": null,
+          "x-applies": "restart"
         },
         "access_token_lifetime": {
           "description": "Access token lifetime. Corresponds to Synapse's\n`access_token_lifetime` (native OAuth tokens; legacy non-refreshable\ntokens are unaffected, matching Synapse's own carve-out).",
           "$ref": "#/$defs/Duration",
-          "default": "1h"
+          "default": "1h",
+          "x-applies": "hot"
         },
         "refresh_token_lifetime": {
           "description": "Refresh token lifetime; `None` means refresh tokens do not expire.\nCorresponds to Synapse's `refreshable_access_token_lifetime`\nfamily.",
@@ -1552,7 +1601,8 @@
               "type": "null"
             }
           ],
-          "default": "1y"
+          "default": "1y",
+          "x-applies": "hot"
         },
         "password": {
           "description": "Password login settings.",
@@ -1576,7 +1626,8 @@
           "items": {
             "$ref": "#/$defs/OidcProviderConfig"
           },
-          "default": []
+          "default": [],
+          "x-applies": "restart"
         },
         "mas_delegation": {
           "description": "When set, delegate to Matrix Authentication Service instead of\nrunning the native OAuth issuer.",
@@ -1588,7 +1639,8 @@
               "type": "null"
             }
           ],
-          "default": null
+          "default": null,
+          "x-applies": "restart"
         }
       },
       "additionalProperties": false
@@ -1600,12 +1652,14 @@
         "enabled": {
           "description": "Allow password login at all. Corresponds to Synapse's\n`password_config.enabled`.",
           "type": "boolean",
-          "default": true
+          "default": true,
+          "x-applies": "restart"
         },
         "pepper": {
           "description": "Inline pepper mixed into password hashes. Prefer `pepper_file`.\nCorresponds to Synapse's `password_config.pepper`.",
           "$ref": "#/$defs/SecretString",
-          "default": null
+          "default": null,
+          "x-applies": "hot"
         },
         "pepper_file": {
           "description": "Path to a file containing the pepper.",
@@ -1613,7 +1667,8 @@
             "string",
             "null"
           ],
-          "default": null
+          "default": null,
+          "x-applies": "hot"
         },
         "policy": {
           "description": "Complexity requirements. Corresponds to Synapse's\n`password_config.policy`.",
@@ -1624,7 +1679,8 @@
             "require_symbol": false,
             "require_uppercase": false,
             "require_lowercase": false
-          }
+          },
+          "x-applies": "hot"
         }
       },
       "additionalProperties": false
@@ -1753,7 +1809,8 @@
         "enabled": {
           "description": "Master switch for appservice transaction delivery.",
           "type": "boolean",
-          "default": true
+          "default": true,
+          "x-applies": "restart"
         },
         "registration_files": {
           "description": "Registration YAML files to import into the appservice registry, once each. Corresponds to\nSynapse's `app_service_config_files`, and exists for migrating from it: the first start\nthat sees a file imports it (unless the registry already has an appservice with that id)\nand records the import; every later start skips it, even if the file has changed. From\nthen on the bridge is managed in the Bridges section of the interface. Bootstrap only: set\nin the bootstrap file or the environment, never stored in the database.",
@@ -1761,14 +1818,16 @@
           "items": {
             "type": "string"
           },
-          "default": []
+          "default": [],
+          "x-applies": "bootstrap"
         },
         "tracking_failure_threshold": {
           "description": "Consecutive delivery failures to one appservice before it is marked\nunhealthy and moved to backlog-only delivery.",
           "type": "integer",
           "format": "uint32",
           "minimum": 0,
-          "default": 50
+          "default": 50,
+          "x-applies": "hot"
         }
       },
       "additionalProperties": false
@@ -1783,7 +1842,8 @@
           "default": {
             "enabled": false,
             "synapse_compat_names": true
-          }
+          },
+          "x-applies": "restart"
         },
         "tracing": {
           "description": "OpenTelemetry tracing.",
@@ -1792,7 +1852,8 @@
             "enabled": false,
             "otlp_endpoint": null,
             "sample_ratio": 0.1
-          }
+          },
+          "x-applies": "restart"
         },
         "logging": {
           "description": "Structured logging.",
@@ -1812,7 +1873,8 @@
               "type": "null"
             }
           ],
-          "default": null
+          "default": null,
+          "x-applies": "restart"
         }
       },
       "additionalProperties": false
@@ -1867,12 +1929,14 @@
         "level": {
           "description": "Minimum level emitted. A change applies to the running server at\nonce, unless `RUST_LOG` set the filter when it started.",
           "$ref": "#/$defs/LogLevel",
-          "default": "info"
+          "default": "info",
+          "x-applies": "hot"
         },
         "json": {
           "description": "Emit JSON lines instead of human-readable text. Corresponds to\nSynapse's `log_config` handler choice, simplified to a boolean since\nthis server has one structured schema rather than arbitrary\n`logging.config.dictConfig` handlers.",
           "type": "boolean",
-          "default": false
+          "default": false,
+          "x-applies": "restart"
         }
       },
       "additionalProperties": false
@@ -1939,21 +2003,24 @@
         "single_node": {
           "description": "Run as a single replica owning everything, with the ownership\nmanager inert and no mesh listener. Corresponds to `hs serve\n--single-node`.",
           "type": "boolean",
-          "default": true
+          "default": true,
+          "x-applies": "bootstrap"
         },
         "room_shards": {
           "description": "Number of room ownership shards. Fixed at cluster creation.",
           "type": "integer",
           "format": "uint32",
           "minimum": 0,
-          "default": 256
+          "default": 256,
+          "x-applies": "restart"
         },
         "user_shards": {
           "description": "Number of user-session ownership shards. Fixed at cluster creation.",
           "type": "integer",
           "format": "uint32",
           "minimum": 0,
-          "default": 256
+          "default": 256,
+          "x-applies": "restart"
         },
         "mesh": {
           "description": "Internal replica-to-replica mesh.",
@@ -1964,17 +2031,20 @@
             "tls": null,
             "shared_secret": null,
             "shared_secret_file": null
-          }
+          },
+          "x-applies": "bootstrap"
         },
         "heartbeat_interval": {
           "description": "How often a replica renews its liveness heartbeat.",
           "$ref": "#/$defs/Duration",
-          "default": "2s"
+          "default": "2s",
+          "x-applies": "restart"
         },
         "lease_ttl": {
           "description": "How long a lease survives without a heartbeat before another\nreplica may claim ownership.",
           "$ref": "#/$defs/Duration",
-          "default": "10s"
+          "default": "10s",
+          "x-applies": "restart"
         }
       },
       "additionalProperties": false
@@ -2073,7 +2143,8 @@
               "type": "null"
             }
           ],
-          "default": null
+          "default": null,
+          "x-applies": "hot"
         }
       },
       "additionalProperties": false
