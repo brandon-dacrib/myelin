@@ -500,3 +500,89 @@ async fn only_the_replica_that_owns_a_destinations_federation_shard_sends_to_it(
 
     outbound.stop();
 }
+
+/// What catch-up sends a destination for a room (`RoomCatchUp`): the latest event this
+/// server's own users sent -- found behind a remote user's newer event too -- and nothing once
+/// the destination has no user joined.
+#[tokio::test]
+async fn catch_up_sends_the_latest_local_event_and_nothing_after_the_destination_left() {
+    use hs_federation::sender::CatchUpSource;
+    let h = Harness::new().await;
+    let source = hs_cli::federation_sender::RoomCatchUp::new(
+        h.rooms.clone(),
+        h.identity.server_name.clone(),
+    );
+    let alice = Harness::alice();
+    let bob = h.bob();
+    let room = h.public_room().await;
+    let room_id = room.query(|a| a.room_id().to_string()).await;
+    room.membership(
+        bob.clone(),
+        Action::Join,
+        bob.clone(),
+        serde_json::json!({}),
+        2_000,
+    )
+    .await
+    .expect("bob joins");
+    let say = |sender: OwnedUserId, body: &'static str, ts: i64| {
+        let room = room.clone();
+        async move {
+            room.send_event(
+                sender,
+                "m.room.message".to_owned(),
+                None,
+                serde_json::json!({ "msgtype": "m.text", "body": body }),
+                None,
+                ts,
+            )
+            .await
+            .expect("message")
+        }
+    };
+
+    say(alice.clone(), "one", 3_000).await;
+    // Bob's message is the room's newest, and not this server's to send.
+    say(bob.clone(), "bob's", 4_000).await;
+    let latest = source
+        .latest_pdu(&room_id, &h.remote)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(latest["content"]["body"], "one", "{latest}");
+    assert!(latest.get("signatures").is_some() && latest.get("event_id").is_none());
+
+    say(alice.clone(), "two", 5_000).await;
+    let latest = source
+        .latest_pdu(&room_id, &h.remote)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(latest["content"]["body"], "two", "{latest}");
+    // A server with nobody in the room is not caught up in it.
+    assert!(
+        source
+            .latest_pdu(&room_id, "elsewhere.example")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    room.membership(
+        alice.clone(),
+        Action::Kick,
+        bob.clone(),
+        serde_json::json!({}),
+        6_000,
+    )
+    .await
+    .expect("kick");
+    assert!(
+        source
+            .latest_pdu(&room_id, &h.remote)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(source.latest_pdu("not a room", &h.remote).await.is_err());
+}
