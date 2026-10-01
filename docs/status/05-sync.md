@@ -1,7 +1,87 @@
 # 05 Sync: status
 
-Last updated: 2026-09-30 (session 9: typing, receipts and presence cross replicas. Session 8,
-session 7 and the integration note follow; sessions 1-6 are preserved unchanged further down.)
+Last updated: 2026-09-30 (session 10: the two CI races. Session 9, session 8, session 7 and the
+integration note follow; sessions 1-6 are preserved unchanged further down.)
+
+## Session 10 (2026-09-30, branch `agent/ci-flakes`): the two races that kept `main` red
+
+`main` failed CI on every push after `d6b3cd7`: two real-binary tests in `crates/hs-cli/tests/`
+failed on GitHub's loaded amd64 runner. Both were server races in this crate, and both are
+fixed in the server, not by waiting in the tests.
+
+**1. `PUT /typing` right after a join answered `403`.**
+(`appservice_ephemeral.rs::a_bridge_is_sent_ephemeral_data_once_across_a_restart_and_not_while_paused`.)
+`put_typing` gated on the user store's membership record, which the session hub writes off the
+registry's global stream a moment *after* the room accepted the join -- the lag `/sync`
+already waits out. `/receipt` and `/read_markers` (`routes::receipts::require_joined`) had the
+same hole; nothing else in `hs-user` gates on store membership. New
+`SessionHub::is_joined(user, room, at_most)`: the store record first (the usual, cheap
+answer); if it does not say `join`, the room's own current `m.room.member` state (written the
+instant the join was accepted; through the mirror on a non-owner replica); if that does not
+say `join` either, `settle_before_read` -- the same bounded wait `/sync` makes,
+`READ_YOUR_WRITES_WAIT`, 500 ms, now `pub(crate)` -- and the store again. A room that does not
+exist has no joined members (`403`, as before). The three routes use it.
+
+**2. `/sync` answered `404 room not found` after an admin room deletion.**
+(`admin_rooms.rs::a_deleted_room_empties_moves_its_members_and_cannot_be_joined`.) The delete
+(`hs-room`'s `admin::content::delete_room`) makes each local member leave and then purges the
+room (`delete_everything`, `forget_resident`) in one go. A hub a moment behind read the leaves
+after the room was gone: `apply_room_update` could not load it, logged a warning and dropped
+them, so every member's record still said `join` for a room the registry no longer had, and
+the per-room loop in `sync::build` turned the `RoomNotFound` into the whole response's error.
+The same happened, without the hub lagging, to any incremental sync whose feed still held the
+deletion's leave once the purge had run. Fixed at both ends:
+
+- **The hub applies a gone room's update from the update itself**
+  (`apply_update_for_a_gone_room`): each `membership_delta` is written to the member's record
+  with a feed entry (unless the room was hot), the member is woken, and the room's public
+  directory row is removed. Logged at `info`.
+- **`/sync` never fails because one room is gone.** A room the registry cannot load is
+  reported in `rooms.leave` with an empty timeline and state in an incremental sync (so a client
+  that still lists it drops it, once), and left out of an initial sync unless the filter asks
+  for left rooms. `resume_mode` takes the handle the loop already loaded instead of loading the
+  room again; the long-poll's hot-room check skips a gone room; and the walks over a user's
+  rooms -- `users_sharing_room_with` (presence, device lists), `users_visible_in_directory_to`,
+  and the three member lookups in `sync::build` -- go through new
+  `SessionHub::joined_member_ids_if_present`, where a gone room has no members.
+  `UserError::is_room_not_found` names the case.
+
+**Observability.** `wait_for_consumed` (behind `/sync`'s wait and now the membership gates')
+logs a `warn` when the hub has not caught up within its bound ("the session hub did not catch
+up with the room stream in time; reading anyway", with `waited_for`, `consumed`, `waited_ms`):
+before, a read-your-writes miss was silent. `is_joined` logs at `debug` when the store was
+behind and the room or the wait answered; a gone room's update is an `info` line; a sync
+reporting a gone room as left is a `debug` line.
+
+**Tests** (each fails without its fix; checked by disabling each fix in turn):
+
+- `routes::typing::tests::a_join_the_hub_has_not_consumed_yet_still_lets_the_member_type`:
+  nothing consumes the room stream, so the store has no record of the creator's or the joiner's
+  membership; both may type, a stranger may not. Without the fix: `403 must be a joined member`.
+- `routes::typing::tests::typing_in_a_room_that_does_not_exist_is_forbidden`.
+- `routes::receipts::tests::a_join_the_hub_has_not_consumed_yet_still_takes_receipts`: a
+  receipt and a fully-read marker in a room whose creation the hub has not seen.
+- `sync::tests::a_deleted_room_does_not_fail_a_members_sync_and_is_reported_as_left`: the
+  hub's lag held open by feeding it by hand; bob leaves, the room is purged and forgotten,
+  then both members' initial syncs and bob's incremental sync succeed, the late leave is
+  applied, bob's next sync carries the room in `leave`, and the one after does not. Without
+  the sync fix: `room !...:sync.test not found` (CI's message); without the hub fix the late
+  leave fails with `RoomNotFound`.
+- `cargo test -p hs-user`: 152 lib + 6 scenario (from 148 + 6).
+- Real binary, debug, under load: the whole `appservice_ephemeral` and `admin_rooms` test files,
+  12 runs each in a row, the two loops running at the same time beside six CPU burners (load
+  average about 10 on the desktop's 10 cores): **12/12 and 12/12 pass**, 26-41 s a run. The
+  failures were not reproduced on this desktop before the fix either (CI's runner is slower),
+  so the unit tests above, which hold the race open, are the proof; these runs show nothing
+  else broke.
+
+**Files.** `crates/hs-user/src/hub.rs` (`is_joined`, `joined_member_ids_if_present`,
+`apply_update_for_a_gone_room`, the `wait_for_consumed` warning), `error.rs`
+(`is_room_not_found`), `routes/typing.rs`, `routes/receipts.rs`, `sync/mod.rs`.
+
+**Verification**: `cargo fmt --all --check`; `cargo clippy -p hs-user -p hs-cli --all-targets
+-- -D warnings`; `cargo test -p hs-user`; `cargo test -p hs-cli --test appservice_ephemeral`
+and `--test admin_rooms`, repeatedly.
 
 ## Session 9 (2026-09-30, branch `agent/ephemeral-replicas`): typing, receipts and presence cross replicas
 

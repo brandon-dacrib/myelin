@@ -60,6 +60,18 @@ the same way, with the release's values in a file (`helm get values myelin -n my
 full SHA:
 `helm upgrade myelin deploy/helm/hs -n myelin --kube-context admin@dacrib0 -f values.yaml --set image.tag=sha-<full commit sha> --wait --timeout 10m`.
 
+**Both CI races are fixed in the server, on `agent/ci-flakes`** (status 05, session 10). A
+typing, receipt or read-marker request no longer trusts the user store alone for "is this a
+joined member": `SessionHub::is_joined` asks the room's own state when the record does not say
+`join` yet, then waits for the hub as `/sync` does. An admin room deletion no longer leaves
+members' records saying `join` for a purged room: the hub applies a gone room's leaves from
+the update itself, and `/sync` reports a room the registry no longer has as left (once) instead
+of answering `404`; the walks over a user's rooms skip it. New unit tests in `hs-user` fail
+without each fix (`a_join_the_hub_has_not_consumed_yet_still_lets_the_member_type`,
+`..._still_takes_receipts`, `a_deleted_room_does_not_fail_a_members_sync_and_is_reported_as_left`);
+the two real-binary test files passed 12 of 12 runs each, run together beside CPU burners. A
+hub wait that runs out is a `warn` line now. Left: merge it, and watch the next CI run of `main`.
+
 **Next steps, in order** (the queue continues; each is one agent, cloud-doable unless marked):
 
 1. ~~Merge `agent/as-ephemeral`~~ merged as `dce1ffb`; its decision is renumbered **0019**.
