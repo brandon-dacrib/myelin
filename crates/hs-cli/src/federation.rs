@@ -724,6 +724,29 @@ impl<B: KvBackend + 'static> RoomDataSource for RegistryRoomSource<B> {
         handle.query(|actor| joined_servers(actor)).await
     }
 
+    async fn server_acl(&self, room_id: &str) -> Option<Value> {
+        // Every room-scoped federation request asks this, so one state lookup rather than the
+        // whole state `state_for_join` renders.
+        let handle = self.handle(room_id).await.ok()?;
+        handle
+            .query(|actor| {
+                actor
+                    .state_event("m.room.server_acl", "")
+                    .ok()
+                    .flatten()
+                    .and_then(|event| full_pdu(event).get("content").cloned())
+            })
+            .await
+    }
+
+    async fn event_for_reference(&self, room_id: &str, event_id: &str) -> Option<Value> {
+        let handle = self.handle(room_id).await.ok()?;
+        let wanted = event_id.to_owned();
+        handle
+            .query(move |actor| event_by_str(actor, &wanted).map(full_pdu))
+            .await
+    }
+
     async fn membership_of(&self, room_id: &str, user_id: &str) -> Option<String> {
         let handle = self.handle(room_id).await.ok()?;
         let user_id = user_id.to_owned();

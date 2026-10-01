@@ -209,6 +209,36 @@ pub trait RoomDataSource: Send + Sync {
             .flatten()
         })
     }
+
+    /// The `content` of the room's current `m.room.server_acl` event, or `None` when the room
+    /// has none or this server does not hold the room. What every room-scoped federation
+    /// endpoint checks the requesting server against (`crate::acl::check_origin`), so -- like
+    /// [`RoomDataSource::member_servers`] -- not gated by [`RoomDataSource::is_visible_to`]. The
+    /// default reads it out of [`RoomDataSource::state_for_join`]; an implementation with a
+    /// cheaper lookup should override it, since it runs on every such request.
+    async fn server_acl(&self, room_id: &str) -> Option<Value> {
+        let state = self.state_for_join(room_id).await.ok()?;
+        state.state.iter().find_map(|(_, event)| {
+            (event.get("type").and_then(Value::as_str) == Some("m.room.server_acl")
+                && event.get("state_key").and_then(Value::as_str) == Some(""))
+            .then(|| event.get("content").cloned())
+            .flatten()
+        })
+    }
+
+    /// One event this server holds in `room_id`, as its full PDU, whoever asks -- for this
+    /// server's own use, not a remote's read: `make_join` needs the body of each event it cites
+    /// to reference it in a room version whose references carry the event's hash (versions 1
+    /// and 2). The default finds it only among the current state events
+    /// ([`RoomDataSource::state_for_join`]); an implementation that holds the timeline should
+    /// override it.
+    async fn event_for_reference(&self, room_id: &str, event_id: &str) -> Option<Value> {
+        let state = self.state_for_join(room_id).await.ok()?;
+        state
+            .state
+            .into_iter()
+            .find_map(|(id, event)| (id == event_id).then_some(event))
+    }
 }
 
 /// The current state plus its auth chain, as `send_join`/`make_join` need it. See

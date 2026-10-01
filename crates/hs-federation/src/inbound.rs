@@ -430,6 +430,7 @@ pub async fn process_transaction(
     }
 
     let mut results = serde_json::Map::new();
+    let mut acl_verdicts: HashMap<String, Result<(), String>> = HashMap::new();
     for pdu in &pdus {
         let fallback_id = pdu
             .get("event_id")
@@ -453,6 +454,29 @@ pub async fn process_transaction(
             );
             continue;
         };
+
+        // The room's server ACL, once per room per transaction: a PDU from a server the room
+        // bans is refused before it is even verified, as Synapse does.
+        let acl = match acl_verdicts.get(room_id) {
+            Some(verdict) => verdict.clone(),
+            None => {
+                let verdict = crate::acl::check_origin(rooms, room_id, origin).await;
+                acl_verdicts.insert(room_id.to_owned(), verdict.clone());
+                verdict
+            }
+        };
+        if let Err(message) = acl {
+            crate::metrics::record_acl_refusal("send");
+            tracing::info!(
+                origin,
+                room_id,
+                "refused a PDU: the room's server ACL denies the sending server"
+            );
+            let event_id = Event::parse(pdu, room_version.clone())
+                .map_or(fallback_id, |event| event.event_id().to_string());
+            results.insert(event_id, serde_json::json!({ "error": message }));
+            continue;
+        }
 
         let event = match verify_pdu(pdu, &room_version, key_cache).await {
             Ok(event) => event,

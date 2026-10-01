@@ -202,7 +202,14 @@ fn apply_x_matrix_layer(
     state: FederationState,
     x_matrix_ctx: Arc<XMatrixContext>,
 ) -> axum::Router {
+    let rooms = state.rooms.clone();
     merged
+        // Runs after routing (a route layer), so the matched `{roomId}` is known, and inside the
+        // `X-Matrix` layer below, so the origin it checks has been verified.
+        .route_layer(axum::middleware::from_fn_with_state(
+            rooms,
+            crate::acl::enforce_on_room_routes,
+        ))
         .with_state(state)
         // Layer order matters: `Router::layer` wraps outside-in, so the layer added *last* runs
         // *first*. `Extension` must run before `verify_x_matrix`'s own `Extension` extractor, so
@@ -306,6 +313,132 @@ mod tests {
                 response.status()
             );
         }
+    }
+
+    /// Every route whose path names a `{roomId}` -- `make_join`, `send_join` (both versions),
+    /// `make_leave`, `send_leave`, `make_knock`, `send_knock`, `invite`, `state`, `state_ids`,
+    /// `backfill`, `event_auth`, `get_missing_events`, `hierarchy`, `timestamp_to_event` -- is
+    /// refused `403 M_FORBIDDEN` for a server the room's `m.room.server_acl` denies (by host,
+    /// port ignored), before the handler runs, and counted. Iterating the manifest makes a
+    /// room-scoped route added later part of this test without anyone listing it. Without the
+    /// route layer, Sytest's nine "Banned servers cannot ..." tests failed.
+    #[tokio::test]
+    async fn every_room_scoped_route_refuses_a_server_the_room_acl_denies() {
+        let dir = tempfile::tempdir().unwrap();
+        let evil_keys = OwnSigningKeys::load_or_generate(dir.path()).unwrap();
+        struct FixedFetcher(serde_json::Value);
+        #[async_trait]
+        impl KeyServerFetcher for FixedFetcher {
+            async fn fetch_server_key(&self, _server_name: &str) -> Option<serde_json::Value> {
+                Some(self.0.clone())
+            }
+        }
+        let origin = "evil.example.org:8448";
+        let doc = build_server_key_response(origin, &evil_keys, &[], 3600).unwrap();
+        let key_cache: Arc<DynRemoteKeyCache> = Arc::new(RemoteKeyCache::new(
+            Box::new(FixedFetcher(doc)) as Box<dyn KeyServerFetcher>,
+        ));
+        let ctx = Arc::new(XMatrixContext {
+            own_server_name: "us.example.org".to_string(),
+            key_cache,
+        });
+
+        let room_id = "!r:us.example.org";
+        let mut rooms = InMemoryRoomSource::new();
+        rooms.insert_room(
+            room_id,
+            crate::room_source::FakeRoom {
+                room_version: Some("11".to_owned()),
+                world_readable: true,
+                joined_servers: vec![origin.to_owned()],
+                state: vec![serde_json::json!({
+                    "event_id": "$acl", "type": "m.room.server_acl", "state_key": "",
+                    "room_id": room_id, "sender": "@admin:us.example.org",
+                    "content": {"allow": ["*"], "deny": ["evil.example.org"]},
+                })],
+                ..Default::default()
+            },
+        );
+        let mut state = test_state();
+        state.rooms = Arc::new(rooms);
+
+        let (v1, manifest_v1) = router(state.clone(), ctx.clone());
+        let (v2, manifest_v2) = router_v2(state, ctx);
+        let mut checked = Vec::new();
+        for (router, manifest) in [(v1, manifest_v1), (v2, manifest_v2)] {
+            for route in manifest
+                .routes
+                .iter()
+                .filter(|route| route.path.contains("{roomId}"))
+            {
+                let path = route.path.replace("{roomId}", room_id);
+                let path = concretize(&path);
+                let body = (route.method != "GET").then(|| serde_json::json!({}));
+                let header = xmatrix::sign_request(
+                    route.method.as_str(),
+                    &path,
+                    origin,
+                    "us.example.org",
+                    body.as_ref(),
+                    evil_keys.primary(),
+                )
+                .unwrap();
+                let before = crate::metrics::acl_refusals(crate::acl::endpoint_label(&route.path));
+                let response = router
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method(route.method.as_str())
+                            .uri(&path)
+                            .header(axum::http::header::AUTHORIZATION, header)
+                            .header(axum::http::header::CONTENT_TYPE, "application/json")
+                            .body(body.map_or_else(Body::empty, |b| Body::from(b.to_string())))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::FORBIDDEN,
+                    "{} {} was not refused",
+                    route.method,
+                    route.path
+                );
+                let bytes = axum::body::to_bytes(response.into_body(), 1 << 16)
+                    .await
+                    .unwrap();
+                let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(error["errcode"], "M_FORBIDDEN", "{}", route.path);
+                assert!(
+                    error["error"].as_str().unwrap().contains("server ACL"),
+                    "{} answered {error}",
+                    route.path
+                );
+                assert!(
+                    crate::metrics::acl_refusals(crate::acl::endpoint_label(&route.path)) > before
+                );
+                checked.push(crate::acl::endpoint_label(&route.path));
+            }
+        }
+        for endpoint in [
+            "make_join",
+            "send_join",
+            "make_leave",
+            "send_leave",
+            "make_knock",
+            "send_knock",
+            "invite",
+            "state",
+            "state_ids",
+            "backfill",
+            "event_auth",
+            "get_missing_events",
+            "hierarchy",
+            "timestamp_to_event",
+        ] {
+            assert!(checked.contains(&endpoint), "{endpoint} was not checked");
+        }
+        assert!(!checked.contains(&"other"), "{checked:?}");
     }
 
     #[tokio::test]
