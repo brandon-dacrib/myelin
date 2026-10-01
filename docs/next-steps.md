@@ -116,7 +116,14 @@ pre-2026-09-26 `volumeClaimTemplates` labels; one `kubectl delete statefulset my
 again, to `sha-a01c1e0f32a192e43fe6df540f046dcec5ca9482`** (revision 6, CD run 36800831078 from
 `main` `a01c1e0`, the CI-race fix): no orphan-delete needed, both pods on the new tag, `/` still
 `307` to `/admin/`, `/health/ready` 200, signing key unchanged, no setup link and no `ERROR` in the
-log (status 12, 2026-10-01). **At the next green `main`**, roll it
+log (status 12, 2026-10-01). **The next green image, `sha-025ef65a5e7554db74199c9509a5772275a1086e`
+(CD from `025ef65`: the rejoin gap, catch-up, backfilled state, the drain and hot-room fixes,
+`/search`, v12 placement, bridge sign-ins), is built but not rolled**: at 14:41Z on 2026-10-01
+Homebrew `kubectl`/`helm` got "no route to host" to `192.168.115.221:6443` again from every
+agent session while Apple's `nc` connected -- the macOS Local Network permission of 2026-09-28,
+back. The owner rolls it from their terminal with the two commands below, or re-grants the
+permission and an agent does; the redaction fix (`c11668a`) is in a later image once
+`agent/ci-clippy` makes CI green again. **At the next green `main`**, roll it
 the same way, with the release's values in a file (`helm get values myelin -n myelin
 --kube-context admin@dacrib0 -o yaml > values.yaml`; not `--reuse-values`) and the new commit's
 full SHA:
