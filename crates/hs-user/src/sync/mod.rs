@@ -137,8 +137,30 @@ pub struct SyncParams {
     /// are; a handful of exotic callers (e.g. some appservice requests) are not. `None` skips
     /// `to_device`, `device_one_time_keys_count` and `device_unused_fallback_key_types` entirely
     /// -- all three are meaningless without a specific device -- but `device_lists` is still
-    /// computed, since it is scoped to the user, not the device.
+    /// computed, since it is scoped to the user, not the device. The feed cursor is recorded
+    /// either way: see [`cursor_device_id`].
     pub device_id: Option<OwnedDeviceId>,
+}
+
+/// The device key a requester with no device records its feed cursor under
+/// ([`crate::store::UserStore::record_device_cursor`]). See [`cursor_device_id`].
+pub const DEVICELESS_CURSOR_KEY: &str = "\u{1}hs-user:no-device";
+
+/// The key `/sync` records the requester's feed cursor under: its device, or, for a requester
+/// bound to none (an appservice's `as_token` acting as its sender or masquerading as one of its
+/// users without `device_id`), [`DEVICELESS_CURSOR_KEY`].
+///
+/// A cursor is what stops the feed coalescing an entry somebody has already been handed
+/// (`crate::store::tables`' module docs). A device-less requester used to record none, so the
+/// entry its token pointed at went on absorbing every later update to that room, the token
+/// already covered it, and the next incremental sync saw no change -- for ever. Cursors are kept
+/// per `(user, device)` and only their maximum per user is ever read, so one synthetic key per
+/// user is enough: it cannot collide with another user's, and a real device that happened to
+/// share its name would only share a cursor whose maximum is what matters anyway. It starts
+/// with a control character no client-chosen device id is expected to carry.
+#[must_use]
+pub fn cursor_device_id(device_id: Option<&ruma::DeviceId>) -> &ruma::DeviceId {
+    device_id.unwrap_or_else(|| DEVICELESS_CURSOR_KEY.into())
 }
 
 /// Which pagination strategy a room's timeline uses this response, and why. See the module docs.
@@ -736,12 +758,22 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
     // entry this response is going to report as consumed must be frozen first: otherwise an
     // event landing mid-response is folded into it, its stored position moves on past that
     // event, and the next sync resumes from *after* it. `routes::sync` records the same cursor
-    // once the response is built, which is by then a no-op.
-    if let Some(device_id) = &device_id {
-        store
-            .record_device_cursor(user_id, device_id, new_feed_seq)
-            .await?;
+    // once the response is built, which is by then a no-op. A requester with no device records
+    // one too, under a key of its own (`cursor_device_id`).
+    if device_id.is_none() {
+        tracing::debug!(
+            %user_id,
+            feed_seq = new_feed_seq,
+            "a /sync with no device; recording its feed cursor under the device-less key"
+        );
     }
+    store
+        .record_device_cursor(
+            user_id,
+            cursor_device_id(device_id.as_deref()),
+            new_feed_seq,
+        )
+        .await?;
 
     let mut candidate_rooms: BTreeSet<OwnedRoomId> = if is_initial {
         store
