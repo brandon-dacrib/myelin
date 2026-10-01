@@ -28,6 +28,13 @@ test.describe("configuration", () => {
     await page.getByRole("main").getByRole("link", { name: "Federation" }).click();
     const timeout = page.getByRole("textbox", { name: "Client timeout" });
     await expect(timeout).toBeVisible();
+    // Each class of "when it applies" is explained once at the top, and each setting has a badge.
+    const legend = page.getByRole("region", { name: /^Most changes here/ });
+    await expect(legend.getByText("Applies on save", { exact: true })).toBeVisible();
+    await expect(legend.getByText("Needs a restart", { exact: true })).toBeVisible();
+    await expect(
+      page.locator("#setting-client_timeout").getByText("Needs a restart", { exact: true }),
+    ).toBeVisible();
     await expectNoAxeViolations(page, "configuration section, untouched form");
 
     // A change the server would refuse, checked without saving.
@@ -110,7 +117,11 @@ test.describe("configuration", () => {
     await page.goto("/admin/configuration/listeners");
     await expect(page.getByRole("heading", { name: "Listeners", level: 1 })).toBeVisible();
     await expect(page.getByText("Bootstrap only")).toBeVisible();
-    await expect(page.getByText("Set at install", { exact: true })).toBeVisible();
+    await expect(
+      page.locator("#setting-listeners").getByText("Per replica (file or environment)", {
+        exact: true,
+      }),
+    ).toBeVisible();
     await expect(page.getByText("client, federation, media, health, admin")).toBeVisible();
     // Decision 0010: nothing here can be stored, so nothing is offered for edit.
     await expect(page.getByRole("checkbox")).toHaveCount(0);

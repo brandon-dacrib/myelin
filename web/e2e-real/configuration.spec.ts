@@ -8,7 +8,7 @@ import { settle } from "./settle";
  * - `media.scanning.icap.preview`, an externally tagged enum (`"negotiate"`, `"off"` or
  *   `{"bytes": N}`), is a choice with a number beneath it, and what it saves is what the server
  *   stores (queue item 2b).
- * - Bootstrap settings (decision 0010) are shown, marked "Set at install", and never offered for
+ * - Bootstrap settings (decision 0010) are shown, marked "Per replica (file or environment)", and never offered for
  *   edit: `listeners` as a whole section, `server.signing_key_path` inside an administered one
  *   (queue item 2c).
  * - A hidden secret inside a list entry survives saving the list (RFC 0020): two OIDC providers
@@ -118,13 +118,17 @@ test.describe("configuration against the real server", () => {
     await page.goto("/admin/configuration/listeners");
     await expect(page.getByText("This section cannot be stored in the database")).toBeVisible();
     const listenerRow = page.locator("#setting-listeners");
-    await expect(listenerRow.getByText("Set at install", { exact: true })).toBeVisible();
+    await expect(
+      listenerRow.getByText("Per replica (file or environment)", { exact: true }),
+    ).toBeVisible();
     await expect(listenerRow.getByRole("button", { name: "Add listener" })).toHaveCount(0);
     await shot(page, "listeners");
 
     await page.goto("/admin/configuration/server");
     const keyRow = page.locator("#setting-signing_key_path");
-    await expect(keyRow.getByText("Set at install", { exact: true })).toBeVisible();
+    await expect(
+      keyRow.getByText("Per replica (file or environment)", { exact: true }),
+    ).toBeVisible();
     await expect(keyRow).toContainText(
       "the bootstrap file, an HS__ environment variable or the Helm values",
     );
@@ -239,7 +243,10 @@ test.describe("configuration against the real server", () => {
     ).toBeVisible();
     await page.getByRole("dialog").getByRole("button", { name: "Save changes" }).click();
     await expect(page.getByText("Rate limits saved", { exact: true })).toBeVisible();
-    await expect(page.getByText("Applied to the running server.", { exact: true })).toBeVisible();
+    // The toast names the setting it applied.
+    await expect(
+      page.getByText("Applied to the running server: Message · Burst count.", { exact: true }),
+    ).toBeVisible();
     await shot(page, "rate-limits-applied");
 
     // The server counted it as applied, not merely stored.

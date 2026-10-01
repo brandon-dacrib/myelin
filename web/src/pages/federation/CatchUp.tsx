@@ -50,7 +50,7 @@ export function CatchUpNotice({ since }: { since: string }) {
             to="/configuration/$section"
             params={{ section: "federation" }}
             hash={settingRowId(MAX_QUEUED_PDUS_SETTING)}
-            className="text-accent hover:underline"
+            className="text-accent underline hover:no-underline"
           >
             Max queued PDUs per destination
           </Link>{" "}

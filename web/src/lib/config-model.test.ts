@@ -61,6 +61,7 @@ describe("normalizeConfigSchema", () => {
       reloadable: true,
       bootstrap: false,
       editable: true,
+      applies: "hot",
     });
     // A bootstrap setting inside an administered section (decision 0010).
     expect(schema.settings["server.signing_key_path"]).toMatchObject({

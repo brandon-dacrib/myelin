@@ -13,6 +13,8 @@ import type { ConfigValidateReport } from "@/api/config";
 import { formatValue, type ChangeEntry } from "@/lib/config-model";
 import { Button } from "@/components/ui/button/Button";
 import { Dialog, DialogClose, DialogContent } from "@/components/ui/dialog/Dialog";
+import type { Applies } from "@/lib/config-applies";
+import { AppliesBadge } from "./AppliesBadge";
 
 export interface ChangeReviewProps {
   open: boolean;
@@ -30,6 +32,8 @@ export interface ChangeReviewProps {
   saving: boolean;
   onValidate: () => void;
   onSave: () => void;
+  /** When each change takes effect, for a badge per change. */
+  appliesFor?: (change: ChangeEntry) => Applies;
 }
 
 export function ChangeReview({
@@ -44,6 +48,7 @@ export function ChangeReview({
   saving,
   onValidate,
   onSave,
+  appliesFor,
 }: ChangeReviewProps) {
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -71,7 +76,7 @@ export function ChangeReview({
           </>
         }
       >
-        <ChangeList changes={changes} />
+        <ChangeList changes={changes} appliesFor={appliesFor} />
 
         {report && (
           <div
@@ -127,7 +132,13 @@ export function ChangeReview({
 }
 
 /** The diff itself. Also used inline on the page, above the form, while edits are pending. */
-export function ChangeList({ changes }: { changes: ChangeEntry[] }) {
+export function ChangeList({
+  changes,
+  appliesFor,
+}: {
+  changes: ChangeEntry[];
+  appliesFor?: (change: ChangeEntry) => Applies;
+}) {
   if (changes.length === 0) {
     return <p className="text-sm text-text-muted">Nothing has changed.</p>;
   }
@@ -135,7 +146,10 @@ export function ChangeList({ changes }: { changes: ChangeEntry[] }) {
     <ul className="divide-y divide-border rounded-md border border-border">
       {changes.map((change) => (
         <li key={change.path} className="px-3 py-2.5">
-          <p className="text-sm font-medium text-text">{change.label}</p>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <p className="text-sm font-medium text-text">{change.label}</p>
+            {appliesFor && <AppliesBadge applies={appliesFor(change)} />}
+          </div>
           <p className="font-identifier text-xs text-text-faint">{change.path}</p>
           <p className="mt-1.5 flex flex-wrap items-center gap-2 text-sm">
             <span className="font-identifier text-text-muted line-through">

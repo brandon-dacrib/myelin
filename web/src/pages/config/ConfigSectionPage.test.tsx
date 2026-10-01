@@ -85,9 +85,16 @@ describe("ConfigSectionPage", () => {
     // `auth`: registration, the directory, token lifetimes and the password policy are hot; the
     // session secret and upstream providers wait for a restart.
     renderSection("auth");
-    expect(
-      await screen.findByText("Most changes here take effect at the next restart"),
-    ).toBeInTheDocument();
+    const legend = within(await screen.findByRole("region", { name: /^Most changes here/ }));
+    expect(legend.getByText("Applies on save")).toBeInTheDocument();
+    expect(legend.getByText("Needs a restart")).toBeInTheDocument();
+    // Each class is explained once, at the top.
+    expect(legend.getByText(/keeps using the old one until it next starts/)).toBeInTheDocument();
+    // And each setting says which it is.
+    const registration = document.getElementById("setting-enable_registration")!;
+    expect(within(registration).getByText("Applies on save")).toBeInTheDocument();
+    const providers = document.getElementById("setting-oidc_providers")!;
+    expect(within(providers).getByText("Needs a restart")).toBeInTheDocument();
   });
 
   it("shows a setting the environment pins as read-only, with the reason", async () => {
@@ -153,9 +160,9 @@ describe("ConfigSectionPage", () => {
 
     await waitFor(() => expect(configValues.federation.client_timeout).toBe("90s"));
     expect(await screen.findByText("Federation saved")).toBeInTheDocument();
-    // The server's answer says the timeout is only read at startup.
+    // The toast names the setting, and that it is only read at startup.
     expect(
-      screen.getByText("Stored. It takes effect the next time this server restarts."),
+      screen.getByText("Stored, and waiting for the next restart: Client timeout."),
     ).toBeInTheDocument();
   });
 
@@ -176,17 +183,23 @@ describe("ConfigSectionPage", () => {
     await user.click(dialog.getByRole("button", { name: "Save changes" }));
 
     expect(await screen.findByText("Rate limits saved")).toBeInTheDocument();
-    expect(screen.getByText("Applied to the running server.")).toBeInTheDocument();
+    expect(
+      screen.getByText(/^Applied to the running server: (Message|Login) · Burst count\.$/),
+    ).toBeInTheDocument();
   });
 
   it("names the settings of a mostly-restart section that apply at once", async () => {
     renderSection("federation");
-    expect(
-      await screen.findByText("Most changes here take effect at the next restart"),
-    ).toBeInTheDocument();
-    expect(screen.getByText(/apply to the running server at once/)).toHaveTextContent(
-      /Domain allowlist/,
+    const legend = within(
+      await screen.findByRole("region", {
+        name: "Most changes here take effect at the next restart; some apply on save",
+      }),
     );
+    expect(legend.getByText("5 settings")).toBeInTheDocument();
+    const allowlist = document.getElementById("setting-domain_allowlist")!;
+    expect(within(allowlist).getByText("Applies on save")).toBeInTheDocument();
+    const timeout = document.getElementById("setting-client_timeout")!;
+    expect(within(timeout).getByText("Needs a restart")).toBeInTheDocument();
   });
 
   it("checks a change against the server without saving it", async () => {
@@ -320,7 +333,7 @@ describe("ConfigSectionPage", () => {
       if (!el) throw new Error("no row yet");
       return el;
     });
-    expect(within(row).getByText("Set at install")).toBeInTheDocument();
+    expect(within(row).getByText("Per replica (file or environment)")).toBeInTheDocument();
     expect(within(row).queryByRole("button", { name: "Add listener" })).not.toBeInTheDocument();
   });
 
@@ -331,7 +344,7 @@ describe("ConfigSectionPage", () => {
       if (!el) throw new Error("no row yet");
       return el;
     });
-    expect(within(row).getByText("Set at install")).toBeInTheDocument();
+    expect(within(row).getByText("Per replica (file or environment)")).toBeInTheDocument();
     expect(row.textContent).toContain(
       "the bootstrap file, an HS__ environment variable or the Helm values",
     );

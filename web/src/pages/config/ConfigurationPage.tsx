@@ -8,6 +8,8 @@
  * sections have been changed from their defaults, which ones a restart is
  * needed for, and which ones the deployment has taken out of your hands.
  */
+import { APPLIES_COPY, APPLIES_ORDER, countApplies, type Applies } from "@/lib/config-applies";
+import { AppliesBadge } from "./AppliesBadge";
 import { useMemo, useState } from "react";
 import { Link } from "@tanstack/react-router";
 import {
@@ -79,6 +81,8 @@ interface SectionCard {
   settingCount: number;
   changedCount: number;
   pinnedCount: number;
+  /** How many of its settings fall in each class of `ConfigSettingInfo.applies`. */
+  applies: Record<Applies, number>;
   matches: SettingField[];
 }
 
@@ -123,9 +127,17 @@ export function ConfigurationPage() {
           <h1 className="text-xl text-text">Configuration</h1>
           <p className="mt-1 max-w-2xl text-sm text-text-muted">
             Every setting this server runs on, kept in its own database rather than in a file on the
-            host. Changes to a reloadable section apply straight away; the rest take effect at the
-            next restart.
+            host. Every setting has a default the server works with untouched; each section page
+            says what a setting does, its default, and when a change to it applies.
           </p>
+          <ul className="mt-2 flex max-w-3xl flex-col gap-1.5 text-sm text-text-muted">
+            {APPLIES_ORDER.map((applies) => (
+              <li key={applies} className="flex flex-wrap items-start gap-2">
+                <AppliesBadge applies={applies} />
+                <span className="min-w-0 flex-1">{APPLIES_COPY[applies].explanation}</span>
+              </li>
+            ))}
+          </ul>
         </div>
         <Dialog>
           <DialogTrigger asChild>
@@ -281,6 +293,13 @@ function SectionCardView({ card }: { card: SectionCard }) {
             <Badge status="warning">{card.pinnedCount} pinned by environment</Badge>
           )}
         </div>
+        {card.settingCount > 0 && (
+          <p className="mt-2 text-xs text-text-muted">
+            {APPLIES_ORDER.filter((a) => card.applies[a] > 0)
+              .map((a) => `${card.applies[a]} ${APPLIES_COPY[a].label.toLowerCase()}`)
+              .join(" · ")}
+          </p>
+        )}
 
         <dl className="mt-3 flex flex-wrap gap-x-6 gap-y-1 text-xs text-text-muted">
           {card.settingCount > 0 && (
@@ -349,8 +368,20 @@ function describeSection(
     if (isChanged(field, getPath(section.values, field.path), origin)) changed += 1;
   }
 
+  const sectionApplies: Applies =
+    (meta?.bootstrap ?? false)
+      ? "bootstrap"
+      : (meta?.reloadable ?? section.reloadable)
+        ? "hot"
+        : "restart";
+
   return {
     name,
+    applies: countApplies(
+      schema?.settings,
+      fields.map((f) => f.fullPath),
+      sectionApplies,
+    ),
     label: model.label,
     summary: model.summary,
     reloadable: meta?.reloadable ?? section.reloadable,

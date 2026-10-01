@@ -59,4 +59,28 @@ test.describe("Federation", () => {
     await expect(page.getByText("Healthy", { exact: true })).toBeVisible();
     domGuard.assertClean();
   });
+
+  test("a destination in catch-up says so, explains it, and links to the queue limit", async ({
+    page,
+  }) => {
+    const domGuard = installDomNestingGuard(page);
+    await signInAsOperator(page);
+    await page.goto("/admin/federation");
+    const row = page.getByRole("row").filter({ hasText: "kde.org" });
+    await expect(row.getByText(/Catching up since/)).toBeVisible();
+    await expect(page.getByText(/1 server is catching up/)).toBeVisible();
+    await expectNoAxeViolations(page, "federation list, a destination catching up");
+
+    await page.getByRole("link", { name: "kde.org" }).click();
+    const notice = page.getByRole("region", { name: /Catching up since/ });
+    await expect(notice).toContainText("longer than its queue holds (10,000 events)");
+    await expectNoAxeViolations(page, "federation destination catching up");
+
+    await notice.getByRole("link", { name: "Max queued PDUs per destination" }).click();
+    const setting = page.locator("#setting-max_queued_pdus_per_destination");
+    await expect(setting).toBeVisible();
+    await expect(setting.getByText("Needs a restart", { exact: true })).toBeVisible();
+    await expect(setting).toContainText("Default: 10000");
+    domGuard.assertClean();
+  });
 });

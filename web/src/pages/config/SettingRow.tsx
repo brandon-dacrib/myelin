@@ -24,6 +24,8 @@ import { Button } from "@/components/ui/button/Button";
 import { SettingControl } from "./SettingControls";
 import { ReadOnlyValue } from "./StructuredControls";
 import { cn } from "@/lib/cn";
+import type { Applies } from "@/lib/config-applies";
+import { AppliesBadge } from "./AppliesBadge";
 
 const ORIGIN_COPY: Record<ConfigOrigin, { label: string; detail: string }> = {
   default: { label: "Default", detail: "Nothing sets this; it is the schema's own default." },
@@ -78,6 +80,8 @@ export interface SettingRowProps {
   onChange: (value: JsonValue | null) => void;
   onRevert: () => void;
   onReset: () => void;
+  /** When a change to this setting takes effect (`ConfigSettingInfo.applies`). */
+  applies?: Applies;
 }
 
 export function SettingRow({
@@ -93,6 +97,7 @@ export function SettingRow({
   onChange,
   onRevert,
   onReset,
+  applies,
 }: SettingRowProps) {
   const controlId = useId();
   const hintId = `${controlId}-hint`;
@@ -168,10 +173,14 @@ export function SettingRow({
 
         <div className="mt-2.5 flex flex-wrap items-center gap-2">
           {origin && <OriginBadge origin={origin} />}
-          {field.bootstrap && (
-            <Badge status="neutral" hideIcon>
-              Set at install
-            </Badge>
+          {applies ? (
+            <AppliesBadge applies={applies} />
+          ) : (
+            field.bootstrap && (
+              <Badge status="neutral" hideIcon>
+                Set at install
+              </Badge>
+            )
           )}
           {changed && !pinned && (
             <Badge status="info" hideIcon>
@@ -251,7 +260,7 @@ export function SettingRow({
             {error}
           </p>
         )}
-        {field.hasDefault && !readOnly && (
+        {field.hasDefault && (
           <p className="mt-1.5 text-xs text-text-faint">
             Default: <span className="font-identifier">{formatValue(field.defaultValue)}</span>
           </p>

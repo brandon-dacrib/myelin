@@ -158,6 +158,12 @@ export interface ConfigSettingInfo {
    * answer, so the interface does not have to infer it from the origin.
    */
   editable: boolean;
+  /**
+   * When a change to it takes effect (`hs_config::reload::Applies`): `hot` on save, `restart`
+   * at the next start, `bootstrap` set per replica and never stored. Absent from a server older
+   * than the classification; `lib/config-applies.ts` then derives it from the other flags.
+   */
+  applies?: "hot" | "restart" | "bootstrap";
 }
 
 export interface ConfigSchemaModel {
@@ -253,6 +259,10 @@ function collectSettings(
       secret: entry.secret === true,
       reloadable: entry.reloadable === true,
       bootstrap,
+      applies:
+        entry.applies === "hot" || entry.applies === "restart" || entry.applies === "bootstrap"
+          ? entry.applies
+          : undefined,
       // An older server that does not send `editable` gets the inference this
       // interface used before the field existed.
       editable:

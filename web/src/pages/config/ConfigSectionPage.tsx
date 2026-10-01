@@ -20,7 +20,6 @@ import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react
 import { Link, useNavigate, useParams, useRouterState, useSearch } from "@tanstack/react-router";
 import { ChevronLeft, Lock, TriangleAlert } from "lucide-react";
 import {
-  describeApplied,
   useConfigSchema,
   useConfigSection,
   useUpdateConfigSection,
@@ -54,7 +53,11 @@ import { QueryProblemState } from "@/components/QueryProblemState";
 import { RelativeTime } from "@/components/RelativeTime";
 import { toast } from "@/components/ui/toast/toast-store";
 import { hasScope } from "@/lib/auth";
+import { appliesOf, countApplies, describeSaveOutcome, type Applies } from "@/lib/config-applies";
+import { settingLabels } from "@/lib/config-history";
+import { AppliesLegend } from "./AppliesBadge";
 import { ChangeReview } from "./ChangeReview";
+import { RateLimitsNote } from "./SectionNotes";
 import { ConfigHistory } from "./ConfigHistory";
 import { SettingRow } from "./SettingRow";
 
@@ -143,25 +146,24 @@ function SectionForm({ section, data, schema, schemaSettled, onReread }: Section
   const fields = useMemo(() => flattenFields(model), [model]);
   const changes = useMemo(() => changeEntries(fields, values, draft), [fields, values, draft]);
 
-  // Settings of this section that apply without a restart when the section as
-  // a whole does not (`ConfigSettingInfo.reloadable`, per setting): the
-  // federation allow and block lists, the log level.
-  const hotSettings = useMemo(
+  // When a change to each setting takes effect (`ConfigSettingInfo.applies`, per setting); the
+  // section's own flags are the answer only for a server that sends no per-setting rows.
+  const sectionApplies: Applies = bootstrap ? "bootstrap" : reloadable ? "hot" : "restart";
+  const appliesFor = useCallback(
+    (fullPath: string) => appliesOf(schema?.settings, fullPath, sectionApplies),
+    [schema, sectionApplies],
+  );
+  const isHot = useCallback((fullPath: string) => appliesFor(fullPath) === "hot", [appliesFor]);
+  const appliesCounts = useMemo(
     () =>
-      Object.entries(schema?.settings ?? {})
-        .filter(([path, info]) => info.reloadable && path.startsWith(`${section}.`))
-        .map(([path]) => path),
-    [schema, section],
+      countApplies(
+        schema?.settings,
+        fields.map((f) => f.fullPath),
+        sectionApplies,
+      ),
+    [schema, fields, sectionApplies],
   );
-  const isHot = useCallback(
-    (fullPath: string) =>
-      reloadable || hotSettings.some((p) => fullPath === p || fullPath.startsWith(`${p}.`)),
-    [reloadable, hotSettings],
-  );
-  const hotLabels = useMemo(
-    () => fields.filter((f) => hotSettings.includes(f.fullPath)).map((f) => f.label),
-    [fields, hotSettings],
-  );
+  const labels = useMemo(() => settingLabels(model), [model]);
   // When the pending changes take effect: all now, all at the next restart, or some of each.
   const hotChanges = changes.filter((c) => isHot(c.field?.fullPath ?? `${section}.${c.path}`));
   const timing =
@@ -234,9 +236,16 @@ function SectionForm({ section, data, schema, schemaSettled, onReread }: Section
           setConflict(null);
           setReport(undefined);
           setReviewOpen(false);
-          // The server's answer says what happened to the running process; the
-          // schema's flags are only the fallback for a server that does not.
-          const outcome = describeApplied(result.section.applied, section, timing === "now");
+          // Name each saved setting with when it applies; the server's answer says whether the
+          // running process took the hot ones.
+          const outcome = describeSaveOutcome(
+            changes.map((c) => {
+              const fullPath = c.field?.fullPath ?? `${section}.${c.path}`;
+              return { label: labels.get(fullPath) ?? c.label, applies: appliesFor(fullPath) };
+            }),
+            result.section.applied,
+            section,
+          );
           toast({
             title: `${model.label} saved`,
             description: outcome.description,
@@ -352,20 +361,8 @@ function SectionForm({ section, data, schema, schemaSettled, onReread }: Section
         </Notice>
       )}
 
-      {!bootstrap && !reloadable && hotLabels.length === 0 && (
-        <Notice tone="info" title="Changes here take effect at the next restart">
-          Saving stores the new value straight away, but this section is not reloadable — the
-          running process keeps the old one until it is restarted.
-        </Notice>
-      )}
-
-      {!bootstrap && !reloadable && hotLabels.length > 0 && (
-        <Notice tone="info" title="Most changes here take effect at the next restart">
-          Saving stores the new value straight away. {hotLabels.join(", ")}{" "}
-          {hotLabels.length === 1 ? "applies" : "apply"} to the running server at once; for
-          everything else the running process keeps the old value until it is restarted.
-        </Notice>
-      )}
+      {fields.length > 0 && <AppliesLegend counts={appliesCounts} />}
+      {section === "rate_limits" && <RateLimitsNote />}
 
       {!schema && schemaSettled && (
         <Notice
@@ -451,6 +448,7 @@ function SectionForm({ section, data, schema, schemaSettled, onReread }: Section
             lockedReason={lockedReason}
             onChange={setValue}
             onRevert={revert}
+            appliesFor={appliesFor}
           />
         </div>
       )}
@@ -506,6 +504,7 @@ function SectionForm({ section, data, schema, schemaSettled, onReread }: Section
         saving={update.isPending}
         onValidate={runValidate}
         onSave={save}
+        appliesFor={(c) => appliesFor(c.field?.fullPath ?? `${section}.${c.path}`)}
       />
     </div>
   );
@@ -523,6 +522,7 @@ interface GroupViewProps {
   lockedReason?: string;
   onChange: (path: string, value: JsonValue | null) => void;
   onRevert: (path: string) => void;
+  appliesFor: (fullPath: string) => Applies;
 }
 
 function GroupView({
@@ -537,6 +537,7 @@ function GroupView({
   lockedReason,
   onChange,
   onRevert,
+  appliesFor,
 }: GroupViewProps) {
   return (
     <section aria-label={heading ?? undefined}>
@@ -565,6 +566,7 @@ function GroupView({
               onChange={(next) => onChange(field.path, next)}
               onRevert={() => onRevert(field.path)}
               onReset={() => onChange(field.path, null)}
+              applies={appliesFor(field.fullPath)}
             />
           ))}
         </div>
@@ -583,6 +585,7 @@ function GroupView({
             lockedReason={lockedReason}
             onChange={onChange}
             onRevert={onRevert}
+            appliesFor={appliesFor}
           />
         </div>
       ))}
