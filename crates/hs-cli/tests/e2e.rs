@@ -2703,10 +2703,12 @@ async fn an_administrator_can_sign_out_a_lost_phone_and_reset_a_forgotten_passwo
 #[tokio::test]
 async fn a_join_is_in_the_very_next_sync_every_time() {
     let dir = tempfile::tempdir().unwrap();
-    let handle = hs_cli::serve::spawn_serve(
-        test_config(0, dir.path()),
-        hs_cli::serve::ServeOptions::default(),
-    )
+    // Thirty joins by one user in a few seconds is past `rate_limits.joins_local` (ten at once,
+    // then one every ten seconds, Synapse's default), as it is for any client; this test is
+    // about `/sync`, so it switches the limits off, as Complement's configuration does.
+    let mut config = test_config(0, dir.path());
+    config.rate_limits.enabled = false;
+    let handle = hs_cli::serve::spawn_serve(config, hs_cli::serve::ServeOptions::default())
     .await
     .expect("server should boot");
     let base = handle.base_url();
