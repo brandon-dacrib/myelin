@@ -40,6 +40,8 @@ export default defineConfig({
     environment: "jsdom",
     globals: false,
     setupFiles: ["./src/test/setup.ts"],
+    // Room for several of setup.ts's five-second async queries in one test under load.
+    testTimeout: 20_000,
     css: true,
     // `e2e/` and `e2e-real/` are Playwright suites (`npm run test:e2e`,
     // `test:e2e:real`); Vitest collecting them fails at import, because

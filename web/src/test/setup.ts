@@ -1,6 +1,6 @@
 import "@testing-library/jest-dom/vitest";
 import { afterEach, afterAll } from "vitest";
-import { cleanup } from "@testing-library/react";
+import { cleanup, configure } from "@testing-library/react";
 import { server } from "@/mocks/node";
 import { resetBridgeOfferings } from "@/mocks/data/bridge-offerings";
 import { resetRegistrationTokens } from "@/mocks/data/registration-tokens";
@@ -71,6 +71,17 @@ if (!Element.prototype.hasPointerCapture) Element.prototype.hasPointerCapture = 
 if (!Element.prototype.releasePointerCapture) {
   Element.prototype.releasePointerCapture = () => undefined;
 }
+
+/**
+ * `findBy*` and `waitFor` give up after five seconds, not Testing Library's default one. A page
+ * test's first render goes through MSW and the query cache, and with sixty files running at once
+ * on a loaded machine that alone can take over a second: on 2026-10-01, at a load average of
+ * 22-30, `MediaPage` and `TasksPage` failed `npm run check` with "Unable to find role=table"
+ * and passed alone. A wait that is longer only makes a real failure slower to report, so this
+ * is the ceiling for every async query; `testTimeout` in `vite.config.ts` leaves room for a test
+ * that makes several of them.
+ */
+configure({ asyncUtilTimeout: 5_000 });
 
 server.listen({ onUnhandledRequest: "error" });
 

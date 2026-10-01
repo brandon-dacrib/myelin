@@ -14,16 +14,17 @@ import { settle } from "./settle";
  * a real `hs serve --data-dir`: registered an admin with `hs register --admin`, logged in over
  * the client-server API, and `GET /api/v1/me` answered 200 with `admin:read`/`admin:write`.
  *
- * Known flake, deliberately not papered over: run as a whole suite, "users list is real" and
- * "user detail" land on the sign-in page, while each passes on its own. The trace shows the only
- * `/api/v1` call in the failing test was `GET /api/v1/me` and it never completed — Playwright
- * records status `-1`. That call is the *sign-in* in `beforeEach`, not a call from the page under
- * test: `signInWithToken` turns a failed fetch into "Couldn't reach the server", leaves you on
- * the sign-in form, and the old `toHaveURL` assertion could not see it (see the comment there).
- * So the app is not signing anybody out on a blip — it says the server is unreachable, which is
- * correct. What is still unexplained is why that one `fetch` to the Vite dev server's `/api/v1`
- * proxy fails only when the suite runs as a whole, against a server answering 200 to twelve
- * consecutive curls. Chase it in the proxy, not in the app.
+ * The flake this suite once had, and its cause (found 2026-10-01): run as a whole suite on
+ * 2026-09-20, "users list is real" and "user detail" landed on the sign-in page while each
+ * passed on its own, and the trace showed `GET /api/v1/me` with status `-1`. That request is the
+ * sign-in in `beforeEach`, and nothing failed it but the test itself: the old `beforeEach`
+ * asserted `toHaveURL(/\/admin\/?$/)`, which is true the moment the button is clicked, so the
+ * test body's `page.goto` ran while `/me` was still in flight, the navigation aborted it (that
+ * is what `-1` is), and the new page had no session. Alone, `/me` answered before the `goto`;
+ * in the full suite, on a cold dev server and a loaded machine, it did not. Not the Vite proxy
+ * and not the server. Reproduced by holding `/me` back 1.5 s with `page.route`: the old
+ * `beforeEach` fails with the same `-1`, the one below passes. Every sign-in in `e2e-real/`
+ * waits for the session (the sign-in form gone) before it navigates.
  */
 
 const hasServer = Boolean(process.env.HS_REAL_SERVER_URL);

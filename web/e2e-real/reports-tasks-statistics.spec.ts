@@ -231,22 +231,42 @@ test.describe("Reports, Tasks and Statistics against the real server", () => {
 
   test("the Statistics page's counts are the server's", async ({ page, request }) => {
     test.setTimeout(90_000);
-    const response = await request.get(`${server}/api/v1/statistics/overview`, {
-      headers: admin(),
-    });
-    expect(response.ok()).toBe(true);
-    const counts = (await response.json()) as {
+    interface Overview {
       users_count: number;
       rooms_count: number;
       media_count?: number;
+    }
+    const overview = async (): Promise<Overview> => {
+      const response = await request.get(`${server}/api/v1/statistics/overview`, {
+        headers: admin(),
+      });
+      expect(response.ok()).toBe(true);
+      return (await response.json()) as Overview;
     };
-    expect(counts.media_count, "the overview counts media").toBeDefined();
+    const key = (o: Overview) => `${o.users_count}/${o.rooms_count}/${o.media_count}`;
 
     await signIn(page);
-    await page.goto("/admin/statistics");
-    await expect(page.getByRole("heading", { name: "Statistics", level: 1 })).toBeVisible();
     const now = page.getByRole("region", { name: "Now" });
     const tile = (label: string) => now.getByText(label, { exact: true }).locator("..");
+
+    // The overview is a snapshot the server recounts at most once a minute
+    // (`STATISTICS_TTL`, crates/hs-cli/src/overview.rs). In the full suite the tests before this
+    // one make accounts, rooms and media, so a recount can fall between reading the counts here
+    // and the page reading them, and the page is then right and the expectation stale (seen
+    // 2026-10-01: "Accounts35" against an expected 33). So the counts are read on both sides of
+    // the page load: equal, and the page was served that same snapshot; different, and a
+    // recount happened in between, which cannot happen twice in one load seconds long.
+    let counts = await overview();
+    for (let attempt = 1; ; attempt += 1) {
+      await page.goto("/admin/statistics");
+      await expect(page.getByRole("heading", { name: "Statistics", level: 1 })).toBeVisible();
+      await expect(tile("Accounts")).toHaveText(/\d/);
+      const after = await overview();
+      if (key(after) === key(counts)) break;
+      expect(attempt, "the overview was recounted during two page loads in a row").toBe(1);
+      counts = after;
+    }
+    expect(counts.media_count, "the overview counts media").toBeDefined();
     await expect(tile("Accounts")).toContainText(counts.users_count.toLocaleString("en-US"));
     await expect(tile("Rooms")).toContainText(counts.rooms_count.toLocaleString("en-US"));
     await expect(tile("Media files")).toContainText(counts.media_count!.toLocaleString("en-US"));

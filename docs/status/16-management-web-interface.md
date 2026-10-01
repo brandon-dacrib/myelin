@@ -4,6 +4,64 @@ Last updated: 2026-10-01 (two known gaps in the browser suites; branch `agent/we
 
 ## 2026-10-01: two known gaps in the browser suites (branch `agent/web-gaps`)
 
+**"One `/api/v1` fetch fails under the full `e2e-real` suite": found, and it was the test.** The
+request was `GET /api/v1/me` from `e2e-real/real-server.spec.ts`'s `beforeEach`, the sign-in,
+with status `-1` in the 2026-09-20 trace, after which "users list is real" and "user detail"
+showed the sign-in page. Nothing failed it but the test: that `beforeEach` asserted
+`toHaveURL(/\/admin\/?$/)`, true the instant "Sign in" is clicked, so the test body's
+`page.goto` ran while `/me` was in flight, the navigation aborted it (Playwright's `-1`), and the
+new page had no session. Alone, `/me` answered before the `goto`; in the full suite, on a cold
+dev server and a loaded machine, it did not. Not the Vite proxy (no `http proxy error` in a
+`DEBUG=vite:proxy` log over eleven full runs) and not the server. Reproduced on purpose with a
+throwaway spec that holds `/me` back 1.5 s with `page.route`: the 2026-09-20 `beforeEach` fails
+with `GET http://localhost:4391/api/v1/me status -1` in its trace and the sign-in form on screen;
+today's (wait for the sign-in form to go, then for the banner) passes. The 2026-09-20 tree itself
+(`git archive 4209d26 web`) run cold against today's server passed users and user detail once,
+so the race needs the slow `/me` to show. `307e5d5` (2026-09-21) had already replaced the URL
+assertion while diagnosing the symptom, which is why the failure never came back; every sign-in
+in `e2e-real/` now waits for the session before it navigates, and the spec's doc comment says
+what the cause was instead of "chase it in the proxy".
+
+The full suite found one more failure of the same shape on the way, and it is fixed: "the
+Statistics page's counts are the server's" (`e2e-real/reports-tasks-statistics.spec.ts`) read
+`GET /statistics/overview`, then loaded the page and expected the same numbers. The overview is a
+snapshot recounted at most once a minute (`STATISTICS_TTL`, `crates/hs-cli/src/overview.rs`), and
+the earlier tests in the suite make accounts, so a recount between the two reads made the page
+right and the expectation stale (run 5 of the first five: `Accounts35` against an expected `33`;
+passes alone). The test now reads the counts on both sides of the page load and compares the page
+with them only when they agree; when they do not, a recount fell in between and it loads once
+more (two recounts within seconds cannot happen).
+
+Before: five full runs against one `hs serve` (`test.local`, admin `@ops`, `HS_REAL_USER`
+`@alice:test.local`, the dev server on 4391 proxying to 8391): 22/22, 22/22, 22/22, 22/22, 21/22
+(the Statistics race), two skipped each (`add-mautrix-bridge` and `migration` need Docker and a
+Synapse fixture). After: `npm run test:e2e:real` five times in a row, 01:12-01:26 EDT at a
+one-minute load average of 16-21, **22/22 each time** (3.0, 3.5, 2.5, 2.3, 2.1 minutes). Over all
+eleven full runs the dev server proxied 11,879 requests with no proxy error. To repeat:
+
+```
+hs generate-config --server-name test.local --data-dir $D -o $D/config.yaml  # then add:
+#   listeners: {listeners: [{bind_addresses: [127.0.0.1], port: 8391,
+#                             resources: [client, federation, media, health, admin]}]}
+#   auth: {registration_shared_secret: <secret>}
+hs serve -c $D/config.yaml
+hs register http://127.0.0.1:8391 -u ops -p <pw> -k <secret> --admin -v   # prints the token
+hs register http://127.0.0.1:8391 -u alice -p <pw> -k <secret> --no-admin
+HS_REAL_UI_PORT=4391 HS_REAL_SERVER_URL=http://127.0.0.1:8391 HS_REAL_ADMIN_TOKEN=syt_... \
+  HS_REAL_USER=@alice:test.local npm run test:e2e:real
+```
+
+The run rewrites the committed `docs/design/screenshots/*-real.png`; put them back with
+`git checkout -- docs/design/screenshots` unless the pages changed.
+
+**And `npm run check` under load.** Twice tonight, at a load average of 22-30, the unit tests
+failed on "Unable to find role=table" (`MediaPage.test.tsx`, once with `TasksPage.test.tsx`),
+each passing alone: Testing Library's `findBy*` gives up after one second, and a page's first
+render through MSW took longer with sixty files at once. `src/test/setup.ts` now sets
+`asyncUtilTimeout` to five seconds (`vite.config.ts`'s `testTimeout` to twenty to leave room);
+no test waits on a timeout to prove an absence, so nothing gets slower unless it fails. After:
+`npm run check` twice at load 16-20, 443/443 each; `npm run test:e2e` 50/50.
+
 **`e2e/configuration.spec.ts` failed once in 112 runs: not reproduced in 150 more, under load;
 the next occurrence is captured.** The mock-backed spec (five tests) was run as
 `HS_E2E_PORT=4391 npx playwright test e2e/configuration.spec.ts --repeat-each=50 --trace

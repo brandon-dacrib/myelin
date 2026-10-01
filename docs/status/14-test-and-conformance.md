@@ -1,5 +1,16 @@
 # 14 Test and conformance (integration lead): status
 
+## 2026-10-01: two browser-suite flakes were the harness (branch `agent/web-gaps`)
+
+Both fixes are in `web/`'s Playwright harness, not in the server; status 16 has the detail. The
+`e2e-real` "fetch that fails under the full suite" was a test navigating away while its own
+sign-in request was in flight (the old `beforeEach` asserted a URL that is true before the
+session exists); a Statistics test compared the page with a count read before the server's
+one-minute recount. After: five full `e2e-real` runs in a row, 22/22 each. For CI,
+`web/playwright.config.ts` now keeps the trace of a failing attempt
+(`retain-on-failure-and-retries`) and sets `failOnFlakyTests`, so a test that only passes on
+retry fails the `web` job and its report, traces included, is uploaded.
+
 ## Re-measurement (2026-09-25/26, session 4): two-way federation, and what the suite found underneath it
 
 The day's code: `POST /join` reaching a room hosted elsewhere through the real handshake, the
