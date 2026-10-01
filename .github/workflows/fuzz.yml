@@ -1,0 +1,54 @@
+name: fuzz
+
+# Every cargo-fuzz target (crates/hs-federation/fuzz, crates/hs-media/fuzz) built on nightly and
+# run for 60 s each from its checked-in seed corpus (tests/fuzz/run_all.sh; status 14 has the
+# 10-minute baseline).
+#
+# Its own workflow, not a job in `ci`: a nightly toolchain can break the build for reasons that
+# are not this repository's (the first run, on 2026-10-01, could not compile `cfg-if` under the
+# sanitizer flags), and `cd`'s "require green ci" step reads the whole `ci` run's conclusion, so
+# a red fuzz job there blocked every image. Here it still fails red and uploads a crash's input,
+# so a finding is seen on the commit that exposed it, without deciding whether that commit ships.
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: 2
+
+jobs:
+  fuzz:
+    name: fuzz (60 s per target)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            crates/hs-federation/fuzz
+            crates/hs-media/fuzz
+      - run: tests/fuzz/run_all.sh 60
+        env:
+          FUZZ_OUT: ${{ runner.temp }}/fuzz-runs
+          FUZZ_REQUIRE: "1"
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-artifacts
+          path: |
+            crates/*/fuzz/artifacts/
+            ${{ runner.temp }}/fuzz-runs/**/fuzz.log
+          retention-days: 14
