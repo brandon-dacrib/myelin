@@ -97,22 +97,20 @@ pub struct InitialStateEvent {
     pub content: serde_json::Value,
 }
 
-/// The result of [`RoomActor::state_at_event`]: the room's state as of immediately *after* one
-/// event, plus the auth chain input a caller answering `/state` or `/state_ids` needs alongside
-/// it.
-///
-/// This is *S′(event)* in the spec's notation (see `hs_state::api::StateStore`'s module docs,
-/// "`state_at` returns the state after the event") -- exactly what `/state_ids`' `pdu_ids` and
-/// `auth_chain_ids` and `/state`'s `pdus`/`auth_chain` want for an explicit `event_id` query
-/// parameter, for *any* event this actor knows, not only the newest one in the timeline. Before
-/// this existed, `hs-room` only tracked one flat current-state map with no history, so the only
-/// event whose state could be answered correctly was the timeline's head (see
-/// `crates/hs-cli/src/federation.rs`'s module doc for the refusal this replaces).
+/// The result of [`RoomActor::state_at_event`] (the room's state as of immediately *after* one
+/// event, *S′(event)* in the spec's notation -- see `hs_state::api::StateStore`'s module docs) and
+/// of [`RoomActor::state_before_event`] (the state immediately *before* it, which is what the
+/// federation `/state` and `/state_ids` endpoints answer for `?event_id=`), plus the auth chain a
+/// caller answering either endpoint needs alongside it -- for *any* event this actor knows, not
+/// only the newest one in the timeline. Before this existed, `hs-room` only tracked one flat
+/// current-state map with no history, so the only event whose state could be answered correctly
+/// was the timeline's head (see `crates/hs-cli/src/federation.rs`'s module doc for the refusal
+/// this replaces).
 #[derive(Debug, Clone)]
 pub struct StateAtEvent {
-    /// Every event that is part of the room's state as of immediately after the queried event,
-    /// one per `(event_type, state_key)`. This is `/state_ids`' `pdu_ids` (or `/state`'s `pdus`,
-    /// once rendered).
+    /// Every event that is part of the room's state at the queried point, one per
+    /// `(event_type, state_key)`. From [`RoomActor::state_before_event`], this is `/state_ids`'
+    /// `pdu_ids` (or `/state`'s `pdus`, once rendered).
     pub state: Vec<Event>,
     /// The auth chain of `state`: every event reachable by following `auth_events` transitively
     /// from any event in `state`. This is `/state_ids`' `auth_chain_ids` -- note it deliberately
@@ -1943,9 +1941,10 @@ impl<B: KvBackend> RoomActor<B> {
     /// Stores one batch of the room's history from before the oldest event this actor holds, as
     /// fetched from another server by `crate::backfill` and verified by its caller (hashes and
     /// signatures; this method checks neither), with the state at each event **walked** rather
-    /// than fetched: exactly [`RoomActor::accept_history`] with [`HistoryKind::BeforeOldest`]
-    /// and no fetched state. `crate::backfill`'s implementation calls `accept_history` itself,
-    /// with the state it asked the sending server for; this is what is left when there is none.
+    /// than fetched: exactly [`RoomActor::accept_history`] with
+    /// [`crate::backfill::HistoryKind::BeforeOldest`] and no fetched state. `crate::backfill`'s
+    /// implementation calls `accept_history` itself, with the state it asked the sending server
+    /// for; this is what is left when there is none.
     ///
     /// # Where the events go
     /// Into the timeline, at negative positions: the newest of the batch just below the lowest
@@ -1960,7 +1959,7 @@ impl<B: KvBackend> RoomActor<B> {
     /// flagged outliers, still readable by whoever may read the room's current state
     /// ([`RoomActor::event_visible_to`]); the state computed for their position is what
     /// [`RoomActor::state_at_event`] answers for them from then on
-    /// ([`RoomActor::root_after`]). An event with a `depth` above the anchor's is not earlier
+    /// (`RoomActor::root_after`). An event with a `depth` above the anchor's is not earlier
     /// history and is dropped, so that an event which will also arrive live is never filed as
     /// history first and then found "already known" when it does.
     ///

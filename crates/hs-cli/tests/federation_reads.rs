@@ -371,6 +371,45 @@ async fn state_is_served_for_any_event_including_historical_ones() {
         "history_visibility was set after the create event, so it is not in the state then: {early_pdus:?}"
     );
 
+    // And it is the state *before* the event, as the spec and Synapse have it: before the
+    // create event there is nothing at all.
+    assert!(early_pdus.is_empty(), "{early_pdus:?}");
+
+    // `/state_ids` names the same events, by ID -- which a PDU of room version 3 or later does
+    // not carry, so they came back as two empty lists until 2026-09-30.
+    let (status, ids) = harness
+        .signed_get(&format!("/state_ids/{room_id}?event_id={newest}"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{ids}");
+    assert_eq!(
+        ids["pdu_ids"].as_array().map(Vec::len),
+        Some(pdus.len()),
+        "{ids}"
+    );
+    assert!(
+        ids["pdu_ids"]
+            .as_array()
+            .expect("pdu_ids")
+            .iter()
+            .all(|id| id.as_str().is_some_and(|id| id.starts_with('$'))),
+        "{ids}"
+    );
+    assert!(
+        !ids["auth_chain_ids"]
+            .as_array()
+            .expect("auth_chain_ids")
+            .is_empty(),
+        "{ids}"
+    );
+    assert!(
+        !ids["pdu_ids"]
+            .as_array()
+            .expect("pdu_ids")
+            .iter()
+            .any(|id| id == newest.as_str()),
+        "the state before an event does not include it: {ids}"
+    );
+
     // An event this server does not have is still a 404, not an empty state map.
     let (status, _) = harness
         .signed_get(&format!("/state/{room_id}?event_id=$nonexistent"))

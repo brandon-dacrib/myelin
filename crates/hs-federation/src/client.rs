@@ -1510,6 +1510,92 @@ mod tests {
         );
     }
 
+    /// `state_ids`, `room_state` and `event` against a stand-in that answers each the way the
+    /// spec shapes it, a `404` for an unknown event, and `/state_ids` without its lists.
+    #[tokio::test]
+    async fn state_ids_state_and_event_read_their_answers() {
+        use axum::extract::{Path, Query};
+        use axum::routing::get;
+        let app = axum::Router::new()
+            .route(
+                "/_matrix/federation/v1/state_ids/{room}",
+                get(
+                    |Path(room): Path<String>,
+                     Query(q): Query<HashMap<String, String>>| async move {
+                        if room.starts_with("!broken") {
+                            return axum::Json(serde_json::json!({"pdu_ids": []}));
+                        }
+                        let at = q.get("event_id").cloned().unwrap_or_default();
+                        axum::Json(serde_json::json!({
+                            "pdu_ids": ["$create", format!("{at}-before")],
+                            "auth_chain_ids": ["$create"],
+                        }))
+                    },
+                ),
+            )
+            .route(
+                "/_matrix/federation/v1/state/{room}",
+                get(|| async {
+                    axum::Json(serde_json::json!({
+                        "pdus": [{"type": "m.room.create"}],
+                        "auth_chain": [],
+                    }))
+                }),
+            )
+            .route(
+                "/_matrix/federation/v1/event/{event}",
+                get(|Path(event): Path<String>| async move {
+                    if event == "$unknown" {
+                        return (
+                            axum::http::StatusCode::NOT_FOUND,
+                            axum::Json(serde_json::json!({"errcode": "M_NOT_FOUND"})),
+                        );
+                    }
+                    (
+                        axum::http::StatusCode::OK,
+                        axum::Json(serde_json::json!({
+                            "origin": "peer",
+                            "origin_server_ts": 1,
+                            "pdus": [{"type": "m.room.topic", "asked": event}],
+                        })),
+                    )
+                }),
+            );
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = client_for_port(
+            port,
+            ClientConfig {
+                ip_policy: IpPolicy::default(),
+                scheme: "http",
+                ..ClientConfig::default()
+            },
+        );
+        let peer = format!("localhost:{port}");
+
+        let (state, chain) = client.state_ids(&peer, "!room:peer", "$at").await.unwrap();
+        assert_eq!(state, vec!["$create".to_owned(), "$at-before".to_owned()]);
+        assert_eq!(chain, vec!["$create".to_owned()]);
+        assert!(matches!(
+            client.state_ids(&peer, "!broken:peer", "$at").await,
+            Err(ClientError::BadResponseJson(..))
+        ));
+
+        let (pdus, chain) = client.room_state(&peer, "!room:peer", "$at").await.unwrap();
+        assert_eq!(pdus.len(), 1);
+        assert!(chain.is_empty());
+
+        let pdu = client.event(&peer, "$topic").await.unwrap();
+        assert_eq!(pdu["asked"], "$topic");
+        assert!(matches!(
+            client.event(&peer, "$unknown").await,
+            Err(ClientError::Rejected { status: 404, .. })
+        ));
+    }
+
     // Suppress "unused" on the unused helper import when compiled without networking pieces used
     // by every test above (kept explicit rather than silently allowed).
     #[allow(dead_code)]

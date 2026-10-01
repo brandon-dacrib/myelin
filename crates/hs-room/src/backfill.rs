@@ -14,9 +14,12 @@
 //! registry's fencing and token-resolver hooks -- the implementation lives in `hs-cli`, which owns
 //! both this crate and `hs-federation`: it runs `GET /_matrix/federation/v1/backfill` against a
 //! server in the room ([`RoomActor::backfill_anchor`] says which event to walk back from and who
-//! to ask), verifies every PDU the way any inbound PDU is verified, and hands the batch to
-//! [`RoomActor::accept_backfilled_events`], which is where the events get their place in the
-//! timeline (negative positions, older than anything held), their state, and their durability.
+//! to ask), verifies every PDU the way any inbound PDU is verified, asks the same server for the
+//! state at the batch's oldest event ([`RoomActor::plan_history`] says which; [`FetchedState`]),
+//! and hands both to [`RoomActor::accept_history`], which is where the events get their place in
+//! the timeline (negative positions, older than anything held), their state (derived forward
+//! from the fetched one, or walked back from what is held when nothing was fetched), their
+//! authorization at that position, and their durability.
 //! When nothing implements it -- a server with federation off, this crate's own tests -- a room's
 //! history is exactly what this server holds, as before.
 //!
@@ -27,7 +30,8 @@
 //!
 //! [`RoomActor::history_before_oldest`]: crate::actor::RoomActor::history_before_oldest
 //! [`RoomActor::backfill_anchor`]: crate::actor::RoomActor::backfill_anchor
-//! [`RoomActor::accept_backfilled_events`]: crate::actor::RoomActor::accept_backfilled_events
+//! [`RoomActor::plan_history`]: crate::actor::RoomActor::plan_history
+//! [`RoomActor::accept_history`]: crate::actor::RoomActor::accept_history
 
 use async_trait::async_trait;
 use hs_model::Event;
