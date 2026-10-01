@@ -61,14 +61,15 @@ never-flagged target given up on; a purge, a missing position and a deletion eac
 came before his join into a `joined` room, nor what came after his leave, and every change
 reached B by catch-up), `a_rewrite_on_the_owner_makes_the_copy_reload`,
 `the_mirror_holds_at_most_its_bound_of_rooms`, and the old reload test rewritten for in-place
-catch-up. With catch-up off (the old behaviour) the first two fail: loader count 4 against 1,
-and 7 whole loads against 1.
+catch-up. With catch-up off (the old behaviour) the first two fail: loader count 2 against 1
+after the first wake, and 3 whole loads against 1.
 
 **Measured** (`crates/hs-cli/tests/cluster_mirror.rs`, new: three real `hs serve` on one
 PostgreSQL 17; A owns the rooms; B1 runs with `HS_SYNC_MIRROR_FULL_RELOAD=1`, B2 as shipped; bob
 long-polls on B1 and carol on B2 while alice sends through A, so both see the same events at
-the same time). Debug build on the shared desktop at load 15-20, so absolute numbers are
-inflated; the ratio is the point. Mirror work per event is the
+the same time). First, a debug build on the shared desktop at load 15-20 (and before the
+250 ms prefetch bound), so absolute numbers are inflated; the ratio is the point. Mirror work
+per event is the
 `hs_user_mirror_catchup_duration_seconds` sum over the phase divided by the messages:
 
 | Room | B1, whole reload (before) | B2, incremental (after) |
@@ -79,22 +80,34 @@ inflated; the ratio is the point. Mirror work per event is the
 B2 loaded no room whole in either phase and its cost per event barely moves with the room's
 size; B1's grows with it.
 
-**The 2,000-event rooms (release build, PostgreSQL with `fsync=off`).** A whole load of the
-room on a non-owner -- what every new event cost it before -- took 26 s and 39 s for 2,000
-messages and 300 members (two runs; B1's `first_read`, the small room's load is milliseconds),
-and 22 s for 2,000 messages and 50 members.
-The full 100-message phase in the 300-member room could not be run on this machine: the owner's
-hub (the fan-out gap below) needed about a minute per update once 300 members had joined, five
-hours for the joins alone. MEASURE-BIG
+**The 2,000-event room, release build** (PostgreSQL in Docker with `fsync=off`; the desktop
+quieter than above), 100 messages per phase:
 
-**Write-to-woken-sync latency** was the same on B1 and B2 (p50 2.6-2.8 s in the small room, 14 s
-in the 33-member room): what dominates it on this machine is the owner's session hub, not the
-reader. **Found with no row:** the owner's hub writes each update's membership records and feed
-entries one member at a time, two store round trips each (`hub::apply_room_update`), so a room's
-updates cost the owner O(members) sequential PostgreSQL round trips; with 30 members on the
-loaded desktop the hub ran minutes behind the room, and a reader's own join reached its records
-only when the hub got there. Added to the known-gaps table. (Session 7's ~150 ms was a release
-build on an idle machine; this run is not comparable to it.)
+| Room | B1, whole reload (before) | B2, incremental (after) |
+|---|---|---|
+| small (3 members) | 45.7 ms/event; sync p50 281 ms, p95 387 ms | 4.2 ms/event; p50 246 ms, p95 365 ms |
+| 2,000 messages, 53 members | 989 ms/event; sync p50 2.26 s, p95 2.69 s | 3.4 ms/event; p50 1.54 s, p95 1.83 s |
+
+B2 loaded no room whole (100 catch-ups of 100 events in each phase); its work per event is the
+same in both rooms, B1's is 22 times larger in the big one. What is left of the latency in the
+big room on B2 is the owner: its hub writes 53 members' records and feed entries before it
+sends the wake (the owner's fan-out, below). Session 7's ~150 ms was a two-member room.
+
+**300 members.** The brief's room (2,000 messages and 300 members) was built twice, but its
+100-message phase did not finish on this machine while it was loaded: the owner's hub needed
+about a minute per update once 300 members had joined (five hours for the joins alone). The
+reader's side of it was measured all the same: B1's whole load of that room -- what every new
+event in it cost a non-owner before -- took 26 s and 39 s (two runs, release build).
+MEASURE-BIG
+
+**Found with no row: the owner's fan-out.** In the debug run the write-to-woken-sync latency
+was the same on B1 and B2 (p50 2.6-2.8 s in the small room, 14 s in the 33-member room): what
+dominated it was the owner's session hub, not the reader. The hub writes each update's
+membership records and feed entries one member at a time, several store round trips each
+(`hub::apply_room_update`), so every update costs the owner O(members) sequential PostgreSQL
+round trips before anyone is woken; with 30 members on the loaded desktop it ran minutes behind
+the room, and a reader's own join reached its records only when the hub got there. Added to the
+known-gaps table.
 
 **Also learned on the way** (test harness, not server): `createRoom` places a room on whichever
 replica owns its minted id's shard, so the test makes rooms until A owns one; with 500 ms

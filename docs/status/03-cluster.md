@@ -41,6 +41,22 @@ Tests: `mesh_refusal_not_cached.rs::a_forward_fenced_twice_succeeds_once_the_han
 first gets the fence's `503`, the second `M_UNKNOWN`).
 
 Verified: ten runs in a row against a private `postgres:17` with the machine at load 9-20 all passed (167-284 s each); `cluster_admin.rs` (both tests), `cargo test -p hs-cluster` (with `chaos.rs`) and `cargo test -p hs-room` pass.
+## 2026-10-01: a non-owner's room reads are incremental (branch `agent/rfc-0018`, tracks 05 and 04)
+
+Not a change to `hs-cluster`, but to what a cluster costs: a replica answering `/sync` for a
+room another replica owns no longer reloads the whole room from the store per event. Its copy
+(`hs_user::cluster::RoomMirror`) is advanced by `hs_room::actor::RoomActor::catch_up`, which
+reads only the timeline rows past it (3.4 ms per event against 989 ms for a whole reload of a
+2,000-message room, release build); a per-room rewrite counter (`room_rewrites`) tells it when
+something other than an append happened (backfill, purge, outliers, ...) and it then reloads,
+logged with the reason. The `user.wake` batch's existing `room_pos` drives it: a copy is caught
+up (for at most 250 ms) before the long-polls the wake is for are woken -- a catch-up awaited
+inline held the mesh request past its 2 s deadline once and was cancelled with it. RFC 0018,
+decision 0022, status 05 session 12 (with a three-replica measurement in
+`crates/hs-cli/tests/cluster_mirror.rs`). Two things for this track from that test: on a loaded
+machine, 500 ms heartbeats with 3 s leases moved shards in the middle of the run (the test uses
+2 s / 30 s), and right after the last replica of three turns `active` shards are still moving
+for several seconds.
 
 ## 2026-09-30: a join or knock by alias is shard-gated (branch `agent/cli-small-gaps`)
 

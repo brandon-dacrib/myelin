@@ -16,6 +16,9 @@
 //! behind the store's is told to reload ([`CatchUpReload::Rewritten`]). So is one that finds a
 //! position missing ([`CatchUpReload::PositionGap`]), a new event with an explicit state (a
 //! rejoin through another server; [`CatchUpReload::ExplicitState`]), or a room that is gone.
+//! **A new write path that changes a room's existing rows, or places rows below its head, must
+//! call `bump_rewrites` in its transaction too**, or other replicas' copies miss it until
+//! they are evicted (decision 0022).
 //!
 //! Redactions are applied here rather than reloaded for: the redaction is a timeline event, and
 //! its target's stored row is rewritten with the `redacted` flag a moment after

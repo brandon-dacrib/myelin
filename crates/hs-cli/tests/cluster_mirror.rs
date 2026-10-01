@@ -15,13 +15,16 @@
 //! less work per event than B1 in the big room.
 //!
 //! The sizes default to a quick run for the gate. The measurement in `docs/status/05-sync.md`
-//! (session 12) used
+//! (session 12) used a release build and
 //!
 //! ```sh
-//! HS_MIRROR_BENCH_EVENTS=2000 HS_MIRROR_BENCH_MEMBERS=300 HS_MIRROR_BENCH_MESSAGES=100 \
+//! HS_MIRROR_BENCH_EVENTS=2000 HS_MIRROR_BENCH_MEMBERS=50 HS_MIRROR_BENCH_MESSAGES=100 \
 //! HS_CLUSTER_TEST_POSTGRES_DSN="postgres://postgres:hspg@127.0.0.1:5439/postgres" \
-//!     cargo test -p hs-cli --test cluster_mirror -- --nocapture
+//!     cargo test --release -p hs-cli --test cluster_mirror -- --nocapture
 //! ```
+//!
+//! With many more members the owner's session hub, which writes every member's records one at a
+//! time, falls far behind the room and the run takes hours (status 05, session 12).
 //!
 //! Runs when a PostgreSQL server is reachable, and prints a skip message otherwise (see
 //! `tests/cluster_ephemeral.rs` for a container to start). Each run makes a database of its own
