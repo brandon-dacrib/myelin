@@ -98,6 +98,33 @@ export function ClusterPage() {
         <h2 id="replicas-heading" className="text-lg text-text">
           Replicas
         </h2>
+        <details className="text-sm text-text-muted">
+          <summary className="cursor-pointer text-accent hover:underline">
+            What the columns mean
+          </summary>
+          <dl className="mt-2 grid max-w-4xl gap-x-4 gap-y-1.5 sm:grid-cols-[10rem_1fr]">
+            <dt className="text-text">Status</dt>
+            <dd>
+              Joining: starting, not yet taking shards. Active: serving and owning shards. Draining:
+              handing its shards to the others because an administrator asked, or it is shutting
+              down. Drained: owns none, still answers requests by forwarding them. Unreachable: its
+              heartbeats stopped, and the others are taking its shards.
+            </dd>
+            <dt className="text-text">Zone</dt>
+            <dd>Where it runs, from its configuration; shards are spread across zones.</dd>
+            <dt className="text-text">Last heartbeat</dt>
+            <dd>
+              When it last told the others it is alive. One silent for longer than the lease
+              (cluster.lease_ttl) is treated as gone.
+            </dd>
+            <dt className="text-text">Mesh address</dt>
+            <dd>
+              Where the other replicas reach it to forward requests to the shard&apos;s owner.
+            </dd>
+            <dt className="text-text">Epoch</dt>
+            <dd>Its generation: a new number each time it starts, so a restart shows here.</dd>
+          </dl>
+        </details>
         {singleNode && replicas.data && (
           <p
             role="note"
@@ -514,7 +541,8 @@ function ShardsSection({
           </h2>
           <p className="text-sm text-text-muted">
             Every room, user, federation destination and appservice hashes onto one shard, and each
-            shard has at most one owner.
+            shard has at most one owner. A shard&apos;s epoch goes up each time it changes owner:
+            one that keeps rising means its ownership is moving back and forth.
           </p>
         </div>
         <div className="flex flex-wrap items-end gap-3">
@@ -652,9 +680,9 @@ function ShardTable({
             )}
           </span>
         ) : (
-          <span className="text-text-muted">unowned</span>
+          <span className="text-text-muted">No owner yet</span>
         ),
-      renderCompact: (s) => s.owner ?? "unowned",
+      renderCompact: (s) => s.owner ?? "No owner yet",
     },
     {
       key: "state",

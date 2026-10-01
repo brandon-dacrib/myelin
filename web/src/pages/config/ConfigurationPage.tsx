@@ -8,7 +8,13 @@
  * sections have been changed from their defaults, which ones a restart is
  * needed for, and which ones the deployment has taken out of your hands.
  */
-import { APPLIES_COPY, APPLIES_ORDER, countApplies, type Applies } from "@/lib/config-applies";
+import {
+  APPLIES_COPY,
+  APPLIES_ORDER,
+  countApplies,
+  describeSource,
+  type Applies,
+} from "@/lib/config-applies";
 import { AppliesBadge } from "./AppliesBadge";
 import { useMemo, useState } from "react";
 import { Link } from "@tanstack/react-router";
@@ -311,8 +317,8 @@ function SectionCardView({ card }: { card: SectionCard }) {
             </div>
           )}
           <div className="flex gap-1">
-            <dt>Highest precedence:</dt>
-            <dd className="font-identifier text-text">{card.source}</dd>
+            <dt>Values from:</dt>
+            <dd className="text-text">{describeSource(card.source)}</dd>
           </div>
           {card.reloadable && (
             <div className="flex gap-1">

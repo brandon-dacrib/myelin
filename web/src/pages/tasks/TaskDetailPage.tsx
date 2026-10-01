@@ -68,7 +68,9 @@ function TaskView({ task }: { task: Task }) {
       <header className="flex flex-wrap items-start justify-between gap-4">
         <div>
           <h1 className="text-xl text-text">{describeTaskAction(task.action)}</h1>
-          <p className="mt-1 break-all font-identifier text-sm text-text-muted">{task.action}</p>
+          <p className="mt-1 break-all text-sm text-text-muted">
+            Admin API operation <span className="font-identifier">{task.action}</span>
+          </p>
           <div className="mt-2">
             <Badge status={meta.status}>{meta.label}</Badge>
           </div>

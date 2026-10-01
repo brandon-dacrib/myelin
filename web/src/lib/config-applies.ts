@@ -149,3 +149,22 @@ export function describeSaveOutcome(
     sentences.push("Stored. The running server already uses these values.");
   return { description: sentences.join(" "), failed: Boolean(failure) && hot.length > 0 };
 }
+
+/**
+ * `ConfigSection.source`, the highest-precedence layer that sets anything in a section, in
+ * words: where its values come from.
+ */
+export function describeSource(source: string): string {
+  switch (source) {
+    case "default":
+      return "Defaults only";
+    case "file":
+      return "The bootstrap file";
+    case "database":
+      return "Saved here (the database)";
+    case "environment":
+      return "Environment variables";
+    default:
+      return source;
+  }
+}

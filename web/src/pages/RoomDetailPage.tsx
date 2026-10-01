@@ -1,3 +1,9 @@
+import {
+  HISTORY_VISIBILITY_LABELS,
+  JOIN_RULE_LABELS,
+  MEMBERSHIP_LABELS,
+  roomWords,
+} from "@/lib/rooms";
 import { useState, type ReactNode } from "react";
 import { useParams, useSearch, useNavigate, Link } from "@tanstack/react-router";
 import { ChevronLeft } from "lucide-react";
@@ -130,7 +136,11 @@ export function RoomDetailPage() {
           <Button
             variant="secondary"
             disabled={!canWrite}
-            title={!canWrite ? "Needs admin:write" : undefined}
+            title={
+              !canWrite
+                ? "Needs admin:write"
+                : "Joins you to the room with full power, granted by a local member who has it"
+            }
             onClick={() =>
               makeAdmin.mutate(id, { onSuccess: () => toast({ title: "Joined as admin" }) })
             }
@@ -157,6 +167,7 @@ export function RoomDetailPage() {
             <Button
               variant="secondary"
               disabled={!canModerate}
+              title={!canModerate ? "Needs moderation:write" : "Lets people join it again"}
               onClick={() =>
                 unblock.mutate(id, { onSuccess: () => toast({ title: "Room unblocked" }) })
               }
@@ -279,16 +290,27 @@ function RoomOverview({ room }: { room: Room }) {
         <h2 className="text-md font-medium text-text">Overview</h2>
         <dl className="mt-3 grid grid-cols-1 gap-x-8 gap-y-4 sm:grid-cols-2">
           <Fact label="Creator" value={room.creator ?? "—"} />
-          <Fact label="Version" value={room.version ?? "—"} />
+          <Fact
+            label="Room version"
+            value={room.version ?? "—"}
+            hint="The Matrix rules the room follows; an old version is upgraded by its admins."
+          />
           <Fact label="Topic" value={room.topic ?? "—"} />
-          <Fact label="Join rule" value={room.join_rule ?? "—"} />
-          <Fact label="History visibility" value={room.history_visibility ?? "—"} />
+          <Fact label="Who can join" value={roomWords(JOIN_RULE_LABELS, room.join_rule)} />
+          <Fact
+            label="Who can read its history"
+            value={roomWords(HISTORY_VISIBILITY_LABELS, room.history_visibility)}
+          />
           <Fact
             label="Members (local / joined)"
             value={`${room.local_members_count ?? 0} / ${room.joined_members_count ?? 0}`}
           />
-          <Fact label="State events" value={String(room.state_events_count ?? 0)} />
-          <Fact label="Federatable" value={room.federatable ? "Yes" : "No"} />
+          <Fact
+            label="State events"
+            value={String(room.state_events_count ?? 0)}
+            hint="Room settings and membership records; a very large number makes joining slow."
+          />
+          <Fact label="People on other servers can join" value={room.federatable ? "Yes" : "No"} />
         </dl>
 
         <h2 className="mt-8 text-md font-medium text-text">Members</h2>
@@ -306,7 +328,7 @@ function RoomOverview({ room }: { room: Room }) {
               <li key={m.user_id} className="flex items-center justify-between gap-3 px-4 py-3">
                 <span className="font-identifier text-text">{m.user_id}</span>
                 <Badge status="neutral" hideIcon>
-                  {m.membership}
+                  {roomWords(MEMBERSHIP_LABELS, m.membership)}
                 </Badge>
               </li>
             ))}
@@ -317,11 +339,12 @@ function RoomOverview({ room }: { room: Room }) {
   );
 }
 
-function Fact({ label, value }: { label: string; value: ReactNode }) {
+function Fact({ label, value, hint }: { label: string; value: ReactNode; hint?: string }) {
   return (
     <div>
       <dt className="text-xs text-text-muted">{label}</dt>
       <dd className="mt-0.5 text-sm text-text">{value}</dd>
+      {hint && <dd className="mt-0.5 text-xs text-text-faint">{hint}</dd>}
     </div>
   );
 }

@@ -1,7 +1,14 @@
 import { useState, type ReactNode } from "react";
 import { useParams, Link } from "@tanstack/react-router";
 import { ChevronLeft } from "lucide-react";
-import { useUser, useLockUser, useUnlockUser, useLogoutUser, useDeactivateUser } from "@/api/users";
+import {
+  useUser,
+  useLockUser,
+  useUnlockUser,
+  useLogoutUser,
+  useDeactivateUser,
+  useReactivateUser,
+} from "@/api/users";
 import { Button } from "@/components/ui/button/Button";
 import { Badge } from "@/components/ui/badge/Badge";
 import { Dialog, DialogTrigger, DialogClose, DialogContent } from "@/components/ui/dialog/Dialog";
@@ -31,6 +38,7 @@ export function UserDetailPage() {
   const unlock = useUnlockUser();
   const logout = useLogoutUser();
   const deactivate = useDeactivateUser();
+  const reactivate = useReactivateUser();
   const [resetOpen, setResetOpen] = useState(false);
   const [noticeOpen, setNoticeOpen] = useState(false);
 
@@ -97,7 +105,7 @@ export function UserDetailPage() {
             <Button
               variant="secondary"
               disabled={!canModerate}
-              title={!canModerate ? "Needs moderation:write" : undefined}
+              title={!canModerate ? "Needs moderation:write" : "Lets them sign in again"}
               onClick={() =>
                 unlock.mutate(
                   { userId: id },
@@ -196,14 +204,29 @@ export function UserDetailPage() {
             <Fact label="Rooms" value={String(user.room_count ?? 0)} />
             <Fact label="Media" value={String(user.media_count ?? 0)} />
             <Fact
-              label="User type"
+              label="Kind of account"
               value={
                 user.is_guest
-                  ? "guest: no password, and only rooms that let guests in"
-                  : (user.user_type ?? "person")
+                  ? "Guest: no password, and only rooms that let guests in"
+                  : (USER_TYPE_LABELS[user.user_type ?? ""] ?? "Person")
               }
             />
-            <Fact label="Appservice" value={user.appservice_id ?? "—"} />
+            <Fact
+              label="Made by a bridge"
+              value={
+                user.appservice_id ? (
+                  <Link
+                    to="/bridges/$bridgeId"
+                    params={{ bridgeId: user.appservice_id }}
+                    className="text-accent hover:underline"
+                  >
+                    {user.appservice_id}
+                  </Link>
+                ) : (
+                  "No"
+                )
+              }
+            />
           </dl>
 
           <UserDevicesSection userId={id} canWrite={canWrite} canModerate={canModerate} />
@@ -218,10 +241,37 @@ export function UserDetailPage() {
         <div>
           <ModerationCard user={user} />
           <h2 className="mt-8 text-md font-medium text-text">Danger</h2>
-          <div className="mt-3 rounded-md border border-danger-border bg-danger-bg p-4">
+          {user.deactivated && (
+            <div className="mt-3 rounded-md border border-border bg-surface p-4">
+              <h3 className="text-sm font-medium text-text">Reactivate this user</h3>
+              <p className="mt-1 text-sm text-text-muted">
+                Lets them sign in again. Rooms they were taken out of when deactivated are not
+                rejoined; they can be invited back.
+              </p>
+              <Button
+                variant="secondary"
+                className="mt-3"
+                disabled={!canWrite || reactivate.isPending}
+                title={!canWrite ? "Needs admin:write" : undefined}
+                onClick={() =>
+                  reactivate.mutate(
+                    { userId: id },
+                    { onSuccess: () => toast({ title: `User ${id} reactivated` }) },
+                  )
+                }
+              >
+                Reactivate
+              </Button>
+            </div>
+          )}
+          <div
+            className="mt-3 rounded-md border border-danger-border bg-danger-bg p-4"
+            hidden={user.deactivated}
+          >
             <h3 className="text-sm font-medium text-text">Deactivate this user</h3>
             <p className="mt-1 text-sm text-text-muted">
-              They can no longer sign in. Their messages stay unless you also erase.
+              They can no longer sign in, and are signed out everywhere. Their messages stay where
+              they are; redact them under Moderation if they must go.
             </p>
             <Dialog>
               <DialogTrigger asChild>
@@ -231,23 +281,29 @@ export function UserDetailPage() {
               </DialogTrigger>
               <DialogContent
                 title={`Deactivate ${id}?`}
-                description="This cannot be undone from here. Their messages and rooms stay unless you separately redact or erase."
+                description="They are signed out everywhere and can no longer sign in. Their messages stay unless you redact them. Reactivate on this page lets them sign in again."
                 footer={
                   <>
                     <DialogClose asChild>
                       <Button variant="secondary">Cancel</Button>
                     </DialogClose>
-                    <Button
-                      variant="danger"
-                      onClick={() =>
-                        deactivate.mutate(
-                          { userId: id },
-                          { onSuccess: () => toast({ title: `User ${id} deactivated` }) },
-                        )
-                      }
-                    >
-                      Deactivate
-                    </Button>
+                    <DialogClose asChild>
+                      <Button
+                        variant="danger"
+                        onClick={() =>
+                          deactivate.mutate(
+                            { userId: id },
+                            {
+                              onSuccess: () => toast({ title: `User ${id} deactivated` }),
+                              onError: () =>
+                                toast({ title: `Couldn't deactivate ${id}`, variant: "danger" }),
+                            },
+                          )
+                        }
+                      >
+                        Deactivate
+                      </Button>
+                    </DialogClose>
                   </>
                 }
               />
@@ -258,6 +314,12 @@ export function UserDetailPage() {
     </div>
   );
 }
+
+/** `User.user_type`, in words: the Matrix types an account can have. */
+const USER_TYPE_LABELS: Record<string, string> = {
+  bot: "Bot",
+  support: "Support account",
+};
 
 function Fact({ label, value }: { label: string; value: ReactNode }) {
   return (

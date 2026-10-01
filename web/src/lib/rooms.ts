@@ -71,3 +71,39 @@ export function localInputToRfc3339(value: string): string | null {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? null : date.toISOString();
 }
+
+/** `m.room.join_rules`' rule, in words. */
+export const JOIN_RULE_LABELS: Record<string, string> = {
+  public: "Anyone can join",
+  invite: "Invite only",
+  knock: "Anyone can ask to join",
+  restricted: "Members of certain spaces can join",
+  knock_restricted: "Members of certain spaces can join; anyone can ask",
+  private: "Invite only",
+};
+
+/** `m.room.history_visibility`, in words: who can read the room's history. */
+export const HISTORY_VISIBILITY_LABELS: Record<string, string> = {
+  world_readable: "Anyone, even without joining",
+  shared: "Members, including history from before they joined",
+  invited: "Members, from when they were invited",
+  joined: "Members, from when they joined",
+};
+
+/** A membership state (`m.room.member`'s `membership`), in words. */
+export const MEMBERSHIP_LABELS: Record<string, string> = {
+  join: "Joined",
+  invite: "Invited",
+  knock: "Asked to join",
+  leave: "Left",
+  ban: "Banned",
+};
+
+/** A wire value in words: its label, or the value with its underscores made spaces. */
+export function roomWords(
+  labels: Record<string, string>,
+  value: string | null | undefined,
+): string {
+  if (!value) return "—";
+  return labels[value] ?? value.replaceAll("_", " ");
+}

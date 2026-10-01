@@ -1300,6 +1300,17 @@ export const handlers = [
     return HttpResponse.json(user);
   }),
 
+  http.post(`${API}/users/:user_id/reactivate`, ({ params }) => {
+    const user = findUser(decodeURIComponent(String(params.user_id)));
+    if (!user)
+      return HttpResponse.json(
+        { type: "urn:hs:problem:not-found", title: "Not found" },
+        { status: 404 },
+      );
+    user.deactivated = false;
+    return HttpResponse.json(user);
+  }),
+
   // ---- Users: moderation and activity (shadow-ban, rate limit, login-as, sessions,
   // memberships, statistics, media, redact-events; ./data/user-moderation.ts) ----
   ...(

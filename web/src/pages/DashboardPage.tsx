@@ -15,6 +15,7 @@ import { isCounter, useTimeseries, type Metric } from "@/api/statistics";
 import { Sparkline } from "@/components/Sparkline";
 import { hasScope } from "@/lib/auth";
 import { describeTaskAction } from "@/lib/tasks";
+import { describeAction, targetTypeLabel } from "@/lib/audit";
 import { classifyError } from "@/api/problem";
 import { Badge } from "@/components/ui/badge/Badge";
 import { QueryProblemState } from "@/components/QueryProblemState";
@@ -105,8 +106,8 @@ export function DashboardPage() {
         id: `destination-${d.server_name}`,
         severity: "warning",
         summary: `Federation with ${d.server_name} has been failing for over an hour.`,
-        actionLabel: "Open federation",
-        actionHref: "/federation",
+        actionLabel: `Open ${d.server_name}`,
+        actionHref: `/federation/${encodeURIComponent(d.server_name ?? "")}`,
       });
     }
     for (const task of failedTasks.data?.items ?? []) {
@@ -256,6 +257,13 @@ export function DashboardPage() {
                       "Cluster"
                     )
                   }
+                  hint={
+                    cluster.isError
+                      ? undefined
+                      : singleNode
+                        ? "One process serves everything."
+                        : "Work is shared between replicas; see Cluster."
+                  }
                 />
                 <Tile
                   label="Users"
@@ -286,6 +294,7 @@ export function DashboardPage() {
                       formatCount(stats.data?.daily_active_users)
                     )
                   }
+                  hint="People who used the server in the last 24 hours."
                 />
               </>
             )}
@@ -425,7 +434,8 @@ export function DashboardPage() {
                     params={{ entryId: entry.id }}
                     className="text-text hover:text-accent hover:underline"
                   >
-                    {entry.action} &middot; {entry.target.type} {entry.target.id}
+                    {describeAction(entry.action)} &middot; {targetTypeLabel(entry.target.type)}{" "}
+                    {entry.target.id}
                   </Link>
                   <span className="flex items-center gap-3 text-text-muted">
                     <span className="font-identifier">
@@ -520,11 +530,12 @@ function ActivityTile({
   );
 }
 
-function Tile({ label, value }: { label: string; value: ReactNode }) {
+function Tile({ label, value, hint }: { label: string; value: ReactNode; hint?: string }) {
   return (
     <div className="rounded-md border border-border bg-surface p-4">
       <p className="text-xs text-text-muted">{label}</p>
       <div className="mt-1 text-2xl text-text">{value}</div>
+      {hint && <p className="mt-1 text-xs text-text-faint">{hint}</p>}
     </div>
   );
 }

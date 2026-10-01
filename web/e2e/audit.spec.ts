@@ -92,10 +92,10 @@ test("phone layout, replay links, missing entries and export errors", async ({ p
     true,
   );
   await page.goto("/admin/audit/audit-7");
-  await expect(page.getByText("Replayed request", { exact: true })).toBeVisible();
+  await expect(page.getByText("Repeated request, done once", { exact: true })).toBeVisible();
   await page.getByRole("link", { name: "audit-8", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Reset password" })).toBeVisible();
-  await expect(page.getByText("Replayed request", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("Repeated request, done once", { exact: true })).toHaveCount(0);
   await expectNoAxeViolations(page, "audit entry on phone");
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(
     true,

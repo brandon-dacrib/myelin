@@ -91,7 +91,7 @@ export function RegistrationTokensPage() {
     },
     {
       key: "pending",
-      header: "Pending",
+      header: "Sign-ups in progress",
       priority: 3,
       align: "end",
       render: (t) => t.pending,

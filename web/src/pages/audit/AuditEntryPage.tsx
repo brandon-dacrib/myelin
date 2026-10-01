@@ -41,7 +41,11 @@ export function AuditEntryPage() {
                 {succeeded(entry) ? "Succeeded" : "Failed"}
                 {entry.outcome.status ? ` · HTTP ${entry.outcome.status}` : ""}
               </Badge>
-              {entry.replayed && <Badge status="info">Replayed request</Badge>}
+              {entry.replayed && (
+                <span title="The same request was sent again with its Idempotency-Key, and the server answered it with the first result instead of doing it twice.">
+                  <Badge status="info">Repeated request, done once</Badge>
+                </span>
+              )}
             </div>
           </header>
           {entry.outcome.problem && (

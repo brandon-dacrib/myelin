@@ -160,7 +160,11 @@ export function BridgeDetailPage() {
             <Button
               variant="secondary"
               disabled={!canWrite}
-              title={!canWrite ? "Needs bridges:write" : undefined}
+              title={
+                !canWrite
+                  ? "Needs bridges:write"
+                  : "Delivers what queued while it was paused, in order, then carries on"
+              }
               onClick={() =>
                 resume.mutate(id, {
                   onSuccess: () => toast({ title: `Bridge ${name} resumed` }),
@@ -174,7 +178,11 @@ export function BridgeDetailPage() {
             <Button
               variant="secondary"
               disabled={!canWrite}
-              title={!canWrite ? "Needs bridges:write" : undefined}
+              title={
+                !canWrite
+                  ? "Needs bridges:write"
+                  : "Stops delivering to the bridge; events queue here and are sent on Resume"
+              }
               onClick={() =>
                 pause.mutate(id, {
                   onSuccess: () => toast({ title: `Bridge ${name} paused` }),
@@ -387,12 +395,14 @@ export function BridgeDetailPage() {
                       {entry.last_error && (
                         <span className="text-xs text-danger">{entry.last_error}</span>
                       )}
-                      <span className="text-xs text-text-muted">{entry.attempts} attempt(s)</span>
+                      <span className="text-xs text-text-muted">
+                        {entry.attempts} {entry.attempts === 1 ? "attempt" : "attempts"}
+                      </span>
                       <span className="text-xs text-text-muted">
                         {formatBacklogEntry(entry.age_ms ?? 0, entry.dead_lettered ?? false)}
                       </span>
                       <Badge status={entry.dead_lettered ? "danger" : "info"}>
-                        {entry.dead_lettered ? "dead-lettered" : "pending"}
+                        {entry.dead_lettered ? "Gave up" : "Waiting"}
                       </Badge>
                     </span>
                   </li>

@@ -53,7 +53,13 @@ import { QueryProblemState } from "@/components/QueryProblemState";
 import { RelativeTime } from "@/components/RelativeTime";
 import { toast } from "@/components/ui/toast/toast-store";
 import { hasScope } from "@/lib/auth";
-import { appliesOf, countApplies, describeSaveOutcome, type Applies } from "@/lib/config-applies";
+import {
+  appliesOf,
+  countApplies,
+  describeSaveOutcome,
+  describeSource,
+  type Applies,
+} from "@/lib/config-applies";
 import { settingLabels } from "@/lib/config-history";
 import { AppliesLegend } from "./AppliesBadge";
 import { ChangeReview } from "./ChangeReview";
@@ -331,8 +337,8 @@ function SectionForm({ section, data, schema, schemaSettled, onReread }: Section
         </div>
         <dl className="flex flex-wrap gap-x-6 gap-y-1 text-xs text-text-muted">
           <div className="flex gap-1">
-            <dt>Highest precedence:</dt>
-            <dd className="font-identifier text-text">{data.section.source}</dd>
+            <dt>Values from:</dt>
+            <dd className="text-text">{describeSource(data.section.source)}</dd>
           </div>
           {reloadable && (
             <div className="flex gap-1">

@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { describeRoomTaskResult, localInputToRfc3339, summarizeEvent } from "./rooms";
+import {
+  HISTORY_VISIBILITY_LABELS,
+  JOIN_RULE_LABELS,
+  MEMBERSHIP_LABELS,
+  describeRoomTaskResult,
+  localInputToRfc3339,
+  roomWords,
+  summarizeEvent,
+} from "./rooms";
 
 describe("summarizeEvent", () => {
   it("shows a message's body, a membership and a redaction", () => {
@@ -69,5 +77,19 @@ describe("localInputToRfc3339", () => {
   it("converts a datetime-local value and rejects an empty one", () => {
     expect(localInputToRfc3339("")).toBeNull();
     expect(localInputToRfc3339("2026-01-02T03:04")).toMatch(/^2026-01-0\dT\d\d:04:00\.000Z$/);
+  });
+});
+
+describe("roomWords", () => {
+  it("says a room's settings and a membership in words, never as wire values", () => {
+    expect(roomWords(JOIN_RULE_LABELS, "knock_restricted")).toBe(
+      "Members of certain spaces can join; anyone can ask",
+    );
+    expect(roomWords(HISTORY_VISIBILITY_LABELS, "shared")).toBe(
+      "Members, including history from before they joined",
+    );
+    expect(roomWords(MEMBERSHIP_LABELS, "ban")).toBe("Banned");
+    expect(roomWords(JOIN_RULE_LABELS, "some_future_rule")).toBe("some future rule");
+    expect(roomWords(JOIN_RULE_LABELS, null)).toBe("—");
   });
 });

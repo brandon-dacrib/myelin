@@ -176,6 +176,23 @@ export function useDeactivateUser() {
   });
 }
 
+/**
+ * Lets a deactivated account sign in again (`POST /users/{user_id}/reactivate`). Its password
+ * and devices are as deactivation left them; rooms it left are not rejoined.
+ */
+export function useReactivateUser() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ userId }: { userId: string }) => {
+      const result = await api.POST("/users/{user_id}/reactivate", {
+        params: { path: { user_id: userId }, header: { "Idempotency-Key": newIdempotencyKey() } },
+      });
+      return unwrap(result);
+    },
+    onSuccess: (_data, { userId }) => invalidateUser(qc, userId),
+  });
+}
+
 export type UserCreate = components["schemas"]["UserCreate"];
 
 /**
