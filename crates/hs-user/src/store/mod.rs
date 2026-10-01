@@ -452,6 +452,21 @@ pub trait UserStore: Send + Sync {
         filter_json: serde_json::Value,
     ) -> Result<String, StoreError>;
 
+    /// Stores a named filter under an id another server assigned it -- the Synapse importer
+    /// (`hs_compat::migration`), so that a client which uploaded filter `0` to Synapse finds it
+    /// at `0` here, as `GET /user/{userId}/filter/0` and `/sync?filter=0`. Overwrites whatever
+    /// was stored under that id. Ids [`UserStore::put_filter`] assigns are sixteen alphanumeric
+    /// characters, so they never collide with Synapse's, which are decimal numbers.
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] on a storage failure.
+    async fn import_filter(
+        &self,
+        user_id: &ruma::UserId,
+        filter_id: &str,
+        filter_json: serde_json::Value,
+    ) -> Result<(), StoreError>;
+
     /// Retrieves a previously stored filter by id.
     ///
     /// # Errors

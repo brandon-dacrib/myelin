@@ -1026,6 +1026,37 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         Ok(())
     }
 
+    /// Records a receipt copied from another implementation's database for this same server
+    /// (the Synapse importer, `hs_compat::migration`): as [`SessionHub::set_receipt`] -- kept
+    /// durably, the room's joined members woken, the other replicas told -- except that nothing
+    /// is sent to other servers. The receipt is not news to them: Synapse sent it when it was
+    /// made. Returns the receipt's stamp.
+    ///
+    /// # Errors
+    /// Returns [`UserError`] if the room could not be loaded.
+    pub async fn import_receipt(
+        &self,
+        room_id: &RoomId,
+        user_id: &UserId,
+        kind: ReceiptKind,
+        event_id: ruma::OwnedEventId,
+        ts: u64,
+    ) -> Result<u64, UserError> {
+        let members = self.joined_member_ids(room_id).await?;
+        let seq = self
+            .receipts
+            .set(room_id, user_id, kind, event_id, ts)
+            .await;
+        for member in &members {
+            self.wake(member).await;
+        }
+        self.publish_ephemeral(EphemeralUpdate::Receipt {
+            room_id: room_id.to_owned(),
+            seq,
+        });
+        Ok(seq)
+    }
+
     /// Applies a typing, receipt or presence EDU another server sent (`origin`), and wakes the
     /// local users it concerns. Returns how many updates were applied; what was dropped (a user
     /// of another server, a user not joined to the room here, a room this server does not have)

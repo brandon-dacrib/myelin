@@ -778,6 +778,20 @@ impl<B: KvBackend> UserStore for TablesUserStore<B> {
         Ok(filter_id)
     }
 
+    async fn import_filter(
+        &self,
+        user_id: &UserId,
+        filter_id: &str,
+        filter_json: serde_json::Value,
+    ) -> Result<(), StoreError> {
+        let key = (user_id.to_string(), filter_id.to_owned());
+        let value = json_encode(&filter_json)?;
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            self.filters.put(txn, &key, &value).map_err(to_kv)
+        })
+        .map_err(StoreError::Kv)
+    }
+
     async fn get_filter(
         &self,
         user_id: &UserId,
@@ -1322,6 +1336,28 @@ mod tests {
         let id = s.put_filter(uid, body.clone()).await.unwrap();
         assert_eq!(s.get_filter(uid, &id).await.unwrap(), Some(body));
         assert_eq!(s.get_filter(uid, "nonexistent").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn an_imported_filter_is_found_under_the_id_it_came_with() {
+        let s = store();
+        let uid = user_id!("@alice:example.org");
+        let body = serde_json::json!({"event_fields": ["type"]});
+        s.import_filter(uid, "0", body.clone()).await.unwrap();
+        assert_eq!(s.get_filter(uid, "0").await.unwrap(), Some(body));
+        // Importing again overwrites, and another user's `0` is their own.
+        let newer = serde_json::json!({"event_fields": ["content"]});
+        s.import_filter(uid, "0", newer.clone()).await.unwrap();
+        assert_eq!(s.get_filter(uid, "0").await.unwrap(), Some(newer));
+        assert_eq!(
+            s.get_filter(user_id!("@bob:example.org"), "0")
+                .await
+                .unwrap(),
+            None
+        );
+        // A generated id never looks like an imported one.
+        let generated = s.put_filter(uid, serde_json::json!({})).await.unwrap();
+        assert!(generated.parse::<u64>().is_err() && generated.len() == 16);
     }
 
     // `prop_assert_eq!` inside the block below comes from the prelude, like every other

@@ -1643,6 +1643,29 @@ impl<B: KvBackend> RoomActor<B> {
         outcome
     }
 
+    /// Takes a join copied from another implementation's database for this same server (the
+    /// Synapse importer, `hs_compat::migration`) as the start of a room this server's user
+    /// joined over federation: checked and written exactly as
+    /// [`RoomActor::accept_remote_join_with_state`] takes a resident server's `send_join`
+    /// answer, but -- as [`RoomActor::import_event`] -- without publishing a [`RoomUpdate`].
+    /// The join is old news: the resident server and the rest of the room had it from the
+    /// server it is copied from, so the federation sender must not send it again, and the
+    /// importer announces the room itself once all of it is in.
+    ///
+    /// # Errors
+    /// Exactly [`RoomActor::accept_remote_join_with_state`]'s.
+    pub fn import_remote_join(
+        &mut self,
+        state: Vec<Event>,
+        auth_chain: Vec<Event>,
+        join_event: Event,
+    ) -> Result<RemoteEventOutcome, RoomError> {
+        self.quiet = true;
+        let outcome = self.accept_remote_join_with_state(state, auth_chain, join_event);
+        self.quiet = false;
+        outcome
+    }
+
     /// Persists a built, authorized event: interns it, writes the event record, timeline entry,
     /// forward-extremity update and relation index entry (if any) in one `hs-kv` transaction, then
     /// updates the in-memory hot state and publishes a [`RoomUpdate`].
@@ -5743,6 +5766,21 @@ impl<B: KvBackend> RoomActorHandle<B> {
         B: 'static,
     {
         self.with_actor(move |actor| actor.import_event(event))
+            .await
+    }
+
+    /// [`RoomActor::import_remote_join`] through the handle: the Synapse importer's way in for a
+    /// room joined over federation.
+    pub async fn import_remote_join(
+        &self,
+        state: Vec<Event>,
+        auth_chain: Vec<Event>,
+        join_event: Event,
+    ) -> Result<RemoteEventOutcome, RoomError>
+    where
+        B: 'static,
+    {
+        self.with_actor(move |actor| actor.import_remote_join(state, auth_chain, join_event))
             .await
     }
 
