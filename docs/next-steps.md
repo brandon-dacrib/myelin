@@ -147,7 +147,7 @@ again, to `sha-a01c1e0f32a192e43fe6df540f046dcec5ca9482`** (revision 6, CD run 3
 `307` to `/admin/`, `/health/ready` 200, signing key unchanged, no setup link and no `ERROR` in the
 log (status 12, 2026-10-01). **The next green image, `sha-025ef65a5e7554db74199c9509a5772275a1086e`
 (CD from `025ef65`: the rejoin gap, catch-up, backfilled state, the drain and hot-room fixes,
-`/search`, v12 placement, bridge sign-ins), is built but not rolled**: at 14:41Z on 2026-10-01
+`/search`, v12 placement, bridge sign-ins), was rolled by the owner from their own terminal at about 21:00Z on 2026-10-01** (revision 7; confirmed from outside: `/` still `307` to `/admin/`, signing key `ed25519:a_JBQV7r` unchanged, and `POST /_matrix/client/v3/search` answers `401 M_MISSING_TOKEN` where the old image answered `M_UNRECOGNIZED`). It had to be the owner's shell because at 14:41Z on 2026-10-01
 Homebrew `kubectl`/`helm` got "no route to host" to `192.168.115.221:6443` again from every
 agent session while Apple's `nc` connected -- the macOS Local Network permission of 2026-09-28,
 back. The owner rolls it from their terminal with the two commands below, or re-grants the
