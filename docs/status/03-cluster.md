@@ -1,3 +1,29 @@
+## 2026-09-30: two known gaps closed (branch `agent/cluster-gaps`)
+
+**`heartbeat_seq` is a counter, not the wall clock.** Peers judge a replica alive by seeing
+its `heartbeat_seq` change (RFC 0001 section 4). It was the wall clock in milliseconds, so two
+heartbeats in one millisecond (or a clock stepped back) read as no progress, i.e. death. Now
+`KvOwnership` keeps an `AtomicU64` that each heartbeat row takes one step of, started at one
+more than `ClusterStore::heartbeat_seq_floor`: the highest sequence any earlier process of the
+same replica wrote, read from its registry row (left behind by a crash) or from a `seq/<id>`
+key that `remove_replica` writes in the same transaction that deletes the row (a drain). The
+wall clock stays in `heartbeat_unix_ms`, for operators only. A replica logs
+`first_heartbeat_seq` when it joins, and `hs_cluster_heartbeat_seq` (gauge) shows the last
+sequence that reached the store.
+
+- `ownership::tests::heartbeats_in_one_millisecond_are_each_a_step_of_progress`: 500 rows
+  built back to back must step by one; on the old code it failed at the first pair ("two
+  heartbeats (at 1790822098077 and 1790822098077 ms) are not two steps of progress").
+- `ownership::tests::a_restart_continues_the_heartbeat_seq_above_the_previous_process`: after
+  a crashed process whose sequence is far above the clock, then after a drain; on the old code
+  the restart went backwards ("Some(1790822101830) after 18000000000000").
+- `store::tests::the_heartbeat_seq_floor_survives_deregistration`.
+
+An upgrade from a binary before this one continues above its millisecond values when the old
+process crashed (its row remains); after a drained old process, which removed its row without
+keeping a `seq/` key, the new process starts at 1. Liveness compares for change, not order, and
+the generation differs, so that one step back is harmless.
+
 ## 2026-09-30: the `user.wake` batch carries typing, receipts and presence (track 05)
 
 Nothing in `hs-cluster` changed. Track 05's `WakeBatch` on the `user.wake` peer route gained

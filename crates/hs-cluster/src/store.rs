@@ -28,6 +28,14 @@ const SHARD_PREFIX: &str = "shard/";
 /// Drain requests live in the replicas keyspace under their own prefix, so
 /// [`ClusterStore::list_replicas`]'s `replica/` range never sees them.
 const DRAIN_PREFIX: &str = "drain/";
+/// The last `heartbeat_seq` a deregistered replica wrote, kept under its own prefix after
+/// [`ClusterStore::remove_replica`] deletes the registry row, so the replica's next process
+/// continues above it ([`ClusterStore::heartbeat_seq_floor`]).
+const SEQ_PREFIX: &str = "seq/";
+
+fn seq_key(id: &ReplicaId) -> Vec<u8> {
+    format!("{SEQ_PREFIX}{}", id.as_str()).into_bytes()
+}
 
 fn drain_key(id: &ReplicaId) -> Vec<u8> {
     format!("{DRAIN_PREFIX}{}", id.as_str()).into_bytes()
@@ -201,6 +209,10 @@ impl<B: KvBackend> ClusterStore<B> {
     /// registration (this process having restarted again, or a `Left` row already garbage
     /// collected and recreated) is left alone.
     ///
+    /// The row's last `heartbeat_seq` is kept under its own key in the same transaction, so the
+    /// replica's next process continues above it ([`ClusterStore::heartbeat_seq_floor`]) even
+    /// though its registry row is gone.
+    ///
     /// # Errors
     /// Returns a store error.
     pub fn remove_replica(
@@ -213,12 +225,42 @@ impl<B: KvBackend> ClusterStore<B> {
             if let Some(existing) = txn.get(&self.replicas, &key)? {
                 let existing: ReplicaRecord = decode_kv("ReplicaRecord", &existing)?;
                 if existing.generation == generation {
+                    let kept = match txn.get(&self.replicas, &seq_key(id))? {
+                        Some(bytes) => decode_kv::<u64>("heartbeat seq", &bytes)?,
+                        None => 0,
+                    };
+                    txn.put(
+                        &self.replicas,
+                        &seq_key(id),
+                        &encode(&kept.max(existing.heartbeat_seq)),
+                    )?;
                     txn.delete(&self.replicas, &key)?;
                 }
             }
             Ok(())
         })
         .map_err(ClusterError::Store)
+    }
+
+    /// The highest `heartbeat_seq` any earlier process of replica `id` is known to have
+    /// written: its registry row's (a process that stopped without draining leaves one) or the
+    /// value [`ClusterStore::remove_replica`] kept when a drained process deregistered,
+    /// whichever is higher; `0` if neither exists. A starting replica numbers its heartbeats
+    /// from one more than this, so a restart never goes backwards. A snapshot read.
+    ///
+    /// # Errors
+    /// Returns a store or decode error.
+    pub fn heartbeat_seq_floor(&self, id: &ReplicaId) -> Result<u64, ClusterError> {
+        let snap = self.backend.snapshot();
+        let row = match snap.get(&self.replicas, &replica_key(id))? {
+            Some(bytes) => decode::<ReplicaRecord>("ReplicaRecord", &bytes)?.heartbeat_seq,
+            None => 0,
+        };
+        let kept = match snap.get(&self.replicas, &seq_key(id))? {
+            Some(bytes) => decode::<u64>("heartbeat seq", &bytes)?,
+            None => 0,
+        };
+        Ok(row.max(kept))
     }
 
     /// Lists every replica row. A snapshot read: does not participate in any transaction's
@@ -508,6 +550,34 @@ mod tests {
         s.remove_replica(&ReplicaId::new("hs-0"), Generation(5))
             .unwrap();
         assert_eq!(s.list_replicas().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn the_heartbeat_seq_floor_survives_deregistration() {
+        let s = store();
+        let id = ReplicaId::new("hs-0");
+        assert_eq!(s.heartbeat_seq_floor(&id).unwrap(), 0);
+        let mut row = replica("hs-0", 5);
+        row.heartbeat_seq = 41;
+        s.heartbeat(&row).unwrap();
+        assert_eq!(s.heartbeat_seq_floor(&id).unwrap(), 41, "from the live row");
+        s.remove_replica(&id, Generation(5)).unwrap();
+        assert!(s.list_replicas().unwrap().is_empty());
+        assert_eq!(
+            s.heartbeat_seq_floor(&id).unwrap(),
+            41,
+            "kept after removal"
+        );
+        // A later, lower row (an older binary's) never lowers it.
+        row.heartbeat_seq = 7;
+        row.generation = Generation(6);
+        s.heartbeat(&row).unwrap();
+        assert_eq!(s.heartbeat_seq_floor(&id).unwrap(), 41);
+        s.remove_replica(&id, Generation(6)).unwrap();
+        assert_eq!(s.heartbeat_seq_floor(&id).unwrap(), 41);
+        // The kept value is not a drain request.
+        assert!(s.list_drain_requests().unwrap().is_empty());
+        assert_eq!(s.heartbeat_seq_floor(&ReplicaId::new("hs-1")).unwrap(), 0);
     }
 
     #[test]

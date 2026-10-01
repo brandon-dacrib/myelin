@@ -4,7 +4,7 @@
 //! and 12.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -237,6 +237,12 @@ pub struct KvOwnership<B: KvBackend> {
     /// Held by the heartbeat loop for each tick, and by [`Drainable::drain`] while it stops the
     /// loop and deregisters (see there).
     tick_lock: tokio::sync::Mutex<()>,
+    /// The `heartbeat_seq` the next heartbeat row carries: a counter, one step per heartbeat
+    /// written, started above every value an earlier process of this replica wrote
+    /// ([`ClusterStore::heartbeat_seq_floor`]). Peers judge liveness by seeing it change, so it
+    /// must never repeat; until 2026-09-30 it was the wall clock in milliseconds, and two
+    /// heartbeats in one millisecond (or a clock stepped back) read as no progress.
+    next_heartbeat_seq: AtomicU64,
     nudge: Notify,
     stop: watch::Sender<bool>,
 }
@@ -256,12 +262,23 @@ impl<B: KvBackend> KvOwnership<B> {
         let store = ClusterStore::open(backend)?;
         let layout = config.layout;
         let store_for_init = store.clone();
-        match tokio::task::spawn_blocking(move || store_for_init.init_layout(layout)).await {
-            Ok(inner) => {
-                inner?;
-            }
+        let me = config.me.clone();
+        let seq_floor = match tokio::task::spawn_blocking(move || {
+            store_for_init.init_layout(layout)?;
+            store_for_init.heartbeat_seq_floor(&me)
+        })
+        .await
+        {
+            Ok(inner) => inner?,
             Err(join_err) => return Err(ClusterError::Store(hs_kv::KvError::backend(join_err))),
-        }
+        };
+        let generation = Generation::fresh(None);
+        tracing::info!(
+            replica = %config.me,
+            generation = generation.0,
+            first_heartbeat_seq = seq_floor.saturating_add(1),
+            "joining the cluster; heartbeats continue above every earlier process of this replica"
+        );
 
         let (shard_map_tx, shard_map_rx) = watch::channel(Arc::new(ShardMap::default()));
         let (events, _) = broadcast::channel(1024);
@@ -269,7 +286,7 @@ impl<B: KvBackend> KvOwnership<B> {
 
         let manager = Arc::new(Self {
             me: config.me.clone(),
-            generation: Generation::fresh(None),
+            generation,
             config,
             store,
             metrics: Arc::new(ClusterMetrics::new()),
@@ -282,6 +299,7 @@ impl<B: KvBackend> KvOwnership<B> {
             draining: AtomicBool::new(false),
             admin_drained: AtomicBool::new(false),
             tick_lock: tokio::sync::Mutex::new(()),
+            next_heartbeat_seq: AtomicU64::new(seq_floor.saturating_add(1)),
             nudge: Notify::new(),
             stop,
         });
@@ -297,6 +315,9 @@ impl<B: KvBackend> KvOwnership<B> {
         self.metrics.clone()
     }
 
+    /// The next heartbeat row: one more step of `heartbeat_seq` than the last one built (the
+    /// liveness signal peers watch), and the wall clock in `heartbeat_unix_ms`, which is for
+    /// operators only and never compared for liveness.
     fn heartbeat_row(&self, state: ReplicaState) -> ReplicaRecord {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -309,7 +330,7 @@ impl<B: KvBackend> KvOwnership<B> {
             zone: self.config.zone.clone(),
             version: self.config.version.clone(),
             state,
-            heartbeat_seq: now, // monotonically increasing enough for liveness purposes
+            heartbeat_seq: self.next_heartbeat_seq.fetch_add(1, Ordering::SeqCst),
             heartbeat_unix_ms: now,
         }
     }
@@ -396,6 +417,7 @@ impl<B: KvBackend> KvOwnership<B> {
         let hb_result = tokio::task::spawn_blocking(move || store.heartbeat(&row_for_hb)).await;
         let heartbeat_ok = matches!(hb_result, Ok(Ok(())));
         if heartbeat_ok {
+            self.metrics.set_heartbeat_seq(row.heartbeat_seq);
             *self
                 .last_heartbeat_ok
                 .write()
@@ -960,6 +982,100 @@ mod tests {
         for shard in mgr.layout().all_shards() {
             assert!(!mgr.is_mine(shard));
         }
+    }
+
+    /// Two heartbeats in the same millisecond are two steps of progress. When `heartbeat_seq`
+    /// was the wall clock in milliseconds they carried the same value, which a peer reads as
+    /// "no progress": a few hundred rows built back to back here held dozens of repeats.
+    #[tokio::test(start_paused = true)]
+    async fn heartbeats_in_one_millisecond_are_each_a_step_of_progress() {
+        let (mgr, _handle) = KvOwnership::start(config("hs-0"), MemoryBackend::new())
+            .await
+            .unwrap();
+        let rows: Vec<ReplicaRecord> = (0..500)
+            .map(|_| mgr.heartbeat_row(ReplicaState::Active))
+            .collect();
+        for pair in rows.windows(2) {
+            assert_eq!(
+                pair[1].heartbeat_seq,
+                pair[0].heartbeat_seq + 1,
+                "two heartbeats (at {} and {} ms) are not two steps of progress",
+                pair[0].heartbeat_unix_ms,
+                pair[1].heartbeat_unix_ms
+            );
+        }
+        // The wall clock is still there for operators.
+        assert!(rows[0].heartbeat_unix_ms > 1_600_000_000_000);
+    }
+
+    /// The sequence a replica's process starts from is above every value an earlier process
+    /// of the same replica wrote: after a drain (which removes the registry row), after a crash
+    /// (which leaves it), and when the earlier value is far above the wall clock (a clock
+    /// stepped back, or an earlier binary's millisecond sequence).
+    #[tokio::test(start_paused = true)]
+    async fn a_restart_continues_the_heartbeat_seq_above_the_previous_process() {
+        let backend = MemoryBackend::new();
+        let store = ClusterStore::open(backend.clone()).unwrap();
+        let row_seq = || {
+            store
+                .list_replicas()
+                .unwrap()
+                .into_iter()
+                .find(|r| r.id.as_str() == "hs-0")
+                .map(|r| r.heartbeat_seq)
+        };
+
+        // A crashed earlier process left a row whose sequence is far above today's clock.
+        let far_ahead = 10 * 1_800_000_000_000;
+        store
+            .heartbeat(&ReplicaRecord {
+                id: ReplicaId::new("hs-0"),
+                generation: Generation(1),
+                mesh_addr: "127.0.0.1:0".into(),
+                zone: None,
+                version: "old".into(),
+                state: ReplicaState::Active,
+                heartbeat_seq: far_ahead,
+                heartbeat_unix_ms: 1,
+            })
+            .unwrap();
+        let (first, _h1) = KvOwnership::start(config("hs-0"), backend.clone())
+            .await
+            .unwrap();
+        assert!(
+            settle_until(Duration::from_millis(60), 200, || row_seq()
+                .is_some_and(|s| s > far_ahead + 3))
+            .await,
+            "the restarted replica's heartbeats went backwards: {:?} after {far_ahead}",
+            row_seq()
+        );
+
+        // A drain removes the row; the next process still continues above it.
+        first.drain(Duration::from_secs(1)).await;
+        assert_eq!(row_seq(), None, "the drained replica deregistered");
+        let last = store.heartbeat_seq_floor(&ReplicaId::new("hs-0")).unwrap();
+        assert!(last > far_ahead + 3);
+        let (second, _h2) = KvOwnership::start(config("hs-0"), backend.clone())
+            .await
+            .unwrap();
+        assert!(
+            settle_until(Duration::from_millis(60), 200, || row_seq().is_some()).await,
+            "the second process never heartbeated"
+        );
+        let resumed = row_seq().unwrap();
+        assert!(
+            resumed > last,
+            "the second process restarted its sequence at {resumed}, not above {last}"
+        );
+        assert!(
+            settle_until(Duration::from_millis(60), 200, || second
+                .metrics()
+                .snapshot()
+                .heartbeat_seq
+                > last)
+            .await,
+            "hs_cluster_heartbeat_seq does not show the sequence"
+        );
     }
 
     #[tokio::test(start_paused = true)]

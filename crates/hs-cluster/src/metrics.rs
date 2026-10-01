@@ -101,6 +101,8 @@ pub struct ClusterMetrics {
     forward_retries: Mutex<HashMap<&'static str, u64>>,
     fenced_total: Mutex<HashMap<&'static str, u64>>,
     live_replicas: AtomicU64,
+    heartbeat_seq: AtomicU64,
+    drain_released_at_once: AtomicU64,
     lease_age: Mutex<Duration>,
     peer_lease_age: Mutex<HashMap<String, Duration>>,
 }
@@ -165,6 +167,17 @@ impl ClusterMetrics {
         self.live_replicas.store(n, Ordering::Relaxed);
     }
 
+    /// Sets the `heartbeat_seq` of this replica's last heartbeat that reached the store.
+    pub fn set_heartbeat_seq(&self, seq: u64) {
+        self.heartbeat_seq.store(seq, Ordering::Relaxed);
+    }
+
+    /// Counts `n` shards a drain released without waiting for a new owner, because no other
+    /// replica was live and hashable to claim them.
+    pub fn record_drain_released_at_once(&self, n: u64) {
+        self.drain_released_at_once.fetch_add(n, Ordering::Relaxed);
+    }
+
     /// Sets this replica's own lease age (time since its last successful heartbeat).
     pub fn set_lease_age(&self, age: Duration) {
         *self
@@ -213,6 +226,8 @@ impl ClusterMetrics {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone(),
             live_replicas: self.live_replicas.load(Ordering::Relaxed),
+            heartbeat_seq: self.heartbeat_seq.load(Ordering::Relaxed),
+            drain_released_at_once: self.drain_released_at_once.load(Ordering::Relaxed),
             lease_age: *self
                 .lease_age
                 .lock()
@@ -236,6 +251,10 @@ pub struct MetricsSnapshot {
     pub fenced_total: HashMap<&'static str, u64>,
     /// `hs_cluster_live_replicas`.
     pub live_replicas: u64,
+    /// `hs_cluster_heartbeat_seq`.
+    pub heartbeat_seq: u64,
+    /// `hs_cluster_drain_released_at_once_total`.
+    pub drain_released_at_once: u64,
     /// `hs_cluster_lease_age_seconds`.
     pub lease_age: Duration,
 }
@@ -247,7 +266,8 @@ pub struct MetricsSnapshot {
 /// `hs_cluster_ownership_changes_total{kind,reason}`, `hs_cluster_forward_latency_seconds{route,
 /// outcome}` (histogram), `hs_cluster_forward_retries_total{reason}`,
 /// `hs_cluster_fenced_total{kind}`, `hs_cluster_live_replicas` and
-/// `hs_cluster_lease_age_seconds`.
+/// `hs_cluster_lease_age_seconds`; and, beyond the RFC, `hs_cluster_heartbeat_seq` and
+/// `hs_cluster_drain_released_at_once_total`.
 #[derive(Clone)]
 pub struct ClusterCollector {
     metrics: std::sync::Arc<ClusterMetrics>,
@@ -385,6 +405,30 @@ impl prometheus_client::collector::Collector for ClusterCollector {
             )?
             .encode_gauge(&live)?;
 
+        let seq = i64::try_from(m.heartbeat_seq.load(Ordering::Relaxed)).unwrap_or(i64::MAX);
+        encoder
+            .encode_descriptor(
+                "hs_cluster_heartbeat_seq",
+                "Sequence number of this replica's last heartbeat to reach the store; it rises \
+                 by one per heartbeat and continues above the last value after a restart",
+                None,
+                MetricType::Gauge,
+            )?
+            .encode_gauge(&seq)?;
+
+        encoder
+            .encode_descriptor(
+                "hs_cluster_drain_released_at_once",
+                "Shards a drain released without waiting for a new owner, because no other \
+                 replica was live to claim them",
+                None,
+                MetricType::Counter,
+            )?
+            .encode_counter::<prometheus_client::encoding::NoLabelSet, _, u64>(
+                &m.drain_released_at_once.load(Ordering::Relaxed),
+                None,
+            )?;
+
         let age = m
             .lease_age
             .lock()
@@ -417,6 +461,8 @@ mod tests {
         m.record_forward_retry("421");
         m.record_fenced("room");
         m.set_live_replicas(2);
+        m.set_heartbeat_seq(17);
+        m.record_drain_released_at_once(5);
         m.set_lease_age(Duration::from_millis(1_500));
 
         let mut registry = prometheus_client::registry::Registry::default();
@@ -433,6 +479,8 @@ mod tests {
             "hs_cluster_forward_retries_total{reason=\"421\"} 1",
             "hs_cluster_fenced_total{kind=\"room\"} 1",
             "hs_cluster_live_replicas 2",
+            "hs_cluster_heartbeat_seq 17",
+            "hs_cluster_drain_released_at_once_total 5",
             "hs_cluster_lease_age_seconds 1.5",
         ] {
             assert!(text.contains(line), "missing `{line}` in:\n{text}");
