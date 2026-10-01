@@ -532,7 +532,11 @@ impl<B: KvBackend + 'static> AppserviceDelivery<B> {
             clock,
             Arc::new(HttpTransactionSender::new()),
         );
+        // The admin API's `appservices.logins` asks bridges through this, counted with the
+        // other appservice series (`hs_admin_bridge_login_queries_total`).
+        let mut bridge_logins = hs_appservice::provisioning::BridgeLogins::new();
         if let Some(metrics) = metrics {
+            bridge_logins = bridge_logins.with_metrics(metrics.clone());
             scheduler = scheduler.with_metrics(metrics);
         }
         let scheduler = Arc::new(scheduler);
@@ -551,7 +555,8 @@ impl<B: KvBackend + 'static> AppserviceDelivery<B> {
                     let gate = gate.clone();
                     Arc::new(move |id: &str| gate.nudge(id))
                 },
-            ),
+            )
+            .with_bridge_logins(bridge_logins),
         );
         let sources = Arc::new(Sources {
             hub: hub.clone(),

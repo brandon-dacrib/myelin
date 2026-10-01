@@ -95,6 +95,11 @@ test.describe("Register a bridge you run yourself", () => {
     await page.getByRole("tab", { name: "Sign in" }).click();
     await expect(page.getByText(/app password/)).toBeVisible();
     await expect(page.getByRole("link", { name: /Bluesky documentation/ })).toBeVisible();
+    // And who has signed in: a shared mautrix bridge is asked about a person the operator names.
+    await expect(page.getByRole("heading", { name: "Who has signed in" })).toBeVisible();
+    await page.getByLabel("Matrix user").fill("@bob:example.org");
+    await page.getByRole("button", { name: "Check" }).click();
+    await expect(page.getByText("@bob:example.org is not signed in.")).toBeVisible();
     await expectNoAxeViolations(page, "bridge detail: sign in");
     domGuard.assertClean();
   });

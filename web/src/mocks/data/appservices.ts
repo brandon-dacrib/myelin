@@ -1,4 +1,10 @@
-import type { AppService, AppServiceHealth, AppServiceBacklogEntry } from "@/api/bridges";
+import type {
+  AppService,
+  AppServiceHealth,
+  AppServiceBacklogEntry,
+  BridgeLogins,
+  BridgeType,
+} from "@/api/bridges";
 
 const now = Date.now();
 const iso = (msAgo: number) => new Date(now - msAgo).toISOString();
@@ -135,4 +141,91 @@ export const appserviceRegistration: Record<string, Record<string, unknown>> = O
 
 export function findAppservice(id: string): AppService | undefined {
   return appservices.find((a) => a.id === id);
+}
+
+/**
+ * What `GET /appservices/{id}/logins` answers in the mock, the way the real server does for each
+ * case: a mautrix bridge asked about `@alice:example.org` (signed in to WhatsApp), anyone else
+ * (not signed in), the Signal bridge (down, so the answer carries the error), a type without a
+ * provisioning API (`supported: false`), and a shared bridge not told whom to ask about (`400`).
+ */
+export function appserviceLogins(
+  id: string,
+  userId: string | null,
+  provisioning: Pick<BridgeType, "provisioning_api" | "provisioning_note"> | undefined,
+): { status: number; body: unknown } {
+  const appservice = findAppservice(id);
+  if (!appservice)
+    return {
+      status: 404,
+      body: { type: "urn:hs:problem:not-found", title: "Not found", status: 404 },
+    };
+  const api = provisioning?.provisioning_api ?? "none";
+  const base = {
+    appservice_id: id,
+    bridge_type: appservice.bridge_type ?? null,
+    provisioning_api: api,
+    user_id: userId,
+    logins: [] as BridgeLogins["logins"],
+    cached: false,
+  };
+  if (api !== "mautrix_v3")
+    return {
+      status: 200,
+      body: {
+        ...base,
+        supported: false,
+        reason:
+          provisioning?.provisioning_note ??
+          "This appservice was not added from the bridge catalogue, so the server does not know whether it has a provisioning API; the bridge keeps who has signed in itself.",
+      },
+    };
+  if (!userId) {
+    const detail =
+      "user_id is required: this bridge is shared, so name the Matrix user to ask about";
+    return {
+      status: 400,
+      body: {
+        type: "urn:hs:problem:validation-failed",
+        title: "Validation failed",
+        status: 400,
+        detail,
+        errors: [{ pointer: "/user_id", detail }],
+      },
+    };
+  }
+  if (appservice.health === "down")
+    return {
+      status: 200,
+      body: {
+        ...base,
+        supported: true,
+        error: {
+          status: 502,
+          reason: "unreachable",
+          detail: "the server could not reach the bridge: connection refused",
+        },
+      },
+    };
+  const checked_at = new Date().toISOString();
+  if (userId === "@alice:example.org" && appservice.bridge_type === "mautrix-whatsapp")
+    return {
+      status: 200,
+      body: {
+        ...base,
+        supported: true,
+        signed_in: true,
+        checked_at,
+        logins: [
+          {
+            user_id: userId,
+            remote_id: "15551234567",
+            remote_name: "+1 555-123-4567",
+            state: "connected",
+            since: iso(3 * 24 * 3_600_000),
+          },
+        ],
+      },
+    };
+  return { status: 200, body: { ...base, supported: true, signed_in: false, checked_at } };
 }

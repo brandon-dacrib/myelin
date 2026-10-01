@@ -4,6 +4,7 @@ import {
   appserviceHealth,
   appserviceBacklog,
   appserviceRegistration,
+  appserviceLogins,
   findAppservice,
 } from "./data/appservices";
 import { bridgeTypes } from "./data/bridge-types";
@@ -881,6 +882,14 @@ export const handlers = [
         { status: 404 },
       );
     return HttpResponse.json(health);
+  }),
+
+  http.get(`${API}/appservices/:id/logins`, ({ params, request }) => {
+    const id = String(params.id);
+    const userId = new URL(request.url).searchParams.get("user_id");
+    const type = bridgeTypes.find((t) => t.id === findAppservice(id)?.bridge_type);
+    const { status, body } = appserviceLogins(id, userId, type);
+    return HttpResponse.json(body as never, { status });
   }),
 
   http.get(`${API}/appservices/:id/backlog`, ({ params, request }) => {

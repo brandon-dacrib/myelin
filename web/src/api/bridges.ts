@@ -139,6 +139,30 @@ export function useAppserviceRegistration(id: string | undefined, enabled: boole
   });
 }
 
+export type BridgeLogins = components["schemas"]["BridgeLogins"];
+export type BridgeLogin = components["schemas"]["BridgeLogin"];
+
+/**
+ * `GET /appservices/{id}/logins`: who has signed in to the bridge, and as what, from the
+ * bridge's own provisioning API (a mautrix bridge's `whoami`). `userId` absent asks about a
+ * per-user instance's owner; a shared bridge answers `400` with an `/user_id` error until it is
+ * told whom. The server keeps answers for 30 seconds, so this does too.
+ */
+export function useAppserviceLogins(id: string | undefined, userId: string | undefined) {
+  return useQuery({
+    queryKey: ["appservice-logins", id, userId ?? null],
+    enabled: Boolean(id),
+    queryFn: async () => {
+      const result = await api.GET("/appservices/{id}/logins", {
+        params: { path: { id: id! }, query: userId ? { user_id: userId } : {} },
+      });
+      return unwrap(result);
+    },
+    staleTime: 30_000,
+    retry: false,
+  });
+}
+
 export function useBridgeTypes() {
   return useQuery({
     queryKey: ["bridge-types"],

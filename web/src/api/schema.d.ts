@@ -75,6 +75,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/appservices/{id}/logins": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Who has signed in to a bridge, and as what
+         * @description Asks the bridge's own provisioning API who has signed in (a mautrix bridgev2 bridge's `/_matrix/provision/v3/whoami`, with the shared secret a catalogue render mints and keeps in the registration's `io.myelin.provisioning_secret`). Answers are kept for 30 seconds per bridge and user. A bridge type with no such API answers `200` with `supported: false` and a `reason`; a bridge that could not be asked answers `200` with `error` set. A read, so not audited.
+         */
+        get: operations["appservices.logins"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/appservices/{id}/pause": {
         parameters: {
             query?: never;
@@ -2573,6 +2593,54 @@ export interface components {
         BridgeInstancePage: components["schemas"]["PageEnvelope"] & {
             items: components["schemas"]["BridgeInstance"][];
         };
+        BridgeLogin: {
+            /** @description The remote network's id for the login. */
+            remote_id: string;
+            /** @description What the remote account is called, for a person (a phone number, a username). */
+            remote_name?: string | null;
+            /**
+             * Format: date-time
+             * @description Since when the login has been in that state.
+             */
+            since?: string | null;
+            /** @description The bridge's state for the login, lower-cased (`connected`, `connecting`, `transient_disconnect`, `bad_credentials`, `logged_out`, `unknown_error`, ...). */
+            state: string;
+            state_reason?: string | null;
+            /** @description The Matrix user who signed in. */
+            user_id: string;
+        };
+        /** @description Who has signed in to a bridge and as what, as the bridge's provisioning API says. */
+        BridgeLogins: {
+            appservice_id: string;
+            /** @description The catalogue entry the registration came from. */
+            bridge_type?: string | null;
+            /** @description Whether this answer came from the 30-second cache. */
+            cached: boolean;
+            /**
+             * Format: date-time
+             * @description When the bridge answered; answers are kept for 30 seconds.
+             */
+            checked_at?: string | null;
+            error?: null | components["schemas"]["BridgeLoginsError"];
+            logins: components["schemas"]["BridgeLogin"][];
+            /** @enum {string} */
+            provisioning_api: "mautrix_v3" | "irc_v1" | "hookshot_v1" | "none";
+            /** @description Why not, when `supported` is false. */
+            reason?: string | null;
+            /** @description Whether the bridge reported at least one login for the user; null when it was not asked or did not answer. */
+            signed_in?: boolean | null;
+            /** @description Whether the server can ask this bridge who has signed in. */
+            supported: boolean;
+            /** @description The Matrix user asked about. */
+            user_id?: string | null;
+        };
+        BridgeLoginsError: {
+            detail: string;
+            /** @enum {string} */
+            reason: "unreachable" | "timeout" | "refused" | "invalid_answer";
+            /** @description 502 for a bridge that could not be reached or answered something unreadable, 504 for one that did not answer in time, otherwise the bridge's own status. */
+            status: number;
+        };
         BridgeOffering: {
             access?: components["schemas"]["BridgeOfferingAccess"];
             /** Format: date-time */
@@ -2656,6 +2724,13 @@ export interface components {
             not_deployable_reason?: string | null;
             /** @description The port the bridge listens on for this server by default, which a render's registration `url` names. */
             port?: number;
+            /**
+             * @description The bridge's own provisioning surface. Only `mautrix_v3` (a mautrix bridgev2 bridge's `/_matrix/provision/v3`) reports who has signed in, through `GET /appservices/{id}/logins`.
+             * @enum {string}
+             */
+            provisioning_api?: "mautrix_v3" | "irc_v1" | "hookshot_v1" | "none";
+            /** @description What that surface means for an administrator, in words. */
+            provisioning_note?: string | null;
             /** @description Whether a render of this type produces a `config_yaml` the bridge reads as it is (mautrix bridges), or only the registration and the notes to run it. */
             renders_config?: boolean;
             required_features?: string[];
@@ -3981,6 +4056,39 @@ export interface operations {
                     "application/json": components["schemas"]["AppServiceHealth"];
                 };
             };
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["InsufficientScope"];
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["RateLimited"];
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    "appservices.logins": {
+        parameters: {
+            query?: {
+                /** @description The Matrix user to ask about. Optional for a per-user bridge instance, whose owner is asked about; required for a shared bridge whose type reports sign-ins. */
+                user_id?: string;
+            };
+            header?: never;
+            path: {
+                /** @description An appservice id. */
+                id: components["parameters"]["AppserviceId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description What the bridge says, or why it cannot be asked. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BridgeLogins"];
+                };
+            };
+            400: components["responses"]["ValidationFailed"];
             401: components["responses"]["Unauthenticated"];
             403: components["responses"]["InsufficientScope"];
             404: components["responses"]["NotFound"];

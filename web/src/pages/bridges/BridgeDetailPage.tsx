@@ -17,6 +17,7 @@ import {
 import { useServerInfo } from "@/api/dashboard";
 import { BridgeGlyph } from "@/components/BridgeGlyph";
 import { BridgeSignInGuide } from "@/components/BridgeSignInGuide";
+import { BridgeSignInState } from "@/components/BridgeSignInState";
 import { Button } from "@/components/ui/button/Button";
 import { Badge } from "@/components/ui/badge/Badge";
 import { Dialog, DialogTrigger, DialogClose, DialogContent } from "@/components/ui/dialog/Dialog";
@@ -26,7 +27,7 @@ import { SkeletonText } from "@/components/ui/skeleton/Skeleton";
 import { CopyableId } from "@/components/CopyableId";
 import { RelativeTime } from "@/components/RelativeTime";
 import { toast } from "@/components/ui/toast/toast-store";
-import { hasScope } from "@/lib/auth";
+import { getSession, hasScope } from "@/lib/auth";
 import { bridgeKind, bridgeTitle, bridgeTypeOf, botMatrixId } from "@/lib/bridge-catalogue";
 import { bridgeHealthMeta, formatBacklogEntry, healthKeyOf } from "@/lib/bridge-state";
 import { cn } from "@/lib/cn";
@@ -44,9 +45,10 @@ const TAB_LABELS: Record<(typeof TABS)[number], string> = {
  * `/bridges/:id` — bridge detail (information-architecture.md, Bridges >
  * Bridge detail). Reconciled 2026-09-18 against the real `AppService`
  * resource: see api/bridges.ts's doc comment for what changed. The Sign in
- * tab says how a person signs in to *this* bridge, from its catalogue entry
- * (`bridge_type`), rather than fabricating per-user login state the API does
- * not expose.
+ * tab says who has signed in, as the bridge's own provisioning API reports it
+ * (`appservices.logins`; a type without one keeps that itself, and the tab
+ * says so), and how a person signs in to *this* bridge, from its catalogue
+ * entry (`bridge_type`).
  */
 export function BridgeDetailPage() {
   const { bridgeId } = useParams({ from: "/bridges/$bridgeId" });
@@ -287,6 +289,7 @@ export function BridgeDetailPage() {
         </Content>
 
         <Content value="sign-in" className="py-6">
+          <BridgeSignInState appserviceId={id} defaultUserId={getSession()?.operator.subject} />
           <BridgeSignInGuide type={type} botId={botId} />
           {bridge.links?.login_url && (
             <a

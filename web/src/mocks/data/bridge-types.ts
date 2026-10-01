@@ -39,6 +39,38 @@ const PORTS: Record<string, number> = {
   "mautrix-imessage": 29337,
 };
 
+/** Each type's provisioning surface and its note, as `bridge_types.rs`'s `provisioning_of`. */
+function provisioning(id: string): Pick<BridgeType, "provisioning_api" | "provisioning_note"> {
+  if (id === "heisenbridge")
+    return {
+      provisioning_api: "none",
+      provisioning_note:
+        "heisenbridge has no provisioning API: its networks, and who uses them, live in its control room, so the bridge keeps that itself.",
+    };
+  if (id === "matrix-appservice-irc")
+    return {
+      provisioning_api: "irc_v1",
+      provisioning_note:
+        "matrix-appservice-irc's provisioning API links rooms to channels; it does not report who is connected as which nick, so the bridge keeps that itself.",
+    };
+  if (id === "matrix-hookshot")
+    return {
+      provisioning_api: "hookshot_v1",
+      provisioning_note:
+        "Hookshot's provisioning API manages each room's connections (webhooks, feeds, repositories); Myelin does not read accounts from it, so the bridge keeps that itself.",
+    };
+  if (id.startsWith("mautrix-") && id !== "mautrix-imessage")
+    return {
+      provisioning_api: "mautrix_v3",
+      provisioning_note:
+        "The bridge's provisioning API (/_matrix/provision/v3/whoami) says who has signed in and as what, with the shared secret Myelin writes into its config.yaml.",
+    };
+  return {
+    provisioning_api: "none",
+    provisioning_note: "This bridge keeps who has signed in itself.",
+  };
+}
+
 /**
  * The same catalogue `crates/hs-admin/src/bridge_types.rs` serves, entry for entry, so that the
  * mock-backed wizard shows what the real one shows. Written for the mock server's own name
@@ -77,6 +109,7 @@ function type(spec: Spec): BridgeType {
     renders_config: mautrix,
     mode: spec.mode ?? "per_user",
     deployable: spec.deployable ?? mautrix,
+    ...provisioning(spec.id),
     sign_in: { steps: spec.steps, notes: spec.notes ?? null },
   };
 }
