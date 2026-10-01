@@ -10,7 +10,7 @@
 |---|---|---|---|---|
 | csapi 1 | `tests/csapi/...` | 343 / 384 | 82 / 106 | `TestDeviceListUpdates`, `TestMessagesOverFederation`, `TestSearch`, `TestServerNotices` FAIL -> PASS; nothing PASS -> FAIL |
 | federation 1 | `tests` | 225 / 314 | 50 / 90 (1 skipped) | 36 FAIL -> PASS (invites, leaves, knocks, restricted joins, `/hierarchy`, media, typing and presence over federation, version 12); nothing PASS -> FAIL; Complement's checkout replaced `TestMSC4311FullCreateEventOnStrippedState` with three new `TestMSC4311*` tests, which fail |
-| csapi 2 | | | | |
+| csapi 2 | `tests/csapi/...` | 340 / 384 | 81 / 106 | the same four FAIL -> PASS; `TestRoomState` PASS -> FAIL (one subtest, `GET /joined_rooms lists newly-created room`: `/joined_rooms` read before the session hub wrote the new room; a flap, see below) |
 | federation 2 | | | | |
 
 ## 2026-10-01: two browser-suite flakes were the harness (branch `agent/web-gaps`)
