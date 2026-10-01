@@ -34,9 +34,20 @@ def normalise_reason(line: str) -> str:
     s = re.sub(r"@[A-Za-z0-9._=/+-]+:[A-Za-z0-9.-]+(:\d+)?", "@USER", s)
     s = re.sub(r"#[A-Za-z0-9._=-]+:[A-Za-z0-9.-]+(:\d+)?", "#ALIAS", s)
     s = re.sub(r"\$[A-Za-z0-9_+/=-]{8,}(:[A-Za-z0-9.-]+(:\d+)?)?", "$EVENT", s)
+    s = re.sub(r"![A-Za-z0-9_-]{18,}", "!ROOM", s)  # room versions 12+: no server part
     s = re.sub(r"localhost:\d+", "localhost:PORT", s)
+    s = re.sub(r"access_token=[^&\s)]+", "access_token=TOKEN", s)
     s = re.sub(r"\b[A-Za-z0-9_-]{20,}\b", "TOKEN", s)
-    s = re.sub(r"\d+", "N", s)
+    # Keep HTTP status codes and API versions (`( 404 Not Found`, `/v3/`, `/r0/`); every other
+    # number becomes N.
+    s = re.sub(r"\( (\d{3}) ", r"( <\1> ", s)
+    s = re.sub(r"/([vr])(\d+)/", r"/\1<\2>/", s)
+    paths = re.findall(r"tests/\S+\.pl", s)  # Sytest file names keep their numbers too
+    s = re.sub(r"tests/\S+\.pl", "\x00", s)
+    s = re.sub(r"(?<![<\d])\d+(?![>\d])", "N", s)
+    s = re.sub(r"<(\d+)>", r"\1", s)
+    for path in paths:
+        s = s.replace("\x00", path, 1)
     s = re.sub(r"\s+", " ", s)
     return s[:200]
 

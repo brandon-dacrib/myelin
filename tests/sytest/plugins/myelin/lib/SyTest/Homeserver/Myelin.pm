@@ -14,8 +14,15 @@
 # servers federate with each other there, so the server name is `localhost:<secure port>`.
 # `hs serve` does not terminate TLS itself (crates/hs-cli/src/serve.rs warns and binds
 # plaintext), which is why tests/complement/ puts stunnel in front and this puts haproxy, which
-# Sytest's image already has, in front. The certificate is self-signed, so outbound federation
-# runs with `verify_certificates: false`, as Sytest's Synapse and Dendrite configurations do.
+# Sytest's image already has, in front.
+#
+# Certificates are verified, unlike Sytest's Synapse and Dendrite configurations (which turn
+# verification off). Each server's certificate is signed by Sytest's own test CA
+# (keys/ca.crt in the Sytest checkout, the CA that also signs Sytest's federation and HTTPS test
+# servers), outbound federation trusts that CA through `federation.custom_ca_certificates`, and
+# myelin_sytest.sh adds it to the container's trust store for the clients that use the system
+# roots (appservice transactions to Sytest's test server). With verification off for federation
+# only, every appservice test failed with "tlsv1 alert unknown ca" (2026-10-01).
 #
 # The server's output goes to `<hs_dir>/hs.log` (and haproxy's to `haproxy.log`), which
 # myelin_sytest.sh copies to /logs/server-N/ after the run.
@@ -29,8 +36,10 @@ package SyTest::Homeserver::Myelin;
 use base qw( SyTest::Homeserver );
 
 use Carp;
+use Cwd ();
 use JSON ();
 use File::Slurper qw( read_binary );
+use SyTest::SSL ();
 
 sub _init
 {
@@ -119,8 +128,8 @@ sub _get_config
          registration_shared_secret => "reg_secret",
       },
       federation => {
-         verify_certificates               => JSON::false,
-         ip_range_blocklist                => [],
+         custom_ca_certificates             => [ _sytest_ca() ],
+         ip_range_blocklist                 => [],
          allow_public_rooms_over_federation => JSON::true,
       },
       media => {
@@ -139,24 +148,24 @@ sub _get_config
    };
 }
 
-# A throwaway self-signed certificate for the secure port. Sytest has no CA for its servers to
-# share, and its own test federation server presents a self-signed certificate too.
+# The certificate for the secure port, signed by Sytest's test CA with Sytest's own helper (the
+# one its federation test servers use), so other servers can verify it.
 sub _generate_tls_keyfiles
 {
    my $self = shift;
 
    return Future->done if -f $self->{paths}{tls_cert} && -f $self->{paths}{tls_key};
 
-   return $self->_run_command(
-      command => [
-         'openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
-         '-keyout', $self->{paths}{tls_key},
-         '-out',    $self->{paths}{tls_cert},
-         '-days',   '2',
-         '-subj',   "/CN=" . $self->{bind_host},
-         '-addext', "subjectAltName=DNS:" . $self->{bind_host},
-      ],
-   );
+   SyTest::SSL::ensure_ssl_key( $self->{paths}{tls_key} );
+   SyTest::SSL::create_ssl_cert( $self->{paths}{tls_cert}, $self->{paths}{tls_key}, $self->{bind_host} );
+   return Future->done;
+}
+
+# Sytest's test CA, which run-tests.pl (working directory: the Sytest checkout) reads as
+# keys/ca.crt.
+sub _sytest_ca
+{
+   return Cwd::abs_path( "keys/ca.crt" );
 }
 
 sub _generate_signing_key
@@ -218,6 +227,10 @@ sub _start_haproxy
    my $config = $self->write_file( "haproxy.conf", <<"EOCONFIG" );
 global
     maxconn 2000
+    # One thread. With one per core, on a loaded desktop haproxy's watchdog killed it mid-run
+    # (a thread "stuck" 2.7 s of CPU in SSL_free under lock contention), and every test after
+    # that failed with "connection refused".
+    nbthread 1
 
 defaults
     mode http

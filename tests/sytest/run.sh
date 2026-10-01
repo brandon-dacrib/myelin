@@ -55,14 +55,25 @@ NAME="myelin-sytest-$$"
 cleanup() { docker rm -f "$NAME" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
+# Extra environment for the servers (they inherit the container's), e.g.
+# SYTEST_EXTRA_ENV="MALLOC_ARENA_MAX=2".
+EXTRA_ENV=()
+for kv in ${SYTEST_EXTRA_ENV:-}; do EXTRA_ENV+=(-e "$kv"); done
+# SYTEST_HS_BINARY: a Linux `hs` (built for the image's Debian release) to run instead of the
+# image's own, so a server change can be tested without rebuilding the image.
+if [ -n "${SYTEST_HS_BINARY:-}" ]; then
+  EXTRA_ENV+=(-v "$SYTEST_HS_BINARY:/usr/local/bin/hs:ro")
+fi
+
 STATUS=0
-docker run --name "$NAME" --rm \
+docker run "${EXTRA_ENV[@]}" --name "$NAME" --rm \
   -v "$SYTEST_DIR:/sytest:ro" \
   -v "$HERE:/myelin:ro" \
   -v "$LOGS:/logs" \
   --tmpfs "/work:exec,size=${SYTEST_WORK_SIZE:-3g}" \
   -e "MYELIN_RUST_LOG=${MYELIN_RUST_LOG:-info}" \
   -e "TIMEOUT_FACTOR=${TIMEOUT_FACTOR:-1}" \
+  -e "MYELIN_MEMORY_INTERVAL=${MYELIN_MEMORY_INTERVAL:-15}" \
   --entrypoint /bin/bash \
   "$IMAGE" /myelin/myelin_sytest.sh "$@" || STATUS=$?
 
@@ -70,6 +81,13 @@ if [ -s "$LOGS/results.tap" ]; then
   python3 "$HERE/summarize.py" "$LOGS/results.tap" \
     --results "$LOGS/results.txt" --summary "$LOGS/summary.txt" || true
   python3 "$HERE/are-we-synapse-yet.py" "$LOGS/results.tap" >"$LOGS/are-we-synapse-yet.txt" 2>&1 || true
+  # A server or haproxy that dies mid-run fails every later test with "connection refused";
+  # say so at the top of the summary instead of letting it read as a few hundred real failures.
+  # (Every process is stopped at the end of a run; those exits are the last lines and expected.)
+  if grep -nE "process (exited|failed)" "$LOGS/run-tests.stderr" >"$LOGS/process-exits.txt" 2>/dev/null; then
+    { echo "process exits during the run (the last few are the shutdown):"; cat "$LOGS/process-exits.txt"; echo; cat "$LOGS/summary.txt"; } >"$LOGS/summary.tmp" \
+      && mv "$LOGS/summary.tmp" "$LOGS/summary.txt"
+  fi
   cat "$LOGS/summary.txt" >&2 || true
 fi
 exit $STATUS
