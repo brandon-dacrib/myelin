@@ -18,6 +18,184 @@ to-device over federation (4); profile queries (2); server ACLs (2); `/room_summ
 `/_matrix/key/v2/query`, Unicode remote aliases, Complement's appservice user (4). Every name,
 the families and how it was run: status 14, session 6; the baseline is
 `docs/status/complement-federation-results.txt` (run 8).
+## Seventeenth session (2026-10-01): the rows Sytest's second run left
+
+**Branch:** `agent/federation-sytest-2`, from `agent/federation-sytest` (`8a01fb5`). Closes the
+ten rows the sixteenth session's "found with no row" list became in `docs/next-steps.md`'s
+known-gaps table, and two things found on the way.
+
+1. **A redacted event says what redacted it, everywhere a client reads it** (`hs-room`). A new
+   `hs_room::actor::redactions` module: applying a redaction
+   (`RoomActor::apply_redaction_by(target, redaction)`) writes the redaction's PDU and ID into
+   the target's `unsigned` -- `redacted_because`, `redacted_by` -- in the store and in memory
+   (covered by neither hashes, signatures nor the reference hash, so the event and its ID are
+   unchanged), and `routes::render::client_event_json` renders them as a client event. Every
+   client read goes through that renderer (`/sync`, `/messages`, `/event`, `/context`,
+   `/state`, search, relations, threads, appservice delivery), so all of them show it. The first
+   redaction to take effect stays the one named. An event redacted before this (no redaction
+   named in it) gets the first one held, in memory, on load. A redaction of room version 11 or
+   later (where `redacts` moved into `content`) is rendered with `redacts` at the top level too,
+   as Synapse does. Federation never sees either field: `hs_cli::federation::full_pdu` now serves a
+   redacted event in its redacted form (it served it whole), which keeps no `unsigned`.
+   **And `/messages` from a `/sync` token left out the newest event**: the sync-token resolver
+   answers the position of the newest event the sync delivered, and a backward page is
+   exclusive of its `from`; a backward page now starts one above it
+   (`routes::query::get_messages`). That is why the receiving server's `/messages` "did not
+   start with the redaction" in Sytest; it was every room's newest event, not a federation bug.
+2. **A member below the redact level could not redact their own message in a room of version 1
+   or 2** (`hs-room`, `pipeline::build_and_authorize`). Those versions' auth rules allow a
+   redaction whose event ID names the same server as the redacted event's; the redaction's ID
+   was minted *after* the auth check (`event_id: None`), so the rule never matched, locally as
+   much as on the remote side. The ID is now minted first and handed to the check.
+3. **`send_join`'s `auth_chain` is the auth chain of the state** (`hs-cli`,
+   `federation::auth_chain_from`): every event reached through an `auth_events` edge, a state
+   event included when another one cites it. The walk left every state event out, so a room
+   whose auth events were all current state answered an empty chain.
+4. **`/event` and `/backfill` answer a `Transaction`** (`hs-federation`, `read_routes`):
+   `origin` (this server), `origin_server_ts`, `pdus`. They answered `pdus` alone. The PDUs are
+   served as stored (a stored PDU's own `origin` is kept; the current PDU formats have none to
+   add), and `/state` and `/get_missing_events` keep the spec's own shapes, which have no
+   `origin`.
+5. **`make_join` refuses a user of another server than the asking one** (`403 M_FORBIDDEN`, as
+   `make_leave` and `make_knock` already did; `join::check_user_is_from_origin`) **and a room no
+   user of this server is in any more** (`404 M_NOT_FOUND`, "not an active room on this
+   server", Synapse's answer; `JoinError::NotInRoom`). Both logged at `info`.
+6. **Joins through Sytest's own server** (`hs-federation`, `hs-cli`, `hs-room`). Three causes:
+   a `make_join` answer without `room_version` was refused, where the spec says it means version
+   1 or 2 (Synapse reads "1"); a resident that does not answer the v2 `send_join` (Sytest's
+   answers `404`) was never asked v1 -- `outbound_join::put_v2_falling_back_to_v1` now asks v1
+   on a `404` or `400 M_UNRECOGNIZED` and unwraps its `[200, {...}]`, for `send_join` and
+   `send_leave`, logged at `info`; and another server's client error was a `502 M_UNKNOWN` to
+   the client -- it is now passed through as it came (status, `errcode`, `error`, the rest of
+   the body, e.g. `M_INCOMPATIBLE_ROOM_VERSION`'s `room_version`; new
+   `RoomError::RemoteRefused`), and not asked of the next server, as Synapse does, except
+   `M_UNABLE_TO_AUTHORISE_JOIN`, which still moves on to the next server (and is still a `502`
+   when none can).
+7. **A redaction that arrives before its event** (`hs-room`, `actor::redactions`). Every
+   redaction held is indexed by the event it names (`RoomActor::redactions_of`), rebuilt from the
+   stored redactions on load -- as durable as the redactions, no table of its own. When an event
+   is stored (`/send`, backfill, a gap fill), the redactions waiting for it take effect under the
+   rule a received redaction always had (sender on the original sender's server, or
+   `may_redact`), logged at `info`. A local redaction of an event not held is now sent and waits
+   (it was sent and then answered `404`).
+8. **Server ACLs on EDUs** (`hs-federation`, `acl::filter_edu`, MSC4163 as Synapse): an
+   `m.typing` for a room whose ACL denies the origin is dropped, and so is that room's part of
+   an `m.receipt`; counted under `hs_federation_acl_refusals_total{endpoint="typing"|"receipt"}`
+   and logged at `info`. One verdict per room per transaction, shared with the PDUs.
+9. **An auth-rejected PDU is stored as rejected** (`hs-room`, `actor::rejected`): flagged, no
+   timeline position, a row in `Tables::outliers` (no new keyspace) so a load finds it, not fed
+   to the state store, hidden from every read (`event_by_id`; federation's `/event` answers 404
+   for it, as Synapse does). Sent again it is already known (`{}`); cited as a prev event it
+   stands for its own prev events (the state after a rejected event is the state before it), so
+   the citing event is placed instead of meeting "missing ancestors" and a fetch of the same
+   rejected event; cited as an auth event it makes the citing event rejected too. Logged at
+   `info` with the reason.
+10. **The notary's held responses are kept** (`hs-federation`, new `key_store`):
+    `RemoteKeyCache::with_store` writes every response it accepts under each key it lists
+    (keyspace `hs_federation.held_key_responses`, one row per `(server, key id)`, overwritten by
+    the next response listing that key) and starts from what is held -- each verified again,
+    oldest first; one that no longer verifies, or expired over a year ago
+    (`key_store::MAX_HELD_AGE_MS`), is forgotten. A restarted notary answers for a server that
+    is down, and keys verify without a refetch. `hs-cli`'s `build_mount` uses it; boot logs
+    "restored the key responses held for other servers" (`restored`, `forgotten`).
+11. **Found on the way, no row: a received event whose content hash fails is taken redacted**
+    (`hs-federation`, `inbound::verify_pdu`), as the spec says ("the event is redacted before
+    processing further"); it was refused. The signature is checked first, over the redacted
+    form as before, so an event nobody signed is still refused. Sytest's "Inbound federation can
+    receive redacted events".
+
+12. **Also on the way:** `send_join` answers an unsigned or badly signed join, and a server
+    submitting another server's user's join, `403 M_FORBIDDEN` (it was `400 M_BAD_JSON`; the
+    sender/origin check now comes before the path's event ID is compared). `PduError` became a
+    struct (`message`, `unsigned`) so a caller can tell a signature failure from a malformed
+    PDU.
+
+Nothing here needs a setting.
+
+**Interfaces changed (additive unless said).** `hs_room::actor::RoomActor::{apply_redaction_by,
+redactions_of, is_rejected_event}`; `hs_room::actor::redactions::{redacted_by, REDACTED_BY,
+REDACTED_BECAUSE}`; `RoomActor::event_by_id` hides rejected events as it hid purged ones;
+`RoomActor::redact_txn` no longer fails for a target not held; `hs_room::RoomError::RemoteRefused`
+and `hs_room::error::RemoteRefusal`; `hs_federation::key_store` (`HeldKeyStore`,
+`KvHeldKeyStore`, `InMemoryHeldKeyStore`); `RemoteKeyCache::with_store`;
+`hs_federation::acl::filter_edu`; `hs_federation::join::{check_user_is_from_origin,
+JoinError::NotInRoom}`; `hs_federation::inbound::PduError` is now a struct (breaking for anyone
+reading `.0`; nothing outside the crate did); `verify_pdu` returns a hash-failing event redacted
+instead of an error.
+
+**Verified.** Every test named here fails without its change (checked by reverting it for
+the `hs-room` ones; the others assert what the old code demonstrably answered: an empty chain,
+`pdus` alone, a template, a refused template, `400`, an error).
+
+- `cargo test -p hs-federation` (210): new `read_routes::tests::event_and_backfill_answer_a_transaction_from_this_server`,
+  `transport::join::tests::{make_join_for_a_user_of_another_server_is_forbidden,
+  make_join_for_a_room_this_server_has_left_is_not_found}`,
+  `join::tests::send_join_refuses_an_unsigned_or_badly_signed_join_as_forbidden` (and the
+  wrong-server test extended to a replay under another path),
+  `outbound_join::tests::a_template_without_a_room_version_and_a_resident_without_v2_send_join_still_join`
+  (a stand-in for Sytest's server: no `room_version`, v2 `404`, v1 `[200, ..]`),
+  `outbound_membership::tests::an_invite_goes_by_v1_to_a_server_without_v2`,
+  `inbound::tests::typing_and_receipts_for_a_room_whose_acl_denies_the_origin_are_dropped`,
+  `inbound::tests::verify_pdu_takes_an_event_whose_hash_fails_redacted` (was
+  `verify_pdu_rejects_a_tampered_body`), `invite::tests::a_tampered_invite_does_not_verify_and_a_changed_one_is_taken_redacted`,
+  `keys::tests::held_key_responses_survive_a_restart_and_long_expired_ones_are_forgotten`.
+- `cargo test -p hs-room` (lib 140, all integration files pass): new
+  `actor::tests::a_member_redacts_their_own_message_in_rooms_of_version_1_and_2` (failed with
+  "m.room.redaction event did not pass any of the allow rules" with the ID minted late),
+  `a_redaction_that_arrives_before_its_event_takes_effect_when_the_event_comes` (across two
+  reloads; failed at "the waiting redaction took effect" with the application disabled),
+  `a_local_redaction_is_named_in_the_event_it_redacts_and_the_first_one_stays`,
+  `a_rejected_event_is_stored_as_rejected_and_later_references_to_it_are_consistent` (failed
+  at `is_rejected_event` with the store disabled), `routes::query::tests::a_backward_page_from_a_sync_token_starts_with_the_newest_event_it_delivered`.
+- `hs-cli`: `--lib` (183, new `remote_join::tests::another_servers_client_error_is_passed_through_to_the_client`);
+  `--test federation_reads` (11; new `send_join_answers_the_auth_chain_of_the_rooms_state` --
+  `make_join`, sign as the remote, `send_join` v1 and v2 in a version-1 room, the chain closed
+  under `auth_events` -- and `make_join_refuses_another_servers_user_and_a_room_this_server_has_left`;
+  `/event` and `/backfill` checked for `origin`/`origin_server_ts`); `--test
+  federation_room_versions` (5; the redaction test is now three, versions 1, 2 and 11, two
+  servers each: bob on B redacts his own message, alice's `/sync` on A gets the redaction, a
+  backward `/messages` from that sync's `next_batch` starts with it, then the message with
+  `unsigned.redacted_by` and a client-shaped `redacted_because`, and `/event` on both servers
+  carries them -- before the session it failed at B's `403` in versions 1 and 2 and at the
+  first `/messages` assertion in 11); `--test federation_keys`, `federation_writes`,
+  `federation_membership` (12; its restricted-room test still gets a `502` for a join no
+  server can authorise), `federation_two_servers`: pass.
+- `cargo fmt --all --check`, `cargo clippy -p hs-federation -p hs-room -p hs-cli --all-targets
+  -- -D warnings`: clean. Not run: the workspace gate.
+- **Sytest, whole suite** (release `hs` on bookworm built from the branch's code before its
+  last, clippy-only commit, through `SYTEST_HS_BINARY`, image `myelin-sytest:9cde6e9`;
+  `docs/status/sytest/2026-10-01-federation-2-results.txt` and `-summary.txt`):
+  **federation 50/105 → 73/105**; the whole suite **448 → 486 of 772** (239 fail, 47 skip).
+  `send_join` API 0/9 → 8/9, `make_join` 0/3 → 3/3, room versions 5/7 → 7/7, Federation API
+  6/14 → 9/14, Backfill 0/5 → 3/5, Invite 1/10 → 4/10, Public Room 0/1 → 1/1. 41 tests newly
+  pass, among them "Can receive redactions from regular users over federation" in all twelve
+  room versions, both inbound `send_join`s, all three outbound `send_join`/`make_join`
+  failure tests, the two `make_join` refusals, "Inbound federation can return events",
+  "Inbound/Outbound federation can backfill events", "Inbound federation can receive redacted
+  events", "Inbound federation ignores redactions from invalid servers room > v3", "Outbound
+  federation can send invites via v1 API", and (from the `/messages` fix) "Message history can
+  be paginated" and "... over federation". The run took eight minutes (35-60 before).
+  **Three that passed failed**, all client-server and none federation: "/joined_rooms returns
+  only joined rooms", "Events come down the correct room" and "Previously left rooms don't
+  appear in the leave section of sync". They fail again run alone, and the cause is in the
+  logs: two `createRoom` calls by one user in the same millisecond got **the same room ID**
+  (a version-12 room's ID is its create event's hash, and nothing makes two such create events
+  differ; `RoomActor::create_placed`). The faster run made them collide. Not this session's to
+  fix (track 04's create path, being changed on `agent/cluster-create-room-flake`); a
+  known-gaps row is added.
+
+**Left.**
+
+- `may_redact` still reads the current power levels, not those at the redaction.
+- Soft failure is still a hard rejection (now a stored one): Sytest's three soft-fail tests.
+- A redaction whose target is in another room is stored in its own room and shown there
+  (Sytest's "An event which redacts an event in a different room should be ignored"); it never
+  touches the other room's event.
+- `send_join` rejects invalid JSON for version 6 too late ("Inbound: send_join rejects invalid
+  JSON for room version 6": the request's signature fails first); federation profile and
+  directory queries (four `fqu` tests); the inbound invite tests that need the legacy
+  `/events` (another row); device-list resync (five `fdk`).
+
 ## Sixteenth session (2026-10-01): what Sytest's first run found between servers
 
 **Branch:** `agent/federation-sytest`, from `agent/test-infra-gaps` (`a649509`; the Sytest

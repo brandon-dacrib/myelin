@@ -1,0 +1,114 @@
+Sytest, 2026-10-01, third run (hs on agent/federation-sytest-2; Sytest 7473158, tests/sytest/run.sh; per test: 2026-10-01-federation-2-results.txt). The second run is 2026-10-01-federation-summary.txt (448 pass, federation 50 of 105).
+
+process exits during the run (the last few are the shutdown):
+1980:WARN: haproxy-0 process failed - code=2
+1981:WARN: haproxy-1 process failed - code=2
+
+tests: 772
+pass: 486
+fail: 239
+expected fail (Sytest's own marking): 0
+skip: 47
+pass rate (of tests run, skips excluded): 67.0%
+
+most common failure reasons (first line of the message, normalised):
+    29  Timed out waiting for test at run-tests.pl line N.
+    23  fixture failed - HTTP Request failed ( 403 Forbidden https://localhost:PORT/_matrix/client/v3/register?kind=guest ) from POST https://localhost:PORT/_matrix/client/v3/register?...
+    18  fixture failed - HTTP Request failed ( 404 Not Found https://localhost:PORT/_matrix/client/r0/events?timeout=N&access_token=TOKEN ) from GET https://localhost:PORT/_matrix/client/r0/events?...
+     9  HTTP Request failed ( 403 Forbidden https://localhost:PORT/_matrix/client/v3/rooms/!ROOM/invite?access_token=TOKEN ) from POST https://localhost:PORT/_matrix/client/v3/rooms/!ROOM/invite?...
+     8  fixture failed - HTTP Request failed ( 404 Not Found https://localhost:PORT/_matrix/client/r0/events?access_token=TOKEN&timeout=N ) from GET https://localhost:PORT/_matrix/client/r0/events?...
+     7  Unexpected response from /send: {
+     6  Expected only N membership events (got N) at tests/10apidoc/09synced.pl line N.
+     6  user not in list at tests/52user-directory/01public.pl line N.
+     5  HTTP Request failed ( 404 Not Found https://localhost:PORT/_matrix/client/v3/peek/!ROOM?access_token=TOKEN ) from POST https://localhost:PORT/_matrix/client/v3/peek/!ROOM?...
+     5  HTTP Request failed ( 404 Not Found https://localhost:PORT/_matrix/client/unstable/account/Npid/bind?access_token=TOKEN ) from POST https://localhost:PORT/_matrix/client/unstable/account/Npid/bind?...
+
+skip reasons:
+    18  lack of can_upgrade_room_version
+    10  lack of can_change_power_levels
+     6  lack of can_upload_self_signing_keys
+     4  failing fixture: no m.login.cas at tests/10apidoc/13ui-auth.pl line 25.
+     4  lack of can_add_tag
+     2  lack of can_get_messages
+     2  lack of can_get_3pe_metadata
+     1  lack of can_upload_media
+
+Are We Synapse Yet?
+===================
+
+Non-Spec APIs: 71% (68/96 tests)
+--------------
+  Non-Spec API             :  50% (1/2 tests)
+  Unknown API (no group specified):  71% (67/94 tests)
+
+Client-Server APIs: 61% (332/542 tests)
+-------------------
+  Registration             :  78% (21/27 tests)
+  Login                    :  58% (11/19 tests)
+  Misc CS APIs             : 100% (1/1 tests)
+  Profile                  : 100% (6/6 tests)
+  Devices                  :  67% (8/12 tests)
+  Presence                 :  38% (3/8 tests)
+  Create Room              : 100% (12/12 tests)
+  Sync API                 :  65% (55/84 tests)
+  Room Membership          :  91% (10/11 tests)
+  Room State APIs          : 100% (10/10 tests)
+  Public Room APIs         :  50% (3/6 tests)
+  Room Aliases             :  85% (11/13 tests)
+  Joining Rooms            : 100% (8/8 tests)
+  Leaving Rooms            : 100% (1/1 tests)
+  Inviting users to Rooms  :  93% (13/14 tests)
+  Banning users            :  40% (2/5 tests)
+  Sending events           : 100% (2/2 tests)
+  Getting events for Rooms :  60% (6/10 tests)
+  Typing API               :  20% (1/5 tests)
+  Receipts                 : 100% (2/2 tests)
+  Read markers             : 100% (1/1 tests)
+  Capabilities API         : 100% (1/1 tests)
+  Logout                   : 100% (4/4 tests)
+  Push APIs                :  36% (19/53 tests)
+  Account APIs             :  80% (8/10 tests)
+  V1 CS APIs               : 100% (1/1 tests)
+  Ephemeral Events         :   0% (0/1 tests)
+  Power Levels             :   0% (0/2 tests)
+  Redaction                : 100% (1/1 tests)
+  Third-Party ID APIs      :  16% (3/19 tests)
+  Guest APIs               :   0% (0/24 tests)
+  Room Auth                :  89% (16/18 tests)
+  Context APIs             :  50% (2/4 tests)
+  Room Upgrade APIs        :  10% (2/21 tests)
+  Room Versions            :  94% (48/51 tests)
+  Device Keys              :  59% (10/17 tests)
+  Device Key Backup        :  90% (9/10 tests)
+  Cross-signing Keys       :   0% (0/7 tests)
+  Tagging APIs             :   0% (0/8 tests)
+  OpenID API               :  67% (2/3 tests)
+  Send-to-Device APIs      : 100% (10/10 tests)
+  Server Admin API         :   0% (0/1 tests)
+  Ignore Users             :   0% (0/3 tests)
+  Media APIs               :  50% (1/2 tests)
+  User Directory APIs      :  45% (5/11 tests)
+  Enforced canonical JSON  : 100% (3/3 tests)
+
+Federation APIs: 70% (73/105 tests)
+----------------
+  Auth                     :  80% (16/20 tests)
+  Device Key APIs          :  44% (4/9 tests)
+  Send-to-Device APIs      : 100% (2/2 tests)
+  Key API                  : 100% (6/6 tests)
+  Query API                :  20% (1/5 tests)
+  send_join API            :  89% (8/9 tests)
+  make_join API            : 100% (3/3 tests)
+  room versions            : 100% (7/7 tests)
+  Federation API           :  64% (9/14 tests)
+  get_missing_events API   :  67% (2/3 tests)
+  Backfill API             :  60% (3/5 tests)
+  Invite API               :  40% (4/10 tests)
+  send_leave API           : 100% (1/1 tests)
+  State APIs               :  60% (6/10 tests)
+  Public Room API          : 100% (1/1 tests)
+
+Application Services APIs: 40% (10/25 tests)
+--------------------------
+  Application Services API :  40% (10/25 tests)
+

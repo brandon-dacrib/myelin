@@ -319,6 +319,24 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
 
 ### Federation
 
+- **A redacted message says what redacted it, and redactions meet their events in any order.**
+  Every client read of a redacted event (`/sync`, `/messages`, `/event`, `/context`, `/state`,
+  search) carries `unsigned.redacted_because` (the redaction) and `unsigned.redacted_by`; a
+  redaction that arrives over federation before the message it redacts takes effect when the
+  message comes, across a restart too; a member of a version-1 or -2 room can redact their own
+  message (refused until now, on every server); and a redacted event is served to other servers
+  redacted, not whole. Also fixed: a backward `/messages` from a `/sync` token left out the
+  room's newest event. Between servers: `send_join` answers the state's whole auth chain (it was
+  empty for a room whose auth events are all current state), `/event` and `/backfill` answer the
+  spec's transaction shape, `make_join` refuses a room this server has left and a user of
+  another server, a join through a server that leaves out `room_version` or lacks the v2
+  `send_join` goes through, another server's refusal reaches the client as it came instead of
+  a `502`, typing and receipts from a server a room's ACL bans are dropped, an event the auth
+  rules reject is kept as rejected so a later reference to it is answered consistently, an event
+  whose content hash fails is taken redacted (as the spec says) instead of refused, and the
+  notary's key responses survive a restart. Verified 2026-10-01 with two real servers
+  (`federation_room_versions.rs`, `federation_reads.rs`) and Sytest: federation 50 of 105 → 73
+  of 105, the whole suite 448 → 486 of 772 (status 06, seventeenth session).
 - **What Sytest's first run found between servers is fixed.** The key server answers the
   deprecated `/_matrix/key/v2/server/{keyId}` and acts as a notary (`/_matrix/key/v2/query`,
   both spellings): another server's keys from the cache inbound verification fills, co-signed,
