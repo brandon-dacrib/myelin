@@ -348,6 +348,9 @@ pub struct RemoteKeyCache<F: KeyServerFetcher> {
     /// the parsed keys above are not enough. Expired responses are kept too -- the spec's
     /// notary answers with the last keys it holds for a server that cannot be reached.
     responses: std::sync::Mutex<HashMap<(String, String), StoredResponse>>,
+    /// Where accepted responses are also written, so a restart starts with them
+    /// ([`RemoteKeyCache::with_store`]); `None` keeps them in memory only.
+    store: Option<Arc<dyn crate::key_store::HeldKeyStore>>,
 }
 
 /// One response held for the notary endpoints: the document and its `valid_until_ts`.
@@ -397,7 +400,51 @@ impl<F: KeyServerFetcher> RemoteKeyCache<F> {
             in_flight: std::sync::Mutex::new(HashMap::new()),
             fetched_at: std::sync::Mutex::new(HashMap::new()),
             responses: std::sync::Mutex::new(HashMap::new()),
+            store: None,
         }
+    }
+
+    /// A cache that also keeps every response it accepts in `store`, and starts with what
+    /// `store` holds (`crate::key_store`): each held response is verified again, oldest first,
+    /// and one that expired more than [`crate::key_store::MAX_HELD_AGE_MS`] ago is forgotten.
+    /// What is restored answers the notary and verifies requests and events exactly as a
+    /// response fetched now would, without the fetch.
+    #[must_use]
+    pub fn with_store(fetcher: F, store: Arc<dyn crate::key_store::HeldKeyStore>) -> Self {
+        let mut cache = Self::new(fetcher);
+        let mut held = store.load();
+        held.sort_by_key(|response| response.valid_until_ts);
+        let cutoff = now_ms().saturating_sub(crate::key_store::MAX_HELD_AGE_MS);
+        let (mut restored, mut forgotten) = (0usize, 0usize);
+        for response in held {
+            if response.valid_until_ts < cutoff {
+                store.forget(&response.server_name, &response.key_id);
+                forgotten += 1;
+                continue;
+            }
+            match cache.ingest(&response.server_name, &response.doc, Ingest::Restored) {
+                Ok(()) => restored += 1,
+                Err(error) => {
+                    tracing::warn!(
+                        server = %response.server_name,
+                        key_id = %response.key_id,
+                        %error,
+                        "a held key response no longer verifies; forgetting it"
+                    );
+                    store.forget(&response.server_name, &response.key_id);
+                    forgotten += 1;
+                }
+            }
+        }
+        if restored + forgotten > 0 {
+            tracing::info!(
+                restored,
+                forgotten,
+                "restored the key responses held for other servers"
+            );
+        }
+        cache.store = Some(store);
+        cache
     }
 
     /// The notary half of `/_matrix/key/v2/query`: the self-signed key responses this cache
@@ -674,6 +721,17 @@ impl<F: KeyServerFetcher> RemoteKeyCache<F> {
         expected_server_name: &str,
         doc: &serde_json::Value,
     ) -> Result<(), KeyLookupError> {
+        self.ingest(expected_server_name, doc, Ingest::Fetched)
+    }
+
+    /// [`RemoteKeyCache::ingest_response`], for a response just fetched (kept in the store, its
+    /// fetch time recorded) or one restored from the store (neither).
+    fn ingest(
+        &self,
+        expected_server_name: &str,
+        doc: &serde_json::Value,
+        how: Ingest,
+    ) -> Result<(), KeyLookupError> {
         let object = signing::to_signable_object(doc)
             .map_err(|_| KeyLookupError::InvalidResponse(expected_server_name.to_string()))?;
 
@@ -795,6 +853,19 @@ impl<F: KeyServerFetcher> RemoteKeyCache<F> {
                 );
             }
         }
+        if how == Ingest::Restored {
+            return Ok(());
+        }
+        if let Some(store) = &self.store {
+            for key_id in candidates.keys() {
+                store.hold(&crate::key_store::HeldKeyResponse {
+                    server_name: expected_server_name.to_owned(),
+                    key_id: key_id.clone(),
+                    valid_until_ts,
+                    doc: doc.clone(),
+                });
+            }
+        }
 
         self.fetched_at
             .lock()
@@ -802,6 +873,15 @@ impl<F: KeyServerFetcher> RemoteKeyCache<F> {
             .insert(expected_server_name.to_string(), now);
         Ok(())
     }
+}
+
+/// Where a response [`RemoteKeyCache::ingest`] takes came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ingest {
+    /// Fetched (or handed in) now: kept in the store, its fetch time recorded.
+    Fetched,
+    /// Read back from the store at boot: already kept, and not fetched now.
+    Restored,
 }
 
 #[cfg(test)]
@@ -1167,5 +1247,56 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, KeyLookupError::FetchFailed(_)));
+    }
+
+    /// The key responses a cache accepts are kept in its store, and a cache built over the same
+    /// store after a restart starts with them: the notary answers for a server that cannot be
+    /// reached any more, and a key verifies without a fetch. A response that expired more than
+    /// a year ago is forgotten at boot. Until 2026-10-01 all of it was in memory only, and a
+    /// restarted notary answered nothing for a server that was down.
+    #[tokio::test]
+    async fn held_key_responses_survive_a_restart_and_long_expired_ones_are_forgotten() {
+        let backend = hs_kv::memory::MemoryBackend::new();
+        let store: Arc<dyn crate::key_store::HeldKeyStore> =
+            Arc::new(crate::key_store::KvHeldKeyStore::open(backend.clone()).unwrap());
+        let fetcher = FixedFetcher::new();
+        let (doc, keys) = signed_response("remote.example.org", 3600);
+        fetcher.set("remote.example.org", doc.clone());
+        let first = RemoteKeyCache::with_store(fetcher, store.clone());
+        first
+            .get_current("remote.example.org", &keys.primary().key_id())
+            .await
+            .unwrap();
+        assert_eq!(store.load().len(), 1, "the accepted response is kept");
+        // A response long expired, as a server gone for over a year left it.
+        store.hold(&crate::key_store::HeldKeyResponse {
+            server_name: "gone.example.org".to_owned(),
+            key_id: "ed25519:old".to_owned(),
+            valid_until_ts: 1,
+            doc: serde_json::json!({"server_name": "gone.example.org"}),
+        });
+        drop(first);
+
+        // The restart: the same store, and the server can no longer be reached.
+        let store: Arc<dyn crate::key_store::HeldKeyStore> =
+            Arc::new(crate::key_store::KvHeldKeyStore::open(backend).unwrap());
+        let restarted = RemoteKeyCache::with_store(FixedFetcher::new(), store.clone());
+        let answered = restarted
+            .notary_responses("remote.example.org", &[], 0)
+            .await;
+        assert_eq!(answered, vec![doc]);
+        let key = restarted
+            .get_current("remote.example.org", &keys.primary().key_id())
+            .await
+            .expect("verifies from what was kept, with no fetch");
+        assert_eq!(key, keys.primary().verifying_key());
+        assert_eq!(restarted.fetcher.count_for("remote.example.org"), 0);
+        assert!(
+            store
+                .load()
+                .iter()
+                .all(|held| held.server_name != "gone.example.org"),
+            "a response expired over a year ago is forgotten"
+        );
     }
 }

@@ -16,6 +16,7 @@ pub mod error;
 pub mod inbound;
 pub mod invite;
 pub mod join;
+pub mod key_store;
 pub mod keys;
 pub mod metrics;
 pub mod outbound_join;
