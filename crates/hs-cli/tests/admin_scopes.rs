@@ -142,7 +142,9 @@ async fn wait_healthy(base: &str) {
 
 /// The scope the served OpenAPI document gives `operation_id`.
 fn documented_scope(document: &Value, operation_id: &str) -> String {
-    let paths = document["paths"].as_object().expect("the document has paths");
+    let paths = document["paths"]
+        .as_object()
+        .expect("the document has paths");
     for operations in paths.values() {
         for operation in operations.as_object().into_iter().flat_map(|o| o.values()) {
             if operation["operationId"] == operation_id {
@@ -223,7 +225,10 @@ async fn the_bridge_listings_are_served_under_the_scope_the_served_document_give
         ("appservices.list", "/api/v1/appservices"),
         ("bridge_types.list", "/api/v1/bridge-types"),
         ("bridge_offerings.list", "/api/v1/bridge-offerings"),
-        ("bridge_deployments.target", "/api/v1/bridge-deployment-target"),
+        (
+            "bridge_deployments.target",
+            "/api/v1/bridge-deployment-target",
+        ),
     ];
     for (operation_id, _) in listings {
         assert_eq!(
