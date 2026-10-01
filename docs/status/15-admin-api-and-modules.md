@@ -50,6 +50,16 @@ Also noted, not changed (the document is stricter than RFC 0004 section 8.2, whi
 
 Verify: `cargo test -p hs-admin --test scope_contract`; `cargo test -p hs-cli --test
 admin_scopes`; in `web/`, `npx vitest run src/components/shell/nav.test.ts`.
+## 2026-10-01: `AppServiceUpdate` documents the provisioning secret (by track 16)
+
+Branch `agent/web-admin-ui`. Documentation of existing behaviour, no handler change:
+`AppServiceUpdate` (the body of `PATCH /appservices/{id}`, `appservices.update`) was an object
+with no properties, which the generated client typed as `Record<string, never>`, so nothing
+could be sent. It now lists `io.myelin.provisioning_secret` (string or null, what
+`appservices.logins` asks a mautrix bridge with) and `additionalProperties: true`, as the
+registry has merged unrecognised keys since `agent/bridge-logins`. The web's Sign in tab sends
+exactly that key to add a secret to a registration made before the server kept one. Checked:
+`cargo test -p hs-admin --test contract` (2 of 2) and the `openapi` unit tests (3 of 3).
 
 ## 2026-10-01: `appservices.logins`, who has signed in to a bridge (by track 11)
 

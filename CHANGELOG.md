@@ -36,6 +36,17 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
   instead of `moderation:write`; a test now asks the router about all 154 authenticated
   operations. The interface shows Rooms and Media to `moderation:read`. No token narrower than
   `admin:read`+`admin:write` can be minted yet, so this matters once scoped tokens exist.
+- **The management interface explains itself** (2026-10-01, `agent/web-admin-ui`). Every
+  configuration setting carries a badge from the server's own classification (applies on save,
+  needs a restart, or per replica from the file or environment), each class is explained once
+  per section, and a save names the settings it applied and the ones waiting for a restart; the
+  administered settings' descriptions were rewritten to say what each does and costs. Federation
+  shows a destination in catch-up and what that means; the Migration page names all thirteen
+  streams the importer copies and lists what a migration leaves behind before it starts; the
+  bridge offering page shows whether each person has signed in, and an older bridge
+  registration takes its provisioning secret from the Sign in tab. A deactivated account can be
+  reactivated from its page. Verified against `hs serve` (`web/e2e-real/explained-pages.spec.ts`
+  and the Configuration and bridge-offering suites, 9 of 9) and the mock suites.
 - **The chart install is a CD gate.** CD installs the Helm chart on a kind cluster with the
   freshly built amd64 image, waits for Ready, reads the setup link from the pod log, checks
   `/health/ready` and the management interface through a port-forward, and creates the first

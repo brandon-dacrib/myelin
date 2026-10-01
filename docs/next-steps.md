@@ -205,6 +205,25 @@ Touches `hs-room` (new `actor::{redactions, rejected}`, `RoomError::RemoteRefuse
 regressed are a version-12 room-ID collision in `createRoom` the faster run exposed (new
 known-gaps row, track 04). Status 06 session 17 has the tests and what is left.
 
+**Branch `agent/web-admin-ui` (2026-10-01, track 16; not merged when written): the interface
+explains itself, by the owner's rule.** The owner, 2026-10-01: *"Sane defaults, and all
+administration is done via the web UI, well explained in the UI."* An operator never needs a
+config file, the CLI or the raw API, nor the docs to read a page. Branched from
+`agent/config-hot` with `main` merged in (it needs `applies`). Federation shows a destination
+in catch-up ("Catching up since ...", what catch-up is, the queue limit and a link to it) and
+fixes "Next retry", which was the last attempt; every configuration setting has a badge from
+`applies` (applies on save / needs a restart / per replica), each class explained once per
+section, and a save names what applied and what waits; the rate limits page says what a `429`
+looks like and that each replica counts alone; the Migration page names the importer's thirteen
+streams and shows the runbook's "what does not move" before a start; the bridge offering page
+has each person's sign-in state, and an older registration gets its provisioning secret from
+the Sign in tab. The administered settings' Rust doc comments were rewritten (they are the
+UI's and `docs/config.md`'s words). An audit of every page fixed the cheap gaps (raw wire
+values, unexplained controls, `users.reactivate` without a page) and listed the rest in status
+16 as the next web items. OpenAPI: `AppServiceUpdate` documents
+`io.myelin.provisioning_secret` (additive). Touches `web/`, `crates/hs-config` (doc comments
+only), `docs/config.md` and the OpenAPI document.
+
 **Branch `agent/platform-gaps` (2026-10-01, track 12; not merged when written): four
 platform gap rows closed by running them.** The operator ran against a real API server for the
 first time (kind): `deploy/operator/ci/kind-smoke.sh` drives a `Bridge` and a single-node
@@ -2164,3 +2183,10 @@ Refreshed 2026-09-28 against the code: closed rows are struck through with the c
   placeholder. Look at the decision itself (the build script's output, the log line, the byte on
   the wire), not at a test that is satisfied either way.
 - **Registered is not working, and a real handler is not working either.** 97 of 158 admin operations have a real handler (`tools/admin_api_coverage.py` counts them; the figure used to be quoted by hand and was different in every document). The rest answer 501. But `users.create` had a real handler for days while the only real user directory answered it 503 — so "has a handler" is a ceiling, and the floor is an end-to-end test through `hs serve`.
+- **Sane defaults, and all administration in the web UI, well explained there** (the owner,
+  2026-10-01). Every branch that adds a setting or an admin API field or operation adds its page,
+  column or badge in `web/` in the same branch, and says inline what it does, its default, what
+  changing it costs and when it applies. A setting's words live in its Rust doc comment (the
+  interface and `docs/config.md` are built from it); its first sentence is the inline hint, so
+  make it say what the setting does for an operator, not restate its name. An operator should
+  never need a config file, the CLI, the raw API or these docs to run the server.

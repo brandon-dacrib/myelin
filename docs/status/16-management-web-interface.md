@@ -1,6 +1,133 @@
 # 16. Management web interface: status
 
-Last updated: 2026-10-01 (two known gaps in the browser suites; branch `agent/web-gaps`).
+Last updated: 2026-10-01 (the interface explains itself; branch `agent/web-admin-ui`).
+
+## 2026-10-01: the interface explains itself, by the owner's rule (branch `agent/web-admin-ui`)
+
+The owner's rule: *"Sane defaults, and all administration is done via the web UI, well
+explained in the UI."* Tonight's branches added admin API surface without its UI; this branch
+closes that and audits every page. Branched from `agent/config-hot` (for `applies`) with
+`origin/main` merged in (for `agent/bridge-logins` and `agent/federation-catchup`).
+
+**Done.**
+
+- **Federation: catch-up.** `Destination.catch_up_since` shows as "Catching up since ..." in the
+  list (`pages/federation/CatchUp.tsx`, `CatchUpBadge`) and as a notice on the destination's page
+  that says what catch-up is, with the queue limit the server runs with (read from
+  `federation.max_queued_pdus_per_destination` through `GET /config/federation`,
+  `useFederationQueueLimit` in `api/federation.ts`) and a link to that setting. The list has a
+  key for every status (opened when a destination is catching up) and an intro; the destination
+  page explains each fact. **Fixed:** "Next retry" showed `retry_last_at`, the last attempt; it is
+  now "Last attempt", and "Next attempt" is computed (`lib/federation.ts::nextAttemptAt`).
+  `RelativeTime` says "in 4 min" for a future time. Mock: `kde.org`, down two days, in catch-up.
+- **Configuration: `applies` everywhere** (`lib/config-applies.ts`, `pages/config/AppliesBadge.tsx`).
+  Each setting has a badge from `ConfigSettingInfo.applies`: "Applies on save", "Needs a
+  restart" or "Per replica (file or environment)" (a setting edited as one form takes its own
+  row, the nearest above, or the rows beneath when they agree). The top of each section explains
+  the classes it has, once, with counts; the index explains all three and counts them per
+  section; the review dialog badges each change; and **a save's toast names what applied and
+  what waits** ("Applied to the running server: Message · Burst count. Stored, and waiting for
+  the next restart: Client timeout."), or that the running server refused the hot ones. The
+  rate limits page has "How rate limits work" (`SectionNotes.tsx`): buckets, per-user/address/
+  origin counting, what a `429 M_LIMIT_EXCEEDED` with `retry_after_ms` looks like to a client,
+  and that each replica counts alone. A read-only setting now shows its default too; "Highest
+  precedence: database" reads "Values from: Saved here (the database)".
+- **Every administered setting explained, in the Rust doc comments** (the UI's and
+  `docs/config.md`'s single source): rate limits (each bucket and its two fields), auth
+  (registration, shared secret, tokens, pepper, policy, OIDC providers, MAS), telemetry,
+  cluster, appservices, federation, media, server, and every section's summary. Settings
+  decision 0016 found nothing reads (`auth.enable_legacy_login`, `password.enabled`,
+  `session_secret`, `appservices.enabled`, `server.admin_contact`, `report_stats`,
+  `media.remote_media_retention`, `rate_limits.third_party_id_validation`) say so. The fixture
+  and `docs/config.md` are regenerated; the mock now takes its descriptions from the fixture and
+  sends a row for every classified setting, as the server does.
+- **Migration: the importer's streams** (`lib/migration.ts::STREAMS`, `streamLabel`). All
+  thirteen (`users` ... `e2e_keys`, `cross_signing`, `key_backups`, `push_rules`, `pushers`,
+  `filters`, `rooms`, `receipts`, `media`) have a label and a one-line explanation in the table,
+  verification, progress bars and log; an unknown stream is spelled in words, never as a wire
+  name. **"What is copied, and what is not"** (`WhatMoves`, open before a start) lists the
+  streams in copy order and the runbook's "What does not move". Pause/abort, rows per batch
+  (default 500), the Not copied column and a disabled Verify say what they mean. The mock copies
+  all thirteen.
+- **Bridges: sign-in state.** The offering page's people's bridges have a "Signed in to <bridge>"
+  column (`offering/InstanceSignIn.tsx`, asked of each ready instance about its owner); a shared
+  bridge's panel links to its Sign in tab (`/bridges/<id>#sign-in` opens that tab). A mautrix
+  bridge registered before the server kept provisioning secrets gets **"Provisioning secret"**
+  on the Sign in tab (`BridgeSignInState.tsx::AddProvisioningSecret`): where the secret is
+  (`provisioning.shared_secret` in the bridge's `config.yaml`), then a `PATCH` of the one key
+  (`useSetProvisioningSecret`). Also fixed: a failed refetch no longer shows the stale earlier
+  answer. Mock: Telegram has no secret until one is added; instances answer `logins`.
+- **Cluster (item 5).** The page reads no Prometheus series (only the admin API), so
+  `hs_cluster_drain_released_at_once_total` and `hs_cluster_heartbeat_seq` have nowhere to go
+  without an admin API field; a replica in drain was already shown, and now every replica
+  column (status values, zone, heartbeat, mesh address, epoch) is explained, and a shard's
+  rising epoch is. `hs_room_search_rooms_behind` is not on `main` (no such series exists yet).
+- **Audit, cheap fixes.** Dashboard: audit entries as sentences, a failing destination links to
+  itself, Mode and Daily active users explained. Users: kind of account and the bridge that made
+  it in words; **Reactivate** for a deactivated account (`users.reactivate`, which had no UI); the
+  deactivate dialog closes and says what deactivation does (it claimed "erase", which the server
+  refuses). Rooms: join rule, history visibility and memberships in words (`lib/rooms.ts`),
+  hints for room version and state events, "People on other servers can join". Bridge detail:
+  what Pause/Resume do, "Gave up"/"Waiting" in the backlog. Task, registration-token and audit
+  entry wording.
+- **OpenAPI** (status 15): `AppServiceUpdate` documents `io.myelin.provisioning_secret` and
+  admits other keys; `schema.d.ts` regenerated.
+
+**Verified.**
+
+- `npm run check`: lint (0 errors; the 4 warnings are the existing fast-refresh ones), types,
+  **483 unit tests in 67 files**, production build. New tests: `lib/federation.test.ts`,
+  `lib/config-applies.test.ts`, `lib/migration.test.ts`, `pages/federation/CatchUp.test.tsx`,
+  `pages/config/AppliesBadge.test.tsx`, `pages/UserDetailPage.test.tsx`, and new cases in
+  `ConfigSectionPage`, `MigrationPage`, `BridgeSignInState`, `BridgeOfferingPage` and `rooms`.
+- `npm run test:e2e` (mock): **53 of 53**, including the new `bridge-sign-in.spec.ts` (2), the
+  catch-up flow in `users-rooms-federation.spec.ts`, the applies legend in
+  `configuration.spec.ts` and the stream lists in `migration.spec.ts`, each with axe.
+- **Against `hs serve`** (this branch's binary, `test.local`, admin token from `hs register`):
+  `e2e-real/explained-pages.spec.ts` (new: Configuration's badges from the server's `applies`, the
+  federation queue setting and its words, the rate limits note, a save naming what waits;
+  Federation's status key with the server's queue limit; Migration's thirteen streams and what is
+  not copied), `e2e-real/configuration.spec.ts` (5, the toast now names "Message · Burst count")
+  and `e2e-real/bridge-offerings.spec.ts`: **9 of 9**. Screenshots in
+  `web/test-results/real-explained-*.png` (not committed: no page is new).
+- `cargo test -p hs-config` (all), `cargo clippy -p hs-config --all-targets -D warnings`,
+  `cargo test -p hs-admin --test contract`.
+- Not seen against the real binary: a destination actually in catch-up (it needs a real remote
+  server down past the queue limit), and the provisioning-secret form (needs a real mautrix
+  registration from before 2026-10-01); both are covered by the mock suites only.
+
+**Next web items (from the audit; not cheap).**
+
+1. **User edit** (`users.update`): grant or revoke server administrator, change display name,
+   avatar and kind of account; today admin is set only at creation.
+2. **Bridge edit and test** (`appservices.update` for url, rate limiting and namespaces;
+   `appservices.ping` as "Test connection").
+3. **Server health on the Overview** (`GET /server/health`, never called): per-check status.
+4. **Exact user lookup** (`users.lookup` by email, phone or SSO subject) and a live username
+   check in Add user (`users.availability`).
+5. **Room lifecycle**: an upgraded room's successor (`tombstoned`, `replacement_room_id`), guest
+   access, and the block reason (asked on Block, shown on the badge).
+6. **Federation and Overview at scale**: both read the first 50 destinations; the Overview
+   counts failing ones from that page instead of `federation_destinations_failing_count`.
+   Needs paging and a failing-first filter.
+7. **Effective server-wide values beside per-user overrides** (a user's rate limit section) and
+   bridge option defaults ("applies to bridges created after saving").
+8. **Cluster series in the admin API**: drains that released at once, heartbeat sequence, and a
+   search index lag (`hs_room_search_rooms_behind`, once it exists) need admin API fields before
+   the Cluster or Statistics page can show them.
+9. **Settings with no reader** (listed above) should either get one or leave the schema; the UI
+   says "has no effect yet" meanwhile. **Erase on deactivate** waits for an eraser on the
+   server (`erase: true` is refused).
+10. Smaller wording left: the audit page's action filter is free text with a wire placeholder;
+    raw Kubernetes phases on the offering page; server notice "m.image without a text body";
+    the sign-in page's `is_admin`; the task result keys humanised from snake_case.
+
+**Decisions made.** A setting edited as one form whose rows disagree is badged "Needs a
+restart" (the cautious answer). The mock's setting descriptions come from the real schema
+fixture, not copies. The "add the secret" action is shown for a mautrix bridge the server
+cannot ask while the registration has a `url` (the only other reason it cannot ask), rather
+than by matching the reason's text. The owner's rule is now a convention in
+`docs/next-steps.md`.
 
 ## 2026-10-01: two known gaps in the browser suites (branch `agent/web-gaps`)
 
