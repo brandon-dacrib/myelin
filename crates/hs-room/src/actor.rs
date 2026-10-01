@@ -32,6 +32,8 @@ use crate::timeline::{Direction, PaginationToken};
 pub mod admin_ops;
 pub mod gaps;
 mod history;
+#[cfg(test)]
+mod new_room_ids;
 
 /// Timeline events with their room-local positions, as [`RoomActor::events_around`] answers.
 pub type PositionedEvents<'a> = Vec<(i64, &'a Event)>;
@@ -42,7 +44,9 @@ pub type PositionedEvents<'a> = Vec<(i64, &'a Event)>;
 /// (one in nine million); with the share an ordinary member of a cluster owns, never in
 /// practice. An attempt is a hash and a signature, so the bound is about 4,096 of them, well
 /// under a second, at the default 256 room shards. A replica that owns no room shard at all
-/// runs out every time, which is what the bound is for.
+/// runs out every time, which is what the bound is for. The same bound covers IDs found
+/// already taken (a version-12 create identical to an earlier one). With no fencing installed
+/// (this crate's own tests; `hs serve` always installs it) the bound is this number itself.
 pub const MAX_ID_ATTEMPTS_PER_SHARD: u32 = 16;
 
 fn to_kv(e: hs_tables::keyspace::TableError) -> hs_kv::KvError {
@@ -259,6 +263,13 @@ enum PersistKind {
     /// A locally built or federation-received event whose state derives from its `prev_events`,
     /// every one of which this actor holds. The ordinary case.
     Ordinary,
+    /// The `m.room.create` of a room this server is creating ([`RoomActor::create_placed`]):
+    /// ordinary, except that the room's ID must be new. The transaction that writes it reads
+    /// `Tables::room_meta` for the room first and refuses with [`RoomError::RoomAlreadyExists`]
+    /// when a room already has the ID -- two version-12 creates with the same content in the
+    /// same millisecond hash to the same ID. The read is in the same serializable transaction
+    /// as the row it guards, so two concurrent creates of one ID cannot both pass it.
+    NewRoom,
     /// A federation join this server's own user made into a room hosted elsewhere
     /// ([`RoomActor::accept_remote_join_with_state`]): its prev events are unknown here, its
     /// state before it is `snapshot` (the resident's resolved state, already persisted as
@@ -465,15 +476,30 @@ impl<B: KvBackend> RoomActor<B> {
     ///   rebuilt with its `origin_server_ts` one millisecond earlier each time until its ID
     ///   hashes to an owned shard.
     ///
-    /// Each attempt is a hash and a signature, no I/O, and about as many attempts as there are
-    /// replicas are expected. They are bounded by [`MAX_ID_ATTEMPTS_PER_SHARD`] times the number
-    /// of room shards; running out (a replica that owns no room shard at all) is
-    /// [`RoomError::Fenced`], a `503` the client retries. The fence is installed on the new
-    /// actor before its create event is persisted, so the whole creation burst is fenced like
-    /// every later write. The attempts taken are observed in `hs_room_create_room_id_attempts`.
+    /// **The ID must also be new.** A version-12 create event holds the sender, the content and
+    /// `origin_server_ts`, so two creates of a room by one user with the same content in the same
+    /// millisecond are one event with one ID; an opaque ID minted at random could, in principle,
+    /// be one a room already has. The create event's write ([`PersistKind::NewRoom`]) refuses an
+    /// ID `Tables::room_meta` already holds, inside the transaction that would claim it, and a
+    /// refused ID is one more attempt: a hash-derived ID is rebuilt with its create event a
+    /// random 1 to 1,024 ms further back (Synapse perturbs the timestamp the same way), a
+    /// minted one is minted again (`info`, and `hs_room_create_room_id_taken_total`). A room is
+    /// never answered with one that already existed. An ID the caller chose is not replaced: a
+    /// taken one is [`RoomError::RoomAlreadyExists`].
+    ///
+    /// Each attempt is a hash and a signature, no I/O except the claim of an ID placed here,
+    /// and about as many attempts as there are replicas are expected. They are bounded, placing
+    /// and claiming together, by [`MAX_ID_ATTEMPTS_PER_SHARD`] times the number of room shards
+    /// (one shard when no fencing is installed); running out (a replica that owns no room shard
+    /// at all) is [`RoomError::Fenced`], a `503` the client retries. The fence is installed on
+    /// the new actor before its create event is persisted, so the whole creation burst is
+    /// fenced like every later write. The attempts taken are observed in
+    /// `hs_room_create_room_id_attempts`.
     ///
     /// # Errors
-    /// As [`RoomActor::create`], plus [`RoomError::Fenced`] when no ID could be placed here.
+    /// As [`RoomActor::create`], plus [`RoomError::Fenced`] when no new ID could be placed here
+    /// within the bound, and [`RoomError::RoomAlreadyExists`] when the chosen `room_id` of an
+    /// opaque-ID version is one a room already has.
     #[allow(clippy::too_many_arguments)]
     pub fn create_placed(
         backend: B,
@@ -489,7 +515,9 @@ impl<B: KvBackend> RoomActor<B> {
         let rules = room_version::rules_for(&room_version)
             .ok_or_else(|| RoomError::UnsupportedRoomVersion(room_version.as_str().to_owned()))?;
 
-        let store = ProductionStateStore::open(room_version.clone(), backend.clone())
+        // Moved into the actor shell of each ID claimed, and taken back from it when the claim
+        // finds the ID taken.
+        let mut store = ProductionStateStore::open(room_version.clone(), backend.clone())
             .map_err(|e| RoomError::State(e.to_string()))?;
 
         let owned_here = |id: &RoomId| {
@@ -497,18 +525,19 @@ impl<B: KvBackend> RoomActor<B> {
                 .as_deref()
                 .is_none_or(|f| f.ownership.is_mine(f.layout.room_shard(id.as_str())))
         };
-        let max_attempts = fencing.as_deref().map_or(1, |f| {
-            MAX_ID_ATTEMPTS_PER_SHARD.saturating_mul(f.layout.rooms.max(1))
-        });
+        // One bound for placing and claiming: with no fencing installed every ID is placed here
+        // at once, and only IDs already taken use attempts.
+        let max_attempts = MAX_ID_ATTEMPTS_PER_SHARD
+            .saturating_mul(fencing.as_deref().map_or(1, |f| f.layout.rooms.max(1)));
         let hash_based = rules.room_id_format == RoomIdFormat::V2HashBased;
 
-        let empty_events: HashMap<EventSn, Event> = HashMap::new();
-        let empty_view = RoomStateView {
-            store: &store,
-            root: store.empty_root(),
-            bodies: EventMap(&empty_events),
-        };
-        let build = |room_id_arg: Option<&RoomId>, ts: i64| {
+        let build = |store: &ProductionStateStore<B>, room_id_arg: Option<&RoomId>, ts: i64| {
+            let empty_events: HashMap<EventSn, Event> = HashMap::new();
+            let empty_view = RoomStateView {
+                store,
+                root: store.empty_root(),
+                bodies: EventMap(&empty_events),
+            };
             pipeline::build_and_authorize(
                 &room_version,
                 &rules,
@@ -529,69 +558,106 @@ impl<B: KvBackend> RoomActor<B> {
         };
 
         let mut attempts: u32 = 0;
-        let (final_room_id, create_event) = loop {
+        let mut taken: u32 = 0;
+        // The version-12 create event's `origin_server_ts`. Earlier rather than later on each
+        // attempt: the create event must not look newer than the creator's join and the
+        // preset's state, which are stamped `now_ms`.
+        let mut ts = now_ms;
+        loop {
             attempts += 1;
-            if hash_based {
-                // Earlier rather than later: the create event must not look newer than the
-                // creator's join and the preset's state, which are stamped `now_ms`.
-                let ts = now_ms.saturating_sub(i64::from(attempts - 1));
-                let event = build(None, ts)?;
+            // How far back the next attempt's create event goes: a millisecond after an ID
+            // placed elsewhere; after a taken one, a random 1 to 1,024 ms. The IDs just below a
+            // taken one are likely the same creator's other rooms of the same burst -- every
+            // identical create walks the same deterministic path from the same `now_ms` -- and
+            // a walk one millisecond at a time would try each of them in turn; a random jump
+            // lands where the burst has left no rooms, and two creates that collided once do
+            // not collide again.
+            let mut step: i64 = 1;
+            let placed = if hash_based {
+                let event = build(&store, None, ts)?;
                 let hash = event.reference_hash().map_err(RoomError::from)?;
                 let hash_b64 = hs_model::hash::encode_reference_hash(&hash, &rules);
                 let id = ruma::RoomId::new_v2(&hash_b64)
                     .map_err(|e| RoomError::Internal(e.to_string()))?;
-                if owned_here(&id) {
-                    break (id, event);
-                }
+                owned_here(&id).then_some((id, event))
             } else if let Some(chosen) = &room_id {
-                break (chosen.clone(), build(Some(chosen), now_ms)?);
+                Some((chosen.clone(), build(&store, Some(chosen), now_ms)?))
             } else {
                 let id = RoomId::new_v1(&identity.server_name);
                 if owned_here(&id) {
-                    let event = build(Some(&id), now_ms)?;
-                    break (id, event);
+                    let event = build(&store, Some(&id), now_ms)?;
+                    Some((id, event))
+                } else {
+                    None
+                }
+            };
+
+            if let Some((id, create_event)) = placed {
+                // Claim the ID by writing the create event under it: the write refuses an ID a
+                // room already has, in the transaction that would otherwise take it.
+                let room_sn = Self::intern_room(&backend, &tables, &id)?;
+                let mut actor = Self::new_shell(
+                    backend.clone(),
+                    tables.clone(),
+                    identity.clone(),
+                    room_sn,
+                    id,
+                    room_version.clone(),
+                    rules,
+                    store,
+                );
+                actor.set_fencing(fencing.clone());
+                match actor.persist_with(create_event, PersistKind::NewRoom) {
+                    Ok(_) => {
+                        if attempts > 1 {
+                            tracing::debug!(
+                                room_id = %actor.room_id,
+                                attempts,
+                                ids_taken = taken,
+                                "placed a new room's id on a room shard this replica owns"
+                            );
+                        }
+                        // Counted once the create event is written: a create the fence refused
+                        // (ownership moved after the id was placed) built no room here, and
+                        // `hs-cli`'s gate makes it again wherever the shard now is.
+                        crate::metrics::observe_create_room_id_attempts(attempts);
+                        return Ok(actor);
+                    }
+                    Err(RoomError::RoomAlreadyExists(_)) if room_id.is_none() || hash_based => {
+                        taken += 1;
+                        step = rand::Rng::random_range(&mut rand::rng(), 1..=1024);
+                        crate::metrics::count_create_room_id_taken();
+                        tracing::info!(
+                            room_id = %actor.room_id,
+                            %creator,
+                            attempts,
+                            "a new room's id was already a room's (the same creator and content \
+                             in the same millisecond); building another"
+                        );
+                        // Nothing was written and nothing in the shell changed: its state store
+                        // goes on to the next attempt.
+                        store = actor.store;
+                    }
+                    Err(e) => return Err(e),
                 }
             }
+
             if attempts >= max_attempts {
                 crate::metrics::observe_create_room_id_attempts(attempts);
                 tracing::warn!(
                     attempts,
+                    ids_taken = taken,
                     room_version = %room_version,
-                    "no new room id hashed to a room shard this replica owns; refusing the \
-                     create so that the client retries (decision 0020)"
+                    "no new room id both hashed to a room shard this replica owns and was free; \
+                     refusing the create so that the client retries (decision 0020)"
                 );
                 return Err(RoomError::Fenced(format!(
-                    "no new room id hashed to a room shard this replica owns after {attempts} \
-                     attempts"
+                    "no new room id both hashed to a room shard this replica owns and was free \
+                     after {attempts} attempts ({taken} taken)"
                 )));
             }
-        };
-        if attempts > 1 {
-            tracing::debug!(
-                room_id = %final_room_id,
-                attempts,
-                "placed a new room's id on a room shard this replica owns"
-            );
+            ts = ts.saturating_sub(step);
         }
-
-        let room_sn = Self::intern_room(&backend, &tables, &final_room_id)?;
-        let mut actor = Self::new_shell(
-            backend,
-            tables,
-            identity,
-            room_sn,
-            final_room_id,
-            room_version,
-            rules,
-            store,
-        );
-        actor.set_fencing(fencing);
-        actor.persist(create_event)?;
-        // Counted once the create event is written: a create the fence refused (ownership
-        // moved after the id was placed) built no room here, and `hs-cli`'s gate makes it again
-        // wherever the shard now is.
-        crate::metrics::observe_create_room_id_attempts(attempts);
-        Ok(actor)
     }
 
     /// An actor holding no events at all: the common starting point of every construction path
@@ -1695,6 +1761,9 @@ impl<B: KvBackend> RoomActor<B> {
     /// Everything else -- the timeline entry, `Tables::room_meta` for the
     /// room's first timeline event (outliers persisted before it do not count), the membership
     /// index, the fencing check, the [`RoomUpdate`] with its `membership_deltas` -- is the same.
+    /// A [`PersistKind::NewRoom`] differs from an ordinary event only in that its transaction
+    /// refuses an ID a room already has, with [`RoomError::RoomAlreadyExists`] and nothing
+    /// written or changed in memory.
     fn persist_with(&mut self, event: Event, kind: PersistKind) -> Result<EventSn, RoomError> {
         if self.deleted {
             return Err(RoomError::RoomNotFound(self.room_id.to_string()));
@@ -1746,7 +1815,7 @@ impl<B: KvBackend> RoomActor<B> {
         // stretch of the room's history this server was not there for. Positions are reserved
         // below it for that history (`crate::actor::gaps`), and the gap is recorded with it.
         let gap_below = match &kind {
-            PersistKind::Ordinary => None,
+            PersistKind::Ordinary | PersistKind::NewRoom => None,
             PersistKind::RemoteJoin { .. } => self.gap_below_for(&event),
         };
         let room_pos = match gap_below {
@@ -1789,7 +1858,7 @@ impl<B: KvBackend> RoomActor<B> {
             .copied()
             .collect();
         let old_extremities: Vec<EventSn> = match &kind {
-            PersistKind::Ordinary => prev_sns
+            PersistKind::Ordinary | PersistKind::NewRoom => prev_sns
                 .iter()
                 .copied()
                 .filter(|sn| self.forward_extremities.contains(sn))
@@ -1797,16 +1866,33 @@ impl<B: KvBackend> RoomActor<B> {
             PersistKind::RemoteJoin { .. } => self.forward_extremities_vec(),
         };
         let snapshot_bytes = match &kind {
-            PersistKind::Ordinary => None,
+            PersistKind::Ordinary | PersistKind::NewRoom => None,
             PersistKind::RemoteJoin { snapshot } => Some(encode_event_sns(snapshot)),
         };
+        let must_be_new = matches!(kind, PersistKind::NewRoom);
 
         // Set from inside the `transact` closure below when the cluster-fencing check fails, so
         // the failure can be reported as `RoomError::Fenced` with its real message rather than
         // the generic `hs_kv::KvError::Aborted` it must travel through `transact`'s fixed error
         // type as (see `crate::fencing::RoomFencing::check`'s own doc comment).
         let fence_failure: std::cell::Cell<Option<String>> = std::cell::Cell::new(None);
+        // Set from inside the closure, like `fence_failure`, when a new room's ID turns out to
+        // be one a room already has (`PersistKind::NewRoom`).
+        let id_taken = std::cell::Cell::new(false);
         let event_sn = transact(&self.backend, TransactConfig::default(), |txn| {
+            if must_be_new
+                && self
+                    .tables
+                    .room_meta
+                    .get(txn, &(room_sn,))
+                    .map_err(to_kv)?
+                    .is_some()
+            {
+                id_taken.set(true);
+                return Err(hs_kv::KvError::Aborted(Box::new(std::io::Error::other(
+                    "a room already has this id",
+                ))));
+            }
             let event_sn = self.tables.event_sn.get_or_create(txn, &event_id_bytes)?;
             if let Some(meta_bytes) = &room_meta_bytes {
                 self.tables
@@ -1881,6 +1967,7 @@ impl<B: KvBackend> RoomActor<B> {
         })
         .map_err(|e| match fence_failure.take() {
             Some(msg) => RoomError::Fenced(msg),
+            None if id_taken.get() => RoomError::RoomAlreadyExists(self.room_id.to_string()),
             None => RoomError::from(e),
         })?;
 
@@ -1893,7 +1980,7 @@ impl<B: KvBackend> RoomActor<B> {
         // the flat map it replaces had no separate store to fall out of sync with). Recorded in
         // this crate's status file rather than silently accepted.
         match &kind {
-            PersistKind::Ordinary => {
+            PersistKind::Ordinary | PersistKind::NewRoom => {
                 self.feed_store(&event, event_sn)?;
             }
             PersistKind::RemoteJoin { snapshot } => {

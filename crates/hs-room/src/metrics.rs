@@ -1,5 +1,6 @@
 //! Process-wide metrics of this crate that are not about moderation (`crate::moderation` has
-//! its own): how many attempts placing a new room's ID took, room upgrades, and the room-event search index.
+//! its own): how many attempts placing a new room's ID took and how many IDs were found taken,
+//! room upgrades, and the room-event search index.
 //!
 //! Process-wide statics, like `crate::moderation`'s: the code that observes them runs inside a
 //! room actor's blocking construction or a background task with no registry at hand, and a
@@ -19,6 +20,12 @@ use prometheus_client::metrics::histogram::Histogram;
 /// replicas in a cluster).
 static CREATE_ROOM_ID_ATTEMPTS: LazyLock<Histogram> =
     LazyLock::new(|| Histogram::new([1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 256.0, 1024.0, 4096.0]));
+
+/// `hs_room_create_room_id_taken_total`: room IDs `RoomActor::create_placed` built for a new
+/// room that a room already had -- a version-12 create identical to an earlier one (the same
+/// creator and content in the same millisecond), or a minted opaque ID that was not new. Each
+/// is one of the attempts `hs_room_create_room_id_attempts` counts, and was built again.
+static CREATE_ROOM_ID_TAKEN: LazyLock<Counter> = LazyLock::new(Counter::default);
 
 /// `hs_room_search_indexed_events_total`: events whose words this replica wrote to the index.
 static SEARCH_INDEXED_EVENTS: LazyLock<Counter> = LazyLock::new(Counter::default);
@@ -74,6 +81,17 @@ pub(crate) fn count_room_upgrade(outcome: &str) {
         .inc();
 }
 
+/// Counts one new room's ID found already taken in `hs_room_create_room_id_taken_total`.
+pub(crate) fn count_create_room_id_taken() {
+    CREATE_ROOM_ID_TAKEN.inc();
+}
+
+/// `hs_room_create_room_id_taken_total` as it stands, for tests.
+#[cfg(test)]
+pub(crate) fn create_room_id_taken() -> u64 {
+    CREATE_ROOM_ID_TAKEN.get()
+}
+
 /// Counts `added` newly indexed events and records that the index holds `documents`.
 pub(crate) fn search_indexed(added: u64, documents: i64) {
     SEARCH_INDEXED_EVENTS.inc_by(added);
@@ -97,19 +115,28 @@ pub(crate) fn observe_search_duration(elapsed: std::time::Duration) {
 }
 
 /// Registers this module's metrics into `registry`: `hs_room_create_room_id_attempts` (decision
-/// 0020), `hs_room_upgrades_total`, and the search index's `hs_room_search_indexed_events_total`,
-/// `hs_room_search_index_documents`, `hs_room_search_rooms_behind`,
-/// `hs_room_search_index_delay_seconds` and `hs_room_search_duration_seconds` (decision 0021).
+/// 0020), `hs_room_create_room_id_taken_total`, `hs_room_upgrades_total`, and the search index's
+/// `hs_room_search_indexed_events_total`, `hs_room_search_index_documents`,
+/// `hs_room_search_rooms_behind`, `hs_room_search_index_delay_seconds` and
+/// `hs_room_search_duration_seconds` (decision 0021).
 pub fn register_metrics(registry: &mut prometheus_client::registry::Registry) {
     registry.register(
         "hs_room_create_room_id_attempts",
-        "Room IDs built per room creation before one hashed to a room shard this replica owns",
+        "Room IDs built per room creation before one hashed to a room shard this replica owns \
+         and was not already a room's",
         CREATE_ROOM_ID_ATTEMPTS.clone(),
     );
     registry.register(
         "hs_room_upgrades",
         "Room upgrades this replica ran, by outcome (completed, replacement_orphaned)",
         ROOM_UPGRADES.clone(),
+    );
+    // Registered without `_total`: the text encoder appends it.
+    registry.register(
+        "hs_room_create_room_id_taken",
+        "Room IDs built for a new room that a room already had (the same creator and content \
+         in the same millisecond), each built again",
+        CREATE_ROOM_ID_TAKEN.clone(),
     );
     // Registered without `_total`: the text encoder appends it.
     registry.register(
