@@ -14,7 +14,13 @@ name: cd
 # |---|---|---|---|---|
 # | push to `main` | yes, tagged `main` and the commit sha | no | yes, a pre-release pinned to that image | yes |
 # | tag `v*` | yes, tagged with the version and `latest` | yes, attached to the release | yes | yes |
-# | manual dispatch | yes, tagged `manual-<sha>` | if asked | no | only if asked |
+# | manual dispatch | unless `images` is off | if asked | no | only if asked |
+#
+# A manual dispatch with `binaries` on and `images` off is the release binaries' dry run: the
+# same matrix a `v*` tag runs -- the management interface built with Node, embedded, the binary
+# booted and its `/admin/` checked -- uploaded as workflow artifacts, with no tag, no GitHub
+# release and nothing pushed. `gh workflow run cd --ref <branch> -f binaries=true -f images=false`
+# (the gate below still waits for CI to pass on that commit first).
 #
 # # Why the image is built twice over
 #
@@ -52,6 +58,10 @@ on:
         description: "Also build standalone binaries"
         type: boolean
         default: false
+      images:
+        description: "Build and smoke-test the images (off for a binaries-only dry run)"
+        type: boolean
+        default: true
 
 concurrency:
   group: cd-${{ github.ref }}
@@ -123,6 +133,7 @@ jobs:
   image:
     name: image (${{ matrix.arch }})
     needs: gate
+    if: github.event_name != 'workflow_dispatch' || inputs.images
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -373,13 +384,57 @@ jobs:
         env:
           HS_ADMIN_WEB_DIST: ${{ github.workspace }}/web/dist
 
-      - name: Check the binary runs and reports its version
-        run: ./target/${{ matrix.target }}/release/hs --version || true
+      - name: Check the binary serves, and that /admin/ is the interface it embedded
+        # The binary is the release, so it is booted rather than asked for a version (which `hs`
+        # does not have a flag for: the `--version || true` this replaced always "passed"). The
+        # same checks as the image's smoke test: it answers /health/live, /admin/ is the
+        # management interface (not the page saying it was left out; both answer 200), and a new
+        # server logs its setup link. Native runners for every target, so it really executes.
+        run: |
+          set -euo pipefail
+          bin="./target/${{ matrix.target }}/release/hs"
+          data="$(mktemp -d)"
+          "$bin" serve --data-dir "$data" --server-name smoke.invalid > serve.log 2>&1 &
+          pid=$!
+          ok=0
+          for _ in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:8008/health/live >/dev/null; then ok=1; break; fi
+            sleep 2
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "the binary never answered /health/live; its log follows" >&2
+            cat serve.log >&2
+            kill "$pid" 2>/dev/null || true
+            exit 1
+          fi
+          admin="$(curl -sf http://127.0.0.1:8008/admin/)"
+          if ! printf '%s' "$admin" | grep -q '<div id="root">'; then
+            echo "/admin/ is not the management interface; it served:" >&2
+            printf '%s\n' "$admin" | head -20 >&2
+            kill "$pid" 2>/dev/null || true
+            exit 1
+          fi
+          if ! grep -q 'setup_link' serve.log; then
+            echo "the first boot did not log a setup link; its log follows" >&2
+            cat serve.log >&2
+            kill "$pid" 2>/dev/null || true
+            exit 1
+          fi
+          echo "the binary serves, /admin/ is the interface, and the log offers a setup link"
+          kill "$pid"
+          wait "$pid" 2>/dev/null || true
 
       - name: Package
         run: |
           set -euo pipefail
-          dir="myelin-${{ github.ref_name }}-${{ matrix.target }}"
+          # The tag on a release; on a manual dry run the ref is a branch, which may hold a `/`
+          # (agent/x), so the archive is named for the commit instead.
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            label="$GITHUB_REF_NAME"
+          else
+            label="manual-${GITHUB_SHA::12}"
+          fi
+          dir="myelin-${label}-${{ matrix.target }}"
           mkdir -p "$dir"
           cp "target/${{ matrix.target }}/release/hs" "$dir/"
           cp README.md LICENSE "$dir/" 2>/dev/null || true
