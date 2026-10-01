@@ -35,6 +35,8 @@ pub mod gaps;
 mod history;
 #[cfg(test)]
 mod new_room_ids;
+pub mod redactions;
+mod rejected;
 
 /// Timeline events with their room-local positions, as [`RoomActor::events_around`] answers.
 pub type PositionedEvents<'a> = Vec<(i64, &'a Event)>;
@@ -360,6 +362,11 @@ pub struct RoomActor<B: KvBackend> {
     rejected_history: HashSet<OwnedEventId>,
     /// `target_event_id -> [child EventSn]`, insertion order, for `crate::relations`.
     relations_by_target: HashMap<OwnedEventId, Vec<EventSn>>,
+    /// `target_event_id -> [m.room.redaction event IDs]`, in the order they were stored: every
+    /// redaction held, by the event it names, whether that event is held or not. Rebuilt from the
+    /// stored redactions on load, so a redaction that arrived before its event is still applied
+    /// when the event comes after a restart (`redactions`).
+    redactions_by_target: HashMap<OwnedEventId, Vec<OwnedEventId>>,
     /// `(sender, device_id-or-empty, txn_id) -> event_id`: transaction-ID deduplication for
     /// `PUT .../send/{txnId}` and `PUT .../redact/{txnId}` (client-server API "Transaction
     /// identifiers": replaying the same `txnId` must return the same `event_id`, not send a
@@ -389,6 +396,9 @@ pub struct RoomActor<B: KvBackend> {
     /// `crate::actor::admin_ops`): held as redacted skeletons so the room's graph and state stay
     /// whole, fed to the state store, and out of the timeline and every read.
     purged: HashSet<EventSn>,
+    /// Events held as rejected by event authorization (`rejected`): indexed by ID, hidden from
+    /// every read, placed nowhere.
+    rejected: HashSet<EventSn>,
     /// Set once an administrator has deleted this room (`crate::actor::admin_ops`). A handle
     /// somebody still holds refuses every write from then on, so nothing can be written into a
     /// room whose records are being removed.
@@ -703,10 +713,12 @@ impl<B: KvBackend> RoomActor<B> {
             placed_outlier_roots: HashMap::new(),
             rejected_history: HashSet::new(),
             relations_by_target: HashMap::new(),
+            redactions_by_target: HashMap::new(),
             txn_dedup: HashMap::new(),
             event_txn: HashMap::new(),
             forgotten: HashSet::new(),
             purged: HashSet::new(),
+            rejected: HashSet::new(),
             deleted: false,
             publish,
             global: None,
@@ -842,6 +854,12 @@ impl<B: KvBackend> RoomActor<B> {
         }
         outliers.sort_by(|(_, a), (_, b)| topological_order(a, b));
         for (sn, event) in outliers {
+            // An event stored as rejected (`rejected`) shares the outliers' index and nothing
+            // else: it is not fed to the state store.
+            if event.header().flags.is_rejected() {
+                actor.absorb_rejected(sn, event);
+                continue;
+            }
             actor.absorb_loaded_outlier(sn, event)?;
         }
 
@@ -923,6 +941,7 @@ impl<B: KvBackend> RoomActor<B> {
             gap_rows.push((top, record));
         }
         actor.restore_gaps(gap_rows);
+        actor.name_redactions_on_load();
 
         Ok(Some(actor))
     }
@@ -1035,6 +1054,8 @@ impl<B: KvBackend> RoomActor<B> {
             .filter_map(|id| self.event_id_index.get(id))
             .copied()
             .collect();
+        // A rejected prev event was never fed to the store; it stands for its own prev events.
+        let prev_sns = self.effective_prev_sns(&prev_sns);
         let auth_sns: Vec<EventSn> = pipeline::decode_event_ids(event.json().get("auth_events"))
             .iter()
             .filter_map(|id| self.event_id_index.get(id))
@@ -1099,6 +1120,7 @@ impl<B: KvBackend> RoomActor<B> {
             None => self.feed_store(&event, event_sn)?,
         };
         self.events.insert(event_sn, event);
+        self.note_redaction_at(event_sn);
         Ok(())
     }
 
@@ -1565,11 +1587,10 @@ impl<B: KvBackend> RoomActor<B> {
     ///    representation this crate does not have. Every rejection this method produces is
     ///    therefore a hard rejection.
     ///
-    /// A failure of either implemented check means the event is **refused outright and not
-    /// persisted at all** (`RoomError::Forbidden`) -- this session's documented choice over
-    /// storing it with a rejected flag (`hs_model::event::EventFlags` already has one, unused
-    /// here): nothing yet reads a "stored but rejected" event back out, so storing one would be
-    /// silent dead weight. Revisit once soft-fail support needs the flag.
+    /// A failure of either implemented check means the event is **refused** (`RoomError::Forbidden`)
+    /// and, since 2026-10-01, **stored as rejected** (`rejected`): flagged, placed nowhere,
+    /// hidden from every read, but held, so that a later event citing it is answered
+    /// consistently rather than with "missing ancestors" and a fetch of the same rejected event.
     ///
     /// # Idempotency and ordering
     /// Receiving the same `event.event_id()` twice returns [`RemoteEventOutcome::AlreadyKnown`]
@@ -1611,97 +1632,15 @@ impl<B: KvBackend> RoomActor<B> {
             return Err(RoomError::MissingAncestors(missing));
         }
 
-        {
-            let mut auth_flat = FlatState::new();
-            let mut auth_event_refs = Vec::with_capacity(auth_sns.len());
-            for &sn in &auth_sns {
-                let e = self
-                    .events
-                    .get(&sn)
-                    .ok_or_else(|| RoomError::Internal("auth event not in hot cache".into()))?;
-                let content = e
-                    .json()
-                    .get("content")
-                    .and_then(CanonicalJsonValue::as_object)
-                    .cloned()
-                    .unwrap_or_default();
-                auth_flat.insert(
-                    e.header().event_type.clone(),
-                    e.header().state_key.clone().unwrap_or_default(),
-                    e.header().sender.clone(),
-                    content,
-                );
-                auth_event_refs.push(AuthEventRef {
-                    event_type: &e.header().event_type,
-                    state_key: e.header().state_key.as_deref().unwrap_or(""),
-                    rejected: e.header().flags.is_rejected(),
-                });
+        match self.authorize_remote(&event, &prev_sns, &auth_sns) {
+            Ok(()) => {}
+            Err(RoomError::Forbidden(reason)) => {
+                if let Err(error) = self.store_rejected(event, &reason) {
+                    tracing::warn!(room_id = %self.room_id, %error, "could not store a rejected event");
+                }
+                return Err(RoomError::Forbidden(reason));
             }
-
-            // From room version 12 (MSC4291) the create event is never among `auth_events`:
-            // its ID is the room ID, and every event is authorised as if it cited it.
-            if self.rules.room_create_event_id_as_room_id
-                && let Some(create) = self.state_event("m.room.create", "")?
-            {
-                auth_flat.insert(
-                    create.header().event_type.clone(),
-                    String::new(),
-                    create.header().sender.clone(),
-                    create
-                        .json()
-                        .get("content")
-                        .and_then(CanonicalJsonValue::as_object)
-                        .cloned()
-                        .unwrap_or_default(),
-                );
-            }
-
-            let content_obj = event
-                .json()
-                .get("content")
-                .and_then(CanonicalJsonValue::as_object)
-                .cloned()
-                .unwrap_or_default();
-            let redacts_owned = extract_redacts(&event);
-            let only_prev_is_create = prev_sns.len() == 1
-                && self
-                    .events
-                    .get(&prev_sns[0])
-                    .is_some_and(|e| e.header().event_type == "m.room.create");
-
-            let incoming = IncomingEvent {
-                event_type: &event.header().event_type,
-                sender: AsRef::<UserId>::as_ref(&event.header().sender),
-                room_id: Some(&self.room_id),
-                state_key: event.header().state_key.as_deref(),
-                content: &content_obj,
-                prev_event_count: prev_sns.len(),
-                only_prev_event_is_room_create: only_prev_is_create,
-                event_id: Some(event.event_id()),
-                redacts: redacts_owned.as_deref(),
-            };
-
-            let state_before = self.state_view(&prev_sns)?;
-            let create_lookup = || {
-                state_before
-                    .event_for("m.room.create", "")
-                    .map(|found| found.is_some())
-                    .map_err(|e| AuthError::reject(e.to_string()))
-            };
-            auth::check_auth_events_selection(
-                &self.rules,
-                &incoming,
-                &auth_event_refs,
-                create_lookup,
-            )
-            .map_err(RoomError::from)?;
-
-            auth::check_event_auth(&self.rules, &incoming, &auth_flat).map_err(|e| {
-                RoomError::Forbidden(format!("auth-events-implied state rejected event: {e}"))
-            })?;
-            auth::check_event_auth(&self.rules, &incoming, &state_before.state_fetch()).map_err(
-                |e| RoomError::Forbidden(format!("state-before-the-event rejected event: {e}")),
-            )?;
+            Err(other) => return Err(other),
         }
 
         let redaction = (event.header().event_type == "m.room.redaction")
@@ -1717,51 +1656,106 @@ impl<B: KvBackend> RoomActor<B> {
         Ok(RemoteEventOutcome::Stored(event_sn))
     }
 
-    /// Applies a redaction received from another server to the event it names, when this room
-    /// holds that event and the redaction may take effect: the sender's server is the original
-    /// sender's (the spec's rule for room version 3 on, under which the auth rules admit any
-    /// member's redaction), or [`RoomActor::may_redact`] allows it (their own event, or the
-    /// room's redact power level, read from the current power levels). Before 2026-10-01 a
-    /// redaction arriving over federation was stored and never applied, so the redacted
-    /// message kept its content here. A redaction that may not take effect, or whose target is
-    /// not held, is stored and left unapplied; that is logged, not an error, since the
-    /// redaction event itself was accepted.
-    fn apply_received_redaction(
-        &mut self,
-        sender: &UserId,
-        target: &EventId,
-        redaction_id: &EventId,
-    ) {
-        let Some(original) = self.event_by_id(target) else {
-            tracing::debug!(
-                room_id = %self.room_id,
-                redaction = %redaction_id,
-                target = %target,
-                "a received redaction names an event this room does not hold; not applied"
+    /// The first two of the spec's three receipt checks for `event` (see
+    /// [`RoomActor::accept_remote_event`]): against the state its own `auth_events` imply, and
+    /// against the state before it, resolved from `prev_sns` (rejected events stand for their own
+    /// prev events, `rejected`).
+    ///
+    /// # Errors
+    /// [`RoomError::Forbidden`] if either check rejects it; [`RoomError::Internal`] or
+    /// [`RoomError::State`] if the state cannot be read.
+    fn authorize_remote(
+        &self,
+        event: &Event,
+        prev_sns: &[EventSn],
+        auth_sns: &[EventSn],
+    ) -> Result<(), RoomError> {
+        let mut auth_flat = FlatState::new();
+        let mut auth_event_refs = Vec::with_capacity(auth_sns.len());
+        for &sn in auth_sns {
+            let e = self
+                .events
+                .get(&sn)
+                .ok_or_else(|| RoomError::Internal("auth event not in hot cache".into()))?;
+            let content = e
+                .json()
+                .get("content")
+                .and_then(CanonicalJsonValue::as_object)
+                .cloned()
+                .unwrap_or_default();
+            auth_flat.insert(
+                e.header().event_type.clone(),
+                e.header().state_key.clone().unwrap_or_default(),
+                e.header().sender.clone(),
+                content,
             );
-            return;
+            auth_event_refs.push(AuthEventRef {
+                event_type: &e.header().event_type,
+                state_key: e.header().state_key.as_deref().unwrap_or(""),
+                rejected: e.header().flags.is_rejected(),
+            });
+        }
+
+        // From room version 12 (MSC4291) the create event is never among `auth_events`:
+        // its ID is the room ID, and every event is authorised as if it cited it.
+        if self.rules.room_create_event_id_as_room_id
+            && let Some(create) = self.state_event("m.room.create", "")?
+        {
+            auth_flat.insert(
+                create.header().event_type.clone(),
+                String::new(),
+                create.header().sender.clone(),
+                create
+                    .json()
+                    .get("content")
+                    .and_then(CanonicalJsonValue::as_object)
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+        }
+
+        let content_obj = event
+            .json()
+            .get("content")
+            .and_then(CanonicalJsonValue::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let redacts_owned = extract_redacts(event);
+        let only_prev_is_create = prev_sns.len() == 1
+            && self
+                .events
+                .get(&prev_sns[0])
+                .is_some_and(|e| e.header().event_type == "m.room.create");
+
+        let incoming = IncomingEvent {
+            event_type: &event.header().event_type,
+            sender: AsRef::<UserId>::as_ref(&event.header().sender),
+            room_id: Some(&self.room_id),
+            state_key: event.header().state_key.as_deref(),
+            content: &content_obj,
+            prev_event_count: prev_sns.len(),
+            only_prev_event_is_room_create: only_prev_is_create,
+            event_id: Some(event.event_id()),
+            redacts: redacts_owned.as_deref(),
         };
-        let same_server = original.header().sender.server_name() == sender.server_name();
-        let allowed = same_server || self.may_redact(sender, target).unwrap_or(false);
-        if !allowed {
-            tracing::info!(
-                room_id = %self.room_id,
-                redaction = %redaction_id,
-                target = %target,
-                sender = %sender,
-                "a received redaction is not allowed to take effect; stored, not applied"
-            );
-            return;
-        }
-        if let Err(error) = self.apply_redaction(target) {
-            tracing::warn!(
-                room_id = %self.room_id,
-                redaction = %redaction_id,
-                target = %target,
-                %error,
-                "could not apply a received redaction"
-            );
-        }
+
+        let state_before = self.state_view(&self.effective_prev_sns(prev_sns))?;
+        let create_lookup = || {
+            state_before
+                .event_for("m.room.create", "")
+                .map(|found| found.is_some())
+                .map_err(|e| AuthError::reject(e.to_string()))
+        };
+        auth::check_auth_events_selection(&self.rules, &incoming, &auth_event_refs, create_lookup)
+            .map_err(RoomError::from)?;
+
+        auth::check_event_auth(&self.rules, &incoming, &auth_flat).map_err(|e| {
+            RoomError::Forbidden(format!("auth-events-implied state rejected event: {e}"))
+        })?;
+        auth::check_event_auth(&self.rules, &incoming, &state_before.state_fetch()).map_err(
+            |e| RoomError::Forbidden(format!("state-before-the-event rejected event: {e}")),
+        )?;
+        Ok(())
     }
 
     /// Imports an event copied from another implementation's database for this same server
@@ -2111,9 +2105,13 @@ impl<B: KvBackend> RoomActor<B> {
             global_seq: 0,
         };
         self.events.insert(event_sn, event);
+        self.note_redaction_at(event_sn);
         if self.quiet {
             return Ok(event_sn);
         }
+        // A redaction that arrived before this event takes effect now (`redactions`). The
+        // importer, quiet, applies the redactions it copies itself.
+        self.apply_waiting_redactions(&update.event_id);
         // A broadcast send fails only when there are no subscribers, which is not an error: a
         // room with nobody listening yet (or right now) is normal.
         if let Some(global) = &self.global {
@@ -2350,6 +2348,7 @@ impl<B: KvBackend> RoomActor<B> {
         planned.reverse();
         let room_sn = self.room_sn;
         let mut added = 0usize;
+        let mut placed: Vec<OwnedEventId> = Vec::new();
         while !planned.is_empty() {
             let take = planned.len().min(OUTLIER_BATCH);
             let chunk: Vec<PlannedHistory> = planned.drain(..take).collect();
@@ -2468,9 +2467,23 @@ impl<B: KvBackend> RoomActor<B> {
                     self.index_relation(&p.event, sn);
                 }
                 self.feed_store_with_state(&p.event, sn, &state_sns)?;
+                placed.push(p.event.event_id().to_owned());
                 self.events.insert(sn, p.event);
+                self.note_redaction_at(sn);
                 added += 1;
             }
+        }
+        // History meets its redactions here as well: one placed for an event held (placed in
+        // this batch or before), and one held, waiting, for an event placed now (`redactions`).
+        for event_id in &placed {
+            let redaction = self.event_by_id(event_id).and_then(|event| {
+                (event.header().event_type == "m.room.redaction")
+                    .then(|| (event.header().sender.clone(), extract_redacts(event)))
+            });
+            if let Some((sender, Some(target))) = redaction {
+                self.apply_received_redaction(&sender, &target, event_id);
+            }
+            self.apply_waiting_redactions(event_id);
         }
         Ok(added)
     }
@@ -4345,7 +4358,7 @@ impl<B: KvBackend> RoomActor<B> {
     #[must_use]
     pub fn event_by_id(&self, event_id: &EventId) -> Option<&Event> {
         let sn = self.event_id_index.get(event_id)?;
-        if self.purged.contains(sn) {
+        if self.purged.contains(sn) || self.rejected.contains(sn) {
             return None;
         }
         self.events.get(sn)
@@ -5298,41 +5311,6 @@ impl<B: KvBackend> RoomActor<B> {
         self.publish.subscribe()
     }
 
-    /// Marks an event redacted (`hs_model::event::EventFlags::REDACTED`) and rewrites its stored
-    /// record. Does not itself authorize the redaction -- callers send the `m.room.redaction`
-    /// event through [`RoomActor::send_event`] first; this is the side effect of that event
-    /// having been accepted.
-    ///
-    /// # Errors
-    /// Returns [`RoomError::EventNotFound`] if `target` is not held by this actor, or
-    /// [`RoomError::Store`] on a storage failure.
-    pub fn apply_redaction(&mut self, target: &EventId) -> Result<(), RoomError> {
-        let sn = *self
-            .event_id_index
-            .get(target)
-            .ok_or_else(|| RoomError::EventNotFound(target.to_string()))?;
-        let event = self
-            .events
-            .get_mut(&sn)
-            .ok_or_else(|| RoomError::EventNotFound(target.to_string()))?;
-        event.flags_mut().set_redacted(true);
-        let flags = event.header().flags.to_byte();
-        let room_sn = self.room_sn;
-        transact(&self.backend, TransactConfig::default(), |txn| {
-            let Some(bytes) = self.tables.events.get(txn, &(sn,)).map_err(to_kv)? else {
-                return Ok(());
-            };
-            let mut persisted: PersistedEvent =
-                serde_json::from_slice(&bytes).map_err(hs_kv::KvError::backend)?;
-            persisted.flags = flags;
-            let bytes = serde_json::to_vec(&persisted).map_err(hs_kv::KvError::backend)?;
-            self.tables.events.put(txn, &(sn,), &bytes).map_err(to_kv)?;
-            let _ = room_sn;
-            Ok(())
-        })
-        .map_err(RoomError::from)
-    }
-
     fn dedup_key(
         sender: &UserId,
         device_id: Option<&ruma::DeviceId>,
@@ -5431,8 +5409,9 @@ impl<B: KvBackend> RoomActor<B> {
     /// leave this check to whoever applies it, so it is the only thing standing between a member
     /// at power 0 and every other member's messages. Until 2026-10-01 nothing made it, and such a
     /// member's redaction emptied the content for everyone (found by Sytest's
-    /// `tests/30rooms/10redactions.pl`). An event this room does not hold is left to
-    /// [`RoomActor::apply_redaction`], which refuses it.
+    /// `tests/30rooms/10redactions.pl`). For an event this room does not hold this answers
+    /// `true`: the redaction waits for the event, and is checked again when it comes
+    /// (`redactions`).
     ///
     /// # Errors
     /// Returns [`RoomError::Internal`] if the room's power levels cannot be read.
@@ -5466,12 +5445,14 @@ impl<B: KvBackend> RoomActor<B> {
     /// Sends a `{txnId}`-suffixed redaction (`PUT .../redact/{eventId}/{txnId}`) and applies its
     /// effect, deduplicating on `(sender, device, txnId)` the same way
     /// [`RoomActor::send_event_txn`] does. A redaction the sender may not make
-    /// ([`RoomActor::may_redact`]) is refused before anything is sent.
+    /// ([`RoomActor::may_redact`]) is refused before anything is sent. A redaction of an event
+    /// this room does not hold (yet) is sent, as Synapse sends it, and waits for the event
+    /// (`redactions`); it was answered `404` after being sent until 2026-10-01.
     ///
     /// # Errors
     /// Returns [`RoomError::Forbidden`] for a redaction of somebody else's event without the
     /// `redact` power level; otherwise see [`RoomActor::send_event`] and
-    /// [`RoomActor::apply_redaction`].
+    /// [`RoomActor::apply_redaction_by`].
     pub fn redact_txn(
         &mut self,
         sender: OwnedUserId,
@@ -5502,7 +5483,9 @@ impl<B: KvBackend> RoomActor<B> {
             Some(target.clone()),
             now_ms,
         )?;
-        self.apply_redaction(&target)?;
+        if self.event_by_id(&target).is_some() {
+            self.apply_redaction_by(&target, event.event_id())?;
+        }
         self.record_txn(&sender, device_id, txn_id, event.event_id());
         Ok(event)
     }
@@ -7466,6 +7449,227 @@ mod tests {
         );
     }
 
+    /// A redaction that arrives before the event it redacts waits for it -- across a reload,
+    /// since the redactions held are indexed again from the store -- and takes effect when the
+    /// event comes, naming itself in the event's `unsigned` so every client read renders
+    /// `redacted_because` and `redacted_by`. Until 2026-10-01 the event, arriving second, kept
+    /// its content forever, and no redacted event named its redaction.
+    #[test]
+    fn a_redaction_that_arrives_before_its_event_takes_effect_when_the_event_comes() {
+        let backend = MemoryBackend::new();
+        let tables = Tables::open(&backend).unwrap();
+        let identity = HomeserverIdentity::for_tests("hs1");
+        let mut actor = RoomActor::create_room(
+            backend.clone(),
+            tables.clone(),
+            identity.clone(),
+            user_id!("@alice:hs1").to_owned(),
+            CreateRoomRequest {
+                preset: Some("public_chat".to_owned()),
+                ..Default::default()
+            },
+            1,
+        )
+        .unwrap();
+        let bob = user_id!("@bob:remote.example");
+        actor
+            .membership_action(
+                bob.to_owned(),
+                Action::Join,
+                bob.to_owned(),
+                serde_json::json!({}),
+                2,
+            )
+            .unwrap();
+        let bob_key = hs_model::signing::SigningKeyPair::generate("1");
+        let bob_server = ruma::ServerName::parse("remote.example").unwrap();
+        // Both built against the same extremities: the redaction does not cite the message, as
+        // when it overtakes it on the way here.
+        let message = build_remote_message(&actor, bob, &bob_server, &bob_key, "regrettable");
+        let message_id = message.event_id().to_owned();
+        let redaction = build_remote_event(
+            &actor,
+            bob,
+            &bob_server,
+            &bob_key,
+            "m.room.redaction",
+            serde_json::json!({"redacts": message_id.as_str(), "reason": "oops"}),
+        );
+        let redaction_id = redaction.event_id().to_owned();
+        assert!(matches!(
+            actor.accept_remote_event(redaction).unwrap(),
+            RemoteEventOutcome::Stored(_)
+        ));
+        assert_eq!(actor.redactions_of(&message_id), [redaction_id.clone()]);
+
+        let room_id = actor.room_id().to_owned();
+        drop(actor);
+        let mut actor =
+            RoomActor::load(backend.clone(), tables.clone(), identity.clone(), &room_id)
+                .unwrap()
+                .expect("the room was persisted");
+        assert_eq!(
+            actor.redactions_of(&message_id),
+            [redaction_id.clone()],
+            "the redaction still waits after a reload"
+        );
+
+        actor.accept_remote_event(message).unwrap();
+        let held = actor.event_by_id(&message_id).unwrap();
+        assert!(
+            held.header().flags.is_redacted(),
+            "the waiting redaction took effect"
+        );
+        let rendered = crate::routes::render::client_event_json(held);
+        assert_eq!(rendered["content"], serde_json::json!({}), "{rendered}");
+        assert_eq!(rendered["unsigned"]["redacted_by"], redaction_id.as_str());
+        let because = &rendered["unsigned"]["redacted_because"];
+        assert_eq!(because["event_id"], redaction_id.as_str(), "{rendered}");
+        assert_eq!(because["redacts"], message_id.as_str(), "{rendered}");
+        assert_eq!(because["content"]["reason"], "oops", "{rendered}");
+        assert!(because.get("signatures").is_none(), "{rendered}");
+
+        // Durable: a reload reads the redacted event back with its redaction named.
+        drop(actor);
+        let actor = RoomActor::load(backend, tables, identity, &room_id)
+            .unwrap()
+            .expect("the room was persisted");
+        let rendered =
+            crate::routes::render::client_event_json(actor.event_by_id(&message_id).unwrap());
+        assert_eq!(rendered["unsigned"]["redacted_by"], redaction_id.as_str());
+        assert_eq!(
+            rendered["unsigned"]["redacted_because"]["event_id"],
+            redaction_id.as_str()
+        );
+    }
+
+    /// A local redaction names itself in the event it redacts, and a second redaction of the
+    /// same event does not replace the first.
+    #[test]
+    fn a_local_redaction_is_named_in_the_event_it_redacts_and_the_first_one_stays() {
+        let mut actor = room("public_chat");
+        let alice = user_id!("@alice:hs1");
+        let message = actor
+            .send_event(
+                alice.to_owned(),
+                "m.room.message".to_owned(),
+                None,
+                serde_json::json!({"msgtype": "m.text", "body": "oops"}),
+                None,
+                2,
+            )
+            .unwrap();
+        let first = actor
+            .redact_txn(
+                alice.to_owned(),
+                None,
+                "t1",
+                message.event_id().to_owned(),
+                None,
+                3,
+            )
+            .unwrap();
+        let second = actor
+            .redact_txn(
+                alice.to_owned(),
+                None,
+                "t2",
+                message.event_id().to_owned(),
+                None,
+                4,
+            )
+            .unwrap();
+        assert_ne!(first.event_id(), second.event_id());
+        let rendered = crate::routes::render::client_event_json(
+            actor.event_by_id(message.event_id()).unwrap(),
+        );
+        assert_eq!(
+            rendered["unsigned"]["redacted_by"],
+            first.event_id().as_str()
+        );
+        assert_eq!(
+            rendered["unsigned"]["redacted_because"]["sender"],
+            alice.as_str()
+        );
+        // A redaction of an event this room does not hold is sent, and waits.
+        let unknown = ruma::OwnedEventId::try_from("$not-here-yet").unwrap();
+        let pending = actor
+            .redact_txn(alice.to_owned(), None, "t3", unknown.clone(), None, 5)
+            .expect("a redaction of an unknown event is sent");
+        assert_eq!(
+            actor.redactions_of(&unknown),
+            [pending.event_id().to_owned()]
+        );
+    }
+
+    /// In rooms of version 1 and 2 a member below the redact level may redact an event whose ID
+    /// names the same server as the redaction's own ID. The redaction's ID was minted after the
+    /// auth check, so the rule never matched and bob's redaction of his own message was refused
+    /// with "m.room.redaction event did not pass any of the allow rules" (Sytest's "Can receive
+    /// redactions from regular users over federation in room version 1/2", on the server that
+    /// joined over federation).
+    #[test]
+    fn a_member_redacts_their_own_message_in_rooms_of_version_1_and_2() {
+        for version in [RoomVersionId::V1, RoomVersionId::V2] {
+            let backend = MemoryBackend::new();
+            let tables = Tables::open(&backend).unwrap();
+            let mut actor = RoomActor::create_room(
+                backend,
+                tables,
+                HomeserverIdentity::for_tests("hs1"),
+                user_id!("@alice:hs1").to_owned(),
+                CreateRoomRequest {
+                    room_version: Some(version.clone()),
+                    preset: Some("public_chat".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .unwrap();
+            let bob = user_id!("@bob:hs1");
+            actor
+                .membership_action(
+                    bob.to_owned(),
+                    Action::Join,
+                    bob.to_owned(),
+                    serde_json::json!({}),
+                    2,
+                )
+                .unwrap();
+            let message = actor
+                .send_event(
+                    bob.to_owned(),
+                    "m.room.message".to_owned(),
+                    None,
+                    serde_json::json!({"msgtype": "m.text", "body": "oops"}),
+                    None,
+                    3,
+                )
+                .unwrap();
+            let redaction = actor.redact_txn(
+                bob.to_owned(),
+                None,
+                "t1",
+                message.event_id().to_owned(),
+                None,
+                4,
+            );
+            assert!(
+                redaction.is_ok(),
+                "version {version}: bob's redaction of his own message was refused: {redaction:?}"
+            );
+            assert!(
+                actor
+                    .event_by_id(message.event_id())
+                    .unwrap()
+                    .header()
+                    .flags
+                    .is_redacted(),
+                "version {version}"
+            );
+        }
+    }
+
     /// Deliverable 3: receiving the same remote event twice is a no-op, not a duplicate or an
     /// error.
     #[test]
@@ -7536,6 +7740,135 @@ mod tests {
         assert!(actor.event_by_id(&bad_event_id).is_none());
         let (events, _) = actor.paginate(None, Direction::Backward, usize::MAX);
         assert!(events.iter().all(|e| e.event_id() != &*bad_event_id));
+    }
+
+    /// `event` (built by [`build_remote_event`]) citing `prev` and `auth` instead, hashed and
+    /// signed again.
+    fn citing(
+        event: &Event,
+        prev: &[&EventId],
+        auth: &[&EventId],
+        remote_server: &ruma::ServerName,
+        remote_key: &hs_model::signing::SigningKeyPair,
+    ) -> Event {
+        use hs_model::canonical::{CanonicalJsonObject, CanonicalJsonValue};
+        use hs_model::{hash, signing};
+        let mut canonical = event.json().clone();
+        canonical.remove("hashes");
+        canonical.remove("signatures");
+        let ids = |list: &[&EventId]| {
+            CanonicalJsonValue::Array(
+                list.iter()
+                    .map(|id| CanonicalJsonValue::String(id.to_string()))
+                    .collect(),
+            )
+        };
+        canonical.insert("prev_events".to_owned(), ids(prev));
+        canonical.insert("auth_events".to_owned(), ids(auth));
+        let content_hash = hash::content_hash_base64(&canonical);
+        canonical.insert(
+            "hashes".to_owned(),
+            CanonicalJsonValue::Object(CanonicalJsonObject::from([(
+                "sha256".to_owned(),
+                CanonicalJsonValue::String(content_hash),
+            )])),
+        );
+        signing::sign_object(&mut canonical, remote_server, remote_key).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&CanonicalJsonValue::Object(canonical).to_canonical_bytes())
+                .unwrap();
+        Event::parse(&value, RoomVersionId::V11).unwrap()
+    }
+
+    /// An event authorization rejects is stored as rejected (since 2026-10-01; it was dropped):
+    /// hidden from every read, known if sent again, and a later event citing it is answered
+    /// consistently -- placed, when it cites it as a prev event (the state after a rejected
+    /// event is the state before it), and rejected in turn when it cites it as an auth event --
+    /// rather than with "missing ancestors". All of it survives a reload.
+    #[test]
+    fn a_rejected_event_is_stored_as_rejected_and_later_references_to_it_are_consistent() {
+        let backend = MemoryBackend::new();
+        let tables = Tables::open(&backend).unwrap();
+        let identity = HomeserverIdentity::for_tests("hs1");
+        let mut actor = RoomActor::create_room(
+            backend.clone(),
+            tables.clone(),
+            identity.clone(),
+            user_id!("@alice:hs1").to_owned(),
+            CreateRoomRequest {
+                preset: Some("public_chat".to_owned()),
+                ..Default::default()
+            },
+            1,
+        )
+        .unwrap();
+        let bob = user_id!("@bob:remote.example");
+        actor
+            .membership_action(
+                bob.to_owned(),
+                Action::Join,
+                bob.to_owned(),
+                serde_json::json!({}),
+                2,
+            )
+            .unwrap();
+        let key = hs_model::signing::SigningKeyPair::generate("1");
+        let server = ruma::ServerName::parse("remote.example").unwrap();
+        let eve = user_id!("@eve:remote.example");
+
+        // Eve was never in the room: her message is rejected, and stored as such.
+        let bad = build_remote_message(&actor, eve, &server, &key, "not a member");
+        let bad_id = bad.event_id().to_owned();
+        assert!(matches!(
+            actor.accept_remote_event(bad.clone()),
+            Err(RoomError::Forbidden(_))
+        ));
+        assert!(actor.is_rejected_event(&bad_id));
+        assert!(actor.event_by_id(&bad_id).is_none(), "hidden from reads");
+        assert!(matches!(
+            actor.accept_remote_event(bad.clone()),
+            Ok(RemoteEventOutcome::AlreadyKnown)
+        ));
+
+        let room_id = actor.room_id().to_owned();
+        drop(actor);
+        let mut actor =
+            RoomActor::load(backend.clone(), tables.clone(), identity.clone(), &room_id)
+                .unwrap()
+                .expect("the room was persisted");
+        assert!(
+            actor.is_rejected_event(&bad_id),
+            "still rejected after a reload"
+        );
+        assert!(actor.event_by_id(&bad_id).is_none());
+        let (page, _) = actor.paginate(None, Direction::Backward, usize::MAX);
+        assert!(page.iter().all(|e| e.event_id() != &*bad_id));
+
+        // Bob's next message cites the rejected one as its only prev event: placed, not
+        // "missing ancestors".
+        let template = build_remote_message(&actor, bob, &server, &key, "after eve");
+        let auth: Vec<OwnedEventId> =
+            pipeline::decode_event_ids(template.json().get("auth_events"));
+        let auth_refs: Vec<&EventId> = auth.iter().map(AsRef::as_ref).collect();
+        let after = citing(&template, &[&bad_id], &auth_refs, &server, &key);
+        let after_id = after.event_id().to_owned();
+        assert!(matches!(
+            actor.accept_remote_event(after),
+            Ok(RemoteEventOutcome::Stored(_))
+        ));
+        assert!(actor.event_by_id(&after_id).is_some());
+
+        // An event citing the rejected one among its auth events is rejected in turn.
+        let template = build_remote_message(&actor, bob, &server, &key, "authed by eve");
+        let mut auth_refs = auth_refs.clone();
+        auth_refs.push(&bad_id);
+        let tainted = citing(&template, &[&after_id], &auth_refs, &server, &key);
+        let tainted_id = tainted.event_id().to_owned();
+        assert!(matches!(
+            actor.accept_remote_event(tainted),
+            Err(RoomError::Forbidden(_))
+        ));
+        assert!(actor.is_rejected_event(&tainted_id));
     }
 
     /// Deliverable 3: an event whose `prev_events` this actor does not hold is the ordinary

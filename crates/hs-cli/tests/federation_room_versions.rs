@@ -280,43 +280,197 @@ async fn invites_in_a_version_3_room_reach_another_server_whatever_their_event_i
     b.handle.shutdown().await;
 }
 
-/// Bob, on B, redacts his own message; on A, where the redaction arrives over federation, the
-/// message's content is gone. Before the fix the redaction was stored on A and the message kept
-/// its body there (Sytest's "Can receive redactions from regular users over federation").
-#[tokio::test]
-async fn a_redaction_received_over_federation_is_applied() {
-    let joined = join_across("11").await;
+/// `GET {base}/_matrix/client/v3/sync` as `token`, from `since` if given, answered within ten
+/// seconds.
+async fn sync(client: &reqwest::Client, base: &str, token: &str, since: Option<&str>) -> Value {
+    let mut url = format!("{base}/_matrix/client/v3/sync?timeout=2000");
+    if let Some(since) = since {
+        url.push_str(&format!("&since={}", urlencode(since)));
+    }
+    client
+        .get(url)
+        .bearer_auth(token)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+fn urlencode(raw: &str) -> String {
+    raw.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// Bob, on B, redacts his own message in a room of `version` made on A, where bob has no power.
+/// On A, where the redaction arrives over federation, the message's content is gone; once
+/// alice's `/sync` has the redaction, a backward `/messages` from that sync's `next_batch` starts
+/// with it, then the message, which names it in `unsigned.redacted_by` and carries it whole in
+/// `unsigned.redacted_because` -- exactly what Sytest's "Can receive redactions from regular
+/// users over federation in room version N" asks of the receiving server. `/event` on both
+/// servers carries the same.
+///
+/// What failed before 2026-10-01's fixes: in versions 1 and 2 bob's redaction was refused on B
+/// (its ID was minted after the auth check, so the same-server rule never matched); in every
+/// version no event rendered `redacted_because` or `redacted_by`; before the sixteenth session
+/// the redaction was not applied on A at all.
+async fn redaction_crosses(version: &str) {
+    let joined = join_across(version).await;
     let message = send(&joined, &joined.b.base, &joined.bob_token, "regrettable").await;
     let event_url = format!(
-        "{}/_matrix/client/v3/rooms/{}/event/{message}",
-        joined.a.base, joined.room_id
+        "{}/_matrix/client/v3/rooms/{}/event/{}",
+        joined.a.base,
+        joined.room_id,
+        urlencode(&message)
     );
     get_until(&joined.client, &event_url, &joined.alice_token, |event| {
         event["content"]["body"] == "regrettable"
     })
     .await;
-    let redaction: Value = joined
+    let since = sync(&joined.client, &joined.a.base, &joined.alice_token, None).await["next_batch"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let response = joined
         .client
         .put(format!(
-            "{}/_matrix/client/v3/rooms/{}/redact/{message}/{}",
+            "{}/_matrix/client/v3/rooms/{}/redact/{}/{}",
             joined.b.base,
             joined.room_id,
+            urlencode(&message),
             uuid_like()
         ))
         .bearer_auth(&joined.bob_token)
         .json(&json!({}))
         .send()
         .await
+        .unwrap();
+    let status = response.status();
+    let redaction: Value = response.json().await.unwrap();
+    assert_eq!(
+        status, 200,
+        "version {version}: bob's redaction of his own message on B: {redaction}"
+    );
+    let redaction_id = redaction["event_id"].as_str().unwrap().to_owned();
+
+    // Alice's sync on A, until its timeline has the redaction.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut since = since;
+    loop {
+        let body = sync(
+            &joined.client,
+            &joined.a.base,
+            &joined.alice_token,
+            Some(&since),
+        )
+        .await;
+        since = body["next_batch"].as_str().unwrap().to_owned();
+        let seen = body["rooms"]["join"][&joined.room_id]["timeline"]["events"]
+            .as_array()
+            .is_some_and(|events| {
+                events
+                    .iter()
+                    .any(|e| e["event_id"] == redaction_id.as_str())
+            });
+        if seen {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "version {version}: the redaction never reached alice's sync on A"
+        );
+    }
+    let page: Value = joined
+        .client
+        .get(format!(
+            "{}/_matrix/client/v3/rooms/{}/messages?dir=b&from={}",
+            joined.a.base,
+            joined.room_id,
+            urlencode(&since)
+        ))
+        .bearer_auth(&joined.alice_token)
+        .send()
+        .await
         .unwrap()
         .json()
         .await
         .unwrap();
-    assert!(redaction["event_id"].is_string(), "{redaction}");
-    let redacted = get_until(&joined.client, &event_url, &joined.alice_token, |event| {
-        event["content"].as_object().is_some_and(|c| c.is_empty())
-    })
-    .await;
-    assert_eq!(redacted["event_id"], message.as_str());
+    let chunk = page["chunk"].as_array().unwrap();
+    assert_eq!(
+        chunk[0]["event_id"], redaction_id,
+        "version {version}: /messages on A does not start with the redaction: {page}"
+    );
+    assert_eq!(chunk[0]["redacts"], message.as_str(), "version {version}");
+    assert_eq!(chunk[1]["event_id"], message.as_str(), "version {version}");
+    assert_eq!(
+        chunk[1]["unsigned"]["redacted_by"], redaction_id,
+        "version {version}: {}",
+        chunk[1]
+    );
+    assert_eq!(
+        chunk[1]["unsigned"]["redacted_because"]["event_id"], redaction_id,
+        "version {version}"
+    );
+    assert_eq!(
+        chunk[1]["unsigned"]["redacted_because"]["sender"], chunk[0]["sender"],
+        "version {version}"
+    );
+    assert!(
+        chunk[1]["unsigned"]["redacted_because"]
+            .get("signatures")
+            .is_none(),
+        "version {version}: redacted_because is shown as a client event"
+    );
+    assert!(
+        chunk[1]["content"]
+            .as_object()
+            .is_some_and(|c| c.is_empty()),
+        "version {version}"
+    );
+
+    for (base, token) in [
+        (&joined.a.base, &joined.alice_token),
+        (&joined.b.base, &joined.bob_token),
+    ] {
+        let event = get_until(
+            &joined.client,
+            &format!(
+                "{base}/_matrix/client/v3/rooms/{}/event/{}",
+                joined.room_id,
+                urlencode(&message)
+            ),
+            token,
+            |event| event["unsigned"]["redacted_by"] == redaction_id.as_str(),
+        )
+        .await;
+        assert_eq!(
+            event["unsigned"]["redacted_because"]["event_id"], redaction_id,
+            "version {version}, {base}"
+        );
+    }
     joined.a.handle.shutdown().await;
     joined.b.handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_redaction_received_over_federation_is_applied_and_shown_in_version_1() {
+    redaction_crosses("1").await;
+}
+
+#[tokio::test]
+async fn a_redaction_received_over_federation_is_applied_and_shown_in_version_2() {
+    redaction_crosses("2").await;
+}
+
+#[tokio::test]
+async fn a_redaction_received_over_federation_is_applied_and_shown_in_version_11() {
+    redaction_crosses("11").await;
 }

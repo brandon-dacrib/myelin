@@ -123,37 +123,104 @@ pub fn attach_replaced_state(
 /// room actor rather than to a renderer -- see [`crate::actor::RoomActor::replaced_state_for`].
 #[must_use]
 pub fn client_event_json(event: &Event) -> serde_json::Value {
-    let mut value = canonical_to_json(&readable_json(event));
-    if let Some(obj) = value.as_object_mut() {
-        for key in [
-            "signatures",
-            "hashes",
-            "auth_events",
-            "prev_events",
-            "depth",
-        ] {
-            obj.remove(key);
-        }
-        obj.insert(
-            "event_id".to_owned(),
-            serde_json::Value::String(event.event_id().to_string()),
-        );
-        let unsigned = obj
-            .entry("unsigned")
-            .or_insert_with(|| serde_json::json!({}));
+    let mut value = client_form(
+        canonical_to_json(&readable_json(event)),
+        event.event_id().as_str(),
+    );
+    if let Some(unsigned) = value
+        .get_mut("unsigned")
+        .and_then(serde_json::Value::as_object_mut)
+    {
         // The stripped state an invite or knock from another server arrived with is kept on
         // the membership event (`unsigned.invite_room_state`/`knock_room_state`) so `/sync`'s
         // `invite`/`knock` section can describe a room this server holds nothing else of
         // (`hs_user::sync`, which reads it from the stored event, not from here). It is not
         // part of the event: the timeline, `/messages`, `/context` and `/event` show the event
         // without it.
-        if let Some(unsigned) = unsigned.as_object_mut() {
-            for key in STRIPPED_STATE_KEYS {
-                unsigned.remove(*key);
-            }
+        for key in STRIPPED_STATE_KEYS {
+            unsigned.remove(*key);
+        }
+        // A redacted event says what redacted it: the redaction, as a client event, and its ID
+        // under Synapse's older name (`crate::actor::redactions`, which keeps both in the
+        // event). The redacted form drops `unsigned`, so they are read from the event as held.
+        if event.header().flags.is_redacted() {
+            unsigned.extend(redaction_unsigned(event));
         }
     }
     value
+}
+
+/// The server-internal fields a client is never shown: what a server needs to verify and place
+/// an event.
+const SERVER_ONLY_KEYS: &[&str] = &[
+    "signatures",
+    "hashes",
+    "auth_events",
+    "prev_events",
+    "depth",
+];
+
+/// `pdu` (a PDU as JSON) in the client-server shape: the server-only fields stripped, `event_id`
+/// set (most room versions never carry it in the event), an `unsigned` object, and for an
+/// `m.room.redaction` of room version 11 or later -- where `redacts` moved into `content` -- its
+/// `redacts` at the top level as well, as Synapse shows it, so a client that reads it where it
+/// used to be finds it.
+fn client_form(mut pdu: serde_json::Value, event_id: &str) -> serde_json::Value {
+    if let Some(obj) = pdu.as_object_mut() {
+        for key in SERVER_ONLY_KEYS {
+            obj.remove(*key);
+        }
+        obj.insert(
+            "event_id".to_owned(),
+            serde_json::Value::String(event_id.to_owned()),
+        );
+        obj.entry("unsigned")
+            .or_insert_with(|| serde_json::json!({}));
+        if obj.get("type").and_then(serde_json::Value::as_str) == Some("m.room.redaction")
+            && !obj.contains_key("redacts")
+            && let Some(redacts) = obj
+                .get("content")
+                .and_then(|content| content.get("redacts"))
+                .cloned()
+        {
+            obj.insert("redacts".to_owned(), redacts);
+        }
+    }
+    pdu
+}
+
+/// `unsigned.redacted_by` and `unsigned.redacted_because` for a redacted `event`, from what
+/// `crate::actor::redactions` kept in it; nothing for an event redacted without a redaction
+/// being named (an administrator's purge).
+fn redaction_unsigned(event: &Event) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    let Some(unsigned) = event
+        .json()
+        .get("unsigned")
+        .and_then(CanonicalJsonValue::as_object)
+    else {
+        return out;
+    };
+    let Some(by) = unsigned
+        .get(crate::actor::redactions::REDACTED_BY)
+        .and_then(CanonicalJsonValue::as_str)
+    else {
+        return out;
+    };
+    out.insert(
+        crate::actor::redactions::REDACTED_BY.to_owned(),
+        serde_json::Value::String(by.to_owned()),
+    );
+    if let Some(because) = unsigned
+        .get(crate::actor::redactions::REDACTED_BECAUSE)
+        .and_then(CanonicalJsonValue::as_object)
+    {
+        out.insert(
+            crate::actor::redactions::REDACTED_BECAUSE.to_owned(),
+            client_form(canonical_to_json(because), by),
+        );
+    }
+    out
 }
 
 /// The `unsigned` keys under which a membership event received from another server carries the

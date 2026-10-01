@@ -414,6 +414,16 @@ pub fn build_and_authorize<S: StateStore>(
         .event_for("m.room.create", "")
         .map_err(|e| RoomError::State(e.to_string()))?;
 
+    // Rooms of version 1 and 2 carry the event's ID in the event, minted here. It is minted
+    // before authorization because the auth rules of those versions read it: a redaction is
+    // allowed when its ID and the redacted event's ID name the same server. Until 2026-10-01 the
+    // ID was minted after `incoming` was built, the rule never matched, and a member below the
+    // redact level could not redact their own message in a version-1 or -2 room (Sytest's "Can
+    // receive redactions from regular users over federation in room version 1/2").
+    let generated_event_id = rules
+        .event_format_requires_event_id
+        .then(|| EventId::new_v1(server_name));
+
     let incoming = IncomingEvent {
         event_type: &new_event.event_type,
         sender: AsRef::<UserId>::as_ref(&new_event.sender),
@@ -429,7 +439,7 @@ pub fn build_and_authorize<S: StateStore>(
             && create_event_for_view.is_some_and(|c| {
                 Some(c.event_id().to_owned()) == prev_events.first().map(|p| p.event_id.clone())
             }),
-        event_id: None,
+        event_id: generated_event_id.as_deref(),
         redacts: new_event.redacts.as_deref(),
     };
 
@@ -445,8 +455,7 @@ pub fn build_and_authorize<S: StateStore>(
         serde_json::Value::Array(auth_events_json),
     );
 
-    if rules.event_format_requires_event_id {
-        let generated = EventId::new_v1(server_name);
+    if let Some(generated) = &generated_event_id {
         object.insert(
             "event_id".into(),
             serde_json::Value::String(generated.to_string()),
