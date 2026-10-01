@@ -328,7 +328,9 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
   reject is answered `{}` in `/send`. Rooms of version 1 and 2 are joined over federation, from
   either side, and a redaction that arrives over federation is applied. Verified 2026-10-01
   with two real binaries (`federation_keys.rs`, `federation_room_versions.rs`) and Sytest:
-  re-run pending.
+  federation 15 of 105 → 50 of 105, the whole suite 407 → 448 of 772. Also fixed: IDs in
+  outbound federation request paths are percent-encoded, so a version-3 room's invites, joins
+  and leaves no longer fail on an event ID with a `/` in it (about half of them).
 - **Restricted rooms, invites, leaves and knocks cross servers, and so do the ephemeral
   things.** A local user joins a restricted room without naming an authoriser, and through
   another server when nobody here may invite; invites (v1 and v2), leaves and knocks are served

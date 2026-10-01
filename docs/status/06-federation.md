@@ -72,6 +72,14 @@ run opened, each in its own commit (hashes are left out: the merge queue rebases
    `RoomActor::may_redact` allows it (own event or redact power, current power levels); one
    that may not take effect is stored and logged, unapplied. Not for the importer, which applies
    its own.
+6. **IDs in outbound request paths are percent-encoded** (seventh commit; found by this
+   run, no row). Nothing encoded them: a room-version-3 event ID is standard base64 and
+   carries a `/` about half the time, which split the path of `send_join`, `invite`,
+   `send_leave`, `send_knock`, `/event`, `/state[_ids]?event_id=` and `/backfill?v=`, and the
+   other server answered `404 M_UNRECOGNIZED` (Sytest's version-3 invite passed in one run and
+   failed in the next). `client::encode_path_segment` (everything outside RFC 3986 `pchar`;
+   `!$@:+=` stay as they are) and `client::encode_query_value` (also `+`, `=`, `&`) are applied
+   to every room, event and user ID the client puts in a path or query.
 
 **Verified.**
 
@@ -85,7 +93,9 @@ run opened, each in its own commit (hashes are left out: the merge queue rebases
   `acl::tests::{the_port_is_not_part_of_the_match, a_malformed_acl_is_read_leniently,
   endpoint_labels_are_a_fixed_set}`,
   `join::tests::make_join_cites_events_by_reference_hash_in_a_version_1_room`,
-  `outbound_join::tests::a_version_1_template_is_given_an_event_id_of_this_servers_making`.
+  `outbound_join::tests::a_version_1_template_is_given_an_event_id_of_this_servers_making`,
+  `client::tests::ids_are_encoded_for_paths_and_queries`,
+  `transport::tests::an_event_id_with_a_slash_is_routed_whole_when_encoded`.
   Each fails without its change (the routes and the notary answered 404, the ACL layer let the
   handler run, the auth rejection was an error, `make_join` answered `UnsupportedRoomVersion`,
   `Event::parse` refused the template).
@@ -98,10 +108,25 @@ run opened, each in its own commit (hashes are left out: the merge queue rebases
   messages cross both ways -- failed with "signed make_join event does not parse: missing
   `event_id`" before the joining side's fix; bob's redaction on B empties the message on A),
   `--test federation_writes` (the auth-rejected PDU is now `{}` and `/event` does not find it),
+  `federation_room_versions.rs`'s `invites_in_a_version_3_room_reach_another_server_whatever_their_event_ids`
+  (six invites into a version-3 room; without the encoding all six succeed about 1 time in 60),
   `--test federation_membership`, `--test federation_two_servers`: pass.
 - `cargo clippy -p hs-federation -p hs-room -p hs-cli --all-targets -- -D warnings`, `cargo fmt
   --all --check`: clean. Not run: the workspace gate.
-- Sytest: being re-run (the release build in Docker is under way); numbers to follow.
+- Sytest, whole suite, on the branch at its redaction commit (release `hs` on bookworm through
+  `SYTEST_HS_BINARY`, image `myelin-sytest:9cde6e9`; `docs/status/sytest/2026-10-01-federation-results.txt`
+  and `-summary.txt`): **federation 15/105 → 50/105**; whole suite 407 → 448 of 772 (276
+  fail, 48 skip). Key API 2/6 → 6/6, Auth 4/20 → 16/20, room versions 0/7 → 5/7, Federation
+  API 1/14 → 6/14, State APIs 3/10 → 6/10, `get_missing_events` 0/3 → 2/3, `send_leave` 0/1 →
+  1/1. 44 tests newly pass, among them ten of the eleven "Banned servers cannot ..." (the
+  eleventh, `/send_leave`, passed before), all four notary tests, the room-version-1 and -2
+  joins, backfills and invites, and "Inbound federation can receive events". Three that
+  passed in the first run failed in this one: `GET /publicRooms lists rooms` and "Newly left
+  rooms appear in the leave section of gapped sync" (client-server, a listing not found and a
+  send refused mid-test; not touched here), and "User can invite remote user to room with
+  version 3", which is the path-encoding bug below -- it passes or fails by the luck of the
+  event ID. The release build in Docker took five hours under the desktop's load, so the
+  path-encoding fix (item 6) was not in the Sytest binary.
 
 **Left.**
 
@@ -115,6 +140,16 @@ run opened, each in its own commit (hashes are left out: the merge queue rebases
 - A PDU the auth rules reject is answered `{}` but still not stored as rejected, so a later
   event citing it meets "missing ancestors"; soft failure is still a hard rejection.
 - The notary's held responses are in memory only (lost on restart) and are never pruned.
+- Found by the second Sytest run, no row yet: `send_join`'s `auth_chain` is empty for a room
+  whose auth events are all current state (the chain leaves out the state events themselves;
+  Sytest's "Inbound federation can receive v1/v2 /send_join" want it non-empty); a PDU served
+  by `/event` and `/backfill` lacks `origin` and, for one test, `origin_server_ts`
+  (`32room-getevent.pl`, `34room-backfill.pl`); `make_join` does not refuse a join for a user
+  of another server than the requester's (v1 spelling) nor for a room everyone left; a user on
+  the remote side of a version-1 or -2 room is refused (403) when redacting their own
+  message; after a received redaction, the receiving server's `/messages` does not start
+  with the redaction (Sytest 32room-versions, every version); outbound joins through Sytest's
+  own server still answer 502 (`send_join` and `make_join` failure pass-through tests).
 
 ## Fifteenth session (2026-09-30): a destination down past its queue is caught up from the rooms
 

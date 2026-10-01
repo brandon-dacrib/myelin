@@ -166,7 +166,7 @@ answers `/_matrix/key/v2/server/{keyId}` and the notary `/_matrix/key/v2/query`;
 server ACL is enforced on every room-scoped federation route (one route layer) and per PDU in
 `/send`; an auth-rejected PDU is `{}` in `/send`; rooms of version 1 and 2 are joined over
 federation (both sides were broken); a redaction received over federation is applied. New
-real-binary tests `federation_keys.rs` and `federation_room_versions.rs`. Sytest re-run pending when written. Status 06
+real-binary tests `federation_keys.rs` and `federation_room_versions.rs`. Sytest, whole suite: federation 15/105 → 50/105, all 772: 407 → 448 passing (`docs/status/sytest/2026-10-01-federation-*`). Found on the way and fixed: no outbound request percent-encoded the IDs in its path, so half of a version-3 room's invites, joins and leaves were answered 404. Status 06
 session 16 has all of it, and what is left (redacted_because is never rendered, ACLs on EDUs).
 
 **Branch `agent/sytest-client` (2026-10-01, tracks 07/05; not merged when written; branched
