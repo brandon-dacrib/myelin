@@ -88,7 +88,7 @@ admin API's room long tail).
 >   pulls fail in agent sessions).
 
 > **2026-09-30, session 14: a version-12 room is built by the owner of its shard** (branch
-> `agent/room-gaps`, commit 691060e; known gap "A v12 room's id cannot be pre-assigned" closed;
+> `agent/room-gaps`, its first commit; known gap "A v12 room's id cannot be pre-assigned" closed;
 > decision 0020; completes RFC 0019). From room version 12 the room id is the create event's hash, so the
 > shard gate's pre-assigned id was ignored and the room was built -- and its create event,
 > creator's join and preset state written, unfenced -- on whichever replica the gate chose,
