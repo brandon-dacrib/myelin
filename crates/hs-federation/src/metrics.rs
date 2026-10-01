@@ -207,6 +207,97 @@ impl EduMetrics {
     }
 }
 
+/// Labels of `hs_federation_catch_up_started_total`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, prometheus_client::encoding::EncodeLabelSet)]
+pub struct CatchUpStartedLabels {
+    /// `queue_full` or `requested` (`crate::outbound_store::CatchUpMark::reason`).
+    pub reason: String,
+}
+
+/// The catch-up metric families (`crate::sender`'s module docs, "Catch-up"). Not labelled by
+/// destination: there can be as many destinations as servers in the federation. The admin API's
+/// destination list says which destination is catching up (`catch_up_since`).
+///
+/// - `hs_federation_catch_up_started_total{reason}`: destinations put in catch-up mode.
+/// - `hs_federation_catch_up_completed_total`: destinations caught up and back on their queue.
+/// - `hs_federation_catch_up_rooms_total`: rooms whose latest event catch-up sent.
+/// - `hs_federation_outbound_pdus_dropped_total`: queued PDUs dropped because their destination
+///   was caught up from the rooms instead.
+#[derive(Clone, Default)]
+pub struct CatchUpMetrics {
+    /// `hs_federation_catch_up_started_total{reason}`.
+    pub started_total: Family<CatchUpStartedLabels, Counter>,
+    /// `hs_federation_catch_up_completed_total`.
+    pub completed_total: Counter,
+    /// `hs_federation_catch_up_rooms_total`.
+    pub rooms_total: Counter,
+    /// `hs_federation_outbound_pdus_dropped_total`.
+    pub dropped_total: Counter,
+}
+
+impl CatchUpMetrics {
+    /// Registers the families into `registry` (the shared one, in `hs serve`).
+    #[must_use]
+    pub fn register(registry: &mut Registry) -> Self {
+        let metrics = Self::default();
+        registry.register(
+            "hs_federation_catch_up_started",
+            "Destinations put in catch-up mode, by reason (queue_full, requested)",
+            metrics.started_total.clone(),
+        );
+        registry.register(
+            "hs_federation_catch_up_completed",
+            "Destinations caught up from the rooms and returned to their queue",
+            metrics.completed_total.clone(),
+        );
+        registry.register(
+            "hs_federation_catch_up_rooms",
+            "Rooms whose latest event was sent to a destination being caught up",
+            metrics.rooms_total.clone(),
+        );
+        registry.register(
+            "hs_federation_outbound_pdus_dropped",
+            "Queued PDUs dropped because their destination was caught up from the rooms instead",
+            metrics.dropped_total.clone(),
+        );
+        metrics
+    }
+
+    /// Counts a destination put in catch-up mode for `reason`.
+    pub fn record_started(&self, reason: &str) {
+        self.started_total
+            .get_or_create(&CatchUpStartedLabels {
+                reason: reason.to_owned(),
+            })
+            .inc();
+    }
+
+    /// How many destinations were put in catch-up mode for `reason`.
+    #[must_use]
+    pub fn started(&self, reason: &str) -> u64 {
+        self.started_total
+            .get_or_create(&CatchUpStartedLabels {
+                reason: reason.to_owned(),
+            })
+            .get()
+    }
+
+    /// Counts a destination caught up.
+    pub fn record_completed(&self) {
+        self.completed_total.inc();
+    }
+
+    /// Counts `n` rooms whose latest event was sent.
+    pub fn record_rooms(&self, n: u64) {
+        self.rooms_total.inc_by(n);
+    }
+
+    /// Counts `n` queued PDUs dropped.
+    pub fn record_dropped(&self, n: u64) {
+        self.dropped_total.inc_by(n);
+    }
+}
+
 /// `edu_type` if it is one of [`KNOWN_EDU_TYPES`], `other` if not.
 fn bounded(edu_type: &str) -> &str {
     KNOWN_EDU_TYPES

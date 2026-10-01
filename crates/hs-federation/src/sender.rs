@@ -52,14 +52,39 @@
 //!   retried, matching what the spec says a receiver's per-PDU result means.
 //! - **Nothing is ever queued for this server's own name**, whatever a caller passes.
 //!
+//! # Catch-up: a destination down for longer than its queue holds
+//!
+//! A destination's queue is bounded ([`SenderConfig::max_queued_pdus_per_destination`],
+//! `federation.max_queued_pdus_per_destination`), so a server that is down for a week does not
+//! grow this server's database by a week of events. Behind the queue the store keeps, per
+//! destination and room, the position of the newest PDU meant for it and of the newest it
+//! accepted -- Synapse's `destination_rooms` and `last_successful_stream_ordering`, split per
+//! room (`crate::outbound_store`'s module docs have the layout).
+//!
+//! A PDU that finds its destination's queue full is not written to it: the destination is put
+//! in **catch-up mode** ([`crate::outbound_store::CatchUpMark`]), and from then on every PDU for
+//! it only moves its room's queued position forward. The worker, noticing the mark (between
+//! attempts at its head transaction, or at once if it was idle), drops what the queue still
+//! holds (noting each room as behind) and catches the destination up: once its backoff allows
+//! an attempt, it sends, oldest room first and fifty rooms to a transaction, **the latest event
+//! of each room the destination is behind in** -- asked of the installed [`CatchUpSource`]
+//! (`hs-cli`'s over the room registry: the newest event this server's own users sent, if the
+//! destination still has a joined member), and computed afresh before each attempt, so what
+//! goes out when the destination comes back is what is latest then. The receiver fetches what
+//! lies between from there (`/get_missing_events`, `/backfill`), exactly as with Synapse. When no
+//! room is behind any more, the mark is cleared in the same transaction that checks it (an
+//! enqueue racing it is either seen as a room behind or queued normally), and the worker returns
+//! to its queue. EDUs are not part of catch-up; they wait in their own capped queue and go out
+//! after it. Every step is logged at `info` with the room count, and counted in
+//! [`crate::metrics::CatchUpMetrics`].
+//!
 //! # What this is not, said loudly
 //!
-//! **No catch-up from the room.** What survives a restart is what was queued: a PDU the feeder
+//! **An event never handed to the sender is not caught up.** A PDU the feeder
 //! (`hs_cli::federation_sender`) never handed over -- because the process died between the
 //! event's persistence and the queueing, or because the feeder fell behind the update stream --
-//! is not sent. Synapse's `destination_rooms` table (the last stream position successfully sent
-//! per destination, so a whole outage is caught up from the room's own history) is the
-//! behavioural reference for closing that, and is the next step, not this one.
+//! moved no room position, so nothing marks its room as behind; it reaches the destination only
+//! as an ancestor of a later event, fetched by the receiver.
 //!
 //! # EDUs
 //!
@@ -127,6 +152,32 @@ pub trait OutboundPduSink: Send + Sync {
 /// docs' "EDUs".
 pub const MAX_QUEUED_EDUS_PER_DESTINATION: usize = 5_000;
 
+/// The default [`SenderConfig::max_queued_pdus_per_destination`] (and of
+/// `federation.max_queued_pdus_per_destination`): a destination's queue holds this many PDUs
+/// before it is dropped and the destination is caught up from the rooms instead (the module
+/// docs' "Catch-up"). At a typical event size of 1-2 KiB, a few tens of MiB per dead
+/// destination at most.
+pub const DEFAULT_MAX_QUEUED_PDUS_PER_DESTINATION: usize = 10_000;
+
+/// How many queue rows the worker drops per store transaction when its destination enters
+/// catch-up mode: well inside `hs-kv`'s per-transaction mutation limit.
+const PURGE_BATCH: usize = 500;
+
+/// Where catch-up gets the event to send for a room (see the module docs' "Catch-up").
+/// `hs-cli` implements it over the room registry; tests script one.
+#[async_trait::async_trait]
+pub trait CatchUpSource: Send + Sync {
+    /// The event, in federation format (as it would be queued), that brings `destination` up to
+    /// date in `room_id`: the latest one this server's own users sent there. `Ok(None)` when
+    /// there is nothing to send -- the destination no longer has a joined member, or the room
+    /// holds no event of this server's -- and the room counts as caught up.
+    ///
+    /// # Errors
+    /// A description of what failed (the room could not be loaded); the room is logged and
+    /// counted as caught up rather than retried forever.
+    async fn latest_pdu(&self, room_id: &str, destination: &str) -> Result<Option<Value>, String>;
+}
+
 /// How a destination's worker waits between failed attempts at one transaction. See the module
 /// docs for which failures this applies to and which are governed by the destination store
 /// instead.
@@ -146,6 +197,11 @@ pub struct SenderConfig {
     /// shared store. `None` (the default) never looks: a single process's store holds only what
     /// its own channels already carried.
     pub store_rescan_interval: Option<Duration>,
+    /// How many PDUs a destination's queue holds before the destination is caught up from the
+    /// rooms instead (the module docs' "Catch-up"). At least one; zero is treated as one.
+    /// [`DEFAULT_MAX_QUEUED_PDUS_PER_DESTINATION`] by default; `hs serve` takes it from
+    /// `federation.max_queued_pdus_per_destination`.
+    pub max_queued_pdus_per_destination: usize,
 }
 
 impl Default for SenderConfig {
@@ -155,6 +211,7 @@ impl Default for SenderConfig {
             max_backoff: Duration::from_secs(3600),
             reset_poll_interval: BACKOFF_POLL_INTERVAL,
             store_rescan_interval: None,
+            max_queued_pdus_per_destination: DEFAULT_MAX_QUEUED_PDUS_PER_DESTINATION,
         }
     }
 }
@@ -240,6 +297,11 @@ struct Shared {
     /// Where an EDU for a destination another replica sends for goes, once installed
     /// ([`FederationSender::install_edu_forwarder`]).
     edu_forwarder: std::sync::OnceLock<Arc<dyn EduForwarder>>,
+    /// Where catch-up gets each room's latest event, once installed
+    /// ([`FederationSender::install_catch_up_source`]).
+    catch_up_source: std::sync::OnceLock<Arc<dyn CatchUpSource>>,
+    /// Where catch-up is counted, once installed ([`FederationSender::install_catch_up_metrics`]).
+    catch_up_metrics: std::sync::OnceLock<crate::metrics::CatchUpMetrics>,
 }
 
 struct DestinationQueue {
@@ -257,6 +319,8 @@ enum Queued {
     /// "There are EDUs in the queue": the doorbell for an idle worker. The EDUs themselves are
     /// in [`EduQueue`], where a newer one can replace an older one before either is sent.
     Edus,
+    /// "Look at the store": the destination was put in catch-up mode.
+    Wake,
 }
 
 /// One destination's unsent EDUs, oldest first, each with its coalescing key.
@@ -320,6 +384,23 @@ enum Delivery {
     Dropped,
     /// [`FederationSender::shutdown`] was called while retrying.
     ShutDown,
+    /// The destination was put in catch-up mode while this transaction waited: its PDUs are
+    /// dropped and the rooms they belong to caught up instead ([`Mode::Queue`] only).
+    Superseded,
+    /// One attempt failed and was recorded; the caller recomputes what to send before the next
+    /// ([`Mode::CatchUp`] only).
+    Failed,
+}
+
+/// How [`Shared::deliver`] treats a failed attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// The queue's head transaction: retried as it is, with the same ID, until it is accepted
+    /// -- or until the destination enters catch-up mode ([`Delivery::Superseded`]).
+    Queue,
+    /// A catch-up transaction: one attempt, since what is latest in each room may have changed
+    /// by the next ([`Delivery::Failed`]).
+    CatchUp,
 }
 
 impl FederationSender {
@@ -371,6 +452,8 @@ impl FederationSender {
                 shut_down: AtomicBool::new(false),
                 edu_metrics: std::sync::OnceLock::new(),
                 edu_forwarder: std::sync::OnceLock::new(),
+                catch_up_source: std::sync::OnceLock::new(),
+                catch_up_metrics: std::sync::OnceLock::new(),
             }),
             queues: Mutex::new(HashMap::new()),
         }
@@ -397,6 +480,63 @@ impl FederationSender {
         if self.shared.edu_forwarder.set(forwarder).is_err() {
             tracing::warn!("an EDU forwarder was already installed on this sender; ignoring");
         }
+    }
+
+    /// Gives catch-up the source of each room's latest event (see the module docs'
+    /// "Catch-up"). Without one, a destination that enters catch-up mode has its rooms counted
+    /// as caught up with nothing sent, and a warning says so. A second install is ignored.
+    pub fn install_catch_up_source(&self, source: Arc<dyn CatchUpSource>) {
+        if self.shared.catch_up_source.set(source).is_err() {
+            tracing::warn!("a catch-up source was already installed on this sender; ignoring");
+        }
+    }
+
+    /// Counts catch-up into `metrics` (`hs_federation_catch_up_*`). A second install is
+    /// ignored.
+    pub fn install_catch_up_metrics(&self, metrics: crate::metrics::CatchUpMetrics) {
+        if self.shared.catch_up_metrics.set(metrics).is_err() {
+            tracing::warn!("catch-up metrics were already installed on this sender; ignoring");
+        }
+    }
+
+    /// Puts `destination` in catch-up mode (see the module docs' "Catch-up"), unless it
+    /// already is: what is queued for it is dropped and each room it is behind in gets its
+    /// latest event instead. Returns whether this call did it. Wakes its worker, if this
+    /// process has one.
+    ///
+    /// # Errors
+    /// Returns the store's error.
+    pub fn mark_for_catch_up(&self, destination: &str) -> Result<bool, OutboundStoreError> {
+        let marked = self
+            .shared
+            .store
+            .mark_catch_up(destination, crate::outbound_store::CATCH_UP_REQUESTED)?;
+        if marked {
+            tracing::info!(destination, "destination put in catch-up mode on request");
+            if let Some(metrics) = self.shared.catch_up_metrics.get() {
+                metrics.record_started(crate::outbound_store::CATCH_UP_REQUESTED);
+            }
+            if let Some(queue) = self
+                .queues
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(destination)
+            {
+                let _ = queue.tx.send(Queued::Wake);
+            }
+        }
+        Ok(marked)
+    }
+
+    /// Every destination in catch-up mode, with its mark, sorted by name. What the admin API
+    /// shows as `catch_up_since`.
+    ///
+    /// # Errors
+    /// Returns the store's error.
+    pub fn catch_up_marks(
+        &self,
+    ) -> Result<Vec<(String, crate::outbound_store::CatchUpMark)>, OutboundStoreError> {
+        self.shared.store.catch_up_marks()
     }
 
     /// The server name every transaction this sender builds carries as `origin`.
@@ -461,7 +601,13 @@ impl FederationSender {
             return Ok(0);
         }
         let mut queues = self.queues.lock().unwrap_or_else(PoisonError::into_inner);
-        let backlog = self.shared.store.queued()?;
+        let mut backlog: std::collections::BTreeMap<String, usize> =
+            self.shared.store.queued()?.into_iter().collect();
+        // A destination in catch-up mode needs its worker whether or not anything is queued:
+        // catch-up is what the worker does next.
+        for (destination, _) in self.shared.store.catch_up_marks()? {
+            backlog.entry(destination).or_insert(0);
+        }
         let mut resumed = 0usize;
         for (destination, count) in backlog {
             if destination == self.shared.own_server_name
@@ -535,8 +681,10 @@ impl FederationSender {
         if targets.is_empty() {
             return;
         }
-        let seq = match self.shared.store.enqueue(&targets, &pdu) {
-            Ok(seq) => seq,
+        let room_id = pdu.get("room_id").and_then(Value::as_str);
+        let max = self.shared.config.max_queued_pdus_per_destination.max(1);
+        let enqueued = match self.shared.store.enqueue(&targets, room_id, &pdu, max) {
+            Ok(enqueued) => enqueued,
             Err(error) => {
                 tracing::error!(
                     destinations = ?targets,
@@ -546,8 +694,31 @@ impl FederationSender {
                 return;
             }
         };
+        let seq = enqueued.seq;
+        for destination in &enqueued.newly_catching_up {
+            tracing::info!(
+                destination,
+                bound = max,
+                room_id,
+                "a destination's outbound queue is full: its queue is dropped and it will be \
+                 caught up with each room's latest event once it answers"
+            );
+            if let Some(metrics) = self.shared.catch_up_metrics.get() {
+                metrics.record_started(crate::outbound_store::CATCH_UP_QUEUE_FULL);
+            }
+            if let Some(queue) = queues.get(destination) {
+                let _ = queue.tx.send(Queued::Wake);
+            }
+        }
+        if !enqueued.catching_up.is_empty() {
+            tracing::debug!(
+                destinations = ?enqueued.catching_up,
+                seq,
+                "destinations in catch-up mode: only the room's position moved"
+            );
+        }
         let pdu = Arc::new(pdu);
-        for destination in targets {
+        for destination in enqueued.queued {
             let Some(queue) = queues.get(&destination) else {
                 tracing::debug!(
                     destination,
@@ -872,11 +1043,12 @@ fn spawn_worker(
     })
 }
 
-/// One destination's loop: first what the store holds for it (a previous run's backlog, or
-/// what was written before this worker's first look), then its channel; each batch delivered,
-/// acknowledged in the store, repeat. With a [`SenderConfig::store_rescan_interval`], an idle
-/// channel sends it back to the store that often. Ends when the queue's sending half is dropped
-/// (the sender was dropped) or on [`Delivery::ShutDown`].
+/// One destination's loop: catch-up first if the destination is marked for it; then what the
+/// store holds for it (a previous run's backlog, or what was written before this worker's first
+/// look); then its channel; each batch delivered, acknowledged in the store, repeat. With a
+/// [`SenderConfig::store_rescan_interval`], an idle channel sends it back to the store that
+/// often; a [`Queued::Wake`] does at once. Ends when the queue's sending half is dropped (the
+/// sender was dropped) or on [`Delivery::ShutDown`].
 async fn run_worker(
     shared: Arc<Shared>,
     destination: String,
@@ -887,7 +1059,23 @@ async fn run_worker(
     // Everything with a sequence number up to here has left the store; a channel copy of it is
     // a duplicate.
     let mut acked_through: u64 = 0;
-    loop {
+    'outer: loop {
+        // Catch-up mode, if the destination is in it: the queue is dropped and each room the
+        // destination is behind in gets its latest event.
+        match shared.store.catch_up_mark(&destination) {
+            Ok(Some(mark)) => {
+                if !shared.catch_up(&destination, &mark, &pending).await {
+                    return;
+                }
+                // Copies of rows the catch-up dropped may still be in the channel.
+                acked_through = acked_through.max(mark.from_seq.saturating_sub(1));
+                continue 'outer;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::error!(destination, %error, "cannot read the catch-up mark");
+            }
+        }
         // What the store holds, oldest first, until it holds nothing.
         loop {
             let batch = match shared.store.peek(&destination, MAX_PDUS_PER_TRANSACTION) {
@@ -905,11 +1093,20 @@ async fn run_worker(
                 break;
             };
             let through = last.seq;
-            let pdus: Vec<Arc<Value>> = batch.into_iter().map(|row| Arc::new(row.pdu)).collect();
-            if let Delivery::ShutDown = shared.send_batch(&destination, &pdus, &edus.take()).await {
-                return;
+            let rows: Vec<(u64, Arc<Value>)> = batch
+                .into_iter()
+                .map(|row| (row.seq, Arc::new(row.pdu)))
+                .collect();
+            let pdus: Vec<Arc<Value>> = rows.iter().map(|(_, pdu)| pdu.clone()).collect();
+            match shared
+                .send_batch(&destination, &pdus, &edus.take(), Mode::Queue)
+                .await
+            {
+                Delivery::ShutDown => return,
+                Delivery::Superseded => continue 'outer,
+                Delivery::Delivered | Delivery::Dropped | Delivery::Failed => {}
             }
-            shared.settle(&destination, through, pdus.len(), &pending);
+            shared.settle(&destination, through, &rows, &pending);
             acked_through = through;
         }
         // Then the channel, until it closes or has been quiet for a rescan interval.
@@ -917,9 +1114,13 @@ async fn run_worker(
             // EDUs left over from a full transaction, or queued while one was being sent (their
             // doorbells may already have been consumed), go out before waiting for anything.
             if edus.len() > 0 {
-                if let Delivery::ShutDown = shared.send_batch(&destination, &[], &edus.take()).await
+                match shared
+                    .send_batch(&destination, &[], &edus.take(), Mode::Queue)
+                    .await
                 {
-                    return;
+                    Delivery::ShutDown => return,
+                    Delivery::Superseded => continue 'outer,
+                    Delivery::Delivered | Delivery::Dropped | Delivery::Failed => {}
                 }
                 continue;
             }
@@ -936,12 +1137,13 @@ async fn run_worker(
             // PDUs from the channel, up to a transaction's worth, skipping any already sent
             // from the store; EDU doorbells need nothing here (the queue is read below).
             let mut batch: Vec<(u64, Arc<Value>)> = Vec::new();
+            let mut woken = false;
             let mut next = Some(first);
             while let Some(queued) = next.take() {
-                if let Queued::Pdu { seq, pdu } = queued
-                    && seq > acked_through
-                {
-                    batch.push((seq, pdu));
+                match queued {
+                    Queued::Pdu { seq, pdu } if seq > acked_through => batch.push((seq, pdu)),
+                    Queued::Wake => woken = true,
+                    Queued::Pdu { .. } | Queued::Edus => {}
                 }
                 if batch.len() >= MAX_PDUS_PER_TRANSACTION {
                     break;
@@ -949,20 +1151,40 @@ async fn run_worker(
                 next = rx.try_recv().ok();
             }
             let edu_batch = edus.take();
-            if batch.is_empty() && edu_batch.is_empty() {
-                continue;
+            if !batch.is_empty() || !edu_batch.is_empty() {
+                let through = batch.last().map_or(acked_through, |(seq, _)| *seq);
+                let pdus: Vec<Arc<Value>> = batch.iter().map(|(_, pdu)| pdu.clone()).collect();
+                match shared
+                    .send_batch(&destination, &pdus, &edu_batch, Mode::Queue)
+                    .await
+                {
+                    Delivery::ShutDown => return,
+                    Delivery::Superseded => continue 'outer,
+                    Delivery::Delivered | Delivery::Dropped | Delivery::Failed => {}
+                }
+                if !pdus.is_empty() {
+                    shared.settle(&destination, through, &batch, &pending);
+                    acked_through = through;
+                }
             }
-            let through = batch.last().map_or(acked_through, |(seq, _)| *seq);
-            let pdus: Vec<Arc<Value>> = batch.into_iter().map(|(_, pdu)| pdu).collect();
-            if let Delivery::ShutDown = shared.send_batch(&destination, &pdus, &edu_batch).await {
-                return;
-            }
-            if !pdus.is_empty() {
-                shared.settle(&destination, through, pdus.len(), &pending);
-                acked_through = through;
+            if woken {
+                continue 'outer;
             }
         }
     }
+}
+
+/// The newest sequence number of each room among `rows`: what a delivered batch moves the
+/// rooms' sent positions to. A PDU without a `room_id` moves nothing.
+fn room_positions(rows: &[(u64, Arc<Value>)]) -> Vec<(String, u64)> {
+    let mut rooms: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for (seq, pdu) in rows {
+        if let Some(room) = pdu.get("room_id").and_then(Value::as_str) {
+            let entry = rooms.entry(room.to_owned()).or_insert(*seq);
+            *entry = (*entry).max(*seq);
+        }
+    }
+    rooms.into_iter().collect()
 }
 
 impl Shared {
@@ -988,20 +1210,30 @@ impl Shared {
             .min(self.config.max_backoff)
     }
 
-    /// One transaction, as a new transaction ID, until it is delivered or dropped.
+    /// One transaction, as a new transaction ID, delivered as `mode` says.
     async fn send_batch(
         &self,
         destination: &str,
         pdus: &[Arc<Value>],
         edus: &[Arc<Value>],
+        mode: Mode,
     ) -> Delivery {
         let txn_id = self.next_txn_id();
-        self.deliver(destination, &txn_id, pdus, edus).await
+        self.deliver(destination, &txn_id, pdus, edus, mode).await
     }
 
-    /// Takes a delivered (or dropped) batch out of the store and the pending counts.
-    fn settle(&self, destination: &str, through: u64, count: usize, pending: &AtomicUsize) {
-        let removed = match self.store.ack(destination, through) {
+    /// Takes a delivered (or dropped) batch out of the store and the pending counts, and moves
+    /// its rooms' sent positions to it.
+    fn settle(
+        &self,
+        destination: &str,
+        through: u64,
+        rows: &[(u64, Arc<Value>)],
+        pending: &AtomicUsize,
+    ) {
+        let count = rows.len();
+        let sent = room_positions(rows);
+        let removed = match self.store.ack(destination, through, &sent) {
             Ok(removed) => removed,
             Err(error) => {
                 tracing::error!(
@@ -1071,14 +1303,205 @@ impl Shared {
         }
     }
 
-    /// Sends one transaction until the destination accepts it, this server's own policy refuses
-    /// it, or the sender is shut down. See the module docs for the retry rules.
+    /// Whether `destination` is in catch-up mode; a store that cannot be read says no (and is
+    /// logged), so the queue carries on as it was.
+    fn catching_up(&self, destination: &str) -> bool {
+        match self.store.catch_up_mark(destination) {
+            Ok(mark) => mark.is_some(),
+            Err(error) => {
+                tracing::error!(destination, %error, "cannot read the catch-up mark");
+                false
+            }
+        }
+    }
+
+    /// Catches `destination` up (see the module docs' "Catch-up"): drops what its queue still
+    /// holds, then sends each room it is behind in that room's latest event, until no room is
+    /// behind and the mark is cleared. Returns `false` if the sender was shut down meanwhile.
+    async fn catch_up(
+        &self,
+        destination: &str,
+        mark: &crate::outbound_store::CatchUpMark,
+        pending: &AtomicUsize,
+    ) -> bool {
+        let started = std::time::Instant::now();
+        tracing::info!(
+            destination,
+            reason = mark.reason,
+            since_ms = mark.since_ms,
+            queued_when_marked = mark.queued_when_marked,
+            "outbound federation: destination entering catch-up"
+        );
+        if !self.drop_queue(destination, pending).await {
+            return false;
+        }
+        let mut rooms_caught_up = 0usize;
+        let mut events_sent = 0usize;
+        loop {
+            if self.shut_down.load(Ordering::Acquire) {
+                return false;
+            }
+            // First wait out the destination's backoff, then decide what to send: what is
+            // latest in each room is what is latest when the attempt is made.
+            let next_attempt = self.state_of(destination).next_attempt_ms.unwrap_or(0);
+            if !self.wait_until(destination, next_attempt).await {
+                return false;
+            }
+            let behind = match self
+                .store
+                .rooms_behind(destination, MAX_PDUS_PER_TRANSACTION)
+            {
+                Ok(behind) => behind,
+                Err(error) => {
+                    tracing::error!(destination, %error, "cannot read the rooms behind; retrying");
+                    tokio::time::sleep(self.config.reset_poll_interval).await;
+                    continue;
+                }
+            };
+            if behind.is_empty() {
+                match self.store.finish_catch_up(destination) {
+                    Ok(true) => break,
+                    // A room fell behind between the two reads: go round again.
+                    Ok(false) => continue,
+                    Err(error) => {
+                        tracing::error!(destination, %error, "cannot clear the catch-up mark");
+                        tokio::time::sleep(self.config.reset_poll_interval).await;
+                        continue;
+                    }
+                }
+            }
+            let mut pdus: Vec<Arc<Value>> = Vec::with_capacity(behind.len());
+            let mut covered: Vec<(String, u64)> = Vec::with_capacity(behind.len());
+            let source = self.catch_up_source.get();
+            if source.is_none() {
+                tracing::warn!(
+                    destination,
+                    rooms = behind.len(),
+                    "no catch-up source is installed: these rooms are counted as caught up \
+                     with nothing sent"
+                );
+            }
+            for room in &behind {
+                if let Some(source) = source {
+                    match source.latest_pdu(&room.room_id, destination).await {
+                        Ok(Some(pdu)) => pdus.push(Arc::new(pdu)),
+                        Ok(None) => tracing::debug!(
+                            destination,
+                            room_id = room.room_id,
+                            "nothing to catch the destination up with in this room"
+                        ),
+                        Err(error) => tracing::warn!(
+                            destination,
+                            room_id = room.room_id,
+                            %error,
+                            "cannot find the room's latest event; not catching up this room"
+                        ),
+                    }
+                }
+                covered.push((room.room_id.clone(), room.queued_seq));
+            }
+            if !pdus.is_empty() {
+                match self
+                    .send_batch(destination, &pdus, &[], Mode::CatchUp)
+                    .await
+                {
+                    Delivery::ShutDown => return false,
+                    // Recompute and try again once the backoff allows.
+                    Delivery::Failed | Delivery::Superseded => continue,
+                    Delivery::Delivered | Delivery::Dropped => {}
+                }
+            }
+            if let Err(error) = self.store.record_sent(destination, &covered) {
+                tracing::error!(destination, %error, "cannot record what catch-up sent; retrying");
+                tokio::time::sleep(self.config.reset_poll_interval).await;
+                continue;
+            }
+            rooms_caught_up += covered.len();
+            events_sent += pdus.len();
+            if let Some(metrics) = self.catch_up_metrics.get() {
+                metrics.record_rooms(pdus.len() as u64);
+            }
+        }
+        if let Some(metrics) = self.catch_up_metrics.get() {
+            metrics.record_completed();
+        }
+        tracing::info!(
+            destination,
+            rooms = rooms_caught_up,
+            events_sent,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "outbound federation: destination caught up; leaving catch-up"
+        );
+        true
+    }
+
+    /// Drops every row the store still holds for `destination` (it is being caught up
+    /// instead), in batches, noting each row's room as behind so that a row written before
+    /// room positions were kept is caught up too. Returns `false` if the sender was shut down
+    /// meanwhile.
+    async fn drop_queue(&self, destination: &str, pending: &AtomicUsize) -> bool {
+        let mut dropped = 0usize;
+        loop {
+            if self.shut_down.load(Ordering::Acquire) {
+                return false;
+            }
+            let rows = match self.store.peek(destination, PURGE_BATCH) {
+                Ok(rows) => rows,
+                Err(error) => {
+                    tracing::error!(destination, %error, "cannot read the queue to drop it");
+                    tokio::time::sleep(self.config.reset_poll_interval).await;
+                    continue;
+                }
+            };
+            let Some(last) = rows.last() else {
+                break;
+            };
+            let through = last.seq;
+            let rows: Vec<(u64, Arc<Value>)> = rows
+                .into_iter()
+                .map(|row| (row.seq, Arc::new(row.pdu)))
+                .collect();
+            let removed = self
+                .store
+                .note_queued(destination, &room_positions(&rows))
+                .and_then(|()| self.store.ack(destination, through, &[]));
+            match removed {
+                Ok(removed) => {
+                    let settled = removed.max(rows.len());
+                    sub_saturating(pending, settled);
+                    sub_saturating(&self.pending_total, settled);
+                    dropped += settled;
+                }
+                Err(error) => {
+                    tracing::error!(destination, %error, "cannot drop the queue; retrying");
+                    tokio::time::sleep(self.config.reset_poll_interval).await;
+                }
+            }
+        }
+        if dropped > 0 {
+            tracing::info!(
+                destination,
+                dropped,
+                "dropped a destination's outbound queue; its rooms are caught up instead"
+            );
+            if let Some(metrics) = self.catch_up_metrics.get() {
+                metrics.record_dropped(dropped as u64);
+            }
+        }
+        true
+    }
+
+    /// Sends one transaction: until the destination accepts it, this server's own policy
+    /// refuses it, or the sender is shut down -- and, in [`Mode::Queue`], until the destination
+    /// enters catch-up mode; in [`Mode::CatchUp`], one attempt. See the module docs for the
+    /// retry rules.
     async fn deliver(
         &self,
         destination: &str,
         txn_id: &str,
         pdus: &[Arc<Value>],
         edus: &[Arc<Value>],
+        mode: Mode,
     ) -> Delivery {
         let path = format!("/_matrix/federation/v1/send/{txn_id}");
         let body = serde_json::json!({
@@ -1103,6 +1526,9 @@ impl Shared {
             );
             if !self.wait_until(destination, next_attempt).await {
                 return Delivery::ShutDown;
+            }
+            if mode == Mode::Queue && self.catching_up(destination) {
+                return Delivery::Superseded;
             }
         }
         loop {
@@ -1193,15 +1619,32 @@ impl Shared {
                     Wait::Until(until)
                 }
             };
-            let keep_going = match wait {
-                Wait::For(delay) => {
+            let keep_going = match (mode, wait) {
+                (_, Wait::For(delay)) => {
                     tokio::time::sleep(delay).await;
                     !self.shut_down.load(Ordering::Acquire)
                 }
-                Wait::Until(until) => self.wait_until(destination, until).await,
+                // Catch-up waits out the recorded backoff itself, after recomputing nothing:
+                // it recomputes once the wait is over.
+                (Mode::CatchUp, Wait::Until(_)) => true,
+                (Mode::Queue, Wait::Until(until)) => self.wait_until(destination, until).await,
             };
             if !keep_going {
                 return Delivery::ShutDown;
+            }
+            match mode {
+                Mode::CatchUp => return Delivery::Failed,
+                Mode::Queue if self.catching_up(destination) => {
+                    tracing::info!(
+                        destination,
+                        txn_id,
+                        pdus = pdus.len(),
+                        "the destination entered catch-up mode while this transaction waited; \
+                         its PDUs are dropped and their rooms caught up instead"
+                    );
+                    return Delivery::Superseded;
+                }
+                Mode::Queue => {}
             }
         }
     }
@@ -1328,6 +1771,7 @@ mod tests {
             max_backoff: Duration::from_secs(1),
             reset_poll_interval: Duration::from_millis(50),
             store_rescan_interval: None,
+            max_queued_pdus_per_destination: DEFAULT_MAX_QUEUED_PDUS_PER_DESTINATION,
         }
     }
 
@@ -1692,6 +2136,7 @@ mod tests {
                 max_backoff: Duration::from_millis(1000),
                 reset_poll_interval: BACKOFF_POLL_INTERVAL,
                 store_rescan_interval: None,
+                max_queued_pdus_per_destination: 1,
             },
             store: Arc::new(InMemoryOutboundStore::new()),
             gate: RwLock::new(Arc::new(SendsEverywhere)),
@@ -1701,6 +2146,8 @@ mod tests {
             shut_down: AtomicBool::new(false),
             edu_metrics: std::sync::OnceLock::new(),
             edu_forwarder: std::sync::OnceLock::new(),
+            catch_up_source: std::sync::OnceLock::new(),
+            catch_up_metrics: std::sync::OnceLock::new(),
         };
         assert_eq!(shared.backoff(1), Duration::from_millis(100));
         assert_eq!(shared.backoff(2), Duration::from_millis(200));
@@ -1798,7 +2245,12 @@ mod tests {
         let (destination, _auth) = spawn_peer(&peer).await;
         let store: Arc<dyn OutboundStore> = Arc::new(InMemoryOutboundStore::new());
         store
-            .enqueue(std::slice::from_ref(&destination), &pdu(0))
+            .enqueue(
+                std::slice::from_ref(&destination),
+                None,
+                &pdu(0),
+                usize::MAX,
+            )
             .unwrap();
         store
             .record_failure(&destination, "connection refused", now_ms() + 3_600_000)
@@ -1834,10 +2286,20 @@ mod tests {
         let (destination, _auth) = spawn_peer(&peer).await;
         let store: Arc<dyn OutboundStore> = Arc::new(InMemoryOutboundStore::new());
         store
-            .enqueue(std::slice::from_ref(&destination), &pdu(0))
+            .enqueue(
+                std::slice::from_ref(&destination),
+                None,
+                &pdu(0),
+                usize::MAX,
+            )
             .unwrap();
         store
-            .enqueue(std::slice::from_ref(&destination), &pdu(1))
+            .enqueue(
+                std::slice::from_ref(&destination),
+                None,
+                &pdu(1),
+                usize::MAX,
+            )
             .unwrap();
 
         let sender = FederationSender::with_store(client(), US, fast(), store.clone());
@@ -2037,7 +2499,12 @@ mod tests {
 
         // The other replica's write: straight into the store, past this sender.
         store
-            .enqueue(std::slice::from_ref(&destination), &pdu(1))
+            .enqueue(
+                std::slice::from_ref(&destination),
+                None,
+                &pdu(1),
+                usize::MAX,
+            )
             .unwrap();
         assert!(wait_for(Duration::from_secs(10), || peer.request_count() == 2).await);
         let second = &peer.requests()[1];
@@ -2055,6 +2522,234 @@ mod tests {
             0,
             "never counted here, never negative"
         );
+    }
+
+    // ---- Catch-up ----
+
+    /// A client-side destination store that never backs off, so that only the sender's own
+    /// (fast, persisted) backoff decides when a failing destination is tried again.
+    struct NeverBacksOff;
+    #[async_trait]
+    impl DestinationStore for NeverBacksOff {
+        async fn get(&self, _destination: &str) -> DestinationState {
+            DestinationState::default()
+        }
+        async fn record_failure(&self, _destination: &str, _max_backoff_ms: u64) {}
+        async fn record_success(&self, _destination: &str) {}
+        async fn list(&self) -> Vec<(String, DestinationState)> {
+            Vec::new()
+        }
+        async fn reset(&self, _destination: &str) {}
+    }
+
+    /// Each room's latest event, as the test says it is; `None` for a room the destination has
+    /// no member in.
+    #[derive(Default)]
+    struct ScriptedRooms(Mutex<HashMap<String, Option<Value>>>);
+    impl ScriptedRooms {
+        fn set(&self, room: &str, latest: Option<Value>) {
+            self.0.lock().unwrap().insert(room.to_owned(), latest);
+        }
+    }
+    #[async_trait]
+    impl CatchUpSource for ScriptedRooms {
+        async fn latest_pdu(
+            &self,
+            room_id: &str,
+            _destination: &str,
+        ) -> Result<Option<Value>, String> {
+            self.0
+                .lock()
+                .unwrap()
+                .get(room_id)
+                .cloned()
+                .ok_or_else(|| format!("unknown room {room_id}"))
+        }
+    }
+
+    fn room_pdu(room: &str, i: usize) -> Value {
+        serde_json::json!({ "type": "m.room.message", "room_id": room, "i": i })
+    }
+
+    fn sent_pdus(peer: &FakeFederationPeer) -> Vec<Vec<u64>> {
+        peer.requests()
+            .iter()
+            .map(|request| {
+                request.body["pdus"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|pdu| pdu["i"].as_u64().unwrap())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The gap this closes: a destination down for longer than its queue holds. Five events
+    /// across two rooms against a queue of three: the queue is dropped, and once the
+    /// destination answers it gets exactly each room's latest event -- oldest room first, in
+    /// one transaction -- and then, out of catch-up, ordinary delivery resumes.
+    #[tokio::test]
+    async fn a_destination_down_past_its_queue_bound_gets_each_rooms_latest_event_then_its_queue() {
+        let reserved = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = reserved.local_addr().unwrap().port();
+        drop(reserved);
+        let destination = format!("localhost:{port}");
+        let store: Arc<dyn OutboundStore> = Arc::new(InMemoryOutboundStore::new());
+        let sender = FederationSender::with_store(
+            client_with(Arc::new(NeverBacksOff)),
+            US,
+            SenderConfig {
+                max_queued_pdus_per_destination: 3,
+                ..fast()
+            },
+            store.clone(),
+        );
+        let rooms = Arc::new(ScriptedRooms::default());
+        sender.install_catch_up_source(rooms.clone());
+        let mut registry = prometheus_client::registry::Registry::default();
+        let metrics = crate::metrics::CatchUpMetrics::register(&mut registry);
+        sender.install_catch_up_metrics(metrics.clone());
+
+        // Nothing yields to the worker in between: three are queued, the fourth finds the
+        // queue full, the fifth only moves its room's position.
+        for (i, room) in ["!a", "!b", "!a", "!b", "!a"].into_iter().enumerate() {
+            rooms.set(room, Some(room_pdu(room, i)));
+            sender.enqueue_pdu([destination.clone()], room_pdu(room, i));
+        }
+        assert_eq!(store.queue_len(&destination).unwrap(), 3);
+        let mark = store.catch_up_mark(&destination).unwrap().expect("marked");
+        assert_eq!(mark.reason, crate::outbound_store::CATCH_UP_QUEUE_FULL);
+        assert_eq!(metrics.started("queue_full"), 1);
+
+        // The worker drops the queue and tries to catch the destination up, which fails.
+        assert!(
+            wait_for(Duration::from_secs(10), || {
+                store.queue_len(&destination).unwrap() == 0
+                    && sender
+                        .destination_state(&destination)
+                        .unwrap()
+                        .is_some_and(|state| state.failures >= 1)
+            })
+            .await
+        );
+        assert_eq!(sender.pending_pdus(), 0, "dropped rows are not pending");
+        assert_eq!(metrics.dropped_total.get(), 3);
+        // While the destination is down, room !b moves on again.
+        rooms.set("!b", Some(room_pdu("!b", 5)));
+        sender.enqueue_pdu([destination.clone()], room_pdu("!b", 5));
+        assert_eq!(
+            store.queue_len(&destination).unwrap(),
+            0,
+            "catching up, not queued"
+        );
+        assert_eq!(sender.catch_up_marks().unwrap().len(), 1);
+
+        // The destination comes up.
+        let peer = FakeFederationPeer::new("peer.example.org");
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap();
+        spawn_peer_on(&peer, listener);
+        assert!(
+            wait_for(Duration::from_secs(10), || store
+                .catch_up_mark(&destination)
+                .unwrap()
+                .is_none())
+            .await,
+            "catch-up never finished"
+        );
+        // !a's latest (4) was queued before !b's (5): oldest room first.
+        assert_eq!(sent_pdus(&peer), vec![vec![4, 5]]);
+        assert!(
+            wait_for(Duration::from_secs(10), || metrics.completed_total.get()
+                == 1)
+            .await
+        );
+        assert_eq!(metrics.rooms_total.get(), 2);
+
+        // Out of catch-up: the next event is queued and sent as ever.
+        sender.enqueue_pdu([destination.clone()], room_pdu("!a", 6));
+        assert!(wait_for(Duration::from_secs(10), || peer.request_count() == 2).await);
+        assert!(wait_for(Duration::from_secs(10), || sender.pending_pdus() == 0).await);
+        assert_eq!(sent_pdus(&peer), vec![vec![4, 5], vec![6]]);
+        assert!(store.rooms_behind(&destination, 10).unwrap().is_empty());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(peer.request_count(), 2, "nothing stale followed");
+
+        let mut text = String::new();
+        prometheus_client::encoding::text::encode(&mut text, &registry).unwrap();
+        assert!(
+            text.contains(r#"hs_federation_catch_up_started_total{reason="queue_full"} 1"#),
+            "{text}"
+        );
+        assert!(
+            text.contains("hs_federation_catch_up_rooms_total 2"),
+            "{text}"
+        );
+        assert!(
+            text.contains("hs_federation_outbound_pdus_dropped_total 3"),
+            "{text}"
+        );
+    }
+
+    /// A mark outlives the process: the next sender over the same store resumes the
+    /// destination even with nothing queued, sends the rooms it can, and skips a room the
+    /// destination has left.
+    #[tokio::test]
+    async fn a_destination_marked_before_a_restart_is_caught_up_by_the_next_sender() {
+        let peer = FakeFederationPeer::new("peer.example.org");
+        let (destination, _auth) = spawn_peer(&peer).await;
+        let backend = MemoryBackend::new();
+        let store: Arc<dyn OutboundStore> =
+            Arc::new(KvOutboundStore::open(backend.clone()).unwrap());
+        for (i, room) in ["!kept", "!left"].into_iter().enumerate() {
+            store
+                .enqueue(
+                    std::slice::from_ref(&destination),
+                    Some(room),
+                    &room_pdu(room, i),
+                    usize::MAX,
+                )
+                .unwrap();
+        }
+        // The previous run asked for catch-up (and died); its queue was not yet dropped.
+        assert!(
+            store
+                .mark_catch_up(&destination, crate::outbound_store::CATCH_UP_REQUESTED)
+                .unwrap()
+        );
+        drop(store);
+
+        let store: Arc<dyn OutboundStore> = Arc::new(KvOutboundStore::open(backend).unwrap());
+        let sender = FederationSender::with_store(client(), US, fast(), store.clone());
+        let rooms = Arc::new(ScriptedRooms::default());
+        rooms.set("!kept", Some(room_pdu("!kept", 7)));
+        rooms.set("!left", None);
+        sender.install_catch_up_source(rooms);
+        assert_eq!(sender.resume().unwrap(), 2);
+        assert!(
+            wait_for(Duration::from_secs(10), || store
+                .catch_up_mark(&destination)
+                .unwrap()
+                .is_none())
+            .await
+        );
+        assert_eq!(sent_pdus(&peer), vec![vec![7]]);
+        assert_eq!(store.queue_len(&destination).unwrap(), 0);
+        assert_eq!(sender.pending_pdus(), 0);
+        assert!(store.rooms_behind(&destination, 10).unwrap().is_empty());
+
+        // Asking again marks it again, and with nothing behind it is over at once.
+        assert!(sender.mark_for_catch_up(&destination).unwrap());
+        assert!(
+            wait_for(Duration::from_secs(10), || store
+                .catch_up_mark(&destination)
+                .unwrap()
+                .is_none())
+            .await
+        );
+        assert_eq!(peer.request_count(), 1);
     }
 
     // ---- EDUs ----

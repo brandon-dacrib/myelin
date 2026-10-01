@@ -28,6 +28,22 @@
 //!   connection-level backoff and applies to every outbound call, not only transactions; the
 //!   admin API merges the two into one row per destination (`crate::admin_source`).
 //!
+//! - `hs_federation.outbound_lengths`: `(destination,) -> i64` (an `atomic_add` counter): how
+//!   many rows `outbound_queue` holds for the destination, kept in the same transactions that
+//!   add and remove them, so the queue bound is checked with one read rather than a scan. A
+//!   store opened over data written before the counter existed counts the queue once, at open
+//!   (`outbound_meta`'s `lengths_v1` key says that has been done).
+//! - `hs_federation.outbound_room_queued`: `(destination, room_id) -> u64` (big-endian): the
+//!   sequence number of the newest PDU of that room this server meant the destination to have
+//!   -- written by every enqueue, whether a queue row was written for it or not.
+//! - `hs_federation.outbound_room_sent`: `(destination, room_id) -> u64`: the sequence number of
+//!   the newest PDU of that room the destination accepted (or that catch-up has accounted for).
+//!   Together with the previous one this is Synapse's `destination_rooms` plus
+//!   `destinations.last_successful_stream_ordering`, split per room: a room is *behind* for a
+//!   destination when its queued position is past its sent one.
+//! - `hs_federation.outbound_catch_up`: `(destination,) -> CatchUpMark` JSON, present while the
+//!   destination is in catch-up mode (see [`CatchUpMark`] and `crate::sender`'s module docs).
+//!
 //! Sequence numbers are `u64` big-endian in the key, so a range over one destination's prefix
 //! is its queue oldest-first, and a `u64` never wraps in practice.
 
@@ -140,6 +156,58 @@ impl OutboundDestinationState {
     }
 }
 
+/// Why a destination is in catch-up mode, and since when. Present in the store from the moment
+/// the destination's queue overflowed (or something else said what was queued for it is not the
+/// whole story) until the sender has sent it the latest event of every room it is behind in.
+/// While a destination has one, nothing more is written to its queue: each new PDU only moves
+/// its room's queued position forward, and catch-up sends the room's latest event instead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatchUpMark {
+    /// When the destination entered catch-up mode, in milliseconds since the epoch.
+    pub since_ms: u64,
+    /// The store's sequence counter when the mark was set: every queue row for the destination
+    /// is older than this, so a copy of one still on its way to the worker can be recognised
+    /// as superseded and skipped.
+    pub from_seq: u64,
+    /// `queue_full` (the queue reached the configured bound) or `requested` (a caller asked,
+    /// [`OutboundStore::mark_catch_up`]).
+    pub reason: String,
+    /// How many PDUs the queue held when the mark was set: what catch-up replaces.
+    #[serde(default)]
+    pub queued_when_marked: u64,
+}
+
+/// [`CatchUpMark::reason`] when the queue reached its bound.
+pub const CATCH_UP_QUEUE_FULL: &str = "queue_full";
+/// [`CatchUpMark::reason`] when a caller asked for catch-up.
+pub const CATCH_UP_REQUESTED: &str = "requested";
+
+/// What [`OutboundStore::enqueue`] did with one PDU.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Enqueued {
+    /// The sequence number the PDU was given (the same for every destination).
+    pub seq: u64,
+    /// The destinations a queue row was written for, in the order given.
+    pub queued: Vec<String>,
+    /// The destinations whose queue was full: this call put them in catch-up mode and wrote no
+    /// row for them.
+    pub newly_catching_up: Vec<String>,
+    /// The destinations already in catch-up mode: no row was written; only the room's queued
+    /// position moved.
+    pub catching_up: Vec<String>,
+}
+
+/// One room a destination is behind in: what catch-up sends the room's latest event for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomBehind {
+    /// The room.
+    pub room_id: String,
+    /// The sequence number of the newest PDU of the room meant for the destination.
+    pub queued_seq: u64,
+    /// The sequence number of the newest one it accepted, if any.
+    pub sent_seq: Option<u64>,
+}
+
 fn truncate(error: &str) -> String {
     if error.len() <= MAX_ERROR_LEN {
         return error.to_owned();
@@ -185,12 +253,21 @@ pub trait OutboundStore: Send + Sync {
     /// what is still queued at shutdown: kept for the next start, or lost.
     fn durable(&self) -> bool;
 
-    /// Appends `pdu` to every destination's queue in one transaction and returns the sequence
-    /// number it was given (the same for each destination).
+    /// Gives `pdu` the next sequence number and, in one transaction, for every destination:
+    /// moves `room_id`'s queued position to it (when there is a room), and appends it to the
+    /// destination's queue -- unless the destination is in catch-up mode, or its queue already
+    /// holds `max_queue_len` PDUs, in which case no row is written and the destination is (or
+    /// stays) in catch-up mode. [`Enqueued`] says which destination went which way.
     ///
     /// # Errors
     /// Returns the backend's error; nothing was queued anywhere then.
-    fn enqueue(&self, destinations: &[String], pdu: &Value) -> Result<u64, OutboundStoreError>;
+    fn enqueue(
+        &self,
+        destinations: &[String],
+        room_id: Option<&str>,
+        pdu: &Value,
+        max_queue_len: usize,
+    ) -> Result<Enqueued, OutboundStoreError>;
 
     /// The oldest `limit` PDUs queued for `destination`, oldest first. A row that no longer
     /// decodes is logged and skipped rather than blocking everything behind it.
@@ -200,11 +277,78 @@ pub trait OutboundStore: Send + Sync {
     fn peek(&self, destination: &str, limit: usize) -> Result<Vec<QueuedPdu>, OutboundStoreError>;
 
     /// Removes every PDU queued for `destination` with a sequence number up to and including
-    /// `through_seq`; returns how many rows that was.
+    /// `through_seq`, and records each `(room_id, seq)` in `sent` as that room's sent position
+    /// for the destination, in one transaction; returns how many rows were removed. `sent` is
+    /// empty for rows that are dropped rather than delivered.
     ///
     /// # Errors
     /// Returns the backend's error.
-    fn ack(&self, destination: &str, through_seq: u64) -> Result<usize, OutboundStoreError>;
+    fn ack(
+        &self,
+        destination: &str,
+        through_seq: u64,
+        sent: &[(String, u64)],
+    ) -> Result<usize, OutboundStoreError>;
+
+    /// The catch-up mark of `destination`, if it is in catch-up mode.
+    ///
+    /// # Errors
+    /// Returns the backend's error.
+    fn catch_up_mark(&self, destination: &str) -> Result<Option<CatchUpMark>, OutboundStoreError>;
+
+    /// Every destination in catch-up mode, sorted by name.
+    ///
+    /// # Errors
+    /// Returns the backend's error.
+    fn catch_up_marks(&self) -> Result<Vec<(String, CatchUpMark)>, OutboundStoreError>;
+
+    /// Puts `destination` in catch-up mode for `reason`, unless it already is. Returns whether
+    /// this call did it.
+    ///
+    /// # Errors
+    /// Returns the backend's error.
+    fn mark_catch_up(&self, destination: &str, reason: &str) -> Result<bool, OutboundStoreError>;
+
+    /// Moves each `(room_id, seq)`'s queued position for `destination` forward to `seq` where
+    /// it is behind it (never back). What the sender does with rows it drops unsent, so that a
+    /// row written before positions were recorded is still caught up.
+    ///
+    /// # Errors
+    /// Returns the backend's error.
+    fn note_queued(
+        &self,
+        destination: &str,
+        rooms: &[(String, u64)],
+    ) -> Result<(), OutboundStoreError>;
+
+    /// The rooms `destination` is behind in (queued position past sent position), oldest queued
+    /// position first, at most `limit`.
+    ///
+    /// # Errors
+    /// Returns the backend's error.
+    fn rooms_behind(
+        &self,
+        destination: &str,
+        limit: usize,
+    ) -> Result<Vec<RoomBehind>, OutboundStoreError>;
+
+    /// Records each `(room_id, seq)` as that room's sent position for `destination`.
+    ///
+    /// # Errors
+    /// Returns the backend's error.
+    fn record_sent(
+        &self,
+        destination: &str,
+        rooms: &[(String, u64)],
+    ) -> Result<(), OutboundStoreError>;
+
+    /// Takes `destination` out of catch-up mode if, and only if, it is behind in no room, in
+    /// one transaction (so an enqueue racing it either lands before, and is seen as a room
+    /// behind, or after, and is queued normally). Returns whether it did.
+    ///
+    /// # Errors
+    /// Returns the backend's error.
+    fn finish_catch_up(&self, destination: &str) -> Result<bool, OutboundStoreError>;
 
     /// Every destination with a non-empty queue, with the queue's length, sorted by name.
     ///
@@ -271,6 +415,30 @@ struct InMemoryInner {
     next_seq: u64,
     queues: HashMap<String, BTreeMap<u64, Value>>,
     states: HashMap<String, OutboundDestinationState>,
+    /// `(destination, room) -> seq`, ordered so one destination's rooms are a range.
+    room_queued: BTreeMap<(String, String), u64>,
+    room_sent: BTreeMap<(String, String), u64>,
+    marks: HashMap<String, CatchUpMark>,
+}
+
+impl InMemoryInner {
+    fn behind(&self, destination: &str) -> Vec<RoomBehind> {
+        let mut rooms: Vec<RoomBehind> = self
+            .room_queued
+            .range((destination.to_owned(), String::new())..)
+            .take_while(|((d, _), _)| d == destination)
+            .filter_map(|((d, room), queued)| {
+                let sent = self.room_sent.get(&(d.clone(), room.clone())).copied();
+                (sent.is_none_or(|sent| sent < *queued)).then(|| RoomBehind {
+                    room_id: room.clone(),
+                    queued_seq: *queued,
+                    sent_seq: sent,
+                })
+            })
+            .collect();
+        rooms.sort_by_key(|room| room.queued_seq);
+        rooms
+    }
 }
 
 impl InMemoryOutboundStore {
@@ -290,18 +458,52 @@ impl OutboundStore for InMemoryOutboundStore {
         false
     }
 
-    fn enqueue(&self, destinations: &[String], pdu: &Value) -> Result<u64, OutboundStoreError> {
+    fn enqueue(
+        &self,
+        destinations: &[String],
+        room_id: Option<&str>,
+        pdu: &Value,
+        max_queue_len: usize,
+    ) -> Result<Enqueued, OutboundStoreError> {
         let mut inner = self.lock();
         inner.next_seq += 1;
         let seq = inner.next_seq;
+        let mut out = Enqueued {
+            seq,
+            ..Enqueued::default()
+        };
         for destination in destinations {
+            if let Some(room) = room_id {
+                inner
+                    .room_queued
+                    .insert((destination.clone(), room.to_owned()), seq);
+            }
+            if inner.marks.contains_key(destination) {
+                out.catching_up.push(destination.clone());
+                continue;
+            }
+            let len = inner.queues.get(destination).map_or(0, BTreeMap::len);
+            if len >= max_queue_len {
+                inner.marks.insert(
+                    destination.clone(),
+                    CatchUpMark {
+                        since_ms: now_ms(),
+                        from_seq: seq,
+                        reason: CATCH_UP_QUEUE_FULL.to_owned(),
+                        queued_when_marked: len as u64,
+                    },
+                );
+                out.newly_catching_up.push(destination.clone());
+                continue;
+            }
             inner
                 .queues
                 .entry(destination.clone())
                 .or_default()
                 .insert(seq, pdu.clone());
+            out.queued.push(destination.clone());
         }
-        Ok(seq)
+        Ok(out)
     }
 
     fn peek(&self, destination: &str, limit: usize) -> Result<Vec<QueuedPdu>, OutboundStoreError> {
@@ -322,8 +524,18 @@ impl OutboundStore for InMemoryOutboundStore {
             .unwrap_or_default())
     }
 
-    fn ack(&self, destination: &str, through_seq: u64) -> Result<usize, OutboundStoreError> {
+    fn ack(
+        &self,
+        destination: &str,
+        through_seq: u64,
+        sent: &[(String, u64)],
+    ) -> Result<usize, OutboundStoreError> {
         let mut inner = self.lock();
+        for (room, seq) in sent {
+            inner
+                .room_sent
+                .insert((destination.to_owned(), room.clone()), *seq);
+        }
         let Some(queue) = inner.queues.get_mut(destination) else {
             return Ok(0);
         };
@@ -334,6 +546,85 @@ impl OutboundStore for InMemoryOutboundStore {
             inner.queues.remove(destination);
         }
         Ok(removed)
+    }
+
+    fn catch_up_mark(&self, destination: &str) -> Result<Option<CatchUpMark>, OutboundStoreError> {
+        Ok(self.lock().marks.get(destination).cloned())
+    }
+
+    fn catch_up_marks(&self) -> Result<Vec<(String, CatchUpMark)>, OutboundStoreError> {
+        let mut all: Vec<(String, CatchUpMark)> = self
+            .lock()
+            .marks
+            .iter()
+            .map(|(name, mark)| (name.clone(), mark.clone()))
+            .collect();
+        all.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(all)
+    }
+
+    fn mark_catch_up(&self, destination: &str, reason: &str) -> Result<bool, OutboundStoreError> {
+        let mut inner = self.lock();
+        if inner.marks.contains_key(destination) {
+            return Ok(false);
+        }
+        let mark = CatchUpMark {
+            since_ms: now_ms(),
+            from_seq: inner.next_seq + 1,
+            reason: reason.to_owned(),
+            queued_when_marked: inner.queues.get(destination).map_or(0, BTreeMap::len) as u64,
+        };
+        inner.marks.insert(destination.to_owned(), mark);
+        Ok(true)
+    }
+
+    fn note_queued(
+        &self,
+        destination: &str,
+        rooms: &[(String, u64)],
+    ) -> Result<(), OutboundStoreError> {
+        let mut inner = self.lock();
+        for (room, seq) in rooms {
+            let entry = inner
+                .room_queued
+                .entry((destination.to_owned(), room.clone()))
+                .or_insert(*seq);
+            *entry = (*entry).max(*seq);
+        }
+        Ok(())
+    }
+
+    fn rooms_behind(
+        &self,
+        destination: &str,
+        limit: usize,
+    ) -> Result<Vec<RoomBehind>, OutboundStoreError> {
+        let mut rooms = self.lock().behind(destination);
+        rooms.truncate(limit);
+        Ok(rooms)
+    }
+
+    fn record_sent(
+        &self,
+        destination: &str,
+        rooms: &[(String, u64)],
+    ) -> Result<(), OutboundStoreError> {
+        let mut inner = self.lock();
+        for (room, seq) in rooms {
+            inner
+                .room_sent
+                .insert((destination.to_owned(), room.clone()), *seq);
+        }
+        Ok(())
+    }
+
+    fn finish_catch_up(&self, destination: &str) -> Result<bool, OutboundStoreError> {
+        let mut inner = self.lock();
+        if !inner.behind(destination).is_empty() {
+            return Ok(false);
+        }
+        inner.marks.remove(destination);
+        Ok(true)
     }
 
     fn queued(&self) -> Result<Vec<(String, usize)>, OutboundStoreError> {
@@ -411,26 +702,171 @@ pub struct KvOutboundStore<B: KvBackend> {
     queue: TypedKeyspace<B::Keyspace, (String, u64)>,
     destinations: TypedKeyspace<B::Keyspace, (String,)>,
     meta: B::Keyspace,
+    lengths: B::Keyspace,
+    room_queued: TypedKeyspace<B::Keyspace, (String, String)>,
+    room_sent: TypedKeyspace<B::Keyspace, (String, String)>,
+    marks: TypedKeyspace<B::Keyspace, (String,)>,
 }
 
 const SEQ_KEY: &[u8] = b"seq";
+/// Present in `outbound_meta` once `outbound_lengths` has been brought up to date with the
+/// queue (see the module docs).
+const LENGTHS_KEY: &[u8] = b"lengths_v1";
+
+fn length_key(destination: &str) -> Vec<u8> {
+    hs_tables::key::TupleKey::encode(&(destination.to_owned(),))
+}
+
+fn decode_u64(bytes: &[u8]) -> Option<u64> {
+    Some(u64::from_be_bytes(bytes.try_into().ok()?))
+}
 
 impl<B: KvBackend> KvOutboundStore<B> {
-    /// Opens (creating if necessary) the three keyspaces on `backend`.
+    /// Opens (creating if necessary) the store's keyspaces on `backend`, and counts the queue
+    /// once if it was written before queue lengths were kept.
     ///
     /// # Errors
-    /// Returns the backend's error if a keyspace cannot be opened.
+    /// Returns the backend's error if a keyspace cannot be opened or the queue counted.
     pub fn open(backend: B) -> Result<Self, hs_kv::KvError> {
         let queue = TypedKeyspace::new(backend.keyspace("hs_federation.outbound_queue")?);
         let destinations =
             TypedKeyspace::new(backend.keyspace("hs_federation.outbound_destinations")?);
         let meta = backend.keyspace("hs_federation.outbound_meta")?;
-        Ok(Self {
+        let lengths = backend.keyspace("hs_federation.outbound_lengths")?;
+        let room_queued =
+            TypedKeyspace::new(backend.keyspace("hs_federation.outbound_room_queued")?);
+        let room_sent = TypedKeyspace::new(backend.keyspace("hs_federation.outbound_room_sent")?);
+        let marks = TypedKeyspace::new(backend.keyspace("hs_federation.outbound_catch_up")?);
+        let store = Self {
             backend,
             queue,
             destinations,
             meta,
+            lengths,
+            room_queued,
+            room_sent,
+            marks,
+        };
+        store.count_lengths_once()?;
+        Ok(store)
+    }
+
+    /// Brings `outbound_lengths` up to date with a queue written before it existed: one scan,
+    /// once per store (in the transaction that records it was done, so two processes opening
+    /// the same store at once do it once between them).
+    fn count_lengths_once(&self) -> Result<(), hs_kv::KvError> {
+        if self
+            .backend
+            .snapshot()
+            .get(&self.meta, LENGTHS_KEY)?
+            .is_some()
+        {
+            return Ok(());
+        }
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            if txn.get(&self.meta, LENGTHS_KEY)?.is_some() {
+                return Ok(());
+            }
+            let mut counts: BTreeMap<String, i64> = BTreeMap::new();
+            for item in self.queue.range(txn, RangeSpec::full()) {
+                let ((destination, _), _) = item.map_err(|e| into_kv(e.into()))?;
+                *counts.entry(destination).or_default() += 1;
+            }
+            for (destination, count) in counts {
+                txn.put(
+                    &self.lengths,
+                    &length_key(&destination),
+                    &count.to_be_bytes(),
+                )?;
+            }
+            txn.put(&self.meta, LENGTHS_KEY, b"1")
         })
+    }
+
+    fn queue_length<R: KvRead<Keyspace = B::Keyspace>>(
+        &self,
+        reader: &R,
+        destination: &str,
+    ) -> Result<u64, hs_kv::KvError> {
+        Ok(reader
+            .get(&self.lengths, &length_key(destination))?
+            .and_then(|bytes| <[u8; 8]>::try_from(bytes.as_ref()).ok())
+            .map_or(0, |bytes| {
+                u64::try_from(i64::from_be_bytes(bytes)).unwrap_or(0)
+            }))
+    }
+
+    fn read_mark<R: KvRead<Keyspace = B::Keyspace>>(
+        &self,
+        reader: &R,
+        destination: &str,
+    ) -> Result<Option<CatchUpMark>, OutboundStoreError> {
+        match self.marks.get(reader, &(destination.to_owned(),))? {
+            Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// One destination's room positions, `room -> seq`, from `keyspace`.
+    fn room_positions<R: KvRead<Keyspace = B::Keyspace>>(
+        &self,
+        reader: &R,
+        keyspace: &TypedKeyspace<B::Keyspace, (String, String)>,
+        destination: &str,
+    ) -> Result<BTreeMap<String, u64>, OutboundStoreError> {
+        let spec =
+            TypedKeyspace::<B::Keyspace, (String, String)>::prefix(&(destination.to_owned(),));
+        let mut out = BTreeMap::new();
+        for item in keyspace.range(reader, spec) {
+            let ((_, room), bytes) = item?;
+            if let Some(seq) = decode_u64(&bytes) {
+                out.insert(room, seq);
+            }
+        }
+        Ok(out)
+    }
+
+    fn behind<R: KvRead<Keyspace = B::Keyspace>>(
+        &self,
+        reader: &R,
+        destination: &str,
+    ) -> Result<Vec<RoomBehind>, OutboundStoreError> {
+        let queued = self.room_positions(reader, &self.room_queued, destination)?;
+        let sent = self.room_positions(reader, &self.room_sent, destination)?;
+        let mut rooms: Vec<RoomBehind> = queued
+            .into_iter()
+            .filter_map(|(room_id, queued_seq)| {
+                let sent_seq = sent.get(&room_id).copied();
+                sent_seq
+                    .is_none_or(|sent| sent < queued_seq)
+                    .then_some(RoomBehind {
+                        room_id,
+                        queued_seq,
+                        sent_seq,
+                    })
+            })
+            .collect();
+        rooms.sort_by_key(|room| room.queued_seq);
+        Ok(rooms)
+    }
+
+    fn put_positions<W: KvWrite<Keyspace = B::Keyspace>>(
+        &self,
+        txn: &mut W,
+        keyspace: &TypedKeyspace<B::Keyspace, (String, String)>,
+        destination: &str,
+        rooms: &[(String, u64)],
+    ) -> Result<(), hs_kv::KvError> {
+        for (room, seq) in rooms {
+            keyspace
+                .put(
+                    txn,
+                    &(destination.to_owned(), room.clone()),
+                    &seq.to_be_bytes(),
+                )
+                .map_err(|e| into_kv(e.into()))?;
+        }
+        Ok(())
     }
 
     fn read_state<R: KvRead<Keyspace = B::Keyspace>>(
@@ -488,20 +924,61 @@ impl<B: KvBackend> OutboundStore for KvOutboundStore<B> {
         true
     }
 
-    fn enqueue(&self, destinations: &[String], pdu: &Value) -> Result<u64, OutboundStoreError> {
+    fn enqueue(
+        &self,
+        destinations: &[String],
+        room_id: Option<&str>,
+        pdu: &Value,
+        max_queue_len: usize,
+    ) -> Result<Enqueued, OutboundStoreError> {
         let bytes = serde_json::to_vec(pdu)?;
-        let seq = transact(&self.backend, TransactConfig::default(), |txn| {
+        let max_queue_len = u64::try_from(max_queue_len).unwrap_or(u64::MAX);
+        let enqueued = transact(&self.backend, TransactConfig::default(), |txn| {
             let seq = txn.atomic_add(&self.meta, SEQ_KEY, 1)?;
             // The counter is an `i64` by `atomic_add`'s contract and never negative here.
             let seq = u64::try_from(seq).unwrap_or(0);
+            let mut out = Enqueued {
+                seq,
+                ..Enqueued::default()
+            };
             for destination in destinations {
+                if let Some(room) = room_id {
+                    self.room_queued
+                        .put(
+                            txn,
+                            &(destination.clone(), room.to_owned()),
+                            &seq.to_be_bytes(),
+                        )
+                        .map_err(|e| into_kv(e.into()))?;
+                }
+                if self.read_mark(txn, destination).map_err(into_kv)?.is_some() {
+                    out.catching_up.push(destination.clone());
+                    continue;
+                }
+                let len = self.queue_length(txn, destination)?;
+                if len >= max_queue_len {
+                    let mark = CatchUpMark {
+                        since_ms: now_ms(),
+                        from_seq: seq,
+                        reason: CATCH_UP_QUEUE_FULL.to_owned(),
+                        queued_when_marked: len,
+                    };
+                    let mark = serde_json::to_vec(&mark).map_err(|e| into_kv(e.into()))?;
+                    self.marks
+                        .put(txn, &(destination.clone(),), &mark)
+                        .map_err(|e| into_kv(e.into()))?;
+                    out.newly_catching_up.push(destination.clone());
+                    continue;
+                }
                 self.queue
                     .put(txn, &(destination.clone(), seq), &bytes)
                     .map_err(|e| into_kv(e.into()))?;
+                txn.atomic_add(&self.lengths, &length_key(destination), 1)?;
+                out.queued.push(destination.clone());
             }
-            Ok(seq)
+            Ok(out)
         })?;
-        Ok(seq)
+        Ok(enqueued)
     }
 
     fn peek(&self, destination: &str, limit: usize) -> Result<Vec<QueuedPdu>, OutboundStoreError> {
@@ -524,25 +1001,156 @@ impl<B: KvBackend> OutboundStore for KvOutboundStore<B> {
         Ok(out)
     }
 
-    fn ack(&self, destination: &str, through_seq: u64) -> Result<usize, OutboundStoreError> {
+    fn ack(
+        &self,
+        destination: &str,
+        through_seq: u64,
+        sent: &[(String, u64)],
+    ) -> Result<usize, OutboundStoreError> {
         let removed = transact(&self.backend, TransactConfig::default(), |txn| {
             let spec =
                 TypedKeyspace::<B::Keyspace, (String, u64)>::prefix(&(destination.to_owned(),));
-            let keys: Vec<(String, u64)> = self
-                .queue
-                .range(txn, spec)
-                .map(|item| item.map(|(key, _)| key).map_err(|e| into_kv(e.into())))
-                .collect::<Result<_, _>>()?;
-            let mut removed = 0usize;
-            for key in keys.into_iter().filter(|(_, seq)| *seq <= through_seq) {
+            // The queue is in sequence order: stop at the first row past `through_seq` rather
+            // than reading the whole of a long queue.
+            let mut keys: Vec<(String, u64)> = Vec::new();
+            for item in self.queue.range(txn, spec) {
+                let (key, _) = item.map_err(|e| into_kv(e.into()))?;
+                if key.1 > through_seq {
+                    break;
+                }
+                keys.push(key);
+            }
+            let removed = keys.len();
+            for key in keys {
                 self.queue
                     .delete(txn, &key)
                     .map_err(|e| into_kv(e.into()))?;
-                removed += 1;
             }
+            if removed > 0 {
+                txn.atomic_add(
+                    &self.lengths,
+                    &length_key(destination),
+                    -i64::try_from(removed).unwrap_or(i64::MAX),
+                )?;
+            }
+            self.put_positions(txn, &self.room_sent, destination, sent)?;
             Ok(removed)
         })?;
         Ok(removed)
+    }
+
+    fn catch_up_mark(&self, destination: &str) -> Result<Option<CatchUpMark>, OutboundStoreError> {
+        self.read_mark(&self.backend.snapshot(), destination)
+    }
+
+    fn catch_up_marks(&self) -> Result<Vec<(String, CatchUpMark)>, OutboundStoreError> {
+        let snapshot = self.backend.snapshot();
+        let mut all = Vec::new();
+        for item in self.marks.range(&snapshot, RangeSpec::full()) {
+            let ((destination,), bytes) = item?;
+            match serde_json::from_slice::<CatchUpMark>(&bytes) {
+                Ok(mark) => all.push((destination, mark)),
+                Err(error) => tracing::error!(
+                    destination,
+                    %error,
+                    "a destination's catch-up mark no longer decodes; ignoring it"
+                ),
+            }
+        }
+        Ok(all)
+    }
+
+    fn mark_catch_up(&self, destination: &str, reason: &str) -> Result<bool, OutboundStoreError> {
+        let marked = transact(&self.backend, TransactConfig::default(), |txn| {
+            if self.read_mark(txn, destination).map_err(into_kv)?.is_some() {
+                return Ok(false);
+            }
+            let next_seq = txn
+                .get(&self.meta, SEQ_KEY)?
+                .and_then(|bytes| <[u8; 8]>::try_from(bytes.as_ref()).ok())
+                .map_or(0, |bytes| {
+                    u64::try_from(i64::from_be_bytes(bytes)).unwrap_or(0)
+                })
+                + 1;
+            let mark = CatchUpMark {
+                since_ms: now_ms(),
+                from_seq: next_seq,
+                reason: reason.to_owned(),
+                queued_when_marked: self.queue_length(txn, destination)?,
+            };
+            let mark = serde_json::to_vec(&mark).map_err(|e| into_kv(e.into()))?;
+            self.marks
+                .put(txn, &(destination.to_owned(),), &mark)
+                .map_err(|e| into_kv(e.into()))?;
+            Ok(true)
+        })?;
+        Ok(marked)
+    }
+
+    fn note_queued(
+        &self,
+        destination: &str,
+        rooms: &[(String, u64)],
+    ) -> Result<(), OutboundStoreError> {
+        if rooms.is_empty() {
+            return Ok(());
+        }
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            for (room, seq) in rooms {
+                let key = (destination.to_owned(), room.clone());
+                let current = self
+                    .room_queued
+                    .get(txn, &key)
+                    .map_err(|e| into_kv(e.into()))?
+                    .and_then(|bytes| decode_u64(&bytes));
+                if current.is_none_or(|current| current < *seq) {
+                    self.room_queued
+                        .put(txn, &key, &seq.to_be_bytes())
+                        .map_err(|e| into_kv(e.into()))?;
+                }
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    fn rooms_behind(
+        &self,
+        destination: &str,
+        limit: usize,
+    ) -> Result<Vec<RoomBehind>, OutboundStoreError> {
+        let mut rooms = self.behind(&self.backend.snapshot(), destination)?;
+        rooms.truncate(limit);
+        Ok(rooms)
+    }
+
+    fn record_sent(
+        &self,
+        destination: &str,
+        rooms: &[(String, u64)],
+    ) -> Result<(), OutboundStoreError> {
+        if rooms.is_empty() {
+            return Ok(());
+        }
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            self.put_positions(txn, &self.room_sent, destination, rooms)
+        })?;
+        Ok(())
+    }
+
+    fn finish_catch_up(&self, destination: &str) -> Result<bool, OutboundStoreError> {
+        let finished = transact(&self.backend, TransactConfig::default(), |txn| {
+            // Read inside the transaction: an enqueue that moves a room's queued position
+            // between this read and the commit conflicts with it, and the retry sees it.
+            if !self.behind(txn, destination).map_err(into_kv)?.is_empty() {
+                return Ok(false);
+            }
+            self.marks
+                .delete(txn, &(destination.to_owned(),))
+                .map_err(|e| into_kv(e.into()))?;
+            Ok(true)
+        })?;
+        Ok(finished)
     }
 
     fn queued(&self) -> Result<Vec<(String, usize)>, OutboundStoreError> {
@@ -646,9 +1254,18 @@ mod tests {
         for (name, store) in stores() {
             let a = "a.example".to_owned();
             let b = "b.example".to_owned();
-            let s1 = store.enqueue(&[a.clone(), b.clone()], &pdu(1)).unwrap();
-            let s2 = store.enqueue(std::slice::from_ref(&a), &pdu(2)).unwrap();
-            let s3 = store.enqueue(&[a.clone(), b.clone()], &pdu(3)).unwrap();
+            let s1 = store
+                .enqueue(&[a.clone(), b.clone()], None, &pdu(1), usize::MAX)
+                .unwrap()
+                .seq;
+            let s2 = store
+                .enqueue(std::slice::from_ref(&a), None, &pdu(2), usize::MAX)
+                .unwrap()
+                .seq;
+            let s3 = store
+                .enqueue(&[a.clone(), b.clone()], None, &pdu(3), usize::MAX)
+                .unwrap()
+                .seq;
             assert!(s1 < s2 && s2 < s3, "{name}: {s1} {s2} {s3}");
 
             let head = store.peek(&a, 2).unwrap();
@@ -664,18 +1281,18 @@ mod tests {
             assert_eq!(store.queue_len(&a).unwrap(), 3);
             assert_eq!(store.queue_len("nobody.example").unwrap(), 0);
 
-            assert_eq!(store.ack(&a, s2).unwrap(), 2, "{name}");
+            assert_eq!(store.ack(&a, s2, &[]).unwrap(), 2, "{name}");
             let rest = store.peek(&a, 50).unwrap();
             assert_eq!(rest.len(), 1, "{name}");
             assert_eq!(rest[0].seq, s3);
             assert_eq!(rest[0].pdu, pdu(3));
             // b's queue was not touched by a's ack.
             assert_eq!(store.peek(&b, 50).unwrap().len(), 2, "{name}");
-            assert_eq!(store.ack(&a, s3).unwrap(), 1);
+            assert_eq!(store.ack(&a, s3, &[]).unwrap(), 1);
             assert!(store.peek(&a, 50).unwrap().is_empty());
             assert_eq!(store.queued().unwrap(), vec![(b.clone(), 2)], "{name}");
             // Acking what is already gone is nothing, not an error.
-            assert_eq!(store.ack(&a, s3).unwrap(), 0);
+            assert_eq!(store.ack(&a, s3, &[]).unwrap(), 0);
         }
     }
 
@@ -724,8 +1341,9 @@ mod tests {
         let backend = MemoryBackend::new();
         let first = KvOutboundStore::open(backend.clone()).unwrap();
         let s1 = first
-            .enqueue(&["peer.example".to_owned()], &pdu(1))
-            .unwrap();
+            .enqueue(&["peer.example".to_owned()], None, &pdu(1), usize::MAX)
+            .unwrap()
+            .seq;
         first
             .record_failure("peer.example", "connection refused", u64::MAX)
             .unwrap();
@@ -738,8 +1356,9 @@ mod tests {
             vec![("peer.example".to_owned(), 1)]
         );
         let s2 = second
-            .enqueue(&["peer.example".to_owned()], &pdu(2))
-            .unwrap();
+            .enqueue(&["peer.example".to_owned()], None, &pdu(2), usize::MAX)
+            .unwrap()
+            .seq;
         assert!(
             s2 > s1,
             "the counter continues, so order is kept: {s1} {s2}"
@@ -752,6 +1371,136 @@ mod tests {
         let state = second.state("peer.example").unwrap().unwrap();
         assert_eq!(state.failures, 1);
         assert_eq!(state.last_error.as_deref(), Some("connection refused"));
+    }
+
+    /// A queue at its bound takes no more rows: the destination is marked for catch-up, and
+    /// from then on each PDU only moves its room's queued position. Delivered rows move the
+    /// sent position; catch-up ends only once no room is behind.
+    #[test]
+    fn a_full_queue_marks_its_destination_and_positions_say_which_rooms_are_behind() {
+        for (name, store) in stores() {
+            let d = "down.example".to_owned();
+            let up = "up.example".to_owned();
+            let both = [d.clone(), up.clone()];
+            let s1 = store.enqueue(&both, Some("!a"), &pdu(1), 2).unwrap();
+            assert_eq!(s1.queued, both.to_vec(), "{name}");
+            let s2 = store.enqueue(&both, Some("!b"), &pdu(2), 2).unwrap();
+            assert_eq!(store.queue_len(&d).unwrap(), 2, "{name}");
+            assert!(store.catch_up_mark(&d).unwrap().is_none());
+
+            // The third is over the bound for both; `up` delivers its first first.
+            assert_eq!(store.ack(&up, s1.seq, &[("!a".into(), s1.seq)]).unwrap(), 1);
+            let s3 = store.enqueue(&both, Some("!a"), &pdu(3), 2).unwrap();
+            assert_eq!(s3.queued, vec![up.clone()], "{name}");
+            assert_eq!(s3.newly_catching_up, vec![d.clone()], "{name}");
+            let mark = store.catch_up_mark(&d).unwrap().expect("marked");
+            assert_eq!(mark.reason, CATCH_UP_QUEUE_FULL);
+            assert_eq!(mark.from_seq, s3.seq);
+            assert_eq!(mark.queued_when_marked, 2);
+            assert_eq!(store.queue_len(&d).unwrap(), 2, "no row past the bound");
+            // `up` delivers the rest of what it has.
+            assert_eq!(
+                store
+                    .ack(&up, s3.seq, &[("!b".into(), s2.seq), ("!a".into(), s3.seq)])
+                    .unwrap(),
+                2
+            );
+            let s4 = store.enqueue(&both, Some("!c"), &pdu(4), 2).unwrap();
+            assert_eq!(s4.queued, vec![up.clone()], "{name}");
+            assert_eq!(s4.catching_up, vec![d.clone()], "{name}");
+            assert_eq!(store.queue_len(&d).unwrap(), 2);
+            assert_eq!(store.catch_up_marks().unwrap().len(), 1);
+
+            // `d` has had nothing: every room is behind, oldest queued position first.
+            let behind = store.rooms_behind(&d, 10).unwrap();
+            let order: Vec<(&str, u64)> = behind
+                .iter()
+                .map(|r| (r.room_id.as_str(), r.queued_seq))
+                .collect();
+            assert_eq!(
+                order,
+                vec![("!b", s2.seq), ("!a", s3.seq), ("!c", s4.seq)],
+                "{name}"
+            );
+            assert_eq!(store.rooms_behind(&d, 1).unwrap().len(), 1);
+            // `up` has had everything but `!c`'s, which is still in its queue.
+            assert_eq!(
+                store
+                    .rooms_behind(&up, 10)
+                    .unwrap()
+                    .iter()
+                    .map(|r| r.room_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["!c"],
+                "{name}"
+            );
+
+            assert!(!store.finish_catch_up(&d).unwrap(), "{name}: still behind");
+            store
+                .record_sent(&d, &[("!b".into(), s2.seq), ("!a".into(), s3.seq)])
+                .unwrap();
+            assert!(!store.finish_catch_up(&d).unwrap(), "{name}: !c is behind");
+            store.record_sent(&d, &[("!c".into(), s4.seq)]).unwrap();
+            assert!(store.finish_catch_up(&d).unwrap(), "{name}");
+            assert!(store.catch_up_mark(&d).unwrap().is_none());
+            // Out of catch-up, but the queue is still at its bound until it is drained.
+            assert_eq!(store.ack(&d, s2.seq, &[]).unwrap(), 2, "{name}");
+            assert_eq!(
+                store.enqueue(&both, Some("!a"), &pdu(5), 2).unwrap().queued,
+                both.to_vec()
+            );
+
+            // `note_queued` only ever moves a position forward.
+            store.note_queued(&d, &[("!z".into(), 1)]).unwrap();
+            store.note_queued(&d, &[("!z".into(), 0)]).unwrap();
+            let z: Vec<RoomBehind> = store
+                .rooms_behind(&d, 10)
+                .unwrap()
+                .into_iter()
+                .filter(|r| r.room_id == "!z")
+                .collect();
+            assert_eq!(z[0].queued_seq, 1, "{name}");
+
+            // Asked for, a mark is set once.
+            assert!(store.mark_catch_up(&up, CATCH_UP_REQUESTED).unwrap());
+            assert!(!store.mark_catch_up(&up, CATCH_UP_REQUESTED).unwrap());
+            let mark = store.catch_up_mark(&up).unwrap().unwrap();
+            assert_eq!(mark.reason, CATCH_UP_REQUESTED, "{name}");
+            assert!(mark.from_seq > s4.seq, "{name}: {mark:?}");
+        }
+    }
+
+    /// A store written before queue lengths were kept counts its queue once when opened, so
+    /// the bound applies to what was already there.
+    #[test]
+    fn a_queue_from_before_lengths_were_kept_is_counted_at_open() {
+        let backend = MemoryBackend::new();
+        let store = KvOutboundStore::open(backend.clone()).unwrap();
+        let d = "d.example".to_owned();
+        for i in 0..3 {
+            store
+                .enqueue(std::slice::from_ref(&d), None, &pdu(i), usize::MAX)
+                .unwrap();
+        }
+        // What an older binary would have left: rows, no lengths, no marker.
+        transact(&backend, TransactConfig::default(), |txn| {
+            txn.delete(&store.lengths, &length_key(&d))?;
+            txn.delete(&store.meta, LENGTHS_KEY)
+        })
+        .unwrap();
+        drop(store);
+
+        let reopened = KvOutboundStore::open(backend).unwrap();
+        let full = reopened
+            .enqueue(std::slice::from_ref(&d), None, &pdu(9), 3)
+            .unwrap();
+        assert_eq!(full.newly_catching_up, vec![d.clone()]);
+        assert_eq!(
+            reopened
+                .queue_length(&reopened.backend.snapshot(), &d)
+                .unwrap(),
+            3
+        );
     }
 
     #[test]
