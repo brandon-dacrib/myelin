@@ -1,5 +1,58 @@
 # 12. Platform and Kubernetes
 
+## 2026-09-30: the demo runs `sha-d6b3cd7` and `/` redirects to `/admin/` (verified on the cluster)
+
+**What was wrong.** Release `myelin` (namespace `myelin`, context `admin@dacrib0`) sat at
+revision 4, "Rollback to 2": revision 3 (2026-09-26 16:17) had failed with `StatefulSet ... spec:
+Forbidden: updates to statefulset spec for fields other than 'replicas', ...`. The live
+StatefulSet predated the 2026-09-26 label fix: its `volumeClaimTemplates` carried the full label
+set (`helm.sh/chart`, `app.kubernetes.io/version`, `managed-by`), the chart now renders only
+`name` and `instance` there, and those labels are immutable. So the pod ran
+`ghcr.io/brandon-dacrib/myelin:main` from 2026-09-29 (digest `sha256:af9971a5…`), from before
+the `GET /` redirect, and the Ingress had no exact `/` route: `https://myelin.dacrib.net/` was
+Traefik's 404. The release was not stuck (`deployed`, not `pending-upgrade`), so no rollback.
+
+**Checked before touching anything.** `helm get values` matched the values the release was
+installed with; `helm template` of this checkout with them and the pinned tag rendered; the
+StatefulSet's data path (`--data-dir /var/lib/hs/data`, claim `data`), selector and ConfigMap
+content were unchanged, so the signing key and database on `data-myelin-hs-0` stay where the new
+pod looks; the `bridges.hs.matrix.org` CRD on the cluster equals `crds/bridge.yaml`
+(`kubectl diff` empty; Helm does not upgrade CRDs, and the new default `bridges.enabled` adds the
+operator Deployment that watches it). No `helm diff` plugin installed.
+
+**What was run** (values as a file, since `--reuse-values` drops the new `bridges.enabled`
+default and fails at `statefulset.yaml:205`):
+
+```sh
+kubectl --context admin@dacrib0 -n myelin delete statefulset myelin-hs --cascade=orphan   # pod and PVC stay
+helm upgrade myelin deploy/helm/hs -n myelin --kube-context admin@dacrib0 -f <values.yaml> \
+  --set image.tag=sha-d6b3cd7928e8956ff86f174005e63cdf63b15e27 --wait --timeout 10m
+```
+
+Revision 5, "Upgrade complete". The new StatefulSet adopted the orphaned pod and rolled it.
+
+**Verified** (2026-10-01 00:57Z):
+
+- `curl -sS -o /dev/null -w '%{http_code} %{redirect_url}' https://myelin.dacrib.net/` →
+  `307 https://myelin.dacrib.net/admin/` (was `404`); `/admin/` → `200`;
+  `/.well-known/matrix/client` → `{"m.homeserver":{"base_url":"https://myelin.dacrib.net"}}`;
+  `/_matrix/client/versions` → `200`; `/_matrix/client/v3/login` lists `m.login.password`.
+- Ingress paths: `Prefix` `/_matrix`, `/.well-known/matrix`, `/admin`, `/api/v1`, `/_synapse`,
+  and `Exact /`.
+- `/health/ready` through `kubectl port-forward svc/myelin-hs 18008:8008` → `ready 200`.
+- Pod `myelin-hs-0` image `ghcr.io/brandon-dacrib/myelin:sha-d6b3cd7928e8956ff86f174005e63cdf63b15e27`,
+  imageID `sha256:f32777a58bf782f5da669bc797a6d7773b6e4f9b92b8352f444fce678dfbbd15`; the
+  bridge operator Deployment `myelin-hs-bridges-operator` is new, 1/1, "bridge operator starting".
+- Signing key unchanged: `/_matrix/key/v2/server` names `ed25519:a_JBQV7r` with key
+  `H+BeCj+FLf/SkfE8un6Blp3QW0v85Z2NHPr3+EeTjxU` before and after.
+- Data kept: the server resolved its configuration at database revision 2 and printed no setup
+  link (it prints one at every start only while no administrator exists). No account was signed
+  in to; none was created.
+- The StatefulSet's `volumeClaimTemplates` labels are now `name` + `instance` only, so the next
+  upgrade needs no orphan-delete.
+
+No chart change was needed.
+
 ## 2026-09-28: the bare host is not a 404 any more (chart half; server half in status 15)
 
 `https://myelin.dacrib.net/` answered Traefik's own "404 page not found": the Ingress routed

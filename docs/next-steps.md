@@ -45,6 +45,18 @@ server` every twenty minutes or so and `postgres::config: WARNING: there is no t
 progress` at INFO many times an hour -- a `COMMIT` or `ROLLBACK` sent outside a transaction,
 which has no row yet.
 
+**Later that evening: the demo runs `sha-d6b3cd7` and `/` redirects to `/admin/`.** An agent
+upgraded release `myelin` to revision 5 with the pinned image `sha-d6b3cd7928e8956ff86f174005e63cdf63b15e27`;
+`https://myelin.dacrib.net/` now answers `307` to `/admin/`, the Ingress routes `Exact /`, and
+the signing key (`ed25519:a_JBQV7r`) and data came across. The old revision-3 failure was the
+pre-2026-09-26 `volumeClaimTemplates` labels; one `kubectl delete statefulset myelin-hs
+--cascade=orphan` cleared it and is not needed again. No chart change. Details and transcript in
+`docs/status/12-platform-and-kubernetes.md` (2026-09-30). **At the next green `main`**, roll it
+the same way, with the release's values in a file (`helm get values myelin -n myelin
+--kube-context admin@dacrib0 -o yaml > values.yaml`; not `--reuse-values`) and the new commit's
+full SHA:
+`helm upgrade myelin deploy/helm/hs -n myelin --kube-context admin@dacrib0 -f values.yaml --set image.tag=sha-<full commit sha> --wait --timeout 10m`.
+
 **Next steps, in order** (the queue continues; each is one agent, cloud-doable unless marked):
 
 1. ~~Merge `agent/as-ephemeral`~~ merged as `dce1ffb`; its decision is renumbered **0019**.
