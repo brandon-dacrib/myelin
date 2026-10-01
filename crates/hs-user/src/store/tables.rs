@@ -21,6 +21,7 @@
 //! | `hs_user.receipt_stream` | `(pos: u64,)` | the server-wide receipt stream: one entry per receipt written, for appservice delivery |
 //! | `hs_user.presence_stream` | `(pos: u64,)` | the server-wide presence stream: one entry per presence change (a new stamp), for appservice delivery |
 //! | `hs_user.hot_positions` | `(room_id, hot_seq)` | the server-wide hot-room stream: one entry per update to a room above the fan-out threshold, its `room_pos` -- `crate::token`'s `hot_seq` indexes here |
+//! | `hs_user.room_members` | `(room_id, user_id)` | each indexed room's joined members, for the user directory; the row with an empty `user_id` is the marker that says the room is indexed (`UserStore::index_room_members_if_absent`) |
 //! | `hs_user.ephemeral_counters` | `receipt_stream` / `presence_stream` / `hot_positions` (raw `atomic_add` keys) | the three streams' position counters |
 //!
 //! # The coalescing invariant, precisely
@@ -123,8 +124,13 @@ pub struct TablesUserStore<B: KvBackend> {
     receipt_stream: TypedKeyspace<B::Keyspace, (u64,)>,
     presence_stream: TypedKeyspace<B::Keyspace, (u64,)>,
     hot_positions: TypedKeyspace<B::Keyspace, (String, u64)>,
+    room_members: TypedKeyspace<B::Keyspace, (String, String)>,
     ephemeral_counters: B::Keyspace,
 }
+
+/// The `user_id` of a room's marker row in `hs_user.room_members`: no user id is empty, and it
+/// sorts before every real one.
+const INDEXED_MARKER: &str = "";
 
 /// The `hs_user.ephemeral_counters` key of the hot-room stream's position counter.
 const HOT_POSITIONS_COUNTER: &[u8] = b"hot_positions";
@@ -178,6 +184,7 @@ impl<B: KvBackend> TablesUserStore<B> {
             receipt_stream: TypedKeyspace::new(open("hs_user.receipt_stream")?),
             presence_stream: TypedKeyspace::new(open("hs_user.presence_stream")?),
             hot_positions: TypedKeyspace::new(open("hs_user.hot_positions")?),
+            room_members: TypedKeyspace::new(open("hs_user.room_members")?),
             ephemeral_counters: open("hs_user.ephemeral_counters")?,
             backend,
         })
@@ -420,6 +427,98 @@ impl<B: KvBackend> UserStore for TablesUserStore<B> {
                 .put(txn, &(rid.clone(), seq), &room_pos.to_be_bytes())
                 .map_err(to_kv)?;
             Ok(seq)
+        })
+        .map_err(StoreError::Kv)
+    }
+
+    async fn index_room_members_if_absent(
+        &self,
+        room_id: &RoomId,
+        members: &[ruma::OwnedUserId],
+    ) -> Result<bool, StoreError> {
+        let rid = room_id.to_string();
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            let marker = (rid.clone(), INDEXED_MARKER.to_owned());
+            if self
+                .room_members
+                .get(txn, &marker)
+                .map_err(to_kv)?
+                .is_some()
+            {
+                return Ok(false);
+            }
+            self.room_members.put(txn, &marker, &[]).map_err(to_kv)?;
+            for member in members {
+                self.room_members
+                    .put(txn, &(rid.clone(), member.to_string()), &[])
+                    .map_err(to_kv)?;
+            }
+            Ok(true)
+        })
+        .map_err(StoreError::Kv)
+    }
+
+    async fn apply_room_member_changes(
+        &self,
+        room_id: &RoomId,
+        changes: &[(ruma::OwnedUserId, bool)],
+    ) -> Result<bool, StoreError> {
+        let rid = room_id.to_string();
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            let marker = (rid.clone(), INDEXED_MARKER.to_owned());
+            if self
+                .room_members
+                .get(txn, &marker)
+                .map_err(to_kv)?
+                .is_none()
+            {
+                return Ok(false);
+            }
+            for (member, joined) in changes {
+                let key = (rid.clone(), member.to_string());
+                if *joined {
+                    self.room_members.put(txn, &key, &[]).map_err(to_kv)?;
+                } else {
+                    self.room_members.delete(txn, &key).map_err(to_kv)?;
+                }
+            }
+            Ok(true)
+        })
+        .map_err(StoreError::Kv)
+    }
+
+    async fn room_member_ids(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Option<Vec<ruma::OwnedUserId>>, StoreError> {
+        let snap = self.backend.snapshot();
+        let spec = TypedKeyspace::<B::Keyspace, (String, String)>::prefix(&(room_id.to_string(),));
+        let mut indexed = false;
+        let mut members = Vec::new();
+        for item in self.room_members.range(&snap, spec) {
+            let ((_, user), _) = item.map_err(StoreError::Table)?;
+            if user == INDEXED_MARKER {
+                indexed = true;
+                continue;
+            }
+            members.push(ruma::UserId::parse(&user).map_err(|e| StoreError::Codec(e.to_string()))?);
+        }
+        Ok(indexed.then_some(members))
+    }
+
+    async fn forget_room_members(&self, room_id: &RoomId) -> Result<(), StoreError> {
+        let rid = room_id.to_string();
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            let spec = TypedKeyspace::<B::Keyspace, (String, String)>::prefix(&(rid.clone(),));
+            let mut keys = Vec::new();
+            for item in self.room_members.range(&*txn, spec) {
+                let (key, _) = item.map_err(to_kv)?;
+                keys.push(key);
+            }
+            for key in keys {
+                self.room_members.delete(txn, &key).map_err(to_kv)?;
+            }
+            Ok(())
         })
         .map_err(StoreError::Kv)
     }
@@ -1116,6 +1215,57 @@ mod tests {
         assert_eq!(s.hot_room_pos_as_of(a, u64::MAX).await.unwrap(), Some(7));
         assert_eq!(s.hot_room_pos_as_of(b, 1).await.unwrap(), None);
         assert_eq!(s.hot_room_pos_as_of(b, 2).await.unwrap(), Some(40));
+    }
+
+    /// A room is indexed whole once; after that only changes apply, and an index of a room
+    /// that is not indexed is never written by a change. A deleted room's rows go entirely.
+    #[tokio::test]
+    async fn the_directory_index_is_written_whole_once_then_changed() {
+        let s = store();
+        let room = room_id!("!r:example.org");
+        let alice = user_id!("@alice:example.org").to_owned();
+        let bob = user_id!("@bob:example.org").to_owned();
+        let carol = user_id!("@carol:example.org").to_owned();
+        assert_eq!(s.room_member_ids(room).await.unwrap(), None);
+        assert!(
+            !s.apply_room_member_changes(room, &[(bob.clone(), true)])
+                .await
+                .unwrap(),
+            "a change to a room that is not indexed writes nothing"
+        );
+        assert_eq!(s.room_member_ids(room).await.unwrap(), None);
+
+        assert!(
+            s.index_room_members_if_absent(room, &[alice.clone(), bob.clone()])
+                .await
+                .unwrap()
+        );
+        assert!(
+            !s.index_room_members_if_absent(room, std::slice::from_ref(&carol))
+                .await
+                .unwrap(),
+            "a second whole index leaves the first alone"
+        );
+        assert_eq!(
+            s.room_member_ids(room).await.unwrap(),
+            Some(vec![alice.clone(), bob.clone()])
+        );
+        assert!(
+            s.apply_room_member_changes(room, &[(bob.clone(), false), (carol.clone(), true)])
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            s.room_member_ids(room).await.unwrap(),
+            Some(vec![alice, carol])
+        );
+        // An indexed room with nobody in it is still indexed: an empty list, not `None`.
+        let empty = room_id!("!empty:example.org");
+        s.index_room_members_if_absent(empty, &[]).await.unwrap();
+        assert_eq!(s.room_member_ids(empty).await.unwrap(), Some(Vec::new()));
+
+        s.forget_room_members(room).await.unwrap();
+        assert_eq!(s.room_member_ids(room).await.unwrap(), None);
     }
 
     #[tokio::test]

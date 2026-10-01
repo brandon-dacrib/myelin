@@ -270,6 +270,9 @@ pub struct SessionHub<B: KvBackend, R: RoomSource<B>> {
     /// `unread_notifications`/`unread_thread_notifications` as the hard-zero placeholder it
     /// always has, rather than failing.
     counts: OnceLock<Arc<dyn CountsStore>>,
+    /// How many rooms a user-directory search has had to read whole, because the directory
+    /// index had nothing for them yet ([`SessionHub::directory_rooms_walked`]).
+    directory_walks: std::sync::atomic::AtomicU64,
     _marker: std::marker::PhantomData<fn() -> B>,
 }
 
@@ -306,6 +309,7 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
             receipts,
             push_rules: OnceLock::new(),
             counts: OnceLock::new(),
+            directory_walks: std::sync::atomic::AtomicU64::new(0),
             _marker: std::marker::PhantomData,
         }
     }
@@ -1175,25 +1179,157 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
     /// with, and everyone joined to a public room (one whose join rule is `public`) -- the spec's
     /// floor for `POST /user_directory/search`, and this server's ceiling.
     ///
-    /// Computed per search by walking rooms, which is the honest cost of having no directory
-    /// table: fine at the size this server runs at today, and the first thing to replace with
-    /// one if a public room ever has tens of thousands of members.
+    /// Read from the directory index in the store (`hs_user.room_members`: each room's joined
+    /// members, kept up to date from the room updates this hub applies,
+    /// [`SessionHub::process_room_update`]), never by loading the rooms: the rooms to look in
+    /// are the user's joined ones (their membership records) and the public ones (the public
+    /// room list this hub keeps), and each one's members are one range read. It used to load
+    /// every one of those rooms and read its state on every search -- a public room of 5,000
+    /// members cost every searcher 5,000 member events read through the room.
+    ///
+    /// A room the index has nothing for -- one whose last update this hub applied came before
+    /// the index existed (a server upgraded from before it) -- is read once, the old way, and
+    /// indexed then ([`SessionHub::directory_rooms_walked`] counts those, and each is an `info`
+    /// line); from then on its updates keep it current. A room that no longer exists has no
+    /// members, as before.
     ///
     /// # Errors
-    /// Returns [`UserError`] if a membership list or a room could not be read.
+    /// Returns [`UserError`] if a membership list, the index, or a room it had to read could
+    /// not be read.
     pub async fn users_visible_in_directory_to(
         &self,
         user_id: &UserId,
     ) -> Result<std::collections::BTreeSet<OwnedUserId>, UserError> {
-        let mut visible = self.users_sharing_room_with(user_id).await?;
-        for room in self.store.list_public_rooms().await? {
-            for member in self.joined_member_ids_if_present(&room.room_id).await? {
-                if member.as_str() != user_id.as_str() {
-                    visible.insert(member);
-                }
-            }
+        // The index and the membership records are written off the room stream a moment after
+        // the rooms accept their events: wait for what was published before the search, as
+        // `/sync` does, so that somebody who has just joined a room can find its members.
+        self.settle_before_read(crate::sync::READ_YOUR_WRITES_WAIT)
+            .await;
+        self.directory_from_index(user_id).await
+    }
+
+    /// [`SessionHub::users_visible_in_directory_to`] without the wait for the hub to catch up:
+    /// the search itself.
+    async fn directory_from_index(
+        &self,
+        user_id: &UserId,
+    ) -> Result<std::collections::BTreeSet<OwnedUserId>, UserError> {
+        let mut rooms: BTreeSet<ruma::OwnedRoomId> = self
+            .store
+            .list_memberships(user_id)
+            .await?
+            .into_iter()
+            .filter(|m| m.membership == "join")
+            .map(|m| m.room_id)
+            .collect();
+        rooms.extend(
+            self.store
+                .list_public_rooms()
+                .await?
+                .into_iter()
+                .map(|room| room.room_id),
+        );
+        let mut visible = BTreeSet::new();
+        for room_id in &rooms {
+            let members = match self.store.room_member_ids(room_id).await? {
+                Some(members) => members,
+                None => self.index_room_by_reading_it(room_id).await?,
+            };
+            visible.extend(
+                members
+                    .into_iter()
+                    .filter(|member| member.as_str() != user_id.as_str()),
+            );
         }
         Ok(visible)
+    }
+
+    /// How many rooms user-directory searches on this hub have had to read whole because the
+    /// directory index had nothing for them (each is then indexed, so a room is counted once
+    /// per process at most, and normally never): the index's rebuild, for an operator wondering
+    /// whether searches are still paying for it, and for tests.
+    #[must_use]
+    pub fn directory_rooms_walked(&self) -> u64 {
+        self.directory_walks
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Reads `room_id`'s joined members from the room itself and indexes them, for a room the
+    /// directory index has nothing for. A room that no longer exists has no members and is not
+    /// indexed.
+    async fn index_room_by_reading_it(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Vec<OwnedUserId>, UserError> {
+        let members = match self.joined_member_ids(room_id).await {
+            Ok(members) => members,
+            Err(error) if error.is_room_not_found() => {
+                tracing::debug!(%room_id, "a room named in a user's records no longer exists");
+                return Ok(Vec::new());
+            }
+            Err(error) => return Err(error),
+        };
+        self.directory_walks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let indexed = self
+            .store
+            .index_room_members_if_absent(room_id, &members)
+            .await?;
+        tracing::info!(
+            %room_id,
+            members = members.len(),
+            indexed,
+            "read a room's members for the user directory, which had no index of it yet"
+        );
+        Ok(members)
+    }
+
+    /// Keeps the directory index (`users_visible_in_directory_to`) current from one room
+    /// update: the members `update` changed are added or removed, by what the room says they
+    /// are now (`members`, every member and their membership, which the caller has just read);
+    /// a room the index has nothing for yet is indexed whole from `members`.
+    async fn index_members_for_directory(
+        &self,
+        update: &RoomUpdate,
+        members: &[(OwnedUserId, String)],
+    ) -> Result<(), UserError> {
+        let changes: Vec<(OwnedUserId, bool)> = update
+            .membership_deltas
+            .iter()
+            .map(|delta| {
+                let now = members
+                    .iter()
+                    .find(|(user, _)| user == &delta.user_id)
+                    .map_or(delta.membership.as_str(), |(_, membership)| {
+                        membership.as_str()
+                    });
+                (delta.user_id.clone(), now == "join")
+            })
+            .collect();
+        if self
+            .store
+            .apply_room_member_changes(&update.room_id, &changes)
+            .await?
+        {
+            return Ok(());
+        }
+        let joined: Vec<OwnedUserId> = members
+            .iter()
+            .filter(|(_, membership)| membership == "join")
+            .map(|(user, _)| user.clone())
+            .collect();
+        if self
+            .store
+            .index_room_members_if_absent(&update.room_id, &joined)
+            .await?
+        {
+            tracing::debug!(
+                room_id = %update.room_id,
+                members = joined.len(),
+                "indexed a room's members for the user directory"
+            );
+        }
+        Ok(())
     }
 
     /// Spawns a background task forwarding `handle`'s publish stream
@@ -1370,6 +1506,8 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
             Some(entry) => self.store.upsert_public_room(entry).await?,
             None => self.store.remove_public_room(&update.room_id).await?,
         }
+        self.index_members_for_directory(&update, &active_members)
+            .await?;
 
         let hot = member_count > self.fan_out_threshold;
 
@@ -1487,6 +1625,7 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
             "a room update arrived for a room that no longer exists; applying its membership changes"
         );
         self.store.remove_public_room(&update.room_id).await?;
+        self.store.forget_room_members(&update.room_id).await?;
         let mut woken = Vec::with_capacity(update.membership_deltas.len());
         for delta in &update.membership_deltas {
             let hot = self
@@ -1889,5 +2028,244 @@ mod tests {
         );
         hub.install_counts_store(second_counts);
         assert!(StdArc::ptr_eq(hub.counts_store().unwrap(), &first_counts));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // The user directory's index.
+    // ---------------------------------------------------------------------------------------
+
+    async fn directory(hub: &TestHub, user: &UserId) -> Vec<String> {
+        hub.users_visible_in_directory_to(user)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|u| u.to_string())
+            .collect()
+    }
+
+    async fn create(
+        rooms: &TestRoomRegistry,
+        creator: &OwnedUserId,
+        preset: &str,
+    ) -> (
+        hs_room::actor::RoomActorHandle<MemoryBackend>,
+        ruma::OwnedRoomId,
+    ) {
+        let handle = rooms
+            .create_room(
+                creator.clone(),
+                CreateRoomRequest {
+                    preset: Some(preset.to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+        (handle, room_id)
+    }
+
+    async fn member(
+        handle: &hs_room::actor::RoomActorHandle<MemoryBackend>,
+        user: &OwnedUserId,
+        action: Action,
+        ts: i64,
+    ) {
+        handle
+            .membership(
+                user.clone(),
+                action,
+                user.clone(),
+                serde_json::json!({}),
+                ts,
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn invite_and_join(
+        handle: &hs_room::actor::RoomActorHandle<MemoryBackend>,
+        inviter: &OwnedUserId,
+        user: &OwnedUserId,
+        ts: i64,
+    ) {
+        handle
+            .membership(
+                inviter.clone(),
+                Action::Invite,
+                user.clone(),
+                serde_json::json!({}),
+                ts,
+            )
+            .await
+            .unwrap();
+        member(handle, user, Action::Join, ts + 1).await;
+    }
+
+    /// Who the directory shows follows membership -- a join, a leave, a room going from public
+    /// to invite-only -- from the index the hub keeps, and no search reads a room to answer.
+    #[tokio::test]
+    async fn the_directory_follows_membership_from_its_index_without_reading_rooms() {
+        let (hub, rooms) = hub(500);
+        std::mem::forget(hub.watch_all(rooms.subscribe_global()));
+        let alice = user_id!("@alice:hub.test").to_owned();
+        let bob = user_id!("@bob:hub.test").to_owned();
+        let carol = user_id!("@carol:hub.test").to_owned();
+        let dave = user_id!("@dave:hub.test").to_owned();
+        let (private, _) = create(&rooms, &alice, "private_chat").await;
+        invite_and_join(&private, &alice, &bob, 2).await;
+        let (public, _) = create(&rooms, &carol, "public_chat").await;
+
+        assert_eq!(
+            directory(&hub, &alice).await,
+            [bob.as_str(), carol.as_str()]
+        );
+        assert_eq!(
+            directory(&hub, &bob).await,
+            [alice.as_str(), carol.as_str()]
+        );
+        assert_eq!(directory(&hub, &dave).await, [carol.as_str()]);
+
+        member(&private, &bob, Action::Leave, 3).await;
+        member(&public, &dave, Action::Join, 4).await;
+        assert_eq!(
+            directory(&hub, &alice).await,
+            [carol.as_str(), dave.as_str()]
+        );
+        assert_eq!(directory(&hub, &bob).await, [carol.as_str(), dave.as_str()]);
+
+        // Carol's room stops being public: only who shares it with somebody sees them now.
+        public
+            .send_event(
+                carol.clone(),
+                "m.room.join_rules".to_owned(),
+                Some(String::new()),
+                serde_json::json!({"join_rule": "invite"}),
+                None,
+                5,
+            )
+            .await
+            .unwrap();
+        assert!(directory(&hub, &alice).await.is_empty());
+        assert_eq!(directory(&hub, &dave).await, [carol.as_str()]);
+        assert_eq!(directory(&hub, &carol).await, [dave.as_str()]);
+
+        assert_eq!(hub.directory_rooms_walked(), 0, "no search read a room");
+    }
+
+    /// The search answers from the index alone. Seeded here for a room the registry does not
+    /// have at all: the old walk loaded each room, found none, and answered nobody.
+    #[tokio::test]
+    async fn a_directory_search_answers_from_the_index_without_loading_any_room() {
+        let (hub, _rooms) = hub(500);
+        let alice = user_id!("@alice:hub.test").to_owned();
+        let bob = user_id!("@bob:hub.test").to_owned();
+        let room = ruma::room_id!("!indexed:hub.test");
+        hub.store()
+            .set_membership(&alice, room, "join", 1, false)
+            .await
+            .unwrap();
+        assert!(
+            hub.store()
+                .index_room_members_if_absent(room, &[alice.clone(), bob.clone()])
+                .await
+                .unwrap()
+        );
+        assert_eq!(directory(&hub, &alice).await, [bob.as_str()]);
+        assert_eq!(hub.directory_rooms_walked(), 0);
+    }
+
+    /// A room whose updates all came before the index existed is read once, by the first search
+    /// that needs it, and from then on kept current by its updates.
+    #[tokio::test]
+    async fn a_room_from_before_the_index_is_read_once_then_kept_current() {
+        let (hub, rooms) = hub(500);
+        let alice = user_id!("@alice:hub.test").to_owned();
+        let bob = user_id!("@bob:hub.test").to_owned();
+        let carol = user_id!("@carol:hub.test").to_owned();
+        // Made while nothing watched the room stream: no index, and the records the store had
+        // from before are written by hand.
+        let (handle, room_id) = create(&rooms, &alice, "private_chat").await;
+        invite_and_join(&handle, &alice, &bob, 2).await;
+        for user in [&alice, &bob] {
+            hub.store()
+                .set_membership(user, &room_id, "join", 1, false)
+                .await
+                .unwrap();
+        }
+        assert_eq!(hub.store().room_member_ids(&room_id).await.unwrap(), None);
+
+        assert_eq!(directory(&hub, &alice).await, [bob.as_str()]);
+        assert_eq!(hub.directory_rooms_walked(), 1);
+        assert_eq!(directory(&hub, &bob).await, [alice.as_str()]);
+        assert_eq!(hub.directory_rooms_walked(), 1, "read once, not per search");
+
+        std::mem::forget(hub.watch_all(rooms.subscribe_global()));
+        invite_and_join(&handle, &alice, &carol, 4).await;
+        assert_eq!(
+            directory(&hub, &alice).await,
+            [bob.as_str(), carol.as_str()]
+        );
+        assert_eq!(hub.directory_rooms_walked(), 1);
+    }
+
+    /// The timing behind the known gap's note: one public room of 5,000 members, searched by
+    /// somebody outside it. Reading the room's members through the room (what every search did)
+    /// against the index. `cargo test -p hs-user --lib directory_search_timing -- --ignored
+    /// --nocapture`; the numbers are in `docs/status/05-sync.md`.
+    #[tokio::test]
+    #[ignore = "a timing, not a check: builds a room of 5,000 members"]
+    async fn directory_search_timing_in_a_public_room_of_5000() {
+        const MEMBERS: usize = 5_000;
+        let (hub, rooms) = hub(500);
+        let owner = user_id!("@owner:hub.test").to_owned();
+        let searcher = user_id!("@searcher:hub.test").to_owned();
+        let (handle, room_id) = create(&rooms, &owner, "public_chat").await;
+        let built = std::time::Instant::now();
+        for i in 0..MEMBERS {
+            let user = UserId::parse(format!("@member{i}:hub.test")).unwrap();
+            member(&handle, &user, Action::Join, 2 + i64::try_from(i).unwrap()).await;
+        }
+        eprintln!("built {MEMBERS} joins in {:?}", built.elapsed());
+        // The hub catches up with the room as it stands: the public room list and the index.
+        let head = handle.query(|a| a.head_update()).await.unwrap();
+        hub.process_room_update(head).await.unwrap();
+
+        let rounds = 20u32;
+        let walk = std::time::Instant::now();
+        for _ in 0..rounds {
+            assert_eq!(
+                hub.joined_member_ids(&room_id).await.unwrap().len(),
+                MEMBERS + 1
+            );
+        }
+        let walk = walk.elapsed() / rounds;
+        // The same walk over a room that is not resident -- after a restart, or evicted --
+        // which the search had to load from the store first.
+        let cold = std::time::Instant::now();
+        for _ in 0..rounds {
+            rooms.forget_resident(&room_id).await;
+            assert_eq!(
+                hub.joined_member_ids(&room_id).await.unwrap().len(),
+                MEMBERS + 1
+            );
+        }
+        let cold = cold.elapsed() / rounds;
+        let indexed = std::time::Instant::now();
+        for _ in 0..rounds {
+            // The search itself: nothing here consumes the room stream, so the wait for the
+            // hub to catch up (`settle_before_read`) would run out its bound every time.
+            assert_eq!(
+                hub.directory_from_index(&searcher).await.unwrap().len(),
+                MEMBERS + 1
+            );
+        }
+        let indexed = indexed.elapsed() / rounds;
+        assert_eq!(hub.directory_rooms_walked(), 0);
+        eprintln!(
+            "per search: reading the resident room {walk:?}, loading and reading it {cold:?}, \
+             from the index {indexed:?}"
+        );
     }
 }

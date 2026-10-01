@@ -271,6 +271,50 @@ pub trait UserStore: Send + Sync {
         room_pos: i64,
     ) -> Result<u64, StoreError>;
 
+    /// Indexes `room_id`'s joined members (`members`, the room's own answer) for the user
+    /// directory -- unless the room is indexed already, in which case nothing is written and
+    /// this returns `false`. One transaction: the marker that says a room is indexed is written
+    /// with its rows, so a room is either wholly indexed or not at all, and a second indexer
+    /// racing the first (the session hub and a search on another replica, say) leaves the
+    /// first's rows alone; what changes after that arrives as
+    /// [`UserStore::apply_room_member_changes`]. See `crate::hub::SessionHub`'s
+    /// `users_visible_in_directory_to`.
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] on a storage failure.
+    async fn index_room_members_if_absent(
+        &self,
+        room_id: &ruma::RoomId,
+        members: &[ruma::OwnedUserId],
+    ) -> Result<bool, StoreError>;
+
+    /// Applies membership changes to an indexed room's joined-member rows: `true` adds the
+    /// user, `false` removes them. Returns `false`, writing nothing, if the room is not indexed
+    /// ([`UserStore::index_room_members_if_absent`] is then the caller's next step).
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] on a storage failure.
+    async fn apply_room_member_changes(
+        &self,
+        room_id: &ruma::RoomId,
+        changes: &[(ruma::OwnedUserId, bool)],
+    ) -> Result<bool, StoreError>;
+
+    /// An indexed room's joined members; `None` if the room is not indexed.
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] on a storage failure.
+    async fn room_member_ids(
+        &self,
+        room_id: &ruma::RoomId,
+    ) -> Result<Option<Vec<ruma::OwnedUserId>>, StoreError>;
+
+    /// Drops a room's joined-member rows and its indexed marker (the room was deleted).
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] on a storage failure.
+    async fn forget_room_members(&self, room_id: &ruma::RoomId) -> Result<(), StoreError>;
+
     /// The newest position of the hot-room stream, `0` if nothing was ever appended to it.
     ///
     /// # Errors
