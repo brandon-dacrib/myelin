@@ -288,6 +288,16 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
   a deployment trusts a private one, after the harness stopped disabling verification.
 - **Spec coverage: 138 of 235 routes (58.7%)** — client-server 108/166, server-server 30/36.
   Generated from the route manifest the binary itself emits, so it cannot overclaim.
+- **Sytest: 407 of 772 tests**, 317 fail, 48 skip, measured 2026-10-01 — the first time the
+  suite ran at all. By feature group: client-server 59%, application services 40%, federation
+  14%. Run in Docker on Sytest's own image with certificates verified against Sytest's CA
+  (`tests/sytest/`; every test by name in `docs/status/sytest/`). It found two bugs, both fixed:
+  a room member without the redact power level could redact anybody's message, and every
+  password hash or login leaked 19 MiB of Argon2 working memory on glibc 2.36 (Debian 12), which
+  took a test server past 10 GB.
+- **Fuzzing:** all eight `cargo fuzz` targets (federation PDU, EDU, X-Matrix header, key server
+  and `.well-known` parsers; media decoding, thumbnailing and multipart) ran ten minutes each,
+  18.7 million inputs, no crash; CI fuzzes each for a minute on every push.
 
 ### Federation
 

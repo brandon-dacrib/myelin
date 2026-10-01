@@ -35,6 +35,7 @@ def normalise_reason(line: str) -> str:
     s = re.sub(r"#[A-Za-z0-9._=-]+:[A-Za-z0-9.-]+(:\d+)?", "#ALIAS", s)
     s = re.sub(r"\$[A-Za-z0-9_+/=-]{8,}(:[A-Za-z0-9.-]+(:\d+)?)?", "$EVENT", s)
     s = re.sub(r"![A-Za-z0-9_-]{18,}", "!ROOM", s)  # room versions 12+: no server part
+    s = re.sub(r"ed25519(%3A|:)[A-Za-z0-9_]+", "ed25519:KEY", s)
     s = re.sub(r"localhost:\d+", "localhost:PORT", s)
     s = re.sub(r"access_token=[^&\s)]+", "access_token=TOKEN", s)
     s = re.sub(r"\b[A-Za-z0-9_-]{20,}\b", "TOKEN", s)

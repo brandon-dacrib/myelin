@@ -73,6 +73,18 @@ two skipped for Docker/Synapse). The mock `configuration.spec.ts` was not reprod
 runs at load 23-37; `playwright.config.ts` now traces every attempt, keeps a failing one's, and
 fails CI on a flaky test so `ci.yml` uploads the report with that trace.
 
+**Branch `agent/test-infra-gaps` (2026-10-01, for the merge queue): `cargo fuzz` executed and
+Sytest run, and three bugs they found fixed.** All eight fuzz targets ran ten minutes each (18.7
+million executions, no crash); `ci.yml` gains a `fuzz` job outside `ci-ok`. Sytest ran whole
+for the first time, in Docker on Sytest's own image (`tests/sytest/`): **407 of 772 pass**, 317
+fail, 48 skip (`docs/status/sytest/2026-10-01-*.txt`). Fixed on the way: every password hash or
+login leaked Argon2's 19 MiB on glibc 2.36 (Sytest drove a server past 10 GB; `hs-auth` now pools
+the blocks); any room member could redact anybody's message (`hs-room` refuses it without the
+redact power level); `hs-admin`'s build script recompiled `hs-admin` and its dependents on every
+cargo invocation without `web/dist`. Touches `crates/hs-auth/src/password.rs`,
+`crates/hs-room/src/actor.rs` (redaction only), `crates/hs-admin/build.rs`, `tests/`,
+`.github/workflows/ci.yml`. Details in `docs/status/14-test-and-conformance.md`, session 5.
+
 **Evening, 2026-09-30: `main` has not built since `d6b3cd7`, and the demo is behind.** Every CD run
 after `d6b3cd7` (17:07) failed at "require green ci" because CI's amd64 `test` job failed one of
 two real-binary tests on the loaded runner, each a server race rather than test noise:
@@ -923,6 +935,8 @@ percentage, is what stands between this and a server somebody else would run.
 What is *not* in those percentages, and should temper them: no security review, no load testing
 beyond a loadgen harness, `cargo fuzz` never run, Sytest never run, and no bridge has yet
 carried a message through an encrypted room. Each of those has historically found things.
+(2026-10-01: fuzzing and Sytest have now run, and Sytest did find things -- a member could
+redact anybody's message, and password hashing leaked memory on glibc 2.36; see the gaps table.)
 
 ## Admin session (2026-09-28, evening): merging the admin branches, then what is left
 
@@ -1837,7 +1851,16 @@ Refreshed 2026-09-28 against the code: closed rows are struck through with the c
 | Only heisenbridge has been run against it | `hs-appservice` | a mautrix-* bridge with an external service (and its media, double puppeting, MSC3202) is the next real-bridge check |
 | The Synapse importer leaves some things behind | `hs-compat`, `hs-cli` | end-to-end keys and key backups, push rules and pushers, receipts, filters, remote media, and rooms this server's users joined over federation (skipped and logged; their members rejoin) are not copied (`docs/compat/synapse-migration-runbook.md`, "What does not move yet") |
 | The Synapse importer has only met a small Synapse | `hs-compat`, `hs-cli` | verified end to end against a real Synapse 1.161 with four accounts and two rooms; a room is replayed whole, in memory, so a very large room will be slow and memory-hungry, and nothing measures throughput yet |
-| Sytest never run | `tests/sytest` | CPAN dependencies absent |
+| ~~Sytest never run~~ | `tests/sytest` | **Closed** 2026-10-01 (`agent/test-infra-gaps`, status 14 session 5): runs in Docker on Sytest's own image (no CPAN on the host) with a new plugin, haproxy for TLS and certificates verified against Sytest's CA. Whole suite: **407 of 772 pass, 317 fail, 48 skip**; client-server 59%, appservices 40%, federation 14% (`docs/status/sytest/2026-10-01-results.txt` per test, `-summary.txt` for reasons and groups). It found the Argon2 leak and the redaction hole below, both fixed. Left: no blacklist yet, and the rows below |
+| Guest access cannot be switched on | `hs-config`, `hs-cli` | `hs_auth::AuthConfig::guest_registration_enabled` has no configuration key (`config_bridge.rs` lists it), so `POST /register?kind=guest` is always 403: Sytest's guest APIs are 0 of 24 |
+| `GET /_matrix/key/v2/server/{keyId}` is not routed | `hs-federation`, `hs-cli` | only the bare `/_matrix/key/v2/server` answers; the deprecated key-id form is what Sytest's federation server asks first (21 failures), which keeps most of Sytest's federation tests from starting; the notary `POST/GET /_matrix/key/v2/query` is unimplemented too |
+| Server ACLs are not enforced on federation endpoints | `hs-federation` | a server banned by `m.room.server_acl` is still served `/make_join`, `/send_join`, `/make_leave`, `/invite`, `/state`, `/state_ids`, `/backfill`, `/event_auth` and `/get_missing_events` (Sytest, 9 tests) |
+| Rooms of version 1 and 2 cannot be joined over federation | `hs-federation` | the join handshake refuses `V1WithHash` event references (`M_UNSUPPORTED_ROOM_VERSION`; 12 Sytest failures); its error message also repeats itself |
+| A PDU rejected by auth is reported as a `/send` error | `hs-federation` | `/send` answers `{"pdus": {"$id": {"error": "event rejected: ..."}}}`; Sytest (and Synapse) expect `{}` for an event that was received and rejected (10 failures) |
+| A third-party (3PID) invite is read as an ordinary invite | `hs-room`, `hs-auth` | `POST /invite` with `id_server`/`medium`/`address` answers 403 "Invite is not a valid transition from Join" (9 Sytest failures) |
+| The legacy `GET /events` stream is unimplemented | `hs-user` | deprecated, but Sytest's helpers still wait on it even with `--exclude-deprecated` (21 fixture failures); implement or blacklist |
+| ~~Any member could redact any other member's message~~ | `hs-room` | **Fixed** 2026-10-01 (`agent/test-infra-gaps`): from room version 3 the auth rules admit any member's redaction and leave the check to whoever applies it; nothing checked, so a member at power 0 emptied others' messages for everyone (Sytest `10redactions.pl`, reproduced on the real binary). `RoomActor::may_redact` now refuses it (403) unless it is the sender's own event or they have the redact level. Left: no code path applies a redaction that arrives over federation (only the local send and the importer call `apply_redaction`); not yet checked end to end |
+| ~~Every password hash leaked 19 MiB on glibc 2.36~~ | `hs-auth` | **Fixed** 2026-10-01 (`agent/test-infra-gaps`): the `argon2` crate's per-hash aligned allocation is never reused by glibc 2.36's heap; Sytest drove a server past 10 GB into the OOM killer; 40 logins: 661 MB before, 39 MB after. Argon2 working memory is pooled. The production image is musl; a release binary on Debian 12 or Ubuntu 22.04 leaked |
 | ~~`cargo fuzz` never executed~~ | `crates/*/fuzz`, `tests/fuzz` | **Closed** 2026-10-01 (`agent/test-infra-gaps`, status 14 session 5): nightly and `cargo-fuzz` installed; all eight targets (five `hs-federation`, three `hs-media`) built and run ten minutes each with `tests/fuzz/run_all.sh 600`: 18.7 million executions, no crash, so no artifact or regression test. `ci.yml`'s new `fuzz` job runs each for 60 s on every push, outside `ci-ok` (nightly can break on its own). Found and fixed on the way: `hs-admin`'s build script made every cargo invocation without `web/dist` recompile `hs-admin` and its dependents. Left: ten minutes is not saturation (every target still found new features at the end); no target covers the client-server JSON bodies, canonical JSON or event auth |
 
 ## Conventions worth keeping

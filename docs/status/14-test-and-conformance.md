@@ -55,7 +55,7 @@ file `web/dist` is missing"). Each `cargo fuzz run` of an `hs-federation` target
 twenty minutes rebuilding before it fuzzed. It now watches `web/dist` when it exists and `web/`
 when it does not (so the first `npm run build` is still noticed); checked before/after with
 `cargo check -p hs-admin -v` (Dirty → Fresh), and that creating `web/dist` and removing it each
-rerun the script once. Commit `823bf5c`. `run_all.sh` also runs the built fuzzer binaries
+rerun the script once. Commit "hs-admin's build script no longer watches a missing web/dist...". `run_all.sh` also runs the built fuzzer binaries
 directly rather than through `cargo fuzz run`, which re-invokes cargo per target.
 
 CI: `ci.yml` has a `fuzz` job (nightly via `dtolnay/rust-toolchain@nightly`, `cargo-fuzz` via
@@ -67,6 +67,90 @@ this repository, and a minute of random input is not a deterministic gate; it ha
 `continue-on-error`, so a crash shows red on the commit that exposed it. Promote it into `ci-ok`
 once it has been green on nightly for a few weeks. `actionlint` clean; the job has not run on
 GitHub yet (it runs on this branch's first push to a PR or `main`).
+
+### Sytest: the whole suite, end to end, 407 of 772
+
+**772 tests: 407 pass, 317 fail, 48 skip (56.2% of those run)**, no server or proxy lost
+mid-run. `hs` at the commit "A password hash or login no longer leaks Argon2's 19 MiB..." on this branch (`18c6a61` before the rebase onto `main`), release build on Debian bookworm, embedded store; Sytest
+`7473158` (2026-09-15); `run-tests.pl -I Myelin -O tap --all --exclude-deprecated`, no blacklist;
+46 minutes. Every test by name: `docs/status/sytest/2026-10-01-results.txt`; counts, failure
+reasons and the feature groups: `docs/status/sytest/2026-10-01-summary.txt`. By group
+(`are-we-synapse-yet.py`): client-server 319/542 (59%), application services 10/25 (40%),
+federation 15/105 (14%), non-spec 60/96. Whole groups at 0: guest APIs 0/24, cross-signing 0/7,
+tagging 0/8, send_join/make_join/invite/backfill over federation, ignore users 0/3.
+
+No CPAN module was installed on the host. `tests/sytest/` (README there) runs Sytest's own
+image, `matrixdotorg/sytest:bookworm`, with a release `hs` built on the same Debian added
+(`build.sh`; the bases come from `mirror.gcr.io`, built with the classic builder and a
+`DOCKER_CONFIG` without the keychain helper), and a new plugin, `plugins/myelin`, replacing the
+`hs-reimplement` scaffold, which named an `hs-server` binary that never existed. Each Sytest
+homeserver is `hs serve` on a plaintext port with haproxy in front for TLS, named
+`localhost:<TLS port>`, its certificate signed by Sytest's test CA and verified by the other
+servers (`federation.custom_ca_certificates`) and by the appservice client (container trust
+store). `run.sh` writes `results.tap`, `results.txt` (PASS/FAIL/SKIP per test), `summary.txt`,
+`are-we-synapse-yet.txt` (Conduit's copy of Dendrite's grouping, Apache-2.0) and each server's
+logs and memory samples. `SYTEST_HS_BINARY` runs a rebuilt `hs` without rebuilding the image.
+
+**The ten most common failure reasons** (first line of the message, ids and numbers folded):
+
+| n | reason | what it is |
+|---:|---|---|
+| 29 | Timed out waiting for test | a wait that never ended: pushes (61push, 7), outbound joins (30room-join, 6), device-list updates (06-device-lists, 5; 40devicelists, 2), read markers in `/sync` (3), and singles |
+| 23 | `403` on `POST /register?kind=guest` (fixture) | guest registration cannot be switched on: `hs_auth::AuthConfig::guest_registration_enabled` has no `hs-config` key (`hs-cli/src/config_bridge.rs` lists it as a gap), so every guest test fails at setup |
+| 21 | `404` on `GET /_matrix/client/r0/events` (fixture) | the pre-sync event stream, deprecated, which Sytest's helpers still use to wait for events even under `--exclude-deprecated` |
+| 21 | `404` on `GET /_matrix/key/v2/server/ed25519:<id>` | the key server answers only the bare `/_matrix/key/v2/server`; the deprecated `{keyID}` path form is not routed, and Sytest's own federation server asks for it before almost everything it does, which is most of federation's 14% |
+| 14 | expected an HTTP 4xx, got success | requests that should be refused and are answered. 9 are `tests/50federation/50server-acl-endpoints.pl`: a server banned by `m.room.server_acl` is still served `/make_join`, `/send_join`, `/make_leave`, `/invite`, `/state`, `/state_ids`, `/backfill`, `/event_auth` and `/get_missing_events`. Also (17 in all, some with a longer first line): a redaction by a random user, `GET /capabilities` without a token, two UIA checks, `/make_join` into a room everyone left, a regular user registering or creating an alias inside an appservice's exclusive namespace, an invalid filter |
+| 10 | `tests/32room-versions.pl`: got a different event id | the events in a room of each version |
+| 10 | `/send` answered `{"pdus": {"$id": {"error": "event rejected: ..."}}}` | Sytest expects `{}` for a PDU that was received and rejected by auth (Synapse accepts it as rejected); the error is reported back as a failure to process |
+| 9 | `403` on `/invite` with an identity-server body: "Invite is not a valid transition from Join" | a third-party (3PID) invite is read as an ordinary invite of the inviter |
+| 6 | `tests/10apidoc/09synced.pl`: "Expected only N membership events" | initial `/sync` membership in the timeline |
+| 6+6 | `502` on `POST /join/...` over federation | rooms of version 1 and 2: the join handshake refuses them (`M_UNSUPPORTED_ROOM_VERSION`, "room versions 1-2 (V1WithHash event references) are not supported by the join handshake"; the message also says "room version ... is not supported" twice over) |
+
+(Upgrades: `/upgrade` answers 403 "sender does not have enough power to send event of type
+m.room.join_rules", 3 failures and 18 skips that need an upgrade.)
+
+**Found by Sytest and fixed: every password operation leaked Argon2's 19 MiB on glibc 2.36.**
+The first full runs lost server 0 partway: a run with no harness problem left had it at 10.5 GB
+of swap and the Docker VM's OOM killer took it, with nothing in its log. `memory.log` showed
+anonymous memory climbing from the first registration. Measured on its own in the Sytest image
+(Debian 12, glibc 2.36): 40 logins took a fresh server from 19 MB to 661 MB, about 19.5 MB each,
+the size of Argon2id's default working memory; `MALLOC_ARENA_MAX=1` did not help and
+`MALLOC_MMAP_THRESHOLD_=131072` did (19 MB flat), so it is glibc's dynamic mmap threshold plus
+its non-reuse of freed aligned chunks (glibc bugs 14581/30723), triggered by the `argon2` crate
+allocating and freeing 19 MiB of 64-byte-aligned blocks per hash. glibc 2.41 (the Complement
+image) grew to 117 MB over 150 logins and stopped. `hs_auth::password` now keeps the blocks in a
+process-wide pool, wiped after each use (that commit); the same 40 logins stay at 39 MB, and server
+0's peak in the counted run was 175 MB. The hashes are bit-for-bit the crate's own (tested both
+ways, plus parameters read from the stored string). The production image is musl and the release
+binaries are built on glibc 2.39, but a release binary run on Debian 12 or Ubuntu 22.04 leaked.
+
+**Found by Sytest and fixed: any member could redact any other member's message.**
+`tests/30rooms/10redactions.pl`'s "as random user does not redact message" got a 200 where it
+expected a 403. Reproduced on the real binary: in a public room, a member at power 0 redacted
+another member's message and its content was `{}` for everyone. From room version 3 the auth
+rules admit any member's `m.room.redaction` and leave the "own event, or the redact power level"
+check to whoever applies it; `RoomActor::redact_txn` applied every redaction it sent.
+`RoomActor::may_redact` now refuses one (403, nothing sent) unless the event is the sender's own
+or they have the room's `redact` level (a version-12 creator always has); the server
+administrator's redaction (`admin_users.rs`) already picks a sender with power and moves on from
+a refusal. Test `a_member_without_redact_power_cannot_redact_another_members_message` (fails on
+the old code); the real binary now answers the same request 403 and the message keeps its
+content. The counted Sytest run predates this fix, so that test is among its 317 failures. Not
+covered: a redaction arriving over federation; no code path applies one.
+
+**Harness problems found on the way** (all in `tests/sytest/`): the default media store
+(`./media-store`) was inside the read-only Sytest checkout; a first boot's fsyncs on the
+container's overlay filesystem took longer than Sytest's 60 s start limit (the servers' data now
+lives on a tmpfs, boot under a second); haproxy with a thread per core was killed by its own
+watchdog under load, and every later test failed with "connection refused" (one thread now; the
+summary names any process that dies mid-run); with federation verification off but nothing else,
+the appservice client rejected Sytest's test server ("tlsv1 alert unknown ca"), fixed by trusting
+Sytest's CA everywhere instead of turning verification off.
+
+Earlier whole-suite run on the image's own binary (`main` at `9cde6e9`, with
+`MALLOC_MMAP_THRESHOLD_=131072` and federation verification off): 404 / 320 / 48. The two runs
+differ by one fewer harness failure class and noise.
+
 
 ## Re-measurement (2026-09-25/26, session 4): two-way federation, and what the suite found underneath it
 
@@ -874,7 +958,8 @@ content, unchanged below this point except where "session 3" is named explicitly
   checks for the Sytest checkout, Perl, Sytest's CPAN dependencies, and an `hs-server` binary,
   skipping cleanly if any is missing — confirmed: skips here (Sytest's CPAN deps are not
   installed). Brace/paren-balance checked (`perl -c` itself needs the CPAN deps this environment
-  lacks, so full compilation was not verified — see "Decisions made").
+  lacks, so full compilation was not verified — see "Decisions made"). **Superseded 2026-10-01
+  (session 5)**: replaced by `plugins/myelin`, run in Docker on Sytest's image, whole suite run.
 - **`tests/oracle/`**: `state_oracle.py` (drives `synapse.state.v2.resolve_events_with_store`,
   with an in-memory `StateResolutionStore` implementation whose auth-chain-difference algorithm is
   the Matrix spec's own definition, adapted in shape from Synapse's own test helper) and
@@ -919,10 +1004,13 @@ state.
 - Re-run `csapi` and the federation package again once track 02/04/06/08/09's items from session
   3's triage land, the same way session 3 re-ran session 2's numbers.
 - Remaining items below are session 2's, still open and unchanged by session 3:
-- Fill in the still-`TODO` `tests/sytest/plugins/hs-reimplement/lib/SyTest/Homeserver/
-  HsReimplement.pm` the same way `tests/complement/`'s scaffold was filled in this session (real
-  `hs` binary, real config) — Sytest's own CPAN dependencies still aren't installed in this
-  environment, so it can be wired up but not run end to end yet.
+- Sytest (session 5): route the rows it opened in `docs/next-steps.md` (guest access config, the
+  `/_matrix/key/v2/server/{keyId}` path, server ACLs on federation endpoints, v1/v2 joins, `/send`
+  for rejected PDUs, 3PID invites, legacy `/events`); decide on a `tests/sytest/sytest-blacklist`
+  for what will not be implemented (legacy `/events`, CAS); re-run after each and commit a new
+  dated results file; consider a weekly CI job (the image build is the slow part).
+- Fuzzing (session 5): promote CI's `fuzz` job into `ci-ok` after a few weeks green; add targets
+  for the client-server JSON bodies, canonical JSON and event auth.
 - Once `hs-http`'s `Builder` (or `hs-admin-mock`) is wired into a binary that writes a real
   `routes.json`: point `hs-spec-coverage`/`tools/dashboard.py` at it and watch the coverage number
   move off 0%. (Unrelated to Complement — `hs serve` already writes `routes.json` via
@@ -937,8 +1025,8 @@ state.
 
 None for this session's own scope. Complement is unblocked as of this session (Docker + a real
 binary both exist now). Still blocked on inputs outside this track's control: network access
-(`pip install matrix-synapse`, Sytest's CPAN deps) for the oracle harness and the Sytest plugin's
-own end-to-end run.
+(`pip install matrix-synapse`) for the oracle harness. (Sytest no longer needs CPAN on the host:
+it runs on Sytest's own image, session 5.)
 
 ## Interfaces provided
 
@@ -968,11 +1056,25 @@ own end-to-end run.
   binary this session could find).
 - Track 03/12's cluster deployment manifests, for `tests/complement/run_cluster.sh` to actually
   drive (currently a documented seam only).
-- Network access, for `tools/fetch-refs.sh`-cloned-but-unbuildable pieces: Sytest's CPAN
-  dependencies and an installed `matrix-synapse` for `tests/oracle/`.
+- Network access, for `tools/fetch-refs.sh`-cloned-but-unbuildable pieces: an installed
+  `matrix-synapse` for `tests/oracle/`.
 
 ## Decisions made
 
+- **(session 5) Sytest runs only in Docker, on `matrixdotorg/sytest`**, never with CPAN on the
+  host; the binary is built on the same Debian release as the image. Certificates are verified
+  (Sytest's CA trusted), unlike Sytest's own Synapse/Dendrite configurations, because turning
+  verification off for one client hid nothing and broke another. `--exclude-deprecated` as
+  Dendrite runs it; no blacklist until somebody decides what will not be implemented.
+- **(session 5) CI's `fuzz` job is not in `ci-ok`'s needs** (nightly can break by itself; a
+  minute of random input is not deterministic) but has no `continue-on-error`, so it shows red.
+- **(session 5) `tests/fuzz/run_all.sh` runs the built fuzzer binaries directly**, not through
+  `cargo fuzz run`, so a target is not preceded by a cargo invocation; seed corpora are read-only
+  and new inputs go under `target/fuzz-runs/`.
+- **(session 5) Bugs Sytest found in other tracks' crates were fixed here** (`hs-auth`
+  password memory, `hs-room` redaction authorization, `hs-admin` build script), each small,
+  tested and named in its owner's row of `docs/next-steps.md`; the larger findings are rows, not
+  fixes.
 - **(session 3) `tests/complement/startup.sh` now defaults to `federation.custom_ca_certificates:
   ["/complement/ca/ca.crt"]` with `verify_certificates` left at its real default (`true`),
   replacing the `verify_certificates: false` workaround as the default.** Verified safe first:
@@ -1087,9 +1189,15 @@ cd refs/complement && COMPLEMENT_BASE_IMAGE=complement-hs-reimplement:dev \
   # federation package: 52 pass / 153 fail / 7 skip (leaf), identical with or without
   # HS_COMPLEMENT_CA_MODE=insecure set -- see session 3's section 2 above
 
-# Sytest / oracle scaffolds (clean-skip without their respective dependencies):
+# Sytest (session 5; Docker; clean-skip without it): image, then the whole suite (~46 min)
+./tests/sytest/build.sh myelin-sytest:dev
+SYTEST_IMAGE_TAG=myelin-sytest:dev ./tests/sytest/run.sh   # results in target/sytest/<timestamp>/
+
+# Fuzzing (session 5; nightly + cargo-fuzz; clean-skip without them): every target, N seconds each
+./tests/fuzz/run_all.sh 60
+
+# Cluster / oracle scaffolds (clean-skip without their respective dependencies):
 ./tests/complement/run_cluster.sh
-./tests/sytest/run_sytest.sh
 ./tests/oracle/run_oracle.sh
 
 # The parity dashboard:
