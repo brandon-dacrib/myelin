@@ -492,6 +492,19 @@ async fn a_user_joins_a_room_on_another_server_and_messages_flow_both_ways() {
                 })
     })
     .await;
+    // Alice talks while bob is out: more than one backfill batch's worth, so that filling the
+    // gap his rejoin leaves takes more than one fetch.
+    const WHILE_OUT: usize = 130;
+    for i in 1..=WHILE_OUT {
+        send_message(
+            &client,
+            &a.base,
+            &alice_token,
+            &room_id,
+            &format!("while bob was out {i}"),
+        )
+        .await;
+    }
     let renamed: Value = client
         .put(format!(
             "{}/_matrix/client/v3/rooms/{room_id}/state/m.room.name",
@@ -537,6 +550,134 @@ async fn a_user_joins_a_room_on_another_server_and_messages_flow_both_ways() {
     assert!(
         members["joined"].get(&bob).is_some(),
         "A knows bob is back before the join returned: {members}"
+    );
+
+    // And the timeline: reading back from his rejoin, bob reaches what alice said while he was
+    // out, in her order, and then what B held from before he left -- the gap between his leave
+    // and his rejoin is fetched from A as the pages reach it (`hs_room::actor::gaps`), not
+    // skipped.
+    let bob_since = sync_until(&client, &b.base, &bob_token, |s| {
+        s["rooms"]["join"].get(&room_id).is_some()
+    })
+    .await["next_batch"]
+        .as_str()
+        .expect("a sync token")
+        .to_owned();
+    let mut from: Option<String> = None;
+    let mut chunk: Vec<Value> = Vec::new();
+    let mut requests = 0;
+    loop {
+        requests += 1;
+        assert!(
+            requests <= 15,
+            "still paginating after {requests} requests: {} events",
+            chunk.len()
+        );
+        let mut url = format!(
+            "{}/_matrix/client/v3/rooms/{room_id}/messages?dir=b&limit=50",
+            b.base
+        );
+        if let Some(token) = &from {
+            url.push_str("&from=");
+            url.push_str(token);
+        }
+        let page: Value = client
+            .get(url)
+            .bearer_auth(&bob_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        chunk.extend(page["chunk"].as_array().cloned().unwrap_or_default());
+        match page.get("end").and_then(Value::as_str) {
+            Some(end) => from = Some(end.to_owned()),
+            None => break,
+        }
+    }
+    let bodies: Vec<String> = chunk
+        .iter()
+        .filter_map(|e| e["content"]["body"].as_str().map(str::to_owned))
+        .collect();
+    let mut expected: Vec<String> = (1..=WHILE_OUT)
+        .rev()
+        .map(|i| format!("while bob was out {i}"))
+        .collect();
+    expected.extend([
+        "welcome bob, from A".to_owned(),
+        "hi alice, from B".to_owned(),
+    ]);
+    expected.extend((1..=BEFORE_BOB).rev().map(|i| format!("before bob {i}")));
+    assert_eq!(
+        bodies, expected,
+        "everything said while bob was out, newest first, then what B held from before"
+    );
+    let position = |wanted: &dyn Fn(&Value) -> bool| chunk.iter().position(wanted);
+    let is_membership = |membership: &'static str| {
+        let bob = bob.clone();
+        move |e: &Value| {
+            e["type"] == "m.room.member"
+                && e["state_key"] == bob
+                && e["content"]["membership"] == membership
+        }
+    };
+    assert_eq!(
+        position(&is_membership("join")),
+        Some(0),
+        "the newest event is the rejoin"
+    );
+    let rename = position(&|e: &Value| {
+        e["type"] == "m.room.name" && e["content"]["name"] == "renamed while bob was out"
+    })
+    .expect("the rename made while bob was out is in his history");
+    let first_while_out = position(&|e: &Value| e["content"]["body"] == "while bob was out 1")
+        .expect("alice's first word while bob was out");
+    let leave = position(&is_membership("leave")).expect("bob's leave");
+    assert!(
+        rename < first_while_out && first_while_out < leave,
+        "the rename ({rename}), then alice's first word ({first_while_out}), then the leave \
+         ({leave})"
+    );
+    assert_eq!(
+        chunk.last().map(|e| e["type"].as_str().unwrap_or("")),
+        Some("m.room.create"),
+        "the last page still reaches the room's creation"
+    );
+
+    // History is not news: bob's next incremental sync has none of it.
+    let incremental: Value = client
+        .get(format!(
+            "{}/_matrix/client/v3/sync?since={bob_since}&timeout=0",
+            b.base
+        ))
+        .bearer_auth(&bob_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        timeline_bodies(&incremental, &room_id).is_empty(),
+        "the history between the leave and the rejoin must not arrive as new events: \
+         {incremental}"
+    );
+
+    // And it is counted: every event placed in the gap.
+    let mut registry = prometheus_client::registry::Registry::default();
+    hs_cli::backfill::register_metrics(&mut registry);
+    let mut exposition = String::new();
+    prometheus_client::encoding::text::encode(&mut exposition, &registry).unwrap();
+    let gap_events: u64 = exposition
+        .lines()
+        .find(|line| line.starts_with("hs_room_backfilled_events_total{kind=\"rejoin_gap\"}"))
+        .and_then(|line| line.rsplit(' ').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no rejoin_gap count in {exposition}"));
+    assert!(
+        gap_events > WHILE_OUT as u64,
+        "the gap's messages and the rename were counted: {gap_events}"
     );
 
     a.handle.shutdown().await;
