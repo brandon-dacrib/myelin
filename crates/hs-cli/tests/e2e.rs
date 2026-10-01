@@ -1157,7 +1157,7 @@ async fn the_setup_link_creates_exactly_one_administrator_however_many_ask_at_on
     assert_eq!(token.len(), 40);
     assert!(token.bytes().all(|b| b.is_ascii_alphabetic()), "{token}");
     assert!(
-        link.starts_with(&format!("http://localhost:{}/", handle.addrs[0].port())),
+        link.starts_with(&format!("http://127.0.0.1:{}/", handle.addrs[0].port())),
         "{link}"
     );
     assert!(needs_setup(&client, &base).await);
@@ -1397,7 +1397,7 @@ async fn the_real_binary_logs_the_same_setup_link_until_it_is_used_and_never_aft
         .collect();
     assert_eq!(token.len(), 40, "{line}");
     assert!(
-        link.starts_with(&format!("http://localhost:{port}/admin/setup#token=")),
+        link.starts_with(&format!("http://127.0.0.1:{port}/admin/setup#token=")),
         "{line}"
     );
     first.stop();
@@ -1496,7 +1496,7 @@ async fn hs_recover_gets_a_locked_out_administrator_back_in_with_the_real_binary
     let printed = String::from_utf8(out.stdout).unwrap();
     assert_eq!(
         printed.trim(),
-        format!("http://localhost:{port}/admin/setup#token={setup_token}")
+        format!("http://127.0.0.1:{port}/admin/setup#token={setup_token}")
     );
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("no active administrator"),
@@ -1541,7 +1541,7 @@ async fn hs_recover_gets_a_locked_out_administrator_back_in_with_the_real_binary
     );
     let link = String::from_utf8(out.stdout).unwrap().trim().to_owned();
     assert!(
-        link.starts_with(&format!("http://localhost:{port}/admin/recover#token=")),
+        link.starts_with(&format!("http://127.0.0.1:{port}/admin/recover#token=")),
         "{link}"
     );
     let token = link.split_once("#token=").unwrap().1.to_owned();
