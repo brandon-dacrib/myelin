@@ -107,8 +107,8 @@ hub wait that runs out is a `warn` line now. Left: merge it, and watch the next 
      `agent/backfill-state` (paragraph below).
    - ~~"A destination down for longer than its queue is not caught up" (`hs-federation`)~~: merged
      as `611ea59` (see below).
-   - "A requester with no device never records a feed cursor" (`hs-user`): small; some
-     appservice callers.
+   - ~~"A requester with no device never records a feed cursor" (`hs-user`)~~ done on
+     `agent/user-gaps` (paragraph below), with the hot-room and user-directory rows.
    - "A room alias in `/join/{alias}` is not shard-gated" (`hs-cli`): small.
    - "Setup link assumes `localhost:<bound port>`" (`hs-cli`): small.
    - "`/search` unimplemented" (`hs-room`): large; needs a cross-room index (tantivy exists in
@@ -131,6 +131,19 @@ running** -- a hand-run of the `hs-kv` conformance tests during a gate exhausted
 100 connections and failed that gate's two-replica test with an empty log; (b) a gate that stops
 without its own script releasing the lock leaves `.git/myelin-merge.lock` behind -- check for
 running `cargo` processes, then `rmdir` it.
+
+**Three `hs-user` gaps closed, and a hot-room busy loop found and fixed** (`agent/user-gaps`,
+not yet merged; status 05 session 11). A requester with no device (an appservice's own token)
+records a feed cursor under a device key of its own, so its incremental syncs see what changed.
+Rooms over the fan-out threshold (500 members) are resumed from a new server-wide hot-room
+stream at the token's `hot_seq` (token v4, v3 still read): a hot room joined after the token
+arrives whole, and -- the bug with no row -- a member of a hot room is no longer re-sent
+everything since their own join on every sync with the long-poll returning at once. The user
+directory reads an index of each room's joined members the hub keeps, instead of loading every
+shared and public room per search. Each row has a test that fails without its fix. Left: the
+hot-room stream is never pruned, the directory rebuild counter is a log line and a hub accessor
+rather than a Prometheus metric, and `/sync`'s own presence and device-list scope still reads
+rooms.
 
 **A destination down for longer than its queue is caught up from the rooms**
 (`agent/federation-catchup` → `611ea59`, 2,453 Rust tests; status 06 session 15; known gap closed). The
@@ -1738,11 +1751,11 @@ Refreshed 2026-09-28 against the code: closed rows are struck through with the c
 | The demo still runs a shared WhatsApp registration | demo | RFC 0017 section 6 says an offering replaces it; not done |
 | The bridge manager runs on one replica only | `hs-cli` | gated to the owner of the global shard, so a handoff pauses provisioning for a tick; never watched on a cluster |
 | A first boot over an empty data directory takes about five seconds | `hs-cli`, `hs-kv` | measured (1fe1db1, status 01): creating the Fjall keyspaces, fsynced and serialized; a warm boot is 0.4 s; the first startup probe of a fresh install is refused |
-| User-directory scope is computed by walking rooms on every search | `hs-user` | fine today; the first thing to index if a public room gets very large |
+| ~~User-directory scope is computed by walking rooms on every search~~ | `hs-user` | **Closed** 2026-09-30 (`agent/user-gaps`, status 05 session 11): a search reads `hs_user.room_members` (each room's joined members, kept by the session hub from the room updates it already applies) for the searcher's joined rooms and the public ones, and loads no room; a room the index has nothing for (last updated before it existed) is read once and indexed, counted by `SessionHub::directory_rooms_walked` and logged. Same answers (`e2e.rs`'s directory test unchanged). Timing, one public room of 5,001 members, release, in-memory: 2.7 ms from the index against 2.3 ms reading a resident room and 125 ms loading one -- the win is never loading or queuing on a room, not a resident room's read. Left: `users_sharing_room_with` (every `/sync`'s presence and device-list scope) still reads rooms |
 | `TestThreadsEndpoint` flapped between runs | `hs-room` | ordering tie on a millisecond timestamp; fixed 2026-09-21, not yet graded -- if any test still moves between identical runs, that is a bug to find, not noise |
 | ~~`TestNetworkPartitionOrdering` moved PASS to FAIL between runs 5 and 6~~ | `hs-room` | **Closed** (2026-09-26, passing in every run since, including the 2026-09-30 targeted sets): an event concurrent with a member's join was hidden from them or not depending on which server's events arrived first; the `shared` rule counts "joined when it arrived" now (2026-09-26), and run 7 has it passing again |
-| A hot room joined after the token is resumed from the join, not sent whole | `hs-user` | the client recovers from `/state` and `/messages`; rare, and written down in `resume_mode` |
-| A requester with no device never records a feed cursor | `hs-user` | its feed entries coalesce forever and an incremental sync sees no change; some appservice callers |
+| ~~A hot room joined after the token is resumed from the join, not sent whole~~ | `hs-user` | **Closed** 2026-09-30 (`agent/user-gaps`, status 05 session 11): hot rooms (over 500 members) are resumed from a server-wide hot-room stream (`hs_user.hot_positions`, one entry per update, whatever the room's size) at the token's new `hot_seq` (token v4; v3 still accepted), so a hot room joined after the token is sent as an initial sync sends it. Found on the way, with no row and worse: **every incremental sync of a member of a hot room re-sent everything since their own membership event, and the long-poll returned at once**, for as long as the room stayed hot -- a busy loop for any client in a room over the threshold. Fixed by the same stream (resume, batch bound and wake). `sync::tests::a_hot_room_*` (three) fail on the old logic. Left: the stream is never pruned; no real-binary test of a 500-member room |
+| ~~A requester with no device never records a feed cursor~~ | `hs-user` | **Closed** 2026-09-30 (`agent/user-gaps`, status 05 session 11): a requester with no device (an appservice's `as_token`, masquerading or not) records its cursor under a device key of its own per user (`sync::cursor_device_id`), so its feed entries stop coalescing past what it was handed. `routes::sync::tests::a_requester_with_no_device_sees_each_new_event_once` (two bridge puppets through the real handler) failed with an empty incremental sync before |
 | The PostgreSQL backend logs `WARNING: there is no transaction in progress` at INFO | `hs-kv` | seen many times an hour on the two-pod cluster's `hs-0`: a `COMMIT`/`ROLLBACK` is sent outside a transaction, and the driver's notices are logged at INFO rather than mapped to the server's own levels |
 | A released shard keeps its fencing epoch until the next owner acquires it | `hs-cluster` | found by the cluster-gaps agent (2026-09-30, status 03): an ordinary `release_shard` (handoff, convergence) leaves the epoch unchanged, so a fence the old owner still holds passes `Fence::check` while the shard has no owner; the next acquisition advances it, so the window is the ownerless interval only. Closing it changes the contract in `store::tests::acquire_then_release_round_trips_epoch`; a decision, not yet taken |
 | ~~`heartbeat_seq` is derived from wall-clock milliseconds~~ | `hs-cluster` | **Closed** 2026-09-30 (`agent/cluster-gaps`, status 03): a counter per replica process, one step per heartbeat, started above the highest value any earlier process of the replica wrote (its registry row, or a `seq/<id>` key kept when a drain deregisters it); the wall clock stays in `heartbeat_unix_ms` for operators; `hs_cluster_heartbeat_seq` gauge. `ownership::tests::heartbeats_in_one_millisecond_are_each_a_step_of_progress` and `a_restart_continues_the_heartbeat_seq_above_the_previous_process` fail on the old code. Before: two ticks in one millisecond read as "no progress", i.e. death |

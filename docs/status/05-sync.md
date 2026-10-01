@@ -1,7 +1,190 @@
 # 05 Sync: status
 
-Last updated: 2026-09-30 (session 10: the two CI races. Session 9, session 8, session 7 and the
-integration note follow; sessions 1-6 are preserved unchanged further down.)
+Last updated: 2026-09-30, 23:25 EDT (session 11: three known gaps and a hot-room bug. Session 10,
+session 9, session 8, session 7 and the integration note follow; sessions 1-6 are preserved
+unchanged further down.)
+
+## Session 11 (2026-09-30, branch `agent/user-gaps`): three known gaps, and hot rooms that repeated themselves
+
+Three rows of the known-gaps table in `docs/next-steps.md`, all in this crate, and one bug
+found on the way that had no row and was worse than any of them. One commit each.
+
+**1. A requester with no device records a feed cursor.** (Row "A requester with no device
+never records a feed cursor".) `/sync` recorded the device cursor -- the bound that stops the
+feed coalescing an entry somebody has been handed (`store::tables` module docs) -- only when
+the requester had a device. An appservice acting as one of its users through its `as_token`
+without `device_id` (a bridge puppet) has none, so the entry its token pointed at went on
+absorbing every later update to that room, and the next incremental sync saw no change, for
+ever. Now `sync::cursor_device_id` gives such a requester a key of its own,
+`DEVICELESS_CURSOR_KEY` (`"\u{1}hs-user:no-device"`), under its own user id: cursors are kept
+per `(user, device)` and only the per-user maximum is read, so two appservice users cannot
+collide, and a real device of the same name would only share a cursor whose maximum is what
+matters anyway. Both places that record a cursor (`sync::build`, before reading;
+`routes::sync`, after) use it. A device-less sync is a `debug` line.
+Test: `routes::sync::tests::a_requester_with_no_device_sees_each_new_event_once` -- through the
+real `GET /sync` handler, two masquerading puppets (an `AppserviceIdentity`, no device): initial
+sync, a message, the incremental sync carries exactly it, the next carries nothing. Without the
+fix: `rooms: {}` on the second sync.
+
+**2. A hot room joined after the token arrives whole -- and a hot room no longer repeats.**
+(Row "A hot room joined after the token is resumed from the join, not sent whole".) A room
+above the fan-out threshold (500 members by default; `hub` module docs) gets no feed entries,
+so `resume_mode` could not tell "joined after the token" from "member all along" and resumed
+both from the user's own membership event. Looking at that turned up the bug with no row:
+**every incremental sync of a member of a hot room re-sent everything since their own
+membership event** (or, past `limit`, the newest events with `limited: true`), and the
+long-poll returned at once every time, because `has_new_data` asked "does the room have
+anything after this member's membership event", which is true for ever once anybody has spoken.
+A client in any room over 500 members spun on `/sync`. Shown before the fix by an experiment
+(threshold 1, two members): the second incremental sync repeated the message, in 3 ms against a
+50 ms timeout.
+
+The fix gives hot rooms what the feed gives cold ones: a position as of a token.
+
+- **The hot-room stream** (`hs_user.hot_positions`, key `(room_id, hot_seq)`, value `room_pos`):
+  one entry per update to a hot room, whatever its size, at the next position of one
+  server-wide counter (`ephemeral_counters`/`hot_positions`, `atomic_add` in the same
+  serializable transaction, so a reader that sees the counter at `n` sees every entry up to
+  `n`). Written by the room owner's hub after the membership records and before anyone is
+  woken (`apply_room_update`; the other order could resume a member who had just joined from
+  their own join). `UserStore::{append_hot_position, latest_hot_seq, hot_room_pos_as_of,
+  latest_hot_seq_of_room}`.
+- **The token carries `hot_seq`** (`SyncToken`, wire version 4, 73 bytes). A version-3 token is
+  still accepted, decoding with `hot_seq` 0: there are real clients now, and a `400` on `since`
+  sends some of them back to an initial sync. The cost is a hot room sent whole once.
+- **`resume_mode`** takes the newer of the feed's position as of `feed_seq` and the hot-room
+  stream's as of `hot_seq`, then the same `was_joined_at` question it already asked for an
+  accepted invitation -- so somebody who joined a hot room after the token is sent it as an
+  initial sync would (state, recent timeline, `limited` as the room's size makes it). No
+  position at all means new to this client: sent whole. A hot room with no entry on the stream
+  at all (a server upgraded from before it, quiet since) is resumed from its head: nothing has
+  happened there the client could have missed.
+- **The batch bound** for a hot room is its stream position as of the token's `hot_seq`
+  (it used to be read live), and **the long-poll** wakes for a hot room only when its newest
+  stream entry is past the token's.
+- `FeedTokenResolver` (a sync token used as `/messages`' `from`) takes the same newer-of-two
+  baseline.
+- The hub logs at `info` when a room crosses the threshold in either direction ("a room crossed
+  the fan-out threshold; its members' records now say so", with the member count and
+  threshold).
+
+Tests (each fails on the old logic; checked by swapping the old `resume_mode` fallback, live
+bound and wake check back in):
+`sync::tests::a_hot_room_joined_after_the_token_arrives_whole` (threshold 1; bob's next sync
+carries `m.room.create`, power levels, join rules, name and all three memberships, the message
+after his join, and alice in `device_lists.changed`; then only "welcome", not limited, no state;
+then nothing. Old: "m.room.create never reached bob"),
+`a_hot_room_sends_each_event_once_and_lets_a_long_poll_wait` (two messages once, then an empty
+answer after the full 300 ms poll, then the third only. Old: "nothing is repeated" failed),
+`a_hot_room_from_before_the_stream_is_not_repeated` (a hot record with no stream entry: nothing
+sent, the poll waits. Old: answered in 1 ms with the room),
+`store::tables::tests::the_hot_room_stream_answers_a_rooms_position_as_of_any_point`,
+`token::tests::a_version_3_token_still_decodes_with_no_hot_position`, and the token round-trip
+property test over nine fields.
+
+**3. The user directory reads an index, not the rooms.** (Row "User-directory scope is
+computed by walking rooms on every search".) `users_visible_in_directory_to` loaded every room
+the searcher is joined to and every public room, and read each one's members through the room
+actor, on every search. Now:
+
+- **The index** (`hs_user.room_members`, key `(room_id, user_id)`): each room's joined members,
+  with a marker row (empty user id) that says the room is indexed. `UserStore::
+  {index_room_members_if_absent, apply_room_member_changes, room_member_ids,
+  forget_room_members}`. A whole index and its marker are one transaction, so a room is indexed
+  wholly or not at all, and a second indexer (the hub racing a search on another replica)
+  leaves the first one's rows alone.
+- **Kept current by the hub** from the room updates it already applies
+  (`index_members_for_directory`): each member an update changed is added or removed by what
+  the room says their membership is now (the member list `apply_room_update` reads anyway); a
+  room the index has nothing for is indexed whole from that list. A deleted room's rows go
+  (`apply_update_for_a_gone_room`). A room going public or private needs nothing new: the public
+  room list the hub keeps already follows `m.room.join_rules`.
+- **The search** is: the searcher's joined rooms (their membership records) plus the public
+  rooms (the list), each one's members one range read. It first waits for the hub to catch up
+  (`settle_before_read`, as `/sync` does), so somebody who has just joined a room finds its
+  members.
+- **The rebuild** is the old walk, per room and once: a room the index has nothing for (its
+  last update came before the index existed) is read from the room and indexed by the first
+  search that needs it. `SessionHub::directory_rooms_walked()` counts those, and each is an
+  `info` line ("read a room's members for the user directory, which had no index of it yet").
+  Not on boot, and not "when the table is empty": a quiet room is indexed when a search first
+  needs it, and an active one by its next update, whichever comes first.
+- Semantics unchanged: shared joined rooms plus public (`join_rule: public`) rooms' joined
+  members, world-readable history not counted, as before.
+
+Tests: `hub::tests::a_directory_search_answers_from_the_index_without_loading_any_room` (the
+index seeded for a room the registry does not have: the answer comes from the index alone; the
+old walk answered nobody), `a_room_from_before_the_index_is_read_once_then_kept_current` (one
+walk for two searches, then a join kept current with no second walk; fails on the old code at the
+walk count), `the_directory_follows_membership_from_its_index_without_reading_rooms` (join,
+leave, a public room made invite-only; `directory_rooms_walked() == 0`; passes on the old walk
+too, which is the point: same answers), `store::tables::tests::
+the_directory_index_is_written_whole_once_then_changed`. The real-server directory test
+(`hs-cli/tests/e2e.rs::the_user_directory_shows_a_searcher_only_who_they_could_already_see`)
+passes unchanged.
+
+**Timing** (`hub::tests::directory_search_timing_in_a_public_room_of_5000`, `#[ignore]`d; one
+public room of 5,001 joined members, searched by somebody outside it, 20 rounds each, in-memory
+backend, `--release` on the desktop):
+
+| per search | release | debug |
+|---|---|---|
+| before: the room resident, members read through the actor | 2.3 ms | 25 ms |
+| before: the room not resident (loaded, then read) | 125 ms | -- |
+| after: from the index | 2.7 ms | 25 ms |
+
+Honestly: against a room that is resident and idle, the index is no faster -- both read 5,000
+rows from memory. What it removes is the room: a search no longer loads a room that is not
+resident (after a restart, or on a replica reading through its mirror, which reloads the whole
+room), and no longer queues on a busy public room's actor behind its writes. On Fjall or
+PostgreSQL the index is a range read of one key prefix; not measured there.
+
+**Verification.** `cargo fmt --all --check`; `cargo clippy -p hs-user -p hs-cli --all-targets
+-- -D warnings` clean; `cargo test -p hs-user`: 162 lib (+1 ignored timing) + 6 scenario, from
+153 + 6. The 13 `crates/hs-cli/tests/` files that touch `/sync` or the user directory
+(`admin_areas`, `admin_rooms`, `bridge_offerings`, `cluster_edus`, `cluster_ephemeral`, `e2e`,
+`federation_catch_up`, `federation_edus`, `federation_membership`, `federation_restart`,
+`federation_two_servers`, `invites_and_notices`, `migration`): all pass. In the first run three
+of `e2e.rs`'s real-binary tests timed out waiting for the binary to boot (load average 21 on the
+desktop's 10 cores, several agents building); run again on their own they passed. The two
+cluster files print `SKIP` without `HS_CLUSTER_TEST_POSTGRES_DSN`, which this session did not
+set (the gate's PostgreSQL containers were left alone).
+
+**Decisions made.**
+- A device-less requester's cursor is a synthetic device key per user, not a cursor keyed on
+  the token: cursors exist only to bound coalescing, and only their per-user maximum is read.
+- Hot rooms get a server-wide position stream rather than a per-room position in the token
+  (which would grow with the account) or a feed entry per member (which is what hot rooms
+  exist to avoid). One counter for all hot rooms means their writes serialize on it; hot rooms
+  are rare (over 500 members), so this is accepted.
+- `SyncToken` version 4 still reads version 3: the first format change made with real clients
+  holding tokens.
+- The directory index is per room (its joined members), not per searcher: a
+  `(searcher, visible user)` table is quadratic in a big public room. The rebuild is lazy and per
+  room rather than a boot-time pass.
+
+**Interfaces provided (new).** `hs_user::sync::{cursor_device_id, DEVICELESS_CURSOR_KEY}`;
+`SyncToken::hot_seq`; `UserStore::{append_hot_position, latest_hot_seq, hot_room_pos_as_of,
+latest_hot_seq_of_room, index_room_members_if_absent, apply_room_member_changes,
+room_member_ids, forget_room_members}`; `SessionHub::directory_rooms_walked`. Two new keyspaces,
+`hs_user.hot_positions` and `hs_user.room_members` (a first boot creates two more, see the
+"first boot takes about five seconds" row). No other crate changes; `hs-cli` needs no wiring.
+
+**Left.**
+- The hot-room stream is never pruned (one row per event in a hot room, as the feed is never
+  pruned either); a retention pass is the same work for both.
+- `directory_rooms_walked` and the threshold crossing are logs and a counter on the hub, not
+  Prometheus metrics: `hs-cli` registers metrics, and it was not in this session's scope.
+- `users_sharing_room_with` (presence and device-list scope, on every `/sync`) still reads each
+  shared room through its actor; it could read the same index, and is the next thing worth
+  measuring.
+- The hot-room path has no real-binary test (a 500-member room through HTTP); the unit tests
+  use a threshold of one.
+
+**Files.** `crates/hs-user/src/sync/mod.rs` (`cursor_device_id`, `resume_mode`, the hot bound
+and wake), `routes/sync.rs` (the cursor, the device-less test), `token.rs` (`hot_seq`, v4),
+`store/mod.rs` and `store/tables.rs` (the hot-room stream, the directory index), `hub.rs`
+(writing both, the directory search, the threshold log).
 
 ## Session 10 (2026-09-30, branch `agent/ci-flakes`): the two races that kept `main` red
 
