@@ -407,8 +407,14 @@ impl<B: KvBackend + 'static> DeviceSource for Sources<B> {
 }
 
 /// The hub's ephemeral observer: rings the ephemeral pump's doorbell.
+///
+/// It holds the pump weakly. The pump reads through the hub ([`Sources`]), and the hub holds
+/// this observer, so a strong reference here was a cycle: after shutdown the hub, the room
+/// registry, the appservice registry and the stores they hold outlived the server, and kept the
+/// embedded store's lock with them. The pump's own task owns it; once that has stopped, a
+/// doorbell rings nothing.
 struct Doorbell<B: KvBackend + 'static> {
-    pump: Arc<EphemeralPump<B>>,
+    pump: std::sync::Weak<EphemeralPump<B>>,
 }
 
 impl<B: KvBackend + 'static> EphemeralObserver for Doorbell<B> {
@@ -420,7 +426,9 @@ impl<B: KvBackend + 'static> EphemeralObserver for Doorbell<B> {
             EphemeralUpdate::Receipt { .. } => Change::Receipt,
             EphemeralUpdate::Presence { .. } => Change::Presence,
         };
-        self.pump.note(&change);
+        if let Some(pump) = self.pump.upgrade() {
+            pump.note(&change);
+        }
     }
 }
 
@@ -576,7 +584,7 @@ impl<B: KvBackend + 'static> AppserviceDelivery<B> {
         // Installed before the first tick, so that a change in between rings a bell the tick
         // answers, rather than waiting for the timer.
         hub.install_ephemeral_observer(Arc::new(Doorbell {
-            pump: ephemeral.clone(),
+            pump: Arc::downgrade(&ephemeral),
         }));
 
         // Subscribed before catching up, so that nothing published in between is missed: an

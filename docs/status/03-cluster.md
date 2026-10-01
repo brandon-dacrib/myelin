@@ -30,6 +30,53 @@ Closes the known gap "A room alias in `/join/{alias}` or `/knock/{alias}` is not
 Verify: `HS_CLUSTER_TEST_POSTGRES_DSN=postgres://postgres:hspg@127.0.0.1:5462/postgres cargo
 test -p hs-cli --test cluster_alias_join`, and `cargo test -p hs-cli --lib -- cluster::`.
 
+## 2026-09-30: an in-process server restarts over its own data directory (branch `agent/cli-small-gaps`)
+
+Closes the known gap "In-process server cannot be restarted over its data directory".
+
+- **Every task on the server's own runtime.** `spawn_serve_with_storage` builds a multi-thread
+  Tokio runtime (threads named `hs-serve`) and starts the server on it, so every `tokio::spawn`
+  below it, in any crate, lands there; `ServeHandle` owns it. `ServeHandle::shutdown` runs the
+  graceful steps as before (readiness, cluster drain, mesh, long-polls, appservice and
+  federation stops, listeners) on that runtime -- aborting and joining this crate's own bridge
+  manager and statistics sampler first, with a `warn` naming either if it does not stop within
+  5 s -- then `Runtime::shutdown_timeout` drops every task still there (the background loops
+  in `hs-user`, `hs-push`, `hs-federation`, `hs-appservice`, ... that do not watch for shutdown)
+  and waits up to `TASKS_STOP_DEADLINE` (10 s) for work on its blocking threads, with a `warn`
+  if that runs out; the store is dropped last. Dropping a handle without `shutdown()` stops the
+  runtime in the background. In `hs serve` the binary's own runtime now only waits for the
+  signal (and runs the configuration follower).
+- **Two reference cycles.** Stopping every task was not enough: the store stayed locked. A
+  component report found them (`ServeHandle`'s `components`: the auth store, audit log,
+  appservice registry, room registry, session hub, e2e store, push stores, media repository,
+  overview and federation sender are watched weakly; whatever is still alive after shutdown is
+  named in a `warn` and returned by `shutdown()`). (1) The session hub held the appservice
+  ephemeral pump's doorbell, which held the pump, which reads through the hub
+  (`appservice_delivery::Doorbell` holds the pump weakly now; the pump's task owns it). (2) The
+  room registry held the federation backfill, which holds the registry: the registry now gets
+  `serve::WeakBackfill`, and the server's running parts own the backfill. (`WeakBackfill`
+  delegates both methods of `hs_room::backfill::Backfill`; a new method needs a line there.)
+- **Test.** `crates/hs-cli/tests/in_process_restart.rs`: `spawn_serve` → register, create a
+  room, send, sync → `shutdown()` → `spawn_serve` over the same `data_dir`, twice, in one
+  process; the message from the first run is in `/messages` each time and `shutdown()` reports
+  nothing outlived it. Before: `FjallError: Locked` on the second start. (With only the runtime
+  change and not the two cycle fixes, the report named the six components above and the lock
+  error remained.)
+- **Real-binary restart tests that exist only because of this** (not converted; each could now
+  be in-process unless it asserts on the log): `e2e.rs`'s `HsProcess` harness says so outright
+  (`receipts_and_presence_are_still_there_after_a_restart_of_the_real_binary`,
+  `after_a_restart_a_message_in_an_old_room_still_reaches_the_other_person`,
+  `a_bridge_is_sent_what_happens_in_a_room_its_bot_is_in_even_across_a_restart`, whose comment
+  names the lock), `admin_user_identity.rs` and `reports_tasks_statistics.rs` (both harnesses
+  say "a restart has to be a new process"), `appservice_ephemeral.rs`'s restart and
+  `migration.rs`'s. The ones that read the operator's log (`e2e.rs`'s setup-link test,
+  `config_history.rs`) or run two federating servers (`federation_restart.rs`,
+  `federation_catch_up.rs`) have other reasons to stay real processes.
+
+Left: a clustered in-process server has not been checked for cycles (the mesh, the sync
+cluster's mirror); its components report would name any. Verify:
+`cargo test -p hs-cli --test in_process_restart`.
+
 ## 2026-09-30: two known gaps closed (branch `agent/cluster-gaps`)
 
 **The last replica of a cluster no longer waits out its drain deadline.** `Drainable::drain`

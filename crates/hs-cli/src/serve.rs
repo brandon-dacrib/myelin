@@ -61,6 +61,10 @@ pub enum ServeError {
     /// Opening the configured storage backend failed.
     #[error(transparent)]
     Storage(#[from] storage::StorageOpenError),
+    /// The runtime the server's tasks run on could not be built, or the server's startup on it
+    /// was cancelled.
+    #[error("the server's runtime: {0}")]
+    Runtime(std::io::Error),
     /// Loading `--capabilities-config` failed.
     #[error(transparent)]
     Capabilities(#[from] versions::CapabilitiesConfigError),
@@ -231,14 +235,14 @@ fn build_router<B: KvBackend>(
     let synapse_admin_router = hs_auth::synapse_admin_router().with_state(auth.clone());
     let synapse_admin_routes = crate::auth_manifest::synapse_admin_routes();
 
-    let (room_router, room_manifest) = hs_room::routes::router::<B>();
-    let room_router = room_router.with_state(mounts.room);
-    let room_routes = room_manifest.routes;
-
     // The shard gate resolves `/join/{alias}` and `/knock/{alias}` through the same directory
     // and federation the room routes use, before the room state moves into the router.
     let alias_resolver: Arc<dyn crate::cluster::AliasResolver> =
         Arc::new(crate::cluster::RoomAliasResolver::new(&mounts.room));
+    let (room_router, room_manifest) = hs_room::routes::router::<B>();
+    let room_router = room_router.with_state(mounts.room);
+    let room_routes = room_manifest.routes;
+
     let legacy_media_enabled = mounts.media.legacy_media_enabled;
     let (media_router, media_manifest) = hs_media::router::authenticated_router::<B>();
     let media_router = media_router.with_state(mounts.media.clone());
@@ -885,6 +889,13 @@ async fn metrics_handler(Extension(metrics): Extension<Arc<Metrics>>) -> impl In
 /// A running server: the addresses it actually bound (useful when a configured port is `0`, as
 /// in tests), a handle to trigger graceful shutdown, and a join handle that resolves once every
 /// listener has finished draining.
+///
+/// Every task the server spawns -- in this crate and in every crate it wires together -- runs on
+/// a Tokio runtime of the server's own ([`server_runtime`]), which the handle owns. That is what
+/// lets [`ServeHandle::shutdown`] stop all of them, including the background loops that do not
+/// watch for shutdown themselves, and then close the store: after it returns, the data
+/// directory can be opened again in the same process. Dropping the handle without
+/// [`ServeHandle::shutdown`] stops the runtime in the background, without the graceful steps.
 pub struct ServeHandle {
     /// Every address the server ended up bound to, one per `(bind_address, port)` pair across
     /// every configured listener.
@@ -894,6 +905,52 @@ pub struct ServeHandle {
     /// it is on the handle so that is one decision made in one place, and so a test can follow
     /// the same link an operator would.
     pub setup_link: Option<String>,
+    /// What `/health/ready` reads. `true` from the moment the listeners are bound;
+    /// [`ServeHandle::withdraw_readiness`] makes it `false`, and nothing makes it `true` again.
+    ready: Arc<AtomicBool>,
+    /// The parts the graceful shutdown stops in order; taken by [`ServeHandle::shutdown`].
+    running: Option<Running>,
+    /// The runtime every one of the server's tasks runs on; `None` only once shut down.
+    runtime: Option<tokio::runtime::Runtime>,
+    /// The server's main components, watched without keeping them alive: what is still alive
+    /// once [`ServeHandle::shutdown`] has stopped everything is held by a reference cycle, and
+    /// is named in a `warn` (it may be what keeps the store open).
+    components: Components,
+    /// Keeps the opened storage backend alive for as long as the server is: Fjall holds an
+    /// exclusive lock on its data directory and the Postgres backend owns a connection pool, and
+    /// dropping either while listeners are still serving would take the store out from under
+    /// them. Type-erased because [`ServeHandle`] is not generic over the backend. Dropped last,
+    /// after the runtime, so nothing is still using it.
+    storage: Option<Box<dyn std::any::Any + Send + Sync>>,
+}
+
+/// The server's main components by name, each held weakly; see [`ServeHandle`]'s `components`.
+#[derive(Default)]
+struct Components(Vec<(&'static str, IsAlive)>);
+
+/// Whether one watched component is still alive.
+type IsAlive = Box<dyn Fn() -> bool + Send + Sync>;
+
+impl Components {
+    /// Watches `component` under `name`, without keeping it alive.
+    fn watch<T: ?Sized + Send + Sync + 'static>(&mut self, name: &'static str, component: &Arc<T>) {
+        let weak = Arc::downgrade(component);
+        self.0
+            .push((name, Box::new(move || weak.strong_count() > 0)));
+    }
+
+    /// The names of those still alive.
+    fn still_alive(&self) -> Vec<&'static str> {
+        self.0
+            .iter()
+            .filter(|(_, alive)| alive())
+            .map(|(name, _)| *name)
+            .collect()
+    }
+}
+
+/// What [`ServeHandle::shutdown`] stops, in the order its steps need them.
+struct Running {
     bridge_manager: tokio::task::JoinHandle<()>,
     /// Samples the statistics every quarter hour (`crate::statistics`); stopped on shutdown so
     /// it does not keep the store open after the server has gone.
@@ -909,19 +966,42 @@ pub struct ServeHandle {
     /// Stops the outbound federation feeder and sender (`crate::federation_sender`); a no-op
     /// when federation is disabled. Type-erased for the same reason as the one above.
     stop_outbound_federation: Box<dyn Fn() + Send + Sync>,
-    /// Keeps the opened storage backend alive for as long as the server is: Fjall holds an
-    /// exclusive lock on its data directory and the Postgres backend owns a connection pool, and
-    /// dropping either while listeners are still serving would take the store out from under
-    /// them. Type-erased because [`ServeHandle`] is not generic over the backend.
-    _storage: Box<dyn std::any::Any + Send + Sync>,
     /// This replica's `hs-cluster` handle, drained on [`ServeHandle::shutdown`] before the HTTP
     /// listeners stop accepting (RFC 0001 section 10).
     cluster: hs_cluster::Cluster,
     /// The mesh listener, if this replica is clustered.
     mesh: Option<crate::cluster::MeshRuntime>,
-    /// What `/health/ready` reads. `true` from the moment the listeners are bound;
-    /// [`ServeHandle::withdraw_readiness`] makes it `false`, and nothing makes it `true` again.
-    ready: Arc<AtomicBool>,
+    /// What a hook holds weakly, owned here for as long as the server runs (see
+    /// [`WeakBackfill`]).
+    _keep_alive: Vec<Arc<dyn std::any::Any + Send + Sync>>,
+}
+
+/// A [`hs_room::backfill::Backfill`] the room registry can hold without keeping it alive: the
+/// federation backfill holds the registry, so the registry holding it strongly was a reference
+/// cycle, and after shutdown the registry -- and the store under it -- outlived the server.
+/// [`Running`] owns the backfill; once the server has stopped, a backfill through this does
+/// nothing. Every method of the trait is delegated, so a new one needs a line here.
+struct WeakBackfill<T>(std::sync::Weak<T>);
+
+#[async_trait::async_trait]
+impl<T: hs_room::backfill::Backfill + 'static> hs_room::backfill::Backfill for WeakBackfill<T> {
+    async fn backfill(&self, room_id: &ruma::RoomId) -> Result<usize, hs_room::error::RoomError> {
+        match self.0.upgrade() {
+            Some(backfill) => backfill.backfill(room_id).await,
+            None => Ok(0),
+        }
+    }
+
+    async fn fill_gap(
+        &self,
+        room_id: &ruma::RoomId,
+        top: i64,
+    ) -> Result<usize, hs_room::error::RoomError> {
+        match self.0.upgrade() {
+            Some(backfill) => backfill.fill_gap(room_id, top).await,
+            None => Ok(0),
+        }
+    }
 }
 
 /// [`ServeHandle`]'s type-erased call into the session hub. See its `release_long_polls` field.
@@ -953,13 +1033,81 @@ impl ServeHandle {
     /// replica owns and waiting, up to [`CLUSTER_DRAIN_DEADLINE`], for a peer to claim it),
     /// stops the mesh listener, then answers every `/sync` that is waiting for news, signals
     /// every HTTP listener to begin graceful shutdown and waits for them to finish draining
-    /// in-flight requests. `hs serve`'s `SIGTERM` handler calls this.
-    pub async fn shutdown(self) {
+    /// in-flight requests. Then it stops every task still running on the server's runtime --
+    /// waiting up to [`TASKS_STOP_DEADLINE`] for work on its blocking threads to finish -- and
+    /// closes the store last, so the data directory can be opened again in this process as soon
+    /// as this returns. `hs serve`'s `SIGTERM` handler calls this.
+    ///
+    /// Returns the names of the server's main components that outlived it, which is empty
+    /// unless a reference cycle holds one (each is also named in a `warn`).
+    pub async fn shutdown(mut self) -> Vec<&'static str> {
         // First, before the drain: a readiness probe that still passes during the drain keeps
         // the Service sending new requests here.
         self.withdraw_readiness();
-        self.bridge_manager.abort();
-        self.statistics_sampler.abort();
+        if let Some(running) = self.running.take() {
+            // On the server's own runtime, so anything the graceful steps spawn is stopped with
+            // the rest below.
+            match &self.runtime {
+                Some(runtime) => {
+                    if let Err(error) = runtime.spawn(running.stop()).await {
+                        tracing::warn!(%error, "the graceful shutdown steps did not finish");
+                    }
+                }
+                None => running.stop().await,
+            }
+        }
+        let runtime = self.runtime.take();
+        let storage = self.storage.take();
+        let stopped = tokio::task::spawn_blocking(move || {
+            if let Some(runtime) = runtime {
+                stop_runtime(runtime, TASKS_STOP_DEADLINE);
+            }
+            // Last: every task that held a handle on the store has been dropped above.
+            drop(storage);
+        })
+        .await;
+        if let Err(error) = stopped {
+            tracing::warn!(%error, "stopping the server's tasks failed; the store may still be open");
+        }
+        let alive = self.components.still_alive();
+        if alive.is_empty() {
+            tracing::info!("the server has stopped and its store is closed");
+        } else {
+            tracing::warn!(
+                components = ?alive,
+                "these components outlived the server's shutdown (a reference cycle holds them), and with them, possibly, the store"
+            );
+        }
+        alive
+    }
+
+    /// The base URL of the first bound listener (`http://127.0.0.1:PORT`), for a caller (tests,
+    /// `hs register` against a just-started local server) that just wants "the" address.
+    #[must_use]
+    pub fn base_url(&self) -> String {
+        format!(
+            "http://{}",
+            self.addrs.first().expect("at least one listener is bound")
+        )
+    }
+}
+
+impl Drop for ServeHandle {
+    fn drop(&mut self) {
+        // Not shut down gracefully: stop every task without waiting. A runtime cannot be dropped
+        // (which blocks) where the caller may be async, and this is the one way that never
+        // blocks.
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
+    }
+}
+
+impl Running {
+    /// The graceful steps of [`ServeHandle::shutdown`], in order.
+    async fn stop(self) {
+        stop_named("bridge manager", self.bridge_manager).await;
+        stop_named("statistics sampler", self.statistics_sampler).await;
         let report = self.cluster.drain(CLUSTER_DRAIN_DEADLINE).await;
         if report.handed_off > 0 || report.released_unclaimed > 0 {
             tracing::info!(
@@ -980,16 +1128,62 @@ impl ServeHandle {
         let _ = self.shutdown_tx.send(true);
         let _ = self.join.await;
     }
+}
 
-    /// The base URL of the first bound listener (`http://127.0.0.1:PORT`), for a caller (tests,
-    /// `hs register` against a just-started local server) that just wants "the" address.
-    #[must_use]
-    pub fn base_url(&self) -> String {
-        format!(
-            "http://{}",
-            self.addrs.first().expect("at least one listener is bound")
-        )
+/// How long [`ServeHandle::shutdown`] waits, once the listeners have drained, for the server's
+/// remaining tasks to stop: the async ones stop at once (they are dropped), so this bounds only
+/// work already running on a blocking thread, such as a store write.
+pub const TASKS_STOP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long a task of this crate's own is given to finish once aborted.
+const NAMED_TASK_STOP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Aborts one of this crate's own background tasks and waits for it to stop, saying which one
+/// did not.
+async fn stop_named(name: &'static str, task: tokio::task::JoinHandle<()>) {
+    task.abort();
+    match tokio::time::timeout(NAMED_TASK_STOP_DEADLINE, task).await {
+        Ok(_) => tracing::debug!(task = name, "stopped"),
+        Err(_) => tracing::warn!(
+            task = name,
+            deadline = ?NAMED_TASK_STOP_DEADLINE,
+            "a background task did not stop when asked; shutting down without it"
+        ),
     }
+}
+
+/// Stops every task left on the server's runtime -- background loops in this crate and in the
+/// crates it wires together that do not watch for shutdown themselves -- and waits up to
+/// `deadline` for its blocking threads. Logs how many there were, and a `warn` when blocking work
+/// outlived the deadline, since the store may then stay open until that work finishes.
+fn stop_runtime(runtime: tokio::runtime::Runtime, deadline: std::time::Duration) {
+    let alive = runtime.metrics().num_alive_tasks();
+    let started = std::time::Instant::now();
+    runtime.shutdown_timeout(deadline);
+    let elapsed = started.elapsed();
+    if elapsed >= deadline {
+        tracing::warn!(
+            tasks = alive,
+            ?deadline,
+            "work on the server's blocking threads did not finish in time; it was left running and may hold the store open until it does"
+        );
+    } else {
+        tracing::info!(
+            tasks = alive,
+            ?elapsed,
+            "stopped the server's remaining tasks"
+        );
+    }
+}
+
+/// The runtime a server's tasks run on: multi-threaded like `hs serve`'s own, its threads named
+/// `hs-serve` so a thread dump says whose they are.
+fn server_runtime() -> Result<tokio::runtime::Runtime, ServeError> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("hs-serve")
+        .build()
+        .map_err(ServeError::Runtime)
 }
 
 /// Builds the router, opens the configured storage backend, binds every listener and starts
@@ -1027,15 +1221,39 @@ pub async fn spawn_serve_with_storage(
         return Err(ServeError::NoListeners);
     }
 
+    // Everything the server spawns runs on a runtime of its own (see `ServeHandle`), so it
+    // starts there too: every `tokio::spawn` below it, in any crate, lands on that runtime.
+    let runtime = server_runtime()?;
     // One generic server, instantiated per backend. `spawn_serve_with_backend` is generic over
     // `B: KvBackend`, so both arms below get the same server built over a different store rather
     // than two code paths that could drift apart; the cost is that it is monomorphized twice.
-    match storage {
-        storage::OpenedStorage::Embedded(backend) => {
-            spawn_serve_with_backend(backend, config, options).await
+    let started = runtime
+        .spawn(async move {
+            match storage {
+                storage::OpenedStorage::Embedded(backend) => {
+                    spawn_serve_with_backend(backend, config, options).await
+                }
+                storage::OpenedStorage::Postgres(backend) => {
+                    spawn_serve_with_backend(backend, config, options).await
+                }
+            }
+        })
+        .await;
+    match started {
+        Ok(Ok(mut handle)) => {
+            handle.runtime = Some(runtime);
+            Ok(handle)
         }
-        storage::OpenedStorage::Postgres(backend) => {
-            spawn_serve_with_backend(backend, config, options).await
+        Ok(Err(error)) => {
+            runtime.shutdown_background();
+            Err(error)
+        }
+        Err(join_error) => {
+            runtime.shutdown_background();
+            match join_error.try_into_panic() {
+                Ok(panic) => std::panic::resume_unwind(panic),
+                Err(join_error) => Err(ServeError::Runtime(std::io::Error::other(join_error))),
+            }
         }
     }
 }
@@ -1064,6 +1282,9 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     let auth_store: Arc<dyn hs_auth::store::AuthStore> = Arc::new(
         hs_auth::store::tables::TablesAuthStore::open(backend.clone())?,
     );
+    // What shutdown checks it let go of (`ServeHandle`'s `components`).
+    let mut components = Components::default();
+    components.watch("auth store", &auth_store);
     // Registration tokens are durable too: an invite link has to survive a restart.
     let mut auth_state = AuthState::with_store(auth_store, auth_config).with_registration_tokens(
         Arc::new(hs_auth::registration_tokens::TablesRegistrationTokens::open(backend.clone())?),
@@ -1095,6 +1316,8 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             .map_err(|e| ServeError::Audit(e.to_string()))?,
     );
     let appservices = crate::appservices::load(&config.appservices, backend.clone(), &server_name)?;
+    components.watch("audit log", &audit);
+    components.watch("appservice registry", &appservices.registry);
     crate::appservices::audit_imports(audit.as_ref(), &appservices.imports)
         .await
         .map_err(|e| ServeError::Audit(e.to_string()))?;
@@ -1136,6 +1359,12 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         }
     }
     let (user_state, e2e_state, push_state) = build_session_mounts(&backend, &auth_state, &rooms)?;
+    components.watch("room registry", &rooms);
+    components.watch("session hub", &user_state.hub);
+    components.watch("e2e store", &user_state.e2e);
+    components.watch("push rules", &push_state.rulesets);
+    components.watch("pushers", &push_state.pushers);
+    components.watch("notification counts", &push_state.counts);
     // The user directory is searched in `hs-auth`, which cannot see rooms; the hub can, and says
     // who each searcher is allowed to find.
     auth_state.install_user_directory_visibility(user_state.hub.clone());
@@ -1239,6 +1468,9 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     let federation_source: Arc<dyn hs_admin::sources::FederationSource>;
     // The sender, to be fed once the cluster is up (its feeder is gated on shard ownership).
     let federation_sender: Option<Arc<hs_federation::sender::FederationSender>>;
+    // What the server's running parts own on behalf of a hook that holds it weakly (to break a
+    // reference cycle), dropped at shutdown.
+    let mut keep_alive: Vec<Arc<dyn std::any::Any + Send + Sync>> = Vec::new();
     // How `POST /join` reaches a room hosted elsewhere (`crate::remote_join`): over the
     // federation mount's own client, so only when federation is on.
     let remote_join: Option<Arc<dyn hs_room::remote_join::RemoteJoin>>;
@@ -1308,6 +1540,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
                 .with_keys(mount.own_keys.clone(), mount.x_matrix.key_cache.clone()),
         );
         federation_sender = Some(mount.sender.clone());
+        components.watch("federation sender", &mount.sender);
         remote_join = Some(Arc::new(crate::remote_join::FederationRemoteJoin::new(
             mount.client.clone(),
             mount.x_matrix.key_cache.clone(),
@@ -1316,12 +1549,17 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         )));
         // And how `GET /messages` reaches the history of such a room from before the join
         // (`crate::backfill`): the same client, the same key cache.
-        rooms.install_backfill(Arc::new(crate::backfill::FederationBackfill::new(
+        // The registry holds it weakly ([`WeakBackfill`]): the backfill holds the registry, and
+        // the other way round too was a cycle that kept the registry, and the store, alive
+        // after shutdown. The server's running parts hold it instead.
+        let backfill = Arc::new(crate::backfill::FederationBackfill::new(
             mount.client.clone(),
             mount.x_matrix.key_cache.clone(),
             rooms.clone(),
             identity.clone(),
-        )));
+        ));
+        rooms.install_backfill(Arc::new(WeakBackfill(Arc::downgrade(&backfill))));
+        keep_alive.push(backfill);
         // And how `GET /rooms/{roomId}/hierarchy` learns about a room of a space that this
         // server does not hold (`crate::hierarchy`): the same client.
         rooms.install_remote_hierarchy(Arc::new(crate::hierarchy::FederationHierarchy::new(
@@ -1496,6 +1734,8 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         Arc::new(hs_room::reports::RoomReports::new(rooms.clone()));
     overview.set_reports(reports.clone());
     // The Statistics page: media usage and the charts, whose gauges are sampled from here on.
+    components.watch("media repository", &media_state.repository);
+    components.watch("server overview", &overview);
     let statistics = Arc::new(
         crate::statistics::ServerStatistics::open(
             backend.clone(),
@@ -1778,24 +2018,30 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     };
 
     Ok(ServeHandle {
-        bridge_manager,
-        statistics_sampler,
         addrs,
         setup_link,
-        shutdown_tx,
-        join,
-        release_long_polls,
-        stop_appservice_delivery: Box::new(move || appservice_delivery.stop()),
-        stop_outbound_federation: Box::new(move || {
-            if let Some((outbound, device_lists)) = &outbound_federation {
-                device_lists.stop();
-                outbound.stop();
-            }
-        }),
-        _storage: Box::new(backend.clone()),
-        cluster,
-        mesh,
         ready,
+        running: Some(Running {
+            bridge_manager,
+            statistics_sampler,
+            shutdown_tx,
+            join,
+            release_long_polls,
+            stop_appservice_delivery: Box::new(move || appservice_delivery.stop()),
+            stop_outbound_federation: Box::new(move || {
+                if let Some((outbound, device_lists)) = &outbound_federation {
+                    device_lists.stop();
+                    outbound.stop();
+                }
+            }),
+            cluster,
+            mesh,
+            _keep_alive: keep_alive,
+        }),
+        // Set by `spawn_serve_with_storage`, which made the runtime this is running on.
+        runtime: None,
+        components,
+        storage: Some(Box::new(backend.clone())),
     })
 }
 
@@ -1833,6 +2079,28 @@ fn link_base(public_baseurl: Option<&str>, addrs: &[SocketAddr]) -> String {
             Some(addr) => format!("http://{addr}"),
         },
     }
+}
+
+/// `server.public_baseurl` when it says something: unset and blank are the same.
+fn configured_public_baseurl(public_baseurl: Option<&str>) -> Option<&str> {
+    public_baseurl.map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// What `hs serve` logs after the setup link when it had to guess the link's host, because
+/// `server.public_baseurl` is unset. `None` when the operator configured it.
+///
+/// The guess is the listener's own address, which is wrong behind a reverse proxy or a remapped
+/// port; but the setup token is checked on whatever host the browser used (the page reads it from
+/// the fragment and sends it in the body of `POST /api/v1/setup`), so the link still works with
+/// its host replaced.
+#[must_use]
+pub fn setup_link_host_hint(public_baseurl: Option<&str>) -> Option<&'static str> {
+    if configured_public_baseurl(public_baseurl).is_some() {
+        return None;
+    }
+    Some(
+        "the setup link's host is this server's own listener, because server.public_baseurl is not set: open this link from wherever you reach this server, replacing the host if needed (the token after #token= is what matters). Behind a reverse proxy or a remapped port, set HS__SERVER__PUBLIC_BASEURL to the address clients use and the link is rooted there",
+    )
 }
 
 /// `hs-config`'s `bind_addresses` defaults to `"::"` (all interfaces, IPv6-mapped), matching
@@ -2083,28 +2351,6 @@ mod tests {
         assert!(paths.contains(&"/_matrix/client/versions"));
         assert!(paths.contains(&"/_matrix/client/v3/capabilities"));
         assert!(paths.contains(&"/_matrix/client/r0/capabilities"));
-/// `server.public_baseurl` when it says something: unset and blank are the same.
-fn configured_public_baseurl(public_baseurl: Option<&str>) -> Option<&str> {
-    public_baseurl.map(str::trim).filter(|s| !s.is_empty())
-}
-
-/// What `hs serve` logs after the setup link when it had to guess the link's host, because
-/// `server.public_baseurl` is unset. `None` when the operator configured it.
-///
-/// The guess is the listener's own address, which is wrong behind a reverse proxy or a remapped
-/// port; but the setup token is checked on whatever host the browser used (the page reads it from
-/// the fragment and sends it in the body of `POST /api/v1/setup`), so the link still works with
-/// its host replaced.
-#[must_use]
-pub fn setup_link_host_hint(public_baseurl: Option<&str>) -> Option<&'static str> {
-    if configured_public_baseurl(public_baseurl).is_some() {
-        return None;
-    }
-    Some(
-        "the setup link's host is this server's own listener, because server.public_baseurl is not set: open this link from wherever you reach this server, replacing the host if needed (the token after #token= is what matters). Behind a reverse proxy or a remapped port, set HS__SERVER__PUBLIC_BASEURL to the address clients use and the link is rooted there",
-    )
-}
-
         assert!(paths.contains(&"/_matrix/client/v3/login"));
         assert!(paths.contains(&"/_matrix/client/r0/login"));
         assert!(paths.contains(&"/health/live"));
@@ -2117,7 +2363,6 @@ pub fn setup_link_host_hint(public_baseurl: Option<&str>) -> Option<&'static str
         assert_eq!(normalize_bind_address("127.0.0.1", 8008), "127.0.0.1:8008");
         assert_eq!(normalize_bind_address("[::1]", 8008), "[::1]:8008");
     }
-}
 
     #[test]
     fn the_link_is_rooted_at_public_baseurl_or_the_first_listener() {
@@ -2148,3 +2393,4 @@ pub fn setup_link_host_hint(public_baseurl: Option<&str>) -> Option<&'static str
         assert!(setup_link_host_hint(Some(" ")).is_some());
         assert!(setup_link_host_hint(Some("https://matrix.example.org")).is_none());
     }
+}
