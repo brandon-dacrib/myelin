@@ -109,6 +109,21 @@ impl UserStore for InMemoryAuthStore {
         Ok(())
     }
 
+    async fn upgrade_guest(
+        &self,
+        user_id: &UserId,
+        password_hash: Option<String>,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.lock();
+        let user = inner
+            .users
+            .get_mut(user_id)
+            .ok_or_else(|| StoreError::NotFound(user_id.to_string()))?;
+        user.is_guest = false;
+        user.password_hash = password_hash;
+        Ok(())
+    }
+
     async fn set_admin(&self, user_id: &UserId, admin: bool) -> Result<(), StoreError> {
         let mut inner = self.lock();
         let user = inner

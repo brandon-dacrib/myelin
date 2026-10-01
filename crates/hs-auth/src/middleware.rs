@@ -223,7 +223,18 @@ impl FromRequestParts<AuthState> for Requester {
     ) -> Result<Self, Self::Rejection> {
         let requester = authenticate(parts, state).await?;
         if requester.is_guest {
-            return Err(MatrixError::guest_access_forbidden());
+            // A guest is admitted only to the endpoints the spec (and Synapse) let guests use;
+            // see `crate::guest`. The full path is read from `OriginalUri`, since a nested
+            // router's own `uri` has lost its mount prefix (`/_matrix/client/v1/media`).
+            let path = parts
+                .extensions
+                .get::<axum::extract::OriginalUri>()
+                .map_or_else(|| parts.uri.path(), |original| original.0.path());
+            if !crate::guest::guest_may_use(&parts.method, path) {
+                crate::guest::count_refused_request();
+                tracing::debug!(user = %requester.user_id, method = %parts.method, path, "refused a guest on an endpoint guests may not use");
+                return Err(MatrixError::guest_access_forbidden());
+            }
         }
         Ok(requester)
     }
@@ -518,6 +529,62 @@ mod tests {
             .unwrap();
         assert_eq!(requester.user_id, uid);
         assert!(requester.is_guest);
+    }
+
+    #[tokio::test]
+    async fn a_guest_is_admitted_by_requester_to_the_endpoints_guests_may_use() {
+        let state = AuthState::in_memory();
+        let uid = user_id!("@guest2:example.org").to_owned();
+        let mut record = UserRecord::new(uid.clone(), 0);
+        record.is_guest = true;
+        state.store.create_user(record).await.unwrap();
+        let token = "syt_guest2";
+        state
+            .store
+            .put_access_token(AccessTokenRecord {
+                hash: TokenHash::of(token),
+                user_id: uid.clone(),
+                device_id: None,
+                expires_at_ms: None,
+                refresh_token_hash: None,
+                last_used_ms: None,
+            })
+            .await
+            .unwrap();
+        let request = |method: &str, uri: &str| {
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let mut sync = parts_for(request("GET", "/_matrix/client/v3/sync")).await;
+        let requester = Requester::from_request_parts(&mut sync, &state)
+            .await
+            .unwrap();
+        assert!(requester.is_guest);
+
+        let mut create = parts_for(request("POST", "/_matrix/client/v3/createRoom")).await;
+        let err = Requester::from_request_parts(&mut create, &state)
+            .await
+            .unwrap_err();
+        assert_eq!(err.errcode().as_str(), "M_GUEST_ACCESS_FORBIDDEN");
+
+        // Behind a nested router the request's own path has lost its prefix; the original one
+        // is what is judged.
+        let mut nested = parts_for(request("GET", "/download/example.org/abc")).await;
+        nested.extensions.insert(axum::extract::OriginalUri(
+            "/_matrix/client/v1/media/download/example.org/abc"
+                .parse()
+                .unwrap(),
+        ));
+        assert!(
+            Requester::from_request_parts(&mut nested, &state)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]

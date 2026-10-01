@@ -292,7 +292,7 @@ impl InMemoryUserDirectory {
 }
 
 fn is_guest(user: &AdminUser) -> bool {
-    user.user_type.as_deref() == Some("guest")
+    user.is_guest || user.user_type.as_deref() == Some("guest")
 }
 
 #[async_trait]

@@ -150,6 +150,16 @@ pub struct AuthConfig {
     /// `enable_registration`.
     #[serde(default)]
     pub enable_registration: bool,
+    /// Let people use this server without an account: a client can ask for a guest session
+    /// (`POST /register?kind=guest`) and gets a temporary account with no password. A guest can
+    /// read rooms whose history is world-readable, join rooms whose guest access is set to "can
+    /// join", talk there, and later turn the guest account into a full one by choosing a
+    /// username and password. Guests cannot create rooms, invite people or upload files. Off by
+    /// default: most servers only want people with accounts. Turning it off again stops new
+    /// guest sessions; guests who already have one keep it. Corresponds to Synapse's
+    /// `allow_guest_access`.
+    #[serde(default)]
+    pub allow_guest_access: bool,
     /// Inline shared secret for the `/_synapse/mk_admin_user`-equivalent
     /// shared-secret registration protocol (see `hs-compat`). Prefer
     /// `registration_shared_secret_file`. Corresponds to Synapse's
@@ -208,6 +218,7 @@ impl Default for AuthConfig {
     fn default() -> Self {
         Self {
             enable_registration: false,
+            allow_guest_access: false,
             user_directory_search_all_users: false,
             registration_shared_secret: SecretString::default(),
             registration_shared_secret_file: None,

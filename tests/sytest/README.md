@@ -77,7 +77,7 @@ SYTEST_HS_BINARY="$PWD/target/hs-bookworm" tests/sytest/run.sh
   `localhost:<TLS port>`. Certificates are signed by Sytest's test CA and verified everywhere:
   federation trusts it through `federation.custom_ca_certificates`, the appservice client through
   the container's trust store. The rest follows what Sytest's Synapse configuration changes: open
-  registration, shared secret `reg_secret`, no rate limits, no IP blocklists, public rooms over
+  registration, guest access, shared secret `reg_secret`, no rate limits, no IP blocklists, public rooms over
   federation, and the appservice registrations Sytest writes for server 0
   (`appservices.registration_files`).
 - `summarize.py`: TAP to `results.txt` and `summary.txt`.

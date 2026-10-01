@@ -543,6 +543,11 @@ fn translate_key(key: &str, v: &Value, config: &mut Config) {
                 config.auth.enable_registration = b;
             }
         }
+        "allow_guest_access" => {
+            if let Some(b) = v.as_bool() {
+                config.auth.allow_guest_access = b;
+            }
+        }
         "registration_shared_secret" => {
             if let Some(s) = v.as_str() {
                 config.auth.registration_shared_secret = SecretString::from(s);

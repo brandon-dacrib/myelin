@@ -49,6 +49,7 @@ pub fn auth_config_from(
         refreshable_access_token_ttl_ms: config.auth.access_token_lifetime.as_millis(),
         refresh_token_ttl_ms: config.auth.refresh_token_lifetime.map(|d| d.as_millis()),
         registration_enabled: config.auth.enable_registration,
+        guest_registration_enabled: config.auth.allow_guest_access,
         ..hs_auth::config::AuthConfig::default()
     };
 
@@ -67,7 +68,7 @@ pub fn auth_config_from(
     // The fields below have no native `hs-config` counterpart at all (day-one gaps on the
     // `hs-config` side, not this bridge's job to invent): `nonrefreshable_access_token_ttl_ms`,
     // `session_lifetime_ms`, `login_token_ttl_ms`, `uia_session_timeout_ms`,
-    // `registration_requires_token`, `valid_registration_tokens`, `guest_registration_enabled`,
+    // `registration_requires_token`, `valid_registration_tokens`,
     // `recaptcha_enabled`, `terms_enabled`, `accept_legacy_query_param_token`. They keep
     // `hs_auth::config::AuthConfig::default()`'s values via the `..` spread above.
 

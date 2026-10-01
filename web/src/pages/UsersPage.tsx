@@ -75,6 +75,11 @@ export function UsersPage() {
               Shadow-banned
             </Badge>
           )}
+          {u.is_guest && (
+            <span title="A guest account: no password, and it can only read and talk in rooms that let guests in. Guests exist while Configuration, Authentication, allow guest access is on.">
+              <Badge status="neutral">Guest</Badge>
+            </span>
+          )}
           {!u.admin && !u.locked && !u.suspended && !u.deactivated && !u.shadow_banned && (
             <Badge status="success">Active</Badge>
           )}
@@ -87,6 +92,7 @@ export function UsersPage() {
           u.suspended && "Suspended",
           u.deactivated && "Deactivated",
           u.shadow_banned && "Shadow-banned",
+          u.is_guest && "Guest",
         ]
           .filter(Boolean)
           .join(", ") || "Active",

@@ -77,7 +77,9 @@ pub struct AuthConfig {
     /// `docs/rfcs/0002-auth-tokens-and-requester.md`.
     pub valid_registration_tokens: HashSet<String>,
 
-    /// Whether `POST /register?kind=guest` is accepted. Synapse's `allow_guest_access`.
+    /// Whether `POST /register?kind=guest` is accepted: `hs_config::auth::AuthConfig::
+    /// allow_guest_access`, Synapse's `allow_guest_access`. Read per request, so turning it off
+    /// stops new guest sessions at once; guests already signed in keep theirs.
     pub guest_registration_enabled: bool,
 
     /// Whether `m.login.recaptcha` is included in the registration UIA flows at all. When
@@ -175,8 +177,8 @@ impl TryFrom<&hs_config::Config> for AuthConfig {
     /// - `registration_requires_token`, `valid_registration_tokens`: `hs-config` has no
     ///   registration-token config surface yet (this crate's own `valid_registration_tokens` is
     ///   day-one, in-process-only storage besides — see that field's own doc comment).
-    /// - `guest_registration_enabled`, `recaptcha_enabled`, `terms_enabled`,
-    ///   `accept_legacy_query_param_token`: same — no native config field yet.
+    /// - `recaptcha_enabled`, `terms_enabled`, `accept_legacy_query_param_token`: same — no
+    ///   native config field yet.
     ///
     /// `shared_secret_auth_secret` (the `com.devture.shared_secret_auth` login provider) has no
     /// dedicated `hs_config` field either, but is deliberately **not** left at its default:
@@ -206,6 +208,7 @@ impl TryFrom<&hs_config::Config> for AuthConfig {
             refreshable_access_token_ttl_ms: config.auth.access_token_lifetime.as_millis(),
             refresh_token_ttl_ms: config.auth.refresh_token_lifetime.map(|d| d.as_millis()),
             registration_enabled: config.auth.enable_registration,
+            guest_registration_enabled: config.auth.allow_guest_access,
             user_directory_search_all_users: config.auth.user_directory_search_all_users,
             // See this method's doc comment: deliberately reused, not left at the default.
             shared_secret_auth_secret: config
@@ -371,6 +374,22 @@ mod tests {
         let auth = AuthConfig::try_from(&config).unwrap();
         assert_eq!(auth.server_name.as_str(), "example.org");
         assert!(auth.registration_enabled);
+    }
+
+    #[test]
+    fn try_from_maps_guest_access_off_by_default_and_on_when_set() {
+        let mut config = minimal_native_config();
+        assert!(
+            !AuthConfig::try_from(&config)
+                .unwrap()
+                .guest_registration_enabled
+        );
+        config.auth.allow_guest_access = true;
+        assert!(
+            AuthConfig::try_from(&config)
+                .unwrap()
+                .guest_registration_enabled
+        );
     }
 
     #[test]

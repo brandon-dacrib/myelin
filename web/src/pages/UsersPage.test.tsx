@@ -114,3 +114,19 @@ describe("A user's page: send notice", () => {
     expect(send).toHaveAttribute("title", "Needs moderation:write");
   });
 });
+
+describe("Users page: guests", () => {
+  it("marks a guest account with a badge that says what a guest is", async () => {
+    await signIn();
+    renderRoutes(ROUTES, "/users", KNOWN);
+    const rowOf = (userId: string) =>
+      screen
+        .getAllByText(userId)
+        .map((cell) => cell.closest("tr"))
+        .find((row): row is HTMLTableRowElement => row !== null) as HTMLElement;
+    await screen.findAllByText("@visitor7:example.org");
+    const badge = within(rowOf("@visitor7:example.org")).getByText("Guest");
+    expect(badge.closest("[title]")?.getAttribute("title")).toMatch(/no password/);
+    expect(within(rowOf("@alice:example.org")).queryByText("Guest")).not.toBeInTheDocument();
+  });
+});

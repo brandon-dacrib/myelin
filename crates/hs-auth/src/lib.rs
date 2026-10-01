@@ -37,6 +37,7 @@ pub mod appservice;
 pub mod clock;
 pub mod config;
 pub mod error;
+pub mod guest;
 pub mod local_user;
 pub mod middleware;
 pub mod password;

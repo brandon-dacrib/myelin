@@ -271,6 +271,10 @@ pub const SETTINGS: &[Setting] = &[
         "POST /register reads it per request",
     ),
     hot(
+        "/auth/allow_guest_access",
+        "POST /register?kind=guest reads it per request",
+    ),
+    hot(
         "/auth/registration_shared_secret",
         "shared-secret registration and login read it per request",
     ),

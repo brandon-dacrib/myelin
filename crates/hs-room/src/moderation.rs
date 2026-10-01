@@ -54,6 +54,14 @@ static MODERATED_WRITES: LazyLock<Family<ModeratedLabels, Counter>> =
 /// Writes refused under the server-wide `rate_limits.message`, process-wide for the same reason.
 static SERVER_RATE_LIMITED: LazyLock<Counter> = LazyLock::new(Counter::default);
 
+/// Guest accounts refused a room because its `m.room.guest_access` does not let guests in.
+static GUEST_JOINS_REFUSED: LazyLock<Counter> = LazyLock::new(Counter::default);
+
+/// Counts one guest refused a room by its guest access (`hs_room_guest_joins_refused_total`).
+pub(crate) fn count_guest_join_refused() {
+    GUEST_JOINS_REFUSED.inc();
+}
+
 fn count(outcome: &'static str) {
     MODERATED_WRITES
         .get_or_create(&ModeratedLabels { outcome })
@@ -63,7 +71,8 @@ fn count(outcome: &'static str) {
 /// Registers `hs_room_moderated_writes_total{outcome}` into `registry` -- writes this crate
 /// refused from a suspended account (`suspended`), swallowed from a shadow-banned one
 /// (`shadow_banned`) or throttled under a rate-limit override (`rate_limited`) -- and
-/// `hs_room_server_rate_limited_writes_total`, writes refused under the server-wide limit.
+/// `hs_room_server_rate_limited_writes_total`, writes refused under the server-wide limit, and
+/// `hs_room_guest_joins_refused_total`, guests refused a room by its guest access.
 pub fn register_metrics(registry: &mut prometheus_client::registry::Registry) {
     // Registered without `_total`: the text encoder appends it.
     registry.register(
@@ -76,6 +85,12 @@ pub fn register_metrics(registry: &mut prometheus_client::registry::Registry) {
         "hs_room_server_rate_limited_writes",
         "Room writes refused 429 under the server-wide rate_limits.message limit",
         SERVER_RATE_LIMITED.clone(),
+    );
+    registry.register(
+        "hs_room_guest_joins_refused",
+        "Joins by guest accounts refused 403 because the room's m.room.guest_access is not \
+         can_join",
+        GUEST_JOINS_REFUSED.clone(),
     );
 }
 

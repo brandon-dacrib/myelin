@@ -247,7 +247,7 @@ Native field paths are dotted `hs-config` `Config` paths, e.g. `federation.domai
 | `registration_shared_secret` | Mapped | `auth.registration_shared_secret` | Also see `docs/compat/synapse-admin-routes.md` and the shared-secret registration protocol in `hs-compat`. |
 | `registration_shared_secret_path` | Mapped | `auth.registration_shared_secret_file` | |
 | `bcrypt_rounds` | Unsupported | — | R-PHASE1 (hs-auth). Password hashing cost factor is not yet tunable; a fixed, at-least-as-strong default is used. |
-| `allow_guest_access` | Unsupported | — | R-PHASE1 (hs-auth). |
+| `allow_guest_access` | Mapped | `auth.allow_guest_access` | |
 | `default_identity_server` | Unsupported | — | R-PHASE1 (hs-auth/hs-identity). |
 | `account_threepid_delegates` | Unsupported | — | R-PHASE1 (hs-auth). |
 | `enable_set_displayname` | Unsupported | — | R-PHASE1 (hs-user/profile). |

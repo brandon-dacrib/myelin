@@ -329,9 +329,19 @@ async fn register_appservice_user(
     finish_registration(state, &user_id, body, inhibit_login).await
 }
 
+/// `POST /register?kind=guest`: a guest account (no password, [`UserRecord::is_guest`]) with a
+/// device and an access token, while `auth.allow_guest_access` is on. Refused with
+/// `403 M_GUEST_ACCESS_FORBIDDEN` while it is off. What a guest may then call is
+/// [`crate::guest`]'s.
 async fn register_guest(state: &AuthState, body: &Value) -> Result<Response, MatrixError> {
     if !state.config.get().guest_registration_enabled {
-        return Err(MatrixError::forbidden("Guest access is disabled"));
+        crate::guest::count_registration(false);
+        tracing::debug!("refused a guest registration: auth.allow_guest_access is off");
+        return Err(MatrixError::new(
+            StatusCode::FORBIDDEN,
+            ErrCode::GuestAccessForbidden,
+            "Guest access is disabled on this server",
+        ));
     }
     let user_id = fresh_user_id(state).await?;
     state
@@ -342,12 +352,53 @@ async fn register_guest(state: &AuthState, body: &Value) -> Result<Response, Mat
             r
         })
         .await?;
+    crate::guest::count_registration(true);
+    tracing::info!(%user_id, "registered a guest account");
 
     let inhibit_login = body
         .get("inhibit_login")
         .and_then(Value::as_bool)
         .unwrap_or(false);
     finish_registration(state, &user_id, body, inhibit_login).await
+}
+
+/// The guest account a registration with `guest_access_token` upgrades: the spec's "Guest
+/// Access" module has a guest become a full account by registering as usual with its access
+/// token and its own localpart as `username`. Refused unless the token is a live guest's and
+/// `username` is that guest's localpart, so one guest cannot take over another's name.
+async fn guest_to_upgrade(
+    state: &AuthState,
+    token: &str,
+    username: Option<&str>,
+) -> Result<OwnedUserId, MatrixError> {
+    let Some(username) = username else {
+        return Err(MatrixError::missing_param(
+            "username is required to upgrade a guest account: the guest's own localpart",
+        ));
+    };
+    let record = state
+        .store
+        .get_access_token(&crate::token::TokenHash::of(token))
+        .await?
+        .filter(|t| t.expires_at_ms.is_none_or(|at| at >= state.now_ms()))
+        .ok_or_else(|| MatrixError::unknown_token(false))?;
+    let user = state
+        .store
+        .get_user(&record.user_id)
+        .await?
+        .filter(|u| !u.deactivated)
+        .ok_or_else(|| MatrixError::unknown_token(false))?;
+    if !user.is_guest {
+        return Err(MatrixError::forbidden(
+            "guest_access_token does not belong to a guest account",
+        ));
+    }
+    if user.user_id.localpart() != username {
+        return Err(MatrixError::forbidden(
+            "A guest account can only be upgraded to its own user ID",
+        ));
+    }
+    Ok(user.user_id)
 }
 
 async fn register_user(state: &AuthState, body: &Value) -> Result<Response, MatrixError> {
@@ -397,9 +448,17 @@ async fn register_user(state: &AuthState, body: &Value) -> Result<Response, Matr
         .map(str::to_ascii_lowercase);
     if let Some(username) = &username {
         validate_localpart(state, username)?;
-        if !state.store.is_localpart_available(username).await? {
-            return Err(MatrixError::user_in_use());
-        }
+    }
+    // A guest becoming a full account keeps its user ID, which is taken -- by the guest.
+    let upgrading = match body.get("guest_access_token").and_then(Value::as_str) {
+        Some(token) => Some(guest_to_upgrade(state, token, username.as_deref()).await?),
+        None => None,
+    };
+    if let Some(username) = &username
+        && upgrading.is_none()
+        && !state.store.is_localpart_available(username).await?
+    {
+        return Err(MatrixError::user_in_use());
     }
 
     let flows = registration_flows(state, token_only);
@@ -455,33 +514,42 @@ async fn register_user(state: &AuthState, body: &Value) -> Result<Response, Matr
         return Ok((StatusCode::UNAUTHORIZED, Json(body)).into_response());
     }
 
-    // Re-check availability defensively (closes the TOCTOU window between the early check above
-    // and account creation, for two concurrent registrations of the same name).
-    let user_id = match &username {
-        Some(name) => {
-            if !state.store.is_localpart_available(name).await? {
-                return Err(MatrixError::user_in_use());
-            }
-            UserId::parse_with_server_name(name, state.server_name()).map_err(|_| {
-                MatrixError::invalid_username(format!("'{name}' is not a valid user ID localpart"))
-            })?
-        }
-        None => fresh_user_id(state).await?,
-    };
-
     let password_hash = match password_raw {
         Some(pw) => Some(password::hash_password(pw).map_err(|_| MatrixError::internal())?),
         None => None,
     };
 
-    state
-        .store
-        .create_user({
-            let mut r = UserRecord::new(user_id.clone(), state.now_ms());
-            r.password_hash = password_hash;
-            r
-        })
-        .await?;
+    let user_id = if let Some(user_id) = upgrading {
+        state.store.upgrade_guest(&user_id, password_hash).await?;
+        crate::guest::count_upgrade();
+        tracing::info!(%user_id, "a guest account became a full account");
+        user_id
+    } else {
+        // Re-check availability defensively (closes the TOCTOU window between the early check
+        // above and account creation, for two concurrent registrations of the same name).
+        let user_id = match &username {
+            Some(name) => {
+                if !state.store.is_localpart_available(name).await? {
+                    return Err(MatrixError::user_in_use());
+                }
+                UserId::parse_with_server_name(name, state.server_name()).map_err(|_| {
+                    MatrixError::invalid_username(format!(
+                        "'{name}' is not a valid user ID localpart"
+                    ))
+                })?
+            }
+            None => fresh_user_id(state).await?,
+        };
+        state
+            .store
+            .create_user({
+                let mut r = UserRecord::new(user_id.clone(), state.now_ms());
+                r.password_hash = password_hash;
+                r
+            })
+            .await?;
+        user_id
+    };
 
     // The account exists: the token this registration presented has been used. A failure to
     // count it is logged rather than failing a registration that has already succeeded.
@@ -956,27 +1024,103 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.status(), StatusCode::FORBIDDEN);
+        assert_eq!(err.errcode().as_str(), "M_GUEST_ACCESS_FORBIDDEN");
+    }
+
+    async fn register_with(state: &AuthState, kind: Option<&str>, body: Value) -> Response {
+        let mut query = HashMap::new();
+        if let Some(kind) = kind {
+            query.insert("kind".to_string(), kind.to_string());
+        }
+        match post_register(
+            State(state.clone()),
+            Query(query),
+            axum::http::HeaderMap::new(),
+            hs_http::buckets::ClientIp(None),
+            PermissiveJson(body),
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => error.into_response(),
+        }
+    }
+
+    fn guest_state() -> AuthState {
+        AuthState::in_memory_with_config(AuthConfig {
+            guest_registration_enabled: true,
+            ..AuthConfig::default()
+        })
     }
 
     #[tokio::test]
     async fn guest_registration_succeeds_when_enabled() {
-        let config = AuthConfig {
-            guest_registration_enabled: true,
-            ..AuthConfig::default()
-        };
-        let state = AuthState::in_memory_with_config(config);
-        let mut query = HashMap::new();
-        query.insert("kind".to_string(), "guest".to_string());
-        let response = post_register(
-            State(state),
-            Query(query),
-            axum::http::HeaderMap::new(),
-            hs_http::buckets::ClientIp(None),
-            PermissiveJson(json!({})),
-        )
-        .await
-        .unwrap();
+        let state = guest_state();
+        let response = register_with(&state, Some("guest"), json!({})).await;
         assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        let user_id = ruma::UserId::parse(body["user_id"].as_str().unwrap()).unwrap();
+        assert_eq!(user_id.server_name(), "example.org");
+        assert!(body["access_token"].is_string());
+        assert!(body["device_id"].is_string());
+        let record = state.store.get_user(&user_id).await.unwrap().unwrap();
+        assert!(record.is_guest);
+        assert!(record.password_hash.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_guest_upgrades_to_a_full_account_with_its_own_localpart() {
+        let state = guest_state();
+        let guest = body_json(register_with(&state, Some("guest"), json!({})).await).await;
+        let user_id = ruma::UserId::parse(guest["user_id"].as_str().unwrap()).unwrap();
+        let body = json!({
+            "username": user_id.localpart(),
+            "password": "SIR_Arthur_David",
+            "guest_access_token": guest["access_token"],
+            "auth": {"type": "m.login.dummy"},
+        });
+        let response = register_with(&state, None, body).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let upgraded = body_json(response).await;
+        assert_eq!(upgraded["user_id"], guest["user_id"]);
+        assert!(upgraded["access_token"].is_string());
+        let record = state.store.get_user(&user_id).await.unwrap().unwrap();
+        assert!(!record.is_guest);
+        assert!(record.password_hash.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_guest_cannot_upgrade_another_guest_or_a_full_account() {
+        let state = guest_state();
+        let first = body_json(register_with(&state, Some("guest"), json!({})).await).await;
+        let second = body_json(register_with(&state, Some("guest"), json!({})).await).await;
+        let first_id = ruma::UserId::parse(first["user_id"].as_str().unwrap()).unwrap();
+        let body = json!({
+            "username": first_id.localpart(),
+            "password": "SIR_Arthur_David",
+            "guest_access_token": second["access_token"],
+            "auth": {"type": "m.login.dummy"},
+        });
+        let response = register_with(&state, None, body).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            state
+                .store
+                .get_user(&first_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_guest
+        );
+
+        // Without the token, the guest's name is taken like any other.
+        let body = json!({
+            "username": first_id.localpart(),
+            "password": "SIR_Arthur_David",
+            "auth": {"type": "m.login.dummy"},
+        });
+        let response = register_with(&state, None, body).await;
+        assert_eq!(body_json(response).await["errcode"], "M_USER_IN_USE");
     }
 
     #[tokio::test]

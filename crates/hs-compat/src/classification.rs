@@ -921,9 +921,9 @@ pub const OPTIONS: &[KeyInfo] = &[
     },
     KeyInfo {
         key: "allow_guest_access",
-        classification: Classification::Unsupported,
-        native: "",
-        note: "R-PHASE1 (hs-auth).",
+        classification: Classification::Mapped,
+        native: "`auth.allow_guest_access`",
+        note: "",
     },
     KeyInfo {
         key: "default_identity_server",

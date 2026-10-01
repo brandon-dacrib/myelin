@@ -98,7 +98,7 @@ sub start
 
 # The native configuration (crates/hs-config) for one Sytest homeserver. The settings that
 # differ from the defaults are the ones Sytest's Synapse configuration (Synapse.pm) also changes:
-# open registration, the shared secret `reg_secret`, no rate limits, no IP-range blocklists (every
+# open registration, guest access, the shared secret `reg_secret`, no rate limits, no IP-range blocklists (every
 # server is on localhost), public rooms over federation, and the appservice registrations Sytest
 # writes for server 0.
 sub _get_config
@@ -124,6 +124,7 @@ sub _get_config
       },
       auth => {
          enable_registration        => JSON::true,
+         allow_guest_access         => JSON::true,
          enable_legacy_login        => JSON::true,
          registration_shared_secret => "reg_secret",
       },

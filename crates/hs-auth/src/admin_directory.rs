@@ -100,6 +100,7 @@ impl AuthStoreUserDirectory {
             locked: record.locked,
             suspended: record.suspended,
             shadow_banned: record.shadow_banned,
+            is_guest: record.is_guest,
             created_at: format_rfc3339_ms(record.created_at_ms),
             last_seen_at,
             device_count: devices.len() as u64,

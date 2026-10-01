@@ -4326,6 +4326,79 @@ impl<B: KvBackend> RoomActor<B> {
             .collect())
     }
 
+    /// Whether the room's `m.room.guest_access` is `can_join`: the spec's "Guest Access" module
+    /// lets a guest account join only such a room. A room without the event does not let guests
+    /// in.
+    ///
+    /// # Errors
+    /// Returns [`RoomError::State`] if the state store fails.
+    pub fn guests_may_join(&self) -> Result<bool, RoomError> {
+        Ok(self
+            .state_event("m.room.guest_access", "")?
+            .and_then(|e| content_str(e, "guest_access"))
+            == Some("can_join"))
+    }
+
+    /// This server's guests still in the room -- joined or invited, with `kind: guest` on their
+    /// membership, which a guest's own join carries -- when the room no longer lets guests in.
+    /// The spec: if `m.room.guest_access` changes so that guests may not join, the server MUST
+    /// set their membership to `leave`. Empty while guests may join.
+    ///
+    /// # Errors
+    /// Returns [`RoomError::State`] if the state store fails.
+    pub fn local_guests_to_remove(&self) -> Result<Vec<OwnedUserId>, RoomError> {
+        if self.guests_may_join()? {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .members()?
+            .into_iter()
+            .filter(|e| {
+                matches!(content_str(e, "membership"), Some("join" | "invite"))
+                    && content_str(e, "kind") == Some("guest")
+            })
+            .filter_map(|e| e.header().state_key.as_deref())
+            .filter_map(|key| UserId::parse(key).ok())
+            .filter(|user| user.server_name() == self.identity.server_name)
+            .collect())
+    }
+
+    /// After `event` has been stored: if it changed `m.room.guest_access` so that guests may not
+    /// join, makes each of this server's guests in the room leave it
+    /// ([`RoomActor::local_guests_to_remove`]). Each guest leaves by itself, as Synapse's
+    /// `kick_guest_users` does, so no power level is needed and the decision stays with the
+    /// guest's own server. A leave that fails is logged and the rest go on.
+    fn remove_guests_after(&mut self, event: &Event, now_ms: i64) {
+        if event.header().event_type != "m.room.guest_access"
+            || event.header().state_key.as_deref() != Some("")
+        {
+            return;
+        }
+        let guests = match self.local_guests_to_remove() {
+            Ok(guests) => guests,
+            Err(error) => {
+                tracing::warn!(room_id = %self.room_id, %error, "could not list the guests to remove after guest access changed");
+                return;
+            }
+        };
+        for guest in guests {
+            match self.membership_action(
+                guest.clone(),
+                Action::Leave,
+                guest.clone(),
+                serde_json::json!({}),
+                now_ms,
+            ) {
+                Ok(_) => {
+                    tracing::info!(room_id = %self.room_id, user = %guest, "a guest left the room: its guest access no longer lets guests in");
+                }
+                Err(error) => {
+                    tracing::warn!(room_id = %self.room_id, user = %guest, %error, "could not make a guest leave after guest access changed");
+                }
+            }
+        }
+    }
+
     /// Whether `requester` may call the bulk read endpoints this crate serves on top of the whole
     /// timeline (`GET .../messages` today) at all, before any single event is filtered by
     /// [`RoomActor::event_visible_to`]. Two denials this distinguishes from "yes, then filter":
@@ -5752,7 +5825,10 @@ impl<B: KvBackend> RoomActorHandle<B> {
         B: 'static,
     {
         self.with_actor(move |actor| {
-            actor.send_event(sender, event_type, state_key, content, redacts, now_ms)
+            let event =
+                actor.send_event(sender, event_type, state_key, content, redacts, now_ms)?;
+            actor.remove_guests_after(&event, now_ms);
+            Ok(event)
         })
         .await
     }
@@ -5882,8 +5958,21 @@ impl<B: KvBackend> RoomActorHandle<B> {
     where
         B: 'static,
     {
-        self.with_actor(move |actor| actor.accept_remote_event(event))
-            .await
+        self.with_actor(move |actor| {
+            let outcome = actor.accept_remote_event(event.clone())?;
+            if matches!(outcome, RemoteEventOutcome::Stored(_)) {
+                let now_ms = i64::try_from(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis(),
+                )
+                .unwrap_or(i64::MAX);
+                actor.remove_guests_after(&event, now_ms);
+            }
+            Ok(outcome)
+        })
+        .await
     }
 
     /// [`RoomActor::import_event`] through the handle: the Synapse importer's way in.

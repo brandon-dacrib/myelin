@@ -3567,6 +3567,8 @@ export interface components {
             device_count?: number;
             display_name?: string | null;
             erased?: boolean;
+            /** @description A guest account, made by POST /register?kind=guest while auth.allow_guest_access is on. It has no password and may only read and talk in rooms that let guests in. */
+            is_guest?: boolean;
             /** Format: date-time */
             last_seen_at?: string | null;
             locked?: boolean;

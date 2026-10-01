@@ -99,6 +99,26 @@ export const users: User[] = [
     room_count: 1,
     media_count: 0,
   },
+  {
+    user_id: "@visitor7:example.org",
+    display_name: null,
+    avatar_url: null,
+    admin: false,
+    deactivated: false,
+    erased: false,
+    locked: false,
+    suspended: false,
+    shadow_banned: false,
+    is_guest: true,
+    user_type: null,
+    consent_version: null,
+    appservice_id: null,
+    created_at: iso(2 * 3_600_000),
+    last_seen_at: iso(10 * 60_000),
+    device_count: 1,
+    room_count: 1,
+    media_count: 0,
+  },
 ];
 
 export const userDevices: Record<string, Device[]> = {

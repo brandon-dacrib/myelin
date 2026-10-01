@@ -1359,6 +1359,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         .set_server_limit(crate::live_config::message_limit(&config.rate_limits));
     metrics.with_registry(crate::live_config::register_metrics);
     metrics.with_registry(hs_http::buckets::register_metrics);
+    metrics.with_registry(hs_auth::guest::register_metrics);
     if let Some(live) = &options.live_config {
         let rooms = rooms.clone();
         let limits = auth_state.limits.clone();
@@ -1383,6 +1384,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             let new = hs_auth::config::AuthConfig::try_from(config).map_err(|e| e.to_string())?;
             tracing::info!(
                 registration_enabled = new.registration_enabled,
+                allow_guest_access = new.guest_registration_enabled,
                 user_directory_search_all_users = new.user_directory_search_all_users,
                 "the auth settings are now in force"
             );

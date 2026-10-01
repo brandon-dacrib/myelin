@@ -437,6 +437,11 @@ pub struct AdminUser {
     pub locked: bool,
     pub suspended: bool,
     pub shadow_banned: bool,
+    /// A guest account: made by `POST /register?kind=guest` while `auth.allow_guest_access` is
+    /// on, with no password, and limited to reading and talking in rooms that let guests in.
+    /// `default` so that a body from before the field existed still reads.
+    #[serde(default)]
+    pub is_guest: bool,
     pub user_type: Option<String>,
     pub consent_version: Option<String>,
     pub appservice_id: Option<String>,

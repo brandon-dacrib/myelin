@@ -221,6 +221,16 @@ pub trait UserStore: Send + Sync {
         hash: Option<String>,
     ) -> Result<(), StoreError>;
 
+    /// Makes a guest account a full one: clears [`UserRecord::is_guest`] and sets the password
+    /// hash, in one write, so the account is never a guest with a password or a full account
+    /// without the one it was upgraded with. Errors with [`StoreError::NotFound`] for an
+    /// unknown user.
+    async fn upgrade_guest(
+        &self,
+        user_id: &ruma::UserId,
+        password_hash: Option<String>,
+    ) -> Result<(), StoreError>;
+
     /// Sets the server-administrator flag.
     async fn set_admin(&self, user_id: &ruma::UserId, admin: bool) -> Result<(), StoreError>;
 

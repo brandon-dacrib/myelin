@@ -15,7 +15,7 @@ Decision 0010: this server is administered through the admin API and the web int
 Every setting is one of three kinds (decision 0016; `hs_config::reload::SETTINGS` is the table, and the schema the admin API serves carries it as `x-applies` on each setting):
 
 - **bootstrap** (7): set at install, per process, never stored in the database;
-- **hot** (39): applies to the running server at once -- a save reports it as reloaded;
+- **hot** (40): applies to the running server at once -- a save reports it as reloaded;
 - **restart** (25): stored at once, read at the next start -- a save reports it as waiting for a restart.
 
 The **Applies** column below gives each setting's kind and what reads it. Sections in which every administered setting is hot: `server`, `rate_limits`, `migration`.
@@ -162,6 +162,7 @@ Authentication and authorization.
 | Field | Type | Default | Applies | Description |
 |---|---|---|---|---|
 | `enable_registration` | boolean | `false` | hot (POST /register reads it per request) | Allow `POST /register`. Corresponds to Synapse's `enable_registration`. |
+| `allow_guest_access` | boolean | `false` | hot (POST /register?kind=guest reads it per request) | Let people use this server without an account: a client can ask for a guest session (`POST /register?kind=guest`) and gets a temporary account with no password. A guest can read rooms whose history is world-readable, join rooms whose guest access is set to "can join", talk there, and later turn the guest account into a full one by choosing a username and password. Guests cannot create rooms, invite people or upload files. Off by default: most servers only want people with accounts. Turning it off again stops new guest sessions; guests who already have one keep it. Corresponds to Synapse's `allow_guest_access`. |
 | `registration_shared_secret` *(secret)* | string | — | hot (shared-secret registration and login read it per request) | Inline shared secret for the `/_synapse/mk_admin_user`-equivalent shared-secret registration protocol (see `hs-compat`). Prefer `registration_shared_secret_file`. Corresponds to Synapse's `registration_shared_secret`. |
 | `registration_shared_secret_file` *(secret)* | string \| null | — | hot (shared-secret registration and login read it per request) | Path to a file containing the shared-secret-registration secret. |
 | `user_directory_search_all_users` | boolean | `false` | hot (the user directory reads it per search) | Let the user directory (`POST /user_directory/search`, the box a client's invite dialog searches) find every account on this server. Off by default: a search then finds only the people the searcher shares a room with and the members of public rooms, which is what the Matrix specification requires and no more. Turning it on lets people find somebody they have not met yet -- convenient on a small server where everyone knows everyone -- at the cost that any account can list every other account's name, including the accounts a bridge creates for other people's contacts. Corresponds to Synapse's `user_directory.search_all_users`. |

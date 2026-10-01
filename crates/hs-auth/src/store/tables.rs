@@ -255,6 +255,18 @@ impl<B: KvBackend> UserStore for TablesAuthStore<B> {
             .await
     }
 
+    async fn upgrade_guest(
+        &self,
+        user_id: &UserId,
+        password_hash: Option<String>,
+    ) -> Result<(), StoreError> {
+        self.update_user(user_id, |u| {
+            u.is_guest = false;
+            u.password_hash = password_hash.clone();
+        })
+        .await
+    }
+
     async fn set_admin(&self, user_id: &UserId, admin: bool) -> Result<(), StoreError> {
         self.update_user(user_id, |u| u.is_admin = admin).await
     }

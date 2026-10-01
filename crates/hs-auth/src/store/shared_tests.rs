@@ -145,6 +145,25 @@ pub(crate) async fn set_password_hash_on_missing_user_is_not_found<S: AuthStore>
     assert!(matches!(err, Err(StoreError::NotFound(_))));
 }
 
+/// `UserStore::upgrade_guest` makes a guest a full account with the password it chose, and an
+/// unknown user is not found.
+pub(crate) async fn upgrading_a_guest_clears_the_flag_and_sets_the_password<S: AuthStore>(s: &S) {
+    let uid = user_id!("@guest:example.org").to_owned();
+    let mut record = UserRecord::new(uid.clone(), 1);
+    record.is_guest = true;
+    s.create_user(record).await.unwrap();
+    s.upgrade_guest(&uid, Some("hash".to_owned()))
+        .await
+        .unwrap();
+    let got = s.get_user(&uid).await.unwrap().unwrap();
+    assert!(!got.is_guest);
+    assert_eq!(got.password_hash.as_deref(), Some("hash"));
+    assert!(matches!(
+        s.upgrade_guest(user_id!("@ghost:example.org"), None).await,
+        Err(StoreError::NotFound(_))
+    ));
+}
+
 /// `UserStore::set_profile_display_name`/`set_profile_avatar_url` round-trip through
 /// `get_user`, and are unset (`None`) on a freshly created account -- distinct from
 /// `DeviceStore::set_display_name`, which this test does not touch.
@@ -737,6 +756,7 @@ pub(crate) async fn run_all<S: AuthStore>(make_store: impl Fn() -> S) {
     is_localpart_available_reflects_existing_users(&make_store()).await;
     user_flag_setters_round_trip(&make_store()).await;
     set_password_hash_on_missing_user_is_not_found(&make_store()).await;
+    upgrading_a_guest_clears_the_flag_and_sets_the_password(&make_store()).await;
     profile_fields_round_trip(&make_store()).await;
     set_profile_fields_on_missing_user_is_not_found(&make_store()).await;
     device_and_token_lifecycle(&make_store()).await;

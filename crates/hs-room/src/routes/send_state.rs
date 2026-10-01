@@ -71,6 +71,11 @@ pub async fn put_state<B: KvBackend + 'static>(
         crate::moderation::note_shadowed(&requester, "state");
         return Ok(Json(json!({"event_id": crate::moderation::shadow_event_id()})).into_response());
     }
+    // A guest's membership goes through the join and leave endpoints, which check the room's
+    // guest access (`crate::routes::membership`); a member event sent as plain state would not.
+    if requester.is_guest && event_type == "m.room.member" {
+        return Err(RoomError::GuestAccessForbidden);
+    }
     let room_id = parse_room_id(&room_id)?;
     let handle = state.rooms.get_or_load(&room_id).await?;
     if event_type == "m.room.member"

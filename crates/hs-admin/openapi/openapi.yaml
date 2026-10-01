@@ -6864,6 +6864,10 @@ components:
           type: boolean
         shadow_banned:
           type: boolean
+        is_guest:
+          type: boolean
+          description: A guest account, made by POST /register?kind=guest while auth.allow_guest_access
+            is on. It has no password and may only read and talk in rooms that let guests in.
         user_type:
           type:
           - string

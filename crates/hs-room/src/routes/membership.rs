@@ -297,16 +297,82 @@ fn percent_decode(raw: &str) -> String {
 /// event since the last one left, so a join made against it is made against the room as it
 /// was then. The resident's answer brings the room's current state with it, the same as a first
 /// join does. With no hook installed the join is made here regardless, as before.
+///
+/// A guest's join carries `kind: guest` and is made only into a room whose guest access is
+/// `can_join` ([`refuse_guest_where_guests_may_not_join`]).
 async fn act_join<B: KvBackend + 'static>(
     state: &RoomState<B>,
     room_id: &str,
-    mut via: Vec<String>,
+    via: Vec<String>,
     requester: &hs_auth::requester::Requester,
     body: &Value,
 ) -> Result<Response, RoomError> {
     let sender = requester.user_id.clone();
     let room_id = parse_room_id(room_id)?;
-    let content = extra(state, Action::Join, &sender, body).await;
+    let mut content = extra(state, Action::Join, &sender, body).await;
+    if requester.is_guest {
+        // How the room (and Synapse's `kick_guest_users`) tells this server's guests apart
+        // from its members when guest access is withdrawn.
+        content["kind"] = Value::String("guest".to_owned());
+    }
+    let joined = join_room(state, &room_id, via, requester, content).await?;
+    if requester.is_guest {
+        refuse_guest_where_guests_may_not_join(state, requester, &room_id).await?;
+    }
+    Ok(joined)
+}
+
+/// The spec's "Guest Access" module: a guest may join only a room whose `m.room.guest_access`
+/// is `can_join`. The room's state is known only once the join is made when the room is joined
+/// through another server, so the check comes after the join: a guest that should not be there
+/// leaves at once and is refused `403`, the same answer a room held here gives. A room held here
+/// that does not let guests in is refused before anything is sent ([`join_room`]).
+async fn refuse_guest_where_guests_may_not_join<B: KvBackend + 'static>(
+    state: &RoomState<B>,
+    requester: &hs_auth::requester::Requester,
+    room_id: &ruma::RoomId,
+) -> Result<(), RoomError> {
+    let handle = state.rooms.get_or_load(room_id).await?;
+    if handle.query(|actor| actor.guests_may_join()).await? {
+        return Ok(());
+    }
+    count_guest_refusal();
+    tracing::info!(%room_id, user = %requester.user_id, "a guest joined a room through another server whose guest access does not let guests in; leaving it");
+    let user = requester.user_id.clone();
+    if let Err(error) = act(
+        state,
+        room_id.as_str(),
+        user.clone(),
+        Action::Leave,
+        user,
+        &json!({}),
+    )
+    .await
+    {
+        tracing::warn!(%room_id, user = %requester.user_id, %error, "could not leave a room a guest may not be in");
+    }
+    Err(RoomError::Forbidden(GUEST_ACCESS_FORBIDDEN.to_owned()))
+}
+
+/// The refusal a guest gets for a room whose guest access does not let guests in.
+const GUEST_ACCESS_FORBIDDEN: &str = "Guest access is not allowed in this room";
+
+/// Counts a guest refused a room by its `m.room.guest_access`.
+fn count_guest_refusal() {
+    crate::moderation::count_guest_join_refused();
+}
+
+/// The join itself, wherever it has to be made: here, or through another server. See
+/// [`act_join`].
+async fn join_room<B: KvBackend + 'static>(
+    state: &RoomState<B>,
+    room_id: &ruma::RoomId,
+    mut via: Vec<String>,
+    requester: &hs_auth::requester::Requester,
+    content: Value,
+) -> Result<Response, RoomError> {
+    let sender = requester.user_id.clone();
+    let room_id = room_id.to_owned();
     match state.rooms.get_or_load(&room_id).await {
         Ok(handle) => {
             if let Some(remote) = &state.remote_join
@@ -382,6 +448,11 @@ async fn act_join<B: KvBackend + 'static>(
                         }
                     }
                 }
+            }
+            if requester.is_guest && !handle.query(|actor| actor.guests_may_join()).await? {
+                count_guest_refusal();
+                tracing::debug!(%room_id, user = %sender, "refused a guest a room whose guest access does not let guests in");
+                return Err(RoomError::Forbidden(GUEST_ACCESS_FORBIDDEN.to_owned()));
             }
             crate::moderation::check_join_limit(state, requester, false)?;
             handle
@@ -898,6 +969,146 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn guest() -> RoomRequester {
+        let mut requester = Requester::for_user(UserId::parse("@guest:hs1").unwrap().to_owned());
+        requester.is_guest = true;
+        RoomRequester(requester)
+    }
+
+    fn membership_of(
+        actor: &crate::actor::RoomActor<MemoryBackend>,
+        user: &str,
+    ) -> (Option<String>, Option<String>) {
+        let event = actor.state_event("m.room.member", user).unwrap();
+        let content = event.map(|e| e.json().get("content").cloned());
+        let field = |key: &str| {
+            content
+                .clone()
+                .flatten()
+                .and_then(|c| c.as_object().and_then(|o| o.get(key).cloned()))
+                .and_then(|v| v.as_str().map(str::to_owned))
+        };
+        (field("membership"), field("kind"))
+    }
+
+    /// The spec's "Guest Access" module: a guest joins only a room whose `m.room.guest_access`
+    /// is `can_join`, and is made to leave when it stops being.
+    #[tokio::test]
+    async fn a_guest_joins_only_while_guest_access_is_can_join_and_leaves_when_it_is_withdrawn() {
+        let state = state(None);
+        let alice_id = UserId::parse("@alice:hs1").unwrap().to_owned();
+        let handle = state
+            .rooms
+            .create_room(
+                alice_id.clone(),
+                crate::actor::CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let room_id = handle.query(|actor| actor.room_id().to_owned()).await;
+        let join = |state: RoomState<MemoryBackend>| {
+            post_join::<MemoryBackend>(
+                State(state),
+                Path(room_id.to_string()),
+                RawQuery(None),
+                guest(),
+                PermissiveJson(json!({})),
+            )
+        };
+
+        // A public room is not a guest room until it says so.
+        let err = join(state.clone()).await.unwrap_err();
+        assert!(matches!(err, RoomError::Forbidden(_)), "{err}");
+        assert_eq!(
+            handle
+                .query(|actor| membership_of(actor, "@guest:hs1"))
+                .await
+                .0,
+            None
+        );
+
+        let set_guest_access = |value: &'static str, at: i64| {
+            let handle = handle.clone();
+            let alice_id = alice_id.clone();
+            async move {
+                handle
+                    .send_event(
+                        alice_id,
+                        "m.room.guest_access".to_owned(),
+                        Some(String::new()),
+                        json!({"guest_access": value}),
+                        None,
+                        at,
+                    )
+                    .await
+                    .unwrap();
+            }
+        };
+        set_guest_access("can_join", 2).await;
+        let response = join(state.clone()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            handle
+                .query(|actor| membership_of(actor, "@guest:hs1"))
+                .await,
+            (Some("join".to_owned()), Some("guest".to_owned()))
+        );
+
+        // A full member is not a guest, and stays.
+        let bob = UserId::parse("@bob:hs1").unwrap().to_owned();
+        handle
+            .membership(bob.clone(), Action::Join, bob.clone(), json!({}), 3)
+            .await
+            .unwrap();
+
+        set_guest_access("forbidden", 4).await;
+        assert_eq!(
+            handle
+                .query(|actor| membership_of(actor, "@guest:hs1"))
+                .await
+                .0
+                .as_deref(),
+            Some("leave")
+        );
+        assert_eq!(
+            handle
+                .query(|actor| membership_of(actor, "@bob:hs1"))
+                .await
+                .0
+                .as_deref(),
+            Some("join")
+        );
+    }
+
+    /// A guest joined through another server to a room that does not let guests in leaves it
+    /// again and is refused, like a room held here.
+    #[tokio::test]
+    async fn a_guest_joined_through_another_server_to_a_room_without_guest_access_leaves_it() {
+        let remote = Arc::new(RecordingRemoteJoin::default());
+        let state = state(Some(remote.clone()));
+        let err = post_join::<MemoryBackend>(
+            State(state.clone()),
+            Path("!nowhere:remote.example".to_owned()),
+            RawQuery(Some("server_name=remote.example".to_owned())),
+            guest(),
+            PermissiveJson(json!({})),
+        )
+        .await
+        .unwrap_err();
+        // The recording hook makes no room here, so the check finds none to let the guest in.
+        assert!(
+            matches!(err, RoomError::Forbidden(_) | RoomError::RoomNotFound(_)),
+            "{err}"
+        );
+        let joins = remote.joins.lock().unwrap();
+        assert_eq!(joins.len(), 1);
+        assert_eq!(joins[0].3["kind"], "guest");
     }
 
     #[tokio::test]

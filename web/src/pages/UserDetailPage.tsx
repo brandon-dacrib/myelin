@@ -195,7 +195,14 @@ export function UserDetailPage() {
             <Fact label="Last seen" value={<RelativeTime at={user.last_seen_at} />} />
             <Fact label="Rooms" value={String(user.room_count ?? 0)} />
             <Fact label="Media" value={String(user.media_count ?? 0)} />
-            <Fact label="User type" value={user.user_type ?? "person"} />
+            <Fact
+              label="User type"
+              value={
+                user.is_guest
+                  ? "guest: no password, and only rooms that let guests in"
+                  : (user.user_type ?? "person")
+              }
+            />
             <Fact label="Appservice" value={user.appservice_id ?? "—"} />
           </dl>
 
