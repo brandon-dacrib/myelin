@@ -367,34 +367,47 @@ pub async fn exchange<B: KvBackend + 'static>(
 
 /// `PUT /_matrix/federation/v1/3pid/onbind`'s work: an identity server says `mxid` has bound an
 /// address that has pending invitations; each invitation for a room this server holds becomes an
-/// invite ([`exchange`]). One that fails is logged and the rest go on. Returns how many became
-/// invites.
-pub async fn on_bind<B: KvBackend + 'static>(state: &RoomState<B>, body: &Value) -> usize {
+/// invite ([`exchange`]). Every invitation is tried; if any could not be exchanged, the last
+/// error is returned, as Synapse answers, so the identity server (and Sytest, which counts on
+/// it) learns the binding was not honoured. Returns how many became invites otherwise.
+///
+/// # Errors
+/// The last [`exchange`] error, or [`RoomError::BadRequest`] for an invitation without
+/// `room_id` or `signed`.
+pub async fn on_bind<B: KvBackend + 'static>(
+    state: &RoomState<B>,
+    body: &Value,
+) -> Result<usize, RoomError> {
     let mut exchanged = 0;
+    let mut last_error = None;
     for invite in body
         .get("invites")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
     {
-        let Some(room_id) = invite
+        let room_id = invite
             .get("room_id")
             .and_then(Value::as_str)
-            .and_then(|r| RoomId::parse(r).ok())
-        else {
-            continue;
-        };
-        let Some(signed) = invite.get("signed") else {
+            .and_then(|r| RoomId::parse(r).ok());
+        let (Some(room_id), Some(signed)) = (room_id, invite.get("signed")) else {
+            last_error = Some(RoomError::BadRequest(
+                "a third-party invitation needs room_id and signed".into(),
+            ));
             continue;
         };
         match exchange(state, &room_id, signed).await {
             Ok(_) => exchanged += 1,
             Err(error) => {
                 tracing::info!(%room_id, %error, "could not turn a bound third-party invitation into an invite");
+                last_error = Some(error);
             }
         }
     }
-    exchanged
+    match last_error {
+        Some(error) => Err(error),
+        None => Ok(exchanged),
+    }
 }
 
 fn now_ms() -> i64 {
@@ -619,10 +632,39 @@ mod tests {
             "mxid": bob,
             "invites": [{"room_id": room_id, "sender": "@alice:hs1", "mxid": bob, "signed": ids.sign(bob, "tok1")}],
         });
-        assert_eq!(on_bind(&state, &body).await, 1);
+        assert_eq!(on_bind(&state, &body).await.unwrap(), 1);
         let invited = membership(&state, &room_id, "@bob:hs1").await.unwrap();
         assert_eq!(invited["membership"], "invite");
         assert_eq!(invited["third_party_invite"]["display_name"], "b...@e...");
+    }
+
+    /// Sytest's "3pid invite join ... are rejected": a third-party invitation that was never
+    /// exchanged lets nobody join an invite-only room.
+    #[tokio::test]
+    async fn a_pending_invitation_lets_nobody_join_an_invite_only_room() {
+        let ids = Arc::new(FakeIdentityServer::with_key(9));
+        let (state, room_id) = room_with(Some(ids)).await;
+        invite(
+            &state,
+            &room_id,
+            user_id!("@alice:hs1"),
+            &by_email(ID_SERVER),
+        )
+        .await
+        .unwrap();
+        let err = crate::routes::membership::post_join::<MemoryBackend>(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(room_id.to_string()),
+            axum::extract::RawQuery(None),
+            crate::state::RoomRequester(hs_auth::requester::Requester::for_user(
+                user_id!("@bob:hs1").to_owned(),
+            )),
+            hs_http::body::PermissiveJson(json!({})),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, RoomError::Forbidden(_)), "{err}");
+        assert!(membership(&state, &room_id, "@bob:hs1").await.is_none());
     }
 
     #[tokio::test]
@@ -644,5 +686,12 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, RoomError::Forbidden(_)), "{err}");
         assert!(membership(&state, &room_id, "@bob:hs1").await.is_none());
+
+        // `onbind` answers the refusal, so the identity server learns the binding did nothing.
+        let body = json!({
+            "mxid": bob,
+            "invites": [{"room_id": room_id, "sender": "@alice:hs1", "mxid": bob, "signed": ids.sign(bob, "tok1")}],
+        });
+        assert!(on_bind(&state, &body).await.is_err());
     }
 }

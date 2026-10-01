@@ -245,18 +245,24 @@ impl IdentityService for HttpIdentityService {
 /// third-party invitations has been bound. Unauthenticated, as the spec has it: each invitation
 /// carries the identity server's signature, which the room's auth rules check against the keys
 /// the room stored, and the keys are re-checked with the identity server before anything is sent
-/// (`hs_room::third_party_invite::exchange`). Always answers `{}`.
+/// (`hs_room::third_party_invite::exchange`). `{}` when every invitation became an invite; the
+/// last refusal otherwise, as Synapse answers.
 pub async fn on_bind<B: hs_kv::KvBackend + 'static>(
     axum::extract::State(state): axum::extract::State<hs_room::state::RoomState<B>>,
     axum::Json(body): axum::Json<Value>,
-) -> axum::Json<Value> {
-    let exchanged = hs_room::third_party_invite::on_bind(&state, &body).await;
-    tracing::info!(
-        mxid = body["mxid"].as_str().unwrap_or_default(),
-        exchanged,
-        "an identity server reported a bound address"
-    );
-    axum::Json(json!({}))
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let mxid = body["mxid"].as_str().unwrap_or_default().to_owned();
+    match hs_room::third_party_invite::on_bind(&state, &body).await {
+        Ok(exchanged) => {
+            tracing::info!(%mxid, exchanged, "an identity server reported a bound address");
+            axum::Json(json!({})).into_response()
+        }
+        Err(error) => {
+            tracing::info!(%mxid, %error, "an identity server reported a bound address whose invitation was refused");
+            error.into_response()
+        }
+    }
 }
 
 #[cfg(test)]
