@@ -190,21 +190,6 @@ impl<B: KvBackend> RoomActor<B> {
             return Ok(CatchUp::Reload(CatchUpReload::Rewritten));
         }
 
-        // Pending redactions from earlier catch-ups first: their rows may say so by now.
-        let pending: Vec<(EventSn, u32)> = self
-            .pending_redactions
-            .iter()
-            .map(|(sn, checks)| (*sn, *checks))
-            .collect();
-        for (sn, checks) in pending {
-            if self.take_stored_redaction(&snapshot, sn)? || checks + 1 >= PENDING_REDACTION_CHECKS
-            {
-                self.pending_redactions.remove(&sn);
-            } else {
-                self.pending_redactions.insert(sn, checks + 1);
-            }
-        }
-
         let start = self.next_room_pos;
         let mut spec = TypedKeyspace::<B::Keyspace, TimelineKey>::prefix(&(room_sn,));
         spec.start = Bound::Included(Bytes::from((room_sn, start).encode()));
@@ -252,6 +237,21 @@ impl<B: KvBackend> RoomActor<B> {
             let mut event = Event::parse(&persisted.json, self.room_version.clone())?;
             *event.flags_mut() = EventFlags::from_byte(persisted.flags);
             batch.push((room_pos, event_sn, event, persisted.purged));
+        }
+
+        // Pending redactions from earlier catch-ups: their rows may say so by now.
+        let pending: Vec<(EventSn, u32)> = self
+            .pending_redactions
+            .iter()
+            .map(|(sn, checks)| (*sn, *checks))
+            .collect();
+        for (sn, checks) in pending {
+            if self.take_stored_redaction(&snapshot, sn)? || checks + 1 >= PENDING_REDACTION_CHECKS
+            {
+                self.pending_redactions.remove(&sn);
+            } else {
+                self.pending_redactions.insert(sn, checks + 1);
+            }
         }
 
         let events = batch.len();

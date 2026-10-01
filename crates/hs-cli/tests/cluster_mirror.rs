@@ -236,7 +236,7 @@ impl Drop for Database {
 }
 
 /// How long a reader may wait for the owner's hub to reach an update (see [`settled_token`]).
-const SETTLE_WITHIN: Duration = Duration::from_secs(1800);
+const SETTLE_WITHIN: Duration = Duration::from_secs(4 * 3600);
 
 /// Room shards in the test cluster: enough that each of three replicas owns some.
 const ROOM_SHARDS: u32 = 16;
@@ -596,19 +596,22 @@ fn bodies(response: &Value, room: &str) -> Vec<String> {
         .collect()
 }
 
-/// An initial sync, repeated until it shows every room in `rooms` joined, then incremental
-/// syncs until nothing is left to catch up on; the token it ends on.
+/// An initial sync, repeated until it shows every room in `rooms` joined, then long-polls until
+/// the message `marker` shows in `marker_room`; the token it ends on.
 ///
 /// The wait is long on purpose. The owner's session hub writes each update's membership
 /// records and feed entries one member at a time, two store round trips each, so after the big
-/// room's members join it is minutes behind on a loaded machine, and a reader's join is only in
-/// its records once the hub reaches it. That is the owner's fan-out cost, which this test does
-/// not measure.
+/// room's members join it is far behind (an hour, at 300 members, in a debug build on a loaded
+/// machine), and the marker sent after them reaches a reader only when the hub gets there. That
+/// is the owner's fan-out cost, which this test does not measure; measuring before the hub has
+/// caught up would.
 async fn settled_token(
     client: &reqwest::Client,
     base: &str,
     user: &User,
     rooms: &[&str],
+    marker_room: &str,
+    marker: &str,
 ) -> Result<String, String> {
     let deadline = Instant::now() + SETTLE_WITHIN;
     let mut token = loop {
@@ -633,13 +636,13 @@ async fn settled_token(
     };
     let deadline = Instant::now() + SETTLE_WITHIN;
     loop {
-        let response = sync(client, base, user, Some(&token), 0).await;
+        let response = sync(client, base, user, Some(&token), 10_000).await;
         token = next_batch(&response);
-        if rooms.iter().all(|r| bodies(&response, r).is_empty()) {
+        if bodies(&response, marker_room).iter().any(|b| b == marker) {
             return Ok(token);
         }
         if Instant::now() >= deadline {
-            return Err(format!("{} never settled on {base}", user.id));
+            return Err(format!("{} never saw {marker:?} on {base}", user.id));
         }
     }
 }
@@ -933,18 +936,11 @@ async fn a_replica_that_does_not_own_a_room_reads_only_its_new_events() {
     let bob = register(&client, b1, "bob").await;
     let carol = register(&client, b2, "carol").await;
 
-    // Both rooms are owned by A (made until they land there), and filled before bob and
-    // carol read them, so neither reader pays for the history being written.
+    // Both rooms are owned by A (made until they land there).
     let small = room_owned_by(&client, a, &admin, &alice, &ids[0], "small").await;
     let big = room_owned_by(&client, a, &admin, &alice, &ids[0], "big").await;
-    let built = Instant::now();
-    send_many(&client, a, &big, &alice, events, 4).await;
-    eprintln!("sent {events} messages in {:?}", built.elapsed());
-    add_members(&client, a, &admin, &big, members, 8).await;
-    eprintln!(
-        "built the big room ({events} messages, {members} members) in {:?}",
-        built.elapsed()
-    );
+    // Bob and carol join before the history is written, so their records exist early and
+    // neither reader holds a copy of the big room while it is being filled.
     for room in [&small, &big] {
         join(&client, b1, room, &bob).await;
         join(&client, b2, room, &carol).await;
@@ -968,10 +964,25 @@ async fn a_replica_that_does_not_own_a_room_reads_only_its_new_events() {
             );
         }
     }
-    let settled = (
-        settled_token(&client, b1, &bob, &[&small, &big]).await,
-        settled_token(&client, b2, &carol, &[&small, &big]).await,
+    let built = Instant::now();
+    send_many(&client, a, &big, &alice, events, 4).await;
+    eprintln!("sent {events} messages in {:?}", built.elapsed());
+    add_members(&client, a, &admin, &big, members, 8).await;
+    eprintln!(
+        "built the big room ({events} messages, {members} members) in {:?}",
+        built.elapsed()
     );
+    // The owner's hub is far behind after the members' joins; a marker sent now reaches the
+    // readers once it has caught up, and the measurement starts from there.
+    let marker = format!("ready {}", rand_suffix());
+    send_message(&client, a, &big, &alice, &marker).await;
+    eprintln!("waiting for the owner to catch up and the readers' syncs to settle");
+    let settle_started = Instant::now();
+    let settled = (
+        settled_token(&client, b1, &bob, &[&small, &big], &big, &marker).await,
+        settled_token(&client, b2, &carol, &[&small, &big], &big, &marker).await,
+    );
+    eprintln!("settled in {:?}", settle_started.elapsed());
     let mut tokens = match settled {
         (Ok(bob_token), Ok(carol_token)) => (bob_token, carol_token),
         (bob_result, carol_result) => {
@@ -1036,6 +1047,10 @@ async fn a_replica_that_does_not_own_a_room_reads_only_its_new_events() {
         carol: &carol,
     };
     let (small_b1, small_b2) = readers.phase("small", &small, messages, &mut tokens).await;
+    eprintln!(
+        "{}",
+        small_b2.report("small room, B2 (incremental, after)", messages)
+    );
     let (big_b1, big_b2) = readers.phase("big", &big, messages, &mut tokens).await;
 
     let report = [
