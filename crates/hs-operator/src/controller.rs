@@ -269,6 +269,7 @@ mod tests {
             BridgeSpec {
                 bridge_type: "heisenbridge".to_owned(),
                 appservice_id: "heisenbridge".to_owned(),
+                owner: None,
                 image: ImageSpec {
                     repository: "hif1/heisenbridge".to_owned(),
                     tag: None,
@@ -314,6 +315,7 @@ mod tests {
             BridgeSpec {
                 bridge_type: "heisenbridge".to_owned(),
                 appservice_id: "heisenbridge".to_owned(),
+                owner: None,
                 image: ImageSpec {
                     repository: "hif1/heisenbridge".to_owned(),
                     tag: None,

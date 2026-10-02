@@ -1,6 +1,28 @@
 //! The manager (RFC 0017 section 4.1): offerings, instances, and the state machine that takes
 //! an instance from `requested` to `ready` -- registered, deployed, answering this server, and
 //! its owner invited to it.
+//!
+//! # What an instance's Kubernetes objects are called
+//!
+//! An instance's `Bridge`, Deployment, Service and pods are named after what they are, so that
+//! `kubectl get pods` says whose bridge each one is: [`deploy_name`] turns the appservice id into
+//! `bridge-<short type>-<owner localpart>` (`bridge-whatsapp-brandon`, pods
+//! `bridge-whatsapp-brandon-<replicaset hash>-<pod hash>`), or `bridge-<short type>` for a shared
+//! instance (`bridge-heisenbridge`). The name is made a DNS-1123 label: lowercase, `[a-z0-9-]`,
+//! every other character mapped to `-`, runs collapsed, no `-` at either end, and at most
+//! [`DEPLOY_NAME_MAX`] characters so that even a pod's name stays within 63. When mapping or
+//! shortening changed the id (so two ids could have come out the same), `-<6 hex of
+//! sha256(appservice id)>` is appended; an id that needed no change gets no suffix. The Secret
+//! and the claim hang off the name as `<name>-files` and `<name>-data` (the operator's rule).
+//!
+//! The name is decided once, when the instance is first named, and stored on its row
+//! ([`InstanceRow::deploy_name`]); nothing recomputes it afterwards, so a running instance keeps
+//! its name until it is removed and asked for again. Instances deployed before 2026-10-02 run
+//! under [`legacy_deploy_name`] (`bridge-<8 hex of sha256(appservice id)>`): their rows carry
+//! that name and they keep it. A row with an appservice id but no stored name (there should be
+//! none; the field has been written since the manager's first version) is named on its next
+//! step: if the runtime has an object under the hashed name, that name is adopted so nothing
+//! already running is orphaned or deployed twice; otherwise it gets the readable name.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
@@ -69,12 +91,61 @@ pub fn short_name(bridge_type: &str) -> &str {
         .unwrap_or(bridge_type)
 }
 
-/// The Kubernetes name for an instance's objects: short, DNS-safe, and the same every time for
-/// the same appservice id.
+/// The longest name an instance's objects get. A Deployment's pods are called
+/// `<name>-<10 hex pod-template hash>-<5 characters>`, so a name of at most 46 characters keeps
+/// even a pod's name within the 63 characters of a DNS-1123 label and nothing is cut short on
+/// the way down.
+pub const DEPLOY_NAME_MAX: usize = 46;
+/// Every instance's objects start with this.
+const DEPLOY_NAME_PREFIX: &str = "bridge-";
+/// How much of the appservice id's hash disambiguates a mapped or shortened name.
+const DEPLOY_NAME_HASH_LEN: usize = 6;
+
+/// The Kubernetes name for an instance's objects, from its appservice id: `bridge-` and the id
+/// made a DNS-1123 label (`whatsapp-brandon` gives `bridge-whatsapp-brandon`; a shared
+/// `heisenbridge` gives `bridge-heisenbridge`). Lowercased, every character outside `[a-z0-9]`
+/// mapped to `-`, runs of `-` collapsed, none at either end, and cut to fit [`DEPLOY_NAME_MAX`];
+/// if any of that changed the id, `-<6 hex of sha256(id)>` is appended so that two ids that map
+/// to the same text (`a.b` and `a-b`, `Alice` and `alice`, two long ids with one prefix) still
+/// get different names. The same every time for the same id. The module doc has the rule in
+/// full and says how an instance named before this rule keeps its old name.
 #[must_use]
 pub fn deploy_name(appservice_id: &str) -> String {
+    let mut stem = String::with_capacity(appservice_id.len());
+    for c in appservice_id.chars() {
+        let c = c.to_ascii_lowercase();
+        if c.is_ascii_lowercase() || c.is_ascii_digit() {
+            stem.push(c);
+        } else if !stem.is_empty() && !stem.ends_with('-') {
+            stem.push('-');
+        }
+    }
+    let stem = stem.trim_end_matches('-');
+    let room = DEPLOY_NAME_MAX - DEPLOY_NAME_PREFIX.len();
+    if stem == appservice_id && stem.len() <= room {
+        return format!("{DEPLOY_NAME_PREFIX}{stem}");
+    }
+    let digest = hex::encode(Sha256::digest(appservice_id.as_bytes()));
+    let hash = &digest[..DEPLOY_NAME_HASH_LEN];
+    let cut = stem
+        .get(..room - 1 - DEPLOY_NAME_HASH_LEN)
+        .unwrap_or(stem)
+        .trim_end_matches('-');
+    if cut.is_empty() {
+        format!("{DEPLOY_NAME_PREFIX}{hash}")
+    } else {
+        format!("{DEPLOY_NAME_PREFIX}{cut}-{hash}")
+    }
+}
+
+/// The name an instance's objects got before 2026-10-02: `bridge-<8 hex of sha256(appservice
+/// id)>`. Rows from then carry it; a row with no stored name is checked against the runtime
+/// under this name before it is given a readable one, so a running instance is adopted rather
+/// than deployed a second time.
+#[must_use]
+pub fn legacy_deploy_name(appservice_id: &str) -> String {
     let digest = Sha256::digest(appservice_id.as_bytes());
-    format!("bridge-{}", &hex::encode(digest)[..8])
+    format!("{DEPLOY_NAME_PREFIX}{}", &hex::encode(digest)[..8])
 }
 
 /// The manager.
@@ -407,17 +478,23 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
 
     fn deploy_spec(row: &InstanceRow, render: &InstanceRender) -> Option<DeploySpec> {
         let appservice_id = row.appservice_id.clone()?;
+        let owner = owner_of(row).map(str::to_owned);
+        let mut labels = BTreeMap::from([
+            ("myelin.dev/bridge-type".to_owned(), row.bridge_type.clone()),
+            (
+                "myelin.dev/appservice-id".to_owned(),
+                label_safe(&appservice_id),
+            ),
+        ]);
+        if let Some(owner) = &owner {
+            labels.insert("myelin.dev/owner".to_owned(), label_safe(owner));
+        }
         Some(DeploySpec {
             name: row.deploy_name.clone()?,
-            labels: BTreeMap::from([
-                ("myelin.dev/bridge-type".to_owned(), row.bridge_type.clone()),
-                (
-                    "myelin.dev/appservice-id".to_owned(),
-                    label_safe(&appservice_id),
-                ),
-            ]),
+            labels,
             bridge_type: row.bridge_type.clone(),
             appservice_id,
+            owner,
             image_repository: render.image_repository.clone(),
             image_tag: render.image_tag.clone(),
             port: render.port,
@@ -456,6 +533,7 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
     }
 
     async fn step(&self, row: &InstanceRow) -> Result<(), String> {
+        let row = &self.settle_deploy_name(row).await?;
         let Some(offering) = self
             .store
             .offering(&row.bridge_type)
@@ -602,6 +680,51 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             InstanceState::Failed => Ok(()),
             InstanceState::Removing => self.remove(row).await,
         }
+    }
+
+    /// The row with its objects' name settled. A row that has one, or has no appservice id yet,
+    /// is returned as it is. A registered row without one (see the module doc) is named now and
+    /// stored: the old hashed name if the runtime has an object under it, so that a bridge
+    /// already running is adopted rather than deployed a second time; otherwise the readable
+    /// name. Once stored the name is never recomputed.
+    async fn settle_deploy_name(&self, row: &InstanceRow) -> Result<InstanceRow, String> {
+        let Some(appservice_id) = row.appservice_id.clone() else {
+            return Ok(row.clone());
+        };
+        if row.deploy_name.is_some() {
+            return Ok(row.clone());
+        }
+        let legacy = legacy_deploy_name(&appservice_id);
+        let adopted = match &self.runtime {
+            Some(runtime) => runtime.status(&legacy).await?.is_some(),
+            None => false,
+        };
+        let name = if adopted {
+            legacy
+        } else {
+            deploy_name(&appservice_id)
+        };
+        tracing::info!(
+            bridge_type = %row.bridge_type,
+            owner = %row.owner,
+            appservice_id = %appservice_id,
+            deploy_name = %name,
+            adopted,
+            "named the bridge instance's objects"
+        );
+        self.store
+            .update_instance(&row.bridge_type, &row.owner, |r| {
+                if r.deploy_name.is_some() {
+                    return false;
+                }
+                r.deploy_name = Some(name.clone());
+                true
+            })
+            .map_err(|e| e.to_string())?;
+        self.store
+            .instance(&row.bridge_type, &row.owner)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "the instance was removed".to_owned())
     }
 
     fn set_state(&self, row: &InstanceRow, state: InstanceState, reason: Option<String>) {
@@ -1242,5 +1365,391 @@ impl<B: KvBackend + 'static> BridgeOfferingSource for BridgeManager<B> {
             compose_yaml: render.compose_yaml.clone(),
             manifest_yaml: manifest_yaml(&spec, &namespace),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use hs_admin::model::BridgeDeployment;
+    use hs_admin::sources::InMemoryAppserviceDirectory;
+    use hs_kv::memory::MemoryBackend;
+
+    use super::*;
+
+    fn is_dns_label(name: &str) -> bool {
+        !name.is_empty()
+            && name.len() <= 63
+            && name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            && !name.starts_with('-')
+            && !name.ends_with('-')
+            && !name.contains("--")
+    }
+
+    #[test]
+    fn a_plain_id_names_its_objects_after_the_type_and_owner() {
+        assert_eq!(deploy_name("whatsapp-brandon"), "bridge-whatsapp-brandon");
+        assert_eq!(deploy_name("whatsapp-alice-2"), "bridge-whatsapp-alice-2");
+        assert_eq!(deploy_name("signal-bob42"), "bridge-signal-bob42");
+    }
+
+    #[test]
+    fn a_shared_instance_is_named_after_the_type_alone() {
+        assert_eq!(deploy_name("heisenbridge"), "bridge-heisenbridge");
+        assert_eq!(deploy_name("hookshot"), "bridge-hookshot");
+    }
+
+    #[test]
+    fn dots_and_uppercase_are_mapped_and_the_name_is_disambiguated() {
+        let name = deploy_name("whatsapp-Alice.Smith");
+        assert!(is_dns_label(&name), "{name}");
+        assert!(name.starts_with("bridge-whatsapp-alice-smith-"), "{name}");
+        let suffix = name.rsplit('-').next().unwrap();
+        assert_eq!(suffix.len(), 6);
+        assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(deploy_name("whatsapp-Alice.Smith"), name, "stable");
+        // The encoded form the manager really produces (`_` is `=5f`) maps the same way.
+        let encoded = deploy_name("whatsapp-ali=5fce");
+        assert!(
+            encoded.starts_with("bridge-whatsapp-ali-5fce-"),
+            "{encoded}"
+        );
+        assert!(is_dns_label(&encoded));
+    }
+
+    #[test]
+    fn a_very_long_owner_is_cut_to_fit_a_pod_name_and_disambiguated() {
+        let long = format!("whatsapp-{}", "a".repeat(100));
+        let name = deploy_name(&long);
+        assert!(is_dns_label(&name), "{name}");
+        assert_eq!(name.len(), DEPLOY_NAME_MAX, "{name}");
+        assert!(name.starts_with("bridge-whatsapp-aaaa"));
+        assert_eq!(name.rsplit('-').next().unwrap().len(), 6);
+        // Same prefix, different tail: different names.
+        let other = deploy_name(&format!("whatsapp-{}b", "a".repeat(99)));
+        assert_ne!(name, other);
+        assert_eq!(&name[..name.len() - 6], &other[..other.len() - 6]);
+        // A pod's name has room for the ReplicaSet and pod suffixes under 63.
+        assert!(name.len() + "-6d4b7f9c8f".len() + "-x7k2p".len() <= 63);
+        // An id of exactly the room needs no suffix; one over does.
+        let room = DEPLOY_NAME_MAX - "bridge-".len();
+        assert_eq!(
+            deploy_name(&"a".repeat(room)),
+            format!("bridge-{}", "a".repeat(room))
+        );
+        let over = deploy_name(&"a".repeat(room + 1));
+        assert_eq!(over.len(), DEPLOY_NAME_MAX);
+        assert_eq!(over.matches('-').count(), 2, "{over}");
+    }
+
+    #[test]
+    fn two_owners_that_map_to_the_same_text_get_different_names() {
+        let dotted = deploy_name("whatsapp-a.b");
+        let dashed = deploy_name("whatsapp-a-b");
+        assert_eq!(dashed, "bridge-whatsapp-a-b");
+        assert_ne!(dotted, dashed);
+        assert!(dotted.starts_with("bridge-whatsapp-a-b-"), "{dotted}");
+        let upper = deploy_name("whatsapp-Alice");
+        let lower = deploy_name("whatsapp-alice");
+        assert_eq!(lower, "bridge-whatsapp-alice");
+        assert_ne!(upper, lower);
+        // Runs collapse and the ends are trimmed, with the suffix saying it happened.
+        let odd = deploy_name("whatsapp-=5f=5fa=5f");
+        assert!(is_dns_label(&odd), "{odd}");
+        assert!(odd.starts_with("bridge-whatsapp-5f-5fa-5f-"), "{odd}");
+        // An id with nothing to keep still gets a valid, stable name.
+        let empty = deploy_name("===");
+        assert!(is_dns_label(&empty), "{empty}");
+        assert_eq!(empty.len(), "bridge-".len() + 6);
+    }
+
+    #[test]
+    fn the_legacy_name_is_the_old_eight_hex_hash() {
+        let legacy = legacy_deploy_name("whatsapp-alice");
+        assert_eq!(legacy.len(), "bridge-".len() + 8);
+        assert!(legacy.starts_with("bridge-"));
+        assert_ne!(legacy, deploy_name("whatsapp-alice"));
+        assert_eq!(legacy, legacy_deploy_name("whatsapp-alice"));
+    }
+
+    #[test]
+    fn a_row_stored_before_names_were_stored_still_reads() {
+        let json = serde_json::json!({
+            "bridge_type": "mautrix-whatsapp",
+            "owner": "@alice:example.org",
+            "state": "registered",
+            "reason": null,
+            "appservice_id": "whatsapp-alice",
+            "as_token": "a",
+            "hs_token": "h",
+            "url": "http://x:1",
+            "front_door_room": null,
+            "dm_room": null,
+            "created_at_ms": 1,
+            "state_since_ms": 1,
+            "ready_at_ms": null
+        });
+        let row: InstanceRow = serde_json::from_value(json).unwrap();
+        assert!(row.deploy_name.is_none());
+        assert_eq!(row.appservice_id.as_deref(), Some("whatsapp-alice"));
+    }
+
+    /// A runtime that remembers what it was asked to apply and reports it ready at once.
+    #[derive(Default)]
+    struct FakeRuntime {
+        objects: Mutex<BTreeMap<String, DeploySpec>>,
+    }
+
+    impl FakeRuntime {
+        fn names(&self) -> Vec<String> {
+            self.objects.lock().unwrap().keys().cloned().collect()
+        }
+
+        fn spec(&self, name: &str) -> Option<DeploySpec> {
+            self.objects.lock().unwrap().get(name).cloned()
+        }
+
+        /// An object that was there before the manager looked: what an instance deployed under
+        /// the hashed name left behind.
+        fn preexisting(&self, name: &str) {
+            self.objects.lock().unwrap().insert(
+                name.to_owned(),
+                DeploySpec {
+                    name: name.to_owned(),
+                    labels: BTreeMap::new(),
+                    bridge_type: "mautrix-whatsapp".into(),
+                    appservice_id: "whatsapp-alice".into(),
+                    owner: None,
+                    image_repository: "x".into(),
+                    image_tag: "y".into(),
+                    port: 1,
+                    args: Vec::new(),
+                    files: BTreeMap::new(),
+                    storage_size: None,
+                },
+            );
+        }
+
+        fn deployment(spec: &DeploySpec) -> BridgeDeployment {
+            BridgeDeployment {
+                namespace: "chat".into(),
+                name: spec.name.clone(),
+                image: format!("{}:{}", spec.image_repository, spec.image_tag),
+                service_url: format!("http://{}.chat.svc:{}", spec.name, spec.port),
+                phase: "Ready".into(),
+                ready: true,
+                message: None,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Runtime for FakeRuntime {
+        fn target(&self) -> BridgeDeploymentTarget {
+            BridgeDeploymentTarget {
+                available: true,
+                namespace: Some("chat".into()),
+                homeserver_url: Some("http://hs.chat.svc:8008".into()),
+                reason: None,
+            }
+        }
+
+        fn service_url(&self, name: &str, port: u16) -> String {
+            format!("http://{name}.chat.svc:{port}")
+        }
+
+        async fn apply(&self, spec: &DeploySpec) -> Result<BridgeDeployment, String> {
+            self.objects
+                .lock()
+                .unwrap()
+                .insert(spec.name.clone(), spec.clone());
+            Ok(Self::deployment(spec))
+        }
+
+        async fn status(&self, name: &str) -> Result<Option<BridgeDeployment>, String> {
+            Ok(self.spec(name).as_ref().map(Self::deployment))
+        }
+
+        async fn delete(&self, name: &str) -> Result<(), String> {
+            self.objects.lock().unwrap().remove(name);
+            Ok(())
+        }
+    }
+
+    fn cluster_manager() -> (Arc<BridgeManager<MemoryBackend>>, Arc<FakeRuntime>) {
+        let runtime = Arc::new(FakeRuntime::default());
+        let manager = BridgeManager::new(
+            MemoryBackend::new(),
+            Arc::new(InMemoryAppserviceDirectory::new()),
+            Some(runtime.clone()),
+            "example.org",
+            "https://example.org",
+        )
+        .unwrap();
+        manager.attach("http://127.0.0.1:9");
+        (manager, runtime)
+    }
+
+    fn cluster() -> BridgeOfferingRequest {
+        BridgeOfferingRequest {
+            runtime: Some("cluster".into()),
+            ..BridgeOfferingRequest::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_new_instance_is_deployed_under_a_readable_name_with_the_owner_labelled() {
+        let (manager, runtime) = cluster_manager();
+        manager.put("mautrix-whatsapp", cluster()).await.unwrap();
+        manager
+            .put_instance("mautrix-whatsapp", "@brandon:example.org")
+            .await
+            .unwrap();
+        manager.tick().await; // requested -> registered: named and registered
+        manager.tick().await; // registered -> deploying: applied
+        assert_eq!(runtime.names(), vec!["bridge-whatsapp-brandon".to_owned()]);
+        let spec = runtime.spec("bridge-whatsapp-brandon").unwrap();
+        assert_eq!(spec.owner.as_deref(), Some("@brandon:example.org"));
+        assert_eq!(spec.labels["myelin.dev/owner"], "brandon-example.org");
+        assert_eq!(spec.labels["myelin.dev/bridge-type"], "mautrix-whatsapp");
+        assert_eq!(spec.labels["myelin.dev/appservice-id"], "whatsapp-brandon");
+        let row = manager
+            .store
+            .instance("mautrix-whatsapp", "@brandon:example.org")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.deploy_name.as_deref(), Some("bridge-whatsapp-brandon"));
+        assert_eq!(
+            row.url.as_deref(),
+            Some("http://bridge-whatsapp-brandon.chat.svc:29318"),
+            "the registration's url is the Service's"
+        );
+        let instance = manager
+            .instance("mautrix-whatsapp", "@brandon:example.org")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(instance.deployment.unwrap().name, "bridge-whatsapp-brandon");
+        // The manifest for running it elsewhere names the owner too.
+        let files = manager
+            .instance_files("mautrix-whatsapp", "@brandon:example.org")
+            .await
+            .unwrap();
+        assert!(
+            files
+                .manifest_yaml
+                .contains("name: bridge-whatsapp-brandon\n")
+        );
+        assert!(
+            files
+                .manifest_yaml
+                .contains("owner: \"@brandon:example.org\""),
+            "{}",
+            files.manifest_yaml
+        );
+    }
+
+    #[tokio::test]
+    async fn a_shared_instance_is_named_after_its_type_and_carries_no_owner() {
+        let (manager, runtime) = cluster_manager();
+        manager.put("heisenbridge", cluster()).await.unwrap();
+        manager.tick().await;
+        manager.tick().await;
+        assert_eq!(runtime.names(), vec!["bridge-heisenbridge".to_owned()]);
+        let spec = runtime.spec("bridge-heisenbridge").unwrap();
+        assert!(spec.owner.is_none());
+        assert!(!spec.labels.contains_key("myelin.dev/owner"));
+    }
+
+    /// A row from before names were stored, whose objects run under the hashed name.
+    async fn registered_without_a_name(manager: &BridgeManager<MemoryBackend>) -> (String, String) {
+        manager.put("mautrix-whatsapp", cluster()).await.unwrap();
+        manager
+            .put_instance("mautrix-whatsapp", "@alice:example.org")
+            .await
+            .unwrap();
+        manager.tick().await; // registered, named
+        let row = manager
+            .store
+            .update_instance("mautrix-whatsapp", "@alice:example.org", |r| {
+                assert_eq!(r.state, InstanceState::Registered);
+                r.deploy_name = None;
+                true
+            })
+            .unwrap()
+            .unwrap();
+        let id = row.appservice_id.unwrap();
+        (legacy_deploy_name(&id), deploy_name(&id))
+    }
+
+    #[tokio::test]
+    async fn an_instance_already_running_under_the_hashed_name_keeps_it() {
+        let (manager, runtime) = cluster_manager();
+        let (legacy, readable) = registered_without_a_name(&manager).await;
+        runtime.preexisting(&legacy);
+
+        manager.tick().await; // adopts the name, applies under it
+        let row = manager
+            .store
+            .instance("mautrix-whatsapp", "@alice:example.org")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.deploy_name.as_deref(), Some(legacy.as_str()));
+        assert_eq!(row.state, InstanceState::Deploying);
+        assert_eq!(
+            runtime.names(),
+            vec![legacy.clone()],
+            "no second deployment"
+        );
+        assert_ne!(legacy, readable);
+
+        // Later ticks never rename it, and removing it deletes the adopted object.
+        manager.tick().await;
+        manager.tick().await;
+        let row = manager
+            .store
+            .instance("mautrix-whatsapp", "@alice:example.org")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.deploy_name.as_deref(), Some(legacy.as_str()));
+        assert_eq!(runtime.names(), vec![legacy.clone()]);
+        manager
+            .delete_instance("mautrix-whatsapp", "@alice:example.org")
+            .await
+            .unwrap();
+        manager.tick().await;
+        assert!(runtime.names().is_empty(), "{:?}", runtime.names());
+        assert!(
+            manager
+                .store
+                .instance("mautrix-whatsapp", "@alice:example.org")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unnamed_instance_with_nothing_running_gets_the_readable_name() {
+        let (manager, runtime) = cluster_manager();
+        let (legacy, readable) = registered_without_a_name(&manager).await;
+        manager.tick().await;
+        let row = manager
+            .store
+            .instance("mautrix-whatsapp", "@alice:example.org")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.deploy_name.as_deref(), Some(readable.as_str()));
+        assert_eq!(readable, "bridge-whatsapp-alice");
+        assert_eq!(runtime.names(), vec![readable.clone()]);
+        assert!(runtime.spec(&legacy).is_none());
+    }
+
+    #[test]
+    fn label_safe_makes_an_owner_a_label_value() {
+        assert_eq!(label_safe("@alice:example.org"), "alice-example.org");
+        assert_eq!(label_safe("@al_ice:ex.org"), "al_ice-ex.org");
     }
 }

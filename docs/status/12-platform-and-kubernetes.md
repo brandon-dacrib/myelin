@@ -1,5 +1,31 @@
 # 12. Platform and Kubernetes
 
+## 2026-10-02: a bridge's Kubernetes objects are named after what they are (branch `agent/bridge-names`)
+
+The owner's WhatsApp bridge was a pod called `bridge-7c1e92a0-…`. Now an instance's `Bridge`,
+Deployment, Service and pods are `bridge-<short type>-<owner localpart>` (`bridge-whatsapp-brandon`),
+`bridge-<short type>` for a shared one, made a DNS-1123 label of at most 46 characters with a
+6-hex suffix only where mapping or shortening changed the id; status 11's entry of today has the
+rule, and `hs_bridges::manager`'s module doc is the reference. What changed on the platform side:
+
+- **The `Bridge` CRD has `spec.owner`** (optional, the owner's Matrix ID; a shared instance has
+  none) and an `Owner` print column, so `kubectl get br` reads `NAME  PHASE  BRIDGETYPE  APPSERVICE
+  OWNER  READY`. `deploy/crds/bridge.yaml` and the chart's copy were regenerated with `gen-crds`
+  and diffed as CD does (identical). A `Bridge` written by hand without `owner` (the smoke's
+  `smoke`) is unchanged.
+- **Every object the operator builds carries `myelin.dev/owner`** (the Matrix ID made label-safe,
+  `brandon-example.org`) next to `myelin.dev/bridge-type` and `myelin.dev/appservice-id`, and the
+  exact owner in an annotation of the same name, on the claim, the Deployment, the Service and the
+  pod template; none of them when the spec has no owner. `kubectl get pods -l myelin.dev/owner=…`
+  is the question the owner asked. The `app.kubernetes.io/*` labels and the selector are as they
+  were, so an existing Deployment's immutable selector is untouched and a rollout is only the pod
+  template's new label (one `Recreate` of each running bridge when the operator is upgraded).
+- **Names already in use stay.** The manager stores the name on the instance's row and never
+  recomputes it; a row without one is matched against the old hashed name on the cluster before
+  it is given a readable one. Nothing on the cluster is renamed by this change.
+
+**The kind smoke** (`deploy/operator/ci/kind-smoke.sh`): was being run when this entry was written; the commit after this one on `agent/bridge-names` says how it went, and if there is none it did not finish.
+
 ## 2026-10-02: the builds cache what they used to redo
 
 What changed, and what each was measured to do (the numbers are in the "Measured" paragraph

@@ -16,8 +16,8 @@ use kube::{Api, Resource as _};
 use serde::Serialize;
 
 use crate::bridge::{
-    ANNOTATION_APPSERVICE_ID, CONDITION_AVAILABLE, LABEL_APPSERVICE_ID, LABEL_BRIDGE_TYPE,
-    label_value,
+    ANNOTATION_APPSERVICE_ID, ANNOTATION_OWNER, CONDITION_AVAILABLE, LABEL_APPSERVICE_ID,
+    LABEL_BRIDGE_TYPE, LABEL_OWNER, label_value,
 };
 use crate::crds::{Bridge, BridgeSpec, BridgeStorage, ImageSpec, Phase};
 
@@ -38,6 +38,9 @@ pub struct BridgeInstanceSpec {
     pub bridge_type: String,
     /// The appservice registration id this process answers for (`whatsapp-alice`).
     pub appservice_id: String,
+    /// The owner's Matrix ID; `None` for a shared instance. Labelled onto every object
+    /// (`myelin.dev/owner`, [`LABEL_OWNER`]) so a person's bridges can be listed.
+    pub owner: Option<String>,
     /// The bridge's image.
     pub image: ImageSpec,
     /// The port the bridge listens on for appservice transactions.
@@ -297,18 +300,32 @@ fn object_labels(spec: &BridgeInstanceSpec) -> BTreeMap<String, String> {
         LABEL_APPSERVICE_ID.to_owned(),
         label_value(&spec.appservice_id),
     );
+    if let Some(owner) = spec_owner(spec) {
+        labels.insert(LABEL_OWNER.to_owned(), label_value(owner));
+    }
     labels
 }
 
+fn spec_owner(spec: &BridgeInstanceSpec) -> Option<&str> {
+    spec.owner
+        .as_deref()
+        .map(str::trim)
+        .filter(|o| !o.is_empty())
+}
+
 fn object_meta(name: String, spec: &BridgeInstanceSpec, namespace: &str) -> ObjectMeta {
+    let mut annotations = BTreeMap::from([(
+        ANNOTATION_APPSERVICE_ID.to_owned(),
+        spec.appservice_id.clone(),
+    )]);
+    if let Some(owner) = spec_owner(spec) {
+        annotations.insert(ANNOTATION_OWNER.to_owned(), owner.to_owned());
+    }
     ObjectMeta {
         name: Some(name),
         namespace: Some(namespace.to_owned()),
         labels: Some(object_labels(spec)),
-        annotations: Some(BTreeMap::from([(
-            ANNOTATION_APPSERVICE_ID.to_owned(),
-            spec.appservice_id.clone(),
-        )])),
+        annotations: Some(annotations),
         ..ObjectMeta::default()
     }
 }
@@ -319,6 +336,7 @@ fn bridge_object(spec: &BridgeInstanceSpec, namespace: &str) -> Bridge {
         BridgeSpec {
             bridge_type: spec.bridge_type.clone(),
             appservice_id: spec.appservice_id.clone(),
+            owner: spec_owner(spec).map(str::to_owned),
             image: spec.image.clone(),
             port: spec.port,
             files_secret: files_secret_name(&spec.name),
@@ -392,6 +410,7 @@ mod tests {
             labels: BTreeMap::from([("myelin.dev/user".to_owned(), "alice".to_owned())]),
             bridge_type: "mautrix-whatsapp".to_owned(),
             appservice_id: "whatsapp-alice".to_owned(),
+            owner: Some("@alice:example.org".to_owned()),
             image: ImageSpec {
                 repository: "dock.mau.dev/mautrix/whatsapp".to_owned(),
                 tag: Some("latest".to_owned()),
@@ -447,8 +466,22 @@ mod tests {
             Some("alice")
         );
 
+        assert_eq!(
+            docs[1]["metadata"]["labels"][LABEL_OWNER].as_str(),
+            Some("alice-example.org")
+        );
+        assert_eq!(
+            docs[1]["metadata"]["annotations"][ANNOTATION_OWNER].as_str(),
+            Some("@alice:example.org")
+        );
+        assert_eq!(
+            docs[0]["metadata"]["labels"][LABEL_OWNER].as_str(),
+            Some("alice-example.org")
+        );
+
         let bridge: Bridge = serde_yaml_ng::from_value(docs[1].clone()).unwrap();
         assert_eq!(bridge.spec.appservice_id, "whatsapp-alice");
+        assert_eq!(bridge.spec.owner.as_deref(), Some("@alice:example.org"));
         assert_eq!(bridge.spec.port, 29318);
         assert_eq!(bridge.spec.storage.size, "1Gi");
         assert!(bridge.status.is_none());

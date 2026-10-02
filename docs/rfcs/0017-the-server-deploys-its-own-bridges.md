@@ -69,8 +69,8 @@ For user `@alice:server` and type `mautrix-whatsapp` (ghost prefix `whatsapp_`, 
 | instance's ghosts | `@whatsapp_alice_{{.}}:server` |
 | instance's exclusive namespaces | `@whatsapp_alice_.*:server`, `@whatsappbot_alice:server`, `#whatsapp_alice_.*:server` |
 | double puppeting | non-exclusive `@alice:server` only |
-| Kubernetes objects | `Bridge`, Deployment and Service `bridge-<8 hex of sha256(appservice id)>`, labelled with the type and the appservice id; Secret `<that>-files`; PVC `<that>-data` |
-| registration `url` | `http://bridge-<hash>.<namespace>.svc:<port>` |
+| Kubernetes objects | `Bridge`, Deployment and Service `bridge-<short type>-<owner localpart>` (`bridge-whatsapp-alice`; pods `bridge-whatsapp-alice-<replicaset>-<pod>`), `bridge-<short type>` for a shared instance (`bridge-heisenbridge`): the appservice id made a DNS-1123 label (lowercase, `[a-z0-9-]`, at most 46 characters so a pod's name fits in 63), with `-<6 hex of sha256(appservice id)>` appended only when mapping or shortening changed it (`whatsapp-ali=5fce` gives `bridge-whatsapp-ali-5fce-3f9a1c`). Labelled `myelin.dev/bridge-type`, `myelin.dev/appservice-id` and, for a person's instance, `myelin.dev/owner` (the Matrix ID made label-safe: `alice-example.org`), with the exact values in annotations of the same names; Secret `<that>-files`; PVC `<that>-data`. The name is decided once, stored on the instance's row, and kept until the instance is removed; one deployed before 2026-10-02 keeps its `bridge-<8 hex of sha256(appservice id)>` name (`hs_bridges::manager`'s module doc has the rule and the adoption) |
+| registration `url` | `http://<that name>.<namespace>.svc:<port>` |
 | bridge `permissions` | `"@alice:server": admin` and nothing else |
 
 The localpart is encoded so that one user's namespace can never contain another's: lowercase
@@ -87,8 +87,8 @@ letters, digits, `.`, `-` and `/` stay as they are and every other byte, includi
                                          ▼
                               homeserver: the manager (hs-bridges)
                     registration ─▶ appservice registry (live at once)
-                    files ─────────▶ Secret bridge-<h>-files
-                    run ───────────▶ Bridge bridge-<h> ──▶ operator ──▶ PVC, Deployment, Service
+                    files ─────────▶ Secret bridge-whatsapp-alice-files
+                    run ───────────▶ Bridge bridge-whatsapp-alice ──▶ operator ──▶ PVC, Deployment, Service
                     watch ◀─────── Bridge.status + the registry's ping
                     ready ─────────▶ personal bot DMs the user; front door says so
 ```
@@ -154,13 +154,14 @@ namespace. It knows nothing about users: one `Bridge` is one bridge process.
 ```yaml
 apiVersion: hs.matrix.org/v1alpha1
 kind: Bridge
-metadata: { name: bridge-1a2b3c4d, namespace: myelin, labels: {...} }
+metadata: { name: bridge-whatsapp-alice, namespace: myelin, labels: {...} }
 spec:
   bridgeType: mautrix-whatsapp
   appserviceId: whatsapp-alice
+  owner: "@alice:example.org"           # absent on a shared instance; labelled as myelin.dev/owner
   image: { repository: dock.mau.dev/mautrix/whatsapp, tag: latest }
   port: 29318
-  filesSecret: bridge-1a2b3c4d-files   # every key becomes a file in /data on first start
+  filesSecret: bridge-whatsapp-alice-files   # every key becomes a file in /data on first start
   args: []                             # heisenbridge takes its flags here
   storage: { size: 1Gi }
   resources: {}

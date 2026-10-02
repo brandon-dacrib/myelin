@@ -24,6 +24,9 @@ spec:
     - jsonPath: .spec.appserviceId
       name: Appservice
       type: string
+    - jsonPath: .spec.owner
+      name: Owner
+      type: string
     - jsonPath: .status.readyReplicas
       name: Ready
       type: integer
@@ -73,6 +76,10 @@ spec:
                 required:
                 - repository
                 type: object
+              owner:
+                description: 'The Matrix ID of the person this bridge is for (`@alice:example.org`); unset for a shared instance that serves everyone on the server. Informational for the operator: it labels the objects with it (`myelin.dev/owner`, made label-safe) so that `kubectl get pods -l myelin.dev/owner=alice-example.org` finds a person''s bridges, and keeps the exact value in an annotation of the same name.'
+                nullable: true
+                type: string
               port:
                 description: The port the bridge listens on for the homeserver's appservice transactions. The Service exposes it under the same number, and the readiness probe is a TCP connect to it.
                 format: int32

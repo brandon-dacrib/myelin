@@ -33,6 +33,7 @@ use super::common::{ImageSpec, OperatorStatus};
     printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
     printcolumn = r#"{"name":"BridgeType","type":"string","jsonPath":".spec.bridgeType"}"#,
     printcolumn = r#"{"name":"Appservice","type":"string","jsonPath":".spec.appserviceId"}"#,
+    printcolumn = r#"{"name":"Owner","type":"string","jsonPath":".spec.owner"}"#,
     printcolumn = r#"{"name":"Ready","type":"integer","jsonPath":".status.readyReplicas"}"#
 )]
 #[serde(rename_all = "camelCase")]
@@ -44,6 +45,13 @@ pub struct BridgeSpec {
     /// for the operator (it labels the objects with it); the homeserver's registry is where the
     /// registration itself lives.
     pub appservice_id: String,
+    /// The Matrix ID of the person this bridge is for (`@alice:example.org`); unset for a shared
+    /// instance that serves everyone on the server. Informational for the operator: it labels
+    /// the objects with it (`myelin.dev/owner`, made label-safe) so that
+    /// `kubectl get pods -l myelin.dev/owner=alice-example.org` finds a person's bridges, and
+    /// keeps the exact value in an annotation of the same name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
     /// The bridge's own image. The container runs the image's own entrypoint.
     pub image: ImageSpec,
     /// The port the bridge listens on for the homeserver's appservice transactions. The Service
@@ -101,6 +109,7 @@ mod tests {
         BridgeSpec {
             bridge_type: "mautrix-whatsapp".to_owned(),
             appservice_id: "whatsapp-alice".to_owned(),
+            owner: Some("@alice:example.org".to_owned()),
             image: ImageSpec {
                 repository: "dock.mau.dev/mautrix/whatsapp".to_owned(),
                 tag: Some("latest".to_owned()),

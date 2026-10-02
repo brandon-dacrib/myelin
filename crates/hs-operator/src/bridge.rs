@@ -33,6 +33,12 @@ pub const LABEL_BRIDGE_TYPE: &str = "myelin.dev/bridge-type";
 pub const LABEL_APPSERVICE_ID: &str = "myelin.dev/appservice-id";
 /// Annotation carrying the exact appservice id (a label value cannot hold every id).
 pub const ANNOTATION_APPSERVICE_ID: &str = "myelin.dev/appservice-id";
+/// Label carrying the owner's Matrix ID made label-safe by [`label_value`]
+/// (`@alice:example.org` becomes `alice-example.org`); absent on a shared instance's objects.
+/// `kubectl get pods -l myelin.dev/owner=alice-example.org` lists one person's bridges.
+pub const LABEL_OWNER: &str = "myelin.dev/owner";
+/// Annotation carrying the owner's exact Matrix ID; absent on a shared instance's objects.
+pub const ANNOTATION_OWNER: &str = "myelin.dev/owner";
 /// Pod-template annotation holding a hash of the `Bridge`'s spec, so a spec change rolls the pod.
 pub const ANNOTATION_SPEC_HASH: &str = "myelin.dev/spec-hash";
 /// The `condition.type` [`status_from`] reports.
@@ -129,7 +135,33 @@ pub fn labels(bridge: &Bridge) -> BTreeMap<String, String> {
         LABEL_APPSERVICE_ID.to_owned(),
         label_value(&bridge.spec.appservice_id),
     );
+    if let Some(owner) = owner_of(bridge) {
+        labels.insert(LABEL_OWNER.to_owned(), label_value(owner));
+    }
     labels
+}
+
+/// The owner named in the spec, when it names one (an empty string is none).
+fn owner_of(bridge: &Bridge) -> Option<&str> {
+    bridge
+        .spec
+        .owner
+        .as_deref()
+        .map(str::trim)
+        .filter(|o| !o.is_empty())
+}
+
+/// The annotations every object built from the `Bridge` carries: the exact appservice id and,
+/// for a person's bridge, the exact owner.
+fn annotations(bridge: &Bridge) -> BTreeMap<String, String> {
+    let mut annotations = BTreeMap::from([(
+        ANNOTATION_APPSERVICE_ID.to_owned(),
+        bridge.spec.appservice_id.clone(),
+    )]);
+    if let Some(owner) = owner_of(bridge) {
+        annotations.insert(ANNOTATION_OWNER.to_owned(), owner.to_owned());
+    }
+    annotations
 }
 
 /// The label selector (`key=value,...`) of one bridge's pods, for a `list` call.
@@ -158,10 +190,7 @@ fn metadata(bridge: &Bridge, name: String) -> ObjectMeta {
         name: Some(name),
         namespace: bridge.namespace(),
         labels: Some(labels(bridge)),
-        annotations: Some(BTreeMap::from([(
-            ANNOTATION_APPSERVICE_ID.to_owned(),
-            bridge.spec.appservice_id.clone(),
-        )])),
+        annotations: Some(annotations(bridge)),
         owner_references: owner_reference(bridge).map(|r| vec![r]),
         ..ObjectMeta::default()
     }
@@ -298,12 +327,8 @@ pub fn desired_deployment(bridge: &Bridge) -> Deployment {
         ..Container::default()
     };
 
-    let mut pod_annotations = BTreeMap::new();
+    let mut pod_annotations = annotations(bridge);
     pod_annotations.insert(ANNOTATION_SPEC_HASH.to_owned(), spec_hash(bridge));
-    pod_annotations.insert(
-        ANNOTATION_APPSERVICE_ID.to_owned(),
-        spec.appservice_id.clone(),
-    );
 
     Deployment {
         metadata: metadata(bridge, name.clone()),
@@ -544,6 +569,7 @@ mod tests {
             BridgeSpec {
                 bridge_type: "mautrix-whatsapp".to_owned(),
                 appservice_id: "whatsapp-alice=5fx".to_owned(),
+                owner: Some("@alice_x:example.org".to_owned()),
                 image: ImageSpec {
                     repository: "dock.mau.dev/mautrix/whatsapp".to_owned(),
                     tag: Some("v0.12.0".to_owned()),
@@ -618,10 +644,10 @@ mod tests {
         assert_eq!(labels["app.kubernetes.io/managed-by"], "myelin-operator");
         assert_eq!(labels[LABEL_BRIDGE_TYPE], "mautrix-whatsapp");
         assert_eq!(labels[LABEL_APPSERVICE_ID], "whatsapp-alice-5fx");
-        assert_eq!(
-            d.metadata.annotations.as_ref().unwrap()[ANNOTATION_APPSERVICE_ID],
-            "whatsapp-alice=5fx"
-        );
+        assert_eq!(labels[LABEL_OWNER], "alice_x-example.org");
+        let annotations = d.metadata.annotations.as_ref().unwrap();
+        assert_eq!(annotations[ANNOTATION_APPSERVICE_ID], "whatsapp-alice=5fx");
+        assert_eq!(annotations[ANNOTATION_OWNER], "@alice_x:example.org");
         let spec = d.spec.unwrap();
         assert_eq!(spec.replicas, Some(1));
         assert_eq!(spec.strategy.unwrap().type_.as_deref(), Some("Recreate"));
@@ -630,10 +656,63 @@ mod tests {
         for (k, v) in &selector {
             assert_eq!(template_labels.as_ref().unwrap().get(k), Some(v));
         }
+        let template_labels = template_labels.unwrap();
         assert_eq!(
-            template_labels.unwrap()["app.kubernetes.io/managed-by"],
+            template_labels["app.kubernetes.io/managed-by"],
             "myelin-operator"
         );
+        assert_eq!(template_labels[LABEL_OWNER], "alice_x-example.org");
+        assert_eq!(template_labels[LABEL_BRIDGE_TYPE], "mautrix-whatsapp");
+        let pod_annotations = spec
+            .template
+            .metadata
+            .as_ref()
+            .unwrap()
+            .annotations
+            .clone()
+            .unwrap();
+        assert_eq!(pod_annotations[ANNOTATION_OWNER], "@alice_x:example.org");
+        assert_eq!(
+            pod_annotations[ANNOTATION_APPSERVICE_ID],
+            "whatsapp-alice=5fx"
+        );
+    }
+
+    #[test]
+    fn every_object_of_a_persons_bridge_carries_the_owner_and_a_shared_one_carries_none() {
+        let b = bridge();
+        for meta in [
+            desired_pvc(&b).metadata,
+            desired_deployment(&b).metadata,
+            desired_service(&b).metadata,
+        ] {
+            let labels = meta.labels.unwrap();
+            assert_eq!(labels[LABEL_OWNER], "alice_x-example.org", "{labels:?}");
+            assert_eq!(labels[LABEL_BRIDGE_TYPE], "mautrix-whatsapp");
+            assert_eq!(labels[LABEL_APPSERVICE_ID], "whatsapp-alice-5fx");
+            assert_eq!(
+                meta.annotations.unwrap()[ANNOTATION_OWNER],
+                "@alice_x:example.org"
+            );
+        }
+        // A shared instance (heisenbridge for everyone) has no owner: no label, no annotation,
+        // and an empty string counts as none.
+        for owner in [None, Some(String::new()), Some("  ".to_owned())] {
+            let mut shared = bridge();
+            shared.spec.owner = owner;
+            let d = desired_deployment(&shared);
+            let labels = d.metadata.labels.unwrap();
+            assert!(!labels.contains_key(LABEL_OWNER), "{labels:?}");
+            assert!(
+                !d.metadata
+                    .annotations
+                    .unwrap()
+                    .contains_key(ANNOTATION_OWNER)
+            );
+            let pod = d.spec.unwrap().template.metadata.unwrap();
+            assert!(!pod.labels.unwrap().contains_key(LABEL_OWNER));
+            assert!(!pod.annotations.unwrap().contains_key(ANNOTATION_OWNER));
+        }
     }
 
     #[test]

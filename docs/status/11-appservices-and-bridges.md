@@ -1,9 +1,64 @@
 # Status: track 11, appservices and bridges
 
-Last updated: 2026-10-01 (who has signed in to a bridge; the `cluster` runtime run on kind;
+Last updated: 2026-10-02 (an instance's Kubernetes objects say whose bridge they are, below);
+before that 2026-10-01 (who has signed in to a bridge; the `cluster` runtime run on kind;
 both below); before that 2026-09-30 (ephemeral, to-device and device-list delivery); before that
 2026-09-27 (RFC 0017 run against the real binary), 2026-09-27 (the bridge manager) and
 2026-09-25.
+
+## Session 2026-10-02 (branch `agent/bridge-names`): the pod says what bridge and whose it is
+
+**The complaint.** The owner set up a WhatsApp bridge for `brandon` from the interface and found
+`bridge-7c1e92a0-6d4b7f9c8f-x7k2p` in `kubectl get pods`: nothing in the name said what bridge
+or whose. `hs_bridges::manager::deploy_name` named every object of an instance
+`bridge-<8 hex of sha256(appservice id)>`, "short, DNS-safe and stable", and nothing else.
+
+**The rule now** (`deploy_name`, the manager's module doc, RFC 0017 section 4.1's table): the
+appservice id made a DNS-1123 label behind `bridge-`, so a person's instance is
+`bridge-<short type>-<owner localpart>` (`bridge-whatsapp-brandon`, pods
+`bridge-whatsapp-brandon-<replicaset>-<pod>`, Secret `-files`, claim `-data`) and a shared one is
+`bridge-<short type>` (`bridge-heisenbridge`). Lowercase, `[a-z0-9-]`, every other character
+mapped to `-`, runs collapsed, no `-` at either end, and at most 46 characters
+(`DEPLOY_NAME_MAX`: `-<10 hex pod-template hash>-<5>` on top stays within a pod name's 63). When
+mapping or shortening changed the id, `-<6 hex of sha256(appservice id)>` is appended so two ids
+that come out the same text stay apart (`whatsapp-a.b` and `whatsapp-a-b`; `whatsapp-ali=5fce`,
+the encoded `ali_ce`, is `bridge-whatsapp-ali-5fce-<6 hex>`); an id that needed no change gets no
+suffix. Seven unit tests: a plain id, the shared case, dots and uppercase, a very long owner
+(exactly 46, a pod name under 63, two long ids with one prefix differ), two owners that map to the
+same text, the legacy name, a row without the field.
+
+**Labels on every object.** The `Bridge` spec gained `owner` (the Matrix ID; absent for a
+shared instance; CRD regenerated, an `Owner` print column), and the operator labels the claim,
+Deployment, Service and pods `myelin.dev/owner=<label-safe Matrix ID>` (`alice-example.org`)
+beside the `myelin.dev/bridge-type` and `myelin.dev/appservice-id` it already set, with the exact
+owner in an annotation of the same name; so `kubectl get pods -l myelin.dev/owner=brandon-example.org`
+lists one person's bridges. The manager puts the same three labels on the `Bridge` itself and
+the rendered `manifest_yaml` carries `owner`. The admin API's `BridgeInstance.deployment.name`
+already carried the object name (the interface shows it); its OpenAPI description now states the
+rule, and the document is **0.1.1** (`agent/admin-token` takes it to 0.1.2 on its own; whichever
+merges second becomes 0.1.3).
+
+**Nothing running is orphaned.** The name is decided once, when the instance is first named, and
+stored on its row (`InstanceRow::deploy_name`, now `#[serde(default)]`); nothing recomputes it, so
+**a running instance keeps its name until it is removed and asked for again** -- renaming would
+mean a second Deployment, a second claim (the bridge's SQLite and crypto store live on it) and a
+registration `url` pointing at a Service that no longer answers. Instances deployed before today
+have the hashed name on their rows and keep it. A row with an appservice id and no stored name
+(none should exist: the field has been written since the manager's first version, but an older
+row reads back with `None` now) is named on its next `step`: `legacy_deploy_name` is asked of the
+runtime first and adopted if an object is there, else the readable name; one log line says which
+(`named the bridge instance's objects`, with `adopted`). Four manager tests over the in-memory
+store and a fake runtime: a new instance deployed as `bridge-whatsapp-brandon` with the owner
+label and the Service URL to match, a shared heisenbridge as `bridge-heisenbridge` without one, an
+unnamed row with an object under the hashed name adopting it (no second deployment, never renamed
+on later ticks, deleted on removal), and one with nothing running getting the readable name.
+
+**Verified**: `cargo test -p hs-bridges` (15 + 6), `cargo test -p hs-operator` (92, including
+the regenerated CRDs matching and the operator's label tests), clippy on `hs-bridges`,
+`hs-operator`, `hs-admin`; `hs-cli` compiles with the new `owner`. `kind-smoke.sh`: see status
+12's entry of the same date for whether it ran. **Not verified:** a real instance with a pre-2026-10-02
+row on the owner's cluster; the demo cluster's one WhatsApp instance keeps its hashed name until
+it is removed and requested again, by design.
 
 ## Session 2026-10-01 (branch `agent/bridge-logins`): the admin API says who has signed in to a bridge
 

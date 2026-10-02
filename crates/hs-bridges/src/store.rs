@@ -82,7 +82,11 @@ pub struct InstanceRow {
     pub state: InstanceState,
     pub reason: Option<String>,
     pub appservice_id: Option<String>,
-    /// The Kubernetes name of its `Bridge`, Deployment and Service.
+    /// The Kubernetes name of its `Bridge`, Deployment and Service, settled once when the
+    /// instance is first named and never recomputed (`crate::manager::deploy_name` has the
+    /// rule). `None` on a row that has not been named yet: the manager names it on its next
+    /// step, adopting whatever already runs under the older hashed name.
+    #[serde(default)]
     pub deploy_name: Option<String>,
     pub as_token: Option<String>,
     pub hs_token: Option<String>,

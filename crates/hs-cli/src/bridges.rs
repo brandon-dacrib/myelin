@@ -79,6 +79,7 @@ impl Runtime for KubernetesRuntime {
                 labels: spec.labels.clone(),
                 bridge_type: spec.bridge_type.clone(),
                 appservice_id: spec.appservice_id.clone(),
+                owner: spec.owner.clone(),
                 image: ImageSpec {
                     repository: spec.image_repository.clone(),
                     tag: Some(spec.image_tag.clone()),

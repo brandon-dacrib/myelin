@@ -16,6 +16,9 @@ pub struct DeploySpec {
     pub labels: BTreeMap<String, String>,
     pub bridge_type: String,
     pub appservice_id: String,
+    /// The owner's Matrix ID; `None` for a shared instance. The `Bridge` carries it so that the
+    /// operator labels every object with `myelin.dev/owner`.
+    pub owner: Option<String>,
     pub image_repository: String,
     pub image_tag: String,
     pub port: u16,
@@ -81,6 +84,9 @@ pub fn manifest_yaml(spec: &DeploySpec, namespace: &str) -> String {
     out.push_str("spec:\n");
     let _ = writeln!(out, "  bridgeType: {}", spec.bridge_type);
     let _ = writeln!(out, "  appserviceId: {}", spec.appservice_id);
+    if let Some(owner) = &spec.owner {
+        let _ = writeln!(out, "  owner: {}", yaml_str(owner));
+    }
     let _ = writeln!(
         out,
         "  image:\n    repository: {}\n    tag: {}",
@@ -116,6 +122,7 @@ mod tests {
             labels: BTreeMap::from([("myelin.dev/appservice-id".into(), "whatsapp-alice".into())]),
             bridge_type: "mautrix-whatsapp".into(),
             appservice_id: "whatsapp-alice".into(),
+            owner: Some("@alice:example.org".into()),
             image_repository: "dock.mau.dev/mautrix/whatsapp".into(),
             image_tag: "latest".into(),
             port: 29318,
@@ -140,5 +147,13 @@ mod tests {
         assert_eq!(docs[1]["spec"]["filesSecret"], docs[0]["metadata"]["name"]);
         assert_eq!(docs[1]["spec"]["args"][1], "@a:x");
         assert_eq!(docs[1]["spec"]["port"], 29318);
+        assert_eq!(docs[1]["spec"]["owner"], "@alice:example.org");
+
+        let shared = DeploySpec {
+            owner: None,
+            ..spec
+        };
+        let yaml = manifest_yaml(&shared, "myelin");
+        assert!(!yaml.contains("owner:"), "{yaml}");
     }
 }
