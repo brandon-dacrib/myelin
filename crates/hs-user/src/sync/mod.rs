@@ -810,6 +810,11 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
             .filter(|e| e.feed_seq <= new_feed_seq)
             .map(|e| e.room_id)
             .collect();
+        // A token older than the feed's retention (`crate::store::tables`, "Retention: the
+        // floor") still finds every room that changed after it here: a room's newest entry at
+        // or below the floor is kept, and is at or after any entry of the room that was
+        // deleted. What such a token may have lost is the room's position as of itself, and
+        // `resume_mode` then sends the room whole.
         for m in store.list_memberships(user_id).await? {
             if m.hot_room && matches!(m.membership.as_str(), "join" | "invite" | "knock") {
                 set.insert(m.room_id);
@@ -5306,5 +5311,83 @@ mod tests {
                 .is_none_or(|events| events.iter().all(|e| e["sender"] != bob.as_str())),
             "nor is a presence it already had: {again}"
         );
+    }
+
+    /// A token older than the feed's retention still learns of every room that changed after
+    /// it: a room's newest entry below the floor is kept, and it is after any that went. Where
+    /// the room's position as of the token went with them, the room is sent whole.
+    #[tokio::test]
+    async fn a_token_older_than_the_feed_retention_still_sees_every_changed_room() {
+        let hub = hub();
+        hub.set_retention(1, 0);
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let handle_a = hub
+            .rooms()
+            .create_room(alice.clone(), CreateRoomRequest::default(), 1)
+            .await
+            .unwrap();
+        hub.watch_room(handle_a.clone()).await;
+        let handle_b = hub
+            .rooms()
+            .create_room(alice.clone(), CreateRoomRequest::default(), 2)
+            .await
+            .unwrap();
+        hub.watch_room(handle_b.clone()).await;
+        let room_a = handle_a.query(|a| a.room_id().to_owned()).await;
+        let room_b = handle_b.query(|a| a.room_id().to_owned()).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let (_, t0) = build(&hub, &e2e, &alice, device_params(None, "D"))
+            .await
+            .unwrap();
+
+        // Two messages in B, then four in A, a sync after each so that every entry is pinned
+        // and the feed grows past twice the retention of one: compacted twice on the way.
+        let mut token = t0;
+        for (handle, body, ts) in [
+            (&handle_b, "b1", 3),
+            (&handle_b, "b2", 4),
+            (&handle_a, "a1", 5),
+            (&handle_a, "a2", 6),
+            (&handle_a, "a3", 7),
+            (&handle_a, "a4", 8),
+        ] {
+            say(handle, &alice, body, ts).await;
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let (_, next) = build(&hub, &e2e, &alice, device_params(Some(token), "D"))
+                .await
+                .unwrap();
+            token = next;
+        }
+        let floor = hub.store().feed_floor(&alice).await.unwrap();
+        assert!(
+            floor > t0.feed_seq,
+            "compacted past the first token: {floor}"
+        );
+        assert_eq!(
+            hub.store()
+                .room_pos_as_of(&alice, &room_b, t0.feed_seq)
+                .await
+                .unwrap(),
+            None,
+            "B's position as of the first token is gone"
+        );
+
+        let (response, _) = build(&hub, &e2e, &alice, device_params(Some(t0), "D"))
+            .await
+            .unwrap();
+        let bodies = |room: &ruma::RoomId| -> Vec<String> {
+            response["rooms"]["join"][room.as_str()]["timeline"]["events"]
+                .as_array()
+                .map(|events| {
+                    events
+                        .iter()
+                        .filter_map(|e| e["content"]["body"].as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(bodies(&room_b), vec!["b1", "b2"], "B, sent whole");
+        assert_eq!(bodies(&room_a), vec!["a1", "a2", "a3", "a4"], "and A");
     }
 }

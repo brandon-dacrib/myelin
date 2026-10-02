@@ -56,6 +56,38 @@ pub struct MembershipRecord {
     pub hot_room: bool,
 }
 
+/// One member's part of a room update's fan-out ([`UserStore::apply_fan_out`]): what
+/// `crate::hub::SessionHub` decided to write for them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FanOutWrite {
+    /// The member.
+    pub user_id: ruma::OwnedUserId,
+    /// The membership record to write, as `(membership, baseline room_pos)`
+    /// ([`UserStore::set_membership`]'s arguments), or `None` to leave the record as it is.
+    pub record: Option<(String, i64)>,
+    /// The record's `hot_room` flag ([`MembershipRecord::hot_room`]); only read with `record`.
+    pub hot_room: bool,
+    /// Whether to append a feed entry at the update's position
+    /// ([`UserStore::append_feed_entry`]).
+    pub feed_entry: bool,
+}
+
+/// What [`UserStore::apply_fan_out`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FanOutReport {
+    /// Membership records written.
+    pub records: usize,
+    /// Feed entries appended or coalesced.
+    pub feed_entries: usize,
+    /// Store transactions it took.
+    pub transactions: usize,
+    /// Members written one at a time after their batch's transaction kept conflicting.
+    pub fallbacks: usize,
+    /// Users whose feed has outgrown its retention and should be compacted
+    /// ([`UserStore::compact_feed`]).
+    pub feeds_to_compact: Vec<ruma::OwnedUserId>,
+}
+
 /// One piece of account data (global or room-scoped), with the counter value it was last written
 /// at -- see `crate::store::tables`'s module docs for how this drives "what account data changed
 /// since token T".
@@ -385,6 +417,111 @@ pub trait UserStore: Send + Sync {
         &self,
         user_id: &ruma::UserId,
     ) -> Result<Vec<MembershipRecord>, StoreError>;
+
+    /// [`UserStore::get_membership`] for every user in `user_ids` at once, in the same order:
+    /// one read of the store rather than one per user, which is what a room update's fan-out
+    /// (`crate::hub::SessionHub`) asks for each of a room's members. The default is the
+    /// one-at-a-time loop; `tables::TablesUserStore` makes it one multi-get.
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] on a storage failure.
+    async fn get_memberships(
+        &self,
+        room_id: &ruma::RoomId,
+        user_ids: &[ruma::OwnedUserId],
+    ) -> Result<Vec<Option<MembershipRecord>>, StoreError> {
+        let mut out = Vec::with_capacity(user_ids.len());
+        for user_id in user_ids {
+            out.push(self.get_membership(user_id, room_id).await?);
+        }
+        Ok(out)
+    }
+
+    /// Writes one room update's fan-out -- each member's new membership record, if any, and a
+    /// feed entry at `room_pos` for those that get one -- in as few transactions as the store
+    /// can manage, rather than one or two per member. The membership records are
+    /// [`UserStore::set_membership`]'s and the feed entries [`UserStore::append_feed_entry`]'s,
+    /// with the same coalescing rule; only the number of round trips differs. The default is
+    /// the one-at-a-time loop, which is also what `tables::TablesUserStore` falls back to for a
+    /// batch whose transaction keeps conflicting.
+    ///
+    /// `feed_retention` is the number of feed entries a user keeps
+    /// (`crate::hub::SessionHub::feed_retention`): a user whose feed has grown to twice that
+    /// since it was last compacted is named in [`FanOutReport::feeds_to_compact`], for the
+    /// caller to [`UserStore::compact_feed`]. `0` never names anyone.
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] on a storage failure.
+    async fn apply_fan_out(
+        &self,
+        room_id: &ruma::RoomId,
+        room_pos: i64,
+        writes: &[FanOutWrite],
+        feed_retention: u64,
+    ) -> Result<FanOutReport, StoreError> {
+        let _ = feed_retention;
+        let mut report = FanOutReport::default();
+        for write in writes {
+            if let Some((membership, baseline_pos)) = &write.record {
+                self.set_membership(
+                    &write.user_id,
+                    room_id,
+                    membership,
+                    *baseline_pos,
+                    write.hot_room,
+                )
+                .await?;
+                report.records += 1;
+            }
+            if write.feed_entry {
+                self.append_feed_entry(&write.user_id, room_id, room_pos)
+                    .await?;
+                report.feed_entries += 1;
+            }
+            report.transactions += usize::from(write.record.is_some() || write.feed_entry);
+        }
+        Ok(report)
+    }
+
+    /// Compacts `user_id`'s feed so that at most `keep` entries stay above its *floor*: every
+    /// entry at or below the new floor is deleted except the newest one per room, which stays
+    /// as the room's position as of the floor, and the floor is recorded
+    /// ([`UserStore::feed_floor`]). A token with a `feed_seq` below the floor still finds every
+    /// room that changed after it (the kept entry is at or after any deleted one), but may
+    /// have lost the room's position as of itself, in which case `crate::sync` sends the room
+    /// whole. Returns how many entries were deleted; `0` when the feed is within `keep` of its
+    /// floor already. A store with no feed retention does nothing.
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] on a storage failure.
+    async fn compact_feed(&self, user_id: &ruma::UserId, keep: u64) -> Result<usize, StoreError> {
+        let _ = (user_id, keep);
+        Ok(0)
+    }
+
+    /// `user_id`'s feed floor: the `feed_seq` at or below which [`UserStore::compact_feed`]
+    /// has compacted the feed to one entry per room. A token's `feed_seq` below it is older
+    /// than the feed remembers. `0` for a feed never compacted.
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] on a storage failure.
+    async fn feed_floor(&self, user_id: &ruma::UserId) -> Result<u64, StoreError> {
+        let _ = user_id;
+        Ok(0)
+    }
+
+    /// Compacts the server-wide hot-room stream ([`UserStore::append_hot_position`]) so that
+    /// at most `keep` entries stay above its floor, the same way [`UserStore::compact_feed`]
+    /// does a feed: below the floor, one entry per room (its position as of the floor) stays.
+    /// A token's `hot_seq` below the floor resumes a hot room from that kept position, or whole
+    /// if the room's kept entry is newer than the token. Returns how many entries were deleted.
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] on a storage failure.
+    async fn compact_hot_stream(&self, keep: u64) -> Result<usize, StoreError> {
+        let _ = keep;
+        Ok(0)
+    }
 
     /// Sets one piece of global (not room-scoped) account data, bumping this user's account-data
     /// counter and stamping the write with the new value.

@@ -1453,6 +1453,18 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         }
     }
     let (user_state, e2e_state, push_state) = build_session_mounts(&backend, &auth_state, &rooms)?;
+    // `server.sync`: how much of the feeds and the hot-room stream the hub keeps, read on every
+    // room update, so a change is in force at once (below, with the other `server` settings).
+    let sync_hub = user_state.hub.clone();
+    sync_hub.set_retention(
+        config.server.sync.feed_retention_entries,
+        config.server.sync.hot_room_stream_retention_entries,
+    );
+    tracing::info!(
+        feed_retention_entries = config.server.sync.feed_retention_entries,
+        hot_room_stream_retention_entries = config.server.sync.hot_room_stream_retention_entries,
+        "sync feed retention in effect (0 keeps everything)"
+    );
     components.watch("room registry", &rooms);
     components.watch("session hub", &user_state.hub);
     components.watch("e2e store", &user_state.e2e);
@@ -2162,6 +2174,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         let recovery = recovery.clone();
         let addrs = addrs.clone();
         let capabilities_config = options.capabilities_config.clone();
+        let hub = sync_hub.clone();
         live.on_change("server", move |config| {
             let features = versions::load_unstable_features(
                 &config.server.unstable_features,
@@ -2169,6 +2182,10 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             )
             .map_err(|e| e.to_string())?;
             unstable_features.set(features);
+            hub.set_retention(
+                config.server.sync.feed_retention_entries,
+                config.server.sync.hot_room_stream_retention_entries,
+            );
             well_known.set(crate::well_known::WellKnown::from_config(config));
             let public = config.server.public_baseurl.as_deref();
             recovery.set_link_base(link_base(public, &addrs));

@@ -134,6 +134,10 @@ pub const SETTINGS: &[Setting] = &[
         "/server/unstable_features",
         "GET /versions reads it per request",
     ),
+    hot(
+        "/server/sync",
+        "the session hub reads it on every room update",
+    ),
     // listeners, storage
     bootstrap("/listeners", "sockets this process binds at startup"),
     bootstrap("/storage", "where the database is, read before it is open"),

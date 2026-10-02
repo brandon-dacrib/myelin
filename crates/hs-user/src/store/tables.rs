@@ -11,6 +11,8 @@
 //! | `hs_user.feed` | `(user_id, feed_seq)` | the durable, coalesced feed -- `crate::token`'s `feed_seq` indexes here |
 //! | `hs_user.feed_by_room` | `(user_id, room_id)` | pointer to the current pending feed entry for that room, if any (coalescing target) |
 //! | `hs_user.device_cursors` | `(user_id, device_id)` | the `feed_seq` most recently handed to each device as a `next_batch` -- the coalescing safety bound |
+//! | `hs_user.device_cursor_max` | `(user_id,)` | the maximum over `hs_user.device_cursors` for the user, kept by [`UserStore::record_device_cursor`] so a fan-out reads it with one multi-get rather than a range per member (absent for a user who has not synced since it was added: computed from the range then) |
+//! | `hs_user.feed_heads` | `(user_id,)` | the feed's newest `feed_seq` and its *floor* (the retention section below), kept by every append; absent for a user whose feed was last written before it was added (the newest is then the reverse range it always was) |
 //! | `hs_user.memberships` | `(user_id, room_id)` | current (not historical) membership snapshot -- the room set for an initial sync |
 //! | `hs_user.account_data_global` | `(user_id, event_type)` | global account data |
 //! | `hs_user.account_data_room` | `(user_id, room_id, event_type)` | room-scoped account data (`m.tag` and friends) |
@@ -22,7 +24,7 @@
 //! | `hs_user.presence_stream` | `(pos: u64,)` | the server-wide presence stream: one entry per presence change (a new stamp), for appservice delivery |
 //! | `hs_user.hot_positions` | `(room_id, hot_seq)` | the server-wide hot-room stream: one entry per update to a room above the fan-out threshold, its `room_pos` -- `crate::token`'s `hot_seq` indexes here |
 //! | `hs_user.room_members` | `(room_id, user_id)` | each indexed room's joined members, for the user directory; the row with an empty `user_id` is the marker that says the room is indexed (`UserStore::index_room_members_if_absent`) |
-//! | `hs_user.ephemeral_counters` | `receipt_stream` / `presence_stream` / `hot_positions` (raw `atomic_add` keys) | the three streams' position counters |
+//! | `hs_user.ephemeral_counters` | `receipt_stream` / `presence_stream` / `hot_positions` (raw `atomic_add` keys) | the three streams' position counters; `hot_positions_floor` (a plain 8-byte key) is the hot-room stream's floor |
 //!
 //! # The coalescing invariant, precisely
 //!
@@ -54,18 +56,45 @@
 //! A room with no device having synced yet (`max_device_cursor == 0`) coalesces aggressively,
 //! which is correct: nobody has been told anything about the feed yet, so nothing needs
 //! preserving.
+//!
+//! # Retention: the floor
+//!
+//! Coalescing bounds how fast a feed grows between two syncs, not how long it is kept: every
+//! entry a device was ever handed a token at or past stayed for ever. [`UserStore::compact_feed`]
+//! is the retention. It moves the user's *floor* (`hs_user.feed_heads`) up so that at most
+//! `keep` entries lie above it, and below the floor keeps exactly one entry per room, the newest,
+//! deleting the rest. Three properties make that safe for every token:
+//!
+//! - **A kept entry is never rewritten.** [`TablesUserStore::append_feed_entry`] coalesces only
+//!   into an entry above the floor (as well as above the maximum device cursor), so a kept
+//!   entry's `room_pos` stays what it was when it was written.
+//! - **A token at or above the floor sees exactly what it did.** Entries above the floor are
+//!   untouched, and a room's position as of a token (`room_pos_as_of`) is its newest entry at or
+//!   below the token: that entry is either above the floor or the one kept per room, which is
+//!   the newest at or below the floor.
+//! - **A token below the floor can only repeat, never skip.** [`UserStore::feed_since`] from
+//!   such a token still names every room that changed after it: a room with a deleted entry
+//!   after the token has its newest entry at or below the floor kept, and that one is at or
+//!   after the deleted one, so after the token too. What may be gone is the room's position as
+//!   of the token (its entries at or below the token): `room_pos_as_of` then answers a kept
+//!   entry no newer than the token, or nothing, and `crate::sync` resumes from there or sends
+//!   the room whole.
+//!
+//! The hot-room stream is compacted the same way ([`UserStore::compact_hot_stream`], the floor in
+//! `hs_user.ephemeral_counters`): its entries are never rewritten at all, and a hot room is a
+//! candidate on every incremental sync, so the same holds there.
 
 use bytes::Bytes;
 use hs_kv::{KvBackend, KvRead, KvWrite, RangeSpec, TransactConfig, transact};
 use hs_tables::keyspace::TypedKeyspace;
 use rand::Rng;
 use rand::distr::Alphanumeric;
-use ruma::{DeviceId, RoomId, UserId};
+use ruma::{DeviceId, OwnedUserId, RoomId, UserId};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    AccountDataRecord, FeedEntry, MembershipRecord, PresenceStreamEntry, PublicRoomEntry,
-    ReceiptStreamEntry, StoreError, StoredPresence, StoredReceipt, UserStore,
+    AccountDataRecord, FanOutReport, FanOutWrite, FeedEntry, MembershipRecord, PresenceStreamEntry,
+    PublicRoomEntry, ReceiptStreamEntry, StoreError, StoredPresence, StoredReceipt, UserStore,
 };
 
 fn to_kv<E: std::error::Error + Send + Sync + 'static>(e: E) -> hs_kv::KvError {
@@ -84,6 +113,33 @@ struct FeedValue {
     room_id: String,
     room_pos: i64,
 }
+
+/// A user's `hs_user.feed_heads` row: where the feed ends and where its compacted part does.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct FeedHead {
+    /// The newest `feed_seq` in the feed, `0` for an empty one.
+    latest: u64,
+    /// The `feed_seq` at or below which the feed is compacted to one entry per room.
+    #[serde(default)]
+    floor: u64,
+}
+
+/// What [`TablesUserStore::append_feed_entry_txn`]'s coalescing decision reads: the room's
+/// current feed entry (the `feed_by_room` pointer) and the user's maximum device cursor.
+#[derive(Debug, Clone, Copy)]
+struct CoalesceBound {
+    existing_seq: Option<u64>,
+    max_cursor: u64,
+}
+
+/// How many members one fan-out transaction writes at most (`UserStore::apply_fan_out`). A
+/// transaction's conflict window grows with its size; a batch that keeps conflicting is retried
+/// member by member, so a bound keeps that fallback small too.
+const FAN_OUT_BATCH: usize = 100;
+
+/// How many feed or stream rows one compaction transaction scans at most: a feed that grew for
+/// months before retention existed is compacted in pieces, not in one transaction.
+const COMPACTION_SCAN_LIMIT: usize = 50_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AccountDataValue {
@@ -112,7 +168,9 @@ pub struct TablesUserStore<B: KvBackend> {
     backend: B,
     feed: TypedKeyspace<B::Keyspace, (String, u64)>,
     feed_by_room: TypedKeyspace<B::Keyspace, (String, String)>,
+    feed_heads: TypedKeyspace<B::Keyspace, (String,)>,
     device_cursors: TypedKeyspace<B::Keyspace, (String, String)>,
+    device_cursor_max: TypedKeyspace<B::Keyspace, (String,)>,
     memberships: TypedKeyspace<B::Keyspace, (String, String)>,
     account_data_global: TypedKeyspace<B::Keyspace, (String, String)>,
     account_data_room: TypedKeyspace<B::Keyspace, (String, String, String)>,
@@ -134,6 +192,10 @@ const INDEXED_MARKER: &str = "";
 
 /// The `hs_user.ephemeral_counters` key of the hot-room stream's position counter.
 const HOT_POSITIONS_COUNTER: &[u8] = b"hot_positions";
+
+/// The `hs_user.ephemeral_counters` key of the hot-room stream's floor
+/// (`UserStore::compact_hot_stream`): a plain 8-byte big-endian value, not an `atomic_add` key.
+const HOT_POSITIONS_FLOOR: &[u8] = b"hot_positions_floor";
 
 /// A `hs_user.receipt_stream` row.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,7 +234,9 @@ impl<B: KvBackend> TablesUserStore<B> {
         Ok(Self {
             feed: TypedKeyspace::new(open("hs_user.feed")?),
             feed_by_room: TypedKeyspace::new(open("hs_user.feed_by_room")?),
+            feed_heads: TypedKeyspace::new(open("hs_user.feed_heads")?),
             device_cursors: TypedKeyspace::new(open("hs_user.device_cursors")?),
+            device_cursor_max: TypedKeyspace::new(open("hs_user.device_cursor_max")?),
             memberships: TypedKeyspace::new(open("hs_user.memberships")?),
             account_data_global: TypedKeyspace::new(open("hs_user.account_data_global")?),
             account_data_room: TypedKeyspace::new(open("hs_user.account_data_room")?),
@@ -197,26 +261,64 @@ impl<B: KvBackend> TablesUserStore<B> {
         &self.backend
     }
 
-    fn latest_feed_seq_txn<R: hs_kv::KvRead<Keyspace = B::Keyspace>>(
+    /// The newest `feed_seq` of `uid`'s feed as its `hs_user.feed_heads` row says, or, for a feed
+    /// last written before that row existed, as the feed's last row says (one reverse range).
+    fn feed_head_txn<R: hs_kv::KvRead<Keyspace = B::Keyspace>>(
         &self,
         txn: &R,
         uid: &str,
-    ) -> Result<u64, StoreError> {
+    ) -> Result<FeedHead, StoreError> {
+        match self
+            .feed_heads
+            .get(txn, &(uid.to_owned(),))
+            .map_err(StoreError::Table)?
+        {
+            Some(bytes) => json_decode(&bytes),
+            None => self.feed_head_from_rows_txn(txn, uid),
+        }
+    }
+
+    /// [`TablesUserStore::feed_head_txn`]'s fallback: the feed's last row, floor `0`.
+    fn feed_head_from_rows_txn<R: hs_kv::KvRead<Keyspace = B::Keyspace>>(
+        &self,
+        txn: &R,
+        uid: &str,
+    ) -> Result<FeedHead, StoreError> {
         let mut spec = TypedKeyspace::<B::Keyspace, (String, u64)>::prefix(&(uid.to_owned(),));
         spec.reverse = true;
         spec.limit = Some(1);
         // The spec above is reversed and limited to one row, so this is "the highest sequence
         // this user's feed has", or 0 for a user with no feed rows at all.
-        match self.feed.range(txn, spec).next() {
+        let latest = match self.feed.range(txn, spec).next() {
             Some(item) => {
                 let ((_, seq), _) = item.map_err(StoreError::Table)?;
-                Ok(seq)
+                seq
             }
-            None => Ok(0),
+            None => 0,
+        };
+        Ok(FeedHead { latest, floor: 0 })
+    }
+
+    /// The maximum device cursor of `uid` as its `hs_user.device_cursor_max` row says, or, for a
+    /// user who has not synced since that row existed, as the cursors themselves say (one
+    /// range).
+    fn max_device_cursor_txn<R: hs_kv::KvRead<Keyspace = B::Keyspace>>(
+        &self,
+        txn: &R,
+        uid: &str,
+    ) -> Result<u64, StoreError> {
+        match self
+            .device_cursor_max
+            .get(txn, &(uid.to_owned(),))
+            .map_err(StoreError::Table)?
+        {
+            Some(bytes) => decode_u64(&bytes),
+            None => self.max_device_cursor_from_rows_txn(txn, uid),
         }
     }
 
-    fn max_device_cursor_txn<R: hs_kv::KvRead<Keyspace = B::Keyspace>>(
+    /// [`TablesUserStore::max_device_cursor_txn`]'s fallback: the maximum over the cursors.
+    fn max_device_cursor_from_rows_txn<R: hs_kv::KvRead<Keyspace = B::Keyspace>>(
         &self,
         txn: &R,
         uid: &str,
@@ -228,6 +330,165 @@ impl<B: KvBackend> TablesUserStore<B> {
             max = max.max(decode_u64(&value)?);
         }
         Ok(max)
+    }
+
+    /// The one feed append, shared by [`UserStore::append_feed_entry`] (one user) and
+    /// [`UserStore::apply_fan_out`] (a batch): the coalescing rule of the module docs, over a
+    /// head and pointer the caller has already read. Writes the feed row, the `feed_by_room`
+    /// pointer when a row is added, and the head; `head` is updated in place for the next
+    /// append in the same transaction. Returns the `feed_seq` the write landed at.
+    fn append_feed_entry_txn<T: KvRead<Keyspace = B::Keyspace> + KvWrite>(
+        &self,
+        txn: &mut T,
+        uid: &str,
+        rid: &str,
+        room_pos: i64,
+        bound: CoalesceBound,
+        head: &mut FeedHead,
+    ) -> Result<u64, StoreError> {
+        let value = json_encode(&FeedValue {
+            room_id: rid.to_owned(),
+            room_pos,
+        })?;
+        if let Some(seq) = bound.existing_seq
+            && seq > bound.max_cursor
+            && seq > head.floor
+        {
+            // Coalesce: overwrite the still-unconsumed entry in place. No new row, no
+            // `feed_by_room` update needed (the pointer is unchanged). An entry at or below the
+            // floor is one `compact_feed` kept as the room's position as of the floor, and it
+            // stays what it was (the module docs, "Retention").
+            self.feed
+                .put(txn, &(uid.to_owned(), seq), &value)
+                .map_err(StoreError::Table)?;
+            return Ok(seq);
+        }
+        let new_seq = head.latest + 1;
+        self.feed
+            .put(txn, &(uid.to_owned(), new_seq), &value)
+            .map_err(StoreError::Table)?;
+        self.feed_by_room
+            .put(
+                txn,
+                &(uid.to_owned(), rid.to_owned()),
+                &new_seq.to_be_bytes(),
+            )
+            .map_err(StoreError::Table)?;
+        head.latest = new_seq;
+        self.feed_heads
+            .put(txn, &(uid.to_owned(),), &json_encode(head)?)
+            .map_err(StoreError::Table)?;
+        Ok(new_seq)
+    }
+
+    /// One batch of [`UserStore::apply_fan_out`] in one transaction: the memberships, feed
+    /// pointers, heads and cursor maxima of the batch's users are read with one multi-get each,
+    /// then every write is buffered and committed together.
+    fn fan_out_batch_txn(
+        &self,
+        rid: &str,
+        room_pos: i64,
+        writes: &[FanOutWrite],
+        feed_retention: u64,
+        report: &mut FanOutReport,
+    ) -> Result<(), hs_kv::KvError> {
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            let feed_users: Vec<String> = writes
+                .iter()
+                .filter(|w| w.feed_entry)
+                .map(|w| w.user_id.to_string())
+                .collect();
+            let pointer_keys: Vec<(String, String)> = feed_users
+                .iter()
+                .map(|uid| (uid.clone(), rid.to_owned()))
+                .collect();
+            let user_keys: Vec<(String,)> = feed_users.iter().map(|uid| (uid.clone(),)).collect();
+            let pointers = self
+                .feed_by_room
+                .multi_get(txn, &pointer_keys)
+                .map_err(to_kv)?;
+            let heads = self.feed_heads.multi_get(txn, &user_keys).map_err(to_kv)?;
+            let maxima = self
+                .device_cursor_max
+                .multi_get(txn, &user_keys)
+                .map_err(to_kv)?;
+
+            let mut records = 0usize;
+            let mut entries = 0usize;
+            let mut to_compact = Vec::new();
+            let mut feed_index = 0usize;
+            for write in writes {
+                let uid = write.user_id.to_string();
+                if let Some((membership, baseline_pos)) = &write.record {
+                    let value = json_encode(&MembershipRecord {
+                        room_id: ruma::RoomId::parse(rid)
+                            .map_err(|e| to_kv(StoreError::Codec(e.to_string())))?
+                            .to_owned(),
+                        membership: membership.clone(),
+                        room_pos: *baseline_pos,
+                        hot_room: write.hot_room,
+                    })
+                    .map_err(to_kv)?;
+                    self.memberships
+                        .put(txn, &(uid.clone(), rid.to_owned()), &value)
+                        .map_err(to_kv)?;
+                    records += 1;
+                }
+                if !write.feed_entry {
+                    continue;
+                }
+                let i = feed_index;
+                feed_index += 1;
+                let existing_seq = pointers[i]
+                    .as_ref()
+                    .map(|b| decode_u64(b))
+                    .transpose()
+                    .map_err(to_kv)?;
+                let mut head = match &heads[i] {
+                    Some(bytes) => json_decode(bytes).map_err(to_kv)?,
+                    None => self.feed_head_from_rows_txn(txn, &uid).map_err(to_kv)?,
+                };
+                let max_cursor = match &maxima[i] {
+                    Some(bytes) => decode_u64(bytes).map_err(to_kv)?,
+                    None => {
+                        // A user who has not synced since the maximum was kept: computed from
+                        // the cursors once, and written so the next fan-out has it to multi-get.
+                        let max = self
+                            .max_device_cursor_from_rows_txn(txn, &uid)
+                            .map_err(to_kv)?;
+                        self.device_cursor_max
+                            .put(txn, &(uid.clone(),), &max.to_be_bytes())
+                            .map_err(to_kv)?;
+                        max
+                    }
+                };
+                self.append_feed_entry_txn(
+                    txn,
+                    &uid,
+                    rid,
+                    room_pos,
+                    CoalesceBound {
+                        existing_seq,
+                        max_cursor,
+                    },
+                    &mut head,
+                )
+                .map_err(to_kv)?;
+                entries += 1;
+                if feed_retention > 0
+                    && head.latest.saturating_sub(head.floor) > feed_retention.saturating_mul(2)
+                {
+                    to_compact.push(write.user_id.clone());
+                }
+            }
+            Ok((records, entries, to_compact))
+        })
+        .map(|(records, entries, to_compact)| {
+            report.records += records;
+            report.feed_entries += entries;
+            report.transactions += 1;
+            report.feeds_to_compact.extend(to_compact);
+        })
     }
 }
 
@@ -250,33 +511,19 @@ impl<B: KvBackend> UserStore for TablesUserStore<B> {
                 .map(|b| decode_u64(&b))
                 .transpose()
                 .map_err(to_kv)?;
-
-            let value = json_encode(&FeedValue {
-                room_id: rid.clone(),
+            let mut head = self.feed_head_txn(txn, &uid).map_err(to_kv)?;
+            self.append_feed_entry_txn(
+                txn,
+                &uid,
+                &rid,
                 room_pos,
-            })
-            .map_err(to_kv)?;
-
-            if let Some(seq) = existing_seq
-                && seq > max_cursor
-            {
-                // Coalesce: overwrite the still-unconsumed entry in place. No new row, no
-                // `feed_by_room` update needed (the pointer is unchanged).
-                self.feed
-                    .put(txn, &(uid.clone(), seq), &value)
-                    .map_err(to_kv)?;
-                return Ok(seq);
-            }
-
-            let latest = self.latest_feed_seq_txn(txn, &uid).map_err(to_kv)?;
-            let new_seq = latest + 1;
-            self.feed
-                .put(txn, &(uid.clone(), new_seq), &value)
-                .map_err(to_kv)?;
-            self.feed_by_room
-                .put(txn, &(uid.clone(), rid.clone()), &new_seq.to_be_bytes())
-                .map_err(to_kv)?;
-            Ok(new_seq)
+                CoalesceBound {
+                    existing_seq,
+                    max_cursor,
+                },
+                &mut head,
+            )
+            .map_err(to_kv)
         })
         .map_err(StoreError::Kv)
     }
@@ -311,7 +558,7 @@ impl<B: KvBackend> UserStore for TablesUserStore<B> {
 
     async fn latest_feed_seq(&self, user_id: &UserId) -> Result<u64, StoreError> {
         let snap = self.backend.snapshot();
-        self.latest_feed_seq_txn(&snap, user_id.as_ref())
+        Ok(self.feed_head_txn(&snap, user_id.as_ref())?.latest)
     }
 
     async fn room_pos_as_of(
@@ -398,7 +645,27 @@ impl<B: KvBackend> UserStore for TablesUserStore<B> {
             let next = current.max(feed_seq);
             self.device_cursors
                 .put(txn, &key, &next.to_be_bytes())
-                .map_err(to_kv)
+                .map_err(to_kv)?;
+            // The maximum over the user's devices, kept beside the cursors so a fan-out reads
+            // it with one multi-get (`fan_out_batch_txn`) rather than a range per member.
+            // Written only when it moves (or has never been written): every write here is a
+            // conflict for a fan-out that read it in the meantime.
+            let row = self
+                .device_cursor_max
+                .get(txn, &(key.0.clone(),))
+                .map_err(to_kv)?;
+            let max = match &row {
+                Some(bytes) => decode_u64(bytes).map_err(to_kv)?,
+                None => self
+                    .max_device_cursor_from_rows_txn(txn, &key.0)
+                    .map_err(to_kv)?,
+            };
+            if row.is_none() || next > max {
+                self.device_cursor_max
+                    .put(txn, &(key.0.clone(),), &next.max(max).to_be_bytes())
+                    .map_err(to_kv)?;
+            }
+            Ok(())
         })
         .map_err(StoreError::Kv)
     }
@@ -634,6 +901,206 @@ impl<B: KvBackend> UserStore for TablesUserStore<B> {
             out.push(json_decode(&value)?);
         }
         Ok(out)
+    }
+
+    async fn get_memberships(
+        &self,
+        room_id: &RoomId,
+        user_ids: &[OwnedUserId],
+    ) -> Result<Vec<Option<MembershipRecord>>, StoreError> {
+        let snap = self.backend.snapshot();
+        let keys: Vec<(String, String)> = user_ids
+            .iter()
+            .map(|user_id| (user_id.to_string(), room_id.to_string()))
+            .collect();
+        self.memberships
+            .multi_get(&snap, &keys)
+            .map_err(StoreError::Table)?
+            .into_iter()
+            .map(|bytes| bytes.map(|b| json_decode(&b)).transpose())
+            .collect()
+    }
+
+    async fn apply_fan_out(
+        &self,
+        room_id: &RoomId,
+        room_pos: i64,
+        writes: &[FanOutWrite],
+        feed_retention: u64,
+    ) -> Result<FanOutReport, StoreError> {
+        let rid = room_id.to_string();
+        let mut report = FanOutReport::default();
+        for batch in writes.chunks(FAN_OUT_BATCH) {
+            match self.fan_out_batch_txn(&rid, room_pos, batch, feed_retention, &mut report) {
+                Ok(()) => {}
+                Err(hs_kv::KvError::RetriesExhausted { .. }) => {
+                    // The batch's transaction kept conflicting (its members' syncs recording
+                    // their cursors while it ran, say). Each member on their own is a short
+                    // transaction with a small conflict window: what every fan-out used to be.
+                    tracing::warn!(
+                        room_id = %room_id,
+                        members = batch.len(),
+                        "a fan-out batch kept conflicting; writing its members one at a time"
+                    );
+                    for write in batch {
+                        if let Some((membership, baseline_pos)) = &write.record {
+                            self.set_membership(
+                                &write.user_id,
+                                room_id,
+                                membership,
+                                *baseline_pos,
+                                write.hot_room,
+                            )
+                            .await?;
+                            report.records += 1;
+                        }
+                        if write.feed_entry {
+                            self.append_feed_entry(&write.user_id, room_id, room_pos)
+                                .await?;
+                            report.feed_entries += 1;
+                        }
+                        report.transactions +=
+                            usize::from(write.record.is_some()) + usize::from(write.feed_entry);
+                        report.fallbacks += 1;
+                    }
+                }
+                Err(e) => return Err(StoreError::Kv(e)),
+            }
+        }
+        Ok(report)
+    }
+
+    async fn compact_feed(&self, user_id: &UserId, keep: u64) -> Result<usize, StoreError> {
+        if keep == 0 {
+            return Ok(0);
+        }
+        let uid = user_id.to_string();
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            let mut head = self.feed_head_txn(txn, &uid).map_err(to_kv)?;
+            let target = head.latest.saturating_sub(keep);
+            if target <= head.floor {
+                return Ok(0);
+            }
+            // Everything at or below the target, oldest first: the entries kept by earlier
+            // compactions (one per room) and everything since the old floor. Bounded: a feed
+            // that outgrew the bound is compacted up to where the scan stopped, and the next
+            // fan-out past twice the retention brings it here again.
+            let lower = Bytes::from(hs_tables::key::encode(&(uid.clone(), 0u64)));
+            let upper = Bytes::from(hs_tables::key::encode(&(uid.clone(), target)));
+            let spec = RangeSpec::new(
+                std::ops::Bound::Included(lower),
+                std::ops::Bound::Included(upper),
+            )
+            .limit(COMPACTION_SCAN_LIMIT);
+            let mut newest_per_room: std::collections::HashMap<String, u64> =
+                std::collections::HashMap::new();
+            let mut seen: Vec<(u64, String)> = Vec::new();
+            for item in self.feed.range(&*txn, spec) {
+                let ((_, seq), value) = item.map_err(to_kv)?;
+                let decoded: FeedValue = json_decode(&value).map_err(to_kv)?;
+                newest_per_room.insert(decoded.room_id.clone(), seq);
+                seen.push((seq, decoded.room_id));
+            }
+            let Some(&(last_seen, _)) = seen.last() else {
+                return Ok(0);
+            };
+            let new_floor = if seen.len() >= COMPACTION_SCAN_LIMIT {
+                last_seen
+            } else {
+                target
+            };
+            let mut pruned = 0usize;
+            for (seq, room) in &seen {
+                if newest_per_room.get(room) != Some(seq) {
+                    self.feed.delete(txn, &(uid.clone(), *seq)).map_err(to_kv)?;
+                    pruned += 1;
+                }
+            }
+            head.floor = new_floor;
+            self.feed_heads
+                .put(txn, &(uid.clone(),), &json_encode(&head).map_err(to_kv)?)
+                .map_err(to_kv)?;
+            Ok(pruned)
+        })
+        .map_err(StoreError::Kv)
+    }
+
+    async fn feed_floor(&self, user_id: &UserId) -> Result<u64, StoreError> {
+        let snap = self.backend.snapshot();
+        Ok(self.feed_head_txn(&snap, user_id.as_ref())?.floor)
+    }
+
+    async fn compact_hot_stream(&self, keep: u64) -> Result<usize, StoreError> {
+        if keep == 0 {
+            return Ok(0);
+        }
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            let head = read_counter(&*txn, &self.ephemeral_counters, HOT_POSITIONS_COUNTER)
+                .map_err(to_kv)?;
+            let floor = match txn
+                .get(&self.ephemeral_counters, HOT_POSITIONS_FLOOR)
+                .map_err(to_kv)?
+            {
+                Some(bytes) => decode_u64(&bytes).map_err(to_kv)?,
+                None => 0,
+            };
+            let target = head.saturating_sub(keep);
+            if target <= floor {
+                return Ok(0);
+            }
+            // The stream is keyed by room then position, so "everything at or below the
+            // target" is the whole keyspace read room by room, bounded by the scan limit. A
+            // room's rows are contiguous: within a complete room, every row at or below the
+            // target but its newest is deleted. A room cut off by the limit is left alone,
+            // and the floor moves only when the scan reached the end.
+            let spec = RangeSpec::full().limit(COMPACTION_SCAN_LIMIT);
+            let mut rows: Vec<(String, u64)> = Vec::new();
+            for item in self.hot_positions.range(&*txn, spec) {
+                let ((room, seq), _) = item.map_err(to_kv)?;
+                rows.push((room, seq));
+            }
+            let complete = rows.len() < COMPACTION_SCAN_LIMIT;
+            let cut_off_room = if complete {
+                None
+            } else {
+                rows.last().map(|(room, _)| room.clone())
+            };
+            let mut pruned = 0usize;
+            let mut i = 0;
+            while i < rows.len() {
+                let room = rows[i].0.clone();
+                let mut j = i;
+                while j < rows.len() && rows[j].0 == room {
+                    j += 1;
+                }
+                if cut_off_room.as_deref() != Some(room.as_str()) {
+                    let newest_below = rows[i..j]
+                        .iter()
+                        .filter(|(_, seq)| *seq <= target)
+                        .map(|(_, seq)| *seq)
+                        .max();
+                    for (_, seq) in &rows[i..j] {
+                        if *seq <= target && Some(*seq) != newest_below {
+                            self.hot_positions
+                                .delete(txn, &(room.clone(), *seq))
+                                .map_err(to_kv)?;
+                            pruned += 1;
+                        }
+                    }
+                }
+                i = j;
+            }
+            if complete {
+                txn.put(
+                    &self.ephemeral_counters,
+                    HOT_POSITIONS_FLOOR,
+                    &target.to_be_bytes(),
+                )
+                .map_err(to_kv)?;
+            }
+            Ok(pruned)
+        })
+        .map_err(StoreError::Kv)
     }
 
     async fn put_global_account_data(
@@ -1423,5 +1890,254 @@ mod tests {
                 Ok(())
             })?;
         }
+    }
+
+    /// The batched fan-out writes exactly what the one-at-a-time calls write -- the same
+    /// membership records, feed entries, pointers and heads, coalesced by the same rule -- for
+    /// a room of more members than one batch holds, in one transaction per batch.
+    #[tokio::test]
+    async fn a_batched_fan_out_writes_what_single_calls_would() {
+        let batched = store();
+        let single = store();
+        let room = room_id!("!a:example.org");
+        let other = room_id!("!b:example.org");
+        let did: &DeviceId = "DEV".into();
+        let users: Vec<OwnedUserId> = (0..250)
+            .map(|i| {
+                UserId::parse(format!("@u{i}:example.org"))
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        // The same history on both: an entry per room, every third user synced past them (so
+        // `room`'s entry is pinned for them and the next one is a new row), every other user
+        // with a record already.
+        for s in [&batched, &single] {
+            for (i, u) in users.iter().enumerate() {
+                s.append_feed_entry(u, room, 1).await.unwrap();
+                s.append_feed_entry(u, other, 1).await.unwrap();
+                if i % 3 == 0 {
+                    s.record_device_cursor(u, did, 2).await.unwrap();
+                }
+                if i % 2 == 0 {
+                    s.set_membership(u, room, "join", 1, false).await.unwrap();
+                }
+            }
+        }
+        let writes: Vec<FanOutWrite> = users
+            .iter()
+            .enumerate()
+            .map(|(i, u)| FanOutWrite {
+                user_id: u.clone(),
+                record: (i % 2 == 1).then(|| ("join".to_owned(), 5)),
+                hot_room: false,
+                feed_entry: true,
+            })
+            .collect();
+        let report = batched.apply_fan_out(room, 7, &writes, 0).await.unwrap();
+        assert_eq!(report.transactions, 3, "250 members in batches of 100");
+        assert_eq!(report.fallbacks, 0);
+        assert_eq!(report.feed_entries, 250);
+        assert_eq!(report.records, 125);
+        assert!(report.feeds_to_compact.is_empty(), "no retention asked for");
+        for write in &writes {
+            if let Some((membership, pos)) = &write.record {
+                single
+                    .set_membership(&write.user_id, room, membership, *pos, false)
+                    .await
+                    .unwrap();
+            }
+            single
+                .append_feed_entry(&write.user_id, room, 7)
+                .await
+                .unwrap();
+        }
+        for (i, u) in users.iter().enumerate() {
+            let (b, s) = (
+                batched.feed_since(u, 0).await.unwrap(),
+                single.feed_since(u, 0).await.unwrap(),
+            );
+            assert_eq!(b, s, "{u}'s feed");
+            if i % 3 == 0 {
+                assert_eq!(b.len(), 3, "{u}: a pinned entry gets a new row");
+            } else {
+                assert_eq!(b.len(), 2, "{u}: an unpinned entry is coalesced into");
+            }
+            assert_eq!(
+                batched.latest_feed_seq(u).await.unwrap(),
+                single.latest_feed_seq(u).await.unwrap()
+            );
+            assert_eq!(
+                batched.current_feed_entry(u, room).await.unwrap(),
+                single.current_feed_entry(u, room).await.unwrap()
+            );
+            assert_eq!(
+                batched.list_memberships(u).await.unwrap(),
+                single.list_memberships(u).await.unwrap()
+            );
+            assert_eq!(
+                batched.max_device_cursor(u).await.unwrap(),
+                single.max_device_cursor(u).await.unwrap()
+            );
+        }
+        // A second fan-out finds the cursor maxima it wrote for the users without one.
+        let report = batched.apply_fan_out(room, 8, &writes, 0).await.unwrap();
+        assert_eq!(report.feed_entries, 250);
+        assert_eq!(
+            batched.get_memberships(room, &users).await.unwrap().len(),
+            250
+        );
+        assert_eq!(
+            batched
+                .get_memberships(room, &users)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|m| m.is_some())
+                .count(),
+            250
+        );
+    }
+
+    /// Below the floor, compaction keeps each room's newest entry and deletes the rest;
+    /// everything above the floor stays; a kept entry is never coalesced into, however far
+    /// behind the devices are; and it is idempotent.
+    #[tokio::test]
+    async fn compaction_keeps_each_rooms_newest_entry_below_the_floor() {
+        let s = store();
+        let uid = user_id!("@alice:example.org");
+        let did: &DeviceId = "DEV1".into();
+        let (a, b, c) = (
+            room_id!("!a:example.org"),
+            room_id!("!b:example.org"),
+            room_id!("!c:example.org"),
+        );
+        assert_eq!(s.append_feed_entry(uid, a, 10).await.unwrap(), 1);
+        assert_eq!(s.append_feed_entry(uid, b, 20).await.unwrap(), 2);
+        s.record_device_cursor(uid, did, 2).await.unwrap();
+        assert_eq!(s.append_feed_entry(uid, a, 11).await.unwrap(), 3);
+        assert_eq!(s.append_feed_entry(uid, c, 30).await.unwrap(), 4);
+        assert_eq!(s.append_feed_entry(uid, b, 21).await.unwrap(), 5);
+        assert_eq!(
+            s.append_feed_entry(uid, a, 12).await.unwrap(),
+            3,
+            "coalesced"
+        );
+        assert_eq!(s.feed_floor(uid).await.unwrap(), 0);
+
+        // Keep one above the floor: the floor is 4. At or below it: a@1, b@2, a@3, c@4.
+        assert_eq!(s.compact_feed(uid, 1).await.unwrap(), 1, "a@1 goes");
+        assert_eq!(s.feed_floor(uid).await.unwrap(), 4);
+        let seqs: Vec<u64> = s
+            .feed_since(uid, 0)
+            .await
+            .unwrap()
+            .iter()
+            .map(|e| e.feed_seq)
+            .collect();
+        assert_eq!(seqs, vec![2, 3, 4, 5]);
+        assert_eq!(s.latest_feed_seq(uid).await.unwrap(), 5);
+        assert_eq!(s.room_pos_as_of(uid, a, 4).await.unwrap(), Some(12));
+        assert_eq!(s.room_pos_as_of(uid, a, 2).await.unwrap(), None, "gone");
+        assert_eq!(s.room_pos_as_of(uid, b, 2).await.unwrap(), Some(20));
+        assert_eq!(s.room_pos_at_token(uid, c, 5).await.unwrap(), Some(30));
+        assert_eq!(s.compact_feed(uid, 1).await.unwrap(), 0, "nothing more");
+        assert_eq!(s.compact_feed(uid, 0).await.unwrap(), 0, "no retention");
+
+        // c's entry @4 is above the device cursor (2) and would have been coalesced into; it
+        // is at the floor, so a new row is written and it stays what it was.
+        assert_eq!(s.append_feed_entry(uid, c, 31).await.unwrap(), 6);
+        assert_eq!(s.room_pos_as_of(uid, c, 4).await.unwrap(), Some(30));
+        // b's @5 is above the floor and the cursor: coalesced as ever.
+        assert_eq!(s.append_feed_entry(uid, b, 22).await.unwrap(), 5);
+
+        // The batched fan-out names a feed past twice its retention.
+        let writes = vec![FanOutWrite {
+            user_id: uid.to_owned(),
+            record: None,
+            hot_room: false,
+            feed_entry: true,
+        }];
+        s.record_device_cursor(uid, did, 6).await.unwrap();
+        let report = s.apply_fan_out(a, 13, &writes, 1).await.unwrap();
+        assert_eq!(report.feeds_to_compact, vec![uid.to_owned()], "7 - 4 > 2");
+        let report = s.apply_fan_out(a, 14, &writes, 10).await.unwrap();
+        assert!(report.feeds_to_compact.is_empty());
+    }
+
+    /// The hot-room stream is compacted the same way: per room, the newest entry at or below
+    /// the floor stays, so a quiet hot room still has a position as of any newer token.
+    #[tokio::test]
+    async fn the_hot_room_stream_keeps_each_rooms_newest_entry_below_its_floor() {
+        let s = store();
+        let (x, y) = (room_id!("!x:example.org"), room_id!("!y:example.org"));
+        assert_eq!(s.append_hot_position(x, 10).await.unwrap(), 1);
+        assert_eq!(s.append_hot_position(y, 20).await.unwrap(), 2);
+        assert_eq!(s.append_hot_position(x, 11).await.unwrap(), 3);
+        assert_eq!(s.append_hot_position(x, 12).await.unwrap(), 4);
+        assert_eq!(s.append_hot_position(y, 21).await.unwrap(), 5);
+        assert_eq!(s.append_hot_position(x, 13).await.unwrap(), 6);
+
+        // Keep two above the floor: the floor is 4. At or below it: x@1, y@2, x@3, x@4.
+        assert_eq!(s.compact_hot_stream(2).await.unwrap(), 2, "x@1 and x@3 go");
+        assert_eq!(s.hot_room_pos_as_of(x, 4).await.unwrap(), Some(12));
+        assert_eq!(s.hot_room_pos_as_of(x, 3).await.unwrap(), None, "gone");
+        assert_eq!(s.hot_room_pos_as_of(y, 3).await.unwrap(), Some(20));
+        assert_eq!(s.hot_room_pos_as_of(y, 6).await.unwrap(), Some(21));
+        assert_eq!(s.latest_hot_seq_of_room(x).await.unwrap(), Some(6));
+        assert_eq!(s.latest_hot_seq().await.unwrap(), 6);
+        assert_eq!(s.compact_hot_stream(2).await.unwrap(), 0, "nothing more");
+        assert_eq!(s.compact_hot_stream(0).await.unwrap(), 0, "no retention");
+        // The stream grows on; the next compaction moves the floor and keeps the new newest.
+        assert_eq!(s.append_hot_position(y, 22).await.unwrap(), 7);
+        assert_eq!(s.append_hot_position(y, 23).await.unwrap(), 8);
+        assert_eq!(s.compact_hot_stream(2).await.unwrap(), 2, "x@4 and y@2 go");
+        assert_eq!(s.hot_room_pos_as_of(x, 8).await.unwrap(), Some(13));
+        assert_eq!(s.hot_room_pos_as_of(y, 6).await.unwrap(), Some(21));
+    }
+
+    /// The feed head and the cursor maximum are kept beside the rows; a store written before
+    /// they existed has neither, and both are recovered from the rows.
+    #[tokio::test]
+    async fn the_feed_head_and_cursor_maximum_are_recovered_from_the_rows() {
+        let s = store();
+        let uid = user_id!("@alice:example.org");
+        let (a, b) = (room_id!("!a:example.org"), room_id!("!b:example.org"));
+        let (d1, d2): (&DeviceId, &DeviceId) = ("D1".into(), "D2".into());
+        s.append_feed_entry(uid, a, 1).await.unwrap();
+        s.append_feed_entry(uid, b, 1).await.unwrap();
+        s.record_device_cursor(uid, d1, 1).await.unwrap();
+        s.record_device_cursor(uid, d2, 2).await.unwrap();
+        s.record_device_cursor(uid, d1, 1).await.unwrap();
+        assert_eq!(s.max_device_cursor(uid).await.unwrap(), 2);
+
+        // As an upgraded store would be: the rows without their summaries.
+        let backend = s.backend().clone();
+        let heads = backend.keyspace("hs_user.feed_heads").unwrap();
+        let maxima = backend.keyspace("hs_user.device_cursor_max").unwrap();
+        transact(&backend, TransactConfig::default(), |txn| {
+            txn.delete(&heads, &hs_tables::key::encode(&(uid.to_string(),)))?;
+            txn.delete(&maxima, &hs_tables::key::encode(&(uid.to_string(),)))
+        })
+        .unwrap();
+        assert_eq!(s.latest_feed_seq(uid).await.unwrap(), 2);
+        assert_eq!(s.feed_floor(uid).await.unwrap(), 0);
+        assert_eq!(s.max_device_cursor(uid).await.unwrap(), 2);
+        // An append continues the sequence and rewrites the head; a cursor rewrites the
+        // maximum; both are read from the summaries again afterwards.
+        assert_eq!(s.append_feed_entry(uid, a, 2).await.unwrap(), 3);
+        s.record_device_cursor(uid, d1, 3).await.unwrap();
+        assert_eq!(s.max_device_cursor(uid).await.unwrap(), 3);
+        let snap = backend.snapshot();
+        assert!(
+            snap.get(&heads, &hs_tables::key::encode(&(uid.to_string(),)))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            snap.get(&maxima, &hs_tables::key::encode(&(uid.to_string(),)))
+                .unwrap()
+                .is_some()
+        );
     }
 }

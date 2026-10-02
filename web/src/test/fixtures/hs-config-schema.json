@@ -14,7 +14,11 @@
         "signing_key_path": "./signing-keys",
         "admin_contact": null,
         "report_stats": false,
-        "unstable_features": {}
+        "unstable_features": {},
+        "sync": {
+          "feed_retention_entries": 10000,
+          "hot_room_stream_retention_entries": 100000
+        }
       }
     },
     "listeners": {
@@ -338,12 +342,42 @@
           },
           "default": {},
           "x-applies": "hot"
+        },
+        "sync": {
+          "description": "How much of each user's sync history this server keeps: the per-user feed that tells\n`/sync` which rooms changed, and the server-wide stream that does the same for very\nlarge rooms. Older history is compacted to each room's last position. A client whose\nsync token is older than what is kept is sent its rooms again; it never misses\nanything.",
+          "$ref": "#/$defs/SyncConfig",
+          "default": {
+            "feed_retention_entries": 10000,
+            "hot_room_stream_retention_entries": 100000
+          },
+          "x-applies": "hot"
         }
       },
       "additionalProperties": false,
       "required": [
         "server_name"
       ]
+    },
+    "SyncConfig": {
+      "description": "Retention of the sync feeds (`server.sync`). Both settings take effect at once.",
+      "type": "object",
+      "properties": {
+        "feed_retention_entries": {
+          "description": "How many feed entries to keep per user. A feed entry records that a room changed; one\nis written per room per update for rooms up to the fan-out threshold, and the entries\na client has not yet synced are merged, so a client that keeps up adds at most one\nentry per room between two syncs. Below the kept entries, each room's last position\nstays, so a token older than this is answered with every room, and a room is resumed\nfrom where the client last saw it or sent whole. `0` keeps every entry for ever. The\nfeed is compacted once it has grown to twice this, so it holds between one and two\ntimes this many entries.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 10000
+        },
+        "hot_room_stream_retention_entries": {
+          "description": "How many entries to keep on the hot-room stream, which records one entry per update to\na room over the fan-out threshold (500 joined members) instead of one per member. A\ntoken older than what is kept resumes each such room from its last kept position, or\nsends it whole. `0` keeps every entry for ever. Compacted once it has grown to twice\nthis.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 100000
+        }
+      },
+      "additionalProperties": false
     },
     "ListenersConfig": {
       "description": "All configured listeners. Restart required to change (see\n[`crate::reload`]): sockets are bound once at startup.",

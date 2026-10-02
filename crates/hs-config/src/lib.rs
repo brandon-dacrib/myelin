@@ -70,7 +70,7 @@ pub use media::MediaConfig;
 pub use migration::MigrationConfig;
 pub use ratelimit::RateLimitConfig;
 pub use secret::SecretString;
-pub use server::ServerConfig;
+pub use server::{ServerConfig, SyncConfig};
 pub use size::{ByteSize, ByteSizeParseError};
 pub use storage::StorageConfig;
 pub use store::{ConfigMeta, ConfigStore, StoreError};

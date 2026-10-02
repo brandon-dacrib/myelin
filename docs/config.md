@@ -15,7 +15,7 @@ Decision 0010: this server is administered through the admin API and the web int
 Every setting is one of three kinds (decision 0016; `hs_config::reload::SETTINGS` is the table, and the schema the admin API serves carries it as `x-applies` on each setting):
 
 - **bootstrap** (7): set at install, per process, never stored in the database;
-- **hot** (41): applies to the running server at once -- a save reports it as reloaded;
+- **hot** (42): applies to the running server at once -- a save reports it as reloaded;
 - **restart** (25): stored at once, read at the next start -- a save reports it as waiting for a restart.
 
 The **Applies** column below gives each setting's kind and what reads it. Sections in which every administered setting is hot: `server`, `rate_limits`, `migration`.
@@ -36,6 +36,7 @@ signing keys are, and what it advertises about itself.
 | `admin_contact` | string \| null | — | hot (read by nothing yet) | An address (`mailto:abuse@example.org`) for people and other servers' operators to report abuse to. Nothing publishes it yet. Corresponds to Synapse's `admin_contact`. |
 | `report_stats` | boolean | `false` | hot (read by nothing yet) | Whether to send anonymous usage statistics to the Matrix.org Foundation, as Synapse can. Nothing sends them yet, so this has no effect. Corresponds to Synapse's `report_stats`. |
 | `unstable_features` | object | `{}` | hot (GET /versions reads it per request) | Extra `unstable_features` flags advertised by `GET /_matrix/client/versions`, by MSC identifier (`org.matrix.msc3202: true`). Merged over the server's built-in set, which is empty: every flag gates a feature a client or bridge will then use, so advertise one only for a feature this server serves. `false` suppresses a built-in flag. |
+| `sync` | object | `{"feed_retention_entries":10000,"hot_room_stream_retention_entries":100000}` | hot (the session hub reads it on every room update) | How much of each user's sync history this server keeps: the per-user feed that tells `/sync` which rooms changed, and the server-wide stream that does the same for very large rooms. Older history is compacted to each room's last position. A client whose sync token is older than what is kept is sent its rooms again; it never misses anything. |
 
 
 ## `listeners`

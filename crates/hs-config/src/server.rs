@@ -63,6 +63,56 @@ pub struct ServerConfig {
     /// for a feature this server serves. `false` suppresses a built-in flag.
     #[serde(default)]
     pub unstable_features: BTreeMap<String, bool>,
+
+    /// How much of each user's sync history this server keeps: the per-user feed that tells
+    /// `/sync` which rooms changed, and the server-wide stream that does the same for very
+    /// large rooms. Older history is compacted to each room's last position. A client whose
+    /// sync token is older than what is kept still learns of every room that changed, and
+    /// is sent a room whole where its position as of the token is gone; it never misses
+    /// anything.
+    #[serde(default)]
+    pub sync: SyncConfig,
+}
+
+/// Retention of the sync feeds (`server.sync`). Both settings take effect at once.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SyncConfig {
+    /// How many feed entries to keep per user. A feed entry records that a room changed; one
+    /// is written per room per update for rooms up to the fan-out threshold, and the entries
+    /// a client has not yet synced are merged, so a client that keeps up adds at most one
+    /// entry per room between two syncs. Below the kept entries, each room's last position
+    /// stays, so a token older than this still finds every room that changed, each resumed
+    /// from its last kept position or sent whole. `0` keeps every entry for ever. The
+    /// feed is compacted once it has grown to twice this, so it holds between one and two
+    /// times this many entries.
+    #[serde(default = "default_feed_retention_entries")]
+    pub feed_retention_entries: u64,
+
+    /// How many entries to keep on the hot-room stream, which records one entry per update to
+    /// a room over the fan-out threshold (500 joined members) instead of one per member. A
+    /// token older than what is kept resumes each such room from its last kept position, or
+    /// sends it whole. `0` keeps every entry for ever. Compacted once it has grown to twice
+    /// this.
+    #[serde(default = "default_hot_room_stream_retention_entries")]
+    pub hot_room_stream_retention_entries: u64,
+}
+
+fn default_feed_retention_entries() -> u64 {
+    10_000
+}
+
+fn default_hot_room_stream_retention_entries() -> u64 {
+    100_000
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            feed_retention_entries: default_feed_retention_entries(),
+            hot_room_stream_retention_entries: default_hot_room_stream_retention_entries(),
+        }
+    }
 }
 
 fn default_signing_key_path() -> PathBuf {
@@ -79,6 +129,7 @@ impl Default for ServerConfig {
             admin_contact: None,
             report_stats: false,
             unstable_features: BTreeMap::new(),
+            sync: SyncConfig::default(),
         }
     }
 }

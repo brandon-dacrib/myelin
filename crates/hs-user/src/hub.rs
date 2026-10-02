@@ -52,7 +52,7 @@ use crate::error::UserError;
 use crate::presence::PresenceRegistry;
 use crate::receipts::{ReceiptKind, ReceiptRegistry};
 use crate::room_source::RoomSource;
-use crate::store::DynUserStore;
+use crate::store::{DynUserStore, FanOutWrite};
 use crate::token::SyncToken;
 use crate::typing::TypingRegistry;
 
@@ -70,6 +70,25 @@ const MIRROR_MAX_IDLE: Duration = Duration::from_secs(600);
 /// deadline (`hs-cli`'s `sync_cluster`, two seconds).
 const PREFETCH_WAIT: Duration = Duration::from_millis(250);
 
+/// How many coalesced feed entries a user keeps by default
+/// ([`SessionHub::set_retention`]): `hs-config`'s `server.sync.feed_retention_entries` default.
+/// A feed grows by at most one entry per room between two of the user's syncs (the coalescing
+/// rule, `crate::store::tables`), so this is thousands of syncs' worth for a client that keeps
+/// up, and a device whose token falls behind it is sent its rooms again rather than losing
+/// anything.
+pub const DEFAULT_FEED_RETENTION_ENTRIES: u64 = 10_000;
+
+/// How many entries the server-wide hot-room stream keeps by default
+/// (`server.sync.hot_room_stream_retention_entries`): one per update to a room above the
+/// fan-out threshold, server-wide.
+pub const DEFAULT_HOT_STREAM_RETENTION_ENTRIES: u64 = 100_000;
+
+/// Set in the environment, makes the hub write a room update's fan-out one member at a time,
+/// one or two store round trips each, as it did before the batched
+/// [`crate::store::UserStore::apply_fan_out`]: the baseline of the measurement in
+/// `docs/status/05-sync.md` (session 14), and an escape hatch.
+pub const FAN_OUT_UNBATCHED_ENV: &str = "HS_SYNC_FAN_OUT_UNBATCHED";
+
 fn membership_of(event: &Event) -> Option<String> {
     event
         .json()
@@ -82,6 +101,13 @@ fn membership_of(event: &Event) -> Option<String> {
 
 fn is_active(membership: &str) -> bool {
     matches!(membership, "join" | "invite" | "knock")
+}
+
+/// What [`SessionHub::fan_out`] wrote.
+struct FanOut {
+    report: crate::store::FanOutReport,
+    /// Records rewritten because the room crossed the fan-out threshold.
+    flipped: usize,
 }
 
 fn content_str(event: &Event, field: &str) -> Option<String> {
@@ -278,6 +304,17 @@ pub struct SessionHub<B: KvBackend, R: RoomSource<B>> {
     /// How many rooms a user-directory search has had to read whole, because the directory
     /// index had nothing for them yet ([`SessionHub::directory_rooms_walked`]).
     directory_walks: std::sync::atomic::AtomicU64,
+    /// How many coalesced feed entries a user keeps ([`SessionHub::set_retention`]); `0` keeps
+    /// them all.
+    feed_retention: std::sync::atomic::AtomicU64,
+    /// How many entries the hot-room stream keeps ([`SessionHub::set_retention`]); `0` keeps
+    /// them all.
+    hot_stream_retention: std::sync::atomic::AtomicU64,
+    /// The hot-room stream position this hub last compacted the stream at: the next compaction
+    /// is due twice the retention past it. In memory only; a fresh hub checks once.
+    hot_compacted_at: std::sync::atomic::AtomicU64,
+    /// Whether [`FAN_OUT_UNBATCHED_ENV`] is set: each member written on their own.
+    fan_out_unbatched: bool,
     _marker: std::marker::PhantomData<fn() -> B>,
 }
 
@@ -298,6 +335,12 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         }));
         let presence = PresenceRegistry::with_store(store.clone());
         let receipts = ReceiptRegistry::with_store(store.clone());
+        let fan_out_unbatched = std::env::var_os(FAN_OUT_UNBATCHED_ENV).is_some_and(|v| v == "1");
+        if fan_out_unbatched {
+            tracing::warn!(
+                "{FAN_OUT_UNBATCHED_ENV}=1: room updates are fanned out one member at a time"
+            );
+        }
         Self {
             store,
             rooms,
@@ -315,8 +358,43 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
             push_rules: OnceLock::new(),
             counts: OnceLock::new(),
             directory_walks: std::sync::atomic::AtomicU64::new(0),
+            feed_retention: std::sync::atomic::AtomicU64::new(DEFAULT_FEED_RETENTION_ENTRIES),
+            hot_stream_retention: std::sync::atomic::AtomicU64::new(
+                DEFAULT_HOT_STREAM_RETENTION_ENTRIES,
+            ),
+            hot_compacted_at: std::sync::atomic::AtomicU64::new(0),
+            fan_out_unbatched,
             _marker: std::marker::PhantomData,
         }
+    }
+
+    /// Sets how much of the feeds and the hot-room stream this hub keeps: `feed_entries`
+    /// coalesced entries per user and `hot_stream_entries` on the server-wide hot-room stream,
+    /// `0` for all of them. Read on every room update, so a change applies at once
+    /// (`hs-config`'s `server.sync`, hot). Below the kept part each room's last position stays
+    /// ([`crate::store::UserStore::compact_feed`]); a device whose token is older than the
+    /// kept part is sent its rooms again, never less. A compaction runs when a feed (or the
+    /// stream) has grown to twice its retention since the last one, so a feed is between one
+    /// and two retentions long.
+    pub fn set_retention(&self, feed_entries: u64, hot_stream_entries: u64) {
+        self.feed_retention
+            .store(feed_entries, std::sync::atomic::Ordering::Relaxed);
+        self.hot_stream_retention
+            .store(hot_stream_entries, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// How many coalesced feed entries a user keeps ([`SessionHub::set_retention`]).
+    #[must_use]
+    pub fn feed_retention(&self) -> u64 {
+        self.feed_retention
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How many entries the hot-room stream keeps ([`SessionHub::set_retention`]).
+    #[must_use]
+    pub fn hot_stream_retention(&self) -> u64 {
+        self.hot_stream_retention
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The durable store backing this hub, for `crate::sync` and `crate::routes` to read from
@@ -1718,13 +1796,71 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
             }
         }
 
+        let started = std::time::Instant::now();
+        let fan_out = self.fan_out(&update, hot, &targets).await?;
+        if fan_out.flipped > 0 {
+            tracing::info!(
+                room_id = %update.room_id,
+                member_count,
+                threshold = self.fan_out_threshold,
+                hot,
+                records = fan_out.flipped,
+                "a room crossed the fan-out threshold; its members' records now say so"
+            );
+        }
+        // A hot room's position goes on the hot-room stream once, whatever its size: what
+        // `/sync` resumes it from and bounds it by (`crate::sync`'s `resume_mode`). Written
+        // after the membership records, so that a sync which sees this position also sees the
+        // membership the update made -- the other way round, a sync could resume a member who
+        // has only just joined from their own join, and send them nothing of the room.
+        if hot {
+            let hot_seq = self
+                .store
+                .append_hot_position(&update.room_id, update.room_pos)
+                .await?;
+            self.compact_hot_stream_if_due(hot_seq).await;
+        }
+        crate::metrics::observe_fan_out(
+            targets.len(),
+            started.elapsed(),
+            fan_out.report.transactions,
+            fan_out.report.fallbacks,
+        );
+        // And everyone is woken last, once everything a woken `/sync` will read is written.
+        for user_id in targets.keys() {
+            self.wake(user_id).await;
+        }
+        // The feeds that outgrew their retention are compacted after the wake: a compaction
+        // is a scan the woken syncs need not wait for, and it deletes nothing they read.
+        self.compact_feeds(&fan_out.report.feeds_to_compact).await;
+
+        Ok(targets.into_keys().collect())
+    }
+
+    /// Writes one update's membership records and feed entries for `targets` (each active
+    /// member, and everyone whose membership the update changed), in a few store transactions
+    /// ([`crate::store::UserStore::apply_fan_out`]) -- or one or two per member with
+    /// [`FAN_OUT_UNBATCHED_ENV`] set. What is written for whom is decided here, from one read
+    /// of every target's record ([`crate::store::UserStore::get_memberships`]).
+    async fn fan_out(
+        &self,
+        update: &RoomUpdate,
+        hot: bool,
+        targets: &HashMap<OwnedUserId, String>,
+    ) -> Result<FanOut, UserError> {
+        let user_ids: Vec<OwnedUserId> = targets.keys().cloned().collect();
+        let existing = self
+            .store
+            .get_memberships(&update.room_id, &user_ids)
+            .await?;
         let mut flipped = 0usize;
-        for (user_id, membership) in &targets {
+        let mut writes = Vec::with_capacity(user_ids.len());
+        for (user_id, existing) in user_ids.into_iter().zip(existing) {
+            let membership = &targets[&user_id];
             let changed_now = update
                 .membership_deltas
                 .iter()
-                .any(|d| &d.user_id == user_id);
-            let existing = self.store.get_membership(user_id, &update.room_id).await?;
+                .any(|d| d.user_id == user_id);
             let missing = existing.is_none();
             // The room crossing the threshold in either direction is written to every member's
             // record, not only the one whose membership this update changed: `crate::sync`
@@ -1733,7 +1869,7 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
             // sent anything from it again (no entries, and not a candidate without them).
             let hot_flipped = existing.as_ref().is_some_and(|m| m.hot_room != hot);
             flipped += usize::from(hot_flipped);
-            if changed_now || missing || hot_flipped {
+            let record = if changed_now || missing || hot_flipped {
                 // A membership record's `room_pos` is a resume baseline, and `hs_room`'s forward
                 // pagination is *exclusive* of it: whatever sits at that position counts as
                 // already delivered. When this update is the user's own membership change, its
@@ -1750,42 +1886,108 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
                     Some(existing) => existing.room_pos,
                     None => update.room_pos.saturating_sub(1),
                 };
-                self.store
-                    .set_membership(user_id, &update.room_id, membership, baseline_pos, hot)
-                    .await?;
-            }
-            if !hot {
-                self.store
-                    .append_feed_entry(user_id, &update.room_id, update.room_pos)
-                    .await?;
-            }
+                Some((membership.clone(), baseline_pos))
+            } else {
+                None
+            };
+            writes.push(FanOutWrite {
+                user_id,
+                record,
+                hot_room: hot,
+                feed_entry: !hot,
+            });
         }
-        if flipped > 0 {
+        let report = if self.fan_out_unbatched {
+            let mut report = crate::store::FanOutReport::default();
+            for write in &writes {
+                if let Some((membership, baseline_pos)) = &write.record {
+                    self.store
+                        .set_membership(
+                            &write.user_id,
+                            &update.room_id,
+                            membership,
+                            *baseline_pos,
+                            hot,
+                        )
+                        .await?;
+                    report.records += 1;
+                    report.transactions += 1;
+                }
+                if write.feed_entry {
+                    self.store
+                        .append_feed_entry(&write.user_id, &update.room_id, update.room_pos)
+                        .await?;
+                    report.feed_entries += 1;
+                    report.transactions += 1;
+                }
+            }
+            report
+        } else {
+            self.store
+                .apply_fan_out(
+                    &update.room_id,
+                    update.room_pos,
+                    &writes,
+                    self.feed_retention(),
+                )
+                .await?
+        };
+        if report.fallbacks > 0 {
             tracing::info!(
                 room_id = %update.room_id,
-                member_count,
-                threshold = self.fan_out_threshold,
-                hot,
-                records = flipped,
-                "a room crossed the fan-out threshold; its members' records now say so"
+                members = writes.len(),
+                fallbacks = report.fallbacks,
+                "a room update's fan-out wrote some members one at a time"
             );
         }
-        // A hot room's position goes on the hot-room stream once, whatever its size: what
-        // `/sync` resumes it from and bounds it by (`crate::sync`'s `resume_mode`). Written
-        // after the membership records, so that a sync which sees this position also sees the
-        // membership the update made -- the other way round, a sync could resume a member who
-        // has only just joined from their own join, and send them nothing of the room.
-        if hot {
-            self.store
-                .append_hot_position(&update.room_id, update.room_pos)
-                .await?;
-        }
-        // And everyone is woken last, once everything a woken `/sync` will read is written.
-        for user_id in targets.keys() {
-            self.wake(user_id).await;
-        }
+        Ok(FanOut { report, flipped })
+    }
 
-        Ok(targets.into_keys().collect())
+    /// Compacts each of `users`' feeds to this hub's retention
+    /// ([`crate::store::UserStore::compact_feed`]), counting what went.
+    async fn compact_feeds(&self, users: &[OwnedUserId]) {
+        let keep = self.feed_retention();
+        if keep == 0 {
+            return;
+        }
+        for user_id in users {
+            match self.store.compact_feed(user_id, keep).await {
+                Ok(pruned) => {
+                    crate::metrics::observe_compaction("feed", pruned);
+                    tracing::debug!(user_id = %user_id, pruned, keep, "compacted a user's feed");
+                }
+                Err(e) => {
+                    tracing::warn!(user_id = %user_id, error = %e, "failed to compact a user's feed");
+                }
+            }
+        }
+    }
+
+    /// Compacts the hot-room stream ([`crate::store::UserStore::compact_hot_stream`]) when it
+    /// has grown to twice its retention since this hub last did, `hot_seq` being its newest
+    /// position.
+    async fn compact_hot_stream_if_due(&self, hot_seq: u64) {
+        let keep = self.hot_stream_retention();
+        if keep == 0 {
+            return;
+        }
+        let last = self
+            .hot_compacted_at
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if hot_seq.saturating_sub(last) <= keep.saturating_mul(2) {
+            return;
+        }
+        self.hot_compacted_at
+            .store(hot_seq, std::sync::atomic::Ordering::Relaxed);
+        match self.store.compact_hot_stream(keep).await {
+            Ok(pruned) => {
+                crate::metrics::observe_compaction("hot_room_stream", pruned);
+                tracing::info!(pruned, keep, hot_seq, "compacted the hot-room stream");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to compact the hot-room stream");
+            }
+        }
     }
 
     /// [`SessionHub::apply_room_update`] for an update whose room no longer exists by the time
@@ -1809,31 +2011,43 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         );
         self.store.remove_public_room(&update.room_id).await?;
         self.store.forget_room_members(&update.room_id).await?;
-        let mut woken = Vec::with_capacity(update.membership_deltas.len());
-        for delta in &update.membership_deltas {
-            let hot = self
-                .store
-                .get_membership(&delta.user_id, &update.room_id)
-                .await?
-                .is_some_and(|m| m.hot_room);
-            self.store
-                .set_membership(
-                    &delta.user_id,
-                    &update.room_id,
-                    &delta.membership,
-                    update.room_pos,
-                    hot,
-                )
-                .await?;
-            if !hot {
-                self.store
-                    .append_feed_entry(&delta.user_id, &update.room_id, update.room_pos)
-                    .await?;
-            }
-            self.wake(&delta.user_id).await;
-            woken.push(delta.user_id.clone());
+        let user_ids: Vec<OwnedUserId> = update
+            .membership_deltas
+            .iter()
+            .map(|d| d.user_id.clone())
+            .collect();
+        let existing = self
+            .store
+            .get_memberships(&update.room_id, &user_ids)
+            .await?;
+        let writes: Vec<FanOutWrite> = update
+            .membership_deltas
+            .iter()
+            .zip(existing)
+            .map(|(delta, existing)| {
+                let hot = existing.is_some_and(|m| m.hot_room);
+                FanOutWrite {
+                    user_id: delta.user_id.clone(),
+                    record: Some((delta.membership.clone(), update.room_pos)),
+                    hot_room: hot,
+                    feed_entry: !hot,
+                }
+            })
+            .collect();
+        let report = self
+            .store
+            .apply_fan_out(
+                &update.room_id,
+                update.room_pos,
+                &writes,
+                self.feed_retention(),
+            )
+            .await?;
+        for user_id in &user_ids {
+            self.wake(user_id).await;
         }
-        Ok(woken)
+        self.compact_feeds(&report.feeds_to_compact).await;
+        Ok(user_ids)
     }
 
     /// A room's current member count, for callers (`crate::sync`'s hot-room fallback) that need
@@ -2656,6 +2870,127 @@ mod tests {
         eprintln!(
             "per search: reading the resident room {walk:?}, loading and reading it {cold:?}, \
              from the index {indexed:?}"
+        );
+    }
+
+    /// A feed that has grown to twice the hub's retention since its floor is compacted after
+    /// the fan-out that took it there, and the hot-room stream likewise: each stays between
+    /// one and two retentions long, with each room's last position kept below the floor.
+    #[tokio::test]
+    async fn feeds_and_the_hot_stream_past_twice_their_retention_are_compacted() {
+        let (hub, rooms) = hub(usize::MAX);
+        std::mem::forget(hub.watch_all(rooms.subscribe_global()));
+        hub.set_retention(2, 0);
+        assert_eq!((hub.feed_retention(), hub.hot_stream_retention()), (2, 0));
+        let alice = user_id!("@alice:hub.test").to_owned();
+        let did: &ruma::DeviceId = "DEV".into();
+        let handle = rooms
+            .create_room(alice.clone(), CreateRoomRequest::default(), 1)
+            .await
+            .unwrap();
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+        for i in 0..8 {
+            // Each message pins the last entry (a sync handed out a token at it), so the next
+            // is a new row rather than coalesced.
+            let latest = hub.store().latest_feed_seq(&alice).await.unwrap();
+            hub.store()
+                .record_device_cursor(&alice, did, latest)
+                .await
+                .unwrap();
+            handle
+                .send_event(
+                    alice.clone(),
+                    "m.room.message".to_owned(),
+                    None,
+                    serde_json::json!({"body": format!("{i}")}),
+                    None,
+                    2 + i,
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        let latest = hub.store().latest_feed_seq(&alice).await.unwrap();
+        let floor = hub.store().feed_floor(&alice).await.unwrap();
+        // The create's entry may be coalesced with the first message's (the cursor was read
+        // before the hub had the create), so eight or nine.
+        assert!(latest >= 8, "the create and eight messages: {latest}");
+        assert!(floor > 0, "compacted at least once");
+        assert!(
+            latest - floor <= 4,
+            "between one and two retentions: {latest} - {floor}"
+        );
+        let entries = hub.store().feed_since(&alice, 0).await.unwrap();
+        assert!(
+            entries.len() <= 5,
+            "one kept, at most four above: {entries:?}"
+        );
+        assert_eq!(
+            hub.store()
+                .room_pos_at_token(&alice, &room_id, latest)
+                .await
+                .unwrap(),
+            Some(entries.last().unwrap().room_pos)
+        );
+
+        // The hot-room stream: a threshold of one makes the room hot with the second member.
+        let (hub, rooms) = self::tests::hub(1);
+        std::mem::forget(hub.watch_all(rooms.subscribe_global()));
+        hub.set_retention(0, 2);
+        let bob = user_id!("@bob:hub.test").to_owned();
+        let handle = rooms
+            .create_room(
+                alice.clone(),
+                CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+        handle
+            .membership(
+                bob.clone(),
+                Action::Join,
+                bob.clone(),
+                serde_json::json!({}),
+                2,
+            )
+            .await
+            .unwrap();
+        for i in 0..8 {
+            handle
+                .send_event(
+                    alice.clone(),
+                    "m.room.message".to_owned(),
+                    None,
+                    serde_json::json!({"body": format!("{i}")}),
+                    None,
+                    3 + i,
+                )
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let head = hub.store().latest_hot_seq().await.unwrap();
+        assert!(head >= 9, "the join and eight messages: {head}");
+        assert_eq!(
+            hub.store().latest_hot_seq_of_room(&room_id).await.unwrap(),
+            Some(head),
+            "the newest entry is never pruned"
+        );
+        assert_eq!(
+            hub.store().hot_room_pos_as_of(&room_id, 1).await.unwrap(),
+            None,
+            "the first entries are gone"
+        );
+        // The hub compacts once the stream has grown by twice the retention since it last
+        // did, so what a compaction now could still take is at most that much.
+        assert!(
+            hub.store().compact_hot_stream(2).await.unwrap() <= 4,
+            "between one and two retentions"
         );
     }
 }
