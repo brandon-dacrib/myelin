@@ -556,6 +556,17 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
   sync names whoever joined or left inside the gap; the sending device sees its
   `unsigned.transaction_id` in `/sync`; a filter naming something that is not a room or user
   id is rejected (status 05, session 14).
+- **Push notifications are sent.** Every accepted room event is evaluated against each local
+  member's push rules; a match that notifies counts toward `/sync`'s `unread_notifications`
+  (per thread too), appears in `GET /notifications`, and is posted to each of the user's HTTP
+  pushers with the badge; a read receipt zeroes the room and sends the new badge; a gateway's
+  `rejected` pushkeys remove their pushers; a password change that logs the other sessions out
+  removes the pushers they registered. Push rules accept any room or sender rule id, list by
+  scope and kind (`GET /pushrules/global/`, `/pushrules/global/{kind}/`), and answer `400` for a
+  malformed path or an unknown action as Synapse does. Verified by unit tests against a fake
+  push gateway and the `/pushrules`/`/pushers` surfaces through the real binary (2026-10-02);
+  the Sytest push group (19 of 53 before) has not yet been rerun on this build -- see
+  `docs/status/10-push.md`, session 2.
 - **`/joined_rooms` lists a room its caller just created or joined, every time.** It waits, as
   `/sync` has since the 2026-09-30 read-your-writes change, for the session hub to have consumed
   everything published before the request (bounded at 500 ms). Before, a client asking the

@@ -1,5 +1,144 @@
 # 10 Push: status
 
+## Session 2 (2026-10-02): Sytest's push group, 19 of 53 before; the fixes are built and unit-tested, not yet rerun under Sytest
+
+**Starting point.** `docs/status/sytest/2026-10-02-results.txt` had 19 of the 53 push-group
+tests passing. A quiet-machine rerun of `tests/61push/*.pl` on the unmodified image gave the
+same 19 (of 55 tests in those files; two of them Sytest groups elsewhere), so none of the
+failures were load. Two causes covered nearly everything: the `/pushrules` surface rejected
+what Sytest sends, and nothing in the server evaluated an event for push at all (status 10's
+session 1 recorded `RoomUpdate::push_evaluation_inputs` as the blocker; the pipeline below no
+longer needs it).
+
+### Done
+
+**Push rules (`crates/hs-push/src/ruleset.rs`, `routes/pushrules.rs`, `routes/mod.rs`)**
+
+- The ruleset is this crate's own `Ruleset` over Ruma's rule, condition and action types. Ruma's
+  `Ruleset` types a room rule's `rule_id` as `OwnedRoomId`, and Sytest's `02add_rules.pl` adds a
+  room rule named `#spam:example.com` (Synapse stores rule ids verbatim). The JSON shape is
+  unchanged, so stored rulesets read back as before; the engine (`engine.rs`) walks the five
+  kinds in priority order and matches with `ConditionalPushRule::applies` /
+  `PatternedPushRule::applies_to`, with room and sender rules a string comparison.
+- `GET /pushrules/global/` and `GET /pushrules/global/{kind}/` list rules. Every other path
+  shape under `/pushrules/` (missing or unknown scope, a kind without its slash, an empty rule
+  id, an unknown attribute, `PUT /pushrules/`) answers `400 M_UNRECOGNIZED`, as Synapse does;
+  `/pushrules` without the slash stays the router's 404. The spec's literal paths are registered
+  verbatim (the spec coverage tool matches on them) with `{scope}` twins beside them.
+- `PUT` validation follows the spec's error table: override/underride need `conditions`,
+  content needs `pattern`, `actions` is required and limited to `notify`, `dont_notify`,
+  `coalesce` and `set_tweak` objects (an unknown action such as MSC2625's `mark_unread` is a
+  400, which is how Sytest learns to skip that test), ids starting with `.` or containing `/`
+  or `\` are refused. A re-`PUT` keeps the rule's place and its `enabled` flag. New override
+  rules slot in after `.m.rule.master`.
+- `GET /pushrules/global/{kind}/{ruleId}/{attr}` returns `{attr: value}` for any field the rule
+  has, 400 otherwise.
+
+**The pipeline (`crates/hs-push/src/pipeline.rs`, `cursors.rs`; `crates/hs-cli/src/push_delivery.rs`)**
+
+- `hs_push::pipeline` is a worker fed by the room registry's global stream (forwarded by
+  `hs-cli`, as the appservice pump is) and by read receipts (`SessionHub::set_receipt` calls the
+  new `install_read_receipt_sink`). For each event it asks an `EventSource` (hs-cli's
+  `RegistrySource` over `RoomRegistry::read_room`) for the event's client JSON, the members with
+  display names and local-ness, the power levels, the room name (`m.room.name`, else the
+  canonical alias) and the sender's display name; then evaluates every joined local member
+  (and the invitee of an invite) against their cached ruleset. A `notify` match increments
+  `CountsStore` (thread-scoped when the event is in a thread), appends to the notification log,
+  and posts to each of the user's HTTP pushers with `counts.unread` = the user's total across
+  rooms. The payload is the spec's, plus `id` (deprecated, still expected by the gateway API's
+  examples and Sytest), `membership`/`user_is_target` for member events, `room_name`,
+  `sender_display_name`, `prio`. `format: event_id_only` sends the reduced body. A gateway's
+  `rejected` list deletes those pushers. An invite from another server takes the room name and
+  inviter's name from `unsigned.invite_room_state`.
+- A read receipt (either kind) zeroes the room's counts (`CountsStore::reset_room`, new), marks
+  the room's log entries read, and sends every HTTP pusher the zero/new badge.
+- Per-room cursors (`hs_push.room_cursor`) skip an event already evaluated: the room stream
+  re-announces a room's newest event whenever the room is loaded. A room first seen with a head
+  older than the pipeline's start by more than 60 s is taken as such a re-announcement and not
+  pushed (so an upgrade does not push every room's last message once).
+- Delivery is spawned per push; a slow gateway delays only its own pushes. Lag on the room
+  stream is logged with the count missed.
+- Metrics: `hs_push_evaluations_total{result=notify|silent|none}` and
+  `hs_push_http_pushes_total{outcome=sent|rejected|failed}`. Logs: a `debug` per matched rule
+  and per push, `info` when a pusher is removed for a rejected pushkey, `warn` on a failed push.
+
+**`GET /notifications` (`routes/notifications.rs`, `notification_log.rs`)**: pages the log
+newest first with `from`/`limit`/`only=highlight`, each entry `{room_id, actions, event,
+profile_tag, read, ts}`; `read` is a per-room watermark set by receipts. Entries carry the
+event JSON as it was, so the endpoint needs no room lookup.
+
+**Pushers and password changes (`pushers.rs`, `crates/hs-auth/src/state.rs`, `routes/account.rs`)**:
+a pusher remembers the device that set it; `POST /account/password` with `logout_devices`
+calls hs-auth's new `SessionRevocationObserver`, answered by `hs_push::pushers::RevokedSessionPushers`,
+which deletes every pusher of another device. Pushers with no known device (migrated) stay.
+
+**Tests**: hs-push 31 -> 56 (ruleset edits and ordering, every 400/404 case of
+`80torture.pl` through the router with an in-memory user, `/notifications` paging, the
+pipeline's evaluation/counting/receipt/delivery/rejection against `hs_testkit::FakePushGateway`,
+counts and log contract tests for both backends, cursor stores, device-scoped pusher deletion).
+`crates/hs-cli/tests/e2e.rs`'s `sync_keys_and_push_surfaces_answer_through_the_real_binary`
+still passes.
+
+### Where this stopped (the machine was rebooted before the rerun)
+
+Baseline, measured this session on the unmodified `myelin-sytest:dev` image with
+`tests/61push/*.pl` alone: 19 pass, 36 fail (55 tests in those files), the same 19 as the
+night's whole-suite run, so no push failure was load. The failures were, by cause: 11 in
+`02add_rules.pl` (room rule ids that are not room ids, and `GET /pushrules/global/{kind}/`
+missing), 11 in `80torture.pl` (400 expected, 404/405/200 given), 9 in `01message-pushed.pl`,
+3 in `03_unread_count.pl`, `08_rejected_pushers.pl`, `09_notifications_api.pl`, and the
+password-change pusher test in `14account/` -- all because nothing evaluated events for push.
+
+Every one of those causes is addressed above, and each has a Rust test (the `80torture.pl`
+table verbatim through the router, the pipeline against `hs_testkit::FakePushGateway`,
+`sync_keys_and_push_surfaces_answer_through_the_real_binary` on the real `hs`). **What is not
+done:** the Sytest rerun on the modified binary. The bookworm release build of this branch's
+`hs` inside Docker (needed for `SYTEST_HS_BINARY`) was still compiling when the reboot was
+called and was stopped. The count after is therefore unmeasured; the expectation from the
+causes above is most of the 36, with `Rejected events are not pushed` and the two
+federation-invite tests the least certain (they depend on the stub room an out-of-band
+invite creates answering `members()` with the invitee, which was read in the code, not run).
+
+To finish: `tests/sytest/build.sh myelin-sytest:push-rules` from this branch, then
+`SYTEST_IMAGE_TAG=myelin-sytest:push-rules tests/sytest/run.sh tests/61push/01message-pushed.pl
+tests/61push/02add_rules.pl tests/61push/03_unread_count.pl tests/61push/05_set_actions.pl
+tests/61push/06_get_pusher.pl tests/61push/07_set_enabled.pl tests/61push/08_rejected_pushers.pl
+tests/61push/09_notifications_api.pl tests/61push/80torture.pl tests/14account/01change-password.pl`,
+and fix whatever the server logs under `server-0/hs.log` show for anything still failing.
+
+### Next
+
+- `.m.rule.suppress_edits`/`m.replace` and reactions already come from the default rules;
+  MSC3664 (reply), MSC4028 and MSC3381 remain as session 1 left them.
+- Thread receipts (MSC3771): a receipt resets the whole room, threads included, because
+  `hs-user` has no thread receipts yet.
+- Email pushers: stored, never delivered to.
+- The cluster: each room's owner evaluates its events (`RegistrySource` returns nothing for a
+  room this replica does not own); the pipeline's cursors and counts are in the shared store.
+  Rule-cache invalidation across replicas is still the session 1 gap.
+
+### Decisions made
+
+- **Own `Ruleset` type instead of `ruma::push::Ruleset`** (above). `hs-cli`'s migration and
+  `hs-user`'s one test were adapted; `hs_push::ruleset::RuleKind` replaces Ruma's in those
+  call sites.
+- **Unknown push actions are a 400**, not stored as custom actions (Ruma would accept any
+  string). Synapse refuses them too; it is the only way a client can tell an action is
+  unsupported.
+- **`hs-push` does not depend on `hs-room`**: the room side is a trait (`EventSource`)
+  implemented in `hs-cli`, like the appservice pump, so the dependency graph is unchanged.
+- **The first sight of a stale room head is not pushed** (60 s grace). The alternative was one
+  spurious push per room after every upgrade.
+- **Badge = total `notify` count across rooms and threads** (Synapse's default, not
+  group-by-room).
+- **`PusherStore::set_pusher` takes the registering device** (a breaking change to this crate's
+  trait; the two `hs-cli` call sites pass `None`).
+
+### Shared dependencies added
+
+None new to the workspace. `hs-push` now uses `bytes`, `prometheus-client` and (dev) `tower`,
+all already in `[workspace.dependencies]`.
+
 ## Session 1: the `/sync` push-rules seam, and checking the default ruleset against the spec
 
 **Starting point.** `hs-push` already existed from earlier phase-0/1 work (the rules engine on
