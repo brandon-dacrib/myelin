@@ -1,5 +1,56 @@
 # 06 Federation: status
 
+## 2026-10-02 (branch `agent/federation-synapse`): the first attempt at a real Synapse
+
+**Goal.** Federate a Myelin built from this tree with a real Synapse in Docker, both directions,
+and record the basic story step by step. Myelin had never talked to a Synapse: every number in the
+README and here comes from Complement, Sytest or two Myelins.
+
+**What landed: the harness, not the run.** `tests/federation-synapse/run.sh` (README beside it)
+builds `hs`, generates a private CA and leaf certificates, starts `ghcr.io/element-hq/synapse`
+(server name `127.0.0.1:8448`, TLS federation listener published on 8448, client API on 8408,
+`federation_custom_ca_list`, `federation_ip_range_blacklist: []`, registration open, rate limits
+off, `allow_public_rooms_over_federation`), an nginx container `fed-synapse-myelin` that
+terminates TLS at `fed-synapse-myelin:8449` on the `fed-synapse` network and proxies to the host's
+plaintext `hs` (server name `fed-synapse-myelin:8449`, `custom_ca_certificates`,
+`ip_range_blocklist: []`, `x_forwarded: true`), then drives every step below through both client
+APIs and writes `results.tsv`. It clean-skips without Docker, curl, jq or openssl, and removes
+every `fed-synapse*` container and network on exit.
+
+**Why there is no result column yet.** The session could not pull any image: `docker pull`
+(ghcr.io, and the ECR mirror alike) fails with "keychain cannot be accessed because the current
+session does not allow user interaction" -- `~/.docker/config.json` names the `osxkeychain`
+credential store and the OrbStack context, and a `DOCKER_CONFIG` without a store still goes
+through it. No Synapse image was on the machine (only nginx and postgres). The session was then
+asked to wrap up for a reboot. So the table records the design and what each step asserts; the
+first run is the next session's first action (pull the image from a terminal that can open the
+keychain, then `tests/federation-synapse/run.sh`).
+
+| Step | What the script checks | Result |
+|---|---|---|
+| 1 keys | both `/_matrix/key/v2/server`; each notary's `/_matrix/key/v2/query/<other>` | not run (no image) |
+| 2 Myelin joins a Synapse room | join by alias, message each way, pre-join history on Myelin, `/joined_members` agree | not run |
+| 3 Synapse joins a Myelin room | the same, mirrored | not run |
+| 4 invites, leave/rejoin, kick, ban | invite each way accepted; Myelin user leaves and rejoins; Synapse kicks (seen on Myelin); Myelin bans (seen on Synapse) | not run |
+| 4 redaction | Synapse redacts its message in the Myelin room; Myelin's `/messages` shows it emptied | not run |
+| 4 typing, receipt | Myelin's `m.typing` and `m.receipt` in Synapse's `/sync` | not run |
+| 4 keys, to-device | Synapse `/keys/query` of the Myelin user after a `/keys/upload`; a to-device message Myelin -> Synapse in `/sync` | not run (device/keys routes are `agent/e2ee-sytest`'s if they fail) |
+| 4 media | a text upload on each side downloaded through the other's `/_matrix/client/v1/media/download` | not run |
+| 4 publicRooms, profile, directory | `/publicRooms?server=` each way; `/profile` of the remote user each way; `/directory/room` of the remote alias each way | not run (`/query/*` is `agent/federation-query`'s if they fail) |
+| 5 versions 10, 11, 12 | a room of each version joined in both directions | not run |
+| 5 restricted | a Synapse space, a restricted v10 room allowing it, the Myelin user joins through the space with Synapse authorising | not run |
+
+**Decisions.** Server names carry ports (direct connect, no `.well-known`/SRV): Myelin's resolver
+is hickory over the system DNS and does not read `/etc/hosts`, and Docker's embedded DNS resolves
+`fed-synapse-myelin` only inside the network, which is exactly where Synapse is. TLS in front of
+Myelin is nginx in a container rather than stunnel on the host, so the harness has no host
+dependency beyond Docker, curl, jq and openssl. Trust is a private CA on both sides
+(`custom_ca_certificates` / `federation_custom_ca_list`), not `verify_certificates: false`.
+
+**Left, and whose.** The run itself (06). `hs serve` terminating TLS on a listener (`listeners[].tls`
+is accepted and only warned about, `crates/hs-cli/src/serve.rs`), which would remove the nginx
+container: hs-cli, track 12/06. Putting the script in a CI leg that has Docker: track 12.
+
 ## 2026-10-01 (track 14, branch `agent/complement-remeasure`): the whole federation package re-measured
 
 Complement's `tests` package on an image of `main` at `2a0b362`, twice: **225 / 314 assertions,
