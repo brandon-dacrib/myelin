@@ -116,6 +116,16 @@ feed_retention_entries=10000 hot_room_stream_retention_entries=100000`); `PATCH
 hub compacted bob's feed three times (8 entries pruned) over twelve messages where the default
 compacts nothing.
 
+**Where this stopped (14:15, the machine being rebooted).** Both parts are done, tested and
+pushed (`1b3e614`, `aaaf6bb` on `agent/sync-feed`); clippy on `hs-user`, `hs-config` and
+`hs-cli`, `cargo test -p hs-user` (183) and `-p hs-config`, `cargo fmt --check` and the web's
+`npm run check` all pass. Not done: running session 12's `cluster_mirror.rs` recipe on the
+batched hub (its release build was stopped for the reboot; at this machine's load the
+300-member PostgreSQL run would have taken hours anyway), so the brief's 303-member
+write-to-woken-sync number on PostgreSQL is not re-measured; the embedded and 22-member
+PostgreSQL numbers above are what was measured. The Docker PostgreSQL container and every
+process of this session were removed before stopping.
+
 **Left.** RFC 0021 for track 01; the 303-member PostgreSQL measurement with `cluster_mirror.rs`
 on a quiet machine (and `tools/fanout_bench.py`, which could become a `hs-cli` test); the hub's other
 per-update store calls (`upsert_public_room` every update, `apply_room_member_changes` even with
