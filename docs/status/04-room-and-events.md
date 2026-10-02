@@ -100,8 +100,27 @@ admin API's room long tail).
 >   not the old room, the create's `m.federate`, the log line's `bans_carried=1
 >   directory_moved=true`).
 > - **Sytest** (`tests/30rooms/60version_upgrade.pl`, image `myelin-sytest:dev` as the
->   baseline, then `SYTEST_HS_BINARY` from this branch): **before 11 of 21** (7 failed, 3
->   skipped), results in `target/sytest/before-1`. After: see the end of this entry.
+>   baseline): **before 11 of 21** (7 failed, 3 skipped; the failures: public-room visibility,
+>   important state, bans, remote aliases, direct room state, federation ability, the
+>   two-server directory test), results in `target/sytest/before-1`. **After: not measured.**
+>   The bookworm `hs` the run needs (`SYTEST_HS_BINARY`) was building in Docker when the
+>   machine had to be stopped (the shared cargo volume was held by other agents' builds for
+>   over an hour; a private-volume build had reached the workspace crates); both builds were
+>   killed and the private volume removed. By what the fixes cover -- each of the seven failing
+>   tests' reason was read from the baseline TAP and has a change above -- the expected count is
+>   18 of 21 (the three skips are `can_change_power_levels`, below), but that is a reading, not
+>   a measurement.
+>
+> **Where this stopped and what is left (2026-10-02, stopped for a reboot).** All four rows
+> and the account-data carry are implemented, unit-tested, lint-clean (`cargo fmt --all
+> --check`, `cargo clippy -p hs-room -p hs-user -p hs-cli --all-targets -- -D warnings`),
+> with `cargo test -p hs-room` (all green), `cargo test -p hs-user` (173) and the two
+> real-binary tests (`hs-cli --test room_upgrade`, `--test redaction_power`) passing; five
+> commits on `agent/room-rows`, pushed. Left: (1) the Sytest measurement of the upgrade
+> file after the change -- build a bookworm `hs` from the branch (`tests/sytest/README.md`'s
+> recipe) and run `SYTEST_HS_BINARY=... tests/sytest/run.sh tests/30rooms/60version_upgrade.pl`,
+> then put the count here and in `CHANGELOG.md`'s upgrade line; (2) the workspace gate (not
+> run here); (3) status 05's "left" line about `users_sharing_room_with` is stale.
 > **Row 2: `may_redact` at the redaction's time** (status 06 session 17's "left": "`may_redact`
 > still reads the current power levels, not those at the redaction"). A redaction is applied
 > when it meets the event it names, which can be long after it was sent: it arrived first (over
