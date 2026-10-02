@@ -263,6 +263,16 @@ here).
 **Also fixed on the way.** Add user hid the live username note behind a stale "already
 exists" refusal until the next submit; a field's refusal now clears as it is retyped.
 
+**Verified.** `npm run check` (lint with four pre-existing fast-refresh warnings in files this
+branch did not touch, types, **526 unit tests in 72 files**, build); `npm run test:e2e` (mock):
+**59 of 59**, with the new `edit-user`, `edit-bridge`, `overview-health`, `find-user` and
+`room-lifecycle` specs and the live-check assertions in `add-user`, each with axe; against
+`hs serve` built from this branch (`example.org`, first administrator made through
+`POST /api/v1/setup`, a stub bridge on `HS_REAL_STUB_BRIDGE_URL` answering
+`POST /_matrix/app/v1/ping`): `e2e-real/web-items.spec.ts` **6 of 6** in one run. Two
+Playwright suites must not run at once in one checkout: both configs write `test-results/`
+and the second run's start wipes the first's traces (seen as `ENOENT` on `.playwright-artifacts`).
+
 **Left from the list**: items 6 to 9 (federation and Overview at scale, effective values beside
 per-user overrides, cluster series in the admin API, settings with no reader and erase on
 deactivate) are the coordinator's or need API work, as noted there.
