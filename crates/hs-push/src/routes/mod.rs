@@ -3,12 +3,14 @@
 //! do. See `docs/status/10-push.md`'s "Interfaces provided" for the exact
 //! `crates/hs-cli/src/serve.rs` wiring this expects.
 //!
-//! The spec spells the whole-ruleset path with a trailing slash (`GET /pushrules/`) and every
-//! other `/pushrules` path without one, which is not a typo on our side: clients send both, so
-//! both are registered against the same handler.
+//! See [`pushrules`]' module docs for the `/pushrules` path grammar and which paths answer
+//! `400`.
 
+pub mod notifications;
 pub mod pushers;
 pub mod pushrules;
+#[cfg(test)]
+mod tests;
 
 use hs_http::router::{AuthKind, Builder, RouteManifest, RouteMeta, Surface};
 use hs_kv::KvBackend;
@@ -20,48 +22,129 @@ fn matrix_client(operation_id: &str) -> RouteMeta {
 }
 
 /// The spec-relative (no version prefix) client-server router fragment: push rules in every form,
-/// and pusher registration.
+/// pusher registration, and the notification log.
 pub fn router<B: KvBackend + 'static>() -> (axum::Router<PushState<B>>, RouteManifest) {
+    // Paths that are not in the spec answer `400 M_UNRECOGNIZED` (see `pushrules`' module docs);
+    // they are registered under the admin surface so the spec coverage tool does not count them
+    // as client-server routes the spec lacks.
+    let malformed = || RouteMeta::new(Surface::Admin, AuthKind::None);
     Builder::new()
         .get(
             "/pushrules/",
             pushrules::get_pushrules_all::<B>,
             matrix_client("getPushRules"),
         )
+        .put("/pushrules/", pushrules::malformed, malformed())
+        .delete("/pushrules/", pushrules::malformed, malformed())
+        .get("/pushrules/{scope}", pushrules::malformed, malformed())
+        .put("/pushrules/{scope}", pushrules::malformed, malformed())
+        .delete("/pushrules/{scope}", pushrules::malformed, malformed())
+        .get(
+            "/pushrules/global/",
+            pushrules::get_pushrules_global::<B>,
+            matrix_client("getPushRulesGlobal"),
+        )
+        .get(
+            "/pushrules/{scope}/",
+            pushrules::get_pushrules_scope::<B>,
+            malformed(),
+        )
+        .put("/pushrules/{scope}/", pushrules::malformed, malformed())
+        .delete("/pushrules/{scope}/", pushrules::malformed, malformed())
+        .get(
+            "/pushrules/{scope}/{kind}",
+            pushrules::malformed,
+            malformed(),
+        )
+        .put(
+            "/pushrules/{scope}/{kind}",
+            pushrules::malformed,
+            malformed(),
+        )
+        .delete(
+            "/pushrules/{scope}/{kind}",
+            pushrules::malformed,
+            malformed(),
+        )
+        .get(
+            "/pushrules/{scope}/{kind}/",
+            pushrules::get_pushrules_kind::<B>,
+            malformed(),
+        )
+        .put(
+            "/pushrules/{scope}/{kind}/",
+            pushrules::malformed,
+            malformed(),
+        )
+        .delete(
+            "/pushrules/{scope}/{kind}/",
+            pushrules::malformed,
+            malformed(),
+        )
         .get(
             "/pushrules/global/{kind}/{ruleId}",
-            pushrules::get_pushrule::<B>,
+            pushrules::global::get_pushrule::<B>,
             matrix_client("getPushRule"),
         )
         .put(
             "/pushrules/global/{kind}/{ruleId}",
-            pushrules::put_pushrule::<B>,
+            pushrules::global::put_pushrule::<B>,
             matrix_client("setPushRule"),
         )
         .delete(
             "/pushrules/global/{kind}/{ruleId}",
-            pushrules::delete_pushrule::<B>,
+            pushrules::global::delete_pushrule::<B>,
             matrix_client("deletePushRule"),
         )
         .get(
+            "/pushrules/{scope}/{kind}/{ruleId}",
+            pushrules::get_pushrule::<B>,
+            malformed(),
+        )
+        .put(
+            "/pushrules/{scope}/{kind}/{ruleId}",
+            pushrules::put_pushrule::<B>,
+            malformed(),
+        )
+        .delete(
+            "/pushrules/{scope}/{kind}/{ruleId}",
+            pushrules::delete_pushrule::<B>,
+            malformed(),
+        )
+        .get(
             "/pushrules/global/{kind}/{ruleId}/actions",
-            pushrules::get_pushrule_actions::<B>,
+            pushrules::global::get_actions::<B>,
             matrix_client("getPushRuleActions"),
         )
         .put(
             "/pushrules/global/{kind}/{ruleId}/actions",
-            pushrules::put_pushrule_actions::<B>,
+            pushrules::global::put_actions::<B>,
             matrix_client("setPushRuleActions"),
         )
         .get(
             "/pushrules/global/{kind}/{ruleId}/enabled",
-            pushrules::get_pushrule_enabled::<B>,
+            pushrules::global::get_enabled::<B>,
             matrix_client("isPushRuleEnabled"),
         )
         .put(
             "/pushrules/global/{kind}/{ruleId}/enabled",
-            pushrules::put_pushrule_enabled::<B>,
+            pushrules::global::put_enabled::<B>,
             matrix_client("setPushRuleEnabled"),
+        )
+        .get(
+            "/pushrules/{scope}/{kind}/{ruleId}/{attr}",
+            pushrules::get_pushrule_attr::<B>,
+            malformed(),
+        )
+        .put(
+            "/pushrules/{scope}/{kind}/{ruleId}/{attr}",
+            pushrules::put_pushrule_attr::<B>,
+            malformed(),
+        )
+        .delete(
+            "/pushrules/{scope}/{kind}/{ruleId}/{attr}",
+            pushrules::malformed,
+            malformed(),
         )
         .get(
             "/pushers",
@@ -72,6 +155,11 @@ pub fn router<B: KvBackend + 'static>() -> (axum::Router<PushState<B>>, RouteMan
             "/pushers/set",
             pushers::post_pushers_set::<B>,
             matrix_client("postPusher"),
+        )
+        .get(
+            "/notifications",
+            notifications::get_notifications::<B>,
+            matrix_client("getNotifications"),
         )
         .build()
 }

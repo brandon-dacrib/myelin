@@ -35,8 +35,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use crate::ruleset::Ruleset;
 use ruma::OwnedUserId;
-use ruma::push::Ruleset;
 
 /// An in-memory cache of compiled (i.e. already-deserialized) per-user rulesets.
 #[derive(Debug, Default)]

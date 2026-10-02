@@ -288,6 +288,9 @@ pub struct SessionHub<B: KvBackend, R: RoomSource<B>> {
     /// once `hs-cli` installs it ([`SessionHub::install_edu_outbox`]). `None`: nothing leaves
     /// this server, which is what federation being off means.
     edu_outbox: OnceLock<Arc<dyn EduOutbox>>,
+    /// Told of every local user's read receipt, so push counts reset and badges update
+    /// (`hs_push::pipeline`), once installed ([`SessionHub::install_read_receipt_sink`]).
+    read_receipt_sink: OnceLock<Arc<dyn hs_push::pipeline::ReadReceiptSink>>,
     /// Told of every typing, receipt and presence change this hub applies -- its own users' and
     /// other replicas' alike -- once installed ([`SessionHub::install_ephemeral_observer`]).
     /// `None`: nobody is listening, which is the default.
@@ -358,6 +361,7 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
             shutting_down: std::sync::atomic::AtomicBool::new(false),
             typing: Arc::new(TypingRegistry::new()),
             edu_outbox: OnceLock::new(),
+            read_receipt_sink: OnceLock::new(),
             ephemeral_observer: OnceLock::new(),
             presence,
             receipts,
@@ -463,6 +467,17 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
     pub fn install_edu_outbox(&self, outbox: Arc<dyn EduOutbox>) {
         if self.edu_outbox.set(outbox).is_err() {
             tracing::warn!("an EDU outbox was already installed on this hub; ignoring");
+        }
+    }
+
+    /// Installs what is told of every read receipt this hub records
+    /// ([`SessionHub::set_receipt`]): the push pipeline, which zeroes the room's unread counts
+    /// and sends the user's pushers the new badge. Same idempotent-install convention as
+    /// [`SessionHub::install_push_rules_store`]; without one, receipts leave counts alone, the
+    /// pre-push behaviour.
+    pub fn install_read_receipt_sink(&self, sink: Arc<dyn hs_push::pipeline::ReadReceiptSink>) {
+        if self.read_receipt_sink.set(sink).is_err() {
+            tracing::warn!("a read receipt sink was already installed on this hub; ignoring");
         }
     }
 
@@ -1135,6 +1150,11 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
             .receipts
             .set(room_id, user_id, kind, event_id.clone(), ts)
             .await;
+        // Push counts follow receipts of either kind: a private receipt is just as much "read".
+        // The sink ignores other servers' users (an inbound EDU's receipt).
+        if let Some(sink) = self.read_receipt_sink.get() {
+            sink.read_receipt(user_id, room_id);
+        }
         let members = self.joined_member_ids(room_id).await?;
         for member in &members {
             self.wake(member).await;

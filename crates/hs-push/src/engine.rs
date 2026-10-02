@@ -1,15 +1,14 @@
-//! The push rules engine: evaluates a `ruma::push::Ruleset` against one event for one recipient.
+//! The push rules engine: evaluates a [`Ruleset`] against one event for one recipient.
 //!
-//! Per `docs/decisions/0007-build-less-reuse-more.md`, this is built on Ruma's push types rather
-//! than reimplementing them: `ruma::push::Ruleset::iter()` already yields rules in exactly the
-//! spec's priority order (override, content, room, sender, underride —
-//! `refs/matrix-spec/content/client-server-api/modules/push.md` "Push Rules"), and
-//! `ruma::push::AnyPushRuleRef::applies` already implements every condition kind (`event_match`,
+//! Per `docs/decisions/0007-build-less-reuse-more.md`, the matching is Ruma's:
+//! `ruma::push::ConditionalPushRule::applies` implements every condition kind (`event_match`,
 //! `contains_display_name`, `room_member_count`, `sender_notification_permission`,
-//! `event_property_is`, `event_property_contains`), the self-sender exclusion, the `enabled`
-//! check, and the "old mention rules disabled when `m.mentions` is present" MSC3952 carve-out.
-//! What is genuinely ours to build is: picking the first applicable rule (the spec's tie-break),
-//! and turning it into the shape the rest of this crate and `crate::pushers` need.
+//! `event_property_is`, `event_property_contains`), the `enabled` check, and the "old mention
+//! rules are disabled when `m.mentions` is present" MSC3952 carve-out;
+//! `ruma::push::PatternedPushRule::applies_to` is the content rule's `content.body` glob. What is
+//! ours: walking the five kinds in the spec's priority order (`crate::ruleset::Ruleset::iter`),
+//! the room and sender rules (a string comparison each), the "never notify a sender about their
+//! own event" rule, and turning the first match into the shape the rest of this crate needs.
 //!
 //! # Test provenance
 //!
@@ -21,8 +20,10 @@
 //! against this crate's own API — no Synapse source is copied, per
 //! `docs/decisions/0007-build-less-reuse-more.md` and this track's brief.
 
-use ruma::push::{Action, FlattenedJson, PushConditionRoomCtx, Ruleset};
+use ruma::push::{Action, FlattenedJson, PushConditionRoomCtx};
 use ruma::serde::Raw;
+
+use crate::ruleset::{RuleKind, RuleRef, Ruleset};
 
 /// The result of evaluating a ruleset against one event for one recipient: which rule matched
 /// (if any) and what it says to do.
@@ -54,30 +55,61 @@ pub fn flatten_event(event_json: &str) -> serde_json::Result<FlattenedJson> {
     Ok(FlattenedJson::from_raw(&raw))
 }
 
+/// Whether one rule matches, by its kind's own test.
+async fn rule_applies(
+    kind: RuleKind,
+    rule: RuleRef<'_>,
+    event: &FlattenedJson,
+    ctx: &PushConditionRoomCtx,
+) -> bool {
+    match (kind, rule) {
+        (RuleKind::Override | RuleKind::Underride, RuleRef::Conditional(r)) => {
+            r.applies(event, ctx).await
+        }
+        (RuleKind::Content, RuleRef::Patterned(r)) => r.applies_to("content.body", event, ctx),
+        (RuleKind::Room, RuleRef::Simple(r)) => {
+            r.enabled && event.get_str("room_id") == Some(r.rule_id.as_str())
+        }
+        (RuleKind::Sender, RuleRef::Simple(r)) => {
+            r.enabled && event.get_str("sender") == Some(r.rule_id.as_str())
+        }
+        // `Ruleset::iter` pairs every kind with its own rule type; any other pairing is a bug in
+        // the iterator, and a rule that cannot be checked must not match.
+        _ => false,
+    }
+}
+
 /// Evaluates `ruleset` against `event` for the recipient described by `ctx`
 /// (`ctx.user_id`/`ctx.user_display_name`), returning the first matching rule's outcome, or
 /// `None` if no rule applies (per spec: the homeserver then must not notify the push gateway at
 /// all, not even with an empty action list).
 ///
-/// Matches [`ruma::push::AnyPushRuleRef::applies`]'s own behavior of never matching the event's
-/// own sender (`ctx.user_id == event["sender"]`): callers do not need to filter the sender out of
-/// their recipient list themselves, though `crate::compiled`'s hot path still skips the sender up
-/// front to avoid the (cheap but pointless) per-rule check.
+/// An event never matches any rule for its own sender (`ctx.user_id == event["sender"]`), so
+/// callers do not need to filter the sender out of their recipient list themselves.
 pub async fn evaluate(
     ruleset: &Ruleset,
     event: &FlattenedJson,
     ctx: &PushConditionRoomCtx,
 ) -> Option<EvaluationOutcome> {
-    for rule in ruleset.iter() {
-        if !rule.applies(event, ctx).await {
+    if event
+        .get_str("sender")
+        .is_some_and(|sender| sender == ctx.user_id)
+    {
+        return None;
+    }
+    for (kind, rule) in ruleset.iter() {
+        if !rule_applies(kind, rule, event, ctx).await {
             continue;
         }
         let actions: Vec<Action> = rule.actions().to_vec();
         return Some(EvaluationOutcome {
             rule_id: rule.rule_id().to_owned(),
-            notify: rule.triggers_notification(),
-            highlight: rule.triggers_highlight(),
-            sound: rule.triggers_sound().map(|s| s.as_ref().to_owned()),
+            notify: actions.iter().any(Action::should_notify),
+            highlight: actions.iter().any(Action::is_highlight),
+            sound: actions
+                .iter()
+                .find_map(Action::sound)
+                .map(|s| s.as_ref().to_owned()),
             actions,
         });
     }
@@ -87,6 +119,7 @@ pub async fn evaluate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ruleset::NewRule;
     use ruma::UInt;
     use ruma::push::PushConditionRoomCtx;
     use ruma::{room_id, user_id};
@@ -146,7 +179,7 @@ mod tests {
         let alice = user_id!("@alice:example.org");
         let mut ruleset = Ruleset::server_default(alice);
         ruleset
-            .set_enabled(ruma::push::RuleKind::Underride, ".m.rule.message", false)
+            .set_enabled(RuleKind::Underride, ".m.rule.message", false)
             .unwrap();
         // Three members, not two: in a two-member room `.m.rule.room_one_to_one` matches ahead of
         // `.m.rule.message`, so disabling `.m.rule.message` alone would not make the ruleset
@@ -348,10 +381,13 @@ mod tests {
         let room = ruma::room_id!("!spec:example.org");
         ruleset
             .insert(
-                ruma::push::NewPushRule::Room(ruma::push::NewSimplePushRule::new(
-                    room.to_owned(),
-                    vec![],
-                )),
+                NewRule {
+                    kind: RuleKind::Room,
+                    rule_id: room.to_string(),
+                    actions: vec![],
+                    conditions: vec![],
+                    pattern: None,
+                },
                 None,
                 None,
             )

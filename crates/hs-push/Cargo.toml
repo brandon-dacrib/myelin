@@ -24,11 +24,14 @@ async-trait = { workspace = true }
 tracing = { workspace = true }
 reqwest = { workspace = true }
 rand = { workspace = true }
+bytes = { workspace = true }
+prometheus-client = { workspace = true }
 
 [dev-dependencies]
 hs-testkit = { path = "../hs-testkit" }
 tokio = { workspace = true, features = ["full", "test-util"] }
 criterion = { workspace = true }
+tower = { workspace = true, features = ["util"] }
 
 [[bench]]
 name = "evaluate"

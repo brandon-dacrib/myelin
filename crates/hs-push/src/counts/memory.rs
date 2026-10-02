@@ -84,6 +84,25 @@ impl CountsStore for InMemoryCountsStore {
             .remove(&key(user_id, room_id, scope));
         Ok(())
     }
+
+    async fn reset_room(&self, user_id: &UserId, room_id: &RoomId) -> Result<(), StoreError> {
+        self.rows
+            .write()
+            .unwrap()
+            .retain(|(u, r, _), _| !(u == user_id && r == room_id));
+        Ok(())
+    }
+
+    async fn total_unread(&self, user_id: &UserId) -> Result<u64, StoreError> {
+        Ok(self
+            .rows
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|((u, _, _), _)| u == user_id)
+            .map(|(_, c)| c.notification_count)
+            .sum())
+    }
 }
 
 #[cfg(test)]

@@ -570,6 +570,7 @@ fn build_session_mounts<B: KvBackend>(
         UserState<B, Arc<hs_room::registry::RoomRegistry<B>>>,
         hs_e2e::state::E2eState<B>,
         hs_push::state::PushState<B>,
+        hs_push::pipeline::PipelineWorker,
     ),
     ServeError,
 > {
@@ -597,21 +598,45 @@ fn build_session_mounts<B: KvBackend>(
 
     let e2e = hs_e2e::state::E2eState::new(auth.clone(), e2e_store);
 
+    let rulesets = Arc::new(hs_push::rulesets::CachedRulesetStore::new(
+        hs_push::rulesets::tables::TablesRulesetStore::open(backend.clone()).map_err(opening)?,
+    ));
+    let pushers: Arc<dyn hs_push::pushers::PusherStore> = Arc::new(
+        hs_push::pushers::tables::TablesPusherStore::open(backend.clone()).map_err(opening)?,
+    );
+    let counts: Arc<dyn hs_push::counts::CountsStore> = Arc::new(
+        hs_push::counts::tables::TablesCountsStore::open(backend.clone()).map_err(opening)?,
+    );
+    let notification_log: Arc<dyn hs_push::notification_log::NotificationLogStore> = Arc::new(
+        hs_push::notification_log::tables::TablesNotificationLogStore::open(backend.clone())
+            .map_err(opening)?,
+    );
+    let http_pushers = Arc::new(hs_push::pushers::http::HttpPusherClient::new(
+        hs_push::pushers::http::RetryPolicy::default(),
+    ));
+    // The pipeline that turns room events into counts, `/notifications` entries and HTTP pushes
+    // (`hs_push::pipeline`'s module docs). Its worker is returned for the caller to start on
+    // the runtime, and the room stream is forwarded to it there too.
+    let (pipeline, pipeline_worker) = hs_push::pipeline::channel(hs_push::pipeline::PipelineDeps {
+        server_name: auth.server_name().to_owned(),
+        source: Arc::new(crate::push_delivery::RegistrySource::new(rooms.clone())),
+        rulesets: rulesets.clone(),
+        pushers: pushers.clone(),
+        counts: counts.clone(),
+        log: notification_log.clone(),
+        cursors: Arc::new(
+            hs_push::cursors::TablesCursorStore::open(backend.clone()).map_err(opening)?,
+        ),
+        http: http_pushers.clone(),
+    });
     let push = hs_push::state::PushState {
         auth: auth.clone(),
-        rulesets: Arc::new(hs_push::rulesets::CachedRulesetStore::new(
-            hs_push::rulesets::tables::TablesRulesetStore::open(backend.clone())
-                .map_err(opening)?,
-        )),
-        pushers: Arc::new(
-            hs_push::pushers::tables::TablesPusherStore::open(backend.clone()).map_err(opening)?,
-        ),
-        counts: Arc::new(
-            hs_push::counts::tables::TablesCountsStore::open(backend.clone()).map_err(opening)?,
-        ),
-        http_pushers: Arc::new(hs_push::pushers::http::HttpPusherClient::new(
-            hs_push::pushers::http::RetryPolicy::default(),
-        )),
+        rulesets,
+        pushers,
+        counts,
+        notification_log,
+        http_pushers,
+        pipeline: Some(pipeline.clone()),
     };
 
     // Three seams other crates built their half of and cannot reach across themselves, because
@@ -622,9 +647,10 @@ fn build_session_mounts<B: KvBackend>(
     // previous behaviour rather than a panic.
     user.hub.install_push_rules_store(push.rulesets.clone());
     user.hub.install_counts_store(push.counts.clone());
+    user.hub.install_read_receipt_sink(Arc::new(pipeline));
     user.hub.install_device_list_token_resolver(&e2e);
 
-    Ok((user, e2e, push))
+    Ok((user, e2e, push, pipeline_worker))
 }
 
 /// The `/api/v1` state a real `hs serve` runs on: admin credentials are verified against this
@@ -801,7 +827,7 @@ fn throwaway_mounts() -> Mounts<hs_kv::memory::MemoryBackend> {
         identity,
         remote_join: None,
     };
-    let (user, e2e, push) = build_session_mounts(&backend, &auth, &rooms)
+    let (user, e2e, push, _pipeline_worker) = build_session_mounts(&backend, &auth, &rooms)
         .expect("opening in-memory session/e2e/push keyspaces cannot fail");
 
     let (federation_state, x_matrix) = crate::federation::manifest_only_mount();
@@ -1348,6 +1374,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     metrics.with_registry(hs_room::metrics::register_metrics);
     // The copies a replica keeps of rooms it does not own, to answer /sync (decision 0022).
     metrics.with_registry(hs_user::metrics::register_metrics);
+    metrics.with_registry(hs_push::pipeline::register_metrics);
     // History fetched from other servers into rooms' timelines (`crate::backfill`).
     metrics.with_registry(crate::backfill::register_metrics);
     // Federation requests a room's server ACL refused, and notary key queries.
@@ -1452,7 +1479,8 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             live.on_change("migration", |_| Ok(()));
         }
     }
-    let (user_state, e2e_state, push_state) = build_session_mounts(&backend, &auth_state, &rooms)?;
+    let (user_state, e2e_state, push_state, push_worker) =
+        build_session_mounts(&backend, &auth_state, &rooms)?;
     // `server.sync`: how much of the feeds and the hot-room stream the hub keeps, read on every
     // room update, so a change is in force at once (below, with the other `server` settings).
     let sync_hub = user_state.hub.clone();
@@ -1481,6 +1509,11 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     // Subscribed here, before any listener is bound below, because the stream does not replay: an
     // update published before this subscription exists would be missed.
     user_state.hub.watch_all(rooms.subscribe_global());
+    // Push follows the same stream, subscribed at the same point for the same reason.
+    if let Some(pipeline) = push_state.pipeline.clone() {
+        tokio::spawn(push_worker.run());
+        crate::push_delivery::forward_room_updates(&rooms, pipeline);
+    }
     // Shutdown's way to the hub, which is generic over the backend where `ServeHandle` is not.
     let release_long_polls: ReleaseLongPolls = {
         let hub = user_state.hub.clone();

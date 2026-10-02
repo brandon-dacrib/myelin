@@ -125,6 +125,43 @@ impl<B: KvBackend> CountsStore for TablesCountsStore<B> {
         })
         .map_err(StoreError::from)
     }
+
+    async fn reset_room(&self, user_id: &UserId, room_id: &RoomId) -> Result<(), StoreError> {
+        // The keys to delete are read outside the transaction (a prefix scan), then deleted
+        // inside it; a notification recorded in between survives, as it should.
+        let snap = self.backend.snapshot();
+        let prefix = (user_id.to_string(), room_id.to_string());
+        let spec = TypedKeyspace::<B::Keyspace, (String, String, String)>::prefix(&prefix);
+        let mut keys = Vec::new();
+        for item in self.counts.range(&snap, spec) {
+            let (key, _) = item?;
+            keys.push(key);
+        }
+        if keys.is_empty() {
+            return Ok(());
+        }
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            for key in &keys {
+                self.counts
+                    .delete(txn, key)
+                    .map_err(hs_kv::KvError::backend)?;
+            }
+            Ok(())
+        })
+        .map_err(StoreError::from)
+    }
+
+    async fn total_unread(&self, user_id: &UserId) -> Result<u64, StoreError> {
+        let snap = self.backend.snapshot();
+        let prefix = (user_id.to_string(),);
+        let spec = TypedKeyspace::<B::Keyspace, (String, String, String)>::prefix(&prefix);
+        let mut total = 0u64;
+        for item in self.counts.range(&snap, spec) {
+            let (_, bytes) = item?;
+            total += decode(&bytes)?.notification_count;
+        }
+        Ok(total)
+    }
 }
 
 #[cfg(test)]

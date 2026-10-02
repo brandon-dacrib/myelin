@@ -1,10 +1,10 @@
 //! An `hs-kv`/`hs-tables`-backed [`super::RulesetStore`], following the pattern
 //! `crates/hs-auth/src/store/tables.rs` set: one keyspace, typed primary key, JSON-encoded row.
 
+use crate::ruleset::Ruleset;
 use hs_kv::{KvBackend, KvRead, KvWrite, TransactConfig, transact};
 use hs_tables::keyspace::TypedKeyspace;
 use ruma::UserId;
-use ruma::push::Ruleset;
 
 use super::RulesetStore;
 use crate::error::StoreError;
@@ -109,7 +109,7 @@ mod tests {
         let read_back = store.get_ruleset(alice).await.unwrap().unwrap();
         assert!(
             read_back
-                .get(ruma::push::RuleKind::Underride, ".m.rule.message")
+                .get(crate::ruleset::RuleKind::Underride, ".m.rule.message")
                 .is_some()
         );
     }

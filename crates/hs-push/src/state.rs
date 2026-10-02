@@ -15,6 +15,8 @@ use hs_kv::KvBackend;
 
 use crate::compiled::RuleCache;
 use crate::counts::CountsStore;
+use crate::notification_log::NotificationLogStore;
+use crate::pipeline::PipelineHandle;
 use crate::pushers::PusherStore;
 use crate::pushers::http::HttpPusherClient;
 use crate::rulesets::CachedRulesetStore;
@@ -33,8 +35,13 @@ pub struct PushState<B: KvBackend> {
     pub pushers: Arc<dyn PusherStore>,
     /// Notification and highlight counts.
     pub counts: Arc<dyn CountsStore>,
+    /// The `/notifications` log.
+    pub notification_log: Arc<dyn NotificationLogStore>,
     /// The HTTP pusher client (retry/backoff against a Push Gateway API-compatible gateway).
     pub http_pushers: Arc<HttpPusherClient>,
+    /// The push pipeline, when one runs in this process (`None` in tests of the HTTP surface
+    /// alone).
+    pub pipeline: Option<PipelineHandle>,
 }
 
 impl<B: KvBackend> FromRef<PushState<B>> for AuthState {

@@ -20,8 +20,8 @@ pub mod tables;
 
 use std::sync::Arc;
 
+use crate::ruleset::Ruleset;
 use ruma::UserId;
-use ruma::push::Ruleset;
 
 use crate::compiled::RuleCache;
 use crate::error::StoreError;
@@ -221,7 +221,11 @@ mod tests {
 
         let mut edited = (*first).clone();
         edited
-            .set_enabled(ruma::push::RuleKind::Underride, ".m.rule.message", false)
+            .set_enabled(
+                crate::ruleset::RuleKind::Underride,
+                ".m.rule.message",
+                false,
+            )
             .unwrap();
         store.set_ruleset(alice, &edited).await.unwrap();
         assert!(
@@ -232,7 +236,7 @@ mod tests {
         let second = store.effective_ruleset(alice).await.unwrap();
         assert!(!Arc::ptr_eq(&first, &second));
         let rule = second
-            .get(ruma::push::RuleKind::Underride, ".m.rule.message")
+            .get(crate::ruleset::RuleKind::Underride, ".m.rule.message")
             .unwrap();
         assert!(!rule.enabled());
     }
@@ -296,14 +300,14 @@ mod tests {
         // everything); every other rule defaults to enabled.
         assert!(
             !rules
-                .get(ruma::push::RuleKind::Override, ".m.rule.master")
+                .get(crate::ruleset::RuleKind::Override, ".m.rule.master")
                 .unwrap()
                 .enabled()
         );
         for id in &override_ids[1..] {
             assert!(
                 rules
-                    .get(ruma::push::RuleKind::Override, *id)
+                    .get(crate::ruleset::RuleKind::Override, id)
                     .unwrap()
                     .enabled(),
                 "{id} must default to enabled"
@@ -332,7 +336,11 @@ mod tests {
 
         let mut edited = default_ruleset(alice);
         edited
-            .set_enabled(ruma::push::RuleKind::Underride, ".m.rule.message", false)
+            .set_enabled(
+                crate::ruleset::RuleKind::Underride,
+                ".m.rule.message",
+                false,
+            )
             .unwrap();
         let written_seq = store.set_ruleset(alice, &edited).await.unwrap();
         assert!(written_seq > 0);

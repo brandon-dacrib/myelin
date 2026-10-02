@@ -3,8 +3,8 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 
+use crate::ruleset::Ruleset;
 use ruma::UserId;
-use ruma::push::Ruleset;
 
 use super::RulesetStore;
 use crate::error::StoreError;

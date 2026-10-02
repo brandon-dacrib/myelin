@@ -53,6 +53,7 @@ use hs_media::id::MediaId;
 use hs_media::metadata::MediaRecord;
 use hs_media::repository::{MediaRepository, content_object_key};
 use hs_push::pushers::PusherStore;
+use hs_push::ruleset::{NewRule, RuleKind, Ruleset};
 use hs_push::rulesets::tables::TablesRulesetStore;
 use hs_push::rulesets::{CachedRulesetStore, RulesetStore};
 use hs_room::RoomError;
@@ -67,10 +68,7 @@ use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
-use ruma::push::{
-    Action, NewConditionalPushRule, NewPatternedPushRule, NewPushRule, NewSimplePushRule,
-    PushCondition, RuleKind, Ruleset,
-};
+use ruma::push::{Action, PushCondition};
 use serde_json::Value;
 
 /// The session hub a running server has.
@@ -193,9 +191,9 @@ impl<B: KvBackend + 'static> StoreTarget<B> {
                     continue;
                 }
             };
-            if ruleset
-                .set_actions(RuleKind::from(kind.as_str()), id, actions)
-                .is_err()
+            if RuleKind::parse(kind)
+                .and_then(|k| ruleset.set_actions(k, id, actions).ok())
+                .is_none()
             {
                 notes.push(format!(
                     "{kind} rule {id}: Synapse has this server-default rule, and this server does \
@@ -204,9 +202,9 @@ impl<B: KvBackend + 'static> StoreTarget<B> {
             }
         }
         for (kind, id, enabled) in &rules.enabled {
-            if ruleset
-                .set_enabled(RuleKind::from(kind.as_str()), id, *enabled)
-                .is_err()
+            if RuleKind::parse(kind)
+                .and_then(|k| ruleset.set_enabled(k, id, *enabled).ok())
+                .is_none()
             {
                 notes.push(format!(
                     "{kind} rule {id} was turned {} in Synapse, and there is no such rule here",
@@ -246,33 +244,28 @@ fn user_id(raw: &str) -> Result<ruma::OwnedUserId, TargetError> {
 }
 
 /// A rule as `PUT /pushrules/global/{kind}/{ruleId}` would make it.
-fn new_push_rule(kind: &str, rule: &Value) -> Result<NewPushRule, String> {
+fn new_push_rule(kind: &str, rule: &Value) -> Result<NewRule, String> {
     let id = rule["rule_id"].as_str().ok_or("no rule_id")?.to_owned();
     let actions: Vec<Action> =
         serde_json::from_value(rule["actions"].clone()).map_err(|e| format!("actions: {e}"))?;
-    let conditions = || -> Result<Vec<PushCondition>, String> {
-        serde_json::from_value(rule["conditions"].clone()).map_err(|e| format!("conditions: {e}"))
+    let kind = RuleKind::parse(kind).ok_or_else(|| format!("no {kind} rules here"))?;
+    let conditions: Vec<PushCondition> = match kind {
+        RuleKind::Override | RuleKind::Underride => {
+            serde_json::from_value(rule["conditions"].clone())
+                .map_err(|e| format!("conditions: {e}"))?
+        }
+        _ => Vec::new(),
     };
-    Ok(match kind {
-        "override" => {
-            NewPushRule::Override(NewConditionalPushRule::new(id, conditions()?, actions))
-        }
-        "underride" => {
-            NewPushRule::Underride(NewConditionalPushRule::new(id, conditions()?, actions))
-        }
-        "content" => {
-            let pattern = rule["pattern"].as_str().ok_or("no pattern")?.to_owned();
-            NewPushRule::Content(NewPatternedPushRule::new(id, pattern, actions))
-        }
-        "room" => NewPushRule::Room(NewSimplePushRule::new(
-            ruma::OwnedRoomId::try_from(id.as_str()).map_err(|e| e.to_string())?,
-            actions,
-        )),
-        "sender" => NewPushRule::Sender(NewSimplePushRule::new(
-            ruma::OwnedUserId::try_from(id.as_str()).map_err(|e| e.to_string())?,
-            actions,
-        )),
-        other => return Err(format!("no {other} rules here")),
+    let pattern = match kind {
+        RuleKind::Content => Some(rule["pattern"].as_str().ok_or("no pattern")?.to_owned()),
+        _ => None,
+    };
+    Ok(NewRule {
+        kind,
+        rule_id: id,
+        actions,
+        conditions,
+        pattern,
     })
 }
 

@@ -122,6 +122,14 @@ pub trait CountsStore: Send + Sync {
         room_id: &RoomId,
         scope: Scope<'_>,
     ) -> Result<(), StoreError>;
+
+    /// Zeroes every scope of the room, main timeline and threads alike: what a read receipt does
+    /// (`crate::pipeline`), since receipts here are per room, not per thread.
+    async fn reset_room(&self, user_id: &UserId, room_id: &RoomId) -> Result<(), StoreError>;
+
+    /// The user's unread notifications across every room and thread: the badge a push carries
+    /// (`counts.unread` in the Push Gateway API).
+    async fn total_unread(&self, user_id: &UserId) -> Result<u64, StoreError>;
 }
 
 #[cfg(test)]
@@ -187,5 +195,36 @@ mod contract_tests {
             .unwrap();
         let all_clear = store.get_room_counts(alice, room).await.unwrap();
         assert_eq!(all_clear, RoomNotificationCounts::default());
+
+        // The badge sums every room and thread of one user, and nobody else's.
+        let other_room = ruma::room_id!("!other:example.org");
+        let bob = ruma::user_id!("@bob:example.org");
+        store
+            .record_notification(alice, room, Scope::Main, false)
+            .await
+            .unwrap();
+        store
+            .record_notification(alice, room, Scope::Thread(thread_root), true)
+            .await
+            .unwrap();
+        store
+            .record_notification(alice, other_room, Scope::Main, false)
+            .await
+            .unwrap();
+        store
+            .record_notification(bob, room, Scope::Main, false)
+            .await
+            .unwrap();
+        assert_eq!(store.total_unread(alice).await.unwrap(), 3);
+        assert_eq!(store.total_unread(bob).await.unwrap(), 1);
+
+        // A receipt resets the whole room, threads included, and leaves other rooms alone.
+        store.reset_room(alice, room).await.unwrap();
+        assert_eq!(
+            store.get_room_counts(alice, room).await.unwrap(),
+            RoomNotificationCounts::default()
+        );
+        assert_eq!(store.total_unread(alice).await.unwrap(), 1);
+        assert_eq!(store.total_unread(bob).await.unwrap(), 1);
     }
 }

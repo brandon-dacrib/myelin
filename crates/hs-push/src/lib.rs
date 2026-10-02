@@ -46,11 +46,14 @@
 pub mod compiled;
 pub mod context;
 pub mod counts;
+pub mod cursors;
 pub mod engine;
 pub mod error;
 pub mod notification_log;
+pub mod pipeline;
 pub mod pushers;
 pub mod routes;
+pub mod ruleset;
 pub mod rulesets;
 pub mod state;
 

@@ -1,8 +1,9 @@
 //! HTTP pushers: posting to a Push Gateway API-compatible gateway (Sygnal, or any other), with
 //! retry and backoff. Per `docs/decisions/0007-build-less-reuse-more.md`, this homeserver does
 //! not build a gateway — this module is the client side only, and its notification payload is
-//! built from `ruma::api::push_gateway::send_event_notification::v1`'s types
-//! (`Notification`, `Device`, `NotificationCounts`, `PusherData`), not a hand-rolled JSON shape.
+//! built by `crate::pipeline` in the spec's shape (plus the deprecated `id` field the Push
+//! Gateway API's own examples and Sytest still expect, which Ruma's `Notification` type has
+//! dropped -- the reason the body is JSON here rather than that type).
 //!
 //! The envelope around those types (the actual `reqwest` POST, retry loop and response parsing)
 //! is hand-written rather than routed through Ruma's `OutgoingRequest`/HTTP-client machinery:
@@ -18,8 +19,7 @@
 use std::time::Duration;
 
 use http::StatusCode;
-use ruma::api::push_gateway::send_event_notification::v1::Notification;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 /// Retry and backoff tuning for [`HttpPusherClient::notify`]. Mirrors the shape of
 /// `hs_kv::TransactConfig`: exponential backoff from `base_backoff`, capped at `max_backoff`.
@@ -77,11 +77,6 @@ pub enum NotifyError {
     },
 }
 
-#[derive(Serialize)]
-struct NotifyRequestBody<'a> {
-    notification: &'a Notification,
-}
-
 #[derive(Deserialize, Default)]
 struct NotifyResponseBody {
     #[serde(default)]
@@ -105,9 +100,9 @@ impl HttpPusherClient {
         }
     }
 
-    /// Posts `notification` to `gateway_url` (the pusher's configured `data.url`, per the spec:
-    /// the full URL including `/_matrix/push/v1/notify`), retrying on transport errors and `5xx`
-    /// responses.
+    /// Posts `body` (the whole request body, `{"notification": {...}}`) to `gateway_url` (the
+    /// pusher's configured `data.url`, per the spec: the full URL including
+    /// `/_matrix/push/v1/notify`), retrying on transport errors and `5xx` responses.
     ///
     /// Returns the gateway's `rejected` pushkey list on any `2xx` response (the spec's mechanism
     /// for "this pushkey is stale, delete the pusher" — the caller, not this function, is
@@ -119,14 +114,13 @@ impl HttpPusherClient {
     pub async fn notify(
         &self,
         gateway_url: &str,
-        notification: &Notification,
+        body: &serde_json::Value,
     ) -> Result<Vec<String>, NotifyError> {
-        let body = NotifyRequestBody { notification };
         let mut attempt = 0u32;
         let mut last_reason: String;
         loop {
             attempt += 1;
-            match self.http.post(gateway_url).json(&body).send().await {
+            match self.http.post(gateway_url).json(body).send().await {
                 Ok(response) => {
                     let status = response.status();
                     if status.is_success() {
@@ -166,7 +160,6 @@ mod tests {
     use axum::Router;
     use axum::response::IntoResponse;
     use axum::routing::post;
-    use ruma::api::push_gateway::send_event_notification::v1::Device;
 
     async fn serve(router: Router) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -177,11 +170,12 @@ mod tests {
         format!("http://{addr}/_matrix/push/v1/notify")
     }
 
-    fn sample_notification() -> Notification {
-        Notification::new(vec![Device::new(
-            "com.example.app".to_owned(),
-            "abc123".to_owned(),
-        )])
+    fn sample_notification() -> serde_json::Value {
+        serde_json::json!({
+            "notification": {
+                "devices": [{"app_id": "com.example.app", "pushkey": "abc123"}]
+            }
+        })
     }
 
     fn fast_retry() -> RetryPolicy {
