@@ -8,16 +8,21 @@
 //!   to-device message for a user of another server, is queued for other servers.
 //! - [`EduDispatcher`]: `hs_federation::edu::InboundEduSink` -- where `/send`'s EDUs go:
 //!   typing, receipts and presence to the session hub; device-list and signing-key updates to
-//!   the device-list stream (so a local user who shares a room with the remote user is told, in
-//!   `/sync`'s `device_lists.changed`, to query their keys again); to-device messages to the
-//!   recipients' device inboxes, each `message_id` once (`hs_e2e::federation::
-//!   receive_direct_to_device`).
+//!   `hs-e2e`'s copy of the remote user's device list and its device-list stream (so a local
+//!   user who shares a room with the remote user is told, in `/sync`'s `device_lists.changed`,
+//!   to query their keys again; `hs_e2e::federation::receive_device_list_update`); to-device
+//!   messages to the recipients' device inboxes, each `message_id` once
+//!   (`hs_e2e::federation::receive_direct_to_device`).
 //! - [`DeviceListAnnouncer`]: follows the local device-list stream and tells the servers of
 //!   everyone a changed local user shares a room with: `m.device_list_update` for each device
-//!   whose keys changed (or that was deleted), `m.signing_key_update` when the user's master or
-//!   self-signing key changed.
+//!   added, changed (keys or display name) or deleted, `m.signing_key_update` when the user's
+//!   master or self-signing key changed (`hs_e2e::federation::device_list_update_edus`).
 //! - [`ClientRemoteKeys`]: `hs_e2e::federation::RemoteKeys` over the federation client -- how a
-//!   local `/keys/query` or `/keys/claim` for a remote user reaches that user's server.
+//!   local `/keys/query` or `/keys/claim` for a remote user reaches that user's server, and how
+//!   their whole device list is fetched (`GET /user/devices/{userId}`).
+//! - [`HubRoomSharing`]: `hs_e2e::federation::RoomSharing` over the session hub -- whether a
+//!   remote user shares a room with a local one, which decides whether their device list is
+//!   copied here.
 //!
 //! # Observability
 //!
@@ -34,14 +39,16 @@
 //! the device-list announcer's: every replica follows the stream and produces those for itself,
 //! and each queues them only for the destinations it sends for.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use hs_e2e::federation::{DIRECT_TO_DEVICE_EDU, InboundToDevice};
+use hs_e2e::federation::{
+    Announced, DIRECT_TO_DEVICE_EDU, InboundDeviceList, InboundToDevice, device_list_update_edus,
+    local_device_list,
+};
 use hs_e2e::state::E2eState;
-use hs_e2e::store::{CrossSigningKeyType, E2eStore};
 use hs_federation::edu::{Edu, InboundEduSink};
 use hs_federation::metrics::{EduMetrics, EduOutcome};
 use hs_federation::sender::FederationSender;
@@ -117,35 +124,39 @@ impl<B: KvBackend + 'static> EduDispatcher<B> {
         Self { hub, e2e, metrics }
     }
 
-    /// Records a device-list change for the user an `m.device_list_update` or
-    /// `m.signing_key_update` names, if they are a user of `origin`.
+    /// Hands an `m.device_list_update` or `m.signing_key_update` to `hs-e2e`, which keeps the
+    /// copy of the user's list and records the change.
     async fn device_list_changed(&self, origin: &str, edu: &Edu) -> EduOutcome {
-        let Some(user_id) = edu
-            .content
-            .get("user_id")
-            .and_then(Value::as_str)
-            .and_then(|u| UserId::parse(u).ok())
-        else {
-            tracing::debug!(
-                origin,
-                edu_type = edu.edu_type,
-                "dropping an EDU with no user_id"
-            );
-            return EduOutcome::Dropped;
+        let result = if edu.edu_type == "m.signing_key_update" {
+            hs_e2e::federation::receive_signing_key_update(&self.e2e, origin, &edu.content).await
+        } else {
+            hs_e2e::federation::receive_device_list_update(&self.e2e, origin, &edu.content).await
         };
-        if user_id.server_name().as_str() != origin {
-            tracing::debug!(
-                origin,
-                %user_id,
-                edu_type = edu.edu_type,
-                "dropping an EDU about a user of another server"
-            );
-            return EduOutcome::Dropped;
-        }
-        match self.e2e.store.record_device_list_change(&user_id).await {
-            Ok(_) => EduOutcome::Applied,
+        let user_id = edu.content.get("user_id").and_then(Value::as_str);
+        match result {
+            Ok(InboundDeviceList::Dropped(reason)) => {
+                tracing::debug!(
+                    origin,
+                    user_id,
+                    edu_type = edu.edu_type,
+                    reason,
+                    "dropping an EDU"
+                );
+                EduOutcome::Dropped
+            }
+            Ok(InboundDeviceList::AlreadyKnown) => EduOutcome::Duplicate,
+            Ok(outcome) => {
+                tracing::debug!(
+                    origin,
+                    user_id,
+                    edu_type = edu.edu_type,
+                    ?outcome,
+                    "device-list EDU"
+                );
+                EduOutcome::Applied
+            }
             Err(error) => {
-                tracing::warn!(%user_id, %error, "could not record a remote device-list change");
+                tracing::warn!(origin, user_id, %error, "could not apply a remote device-list change");
                 EduOutcome::Dropped
             }
         }
@@ -217,14 +228,13 @@ pub const DEVICE_LIST_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// Follows the local device-list stream and announces each local user's changes to the servers
 /// that share a room with them. See the module docs.
 ///
-/// Polling, not a hook: every device-list change -- a key upload, a device deleted through
-/// `hs-auth`, a cross-signing key or signature -- already goes through `hs-e2e`'s stream, and
-/// reading the stream catches all of them without either crate learning about federation. The
-/// stream names the user, not what changed, so the announcer remembers what it last announced
-/// for each user (their devices' keys, their master and self-signing keys) and sends only the
-/// difference: an `m.device_list_update` per device added, changed or deleted, and an
-/// `m.signing_key_update` when a cross-signing key changed. The first change it sees for a user
-/// announces every device and any cross-signing keys, since it cannot tell what changed. It
+/// Polling, not a hook: every device-list change -- a key upload, a device added, renamed or
+/// deleted through `hs-auth`, a cross-signing key or signature -- already goes through
+/// `hs-e2e`'s stream, and reading the stream catches all of them without either crate learning
+/// about federation. The stream names the user, not what changed, so the announcer remembers
+/// what it last announced for each user (`hs_e2e::federation::Announced`) and sends only the
+/// difference (`hs_e2e::federation::device_list_update_edus`). The first change it sees for a
+/// user announces every device and any cross-signing keys, since it cannot tell what changed. It
 /// starts from the stream's position at start: what changed while the server was down is not
 /// announced (Synapse keeps an outbound table for that; a remote server here re-learns the list
 /// on the next change, or when its user next queries).
@@ -236,110 +246,18 @@ pub struct DeviceListAnnouncer {
     task: tokio::task::JoinHandle<()>,
 }
 
-/// What [`DeviceListAnnouncer`] last announced for one user.
-#[derive(Debug, Clone, Default, PartialEq)]
-struct Announced {
-    /// The device-list stream position of the last `m.device_list_update` sent, for `prev_id`.
-    stream_id: Option<u64>,
-    /// Each device's keys, as announced.
-    devices: BTreeMap<String, Value>,
-    /// The master key, as announced.
-    master: Option<Value>,
-    /// The self-signing key, as announced.
-    self_signing: Option<Value>,
-}
-
-/// A user's device keys and cross-signing keys as they are now.
-struct Current {
-    devices: BTreeMap<String, Value>,
-    master: Option<Value>,
-    self_signing: Option<Value>,
-}
-
-/// The EDUs (type and content) that tell another server about the difference between `before`
-/// (`None`: nothing is known to have been announced) and `now` for `user_id`, stamped with
-/// device-list stream position `stream_id`. Returns them and what is announced afterwards.
-fn updates_for(
-    user_id: &UserId,
-    before: Option<&Announced>,
-    now: Current,
-    stream_id: u64,
-) -> (Vec<(&'static str, Value)>, Announced) {
-    let mut edus = Vec::new();
-    let unknown = Announced::default();
-    let before_known = before.is_some();
-    let before = before.unwrap_or(&unknown);
-    let prev_id: Vec<u64> = before.stream_id.into_iter().collect();
-    let mut sent_device_update = false;
-    for (device_id, keys) in &now.devices {
-        if before.devices.get(device_id) != Some(keys) {
-            edus.push((
-                "m.device_list_update",
-                json!({
-                    "user_id": user_id,
-                    "device_id": device_id,
-                    "stream_id": stream_id,
-                    "prev_id": prev_id,
-                    "deleted": false,
-                    "keys": keys,
-                }),
-            ));
-            sent_device_update = true;
-        }
-    }
-    for device_id in before.devices.keys() {
-        if !now.devices.contains_key(device_id) {
-            edus.push((
-                "m.device_list_update",
-                json!({
-                    "user_id": user_id,
-                    "device_id": device_id,
-                    "stream_id": stream_id,
-                    "prev_id": prev_id,
-                    "deleted": true,
-                }),
-            ));
-            sent_device_update = true;
-        }
-    }
-    let cross_signing_changed =
-        now.master != before.master || now.self_signing != before.self_signing;
-    let has_cross_signing = now.master.is_some() || now.self_signing.is_some();
-    if has_cross_signing && (cross_signing_changed || !before_known) {
-        let mut content = json!({"user_id": user_id});
-        if let Some(master) = &now.master {
-            content["master_key"] = master.clone();
-        }
-        if let Some(self_signing) = &now.self_signing {
-            content["self_signing_key"] = self_signing.clone();
-        }
-        edus.push(("m.signing_key_update", content));
-    }
-    let announced = Announced {
-        stream_id: if sent_device_update {
-            Some(stream_id)
-        } else {
-            before.stream_id
-        },
-        devices: now.devices,
-        master: now.master,
-        self_signing: now.self_signing,
-    };
-    (edus, announced)
-}
-
 impl DeviceListAnnouncer {
     /// Starts following `e2e`'s stream from its current position, announcing through `sender`
     /// to the servers `hub` says share a room with each changed user of `own_server`.
     #[must_use]
     pub fn start<B: KvBackend + 'static>(
         hub: Arc<Hub<B>>,
-        e2e: Arc<dyn E2eStore>,
+        e2e: E2eState<B>,
         sender: Arc<FederationSender>,
         own_server: OwnedServerName,
     ) -> Self {
         let task = tokio::spawn(async move {
-            let mut last = match e2e.current_stream_pos().await {
+            let mut last = match e2e.store.current_stream_pos().await {
                 Ok(pos) => pos,
                 Err(error) => {
                     tracing::error!(%error, "cannot read the device-list stream; device-list updates will not be sent");
@@ -351,7 +269,7 @@ impl DeviceListAnnouncer {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 interval.tick().await;
-                let now = match e2e.current_stream_pos().await {
+                let now = match e2e.store.current_stream_pos().await {
                     Ok(pos) if pos > last => pos,
                     Ok(_) => continue,
                     Err(error) => {
@@ -359,7 +277,7 @@ impl DeviceListAnnouncer {
                         continue;
                     }
                 };
-                let changed = match e2e.changed_users_since(last, Some(now)).await {
+                let changed = match e2e.store.changed_users_since(last, Some(now)).await {
                     Ok(users) => users,
                     Err(error) => {
                         tracing::warn!(%error, "cannot read the device-list changes");
@@ -372,8 +290,7 @@ impl DeviceListAnnouncer {
                         continue;
                     }
                     let before = announced.get(&user_id);
-                    if let Some(after) = announce(&hub, &*e2e, &sender, &user_id, now, before).await
-                    {
+                    if let Some(after) = announce(&hub, &e2e, &sender, &user_id, before).await {
                         announced.insert(user_id, after);
                     }
                 }
@@ -394,49 +311,24 @@ impl Drop for DeviceListAnnouncer {
     }
 }
 
-/// Reads `user_id`'s keys now.
-async fn current_keys(e2e: &dyn E2eStore, user_id: &UserId) -> Result<Current, String> {
-    let devices = e2e
-        .list_device_keys(user_id)
-        .await
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .map(|(device_id, row)| (device_id.to_string(), row.keys))
-        .collect();
-    let master = e2e
-        .get_cross_signing_key(user_id, CrossSigningKeyType::Master)
-        .await
-        .map_err(|e| e.to_string())?;
-    let self_signing = e2e
-        .get_cross_signing_key(user_id, CrossSigningKeyType::SelfSigning)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(Current {
-        devices,
-        master,
-        self_signing,
-    })
-}
-
 /// Sends what changed for `user_id` since `before` to the servers of everyone they share a
 /// joined room with, and returns what is announced now (`None`: nothing could be read, so
 /// nothing changes).
 async fn announce<B: KvBackend + 'static>(
     hub: &Hub<B>,
-    e2e: &dyn E2eStore,
+    e2e: &E2eState<B>,
     sender: &FederationSender,
     user_id: &UserId,
-    stream_id: u64,
     before: Option<&Announced>,
 ) -> Option<Announced> {
-    let now = match current_keys(e2e, user_id).await {
+    let now = match local_device_list(e2e, user_id).await {
         Ok(now) => now,
         Err(error) => {
-            tracing::warn!(%user_id, %error, "cannot read a user's keys to announce them");
+            tracing::warn!(%user_id, %error, "cannot read a user's devices to announce them");
             return None;
         }
     };
-    let (edus, after) = updates_for(user_id, before, now, stream_id);
+    let (edus, after) = device_list_update_edus(user_id, before, now);
     if edus.is_empty() {
         tracing::debug!(%user_id, "a device-list change with nothing another server is told about");
         return Some(after);
@@ -522,20 +414,68 @@ impl hs_e2e::federation::RemoteKeys for ClientRemoteKeys {
         )
         .await
     }
+
+    async fn devices(&self, server: &str, user_id: &str) -> Result<Value, String> {
+        // `@` and `:` are path characters; nothing in a user id needs escaping.
+        let path = format!("/_matrix/federation/v1/user/devices/{user_id}");
+        match self.client.send(server, "GET", &path, None).await {
+            Ok(response) if response.status == 200 => Ok(response.body),
+            Ok(response) => Err(format!("HTTP {}: {}", response.status, response.body)),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+}
+
+/// `hs_e2e::federation::RoomSharing` over the session hub's membership records. See the module
+/// docs.
+pub struct HubRoomSharing<B: KvBackend> {
+    hub: Arc<Hub<B>>,
+    own_server: OwnedServerName,
+}
+
+impl<B: KvBackend> HubRoomSharing<B> {
+    /// Answers from `hub` for users of `own_server`.
+    #[must_use]
+    pub fn new(hub: Arc<Hub<B>>, own_server: OwnedServerName) -> Self {
+        Self { hub, own_server }
+    }
+}
+
+#[async_trait]
+impl<B: KvBackend + 'static> hs_e2e::federation::RoomSharing for HubRoomSharing<B> {
+    async fn shares_a_room_with_a_local_user(&self, user_id: &UserId) -> bool {
+        match self.hub.users_sharing_room_with(user_id).await {
+            Ok(users) => users.iter().any(|u| u.server_name() == self.own_server),
+            Err(error) => {
+                tracing::warn!(%user_id, %error, "cannot work out whether a remote user shares a room here");
+                false
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hs_e2e::federation::{AnnouncedDevice, LocalDeviceList};
 
-    fn current(devices: &[(&str, Value)], master: Option<Value>) -> Current {
-        Current {
+    fn list(devices: &[(&str, Value)], master: Option<Value>, stream_id: u64) -> LocalDeviceList {
+        LocalDeviceList {
             devices: devices
                 .iter()
-                .map(|(d, k)| ((*d).to_owned(), k.clone()))
+                .map(|(d, k)| {
+                    (
+                        (*d).to_owned(),
+                        AnnouncedDevice {
+                            keys: Some(k.clone()),
+                            display_name: None,
+                        },
+                    )
+                })
                 .collect(),
             master,
             self_signing: None,
+            stream_id,
         }
     }
 
@@ -543,69 +483,30 @@ mod tests {
         edus.iter().map(|(t, _)| *t).collect()
     }
 
+    /// The announcer's contract with `hs-e2e`'s diff: the first change seen for a user
+    /// announces everything, and the next announcement names the first in `prev_id`.
     #[test]
-    fn the_first_change_seen_for_a_user_announces_everything() {
+    fn the_first_change_seen_for_a_user_announces_everything_and_the_next_follows_it() {
         let user = ruma::user_id!("@alice:a.example");
-        let (edus, after) = updates_for(
+        let (edus, after) = device_list_update_edus(
             user,
             None,
-            current(&[("D1", json!({"k": 1}))], Some(json!({"m": 1}))),
-            7,
+            list(&[("D1", json!({"k": 1}))], Some(json!({"m": 1})), 7),
         );
         assert_eq!(
             types(&edus),
             ["m.device_list_update", "m.signing_key_update"]
         );
         assert_eq!(edus[0].1["prev_id"], json!([]));
+        assert_eq!(edus[0].1["stream_id"], 7);
         assert_eq!(edus[1].1["master_key"], json!({"m": 1}));
-        assert_eq!(after.stream_id, Some(7));
-    }
-
-    #[test]
-    fn a_cross_signing_change_is_a_signing_key_update_and_nothing_else() {
-        let user = ruma::user_id!("@alice:a.example");
-        let (_, before) = updates_for(user, None, current(&[("D1", json!({"k": 1}))], None), 3);
-        let (edus, after) = updates_for(
-            user,
-            Some(&before),
-            current(&[("D1", json!({"k": 1}))], Some(json!({"m": 1}))),
-            4,
-        );
-        assert_eq!(types(&edus), ["m.signing_key_update"]);
-        assert_eq!(edus[0].1["user_id"], user.as_str());
-        // No device update went out, so the next one still follows the last that did.
-        assert_eq!(after.stream_id, Some(3));
-        // And the same keys again are nothing to announce.
-        let (edus, _) = updates_for(
+        let (edus, _) = device_list_update_edus(
             user,
             Some(&after),
-            current(&[("D1", json!({"k": 1}))], Some(json!({"m": 1}))),
-            5,
+            list(&[("D1", json!({"k": 2}))], Some(json!({"m": 1})), 9),
         );
-        assert!(edus.is_empty(), "{edus:?}");
-    }
-
-    #[test]
-    fn only_changed_and_deleted_devices_are_announced_after_the_first_change() {
-        let user = ruma::user_id!("@alice:a.example");
-        let (_, before) = updates_for(
-            user,
-            None,
-            current(&[("D1", json!({"k": 1})), ("D2", json!({"k": 2}))], None),
-            3,
-        );
-        let (edus, after) = updates_for(
-            user,
-            Some(&before),
-            current(&[("D1", json!({"k": 1})), ("D3", json!({"k": 3}))], None),
-            9,
-        );
-        assert_eq!(edus.len(), 2, "{edus:?}");
-        assert_eq!(edus[0].1["device_id"], "D3");
-        assert_eq!(edus[0].1["deleted"], false);
-        assert_eq!(edus[0].1["prev_id"], json!([3]));
-        assert_eq!(edus[1].1["device_id"], "D2");
-        assert_eq!(edus[1].1["deleted"], true);
-        assert_eq!(after.stream_id, Some(9));
+        assert_eq!(types(&edus), ["m.device_list_update"]);
+        assert_eq!(edus[0].1["prev_id"], json!([7]));
+        assert_eq!(edus[0].1["stream_id"], 9);
     }
 }

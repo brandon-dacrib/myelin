@@ -207,6 +207,13 @@ pub trait DeviceKeyStore: Send + Sync {
     /// ever changed.
     async fn current_stream_pos(&self) -> Result<u64, StoreError>;
 
+    /// The stream position of `user_id`'s most recent device-list change, or `0` if they have
+    /// never had one. What this server reports as `stream_id` in its `/user/devices/{userId}`
+    /// answer and stamps on the `m.device_list_update` EDUs it sends for the user, so the two
+    /// agree and a receiving server can tell an update that follows its copy from one that
+    /// skipped something.
+    async fn user_stream_pos(&self, user_id: &UserId) -> Result<u64, StoreError>;
+
     /// Every distinct user whose device list changed with a stream position greater than `since`
     /// and at most `upto` (`upto = None` means "no upper bound", i.e. up to
     /// [`DeviceKeyStore::current_stream_pos`]).
@@ -494,6 +501,89 @@ pub trait ToDeviceStore: Send + Sync {
     ) -> Result<bool, StoreError>;
 }
 
+/// One device of a user of another server, as this server last learned it: from that server's
+/// `GET /user/devices/{userId}` or an `m.device_list_update` EDU.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteDeviceRow {
+    /// The device's `device_keys` object, verbatim, if it has uploaded any.
+    pub keys: Option<Value>,
+    /// The device's display name, if its server shares it.
+    pub display_name: Option<String>,
+}
+
+/// What this server knows about a remote user's device list as a whole. See
+/// [`RemoteDeviceListStore`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteUserRow {
+    /// The user's server's device-list stream position this copy is current to: the `stream_id`
+    /// of its `/user/devices` answer, or of the last `m.device_list_update` applied.
+    pub stream_id: u64,
+    /// The user's master cross-signing key, if their server told us one.
+    pub master: Option<Value>,
+    /// The user's self-signing cross-signing key, if their server told us one.
+    pub self_signing: Option<Value>,
+    /// Set when an update arrived that could not be applied in sequence and the list could not
+    /// be fetched again: the copy may be missing a change, and must be fetched again before it
+    /// is served.
+    pub stale: bool,
+}
+
+/// This server's copy of other servers' users' device lists: a user's devices (keys and display
+/// names) and cross-signing keys, kept while a local user shares a room with them, filled from
+/// their server's `/user/devices/{userId}` and kept current from the `m.device_list_update` and
+/// `m.signing_key_update` EDUs their server sends. `/keys/query` serves a remote user from this
+/// copy when it is complete ([`RemoteUserRow::stale`] is false), so a key query does not cost a
+/// federation request each time and still answers when the user's server is down. See
+/// `crate::federation`'s module docs.
+#[async_trait]
+pub trait RemoteDeviceListStore: Send + Sync {
+    /// What is known about `user_id`'s list, if anything.
+    async fn get_remote_user(&self, user_id: &UserId) -> Result<Option<RemoteUserRow>, StoreError>;
+
+    /// `user_id`'s devices as last learned, ordered by device id.
+    async fn list_remote_devices(
+        &self,
+        user_id: &UserId,
+    ) -> Result<Vec<(OwnedDeviceId, RemoteDeviceRow)>, StoreError>;
+
+    /// Replaces everything known about `user_id` with a complete list (a `/user/devices`
+    /// answer): the devices given are the only ones afterwards, and the user is no longer stale.
+    async fn replace_remote_device_list(
+        &self,
+        user_id: &UserId,
+        user: RemoteUserRow,
+        devices: Vec<(OwnedDeviceId, RemoteDeviceRow)>,
+    ) -> Result<(), StoreError>;
+
+    /// Applies one `m.device_list_update` for a user whose list is held: upserts the device
+    /// (`Some`) or removes it (`None`), and moves the user's `stream_id` forward to `stream_id`.
+    /// Errors with [`StoreError::NotFound`] if the user's list is not held.
+    async fn apply_remote_device_update(
+        &self,
+        user_id: &UserId,
+        device_id: &DeviceId,
+        device: Option<RemoteDeviceRow>,
+        stream_id: u64,
+    ) -> Result<(), StoreError>;
+
+    /// Replaces the cross-signing keys held for a user whose list is held (an
+    /// `m.signing_key_update`). Errors with [`StoreError::NotFound`] if the user's list is not
+    /// held.
+    async fn set_remote_signing_keys(
+        &self,
+        user_id: &UserId,
+        master: Option<Value>,
+        self_signing: Option<Value>,
+    ) -> Result<(), StoreError>;
+
+    /// Marks a held list stale (see [`RemoteUserRow::stale`]). A no-op for a user whose list is
+    /// not held.
+    async fn mark_remote_user_stale(&self, user_id: &UserId) -> Result<(), StoreError>;
+
+    /// Drops everything held about `user_id`.
+    async fn forget_remote_user(&self, user_id: &UserId) -> Result<(), StoreError>;
+}
+
 /// The union of every storage trait this crate needs, for callers that want "the e2e store"
 /// without naming each capability individually — mirrors `hs_auth::store::AuthStore`.
 pub trait E2eStore:
@@ -503,6 +593,7 @@ pub trait E2eStore:
     + CrossSigningStore
     + BackupStore
     + ToDeviceStore
+    + RemoteDeviceListStore
 {
 }
 impl<
@@ -511,7 +602,8 @@ impl<
         + FallbackKeyStore
         + CrossSigningStore
         + BackupStore
-        + ToDeviceStore,
+        + ToDeviceStore
+        + RemoteDeviceListStore,
 > E2eStore for T
 {
 }

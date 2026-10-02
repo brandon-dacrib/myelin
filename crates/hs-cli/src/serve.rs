@@ -1708,6 +1708,12 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         e2e_state.install_remote_keys(Arc::new(crate::edus::ClientRemoteKeys::new(
             mount.client.clone(),
         )));
+        // Whether a remote user shares a room with a local one decides whether `hs-e2e` keeps
+        // a copy of their device list (`hs_e2e::federation`'s module docs).
+        e2e_state.install_room_sharing(Arc::new(crate::edus::HubRoomSharing::new(
+            user_state.hub.clone(),
+            server_name.clone(),
+        )));
         // Another server's avatars and attachments: fetched over the same client, cached in
         // the media repository (`hs_media::remote`).
         crate::media::install_remote_media(&media_state.repository, mount.client.clone(), &metrics);
@@ -1853,7 +1859,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         // user (`crate::edus::DeviceListAnnouncer`), through the same sender.
         let device_lists = crate::edus::DeviceListAnnouncer::start(
             user_state.hub.clone(),
-            e2e_state.store.clone(),
+            e2e_state.clone(),
             sender.clone(),
             server_name.clone(),
         );

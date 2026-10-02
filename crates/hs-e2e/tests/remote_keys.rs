@@ -47,6 +47,15 @@ impl RemoteKeys for FakeRemote {
             "@bob:there.example": {"BOBDEV": {"signed_curve25519:AAAA": {"key": "otk"}}}
         }}))
     }
+
+    async fn devices(&self, server: &str, user_id: &str) -> Result<Value, String> {
+        self.0.lock().unwrap().push((
+            "devices".to_owned(),
+            server.to_owned(),
+            Value::String(user_id.to_owned()),
+        ));
+        Err("not asked in these tests".to_owned())
+    }
 }
 
 fn app(remote: Option<Arc<FakeRemote>>) -> (axum::Router, E2eState<MemoryBackend>) {

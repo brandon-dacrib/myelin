@@ -1128,9 +1128,20 @@ impl<B: KvBackend + 'static> FederationQuerySource for ServerQuerySource<B> {
 
     async fn devices(&self, user_id: &str) -> Option<Value> {
         let parsed = ruma::UserId::parse(user_id).ok()?;
+        // The whole list -- every device, named, with the cross-signing keys -- needs the
+        // e2e state ([`ServerQuerySource::with_keys`]); without it, the devices with keys.
+        if let Some(e2e) = self.keys.as_ref() {
+            return match hs_e2e::federation::federation_user_devices(e2e, &parsed).await {
+                Ok(answer) => answer,
+                Err(error) => {
+                    tracing::info!(user_id, %error, "could not answer a remote device-list query");
+                    None
+                }
+            };
+        }
         self.auth.get_user(&parsed).await.ok().flatten()?;
         let keys = self.e2e.list_device_keys(&parsed).await.ok()?;
-        let stream_id = self.e2e.current_stream_pos().await.ok()?;
+        let stream_id = self.e2e.user_stream_pos(&parsed).await.ok()?;
         let devices: Vec<Value> = keys
             .into_iter()
             .map(|(device_id, row)| {

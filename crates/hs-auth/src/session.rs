@@ -55,6 +55,11 @@ pub async fn create_session(
                     last_seen_ip: None,
                 })
                 .await?;
+            // A new device is a device-list change: the user's other devices, and everyone
+            // they share a room with, must learn there is a device to encrypt to (Sytest's
+            // "Local new device changes appear in v2 /sync" and "Users receive device_list
+            // updates for their own devices").
+            state.notify_device_list_changed(user_id).await;
         }
     }
 

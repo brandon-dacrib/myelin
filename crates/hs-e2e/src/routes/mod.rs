@@ -139,10 +139,13 @@ pub fn router<B: KvBackend + 'static>() -> (axum::Router<E2eState<B>>, RouteMani
         .build()
 }
 
-/// MSC3983/MSC3984's appservice key proxies. Mount under `/_matrix/client/unstable` directly
-/// (these paths already spell out `unstable`, unlike everything in [`router`]).
+/// Everything mounted under `/_matrix/client/unstable`: MSC3983/MSC3984's appservice key proxies
+/// (whose paths spell out `unstable` themselves), and every route of [`router`] again, because
+/// clients written before the paths were versioned still call them there -- Sytest's
+/// cross-signing tests `POST /unstable/keys/device_signing/upload` and
+/// `/unstable/keys/signatures/upload`, and answered 404 until this alias existed.
 pub fn unstable_router<B: KvBackend + 'static>() -> (axum::Router<E2eState<B>>, RouteManifest) {
-    Builder::new()
+    let (proxies, mut manifest) = Builder::new()
         .post(
             "/org.matrix.msc3983/keys/claim",
             appservice_proxy::post_msc3983_claim::<B>,
@@ -153,7 +156,10 @@ pub fn unstable_router<B: KvBackend + 'static>() -> (axum::Router<E2eState<B>>, 
             appservice_proxy::post_msc3984_keys_query::<B>,
             matrix_appservice("msc3984KeysQuery"),
         )
-        .build()
+        .build();
+    let (versioned, versioned_manifest) = router::<B>();
+    manifest.routes.extend(versioned_manifest.routes);
+    (proxies.merge(versioned), manifest)
 }
 
 #[cfg(test)]
@@ -207,5 +213,32 @@ mod tests {
                 .iter()
                 .any(|r| r.path == "/org.matrix.msc3983/keys/claim")
         );
+    }
+
+    /// The versioned routes are reachable under `/unstable` too (Sytest's cross-signing tests
+    /// call `/unstable/keys/device_signing/upload`): an authenticated-only route answers 401
+    /// there, not 404.
+    #[tokio::test]
+    async fn the_unstable_router_also_serves_every_versioned_route() {
+        let (router, manifest) = unstable_router::<MemoryBackend>();
+        assert!(
+            manifest
+                .routes
+                .iter()
+                .any(|r| r.path == "/keys/device_signing/upload")
+        );
+        let app = router.with_state(state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/keys/device_signing/upload")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }

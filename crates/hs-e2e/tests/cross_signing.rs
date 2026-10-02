@@ -115,8 +115,16 @@ async fn bootstrap_cross_signing(
     (user_id, master, ssk)
 }
 
+/// The `auth` field that satisfies the re-authentication `/keys/device_signing/upload` asks for
+/// once cross-signing is set up: the password stage, in the legacy `user` spelling Sytest uses
+/// (the route reads it as `identifier`).
+fn password_auth(user_id: &str, password: &str) -> Value {
+    json!({"type": "m.login.password", "user": user_id, "password": password})
+}
+
 /// Adds a genuinely-signed user-signing key to a user who already has a master key stored (as
-/// [`bootstrap_cross_signing`] leaves them), via a second `/keys/device_signing/upload` call.
+/// [`bootstrap_cross_signing`] leaves them), via a second `/keys/device_signing/upload` call --
+/// which, cross-signing being set up, needs the caller to re-authenticate.
 async fn add_user_signing_key(
     scenario: &mut Scenario,
     name: &str,
@@ -130,7 +138,10 @@ async fn add_user_signing_key(
             Some(name),
             Method::POST,
             "/keys/device_signing/upload",
-            Some(obj1("user_signing_key", signed_usk)),
+            Some(json!({
+                "user_signing_key": signed_usk,
+                "auth": password_auth(user_id, "correct horse battery staple 42"),
+            })),
         )
         .await
         .assert_ok();
@@ -275,10 +286,100 @@ async fn device_signing_upload_verifies_against_a_previously_stored_master_key()
             Method::POST,
             "/keys/device_signing/upload",
             // No `master_key` in this request -- must fall back to the one stored above.
-            Some(obj1("self_signing_key", signed_ssk)),
+            Some(json!({
+                "self_signing_key": signed_ssk,
+                "auth": password_auth(&alice_id, "correct horse battery staple"),
+            })),
         )
         .await
         .assert_ok();
+}
+
+/// Sytest's "Fails to replace cross-signing keys with no auth": once a master key is stored, a
+/// different one is a reset, and a reset with no `auth` is a `401` UIA challenge that changes
+/// nothing. The same key again is a no-op `200`, and setting up for the first time needed no
+/// `auth` (the upload at the top of this test).
+#[tokio::test]
+async fn device_signing_upload_requires_reauthentication_to_replace_a_master_key() {
+    let mut scenario = Scenario::new(app());
+    scenario
+        .register("alice", "alice", "correct horse battery staple")
+        .await
+        .assert_ok();
+    let alice_id = scenario.session("alice").unwrap().user_id.clone().unwrap();
+    let first = make_cross_signing_key(&alice_id, "master", "first");
+    scenario
+        .send(
+            Some("alice"),
+            Method::POST,
+            "/keys/device_signing/upload",
+            Some(obj1("master_key", first.json.clone())),
+        )
+        .await
+        .assert_ok();
+
+    let second = make_cross_signing_key(&alice_id, "master", "second");
+    let challenge = scenario
+        .send(
+            Some("alice"),
+            Method::POST,
+            "/keys/device_signing/upload",
+            Some(obj1("master_key", second.json.clone())),
+        )
+        .await;
+    challenge.assert_status(StatusCode::UNAUTHORIZED);
+    assert!(
+        challenge.json["flows"].is_array() && challenge.json["session"].is_string(),
+        "a UIA challenge: {}",
+        challenge.json
+    );
+    let query = scenario
+        .send(
+            Some("alice"),
+            Method::POST,
+            "/keys/query",
+            Some(json!({"device_keys": {alice_id.clone(): []}})),
+        )
+        .await;
+    assert_eq!(
+        query.json["master_keys"][&alice_id]["keys"], first.json["keys"],
+        "the stored key is unchanged by a refused reset"
+    );
+
+    scenario
+        .send(
+            Some("alice"),
+            Method::POST,
+            "/keys/device_signing/upload",
+            Some(obj1("master_key", first.json.clone())),
+        )
+        .await
+        .assert_ok();
+
+    scenario
+        .send(
+            Some("alice"),
+            Method::POST,
+            "/keys/device_signing/upload",
+            Some(json!({
+                "master_key": second.json,
+                "auth": password_auth(&alice_id, "correct horse battery staple"),
+            })),
+        )
+        .await
+        .assert_ok();
+    let query = scenario
+        .send(
+            Some("alice"),
+            Method::POST,
+            "/keys/query",
+            Some(json!({"device_keys": {alice_id.clone(): []}})),
+        )
+        .await;
+    assert_eq!(
+        query.json["master_keys"][&alice_id]["keys"],
+        second.json["keys"]
+    );
 }
 
 /// `/keys/signatures/upload`: a device key can only be signed by its own user -- another user's

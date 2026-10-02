@@ -84,6 +84,10 @@ pub struct E2eState<B: KvBackend> {
     /// ([`crate::federation::ToDeviceOutbox`]), once installed. Shared across clones like
     /// `remote_keys`; unset means such messages are dropped (logged).
     to_device_outbox: Arc<OnceLock<Arc<dyn crate::federation::ToDeviceOutbox>>>,
+    /// Whether a remote user shares a room with a local one ([`crate::federation::RoomSharing`]),
+    /// once installed: the condition for keeping a copy of their device list. Shared across
+    /// clones like `remote_keys`; unset means no copy is ever kept.
+    room_sharing: Arc<OnceLock<Arc<dyn crate::federation::RoomSharing>>>,
     /// Marker so `B` (the backend `E2eState` was constructed over) is nameable in code that
     /// otherwise only touches `store` through the trait object — kept even though `store` itself
     /// erases `B`, so `E2eState<B>: FromRequestParts` bounds line up the same way `RoomState<B>`'s
@@ -168,8 +172,24 @@ impl<B: KvBackend> E2eState<B> {
             sync_token_resolver: Arc::new(OnceLock::new()),
             remote_keys: Arc::new(OnceLock::new()),
             to_device_outbox: Arc::new(OnceLock::new()),
+            room_sharing: Arc::new(OnceLock::new()),
             _backend: std::marker::PhantomData,
         }
+    }
+
+    /// Installs how this crate learns whether a remote user shares a room with a local one
+    /// ([`crate::federation::RoomSharing`]). Same idempotent-install convention as
+    /// [`E2eState::install_sync_token_resolver`].
+    pub fn install_room_sharing(&self, sharing: Arc<dyn crate::federation::RoomSharing>) {
+        if self.room_sharing.set(sharing).is_err() {
+            tracing::warn!("room sharing was already installed on this e2e state; ignoring");
+        }
+    }
+
+    /// The installed [`crate::federation::RoomSharing`], if any.
+    #[must_use]
+    pub fn room_sharing(&self) -> Option<&Arc<dyn crate::federation::RoomSharing>> {
+        self.room_sharing.get()
     }
 
     /// Installs the [`SyncTokenResolver`] `GET /keys/changes` consults for a `from`/`to` value

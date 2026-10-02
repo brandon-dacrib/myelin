@@ -1,10 +1,12 @@
 //! `POST /keys/query`.
 //!
-//! A local user's keys come from this server's store. A remote user's come from their own
-//! server, asked through the installed [`crate::federation::RemoteKeys`] (one request per server,
-//! all at once); a server that cannot be reached is listed in `failures`, as the spec says. With
-//! no `RemoteKeys` installed (federation off) remote users are skipped, as before federation
-//! existed. See [`crate::federation`] for why nothing is cached.
+//! A local user's keys come from this server's store, each device's entry carrying
+//! `unsigned.device_display_name` when the device has a name (the spec's one `unsigned` field
+//! here; always an object, so a client can read it without checking). A remote user's come from
+//! the copy this server keeps of their list, or from their server
+//! ([`crate::federation::remote_keys_query`]); a server that cannot be reached is listed in
+//! `failures`, as the spec says. With no [`crate::federation::RemoteKeys`] installed (federation
+//! off) remote users are skipped, as before federation existed.
 
 use axum::Json;
 use axum::extract::State;
@@ -36,32 +38,12 @@ pub(crate) async fn build_keys_query_response<B: KvBackend + 'static>(
 ) -> Result<Value, E2eError> {
     let mut local = local_keys_query(state, Some(requesting_user), device_keys_req).await?;
     let mut failures = Map::new();
-    if let (Some(remote), Some(requested)) = (state.remote_keys(), device_keys_req.as_object()) {
-        let by_server =
-            crate::federation::remote_part(requested, state.auth.server_name().as_str());
-        let asked = by_server.clone();
-        for (server, answer) in
-            crate::federation::ask_servers(remote, crate::federation::Ask::Query, by_server).await
-        {
-            let Some(asked) = asked.get(&server) else {
-                continue;
-            };
-            match answer {
-                Ok(answer) => {
-                    for (field, into) in [
-                        ("device_keys", &mut local.device_keys),
-                        ("master_keys", &mut local.master_keys),
-                        ("self_signing_keys", &mut local.self_signing_keys),
-                    ] {
-                        crate::federation::merge_for_server(into, &answer, field, &server, asked);
-                    }
-                }
-                Err(reason) => {
-                    tracing::info!(server, reason, "could not query a server for device keys");
-                    failures.insert(server, crate::federation::failure(&reason));
-                }
-            }
-        }
+    if let Some(requested) = device_keys_req.as_object() {
+        let remote = crate::federation::remote_keys_query(state, requested).await?;
+        local.device_keys.extend(remote.device_keys);
+        local.master_keys.extend(remote.master_keys);
+        local.self_signing_keys.extend(remote.self_signing_keys);
+        failures = remote.failures;
     }
 
     Ok(json!({
@@ -142,6 +124,21 @@ pub(crate) async fn local_keys_query<B: KvBackend + 'static>(
         };
 
         let devices = state.store.list_device_keys(user_id).await?;
+        // Display names are for this server's own clients; what another server gets is
+        // `/user/devices`'s business, where `allow_device_name_lookup_over_federation` applies.
+        let names: std::collections::HashMap<String, String> = if requesting_user.is_some() {
+            state
+                .auth
+                .store
+                .list_devices(user_id)
+                .await
+                .map_err(|e| crate::store::StoreError::Backend(e.to_string()))?
+                .into_iter()
+                .filter_map(|d| d.display_name.map(|n| (d.device_id.to_string(), n)))
+                .collect()
+        } else {
+            std::collections::HashMap::new()
+        };
         let mut per_user = Map::new();
         for (device_id, row) in devices {
             if let Some(list) = &wanted
@@ -150,7 +147,23 @@ pub(crate) async fn local_keys_query<B: KvBackend + 'static>(
             {
                 continue;
             }
-            per_user.insert(device_id.to_string(), row.keys);
+            let mut keys = row.keys;
+            if requesting_user.is_some()
+                && let Some(obj) = keys.as_object_mut()
+            {
+                let unsigned = obj
+                    .entry("unsigned")
+                    .or_insert_with(|| Value::Object(Map::new()));
+                if let (Some(unsigned), Some(name)) =
+                    (unsigned.as_object_mut(), names.get(device_id.as_str()))
+                {
+                    unsigned.insert(
+                        "device_display_name".to_owned(),
+                        Value::String(name.clone()),
+                    );
+                }
+            }
+            per_user.insert(device_id.to_string(), keys);
         }
         // Always report an entry for a requested (valid, local) user, even an empty one -- the
         // spec's response shape is "for each user requested", not "for each user found with

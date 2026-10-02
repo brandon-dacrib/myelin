@@ -46,16 +46,20 @@
 //!   existing device ID) that `cross_signing.yaml` documents for `/keys/device_signing/upload`.
 //!   Unrelated to signature verification; not touched this session.
 //!
-//! `/keys/device_signing/upload` also still skips user-interactive auth (UIA) re-authentication,
-//! which the spec requires before accepting new cross-signing keys for a non-appservice caller.
-//! `hs_auth::reauth::run` is public and this crate's `E2eState` already embeds an `AuthState`, so
-//! the bridge needed to wire it in does exist -- but doing so risks breaking
-//! `hs-loadgen`'s `real_client_encrypted` test (which bootstraps cross-signing with no `auth`
-//! data at all) unless that crate is updated in the same session, and `hs-loadgen` belongs to
-//! another track. Left for a coordinated session; see `docs/status/08-e2ee.md`.
+//! # User-interactive auth
+//!
+//! `/keys/device_signing/upload` asks the caller to re-authenticate (`hs_auth::reauth::run`,
+//! a `401` carrying the UIA flows until the `auth` field satisfies one) when, and only when,
+//! it would *change* cross-signing keys that are already set up: the user has a master key, the
+//! caller is not an appservice, and at least one key in the request differs from the one stored.
+//! Setting the keys up for the first time needs no UIA (Matrix 1.11's wording of MSC3967), and
+//! re-uploading the same keys is a no-op `200` -- which is also what lets `hs-loadgen`'s
+//! `real_client_encrypted` scenario bootstrap cross-signing with no `auth` at all. A legacy
+//! `auth` with a top-level `user` (Sytest sends it) is read as `identifier.m.id.user`.
 
 use axum::Json;
 use axum::extract::State;
+use axum::response::{IntoResponse, Response};
 use ed25519_dalek::VerifyingKey;
 use hs_http::body::PermissiveJson;
 use hs_kv::KvBackend;
@@ -67,12 +71,78 @@ use crate::error::E2eError;
 use crate::state::{E2eRequester, E2eState};
 use crate::store::CrossSigningKeyType;
 
+/// Whether `body` carries, for any of the three keys, something other than what is stored --
+/// what decides between "set up or reset cross-signing" and a no-op re-upload.
+async fn has_different_keys<B: KvBackend + 'static>(
+    state: &E2eState<B>,
+    user_id: &UserId,
+    body: &Value,
+) -> Result<bool, E2eError> {
+    for (field, key_type) in [
+        ("master_key", CrossSigningKeyType::Master),
+        ("self_signing_key", CrossSigningKeyType::SelfSigning),
+        ("user_signing_key", CrossSigningKeyType::UserSigning),
+    ] {
+        let Some(submitted) = body.get(field) else {
+            continue;
+        };
+        let stored = state.store.get_cross_signing_key(user_id, key_type).await?;
+        // Signatures accumulate on a stored key, so compare the key material, not the object.
+        if stored.as_ref().and_then(|k| k.get("keys")) != submitted.get("keys") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// `body` with a legacy `auth.user` (the pre-r0.6 spelling of the password stage, which Sytest
+/// still sends) rewritten to `auth.identifier`, so `hs_auth::reauth::run` can read it.
+fn with_legacy_auth_user_as_identifier(mut body: Value) -> Value {
+    if let Some(auth) = body.get_mut("auth").and_then(Value::as_object_mut)
+        && !auth.contains_key("identifier")
+        && let Some(user) = auth.get("user").cloned()
+    {
+        auth.insert(
+            "identifier".to_owned(),
+            json!({"type": "m.id.user", "user": user}),
+        );
+    }
+    body
+}
+
 /// `POST /keys/device_signing/upload`.
 pub async fn post_device_signing_upload<B: KvBackend + 'static>(
     State(state): State<E2eState<B>>,
     E2eRequester(requester): E2eRequester,
     PermissiveJson(body): PermissiveJson<Value>,
-) -> Result<Json<Value>, E2eError> {
+) -> Result<Response, E2eError> {
+    if !has_different_keys(&state, &requester.user_id, &body).await? {
+        return Ok(Json(json!({})).into_response());
+    }
+    let is_set_up = state
+        .store
+        .get_cross_signing_key(&requester.user_id, CrossSigningKeyType::Master)
+        .await?
+        .is_some();
+    if is_set_up && requester.appservice.is_none() {
+        let body = with_legacy_auth_user_as_identifier(body.clone());
+        if let Some(challenge) = hs_auth::reauth::run(&state.auth, &requester, &body)
+            .await
+            .map_err(|e| {
+                E2eError::BadRequest(format!("user-interactive auth could not run: {e}"))
+            })?
+        {
+            tracing::info!(
+                user_id = %requester.user_id,
+                "asking a user to re-authenticate before their cross-signing keys are reset"
+            );
+            return Ok(challenge);
+        }
+        tracing::info!(
+            user_id = %requester.user_id,
+            "a user re-authenticated and is resetting their cross-signing keys"
+        );
+    }
     // Resolve the master key to verify `self_signing_key`/`user_signing_key` against *before*
     // writing anything: the one in this request if given, else the user's most recently stored
     // one. Per `cross_signing.yaml`, having neither is `M_MISSING_PARAM`, and a request that fails
@@ -121,7 +191,7 @@ pub async fn post_device_signing_upload<B: KvBackend + 'static>(
             .record_device_list_change(&requester.user_id)
             .await?;
     }
-    Ok(Json(json!({})))
+    Ok(Json(json!({})).into_response())
 }
 
 /// The unprefixed public key value inside a cross-signing key object's `keys` map -- the spec's

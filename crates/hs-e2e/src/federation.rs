@@ -17,21 +17,46 @@
 //! are keyed by the sender's own, local, user ID), so a transaction a remote server retries does
 //! not deliver its messages twice. The table is durable: the dedupe holds across a restart.
 //!
-//! # No cache
+//! # Remote device lists: the copy this server keeps
 //!
-//! Every `/keys/query` for a remote user asks that user's server. Synapse caches a remote user's
-//! device list while it shares a room with them and keeps the cache fresh from the
-//! `m.device_list_update` EDUs it receives; this server records those EDUs as device-list changes
-//! (so clients are told to re-query) but keeps no copy of the keys, so the re-query is always
-//! answered by the only server that knows. That costs one federation request per query and can
-//! never serve a stale key -- Complement's `TestDeviceListUpdates` checks exactly that a server
-//! "must not return a cached device list" after a user left and changed their keys.
+//! A `/keys/query` for a user of another server is answered from this server's own copy of their
+//! device list ([`crate::store::RemoteDeviceListStore`]) when it holds one that is complete, and
+//! otherwise by asking their server. Which way it asks depends on whether a local user shares a
+//! room with them ([`RoomSharing`], installed by `hs-cli` over the session hub):
+//!
+//! - **Sharing a room** -- the user's server will send this one an `m.device_list_update` for
+//!   every change, so a copy can be kept current. The copy is filled from
+//!   `GET /user/devices/{userId}` (the whole list, its `stream_id`, and the master and
+//!   self-signing keys), then each EDU whose `prev_id`s are all at or before the copy's
+//!   `stream_id` is applied to it directly, and one that is not (a gap: an update was missed, or
+//!   there is no copy yet) makes this server fetch the whole list again
+//!   ([`receive_device_list_update`]). When the fetch fails the copy is marked stale and is not
+//!   served until a fetch succeeds. A copy that is complete is served without asking anybody,
+//!   which is what lets a client query keys while the other server is down.
+//! - **Not sharing a room** -- no EDUs would come, so no copy is kept: the query goes to
+//!   `POST /user/keys/query` on their server and the answer is passed on, uncached.
+//!
+//! Which is how Synapse does it and what Sytest's `50federation/40devicelists.pl` and
+//! `41end-to-end-keys/06-device-lists.pl` check; it replaced an earlier design that cached
+//! nothing and asked the user's server on every query. Complement's `TestDeviceListUpdates`
+//! ("must not return a cached device list" after a user left and changed their keys) still holds:
+//! a user who left shares no room, so their next change is a missed update, and the copy is
+//! re-fetched before it is served again.
+//!
+//! The other direction is here too: [`federation_user_devices`] answers `/user/devices/{userId}`
+//! for this server's own users, and [`device_list_update_edus`] works out the
+//! `m.device_list_update` and `m.signing_key_update` EDUs that tell other servers what changed
+//! (`hs-cli`'s announcer sends them to the servers sharing a room with the user).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use ruma::{OwnedDeviceId, UserId};
 use serde_json::{Map, Value, json};
+
+use crate::error::E2eError;
+use crate::store::{CrossSigningKeyType, RemoteDeviceRow, RemoteUserRow};
 
 /// Reaches another server's `/user/keys/query` and `/user/keys/claim`. Implemented in `hs-cli`
 /// over `hs_federation::client::FederationClient`; installed with
@@ -45,6 +70,21 @@ pub trait RemoteKeys: Send + Sync {
     /// `POST /_matrix/federation/v1/user/keys/claim` to `server` with `{"one_time_keys":
     /// one_time_keys}`, returning the response body.
     async fn claim(&self, server: &str, one_time_keys: Value) -> Result<Value, String>;
+
+    /// `GET /_matrix/federation/v1/user/devices/{user_id}` to `server`, returning the response
+    /// body (the user's whole device list); `Err` describes why there is none.
+    async fn devices(&self, server: &str, user_id: &str) -> Result<Value, String>;
+}
+
+/// Whether a user of another server shares a room with a user of this one -- the condition for
+/// keeping a copy of their device list (see the module docs). Implemented in `hs-cli` over the
+/// session hub's membership records; installed with
+/// [`crate::state::E2eState::install_room_sharing`]. Without one, no copy is kept and every
+/// remote query asks the user's server.
+#[async_trait]
+pub trait RoomSharing: Send + Sync {
+    /// True if some user of this server is joined to a room `user_id` is joined to.
+    async fn shares_a_room_with_a_local_user(&self, user_id: &UserId) -> bool;
 }
 
 /// The part of a request naming users of servers other than `own_server`, grouped by server:
@@ -350,9 +390,731 @@ pub async fn receive_direct_to_device<B: hs_kv::KvBackend + 'static>(
     })
 }
 
+// ------------------------------------------------------------------------------------------
+// This server's copy of remote users' device lists
+// ------------------------------------------------------------------------------------------
+
+/// Whether a copy of `user_id`'s device list is kept: true when a [`RoomSharing`] is installed
+/// and says a local user shares a room with them.
+async fn is_tracked<B: hs_kv::KvBackend + 'static>(
+    state: &crate::state::E2eState<B>,
+    user_id: &UserId,
+) -> bool {
+    match state.room_sharing() {
+        Some(sharing) => sharing.shares_a_room_with_a_local_user(user_id).await,
+        None => false,
+    }
+}
+
+/// A `/user/devices/{userId}` answer, parsed into what the store keeps. `None` if it is not
+/// about `user_id` or not shaped like one.
+fn parse_user_devices(
+    user_id: &UserId,
+    answer: &Value,
+) -> Option<(RemoteUserRow, Vec<(OwnedDeviceId, RemoteDeviceRow)>)> {
+    if answer.get("user_id").and_then(Value::as_str) != Some(user_id.as_str()) {
+        return None;
+    }
+    let devices = answer.get("devices")?.as_array()?;
+    let mut rows = Vec::with_capacity(devices.len());
+    for device in devices {
+        let Some(device_id) = device.get("device_id").and_then(Value::as_str) else {
+            continue;
+        };
+        rows.push((
+            OwnedDeviceId::from(device_id),
+            RemoteDeviceRow {
+                keys: device.get("keys").filter(|k| k.is_object()).cloned(),
+                display_name: device
+                    .get("device_display_name")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            },
+        ));
+    }
+    Some((
+        RemoteUserRow {
+            stream_id: answer.get("stream_id").and_then(Value::as_u64).unwrap_or(0),
+            master: answer.get("master_key").filter(|k| k.is_object()).cloned(),
+            self_signing: answer
+                .get("self_signing_key")
+                .filter(|k| k.is_object())
+                .cloned(),
+            stale: false,
+        },
+        rows,
+    ))
+}
+
+/// Fetches `user_id`'s whole device list from their server and replaces the copy held. Returns
+/// whether that succeeded; on failure the copy, if any, is marked stale (logged either way).
+///
+/// # Errors
+/// A storage error.
+pub async fn resync_remote_user<B: hs_kv::KvBackend + 'static>(
+    state: &crate::state::E2eState<B>,
+    remote: &Arc<dyn RemoteKeys>,
+    user_id: &UserId,
+) -> Result<bool, E2eError> {
+    let server = user_id.server_name().as_str();
+    let parsed = match remote.devices(server, user_id.as_str()).await {
+        Ok(answer) => parse_user_devices(user_id, &answer),
+        Err(reason) => {
+            tracing::warn!(%user_id, server, reason, "could not fetch a remote user's device list");
+            None
+        }
+    };
+    match parsed {
+        Some((user, devices)) => {
+            tracing::info!(
+                %user_id,
+                server,
+                devices = devices.len(),
+                stream_id = user.stream_id,
+                "fetched a remote user's device list"
+            );
+            state
+                .store
+                .replace_remote_device_list(user_id, user, devices)
+                .await?;
+            Ok(true)
+        }
+        None => {
+            state.store.mark_remote_user_stale(user_id).await?;
+            Ok(false)
+        }
+    }
+}
+
+/// What [`receive_device_list_update`] or [`receive_signing_key_update`] did with one EDU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboundDeviceList {
+    /// The update followed the copy held and was applied to it.
+    Applied,
+    /// The update did not follow the copy held (or there was none), so the whole list was
+    /// fetched again from the user's server.
+    Resynced,
+    /// As [`InboundDeviceList::Resynced`], but the fetch failed: the copy is marked stale and
+    /// will be fetched again when next needed.
+    ResyncFailed,
+    /// The user's list is not kept (no local user shares a room with them); the change was
+    /// recorded so a client that does ask is told to query again, and nothing else was done.
+    Noted,
+    /// The update is at or before the copy's position: already known.
+    AlreadyKnown,
+    /// The EDU was malformed or spoke for a user of a server other than its origin; the reason.
+    Dropped(&'static str),
+}
+
+/// The user an EDU from `origin` is about, if it names a valid user of `origin`.
+fn edu_user(origin: &str, content: &Value) -> Result<ruma::OwnedUserId, &'static str> {
+    let user_id = content
+        .get("user_id")
+        .and_then(Value::as_str)
+        .and_then(|u| UserId::parse(u).ok())
+        .ok_or("no valid user_id")?;
+    if user_id.server_name().as_str() != origin {
+        return Err("user is not of the origin server");
+    }
+    Ok(user_id)
+}
+
+/// Applies one `m.device_list_update` EDU from `origin` (the transaction's authenticated
+/// sender). See the module docs for the rules; every outcome but
+/// [`InboundDeviceList::Dropped`] and [`InboundDeviceList::AlreadyKnown`] records a device-list
+/// change for the user, so local clients that share a room with them are told to query again.
+///
+/// # Errors
+/// A storage error.
+pub async fn receive_device_list_update<B: hs_kv::KvBackend + 'static>(
+    state: &crate::state::E2eState<B>,
+    origin: &str,
+    content: &Value,
+) -> Result<InboundDeviceList, E2eError> {
+    let user_id = match edu_user(origin, content) {
+        Ok(user_id) => user_id,
+        Err(reason) => return Ok(InboundDeviceList::Dropped(reason)),
+    };
+    let Some(device_id) = content.get("device_id").and_then(Value::as_str) else {
+        return Ok(InboundDeviceList::Dropped("no device_id"));
+    };
+    let stream_id = content
+        .get("stream_id")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let prev_ids: Vec<u64> = content
+        .get("prev_id")
+        .and_then(Value::as_array)
+        .map(|ids| ids.iter().filter_map(Value::as_u64).collect())
+        .unwrap_or_default();
+
+    if let Some(held) = state.store.get_remote_user(&user_id).await?
+        && !held.stale
+    {
+        if stream_id <= held.stream_id {
+            tracing::debug!(%user_id, stream_id, held = held.stream_id, "a device-list update already known");
+            return Ok(InboundDeviceList::AlreadyKnown);
+        }
+        if prev_ids.iter().all(|prev| *prev <= held.stream_id) {
+            let device = if content.get("deleted").and_then(Value::as_bool) == Some(true) {
+                None
+            } else {
+                Some(RemoteDeviceRow {
+                    keys: content.get("keys").filter(|k| k.is_object()).cloned(),
+                    display_name: content
+                        .get("device_display_name")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                })
+            };
+            state
+                .store
+                .apply_remote_device_update(&user_id, device_id.into(), device, stream_id)
+                .await?;
+            state.store.record_device_list_change(&user_id).await?;
+            tracing::debug!(%user_id, device_id, stream_id, "applied a device-list update");
+            return Ok(InboundDeviceList::Applied);
+        }
+        tracing::info!(
+            %user_id,
+            stream_id,
+            ?prev_ids,
+            held = held.stream_id,
+            "a device-list update skipped something; fetching the list again"
+        );
+    }
+
+    if !is_tracked(state, &user_id).await {
+        state.store.record_device_list_change(&user_id).await?;
+        return Ok(InboundDeviceList::Noted);
+    }
+    let Some(remote) = state.remote_keys() else {
+        state.store.record_device_list_change(&user_id).await?;
+        return Ok(InboundDeviceList::Noted);
+    };
+    let fetched = resync_remote_user(state, remote, &user_id).await?;
+    state.store.record_device_list_change(&user_id).await?;
+    Ok(if fetched {
+        InboundDeviceList::Resynced
+    } else {
+        InboundDeviceList::ResyncFailed
+    })
+}
+
+/// Applies one `m.signing_key_update` EDU from `origin`: the user's master and self-signing keys
+/// replace those in the copy held, if one is; the change is recorded either way.
+///
+/// # Errors
+/// A storage error.
+pub async fn receive_signing_key_update<B: hs_kv::KvBackend + 'static>(
+    state: &crate::state::E2eState<B>,
+    origin: &str,
+    content: &Value,
+) -> Result<InboundDeviceList, E2eError> {
+    let user_id = match edu_user(origin, content) {
+        Ok(user_id) => user_id,
+        Err(reason) => return Ok(InboundDeviceList::Dropped(reason)),
+    };
+    let outcome = if state.store.get_remote_user(&user_id).await?.is_some() {
+        state
+            .store
+            .set_remote_signing_keys(
+                &user_id,
+                content.get("master_key").filter(|k| k.is_object()).cloned(),
+                content
+                    .get("self_signing_key")
+                    .filter(|k| k.is_object())
+                    .cloned(),
+            )
+            .await?;
+        InboundDeviceList::Applied
+    } else {
+        InboundDeviceList::Noted
+    };
+    state.store.record_device_list_change(&user_id).await?;
+    Ok(outcome)
+}
+
+/// The keys for users of other servers that a `/keys/query` asked about, by field, plus the
+/// servers that could not be asked -- the remote half of [`crate::routes::keys_query`]'s answer.
+#[derive(Debug, Default)]
+pub(crate) struct RemoteAnswer {
+    pub(crate) device_keys: Map<String, Value>,
+    pub(crate) master_keys: Map<String, Value>,
+    pub(crate) self_signing_keys: Map<String, Value>,
+    pub(crate) failures: Map<String, Value>,
+}
+
+/// Serves `user_id` from the copy held, honouring `wanted` (device ids; empty means all).
+async fn answer_from_copy<B: hs_kv::KvBackend + 'static>(
+    state: &crate::state::E2eState<B>,
+    user_id: &UserId,
+    wanted: &[String],
+    held: &RemoteUserRow,
+    into: &mut RemoteAnswer,
+) -> Result<(), E2eError> {
+    let mut per_user = Map::new();
+    for (device_id, row) in state.store.list_remote_devices(user_id).await? {
+        if !wanted.is_empty() && !wanted.iter().any(|w| w == device_id.as_str()) {
+            continue;
+        }
+        let Some(mut keys) = row.keys else {
+            continue;
+        };
+        if let Some(obj) = keys.as_object_mut() {
+            let unsigned = obj
+                .entry("unsigned")
+                .or_insert_with(|| Value::Object(Map::new()));
+            if let (Some(unsigned), Some(name)) = (unsigned.as_object_mut(), &row.display_name) {
+                unsigned.insert(
+                    "device_display_name".to_owned(),
+                    Value::String(name.clone()),
+                );
+            }
+        }
+        per_user.insert(device_id.to_string(), keys);
+    }
+    into.device_keys
+        .insert(user_id.to_string(), Value::Object(per_user));
+    if let Some(master) = &held.master {
+        into.master_keys.insert(user_id.to_string(), master.clone());
+    }
+    if let Some(self_signing) = &held.self_signing {
+        into.self_signing_keys
+            .insert(user_id.to_string(), self_signing.clone());
+    }
+    Ok(())
+}
+
+/// The device ids a `/keys/query` entry asks for (`[]`, or anything that is not a list of
+/// strings, meaning every device).
+fn wanted_devices(asked: &Value) -> Vec<String> {
+    asked
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Answers the remote part of a `/keys/query`: `requested` is the request's `device_keys`
+/// map, of which only users of other servers are considered. Each is served from the copy held
+/// when it is complete; otherwise their list is fetched from their server and kept if a local
+/// user shares a room with them, else their server is asked `POST /user/keys/query` and the
+/// answer passed on. A server that could not be asked is in `failures`. See the module docs.
+///
+/// # Errors
+/// A storage error.
+pub(crate) async fn remote_keys_query<B: hs_kv::KvBackend + 'static>(
+    state: &crate::state::E2eState<B>,
+    requested: &Map<String, Value>,
+) -> Result<RemoteAnswer, E2eError> {
+    let mut answer = RemoteAnswer::default();
+    let Some(remote) = state.remote_keys() else {
+        return Ok(answer);
+    };
+    let own_server = state.auth.server_name();
+    let mut to_ask: BTreeMap<String, Map<String, Value>> = BTreeMap::new();
+    for (user_id_str, asked) in requested {
+        let Ok(user_id) = UserId::parse(user_id_str.as_str()) else {
+            continue;
+        };
+        if user_id.server_name() == own_server {
+            continue;
+        }
+        let wanted = wanted_devices(asked);
+        let held = state.store.get_remote_user(&user_id).await?;
+        let tracked = is_tracked(state, &user_id).await;
+        if let Some(held) = held {
+            if !tracked {
+                // No room is shared any more, so no update has been coming: whatever is held
+                // may be behind (Complement's `TestDeviceListUpdates`: a user who left and
+                // changed their keys must not be served the old ones). Dropped, and the
+                // user's server asked.
+                tracing::info!(%user_id, "a remote user shares no room here any more; dropping the copy of their device list");
+                state.store.forget_remote_user(&user_id).await?;
+            } else if !held.stale {
+                answer_from_copy(state, &user_id, &wanted, &held, &mut answer).await?;
+                continue;
+            }
+        }
+        if tracked
+            && resync_remote_user(state, remote, &user_id).await?
+            && let Some(held) = state.store.get_remote_user(&user_id).await?
+        {
+            answer_from_copy(state, &user_id, &wanted, &held, &mut answer).await?;
+            continue;
+        }
+        to_ask
+            .entry(user_id.server_name().to_string())
+            .or_default()
+            .insert(user_id_str.clone(), asked.clone());
+    }
+    let asked = to_ask.clone();
+    for (server, result) in ask_servers(remote, Ask::Query, to_ask).await {
+        let Some(asked) = asked.get(&server) else {
+            continue;
+        };
+        match result {
+            Ok(body) => {
+                for (field, into) in [
+                    ("device_keys", &mut answer.device_keys),
+                    ("master_keys", &mut answer.master_keys),
+                    ("self_signing_keys", &mut answer.self_signing_keys),
+                ] {
+                    merge_for_server(into, &body, field, &server, asked);
+                }
+            }
+            Err(reason) => {
+                tracing::info!(server, reason, "could not query a server for device keys");
+                answer.failures.insert(server, failure(&reason));
+            }
+        }
+    }
+    Ok(answer)
+}
+
+// ------------------------------------------------------------------------------------------
+// This server's own users' device lists, as other servers see them
+// ------------------------------------------------------------------------------------------
+
+/// One of a local user's devices as announced to other servers: what
+/// [`device_list_update_edus`] compares to find what changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnnouncedDevice {
+    /// The device's `device_keys`, if it has uploaded any.
+    pub keys: Option<Value>,
+    /// The device's display name, if it has one.
+    pub display_name: Option<String>,
+}
+
+/// A local user's device list as it is now: every device `hs-auth` knows (with its keys, when
+/// uploaded, and display name), the cross-signing keys other servers may see, and the user's
+/// device-list stream position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalDeviceList {
+    /// By device id.
+    pub devices: BTreeMap<String, AnnouncedDevice>,
+    /// The master key, if any.
+    pub master: Option<Value>,
+    /// The self-signing key, if any.
+    pub self_signing: Option<Value>,
+    /// [`crate::store::DeviceKeyStore::user_stream_pos`] for the user.
+    pub stream_id: u64,
+}
+
+/// Reads `user_id`'s [`LocalDeviceList`] now.
+///
+/// # Errors
+/// A storage error.
+pub async fn local_device_list<B: hs_kv::KvBackend + 'static>(
+    state: &crate::state::E2eState<B>,
+    user_id: &UserId,
+) -> Result<LocalDeviceList, E2eError> {
+    let mut devices: BTreeMap<String, AnnouncedDevice> = state
+        .auth
+        .store
+        .list_devices(user_id)
+        .await
+        .map_err(|e| crate::store::StoreError::Backend(e.to_string()))?
+        .into_iter()
+        .map(|device| {
+            (
+                device.device_id.to_string(),
+                AnnouncedDevice {
+                    keys: None,
+                    display_name: device.display_name,
+                },
+            )
+        })
+        .collect();
+    for (device_id, row) in state.store.list_device_keys(user_id).await? {
+        devices
+            .entry(device_id.to_string())
+            .or_insert_with(|| AnnouncedDevice {
+                keys: None,
+                display_name: None,
+            })
+            .keys = Some(row.keys);
+    }
+    Ok(LocalDeviceList {
+        devices,
+        master: state
+            .store
+            .get_cross_signing_key(user_id, CrossSigningKeyType::Master)
+            .await?,
+        self_signing: state
+            .store
+            .get_cross_signing_key(user_id, CrossSigningKeyType::SelfSigning)
+            .await?,
+        stream_id: state.store.user_stream_pos(user_id).await?,
+    })
+}
+
+/// Answers another server's `GET /user/devices/{userId}` for one of this server's users:
+/// their devices (keys when uploaded, display names), the user's device-list stream position,
+/// and their master and self-signing keys. `None` for a user this server does not have.
+/// The caller applies `allow_device_name_lookup_over_federation` (the federation route strips
+/// the names when it is off).
+///
+/// # Errors
+/// A storage error.
+pub async fn federation_user_devices<B: hs_kv::KvBackend + 'static>(
+    state: &crate::state::E2eState<B>,
+    user_id: &UserId,
+) -> Result<Option<Value>, E2eError> {
+    if user_id.server_name() != state.auth.server_name()
+        || state
+            .auth
+            .store
+            .get_user(user_id)
+            .await
+            .map_err(|e| crate::store::StoreError::Backend(e.to_string()))?
+            .is_none()
+    {
+        return Ok(None);
+    }
+    let list = local_device_list(state, user_id).await?;
+    let devices: Vec<Value> = list
+        .devices
+        .into_iter()
+        .map(|(device_id, device)| {
+            let mut entry = json!({"device_id": device_id});
+            if let Some(keys) = device.keys {
+                entry["keys"] = keys;
+            }
+            if let Some(name) = device.display_name {
+                entry["device_display_name"] = Value::String(name);
+            }
+            entry
+        })
+        .collect();
+    let mut answer = json!({
+        "user_id": user_id,
+        "stream_id": list.stream_id,
+        "devices": devices,
+    });
+    if let Some(master) = list.master {
+        answer["master_key"] = master;
+    }
+    if let Some(self_signing) = list.self_signing {
+        answer["self_signing_key"] = self_signing;
+    }
+    Ok(Some(answer))
+}
+
+/// What has been announced to other servers for one local user, as [`device_list_update_edus`]
+/// left it: the next call compares against it. `Default` is "nothing is known to have been
+/// announced".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Announced {
+    /// The stream position stamped on the last announcement, for the next one's `prev_id`.
+    pub stream_id: Option<u64>,
+    /// Each device as announced.
+    pub devices: BTreeMap<String, AnnouncedDevice>,
+    /// The master key as announced.
+    pub master: Option<Value>,
+    /// The self-signing key as announced.
+    pub self_signing: Option<Value>,
+}
+
+/// The EDUs (type and content) that tell another server the difference between `before`
+/// (`None`: nothing is known to have been announced) and `now` for `user_id`: an
+/// `m.device_list_update` for each device added, changed (keys or display name) or deleted,
+/// stamped with `now.stream_id` and naming the previous announcement in `prev_id`, and an
+/// `m.signing_key_update` when a cross-signing key changed. The first announcement for a user
+/// names every device and any cross-signing keys, since nothing is known to have been sent.
+/// Returns them and what is announced afterwards.
+#[must_use]
+pub fn device_list_update_edus(
+    user_id: &UserId,
+    before: Option<&Announced>,
+    now: LocalDeviceList,
+) -> (Vec<(&'static str, Value)>, Announced) {
+    let mut edus = Vec::new();
+    let unknown = Announced::default();
+    let before_known = before.is_some();
+    let before = before.unwrap_or(&unknown);
+    let prev_id: Vec<u64> = before.stream_id.into_iter().collect();
+    let update = |device_id: &str, device: Option<&AnnouncedDevice>| {
+        let mut content = json!({
+            "user_id": user_id,
+            "device_id": device_id,
+            "stream_id": now.stream_id,
+            "prev_id": prev_id,
+            "deleted": device.is_none(),
+        });
+        if let Some(device) = device {
+            if let Some(keys) = &device.keys {
+                content["keys"] = keys.clone();
+            }
+            if let Some(name) = &device.display_name {
+                content["device_display_name"] = Value::String(name.clone());
+            }
+        }
+        ("m.device_list_update", content)
+    };
+    for (device_id, device) in &now.devices {
+        if before.devices.get(device_id) != Some(device) {
+            edus.push(update(device_id, Some(device)));
+        }
+    }
+    for device_id in before.devices.keys() {
+        if !now.devices.contains_key(device_id) {
+            edus.push(update(device_id, None));
+        }
+    }
+    let cross_signing_changed =
+        now.master != before.master || now.self_signing != before.self_signing;
+    let has_cross_signing = now.master.is_some() || now.self_signing.is_some();
+    if has_cross_signing && (cross_signing_changed || !before_known) {
+        let mut content = json!({"user_id": user_id});
+        if let Some(master) = &now.master {
+            content["master_key"] = master.clone();
+        }
+        if let Some(self_signing) = &now.self_signing {
+            content["self_signing_key"] = self_signing.clone();
+        }
+        edus.push(("m.signing_key_update", content));
+    }
+    let announced = Announced {
+        stream_id: Some(now.stream_id),
+        devices: now.devices,
+        master: now.master,
+        self_signing: now.self_signing,
+    };
+    (edus, announced)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn named(keys: Option<Value>, name: Option<&str>) -> AnnouncedDevice {
+        AnnouncedDevice {
+            keys,
+            display_name: name.map(str::to_owned),
+        }
+    }
+
+    fn list(devices: Vec<(&str, AnnouncedDevice)>, stream_id: u64) -> LocalDeviceList {
+        LocalDeviceList {
+            devices: devices
+                .into_iter()
+                .map(|(d, a)| (d.to_owned(), a))
+                .collect(),
+            master: None,
+            self_signing: None,
+            stream_id,
+        }
+    }
+
+    /// Sytest's "Can query remote device keys using POST after notification" renames a device
+    /// and waits for the other server to hear: a display-name change alone is an update, and a
+    /// device with no keys is announced (with none) rather than left out.
+    #[test]
+    fn a_renamed_or_keyless_device_is_announced_and_an_unchanged_one_is_not() {
+        let user = ruma::user_id!("@alice:a.example");
+        let (edus, after) = device_list_update_edus(
+            user,
+            None,
+            list(
+                vec![
+                    ("D1", named(Some(json!({"k": 1})), None)),
+                    ("D2", named(None, Some("phone"))),
+                ],
+                4,
+            ),
+        );
+        assert_eq!(edus.len(), 2, "{edus:?}");
+        assert!(edus[0].1.get("device_display_name").is_none());
+        assert!(edus[1].1.get("keys").is_none());
+        assert_eq!(edus[1].1["device_display_name"], "phone");
+
+        let (edus, after) = device_list_update_edus(
+            user,
+            Some(&after),
+            list(
+                vec![
+                    ("D1", named(Some(json!({"k": 1})), Some("laptop"))),
+                    ("D2", named(None, Some("phone"))),
+                ],
+                6,
+            ),
+        );
+        assert_eq!(edus.len(), 1, "{edus:?}");
+        assert_eq!(edus[0].1["device_id"], "D1");
+        assert_eq!(edus[0].1["device_display_name"], "laptop");
+        assert_eq!(edus[0].1["keys"], json!({"k": 1}));
+        assert_eq!(edus[0].1["prev_id"], json!([4]));
+        assert_eq!(edus[0].1["stream_id"], 6);
+
+        let (edus, after) = device_list_update_edus(
+            user,
+            Some(&after),
+            list(
+                vec![("D1", named(Some(json!({"k": 1})), Some("laptop")))],
+                7,
+            ),
+        );
+        assert_eq!(edus.len(), 1, "{edus:?}");
+        assert_eq!(edus[0].1["device_id"], "D2");
+        assert_eq!(edus[0].1["deleted"], true);
+        assert_eq!(after.stream_id, Some(7));
+
+        let (edus, _) = device_list_update_edus(
+            user,
+            Some(&after),
+            list(
+                vec![("D1", named(Some(json!({"k": 1})), Some("laptop")))],
+                8,
+            ),
+        );
+        assert!(edus.is_empty(), "{edus:?}");
+    }
+
+    #[test]
+    fn a_cross_signing_change_alone_is_a_signing_key_update() {
+        let user = ruma::user_id!("@alice:a.example");
+        let (_, before) = device_list_update_edus(user, None, list(vec![], 1));
+        let mut now = list(vec![], 2);
+        now.master = Some(json!({"m": 1}));
+        let (edus, after) = device_list_update_edus(user, Some(&before), now.clone());
+        assert_eq!(edus.len(), 1, "{edus:?}");
+        assert_eq!(edus[0].0, "m.signing_key_update");
+        assert_eq!(edus[0].1["master_key"], json!({"m": 1}));
+        let (edus, _) = device_list_update_edus(user, Some(&after), now);
+        assert!(edus.is_empty(), "{edus:?}");
+    }
+
+    #[test]
+    fn a_user_devices_answer_is_believed_only_about_the_user_asked_for() {
+        let bob = ruma::user_id!("@bob:there.example");
+        let good = json!({
+            "user_id": bob, "stream_id": 5,
+            "devices": [
+                {"device_id": "D1", "keys": {"k": 1}, "device_display_name": "one"},
+                {"device_id": "D2"},
+                {"no": "device_id"},
+            ],
+            "master_key": {"usage": ["master"]},
+        });
+        let (user, devices) = parse_user_devices(bob, &good).expect("well formed");
+        assert_eq!(user.stream_id, 5);
+        assert!(!user.stale);
+        assert_eq!(user.master, Some(json!({"usage": ["master"]})));
+        assert_eq!(user.self_signing, None);
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[0].1.keys, Some(json!({"k": 1})));
+        assert_eq!(devices[0].1.display_name.as_deref(), Some("one"));
+        assert_eq!(devices[1].1.keys, None);
+
+        let other = json!({"user_id": "@mallory:there.example", "stream_id": 1, "devices": []});
+        assert!(parse_user_devices(bob, &other).is_none());
+        assert!(parse_user_devices(bob, &json!({"user_id": bob})).is_none());
+    }
 
     #[test]
     fn a_small_share_is_one_edu_with_the_message_id_as_given() {

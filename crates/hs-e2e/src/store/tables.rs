@@ -19,6 +19,9 @@
 //! | `hs_e2e.to_device` | `(user_id, device_id, stream_id: u64)` | [`ToDeviceStore`] |
 //! | `hs_e2e.to_device_txn` | `(sender_user, sender_device, txn_id)` | [`ToDeviceStore`] idempotency |
 //! | `hs_e2e.to_device_stream` | `(pos: u64,)` | [`ToDeviceStore`]'s server-wide stream: one entry per queued message, naming the device and its queue position, for appservice delivery |
+//! | `hs_e2e.user_stream_pos` | `(user_id,)` | [`DeviceKeyStore::user_stream_pos`]: each user's latest change position, written with every bump of the stream |
+//! | `hs_e2e.remote_users` | `(user_id,)` | [`RemoteDeviceListStore`]: what is known of a remote user's list as a whole |
+//! | `hs_e2e.remote_devices` | `(user_id, device_id)` | [`RemoteDeviceListStore`]: a remote user's devices |
 //! | `hs_e2e.counters` | varies (raw tuple-encoded) | monotonic counters via `atomic_add` |
 //!
 //! No secondary indexes are needed anywhere in this table: every lookup this crate performs is
@@ -40,8 +43,9 @@ use serde_json::Value;
 
 use super::{
     BackupSessionRow, BackupStore, BackupVersionRow, CrossSigningKeyType, CrossSigningStore,
-    DeviceKeyStore, DeviceKeysRow, FallbackKeyStore, OneTimeKeyStore, StoreError, ToDeviceMessage,
-    ToDeviceStore, ToDeviceStreamEntry,
+    DeviceKeyStore, DeviceKeysRow, FallbackKeyStore, OneTimeKeyStore, RemoteDeviceListStore,
+    RemoteDeviceRow, RemoteUserRow, StoreError, ToDeviceMessage, ToDeviceStore,
+    ToDeviceStreamEntry,
 };
 
 type DeviceKeysKey = (String, String);
@@ -54,6 +58,9 @@ type BackupSessionKey = (String, u64, String, String);
 type ToDeviceKey = (String, String, u64);
 type ToDeviceTxnKey = (String, String, String);
 type ToDeviceStreamKey = (u64,);
+type UserStreamPosKey = (String,);
+type RemoteUserKey = (String,);
+type RemoteDeviceKey = (String, String);
 
 fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, StoreError> {
     serde_json::from_slice(bytes).map_err(|e| StoreError::Backend(format!("decode: {e}")))
@@ -123,6 +130,9 @@ pub struct TablesE2eStore<B: KvBackend> {
     to_device: TypedKeyspace<B::Keyspace, ToDeviceKey>,
     to_device_txn: TypedKeyspace<B::Keyspace, ToDeviceTxnKey>,
     to_device_stream: TypedKeyspace<B::Keyspace, ToDeviceStreamKey>,
+    user_stream_pos: TypedKeyspace<B::Keyspace, UserStreamPosKey>,
+    remote_users: TypedKeyspace<B::Keyspace, RemoteUserKey>,
+    remote_devices: TypedKeyspace<B::Keyspace, RemoteDeviceKey>,
     counters: B::Keyspace,
 }
 
@@ -149,6 +159,9 @@ impl<B: KvBackend> TablesE2eStore<B> {
             to_device: TypedKeyspace::new(open("hs_e2e.to_device")?),
             to_device_txn: TypedKeyspace::new(open("hs_e2e.to_device_txn")?),
             to_device_stream: TypedKeyspace::new(open("hs_e2e.to_device_stream")?),
+            user_stream_pos: TypedKeyspace::new(open("hs_e2e.user_stream_pos")?),
+            remote_users: TypedKeyspace::new(open("hs_e2e.remote_users")?),
+            remote_devices: TypedKeyspace::new(open("hs_e2e.remote_devices")?),
             counters: open("hs_e2e.counters")?,
             backend,
         })
@@ -167,7 +180,39 @@ impl<B: KvBackend> TablesE2eStore<B> {
         self.device_list_stream
             .put(txn, &(pos,), user_id.as_bytes())
             .map_err(to_kv)?;
+        self.user_stream_pos
+            .put(txn, &(user_id.to_string(),), &pos.to_be_bytes())
+            .map_err(to_kv)?;
         Ok(pos)
+    }
+
+    fn read_remote_user<R: KvRead<Keyspace = B::Keyspace>>(
+        &self,
+        read: &R,
+        user_id: &UserId,
+    ) -> Result<Option<RemoteUserRow>, KvError> {
+        match self
+            .remote_users
+            .get(read, &(user_id.to_string(),))
+            .map_err(to_kv)?
+        {
+            Some(bytes) => Ok(Some(decode_kv(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn remote_device_keys_under<R: KvRead<Keyspace = B::Keyspace>>(
+        &self,
+        read: &R,
+        user_id: &UserId,
+    ) -> Result<Vec<RemoteDeviceKey>, KvError> {
+        let prefix = TypedKeyspace::<B::Keyspace, RemoteDeviceKey>::prefix(&(user_id.to_string(),));
+        let mut keys = Vec::new();
+        for item in self.remote_devices.range(read, prefix) {
+            let (key, _) = item.map_err(to_kv)?;
+            keys.push(key);
+        }
+        Ok(keys)
     }
 }
 
@@ -286,6 +331,24 @@ impl<B: KvBackend> DeviceKeyStore for TablesE2eStore<B> {
                     .try_into()
                     .map_err(|_| StoreError::Backend("corrupt counter".to_string()))?;
                 Ok(u64::try_from(i64::from_be_bytes(arr)).unwrap_or(0))
+            }
+        }
+    }
+
+    async fn user_stream_pos(&self, user_id: &UserId) -> Result<u64, StoreError> {
+        let snap = self.backend.snapshot();
+        match self
+            .user_stream_pos
+            .get(&snap, &(user_id.to_string(),))
+            .map_err(|e| StoreError::Backend(e.to_string()))?
+        {
+            None => Ok(0),
+            Some(bytes) => {
+                let arr: [u8; 8] = bytes
+                    .as_ref()
+                    .try_into()
+                    .map_err(|_| StoreError::Backend("corrupt user stream position".into()))?;
+                Ok(u64::from_be_bytes(arr))
             }
         }
     }
@@ -1141,6 +1204,132 @@ impl<B: KvBackend> ToDeviceStore for TablesE2eStore<B> {
             }
             self.to_device_txn.put(txn, &key, &[]).map_err(to_kv)?;
             Ok(false)
+        })
+        .map_err(store_err)
+    }
+}
+
+#[async_trait::async_trait]
+impl<B: KvBackend> RemoteDeviceListStore for TablesE2eStore<B> {
+    async fn get_remote_user(&self, user_id: &UserId) -> Result<Option<RemoteUserRow>, StoreError> {
+        let snap = self.backend.snapshot();
+        self.read_remote_user(&snap, user_id).map_err(store_err)
+    }
+
+    async fn list_remote_devices(
+        &self,
+        user_id: &UserId,
+    ) -> Result<Vec<(OwnedDeviceId, RemoteDeviceRow)>, StoreError> {
+        let snap = self.backend.snapshot();
+        let prefix = TypedKeyspace::<B::Keyspace, RemoteDeviceKey>::prefix(&(user_id.to_string(),));
+        let mut out = Vec::new();
+        for item in self.remote_devices.range(&snap, prefix) {
+            let ((_u, device_id), value) = item.map_err(|e| StoreError::Backend(e.to_string()))?;
+            let row: RemoteDeviceRow = decode(&value)?;
+            out.push((OwnedDeviceId::from(device_id), row));
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
+
+    async fn replace_remote_device_list(
+        &self,
+        user_id: &UserId,
+        user: RemoteUserRow,
+        devices: Vec<(OwnedDeviceId, RemoteDeviceRow)>,
+    ) -> Result<(), StoreError> {
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            for key in self.remote_device_keys_under(txn, user_id)? {
+                self.remote_devices.delete(txn, &key).map_err(to_kv)?;
+            }
+            for (device_id, row) in &devices {
+                let key = (user_id.to_string(), device_id.to_string());
+                let value = encode_kv(row)?;
+                self.remote_devices.put(txn, &key, &value).map_err(to_kv)?;
+            }
+            let value = encode_kv(&user)?;
+            self.remote_users
+                .put(txn, &(user_id.to_string(),), &value)
+                .map_err(to_kv)?;
+            Ok(())
+        })
+        .map_err(store_err)
+    }
+
+    async fn apply_remote_device_update(
+        &self,
+        user_id: &UserId,
+        device_id: &DeviceId,
+        device: Option<RemoteDeviceRow>,
+        stream_id: u64,
+    ) -> Result<(), StoreError> {
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            let mut user = self
+                .read_remote_user(txn, user_id)?
+                .ok_or_else(|| to_kv(RowMissing(user_id.to_string())))?;
+            let key = (user_id.to_string(), device_id.to_string());
+            match &device {
+                Some(row) => {
+                    let value = encode_kv(row)?;
+                    self.remote_devices.put(txn, &key, &value).map_err(to_kv)?;
+                }
+                None => self.remote_devices.delete(txn, &key).map_err(to_kv)?,
+            }
+            user.stream_id = user.stream_id.max(stream_id);
+            let value = encode_kv(&user)?;
+            self.remote_users
+                .put(txn, &(user_id.to_string(),), &value)
+                .map_err(to_kv)?;
+            Ok(())
+        })
+        .map_err(store_err)
+    }
+
+    async fn set_remote_signing_keys(
+        &self,
+        user_id: &UserId,
+        master: Option<Value>,
+        self_signing: Option<Value>,
+    ) -> Result<(), StoreError> {
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            let mut user = self
+                .read_remote_user(txn, user_id)?
+                .ok_or_else(|| to_kv(RowMissing(user_id.to_string())))?;
+            user.master = master.clone();
+            user.self_signing = self_signing.clone();
+            let value = encode_kv(&user)?;
+            self.remote_users
+                .put(txn, &(user_id.to_string(),), &value)
+                .map_err(to_kv)?;
+            Ok(())
+        })
+        .map_err(store_err)
+    }
+
+    async fn mark_remote_user_stale(&self, user_id: &UserId) -> Result<(), StoreError> {
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            let Some(mut user) = self.read_remote_user(txn, user_id)? else {
+                return Ok(());
+            };
+            user.stale = true;
+            let value = encode_kv(&user)?;
+            self.remote_users
+                .put(txn, &(user_id.to_string(),), &value)
+                .map_err(to_kv)?;
+            Ok(())
+        })
+        .map_err(store_err)
+    }
+
+    async fn forget_remote_user(&self, user_id: &UserId) -> Result<(), StoreError> {
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            for key in self.remote_device_keys_under(txn, user_id)? {
+                self.remote_devices.delete(txn, &key).map_err(to_kv)?;
+            }
+            self.remote_users
+                .delete(txn, &(user_id.to_string(),))
+                .map_err(to_kv)?;
+            Ok(())
         })
         .map_err(store_err)
     }
