@@ -15,12 +15,23 @@ use crate::state::{UserRequester, UserState};
 /// `GET /joined_rooms`: every room `crate::store::UserStore` currently has this user recorded as
 /// `"join"` in.
 ///
+/// The memberships are written by the session hub off the room stream, a moment after the
+/// event, so this first waits, as `/sync` does, for the hub to have consumed everything
+/// published before the request arrived (`SessionHub::settle_before_read`): a room a client
+/// has just created, or just joined, is in its very next `/joined_rooms`. Until 2026-10-02 it
+/// could be missing (Complement's `TestRoomState` and `hs-cli`'s `room_id_uniqueness` test on
+/// CI's slower arm64 runner both found a room created a moment before absent).
+///
 /// # Errors
 /// Returns [`UserError`] on a store failure.
 pub async fn get_joined_rooms<B: KvBackend + 'static, R: RoomSource<B> + 'static>(
     State(state): State<UserState<B, R>>,
     UserRequester(requester): UserRequester,
 ) -> Result<Response, UserError> {
+    state
+        .hub
+        .settle_before_read(crate::sync::READ_YOUR_WRITES_WAIT)
+        .await;
     let memberships = state
         .hub
         .store()

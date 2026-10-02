@@ -307,6 +307,11 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
 
 ### Conformance
 
+- **Sytest: 548 of 772** (client-server 385 of 543, federation 78 of 105), measured 2026-10-02 on
+  `main` at `09f24ee` with the night's seven branches merged; 448 the evening before, 407 that
+  morning, never run before 2026-10-01. Thirty-three of the 190 failures are the suite's own
+  timeouts under load and are expected to pass on a quiet machine. Per-test results, by name, in
+  `docs/status/sytest/`.
 - **Complement `csapi`: 317 of 384 assertions**, 78 of 106 top-level tests, measured 2026-09-26 (run 11, `9672d61`: the two "after joining new room" subtests of `TestMessagesOverFederation` moved to passing with the history before a join fetched; nothing moved the other way). Before that 314 of 384, measured 2026-09-21
   and again, identical by name, on 2026-09-26;
   241 of 370 that morning, 191 of 296 the run before that. The first run this project ever took was 125; the suite had never
@@ -488,6 +493,12 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
 
 ### Client-server API
 
+- **`/joined_rooms` lists a room its caller just created or joined, every time.** It waits, as
+  `/sync` has since the 2026-09-30 read-your-writes change, for the session hub to have consumed
+  everything published before the request (bounded at 500 ms). Before, a client asking the
+  moment `createRoom` returned could be short a room: Complement's `TestRoomState` saw it once in
+  two runs, and the twenty-rooms-at-once test saw it on CI's arm64 runner on every push of
+  2026-10-01 night. Verified by the real-binary test on 2026-10-02.
 - Rooms: creation, membership, state, timeline, `/messages`, `/context`, relations, threads, room
   upgrade, aliases, the room directory, redactions, and idempotent state sends and joins.
 - **History visibility is enforced on every read path.** A user who has left a non-world-readable

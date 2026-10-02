@@ -1,8 +1,28 @@
 # 05 Sync: status
 
-Last updated: 2026-10-01 (session 12: RFC 0018, a non-owner's room copy catches up instead of
+Last updated: 2026-10-02 (session 13: `/joined_rooms` read-your-writes. Session 12: RFC 0018, a non-owner's room copy catches up instead of
 reloading. Session 11, session 10, session 9, session 8, session 7 and the integration note
 follow; sessions 1-6 are preserved unchanged further down.)
+
+## Session 13 (2026-10-02, branch `agent/joined-rooms-rywr`): `/joined_rooms` sees the caller's own writes
+
+Closes the known gap "`TestRoomState` flaps: a room just created can be missing from
+`/joined_rooms`" (status 14 session 6), which on 2026-10-01 night also failed `hs-cli`'s
+`room_id_uniqueness.rs` on GitHub's arm64 runner on every push to `main` (twenty rooms created at
+once, then `/joined_rooms` short one or two of them; never on amd64, never on the desktop).
+
+`UserStore::list_memberships`, which `get_joined_rooms` lists, is written by the session hub off
+the registry's global stream, a moment after the event. `/sync` has waited for that moment since
+`4e1990f` (`SessionHub::settle_before_read`: everything the registry had published when the
+request arrived is consumed before the read, bounded at 500 ms, and in a cluster every peer's
+wakes too). `/joined_rooms` now does the same before it reads, one call. Nothing else changed:
+the hub, the store and the stream are as they were.
+
+Tested: `cargo test -p hs-user` (unchanged suite) and `cargo test -p hs-cli --test
+room_id_uniqueness` three times in a row on the desktop, where it had never failed; the proof is
+CI's arm64 leg going green on the merge, which this entry's next revision should record. The
+wait's own tests are session 10's (`a_sync_sent_the_moment_after_a_join_sees_the_join`, and the
+hub made to fall behind).
 
 ## Session 12 (2026-10-01, branch `agent/rfc-0018`): a replica that does not own a room reads only its new events
 

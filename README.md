@@ -57,7 +57,7 @@ Megolm establishes, the recipient decrypts. `cargo test -p hs-loadgen --test rea
 | Complement federation, whole package | 225 / 314 assertions (50 / 90 tests), measured 2026-10-01 on `main` at `2a0b362`, twice (49 / 90 the second time: a race in the test); 75 / 250 (14 / 88) on 2026-09-26 |
 | Complement federation, restricted rooms, invites and knocks | 17 / 18 tests in both whole-package runs of 2026-10-01; the one left is a race in the test itself |
 | Complement `TestSearch`, `TestMessagesOverFederation` | 1 / 1 each, in both runs of 2026-10-01 (0 / 1 before 2026-09-30) |
-| Sytest, whole suite | 448 / 772 (48 skipped) on 2026-10-01 evening, from 407 on the first run that morning; federation group 15 → 50 of 105; per-test results in `docs/status/sytest/` |
+| Sytest, whole suite | 548 / 772 (34 skipped) on 2026-10-02 with every branch merged, from 448 the evening before and 407 that morning; client-server group 385 of 543, federation group 15 → 78 of 105; per-test results in `docs/status/sytest/` |
 | `cargo fuzz` | 8 targets, 18.7 million executions under ASan, no crash (2026-10-01) |
 | Spec routes served | 138 / 235 (58.7%) — client-server 108/166, server-server 30/36 |
 | Rust | 27 crates, ~250k lines including tests, 2,534 tests |
@@ -170,7 +170,7 @@ broken up, because the parts are nowhere near each other. This table is kept cur
 
 Federation is the honest answer to "when could I use this": a user here can join a room on
 another instance of this server and talk, but it has not been pointed at Synapse. The second
-honest answer is Sytest's 407 of 772, which names every missing piece by test.
+honest answer is Sytest's 548 of 772, which names every missing piece by test.
 
 ## Where things are
 

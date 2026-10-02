@@ -1,10 +1,100 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-10-01, 18:10 EDT (the all-gaps night wrapped up; twelve branches unmerged, listed first). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+Written 2026-09-20 by the integration lead, last revised 2026-10-02, 00:20 EDT (every branch merged, Sytest 548 of 772, one branch open for the CI fix). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
-## Resume here: 2026-10-01, 18:10 EDT -- the wrap-up of the all-gaps night
+## Resume here: 2026-10-02, 00:20 EDT -- the seven branches are merged, Sytest is 548 of 772
+
+**Where `main` is.** `2b3169e`, **2,661 Rust tests** (`cargo test --workspace --all-targets -- --list`),
+every one of the seven branches left unmerged at 19:05 on it, each through the full gate with both
+PostgreSQL servers, in this order: `admin-scopes` `ab3f29c`, `room-id-uniqueness` `6180d20`,
+`rfc-0018` `fc26bf9`, `sytest-client` `3c0ae61`, `merge-queue-batch` `de9956e` (new tonight, below),
+`federation-sytest-2` `09f24ee`, `web-admin-ui` `2b3169e`. The two redundant branches are gone.
+**One branch is open:** `agent/joined-rooms-rywr`, the CI fix and this document, which needs one
+gate (`tools/merge-queue.sh agent/joined-rooms-rywr`); nothing else is unmerged.
+
+**CI on `main` has been red since `6180d20`**, on every push tonight, and so no `cd` image after
+`564f540` is green. One test: `crates/hs-cli/tests/room_id_uniqueness.rs` makes twenty rooms at
+once and asks `/joined_rooms`, which on GitHub's arm64 runner (never amd64, never the desktop) was
+short a room or two -- the known-gaps row "`TestRoomState` flaps: a room just created can be
+missing from `/joined_rooms`", now closed: `get_joined_rooms` waits for the session hub to have
+consumed what was published before the request, exactly as `/sync` has since `4e1990f`
+(`SessionHub::settle_before_read`, bounded at 500 ms). Status 05 session 13. **Roll the demo to
+the first green `cd` run after this branch merges** (the `helm upgrade` in item 1 below with that
+run's `sha-`); `564f540` is the newest green image until then.
+
+**Two gates failed on real disagreements between branches and `main`, each fixed on the branch
+and requeued, not forced:**
+
+1. `federation-sytest-2` failed `hs-user`'s `messages_accepts_a_token_minted_by_sync_in_both_directions`.
+   `main`'s test said a backward `/messages` page from a `/sync` token must not repeat the newest
+   event the sync showed; the branch, and `sytest-client` independently (two different Sytest
+   tests), say it must start with it -- Synapse's reading, a stream token marks the point after
+   the events it delivered. The test now asserts that. `sytest-client` merged first, so its
+   implementation is the one on `main`; the branch's equivalent hunk and its unit test were
+   dropped in the resolution, the rest of its 19 commits intact.
+2. `sytest-client` failed `hs-cli`'s `rooms_refuse_what_the_spec_says_they_must_and_spell_out_their_defaults`,
+   which joined with `"third_party_signed": {"x": 1}` among other junk and expected the key dropped.
+   Now that the key claims a third-party invitation, a value with no `mxid` is `400 M_BAD_JSON`
+   (the branch had answered `403 "names somebody else"`), and the test sends its junk expecting
+   400, then joins without it and checks what it always checked (`3c0ae61`).
+
+The other conflicts were mechanical and are recorded in the merge commits' files: `metrics.rs`
+keep-both (`room-id-uniqueness` against `room-cluster-small`'s upgrade metric); `actor.rs`, the
+transactional id claim over `sytest-client`'s millisecond walk, its tests kept; `hs-config`'s
+`auth.rs` keep-both with `docs/config.md` and the web schema fixture regenerated rather than
+merged; `UserDetailPage.tsx`, the branch's labels with `main`'s guest line inside them. Three
+branches had been built on `config-hot` with `main` merged in and could not be rebased as they
+stood; each was replayed from its own first commit (`git rebase --onto origin/main <last merge>`).
+
+**Sytest on the merged tree** (`09f24ee`, image `myelin-sytest:dev`, run `20261002T022745Z`, with the
+last gate running alongside it): **548 / 772** (34 skipped, 190 failed), client-server **385 / 543**,
+federation **78 / 105**. Last night `main` was 448, the best single branch 486. Thirty-three of the
+failures are "Timed out waiting for test", the load; nine "Unexpected response from /send"; the
+groups at zero are cross-signing (0/7), tagging (0/8), ignore-users (0/3), power levels (0/2).
+Per-test results: `docs/status/sytest/2026-10-02-{results,summary,are-we-synapse-yet}.txt`; status 14
+session 7. A re-run on a quiet machine is the next measurement; expect the timeouts to pass.
+
+**The merge queue has a batch mode** (`de9956e`): `tools/merge-queue.sh agent/a,agent/b,agent/c`
+stacks the group from `origin/main` and gates the stack once, pushes it all or, when the gate
+fails, gates each branch alone; `--dry-run` shows what a plan would stack, in a worktree of its
+own with no lock; `--dry-run=fail` shows the fallback. Both were run tonight against the real
+branches. Also measured tonight: a gate with a warm `target/` is 8-20 minutes, not 40, so batching
+pays on a night with many disjoint branches and not much otherwise.
+
+**What is next, in order:**
+
+1. **Merge `agent/joined-rooms-rywr`**, then **roll the demo** to the first green `cd` image after
+   it: `helm --kube-context admin@dacrib0 get values myelin -n myelin -o yaml >
+   /tmp/myelin-values.yaml && helm --kube-context admin@dacrib0 upgrade myelin
+   /Users/brandon/myelin/deploy/helm/hs -n myelin -f /tmp/myelin-values.yaml --set
+   image.tag=sha-<full sha> --wait --timeout 10m`, from the owner's own shell (Homebrew
+   `kubectl`/`helm` cannot reach the API server from an agent session). The demo runs `sha-025ef65`.
+2. **The two-pod cluster run** with that image (item 2 of the 2026-09-30 list), watching the
+   last-replica drain, catch-up, the search indexer per replica, the fenced-create retry, and
+   whether one late heartbeat at load costs a replica every shard. Needs the owner's terminal.
+3. **Sytest again on a quiet machine**, then its leftovers by group: push rules (19/53), sync
+   (57/84), the user directory (5/11), cross-signing, tagging, ignored users, room upgrades
+   (11/21), federation's query API (1/5) and device keys (4/9).
+4. **The rows the night opened** (unchanged from 18:10): the web audit list in status 16, a
+   narrower admin token (RFC 0004 §8.1), the hot-room stream and feed pruning,
+   `users_sharing_room_with` on the member index, `PLAN.md` §6.5, placed outliers before
+   `ed3ad77` with no state row, bans not carried by a room upgrade, `may_redact` at the
+   redaction's time, and the owner's hub writing feed entries one round trip at a time
+   (`SessionHub::apply_room_update`, found by the RFC 0018 work).
+5. **Then the table**, as before.
+
+**For the merge queue:** `tools/merge-queue.sh <branches...>` from the main checkout with the six
+`HS_*_TEST_POSTGRES_*` variables (a ready `gate-env.sh` was in the 2026-10-01 night session's
+scratchpad; the recipe is at the top of `crates/hs-kv/tests/postgres_tls.rs`, and the trust anchor
+is the test CA at `/private/tmp/claude-501/-Users-brandon-myelin/e6e0b427-10a1-457d-8bde-b166a507435f/scratchpad/pgtls/ca.crt`,
+not `server.crt`); never push to `main` while a gate runs unless the change is under `docs/`.
+Several queues may be started at once; they share the lock and take turns. The permission
+classifier in an agent session denies `git push origin --delete`, so a branch the queue did not
+delete is the owner's to delete.
+
+## Earlier: 2026-10-01, 18:10 EDT -- the wrap-up of the all-gaps night
 
 **Where `main` is.** `48e1ff3` plus this document, **2,572 Rust tests**, about 110 commits since 2026-09-30 18:00, every
 code commit through the full gate with both PostgreSQL servers. CI on `main` was red from
@@ -2121,7 +2211,7 @@ Refreshed 2026-09-28 against the code: closed rows are struck through with the c
 | ~~A first boot over an empty data directory takes about five seconds~~ | `hs-cli`, `hs-kv` | **Closed** 2026-10-01 (`agent/boot-time`, status 01, decision 0024): every `hs-kv` keyspace on Fjall is a `[len][name]` prefix in one shared Fjall keyspace, so a fresh store creates one Fjall keyspace instead of 109 (Fjall has no batched creation and serializes creations under a lock); old data directories are read in their per-table layout, unmigrated. Launch to `listening`, five runs, load 11-18: debug cold 8.8 s → 0.72 s, release cold 9.4 s (20.7 s in a second, busier run) → 0.62 s, warm 0.4 to 0.8 s. The `listening` line says `boot_ms`, `cold`, `keyspaces_created`; `hs_boot_duration_seconds{cold}`. Guards: `hs-kv/tests/fjall_keyspace_creation.rs` (one Fjall keyspace for ninety tables; a crash right after a first boot loses nothing; the old layout still read) and `hs-cli/tests/boot_time.rs` (the real binary, `SIGKILL` after the first boot, account still there). The chart's startup probe (150 s budget) already tolerated it and is unchanged; its very first probe can still be refused as the container starts, one event inside the budget |
 | ~~User-directory scope is computed by walking rooms on every search~~ | `hs-user` | **Closed** 2026-09-30 (`agent/user-gaps`, status 05 session 11): a search reads `hs_user.room_members` (each room's joined members, kept by the session hub from the room updates it already applies) for the searcher's joined rooms and the public ones, and loads no room; a room the index has nothing for (last updated before it existed) is read once and indexed, counted by `SessionHub::directory_rooms_walked` and logged. Same answers (`e2e.rs`'s directory test unchanged). Timing, one public room of 5,001 members, release, in-memory: 2.7 ms from the index against 2.3 ms reading a resident room and 125 ms loading one -- the win is never loading or queuing on a room, not a resident room's read. Left: `users_sharing_room_with` (every `/sync`'s presence and device-list scope) still reads rooms |
 | ~~`TestThreadsEndpoint` flapped between runs~~ | `hs-room` | **Graded** 2026-10-01 (`agent/complement-remeasure`, status 14 session 6): `TestThreadsEndpoint` passed in both whole-package csapi runs from one image of `main` (`2a0b362`). Two other tests did move between those identical runs, each with its own row below: `TestRoomState` (csapi; a real read-your-writes bug in `/joined_rooms`) and `TestKnockRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11` (federation; the known race in the test). Every other name, subtests included, matched run to run. Before: an ordering tie on a millisecond timestamp, fixed 2026-09-21 |
-| `TestRoomState` flaps: a room just created can be missing from `/joined_rooms` | `hs-user` | found 2026-10-01 (status 14 session 6): PASS in csapi run 13, FAIL in run 14 from the same image, and so PASS -> FAIL against 2026-09-26 in one run of two. Subtest `GET /joined_rooms lists newly-created room`, failing assertion `apidoc_room_state_test.go:187: failed to find room with id: !rpTZ1hl3asiID13ycE:hs1` (the test asks `GET /joined_rooms` the moment its `createRoom` returns). `hs_user::routes::rooms::get_joined_rooms` lists `UserStore::list_memberships`, which the session hub writes off the registry's stream a moment after the room accepted the join, without the bounded wait `/sync`, `/typing`, `/receipt` and `/read_markers` make (`SessionHub::settle_before_read`, `READ_YOUR_WRITES_WAIT`; status 05 session 10 said nothing else gated on store membership, but this lists it). Likely one line: settle before the read. Any other route that answers from the hub's store has the same window |
+| ~~`TestRoomState` flaps: a room just created can be missing from `/joined_rooms`~~ | `hs-user` | **Closed** 2026-10-02 (`agent/joined-rooms-rywr`, status 05 session 13): `get_joined_rooms` waits for the hub to have consumed what was published before the request, as `/sync` does; it also failed `hs-cli`'s `room_id_uniqueness` test on CI's arm64 runner on every push of 2026-10-01 night. Was: found 2026-10-01 (status 14 session 6): PASS in csapi run 13, FAIL in run 14 from the same image, and so PASS -> FAIL against 2026-09-26 in one run of two. Subtest `GET /joined_rooms lists newly-created room`, failing assertion `apidoc_room_state_test.go:187: failed to find room with id: !rpTZ1hl3asiID13ycE:hs1` (the test asks `GET /joined_rooms` the moment its `createRoom` returns). `hs_user::routes::rooms::get_joined_rooms` lists `UserStore::list_memberships`, which the session hub writes off the registry's stream a moment after the room accepted the join, without the bounded wait `/sync`, `/typing`, `/receipt` and `/read_markers` make (`SessionHub::settle_before_read`, `READ_YOUR_WRITES_WAIT`; status 05 session 10 said nothing else gated on store membership, but this lists it). Likely one line: settle before the read. Any other route that answers from the hub's store has the same window |
 | A NoCreators restricted-join test moved between identical runs | Complement's test (`tests/restricted_rooms_test.go`) | found 2026-10-01 (status 14 session 6): `TestKnockRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11` PASS in federation run 8, FAIL in run 9 at `restricted_rooms_test.go:554` (bob's sync never shows charlie joined with `join_authorised_via_users_server` = bob): charlie's join through hs2 was answered `403` about 15 ms after alice's power-levels change was accepted on hs1, before hs2 had it. The race of status 06 session 14, item 3, which the test loses when this server answers faster than federation delivers; its three siblings on the same helper went FAIL/FAIL (`TestRestrictedRooms...V11`, `TestKnockRestrictedRooms...V12`) and PASS/PASS (`TestRestrictedRooms...V12`) in these runs, and all four failed in all four runs of 2026-09-30. Fix is a wait in the test (upstream, or a patch in `tests/complement/`), priority 4 above; until then these four are noise by construction and should not be read as moves |
 | ~~`TestNetworkPartitionOrdering` moved PASS to FAIL between runs 5 and 6~~ | `hs-room` | **Closed** (2026-09-26, passing in every run since, including the 2026-09-30 targeted sets): an event concurrent with a member's join was hidden from them or not depending on which server's events arrived first; the `shared` rule counts "joined when it arrived" now (2026-09-26), and run 7 has it passing again |
 | ~~A hot room joined after the token is resumed from the join, not sent whole~~ | `hs-user` | **Closed** 2026-09-30 (`agent/user-gaps`, status 05 session 11): hot rooms (over 500 members) are resumed from a server-wide hot-room stream (`hs_user.hot_positions`, one entry per update, whatever the room's size) at the token's new `hot_seq` (token v4; v3 still accepted), so a hot room joined after the token is sent as an initial sync sends it. Found on the way, with no row and worse: **every incremental sync of a member of a hot room re-sent everything since their own membership event, and the long-poll returned at once**, for as long as the room stayed hot -- a busy loop for any client in a room over the threshold. Fixed by the same stream (resume, batch bound and wake). `sync::tests::a_hot_room_*` (three) fail on the old logic. Left: the stream is never pruned; no real-binary test of a 500-member room |

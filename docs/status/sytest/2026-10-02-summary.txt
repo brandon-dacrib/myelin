@@ -1,0 +1,31 @@
+process exits during the run (the last few are the shutdown):
+3296:WARN: haproxy-0 process failed - code=2
+3297:WARN: haproxy-1 process failed - code=2
+
+tests: 772
+pass: 548
+fail: 190
+expected fail (Sytest's own marking): 0
+skip: 34
+pass rate (of tests run, skips excluded): 74.3%
+
+most common failure reasons (first line of the message, normalised):
+    33  Timed out waiting for test at run-tests.pl line N.
+     9  Unexpected response from /send: {
+     6  Expected only N membership events (got N) at tests/10apidoc/09synced.pl line N.
+     6  user not in list at tests/52user-directory/01public.pl line N.
+     5  HTTP Request failed ( 404 Not Found https://localhost:PORT/_matrix/client/v3/peek/!ROOM?access_token=TOKEN ) from POST https://localhost:PORT/_matrix/client/v3/peek/!ROOM?...
+     5  HTTP Request failed ( 404 Not Found https://localhost:PORT/_matrix/client/unstable/account/Npid/bind?access_token=TOKEN ) from POST https://localhost:PORT/_matrix/client/unstable/account/Npid/bind?...
+     5  HTTP Request failed ( 400 Bad Request https://localhost:PORT/_matrix/client/v3/pushrules/global/room/%Na:example.com?access_token=TOKEN ) from PUT https://localhost:PORT/_matrix/client/v3/pushrules/gl
+     4  Expected to receive an HTTP N failure but it succeeded at run-tests.pl line N.
+     3  No join for joined user at tests/31sync/06state.pl line N.
+     3  Expected to receive an HTTP Nxx failure but it succeeded at run-tests.pl line N.
+
+skip reasons:
+    13  lack of can_change_power_levels
+     6  lack of can_upload_self_signing_keys
+     6  lack of can_add_tag
+     4  failing fixture: no m.login.cas at tests/10apidoc/13ui-auth.pl line 25.
+     2  lack of can_get_messages
+     2  lack of can_get_3pe_metadata
+     1  lack of can_upload_media

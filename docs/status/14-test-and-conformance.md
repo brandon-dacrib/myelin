@@ -1,5 +1,31 @@
 # 14 Test and conformance (integration lead): status
 
+## Session 7 (2026-10-02, branch `agent/joined-rooms-rywr`): Sytest on the merged tree
+
+The whole suite on `main` at `09f24ee`, with every branch of the 2026-10-01 night merged (image
+`myelin-sytest:dev` built from that tree, Sytest `747315856d24eee846c6923b696fff9fae55ca0f`, run
+`20261002T022745Z`, while the last merge gate ran on the same desktop): **548 / 772** (34
+skipped, 190 failed, no expected failures), **74.3%** of tests run. Client-server **385 / 543**,
+federation **78 / 105**, non-spec 71 / 97. The evening before, `main` was 448 and the branches
+measured separately 458 (`sytest-client`) and 486 (`federation-sytest-2`); this is the first
+number for the combination.
+
+What is at 100%: create room, membership, room state, joining, leaving, sending, typing,
+receipts, read markers, logout, redaction, send-to-device, canonical JSON, federation's key API,
+make_join and room versions. Near it: guests 23/24, room auth 17/18, room versions 48/51,
+invites 13/14, key backup 9/10, federation invites 9/10 and send_join 8/9. The low groups: push
+APIs 19/53, sync 57/84, user directory 5/11, room upgrades 11/21, third-party IDs 10/19, device
+keys 10/17, cross-signing 0/7, tagging 0/8, ignore users 0/3, power levels 0/2, federation's
+query API 1/5 and device-key API 4/9.
+
+Of the 190 failures, 33 are "Timed out waiting for test" (the load: a full `cargo test
+--workspace` gate ran alongside), 9 "Unexpected response from /send", 6 "Expected only N
+membership events" in `10apidoc/09synced.pl`, 6 "user not in list" in the user directory, 5
+each for `/peek` (404), `/account/3pid/bind` (404) and `PUT /pushrules/global/room/...` (400).
+`are-we-synapse-yet.txt`, `results.txt` and `summary.txt` are committed as
+`docs/status/sytest/2026-10-02-*`. Next: the same run on a quiet machine, which should turn the
+timeouts, then the groups above in the order of `docs/next-steps.md`.
+
 ## Session 6 (2026-10-01, branch `agent/complement-remeasure`): Complement re-measured on `main`
 
 Both whole packages, twice each, from one image built from `main` at `2a0b362` (everything of
