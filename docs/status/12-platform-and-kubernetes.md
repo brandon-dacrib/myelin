@@ -24,7 +24,25 @@ rule, and `hs_bridges::manager`'s module doc is the reference. What changed on t
   recomputes it; a row without one is matched against the old hashed name on the cluster before
   it is given a readable one. Nothing on the cluster is renamed by this change.
 
-**The kind smoke** (`deploy/operator/ci/kind-smoke.sh`): was being run when this entry was written; the commit after this one on `agent/bridge-names` says how it went, and if there is none it did not finish.
+**The kind smoke ran here and passed.** `deploy/operator/ci/kind-smoke.sh myelin:bridge-names
+--kind bridge-names --heisenbridge` on a kind v1.33.1 cluster (the node image and heisenbridge
+came through `mirror.gcr.io`, since Docker Hub pulls fail from an agent session; the server image
+was built from this branch with `deploy/Dockerfile`): the hand-written `Bridge` went Ready,
+Degraded (`ErrImagePull`) and Ready again, owned objects and all; **the heisenbridge offering's
+instance was deployed as `bridge-heisenbridge`**, Service URL
+`http://bridge-heisenbridge.<ns>.svc:9898`, pod `bridge-heisenbridge-68f5f95fb8-n4b6r`, labelled
+`myelin.dev/bridge-type=heisenbridge`, `myelin.dev/appservice-id=heisenbridge` and no owner
+(shared), `kubectl get br` reading `bridge-heisenbridge  Ready  heisenbridge  heisenbridge  <empty
+OWNER>  1`; it reached `ready` in 16 s, was removed to 0 objects, "All checks passed". A
+per-user `Bridge` applied by hand into the same namespace while the operator ran
+(`bridge-whatsapp-brandon`, `owner: "@brandon:example.org"`) got pod
+`bridge-whatsapp-brandon-75fb9fb5f7-pvr2l` with `myelin.dev/owner=brandon-example.org` on the
+pod, Deployment, Service and claim (`-l myelin.dev/owner=brandon-example.org` lists all four),
+the exact ID in the `myelin.dev/owner` annotation, and `OWNER  @brandon:example.org` in `kubectl
+get br`. **Not run:** a per-user instance through the manager on a cluster (the smoke's only
+per-user types need a real WhatsApp or Signal; the manager side of that path is the
+`a_new_instance_is_deployed_under_a_readable_name_with_the_owner_labelled` test over the fake
+runtime), and the adoption of a pre-2026-10-02 row on the owner's cluster.
 
 ## 2026-10-02: the builds cache what they used to redo
 
