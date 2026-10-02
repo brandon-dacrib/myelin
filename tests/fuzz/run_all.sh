@@ -44,8 +44,15 @@ for fuzz_dir in "$ROOT"/crates/*/fuzz; do
   [ -f "$fuzz_dir/Cargo.toml" ] || continue
   crate="$(basename "$(dirname "$fuzz_dir")")"
   echo "run_all.sh: building $crate's fuzz targets" >&2
-  if ! (cd "$fuzz_dir" && cargo "+$TOOLCHAIN" fuzz build 2>&1 | tail -3); then
-    echo "run_all.sh: $crate: build failed" >&2
+  mkdir -p "$OUT/$crate"
+  build_log="$OUT/$crate/build.log"
+  # The whole build log is kept; on failure every `error` block is printed, not the last three
+  # lines (which, on 2026-10-01, said only "could not compile `cfg-if` due to 2 previous errors").
+  if (cd "$fuzz_dir" && cargo "+$TOOLCHAIN" fuzz build >"$build_log" 2>&1); then
+    tail -1 "$build_log" >&2
+  else
+    echo "run_all.sh: $crate: build failed; full log in $build_log" >&2
+    sed 's/\x1b\[[0-9;]*m//g' "$build_log" | grep -E -A12 '^error' | head -80 >&2
     FAILED=1
     continue
   fi
