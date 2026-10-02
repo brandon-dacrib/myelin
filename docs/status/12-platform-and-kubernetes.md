@@ -72,6 +72,26 @@ every crate with a `build.rs`, host and target side, before the real build.
 | `tests/sytest/build.sh`, four jobs | 295 s cold | 125 s after a one-line change (one crate compiled); the binary runs |
 | `npm run lint`, unchanged tree | 12.6 s | 1.1 s |
 
+**On GitHub's runners** (the fair "before" is a commit that touched a crate, `1248b3b`; the
+"after" is the probe branch `agent/build-cache-probe`, one line in `hs-cli`, deleted after its
+runs: CI 37055332609, CD 37055365887 dispatched without publishing):
+
+| Job | Before | After | Note |
+|---|---|---|---|
+| CD `image (amd64)`, the build step | 12m26s | 9m30s | the cooked layer is `CACHED`; 7m45s is the release build of the 21 workspace crates on four vCPUs |
+| CD `image (arm64)`, the build step | 9m53s | 8m18s | |
+| CD, a change to the Dockerfile or the manifests (cold cook) | 12m26s / 9m53s | 14m42s / 12m05s | once per such change: installing cargo-chef and exporting the cooked layer |
+| CI `test (amd64)` / `test (arm64)` | 9m06s / 10m35s | 8m54s / 8m54s | running the tests is most of the job |
+| CI `clippy` | 52 s / 55 s | 1m11s / 49 s | within noise |
+| CI `web` | 6m18s | 6m07s | the Playwright Chromium is a cache hit |
+
+**rust-cache's key does not see profiles.** From `90061f9` to `b9e9cdb` every CI run restored
+the cache built with the old profile, recompiled all 543 dependencies (clippy 52 s → 2m20s)
+and never saved the result, because the key (dependency sections of the manifests, the lock
+file, the toolchain) still matched. `prefix-key: v1-rust` in ci.yml is the bump; it has to move
+again whenever a profile or a build-affecting variable changes. CD's `binaries` job keys on
+the release profile, which did not change.
+
 The sccache gain in wall time is modest on a quiet 12-core machine because the uncached part
 (proc macros and binaries, 80 calls; the 21 incremental workspace crates; build-script runs;
 linking) is the critical path; the CPU time halves, which is what matters with ten agents
