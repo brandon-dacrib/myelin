@@ -1,10 +1,53 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-10-02, 14:25 EDT (ten branches pushed, one batch gate running, the machine reboots). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+Written 2026-09-20 by the integration lead, last revised 2026-10-02, 17:50 EDT (the builds got faster, four new branches, the machine reboots again). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
-## Resume here: 2026-10-02, 14:25 EDT -- ten branches pushed, one batch gate running, the machine reboots
+## Resume here: 2026-10-02, 17:50 EDT -- the builds got faster, four new branches, the machine reboots again
+
+**Where `main` is.** `2fac8666`: the offering page's "Next steps for <person>" (merged through the
+queue at 17:41, gate green), on top of the afternoon's build work (`90061f9`, `8ab7b49`,
+`b9e9cdb`, `ac5f138`: dependencies without debug info, sccache on the desktop, CI caches kept on
+failure with a bumped key, cargo-chef in `deploy/Dockerfile`, cache mounts in the Sytest and
+Complement images, the per-build numbers in status 12). CI and CD green on `ac5f138`. **None of
+the 14:25 section's ten branches has merged yet**; that section, its table, its conflicts and its
+merge order still stand, below.
+
+**The gate that was running at the reboot:** `tools/merge-queue.sh agent/bridge-names`, started
+17:36, detached. If the reboot killed it: `rmdir .git/myelin-merge.lock`, check `git log
+origin/main` for whether it pushed (`d0e7ebce` rebased), and re-run. The gate's PostgreSQL was
+`docker run --rm -d --name hs-merge-queue-pg -e POSTGRES_PASSWORD=hspg -p 127.0.0.1:5462:5432
+public.ecr.aws/docker/library/postgres:17` with
+`HS_CLUSTER_TEST_POSTGRES_DSN=postgres://postgres:hspg@127.0.0.1:5462/postgres`; it does not
+survive a reboot.
+
+**The four branches of this session**, each with a dated status entry, worktree under
+`.claude/worktrees/<name>`, and verified as said:
+
+| Branch | Tip | What it holds | Verified | Gate |
+|---|---|---|---|---|
+| `agent/bridge-names` | `d0e7ebce` | a person's bridge objects are `bridge-whatsapp-brandon`, not `bridge-<8 hex>`; `myelin.dev/owner` and type labels on pod, Deployment, Service, claim and `Bridge`; the name is stored on the instance row once and an instance deployed under the old hashed name is adopted, never renamed; `BridgeDeployment.name` documents the rule; OpenAPI 0.1.1. Status 11 and 12, RFC 0017 §4.1 | kind smoke passed with the real binary (`bridge-heisenbridge`, and a hand-applied per-user `Bridge` gave pod `bridge-whatsapp-brandon-…`); hs-bridges 21, hs-operator 92 | running at the reboot |
+| `agent/user-erase` | `fa1a1bb4` | **deleting a user**: `POST /users/{id}/deactivate {erase:true}` deactivates, leaves every room (`UserActivitySource::leave_all_rooms`, hs-room), then erases (hs-auth `erasure.rs`: password, tokens, devices through the device-list hook so hs-e2e drops keys, 3PIDs, external ids, profile, features; `UserRecord.erased`/`erased_at_ms`); audit `/erased`, event `user.erased`; reactivate and reset-password 409; the client's own `/account/deactivate {erase:true}` too; `/_synapse/admin/v1/deactivate` route added to hs-compat (the proxy is still not mounted by `hs serve`); OpenAPI 0.1.1 (**collides with bridge-names' 0.1.1 and admin-token's 0.1.2: rebase and take the next number**). Status 07, 15, 04 | real binary `crates/hs-cli/tests/user_erasure.rs`; hs-auth 253, hs-admin 293, hs-room 166 | not run; rebase onto main after bridge-names |
+| `agent/user-erase-web` | `749301c` | the UI: "Also erase their data" in the deactivate dialog with the plain-words explanation, an Erase box for deactivated accounts, Erased badges, Reactivate replaced by a why-not box; mocks; `web/e2e/user-erase.spec.ts`; `web/e2e-real/user-erase.spec.ts` to run on the merged binary. Status 16 | `npm run check` 504 tests, `test:e2e` 55 | gate it stacked with `agent/user-erase`: `tools/merge-queue.sh agent/user-erase,agent/user-erase-web`; then run the real spec |
+| `agent/bridge-login` | see its status entry | **why `login qr` does nothing** in a person's WhatsApp bridge chat: a reproduction with the real mautrix-whatsapp image and an encrypting client, told to stop for the reboot | whatever its status 11 entry says | not run |
+
+**The owner's WhatsApp bridge** (`@brandon`, demo cluster): the personal bot's chat is created
+encrypted by default (`invite_owner`, `encryption.unwrap_or(true)`) and the bridge runs
+appservice-mode encryption; a typed encrypted message to a real bridge had never been exercised
+(status 11, 2026-09-30: "No phone, so no encrypted message"). The pod named
+`myelin-hs-bridges-operator-…` is the chart's operator; the instance's pod is `bridge-<8 hex>`
+until `agent/bridge-names` merges and the instance is removed and re-added. **Workaround on the
+running server**: offering Settings, Encryption off, remove the person's bridge, add it again,
+accept the new invite, `login qr`. The `kubectl logs` of the instance pod, grepped for
+`decrypt`, confirms or refutes the suspicion; `agent/bridge-login`'s entry has the rest.
+
+**Order to merge next:** `bridge-names` (if the reboot killed its gate), then
+`user-erase,user-erase-web` as one batch (rebase `user-erase` first for the OpenAPI version),
+then `bridge-login` when it is done, then the ten branches of the 14:25 section in their order.
+Remove each worktree after its merge (`git worktree remove .claude/worktrees/<name>`).
+
+## Earlier: 2026-10-02, 14:25 EDT -- ten branches pushed, one batch gate running, the machine reboots
 
 **Where `main` is.** `a02f096` (the gaps table and PLAN §6.5) plus `8c2cef8` (the README's federation
 row and a two-hour fuzz job), pushed together after the gate below. CI (`ci` and `cd`) is green on

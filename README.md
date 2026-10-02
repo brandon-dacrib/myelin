@@ -40,10 +40,22 @@ appservice mode against it.
 **And a bridge can be offered to everyone.** An administrator switches WhatsApp on for the
 server; a person gets their own bridge by messaging `@whatsappbot`, which sets it up and
 invites them to it with the sign-in steps; the administrator sees everybody's bridge on one
-page. Each instance has its own registration, ghosts and process, so one person's trouble
-touches nobody else. Verified against the real server, with a real heisenbridge started from
+page, and under it "Next steps for <person>": their own bot's name, the steps to relay, a
+copy-as-message button, and "this is you" when it is the administrator's own. Each instance
+has its own registration, ghosts and process, so one person's trouble touches nobody else. Verified against the real server, with a real heisenbridge started from
 the files the server rendered (`docs/rfcs/0017-the-server-deploys-its-own-bridges.md`). The
 server deploying each instance as a pod is built and waits for its first run on a cluster.
+What is not yet proven: a person typing `login qr` to their bridge in the **encrypted** chat
+it opens by default. The first owner to try it got no answer (2026-10-02); the reproduction with
+a real mautrix-whatsapp is on branch `agent/bridge-login`, and until it lands, turn the
+offering's Encryption setting off before adding someone's bridge.
+
+**Removing a user is one checkbox.** Deactivating an account on its page offers "Also erase
+their data": the password and every session, every device and its encryption keys, email,
+phone and single-sign-on links, the display name and avatar, and membership of every room, with
+the account marked erased and never reactivated; messages stay unless redacted. Verified on the
+real binary; on branches `agent/user-erase` and `agent/user-erase-web` at the time of writing,
+merging next.
 
 **Two encrypted clients exchange a message this server cannot read.** `matrix-rust-sdk` with
 encryption enabled: keys upload, cross-signing bootstraps, one-time keys are claimed atomically,
