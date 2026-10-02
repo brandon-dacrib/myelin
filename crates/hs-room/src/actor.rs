@@ -3394,6 +3394,18 @@ impl<B: KvBackend> RoomActor<B> {
             "trusted_private_chat" => ("invite", "shared", "can_join"),
             _ => ("invite", "shared", "can_join"),
         };
+        // "`initial_state` ... takes precedence over events set by `preset`" (`POST /createRoom`):
+        // a preset event the request carries its own copy of is not sent first, as Synapse does
+        // not send it (`_send_events_for_new_room`). Sending both put the preset's value first in
+        // the timeline, where a client reading the room's first state (Sytest's "/upgrade copies
+        // important state to the new room") found the wrong one, and cost every upgraded room
+        // three state events it then overwrote.
+        let in_initial_state = |event_type: &str| {
+            request
+                .initial_state
+                .iter()
+                .any(|entry| entry.event_type == event_type && entry.state_key.is_empty())
+        };
 
         let mut power_levels_content = {
             let mut users = serde_json::Map::new();
@@ -3483,30 +3495,36 @@ impl<B: KvBackend> RoomActor<B> {
             now_ms,
         )?;
 
-        actor.send_event(
-            creator.clone(),
-            "m.room.join_rules".to_owned(),
-            Some(String::new()),
-            serde_json::json!({"join_rule": join_rule}),
-            None,
-            now_ms,
-        )?;
-        actor.send_event(
-            creator.clone(),
-            "m.room.history_visibility".to_owned(),
-            Some(String::new()),
-            serde_json::json!({"history_visibility": history_visibility}),
-            None,
-            now_ms,
-        )?;
-        actor.send_event(
-            creator.clone(),
-            "m.room.guest_access".to_owned(),
-            Some(String::new()),
-            serde_json::json!({"guest_access": guest_access}),
-            None,
-            now_ms,
-        )?;
+        if !in_initial_state("m.room.join_rules") {
+            actor.send_event(
+                creator.clone(),
+                "m.room.join_rules".to_owned(),
+                Some(String::new()),
+                serde_json::json!({"join_rule": join_rule}),
+                None,
+                now_ms,
+            )?;
+        }
+        if !in_initial_state("m.room.history_visibility") {
+            actor.send_event(
+                creator.clone(),
+                "m.room.history_visibility".to_owned(),
+                Some(String::new()),
+                serde_json::json!({"history_visibility": history_visibility}),
+                None,
+                now_ms,
+            )?;
+        }
+        if !in_initial_state("m.room.guest_access") {
+            actor.send_event(
+                creator.clone(),
+                "m.room.guest_access".to_owned(),
+                Some(String::new()),
+                serde_json::json!({"guest_access": guest_access}),
+                None,
+                now_ms,
+            )?;
+        }
 
         for entry in &request.initial_state {
             actor.send_event(
@@ -3908,6 +3926,73 @@ impl<B: KvBackend> RoomActor<B> {
             .get("type")?
             .as_str()
             .map(str::to_owned)
+    }
+
+    /// Whether this room federates: `false` only when its `m.room.create` says `"m.federate":
+    /// false`. `/upgrade` carries that into the replacement's create event, so an upgrade
+    /// cannot quietly open a room to other servers (Synapse's `clone_existing_room` does the
+    /// same).
+    #[must_use]
+    pub fn creation_federate(&self) -> bool {
+        self.state_event("m.room.create", "")
+            .ok()
+            .flatten()
+            .and_then(|create| {
+                create
+                    .json()
+                    .get("content")?
+                    .as_object()?
+                    .get("m.federate")
+                    .map(|v| {
+                        matches!(v, CanonicalJsonValue::Bool(true))
+                            || !matches!(v, CanonicalJsonValue::Bool(false))
+                    })
+            })
+            .unwrap_or(true)
+    }
+
+    /// The room this one replaced, from its `m.room.create`'s `predecessor.room_id`, if the
+    /// create names one (`/upgrade` writes it; a room from another server may carry one too).
+    #[must_use]
+    pub fn predecessor_room_id(&self) -> Option<OwnedRoomId> {
+        let create = self.state_event("m.room.create", "").ok().flatten()?;
+        let room_id = create
+            .json()
+            .get("content")?
+            .as_object()?
+            .get("predecessor")?
+            .as_object()?
+            .get("room_id")?
+            .as_str()?;
+        RoomId::parse(room_id).ok().map(|id| id.to_owned())
+    }
+
+    /// Every current ban, as `(state_key, content)`: the `m.room.member` events whose
+    /// `membership` is `ban`, with their content as it is (the reason, and whatever else the
+    /// banning event carried). `/upgrade` sends each into the replacement room, as the spec's
+    /// room-upgrade module suggests and Synapse does, so a banned user is not let back in by the
+    /// upgrade. The content is owned (not a borrowed [`Event`]) because the caller sends it as a
+    /// new event, into another room.
+    ///
+    /// # Errors
+    /// Returns [`RoomError::State`] if the state store fails.
+    pub fn banned_members(&self) -> Result<Vec<(String, serde_json::Value)>, RoomError> {
+        Ok(self
+            .members()?
+            .into_iter()
+            .filter_map(|event| {
+                let content = event.json().get("content")?;
+                let membership = content.as_object()?.get("membership")?.as_str()?;
+                if membership != "ban" {
+                    return None;
+                }
+                let state_key = event.header().state_key.clone()?;
+                let content =
+                    serde_json::from_slice::<serde_json::Value>(&content.to_canonical_bytes())
+                        .ok()?;
+                Some((state_key, content))
+            })
+            .collect())
     }
 
     /// Builds this room's admin-API summary (`hs_admin::model::AdminRoom`, the `GET /rooms`/`GET

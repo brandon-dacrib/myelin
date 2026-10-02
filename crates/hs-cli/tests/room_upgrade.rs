@@ -367,3 +367,139 @@ async fn a_tombstone_names_a_replacement_room_that_can_be_joined_by_that_id() {
         2
     );
 }
+
+/// What an upgrade carries that is not the spec's recommended state: a ban (the banned user is
+/// banned in the replacement and cannot follow the tombstone), the room's place in the public
+/// directory (the replacement is listed, the old room no longer), and a room closed to
+/// federation stays closed. Before 2026-10-02 none of the three came across.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_upgrade_carries_bans_the_directory_entry_and_federation_closure() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = reserve_port();
+    let config = dir.path().join("hs.yaml");
+    std::fs::write(&config, config_yaml(port, &dir.path().join("data"))).unwrap();
+    let client = Client {
+        http: reqwest::Client::new(),
+        base: format!("http://127.0.0.1:{port}"),
+    };
+    let mut hs = HsProcess::serve(&config);
+    hs.wait_for("listening");
+    let post = reqwest::Method::POST;
+
+    let alice = client.register("alice").await;
+    let mallory = client.register("mallory").await;
+    let old = client
+        .call(
+            post.clone(),
+            "/_matrix/client/v3/createRoom",
+            &alice,
+            json!({
+                "preset": "public_chat",
+                "room_version": "10",
+                "visibility": "public",
+                "creation_content": {"m.federate": false},
+            }),
+        )
+        .await["room_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    client
+        .call(
+            post.clone(),
+            &format!("/_matrix/client/v3/join/{}", segment(&old)),
+            &mallory,
+            json!({}),
+        )
+        .await;
+    client
+        .call(
+            post.clone(),
+            &format!("/_matrix/client/v3/rooms/{}/ban", segment(&old)),
+            &alice,
+            json!({"user_id": format!("@mallory:{SERVER}"), "reason": "spam"}),
+        )
+        .await;
+
+    let replacement = client
+        .call(
+            post.clone(),
+            &format!("/_matrix/client/v3/rooms/{}/upgrade", segment(&old)),
+            &alice,
+            json!({"new_version": "11"}),
+        )
+        .await["replacement_room"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // The ban came across, with its reason, and it holds.
+    let ban = client
+        .get(
+            &format!(
+                "/_matrix/client/v3/rooms/{}/state/m.room.member/{}",
+                segment(&replacement),
+                segment(&format!("@mallory:{SERVER}"))
+            ),
+            &alice,
+        )
+        .await;
+    assert_eq!(ban["membership"], "ban");
+    assert_eq!(ban["reason"], "spam");
+    let refused = client
+        .http
+        .post(format!(
+            "{}/_matrix/client/v3/join/{}",
+            client.base,
+            segment(&replacement)
+        ))
+        .bearer_auth(&mallory)
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        refused.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "mallory cannot follow the tombstone into the replacement"
+    );
+
+    // The directory lists the replacement and not the tombstoned room.
+    let listed = client.get("/_matrix/client/v3/publicRooms", &alice).await;
+    let ids: Vec<&str> = listed["chunk"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|room| room["room_id"].as_str())
+        .collect();
+    assert!(ids.contains(&replacement.as_str()), "{listed}");
+    assert!(!ids.contains(&old.as_str()), "{listed}");
+    let visibility = client
+        .get(
+            &format!(
+                "/_matrix/client/v3/directory/list/room/{}",
+                segment(&replacement)
+            ),
+            &alice,
+        )
+        .await;
+    assert_eq!(visibility["visibility"], "public");
+
+    // The replacement is as closed to federation as the old room was.
+    let create = client
+        .get(
+            &format!(
+                "/_matrix/client/v3/rooms/{}/state/m.room.create/",
+                segment(&replacement)
+            ),
+            &alice,
+        )
+        .await;
+    assert_eq!(create["m.federate"], false);
+
+    let line = hs.wait_for("upgraded a room");
+    assert!(
+        line.contains("bans_carried=1") && line.contains("directory_moved=true"),
+        "the upgrade's log line counts the ban and the directory move: {line}"
+    );
+}

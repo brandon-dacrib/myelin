@@ -547,6 +547,15 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
   moment `createRoom` returned could be short a room: Complement's `TestRoomState` saw it once in
   two runs, and the twenty-rooms-at-once test saw it on CI's arm64 runner on every push of
   2026-10-01 night. Verified by the real-binary test on 2026-10-02.
+- **A room upgrade carries its bans, its directory entry and its federation closure**
+  (2026-10-02). `POST /rooms/{roomId}/upgrade` sends every ban of the old room into the
+  replacement (a banned user cannot follow the tombstone), lists the replacement in the room
+  directory in the old room's place, keeps `"m.federate": false`, and gives a moderator who
+  upgrades the room their old level back once the copied state is in. The copied state stands
+  in for the preset's instead of following it. When one of this server's users joins a
+  replacement another server made, this server's aliases for the old room and its directory
+  entry follow (as Synapse's do). Verified on the real binary; Sytest's room-upgrade file was
+  11 of 21 before (the count after is in status 04 session 18).
 - Rooms: creation, membership, state, timeline, `/messages`, `/context`, relations, threads, room
   upgrade, aliases, the room directory, redactions, and idempotent state sends and joins.
 - **History visibility is enforced on every read path.** A user who has left a non-world-readable

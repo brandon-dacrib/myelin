@@ -429,7 +429,7 @@ async fn join_room<B: KvBackend + 'static>(
                 }
                 crate::moderation::check_join_limit(state, requester, true)?;
                 let joined = remote.join(&sender, &room_id, &via, content).await?;
-                return Ok(Json(json!({ "room_id": joined })).into_response());
+                return Ok(joined_response(state, &joined, &sender).await);
             }
             let mut content = content;
             if content.get("join_authorised_via_users_server").is_none() {
@@ -465,7 +465,7 @@ async fn join_room<B: KvBackend + 'static>(
                                 crate::moderation::check_join_limit(state, requester, true)?;
                                 let joined =
                                     remote.join(&sender, &room_id, &through, content).await?;
-                                return Ok(Json(json!({ "room_id": joined })).into_response());
+                                return Ok(joined_response(state, &joined, &sender).await);
                             }
                         }
                     }
@@ -478,9 +478,15 @@ async fn join_room<B: KvBackend + 'static>(
             }
             crate::moderation::check_join_limit(state, requester, false)?;
             handle
-                .membership(sender.clone(), Action::Join, sender, content, now_ms())
+                .membership(
+                    sender.clone(),
+                    Action::Join,
+                    sender.clone(),
+                    content,
+                    now_ms(),
+                )
                 .await?;
-            Ok(Json(json!({ "room_id": room_id })).into_response())
+            Ok(joined_response(state, &room_id, &sender).await)
         }
         Err(RoomError::RoomNotFound(_)) if state.remote_join.is_some() => {
             let remote = state
@@ -500,10 +506,22 @@ async fn join_room<B: KvBackend + 'static>(
             }
             crate::moderation::check_join_limit(state, requester, true)?;
             let joined = remote.join(&sender, &room_id, &via, content).await?;
-            Ok(Json(json!({ "room_id": joined })).into_response())
+            Ok(joined_response(state, &joined, &sender).await)
         }
         Err(e) => Err(e),
     }
+}
+
+/// The `POST /join` response for `room_id`, after what a join into an upgraded room's
+/// replacement carries over from its predecessor (`crate::routes::upgrade::transfer_on_join`:
+/// this server's aliases for the old room and its directory entry) has been done.
+async fn joined_response<B: KvBackend + 'static>(
+    state: &RoomState<B>,
+    room_id: &ruma::RoomId,
+    sender: &ruma::OwnedUserId,
+) -> Response {
+    crate::routes::upgrade::transfer_on_join(state, room_id, sender).await;
+    Json(json!({ "room_id": room_id })).into_response()
 }
 
 /// Whether `user` is joined to any of `rooms`, as this server holds them. A room this server

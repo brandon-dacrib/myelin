@@ -6,6 +6,10 @@ Last updated: 2026-10-01 (session 16: upgrading a room to version 12; session 15
 /search`, below). Before that, 2026-09-30 (session
 Last updated: 2026-10-02 (session 18: an erased user leaves every room; session 17: a new
 room's id is new; session 15: `POST /search`, below). Before that, 2026-09-30 (session
+Last updated: 2026-10-02 (session 18: bans carried by an upgrade, redactions judged at their
+time, state rows for old placed outliers, `users_sharing_room_with` on the member index).
+Before that, 2026-10-01 (session 17: a new room's id is new; session 16: upgrading a room to
+version 12; session 15: `POST /search`, below) and 2026-09-30 (session
 14: a new room's id is placed on a shard the replica building it owns, version 12 included;
 session 13: the state at backfilled history is asked for; session 12: the history between a
 leave and a rejoin; session 11: the client space hierarchy) and 2026-09-28 (session 10: the
@@ -31,6 +35,72 @@ admin API's room long tail).
 > can refuse it) is reported with the reason and left once the store is well. Not done: the leave
 > events carry no `reason`; federation does not redact an erased user's events for other servers.
 
+> **2026-10-02, session 18: the four `hs-room` rows the last two nights opened** (branch
+> `agent/room-rows`, one commit per row, in the order below; next-steps 2026-10-02 item 4).
+>
+> **Row 1: bans are carried by a room upgrade** (known gap text: "Bans are not carried over"
+> in the version-12 upgrade row's "left"). `POST /rooms/{roomId}/upgrade` now does what
+> Synapse's `_upgrade_room`/`clone_existing_room` and `transfer_room_state_on_room_upgrade` do
+> beyond the spec's recommended state list (`crates/hs-room/src/routes/upgrade.rs`):
+>
+> - **Bans.** Every current ban of the old room (`RoomActor::banned_members`, new: the
+>   `m.room.member` events whose `membership` is `ban`, with their content -- the reason comes
+>   along) is sent into the replacement by the upgrader right after the room is created, while
+>   they still hold 100 there. Best-effort per ban (one the auth rules refuse is a `warn` and
+>   the upgrade stands); the upgrade's `info` line carries `bans_carried` and
+>   `bans_in_old_room`. A banned user cannot join the replacement (403).
+> - **`m.federate`.** A room created with `"m.federate": false` has a replacement whose create
+>   says so too (`RoomActor::creation_federate`, new); an open room's replacement does not grow
+>   the key.
+> - **The room directory.** A published old room is unpublished and its replacement published
+>   in its place (`move_directory_entry`; `directory_moved` on the log line).
+> - **The upgrader's level.** When the copied power levels rank the upgrader below 100 in a
+>   version where creators are not implicitly privileged (a moderator at 50 allowed to send
+>   `m.room.tombstone`), the replacement is created with them at 100 so the copied state can
+>   be sent (`m.room.encryption` and the history visibility sit at 100 in the default `events`
+>   map), and the old room's power levels are then sent verbatim as a second event
+>   (`lift_upgrader`; Synapse's two power-level events, matrix-org/synapse#6632). The old
+>   room's lock-down still runs only if the upgrader may rewrite its power levels.
+> - **The copied state stands in for the preset's.** `RoomActor::create_room` no longer sends
+>   the preset's `m.room.join_rules`, `m.room.history_visibility` or `m.room.guest_access` when
+>   `initial_state` carries that type (the spec's "`initial_state` takes precedence over
+>   `preset`"; Synapse's `_send_events_for_new_room`). An upgraded room has each once, with the
+>   old room's value, where it had the preset's value first and the copy after it; Sytest's
+>   "/upgrade copies important state to the new room" reads the first one in the timeline and
+>   failed on that. Every `createRoom` with such an `initial_state` entry saves the events too.
+> - **The join side.** When one of this server's users joins a room whose create names a
+>   predecessor this server holds (another server's upgrade), the local aliases this server
+>   hosts for the old room move to the replacement and its directory entry follows
+>   (`routes::upgrade::transfer_on_join`, from every successful `POST /join` of a held or remote
+>   room, not a knock; `info` line with `aliases_moved`/`directory_moved`; nothing fails the
+>   join). This is what Synapse does from its join handler, and what Sytest's remote-alias and
+>   two-server directory tests need from the remote side.
+> - **Tests.** `routes::upgrade::tests`: `an_upgrade_carries_the_old_rooms_bans` (to versions
+>   10 and 12; the reason kept, a stranger's ban too, the banned user refused),
+>   `an_upgrade_keeps_a_room_closed_to_federation`,
+>   `an_upgrade_moves_the_directory_entry_to_the_replacement`,
+>   `a_moderators_upgrade_restores_their_level_in_the_replacement` (two power-level events, the
+>   encryption state copied, the old room's levels untouched),
+>   `the_copied_state_replaces_the_presets_in_the_replacement`,
+>   `a_join_into_a_replacement_moves_this_servers_aliases_and_directory_entry`.
+>   `crates/hs-cli/tests/room_upgrade.rs::an_upgrade_carries_bans_the_directory_entry_and_federation_closure`
+>   (the real `hs` binary: mallory banned with a reason, the upgrade, the ban read back in the
+>   replacement with its reason, mallory's join 403, `/publicRooms` lists the replacement and
+>   not the old room, the create's `m.federate`, the log line's `bans_carried=1
+>   directory_moved=true`).
+> - **Sytest** (`tests/30rooms/60version_upgrade.pl`, image `myelin-sytest:dev` as the
+>   baseline, then `SYTEST_HS_BINARY` from this branch): **before 11 of 21** (7 failed, 3
+>   skipped), results in `target/sytest/before-1`. After: see the end of this entry.
+> - **Power levels 0/2.** Sytest's "Power Levels" group is unreachable from the server side:
+>   every test in it (and ten more, 13 skips in the night's run) requires the fixture
+>   `can_change_power_levels`, which was proven by `tests/10apidoc/36room-levels.pl`'s test
+>   until upstream deleted it in July 2024 ("Delete `10apidoc/36room-levels` as it was migrated
+>   to Complement", matrix-org/sytest#1316); the file now holds only the
+>   `matrix_change_room_power_levels` helper. Synapse skips them too. The behaviours they
+>   check (a power-0 user cannot ban, rename or change levels; nobody sets a `ban`/`kick`/
+>   `redact` level above their own) are `hs_state::auth`'s and Complement's `TestPowerLevels`.
+>   Not a row to chase in Sytest.
+>
 > **2026-10-01, session 16: an upgrade to room version 12 tombstones the old room with the
 > replacement's real id** (branch `agent/room-cluster-small`, its first commit; known gap
 > "Upgrading a room to version 12 leaves a tombstone pointing nowhere" closed).

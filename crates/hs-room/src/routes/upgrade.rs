@@ -110,6 +110,140 @@ fn power_levels_for_replacement(
     content
 }
 
+/// The power levels the replacement room is created with, and the ones to send once its
+/// initial state is in: the upgrader needs enough power to send the copied state (the old
+/// room's `events` map may put `m.room.encryption` or the history visibility at 100 while the
+/// upgrader is a moderator at 50 who was only allowed to send the tombstone), so when
+/// `translated` ranks them below 100 in a version where the creator's power is explicit they
+/// are lifted to 100 for the creation, and `translated` itself is sent afterwards to put them
+/// back (Synapse's `_upgrade_room`, matrix-org/synapse#6632). Returns `(first, None)` when no
+/// lift is needed: the upgrader already holds 100, or the version privileges creators and the
+/// `users` map cannot name them.
+fn lift_upgrader(
+    translated: Value,
+    rules: &RoomVersionRules,
+    upgrader: &OwnedUserId,
+) -> (Value, Option<Value>) {
+    if rules.explicitly_privilege_room_creators {
+        return (translated, None);
+    }
+    let users_default = translated
+        .get("users_default")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let current = translated
+        .get("users")
+        .and_then(Value::as_object)
+        .and_then(|users| users.get(upgrader.as_str()))
+        .and_then(Value::as_i64)
+        .unwrap_or(users_default);
+    if current >= 100 {
+        return (translated, None);
+    }
+    let mut first = translated.clone();
+    if let Some(obj) = first.as_object_mut() {
+        let users = obj
+            .entry("users")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if let Some(users) = users.as_object_mut() {
+            users.insert(upgrader.to_string(), json!(100));
+        }
+    }
+    (first, Some(translated))
+}
+
+/// Moves the old room's entry in this server's room directory to its replacement: when the old
+/// room is published, it is unpublished and the replacement published in its place. Returns
+/// whether anything moved. Best-effort, logged: the directory is a server-local fact beside the
+/// rooms, and an upgrade that has already happened is not undone for it.
+fn move_directory_entry<B: KvBackend>(
+    state: &RoomState<B>,
+    old_room_id: &RoomId,
+    new_room_id: &RoomId,
+) -> bool {
+    match state.rooms.is_directory_public(old_room_id) {
+        Ok(true) => {}
+        Ok(false) => return false,
+        Err(e) => {
+            tracing::warn!(%old_room_id, error = %e, "could not read whether an upgraded room was in the room directory");
+            return false;
+        }
+    }
+    if let Err(e) = state.rooms.set_directory_visibility(new_room_id, true) {
+        tracing::warn!(%old_room_id, %new_room_id, error = %e, "could not publish an upgraded room's replacement in the room directory");
+        return false;
+    }
+    if let Err(e) = state.rooms.set_directory_visibility(old_room_id, false) {
+        tracing::warn!(%old_room_id, %new_room_id, error = %e, "could not take an upgraded room out of the room directory");
+    }
+    true
+}
+
+/// What this server carries from a room to its replacement when one of its users joins the
+/// replacement (`POST /join`): the local aliases it hosts for the old room, and the old
+/// room's place in its room directory. The upgrade itself does both for the server that ran
+/// it; this is for every other server with a user in the old room, whose directory and
+/// aliases still name the old room until one of its users follows the tombstone (Synapse's
+/// `transfer_room_state_on_room_upgrade`, run from its join handler). Nothing happens unless
+/// the joined room's `m.room.create` names a predecessor this server holds, and nothing it
+/// does fails the join: every step is logged on failure. Returns how many aliases moved and
+/// whether the directory entry did.
+pub(crate) async fn transfer_on_join<B: KvBackend + 'static>(
+    state: &RoomState<B>,
+    new_room_id: &RoomId,
+    joiner: &OwnedUserId,
+) -> (usize, bool) {
+    let Ok(new_handle) = state.rooms.get_or_load(new_room_id).await else {
+        return (0, false);
+    };
+    let Some(old_room_id) = new_handle.query(|actor| actor.predecessor_room_id()).await else {
+        return (0, false);
+    };
+    let Ok(old_handle) = state.rooms.get_or_load(&old_room_id).await else {
+        return (0, false);
+    };
+    let aliases = old_handle
+        .query(|actor| actor.list_aliases().unwrap_or_default())
+        .await;
+    let mut moved = 0usize;
+    for alias in &aliases {
+        let Ok(alias_id) = <&ruma::RoomAliasId>::try_from(alias.as_str()) else {
+            continue;
+        };
+        let owned = alias_id.to_owned();
+        if let Err(e) = old_handle
+            .query(move |actor| actor.remove_alias(&owned))
+            .await
+        {
+            tracing::warn!(%old_room_id, %new_room_id, alias, error = %e, "could not take an alias off an upgraded room");
+            continue;
+        }
+        let owned = alias_id.to_owned();
+        let creator = joiner.clone();
+        match new_handle
+            .query(move |actor| actor.create_alias(&owned, &creator))
+            .await
+        {
+            Ok(()) => moved += 1,
+            Err(e) => {
+                tracing::warn!(%old_room_id, %new_room_id, alias, error = %e, "could not move an upgraded room's alias to its replacement")
+            }
+        }
+    }
+    let directory_moved = move_directory_entry(state, &old_room_id, new_room_id);
+    if moved > 0 || directory_moved {
+        tracing::info!(
+            %old_room_id,
+            %new_room_id,
+            user = %joiner,
+            aliases_moved = moved,
+            directory_moved,
+            "a user joined an upgraded room's replacement; this server's aliases and directory entry followed it"
+        );
+    }
+    (moved, directory_moved)
+}
+
 /// The request body's `additional_creators` (client-server API v1.16, room version 12 and later),
 /// every entry a user ID; empty when the field is absent.
 fn additional_creators(body: &Value) -> Result<Vec<OwnedUserId>, RoomError> {
@@ -253,7 +387,7 @@ pub async fn post_upgrade<B: KvBackend + 'static>(
     let (
         may_tombstone,
         transferable,
-        creation_type,
+        (creation_type, federate, bans),
         old_aliases,
         canonical_alias,
         (old_privileged_creators, old_creators),
@@ -287,7 +421,11 @@ pub async fn post_upgrade<B: KvBackend + 'static>(
             (
                 may_tombstone,
                 actor.transferable_state(),
-                actor.creation_type(),
+                (
+                    actor.creation_type(),
+                    actor.creation_federate(),
+                    actor.banned_members().unwrap_or_default(),
+                ),
                 actor.list_aliases().unwrap_or_default(),
                 canonical_alias,
                 (
@@ -301,16 +439,22 @@ pub async fn post_upgrade<B: KvBackend + 'static>(
     let mut creators = vec![sender.clone()];
     creators.extend(extra_creators.iter().cloned());
     let mut power_level_content_override = None;
+    // The old room's power levels as they will stand in the replacement once the upgrade is
+    // done, when the upgrader had to be lifted to 100 to send them (`lift_upgrader`).
+    let mut power_levels_to_restore = None;
     let mut initial_state = Vec::with_capacity(transferable.len());
     for (event_type, content) in transferable {
         if event_type == "m.room.power_levels" {
-            power_level_content_override = Some(power_levels_for_replacement(
+            let translated = power_levels_for_replacement(
                 content,
                 &rules,
                 &creators,
                 old_privileged_creators,
                 &old_creators,
-            ));
+            );
+            let (first, restore) = lift_upgrader(translated, &rules, &sender);
+            power_level_content_override = Some(first);
+            power_levels_to_restore = restore;
         } else {
             initial_state.push(InitialStateEvent {
                 event_type: event_type.to_owned(),
@@ -323,6 +467,11 @@ pub async fn post_upgrade<B: KvBackend + 'static>(
     let mut creation_content = serde_json::Map::new();
     if let Some(room_type) = creation_type {
         creation_content.insert("type".to_owned(), Value::String(room_type));
+    }
+    if !federate {
+        // A room closed to other servers stays closed: `m.federate` is in the create event and
+        // nowhere else, so it is the one thing an upgrade cannot carry as state.
+        creation_content.insert("m.federate".to_owned(), Value::Bool(false));
     }
     if !extra_creators.is_empty() {
         creation_content.insert(
@@ -397,6 +546,34 @@ pub async fn post_upgrade<B: KvBackend + 'static>(
     };
     let new_room_id = new_handle.query(|actor| actor.room_id().to_owned()).await;
 
+    // The old room's bans, each sent into the replacement by the upgrader (who holds 100 here
+    // until `power_levels_to_restore` is sent, so the room's ban level cannot stop them). Best
+    // effort per ban, as Synapse's are: one the auth rules refuse (a banned user the copied
+    // power levels rank above the upgrader) is logged and skipped, and the upgrade stands.
+    let mut bans_carried = 0usize;
+    for (banned, content) in &bans {
+        match new_handle
+            .send_event(
+                sender.clone(),
+                "m.room.member".to_owned(),
+                Some(banned.clone()),
+                content.clone(),
+                None,
+                now,
+            )
+            .await
+        {
+            Ok(_) => bans_carried += 1,
+            Err(e) => tracing::warn!(
+                old_room_id = %old_room_id,
+                new_room_id = %new_room_id,
+                banned = %banned,
+                error = %e,
+                "an upgrade could not carry a ban into the replacement room"
+            ),
+        }
+    }
+
     // Step 4, continued: move every local alias this server hosts for the old room onto the new
     // one. Best-effort per alias -- `create_alias` can fail if the alias somehow already points
     // elsewhere (should not happen: it was just read off the old room's own alias set a moment
@@ -445,6 +622,33 @@ pub async fn post_upgrade<B: KvBackend + 'static>(
             .await;
     }
 
+    // The upgrader was lifted to 100 to send the replacement's initial state; now that it is
+    // sent, the power levels become what the old room's were (Synapse's two power-level events
+    // in an upgraded room, matrix-org/synapse#6632). Best-effort: the room exists either way.
+    if let Some(restore) = power_levels_to_restore
+        && let Err(e) = new_handle
+            .send_event(
+                sender.clone(),
+                "m.room.power_levels".to_owned(),
+                Some(String::new()),
+                restore,
+                None,
+                now,
+            )
+            .await
+    {
+        tracing::warn!(
+            old_room_id = %old_room_id,
+            new_room_id = %new_room_id,
+            error = %e,
+            "an upgrade could not restore the upgrader's old power level in the replacement room"
+        );
+    }
+
+    // A published room's replacement takes its place in this server's room directory
+    // (Synapse's `transfer_room_state_on_room_upgrade`); the old room, tombstoned, leaves it.
+    let directory_moved = move_directory_entry(&state, &old_room_id, &new_room_id);
+
     // Step 6 ("if possible..."): lock the old room down. The spec's own hedge means a failure
     // here (the upgrading user often has just enough power to tombstone but not to re-author
     // power levels) must not fail the upgrade that has, by this point, already succeeded.
@@ -478,6 +682,10 @@ pub async fn post_upgrade<B: KvBackend + 'static>(
         old_room_id = %old_room_id,
         new_room_id = %new_room_id,
         new_version = %new_version,
+        bans_carried,
+        bans_in_old_room = bans.len(),
+        aliases_moved = old_aliases.len(),
+        directory_moved,
         "upgraded a room"
     );
     Ok(Json(json!({"replacement_room": new_room_id.to_string()})).into_response())
@@ -949,5 +1157,360 @@ mod tests {
             .query(|actor| actor.state_event("m.room.tombstone", "").unwrap().is_some())
             .await;
         assert!(!tombstoned, "a rejected upgrade must not send a tombstone");
+    }
+
+    async fn join(
+        state: &RoomState<MemoryBackend>,
+        user: &ruma::UserId,
+        room: &str,
+    ) -> Result<Value, RoomError> {
+        let response = crate::routes::membership::post_join::<MemoryBackend>(
+            State(state.clone()),
+            Path(room.to_owned()),
+            axum::extract::RawQuery(None),
+            requester(user),
+            PermissiveJson(json!({})),
+        )
+        .await?;
+        Ok(json_body(response).await)
+    }
+
+    /// How many events of `event_type` the room's timeline holds, oldest to newest.
+    async fn timeline_count(
+        state: &RoomState<MemoryBackend>,
+        room: &ruma::RoomId,
+        event_type: &'static str,
+    ) -> usize {
+        let handle = state.rooms.get_or_load(room).await.unwrap();
+        handle
+            .query(move |actor| {
+                actor
+                    .events_after(i64::MIN, usize::MAX)
+                    .iter()
+                    .filter(|(_, e)| e.header().event_type == event_type)
+                    .count()
+            })
+            .await
+    }
+
+    /// The old room's bans go with it: a user banned before the upgrade is banned in the
+    /// replacement, with the ban's content (the reason), and cannot join it. Before this the
+    /// replacement got the spec's recommended state only, and the banned user walked in through
+    /// the tombstone (Sytest's "/upgrade copies ban events to the new room").
+    #[tokio::test]
+    async fn an_upgrade_carries_the_old_rooms_bans() {
+        for version in ["10", "12"] {
+            let state = app();
+            let alice = user_id!("@alice:hs1");
+            let bob = user_id!("@bob:hs1");
+            let old = create(&state, alice, json!({"preset": "public_chat"})).await;
+            let old_id = RoomId::parse(&old).unwrap().to_owned();
+            join(&state, bob, &old).await.unwrap();
+            let old_handle = state.rooms.get_or_load(&old_id).await.unwrap();
+            old_handle
+                .membership(
+                    alice.to_owned(),
+                    crate::membership::Action::Ban,
+                    bob.to_owned(),
+                    json!({"reason": "spam"}),
+                    now_ms(),
+                )
+                .await
+                .unwrap();
+            // Somebody who was never in the room, banned ahead of time, is carried too.
+            old_handle
+                .membership(
+                    alice.to_owned(),
+                    crate::membership::Action::Ban,
+                    user_id!("@mallory:elsewhere.example").to_owned(),
+                    json!({}),
+                    now_ms(),
+                )
+                .await
+                .unwrap();
+
+            let replacement = upgrade(&state, alice, &old, json!({"new_version": version}))
+                .await
+                .unwrap();
+            let new_id = RoomId::parse(&replacement).unwrap().to_owned();
+
+            let ban = state_content(&state, &new_id, "m.room.member", "@bob:hs1")
+                .await
+                .unwrap_or_else(|| panic!("bob's ban is in the version-{version} replacement"));
+            assert_eq!(ban["membership"], "ban");
+            assert_eq!(ban["reason"], "spam", "the ban's content came with it");
+            let other = state_content(
+                &state,
+                &new_id,
+                "m.room.member",
+                "@mallory:elsewhere.example",
+            )
+            .await
+            .expect("a ban of a stranger is carried too");
+            assert_eq!(other["membership"], "ban");
+            let refused = join(&state, bob, &replacement).await.unwrap_err();
+            assert!(
+                matches!(refused, RoomError::Forbidden(_)),
+                "bob stays out of the version-{version} replacement: {refused:?}"
+            );
+        }
+    }
+
+    /// A room closed to federation (`"m.federate": false` on its create event) stays closed
+    /// across an upgrade: the replacement's create event says so too (Sytest's "/upgrade
+    /// preserves room federation ability").
+    #[tokio::test]
+    async fn an_upgrade_keeps_a_room_closed_to_federation() {
+        let state = app();
+        let alice = user_id!("@alice:hs1");
+        let closed = create(
+            &state,
+            alice,
+            json!({"creation_content": {"m.federate": false}}),
+        )
+        .await;
+        let replacement = upgrade(&state, alice, &closed, json!({"new_version": "11"}))
+            .await
+            .unwrap();
+        let create_content = state_content(
+            &state,
+            &RoomId::parse(&replacement).unwrap().to_owned(),
+            "m.room.create",
+            "",
+        )
+        .await
+        .unwrap();
+        assert_eq!(create_content["m.federate"], false);
+
+        let open = create(&state, alice, json!({})).await;
+        let replacement = upgrade(&state, alice, &open, json!({"new_version": "11"}))
+            .await
+            .unwrap();
+        let create_content = state_content(
+            &state,
+            &RoomId::parse(&replacement).unwrap().to_owned(),
+            "m.room.create",
+            "",
+        )
+        .await
+        .unwrap();
+        assert!(
+            create_content.get("m.federate").is_none(),
+            "an open room's replacement does not grow an m.federate key: {create_content}"
+        );
+    }
+
+    /// A published room's replacement takes its place in the room directory, and the old
+    /// room leaves it (Sytest's "/upgrade should preserve room visibility for public rooms").
+    #[tokio::test]
+    async fn an_upgrade_moves_the_directory_entry_to_the_replacement() {
+        let state = app();
+        let alice = user_id!("@alice:hs1");
+        let old = create(
+            &state,
+            alice,
+            json!({"preset": "public_chat", "visibility": "public"}),
+        )
+        .await;
+        let old_id = RoomId::parse(&old).unwrap().to_owned();
+        assert!(state.rooms.is_directory_public(&old_id).unwrap());
+
+        let replacement = upgrade(&state, alice, &old, json!({"new_version": "11"}))
+            .await
+            .unwrap();
+        let new_id = RoomId::parse(&replacement).unwrap().to_owned();
+        assert!(
+            state.rooms.is_directory_public(&new_id).unwrap(),
+            "the replacement is published"
+        );
+        assert!(
+            !state.rooms.is_directory_public(&old_id).unwrap(),
+            "the tombstoned room is not"
+        );
+
+        let private = create(&state, alice, json!({"preset": "public_chat"})).await;
+        let replacement = upgrade(&state, alice, &private, json!({"new_version": "11"}))
+            .await
+            .unwrap();
+        assert!(
+            !state
+                .rooms
+                .is_directory_public(&RoomId::parse(&replacement).unwrap().to_owned())
+                .unwrap(),
+            "an unpublished room's replacement is not published"
+        );
+    }
+
+    /// A moderator allowed to send the tombstone upgrades the room: in the replacement they
+    /// hold 100 only long enough to send the copied state, after which the power levels are
+    /// the old room's exactly (the moderator at 50 again), and the old room's power levels --
+    /// which a moderator cannot rewrite -- are left as they were (Sytest's "/upgrade preserves
+    /// the power level of the upgrading user in old and new rooms", matrix-org/synapse#6632).
+    #[tokio::test]
+    async fn a_moderators_upgrade_restores_their_level_in_the_replacement() {
+        let state = app();
+        let alice = user_id!("@alice:hs1");
+        let bob = user_id!("@bob:hs1");
+        let old = create(&state, alice, json!({"preset": "public_chat"})).await;
+        let old_id = RoomId::parse(&old).unwrap().to_owned();
+        join(&state, bob, &old).await.unwrap();
+        let old_handle = state.rooms.get_or_load(&old_id).await.unwrap();
+        let mut levels = state_content(&state, &old_id, "m.room.power_levels", "")
+            .await
+            .unwrap();
+        levels["users"]["@bob:hs1"] = json!(50);
+        levels["events"]["m.room.tombstone"] = json!(50);
+        old_handle
+            .send_event(
+                alice.to_owned(),
+                "m.room.power_levels".to_owned(),
+                Some(String::new()),
+                levels.clone(),
+                None,
+                now_ms(),
+            )
+            .await
+            .unwrap();
+        // State a moderator may not send: the default `events` map puts encryption at 100.
+        old_handle
+            .send_event(
+                alice.to_owned(),
+                "m.room.encryption".to_owned(),
+                Some(String::new()),
+                json!({"algorithm": "m.megolm.v1.aes-sha2"}),
+                None,
+                now_ms(),
+            )
+            .await
+            .unwrap();
+
+        let replacement = upgrade(&state, bob, &old, json!({"new_version": "11"}))
+            .await
+            .expect("a moderator who may send the tombstone may upgrade");
+        let new_id = RoomId::parse(&replacement).unwrap().to_owned();
+        let new_levels = state_content(&state, &new_id, "m.room.power_levels", "")
+            .await
+            .unwrap();
+        assert_eq!(
+            new_levels, levels,
+            "the replacement's power levels are the old room's"
+        );
+        assert_eq!(
+            timeline_count(&state, &new_id, "m.room.power_levels").await,
+            2,
+            "one power-levels event to create the room with bob at 100, one to put him back"
+        );
+        let encryption = state_content(&state, &new_id, "m.room.encryption", "")
+            .await
+            .expect("the encryption state, at level 100, was still copied");
+        assert_eq!(encryption["algorithm"], "m.megolm.v1.aes-sha2");
+        let old_levels = state_content(&state, &old_id, "m.room.power_levels", "")
+            .await
+            .unwrap();
+        assert_eq!(
+            old_levels, levels,
+            "a moderator cannot lock the old room down, so its power levels are unchanged"
+        );
+    }
+
+    /// The copied state stands in for the preset's: a replacement whose predecessor had
+    /// `history_visibility: joined` has exactly one history-visibility event, saying `joined`,
+    /// not the preset's `shared` first and the copy after it (Sytest's "/upgrade copies
+    /// important state to the new room", which reads the first such event in the timeline).
+    #[tokio::test]
+    async fn the_copied_state_replaces_the_presets_in_the_replacement() {
+        let state = app();
+        let alice = user_id!("@alice:hs1");
+        let old = create(
+            &state,
+            alice,
+            json!({
+                "preset": "public_chat",
+                "initial_state": [
+                    {"type": "m.room.history_visibility", "state_key": "", "content": {"history_visibility": "joined"}},
+                    {"type": "m.room.guest_access", "state_key": "", "content": {"guest_access": "can_join"}},
+                ],
+            }),
+        )
+        .await;
+        let old_id = RoomId::parse(&old).unwrap().to_owned();
+        assert_eq!(
+            timeline_count(&state, &old_id, "m.room.history_visibility").await,
+            1,
+            "initial_state takes precedence over the preset at creation too"
+        );
+        let replacement = upgrade(&state, alice, &old, json!({"new_version": "11"}))
+            .await
+            .unwrap();
+        let new_id = RoomId::parse(&replacement).unwrap().to_owned();
+        for (event_type, key, value) in [
+            ("m.room.history_visibility", "history_visibility", "joined"),
+            ("m.room.guest_access", "guest_access", "can_join"),
+            ("m.room.join_rules", "join_rule", "public"),
+        ] {
+            assert_eq!(
+                timeline_count(&state, &new_id, event_type).await,
+                1,
+                "{event_type} is sent once in the replacement"
+            );
+            assert_eq!(
+                state_content(&state, &new_id, event_type, "")
+                    .await
+                    .unwrap()[key],
+                value
+            );
+        }
+    }
+
+    /// Another server upgraded a room this server's users were in: when one of them joins the
+    /// replacement (whose create names the old room), this server's aliases for the old room
+    /// and its place in this server's directory follow, as Synapse's do on join. Here the
+    /// replacement is made locally with a `predecessor` in its create, which is what a remote
+    /// one looks like once it is held.
+    #[tokio::test]
+    async fn a_join_into_a_replacement_moves_this_servers_aliases_and_directory_entry() {
+        let state = app();
+        let alice = user_id!("@alice:hs1");
+        let bob = user_id!("@bob:hs1");
+        let old = create(
+            &state,
+            alice,
+            json!({"preset": "public_chat", "visibility": "public", "room_alias_name": "ours"}),
+        )
+        .await;
+        let old_id = RoomId::parse(&old).unwrap().to_owned();
+        let replacement = create(
+            &state,
+            alice,
+            json!({"preset": "public_chat", "creation_content": {"predecessor": {"room_id": old}}}),
+        )
+        .await;
+        let new_id = RoomId::parse(&replacement).unwrap().to_owned();
+        let alias = <&ruma::RoomAliasId>::try_from("#ours:hs1").unwrap();
+        assert_eq!(
+            state.rooms.resolve_alias(alias).unwrap(),
+            Some(old_id.clone())
+        );
+        assert!(!state.rooms.is_directory_public(&new_id).unwrap());
+
+        join(&state, bob, &replacement).await.unwrap();
+
+        assert_eq!(
+            state.rooms.resolve_alias(alias).unwrap(),
+            Some(new_id.clone()),
+            "the alias followed bob's join"
+        );
+        assert!(state.rooms.is_directory_public(&new_id).unwrap());
+        assert!(!state.rooms.is_directory_public(&old_id).unwrap());
+        assert!(
+            state
+                .rooms
+                .get_or_load(&old_id)
+                .await
+                .unwrap()
+                .query(|actor| actor.list_aliases().unwrap())
+                .await
+                .is_empty()
+        );
     }
 }
