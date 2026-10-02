@@ -7,6 +7,7 @@ import {
   appserviceLogins,
   findAppservice,
   patchAppservice,
+  pingAppservice,
 } from "./data/appservices";
 import { bridgeTypes } from "./data/bridge-types";
 import {
@@ -865,6 +866,25 @@ export const handlers = [
 
   http.patch(`${API}/appservices/:id`, async ({ params, request }) => {
     const patch = (await request.json()) as Record<string, unknown>;
+    if ("url" in patch && patch.url !== null && !/^https?:\/\//.test(String(patch.url)))
+      return problem(400, "validation-failed", "Validation failed", {
+        errors: [{ pointer: "/url", detail: "must be an http:// or https:// URL, or null" }],
+      });
+    const rules = Object.values((patch.namespaces as Record<string, unknown[]>) ?? {}).flat();
+    for (const rule of rules) {
+      const regex = (rule as { regex?: string }).regex ?? "";
+      try {
+        new RegExp(regex);
+      } catch {
+        return problem(400, "validation-failed", "Validation failed", {
+          errors: [{ pointer: "/namespaces", detail: `"${regex}" is not a valid regex` }],
+        });
+      }
+      if (regex.startsWith("@irc_"))
+        return problem(409, "conflict", "Conflict", {
+          detail: `"${regex}" overlaps the exclusive users namespace of irc`,
+        });
+    }
     const appservice = patchAppservice(String(params.id), patch ?? {});
     if (!appservice)
       return HttpResponse.json(
@@ -961,6 +981,12 @@ export const handlers = [
         { status: 404 },
       );
     appservice.paused = false;
+    return HttpResponse.json(appservice);
+  }),
+
+  http.post(`${API}/appservices/:id/ping`, ({ params }) => {
+    const appservice = pingAppservice(String(params.id));
+    if (!appservice) return problem(404, "not-found", "Not found");
     return HttpResponse.json(appservice);
   }),
 

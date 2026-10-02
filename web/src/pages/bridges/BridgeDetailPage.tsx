@@ -13,6 +13,9 @@ import {
   useRotateAppserviceTokens,
   useReplayAppserviceBacklog,
   useDeleteAppservice,
+  usePingAppservice,
+  type AppService,
+  type AppserviceNamespaces,
 } from "@/api/bridges";
 import { useServerInfo } from "@/api/dashboard";
 import { BridgeGlyph } from "@/components/BridgeGlyph";
@@ -31,6 +34,7 @@ import { getSession, hasScope } from "@/lib/auth";
 import { bridgeKind, bridgeTitle, bridgeTypeOf, botMatrixId } from "@/lib/bridge-catalogue";
 import { bridgeHealthMeta, formatBacklogEntry, healthKeyOf } from "@/lib/bridge-state";
 import { cn } from "@/lib/cn";
+import { EditBridgeDialog } from "./EditBridgeDialog";
 
 const TABS = ["overview", "sign-in", "registration", "transactions", "danger"] as const;
 const TAB_LABELS: Record<(typeof TABS)[number], string> = {
@@ -54,6 +58,7 @@ export function BridgeDetailPage() {
   const { bridgeId } = useParams({ from: "/bridges/$bridgeId" });
   const navigate = useNavigate();
   const [revealTokens, setRevealTokens] = useState(false);
+  const [editOpen, setEditOpen] = useState(false);
   // `#sign-in` (from the offering page) opens that tab.
   const hash = useRouterState({ select: (s) => s.location.hash });
   const [activeTab, setActiveTab] = useState<(typeof TABS)[number]>(
@@ -80,6 +85,7 @@ export function BridgeDetailPage() {
   const rotate = useRotateAppserviceTokens();
   const replay = useReplayAppserviceBacklog();
   const del = useDeleteAppservice();
+  const ping = usePingAppservice();
 
   if (!hasScope("bridges:read")) {
     return (
@@ -156,6 +162,51 @@ export function BridgeDetailPage() {
           </div>
         </div>
         <div className="flex flex-wrap gap-2">
+          <Button
+            variant="secondary"
+            disabled={!canWrite}
+            title={!canWrite ? "Needs bridges:write" : "URL, rate limiting and namespaces"}
+            onClick={() => setEditOpen(true)}
+          >
+            Edit
+          </Button>
+          {editOpen && (
+            <EditBridgeDialog
+              key={id}
+              bridge={bridge}
+              name={name}
+              open={editOpen}
+              onOpenChange={setEditOpen}
+            />
+          )}
+          <Button
+            variant="secondary"
+            disabled={!canWrite || ping.isPending || !bridge.url}
+            title={
+              !canWrite
+                ? "Needs bridges:write"
+                : !bridge.url
+                  ? "The registration has no URL, so there is nothing to reach"
+                  : "Sends the bridge an empty transaction now and records whether it answered"
+            }
+            onClick={() =>
+              ping.mutate(id, {
+                onSuccess: (after) => {
+                  const key = healthKeyOf(after);
+                  if (key === "healthy") toast({ title: `${name} answered` });
+                  else
+                    toast({
+                      title: `${name} did not answer`,
+                      description: "The reason is on the page as soon as it is read back.",
+                      variant: "danger",
+                    });
+                },
+                onError: () => toast({ title: `Couldn't ping ${name}`, variant: "danger" }),
+              })
+            }
+          >
+            {ping.isPending ? "Testing…" : "Test connection"}
+          </Button>
           {bridge.paused ? (
             <Button
               variant="secondary"
@@ -298,6 +349,12 @@ export function BridgeDetailPage() {
             <Fact label="Rate limited" value={bridge.rate_limited ? "Yes" : "No, exempt"} />
             <Fact label="Added" value={<RelativeTime at={bridge.created_at} />} />
           </dl>
+          <h2 className="mt-6 text-sm font-medium text-text">Namespaces</h2>
+          <p className="mt-1 text-sm text-text-muted">
+            The user IDs, room aliases and room IDs this bridge speaks for. An exclusive rule means
+            nobody but the bridge may create them. Change them with Edit.
+          </p>
+          <NamespaceList namespaces={bridge.namespaces} />
         </Content>
 
         <Content value="sign-in" className="py-6">
@@ -465,6 +522,48 @@ function redactTokens(registration: Record<string, unknown>): Record<string, unk
     if (key in redacted) redacted[key] = "•".repeat(24);
   }
   return redacted;
+}
+
+const NAMESPACE_LABELS = { users: "Users", aliases: "Aliases", rooms: "Rooms" } as const;
+
+/** A registration's namespace rules, by category, each pattern with whether it is exclusive. */
+function NamespaceList({ namespaces }: { namespaces: AppService["namespaces"] }) {
+  const source = (namespaces ?? {}) as AppserviceNamespaces;
+  const categories = (Object.keys(NAMESPACE_LABELS) as (keyof typeof NAMESPACE_LABELS)[]).map(
+    (key) => [key, Array.isArray(source[key]) ? source[key] : []] as const,
+  );
+  if (categories.every(([, rules]) => rules.length === 0)) {
+    return (
+      <p className="mt-2 text-sm text-text-muted">
+        None: the bridge speaks only as its own bot user.
+      </p>
+    );
+  }
+  return (
+    <dl className="mt-3 grid grid-cols-1 gap-x-8 gap-y-3 sm:grid-cols-3">
+      {categories.map(([key, rules]) => (
+        <div key={key}>
+          <dt className="text-xs text-text-muted">{NAMESPACE_LABELS[key]}</dt>
+          <dd className="mt-0.5 text-sm text-text">
+            {rules.length === 0 ? (
+              <span className="text-text-muted">None</span>
+            ) : (
+              <ul className="flex flex-col gap-1">
+                {rules.map((rule, i) => (
+                  <li key={`${rule.regex}-${i}`} className="flex flex-wrap items-center gap-2">
+                    <code className="font-identifier text-xs">{rule.regex}</code>
+                    <span className="text-xs text-text-muted">
+                      {rule.exclusive ? "exclusive" : "shared"}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </dd>
+        </div>
+      ))}
+    </dl>
+  );
 }
 
 function Tile({ label, children }: { label: string; children: ReactNode }) {

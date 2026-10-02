@@ -200,6 +200,68 @@ export function useSetProvisioningSecret() {
   });
 }
 
+/** One rule of a registration's namespaces: a regex over the id and whether it is exclusive. */
+export interface NamespaceRule {
+  regex: string;
+  exclusive?: boolean;
+}
+
+/** `AppService.namespaces` as the registration format defines it: three lists of rules. */
+export interface AppserviceNamespaces {
+  users?: NamespaceRule[];
+  aliases?: NamespaceRule[];
+  rooms?: NamespaceRule[];
+}
+
+/** The registration fields the edit dialog changes, as a merge patch (RFC 7396). */
+export interface AppserviceUpdate {
+  url?: string | null;
+  rate_limited?: boolean;
+  namespaces?: AppserviceNamespaces;
+}
+
+/**
+ * Changes a registration's url, rate limiting or namespaces (`PATCH /appservices/{id}`, a merge
+ * patch). `namespaces` is replaced whole: a merge patch replaces arrays rather than merging them,
+ * so the dialog sends every rule, not just the changed one. A rule that overlaps another
+ * bridge's exclusive namespace is refused by the server.
+ */
+export function useUpdateAppservice() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ id, patch }: { id: string; patch: AppserviceUpdate }) => {
+      const result = await api.PATCH("/appservices/{id}", {
+        params: { path: { id } },
+        body: { ...patch },
+      });
+      return unwrap(result);
+    },
+    onSuccess: (_data, { id }) => {
+      qc.invalidateQueries({ queryKey: ["appservices"] });
+      qc.invalidateQueries({ queryKey: ["appservice", id] });
+      qc.invalidateQueries({ queryKey: ["appservice-registration", id] });
+    },
+  });
+}
+
+/**
+ * Pings the bridge now (`POST /appservices/{id}/ping`): the server sends an empty transaction to
+ * its url and records the outcome in its health, which the answer's `health` field and
+ * `GET .../health` then reflect. "Test connection" on the bridge page.
+ */
+export function usePingAppservice() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (id: string) => {
+      const result = await api.POST("/appservices/{id}/ping", {
+        params: { path: { id }, header: { "Idempotency-Key": newIdempotencyKey() } },
+      });
+      return unwrap(result);
+    },
+    onSuccess: (_data, id) => invalidateAfterAction(qc, id),
+  });
+}
+
 export function useBridgeTypes() {
   return useQuery({
     queryKey: ["bridge-types"],

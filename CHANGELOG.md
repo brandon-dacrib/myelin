@@ -60,6 +60,12 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
   and offers display name, avatar and kind of account; only what changed is sent, and a field
   this server cannot change yet is refused beside the field in the server's own words rather
   than silently ignored. Verified against `hs serve` (`web/e2e-real/web-items.spec.ts`).
+- **A bridge's registration can be edited and its connection tested from its page**
+  (2026-10-02, `agent/web-items`). "Edit" changes the url, rate limiting and the namespaces as
+  rules with an exclusive switch, explained in place, and the page lists the namespaces; "Test
+  connection" pings the bridge now and says whether it answered, with the server's reason on the
+  page when it did not. Verified against `hs serve` with a stub bridge
+  (`web/e2e-real/web-items.spec.ts`).
 - **The management interface explains itself** (2026-10-01, `agent/web-admin-ui`). Every
   configuration setting carries a badge from the server's own classification (applies on save,
   needs a restart, or per replica from the file or environment), each class is explained once

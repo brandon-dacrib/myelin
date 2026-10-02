@@ -75,3 +75,80 @@ test.describe("Web items against the real server", () => {
     await expect(page.getByRole("heading", { name: "Edit Me" })).toBeVisible();
   });
 });
+
+test.describe("Bridge edit and test against the real server", () => {
+  test.skip(
+    !process.env.HS_REAL_SERVER_URL || !adminToken || !process.env.HS_REAL_STUB_BRIDGE_URL,
+    "HS_REAL_SERVER_URL, HS_REAL_ADMIN_TOKEN and HS_REAL_STUB_BRIDGE_URL (a server answering POST /_matrix/app/v1/ping with 200) not set",
+  );
+
+  test("test connection answers, the registration is edited, and a dead url does not answer", async ({
+    page,
+    request,
+  }) => {
+    const id = `wi-${run}`;
+    // How the page names a bridge with no catalogue entry (`deriveDisplayName`).
+    const name = id
+      .split(/[-_]/)
+      .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+      .join(" ");
+    const stubUrl = process.env.HS_REAL_STUB_BRIDGE_URL!;
+    const created = await request.post("/api/v1/appservices", {
+      headers: { ...authed(), "idempotency-key": `web-items-as-${run}` },
+      data: {
+        registration: {
+          id,
+          url: stubUrl,
+          as_token: `as_${run}_0123456789abcdef`,
+          hs_token: `hs_${run}_0123456789abcdef`,
+          sender_localpart: `${id}bot`,
+          rate_limited: false,
+          namespaces: { users: [{ regex: `@${id}_.*:example\\.org`, exclusive: true }] },
+        },
+      },
+    });
+    expect(created.ok(), await created.text()).toBe(true);
+
+    await signIn(page);
+    await page.goto(`/admin/bridges/${id}`);
+    await expect(page.getByRole("heading", { name })).toBeVisible();
+    await expect(page.getByText(`@${id}_.*:example\\.org`)).toBeVisible();
+
+    await page.getByRole("button", { name: "Test connection" }).click();
+    await expect(page.getByText(`${name} answered`).first()).toBeVisible();
+    await expect(page.getByText("Healthy", { exact: true }).first()).toBeVisible();
+
+    await page.getByRole("button", { name: "Edit", exact: true }).click();
+    const dialog = page.getByRole("dialog", { name: `Edit ${name}` });
+    const deadUrl = stubUrl.replace(/:(\d+)$/, (_m, port) => `:${Number(port) + 1}`);
+    await dialog.getByLabel(/^URL/).fill(deadUrl);
+    await dialog.getByRole("switch", { name: "Rate limited" }).click();
+    await dialog.getByRole("button", { name: "Add rule" }).nth(1).click();
+    await dialog.getByLabel("Alias namespaces pattern").fill(`#${id}_.*:example\\.org`);
+    await dialog.getByRole("button", { name: "Save" }).click();
+    await expect(dialog).toBeHidden();
+    await expect(page.getByText(deadUrl)).toBeVisible();
+    await expect(page.getByText("Yes", { exact: true })).toBeVisible();
+    await expect(page.getByText(`#${id}_.*:example\\.org`)).toBeVisible();
+    const after = await request.get(`/api/v1/appservices/${id}`, { headers: authed() });
+    const body = (await after.json()) as {
+      url: string;
+      rate_limited: boolean;
+      namespaces: { aliases: { regex: string; exclusive: boolean }[] };
+    };
+    expect(body.url).toBe(deadUrl);
+    expect(body.rate_limited).toBe(true);
+    expect(body.namespaces.aliases).toEqual([
+      { regex: `#${id}_.*:example\\.org`, exclusive: true },
+    ]);
+
+    await page.getByRole("button", { name: "Test connection" }).click();
+    await expect(page.getByText(`${name} did not answer`).first()).toBeVisible();
+    await expect(page.getByText(/failed to connect to the appservice/)).toBeVisible();
+    await settle(page);
+    await page.screenshot({ path: "test-results/real-bridge-did-not-answer.png", fullPage: true });
+
+    const deleted = await request.delete(`/api/v1/appservices/${id}`, { headers: authed() });
+    expect(deleted.ok()).toBe(true);
+  });
+});

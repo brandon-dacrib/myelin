@@ -182,6 +182,38 @@ export function patchAppservice(
   }
   if (typeof patch.url === "string" || patch.url === null) appservice.url = patch.url;
   if (typeof patch.rate_limited === "boolean") appservice.rate_limited = patch.rate_limited;
+  if (patch.namespaces && typeof patch.namespaces === "object")
+    appservice.namespaces = patch.namespaces as Record<string, never>;
+  return appservice;
+}
+
+/**
+ * What a ping does in the mock: a bridge whose url points at localhost or a `.svc` host answers,
+ * except `signal`, which stays down as its health fixture says; a bridge with no url cannot be
+ * pinged at all.
+ */
+export function pingAppservice(id: string): AppService | undefined {
+  const appservice = findAppservice(id);
+  if (!appservice) return undefined;
+  const now = new Date().toISOString();
+  if (appservice.paused) {
+    appserviceHealth[id] = { status: "paused", last_ping_at: now, last_error: null };
+  } else if (!appservice.url) {
+    appserviceHealth[id] = {
+      status: "down",
+      last_ping_at: now,
+      last_error: "the registration has no url, so there is nothing to ping",
+    };
+  } else if (id === "signal") {
+    appserviceHealth[id] = {
+      status: "down",
+      last_ping_at: now,
+      last_error: "Connection refused: signal daemon not responding on :29328",
+    };
+  } else {
+    appserviceHealth[id] = { status: "healthy", last_ping_at: now, last_error: null };
+  }
+  appservice.health = appserviceHealth[id]!.status;
   return appservice;
 }
 

@@ -170,6 +170,27 @@ the field with the server's words. **Left:** display name, avatar and kind of ac
 data source on the server (`crates/hs-admin/src/router.rs::users_update`, "no data source can
 change this field yet"); the form offers them and reports the refusal honestly meanwhile.
 
+**2. Bridge edit and test** (`appservices.update` and `appservices.ping`;
+`pages/bridges/EditBridgeDialog.tsx`, `useUpdateAppservice` and `usePingAppservice` in
+`api/bridges.ts`). "Edit" on a bridge's page changes its url (empty means never pushed to),
+whether it is rate limited, and its namespaces as three lists of rules (pattern, exclusive),
+each explained; the tokens and bot name are named as what it does not change. The whole
+namespaces object is sent, every rule, because the server applies an RFC 7396 merge patch and
+a merge patch replaces a list. A rule left empty is refused before the server is asked; a
+server refusal (an invalid pattern, or `409` for an overlap with another bridge's exclusive
+namespace) is shown under the namespaces. The Overview tab now lists the namespaces, so what
+Edit changes is on the page. "Test connection" pings the bridge now (an empty transaction to
+its url), toasts whether it answered, and the page's health banner shows the server's reason
+when it did not; it is disabled, with the reason, for a registration with no url. Mock: `PATCH`
+validates the url and patterns and refuses `@irc_` as a conflict; `POST .../ping` makes every
+bridge healthy but `signal`, which stays down with its reason. Verified against the real
+binary with a stub bridge answering `POST /_matrix/app/v1/ping` (`HS_REAL_STUB_BRIDGE_URL`):
+"answered" and Healthy from the page; url, rate limiting and an alias rule saved and read back
+through `GET /appservices/{id}`; then, with the url moved to a closed port, "did not answer" and
+the banner "failed to connect to the appservice: error sending request...". Found on the way:
+a ping answered by an HTTP/1.0 server that does not read the body is reported as "timed out
+waiting for the appservice to respond" within 35 ms; a bridge that reads the body is fine.
+
 ## 2026-10-01: the interface explains itself, by the owner's rule (branch `agent/web-admin-ui`)
 
 The owner's rule: *"Sane defaults, and all administration is done via the web UI, well
@@ -269,8 +290,8 @@ closes that and audits every page. Branched from `agent/config-hot` (for `applie
 1. ~~**User edit** (`users.update`): grant or revoke server administrator, change display name,
    avatar and kind of account; today admin is set only at creation.~~ Done 2026-10-02 (the
    server applies `admin`; the other three fields wait for a data source).
-2. **Bridge edit and test** (`appservices.update` for url, rate limiting and namespaces;
-   `appservices.ping` as "Test connection").
+2. ~~**Bridge edit and test** (`appservices.update` for url, rate limiting and namespaces;
+   `appservices.ping` as "Test connection").~~ Done 2026-10-02.
 3. **Server health on the Overview** (`GET /server/health`, never called): per-check status.
 4. **Exact user lookup** (`users.lookup` by email, phone or SSO subject) and a live username
    check in Add user (`users.availability`).
