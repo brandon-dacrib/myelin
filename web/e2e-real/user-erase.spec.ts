@@ -185,7 +185,9 @@ test.describe("Erasing a user against the real server", () => {
     await expect(
       page.getByRole("heading", { name: `Person ${localpart}`, level: 1 }),
     ).toBeVisible();
-    await expect(page.getByText("PHONE browser")).toBeVisible();
+    await expect(
+      page.getByRole("tabpanel", { name: "Sessions" }).getByText("PHONE browser", { exact: true }),
+    ).toBeVisible();
 
     await page.getByRole("button", { name: "Deactivate" }).click();
     const dialog = page.getByRole("dialog", { name: `Deactivate ${userId}?` });

@@ -72,9 +72,22 @@ export function useUserDevices(userId: string | undefined) {
   });
 }
 
+/**
+ * After anything that changes an account: the lists, the account itself, and every per-user
+ * query (`["user-devices", id]`, `["user-threepids", id]`, `["user-memberships", id, ...]` and
+ * the rest, across the api modules), since one action can change several of them at once.
+ * Erasing an account empties its devices, identities and memberships, and until 2026-10-02
+ * only `["user", id]` was refetched, so the page kept showing the devices the server had just
+ * deleted (found by `web/e2e-real/user-erase.spec.ts` against the real server).
+ */
 function invalidateUser(qc: ReturnType<typeof useQueryClient>, userId: string) {
   qc.invalidateQueries({ queryKey: ["users"] });
-  qc.invalidateQueries({ queryKey: ["user", userId] });
+  qc.invalidateQueries({
+    predicate: (query) => {
+      const [kind, id] = query.queryKey;
+      return typeof kind === "string" && kind.startsWith("user") && id === userId;
+    },
+  });
 }
 
 function useUserAction(

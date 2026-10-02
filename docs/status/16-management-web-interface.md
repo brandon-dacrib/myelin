@@ -76,6 +76,8 @@ Last updated: 2026-10-02 (user erasure; branch `agent/user-erase-web`).
 
 ## 2026-10-02: user erasure, "delete a user" (branch `agent/user-erase-web`)
 
+**Run against the real server, 18:08 EDT** (`hs` from `agent/user-erase` rebased on `main` at `d0642a05`, `web/e2e-real/user-erase.spec.ts`): **2 of 2**, after two fixes the run itself forced: the page kept showing the devices the server had just deleted, because the deactivate mutation refetched only `["user", id]`; `invalidateUser` in `web/src/api/users.ts` now refetches every per-user query (devices, sessions, identities, memberships, media, statistics). And the spec's own `getByText("PHONE browser")` matched three elements; it is scoped to the Sessions table. Screenshots `docs/design/screenshots/user-erase-{dialog,page,list}-real.png` are from that run.
+
 The server side is `agent/user-erase` (`POST /users/{id}/deactivate` with `erase: true`,
 `User.erased`, 409 from reactivate and reset-password on an erased account); this branch is its
 UI, built against the OpenAPI contract and the MSW mocks, with a real-server spec for the merged
