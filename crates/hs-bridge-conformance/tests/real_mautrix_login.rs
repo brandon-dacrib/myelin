@@ -471,11 +471,19 @@ async fn login_qr(encrypted: bool) -> Result<()> {
     // The bridge, and where the server reaches it.
     let bridge_port = reserve_port();
     let name = format!("hs-bridge-login-{label}-{}", std::process::id());
+    // `host.docker.internal` is how the bridge's config names this server (the rendered
+    // `homeserver.address` comes from `public_baseurl` above). Docker on a Mac resolves it by
+    // itself; Docker on Linux, GitHub's runners included, only with this flag, and without it
+    // the bridge answered the server's pings (that direction uses the published port) but could
+    // never reach the server to accept the invite or send, and CI failed on 2026-10-02 with
+    // "said nothing within 30s" on both architectures.
     docker(&[
         "run",
         "-d",
         "--name",
         &name,
+        "--add-host",
+        "host.docker.internal:host-gateway",
         "-p",
         &format!("127.0.0.1:{bridge_port}:29318"),
         "-v",
