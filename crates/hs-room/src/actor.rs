@@ -31,6 +31,7 @@ use crate::timeline::{Direction, PaginationToken};
 
 pub mod admin_ops;
 pub mod catch_up;
+mod fetched_state;
 pub mod gaps;
 mod history;
 #[cfg(test)]
@@ -291,6 +292,25 @@ enum PersistKind {
         /// The `EventSn`s of the resident's `state`, one per `(event_type, state_key)`.
         snapshot: Vec<EventSn>,
     },
+    /// An event received over federation whose prev events include one this server holds with
+    /// a fetched state (`fetched_state`): fed to the state store with the resolved state before
+    /// it (`snapshot`) rather than from its prev events, since the store's own state at such a
+    /// prev event is meaningless (`RoomActor::feed_store_outlier`); otherwise an ordinary event
+    /// -- it supersedes only the extremities it cites, and opens no timeline gap.
+    AfterFetchedState { snapshot: Vec<EventSn> },
+}
+
+/// Which state [`RoomActor::authorize_remote_at`] checks an event against, besides the one its
+/// own `auth_events` imply.
+#[derive(Clone, Copy)]
+enum StateBefore<'a> {
+    /// The state resolved from the event's prev events, as held: the ordinary case.
+    FromPrevEvents,
+    /// An explicit snapshot: the state before an event this server could not walk back to, as
+    /// another server answered it.
+    Explicit(&'a [EventSn]),
+    /// No state before: the event is checked against its own `auth_events` only.
+    None,
 }
 
 /// One event of a batch of history, planned for its place in the timeline (see
@@ -370,6 +390,10 @@ pub struct RoomActor<B: KvBackend> {
     /// by [`RoomActor::persist_repaired_outlier_states`]. See [`RoomActor::load`]'s "Placed
     /// outliers without a state row".
     repaired_outlier_states: Vec<(EventSn, Vec<EventSn>)>,
+    /// The outliers held with a fetched state and no timeline position (`fetched_state`): the
+    /// prev events of received events this server could not walk back to. An event citing one
+    /// is fed to the state store with its resolved state ([`PersistKind::AfterFetchedState`]).
+    fetched_state_outliers: HashSet<EventSn>,
     /// History events another server sent that failed authorization at their position
     /// (`history`): never stored, and never again counted as missing from a timeline gap.
     /// In-memory only; after a reload a gap that cites one asks for it once more and rejects it
@@ -727,6 +751,7 @@ impl<B: KvBackend> RoomActor<B> {
             gaps: BTreeMap::new(),
             placed_outlier_roots: HashMap::new(),
             repaired_outlier_states: Vec::new(),
+            fetched_state_outliers: HashSet::new(),
             rejected_history: HashSet::new(),
             relations_by_target: HashMap::new(),
             redactions_by_target: HashMap::new(),
@@ -949,6 +974,15 @@ impl<B: KvBackend> RoomActor<B> {
                 continue;
             }
             actor.absorb_loaded_event(event_sn, event, room_pos, explicit_state.as_deref())?;
+        }
+
+        // An outlier held with a fetched state and no timeline position (`fetched_state`): the
+        // state after it is the one it was held with, as at the time it was.
+        for (sn, state) in explicit_states {
+            if actor.events.contains_key(&sn) && !actor.rejected.contains(&sn) {
+                actor.record_placed_outlier_state(sn, &state)?;
+                actor.fetched_state_outliers.insert(sn);
+            }
         }
 
         // The authoritative forward-extremity set is whatever `RoomActor::persist` last wrote to
@@ -1769,7 +1803,11 @@ impl<B: KvBackend> RoomActor<B> {
         let redaction = (event.header().event_type == "m.room.redaction")
             .then(|| (event.header().sender.clone(), extract_redacts(&event)));
         let redaction_id = event.event_id().to_owned();
-        let event_sn = self.persist(event)?;
+        let kind = match self.fetched_state_snapshot_for(&prev_sns)? {
+            Some(snapshot) => PersistKind::AfterFetchedState { snapshot },
+            None => PersistKind::Ordinary,
+        };
+        let event_sn = self.persist_with(event, kind)?;
         // The importer applies the redactions it copies itself (`import_redaction`).
         if let Some((sender, Some(target))) = redaction
             && !self.quiet
@@ -1792,6 +1830,24 @@ impl<B: KvBackend> RoomActor<B> {
         event: &Event,
         prev_sns: &[EventSn],
         auth_sns: &[EventSn],
+    ) -> Result<(), RoomError> {
+        self.authorize_remote_at(event, prev_sns, auth_sns, StateBefore::FromPrevEvents)
+    }
+
+    /// [`RoomActor::authorize_remote`] with the state before the event chosen by the caller
+    /// ([`StateBefore`]): resolved from `prev_sns` as usual, an explicit snapshot (what another
+    /// server answered as the state at an event this server could not walk back to,
+    /// `fetched_state`), or none at all (an outlier held for the state it is part of, which is
+    /// checked against its own `auth_events` only, as a `send_join` snapshot's events are).
+    ///
+    /// # Errors
+    /// [`RoomActor::authorize_remote`]'s.
+    fn authorize_remote_at(
+        &self,
+        event: &Event,
+        prev_sns: &[EventSn],
+        auth_sns: &[EventSn],
+        at: StateBefore<'_>,
     ) -> Result<(), RoomError> {
         let mut auth_flat = FlatState::new();
         let mut auth_event_refs = Vec::with_capacity(auth_sns.len());
@@ -1856,18 +1912,38 @@ impl<B: KvBackend> RoomActor<B> {
             room_id: Some(&self.room_id),
             state_key: event.header().state_key.as_deref(),
             content: &content_obj,
-            prev_event_count: prev_sns.len(),
+            // An event whose prev events this server does not hold (`StateBefore::Explicit`,
+            // `StateBefore::None`) is judged by the prev events it declares, not those held.
+            prev_event_count: match at {
+                StateBefore::FromPrevEvents => prev_sns.len(),
+                StateBefore::Explicit(_) | StateBefore::None => {
+                    pipeline::decode_event_ids(event.json().get("prev_events")).len()
+                }
+            },
             only_prev_event_is_room_create: only_prev_is_create,
             event_id: Some(event.event_id()),
             redacts: redacts_owned.as_deref(),
         };
 
-        let state_before = self.state_view(&self.effective_prev_sns(prev_sns))?;
-        let create_lookup = || {
-            state_before
+        let state_before = match at {
+            StateBefore::FromPrevEvents => {
+                Some(self.state_view(&self.effective_prev_sns(prev_sns))?)
+            }
+            StateBefore::Explicit(state_sns) => Some(RoomStateView {
+                store: &self.store,
+                root: self.root_from_sns(state_sns, None)?,
+                bodies: EventMap(&self.events),
+            }),
+            StateBefore::None => None,
+        };
+        let create_lookup = || match &state_before {
+            Some(state_before) => state_before
                 .event_for("m.room.create", "")
                 .map(|found| found.is_some())
-                .map_err(|e| AuthError::reject(e.to_string()))
+                .map_err(|e| AuthError::reject(e.to_string())),
+            None => Ok(auth_event_refs
+                .iter()
+                .any(|auth_event| auth_event.event_type == "m.room.create")),
         };
         auth::check_auth_events_selection(&self.rules, &incoming, &auth_event_refs, create_lookup)
             .map_err(RoomError::from)?;
@@ -1875,9 +1951,11 @@ impl<B: KvBackend> RoomActor<B> {
         auth::check_event_auth(&self.rules, &incoming, &auth_flat).map_err(|e| {
             RoomError::Forbidden(format!("auth-events-implied state rejected event: {e}"))
         })?;
-        auth::check_event_auth(&self.rules, &incoming, &state_before.state_fetch()).map_err(
-            |e| RoomError::Forbidden(format!("state-before-the-event rejected event: {e}")),
-        )?;
+        if let Some(state_before) = &state_before {
+            auth::check_event_auth(&self.rules, &incoming, &state_before.state_fetch()).map_err(
+                |e| RoomError::Forbidden(format!("state-before-the-event rejected event: {e}")),
+            )?;
+        }
         Ok(())
     }
 
@@ -2000,7 +2078,9 @@ impl<B: KvBackend> RoomActor<B> {
         // stretch of the room's history this server was not there for. Positions are reserved
         // below it for that history (`crate::actor::gaps`), and the gap is recorded with it.
         let gap_below = match &kind {
-            PersistKind::Ordinary | PersistKind::NewRoom => None,
+            PersistKind::Ordinary
+            | PersistKind::NewRoom
+            | PersistKind::AfterFetchedState { .. } => None,
             PersistKind::RemoteJoin { .. } => self.gap_below_for(&event),
         };
         let room_pos = match gap_below {
@@ -2043,7 +2123,9 @@ impl<B: KvBackend> RoomActor<B> {
             .copied()
             .collect();
         let old_extremities: Vec<EventSn> = match &kind {
-            PersistKind::Ordinary | PersistKind::NewRoom => prev_sns
+            PersistKind::Ordinary
+            | PersistKind::NewRoom
+            | PersistKind::AfterFetchedState { .. } => prev_sns
                 .iter()
                 .copied()
                 .filter(|sn| self.forward_extremities.contains(sn))
@@ -2052,7 +2134,9 @@ impl<B: KvBackend> RoomActor<B> {
         };
         let snapshot_bytes = match &kind {
             PersistKind::Ordinary | PersistKind::NewRoom => None,
-            PersistKind::RemoteJoin { snapshot } => Some(encode_event_sns(snapshot)),
+            PersistKind::RemoteJoin { snapshot } | PersistKind::AfterFetchedState { snapshot } => {
+                Some(encode_event_sns(snapshot))
+            }
         };
         let must_be_new = matches!(kind, PersistKind::NewRoom);
 
@@ -2168,7 +2252,7 @@ impl<B: KvBackend> RoomActor<B> {
             PersistKind::Ordinary | PersistKind::NewRoom => {
                 self.feed_store(&event, event_sn)?;
             }
-            PersistKind::RemoteJoin { snapshot } => {
+            PersistKind::RemoteJoin { snapshot } | PersistKind::AfterFetchedState { snapshot } => {
                 self.feed_store_with_state(&event, event_sn, snapshot)?;
             }
         }
@@ -6301,6 +6385,24 @@ impl<B: KvBackend> RoomActorHandle<B> {
         .await
     }
 
+    /// [`RoomActor::accept_prev_event_with_state`] through the handle: how
+    /// `hs_federation::inbound::RoomWriteSink` holds a missing prev event with the state another
+    /// server answered for it (`fetched_state`).
+    pub async fn accept_prev_event_with_state(
+        &self,
+        prev: Event,
+        state_before: Vec<OwnedEventId>,
+        fetched: Vec<Event>,
+    ) -> Result<RemoteEventOutcome, RoomError>
+    where
+        B: 'static,
+    {
+        self.with_actor(move |actor| {
+            actor.accept_prev_event_with_state(prev.clone(), &state_before, fetched.clone())
+        })
+        .await
+    }
+
     /// [`RoomActor::import_event`] through the handle: the Synapse importer's way in.
     pub async fn import_event(&self, event: Event) -> Result<RemoteEventOutcome, RoomError>
     where
@@ -6501,7 +6603,7 @@ mod tests {
     use proptest::prelude::*;
     use ruma::{RoomVersionId, user_id};
 
-    fn room(preset: &str) -> RoomActor<MemoryBackend> {
+    pub(super) fn room(preset: &str) -> RoomActor<MemoryBackend> {
         let backend = MemoryBackend::new();
         let tables = Tables::open(&backend).unwrap();
         let identity = HomeserverIdentity::for_tests("hs1");

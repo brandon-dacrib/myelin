@@ -1,0 +1,20 @@
+tests: 130
+pass: 88
+fail: 42
+expected fail (Sytest's own marking): 0
+skip: 0
+pass rate (of tests run, skips excluded): 67.7%
+
+most common failure reasons (first line of the message, normalised):
+    13  Timed out waiting for test at run-tests.pl line N.
+     9  Unexpected response from /send: {
+     1  HTTP Request failed ( 404 Not Found https://localhost:PORT/_matrix/client/v3/directory/room/%N%EN%N%N:localhost:PORT?access_token=TOKEN ) from GET https://localhost:PORT/_matrix/client/v3/directory/ro
+     1  Expected canonical alias to be empty at tests/30rooms/05aliases.pl line N.
+     1  Remote room list did not include expected room at tests/30rooms/70publicroomslist.pl line N.
+     1  Got N, expected N for number of rooms at tests/30rooms/70publicroomslist.pl line N.
+     1  HTTP Request failed ( 401 Unauthorized https://localhost:PORT/_matrix/federation/v1/query/profile?field=displayname&user_id=%TOKEN%NAlocalhost%NAN ) from GET https://localhost:PORT/_matrix/federation/
+     1  HTTP Request failed ( 404 Not Found https://localhost:PORT/_matrix/client/v3/profile/@USER/displayname?access_token=TOKEN ) from GET https://localhost:PORT/_matrix/client/v3/profile/@USER/displayname?
+     1  Expected a 'displayname' key at tests/50federation/10query-profile.pl line N.
+     1  HTTP Request failed ( 404 Not Found https://localhost:PORT/_matrix/client/v3/directory/room/%Ntest:localhost:PORT?access_token=TOKEN ) from GET https://localhost:PORT/_matrix/client/v3/directory/room/
+
+skip reasons:

@@ -1,0 +1,130 @@
+PASS Room aliases can contain Unicode
+FAIL Remote room alias queries can handle Unicode
+PASS Canonical alias can be set
+PASS Canonical alias can include alt_aliases
+PASS Regular users can add and delete aliases in the default room configuration
+PASS Regular users can add and delete aliases when m.room.aliases is restricted
+PASS Deleting a non-existent alias should return a 404
+PASS Users can't delete other's aliases
+PASS Users with sufficient power-level can delete other's aliases
+FAIL Can delete canonical alias
+PASS Alias creators can delete alias with no ops
+PASS Alias creators can delete canonical alias with no ops
+PASS Only room members can list aliases of a room
+FAIL Can get remote public room list
+FAIL Can paginate public room list
+PASS Asking for a remote rooms list, but supplying the local server's name, returns the local rooms list
+PASS Checking local federation server
+PASS Federation key API allows unsigned requests for keys
+PASS Federation key API can act as a notary server via a GET request
+PASS Federation key API can act as a notary server via a POST request
+PASS Key notary server should return an expired key if it can't find any others
+PASS Key notary server must not overwrite a valid key with a spurious result from the origin server
+FAIL Non-numeric ports in server names are rejected
+FAIL Outbound federation can query profile data
+FAIL Inbound federation can query profile data
+FAIL Outbound federation can query room alias directory
+PASS Inbound federation can query room alias directory
+PASS Outbound federation can query v1 /send_join
+PASS Outbound federation can query v2 /send_join
+PASS Outbound federation passes make_join failures through to the client
+PASS Inbound federation can receive v1 /send_join
+PASS Inbound federation can receive v2 /send_join
+PASS Inbound /v1/make_join rejects remote attempts to join local users to rooms
+PASS Inbound /make_join rejects attempts to join rooms where all users have left
+PASS Inbound /v1/send_join rejects incorrectly-signed joins
+PASS Inbound /v1/send_join rejects joins from other servers
+PASS Inbound federation rejects remote attempts to kick local users to rooms
+PASS Inbound federation rejects attempts to join v1 rooms from servers without v1 support
+PASS Inbound federation rejects attempts to join v2 rooms from servers lacking version support
+PASS Inbound federation rejects attempts to join v2 rooms from servers only supporting v1
+PASS Inbound federation accepts attempts to join v2 rooms from servers with support
+PASS Outbound federation correctly handles unsupported room versions
+PASS A pair of servers can establish a join in a v2 room
+PASS Outbound federation rejects send_join responses with no m.room.create event
+PASS Outbound federation rejects m.room.create events with an unknown room version
+PASS Event with an invalid signature in the send_join response should not cause room join to fail
+PASS Membership event with an invalid displayname in the send_join response should not cause room join to fail
+FAIL Inbound: send_join rejects invalid JSON for room version 6
+PASS Outbound federation can send events
+PASS Inbound federation can receive events
+PASS Inbound federation can receive redacted events
+FAIL Ephemeral messages received from servers are correctly expired
+FAIL Events whose auth_events are in the wrong room do not mess up the room state
+PASS Inbound federation can return events
+FAIL Inbound federation redacts events from erased users
+PASS Outbound federation can request missing events
+FAIL outliers whose auth_events are in a different room are correctly rejected
+PASS Outbound federation will ignore a missing event with bad JSON for room version 6
+PASS Outbound federation can backfill events
+PASS Inbound federation can backfill events
+FAIL Backfill checks the events requested belong to the room
+FAIL Backfilled events whose prev_events are in a different room do not allow cross-room back-pagination
+PASS Outbound federation rejects backfill containing invalid JSON for events in room version 6
+PASS Outbound federation can send invites via v1 API
+PASS Outbound federation can send invites via v2 API
+PASS Inbound federation can receive invites via v1 API
+PASS Inbound federation can receive invites via v2 API
+PASS Inbound federation can receive invite and reject when remote replies with a 403
+PASS Inbound federation can receive invite and reject when remote replies with a 500
+PASS Inbound federation can receive invite and reject when remote is unreachable
+FAIL Inbound federation rejects invites which are not signed by the sender
+PASS Inbound federation can receive invite rejections
+PASS Inbound federation rejects incorrectly-signed invite rejections
+PASS Inbound /v1/send_leave rejects leaves from other servers
+FAIL Inbound federation rejects invites which include invalid JSON for room version 6
+FAIL Outbound federation rejects invite response which include invalid JSON for room version 6
+FAIL Inbound federation rejects invite rejections which include invalid JSON for room version 6
+PASS Inbound federation can get state for a room
+PASS Inbound federation of state requires event_id as a mandatory paramater
+PASS Inbound federation can get state_ids for a room
+PASS Inbound federation of state_ids requires event_id as a mandatory paramater
+PASS Federation rejects inbound events where the prev_events cannot be found
+FAIL /state returns M_NOT_FOUND for an outlier
+FAIL /state_ids returns M_NOT_FOUND for an outlier
+FAIL /state returns M_NOT_FOUND for a rejected message event
+FAIL /state_ids returns M_NOT_FOUND for a rejected message event
+FAIL Room state after a rejected message event is the same as before
+FAIL /state returns M_NOT_FOUND for a rejected state event
+FAIL /state_ids returns M_NOT_FOUND for a rejected state event
+FAIL Room state after a rejected state event is the same as before
+FAIL Outbound federation requests missing prev_events and then asks for /state_ids and resolves the state
+FAIL Federation handles empty auth_events in state_ids sanely
+PASS Getting state checks the events requested belong to the room
+PASS Getting state IDs checks the events requested belong to the room
+FAIL Should not be able to take over the room by pretending there is no PL event
+PASS Inbound federation can get public room list
+PASS Outbound federation sends receipts
+PASS Inbound federation rejects receipts from wrong remote
+PASS Inbound federation ignores redactions from invalid servers room > v3
+FAIL An event which redacts an event in a different room should be ignored
+PASS An event which redacts itself should be ignored
+PASS A pair of events which redact each other should be ignored
+PASS Local device key changes get to remote servers
+FAIL Server correctly handles incoming m.device_list_update
+FAIL Server correctly resyncs when client query keys and there is no remote cache
+FAIL Server correctly resyncs when server leaves and rejoins a room
+PASS Local device key changes get to remote servers with correct prev_id
+FAIL Device list doesn't change if remote server is down
+FAIL If a device list update goes missing, the server resyncs on the next one
+FAIL Federation publicRoom Name/topic keys are correct
+PASS Remote servers cannot set power levels in rooms without existing powerlevels
+PASS Remote servers should reject attempts by non-creators to set the power levels
+PASS Inbound federation rejects typing notifications from wrong remote
+FAIL New federated private chats get full presence information (SYN-115)
+FAIL Forward extremities remain so even after the next events are populated as outliers
+PASS Banned servers cannot send events
+PASS Banned servers cannot /make_join
+PASS Banned servers cannot /send_join
+PASS Banned servers cannot /make_leave
+PASS Banned servers cannot /send_leave
+PASS Banned servers cannot /invite
+PASS Banned servers cannot get room state
+PASS Banned servers cannot get room state ids
+PASS Banned servers cannot backfill
+PASS Banned servers cannot /event_auth
+PASS Banned servers cannot get missing events
+PASS Server correctly handles transactions that break edu limits
+FAIL Inbound federation correctly soft fails events
+FAIL Inbound federation accepts a second soft-failed event
+FAIL Inbound federation correctly handles soft failed events as extremities

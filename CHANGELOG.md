@@ -11,6 +11,10 @@ Versions follow [semantic versioning](https://semver.org). Nothing is released y
 
 ## Unreleased
 
+- A user's profile and a room alias of another server are read through this server (`GET /profile/{userId}`, `GET /directory/room/{alias}`), and so is another server's public room list (`/publicRooms?server=`); the federation `/query/profile` answers the stored display name and avatar, and the federation `/publicRooms` lists the rooms published to the directory.
+- A join, leave, knock or invite that is not canonical JSON for its room version is `400 M_BAD_JSON` before its signature is checked; an unsigned invite is `403`.
+- Backfill from events of another room answers nothing; `/state` and `/state_ids` at a rejected event are `404`; an event citing a rejected event is readable and reaches `/sync`.
+
 Everything below exists on `main` and has never been tagged. The container image is published
 continuously to `ghcr.io/brandon-dacrib/myelin` as `main` and `sha-<commit>`, and the Helm chart
 to `oci://ghcr.io/brandon-dacrib/charts/hs` as a pre-release, `0.1.0-main.<run>.g<commit>`, that

@@ -18,6 +18,77 @@ to-device over federation (4); profile queries (2); server ACLs (2); `/room_summ
 `/_matrix/key/v2/query`, Unicode remote aliases, Complement's appservice user (4). Every name,
 the families and how it was run: status 14, session 6; the baseline is
 `docs/status/complement-federation-results.txt` (run 8).
+## Eighteenth session (2026-10-02, branch `agent/federation-query`): the query API, and what Sytest's federation files really fail
+
+**Stopped early: the owner rebooted the machine.** Everything below builds and its crate tests
+pass (`cargo test -p hs-auth --lib`, `-p hs-room --lib` (171), `-p hs-federation` (214+),
+`-p hs-cli --lib`, `--test federation_reads`, `--test federation_writes`,
+`--test federation_two_servers`; `cargo clippy` clean on the touched crates; `cargo fmt --check`).
+**Not yet re-measured on Sytest**: the branch's bookworm `hs` build was killed at the reboot
+notice, so every count here is the baseline, run this session with the federation files on
+`main`'s binary (`tests/50federation/*.pl`, `tests/30rooms/05aliases.pl`,
+`tests/30rooms/70publicroomslist.pl`; `docs/status/sytest/2026-10-02-federation-query-baseline-results.txt`
+and `-summary.txt`): **88 of 130, 42 failing** (13 of them timeouts, 9 "Unexpected response from
+/send"). A directory argument to `run-tests.pl` is ignored; the files must be listed.
+
+Done, each with a Rust test that fails without it, in commit order:
+
+1. **The query API** (`fqu` 1/4 -> expected 4/4). `GET /profile/{userId}[/field]` for a user of
+   another server asks that server's `/query/profile` (`hs_auth::state::RemoteProfileSource`,
+   installed by `hs serve` from `hs_cli::remote_profile` over the federation client; its `404` is
+   a `404`, an unreachable server `502 M_UNKNOWN`). `GET /directory/room/{alias}` for another
+   server's alias goes through `RemoteJoin::resolve_alias` (also "Remote room alias queries can
+   handle Unicode"). Inbound `/query/profile` answered `{}` for every user; it answers the stored
+   display name and avatar (`hs_cli::federation::ServerQuerySource::profile`). An X-Matrix
+   `origin` that is not a server name (`localhost:http`) is `400 M_INVALID_PARAM`, not `401`
+   ("Non-numeric ports in server names are rejected"). Real-binary test:
+   `federation_two_servers::a_remote_users_profile_and_a_remote_alias_are_asked_of_their_server`.
+2. **Canonical JSON before the signature**: `send_join`/`send_leave`/`send_knock` and a received
+   invite check the event against the room version's canonical JSON first (a float in a v6 room
+   is `400 M_BAD_JSON`; it was `403`); an invite with no signature from its sender is `403`; an
+   invite answered by the invitee's server with a float is `400 M_BAD_JSON` to the inviting
+   client (`OutboundJoinError::NotCanonicalJson`). Five Sytest tests.
+3. **Backfill from events that are not the room's answers no events** ("Backfill checks the
+   events requested belong to the room").
+4. **The public room directory**: the federation `/publicRooms` lists the rooms published to the
+   directory with the client-server entry shape (it listed `hs-user`'s join-rule proxy:
+   `RegistryRoomSource::new` lost its `directory` argument, as did `build_mount`);
+   `GET`/`POST /publicRooms?server=` asks that server over federation
+   (`RemoteJoin::public_rooms`). `/state` and `/state_ids` at a rejected event are `404`.
+5. **An event citing a rejected event as its prev event** is read at the state before the
+   rejected one everywhere (`/state[_ids]`, the history-visibility check every client read
+   applies, `replaced_state_event`): it was a `404` to federation and invisible to `/sync`, which
+   is why the six rejected-event tests timed out.
+6. **In progress -- the `/state_ids` fallback for a missing prev event** (`hs-room`,
+   `actor::fetched_state`, done and tested; the federation side not written). The room side:
+   `RoomActor::accept_prev_event_with_state(prev, state_before_ids, fetched)` holds a missing prev
+   event as an outlier with the state another server answered for it (every fetched event
+   authorised against its own auth events, a refused one stored rejected and left out; a durable
+   `state_snapshots` row, read back on load), and an event citing it is then accepted ordinarily
+   and fed to the state store with its resolved state (`PersistKind::AfterFetchedState`), keeping
+   the old extremities. `authorize_remote_at` takes a `StateBefore` (prev events, explicit, none).
+   **Left**: in `hs-federation`, `AncestorFetcher::{fetch_state_ids, fetch_event, fetch_state}`
+   (the client has `state_ids`, `event`, `room_state`), `RoomWriteSink::{knows_event,
+   accept_prev_event_with_state}`, and a `resolve_through_state` step in `inbound.rs` after
+   `resolve_missing_ancestors` gives up: for each prev event of the received event the sink lacks
+   (at most ~5), `/state_ids` at it, `/event` for what is missing, then the sink; then retry the
+   event. Sytest's server answers `/backfill` with `404`, which is why nine tests fail with
+   "Unexpected response from /send: missing ancestor ... HTTP 404"; this closes those, the two
+   outlier `/state` tests, "Forward extremities remain so ...", "Outbound federation requests
+   missing prev_events and then asks for /state_ids ...", "Federation handles empty auth_events
+   in state_ids sanely" and "Should not be able to take over the room ..." (the room-side test for
+   that one passes).
+
+Still failing on the baseline and not touched: soft failure (3; needs a soft-failed flag in
+`hs-model`, hs-room keeping such events out of every client read, sync included), device lists
+(5, `agent/e2ee-sytest`), ephemeral messages (MSC2228), erased users' events redacted over
+federation, the cross-room redaction, "New federated private chats get full presence
+information", and the two `30rooms` tests "Can delete canonical alias" and "Can paginate public
+room list" (hs-room, not federation).
+
+Known-gaps rows: none of key server `{keyId}`, server ACLs, v1/v2 rooms, rejected PDU `{}` were
+touched this session (all four were closed in the sixteenth and seventeenth sessions).
+
 ## Seventeenth session (2026-10-01): the rows Sytest's second run left
 
 **Branch:** `agent/federation-sytest-2`, from `agent/federation-sytest` (`8a01fb5`). Closes the
