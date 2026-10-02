@@ -21,7 +21,7 @@ test.describe("room lifecycle", () => {
     await expect(page.getByText("Blocked because")).toBeVisible();
     await expectNoAxeViolations(page, "blocked room with a reason");
 
-    await page.goto("/admin/rooms/!general-v6:example.org");
+    await page.goto("/admin/rooms/!watercooler-v6:example.org");
     await expect(page.getByText("Upgraded", { exact: true })).toBeVisible();
     await expect(page.getByText(/This room was upgraded and closed/)).toBeVisible();
     await page.getByRole("link", { name: "!general:example.org" }).first().click();

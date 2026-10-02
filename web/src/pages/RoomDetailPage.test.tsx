@@ -43,7 +43,7 @@ describe("Room lifecycle", () => {
   });
 
   it("says an upgraded room is closed and links its successor", async () => {
-    const { router } = await open("/rooms/!general-v6:example.org");
+    const { router } = await open("/rooms/!watercooler-v6:example.org");
     expect(screen.getByText("Upgraded")).toBeInTheDocument();
     expect(screen.getByText(/This room was upgraded and closed/)).toBeInTheDocument();
     expect(screen.getByText("Upgraded to")).toBeInTheDocument();

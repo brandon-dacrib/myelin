@@ -235,7 +235,7 @@ may not join") with what a guest is. Block asks for a reason (optional, explaine
 the badge and kept in the audit log); the badge then reads "Blocked: Spam ring" and a "Blocked
 because" fact repeats it, "No reason was given." when none was. The Block dialog also says what
 blocking does and does not do (members stay; delete removes them; Unblock reverses it). Mock:
-`!general-v6:example.org`, General before its upgrade, tombstoned to `!general`; block keeps
+`!watercooler-v6:example.org`, the watercooler before its upgrade, tombstoned to `!general`; block keeps
 the reason, unblock clears it. Verified against the real binary: a room made and upgraded
 through the client API shows Upgraded, "Guests may join" and the successor link, Block with a
 reason is read back as `blocked_reason` from `GET /rooms/{id}`, and the link opens the successor

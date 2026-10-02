@@ -98,10 +98,10 @@ export const rooms: Room[] = [
     forgotten: false,
   },
   {
-    // General before its upgrade: closed, pointing at the room that replaced it.
-    room_id: "!general-v6:example.org",
-    name: "General (old)",
-    topic: "Company-wide announcements",
+    // The watercooler before its upgrade: closed, pointing at the room that replaced it.
+    room_id: "!watercooler-v6:example.org",
+    name: "Watercooler (closed)",
+    topic: "Chat about anything",
     avatar_url: null,
     canonical_alias: null,
     joined_members_count: 3,
