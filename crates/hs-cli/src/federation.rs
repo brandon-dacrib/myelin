@@ -1107,12 +1107,22 @@ impl<B: KvBackend + 'static> FederationQuerySource for ServerQuerySource<B> {
     async fn profile(&self, user_id: &str, field: Option<&str>) -> Option<Value> {
         let parsed = ruma::UserId::parse(user_id).ok()?;
         // An existing local user with nothing set gets an empty profile, not a 404: "this user
-        // exists and has no display name" and "no such user" are different answers, and this
-        // server has no profile storage at all yet (no `/profile` route exists on the
-        // client-server side either), so every local user is the first case.
-        self.auth.get_user(&parsed).await.ok().flatten()?;
+        // exists and has no display name" and "no such user" are different answers. A field
+        // never set is left out, as the client-server `/profile` leaves it out.
+        let record = self.auth.get_user(&parsed).await.ok().flatten()?;
+        let mut profile = serde_json::Map::new();
+        if field.is_none_or(|f| f == "displayname")
+            && let Some(name) = record.display_name
+        {
+            profile.insert("displayname".to_owned(), Value::String(name));
+        }
+        if field.is_none_or(|f| f == "avatar_url")
+            && let Some(avatar) = record.avatar_url
+        {
+            profile.insert("avatar_url".to_owned(), Value::String(avatar));
+        }
         match field {
-            Some("displayname" | "avatar_url") | None => Some(serde_json::json!({})),
+            Some("displayname" | "avatar_url") | None => Some(Value::Object(profile)),
             Some(_) => None,
         }
     }

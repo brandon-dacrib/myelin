@@ -12,10 +12,12 @@
 //!   an explicit `null` (`serde_json`'s `Value` construction below only inserts a key when the
 //!   stored value is `Some`).
 //!
-//! This server only serves local users' profiles here (no federation profile-query fallback for
-//! a remote `userId`; that would be track 06's `query/profile` federation client call, out of
-//! scope for this crate). A `PUT` for a remote user id is also `M_FORBIDDEN` since it can never
-//! equal the local requester's own id.
+//! A `GET` for a user of another server is answered by that server, through the
+//! [`crate::state::RemoteProfileSource`] `hs serve` installs when federation is on (the
+//! federation `/query/profile` call this crate cannot make itself): its `404` is a `404` here,
+//! and a server that cannot be asked is `502 M_UNKNOWN`, as Synapse answers. Without one
+//! installed, a remote user is `404 M_NOT_FOUND`. A `PUT` for a remote user id is `M_FORBIDDEN`
+//! since it can never equal the local requester's own id.
 //!
 //! # This module owns the storage write; `hs-room` owns mounting the `PUT`s
 //!
@@ -49,6 +51,33 @@ fn parse_user_id(raw: &str) -> Result<ruma::OwnedUserId, MatrixError> {
     UserId::parse(raw).map_err(|e| MatrixError::invalid_param(format!("invalid user_id: {e}")))
 }
 
+/// A remote user's profile from their server, narrowed to `field`, or `None` when `user_id` is
+/// one of this server's own users (the caller reads the store then). See the module docs.
+async fn remote_profile(
+    state: &AuthState,
+    user_id: &UserId,
+    field: Option<&str>,
+) -> Result<Option<Value>, MatrixError> {
+    if user_id.server_name() == state.server_name() {
+        return Ok(None);
+    }
+    let Some(source) = state.remote_profiles() else {
+        return Err(MatrixError::not_found(format!("{user_id} not found")));
+    };
+    match source.remote_profile(user_id, field).await {
+        Ok(Some(profile)) => Ok(Some(profile)),
+        Ok(None) => Err(MatrixError::not_found(format!("{user_id} not found"))),
+        Err(reason) => {
+            tracing::info!(%user_id, reason, "could not fetch a remote user's profile");
+            Err(MatrixError::new(
+                axum::http::StatusCode::BAD_GATEWAY,
+                crate::error::ErrCode::Unknown,
+                "Failed to fetch profile",
+            ))
+        }
+    }
+}
+
 async fn load_user(state: &AuthState, user_id: &UserId) -> Result<UserRecord, MatrixError> {
     state
         .store
@@ -71,6 +100,9 @@ pub async fn get_profile(
     Path(user_id): Path<String>,
 ) -> Result<Response, MatrixError> {
     let uid = parse_user_id(&user_id)?;
+    if let Some(profile) = remote_profile(&state, &uid, None).await? {
+        return Ok(Json(profile).into_response());
+    }
     let record = load_user(&state, &uid).await?;
     let mut body = json!({});
     if let Some(name) = record.display_name {
@@ -88,6 +120,9 @@ pub async fn get_displayname(
     Path(user_id): Path<String>,
 ) -> Result<Response, MatrixError> {
     let uid = parse_user_id(&user_id)?;
+    if let Some(profile) = remote_profile(&state, &uid, Some("displayname")).await? {
+        return Ok(Json(profile).into_response());
+    }
     let record = load_user(&state, &uid).await?;
     let mut body = json!({});
     if let Some(name) = record.display_name {
@@ -132,6 +167,9 @@ pub async fn get_avatar_url(
     Path(user_id): Path<String>,
 ) -> Result<Response, MatrixError> {
     let uid = parse_user_id(&user_id)?;
+    if let Some(profile) = remote_profile(&state, &uid, Some("avatar_url")).await? {
+        return Ok(Json(profile).into_response());
+    }
     let record = load_user(&state, &uid).await?;
     let mut body = json!({});
     if let Some(avatar) = record.avatar_url {
@@ -171,6 +209,7 @@ mod tests {
     use super::*;
     use axum::http::StatusCode;
     use ruma::user_id;
+    use std::sync::Arc;
 
     async fn state_with_user() -> AuthState {
         let state = AuthState::in_memory();
@@ -199,6 +238,124 @@ mod tests {
         assert!(json.get("displayname").is_none());
         assert!(json.get("avatar_url").is_none());
         assert_eq!(json, json!({}));
+    }
+
+    /// A stand-in for the other server: answers one user, with what it was asked for.
+    struct RemoteServer {
+        asked: std::sync::Mutex<Vec<(String, Option<String>)>>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::state::RemoteProfileSource for RemoteServer {
+        async fn remote_profile(
+            &self,
+            user_id: &UserId,
+            field: Option<&str>,
+        ) -> Result<Option<Value>, String> {
+            self.asked
+                .lock()
+                .unwrap()
+                .push((user_id.to_string(), field.map(str::to_owned)));
+            if self.fail {
+                return Err("connection refused".into());
+            }
+            if user_id.as_str() != "@bob:remote.example" {
+                return Ok(None);
+            }
+            Ok(Some(match field {
+                Some("displayname") => json!({"displayname": "Bob"}),
+                Some("avatar_url") => json!({"avatar_url": "mxc://remote.example/bob"}),
+                _ => json!({"displayname": "Bob", "avatar_url": "mxc://remote.example/bob"}),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_remote_users_profile_comes_from_their_server() {
+        let state = state_with_user().await;
+        let remote = Arc::new(RemoteServer {
+            asked: std::sync::Mutex::new(Vec::new()),
+            fail: false,
+        });
+        state.install_remote_profiles(remote.clone());
+
+        let response = get_displayname(
+            State(state.clone()),
+            Path("@bob:remote.example".to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&bytes).unwrap(),
+            json!({"displayname": "Bob"})
+        );
+        let response = get_profile(
+            State(state.clone()),
+            Path("@bob:remote.example".to_string()),
+        )
+        .await
+        .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&bytes).unwrap(),
+            json!({"displayname": "Bob", "avatar_url": "mxc://remote.example/bob"})
+        );
+        // The other server's 404 is this server's 404.
+        let err = get_avatar_url(
+            State(state.clone()),
+            Path("@nobody:remote.example".to_string()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
+        // A local user is never asked of another server.
+        get_profile(State(state.clone()), Path("@alice:example.org".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(
+            *remote.asked.lock().unwrap(),
+            vec![
+                (
+                    "@bob:remote.example".to_string(),
+                    Some("displayname".to_string())
+                ),
+                ("@bob:remote.example".to_string(), None),
+                (
+                    "@nobody:remote.example".to_string(),
+                    Some("avatar_url".to_string())
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_remote_server_that_cannot_be_asked_is_a_bad_gateway_and_none_installed_is_not_found()
+    {
+        let state = AuthState::in_memory();
+        let err = get_displayname(
+            State(state.clone()),
+            Path("@bob:remote.example".to_string()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
+
+        state.install_remote_profiles(Arc::new(RemoteServer {
+            asked: std::sync::Mutex::new(Vec::new()),
+            fail: true,
+        }));
+        let err = get_displayname(State(state), Path("@bob:remote.example".to_string()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(err.errcode().as_str(), "M_UNKNOWN");
     }
 
     #[tokio::test]

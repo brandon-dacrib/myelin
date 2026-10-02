@@ -64,6 +64,27 @@ pub trait UserDirectoryVisibility: Send + Sync {
     ) -> Result<std::collections::BTreeSet<ruma::OwnedUserId>, String>;
 }
 
+/// Where `GET /profile/{userId}`, `/displayname` and `/avatar_url` get the profile of a user of
+/// another server: that server, over federation (`GET /_matrix/federation/v1/query/profile`).
+/// This crate cannot speak federation (`hs-federation` is a peer, and `hs serve` is where the
+/// two meet), so, like [`UserDirectoryVisibility`], the question is a trait defined here and
+/// answered from outside, installed by `hs serve` through [`AuthState::install_remote_profiles`]
+/// when federation is on. Unset, a remote user's profile is `404 M_NOT_FOUND`, as before.
+#[async_trait::async_trait]
+pub trait RemoteProfileSource: Send + Sync {
+    /// `user_id`'s profile as their server answers it, narrowed to `field` (`displayname` or
+    /// `avatar_url`) when one is given. `Ok(None)` when that server does not know the user.
+    ///
+    /// # Errors
+    /// Why the server could not be asked, or answered with something other than a profile or a
+    /// `404`; the client gets `502`.
+    async fn remote_profile(
+        &self,
+        user_id: &UserId,
+        field: Option<&str>,
+    ) -> Result<Option<serde_json::Value>, String>;
+}
+
 /// Everything a handler needs: storage, the appservice registry, rate limiting, config and a
 /// clock, all behind `Arc` so `AuthState` itself is cheap to clone (axum requires `State<S>: Clone`).
 #[derive(Clone)]
@@ -110,6 +131,8 @@ pub struct AuthState {
     pub(crate) user_directory_visibility: Arc<OnceLock<Arc<dyn UserDirectoryVisibility>>>,
     /// See [`SessionRevocationObserver`] and [`AuthState::install_session_revocation_observer`].
     pub(crate) session_revocation_observer: Arc<OnceLock<Arc<dyn SessionRevocationObserver>>>,
+    /// See [`RemoteProfileSource`] and [`AuthState::install_remote_profiles`].
+    pub(crate) remote_profiles: Arc<OnceLock<Arc<dyn RemoteProfileSource>>>,
 }
 
 impl AuthState {
@@ -131,6 +154,7 @@ impl AuthState {
             device_list_notifier: Arc::new(OnceLock::new()),
             user_directory_visibility: Arc::new(OnceLock::new()),
             session_revocation_observer: Arc::new(OnceLock::new()),
+            remote_profiles: Arc::new(OnceLock::new()),
         }
     }
 
@@ -263,6 +287,24 @@ impl AuthState {
     #[must_use]
     pub fn user_directory_visibility(&self) -> Option<&Arc<dyn UserDirectoryVisibility>> {
         self.user_directory_visibility.get()
+    }
+
+    /// Installs where a remote user's profile is asked for (`hs serve`, over federation). Same
+    /// one-installer convention as [`AuthState::install_device_list_notifier`].
+    pub fn install_remote_profiles(&self, source: Arc<dyn RemoteProfileSource>) {
+        if self.remote_profiles.set(source).is_err() {
+            tracing::warn!(
+                "a remote profile source was already installed on this auth state; ignoring the \
+                 second install"
+            );
+        }
+    }
+
+    /// The installed [`RemoteProfileSource`], if any. `None` means this process cannot ask
+    /// other servers (federation off, or a test of this crate alone).
+    #[must_use]
+    pub fn remote_profiles(&self) -> Option<&Arc<dyn RemoteProfileSource>> {
+        self.remote_profiles.get()
     }
 
     /// The installed [`DeviceListChangeNotifier`], if any.

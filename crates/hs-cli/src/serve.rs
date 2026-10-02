@@ -1731,6 +1731,11 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             rooms.clone(),
             identity.clone(),
         )));
+        // And how `GET /profile/{userId}` reaches a user of another server
+        // (`crate::remote_profile`): the same client.
+        auth_state.install_remote_profiles(Arc::new(
+            crate::remote_profile::FederationRemoteProfile::new(mount.client.clone()),
+        ));
         // And how `GET /messages` reaches the history of such a room from before the join
         // (`crate::backfill`): the same client, the same key cache.
         // The registry holds it weakly ([`WeakBackfill`]): the backfill holds the registry, and

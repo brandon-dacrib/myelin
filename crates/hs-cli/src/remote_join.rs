@@ -246,7 +246,7 @@ fn map_outbound_error(error: &OutboundJoinError) -> RoomError {
 }
 
 /// Percent-encodes `value` for a query string: everything but the unreserved characters.
-fn query_encode(value: &str) -> String {
+pub(crate) fn query_encode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
         match byte {

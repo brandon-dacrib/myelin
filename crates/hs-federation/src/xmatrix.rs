@@ -247,6 +247,9 @@ pub fn sign_request(
 )]
 enum VerifyError {
     Parse(XMatrixParseError),
+    /// The `origin` is not a server name (`localhost:http`, say): there is nothing to look a key
+    /// up for, and the request is malformed rather than unauthorised.
+    BadOrigin,
     WrongDestination,
     BodyTooLarge,
     BadJsonBody,
@@ -261,6 +264,11 @@ impl IntoResponse for VerifyError {
                 StatusCode::PAYLOAD_TOO_LARGE,
                 MatrixErrorCode::TooLarge,
                 "request body exceeds the federation size limit",
+            ),
+            VerifyError::BadOrigin => MatrixError::custom(
+                StatusCode::BAD_REQUEST,
+                MatrixErrorCode::InvalidParam,
+                "the X-Matrix origin is not a valid server name",
             ),
             _ => MatrixError::custom(
                 StatusCode::UNAUTHORIZED,
@@ -324,6 +332,11 @@ fn signed_uri(req: &Request<Body>) -> String {
 
 async fn do_verify(ctx: &XMatrixContext, req: Request<Body>) -> Result<Request<Body>, VerifyError> {
     let auth = parse_x_matrix_header(req.headers()).map_err(VerifyError::Parse)?;
+    // A server name's port is a number: `localhost:http` names nothing a key could be fetched
+    // from (Sytest's "Non-numeric ports in server names are rejected").
+    if ruma::ServerName::parse(&auth.origin).is_err() {
+        return Err(VerifyError::BadOrigin);
+    }
     if auth.destination != ctx.own_server_name {
         return Err(VerifyError::WrongDestination);
     }
@@ -548,6 +561,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Sytest's "Non-numeric ports in server names are rejected": `localhost:http` is not a
+    /// server name, and the answer is a `400`, not a `401` for a key that could not be fetched.
+    #[tokio::test]
+    async fn an_origin_that_is_not_a_server_name_is_a_bad_request() {
+        let (keys, _dir) = origin_keys();
+        let key_cache = cache_with_origin("origin.example.org", &keys).await;
+        let ctx = Arc::new(XMatrixContext {
+            own_server_name: "dest.example.org".to_string(),
+            key_cache,
+        });
+        let app = test_app(ctx);
+        let header = build_x_matrix_header(&XMatrixAuth {
+            origin: "localhost:http".to_string(),
+            destination: "dest.example.org".to_string(),
+            key_id: "ed25519:1".to_string(),
+            sig: "AAAA".to_string(),
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/_matrix/federation/v1/query/profile?user_id=%40a%3Adest.example.org")
+                    .header(AUTHORIZATION, header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["errcode"], "M_INVALID_PARAM");
     }
 
     #[tokio::test]

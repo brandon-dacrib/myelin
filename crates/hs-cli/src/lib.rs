@@ -41,6 +41,7 @@ pub mod push_delivery;
 pub mod recover;
 pub mod register;
 pub mod remote_join;
+pub mod remote_profile;
 pub mod room_admin;
 pub mod serve;
 pub mod server_notices;

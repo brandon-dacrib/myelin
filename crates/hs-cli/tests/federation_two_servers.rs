@@ -891,3 +891,114 @@ async fn joining_through_a_server_that_does_not_know_the_room_is_not_found() {
     a.handle.shutdown().await;
     b.handle.shutdown().await;
 }
+
+/// Sytest's "Outbound/Inbound federation can query profile data" and "... room alias directory",
+/// between two real servers: a profile and an alias of A's user and room, read through B's
+/// client API, come from A over `/query/profile` and `/query/directory`; a user and an alias A
+/// does not have are `404`s on B too.
+#[tokio::test]
+async fn a_remote_users_profile_and_a_remote_alias_are_asked_of_their_server() {
+    let port_a = reserve_port();
+    let port_b = reserve_port();
+    let a = start(port_a).await;
+    let b = start(port_b).await;
+    let client = reqwest::Client::new();
+    let (alice, alice_token) = register(&client, &a.base, "alice").await;
+    let (_bob, bob_token) = register(&client, &b.base, "bob").await;
+
+    let put = client
+        .put(format!(
+            "{}/_matrix/client/v3/profile/{alice}/displayname",
+            a.base
+        ))
+        .bearer_auth(&alice_token)
+        .json(&json!({"displayname": "Displayname Set For Federation Test"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put.status(), 200);
+    let created: Value = client
+        .post(format!("{}/_matrix/client/v3/createRoom", a.base))
+        .bearer_auth(&alice_token)
+        .json(&json!({"preset": "public_chat", "room_alias_name": "☕"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let room_id = created["room_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("createRoom failed: {created}"))
+        .to_owned();
+
+    // B asks A for alice's display name, her whole profile, and the alias.
+    let displayname: Value = client
+        .get(format!(
+            "{}/_matrix/client/v3/profile/{alice}/displayname",
+            b.base
+        ))
+        .bearer_auth(&bob_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        displayname,
+        json!({"displayname": "Displayname Set For Federation Test"})
+    );
+    let profile: Value = client
+        .get(format!("{}/_matrix/client/v3/profile/{alice}", b.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        profile,
+        json!({"displayname": "Displayname Set For Federation Test"})
+    );
+    let alias = format!("%23%E2%98%95:{}", a.name);
+    let directory: Value = client
+        .get(format!(
+            "{}/_matrix/client/v3/directory/room/{alias}",
+            b.base
+        ))
+        .bearer_auth(&bob_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(directory["room_id"], room_id, "{directory}");
+    assert_eq!(directory["servers"], json!([a.name]), "{directory}");
+
+    // What A does not have is not found on B either.
+    let unknown = client
+        .get(format!(
+            "{}/_matrix/client/v3/profile/@nobody:{}/avatar_url",
+            b.base, a.name
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), 404);
+    let unknown = client
+        .get(format!(
+            "{}/_matrix/client/v3/directory/room/%23nowhere:{}",
+            b.base, a.name
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), 404);
+    let body: Value = unknown.json().await.unwrap();
+    assert_eq!(body["errcode"], "M_NOT_FOUND", "{body}");
+
+    a.handle.shutdown().await;
+    b.handle.shutdown().await;
+}
