@@ -176,3 +176,56 @@ test.describe("Overview health against the real server", () => {
     await page.screenshot({ path: "test-results/real-overview-health.png" });
   });
 });
+
+test.describe("Exact lookup and the username check against the real server", () => {
+  test.skip(
+    !process.env.HS_REAL_SERVER_URL || !adminToken,
+    "HS_REAL_SERVER_URL and HS_REAL_ADMIN_TOKEN not set",
+  );
+
+  test("an email the server holds opens the account; the username check says what it can", async ({
+    page,
+    request,
+  }) => {
+    const localpart = `find-${run}`;
+    const { user_id } = await makeUser(request, localpart, "Find Me");
+    const address = `${localpart}@example.org`;
+    const added = await request.post(`/api/v1/users/${encodeURIComponent(user_id)}/threepids`, {
+      headers: authed(),
+      data: { medium: "email", address },
+    });
+    expect(added.ok(), await added.text()).toBe(true);
+
+    await signIn(page);
+    await page.goto("/admin/users");
+    await page.getByText("Find by email, phone or sign-in provider").click();
+    await page.getByLabel(/^Email address/).fill(address);
+    await page.getByRole("button", { name: "Find the account" }).click();
+    await expect(page.getByRole("heading", { name: "Find Me" })).toBeVisible();
+
+    await page.goto("/admin/users");
+    await page.getByText("Find by email, phone or sign-in provider").click();
+    await page.getByLabel(/^Email address/).fill(`nobody-${run}@example.org`);
+    await page.getByRole("button", { name: "Find the account" }).click();
+    await expect(page.getByRole("status")).toHaveText(
+      `No account has nobody-${run}@example.org as a verified email address.`,
+    );
+
+    // The username check: this server's directory answers 503, and the dialog says so.
+    const availability = await request.get(`/api/v1/users/availability?localpart=${localpart}`, {
+      headers: authed(),
+    });
+    await page.getByRole("button", { name: "Add user" }).click();
+    const dialog = page.getByRole("dialog", { name: "Add a user" });
+    await dialog.getByLabel(/^Username/).fill(localpart);
+    if (availability.status() === 503) {
+      await expect(
+        dialog.getByText(/can’t check usernames in advance; a taken one is refused on Create/),
+      ).toBeVisible();
+    } else {
+      await expect(dialog.getByText(`${user_id} is taken.`)).toBeVisible();
+    }
+    await settle(page);
+    await page.screenshot({ path: "test-results/real-add-user-availability.png" });
+  });
+});

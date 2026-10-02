@@ -247,3 +247,42 @@ export function useUpdateUser() {
     onSuccess: (_data, { userId }) => invalidateUser(qc, userId),
   });
 }
+
+/** What `users.lookup` can be asked for: a verified email or phone, or a sign-in provider's subject. */
+export type UserLookup =
+  | { kind: "email" | "msisdn"; address: string }
+  | { kind: "external"; provider: string; externalId: string };
+
+/**
+ * The one account that has exactly this email, phone number or sign-in identity
+ * (`GET /users/lookup`), or `null` when none has: the server's `404` is an answer here, not a
+ * fault. The list's search matches names and IDs loosely; this is for when an administrator
+ * holds the exact address a person signed up with.
+ */
+export async function lookupUser(lookup: UserLookup): Promise<User | null> {
+  const query =
+    lookup.kind === "external"
+      ? { provider: lookup.provider, external_id: lookup.externalId }
+      : { medium: lookup.kind, address: lookup.address };
+  const result = await api.GET("/users/lookup", { params: { query } });
+  if (result.response.status === 404) return null;
+  return unwrap(result);
+}
+
+/**
+ * Whether `localpart` is free (`GET /users/availability`), asked while an administrator types a
+ * username. A server whose user directory cannot check in advance answers `503`; the caller
+ * says so instead of pretending to know.
+ */
+export function useLocalpartAvailability(localpart: string) {
+  return useQuery({
+    queryKey: ["localpart-availability", localpart],
+    enabled: localpart.length > 0,
+    queryFn: async () => {
+      const result = await api.GET("/users/availability", { params: { query: { localpart } } });
+      return unwrap(result).available ?? null;
+    },
+    staleTime: 15_000,
+    retry: false,
+  });
+}

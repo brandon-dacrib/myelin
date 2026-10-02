@@ -13,6 +13,7 @@ import { QueryProblemState } from "@/components/QueryProblemState";
 import { RelativeTime } from "@/components/RelativeTime";
 import { hasScope } from "@/lib/auth";
 import { AddUserDialog } from "./users/AddUserDialog";
+import { LookupUser } from "./users/LookupUser";
 import { CreateTokenDialog } from "./settings/CreateTokenDialog";
 
 /** `/users` — flows.md flow 2: find and deal with a user. */
@@ -179,6 +180,8 @@ export function UsersPage() {
           </Button>
         )}
       </form>
+
+      <LookupUser />
 
       <div className="mt-3 flex items-center gap-2">
         <Switch

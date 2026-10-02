@@ -1090,6 +1090,45 @@ export const handlers = [
     users.push(created);
     return HttpResponse.json(created, { status: 201 });
   }),
+  // Before `/users/:user_id`: MSW matches in order, and these would otherwise be a user id.
+  http.get(`${API}/users/lookup`, ({ request }) => {
+    const url = new URL(request.url);
+    const medium = url.searchParams.get("medium");
+    const address = url.searchParams.get("address");
+    const provider = url.searchParams.get("provider");
+    const externalId = url.searchParams.get("external_id");
+    const bothOrNeither = (a: string | null, b: string | null) => (a === null) === (b === null);
+    if (!bothOrNeither(medium, address) || !bothOrNeither(provider, externalId))
+      return problem(400, "validation-failed", "Validation failed", {
+        detail: "medium and address must both be given, or neither",
+      });
+    if ((medium === null) === (provider === null))
+      return problem(400, "validation-failed", "Validation failed", {
+        detail: "exactly one of (medium, address) or (provider, external_id) is required",
+      });
+    const owner =
+      medium !== null
+        ? Object.entries(userThreepids).find(([, list]) =>
+            list.some(
+              (t) => t.medium === medium && t.address.toLowerCase() === address!.toLowerCase(),
+            ),
+          )?.[0]
+        : Object.entries(userExternalIds).find(([, list]) =>
+            list.some((e) => e.provider === provider && e.external_id === externalId),
+          )?.[0];
+    const user = owner ? findUser(owner) : undefined;
+    return user
+      ? HttpResponse.json(user)
+      : problem(404, "not-found", "Not found", { detail: "no user matches the given criteria" });
+  }),
+  http.get(`${API}/users/availability`, ({ request }) => {
+    const localpart = new URL(request.url).searchParams.get("localpart");
+    if (!localpart)
+      return problem(400, "validation-failed", "Validation failed", {
+        errors: [{ pointer: "param:localpart", detail: "localpart is required" }],
+      });
+    return HttpResponse.json({ available: !findUser(`@${localpart.toLowerCase()}:example.org`) });
+  }),
   http.get(`${API}/users/:user_id`, ({ params }) => {
     const user = findUser(decodeURIComponent(String(params.user_id)));
     if (!user)

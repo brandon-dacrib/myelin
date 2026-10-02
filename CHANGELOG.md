@@ -70,6 +70,11 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
   `GET /server/health`, which nothing called before, is a card at the top of Health: the
   overall state, each check named in words with what its state means, and an Attention row
   when the server is degraded or down. Verified against `hs serve`.
+- **An account can be found by the exact email, phone or sign-in identity it holds, and Add
+  user says as you type whether a username is free** (2026-10-02, `agent/web-items`). The Users
+  page's "Find by email, phone or sign-in provider" opens the one matching account or says
+  nobody has it; the username check says free, taken, or that this server cannot check in
+  advance (its directory answers 503 today), honestly. Verified against `hs serve`.
 - **The management interface explains itself** (2026-10-01, `agent/web-admin-ui`). Every
   configuration setting carries a badge from the server's own classification (applies on save,
   needs a restart, or per replica from the file or environment), each class is explained once

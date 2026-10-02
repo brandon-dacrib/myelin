@@ -23,12 +23,14 @@ test.describe("add user", () => {
 
     // Refused first, so the error state is checked too.
     await dialog.getByLabel(/^Username/).fill("alice");
+    await expect(dialog.getByText("@alice:example.org is taken.")).toBeVisible();
     await dialog.getByRole("button", { name: "Generate" }).click();
     await dialog.getByRole("button", { name: "Create account" }).click();
     await expect(dialog.getByText("@alice:example.org already exists")).toBeVisible();
     await expectNoAxeViolations(page, "add user dialog, username taken");
 
     await dialog.getByLabel(/^Username/).fill("carol");
+    await expect(dialog.getByText("@carol:example.org is free.")).toBeVisible();
     await dialog.getByLabel(/^Display name/).fill("Carol D");
     const password = await dialog.getByLabel(/^Password/).inputValue();
     expect(password).toHaveLength(20);

@@ -1,6 +1,9 @@
 import { useId, useState, type FormEvent } from "react";
 import { Link } from "@tanstack/react-router";
-import { useCreateUser, type User } from "@/api/users";
+import { useCreateUser, useLocalpartAvailability, type User } from "@/api/users";
+import { useServerInfo } from "@/api/dashboard";
+import { classifyError } from "@/api/problem";
+import { useDebouncedValue } from "@/lib/use-debounced-value";
 import { ApiProblemError } from "@/api/problem";
 import { generatePassword } from "@/lib/password";
 import { Button } from "@/components/ui/button/Button";
@@ -10,6 +13,28 @@ import { Switch } from "@/components/ui/switch/Switch";
 import { CopyableId } from "@/components/CopyableId";
 
 type FieldName = "username" | "password";
+
+/**
+ * The live username check in a sentence: free, taken, or that this server cannot say in
+ * advance (its user directory answers `503`), in which case a taken name is refused on Create.
+ */
+function describeAvailability(
+  localpart: string,
+  serverName: string | undefined,
+  availability: { data?: boolean | null; isError: boolean; error: unknown; isFetching: boolean },
+): string | null {
+  if (!localpart) return null;
+  const id = `@${localpart}:${serverName ?? "this server"}`;
+  if (availability.isError) {
+    const { kind } = classifyError(availability.error);
+    return kind === "unavailable" || kind === "not-implemented"
+      ? "This server can’t check usernames in advance; a taken one is refused on Create."
+      : null;
+  }
+  if (availability.data === true) return `${id} is free.`;
+  if (availability.data === false) return `${id} is taken.`;
+  return availability.isFetching ? `Checking ${id}…` : null;
+}
 
 const FIELD_FOR_POINTER: Record<string, FieldName> = {
   "/localpart": "username",
@@ -43,6 +68,13 @@ export function AddUserDialog({
   const [admin, setAdmin] = useState(false);
   const [error, setError] = useState<{ message: string; field: FieldName | null } | null>(null);
   const [created, setCreated] = useState<{ user: User; password: string } | null>(null);
+  const serverName = useServerInfo().data?.name;
+  // Asked once the typing pauses, for a username that could be one at all.
+  const localpart = useDebouncedValue(username.trim().replace(/^@/, "").split(":")[0] ?? "", 400);
+  const availability = useLocalpartAvailability(
+    /^[a-z0-9._=\-/+]+$/.test(localpart) ? localpart : "",
+  );
+  const availabilityNote = describeAvailability(localpart, serverName, availability);
 
   function reset() {
     setUsername("");
@@ -153,7 +185,10 @@ export function AddUserDialog({
         <form className="flex flex-col gap-4" onSubmit={handleSubmit} noValidate>
           <Field
             label="Username"
-            hint="Lowercase letters and digits. They’ll be @username on this server."
+            hint={
+              availabilityNote ??
+              "Lowercase letters and digits. They’ll be @username on this server."
+            }
             error={fieldError("username")}
             required
           >
@@ -164,7 +199,11 @@ export function AddUserDialog({
                 autoCapitalize="none"
                 spellCheck={false}
                 value={username}
-                onChange={(e) => setUsername(e.target.value)}
+                onChange={(e) => {
+                  setUsername(e.target.value);
+                  // A refusal about the old name is not about this one.
+                  if (error?.field === "username") setError(null);
+                }}
               />
             )}
           </Field>
@@ -188,7 +227,10 @@ export function AddUserDialog({
                   spellCheck={false}
                   className={passwordVisible ? "font-identifier" : undefined}
                   value={password}
-                  onChange={(e) => setPassword(e.target.value)}
+                  onChange={(e) => {
+                    setPassword(e.target.value);
+                    if (error?.field === "password") setError(null);
+                  }}
                 />
                 <Button
                   type="button"

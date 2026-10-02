@@ -205,6 +205,27 @@ five checks, all ok; the unit tests override it to degraded and to 501. Verified
 real binary: its three checks (`audit`, `events`, `users`, all ok) on the page
 (`test-results/real-overview-health.png`).
 
+**4. Exact user lookup and the live username check** (`users.lookup`, `users.availability`;
+`pages/users/LookupUser.tsx`, `lookupUser` and `useLocalpartAvailability` in `api/users.ts`,
+`lib/use-debounced-value.ts`). The Users page has "Find by email, phone or sign-in provider"
+under the search: what you have (email address, phone number, or a sign-in provider and the
+subject it knows the person by), explained as the one account with exactly this identity where
+the search above matches loosely; a hit opens the account, a `404` says "No account has ... as a
+verified email address." as an answer, not a fault, and a `501`/`503` says the server cannot
+look accounts up this way yet. Add user asks `users.availability` once typing pauses (400 ms)
+and says under the field "@carol:example.org is free." or "... is taken."; a refusal about the
+old name clears as soon as the name is retyped (it used to hide the hint until the next
+submit). The real server's directory answers `503 "does not support availability checks yet"`,
+and the dialog then says "This server can't check usernames in advance; a taken one is refused
+on Create." Mock: `/users/lookup` searches the 3PID and external-id fixtures,
+`/users/availability` the users; both registered before `/users/:user_id`, which MSW would
+otherwise match first. Verified against the real binary: an email added through
+`POST /users/{id}/threepids` opens the account from the lookup, an unknown one gets the
+sentence, and Add user shows the 503 sentence (`test-results/real-add-user-availability.png`).
+**Left:** the availability check needs `check_localpart_available` on the server's user
+directory (`crates/hs-admin/src/router.rs::users_availability`), and a phone or SSO lookup was
+seen only in the mock (the real walk had an email).
+
 ## 2026-10-01: the interface explains itself, by the owner's rule (branch `agent/web-admin-ui`)
 
 The owner's rule: *"Sane defaults, and all administration is done via the web UI, well
@@ -308,8 +329,9 @@ closes that and audits every page. Branched from `agent/config-hot` (for `applie
    `appservices.ping` as "Test connection").~~ Done 2026-10-02.
 3. ~~**Server health on the Overview** (`GET /server/health`, never called): per-check status.~~
    Done 2026-10-02.
-4. **Exact user lookup** (`users.lookup` by email, phone or SSO subject) and a live username
-   check in Add user (`users.availability`).
+4. ~~**Exact user lookup** (`users.lookup` by email, phone or SSO subject) and a live username
+   check in Add user (`users.availability`).~~ Done 2026-10-02 (the live check needs the
+   server's directory to support it; it says so meanwhile).
 5. **Room lifecycle**: an upgraded room's successor (`tombstoned`, `replacement_room_id`), guest
    access, and the block reason (asked on Block, shown on the badge).
 6. **Federation and Overview at scale**: both read the first 50 destinations; the Overview

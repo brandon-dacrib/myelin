@@ -13,6 +13,8 @@ import {
 import { AddUserDialog } from "./AddUserDialog";
 import { users } from "@/mocks/data/users";
 import { signIn, signOut } from "@/lib/auth";
+import { http, HttpResponse } from "msw";
+import { server } from "@/mocks/node";
 
 function renderDialog() {
   const onOpenChange = vi.fn();
@@ -135,6 +137,40 @@ describe("AddUserDialog", () => {
     await user.click(dialog.getByRole("button", { name: "Create account" }));
     expect(await dialog.findByText("Set a password, or generate one.")).toBeInTheDocument();
     expect(users).toHaveLength(before);
+  });
+
+  it("says as you type whether the username is free or taken", async () => {
+    const user = userEvent.setup();
+    renderDialog();
+    const dialog = within(await screen.findByRole("dialog", { name: "Add a user" }));
+    await user.type(dialog.getByLabelText(/^Username/), "alice");
+    expect(await dialog.findByText("@alice:example.org is taken.")).toBeInTheDocument();
+    await user.clear(dialog.getByLabelText(/^Username/));
+    await user.type(dialog.getByLabelText(/^Username/), "carol");
+    expect(await dialog.findByText("@carol:example.org is free.")).toBeInTheDocument();
+  });
+
+  it("says when this server cannot check usernames in advance", async () => {
+    server.use(
+      http.get("*/api/v1/users/availability", () =>
+        HttpResponse.json(
+          {
+            type: "urn:hs:problem:unavailable",
+            title: "Unavailable",
+            status: 503,
+            detail: "this user directory does not support availability checks yet",
+          },
+          { status: 503 },
+        ),
+      ),
+    );
+    const user = userEvent.setup();
+    renderDialog();
+    const dialog = within(await screen.findByRole("dialog", { name: "Add a user" }));
+    await user.type(dialog.getByLabelText(/^Username/), "carol");
+    expect(
+      await dialog.findByText(/can’t check usernames in advance; a taken one is refused on Create/),
+    ).toBeInTheDocument();
   });
 
   it("forgets what was typed when it closes", async () => {
