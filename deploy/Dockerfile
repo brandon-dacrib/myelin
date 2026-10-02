@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1.7
-#
 # Multi-stage, multi-arch (linux/amd64, linux/arm64) image for the `hs` binary
 # (crates/hs-cli), built statically against musl so the final stage needs no libc at all and can
 # be `gcr.io/distroless/static` — the smallest, lowest-CVE-surface distroless base there is.
@@ -18,8 +16,24 @@
 #
 # Build arguments:
 #   RUST_VERSION  - pinned to match rust-toolchain.toml's channel; defaults to a recent stable.
+#   RUST_IMAGE, NODE_IMAGE, RUNTIME_IMAGE - the base images, for a builder that cannot reach
+#                 Docker Hub. On this project's desktop an agent session's `docker pull` from
+#                 Docker Hub fails in the keychain credential helper, so a local build passes
+#                 the `mirror.gcr.io/library/...` names (as tests/sytest/build.sh does):
+#
+#     docker buildx build -f deploy/Dockerfile \
+#       --build-arg RUST_IMAGE=mirror.gcr.io/library/rust:1.98-slim-bookworm \
+#       --build-arg NODE_IMAGE=mirror.gcr.io/library/node:22-bookworm-slim -t myelin:dev .
+#
+# There is no `# syntax=docker/dockerfile:...` line for the same reason: it fetches the frontend
+# from Docker Hub before anything else, and every feature used here (cache mounts, `COPY
+# --chown`) has been in BuildKit's built-in frontend since Docker 20.10.
 #
 ARG RUST_VERSION=1.98
+ARG RUST_IMAGE=rust:${RUST_VERSION}-slim-bookworm
+ARG NODE_VERSION=22
+ARG NODE_IMAGE=node:${NODE_VERSION}-bookworm-slim
+ARG RUNTIME_IMAGE=gcr.io/distroless/static-debian12:nonroot
 #
 # ---------------------------------------------------------------------------------------------
 # The management interface. Its output is JavaScript, the same for every architecture, so unlike
@@ -30,8 +44,7 @@ ARG RUST_VERSION=1.98
 # it compiles, which is why that one directory of `crates/` is copied in beside `web/`, at the
 # relative path the script expects.
 # ---------------------------------------------------------------------------------------------
-ARG NODE_VERSION=22
-FROM --platform=$BUILDPLATFORM node:${NODE_VERSION}-bookworm-slim AS web
+FROM --platform=$BUILDPLATFORM ${NODE_IMAGE} AS web
 
 WORKDIR /src/web
 COPY web/package.json web/package-lock.json ./
@@ -50,7 +63,19 @@ RUN npm run build
 # Simpler and more robust than cross-compiling from a single amd64 host, at the cost of a slower
 # (emulated) arm64 build in CI unless run on a native arm64 runner
 # (.github/workflows/ci.yml's `ubuntu-24.04-arm` matrix leg is exactly that).
-FROM rust:${RUST_VERSION}-slim-bookworm AS builder
+#
+# The Rust build is three stages on one base. `chef` is the toolchain plus cargo-chef; `planner`
+# reduces the workspace to a recipe (its manifests and lock file, nothing else); `builder` cooks
+# the dependency graph from that recipe in a layer of its own, and only then copies the sources
+# in and builds the server. The cooked layer's cache key is the recipe, so a source change
+# recompiles the workspace's own crates and nothing beneath them. Until 2026-10-02 this stage
+# kept `target/` in a `--mount=type=cache`, which BuildKit holds in the builder's local state and
+# never exports: on CD's fresh runner every image build compiled every dependency from scratch
+# (66 minutes for one image on 2026-10-01), with the `type=gha` cache holding only layers that
+# could never hit because the `COPY crates` above them changed on every commit. A layer can be
+# exported, so the cooked dependencies now ride in that cache. The cargo registry keeps its cache
+# mount, which only matters on a builder that lives between builds (a desktop).
+FROM ${RUST_IMAGE} AS chef
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         musl-tools \
@@ -68,14 +93,27 @@ RUN case "$(uname -m)" in \
 
 RUN rustup target add "$(cat /rust_target.txt)"
 
+# Built from source rather than taken from the `lukemathwalker/cargo-chef` image, so the base
+# stays the official `rust` image the rest of this file and tests/sytest/Dockerfile pin. The
+# layer is keyed on this instruction and RUST_VERSION, so it is cached until the toolchain moves.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    cargo install cargo-chef --locked
+
+ENV CARGO_TERM_COLOR=never
 WORKDIR /src
 
-# The whole workspace is copied in one shot rather than layering a dummy-crate dependency-warming
-# trick on top: the `--mount=type=cache` mounts below on `/usr/local/cargo/registry` and
-# `/src/target` already give incremental rebuilds their speedup (BuildKit persists those across
-# builds), without the extra Dockerfile complexity and the risk of the dummy build drifting from
-# the workspace's real crate list. Falls back gracefully to a slower full rebuild on a builder
-# without BuildKit cache-mount support.
+FROM chef AS planner
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+
+COPY --from=planner /src/recipe.json recipe.json
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    cargo chef cook --release --locked -p hs-cli --target "$(cat /rust_target.txt)" \
+        --recipe-path recipe.json
+
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
@@ -86,10 +124,9 @@ COPY crates ./crates
 COPY --from=web /src/web/dist /src/web-dist
 ENV HS_ADMIN_WEB_DIST=/src/web-dist
 
-ENV CARGO_TERM_COLOR=never
-
+# No cache mount over /src/target here: it would hide the cooked dependencies in this stage's
+# own layers, which are the cache.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
     RUST_TARGET="$(cat /rust_target.txt)" && \
     cargo build --release --locked -p hs-cli --target "${RUST_TARGET}" && \
     mkdir -p /out /out/data && \
@@ -98,7 +135,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # ---------------------------------------------------------------------------
 # Runtime: distroless static, non-root, no shell, nothing but the binary and CA certs.
 # ---------------------------------------------------------------------------
-FROM gcr.io/distroless/static-debian12:nonroot AS runtime
+FROM ${RUNTIME_IMAGE} AS runtime
 
 # distroless/static-debian12:nonroot already runs as uid/gid 65532 ("nonroot") and ships CA
 # certificates (needed for outbound federation TLS and OTLP/Sentry export over HTTPS).

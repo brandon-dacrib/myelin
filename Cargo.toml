@@ -144,6 +144,15 @@ matrix-sdk = { version = "0.19", default-features = false, features = ["rustls-a
 opt-level = 0
 debug = 1
 
+# Dependencies are built without debug info in dev and test builds. Only the workspace's own
+# crates keep their line tables (`debug = 1` above), which is what a backtrace from a failing test
+# needs; the thousand-odd crates under them contributed most of the debug info that was being
+# generated, written and linked on every build and most of target/'s size, for frames nobody reads.
+# This is what `CARGO_PROFILE_DEV_DEBUG=0` already did for the agents' worktrees, made the default
+# for the dependencies everywhere and settable per crate here if one ever needs stepping into.
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 4

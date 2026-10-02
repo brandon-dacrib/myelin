@@ -1,5 +1,61 @@
 # 12. Platform and Kubernetes
 
+## 2026-10-02: the builds cache what they used to redo
+
+What changed, and what each was measured to do (the numbers are in the "Measured" paragraph
+below as they came in; a row without one says so):
+
+- **Dependencies carry no debug info in dev and test builds.** `[profile.dev.package."*"]
+  debug = false` in the root `Cargo.toml`. The workspace's own crates keep their line tables
+  (`debug = 1`), so a failing test's backtrace still has line numbers where it matters; the
+  thousand-odd crates beneath them no longer have debug info generated, written and linked on
+  every build. This is what the agents' worktrees already did with `CARGO_PROFILE_DEV_DEBUG=0`
+  (so their caches are unchanged by it); the main checkout rebuilt its dependencies once.
+- **sccache on the desktop** (not committed: `~/.cargo/config.toml` sets `build.rustc-wrapper`;
+  `brew install sccache`, 0.18.0; a 32 GB disk cache). Every worktree used to build the whole
+  dependency graph from nothing, because each has its own `target/` (and must: concurrent cargo
+  invocations in one `target/` serialise on its lock). With sccache the dependencies compile once
+  per flag set and the next worktree gets them as cache hits. Workspace crates are incremental
+  and pass through uncached, as before. `AGENTS.md`'s desktop section says so, and that its
+  idle server is not a straggler.
+- **CI: `CARGO_INCREMENTAL=0`, `cache-on-failure: true` on every `rust-cache`, and the Playwright
+  Chromium cached by Playwright version.** A runner never builds twice, so incremental
+  compilation only wrote dependency graphs nothing read and bloated the saved cache. A red run
+  used to save no cache at all, so the fix's run was a cold build (CI was red on `main` from
+  `564f540` to `e73ea52`, every run cold). The Chromium download (`npx playwright install`) is
+  now a cache hit keyed on the `@playwright/test` version; its apt dependencies are installed on
+  every run either way.
+- **`deploy/Dockerfile` cooks the dependency graph with cargo-chef** in a layer of its own, keyed
+  on the manifests and lock file, before the sources are copied in. The old `--mount=type=cache`
+  on `target/` lives only in the builder's local state, which on CD's fresh runner is nothing:
+  every image build was a cold release build of every dependency (66 minutes for one image on
+  2026-10-01), and the `type=gha` cache could only ever hit layers above the `COPY crates` that
+  changed with every commit. A layer is exported, so the cooked dependencies now ride in that
+  cache; a source change recompiles the workspace's crates and nothing beneath them. The base
+  images are build arguments (`RUST_IMAGE`, `NODE_IMAGE`, `RUNTIME_IMAGE`, defaults unchanged)
+  and the `# syntax=` line is gone, so a session on the desktop, which cannot reach Docker Hub,
+  can build the image through `mirror.gcr.io`. **Cache size:** the cooked layer is a few GB per
+  architecture in a 10 GB per-repository GitHub Actions cache that CI's four `rust-cache` entries
+  share; if CI's caches start missing, that is why, and `mode=min` is not an answer (it exports
+  only the final image's layers, which for distroless is nothing). Watch it.
+- **`tests/sytest/Dockerfile` and `tests/complement/Dockerfile.template` keep the registry and
+  `target/` in BuildKit cache mounts**, with the binary copied out in the same `RUN`. A second
+  `tests/sytest/build.sh` compiles only what changed. `build.sh` now builds with BuildKit: the
+  replacement `DOCKER_CONFIG` it uses to dodge the keychain helper also hid `~/.docker/cli-plugins`
+  (where OrbStack keeps buildx), which is why it had been on the classic builder; the plugin
+  directory is linked into the temporary config.
+- **`npm run lint` caches** (`eslint --cache`, `prettier --cache`, under `node_modules/.cache/`):
+  12.6 s → 1.1 s on an unchanged tree.
+
+**Not done, deliberately:** `cargo nextest` (each test in its own process changes the semantics
+of the real-binary tests that share ports and environment); `lld`/`mold` on the arm64 Linux leg
+(rust-lld is the default on x86_64 Linux since Rust 1.90; on aarch64 the opt-in is still
+unstable); sccache in CI (`rust-cache` already keeps the compiled graph, and two caches of the
+same thing would fight over the 10 GB).
+
+**Measured** (M2 Pro, 12 cores, quiet machine, this session; see "Verification" below):
+*pending as this entry is written; filled in below.*
+
 ## 2026-10-01 (branch `agent/platform-gaps`): the operator has run against an API server
 
 Until today neither controller in `hs operator` had met a real API server: the `Bridge`

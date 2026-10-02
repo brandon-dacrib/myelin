@@ -78,6 +78,14 @@ branch unmerged; start the queue detached (`(nohup tools/merge-queue.sh ... > lo
 `myelin-sytest-cargo-target`; five at once is one build at a time at a load of 60. Next wave:
 one Sytest image built by the coordinator from the merged tree, and agents measure on it.
 
+**The builds got faster on 2026-10-02 afternoon** (status 12, dated entry): dependencies without
+debug info in dev builds, sccache on the desktop so a worktree's dependency build is a cache hit,
+CI caches saved on failure and without incremental artifacts, cargo-chef in `deploy/Dockerfile`
+so CD's image builds stop recompiling every dependency, cache mounts in the Sytest and Complement
+images so `tests/sytest/build.sh` is incremental, and a lint cache. `CARGO_PROFILE_DEV_DEBUG=0`
+is no longer needed in worktrees. The deploy image now builds from a session through
+`mirror.gcr.io` (the command is in `AGENTS.md`).
+
 ## Earlier: 2026-10-02, 00:20 EDT -- the seven branches are merged, Sytest is 548 of 772
 
 **Where `main` is.** `2b3169e`, **2,661 Rust tests** (`cargo test --workspace --all-targets -- --list`),

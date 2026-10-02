@@ -41,7 +41,10 @@ Environment for `run.sh`:
 | `MYELIN_MEMORY_INTERVAL` | `15` | seconds between `memory.log` samples |
 | `SYTEST_WORK_SIZE` | `3g` | the tmpfs holding the servers' data |
 
-A bookworm `hs` for `SYTEST_HS_BINARY`, reusing a cargo cache between builds:
+`build.sh` itself is incremental (the registry and `target/` are BuildKit cache mounts, so a
+rebuild after a server change compiles only what changed), which is the simplest way to test a
+change. A bookworm `hs` for `SYTEST_HS_BINARY`, reusing a cargo cache between builds, is the
+other way, and does not need the Sytest image rebuilt at all:
 
 ```bash
 docker run --rm -v "$PWD:/src:ro" -v myelin-sytest-cargo-target:/target \
@@ -56,8 +59,8 @@ SYTEST_HS_BINARY="$PWD/target/hs-bookworm" tests/sytest/run.sh
 
 - `Dockerfile` / `build.sh`: builds `hs` in `rust:1.98-slim-bookworm` (the same Debian as Sytest's
   image, so glibc matches) and copies it into `matrixdotorg/sytest:bookworm`. `build.sh` streams a
-  tar of the repository (no `target/`), uses the classic builder and a `DOCKER_CONFIG` with no
-  credential helper, and pulls the bases from `mirror.gcr.io`, because Docker Hub pulls through
+  tar of the repository (no `target/`), uses BuildKit (for the cache mounts) with a `DOCKER_CONFIG`
+  that has no credential helper, and pulls the bases from `mirror.gcr.io`, because Docker Hub pulls through
   the desktop's keychain helper fail in agent sessions.
 - `run.sh`: mounts the Sytest checkout at `/sytest`, this directory at `/myelin` and the results
   directory at `/logs`, puts the servers' working directory on a tmpfs (on the container's

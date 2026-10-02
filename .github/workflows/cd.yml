@@ -388,6 +388,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+          cache-on-failure: true
 
       # The management interface is embedded in the binary, so it is built first.
       # HS_ADMIN_WEB_DIST makes `crates/hs-admin/build.rs` fail the build rather than quietly

@@ -55,7 +55,14 @@ COPY . .
 # --jobs 4, not the full core count: this machine is shared with several other agents' `cargo`
 # invocations at once (see this track's brief and docs/status/dashboard.md), and a release build
 # of the whole dependency graph is the single most CPU-hungry thing this track does.
-RUN cargo build --release --jobs 4 -p hs-cli
+#
+# The registry and `target/` are BuildKit cache mounts (build.sh builds with the daemon's
+# default builder, BuildKit on any current Docker), so a rebuild after a source change compiles
+# only what changed instead of the whole graph. The binary is copied out of the mount in the
+# same RUN: a cache mount is not part of the layer.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=myelin-cargo-registry \
+    --mount=type=cache,target=/workspace/target,id=myelin-complement-target \
+    cargo build --release --jobs 4 -p hs-cli && cp target/release/hs /hs
 
 # ---- runtime stage ----------------------------------------------------------------------------
 FROM debian:trixie-slim
@@ -63,7 +70,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     openssl ca-certificates curl stunnel4 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=build /workspace/target/release/hs /usr/local/bin/hs
+COPY --from=build /hs /usr/local/bin/hs
 COPY tests/complement/startup.sh /startup.sh
 COPY tests/complement/stunnel.conf.template /stunnel.conf.template
 RUN chmod +x /startup.sh

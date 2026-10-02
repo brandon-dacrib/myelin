@@ -5,10 +5,15 @@
 #
 # As tests/complement/build.sh does, this streams a tar of the repository to `docker build`
 # instead of sending `.` as the context, leaving out `target/`, `.git/`, `refs/` and the web
-# build's output. It uses the classic builder (`DOCKER_BUILDKIT=0`) and a `DOCKER_CONFIG` with
-# no credential helper, and pulls the base images from `mirror.gcr.io`: on the project's desktop
-# Docker Hub pulls go through the macOS keychain helper, which agent sessions cannot use. Set
-# RUST_IMAGE / SYTEST_IMAGE to override the bases (CI can use the Docker Hub names).
+# build's output. It uses a `DOCKER_CONFIG` with no credential helper, and pulls the base images
+# from `mirror.gcr.io`: on the project's desktop Docker Hub pulls go through the macOS keychain
+# helper, which agent sessions cannot use. Set RUST_IMAGE / SYTEST_IMAGE to override the bases
+# (CI can use the Docker Hub names).
+#
+# It builds with BuildKit, which the Dockerfile's cache mounts need (a second build compiles
+# only what changed). The replacement `DOCKER_CONFIG` hides `~/.docker/cli-plugins`, where
+# OrbStack puts the buildx plugin, and without it `docker build` falls back to the classic
+# builder and rejects the mounts; so the plugin directory is linked into the temporary config.
 set -euo pipefail
 cd "$(dirname "$0")/../.."  # repository root
 
@@ -26,6 +31,7 @@ fi
 if [ -z "${DOCKER_CONFIG:-}" ]; then
   DOCKER_CONFIG="$(mktemp -d)"
   echo '{"auths":{}}' >"$DOCKER_CONFIG/config.json"
+  [ -d "$HOME/.docker/cli-plugins" ] && ln -s "$HOME/.docker/cli-plugins" "$DOCKER_CONFIG/cli-plugins"
   export DOCKER_CONFIG
 fi
 if ! docker info >/dev/null 2>&1; then
@@ -46,7 +52,7 @@ tar \
   --exclude='./crates/*/fuzz/artifacts' \
   --exclude='./logs' \
   -cf - . \
-  | DOCKER_BUILDKIT=0 docker build \
+  | DOCKER_BUILDKIT=1 docker build \
       --build-arg "RUST_IMAGE=$RUST_IMAGE" \
       --build-arg "SYTEST_IMAGE=$SYTEST_IMAGE" \
       -t "$IMAGE_TAG" -f tests/sytest/Dockerfile -
