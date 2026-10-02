@@ -20,6 +20,7 @@ import { RelativeTime } from "@/components/RelativeTime";
 import { toast } from "@/components/ui/toast/toast-store";
 import { hasScope } from "@/lib/auth";
 import { ResetPasswordDialog } from "./users/ResetPasswordDialog";
+import { EditUserDialog } from "./users/EditUserDialog";
 import { SendNoticeDialog } from "./settings/SendNoticeDialog";
 import { UserDevicesSection } from "./users/UserDevicesSection";
 import { UserIdentitySection } from "./users/UserIdentitySection";
@@ -40,6 +41,7 @@ export function UserDetailPage() {
   const deactivate = useDeactivateUser();
   const reactivate = useReactivateUser();
   const [resetOpen, setResetOpen] = useState(false);
+  const [editOpen, setEditOpen] = useState(false);
   const [noticeOpen, setNoticeOpen] = useState(false);
   // "Also erase their data" in the deactivate dialog; forgotten when the dialog closes.
   const [eraseToo, setEraseToo] = useState(false);
@@ -104,6 +106,21 @@ export function UserDetailPage() {
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
+          <Button
+            variant="secondary"
+            disabled={!canWrite}
+            title={
+              !canWrite
+                ? "Needs admin:write"
+                : "Display name, avatar, kind of account, server administrator"
+            }
+            onClick={() => setEditOpen(true)}
+          >
+            Edit
+          </Button>
+          {editOpen && (
+            <EditUserDialog key={id} user={user} open={editOpen} onOpenChange={setEditOpen} />
+          )}
           {user.locked ? (
             <Button
               variant="secondary"

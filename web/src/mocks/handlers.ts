@@ -1071,6 +1071,42 @@ export const handlers = [
     return HttpResponse.json(user);
   }),
 
+  http.patch(`${API}/users/:user_id`, async ({ params, request }) => {
+    const user = findUser(decodeURIComponent(String(params.user_id)));
+    if (!user) return problem(404, "not-found", "Not found", { detail: "no such user" });
+    const body = (await request.json()) as {
+      display_name?: unknown;
+      avatar_url?: unknown;
+      admin?: unknown;
+      user_type?: unknown;
+    };
+    const errors: { pointer: string; detail: string }[] = [];
+    if ("admin" in body && typeof body.admin !== "boolean")
+      errors.push({ pointer: "/admin", detail: "must be a boolean" });
+    if ("display_name" in body && typeof body.display_name !== "string")
+      errors.push({ pointer: "/display_name", detail: "must be a string" });
+    if ("avatar_url" in body && typeof body.avatar_url !== "string")
+      errors.push({ pointer: "/avatar_url", detail: "must be a string" });
+    if (
+      "avatar_url" in body &&
+      body.avatar_url !== "" &&
+      !/^mxc:\/\//.test(String(body.avatar_url))
+    )
+      errors.push({ pointer: "/avatar_url", detail: "must be an mxc:// URL" });
+    if ("user_type" in body && body.user_type !== null && typeof body.user_type !== "string")
+      errors.push({ pointer: "/user_type", detail: "must be a string or null" });
+    if (errors.length > 0)
+      return problem(400, "validation-failed", "Validation failed", {
+        detail: "one or more fields in the request cannot be applied",
+        errors,
+      });
+    if (typeof body.admin === "boolean") user.admin = body.admin;
+    if (typeof body.display_name === "string") user.display_name = body.display_name || null;
+    if (typeof body.avatar_url === "string") user.avatar_url = body.avatar_url || null;
+    if ("user_type" in body) user.user_type = (body.user_type as string | null) || null;
+    return HttpResponse.json(user);
+  }),
+
   http.get(`${API}/users/:user_id/devices`, ({ params, request }) => {
     const devices = userDevices[decodeURIComponent(String(params.user_id))] ?? [];
     const url = new URL(request.url);

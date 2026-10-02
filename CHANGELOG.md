@@ -55,6 +55,11 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
   instead of `moderation:write`; a test now asks the router about all 154 authenticated
   operations. The interface shows Rooms and Media to `moderation:read`. No token narrower than
   `admin:read`+`admin:write` can be minted yet, so this matters once scoped tokens exist.
+- **An account can be edited after it is made** (2026-10-02, `agent/web-items`). "Edit" on a
+  user's page grants or revokes server administrator, which until now was set only at creation,
+  and offers display name, avatar and kind of account; only what changed is sent, and a field
+  this server cannot change yet is refused beside the field in the server's own words rather
+  than silently ignored. Verified against `hs serve` (`web/e2e-real/web-items.spec.ts`).
 - **The management interface explains itself** (2026-10-01, `agent/web-admin-ui`). Every
   configuration setting carries a badge from the server's own classification (applies on save,
   needs a restart, or per replica from the file or environment), each class is explained once

@@ -225,3 +225,25 @@ export function useCreateUser() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ["users"] }),
   });
 }
+
+export type UserUpdate = components["schemas"]["UserUpdate"];
+
+/**
+ * Changes an account's own fields (`PATCH /users/{user_id}`): server administrator, display
+ * name, avatar and kind of account. Send only the fields that changed: a server that cannot
+ * change a field yet answers `400 validation-failed` naming it, even when it is sent unchanged,
+ * so a form that resends everything would be refused for a field it did not touch.
+ */
+export function useUpdateUser() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ userId, patch }: { userId: string; patch: UserUpdate }) => {
+      const result = await api.PATCH("/users/{user_id}", {
+        params: { path: { user_id: userId } },
+        body: patch,
+      });
+      return unwrap(result);
+    },
+    onSuccess: (_data, { userId }) => invalidateUser(qc, userId),
+  });
+}

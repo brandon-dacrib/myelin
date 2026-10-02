@@ -147,6 +147,28 @@ documents its failing-first default and paging past 50; `GET /cluster` carries
 Overview's `federation_destinations_failing_count` is filled from every destination on the
 real server. The Overview tile, the Federation sort control and the Cluster columns are the
 web items left; `schema.d.ts` has the fields.
+Last updated: 2026-10-02 (the audit's larger web items; branch `agent/web-items`).
+
+## 2026-10-02: the audit's larger web items (branch `agent/web-items`)
+
+The items the 2026-10-01 audit left as "not cheap", each its own commit, each verified against
+`hs serve` built from this branch (`web/e2e-real/web-items.spec.ts`, admin made through
+`POST /api/v1/setup`) as well as the mock suites.
+
+**1. User edit** (`users.update`, `pages/users/EditUserDialog.tsx`, `useUpdateUser` in
+`api/users.ts`). "Edit" on a user's page opens a form for display name, avatar (an `mxc://`
+address), kind of account (person, bot, support) and server administrator, each explained; until
+now administrator was set only when the account was made. Only the fields that changed are
+sent, and that is load-bearing: the real server applies `admin` and refuses any other field
+present in the body, even unchanged, with `400 validation-failed` naming it. A refusal is shown
+beside the field it names, in the server's words ("This server says: no data source can change
+this field yet."), and the dialog stays open. Taking administrator away from the signed-in
+account warns that it locks them out of this interface. Mock: `PATCH /users/:user_id` applies
+all four fields. Verified against the real binary: a fresh account granted administrator from
+the page (`GET /users/{id}` then says `admin: true`), and a display-name change refused beside
+the field with the server's words. **Left:** display name, avatar and kind of account need a
+data source on the server (`crates/hs-admin/src/router.rs::users_update`, "no data source can
+change this field yet"); the form offers them and reports the refusal honestly meanwhile.
 
 ## 2026-10-01: the interface explains itself, by the owner's rule (branch `agent/web-admin-ui`)
 
@@ -244,8 +266,9 @@ closes that and audits every page. Branched from `agent/config-hot` (for `applie
 
 **Next web items (from the audit; not cheap).**
 
-1. **User edit** (`users.update`): grant or revoke server administrator, change display name,
-   avatar and kind of account; today admin is set only at creation.
+1. ~~**User edit** (`users.update`): grant or revoke server administrator, change display name,
+   avatar and kind of account; today admin is set only at creation.~~ Done 2026-10-02 (the
+   server applies `admin`; the other three fields wait for a data source).
 2. **Bridge edit and test** (`appservices.update` for url, rate limiting and namespaces;
    `appservices.ping` as "Test connection").
 3. **Server health on the Overview** (`GET /server/health`, never called): per-check status.
