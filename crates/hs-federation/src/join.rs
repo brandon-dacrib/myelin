@@ -695,6 +695,13 @@ pub async fn send_membership(
     let rules = hs_model::room_version::rules_for(&room_version)
         .ok_or_else(|| JoinError::UnsupportedRoomVersion(room_version_str.clone()))?;
 
+    // An event the room version's canonical JSON cannot carry (a float, an integer out of range
+    // in version 6 and later) is a bad request before its signature is looked at: the signature
+    // check canonicalises too, and would call it unsigned (Sytest's "Inbound: send_join rejects
+    // invalid JSON for room version 6").
+    to_canonical_object(signed_event, rules.strict_canonical_json)
+        .map_err(|e| JoinError::MalformedEvent(format!("not canonical JSON: {e}")))?;
+
     let authorising = authorise_with.map(|_| own_server_name);
     // A membership event not signed as it must be is the room refusing it (`403 M_FORBIDDEN`,
     // as Synapse answers and Sytest's "Inbound /v1/send_join rejects incorrectly-signed joins"
@@ -1758,6 +1765,47 @@ mod tests {
             .unwrap_err();
             assert!(matches!(err, JoinError::NotAuthorized(_)), "{err}");
         }
+    }
+
+    /// Sytest's "Inbound: send_join rejects invalid JSON for room version 6": a float in the
+    /// event is a bad request, not a signature failure (`403`), which it was while the
+    /// signature was checked first.
+    #[tokio::test]
+    async fn send_join_refuses_an_event_that_is_not_canonical_json_as_malformed() {
+        let (rooms, room_id, _) = room_with_creator();
+        let dir = tempfile::tempdir().unwrap();
+        let keys = OwnSigningKeys::load_or_generate(dir.path()).unwrap();
+        let doc = build_server_key_response("joiner.example.org", &keys, &[], 3600).unwrap();
+        let cache = RemoteKeyCache::new(Box::new(FixedFetcher(doc)) as Box<dyn KeyServerFetcher>);
+        let mut signed = sign_member_event(
+            &keys,
+            &room_id,
+            "@bob:joiner.example.org",
+            vec![Value::String("$creatorjoin".to_owned())],
+            vec![],
+            5,
+        );
+        let event_id = hs_model::Event::parse(&signed, RoomVersionId::V11)
+            .unwrap()
+            .event_id()
+            .to_string();
+        signed["content"]["bad_val"] = serde_json::json!(1.1);
+        let sink = StaticWriteSink::new(Vec::new(), "unused");
+        let err = send_join(
+            &rooms,
+            &sink,
+            &cache,
+            &room_id,
+            &event_id,
+            &signed,
+            "joiner.example.org",
+            "resident.example.org",
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, JoinError::MalformedEvent(_)), "{err}");
     }
 
     #[tokio::test]

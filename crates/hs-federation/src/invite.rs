@@ -110,9 +110,23 @@ pub async fn receive_invite(
         ));
     }
 
+    // Canonical JSON first (a float in a version-6 room is `400 M_BAD_JSON`, Sytest's "Inbound
+    // federation rejects invites which include invalid JSON for room version 6"); then the
+    // signature, whose absence is the room refusing the invite (`403`, "... invites which are
+    // not signed by the sender"), and a PDU that does not parse at all is a bad request.
+    let strict = hs_model::room_version::rules_for(&version)
+        .is_some_and(|rules| rules.strict_canonical_json);
+    hs_model::canonical::to_canonical_object(raw_event, strict)
+        .map_err(|e| InviteError::Malformed(format!("the invite is not canonical JSON: {e}")))?;
     let event = verify_pdu(raw_event, &version, key_cache)
         .await
-        .map_err(|e| InviteError::Malformed(format!("the invite does not verify: {e}")))?;
+        .map_err(|e| {
+            if e.unsigned {
+                InviteError::Forbidden(format!("the invite is not signed by its sender: {e}"))
+            } else {
+                InviteError::Malformed(format!("the invite does not verify: {e}"))
+            }
+        })?;
     if event.event_id().as_str() != event_id {
         return Err(InviteError::Malformed(
             "the event ID in the path is not the event's".to_owned(),
@@ -497,6 +511,43 @@ mod tests {
             "inviter.example.org",
             "!r:inviter.example.org",
             &event_id_of(&raw),
+            "11",
+            &raw,
+            &[],
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, InviteError::Forbidden(_)), "{err}");
+
+        // Sytest's "Inbound federation rejects invites which are not signed by the sender":
+        // no signature at all is the same refusal, and a float is a bad request before that.
+        let mut raw = signed_invite(&f.inviter_keys, "@bob:invitee.example.org", "invite");
+        raw["signatures"] = json!({});
+        let err = receive_invite(
+            &f.handling,
+            &f.cache,
+            "invitee.example.org",
+            "inviter.example.org",
+            "!r:inviter.example.org",
+            &event_id_of(&raw),
+            "11",
+            &raw,
+            &[],
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, InviteError::Forbidden(_)), "{err}");
+        let mut raw = signed_invite(&f.inviter_keys, "@bob:invitee.example.org", "invite");
+        let event_id = event_id_of(&raw);
+        raw["signatures"] = json!({});
+        raw["content"]["bad_val"] = json!(1.1);
+        let err = receive_invite(
+            &f.handling,
+            &f.cache,
+            "invitee.example.org",
+            "inviter.example.org",
+            "!r:inviter.example.org",
+            &event_id,
             "11",
             &raw,
             &[],

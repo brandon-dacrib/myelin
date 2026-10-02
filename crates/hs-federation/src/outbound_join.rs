@@ -77,6 +77,12 @@ pub enum OutboundJoinError {
     /// The answer to the second step (`send_*`, `invite`) was not shaped as the spec requires.
     #[error("the answer from {0} was malformed: {1}")]
     MalformedResponse(String, String),
+    /// The event the other server answered with is not canonical JSON under the room version's
+    /// rules (a float in a version-6 room): the answer is bad JSON, which the client is told
+    /// (`400 M_BAD_JSON`; Sytest's "Outbound federation rejects invite response which include
+    /// invalid JSON for room version 6"), not a server that could not be reached.
+    #[error("the answer from {destination} is not canonical JSON: {reason}")]
+    NotCanonicalJson { destination: String, reason: String },
     /// An event in the returned `state` or `auth_chain` failed the same verification any inbound
     /// PDU gets -- content hash or signature. Carries the failing event's raw JSON for logging;
     /// never trusted further than that.

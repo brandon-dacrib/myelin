@@ -221,6 +221,14 @@ pub async fn send_invite(
     let returned = answer.get("event").ok_or_else(|| {
         OutboundJoinError::MalformedResponse(destination.to_owned(), "missing `event`".to_owned())
     })?;
+    let strict = hs_model::room_version::rules_for(room_version)
+        .is_some_and(|rules| rules.strict_canonical_json);
+    hs_model::canonical::to_canonical_object(returned, strict).map_err(|e| {
+        OutboundJoinError::NotCanonicalJson {
+            destination: destination.to_owned(),
+            reason: e.to_string(),
+        }
+    })?;
     let cosigned = verify_pdu(returned, room_version, key_cache)
         .await
         .map_err(|source| OutboundJoinError::UnverifiedEvent {
@@ -483,6 +491,110 @@ mod tests {
         assert!(
             sent.get("room_version").is_none(),
             "v1 carries the event alone"
+        );
+    }
+
+    /// Sytest's "Outbound federation rejects invite response which include invalid JSON for
+    /// room version 6": the invitee's server co-signs the invite and adds a float; the answer
+    /// is bad JSON ([`OutboundJoinError::NotCanonicalJson`], a `400 M_BAD_JSON` to the client),
+    /// not an unverifiable event or a server that could not be reached.
+    #[tokio::test]
+    async fn an_invite_answered_with_a_float_is_bad_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let inviter_keys = OwnSigningKeys::load_or_generate(dir.path()).unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        let invitee_keys = Arc::new(OwnSigningKeys::load_or_generate(dir2.path()).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let invitee = format!(
+            "invitee.example.org:{}",
+            listener.local_addr().unwrap().port()
+        );
+
+        let mut object = to_canonical_object(
+            &json!({
+                "type": "m.room.member",
+                "room_id": "!r:inviter.example.org",
+                "sender": "@alice:inviter.example.org",
+                "state_key": format!("@bob:{invitee}"),
+                "content": {"membership": "invite"},
+                "origin_server_ts": 1,
+                "depth": 5,
+                "prev_events": ["$prev"],
+                "auth_events": ["$create"],
+            }),
+            true,
+        )
+        .unwrap();
+        let hash = hs_model::hash::content_hash_base64(&object);
+        object.insert(
+            "hashes".to_owned(),
+            CanonicalJsonValue::Object(CanonicalJsonObject::from([(
+                "sha256".to_owned(),
+                CanonicalJsonValue::String(hash),
+            )])),
+        );
+        add_signature(&mut object, "inviter.example.org", &inviter_keys);
+        let value: Value =
+            serde_json::from_slice(&CanonicalJsonValue::Object(object).to_canonical_bytes())
+                .unwrap();
+        let event = Event::parse(&value, RoomVersionId::V6).unwrap();
+
+        let app = axum::Router::new().route(
+            "/_matrix/federation/v2/invite/{room}/{event}",
+            axum::routing::put({
+                let invitee = invitee.clone();
+                let keys = invitee_keys.clone();
+                move |axum::Json(body): axum::Json<Value>| {
+                    let mut object = to_canonical_object(&body["event"], true).unwrap();
+                    add_signature(&mut object, &invitee, &keys);
+                    let mut cosigned: Value = serde_json::from_slice(
+                        &CanonicalJsonValue::Object(object).to_canonical_bytes(),
+                    )
+                    .unwrap();
+                    cosigned["bad_val"] = json!(1.1);
+                    async move { axum::Json(json!({"event": cosigned})) }
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+
+        let client = FederationClient::new(
+            "inviter.example.org".to_owned(),
+            inviter_keys.primary().clone(),
+            crate::client::ClientConfig {
+                scheme: "http",
+                ip_policy: crate::client::IpPolicy::from_cidrs(&[], &[]),
+                ..Default::default()
+            },
+            Arc::new(InMemoryDestinationStore::default()),
+            Arc::new(NoWellKnown),
+            Arc::new(Loopback),
+            Arc::new(Loopback),
+        );
+        let key_docs: HashMap<String, Value> = [
+            (
+                "inviter.example.org".to_owned(),
+                build_server_key_response("inviter.example.org", &inviter_keys, &[], 3600).unwrap(),
+            ),
+            (
+                invitee.clone(),
+                build_server_key_response(&invitee, &invitee_keys, &[], 3600).unwrap(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let cache = RemoteKeyCache::new(Box::new(Keys(key_docs)) as Box<dyn KeyServerFetcher>);
+
+        let err = send_invite(&client, &cache, &invitee, &RoomVersionId::V6, &event, &[])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, OutboundJoinError::NotCanonicalJson { .. }),
+            "{err}"
         );
     }
 }

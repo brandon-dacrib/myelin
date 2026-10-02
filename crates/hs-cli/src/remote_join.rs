@@ -241,6 +241,7 @@ fn map_outbound_error(error: &OutboundJoinError) -> RoomError {
                 extra,
             }))
         }
+        OutboundJoinError::NotCanonicalJson { .. } => RoomError::BadRequest(error.to_string()),
         other => RoomError::RemoteJoinFailed(other.to_string()),
     }
 }
