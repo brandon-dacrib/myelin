@@ -2190,7 +2190,13 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             let public = config.server.public_baseurl.as_deref();
             recovery.set_link_base(link_base(public, &addrs));
             bridges.set_public_base_url(public.unwrap_or(""));
-            tracing::info!(public_baseurl = ?public, "the server settings are now in force");
+            tracing::info!(
+                public_baseurl = ?public,
+                feed_retention_entries = config.server.sync.feed_retention_entries,
+                hot_room_stream_retention_entries =
+                    config.server.sync.hot_room_stream_retention_entries,
+                "the server settings are now in force"
+            );
             Ok(())
         });
     }

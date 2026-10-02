@@ -645,6 +645,21 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
 
 ### Operations
 
+- **A room's owner writes a message's fan-out to its members in a few store transactions, and
+  sync history has a retention.** The session hub used to read and write each member's feed
+  records one store round trip at a time before waking anyone (8 s of the wake latency in a
+  303-member room, status 05 session 12); it now reads a room's memberships with one multi-get
+  and writes the feed in transactions of up to 100 members. Measured 2026-10-02 on the real
+  binary, same build both ways, 302 members: on the embedded store 10.2 ms to 4.1 ms per update
+  over a run of 353 updates (15,100 transactions to 200), on PostgreSQL in Docker with 22
+  members 794 ms to 292 ms per update, on a desktop at load 25-37; the remaining PostgreSQL cost
+  is one statement per written row at commit (RFC 0021). Each user's feed and the server-wide
+  hot-room stream are now kept to `server.sync.feed_retention_entries` (10,000) and
+  `server.sync.hot_room_stream_retention_entries` (100,000), hot settings; below the kept part
+  each room's last position stays, so a client with an older token is sent a room whole rather
+  than anything missed (decision 0025). Verified on the real binary: the startup line, a
+  `PATCH /api/v1/config/server` taking effect at once, and `hs_user_pruned_entries_total`
+  counting what went.
 - **A first boot is as quick as any other.** Over an empty data directory the embedded backend
   used to create one Fjall keyspace per table, 109 of them, each several fsyncs under a global
   lock; every table now lives behind a prefix in one shared Fjall keyspace (decision 0024), so a

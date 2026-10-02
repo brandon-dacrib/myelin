@@ -1,8 +1,140 @@
 # 05 Sync: status
 
-Last updated: 2026-10-02 (session 13: `/joined_rooms` read-your-writes. Session 12: RFC 0018, a non-owner's room copy catches up instead of
-reloading. Session 11, session 10, session 9, session 8, session 7 and the integration note
-follow; sessions 1-6 are preserved unchanged further down.)
+Last updated: 2026-10-02 (session 14: the owner's fan-out in batches, and feed retention.
+Session 13: `/joined_rooms` read-your-writes. Session 12: RFC 0018, a non-owner's room copy
+catches up instead of reloading. Session 11, session 10, session 9, session 8, session 7 and
+the integration note follow; sessions 1-6 are preserved unchanged further down.)
+
+## Session 14 (2026-10-02, branch `agent/sync-feed`): a room update's fan-out in batches, and retention for the feeds and the hot-room stream
+
+Two rows: the known gap "The owner's session hub writes each member's record and feed entry
+one store round trip at a time" (found in session 12), and the next-steps item "the hot-room
+stream and feed pruning" (session 11 left both unbounded). Decision 0025 records both.
+
+**The fan-out.** `SessionHub::apply_room_update` read each active member's membership record
+(a snapshot and a `get`) and appended each member's feed entry (a transaction of two ranges,
+a get and two puts) one member at a time: on PostgreSQL about thirteen statements and two
+transaction set-ups per member, sequentially, before anyone was woken. Now:
+
+- `UserStore::get_memberships(room, users)` reads every target's record with one multi-get;
+  the hub's `fan_out` decides what to write for whom exactly as before (the baseline rule, the
+  hot flip, the comments moved with it) and hands the store a `Vec<FanOutWrite>`.
+- `UserStore::apply_fan_out` writes them in transactions of at most 100 members
+  (`FAN_OUT_BATCH`), reading each batch's `feed_by_room` pointers, feed heads and device-cursor
+  maxima with one multi-get each, then buffering every put for one commit. The coalescing rule
+  is the one function for both paths (`append_feed_entry_txn`), so a single append and a batch
+  cannot drift apart (the test compares them row for row over 250 members).
+- Two summary rows made that possible: `hs_user.feed_heads` `(user_id) -> {latest, floor}`,
+  written by every append (so `latest_feed_seq`, which every long-poll's `has_new_data` reads,
+  is now a get instead of a reverse range), and `hs_user.device_cursor_max` `(user_id) -> u64`,
+  written by `record_device_cursor` only when the maximum moves. Both are recovered from the
+  rows they summarise when absent and written on the way, so an existing store needs no
+  migration (tested by deleting them).
+- A batch whose transaction runs out of retries (its members' syncs recording cursors while it
+  ran) is written member by member, logged, and counted
+  (`hs_user_fan_out_transactions_total{outcome=fallback}`). `HS_SYNC_FAN_OUT_UNBATCHED=1` makes
+  that the only path: the measurement's baseline and an escape hatch (a `warn` at startup).
+- The room that no longer exists (`apply_update_for_a_gone_room`) uses the same two calls.
+
+**Retention.** Coalescing bounds a feed's growth between two syncs, not its length: an entry any
+device had been handed a token at or past stayed for ever, and the hot-room stream was never
+pruned. Now each has a *floor* (`crate::store::tables`, "Retention: the floor"):
+
+- `UserStore::compact_feed(user, keep)` moves the user's floor so that at most `keep` entries
+  lie above it, keeps exactly one entry per room at or below it (the newest), deletes the rest,
+  and records the floor in the feed head. `compact_hot_stream(keep)` does the same to the
+  hot-room stream, room by room, with its floor in `hs_user.ephemeral_counters`. Both scan at
+  most 50,000 rows per transaction and continue next time.
+- The hub compacts a feed once it has grown to twice its retention since its floor
+  (`apply_fan_out` names such users in `FanOutReport::feeds_to_compact`; the compaction runs
+  after the wake), and the stream once it has grown twice its retention since the hub last
+  compacted it. So each is between one and two retentions long, and a quiet user costs nothing.
+- Why every token is still answered correctly, in short: a kept entry is never coalesced into
+  (`append_feed_entry_txn` coalesces only above the floor), so it stays the room's position as
+  of its own `feed_seq`; a token at or above the floor sees what it did; and a token below the
+  floor still finds every room that changed after it, because a room with a deleted entry after
+  the token has its newest entry at or below the floor kept, and that one is after the deleted
+  one. What such a token may have lost is the room's position as of itself, and `resume_mode`
+  then sends the room whole: repeat, never skip. No change to `/sync` was needed (a first
+  version added an "expired token" path; the argument above made it unnecessary and it was
+  removed).
+- **Configuration:** `server.sync.feed_retention_entries` (default 10,000) and
+  `server.sync.hot_room_stream_retention_entries` (default 100,000), `0` keeps everything; hot
+  (`/server/sync` in `hs_config::reload::SETTINGS`, "the session hub reads it on every room
+  update"); under `server` because the management interface lists its eleven sections by name
+  and a `sync` section is a cross-track change. `hs serve` logs `sync feed retention in effect`
+  with both values at startup, and the "server settings are now in force" line carries them on
+  a reload. `docs/config.md` and `web/src/test/fixtures/hs-config-schema.json` regenerated;
+  `npm run check` passes on the fixture.
+- **Metrics** (`hs_user::metrics`): `hs_user_fan_out_duration_seconds`,
+  `hs_user_fan_out_members_total`, `hs_user_fan_out_transactions_total{outcome}`,
+  `hs_user_pruned_entries_total{stream=feed|hot_room_stream}`,
+  `hs_user_compactions_total{stream}`.
+
+**Tests.** `store::tables::tests`: `a_batched_fan_out_writes_what_single_calls_would` (250
+members, three transactions, every user's feed, pointer, head, records and cursor maximum equal
+to the one-at-a-time store's), `compaction_keeps_each_rooms_newest_entry_below_the_floor`
+(the kept entry, the floor, positions as of tokens on both sides of it, the no-coalesce-into-
+kept rule, idempotence, and `feeds_to_compact` past twice the retention),
+`the_hot_room_stream_keeps_each_rooms_newest_entry_below_its_floor`,
+`the_feed_head_and_cursor_maximum_are_recovered_from_the_rows`. `hub::tests::
+feeds_and_the_hot_stream_past_twice_their_retention_are_compacted` (through real room
+updates). `sync::tests::a_token_older_than_the_feed_retention_still_sees_every_changed_room`
+(two rooms, the feed compacted twice past the first token, B's position as of it gone; the sync
+from that token has both rooms with every message). `hs-config`'s schema walk and fixture tests
+cover the setting. `cargo test -p hs-user`: 177 + 6 pass.
+
+**Measured** on the real release binary (`hs serve`, one node,
+`crates/hs-user/tools/fanout_bench.py`: alice makes a public room, bob joins, the admin API joins `MEMBERS` more,
+a marker message waits for the hub to catch up, then `MESSAGES` messages from alice while bob
+long-polls; the owner's `hs_user_fan_out_duration_seconds` on `/metrics` is the fan-out's cost
+per update). Same binary both ways, `HS_SYNC_FAN_OUT_UNBATCHED=1` as the "before". The desktop
+was at load average 25-37 throughout (other agents' builds), so absolute numbers are inflated;
+the ratios are the point.
+
+| Store | Room | Before: fan-out per update | After | Catch-up after the joins, before -> after |
+|---|---|---|---|---|
+| embedded (Fjall), 302 members, 50 messages | message phase | 9.1 ms | 6.0 ms | 2.6 s -> 1.0 s after the 300th join request |
+| embedded, whole run (353 updates, 75-82k member writes) | joins and messages | 10.2 ms | 4.1 ms | |
+| PostgreSQL 17 in Docker (`fsync=off`), 22 members, 10 messages | message phase | 761 ms | 565 ms | 162 s -> 130 s |
+| PostgreSQL, whole run (33 updates) | joins and messages | 794 ms | 292 ms | |
+
+The embedded wake latency was 37-38 ms p50 either way (the feed was never the bottleneck on
+Fjall; 15,100 transactions became 200). On PostgreSQL the batched path still issues one
+`INSERT` per buffered write at commit (`hs-kv`'s `flush_pending`), two or three per member, so a
+300-member update is some 600-900 statements, each a Docker round trip here: that is RFC 0021
+(a multi-row upsert per table, about ten statements per update), the remaining step for the
+brief's 303-member room on PostgreSQL. The write-to-woken-sync latency on PostgreSQL today
+(30-117 s with 22 members, an empty `/sync` 1-3.5 s) is the loaded machine and the Docker
+round trip per statement, not the fan-out (0.3-0.8 s of it); the 300-member PostgreSQL run of
+session 12's recipe was not feasible on this machine today (hours at this per-statement cost)
+and is listed under "Left".
+
+**Also verified on the real binary:** the startup line (`sync feed retention in effect
+feed_retention_entries=10000 hot_room_stream_retention_entries=100000`); `PATCH
+/api/v1/config/server {"sync": {...}}` answers `reloadable: true`, and with a retention of 2 the
+hub compacted bob's feed three times (8 entries pruned) over twelve messages where the default
+compacts nothing.
+
+**Left.** RFC 0021 for track 01; the 303-member PostgreSQL measurement with `cluster_mirror.rs`
+on a quiet machine (and `tools/fanout_bench.py`, which could become a `hs-cli` test); the hub's other
+per-update store calls (`upsert_public_room` every update, `apply_room_member_changes` even with
+no change) are the next sequential round trips on the owner's path.
+
+**Files.** `crates/hs-user/src/{hub,metrics}.rs`, `crates/hs-user/src/store/{mod,tables}.rs`,
+`crates/hs-user/src/sync/mod.rs` (a comment), `crates/hs-config/src/{server,reload,lib}.rs`,
+`crates/hs-cli/src/serve.rs`, `docs/config.md`, `web/src/test/fixtures/hs-config-schema.json`,
+`docs/decisions/0025-sync-feeds-are-compacted-to-a-floor.md`,
+`docs/rfcs/0021-postgres-commit-flushes-writes-in-bulk.md`.
+
+**Verify.** `cargo test -p hs-user`, `cargo test -p hs-config`, `cargo clippy -p hs-user -p
+hs-config -p hs-cli --all-targets -- -D warnings`; the measurement as above.
+
+**Decisions made.** Decision 0025 (batches of 100 with a per-member fallback; the floor and
+the kept entry per room; compaction at twice the retention; `server.sync` under `server`;
+the two summary rows recovered from the rows). The hub's defaults
+(`hub::DEFAULT_FEED_RETENTION_ENTRIES`, `DEFAULT_HOT_STREAM_RETENTION_ENTRIES`) equal the
+config's, so a hub built without `hs-cli` behaves the same.
 
 ## Session 13 (2026-10-02, branch `agent/joined-rooms-rywr`): `/joined_rooms` sees the caller's own writes
 
