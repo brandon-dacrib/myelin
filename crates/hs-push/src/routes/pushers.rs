@@ -103,6 +103,7 @@ pub async fn post_pushers_set<B: KvBackend + 'static>(
         }
     };
 
+    let app_id = body.app_id.clone();
     let pusher: Pusher = PusherInit {
         ids: PusherIds::new(body.pushkey, body.app_id),
         kind: pusher_kind,
@@ -114,9 +115,10 @@ pub async fn post_pushers_set<B: KvBackend + 'static>(
     .into();
     state
         .pushers
-        .set_pusher(&requester.user_id, pusher)
+        .set_pusher(&requester.user_id, pusher, requester.device_id.clone())
         .await
         .map_err(store_err)?;
+    tracing::debug!(user = %requester.user_id, app_id, "pusher set");
     Ok(Json(json!({})))
 }
 

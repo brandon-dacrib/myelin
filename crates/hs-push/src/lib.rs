@@ -1,12 +1,13 @@
 //! `hs-push`: the push rules engine, notification counts, and pushers (track 10,
 //! `docs/workstreams/10-push.md`).
 //!
-//! Built on Ruma's `ruma::push` types rather than a reimplementation of them, per
-//! `docs/decisions/0007-build-less-reuse-more.md`: `Ruleset::iter` already yields rules in the
-//! spec's priority order and `AnyPushRuleRef::applies` already implements every condition kind.
-//! What this crate owns is everything around that — where a user's rules live, how they are cached
-//! so a busy room does not re-parse them once per recipient, what the outcome of an evaluation
-//! means, and where the resulting notification goes.
+//! Built on Ruma's `ruma::push` rule, condition and action types rather than a reimplementation
+//! of them, per `docs/decisions/0007-build-less-reuse-more.md`: `ConditionalPushRule::applies`
+//! already implements every condition kind. The container is this crate's own
+//! ([`ruleset::Ruleset`]: Ruma's insists a room rule's id is a room id, which clients do not
+//! keep to). What this crate owns is everything around the rules — where a user's rules live,
+//! how they are cached so a busy room does not re-parse them once per recipient, what the
+//! outcome of an evaluation means, and where the resulting notification goes.
 //!
 //! # Modules
 //!
@@ -17,6 +18,8 @@
 //!   `ruma::push::PushConditionRoomCtx`.
 //! - [`compiled`]: [`compiled::RuleCache`], the per-user `Arc<Ruleset>` cache that keeps the
 //!   per-recipient hot path off the store, with write-through invalidation.
+//! - [`ruleset`]: [`ruleset::Ruleset`], a user's rules in the spec's shape, with the edits
+//!   `/pushrules` makes.
 //! - [`rulesets`]: [`rulesets::RulesetStore`] and the cached read path evaluation actually calls
 //!   ([`rulesets::CachedRulesetStore`]), plus the in-memory and `hs-tables` implementations.
 //! - [`counts`]: [`counts::CountsStore`], the single source of truth for the notification and
@@ -26,6 +29,8 @@
 //!   separate from the aggregate counts.
 //! - [`pushers`]: [`pushers::PusherStore`] for `/pushers`, and [`pushers::http`], the Push Gateway
 //!   API client with retry and backoff.
+//! - [`pipeline`]: the worker that turns room events into counts, log entries and pushes, and
+//!   read receipts into resets and badge updates; [`cursors`] is its per-room position.
 //! - [`routes`]: the client-server HTTP endpoints, as a router fragment ([`routes::router`]).
 //! - [`state`]: [`state::PushState`], this crate's axum shared state, and
 //!   [`state::PushRequester`], the `hs-auth` `Requester` bridge.

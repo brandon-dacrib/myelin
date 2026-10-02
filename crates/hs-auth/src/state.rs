@@ -30,6 +30,17 @@ pub trait DeviceListChangeNotifier: Send + Sync {
     async fn notify_device_list_changed(&self, user_id: &UserId);
 }
 
+/// Told when a user's other sessions are revoked (`POST /account/password` with
+/// `logout_devices`, the default): the push layer removes the pushers those sessions
+/// registered, as the spec asks, since a pusher belongs to the login that made it. Defined here
+/// and answered from outside, like [`DeviceListChangeNotifier`], because this crate cannot see
+/// pushers.
+#[async_trait::async_trait]
+pub trait SessionRevocationObserver: Send + Sync {
+    /// Every session of `user_id` but `kept_device`'s (`None`: every session) was revoked.
+    async fn other_sessions_revoked(&self, user_id: &UserId, kept_device: Option<&ruma::DeviceId>);
+}
+
 /// Who `POST /user_directory/search` may show to whom.
 ///
 /// The spec's floor for that endpoint is "the users the requesting user shares a room with and
@@ -97,6 +108,8 @@ pub struct AuthState {
     pub(crate) device_list_notifier: Arc<OnceLock<Arc<dyn DeviceListChangeNotifier>>>,
     /// See [`UserDirectoryVisibility`] and [`AuthState::install_user_directory_visibility`].
     pub(crate) user_directory_visibility: Arc<OnceLock<Arc<dyn UserDirectoryVisibility>>>,
+    /// See [`SessionRevocationObserver`] and [`AuthState::install_session_revocation_observer`].
+    pub(crate) session_revocation_observer: Arc<OnceLock<Arc<dyn SessionRevocationObserver>>>,
 }
 
 impl AuthState {
@@ -117,6 +130,7 @@ impl AuthState {
             registration_tokens: Arc::new(InMemoryRegistrationTokens::new()),
             device_list_notifier: Arc::new(OnceLock::new()),
             user_directory_visibility: Arc::new(OnceLock::new()),
+            session_revocation_observer: Arc::new(OnceLock::new()),
         }
     }
 
@@ -216,6 +230,31 @@ impl AuthState {
                 "a user-directory visibility source was already installed on this auth state; \
                  ignoring the second install"
             );
+        }
+    }
+
+    /// Installs what is told when a user's other sessions are revoked. Same one-installer
+    /// convention as [`AuthState::install_device_list_notifier`].
+    pub fn install_session_revocation_observer(
+        &self,
+        observer: Arc<dyn SessionRevocationObserver>,
+    ) {
+        if self.session_revocation_observer.set(observer).is_err() {
+            tracing::warn!(
+                "a session revocation observer was already installed on this auth state; \
+                 ignoring the second install"
+            );
+        }
+    }
+
+    /// Calls the installed [`SessionRevocationObserver`], if any; a no-op otherwise.
+    pub async fn notify_other_sessions_revoked(
+        &self,
+        user_id: &UserId,
+        kept_device: Option<&ruma::DeviceId>,
+    ) {
+        if let Some(observer) = self.session_revocation_observer.get() {
+            observer.other_sessions_revoked(user_id, kept_device).await;
         }
     }
 

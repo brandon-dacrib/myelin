@@ -947,11 +947,11 @@ mod tests {
         let h = harness();
         let alice = user_id!("@alice:example.org");
         h.pushers
-            .set_pusher(alice, http_pusher("fresh", &url))
+            .set_pusher(alice, http_pusher("fresh", &url), None)
             .await
             .unwrap();
         h.pushers
-            .set_pusher(alice, http_pusher("stale", &url))
+            .set_pusher(alice, http_pusher("stale", &url), None)
             .await
             .unwrap();
         let room = room_id!("!room:example.org");

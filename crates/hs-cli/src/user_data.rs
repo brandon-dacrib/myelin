@@ -94,7 +94,7 @@ mod tests {
             "data": {"url": "https://push.example.org/_matrix/push/v1/notify"}
         }))
         .unwrap();
-        pushers.set_pusher(alice, pusher).await.unwrap();
+        pushers.set_pusher(alice, pusher, None).await.unwrap();
 
         let source = StoredUserData::new(store, pushers);
         let data = source.account_data("@alice:example.org").await.unwrap();

@@ -2,8 +2,8 @@
 
 use hs_kv::{KvBackend, TransactConfig, transact};
 use hs_tables::keyspace::TypedKeyspace;
-use ruma::UserId;
 use ruma::api::client::push::{Pusher, PusherIds};
+use ruma::{DeviceId, OwnedDeviceId, UserId};
 
 use super::PusherStore;
 use crate::error::StoreError;
@@ -11,9 +11,11 @@ use crate::error::StoreError;
 /// | keyspace | primary key | value |
 /// |---|---|---|
 /// | `hs_push.pushers` | `(user_id, app_id, pushkey)` | the `Pusher`, JSON-encoded |
+/// | `hs_push.pusher_devices` | `(user_id, app_id, pushkey)` | the device that registered it, as UTF-8; no row for a pusher with no known device |
 pub struct TablesPusherStore<B: KvBackend> {
     backend: B,
     pushers: TypedKeyspace<B::Keyspace, (String, String, String)>,
+    devices: TypedKeyspace<B::Keyspace, (String, String, String)>,
 }
 
 impl<B: KvBackend> TablesPusherStore<B> {
@@ -27,7 +29,16 @@ impl<B: KvBackend> TablesPusherStore<B> {
                 .keyspace("hs_push.pushers")
                 .map_err(|e| StoreError::Backend(e.to_string()))?,
         );
-        Ok(Self { backend, pushers })
+        let devices = TypedKeyspace::new(
+            backend
+                .keyspace("hs_push.pusher_devices")
+                .map_err(|e| StoreError::Backend(e.to_string()))?,
+        );
+        Ok(Self {
+            backend,
+            pushers,
+            devices,
+        })
     }
 }
 
@@ -51,14 +62,29 @@ impl<B: KvBackend> PusherStore for TablesPusherStore<B> {
         Ok(out)
     }
 
-    async fn set_pusher(&self, user_id: &UserId, pusher: Pusher) -> Result<(), StoreError> {
+    async fn set_pusher(
+        &self,
+        user_id: &UserId,
+        pusher: Pusher,
+        device_id: Option<OwnedDeviceId>,
+    ) -> Result<(), StoreError> {
         let k = key(user_id, &pusher.ids);
         let value = serde_json::to_vec(&pusher)
             .map_err(|e| StoreError::Backend(format!("encode pusher: {e}")))?;
         transact(&self.backend, TransactConfig::default(), |txn| {
             self.pushers
                 .put(txn, &k, &value)
-                .map_err(hs_kv::KvError::backend)
+                .map_err(hs_kv::KvError::backend)?;
+            match &device_id {
+                Some(device) => self
+                    .devices
+                    .put(txn, &k, device.as_bytes())
+                    .map_err(hs_kv::KvError::backend),
+                None => self
+                    .devices
+                    .delete(txn, &k)
+                    .map_err(hs_kv::KvError::backend),
+            }
         })
         .map_err(StoreError::from)
     }
@@ -68,7 +94,43 @@ impl<B: KvBackend> PusherStore for TablesPusherStore<B> {
         transact(&self.backend, TransactConfig::default(), |txn| {
             self.pushers
                 .delete(txn, &k)
+                .map_err(hs_kv::KvError::backend)?;
+            self.devices
+                .delete(txn, &k)
                 .map_err(hs_kv::KvError::backend)
+        })
+        .map_err(StoreError::from)
+    }
+
+    async fn delete_pushers_of_other_devices(
+        &self,
+        user_id: &UserId,
+        kept: Option<&DeviceId>,
+    ) -> Result<(), StoreError> {
+        let snap = self.backend.snapshot();
+        let prefix = (user_id.to_string(),);
+        let spec = TypedKeyspace::<B::Keyspace, (String, String, String)>::prefix(&prefix);
+        let mut doomed = Vec::new();
+        for item in self.devices.range(&snap, spec) {
+            let (k, device) = item?;
+            if kept.is_some_and(|d| d.as_bytes() == device.as_ref()) {
+                continue;
+            }
+            doomed.push(k);
+        }
+        if doomed.is_empty() {
+            return Ok(());
+        }
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            for k in &doomed {
+                self.pushers
+                    .delete(txn, k)
+                    .map_err(hs_kv::KvError::backend)?;
+                self.devices
+                    .delete(txn, k)
+                    .map_err(hs_kv::KvError::backend)?;
+            }
+            Ok(())
         })
         .map_err(StoreError::from)
     }
@@ -77,24 +139,9 @@ impl<B: KvBackend> PusherStore for TablesPusherStore<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pushers::contract_tests::{devices_scope_deletion, sample_pusher};
     use hs_kv::memory::MemoryBackend;
-    use ruma::api::client::push::{PusherInit, PusherKind};
-    use ruma::push::HttpPusherData;
     use ruma::user_id;
-
-    fn sample_pusher(pushkey: &str) -> Pusher {
-        PusherInit {
-            ids: PusherIds::new(pushkey.to_owned(), "com.example.app".to_owned()),
-            kind: PusherKind::Http(HttpPusherData::new(
-                "https://gw.example.org/notify".to_owned(),
-            )),
-            app_display_name: "Example".to_owned(),
-            device_display_name: "Phone".to_owned(),
-            profile_tag: None,
-            lang: "en".to_owned(),
-        }
-        .into()
-    }
 
     #[tokio::test]
     async fn round_trips_and_scopes_by_user() {
@@ -103,10 +150,13 @@ mod tests {
         let bob = user_id!("@bob:example.org");
 
         store
-            .set_pusher(alice, sample_pusher("key-1"))
+            .set_pusher(alice, sample_pusher("key-1"), None)
             .await
             .unwrap();
-        store.set_pusher(bob, sample_pusher("key-2")).await.unwrap();
+        store
+            .set_pusher(bob, sample_pusher("key-2"), None)
+            .await
+            .unwrap();
 
         let alice_pushers = store.get_pushers(alice).await.unwrap();
         assert_eq!(alice_pushers.len(), 1);
@@ -121,5 +171,11 @@ mod tests {
             .unwrap();
         assert!(store.get_pushers(alice).await.unwrap().is_empty());
         assert_eq!(store.get_pushers(bob).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn satisfies_the_shared_pusher_store_contract() {
+        let store = TablesPusherStore::open(MemoryBackend::new()).unwrap();
+        devices_scope_deletion(&store).await;
     }
 }

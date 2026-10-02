@@ -648,6 +648,10 @@ fn build_session_mounts<B: KvBackend>(
     user.hub.install_push_rules_store(push.rulesets.clone());
     user.hub.install_counts_store(push.counts.clone());
     user.hub.install_read_receipt_sink(Arc::new(pipeline));
+    // A password change that ends the other sessions ends their pushers too.
+    auth.install_session_revocation_observer(Arc::new(
+        hs_push::pushers::RevokedSessionPushers::new(push.pushers.clone()),
+    ));
     user.hub.install_device_list_token_resolver(&e2e);
 
     Ok((user, e2e, push, pipeline_worker))

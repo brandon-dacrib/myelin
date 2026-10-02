@@ -64,6 +64,14 @@ pub async fn post_account_password(
             .store
             .delete_all_refresh_tokens_for_user(&requester.user_id)
             .await?;
+        // The sessions are gone; so are the pushers they registered (`hs-push`'s observer).
+        let kept_device = requester
+            .access_token_id
+            .as_ref()
+            .and(requester.device_id.as_deref());
+        state
+            .notify_other_sessions_revoked(&requester.user_id, kept_device)
+            .await;
     }
 
     Ok(Json(json!({})).into_response())

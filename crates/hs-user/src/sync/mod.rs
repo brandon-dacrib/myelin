@@ -3368,7 +3368,11 @@ mod tests {
 
         let mut edited = hs_push::rulesets::default_ruleset(&alice);
         edited
-            .set_enabled(hs_push::ruleset::RuleKind::Underride, ".m.rule.message", false)
+            .set_enabled(
+                hs_push::ruleset::RuleKind::Underride,
+                ".m.rule.message",
+                false,
+            )
             .unwrap();
         rulesets.set_ruleset(&alice, &edited).await.unwrap();
 

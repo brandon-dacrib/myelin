@@ -818,7 +818,10 @@ impl<B: KvBackend + 'static> MigrationTarget for StoreTarget<B> {
             return Ok(Imported::AlreadyThere);
         }
         let was_there = existing.is_some();
-        self.pushers.set_pusher(&id, record).await.map_err(fatal)?;
+        self.pushers
+            .set_pusher(&id, record, None)
+            .await
+            .map_err(fatal)?;
         Ok(if was_there {
             Imported::Updated
         } else {
