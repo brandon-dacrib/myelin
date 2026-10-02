@@ -556,6 +556,12 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
   replacement another server made, this server's aliases for the old room and its directory
   entry follow (as Synapse's do). Verified on the real binary; Sytest's room-upgrade file was
   11 of 21 before (the count after is in status 04 session 18).
+- **A redaction is judged by the power levels in force when it was sent** (2026-10-02), not
+  when it is applied. A redaction that waits for its event (it arrived first, over federation or
+  ahead of a backfill) or arrives late over federation now takes effect if its sender could
+  redact *then* -- a moderator demoted since still redacts, a member promoted since does not.
+  Verified on the real binary around a power-level change, and in unit tests for the waiting
+  and the federation cases.
 - Rooms: creation, membership, state, timeline, `/messages`, `/context`, relations, threads, room
   upgrade, aliases, the room directory, redactions, and idempotent state sends and joins.
 - **History visibility is enforced on every read path.** A user who has left a non-world-readable

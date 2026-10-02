@@ -238,6 +238,16 @@ fn content_str<'a>(event: &'a Event, key: &str) -> Option<&'a str> {
 const OUTLIER_BATCH: usize = 256;
 
 /// The decoded inputs [`RoomActor::store_inputs`] prepares for the state store.
+/// The `m.room.power_levels` in force when an event was sent ([`RoomActor::power_levels_at`]).
+enum PowerLevelsAt<'a> {
+    /// This one.
+    Event(&'a Event),
+    /// The room had none: the spec's defaults apply.
+    None,
+    /// Not known here (an outlier whose state before it this server never had).
+    Unknown,
+}
+
 struct StoreInputs {
     prev_sns: Vec<EventSn>,
     auth_sns: Vec<EventSn>,
@@ -5501,6 +5511,72 @@ impl<B: KvBackend> RoomActor<B> {
     /// # Errors
     /// Returns [`RoomError::Internal`] if the room's power levels cannot be read.
     pub fn may_redact(&self, user: &UserId, target: &EventId) -> Result<bool, RoomError> {
+        self.may_redact_under(user, target, None)
+    }
+
+    /// [`RoomActor::may_redact`] judged by the power levels in force when `redaction` was sent,
+    /// not the current ones: the `m.room.power_levels` its `auth_events` name (the auth rules
+    /// require the current one there), or, for a redaction naming none, the ones in the state
+    /// before it; only a redaction whose state before it is not known here (an outlier) is
+    /// judged by the current power levels. A redaction is applied when it meets the event it
+    /// names, which can be long after it was sent -- it arrived first, over federation or
+    /// from a local sender ahead of a backfill, or it was sent elsewhere and came late -- and
+    /// until 2026-10-02 the current power levels decided it: a moderator's redaction was
+    /// dropped because they had been demoted since, and a power-0 member's took effect because
+    /// they had been promoted since.
+    ///
+    /// # Errors
+    /// Returns [`RoomError::Internal`] if the power levels cannot be read, or
+    /// [`RoomError::State`] reading the state before the redaction.
+    pub fn may_redact_at(
+        &self,
+        user: &UserId,
+        target: &EventId,
+        redaction: &Event,
+    ) -> Result<bool, RoomError> {
+        let levels = match self.power_levels_at(redaction)? {
+            PowerLevelsAt::Event(event) => Some(event),
+            PowerLevelsAt::None => None,
+            PowerLevelsAt::Unknown => return self.may_redact_under(user, target, None),
+        };
+        self.may_redact_under(user, target, Some(levels))
+    }
+
+    /// The `m.room.power_levels` in force when `event` was sent: the one its `auth_events`
+    /// name, else the one in the state before it.
+    fn power_levels_at(&self, event: &Event) -> Result<PowerLevelsAt<'_>, RoomError> {
+        let cited = pipeline::decode_event_ids(event.json().get("auth_events"))
+            .iter()
+            .filter_map(|id| self.event_by_id(id))
+            .find(|auth| {
+                auth.header().event_type == "m.room.power_levels"
+                    && auth.header().state_key.as_deref() == Some("")
+            });
+        if let Some(levels) = cited {
+            return Ok(PowerLevelsAt::Event(levels));
+        }
+        let Some(state) = self.state_before_event(event.event_id())? else {
+            return Ok(PowerLevelsAt::Unknown);
+        };
+        let levels = state
+            .state
+            .iter()
+            .find(|e| {
+                e.header().event_type == "m.room.power_levels"
+                    && e.header().state_key.as_deref() == Some("")
+            })
+            .and_then(|e| self.event_by_id(e.event_id()));
+        Ok(levels.map_or(PowerLevelsAt::None, PowerLevelsAt::Event))
+    }
+
+    /// [`RoomActor::may_redact`] against `levels` -- `Some(Some(event))` a power-levels event,
+    /// `Some(None)` a room with none -- or, for `None`, the current power levels.
+    fn may_redact_under(
+        &self,
+        user: &UserId,
+        target: &EventId,
+        levels: Option<Option<&Event>>,
+    ) -> Result<bool, RoomError> {
         let Some(original) = self.event_by_id(target) else {
             return Ok(true);
         };
@@ -5510,7 +5586,11 @@ impl<B: KvBackend> RoomActor<B> {
         let rules = room_version::rules_for(self.room_version())
             .ok_or_else(|| RoomError::Internal("unknown room version".into()))?;
         let creators = self.room_creators(&rules)?;
-        let Some(event) = self.state_event("m.room.power_levels", "")? else {
+        let levels = match levels {
+            Some(levels) => levels,
+            None => self.state_event("m.room.power_levels", "")?,
+        };
+        let Some(event) = levels else {
             // No power levels yet: the spec's defaults, 100 for a creator, 0 for everybody else,
             // against a redact level of 50.
             return Ok(creators.iter().any(|c| c == user));
@@ -7531,6 +7611,156 @@ mod tests {
                 .flags
                 .is_redacted(),
             "bob's own redaction, received over federation, must take effect"
+        );
+    }
+
+    /// Sets `user`'s level in the room's power levels to `level`, by alice.
+    fn set_power(actor: &mut RoomActor<MemoryBackend>, user: &UserId, level: i64, now: i64) {
+        let mut levels = power_levels_of(actor);
+        levels["users"][user.as_str()] = serde_json::json!(level);
+        actor
+            .send_event(
+                user_id!("@alice:hs1").to_owned(),
+                "m.room.power_levels".to_owned(),
+                Some(String::new()),
+                levels,
+                None,
+                now,
+            )
+            .unwrap();
+    }
+
+    fn is_redacted(actor: &RoomActor<MemoryBackend>, id: &EventId) -> bool {
+        actor.event_by_id(id).unwrap().header().flags.is_redacted()
+    }
+
+    /// A redaction that waits for its event is judged, when the event comes, by the power
+    /// levels in force when the redaction was sent: a moderator's redaction of an event not
+    /// yet held takes effect when the event arrives although they have been demoted since,
+    /// and a power-0 member's does not although they have been promoted since. Until
+    /// 2026-10-02 the current power levels decided both, the wrong way round.
+    #[test]
+    fn a_waiting_redaction_is_judged_by_the_power_levels_when_it_was_sent() {
+        let bob = user_id!("@bob:hs1");
+        let carol = user_id!("@carol:other.example");
+        let carol_key = hs_model::signing::SigningKeyPair::generate("1");
+        let carol_server = ruma::ServerName::parse("other.example").unwrap();
+        let setup = || {
+            let mut actor = room("public_chat");
+            for user in [bob, carol] {
+                actor
+                    .membership_action(
+                        user.to_owned(),
+                        Action::Join,
+                        user.to_owned(),
+                        serde_json::json!({}),
+                        2,
+                    )
+                    .unwrap();
+            }
+            actor
+        };
+
+        // A moderator redacts an event this server has not received yet, then is demoted.
+        let mut actor = setup();
+        set_power(&mut actor, bob, 50, 3);
+        let message = build_remote_message(&actor, carol, &carol_server, &carol_key, "late");
+        let target = message.event_id().to_owned();
+        actor
+            .redact_txn(bob.to_owned(), None, "t1", target.clone(), None, 4)
+            .unwrap();
+        set_power(&mut actor, bob, 0, 5);
+        actor.accept_remote_event(message).unwrap();
+        assert!(
+            is_redacted(&actor, &target),
+            "bob held 50 when he sent the redaction; his demotion since does not undo it"
+        );
+
+        // A power-0 member redacts an event not yet held, then is promoted.
+        let mut actor = setup();
+        let message = build_remote_message(&actor, carol, &carol_server, &carol_key, "late");
+        let target = message.event_id().to_owned();
+        actor
+            .redact_txn(bob.to_owned(), None, "t2", target.clone(), None, 4)
+            .unwrap();
+        set_power(&mut actor, bob, 50, 5);
+        actor.accept_remote_event(message).unwrap();
+        assert!(
+            !is_redacted(&actor, &target),
+            "bob held 0 when he sent the redaction; his promotion since does not make it good"
+        );
+    }
+
+    /// A redaction received over federation is judged by the power levels its `auth_events`
+    /// name -- the ones in force where and when it was sent -- not by the current ones: a
+    /// remote moderator's redaction, sent before their demotion and arriving after it, takes
+    /// effect; a remote member's redaction sent at power 0 does not, however they rank now.
+    #[test]
+    fn a_received_redaction_is_judged_by_the_power_levels_it_was_sent_under() {
+        let bob = user_id!("@bob:hs1");
+        let carol = user_id!("@carol:other.example");
+        let carol_key = hs_model::signing::SigningKeyPair::generate("1");
+        let carol_server = ruma::ServerName::parse("other.example").unwrap();
+        let setup = || {
+            let mut actor = room("public_chat");
+            for user in [bob, carol] {
+                actor
+                    .membership_action(
+                        user.to_owned(),
+                        Action::Join,
+                        user.to_owned(),
+                        serde_json::json!({}),
+                        2,
+                    )
+                    .unwrap();
+            }
+            let message = actor
+                .send_event(
+                    bob.to_owned(),
+                    "m.room.message".to_owned(),
+                    None,
+                    serde_json::json!({"msgtype": "m.text", "body": "bob's"}),
+                    None,
+                    3,
+                )
+                .unwrap();
+            (actor, message.event_id().to_owned())
+        };
+
+        let (mut actor, target) = setup();
+        set_power(&mut actor, carol, 50, 4);
+        let redaction = build_remote_event(
+            &actor,
+            carol,
+            &carol_server,
+            &carol_key,
+            "m.room.redaction",
+            serde_json::json!({"redacts": target.as_str()}),
+        );
+        set_power(&mut actor, carol, 0, 5);
+        assert!(matches!(
+            actor.accept_remote_event(redaction).unwrap(),
+            RemoteEventOutcome::Stored(_)
+        ));
+        assert!(
+            is_redacted(&actor, &target),
+            "carol's redaction cites the power levels under which she held 50"
+        );
+
+        let (mut actor, target) = setup();
+        let redaction = build_remote_event(
+            &actor,
+            carol,
+            &carol_server,
+            &carol_key,
+            "m.room.redaction",
+            serde_json::json!({"redacts": target.as_str()}),
+        );
+        set_power(&mut actor, carol, 50, 5);
+        actor.accept_remote_event(redaction).unwrap();
+        assert!(
+            !is_redacted(&actor, &target),
+            "carol's redaction cites the power levels under which she held 0"
         );
     }
 

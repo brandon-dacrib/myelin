@@ -91,6 +91,36 @@ admin API's room long tail).
 > - **Sytest** (`tests/30rooms/60version_upgrade.pl`, image `myelin-sytest:dev` as the
 >   baseline, then `SYTEST_HS_BINARY` from this branch): **before 11 of 21** (7 failed, 3
 >   skipped), results in `target/sytest/before-1`. After: see the end of this entry.
+> **Row 2: `may_redact` at the redaction's time** (status 06 session 17's "left": "`may_redact`
+> still reads the current power levels, not those at the redaction"). A redaction is applied
+> when it meets the event it names, which can be long after it was sent: it arrived first (over
+> federation, or a local redaction of an event a backfill brings later) and waited
+> (`actor::redactions`), or it was sent on another server and came late. Until now the current
+> power levels decided it, so a moderator's redaction was dropped because they had been demoted
+> in between, and a power-0 member's took effect because they had been promoted in between.
+>
+> - `RoomActor::may_redact_at(user, target, redaction)` (new) judges the sender by the
+>   `m.room.power_levels` the redaction's `auth_events` name -- the auth rules require the one
+>   current where it was sent -- or, for a redaction naming none, the one in the state before
+>   it (`state_before_event`); only an outlier whose state before it is not known here falls
+>   back to the current levels (`may_redact`, unchanged for the local send, where "now" is the
+>   redaction's time). `redaction_may_take_effect` takes the redaction's id and uses it, so both
+>   the waiting path (`apply_waiting_redactions`) and the received path
+>   (`apply_received_redaction`) are judged at the redaction's time. The spec's same-server
+>   rule (from room version 3) is unchanged.
+> - **Tests**, both failing with `redaction_may_take_effect` put back on the current levels
+>   (checked): `actor::tests::a_waiting_redaction_is_judged_by_the_power_levels_when_it_was_sent`
+>   (bob at 50 redacts a remote event not yet held, is demoted to 0, the event arrives:
+>   redacted; bob at 0 redacts, is promoted, the event arrives: not redacted) and
+>   `a_received_redaction_is_judged_by_the_power_levels_it_was_sent_under` (carol on another
+>   server at 50 builds a redaction of bob's message, is demoted, it arrives: applied; built at
+>   0, promoted, arrives: not). `crates/hs-cli/tests/redaction_power.rs` (new; the real `hs`
+>   binary): bob at 0 is refused (403), at 50 redacts alice's message and `/event` shows it
+>   empty, demoted to 0 his next redaction is refused and the first stands.
+> - **Observability.** Unchanged lines: "a received redaction is not allowed to take effect"
+>   and "a redaction that arrived before its event is not allowed to take effect" at `info`,
+>   now meaning "under the levels of its time".
+>
 > - **Power levels 0/2.** Sytest's "Power Levels" group is unreachable from the server side:
 >   every test in it (and ten more, 13 skips in the night's run) requires the fixture
 >   `can_change_power_levels`, which was proven by `tests/10apidoc/36room-levels.pl`'s test

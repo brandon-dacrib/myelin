@@ -80,7 +80,7 @@ impl<B: KvBackend> RoomActor<B> {
             else {
                 continue;
             };
-            if !self.redaction_may_take_effect(&sender, event_id) {
+            if !self.redaction_may_take_effect(&sender, event_id, &redaction_id) {
                 tracing::info!(
                     room_id = %self.room_id,
                     redaction = %redaction_id,
@@ -111,14 +111,25 @@ impl<B: KvBackend> RoomActor<B> {
     /// Whether a redaction by `sender` of `target` (held) may take effect: the sender is on the
     /// original sender's server (the spec's rule from room version 3, under which the auth rules
     /// admit any member's redaction and leave this check to whoever applies it), or
-    /// [`RoomActor::may_redact`] allows it (their own event, or the room's redact power level,
-    /// read from the current power levels).
-    pub(super) fn redaction_may_take_effect(&self, sender: &UserId, target: &EventId) -> bool {
+    /// [`RoomActor::may_redact_at`] allows it (their own event, or the room's redact power level
+    /// as it stood when the redaction was sent).
+    pub(super) fn redaction_may_take_effect(
+        &self,
+        sender: &UserId,
+        target: &EventId,
+        redaction_id: &EventId,
+    ) -> bool {
         let Some(original) = self.event_by_id(target) else {
             return false;
         };
-        original.header().sender.server_name() == sender.server_name()
-            || self.may_redact(sender, target).unwrap_or(false)
+        if original.header().sender.server_name() == sender.server_name() {
+            return true;
+        }
+        match self.event_by_id(redaction_id) {
+            Some(redaction) => self.may_redact_at(sender, target, redaction),
+            None => self.may_redact(sender, target),
+        }
+        .unwrap_or(false)
     }
 
     /// Applies a redaction received from another server to the event it names, when this room
@@ -143,7 +154,7 @@ impl<B: KvBackend> RoomActor<B> {
             );
             return;
         }
-        if !self.redaction_may_take_effect(sender, target) {
+        if !self.redaction_may_take_effect(sender, target, redaction_id) {
             tracing::info!(
                 room_id = %self.room_id,
                 redaction = %redaction_id,
