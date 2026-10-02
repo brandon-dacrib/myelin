@@ -894,18 +894,46 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             .map_err(|e| e.to_string())?;
         let kind = bridge_types::get(&row.bridge_type, &self.server_name);
         let encrypted = offering.options.encryption.unwrap_or(true);
-        let room = client
-            .create_dm(&token, &bot, owner, encrypted)
-            .await
-            .map_err(|e| e.to_string())?;
-        // With double puppeting the instance may act as its owner, and only then can it mark
-        // the chat as direct on the owner's side too, the way a mautrix bridge does itself.
-        if kind.as_ref().is_some_and(|k| k.supports_double_puppeting)
-            && offering.options.double_puppeting.unwrap_or(true)
-            && let Err(e) = client.add_direct(&token, owner, &bot, &room).await
-        {
-            tracing::debug!(error = %e, owner, "could not mark the chat direct for its owner");
-        }
+        // A mautrix bridge takes bare commands (`login qr`) only in a person's management
+        // room, and it marks a room as that only when the person invites its bot into a chat
+        // with just the two of them (bridgev2's `handleBotInvite`). Anywhere else a message
+        // without the bridge's command prefix is dropped without a word, and a chat the bot
+        // started and the owner accepted is anywhere else: typing in it did nothing
+        // (`docs/status/11-appservices-and-bridges.md`, 2026-10-02). So, where the instance
+        // may act as its owner (double puppeting: the registration's non-exclusive claim on
+        // them), the chat is started as the owner with the bot invited, and the bot is joined
+        // here as well so the steps can be posted at once; the bridge accepts the invite it is
+        // sent, finds two members and marks the room. Without that claim the chat can only be
+        // started by the bot, and the steps say to start one.
+        let as_owner = kind.as_ref().is_some_and(|k| k.supports_double_puppeting)
+            && offering.options.double_puppeting.unwrap_or(true);
+        let room = if as_owner {
+            let room = client
+                .create_dm(&token, owner, &bot, encrypted)
+                .await
+                .map_err(|e| format!("could not start the chat as its owner: {e}"))?;
+            client
+                .join(&token, &bot, &room)
+                .await
+                .map_err(|e| format!("the bot could not join the chat: {e}"))?;
+            if let Err(e) = client.add_direct(&token, &bot, owner, &room).await {
+                tracing::debug!(error = %e, owner, "could not mark the chat direct for the bot");
+            }
+            room
+        } else {
+            client
+                .create_dm(&token, &bot, owner, encrypted)
+                .await
+                .map_err(|e| e.to_string())?
+        };
+        tracing::info!(
+            bridge_type = %row.bridge_type,
+            owner,
+            room,
+            started_by = if as_owner { "owner" } else { "bot" },
+            encrypted,
+            "started the owner's chat with their bridge's bot"
+        );
         let recorded = self
             .store
             .update_instance(&row.bridge_type, &row.owner, |r| {
@@ -931,6 +959,17 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             .unwrap_or_default();
         let mut text = format!("This is your own {name} bridge. To sign in:\n");
         let mut html = format!("<p>This is your own {name} bridge. To sign in:</p><ol>");
+        if !as_owner {
+            // The bridge will not take commands in a chat its bot started.
+            let line = format!(
+                "The bridge only takes commands in a chat you start: invite {bot} to a new direct chat, then follow these steps there."
+            );
+            text = format!("This is your own {name} bridge. {line}\n");
+            html = format!(
+                "<p>This is your own {name} bridge. {}</p><ol>",
+                crate::front_door::inline_html(&line)
+            );
+        }
         for step in steps.iter() {
             // "Start a direct chat with me and send `login qr`" reads oddly in the chat itself.
             let step = step.replace("Start a direct chat with me and send", "Send");
@@ -948,12 +987,25 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             bridge_types::front_door_localpart(&row.bridge_type),
         ) && let Ok(tokens) = self.tokens()
         {
-            let text = format!(
-                "Your {name} bridge is ready. I've invited you to a chat with {bot}: accept it and follow the steps there to sign in."
-            );
-            let html = format!(
-                "Your {name} bridge is ready. I've invited you to a chat with <a href=\"https://matrix.to/#/{bot}\">{bot}</a>: accept it and follow the steps there to sign in."
-            );
+            let (text, html) = if as_owner {
+                (
+                    format!(
+                        "Your {name} bridge is ready. I've started a chat for you with {bot}: open it and follow the steps there to sign in."
+                    ),
+                    format!(
+                        "Your {name} bridge is ready. I've started a chat for you with <a href=\"https://matrix.to/#/{bot}\">{bot}</a>: open it and follow the steps there to sign in."
+                    ),
+                )
+            } else {
+                (
+                    format!(
+                        "Your {name} bridge is ready. I've invited you to a chat with {bot}: accept it and follow the steps there to sign in."
+                    ),
+                    format!(
+                        "Your {name} bridge is ready. I've invited you to a chat with <a href=\"https://matrix.to/#/{bot}\">{bot}</a>: accept it and follow the steps there to sign in."
+                    ),
+                )
+            };
             let _ = client
                 .notice(&tokens.as_token, &self.mxid(door), door_room, &text, &html)
                 .await;

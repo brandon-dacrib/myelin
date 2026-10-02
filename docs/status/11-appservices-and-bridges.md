@@ -5,6 +5,115 @@ before that 2026-10-01 (who has signed in to a bridge; the `cluster` runtime run
 both below); before that 2026-09-30 (ephemeral, to-device and device-list delivery); before that
 2026-09-27 (RFC 0017 run against the real binary), 2026-09-27 (the bridge manager) and
 2026-09-25.
+Last updated: 2026-10-02 (`login qr` in the personal bot's chat did nothing: found with the
+real bridge, fixed in the manager; below); before that 2026-10-01 (who has signed in to a bridge;
+the `cluster` runtime run on kind); before that 2026-09-30 (ephemeral, to-device and device-list
+delivery); before that 2026-09-27 (RFC 0017 run against the real binary), 2026-09-27 (the bridge
+manager) and 2026-09-25.
+
+## Session 2026-10-02 (branch `agent/bridge-login`): typing `login qr` to the personal bot did nothing
+
+**What the owner saw.** A per-person mautrix-whatsapp bridge set up from the interface, the
+invitation from `@whatsappbot_<localpart>` accepted in Element, `login qr` sent in that chat: no
+reply, no QR code. The chat is end-to-end encrypted by default (`options.encryption`), so the
+first suspicion was appservice-mode encryption (MSC3202/4203/4190), which no person had ever
+typed through.
+
+**Reproduced with the real bridge**, and the suspicion was wrong. The new test
+`crates/hs-bridge-conformance/tests/real_mautrix_login.rs` boots the real `hs` binary
+(`public_baseurl: http://host.docker.internal:<port>`, embedded store, local media), claims it,
+registers alice on a `matrix-sdk` client with `e2e-encryption` on, enables the offering
+(`PUT /api/v1/bridge-offerings/mautrix-whatsapp {"runtime":"elsewhere"}`), makes her instance,
+writes its files (`POST .../instances/@alice:test.local/files`) into a volume, runs
+`dock.mau.dev/mautrix/whatsapp:latest` (`v26.09+dev.a0325e76`) against them, patches the
+registration's `url` to the container's port, waits for `ready`, and acts as alice: joins the
+chat and sends `login qr`, then waits 30 s for the bot. On `main`'s manager, with the chat
+encrypted:
+
+- The server delivered everything: `delivered a transaction ... txn_id=6 events=1` (the
+  `m.room.encrypted`), `txn_id=7 to_device=1` (her client's `m.room_key` for the bot's device,
+  270 ms later); `appservices.health` said `healthy`, no backlog.
+- The bridge **decrypted it**: `Decrypting received event event_id=$qwmu...`, `Couldn't find
+  session, waiting for keys to arrive... wait_seconds=3`, `Created inbound olm session ...
+  sender=@alice:test.local`, `Upserting megolm inbound group session`, `Got keys after waiting,
+  trying to decrypt event again`, **`Event decrypted successfully decrypted_event_type="m.room.message
+  (message)"`**. Then nothing at all: no command, no request to the room, no warning.
+- The same message typed as **`!wa login qr`** (`HS_BRIDGE_LOGIN_TEXT`) was answered at once,
+  encrypted, by three events the client decrypted: an `m.notice` **"⚠️ This is not your
+  management room. Entering login info must be prefixed with `!wa` like other commands."**, an
+  `m.notice` "Scan the QR code with the WhatsApp mobile app to log in", and an `m.image` (the QR,
+  uploaded to this server's media).
+
+**Root cause (the manager's).** A mautrix `bridgev2` bridge takes a bare command (no `!wa`)
+only in the sender's *management room* (`bridgev2/queue.go`, `QueueMatrixEvent`:
+`strings.HasPrefix(msg.Body, CommandPrefix) || evt.RoomID == sender.ManagementRoom`), and the
+only place it ever sets a management room is `handleBotInvite` (`bridgev2/matrixinvite.go`):
+*the person invites the bot* into a room, the bot accepts, and if the room then has two members
+it is marked. Any other room is "not a portal" (`ErrNoPortal`, `WithSendNotice(false)`): the
+message is dropped without a word, even after being decrypted. `BridgeManager::invite_owner`
+created the chat **as the bot and invited the owner**, so the bridge saw its own bot create a
+room and a person join it, and never an invitation to accept. Every chat the manager had ever
+made was such a room; encryption had nothing to do with it (the unencrypted chat failed the
+same way, in the second run of the test before the fix).
+
+**The fix** (`crates/hs-bridges/src/manager.rs`, `invite_owner`): where the instance may act as
+its owner (double puppeting on, which is the registration's non-exclusive claim on the owner and
+the catalogue's default for every mautrix type), the chat is **created as the owner with the bot
+invited** (`is_direct`, encrypted per the option, `m.direct` on both sides), and the manager
+joins the bot at once so the sign-in steps can be posted; the bridge is sent the invitation in a
+transaction, accepts it (`Accepted invite to room as bot`), counts two members and marks the
+room. Without double puppeting the manager cannot act as the owner, so the chat is still the
+bot's and its first line now says so: "The bridge only takes commands in a chat you start:
+invite `@whatsappbot_…` to a new direct chat, then follow these steps there." The front door's
+"ready" line says "I've started a chat for you with …: open it" in the first case and keeps
+"I've invited you to a chat with …: accept it" in the second. A new `info` line names the room:
+`started the owner's chat with their bridge's bot bridge_type= owner= room= started_by=owner|bot
+encrypted=`.
+
+**After the fix, the same test, both chats** (`cargo test -p hs-bridge-conformance --test
+real_mautrix_login`, 2 of 2, 24 s with the image present): alice's `login qr` is
+`Received command mx_command=login`, the bridge dials `wss://web.whatsapp.com/ws/chat`,
+`Received QR codes code_count=6`, and answers "Scan the QR code with the WhatsApp mobile app to
+log in" and the `m.image`; in the encrypted chat both are `m.room.encrypted` and her client
+decrypts them (`Sharing group session for room ... destination_map={"@alice:test.local":{...}}`,
+the bot's `m.room_key` through `/sendToDevice` and her `/sync`'s `to_device`). So **appservice-mode
+encryption works end to end with a real bridge and a real encrypting client, in both
+directions**, which until now had only been inferred from key uploads and a key request. The
+test skips, saying why, without Docker, the image or the binary; `HS_BRIDGE_LOGIN_LOG_DIR`
+keeps both logs.
+
+**For the owner's running server, right now.** The existing chat was made by the bot and will
+never be a management room; nothing in the server can change that after the fact. Either:
+(a) in that chat, type **`!wa login qr`** (the prefixed form works anywhere the bot is; the bridge
+will say the room is not its management room, then show the QR), or (b) from Element, **start a
+new direct chat and invite `@whatsappbot_<localpart>:<server>`**: the bot accepts, says "This
+room has been marked as your management room", and `login qr` works there. Or, after this
+branch is deployed, `stop whatsapp confirm` and `start whatsapp` with `@bridges` (or delete and
+re-create the instance on the offering page): the new chat is started as the person and works
+as the steps say. Instances that already have a `dm_room` are left alone.
+
+**How to see this when it happens again.** The server cannot tell that a bridge dropped a message
+it was delivered: `appservices.health` and the backlog say delivered, and they are right. The
+place to look is the bridge's own log (`docker logs <container>`, or `kubectl -n <bridges
+namespace> logs deploy/<deployment.name>` from the instance's `deployment` on the Bridge page):
+a message that was taken is `Received command mx_command=…`; one that was decrypted and dropped is
+`Event decrypted successfully` followed by nothing; one that could not be decrypted is `Failed to
+decrypt event` or `Didn't get session, giving up`, and then the server's `delivered a transaction
+... to_device=` lines say whether the key ever went out.
+
+**Verified.** `cargo test -p hs-bridge-conformance` (the 4 synthetic scenarios and the 2 real
+ones), `cargo test -p hs-bridges`, `cargo test -p hs-cli --test bridge_offerings` (3; two of
+them asserted the old invitation and now assert the chat started as alice with the bot's
+invitation from her, `is_direct`, both joined, and the bridge sent the invitation),
+`cargo clippy -p hs-bridges -p hs-bridge-conformance -p hs-cli --all-targets -- -D warnings`,
+`cargo fmt --all --check`.
+
+**Not verified / left.** The `cluster` runtime path is the same code but was not run on kind
+today. Nobody scanned the QR with a phone, so the bridge's `login` flow past its first step, and
+a WhatsApp message in either direction, remain unseen. The bridge's welcome ("Hello, I'm a
+WhatsApp bridge bot … This room has been marked as your management room") and the manager's
+steps both land in the chat, in either order. `mautrix-discord` was not checked to be on
+`bridgev2`; if it still uses the older framework its management-room rule may differ.
 
 ## Session 2026-10-02 (branch `agent/bridge-names`): the pod says what bridge and whose it is
 
@@ -711,6 +820,13 @@ to anything broken.
 
 ## Decisions made
 
+- **The owner's chat with their bridge's bot is started as the owner, not by the bot**
+  (2026-10-02). mautrix marks a room as a person's management room only when the person invites
+  its bot; a chat the bot starts never takes bare commands, so the invitation the manager used to
+  send produced a chat where typing did nothing. This uses double puppeting (the non-exclusive
+  claim on the owner the registration already carries for the mautrix types); without it the
+  chat is still the bot's and its first line tells the person to start one. Encryption stays on
+  by default: it was proven end to end with the real bridge in the same session.
 - **`receive_ephemeral` and `de.sorunome.msc2409.push_ephemeral` are tracked as two independent
   booleans**, not folded into one "wants ephemeral" flag, after reading Synapse's actual loader
   (`refs/synapse/synapse/config/appservice.py`: `supports_ephemeral = as_info.get

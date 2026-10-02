@@ -2242,14 +2242,18 @@ dependencies = [
 name = "hs-bridge-conformance"
 version = "0.0.1"
 dependencies = [
+ "anyhow",
  "async-trait",
  "axum",
  "hs-appservice",
  "hs-auth",
  "hs-http",
  "hs-kv",
+ "matrix-sdk",
+ "reqwest 0.12.28",
  "ruma 0.15.1",
  "serde_json",
+ "tempfile",
  "tokio",
  "tower",
  "tracing",

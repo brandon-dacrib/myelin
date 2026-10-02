@@ -96,6 +96,29 @@ server. What it has still not done is decrypt or encrypt a room message: that ne
 WhatsApp account, and a phone. The bridge's avatar fetch from `maunium.net` got a 502 (no
 federation on that test server), which is unrelated and harmless.
 
+## 2026-10-02: a person types `login qr` to their own bot, and the chat is encrypted
+
+The first time anyone typed to a personal bot through this server, and it did nothing. The
+reproduction is now a test, `crates/hs-bridge-conformance/tests/real_mautrix_login.rs`: the real
+binary, this image (`dock.mau.dev/mautrix/whatsapp:latest`, `v26.09+dev.a0325e76`) from an
+offering instance's files, and alice on `matrix-sdk` with encryption, twice (the chat encrypted,
+the offering's default, and in the clear). Before the fix the bridge decrypted `login qr`
+(`Event decrypted successfully decrypted_event_type="m.room.message (message)"`) and dropped it:
+the chat had been started by its bot, and a mautrix bridge only takes bare commands in a room the
+person invited the bot into (its management room). `!wa login qr` in the same chat got "⚠️ This
+is not your management room. Entering login info must be prefixed with `!wa` like other
+commands." and then the QR. The manager now starts the chat as the person (double puppeting)
+with the bot invited; the bridge accepts (`Accepted invite to room as bot`) and marks it, and
+`login qr` is `Received command mx_command=login`, `Received QR codes code_count=6`, "Scan the QR
+code with the WhatsApp mobile app to log in" and an `m.image` of the code, all of it encrypted
+and decrypted by alice's client in the encrypted chat. Details and the owner's way out of an
+existing chat: `docs/status/11-appservices-and-bridges.md`, 2026-10-02.
+
+Running it: `cargo build -p hs-cli --bin hs`, then `cargo test -p hs-bridge-conformance --test
+real_mautrix_login -- --nocapture` with Docker reachable (it pulls the image from mau.dev if it
+is missing, and skips, saying why, when it cannot). `HS_BRIDGE_LOGIN_LOG_DIR=<dir>` keeps the
+server's and the bridge's logs; `HS_BRIDGE_LOGIN_TEXT='!wa login qr'` types something else.
+
 ## 2026-10-01: the server asks the bridge who has signed in
 
 The render now writes a `provisioning.shared_secret` of its own into `config.yaml` and keeps the

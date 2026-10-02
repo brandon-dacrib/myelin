@@ -645,38 +645,60 @@ async fn an_offering_takes_an_instance_from_requested_to_ready_and_removes_it_ag
     assert!(seen["reason"].is_null());
 
     let bot = "@whatsappbot_alice:example.org";
+    // Her chat with the bot is started as her (double puppeting), with the bot invited by her
+    // and joined: the one shape a mautrix bridge takes as her management room, where a bare
+    // `login qr` is a command (a chat the bot started is not one, and typing in it did
+    // nothing). The sign-in steps are already in it.
     let synced = alice
         .sync_until(None, |s| {
-            s["rooms"]["invite"]
-                .as_object()
-                .is_some_and(|rooms| !rooms.is_empty())
+            s["rooms"]["join"].as_object().is_some_and(|rooms| {
+                rooms
+                    .values()
+                    .any(|j| !notices_from(&j["timeline"], bot).is_empty())
+            })
         })
         .await;
-    let (dm, invite) = synced["rooms"]["invite"]
+    let (dm, joined) = synced["rooms"]["join"]
         .as_object()
         .unwrap()
         .iter()
-        .next()
+        .find(|(_, j)| !notices_from(&j["timeline"], bot).is_empty())
         .unwrap();
-    let member = invite["invite_state"]["events"]
+    let said = notices_from(&joined["timeline"], bot).join("\n");
+    assert!(said.contains("This is your own WhatsApp bridge"), "{said}");
+    assert!(said.contains("login qr"), "{said}");
+    let history = alice
+        .matrix(
+            GET,
+            &format!("/rooms/{}/messages?dir=b&limit=50", escape(dm)),
+            None,
+        )
+        .await;
+    let invite = history["chunk"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|e| e["type"] == "m.room.member" && e["state_key"] == alice_id)
-        .unwrap_or_else(|| panic!("{invite}"));
-    assert_eq!(member["sender"], bot, "{member}");
-    assert_eq!(member["content"]["is_direct"], true, "{member}");
-    alice
-        .matrix(POST, &format!("/join/{}", escape(dm)), Some(json!({})))
-        .await;
-    let synced = alice
-        .sync_until(None, |s| {
-            !notices_from(&s["rooms"]["join"][dm]["timeline"], bot).is_empty()
+        .find(|e| {
+            e["type"] == "m.room.member"
+                && e["state_key"] == bot
+                && e["content"]["membership"] == "invite"
         })
+        .unwrap_or_else(|| panic!("{history}"));
+    assert_eq!(invite["sender"], alice_id, "{invite}");
+    assert_eq!(invite["content"]["is_direct"], true, "{invite}");
+    let members = alice
+        .matrix(GET, &format!("/rooms/{}/members", escape(dm)), None)
         .await;
-    let said = notices_from(&synced["rooms"]["join"][dm]["timeline"], bot).join("\n");
-    assert!(said.contains("This is your own WhatsApp bridge"), "{said}");
-    assert!(said.contains("login qr"), "{said}");
+    let now_in = |who: &str| {
+        members["chunk"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["state_key"] == who)
+            .map(|e| e["content"]["membership"].clone())
+    };
+    assert_eq!(now_in(bot), Some(json!("join")), "{members}");
+    assert_eq!(now_in(alice_id), Some(json!("join")), "{members}");
     // Double puppeting lets the instance act as alice, and it used that to mark the chat as
     // direct on her side too, without dropping anything else she had there.
     let direct = alice
@@ -687,8 +709,9 @@ async fn an_offering_takes_an_instance_from_requested_to_ready_and_removes_it_ag
         )
         .await;
     assert_eq!(direct[bot], json!([dm]), "{direct}");
-    // And the bridge itself was told what happened in that room: the events reached its
-    // transactions endpoint, carrying the instance's own hs_token.
+    // And the bridge itself was told what happened in that room: its bot's invitation reached
+    // its transactions endpoint, carrying the instance's own hs_token (a mautrix bridge
+    // accepts it and marks the room from there).
     until("the bridge is sent the room", || async {
         bridge
             .transactions
@@ -696,7 +719,11 @@ async fn an_offering_takes_an_instance_from_requested_to_ready_and_removes_it_ag
             .unwrap()
             .iter()
             .flat_map(|t| t["events"].as_array().cloned().unwrap_or_default())
-            .any(|e| e["type"] == "m.room.member" && e["state_key"] == alice_id)
+            .any(|e| {
+                e["type"] == "m.room.member"
+                    && e["state_key"] == bot
+                    && e["content"]["membership"] == "invite"
+            })
     })
     .await;
     // Ready is where it rests: two more ticks change nothing.
@@ -885,7 +912,8 @@ async fn a_person_gets_a_bridge_by_messaging_its_front_door_and_the_manager_bot_
         )
         .await;
 
-    // Alice's bridge comes up. Her bot invites her, and the front door says so where she asked.
+    // Alice's bridge comes up. Her chat with its bot is started for her, and the front door
+    // says so where she asked.
     until_state(&admin, &instance_path, "starting").await;
     let registration = admin
         .admin(GET, "/appservices/whatsapp-alice/registration", None)
@@ -898,26 +926,24 @@ async fn a_person_gets_a_bridge_by_messaging_its_front_door_and_the_manager_bot_
             Some(json!({"url": url})),
         )
         .await;
-    let invited = alice_watch
-        .next(|s| {
-            s["rooms"]["invite"]
-                .as_object()
-                .is_some_and(|rooms| !rooms.is_empty())
-        })
-        .await;
-    let dm = invited["rooms"]["invite"]
-        .as_object()
-        .unwrap()
-        .keys()
-        .next()
-        .unwrap()
-        .to_owned();
     let said = alice_watch.next_notice(&front, door).await;
     assert!(said.contains("Your WhatsApp bridge is ready"), "{said}");
     assert!(
-        said.contains("invited you to a chat with @whatsappbot_alice:example.org"),
+        said.contains("started a chat for you with @whatsappbot_alice:example.org"),
         "{said}"
     );
+    // The chat was started as her: it is among her joined rooms, with the steps in it.
+    let rooms = alice.matrix(GET, "/sync?timeout=0", None).await;
+    let dm = rooms["rooms"]["join"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .find(|(room, j)| {
+            *room != &front
+                && !notices_from(&j["timeline"], "@whatsappbot_alice:example.org").is_empty()
+        })
+        .map(|(room, _)| room.clone())
+        .unwrap_or_else(|| panic!("{rooms}"));
     assert_ne!(dm, front);
     // By now bob's two further messages have long been handled: one refusal, not three.
     assert_eq!(room_notices(bob, &bobs, door).await.len(), 1);
