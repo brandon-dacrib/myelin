@@ -46,9 +46,14 @@ for fuzz_dir in "$ROOT"/crates/*/fuzz; do
   echo "run_all.sh: building $crate's fuzz targets" >&2
   mkdir -p "$OUT/$crate"
   build_log="$OUT/$crate/build.log"
-  # The whole build log is kept; on failure every `error` block is printed, not the last three
-  # lines (which, on 2026-10-01, said only "could not compile `cfg-if` due to 2 previous errors").
-  if (cd "$fuzz_dir" && cargo "+$TOOLCHAIN" fuzz build >"$build_log" 2>&1); then
+  # `--target "$HOST"` is not optional: without it cargo-fuzz builds for the triple *it* was
+  # compiled for (`current_platform::CURRENT_PLATFORM`), and CI's prebuilt cargo-fuzz binary is a
+  # musl build, so on an x86_64-unknown-linux-gnu runner it picked x86_64-unknown-linux-musl --
+  # which has no rust-std installed and on which ASAN cannot link against a static libc. That was
+  # every red `fuzz` run from 2026-10-01 to 2026-10-02. The whole build log is kept; on failure
+  # every `error` block is printed, not the last three lines (which said only "could not compile
+  # `cfg-if` due to 2 previous errors").
+  if (cd "$fuzz_dir" && cargo "+$TOOLCHAIN" fuzz build --target "$HOST" >"$build_log" 2>&1); then
     tail -1 "$build_log" >&2
   else
     echo "run_all.sh: $crate: build failed; full log in $build_log" >&2
