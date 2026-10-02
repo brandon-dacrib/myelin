@@ -1,36 +1,35 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-10-02, 17:50 EDT (the builds got faster, four new branches, the machine reboots again). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+Written 2026-09-20 by the integration lead, last revised 2026-10-02, 18:25 EDT (the builds got faster, four branches merged, the machine reboots again). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
-## Resume here: 2026-10-02, 17:50 EDT -- the builds got faster, four new branches, the machine reboots again
+## Resume here: 2026-10-02, 18:25 EDT -- the builds got faster, four branches merged, the machine reboots again
 
-**Where `main` is.** `2fac8666`: the offering page's "Next steps for <person>" (merged through the
-queue at 17:41, gate green), on top of the afternoon's build work (`90061f9`, `8ab7b49`,
-`b9e9cdb`, `ac5f138`: dependencies without debug info, sccache on the desktop, CI caches kept on
-failure with a bumped key, cargo-chef in `deploy/Dockerfile`, cache mounts in the Sytest and
-Complement images, the per-build numbers in status 12). CI and CD green on `ac5f138`. **None of
-the 14:25 section's ten branches has merged yet**; that section, its table, its conflicts and its
-merge order still stand, below.
+**Where `main` is.** `914ad7ae`, with everything this session made merged through the queue, each
+gate green: the afternoon's build work (`90061f9`, `8ab7b49`, `b9e9cdb`, `ac5f138`: dependencies
+without debug info, sccache on the desktop, CI caches kept on failure with a bumped key,
+cargo-chef in `deploy/Dockerfile`, cache mounts in the Sytest and Complement images, the per-build
+numbers in status 12), then the four branches below (`2fac8666`, `d0642a05`, `da879bbd`,
+`914ad7ae`). **No gate is running, no lock is held, no worktree of this session remains**, and the
+gate's PostgreSQL container is removed (recreate it with `docker run --rm -d --name
+hs-merge-queue-pg -e POSTGRES_PASSWORD=hspg -p 127.0.0.1:5462:5432
+public.ecr.aws/docker/library/postgres:17` and
+`HS_CLUSTER_TEST_POSTGRES_DSN=postgres://postgres:hspg@127.0.0.1:5462/postgres`). **None of the
+14:25 section's ten branches has merged yet**; that section, its table, its conflicts and its
+merge order still stand, below, and they now rebase onto a `main` that changed `hs-admin`'s
+router (`users.deactivate`), `hs-auth`'s store and directory, `hs-cli`'s `serve.rs`
+(`AdminSources.remote_join`), `hs-bridges`' manager, and the users and bridge pages in `web/`.
+The OpenAPI version on `main` is **0.1.2**; `agent/admin-token` must take 0.1.3.
 
-**The gate that was running at the reboot:** `tools/merge-queue.sh agent/bridge-names`, started
-17:36, detached. If the reboot killed it: `rmdir .git/myelin-merge.lock`, check `git log
-origin/main` for whether it pushed (`d0e7ebce` rebased), and re-run. The gate's PostgreSQL was
-`docker run --rm -d --name hs-merge-queue-pg -e POSTGRES_PASSWORD=hspg -p 127.0.0.1:5462:5432
-public.ecr.aws/docker/library/postgres:17` with
-`HS_CLUSTER_TEST_POSTGRES_DSN=postgres://postgres:hspg@127.0.0.1:5462/postgres`; it does not
-survive a reboot.
-
-**The four branches of this session**, each with a dated status entry, worktree under
-`.claude/worktrees/<name>`, and verified as said:
+**The four branches of this session, all merged**, each with a dated status entry:
 
 | Branch | Tip | What it holds | Verified | Gate |
 |---|---|---|---|---|
-| `agent/bridge-names` | `d0e7ebce` | a person's bridge objects are `bridge-whatsapp-brandon`, not `bridge-<8 hex>`; `myelin.dev/owner` and type labels on pod, Deployment, Service, claim and `Bridge`; the name is stored on the instance row once and an instance deployed under the old hashed name is adopted, never renamed; `BridgeDeployment.name` documents the rule; OpenAPI 0.1.1. Status 11 and 12, RFC 0017 §4.1 | kind smoke passed with the real binary (`bridge-heisenbridge`, and a hand-applied per-user `Bridge` gave pod `bridge-whatsapp-brandon-…`); hs-bridges 21, hs-operator 92 | running at the reboot |
-| `agent/user-erase` | `fa1a1bb4` | **deleting a user**: `POST /users/{id}/deactivate {erase:true}` deactivates, leaves every room (`UserActivitySource::leave_all_rooms`, hs-room), then erases (hs-auth `erasure.rs`: password, tokens, devices through the device-list hook so hs-e2e drops keys, 3PIDs, external ids, profile, features; `UserRecord.erased`/`erased_at_ms`); audit `/erased`, event `user.erased`; reactivate and reset-password 409; the client's own `/account/deactivate {erase:true}` too; `/_synapse/admin/v1/deactivate` route added to hs-compat (the proxy is still not mounted by `hs serve`); OpenAPI 0.1.1 (**collides with bridge-names' 0.1.1 and admin-token's 0.1.2: rebase and take the next number**). Status 07, 15, 04 | real binary `crates/hs-cli/tests/user_erasure.rs`; hs-auth 253, hs-admin 293, hs-room 166 | not run; rebase onto main after bridge-names |
-| `agent/user-erase-web` | `749301c` | the UI: "Also erase their data" in the deactivate dialog with the plain-words explanation, an Erase box for deactivated accounts, Erased badges, Reactivate replaced by a why-not box; mocks; `web/e2e/user-erase.spec.ts`; `web/e2e-real/user-erase.spec.ts` to run on the merged binary. Status 16 | `npm run check` 504 tests, `test:e2e` 55 | gate it stacked with `agent/user-erase`: `tools/merge-queue.sh agent/user-erase,agent/user-erase-web`; then run the real spec |
-| `agent/bridge-login` | `64c8be4d` | **why `login qr` did nothing**: mautrix `bridgev2` takes a bare command only in the sender's management room, which is set when the *person invites the bot*; the manager created the chat as the bot and invited the person, so the bridge decrypted the message and dropped it with no notice (encryption was fine both ways). Fix: with double puppeting the chat is created as the owner with the bot invited; without, the first line says to start the chat yourself. New real-bridge test `crates/hs-bridge-conformance/tests/real_mautrix_login.rs` (encrypted and plain, asserts the QR). Status 11, `docs/bridges/mautrix.md` | real mautrix-whatsapp in Docker 2/2; hs-bridges, hs-cli `bridge_offerings` 3/3 | not run |
+| `agent/bridge-names` | `d0e7ebce` | a person's bridge objects are `bridge-whatsapp-brandon`, not `bridge-<8 hex>`; `myelin.dev/owner` and type labels on pod, Deployment, Service, claim and `Bridge`; the name is stored on the instance row once and an instance deployed under the old hashed name is adopted, never renamed; `BridgeDeployment.name` documents the rule; OpenAPI 0.1.1. Status 11 and 12, RFC 0017 §4.1 | kind smoke passed with the real binary (`bridge-heisenbridge`, and a hand-applied per-user `Bridge` gave pod `bridge-whatsapp-brandon-…`); hs-bridges 21, hs-operator 92 | merged `d0642a05` (stacked with bridge-login) |
+| `agent/user-erase` | `fa1a1bb4` | **deleting a user**: `POST /users/{id}/deactivate {erase:true}` deactivates, leaves every room (`UserActivitySource::leave_all_rooms`, hs-room), then erases (hs-auth `erasure.rs`: password, tokens, devices through the device-list hook so hs-e2e drops keys, 3PIDs, external ids, profile, features; `UserRecord.erased`/`erased_at_ms`); audit `/erased`, event `user.erased`; reactivate and reset-password 409; the client's own `/account/deactivate {erase:true}` too; `/_synapse/admin/v1/deactivate` route added to hs-compat (the proxy is still not mounted by `hs serve`); OpenAPI 0.1.1 (**collides with bridge-names' 0.1.1 and admin-token's 0.1.2: rebase and take the next number**). Status 07, 15, 04 | real binary `crates/hs-cli/tests/user_erasure.rs`; hs-auth 253, hs-admin 293, hs-room 166 | merged `da879bbd` (OpenAPI 0.1.2) |
+| `agent/user-erase-web` | `749301c` | the UI: "Also erase their data" in the deactivate dialog with the plain-words explanation, an Erase box for deactivated accounts, Erased badges, Reactivate replaced by a why-not box; mocks; `web/e2e/user-erase.spec.ts`; `web/e2e-real/user-erase.spec.ts` to run on the merged binary. Status 16 | `npm run check` 504 tests, `test:e2e` 55; **the real spec 2/2 on the erasure binary**, which found and fixed a stale device list after erasing | merged `914ad7ae` |
+| `agent/bridge-login` | `64c8be4d` | **why `login qr` did nothing**: mautrix `bridgev2` takes a bare command only in the sender's management room, which is set when the *person invites the bot*; the manager created the chat as the bot and invited the person, so the bridge decrypted the message and dropped it with no notice (encryption was fine both ways). Fix: with double puppeting the chat is created as the owner with the bot invited; without, the first line says to start the chat yourself. New real-bridge test `crates/hs-bridge-conformance/tests/real_mautrix_login.rs` (encrypted and plain, asserts the QR). Status 11, `docs/bridges/mautrix.md` | real mautrix-whatsapp in Docker 2/2; hs-bridges, hs-cli `bridge_offerings` 3/3 | merged `d0642a05` |
 
 **The owner's WhatsApp bridge** (`@brandon`, demo cluster): the chat the bot opened can never
 become its management room. **Today, no deploy needed:** type `!wa login qr` (or `!wa login
@@ -44,11 +43,11 @@ see a bridge drop a delivered message (health and backlog say delivered, correct
 bridge's log does: `Received command` means taken, `Event decrypted successfully` then nothing
 means dropped as not a management room.
 
-**Order to merge next:** `bridge-names` (if the reboot killed its gate), then `bridge-login`
-(hs-bridges manager and tests only; disjoint from the rest), then `user-erase,user-erase-web`
-as one batch (rebase `user-erase` first for the OpenAPI version), then the ten branches of the
-14:25 section in their order.
-Remove each worktree after its merge (`git worktree remove .claude/worktrees/<name>`).
+**Order to merge next:** the ten branches of the 14:25 section in their order, one Sytest
+measurement after them. Remove each worktree after its merge (`git worktree remove
+.claude/worktrees/<name>`). **For the merge queue:** a push to `main` outside `docs/` while a
+gate runs (a README edit counts) makes the queue discard a green gate with "main moved (code)";
+push only `docs/` during a gate.
 
 ## Earlier: 2026-10-02, 14:25 EDT -- ten branches pushed, one batch gate running, the machine reboots
 

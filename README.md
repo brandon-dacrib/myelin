@@ -49,15 +49,15 @@ One thing was wrong until 2026-10-02: the chat the server opened for a person wa
 by the bot, and a mautrix bridge only takes bare commands in a chat the *person* started, so
 `login qr` typed there was decrypted and silently dropped. Reproduced with the real
 mautrix-whatsapp and an encrypting client (the appservice-mode encryption worked end to end
-both ways), fixed on branch `agent/bridge-login` so the chat is started as the person with the
-bot invited, and tested against the real bridge. In an existing chat, `!wa login qr` works today.
+both ways), fixed so the chat is started as the person with the bot invited, and tested against the real
+bridge (`crates/hs-bridge-conformance/tests/real_mautrix_login.rs`). In a chat made before the
+fix, `!wa login qr` works.
 
 **Removing a user is one checkbox.** Deactivating an account on its page offers "Also erase
 their data": the password and every session, every device and its encryption keys, email,
 phone and single-sign-on links, the display name and avatar, and membership of every room, with
 the account marked erased and never reactivated; messages stay unless redacted. Verified on the
-real binary; on branches `agent/user-erase` and `agent/user-erase-web` at the time of writing,
-merging next.
+real binary and in the browser against it (`web/e2e-real/user-erase.spec.ts`).
 
 **Two encrypted clients exchange a message this server cannot read.** `matrix-rust-sdk` with
 encryption enabled: keys upload, cross-signing bootstraps, one-time keys are claimed atomically,
