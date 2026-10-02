@@ -191,6 +191,20 @@ the banner "failed to connect to the appservice: error sending request...". Foun
 a ping answered by an HTTP/1.0 server that does not read the body is reported as "timed out
 waiting for the appservice to respond" within 35 ms; a bridge that reads the body is fine.
 
+**3. Server health on the Overview** (`GET /server/health`, never called before;
+`useServerHealth` in `api/dashboard.ts`, `pages/dashboard/ServerHealthCard.tsx`, words in
+`lib/server-health.ts`). The Health section opens with a "Server health" card: the overall
+state as a badge, one sentence ("Every probe answered: audit log, event stream, user
+directory." or "Server health is degraded: user directory unknown."), and a row per check with
+its name in an operator's words (`audit` is "Audit log", `users` is "User directory"; an
+unlisted key is humanised) and what its state means ("Cannot be checked: the part of the server
+that would answer is not wired up here." for `unknown`). A server that is not `ok` gets an
+Attention row that scrolls to the card; a `/server/health` that cannot be read joins the
+"can't check ... yet" sentence instead of an all-clear. Read again every 30 seconds. Mock:
+five checks, all ok; the unit tests override it to degraded and to 501. Verified against the
+real binary: its three checks (`audit`, `events`, `users`, all ok) on the page
+(`test-results/real-overview-health.png`).
+
 ## 2026-10-01: the interface explains itself, by the owner's rule (branch `agent/web-admin-ui`)
 
 The owner's rule: *"Sane defaults, and all administration is done via the web UI, well
@@ -292,7 +306,8 @@ closes that and audits every page. Branched from `agent/config-hot` (for `applie
    server applies `admin`; the other three fields wait for a data source).
 2. ~~**Bridge edit and test** (`appservices.update` for url, rate limiting and namespaces;
    `appservices.ping` as "Test connection").~~ Done 2026-10-02.
-3. **Server health on the Overview** (`GET /server/health`, never called): per-check status.
+3. ~~**Server health on the Overview** (`GET /server/health`, never called): per-check status.~~
+   Done 2026-10-02.
 4. **Exact user lookup** (`users.lookup` by email, phone or SSO subject) and a live username
    check in Add user (`users.availability`).
 5. **Room lifecycle**: an upgraded room's successor (`tombstoned`, `replacement_room_id`), guest

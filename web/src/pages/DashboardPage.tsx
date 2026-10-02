@@ -8,6 +8,7 @@ import {
   useClusterStatus,
   useFederationDestinations,
   useRecentAuditEntries,
+  useServerHealth,
 } from "@/api/dashboard";
 import { useAppservices, deriveDisplayName } from "@/api/bridges";
 import { useTasks } from "@/api/tasks";
@@ -23,6 +24,8 @@ import { SkeletonText, Skeleton } from "@/components/ui/skeleton/Skeleton";
 import { RelativeTime } from "@/components/RelativeTime";
 import { navigateToHref } from "@/lib/navigate-href";
 import { bridgeHealthMeta, healthKeyOf } from "@/lib/bridge-state";
+import { healthSummary } from "@/lib/server-health";
+import { ServerHealthCard } from "./dashboard/ServerHealthCard";
 
 interface AttentionRow {
   id: string;
@@ -47,6 +50,7 @@ export function DashboardPage() {
   const federation = useFederationDestinations(50);
   const auditLog = useRecentAuditEntries(5);
   const failedTasks = useTasks({ status: "failed", limit: 20 });
+  const health = useServerHealth();
 
   const isLoading =
     stats.isLoading ||
@@ -72,6 +76,7 @@ export function DashboardPage() {
   if (federation.isError) unchecked.push("federation");
   if (stats.isError || stats.data?.pending_reports_count == null) unchecked.push("reports");
   if (failedTasks.isError) unchecked.push("tasks");
+  if (health.isError) unchecked.push("server health");
 
   const unhealthyBridges = useMemo(
     () => (appservices.data?.items ?? []).filter((b) => b.health !== "healthy" && !b.paused),
@@ -84,6 +89,15 @@ export function DashboardPage() {
 
   const attention: AttentionRow[] = useMemo(() => {
     const rows: AttentionRow[] = [];
+    if (health.data && health.data.status && health.data.status !== "ok") {
+      rows.push({
+        id: "server-health",
+        severity: health.data.status === "down" ? "danger" : "warning",
+        summary: healthSummary(health.data.status, health.data.checks),
+        actionLabel: "See the checks",
+        actionHref: "#health-heading",
+      });
+    }
     for (const b of unhealthyBridges) {
       rows.push({
         id: `bridge-${b.id}`,
@@ -134,7 +148,7 @@ export function DashboardPage() {
       });
     }
     return rows;
-  }, [unhealthyBridges, failingDestinations, stats.data, failedTasks.data]);
+  }, [health.data, unhealthyBridges, failingDestinations, stats.data, failedTasks.data]);
 
   const singleNode = (cluster.data?.replica_count ?? 1) <= 1;
 
@@ -201,7 +215,13 @@ export function DashboardPage() {
                     <p className="flex-1 text-sm text-text">{item.summary}</p>
                     <button
                       type="button"
-                      onClick={() => navigateToHref(navigate, item.actionHref)}
+                      onClick={() =>
+                        item.actionHref.startsWith("#")
+                          ? document
+                              .getElementById(item.actionHref.slice(1))
+                              ?.scrollIntoView({ block: "start" })
+                          : navigateToHref(navigate, item.actionHref)
+                      }
                       className="rounded-sm px-2 py-1 text-sm font-medium text-accent hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--color-focus)]"
                     >
                       {item.actionLabel}
@@ -217,6 +237,9 @@ export function DashboardPage() {
           <h2 id="health-heading" className="text-md font-medium text-text">
             Health
           </h2>
+          <div className="mt-3">
+            <ServerHealthCard />
+          </div>
           <div className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-4">
             {isLoading &&
               Array.from({ length: 6 }).map((_, i) => (

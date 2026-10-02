@@ -66,6 +66,10 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
   connection" pings the bridge now and says whether it answered, with the server's reason on the
   page when it did not. Verified against `hs serve` with a stub bridge
   (`web/e2e-real/web-items.spec.ts`).
+- **The Overview shows the server's own health checks** (2026-10-02, `agent/web-items`).
+  `GET /server/health`, which nothing called before, is a card at the top of Health: the
+  overall state, each check named in words with what its state means, and an Attention row
+  when the server is degraded or down. Verified against `hs serve`.
 - **The management interface explains itself** (2026-10-01, `agent/web-admin-ui`). Every
   configuration setting carries a badge from the server's own classification (applies on save,
   needs a restart, or per replica from the file or environment), each class is explained once

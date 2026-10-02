@@ -502,7 +502,10 @@ export const handlers = [
   }),
   http.get(`${API}/server`, () => HttpResponse.json(serverInfo)),
   http.get(`${API}/server/health`, () =>
-    HttpResponse.json({ status: "ok", checks: { storage: "ok", federation: "ok" } }),
+    HttpResponse.json({
+      status: "ok",
+      checks: { audit: "ok", events: "ok", users: "ok", storage: "ok", federation: "ok" },
+    }),
   ),
   // ---- Cluster (the replicas and shards in ./data/cluster) ----
   http.get(`${API}/cluster`, () => HttpResponse.json(clusterSummary())),

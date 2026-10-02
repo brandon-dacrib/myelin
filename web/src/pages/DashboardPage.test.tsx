@@ -121,6 +121,55 @@ describe("Overview", () => {
     expect(screen.queryByText(/can.t check/)).not.toBeInTheDocument();
   });
 
+  it("shows each of the server's health checks in words, and an ok server gives no row", async () => {
+    server.use(
+      http.get("/api/v1/server/health", () =>
+        HttpResponse.json({ status: "ok", checks: { audit: "ok", events: "ok", users: "ok" } }),
+      ),
+    );
+    renderDashboard();
+    const card = within(await screen.findByRole("region", { name: "Health" }));
+    expect(
+      await card.findByText("Every probe answered: audit log, event stream, user directory."),
+    ).toBeInTheDocument();
+    expect(card.getByText("Audit log")).toBeInTheDocument();
+    expect(card.getByText("Event stream")).toBeInTheDocument();
+    expect(card.getByText("User directory")).toBeInTheDocument();
+    expect(card.getAllByText("Ok")).toHaveLength(4);
+    expect(screen.queryByText(/Server health is degraded/)).not.toBeInTheDocument();
+  });
+
+  it("names a check the server cannot vouch for, and puts the degraded server under Attention", async () => {
+    server.use(
+      http.get("/api/v1/server/health", () =>
+        HttpResponse.json({
+          status: "degraded",
+          checks: { audit: "ok", events: "ok", users: "unknown" },
+        }),
+      ),
+    );
+    renderDashboard();
+    expect(
+      await screen.findAllByText("Server health is degraded: user directory unknown."),
+    ).toHaveLength(2);
+    expect(screen.getByText(/not wired up here/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "See the checks" })).toBeInTheDocument();
+  });
+
+  it("says when server health could not be read, and does not give the all-clear", async () => {
+    server.use(
+      http.get("/api/v1/server/health", notImplemented),
+      http.get("/api/v1/statistics/overview", () =>
+        HttpResponse.json({ users_count: 3, rooms_count: 2, pending_reports_count: 0 }),
+      ),
+      http.get("/api/v1/appservices", () => HttpResponse.json(emptyPage)),
+      http.get("/api/v1/federation/destinations", () => HttpResponse.json(emptyPage)),
+      http.get("/api/v1/tasks", () => HttpResponse.json(emptyPage)),
+    );
+    renderDashboard();
+    expect(await screen.findByText(/It can.t check server health yet/)).toBeInTheDocument();
+  });
+
   it("says so when a task failed in the last day, and links to it", async () => {
     renderDashboard();
 

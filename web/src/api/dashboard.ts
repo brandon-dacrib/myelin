@@ -27,6 +27,7 @@ import { useQuery } from "@tanstack/react-query";
 import { api } from "./client";
 import { useLiveEvents } from "./events";
 import { unwrap } from "./problem";
+import type { components } from "./schema";
 
 /**
  * The Overview's counts, which the sidebar's open-report count reads too. While the event stream
@@ -86,6 +87,24 @@ export function useRecentAuditEntries(limit = 5) {
     queryKey: ["audit-log-recent", limit],
     queryFn: async () => {
       const result = await api.GET("/audit-log", { params: { query: { limit } } });
+      return unwrap(result);
+    },
+    refetchInterval: 30_000,
+  });
+}
+
+export type ServerHealth = components["schemas"]["ServerHealth"];
+
+/**
+ * The server's own probe summary (`GET /server/health`): an overall `ok`, `degraded` or `down`,
+ * and one line per check. A check whose backing source is absent is `unknown`, never `ok`, and
+ * that alone makes the whole answer `degraded`: the server does not vouch for what it cannot see.
+ */
+export function useServerHealth() {
+  return useQuery({
+    queryKey: ["server-health"],
+    queryFn: async () => {
+      const result = await api.GET("/server/health");
       return unwrap(result);
     },
     refetchInterval: 30_000,

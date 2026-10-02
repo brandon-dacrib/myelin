@@ -152,3 +152,27 @@ test.describe("Bridge edit and test against the real server", () => {
     expect(deleted.ok()).toBe(true);
   });
 });
+
+test.describe("Overview health against the real server", () => {
+  test.skip(
+    !process.env.HS_REAL_SERVER_URL || !adminToken,
+    "HS_REAL_SERVER_URL and HS_REAL_ADMIN_TOKEN not set",
+  );
+
+  test("the server's own checks are on the Overview, in words", async ({ page, request }) => {
+    const answer = await request.get("/api/v1/server/health", { headers: authed() });
+    const health = (await answer.json()) as { status: string; checks: Record<string, string> };
+    await signIn(page);
+    await page.goto("/admin/");
+    const card = page.getByRole("region", { name: "Health" });
+    await expect(
+      card.getByText(health.status === "ok" ? "Ok" : /Degraded|Down/).first(),
+    ).toBeVisible();
+    for (const key of Object.keys(health.checks)) {
+      const label = { audit: "Audit log", events: "Event stream", users: "User directory" }[key];
+      if (label) await expect(card.getByText(label, { exact: true })).toBeVisible();
+    }
+    await settle(page);
+    await page.screenshot({ path: "test-results/real-overview-health.png" });
+  });
+});
