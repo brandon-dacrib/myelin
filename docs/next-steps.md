@@ -6,8 +6,13 @@ The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/
 
 ## Resume here: 2026-10-02, 18:25 EDT -- the builds got faster, four branches merged, the machine reboots again
 
-**Where `main` is.** `914ad7ae`, with everything this session made merged through the queue, each
-gate green: the afternoon's build work (`90061f9`, `8ab7b49`, `b9e9cdb`, `ac5f138`: dependencies
+**Where `main` is.** `99589af3`: everything this session made, merged through the queue, each
+gate green, plus one direct push (the new real-bridge test needed `--add-host
+host.docker.internal:host-gateway` to run on Linux runners; CI on `d0642a05` and `914ad7ae` had
+failed on it, so no image of those commits exists). **CI and CD are green on `99589af3`**, both
+image legs with the kind smokes; **`sha-99589af3454fe21559a56ea25b4b88106b4acd10` is the image
+to roll the demo to**, and carries the bridge chat fix, the readable names and user erasure.
+Before it, the afternoon's build work (`90061f9`, `8ab7b49`, `b9e9cdb`, `ac5f138`: dependencies
 without debug info, sccache on the desktop, CI caches kept on failure with a bumped key,
 cargo-chef in `deploy/Dockerfile`, cache mounts in the Sytest and Complement images, the per-build
 numbers in status 12), then the four branches below (`2fac8666`, `d0642a05`, `da879bbd`,
