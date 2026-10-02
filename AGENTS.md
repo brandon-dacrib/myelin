@@ -42,6 +42,7 @@ These rules come from runs of nine agents at once (2026-09-28), where finished w
 - **Set `HS_CLUSTER_TEST_POSTGRES_DSN` for the gate.** Without it, the two-replica test in `crates/hs-cli/tests/cluster_admin.rs` prints `SKIP` and passes. Use a PostgreSQL whose user can create databases (see the script's header).
 - **Never `pkill -f` a pattern that other agents' processes also match** (`vitest`, `playwright`, the lock-wait loop). Kill your own PIDs.
 - **Installs and long builds belong to a background agent**, not the coordinating session.
+- **An agent closes everything it opened before it reports, and the coordinator removes its worktree once its branch is merged.** On 2026-10-01 a day-old `hs serve`, five Playwright Chromium processes (one at 78% CPU for 23 hours) and 28 worktrees holding 390 GB of `target/` were found from agents that had long since finished. Before reporting: kill every process you started (`hs`, test binaries, Playwright and Chromium, dev servers), stop and remove your containers and volumes, and check `ps` shows none of your PIDs. After the merge: `git worktree remove` the agent's worktree and `git worktree prune`. Stragglers are not welcome.
 - **The handover lists every unmerged branch.** Before a session ends, `docs/next-steps.md` names each branch from `git branch -r --no-merged origin/main`, what it holds and how far its gate got.
 
 ## The Owner's Desktop
