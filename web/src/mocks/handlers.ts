@@ -120,6 +120,7 @@ import {
   refreshValidity,
   registrationTokens,
 } from "./data/registration-tokens";
+import { adminTokens, findAdminToken, mintMockAdminToken } from "./data/admin-tokens";
 import { serverNotices, SERVER_NOTICES_USER } from "./data/server-notices";
 import {
   findMedia,
@@ -1538,6 +1539,75 @@ export const handlers = [
     );
     if (index < 0) return problem(404, "not-found", "Not found");
     registrationTokens.splice(index, 1);
+    return new HttpResponse(null, { status: 204 });
+  }),
+
+  // ---- Admin tokens (Settings): tokens narrower than a full administrator's ----
+  http.get(`${API}/admin-tokens`, ({ request }) =>
+    HttpResponse.json(paginate(adminTokens, new URL(request.url))),
+  ),
+
+  http.post(`${API}/admin-tokens`, async ({ request }) => {
+    const body = (await request.json().catch(() => ({}))) as {
+      name?: string;
+      scopes?: string[];
+      expires_at?: string | null;
+    };
+    const name = (body.name ?? "").trim();
+    if (!name) {
+      const detail = "name is required: what this token is for, so it can be told from the others";
+      return problem(400, "validation-failed", "Validation failed", {
+        detail,
+        errors: [{ pointer: "/name", detail }],
+      });
+    }
+    const scopes: string[] =
+      body.scopes === undefined ? ["admin:read", "admin:write"] : body.scopes;
+    if (scopes.length === 0) {
+      const detail = "scopes must name at least one scope; omit it for a full administrator's";
+      return problem(400, "validation-failed", "Validation failed", {
+        detail,
+        errors: [{ pointer: "/scopes", detail }],
+      });
+    }
+    const unknown = scopes.find((s) => !(ALL_SCOPES as readonly string[]).includes(s));
+    if (unknown) {
+      const detail = `unknown scope "${unknown}"`;
+      return problem(400, "validation-failed", "Validation failed", {
+        detail,
+        errors: [{ pointer: "/scopes", detail }],
+      });
+    }
+    if (body.expires_at != null && Date.parse(body.expires_at) <= Date.now()) {
+      const detail = "expires_at is in the past; a new token must be usable";
+      return problem(400, "validation-failed", "Validation failed", {
+        detail,
+        errors: [{ pointer: "/expires_at", detail }],
+      });
+    }
+    const { id, token } = mintMockAdminToken();
+    const created = {
+      id,
+      name,
+      scopes: ALL_SCOPES.filter((s) => scopes.includes(s)),
+      created_at: new Date().toISOString(),
+      created_by: "@ops:example.org",
+      expires_at: body.expires_at ?? null,
+    };
+    adminTokens.push(created);
+    return HttpResponse.json({ ...created, token }, { status: 201 });
+  }),
+
+  http.get(`${API}/admin-tokens/:id`, ({ params }) => {
+    const found = findAdminToken(String(params.id));
+    if (!found) return problem(404, "not-found", "Not found");
+    return HttpResponse.json(found);
+  }),
+
+  http.delete(`${API}/admin-tokens/:id`, ({ params }) => {
+    const index = adminTokens.findIndex((t) => t.id === String(params.id));
+    if (index < 0) return problem(404, "not-found", "Not found");
+    adminTokens.splice(index, 1);
     return new HttpResponse(null, { status: 204 });
   }),
 

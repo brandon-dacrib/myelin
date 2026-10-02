@@ -123,6 +123,22 @@ HS_REAL_ADMIN_TOKEN=... npx playwright test --config playwright.real.config.ts e
 (the server-side details it assumes beyond the contract: `/users/{id}/memberships?membership=join`
 lists the rooms they are still in; the keys and room-event checks are tolerant of a 4xx).
 
+Last updated: 2026-10-02 (Settings, Admin tokens; branch `agent/admin-token`).
+
+## 2026-10-02: Settings, Admin tokens (branch `agent/admin-token`, by track 15)
+
+A new Settings view, `/settings/admin-tokens` (`web/src/pages/settings/AdminTokensPage.tsx`,
+`CreateAdminTokenDialog.tsx`, `web/src/lib/scopes.ts`, `web/src/api/admin-tokens.ts`): the
+admin API tokens minted on this server, each row with its scopes as badges (the sentence for
+each scope on hover), expiry and who minted it, and a revoke that says the next request is
+refused. The mint dialog is a checkbox per scope with a sentence saying what it lets the
+holder do (`SCOPE_DESCRIPTIONS`), starting as a full administrator's token, naming what the
+chosen set holds and which boxes another already includes; the token is shown once with a copy
+button. Settings tab, palette entry (`settings-admin-tokens`, gated `admin:read` as
+`admin_tokens.list` is), MSW handlers and seed, page tests, `e2e/admin-tokens.spec.ts`, and
+`e2e-real/admin-tokens.spec.ts` against the real server (a `bridges:read` token minted on the
+page is served `/bridge-types`, refused `/users` naming `admin:read`, and `401` once revoked
+from the page). Client regenerated. Details in status 15's entry of the same date.
 
 ## 2026-10-01: the interface explains itself, by the owner's rule (branch `agent/web-admin-ui`)
 

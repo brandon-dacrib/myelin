@@ -103,6 +103,12 @@ export const subNavItems: Omit<NavItem, "icon">[] = [
     scope: "admin:read",
   },
   {
+    id: "settings-admin-tokens",
+    label: "Admin tokens",
+    href: "/settings/admin-tokens",
+    scope: "admin:read",
+  },
+  {
     id: "settings-server-notices",
     label: "Server notices",
     href: "/settings/server-notices",

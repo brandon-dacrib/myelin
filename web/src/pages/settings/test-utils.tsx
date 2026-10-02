@@ -28,6 +28,7 @@ export function renderSettingsRoute(
   const known = [
     "/",
     "/settings/registration-tokens",
+    "/settings/admin-tokens",
     "/settings/server-notices",
     "/users/$userId",
   ].filter((p) => p !== routePath);

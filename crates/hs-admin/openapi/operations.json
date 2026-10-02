@@ -641,6 +641,42 @@
     },
     {
       "method": "GET",
+      "path": "/admin-tokens",
+      "operation_id": "admin_tokens.list",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "AdminTokens",
+      "idempotent_post": false
+    },
+    {
+      "method": "POST",
+      "path": "/admin-tokens",
+      "operation_id": "admin_tokens.create",
+      "scope": "admin:write",
+      "public": false,
+      "tag": "AdminTokens",
+      "idempotent_post": true
+    },
+    {
+      "method": "DELETE",
+      "path": "/admin-tokens/{id}",
+      "operation_id": "admin_tokens.delete",
+      "scope": "admin:write",
+      "public": false,
+      "tag": "AdminTokens",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/admin-tokens/{id}",
+      "operation_id": "admin_tokens.get",
+      "scope": "admin:read",
+      "public": false,
+      "tag": "AdminTokens",
+      "idempotent_post": false
+    },
+    {
+      "method": "GET",
       "path": "/reports",
       "operation_id": "reports.list",
       "scope": "moderation:read",

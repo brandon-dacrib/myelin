@@ -5,6 +5,7 @@ import { server } from "@/mocks/node";
 import { resetBridgeOfferings } from "@/mocks/data/bridge-offerings";
 import { resetAppserviceSecrets } from "@/mocks/data/appservices";
 import { resetRegistrationTokens } from "@/mocks/data/registration-tokens";
+import { resetAdminTokens } from "@/mocks/data/admin-tokens";
 import { resetServerNotices } from "@/mocks/data/server-notices";
 import { resetMedia } from "@/mocks/data/media";
 import { resetReports } from "@/mocks/data/reports";
@@ -94,6 +95,7 @@ afterEach(() => {
   resetAppserviceSecrets();
   // So are the registration tokens and the server-notice history.
   resetRegistrationTokens();
+  resetAdminTokens();
   resetServerNotices();
   // So is its media (quarantine, protection and the deletions change it).
   resetMedia();

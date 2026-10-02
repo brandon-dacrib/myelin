@@ -37,6 +37,14 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
   served and written to. A room is copied a page at a time, and each room's events per second,
   bytes per second and the server's peak memory are logged and in `/metrics`; one room of
   100,000 events and 2,000 members was measured (`docs/status/13-config-compat-and-migration.md`).
+- **An admin token can be narrower than an administrator** (2026-10-02): Settings, Admin
+  tokens mints a token with a chosen set of the six scopes, each explained in a sentence, and
+  shows it once; `hs admin-token create --scope bridges:read` does the same from a shell;
+  `POST /api/v1/admin-tokens` is the API. A request outside the token's scopes is refused with
+  `403 insufficient-scope` naming the scope, and the refusals are counted in
+  `hs_admin_scope_refusals_total`. The mint and the revocation are in the audit log with the
+  scopes. Verified on the real binary: a `bridges:read` token is served the bridge listings,
+  refused the users list, and refused everything once revoked.
 - **Every admin API operation enforces the scope its OpenAPI document gives it** (2026-10-01):
   26 bridge operations took `admin:*` instead of `bridges:*` and `users.logout` `admin:write`
   instead of `moderation:write`; a test now asks the router about all 154 authenticated

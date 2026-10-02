@@ -36,6 +36,10 @@ pub enum Command {
     /// Prints a one-time link that gets an administrator back into a running server nobody can
     /// sign in to. Run it where the server keeps its signing key: the request is signed with it.
     Recover(RecoverArgs),
+    /// Mints, lists and revokes admin API tokens narrower than an administrator's, against a
+    /// running server, with an administrator's credential (`--token` or `HS_ADMIN_TOKEN`).
+    #[command(name = "admin-token")]
+    AdminToken(AdminTokenArgs),
     /// Writes the `routes.json` manifest (`docs/rfcs/0005-routes-json-manifest.md`) without
     /// booting a server — routes are static, independent of runtime config.
     RoutesManifest(RoutesManifestArgs),
@@ -322,6 +326,71 @@ pub struct RecoverArgs {
     pub data_dir: Option<PathBuf>,
 }
 
+/// `hs admin-token` arguments. The same operations as the management interface's Settings,
+/// Admin tokens page (`/api/v1/admin-tokens`), for scripts.
+#[derive(Debug, Args)]
+pub struct AdminTokenArgs {
+    /// The running server's base URL.
+    #[arg(
+        long = "server",
+        default_value = "http://127.0.0.1:8008",
+        global = true
+    )]
+    pub server_url: String,
+
+    /// An administrator's credential: an admin token holding `admin:write`, or a Matrix access
+    /// token of a user with the administrator flag. Else `HS_ADMIN_TOKEN`, else prompted for.
+    #[arg(
+        long = "token",
+        env = "HS_ADMIN_TOKEN",
+        hide_env_values = true,
+        global = true
+    )]
+    pub token: Option<String>,
+
+    /// What to do.
+    #[command(subcommand)]
+    pub command: AdminTokenCommand,
+}
+
+/// Every `hs admin-token` subcommand.
+#[derive(Debug, Subcommand)]
+pub enum AdminTokenCommand {
+    /// Mints a token and prints it on stdout, once: it is stored hashed and cannot be shown
+    /// again.
+    Create(AdminTokenCreateArgs),
+    /// Lists the tokens with their scopes, one per line (id, name, scopes, created, expires).
+    List,
+    /// Revokes a token by id; its next request is refused.
+    Revoke(AdminTokenRevokeArgs),
+}
+
+/// `hs admin-token create` arguments.
+#[derive(Debug, Args)]
+pub struct AdminTokenCreateArgs {
+    /// What the token is for, so it can be told from the others.
+    #[arg(long = "name")]
+    pub name: String,
+
+    /// A scope the token carries; repeat for several. One of admin:read, admin:write,
+    /// bridges:read, bridges:write, moderation:read, moderation:write. With none given the
+    /// token is a full administrator's (admin:read and admin:write).
+    #[arg(long = "scope")]
+    pub scopes: Vec<String>,
+
+    /// When the token stops working, as a duration from now: 30d, 12h, 90m, 300s. Never when
+    /// omitted.
+    #[arg(long = "expires-in")]
+    pub expires_in: Option<String>,
+}
+
+/// `hs admin-token revoke` arguments.
+#[derive(Debug, Args)]
+pub struct AdminTokenRevokeArgs {
+    /// The token's id, as `hs admin-token list` prints it.
+    pub id: String,
+}
+
 /// `hs register` arguments (`register_new_matrix_user`-compatible; see
 /// `docs/compat/cli-shims.md`).
 #[derive(Debug, Args)]
@@ -390,6 +459,7 @@ pub async fn dispatch(cli: Cli) -> i32 {
         Command::GenerateSigningKey(args) => run_generate_signing_key(&args),
         Command::Register(args) => run_register(&args).await,
         Command::Recover(args) => run_recover(&args).await,
+        Command::AdminToken(args) => run_admin_token(&args).await,
         Command::RoutesManifest(args) => run_routes_manifest(&args),
         Command::Serve(args) => run_serve(&args).await,
         Command::FederationJoinRoom(args) => crate::federation::run_join_room(&args).await,
@@ -646,6 +716,110 @@ async fn run_recover(args: &RecoverArgs) -> i32 {
         Err(e) => {
             eprintln!("hs recover: {e}");
             1
+        }
+    }
+}
+
+/// `hs admin-token`: the credential, then the subcommand against the server.
+async fn run_admin_token(args: &AdminTokenArgs) -> i32 {
+    let bearer = match &args.token {
+        Some(t) if !t.trim().is_empty() => t.trim().to_owned(),
+        _ => match prompt_password("Administrator token") {
+            Ok(t) if !t.trim().is_empty() => t.trim().to_owned(),
+            Ok(_) => {
+                eprintln!("hs admin-token: a credential is needed: --token, or HS_ADMIN_TOKEN");
+                return 2;
+            }
+            Err(e) => {
+                eprintln!("hs admin-token: failed to read the token: {e}");
+                return 2;
+            }
+        },
+    };
+    let client = reqwest::Client::new();
+    match &args.command {
+        AdminTokenCommand::Create(create) => {
+            let scopes = match crate::admin_tokens::parse_scopes(&create.scopes) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("hs admin-token: {e}");
+                    return 2;
+                }
+            };
+            let now_ms = hs_admin::admin_tokens::now_ms();
+            let expires_at = match &create.expires_in {
+                None => None,
+                Some(spec) => match crate::admin_tokens::expires_in_to_rfc3339(spec, now_ms) {
+                    Some(at) => Some(at),
+                    None => {
+                        eprintln!(
+                            "hs admin-token: --expires-in takes a positive duration such as \
+                             30d, 12h, 90m or 300s, not {spec:?}"
+                        );
+                        return 2;
+                    }
+                },
+            };
+            let request = crate::admin_tokens::CreateRequest {
+                name: create.name.clone(),
+                scopes: if scopes.is_empty() {
+                    None
+                } else {
+                    Some(scopes)
+                },
+                expires_at,
+            };
+            match crate::admin_tokens::create(&client, &args.server_url, &bearer, &request).await {
+                Ok(created) => {
+                    // The token alone on stdout, so `$(hs admin-token create ...)` is the token.
+                    println!("{}", created.secret);
+                    eprintln!(
+                        "Minted admin token {} ({}) with scopes {}; expires {}. It is shown \
+                         once: store it now. Revoke it with: hs admin-token revoke {}",
+                        created.token.id,
+                        created.token.name,
+                        created
+                            .token
+                            .scopes
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        created.token.expires_at.as_deref().unwrap_or("never"),
+                        created.token.id
+                    );
+                    0
+                }
+                Err(e) => {
+                    eprintln!("hs admin-token: {e}");
+                    1
+                }
+            }
+        }
+        AdminTokenCommand::List => {
+            match crate::admin_tokens::list(&client, &args.server_url, &bearer).await {
+                Ok(tokens) => {
+                    print!("{}", crate::admin_tokens::format_list(&tokens));
+                    0
+                }
+                Err(e) => {
+                    eprintln!("hs admin-token: {e}");
+                    1
+                }
+            }
+        }
+        AdminTokenCommand::Revoke(revoke) => {
+            match crate::admin_tokens::revoke(&client, &args.server_url, &bearer, &revoke.id).await
+            {
+                Ok(()) => {
+                    eprintln!("Revoked admin token {}", revoke.id);
+                    0
+                }
+                Err(e) => {
+                    eprintln!("hs admin-token: {e}");
+                    1
+                }
+            }
         }
     }
 }

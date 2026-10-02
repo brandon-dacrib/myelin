@@ -90,6 +90,9 @@ pub enum ServeError {
     /// Opening the audit log, or recording a registration file's import in it, failed.
     #[error("failed to open or write the audit log: {0}")]
     Audit(String),
+    /// Opening the admin token store failed.
+    #[error("failed to open the admin token store: {0}")]
+    AdminTokens(String),
     /// Starting the `hs-cluster` ownership manager (or, when clustered, its mesh forwarder)
     /// failed.
     #[error(transparent)]
@@ -633,6 +636,10 @@ fn build_session_mounts<B: KvBackend>(
 /// store — both constructed `from_auth_state` so the admin surface and the client-server surface
 /// read one backend handle rather than two.
 ///
+/// `hs_admin::admin_tokens::ScopedTokenVerifier` sits in front of it and accepts the admin tokens
+/// minted on the Settings page or by `hs admin-token`, each with the scopes it was minted with
+/// (`crate::admin_tokens::TablesAdminTokens` keeps them, hashed, on the same backend).
+///
 /// The audit sink is durable ([`crate::audit::TablesAuditSink`], over the same backend as every
 /// other store), so who locked an account or promoted an admin survives a restart. The event bus
 /// stays in-process by design: it is a live stream for `GET /api/v1/events` subscribers, not a
@@ -640,16 +647,26 @@ fn build_session_mounts<B: KvBackend>(
 fn admin_state<B: KvBackend + 'static>(
     auth: &AuthState,
     audit: Arc<crate::audit::TablesAuditSink<B>>,
+    admin_tokens: Arc<crate::admin_tokens::TablesAdminTokens<B>>,
     rooms: &Arc<hs_room::registry::RoomRegistry<B>>,
     server_name: &str,
     enabled_components: Vec<String>,
     sources: AdminSources,
 ) -> hs_admin::router::AdminState {
-    let state = hs_admin::router::AdminState::new(
+    // Two kinds of credential: an admin token minted on the Settings page or by `hs admin-token`
+    // (`hsa_...`, carrying the scopes it was minted with), and the legacy one, a Matrix access
+    // token of a user with the administrator flag (every scope).
+    let verifier = hs_admin::admin_tokens::ScopedTokenVerifier::new(
+        admin_tokens.clone(),
         Arc::new(hs_auth::admin_verifier::AdminTokenVerifier::from_auth_state(auth)),
+    );
+    let state = hs_admin::router::AdminState::new(
+        Arc::new(verifier),
         audit,
         Arc::new(hs_admin::events::EventBus::new()),
     )
+    // The tokens themselves: minted, listed with their scopes, and revoked here.
+    .with_admin_tokens(admin_tokens)
     .with_users(Arc::new(
         hs_auth::admin_directory::AuthStoreUserDirectory::from_auth_state(auth),
     ))
@@ -1350,6 +1367,13 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         .registry
         .set_failure_threshold(config.appservices.tracking_failure_threshold);
     components.watch("audit log", &audit);
+    // Admin tokens narrower than an administrator's (RFC 0004 section 8.1), durable so a token
+    // handed to a bridge team keeps working across a restart.
+    let admin_tokens = Arc::new(
+        crate::admin_tokens::TablesAdminTokens::open(backend.clone())
+            .map_err(|e| ServeError::AdminTokens(e.to_string()))?,
+    );
+    components.watch("admin tokens", &admin_tokens);
     components.watch("appservice registry", &appservices.registry);
     crate::appservices::audit_imports(audit.as_ref(), &appservices.imports)
         .await
@@ -1374,6 +1398,8 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         .set_server_limit(crate::live_config::message_limit(&config.rate_limits));
     metrics.with_registry(crate::live_config::register_metrics);
     metrics.with_registry(hs_http::buckets::register_metrics);
+    // Admin API requests refused for lacking their operation's scope, by scope.
+    metrics.with_registry(hs_admin::metrics::register_metrics);
     metrics.with_registry(hs_auth::guest::register_metrics);
     metrics.with_registry(hs_room::third_party_invite::register_metrics);
     // Third-party invites reach only the identity servers `auth.identity_servers` names; the
@@ -1896,6 +1922,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     let mut admin = admin_state(
         &auth_state,
         audit,
+        admin_tokens,
         &rooms,
         server_name.as_str(),
         enabled_components,

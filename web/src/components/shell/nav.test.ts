@@ -33,6 +33,7 @@ const landingOperation: Record<string, string> = {
   configuration: "config.list",
   settings: "registration_tokens.list",
   "settings-registration-tokens": "registration_tokens.list",
+  "settings-admin-tokens": "admin_tokens.list",
   "settings-server-notices": "server_notices.list",
 };
 

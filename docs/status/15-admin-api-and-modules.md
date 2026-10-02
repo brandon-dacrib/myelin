@@ -64,6 +64,75 @@ nothing, and bob's own `/account/deactivate` with `erase` erases him.
 **Not done.** Federation does not yet redact an erased user's events when serving them to other
 servers (Synapse's `erased_users` table does); a self-service erasure does not leave rooms
 (status 07); the Synapse proxy is not mounted.
+## 2026-10-02: admin tokens narrower than an administrator's (branch `agent/admin-token`)
+
+The gap yesterday's entry named: the six scopes were enforced on all 154 operations, but the
+only credential was a Matrix access token of an administrator, holding every scope. An admin
+token (RFC 0004 section 8.1's `service_account` principal) is now minted with the scopes its
+holder needs, from the API, the CLI and the Settings page.
+
+- **API.** `crates/hs-admin/src/admin_tokens.rs`: `admin_tokens.list` and `.get`
+  (`admin:read`), `.create` and `.delete` (`admin:write`) at `/admin-tokens`; OpenAPI
+  `AdminToken`, `AdminTokenCreate`, `AdminTokenCreated`, `AdminTokenPage`, a `Scope` enum
+  schema and the `AdminTokens` tag (`x-hs-changelog` 0.1.1, additive). A mint takes a `name`,
+  `scopes` (default `admin:read` and `admin:write`, a full administrator's, so a token minted
+  without thinking about scopes does what the legacy credential does; empty is refused with
+  `/scopes` named) and an optional `expires_at`. The `201` is the one place the token appears
+  (`hsa_` and 40 letters and digits); only its SHA-256 is stored. `Idempotency-Key` replays
+  the same token. `DELETE` revokes: the next request with it is `401`.
+- **Verifier.** `ScopedTokenVerifier` wraps the legacy verifier: a bearer starting with
+  `hsa_` is decided from the token store alone (`Invalid`, `Expired`, or a
+  `service_account` principal whose `id` is the token's id, `display_name` its name, `scopes`
+  exactly what it was minted with, `issued_by: "admin-tokens"`); everything else goes to
+  `hs_auth::admin_verifier::AdminTokenVerifier` as before. `Scope::satisfies` does the rest, so
+  a `bridges:write` token reads bridges and an `admin:read` token reads everything.
+- **Store.** `hs-admin` keeps no storage dependency: `AdminTokenSource` is the trait,
+  `InMemoryAdminTokens` serves tests, and `crates/hs-cli/src/admin_tokens.rs::TablesAdminTokens`
+  is the durable one over `hs-kv` (`hs_admin.tokens` by id, `hs_admin.tokens_by_hash` for the
+  verifier's one lookup, both rows in one transaction). `hs serve` opens it beside the audit
+  log and composes the verifier (`serve.rs::admin_state`).
+- **Audit and events.** `admin_tokens.create` is audited with `/name`, `/scopes` and
+  `/expires_at` changes and never the token; `admin_tokens.delete` with the scopes the token
+  carried. Events `admin_token.created` and `admin_token.revoked`. Both are logged at `info`
+  with the token id, name, scopes and who did it.
+- **Metric.** `hs_admin_scope_refusals_total{required_scope}` (`crates/hs-admin/src/metrics.rs`,
+  counted in `require_scope`, registered by `hs serve`): a token that keeps being refused is
+  either minted too narrow or used for something it was not meant for.
+- **CLI.** `hs admin-token create --name NAME [--scope S]... [--expires-in 30d]`, `list`,
+  `revoke ID`, against a running server with `--token` or `HS_ADMIN_TOKEN` (else prompted,
+  not echoed). `create` prints the token alone on stdout, so `$(hs admin-token create ...)` is
+  the token; a refusal names the required scope.
+- **Web** (`web/src/pages/settings/AdminTokensPage.tsx`, `CreateAdminTokenDialog.tsx`,
+  `web/src/lib/scopes.ts`): Settings, Admin tokens. The mint dialog is a checkbox per scope
+  with a sentence saying what it lets the holder do, starting as a full administrator's token,
+  saying what the chosen set holds and which boxes are already included by another; the token
+  is shown once with a copy button. Rows show the scopes as badges (one `admin:write` badge
+  for a full administrator's, the sentence on hover), expiry and who minted it; revoke
+  confirms and says the next request is refused. Client regenerated (`npm run
+  generate:client`); MSW handlers and seed in `web/src/mocks/data/admin-tokens.ts`.
+
+Verified on the real binary (`crates/hs-cli/tests/admin_tokens.rs`): the first administrator
+mints a `bridges:read` token on `/api/v1/admin-tokens`; the token is served `/bridge-types`
+and `/appservices` (200), refused `/users` and a mint with `403 insufficient-scope` naming
+`admin:read` and `admin:write`; `/me` reports `service_account` with `["bridges:read"]`;
+`/metrics` counts both refusals; the audit log holds the mint with `/scopes` and never the
+token; after `DELETE` the token is `401` everywhere. Then `hs admin-token create --scope
+moderation:write --expires-in 1d` prints a token that reads `/reports` and is refused
+`/audit-log` (`admin:read`); `list` shows it with its scopes and not the revoked one; a
+`moderation:write` token running `create` is refused "required scope: admin:write"; `revoke`
+makes it `401`. `web/e2e-real/admin-tokens.spec.ts` does the same from the page against the
+real server.
+
+Not done, deliberately: `last_used_at` (a write per verified request; revisit if operators ask),
+per-token rate-limit identity (the limiter keys by principal id, which is now the token id),
+and the OAuth issuer and client-credentials grant of RFC 0004 section 8.1 (admin tokens are the
+`service_account` kind; `user` and `client` principals still wait on track 07's issuer).
+
+Verify: `cargo test -p hs-admin` (`tests/admin_tokens.rs`, `tests/scope_contract.rs` now 158
+operations); `cargo test -p hs-cli --test admin_tokens`; in `web/`, `npx vitest run
+src/pages/settings/AdminTokensPage.test.tsx src/lib/scopes.test.ts`, `npm run check`, `npm
+run test:e2e`, and with a server, `HS_REAL_SERVER_URL=... HS_REAL_ADMIN_TOKEN=... npx
+playwright test --config playwright.real.config.ts e2e-real/admin-tokens.spec.ts`.
 
 ## 2026-10-01: every operation enforces the scope the document gives it
 
@@ -818,6 +887,10 @@ None.
 
 ## Interfaces provided
 
+- `hs_admin::admin_tokens::{AdminTokenSource, InMemoryAdminTokens, ScopedTokenVerifier,
+  AdminToken, AdminTokenRecord, NewAdminToken, mint, hash_token}` and
+  `AdminState::with_admin_tokens` (2026-10-02); `hs_admin::metrics::register_metrics`.
+
 - `docs/rfcs/0004-admin-api.md` — the frozen-at-week-8 (draft until then) admin API design.
 - `docs/rfcs/0005-routes-json-manifest.md` — the `routes.json` format for track 14.
 - `crates/hs-admin/openapi/openapi.yaml` and `openapi/operations.json` — the OpenAPI 3.1 contract and its Rust-consumable operation table. **Track 16: generate your client and mock-check your work against `openapi.yaml`; it is validated (`redocly lint`, 0 errors) and the contract test proves the real router agrees with it.**
@@ -841,6 +914,13 @@ None.
 - 16: usability feedback on the OpenAPI document and the mock server, as RFC 0004 amendments (RFC 0004 section 15).
 
 ## Decisions made
+
+- **2026-10-02, admin tokens** (`docs/decisions/0025-admin-tokens-carry-their-scopes.md`):
+  a minted token's scopes are an explicit list, defaulting to a full administrator's; the
+  token is `hsa_`-prefixed and stored hashed; the verifier decides `hsa_` bearers alone and
+  defers the rest to the legacy verifier; only `admin:write` mints, lists or revokes, so no
+  token mints one wider than its minter; revocation deletes the row and the audit log keeps
+  the record.
 
 - **Deferred the `wasmtime` host to Phase 1**, per the instruction not to build `wasmtime` on this shared machine. Wrote the feasibility verdict (`docs/design/wasmtime-feasibility.md`) as a design document instead; no `wasmtime` dependency was added anywhere. This satisfies the brief's "day-one work: ... a `wasmtime` component-model feasibility spike" as a design spike, not a code spike.
 - **`hs_admin::events::EventBus` assigns event ids itself** (a monotonic `ulid::Generator`), overwriting whatever id the caller's `Event` carried, rather than trusting `Event::new`'s plain `Ulid::new()`. RFC 0004 section 10 requires "ids are monotonic per server"; a non-monotonic generator broke a real test (two events published in the same millisecond did not sort correctly as plain strings) before this fix.

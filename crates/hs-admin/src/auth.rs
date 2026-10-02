@@ -121,6 +121,7 @@ pub async fn require_scope(
             held = ?principal.scopes.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
             "admin API request refused: the token lacks the operation's scope"
         );
+        crate::metrics::count_scope_refusal(required.as_str());
         return ScopeDecision::InsufficientScope(
             hs_http::Problem::insufficient_scope()
                 .with_detail(format!(

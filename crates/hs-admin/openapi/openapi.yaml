@@ -23,6 +23,11 @@ info:
   - version: 0.1.0
     date: '2026-09-18'
     notes: Initial draft covering every resource in RFC 0004 section 4. Not yet frozen; freezes at week 8 as contract 1.0.
+  - version: 0.1.1
+    date: '2026-10-02'
+    notes: 'Additive: /admin-tokens (list, create, get, delete) mints admin API tokens that carry
+      a chosen subset of the scopes (RFC 0004 section 8.1, service_account principals). A token
+      lacking an operation''s scope gets 403 insufficient-scope naming the scope, as before.'
 servers:
 - url: /api/v1
   description: Same origin as /_matrix on the client listener.
@@ -45,6 +50,9 @@ tags:
   description: Event and user reports (one inbox, kind discriminated).
 - name: RegistrationTokens
   description: Registration token management.
+- name: AdminTokens
+  description: Admin API tokens narrower than a full administrator's, minted with the scopes
+    their holder needs.
 - name: Tasks
   description: Long-running operations.
 - name: Statistics
@@ -2931,6 +2939,143 @@ paths:
       responses:
         '204':
           description: Deleted.
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/InsufficientScope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /admin-tokens:
+    get:
+      summary: List admin tokens
+      description: Every admin API token minted on this server, with the scopes each one
+        carries. The tokens themselves are never listed; a lost one is revoked and re-minted.
+      operationId: admin_tokens.list
+      tags:
+      - AdminTokens
+      security:
+      - OAuth2:
+        - admin:read
+      parameters:
+      - $ref: '#/components/parameters/Limit'
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/IncludeTotal'
+      responses:
+        '200':
+          description: A page of tokens.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminTokenPage'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/InsufficientScope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '400':
+          $ref: '#/components/responses/InvalidCursor'
+    post:
+      summary: Mint an admin token
+      description: Mints an admin API token carrying the chosen scopes (a full administrator's,
+        `admin:read` and `admin:write`, when `scopes` is omitted). The response is the only
+        time the token is shown. The audit entry records the name, scopes and expiry.
+      operationId: admin_tokens.create
+      tags:
+      - AdminTokens
+      security:
+      - OAuth2:
+        - admin:write
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminTokenCreate'
+      responses:
+        '201':
+          description: The minted token, with the bearer string in `token`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminTokenCreated'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/InsufficientScope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/IdempotencyMismatch'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+  /admin-tokens/{id}:
+    get:
+      summary: Get an admin token
+      operationId: admin_tokens.get
+      tags:
+      - AdminTokens
+      security:
+      - OAuth2:
+        - admin:read
+      parameters:
+      - $ref: '#/components/parameters/AdminTokenId'
+      responses:
+        '200':
+          description: The token, without its secret.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminToken'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/InsufficientScope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+    delete:
+      summary: Revoke an admin token
+      description: Revokes the token; its next request is `401`. Audited with the scopes it
+        carried.
+      operationId: admin_tokens.delete
+      tags:
+      - AdminTokens
+      security:
+      - OAuth2:
+        - admin:write
+      parameters:
+      - $ref: '#/components/parameters/AdminTokenId'
+      responses:
+        '204':
+          description: Revoked.
         '401':
           $ref: '#/components/responses/Unauthenticated'
         '403':
@@ -6454,6 +6599,13 @@ components:
       required: true
       schema:
         type: string
+    AdminTokenId:
+      name: id
+      in: path
+      description: An admin token's id (a ULID), as `GET /admin-tokens` lists it.
+      required: true
+      schema:
+        type: string
     ReplicaId:
       name: id
       in: path
@@ -7681,6 +7833,88 @@ components:
           - string
           - 'null'
           format: date-time
+    Scope:
+      type: string
+      description: One of the six scopes of RFC 0004 section 8.2. `admin:write` implies every
+        other scope; each `*:write` implies its own `*:read`; `admin:read` satisfies every
+        other `:read`.
+      enum:
+      - admin:read
+      - admin:write
+      - bridges:read
+      - bridges:write
+      - moderation:read
+      - moderation:write
+    AdminToken:
+      type: object
+      description: An admin API token, as listed. `scopes` is exactly what it was minted with,
+        in catalog order; what that lets its holder do follows the rules on `Scope`. The token
+        itself is never listed.
+      required:
+      - id
+      - name
+      - scopes
+      - created_at
+      - created_by
+      - expires_at
+      properties:
+        id:
+          type: string
+          description: A ULID, what revocation and the audit log name the token by.
+        name:
+          type: string
+          description: What the operator called it; not unique.
+        scopes:
+          type: array
+          items:
+            $ref: '#/components/schemas/Scope'
+        created_at:
+          type: string
+          format: date-time
+        created_by:
+          type: string
+          description: The principal that minted it (a user id, or another token's id).
+        expires_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: When it stops working; null for never.
+    AdminTokenCreate:
+      type: object
+      required:
+      - name
+      properties:
+        name:
+          type: string
+          description: What the token is for, so it can be told from the others. Required; at
+            most 100 characters.
+          maxLength: 100
+        scopes:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/Scope'
+          description: The scopes the token carries. Omit it for a full administrator's
+            (`admin:read` and `admin:write`). Empty is refused.
+        expires_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: When the token stops working; null or absent for never. Must be in the
+            future.
+    AdminTokenCreated:
+      allOf:
+      - $ref: '#/components/schemas/AdminToken'
+      - type: object
+        required:
+        - token
+        properties:
+          token:
+            type: string
+            description: The bearer token (`hsa_` and 40 letters and digits). Shown once; only
+              its hash is stored.
     AppService:
       type: object
       properties:
@@ -9142,6 +9376,17 @@ components:
             type: array
             items:
               $ref: '#/components/schemas/RegistrationToken'
+    AdminTokenPage:
+      allOf:
+      - $ref: '#/components/schemas/PageEnvelope'
+      - type: object
+        required:
+        - items
+        properties:
+          items:
+            type: array
+            items:
+              $ref: '#/components/schemas/AdminToken'
     AppServicePage:
       allOf:
       - $ref: '#/components/schemas/PageEnvelope'

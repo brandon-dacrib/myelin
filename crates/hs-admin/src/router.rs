@@ -97,6 +97,11 @@ pub struct AdminState {
     /// What the `registration_tokens.*` operations read and write: the tokens client-server
     /// registration accepts. `None` until wired with [`AdminState::with_registration_tokens`].
     pub registration_tokens: Option<Arc<dyn crate::registration_tokens::RegistrationTokenSource>>,
+    /// What the `admin_tokens.*` operations read and write: admin API tokens narrower than a
+    /// full administrator's (see [`crate::admin_tokens`]). `None` until wired with
+    /// [`AdminState::with_admin_tokens`]; the verifier that accepts them is wired separately,
+    /// as [`crate::admin_tokens::ScopedTokenVerifier`] over the same source.
+    pub admin_tokens: Option<Arc<dyn crate::admin_tokens::AdminTokenSource>>,
     /// What the `server_notices.*` operations send through and list. `None` until wired with
     /// [`AdminState::with_server_notices`].
     pub server_notices: Option<Arc<dyn crate::server_notices::ServerNoticeSource>>,
@@ -173,6 +178,7 @@ impl AdminState {
             federation: None,
             bridge_offerings: None,
             registration_tokens: None,
+            admin_tokens: None,
             server_notices: None,
             reports: None,
             tasks: None,
@@ -239,6 +245,18 @@ impl AdminState {
         tokens: Arc<dyn crate::registration_tokens::RegistrationTokenSource>,
     ) -> Self {
         self.registration_tokens = Some(tokens);
+        self
+    }
+
+    /// Wires the admin tokens, making the `admin_tokens.*` operations real. The verifier that
+    /// accepts the minted tokens is [`crate::admin_tokens::ScopedTokenVerifier`] over the same
+    /// source, passed to [`AdminState::new`].
+    #[must_use]
+    pub fn with_admin_tokens(
+        mut self,
+        tokens: Arc<dyn crate::admin_tokens::AdminTokenSource>,
+    ) -> Self {
+        self.admin_tokens = Some(tokens);
         self
     }
 
@@ -577,6 +595,10 @@ const REAL_HANDLERS: &[&str] = &[
     "registration_tokens.create",
     "registration_tokens.update",
     "registration_tokens.delete",
+    "admin_tokens.list",
+    "admin_tokens.get",
+    "admin_tokens.create",
+    "admin_tokens.delete",
     "server_notices.list",
     "server_notices.send",
     "reports.list",
@@ -5636,6 +5658,10 @@ fn register_real_operation(builder: Builder<AdminState>, op: OperationDef) -> Bu
         "registration_tokens.delete" => {
             builder.add(method, &full_path, crate::registration_tokens::delete, meta)
         }
+        "admin_tokens.list" => builder.add(method, &full_path, crate::admin_tokens::list, meta),
+        "admin_tokens.get" => builder.add(method, &full_path, crate::admin_tokens::get, meta),
+        "admin_tokens.create" => builder.add(method, &full_path, crate::admin_tokens::create, meta),
+        "admin_tokens.delete" => builder.add(method, &full_path, crate::admin_tokens::delete, meta),
         "server_notices.list" => builder.add(method, &full_path, crate::server_notices::list, meta),
         "server_notices.send" => builder.add(method, &full_path, crate::server_notices::send, meta),
         "reports.list" => builder.add(method, &full_path, crate::reports::reports_list, meta),

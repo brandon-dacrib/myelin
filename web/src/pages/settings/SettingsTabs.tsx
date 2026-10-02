@@ -2,11 +2,15 @@ import { Link } from "@tanstack/react-router";
 import { cn } from "@/lib/cn";
 
 /**
- * The views of Settings (information-architecture.md, Settings): registration tokens and server
- * notices so far. Links, not tabs, as in Bridges: each view has its own address, so it can be
+ * The views of Settings (information-architecture.md, Settings): registration tokens, admin
+ * tokens and server notices so far. Links, not tabs, as in Bridges: each view has its own address, so it can be
  * linked to, bookmarked and reached from the command palette.
  */
-export function SettingsTabs({ current }: { current: "registration-tokens" | "server-notices" }) {
+export function SettingsTabs({
+  current,
+}: {
+  current: "registration-tokens" | "admin-tokens" | "server-notices";
+}) {
   const item = (active: boolean) =>
     cn(
       "-mb-px border-b-2 px-3 py-2 text-sm transition-colors duration-fast",
@@ -23,6 +27,13 @@ export function SettingsTabs({ current }: { current: "registration-tokens" | "se
         className={item(current === "registration-tokens")}
       >
         Registration tokens
+      </Link>
+      <Link
+        to="/settings/admin-tokens"
+        aria-current={current === "admin-tokens" ? "page" : undefined}
+        className={item(current === "admin-tokens")}
+      >
+        Admin tokens
       </Link>
       <Link
         to="/settings/server-notices"

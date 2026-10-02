@@ -1,6 +1,6 @@
 # RFC 0004. The admin API (`/api/v1`)
 
-Date: 2026-09-17. Status: draft for review by tracks 16 and 13; freezes at week 8 as "API v1 contract". Owner: track 15.
+Date: 2026-09-17. Status: draft for review by tracks 16 and 13; freezes at week 8 as "API v1 contract". Owner: track 15. Section 8.1's `service_account` principals exist since 2026-10-02 as admin tokens minted at `/admin-tokens` with a chosen subset of the scopes (decision 0025); `user` and `client` principals still wait on 07's OAuth issuer.
 
 Companion artifacts: the OpenAPI 3.1 document at `crates/hs-admin/openapi/openapi.yaml` (the contract), the mock server `hs-admin-mock` (track 16 develops against it), and the `hs-admin` router whose contract tests assert agreement with the document.
 

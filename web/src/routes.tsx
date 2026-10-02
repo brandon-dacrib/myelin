@@ -74,6 +74,10 @@ const RegistrationTokensPage = lazyRouteComponent(
   () => import("@/pages/settings/RegistrationTokensPage"),
   "RegistrationTokensPage",
 );
+const AdminTokensPage = lazyRouteComponent(
+  () => import("@/pages/settings/AdminTokensPage"),
+  "AdminTokensPage",
+);
 const ServerNoticesPage = lazyRouteComponent(
   () => import("@/pages/settings/ServerNoticesPage"),
   "ServerNoticesPage",
@@ -370,6 +374,12 @@ const registrationTokensRoute = createRoute({
   validateSearch: cursorValidator,
   component: RegistrationTokensPage,
 });
+const adminTokensRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/settings/admin-tokens",
+  validateSearch: cursorValidator,
+  component: AdminTokensPage,
+});
 const serverNoticesRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/settings/server-notices",
@@ -416,6 +426,7 @@ const routeTree = rootRoute.addChildren([
   auditEntryRoute,
   settingsRoute,
   registrationTokensRoute,
+  adminTokensRoute,
   serverNoticesRoute,
   registerRoute,
 ]);

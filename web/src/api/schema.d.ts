@@ -4,6 +4,51 @@
  */
 
 export interface paths {
+    "/admin-tokens": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List admin tokens
+         * @description Every admin API token minted on this server, with the scopes each one carries. The tokens themselves are never listed; a lost one is revoked and re-minted.
+         */
+        get: operations["admin_tokens.list"];
+        put?: never;
+        /**
+         * Mint an admin token
+         * @description Mints an admin API token carrying the chosen scopes (a full administrator's, `admin:read` and `admin:write`, when `scopes` is omitted). The response is the only time the token is shown. The audit entry records the name, scopes and expiry.
+         */
+        post: operations["admin_tokens.create"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/admin-tokens/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get an admin token */
+        get: operations["admin_tokens.get"];
+        put?: never;
+        post?: never;
+        /**
+         * Revoke an admin token
+         * @description Revokes the token; its next request is `401`. Audited with the scopes it carried.
+         */
+        delete: operations["admin_tokens.delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/appservices": {
         parameters: {
             query?: never;
@@ -2453,6 +2498,41 @@ export interface components {
             token_id?: string;
             user_agent?: string;
         };
+        /** @description An admin API token, as listed. `scopes` is exactly what it was minted with, in catalog order; what that lets its holder do follows the rules on `Scope`. The token itself is never listed. */
+        AdminToken: {
+            /** Format: date-time */
+            created_at: string;
+            /** @description The principal that minted it (a user id, or another token's id). */
+            created_by: string;
+            /**
+             * Format: date-time
+             * @description When it stops working; null for never.
+             */
+            expires_at: string | null;
+            /** @description A ULID, what revocation and the audit log name the token by. */
+            id: string;
+            /** @description What the operator called it; not unique. */
+            name: string;
+            scopes: components["schemas"]["Scope"][];
+        };
+        AdminTokenCreate: {
+            /**
+             * Format: date-time
+             * @description When the token stops working; null or absent for never. Must be in the future.
+             */
+            expires_at?: string | null;
+            /** @description What the token is for, so it can be told from the others. Required; at most 100 characters. */
+            name: string;
+            /** @description The scopes the token carries. Omit it for a full administrator's (`admin:read` and `admin:write`). Empty is refused. */
+            scopes?: components["schemas"]["Scope"][];
+        };
+        AdminTokenCreated: components["schemas"]["AdminToken"] & {
+            /** @description The bearer token (`hsa_` and 40 letters and digits). Shown once; only its hash is stored. */
+            token: string;
+        };
+        AdminTokenPage: components["schemas"]["PageEnvelope"] & {
+            items: components["schemas"]["AdminToken"][];
+        };
         AppService: {
             /** @description The bridge-type catalogue entry this appservice was created from, read from the registration's `io.myelin.bridge_type` key. Null for a registration that did not come through the catalogue. */
             bridge_type?: string | null;
@@ -3377,6 +3457,11 @@ export interface components {
         RoomStatisticPage: components["schemas"]["PageEnvelope"] & {
             items: components["schemas"]["RoomStatistic"][];
         };
+        /**
+         * @description One of the six scopes of RFC 0004 section 8.2. `admin:write` implies every other scope; each `*:write` implies its own `*:read`; `admin:read` satisfies every other `:read`.
+         * @enum {string}
+         */
+        Scope: "admin:read" | "admin:write" | "bridges:read" | "bridges:write" | "moderation:read" | "moderation:write";
         ServerHealth: {
             checks?: {
                 [key: string]: string;
@@ -3780,6 +3865,8 @@ export interface components {
         };
     };
     parameters: {
+        /** @description An admin token's id (a ULID), as `GET /admin-tokens` lists it. */
+        AdminTokenId: string;
         /** @description An appservice id. */
         AppserviceId: string;
         /** @description An audit entry id (ULID). */
@@ -3840,6 +3927,132 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    "admin_tokens.list": {
+        parameters: {
+            query?: {
+                /** @description Opaque keyset cursor from a previous page's next_cursor or prev_cursor. */
+                cursor?: components["parameters"]["Cursor"];
+                /** @description Ask for the total count. Only honoured where a count is cheap; otherwise total is omitted. */
+                include_total?: components["parameters"]["IncludeTotal"];
+                /** @description Page size. Values above the resource's max are clamped, not rejected. */
+                limit?: components["parameters"]["Limit"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A page of tokens. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminTokenPage"];
+                };
+            };
+            400: components["responses"]["InvalidCursor"];
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["InsufficientScope"];
+            429: components["responses"]["RateLimited"];
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    "admin_tokens.create": {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description 1-255 visible ASCII characters. Replays return the stored response for 24 hours. */
+                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AdminTokenCreate"];
+            };
+        };
+        responses: {
+            /** @description The minted token, with the bearer string in `token`. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminTokenCreated"];
+                };
+            };
+            400: components["responses"]["ValidationFailed"];
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["InsufficientScope"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["PayloadTooLarge"];
+            415: components["responses"]["UnsupportedMediaType"];
+            422: components["responses"]["IdempotencyMismatch"];
+            429: components["responses"]["RateLimited"];
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    "admin_tokens.get": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description An admin token's id (a ULID), as `GET /admin-tokens` lists it. */
+                id: components["parameters"]["AdminTokenId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The token, without its secret. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminToken"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["InsufficientScope"];
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["RateLimited"];
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    "admin_tokens.delete": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description An admin token's id (a ULID), as `GET /admin-tokens` lists it. */
+                id: components["parameters"]["AdminTokenId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Revoked. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["InsufficientScope"];
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["RateLimited"];
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
     "appservices.list": {
         parameters: {
             query?: {

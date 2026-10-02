@@ -62,6 +62,8 @@ rand_core = { workspace = true }
 rpassword = { workspace = true }
 reqwest = { workspace = true }
 ruma = { workspace = true }
+# `hs admin-token create --expires-in`: an instant as RFC 3339 (`src/admin_tokens.rs`).
+time = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

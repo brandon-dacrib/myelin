@@ -24,6 +24,9 @@
 //!   [`cluster::ClusterSource`] they call, implemented for real in `hs-cli` over `hs-cluster`.
 //! - [`assets`]: serves the management interface's built assets at `/admin/`.
 //! - [`registration_tokens`]: the `registration_tokens.*` operations and the source they use.
+//! - [`admin_tokens`]: admin API tokens narrower than a full administrator's: the
+//!   `admin_tokens.*` operations, the source they use, and the verifier that accepts them.
+//! - [`metrics`]: the admin API's own counters, registered by whoever serves it.
 //! - [`server_notices`]: the `server_notices.*` operations and the source they use.
 //! - [`user_moderation`]: the moderation and activity half of the Users area (suspension,
 //!   shadow-bans, rate-limit overrides, support sessions, sessions, memberships, statistics,
@@ -36,6 +39,7 @@
 //! server for track 16 to develop against; it does not depend on this library's router skeleton
 //! (which answers `501` for every operation) so that it can return realistic data instead.
 
+pub mod admin_tokens;
 pub mod assets;
 pub mod audit;
 pub mod auth;
@@ -49,6 +53,7 @@ pub mod federation;
 mod handler_kit;
 pub mod idempotency;
 pub mod media;
+pub mod metrics;
 pub mod migration;
 pub mod model;
 pub mod openapi;

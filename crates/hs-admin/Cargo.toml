@@ -30,6 +30,10 @@ rust-embed = { workspace = true, features = ["interpolate-folder-path"] }
 futures = { workspace = true }
 bytes = { workspace = true }
 async-stream = { workspace = true }
+# Admin tokens are stored as their SHA-256 (`src/admin_tokens.rs`).
+sha2 = { workspace = true }
+# `hs_admin_scope_refusals_total` (`src/metrics.rs`).
+prometheus-client = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
