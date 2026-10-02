@@ -119,7 +119,42 @@ export const users: User[] = [
     room_count: 1,
     media_count: 0,
   },
+  // Deactivated and then erased: nothing personal is left on the server, only the id and the
+  // messages they sent. The badge and the page's "nothing to reactivate" state come from here.
+  {
+    user_id: "@gone:example.org",
+    display_name: null,
+    avatar_url: null,
+    admin: false,
+    deactivated: true,
+    erased: true,
+    locked: false,
+    suspended: false,
+    shadow_banned: false,
+    user_type: null,
+    consent_version: null,
+    appservice_id: null,
+    created_at: iso(300 * 24 * 3_600_000),
+    last_seen_at: iso(45 * 24 * 3_600_000),
+    device_count: 0,
+    room_count: 0,
+    media_count: 2,
+  },
 ];
+
+/**
+ * What the server does to an account when told to erase it (`POST /users/{id}/deactivate` with
+ * `erase: true`): deactivates it if it was not already, then clears everything personal. The
+ * caller empties the per-user tables (devices, email and phone, linked identities) itself.
+ */
+export function eraseUser(user: User): void {
+  user.deactivated = true;
+  user.erased = true;
+  user.display_name = null;
+  user.avatar_url = null;
+  user.device_count = 0;
+  user.room_count = 0;
+}
 
 export const userDevices: Record<string, Device[]> = {
   "@admin:example.org": [

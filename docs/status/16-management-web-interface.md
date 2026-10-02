@@ -72,6 +72,55 @@ so, and an operator relaying it had nothing to copy. Now:
 **Where this stopped.** `npm run check` and `npm run test:e2e` green in the worktree (results in
 the branch's report). Not verified against the real `hs` binary this session: the offering page's
 real-binary flow needs a cluster deployment target, which a session does not have.
+Last updated: 2026-10-02 (user erasure; branch `agent/user-erase-web`).
+
+## 2026-10-02: user erasure, "delete a user" (branch `agent/user-erase-web`)
+
+The server side is `agent/user-erase` (`POST /users/{id}/deactivate` with `erase: true`,
+`User.erased`, 409 from reactivate and reset-password on an erased account); this branch is its
+UI, built against the OpenAPI contract and the MSW mocks, with a real-server spec for the merged
+binary. Only `web/` and these two documents change.
+
+**Done.**
+
+- **A user's page** (`pages/UserDetailPage.tsx`). The deactivate dialog has an "Also erase their
+  data" box, off by default, with the list of what goes (password and every session, every device
+  with its encryption keys, email, phone and single-sign-on links, display name and avatar,
+  membership of every room) and what stays (their messages, unless redacted under Moderation),
+  and that it cannot be undone or reactivated. Ticked, the button reads "Deactivate and erase"
+  and the request carries `erase: true`; left alone, the body is `{}` as before. An account that
+  is deactivated but not erased gets a red "Erase this user's data" box with the same explanation
+  and its own confirm. An erased account shows the "Erased" badge beside "Deactivated", the id as
+  its heading, "Display name and avatar: cleared when the account was erased" in the overview,
+  "No devices." under Sessions, a "This account was erased" box in place of Reactivate and the
+  erase and deactivate boxes, and "Reset password" disabled with "An erased account has no
+  password to reset". The explanation is one component (`EraseExplanation`), used in all three
+  places.
+- **The list** (`pages/UsersPage.tsx`): an "Erased" badge beside "Deactivated", with a title that
+  says what is gone, and "Erased" in the row's compact status words.
+- **Mocks** (`mocks/handlers.ts`, `mocks/data/users.ts`): `erase: true` sets `erased` and
+  `deactivated`, clears the display name and avatar, zeroes `device_count` and `room_count` and
+  empties the user's devices, email/phone and linked identities; a second erase is a 200 no-op;
+  reactivate and reset-password on an erased user answer 409 problem+json with a `detail`.
+  `@gone:example.org` is the erased fixture.
+- **Tests.** `UserDetailPage.test.tsx`: the box changes the posted body (`[{erase: true}]`
+  against `[{}]`), the erase box on a deactivated account, the erased state (no Reactivate, no
+  Deactivate, no Erase data, reset disabled with the reason). `UsersPage.test.tsx`: the badge in
+  the row. `e2e/user-erase.spec.ts`: both paths on the mock with axe on each dialog and the
+  erased page. `e2e-real/user-erase.spec.ts`: a real user with a display name, a keyed device
+  and a room they spoke in is erased from the page; asserts the badges, the empty device list,
+  `GET /users/{id}` (`erased`, no name, no devices), the token refused, no keys served, the room
+  left with the message still there, 409 problem+json from reactivate and reset-password, a
+  second erase as a 200 no-op, and the list row; a second test erases an account that was only
+  deactivated from its own box.
+
+**Verified** (2026-10-02, this worktree): `npm run check` and `npm run test:e2e`; see the
+"where this stopped" line below for the counts. **Not run:** the real-server spec, which needs
+`agent/user-erase` merged: `cd web && HS_REAL_SERVER_URL=http://localhost:8008
+HS_REAL_ADMIN_TOKEN=... npx playwright test --config playwright.real.config.ts e2e-real/user-erase.spec.ts`
+(the server-side details it assumes beyond the contract: `/users/{id}/memberships?membership=join`
+lists the rooms they are still in; the keys and room-event checks are tolerant of a 4xx).
+
 
 ## 2026-10-01: the interface explains itself, by the owner's rule (branch `agent/web-admin-ui`)
 

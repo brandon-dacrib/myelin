@@ -84,7 +84,7 @@ import { cachedKeys, destinationRooms, ownKeys, startKeyRefresh } from "./data/f
 import { roomStatistics, sortStatistics, timeseries, userMediaStatistics } from "./data/statistics";
 import type { ReportResolve } from "@/api/reports";
 import { succeeded } from "@/lib/audit";
-import { users, userDevices, findUser } from "./data/users";
+import { users, userDevices, findUser, eraseUser } from "./data/users";
 import {
   KNOWN_FEATURES,
   userAccountData,
@@ -1274,6 +1274,10 @@ export const handlers = [
         { type: "urn:hs:problem:not-found", title: "Not found", status: 404 },
         { status: 404 },
       );
+    if (findUser(userId)?.erased)
+      return problem(409, "conflict", "Conflict", {
+        detail: `${userId} was erased; an erased account has no password to reset`,
+      });
     const body = (await request.json()) as { password?: string; logout_devices?: boolean };
     if (!body.password || body.password.length < 8)
       return HttpResponse.json(
@@ -1289,24 +1293,41 @@ export const handlers = [
     return HttpResponse.json({});
   }),
 
-  http.post(`${API}/users/:user_id/deactivate`, ({ params }) => {
-    const user = findUser(decodeURIComponent(String(params.user_id)));
+  http.post(`${API}/users/:user_id/deactivate`, async ({ params, request }) => {
+    const userId = decodeURIComponent(String(params.user_id));
+    const user = findUser(userId);
     if (!user)
       return HttpResponse.json(
         { type: "urn:hs:problem:not-found", title: "Not found" },
         { status: 404 },
       );
+    const body = (await request.json().catch(() => ({}))) as { erase?: boolean };
+    if (body.erase) {
+      // Erasing an already-erased account is a no-op; otherwise everything personal goes.
+      if (!user.erased) {
+        eraseUser(user);
+        userDevices[userId] = [];
+        userThreepids[userId] = [];
+        userExternalIds[userId] = [];
+      }
+      return HttpResponse.json(user);
+    }
     user.deactivated = true;
     return HttpResponse.json(user);
   }),
 
   http.post(`${API}/users/:user_id/reactivate`, ({ params }) => {
-    const user = findUser(decodeURIComponent(String(params.user_id)));
+    const userId = decodeURIComponent(String(params.user_id));
+    const user = findUser(userId);
     if (!user)
       return HttpResponse.json(
         { type: "urn:hs:problem:not-found", title: "Not found" },
         { status: 404 },
       );
+    if (user.erased)
+      return problem(409, "conflict", "Conflict", {
+        detail: `${userId} was erased; an erased account cannot be reactivated`,
+      });
     user.deactivated = false;
     return HttpResponse.json(user);
   }),

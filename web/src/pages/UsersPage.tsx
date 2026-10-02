@@ -70,6 +70,11 @@ export function UsersPage() {
           {u.locked && <Badge status="warning">Locked</Badge>}
           {u.suspended && <Badge status="warning">Suspended</Badge>}
           {u.deactivated && <Badge status="danger">Deactivated</Badge>}
+          {u.erased && (
+            <span title="Deactivated and then erased: their password, sessions, devices and keys, email and phone, sign-in links, display name and avatar are gone and they left every room. Only their messages remain, unless redacted. It cannot be undone.">
+              <Badge status="danger">Erased</Badge>
+            </span>
+          )}
           {u.shadow_banned && (
             <Badge status="muted" hideIcon>
               Shadow-banned
@@ -91,6 +96,7 @@ export function UsersPage() {
           u.locked && "Locked",
           u.suspended && "Suspended",
           u.deactivated && "Deactivated",
+          u.erased && "Erased",
           u.shadow_banned && "Shadow-banned",
           u.is_guest && "Guest",
         ]

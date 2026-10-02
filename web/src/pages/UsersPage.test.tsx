@@ -130,3 +130,19 @@ describe("Users page: guests", () => {
     expect(within(rowOf("@alice:example.org")).queryByText("Guest")).not.toBeInTheDocument();
   });
 });
+
+describe("Users page: erased accounts", () => {
+  it("marks an erased account beside Deactivated, with the badge explaining what is gone", async () => {
+    await signIn();
+    renderRoutes(ROUTES, "/users", KNOWN);
+    await screen.findAllByText("@gone:example.org");
+    const row = screen
+      .getAllByText("@gone:example.org")
+      .map((cell) => cell.closest("tr"))
+      .find((r): r is HTMLTableRowElement => r !== null) as HTMLElement;
+    expect(within(row).getByText("Deactivated")).toBeInTheDocument();
+    const erased = within(row).getByText("Erased");
+    expect(erased.closest("[title]")?.getAttribute("title")).toMatch(/cannot be undone/);
+    expect(within(row).queryByText("Active")).not.toBeInTheDocument();
+  });
+});
