@@ -106,7 +106,9 @@ ones), `cargo test -p hs-bridges`, `cargo test -p hs-cli --test bridge_offerings
 them asserted the old invitation and now assert the chat started as alice with the bot's
 invitation from her, `is_direct`, both joined, and the bridge sent the invitation),
 `cargo clippy -p hs-bridges -p hs-bridge-conformance -p hs-cli --all-targets -- -D warnings`,
-`cargo fmt --all --check`.
+`cargo fmt --all --check`. All of these were green at the branch's tip (the first commit's message
+said `bridge_offerings` was still running; it finished 3 of 3, 5.9 s). The workspace gate was
+not run (merge queue's job).
 
 **Not verified / left.** The `cluster` runtime path is the same code but was not run on kind
 today. Nobody scanned the QR with a phone, so the bridge's `login` flow past its first step, and
