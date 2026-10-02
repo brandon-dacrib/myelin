@@ -506,6 +506,22 @@ async fn backfill_walks_the_timeline_backwards_from_the_live_end() {
     assert!(pdus.len() <= 3, "the server-side limit must be honoured");
 }
 
+/// Sytest's "Backfill checks the events requested belong to the room": asked to walk back from
+/// an event of another room, backfill answers no events, not this room's newest history.
+#[tokio::test]
+async fn backfill_from_an_event_of_another_room_answers_nothing() {
+    let harness = Harness::new().await;
+    let (room_id, _) = harness.room_with_a_message(true).await;
+    let (_other_room, other_message) = harness.room_with_a_message(true).await;
+
+    let (status, body) = harness
+        .signed_get(&format!("/backfill/{room_id}?limit=1&v={other_message}"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["origin"], US, "{body}");
+    assert_eq!(body["pdus"], serde_json::json!([]), "{body}");
+}
+
 /// A version-1 room joined the way Sytest's "Inbound federation can receive v1/v2 /send_join"
 /// joins it: `make_join`, sign, `send_join`. Both spellings answer the room's state with an auth
 /// chain that is the state's own -- every event reached through `auth_events`, the create event,

@@ -486,6 +486,21 @@ impl<B: KvBackend + 'static> RoomDataSource for RegistryRoomSource<B> {
         // because `room_pos` -- what `paginate` is keyed by -- is only carried on the persisted
         // row, not on the in-memory event.
         let token = self.backfill_token(room_id, from_event_ids);
+        if token.is_none() && !from_event_ids.is_empty() {
+            // None of `v` is an event of this room (one of another room, or one this server
+            // has never seen): there is nothing to walk back from, and the answer is empty,
+            // not the room's newest history (Sytest's "Backfill checks the events requested
+            // belong to the room").
+            self.with_visible_room(room_id, requesting_server, |_| Ok(()))
+                .await?;
+            tracing::info!(
+                room_id,
+                requesting_server,
+                v = ?from_event_ids,
+                "backfill asked from events that are not this room's; answering none"
+            );
+            return Ok(Vec::new());
+        }
         let server = requesting_server.to_owned();
         self.with_visible_room(room_id, requesting_server, move |actor| {
             let (events, _) = actor.paginate(token, Direction::Backward, limit);
