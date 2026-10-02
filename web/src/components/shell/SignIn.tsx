@@ -97,8 +97,10 @@ function RealSignIn() {
     <SignInShell>
       <NeedsSetupNotice />
       <p className="mt-2 text-sm text-text-muted">
-        Sign in with a server administrator&apos;s Matrix account. There is no separate admin login
-        — any account with <code className="font-identifier">is_admin</code> set works here.
+        Sign in with a server administrator&apos;s Matrix account. There is no separate admin login:
+        any account that administers this server works here, whether it was made with the setup
+        link, with <code className="font-identifier">hs register --admin</code>, or given
+        administrator on its page.
       </p>
 
       <div

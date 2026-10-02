@@ -67,3 +67,36 @@ export function describeProgress(task: Pick<Task, "progress">): string | null {
     ? `${progress.current.toLocaleString()} of ${progress.total.toLocaleString()}${unit}`
     : `${progress.current.toLocaleString()}${unit}`;
 }
+
+/** The keys a task's flat result can carry, in words; anything else has its underscores read as spaces. */
+const RESULT_KEY_LABELS: Record<string, string> = {
+  purged: "Events purged",
+  kept_state: "State events kept",
+  kept_local: "Local events kept",
+  events_deleted: "Events deleted",
+  events_redacted: "Events redacted",
+  kicked_users: "Members removed",
+  failed_to_kick_users: "Members that could not be removed",
+  new_room_id: "Moved to room",
+  quarantined: "Items quarantined",
+  already_quarantined: "Already quarantined",
+  protected: "Protected, left alone",
+  deleted: "Deleted",
+  deleted_bytes: "Bytes freed",
+  replayed: "Transactions replayed",
+  rescanned: "Items rescanned",
+  failed: "Failed",
+  skipped: "Skipped",
+  blocked: "Blocked",
+  rooms: "Rooms",
+  events: "Events",
+  users: "Users",
+  media: "Media items",
+};
+
+/** A result key in words: "kept_state" is "State events kept". */
+export function describeResultKey(key: string): string {
+  if (RESULT_KEY_LABELS[key]) return RESULT_KEY_LABELS[key];
+  const words = key.replace(/[._]/g, " ").trim();
+  return words.charAt(0).toUpperCase() + words.slice(1);
+}

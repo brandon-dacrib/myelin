@@ -93,3 +93,12 @@ describe("roomWords", () => {
     expect(roomWords(JOIN_RULE_LABELS, null)).toBe("—");
   });
 });
+
+describe("summarizeEvent, a message with no text", () => {
+  it("says what kind it is rather than its msgtype", async () => {
+    const { summarizeEvent } = await import("./rooms");
+    expect(
+      summarizeEvent({ type: "m.room.message", content: { msgtype: "m.image" }, redacted: false }),
+    ).toBe("(an image, with no text)");
+  });
+});

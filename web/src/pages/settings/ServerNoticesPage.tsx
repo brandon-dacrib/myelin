@@ -1,3 +1,4 @@
+import { describeMessageWithoutBody } from "@/lib/server-notices";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import { Megaphone } from "lucide-react";
 import { useServerNotices, type ServerNoticeView } from "@/api/server-notices";
@@ -56,9 +57,9 @@ export function ServerNoticesPage() {
         n.body !== null ? (
           <span className="line-clamp-2 max-w-xl text-sm text-text">{n.body}</span>
         ) : (
-          <span className="text-sm text-text-muted">{n.type} without a text body</span>
+          <span className="text-sm text-text-muted">{describeMessageWithoutBody(n.type)}</span>
         ),
-      renderCompact: (n) => n.body ?? n.type,
+      renderCompact: (n) => n.body ?? describeMessageWithoutBody(n.type),
     },
     {
       key: "sender",

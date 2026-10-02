@@ -303,3 +303,54 @@ test.describe("Room lifecycle against the real server", () => {
     await expect(page.getByText("Upgraded", { exact: true })).toHaveCount(0);
   });
 });
+
+test.describe("Wording against the real server", () => {
+  test.skip(
+    !process.env.HS_REAL_SERVER_URL || !adminToken,
+    "HS_REAL_SERVER_URL and HS_REAL_ADMIN_TOKEN not set",
+  );
+
+  test("the sign-in page, the audit filter and a task's result read in words", async ({
+    page,
+    request,
+  }) => {
+    await page.goto("/");
+    await expect(
+      page.getByText(/any account that administers this server works here/),
+    ).toBeVisible();
+    await expect(page.getByText("is_admin")).toHaveCount(0);
+
+    await signIn(page);
+    await page.goto("/admin/audit");
+    const action = page.getByLabel("Action", { exact: true });
+    await expect(action).toHaveAttribute("placeholder", "Any action");
+    await expect(page.getByText(/by the server's name for it; the list offers each/)).toBeVisible();
+    const suggestions = await page.evaluate(() => {
+      const input = document.querySelector<HTMLInputElement>('input[list$="-actions"]');
+      const list = input?.list;
+      return list ? Array.from(list.options).map((o) => [o.value, o.label]) : [];
+    });
+    expect(suggestions).toContainEqual(["users.update", "Updated user"]);
+    expect(suggestions).toContainEqual(["appservices.ping", "Pinged bridge"]);
+    await action.fill("users.update");
+    await page.getByRole("button", { name: "Apply" }).click();
+    await expect(page).toHaveURL(/action=users\.update/);
+    await expect(page.getByText("Updated user").first()).toBeVisible();
+
+    // A task with a result: redact everything a fresh user sent (nothing), through the API.
+    const { user_id } = await makeUser(request, `task-${run}`);
+    const started = await request.post(
+      `/api/v1/users/${encodeURIComponent(user_id)}/redact-events`,
+      { headers: { ...authed(), "idempotency-key": `web-items-task-${run}` }, data: {} },
+    );
+    expect(started.ok(), await started.text()).toBe(true);
+    const task = (await started.json()) as { id: string };
+    await page.goto(`/admin/tasks/${task.id}`);
+    await expect(page.getByRole("heading", { name: "Result" })).toBeVisible({ timeout: 30_000 });
+    const labels = await page.locator("dl dt").allTextContents();
+    expect(labels.length).toBeGreaterThan(0);
+    for (const label of labels) expect(label).toMatch(/^[A-Z][^_]*$/);
+    await settle(page);
+    await page.screenshot({ path: "test-results/real-task-result-words.png" });
+  });
+});

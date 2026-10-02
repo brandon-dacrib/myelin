@@ -124,7 +124,7 @@ describe("A task", () => {
   it("shows what a finished task reported", async () => {
     open("/tasks/01J9ZT000000000000000000T3");
     expect(await screen.findByRole("heading", { name: "Result" })).toBeVisible();
-    expect(screen.getByText("Replayed")).toBeInTheDocument();
+    expect(screen.getByText("Transactions replayed")).toBeInTheDocument();
     expect(screen.getByText("42")).toBeInTheDocument();
     expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
   });

@@ -32,3 +32,13 @@ describe("splitRecipients", () => {
     expect(splitRecipients("@a:x, @b:x;@c:x  @d:x\n")).toEqual(["@a:x", "@b:x", "@c:x", "@d:x"]);
   });
 });
+
+describe("describeMessageWithoutBody", () => {
+  it("names the kind of message that has no text", async () => {
+    const { describeMessageWithoutBody } = await import("./server-notices");
+    expect(describeMessageWithoutBody("m.image")).toBe("An image, with no text");
+    expect(describeMessageWithoutBody("m.file")).toBe("A file, with no text");
+    expect(describeMessageWithoutBody("m.sticker")).toBe("A m.sticker message, with no text");
+    expect(describeMessageWithoutBody(null)).toBe("A message, with no text");
+  });
+});

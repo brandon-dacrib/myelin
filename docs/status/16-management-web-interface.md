@@ -241,6 +241,32 @@ through the client API shows Upgraded, "Guests may join" and the successor link,
 reason is read back as `blocked_reason` from `GET /rooms/{id}`, and the link opens the successor
 (`test-results/real-room-lifecycle.png`).
 
+**10. The smaller wording items.** The audit page's Action filter keeps its free text (the
+e2e types a wire id) but its placeholder is "Any action", a hint says what goes there, and a
+datalist offers every audited action (`AUDITED_ACTIONS` in `lib/audit.ts`, the write operations
+of the OpenAPI copied 2026-10-02) labelled with its reading; the reader learned the nouns it
+lacked (bridge instance, bridge offering, recovery link) and three phrases, and a test checks
+every listed action reads as words. The offering page's deployment phase is a badge in words
+(`deploymentPhaseMeta` in `lib/bridge-offerings.ts`: Ready is "Running", Pending "Starting",
+Degraded "Not running properly"). A notice or message with no text says what it is
+(`describeMessageWithoutBody` in `lib/server-notices.ts`: "An image, with no text") on the
+notices page and in the room timeline. The sign-in page says who can sign in in words (an
+account that administers the server, made with the setup link, `hs register --admin`, or given
+administrator on its page) instead of naming `is_admin`. A task's result keys have words
+(`describeResultKey` in `lib/tasks.ts`: `kept_state` is "State events kept", `replayed`
+"Transactions replayed"; an unknown key reads as before). Verified against the real binary:
+the sign-in sentence, the audit filter's hint, suggestions and a filtered list, and a
+redact-events task's result page with every key a capitalised phrase
+(`test-results/real-task-result-words.png`); the deployment phase is mock-only (no Kubernetes
+here).
+
+**Also fixed on the way.** Add user hid the live username note behind a stale "already
+exists" refusal until the next submit; a field's refusal now clears as it is retyped.
+
+**Left from the list**: items 6 to 9 (federation and Overview at scale, effective values beside
+per-user overrides, cluster series in the admin API, settings with no reader and erase on
+deactivate) are the coordinator's or need API work, as noted there.
+
 ## 2026-10-01: the interface explains itself, by the owner's rule (branch `agent/web-admin-ui`)
 
 The owner's rule: *"Sane defaults, and all administration is done via the web UI, well
@@ -360,9 +386,10 @@ closes that and audits every page. Branched from `agent/config-hot` (for `applie
 9. **Settings with no reader** (listed above) should either get one or leave the schema; the UI
    says "has no effect yet" meanwhile. **Erase on deactivate** waits for an eraser on the
    server (`erase: true` is refused).
-10. Smaller wording left: the audit page's action filter is free text with a wire placeholder;
+10. ~~Smaller wording left: the audit page's action filter is free text with a wire placeholder;
     raw Kubernetes phases on the offering page; server notice "m.image without a text body";
-    the sign-in page's `is_admin`; the task result keys humanised from snake_case.
+    the sign-in page's `is_admin`; the task result keys humanised from snake_case.~~ Done
+    2026-10-02.
 
 **Decisions made.** A setting edited as one form whose rows disagree is badged "Needs a
 restart" (the cautious answer). The mock's setting descriptions come from the real schema

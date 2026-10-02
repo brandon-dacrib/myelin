@@ -79,6 +79,11 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
   it is closed and links the room that replaced it, guest access is a fact in words, and Block
   asks why, showing the reason on the badge and keeping it with the room and in the audit log.
   Verified against `hs serve` with a room upgraded through the client API.
+- **Five places that showed wire names now read in words** (2026-10-02, `agent/web-items`):
+  the audit log's action filter suggests every audited action with its reading, a bridge
+  deployment's phase is "Running", "Starting" or "Not running properly", a notice or message
+  with no text says what it is, the sign-in page says who can sign in without naming a database
+  flag, and a task's result keys are phrases. Verified against `hs serve`.
 - **The management interface explains itself** (2026-10-01, `agent/web-admin-ui`). Every
   configuration setting carries a badge from the server's own classification (applies on save,
   needs a restart, or per replica from the file or environment), each class is explained once

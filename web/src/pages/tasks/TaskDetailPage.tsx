@@ -20,6 +20,7 @@ import {
   describeTaskAction,
   progressFraction,
   TASK_STATUS_META,
+  describeResultKey,
 } from "@/lib/tasks";
 import { TaskProgressBar } from "./TaskProgress";
 
@@ -166,11 +167,6 @@ function Fact({ label, children }: { label: string; children: ReactNode }) {
   );
 }
 
-function humanize(key: string): string {
-  const words = key.replace(/_/g, " ");
-  return words.charAt(0).toUpperCase() + words.slice(1);
-}
-
 /**
  * What the task reported when it finished. A flat record of numbers and words is shown as
  * facts; anything else is shown as the server sent it, read-only.
@@ -190,7 +186,7 @@ function TaskResult({ task }: { task: Task }) {
       {flat ? (
         <dl className="grid gap-4 rounded-md border border-border bg-surface p-4 text-sm sm:grid-cols-3 [&_dd]:mt-1 [&_dd]:text-text [&_dt]:text-text-muted">
           {Object.entries(result as Record<string, string | number | boolean>).map(([k, v]) => (
-            <Fact key={k} label={humanize(k)}>
+            <Fact key={k} label={describeResultKey(k)}>
               {typeof v === "number" ? v.toLocaleString() : String(v)}
             </Fact>
           ))}

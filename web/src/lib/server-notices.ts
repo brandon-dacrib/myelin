@@ -40,3 +40,19 @@ export function splitRecipients(input: string): string[] {
     .map((part) => part.trim())
     .filter(Boolean);
 }
+
+/** What a message with no `body` is, by its `msgtype`: "An image, with no text". */
+export function describeMessageWithoutBody(msgtype: string | null | undefined): string {
+  const KINDS: Record<string, string> = {
+    "m.image": "An image",
+    "m.file": "A file",
+    "m.audio": "An audio clip",
+    "m.video": "A video",
+    "m.location": "A location",
+    "m.emote": "An action",
+    "m.notice": "A notice",
+    "m.text": "A message",
+  };
+  const kind = msgtype ? (KINDS[msgtype] ?? `A ${msgtype} message`) : "A message";
+  return `${kind}, with no text`;
+}

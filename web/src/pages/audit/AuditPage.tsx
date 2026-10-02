@@ -19,6 +19,7 @@ import {
   TARGET_TYPES,
   targetTypeLabel,
   type AuditEntry,
+  AUDITED_ACTIONS,
 } from "@/lib/audit";
 import { hasAuditFilters, type AuditSearch } from "./audit-search";
 
@@ -218,14 +219,27 @@ function AuditFiltersForm({
             />
           )}
         </Field>
-        <Field label="Action">
+        <Field
+          label="Action"
+          hint="What was done, by the server's name for it; the list offers each with its reading. Empty means any."
+        >
           {(props) => (
-            <Input
-              {...props}
-              placeholder="users.reset_password"
-              value={draft.action ?? ""}
-              onChange={(event) => update("action", event.target.value)}
-            />
+            <>
+              <Input
+                {...props}
+                list={`${props.id}-actions`}
+                placeholder="Any action"
+                autoComplete="off"
+                spellCheck={false}
+                value={draft.action ?? ""}
+                onChange={(event) => update("action", event.target.value)}
+              />
+              <datalist id={`${props.id}-actions`}>
+                {AUDITED_ACTIONS.map((action) => (
+                  <option key={action} value={action} label={describeAction(action)} />
+                ))}
+              </datalist>
+            </>
           )}
         </Field>
         <Field label="Resource type">

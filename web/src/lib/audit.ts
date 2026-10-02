@@ -97,6 +97,92 @@ export function targetRoute(
   }
 }
 
+/**
+ * Every action the server records (the write operations of
+ * `crates/hs-admin/openapi/openapi.yaml`, copied 2026-10-02), for the audit filter to suggest
+ * with its reading in words. An action the list lacks can still be typed.
+ */
+export const AUDITED_ACTIONS: readonly string[] = [
+  "appservices.create",
+  "appservices.delete",
+  "appservices.pause",
+  "appservices.ping",
+  "appservices.replay",
+  "appservices.resume",
+  "appservices.rotate_tokens",
+  "appservices.update",
+  "bridge_instances.delete",
+  "bridge_instances.files",
+  "bridge_instances.put",
+  "bridge_offerings.delete",
+  "bridge_offerings.put",
+  "cluster.replicas.drain",
+  "cluster.replicas.undrain",
+  "config.history.revert",
+  "config.reload",
+  "config.update",
+  "federation.destinations.reset",
+  "federation.keys.refresh",
+  "media.delete_bulk",
+  "media.delete_one",
+  "media.protect",
+  "media.purge_remote_cache",
+  "media.quarantine",
+  "media.unprotect",
+  "media.unquarantine",
+  "migration.abort",
+  "migration.cutover",
+  "migration.pause",
+  "migration.resume",
+  "migration.start",
+  "migration.verify",
+  "recovery.links.create",
+  "recovery.reset",
+  "registration_tokens.create",
+  "registration_tokens.delete",
+  "registration_tokens.update",
+  "reports.delete",
+  "reports.resolve",
+  "rooms.aliases.add",
+  "rooms.aliases.remove",
+  "rooms.block",
+  "rooms.delete",
+  "rooms.forward_extremities.delete",
+  "rooms.join",
+  "rooms.make_admin",
+  "rooms.media.quarantine",
+  "rooms.purge_history",
+  "rooms.unblock",
+  "server_notices.send",
+  "setup.create",
+  "tasks.cancel",
+  "users.create",
+  "users.deactivate",
+  "users.devices.bulk_delete",
+  "users.devices.delete",
+  "users.devices.update",
+  "users.experimental_features.put",
+  "users.external_ids.add",
+  "users.external_ids.remove",
+  "users.lock",
+  "users.login_as",
+  "users.logout",
+  "users.media.delete",
+  "users.rate_limit.delete",
+  "users.rate_limit.put",
+  "users.reactivate",
+  "users.redact_events",
+  "users.reset_password",
+  "users.shadow_ban",
+  "users.suspend",
+  "users.threepids.add",
+  "users.threepids.remove",
+  "users.unlock",
+  "users.unshadow_ban",
+  "users.unsuspend",
+  "users.update",
+];
+
 /** Actions whose generic "<verb> <noun>" reading would be wrong or awkward. */
 const ACTION_PHRASES: Record<string, string> = {
   "setup.create": "Created the first administrator",
@@ -135,6 +221,9 @@ const ACTION_PHRASES: Record<string, string> = {
   "cluster.replicas.drain": "Drained replica",
   "cluster.replicas.undrain": "Undrained replica",
   "tasks.cancel": "Cancelled task",
+  "bridge_instances.files": "Wrote a bridge instance's files",
+  "config.history.revert": "Reverted configuration",
+  "recovery.reset": "Recovered administrator access",
 };
 
 const VERBS: Record<string, string> = {
@@ -183,6 +272,9 @@ const NOUNS: Record<string, string> = {
   migration: "migration",
   "cluster.replicas": "replica",
   setup: "administrator",
+  bridge_instances: "bridge instance",
+  bridge_offerings: "bridge offering",
+  "recovery.links": "recovery link",
 };
 
 /**

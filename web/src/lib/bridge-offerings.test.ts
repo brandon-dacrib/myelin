@@ -103,3 +103,16 @@ describe("user lists", () => {
     expect(looksLikeUserId("@alice")).toBe(false);
   });
 });
+
+describe("deploymentPhaseMeta", () => {
+  it("reads the operator's phases in words, and leaves an unknown one as it came", async () => {
+    const { deploymentPhaseMeta } = await import("./bridge-offerings");
+    expect(deploymentPhaseMeta("Ready")).toEqual({ label: "Running", status: "success" });
+    expect(deploymentPhaseMeta("Pending")).toEqual({ label: "Starting", status: "info" });
+    expect(deploymentPhaseMeta("Degraded")).toEqual({
+      label: "Not running properly",
+      status: "danger",
+    });
+    expect(deploymentPhaseMeta("Evicted")).toEqual({ label: "Evicted", status: "neutral" });
+  });
+});

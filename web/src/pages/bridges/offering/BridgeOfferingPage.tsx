@@ -38,6 +38,7 @@ import {
   instanceStateBadge,
   instanceStateLabel,
   runtimeMeta,
+  deploymentPhaseMeta,
 } from "@/lib/bridge-offerings";
 import { AddInstanceDialog } from "./AddInstanceDialog";
 import { InstanceFilesDialog } from "./InstanceFilesDialog";
@@ -672,9 +673,11 @@ function DeploymentCell({
   }
   return (
     <div className="flex max-w-[15rem] flex-col gap-0.5">
-      <span className="text-text">
-        {d.phase}
-        <span className="text-text-muted"> · {d.name}</span>
+      <span className="flex items-center gap-2 text-text">
+        <Badge status={deploymentPhaseMeta(d.phase).status}>
+          {deploymentPhaseMeta(d.phase).label}
+        </Badge>
+        <span className="text-text-muted">{d.name}</span>
       </span>
       {d.message && (
         <span className="font-identifier text-xs break-words text-text-muted">{d.message}</span>

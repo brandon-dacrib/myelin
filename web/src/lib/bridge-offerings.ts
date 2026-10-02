@@ -186,3 +186,23 @@ export function accessIsValid(allLocalUsers: boolean, users: readonly string[]):
 export function instanceOwnerLabel(instance: Pick<BridgeInstance, "user_id">): string {
   return instance.user_id ?? "Everyone (shared)";
 }
+
+/**
+ * A bridge deployment's phase (`BridgeDeployment.phase`, what the operator reports about the
+ * pod) in words, with a badge status. `Ready` is the one that means the bridge is up.
+ */
+export function deploymentPhaseMeta(phase: string): {
+  label: string;
+  status: NonNullable<BadgeProps["status"]>;
+} {
+  switch (phase) {
+    case "Ready":
+      return { label: "Running", status: "success" };
+    case "Pending":
+      return { label: "Starting", status: "info" };
+    case "Degraded":
+      return { label: "Not running properly", status: "danger" };
+    default:
+      return { label: phase, status: "neutral" };
+  }
+}

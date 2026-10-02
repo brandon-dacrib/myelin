@@ -1,4 +1,5 @@
 import type { RoomEvent, RoomTask } from "@/api/room-contents";
+import { describeMessageWithoutBody } from "./server-notices";
 
 /** How the room page words events and the results of the tasks it starts. */
 
@@ -12,7 +13,7 @@ export function summarizeEvent(
     typeof content[key] === "string" ? (content[key] as string) : null;
   switch (event.type) {
     case "m.room.message":
-      return text("body") ?? `(${text("msgtype") ?? "message"})`;
+      return text("body") ?? `(${describeMessageWithoutBody(text("msgtype")).toLowerCase()})`;
     case "m.room.member":
       return `${event.state_key ?? "someone"}: ${text("membership") ?? "?"}`;
     case "m.room.name":

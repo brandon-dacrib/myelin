@@ -59,3 +59,16 @@ describe("succeeded", () => {
     expect(succeeded({ outcome: {} })).toBe(true);
   });
 });
+
+describe("AUDITED_ACTIONS", () => {
+  it("lists every write operation once, each with a reading in words", async () => {
+    const { AUDITED_ACTIONS } = await import("./audit");
+    expect(new Set(AUDITED_ACTIONS).size).toBe(AUDITED_ACTIONS.length);
+    expect(AUDITED_ACTIONS).toContain("users.update");
+    expect(AUDITED_ACTIONS).toContain("appservices.ping");
+    for (const action of AUDITED_ACTIONS) {
+      expect(describeAction(action)).not.toBe(action);
+      expect(describeAction(action)).toMatch(/^[A-Z]/);
+    }
+  });
+});

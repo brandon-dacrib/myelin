@@ -19,3 +19,12 @@ describe("tasks", () => {
     expect(describeProgress({})).toBeNull();
   });
 });
+
+describe("describeResultKey", () => {
+  it("names the keys tasks report, and reads an unknown one as words", async () => {
+    const { describeResultKey } = await import("./tasks");
+    expect(describeResultKey("kept_state")).toBe("State events kept");
+    expect(describeResultKey("failed_to_kick_users")).toBe("Members that could not be removed");
+    expect(describeResultKey("thumbnails_rebuilt")).toBe("Thumbnails rebuilt");
+  });
+});
