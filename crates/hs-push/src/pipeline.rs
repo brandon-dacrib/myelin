@@ -619,6 +619,39 @@ fn tweaks_of(actions: &[Action]) -> Value {
     Value::Object(tweaks)
 }
 
+/// A stripped state event of `type`/`state_key` in the event's `unsigned.invite_room_state`:
+/// what an invite from another server carries in place of room state this server does not
+/// have, and so the only source of the room's name and the inviter's display name for it.
+fn invite_room_state<'a>(event: &'a Value, event_type: &str, state_key: &str) -> Option<&'a Value> {
+    event
+        .get("unsigned")?
+        .get("invite_room_state")?
+        .as_array()?
+        .iter()
+        .find(|s| s["type"] == event_type && s["state_key"] == state_key)
+}
+
+/// The room's name for a push: what the source knew, else what the invite carried.
+fn room_name_for(described: &DescribedEvent) -> Option<String> {
+    described.room_name.clone().or_else(|| {
+        invite_room_state(&described.event, "m.room.name", "")?["content"]["name"]
+            .as_str()
+            .filter(|n| !n.is_empty())
+            .map(str::to_owned)
+    })
+}
+
+/// The sender's display name for a push: what the source knew, else what the invite carried.
+fn sender_display_name_for(described: &DescribedEvent) -> Option<String> {
+    described.sender_display_name.clone().or_else(|| {
+        let sender = described.event["sender"].as_str()?;
+        invite_room_state(&described.event, "m.room.member", sender)?["content"]["displayname"]
+            .as_str()
+            .filter(|n| !n.is_empty())
+            .map(str::to_owned)
+    })
+}
+
 /// The Push Gateway API body for an event, for one pusher.
 fn event_notification(
     described: &DescribedEvent,
@@ -661,10 +694,10 @@ fn event_notification(
         notification["membership"] = event["content"]["membership"].clone();
         notification["user_is_target"] = json!(event["state_key"] == user_id.as_str());
     }
-    if let Some(name) = &described.sender_display_name {
+    if let Some(name) = sender_display_name_for(described) {
         notification["sender_display_name"] = json!(name);
     }
-    if let Some(name) = &described.room_name {
+    if let Some(name) = room_name_for(described) {
         notification["room_name"] = json!(name);
     }
     json!({ "notification": notification })
@@ -1006,6 +1039,48 @@ mod tests {
         let badge = &gateway.notifications()[2].notification;
         assert_eq!(badge["counts"]["unread"], 0);
         assert_eq!(badge["devices"][0]["pushkey"], "fresh");
+    }
+
+    #[test]
+    fn an_invite_from_another_server_names_the_room_from_what_it_carried() {
+        let mut described = describe(json!({
+            "event_id": "$inv",
+            "room_id": "!room:remote.org",
+            "type": "m.room.member",
+            "sender": "@charlie:remote.org",
+            "state_key": "@alice:example.org",
+            "content": {"membership": "invite"},
+            "unsigned": {"invite_room_state": [
+                {"type": "m.room.name", "state_key": "", "content": {"name": "Test Name"}},
+                {"type": "m.room.member", "state_key": "@charlie:remote.org",
+                 "content": {"membership": "join", "displayname": "Charlie"}},
+            ]},
+        }));
+        described.room_name = None;
+        described.sender_display_name = None;
+        assert_eq!(room_name_for(&described).as_deref(), Some("Test Name"));
+        assert_eq!(
+            sender_display_name_for(&described).as_deref(),
+            Some("Charlie")
+        );
+        let outcome = EvaluationOutcome {
+            rule_id: ".m.rule.invite_for_me".to_owned(),
+            actions: vec![Action::Notify],
+            notify: true,
+            highlight: false,
+            sound: None,
+        };
+        let body = event_notification(
+            &described,
+            user_id!("@alice:example.org"),
+            &outcome,
+            1,
+            &http_pusher("k", "http://gw"),
+            false,
+        );
+        assert_eq!(body["notification"]["room_name"], "Test Name");
+        assert_eq!(body["notification"]["membership"], "invite");
+        assert_eq!(body["notification"]["user_is_target"], true);
     }
 
     #[test]
