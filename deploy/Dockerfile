@@ -126,8 +126,23 @@ ENV HS_ADMIN_WEB_DIST=/src/web-dist
 
 # No cache mount over /src/target here: it would hide the cooked dependencies in this stage's
 # own layers, which are the cache.
+#
+# The cook ran cargo-chef's stub of every workspace build script, and `COPY` keeps the real
+# scripts' mtimes, which are older than the cook, so cargo then sees the stub's run as fresh:
+# `crates/hs-admin/build.rs` never staged the interface, and the first cooked build failed with
+# "folder '.../out/web-dist' does not exist" (2026-10-02). The stubs' compiled binaries and
+# fingerprints (host artifacts, under target/release/ because of `--target`) and their runs'
+# outputs and fingerprints (under target/<triple>/release/) are removed for every crate that has
+# a build script, so each is compiled and run for real.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     RUST_TARGET="$(cat /rust_target.txt)" && \
+    for script in crates/*/build.rs; do \
+        crate="$(basename "$(dirname "$script")")"; \
+        rm -rf "target/release/build/${crate}-"* \
+               "target/release/.fingerprint/${crate}-"* \
+               "target/${RUST_TARGET}/release/build/${crate}-"* \
+               "target/${RUST_TARGET}/release/.fingerprint/${crate}-"*; \
+    done && \
     cargo build --release --locked -p hs-cli --target "${RUST_TARGET}" && \
     mkdir -p /out /out/data && \
     cp "target/${RUST_TARGET}/release/hs" /out/hs

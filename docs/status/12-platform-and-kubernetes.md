@@ -53,8 +53,30 @@ of the real-binary tests that share ports and environment); `lld`/`mold` on the 
 unstable); sccache in CI (`rust-cache` already keeps the compiled graph, and two caches of the
 same thing would fight over the 10 GB).
 
-**Measured** (M2 Pro, 12 cores, quiet machine, this session; see "Verification" below):
-*pending as this entry is written; filled in below.*
+**What the first cooked build taught:** cargo-chef's cook runs a stub of every workspace build
+script, and `COPY` keeps the real scripts' mtimes, which are older than the cook, so cargo then
+treats the stub's compiled binary (a host artifact under `target/release/`, because of
+`--target`) and its run as fresh. `crates/hs-admin/build.rs` never staged the interface and the
+build failed with "folder '.../out/web-dist' does not exist", locally and in CD run 37049504150
+(both image legs). The builder now removes the stub's binary, run output and fingerprints for
+every crate with a `build.rs`, host and target side, before the real build.
+
+**Measured** (M2 Pro, 12 cores; the machine had just rebooted, so quiet unless said otherwise):
+
+| What | Before | After |
+|---|---|---|
+| `cargo build -p hs-cli` into an empty `target/`, dev profile, no sccache (the cold baseline) | 97 s wall, 347 s CPU | |
+| the same into another empty `target/`, sccache warm | | 81 s wall, 170 s CPU, 808 hits / 0 misses (while a Sytest image built alongside) |
+| `deploy/Dockerfile`, no layer cache at all (`--no-cache`) | | 81 s to the end of the cook (cargo-chef installed in 13 s, 533 crates cooked in 47 s), then the workspace |
+| `deploy/Dockerfile`, cooked layer cached, one-line source change | every dependency again (66 min under load on 2026-10-01) | 188 s, 16 layers cached, 21 workspace crates compiled; the image boots, `/admin/` is the interface, the setup link is logged |
+| `tests/sytest/build.sh`, four jobs | 295 s cold | 125 s after a one-line change (one crate compiled); the binary runs |
+| `npm run lint`, unchanged tree | 12.6 s | 1.1 s |
+
+The sccache gain in wall time is modest on a quiet 12-core machine because the uncached part
+(proc macros and binaries, 80 calls; the 21 incremental workspace crates; build-script runs;
+linking) is the critical path; the CPU time halves, which is what matters with ten agents
+building at once at a load of 60. The first warm build after populating the cache showed 409
+misses that a later identical build did not (808 hits); not understood, not reproduced.
 
 ## 2026-10-01 (branch `agent/platform-gaps`): the operator has run against an API server
 
