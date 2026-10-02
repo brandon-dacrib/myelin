@@ -276,7 +276,7 @@ Auth chain difference is the expensive primitive under state resolution v2. The 
 
 | Backend | Keyspaces | Transactions | Watches | Sharding | Use |
 |---|---|---|---|---|---|
-| Fjall (embedded) | One keyspace per table | Serializable snapshot isolation, single process | In-process | All shards local | Single node, small ARM host, tests |
+| Fjall (embedded) | One Fjall keyspace for every table, each table under a length-prefixed name (decision 0024, 2026-10-01; one Fjall keyspace per table cost 4.5 s of a 5 s first boot) | Serializable snapshot isolation, single process | In-process | All shards local | Single node, small ARM host, tests |
 | PostgreSQL | One table per keyspace: `k bytea primary key, v bytea`, plus a few typed tables where SQL earns its keep (appservice registry, admin listings, audit log) | `SERIALIZABLE` with retry, pipelined multi-get via `= ANY($1)` and range scans on the primary key | `LISTEN` / `NOTIFY` | Logical shards; one database; CloudNativePG for HA | Default cluster backend |
 | SlateDB on object storage | One SlateDB per shard (rooms and users are hashed into a fixed number of virtual shards, for example 256, plus one global shard) | Per-shard transactions; each shard has one writer, the shard's owner, fenced by SlateDB's manifest protocol | In-process on the owner, mesh to others | Physical: each shard is its own object-store prefix; failover opens the shard elsewhere after fencing | Diskless clusters; also a single node that wants S3 durability for free |
 | FoundationDB | Subspaces | Native | Native | Native | Very large deployments, later |
