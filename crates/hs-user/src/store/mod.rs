@@ -103,12 +103,20 @@ pub struct AccountDataRecord {
 
 /// One room directory row, as `GET /publicRooms` reports it (the `PublicRoomsChunk` shape the
 /// spec defines). Populated by `crate::hub::SessionHub::process_room_update` whenever it observes
-/// a room whose current `m.room.join_rules` is `"public"`; see [`UserStore::list_public_rooms`]'s
-/// doc comment for the coverage gap this implies.
+/// a room whose current `m.room.join_rules` is `"public"` -- or whose history is
+/// `world_readable`, which counts for the *user* directory but not for `/publicRooms`
+/// ([`PublicRoomEntry::join_rule_public`] tells the two apart; see
+/// [`UserStore::list_public_rooms`] and [`UserStore::list_directory_public_rooms`]). See
+/// [`UserStore::list_public_rooms`]'s doc comment for the coverage gap this implies.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublicRoomEntry {
     /// The room.
     pub room_id: OwnedRoomId,
+    /// Whether `m.room.join_rules` is `"public"`: what makes a room belong in `/publicRooms`.
+    /// `false` for a row kept only because the room is world-readable. Rows from before this
+    /// field existed were all written for public join rules, hence the default.
+    #[serde(default = "default_true")]
+    pub join_rule_public: bool,
     /// `m.room.name`'s content, if set.
     pub name: Option<String>,
     /// `m.room.topic`'s content, if set.
@@ -123,6 +131,10 @@ pub struct PublicRoomEntry {
     pub world_readable: bool,
     /// Whether guests can join without registering.
     pub guest_can_join: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// One user's latest read receipt of one kind in one room, as [`UserStore::put_receipt`] keeps
@@ -626,7 +638,9 @@ pub trait UserStore: Send + Sync {
     /// Returns [`StoreError`] on a storage failure.
     async fn remove_public_room(&self, room_id: &ruma::RoomId) -> Result<(), StoreError>;
 
-    /// Every room this process's directory currently believes is public. **Global, not
+    /// Every room this process's directory currently believes is public: join rule `public`
+    /// (what `/publicRooms` lists; a world-readable room with another join rule is not here,
+    /// see [`UserStore::list_directory_public_rooms`]). **Global, not
     /// per-user**, and -- like every room this crate learns about at all -- only as complete as
     /// `crate::hub::SessionHub::watch_room` coverage is (`crate::hub`'s module docs, "The
     /// discovery gap"): a public room this process has never been told to watch never appears
@@ -637,6 +651,16 @@ pub trait UserStore: Send + Sync {
     /// # Errors
     /// Returns [`StoreError`] on a storage failure.
     async fn list_public_rooms(&self) -> Result<Vec<PublicRoomEntry>, StoreError>;
+
+    /// Every room whose members the user directory offers to everybody: join rule `public`, or
+    /// history visibility `world_readable` (Synapse's `users_in_public_rooms` counts both; so
+    /// does Sytest's "Users stay in directory when join_rules are changed but
+    /// history_visibility is world_readable"). A superset of [`UserStore::list_public_rooms`],
+    /// with the same coverage caveat.
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] on a storage failure.
+    async fn list_directory_public_rooms(&self) -> Result<Vec<PublicRoomEntry>, StoreError>;
 
     /// Records `receipt` as the latest of its user and kind in `room_id`, replacing any earlier
     /// one.

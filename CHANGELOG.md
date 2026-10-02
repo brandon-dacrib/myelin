@@ -541,6 +541,21 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
 
 ### Client-server API
 
+- **Room tags, and tags that follow a room upgrade.** `GET`/`PUT`/`DELETE
+  /user/{userId}/rooms/{roomId}/tags[/{tag}]` exist (they did not), as the room's `m.tag`
+  account data seen one key at a time, and reach `/sync` like any room account data; setting
+  account data, a tag or a read marker now wakes a waiting `/sync` instead of letting it time
+  out. Verified by Sytest's `42tags.pl` on the real binary (6/8; the two "tags copied to the
+  new room" tests ran against a build from before that copy existed). Built and unit-tested,
+  not yet run through Sytest: a user who joins an upgraded room's successor gets their tags
+  and `m.direct` entry for the old room; `m.ignored_user_list` is honoured by `/sync` (an
+  ignored user's messages and invitations are not delivered); the user directory counts a
+  world-readable room as public, lets a user find themself while in a public room, and stops
+  offering a public room's remote members once nobody local is in it; lazily loaded members
+  are sent once per device (`include_redundant_members` asks for them again) and a gapped
+  sync names whoever joined or left inside the gap; the sending device sees its
+  `unsigned.transaction_id` in `/sync`; a filter naming something that is not a room or user
+  id is rejected (status 05, session 14).
 - **`/joined_rooms` lists a room its caller just created or joined, every time.** It waits, as
   `/sync` has since the 2026-09-30 read-your-writes change, for the session hub to have consumed
   everything published before the request (bounded at 500 ms). Before, a client asking the

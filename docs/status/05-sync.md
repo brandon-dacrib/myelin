@@ -145,6 +145,171 @@ the kept entry per room; compaction at twice the retention; `server.sync` under 
 the two summary rows recovered from the rows). The hub's defaults
 (`hub::DEFAULT_FEED_RETENTION_ENTRIES`, `DEFAULT_HOT_STREAM_RETENTION_ENTRIES`) equal the
 config's, so a hub built without `hs-cli` behaves the same.
+Last updated: 2026-10-02 (session 14: Sytest's tagging, ignore-users, user-directory and sync
+leftovers. Session 13: `/joined_rooms` read-your-writes. Session 12: RFC 0018, a non-owner's
+room copy catches up instead of reloading. Session 11, session 10, session 9, session 8,
+session 7 and the integration note follow; sessions 1-6 are preserved unchanged further down.)
+
+## Session 14 (2026-10-02, branch `agent/user-sytest`): Sytest's client-server leftovers in this crate's area
+
+The whole-suite run on `main` at `09f24ee` (`docs/status/sytest/2026-10-02-results.txt`) had
+tagging at 0/8, ignore-users at 0/3, the user directory at 5/11 and the Sync API at 57/84.
+Each group's Sytest files were run against the real binary from this branch (built for the
+Sytest image's Debian with `SYTEST_HS_BINARY`, `tests/sytest/README.md`), before and after.
+
+### Per group
+
+| Group | Files | Before (`09f24ee`, whole suite) | After (this branch, the files alone) |
+|---|---|---|---|
+| Tagging | `42tags.pl` | 0/8 | 6/8 (binary from mid-session, before the upgrade copy: see below) |
+| Ignore users | `49ignore.pl` | 0/3 | not run |
+| User directory | `52user-directory/*.pl` | 5/11 | not run |
+| Sync API | `31sync/*.pl`, `80torture/10filters.pl` | 57/84 | not run |
+
+**Where this stopped (2026-10-02, the owner's reboot).** The Linux `hs` for `SYTEST_HS_BINARY`
+took 94 minutes to build in Docker under a load average of 60 (three other agents' release
+builds at once), and it compiled from the tree *as it was partway through this session*: it had
+the tag routes, not the upgrade copy, and an unknown part of the rest. `tests/42tags.pl` against
+it: 6/8, the two upgrade-copy tests failing for want of the code (the server log has no
+"copied account data" line; `hs_room::routes::upgrade` did write the predecessor). The rebuild
+of the final tree was stopped for the reboot at `Compiling hs-auth`. Every other number in the
+table is unmeasured on the real binary: the unit tests in this crate cover each change
+(`cargo test -p hs-user`, 185 + 6), the Sytest runs are the next step. To finish: rebuild the
+bookworm binary (the cargo cache is in the Docker volume `user-sytest-cargo-target`, kept; rustup
+auto-installs `stable` into the container, do not set `RUSTUP_AUTO_INSTALL=0`), then
+`SYTEST_HS_BINARY=target/hs-bookworm tests/sytest/run.sh tests/42tags.pl`, `tests/49ignore.pl`,
+`tests/52user-directory`, `tests/31sync tests/80torture/10filters.pl`, and fill this table in.
+`target/hs-bookworm-first` is the mid-session binary, kept for comparison; `target/sytest/first-tags/`
+has that run.
+
+### What changed
+
+**Tags** (`crates/hs-user/src/routes/tags.rs`, new). There were no tag endpoints at all.
+`GET /user/{userId}/rooms/{roomId}/tags`, `PUT` and `DELETE .../tags/{tag}` are the `tags` map
+of the room's `m.tag` account data seen one key at a time; every change is written back whole
+through `put_room_account_data`, so a tag reaches `/sync` as the room's `m.tag` with the whole
+map, as the spec has it. Removing a tag that was never set succeeds and writes nothing. A tag's
+content must be an object.
+
+**Account data wakes the sync** (`SessionHub::account_data_changed`). `has_new_data` already
+noticed the account-data counter move, but nothing woke a waiting long-poll to look: a tag,
+account data or read marker set while a client waited was seen when the wait timed out or
+something else happened. The account-data, tag and `m.fully_read` routes now wake the user.
+
+**Tags and `m.direct` follow a room upgrade** (`SessionHub::copy_account_data_from_predecessor`,
+called from the new `handle_room_update`, which wraps `apply_room_update` on the live path and
+in `process_room_update`). When somebody joins a room whose `m.room.create` names a
+`predecessor`, their `m.tag` for the old room becomes the new room's (unless the new room
+already has one) and every `m.direct` list naming the old room gains the new one -- the spec's
+room-upgrade step that belongs to the users' server, which Synapse does on a local join.
+Remote members never have account data here, so the copy is naturally local-only; a room
+without a predecessor costs one state lookup.
+
+**Ignored users** (`crate::sync`, `ignored_users_of`). `m.ignored_user_list` was never read.
+`/sync` now reads it once per request: an ignored user's non-state events are left out of every
+timeline (their joins, leaves and renames still arrive, or the client's picture of the room
+drifts), a batch whose only news was theirs says nothing about the room, and an invitation from
+them is not shown by an initial or an incremental sync. The invite stays pending: un-ignoring
+makes it appear (in an initial sync; an incremental one is past the invite's feed entry by
+then, as on Synapse).
+
+**User directory** (`SessionHub::directory_from_index`, `public_directory_entry`,
+`UserStore::list_directory_public_rooms`; one line in `hs-auth`). Three rules were wrong:
+
+- A world-readable room counts as public for the user directory whatever its join rule
+  (Synapse's `users_in_public_rooms`; Sytest's "Users stay in directory when join_rules are
+  changed but history_visibility is world_readable"). `PublicRoomEntry` rows are now written for
+  such rooms too, with a new `join_rule_public: bool` (serde default `true`, so rows from before
+  are read as what they were); `list_public_rooms` -- what `/publicRooms` and federation's
+  public-room list read -- keeps returning only join-rule-public rooms, and the new
+  `list_directory_public_rooms` returns both.
+- The requester finds themself when they are in a public room. Sytest's directory tests search
+  for the requester's own display name after joining and expect it, and not after leaving;
+  Synapse answers so. `hs-auth`'s route dropped the requester unconditionally ("nobody searches
+  for themselves"); it now leaves that to the room layer's answer, and drops them only when
+  there is no room layer or every account is searchable. The trait's doc says so (that one
+  filter line and the doc are the only change outside this crate).
+- A public room counts while somebody on this server is in it: once the last local member
+  leaves, its remote members are no longer offered (Synapse empties the room's rows when the
+  server leaves). Decided from the requester's server name, since the hub has none of its own.
+
+**Lazy loading of members** (`crate::lazy_members`, new; `crate::sync`'s `LazyScope`). Eight
+Sytest tests, "Expected only N membership events (got N)": the `state` section sent the
+requester's own membership on every incremental sync and never remembered what it had sent.
+Now: the requester's membership is added on a sync the client has no baseline for (initial,
+`full_state`, a room new to it), as Synapse adds it; an incremental sync sends the memberships
+of the timeline's senders minus what this device was already sent (a per-`(user, device)`
+memory of `(room, member) -> event id`, bounded, in process memory, cleared by an initial
+sync; a changed membership is a new event id and is sent again) unless
+`include_redundant_members` asks for them all; a gapped incremental sync adds whoever joined
+or left inside the gap, found by the membership event's room position being past the token's.
+Member events are matched by their `state_key`, not their `sender` -- an invite's sender is the
+inviter, and it is the member's event the client needs.
+
+**Smaller**: the device that sent an event with a transaction id sees `unsigned.transaction_id`
+on it in `/sync` (`RoomActor::transaction_id_for`, as `/messages` already used); a named room's
+`summary` has no `m.heroes` key rather than an empty list (Sytest compares the object);
+`POST /user/{userId}/filter` and an inline `filter` reject a `rooms`/`not_rooms` entry that is
+not a room id and a `senders`/`not_senders` entry that is not a user id
+(`SyncFilter::validate_ids`), instead of storing a filter that matched nothing.
+
+### Still failing, and why
+
+Known before any run, from reading the tests:
+
+- "remote user has tags copied to the new room" needs the remote server's hub to see the join
+  to the upgraded room with its predecessor; the same code runs there (it is the joining
+  user's server that copies), so it should pass with the local one -- unverified.
+- "User in remote room doesn't appear in user directory after server left room": its first
+  assertion has a remote server's user find a user of another server they share a public room
+  with; remote members are not in `hs-auth`'s user list, so they are never ranked. RFC 0021.
+- "The only membership state included in a gapped incremental sync is for senders in the
+  timeline" expects the gap's joiner alone and not the timeline's sender; Sytest's own comment
+  marks it as expected to fail with lazy loading as Synapse does it, and this implementation
+  (sender plus gap changes) answers as Synapse would.
+- The 03joined, 04timeline (`next_batch` in `/messages`), 13filtered_sync (federation
+  `event_format`) and 14read-markers failures were not diagnosed beyond reading: the summary
+  named no reason of theirs, so they may be among the 33 "Timed out waiting for test" of the
+  loaded run. Read markers got the wake they were missing; `event_format: federation` is not
+  implemented (parsed, ignored, `crate::filter`'s module docs).
+
+### Verified
+
+`cargo fmt --all --check`, `cargo clippy -p hs-user -p hs-auth --all-targets -- -D warnings`,
+`cargo test -p hs-user` (185 unit tests, 6 scenario tests) and `cargo test -p hs-auth --lib`
+(249). Sytest: only the tags run above, on a mid-session binary.
+
+### Decisions made (session 14)
+
+- Tags are room account data and nothing else: no table of their own, so the sync path, the
+  importer and the account-data counter all see them without special cases.
+- The copy of tags and `m.direct` on an upgrade join lives in the session hub (where the join
+  delta arrives and account data is owned), not in `hs-room`'s join; `apply_room_update`
+  itself was not touched (another branch is working in it) -- the two live call sites in
+  `consume_updates` and `process_room_update` go through `handle_room_update` instead.
+- The directory's "public" is join rule `public` or history `world_readable`; `/publicRooms`'s
+  is join rule `public` only. One table, one flag, two readers.
+- The requester can find themself while in a public room (Synapse, Sytest). This is the one
+  change in `hs-auth`.
+- The lazy-loading memory is per device and in process memory, as Synapse's is. A replica that
+  does not have it sends a member event once more, which is harmless; it is never a source of
+  truth.
+- Remote members of shared and public rooms are not searchable: RFC 0021 proposes the trait
+  change `hs-auth` would need.
+
+### Interfaces provided (session 14)
+
+- `GET/PUT/DELETE /_matrix/client/v3/user/{userId}/rooms/{roomId}/tags[/{tag}]`, mounted by the
+  crate's router as the other account-data routes are.
+- `SessionHub::account_data_changed(&UserId)`: wake a user's `/sync` after an account-data
+  write made outside this crate's routes.
+- `SessionHub::lazy_members()`: the per-device memory, for tests and an operator's metric.
+- `UserStore::list_directory_public_rooms`, `PublicRoomEntry::join_rule_public`.
+
+### Interfaces needed (session 14)
+
+- RFC 0021: `UserDirectoryVisibility::visible_to` carrying names for remote members, and the
+  route ranking them (`hs-auth`).
 
 ## Session 13 (2026-10-02, branch `agent/joined-rooms-rywr`): `/joined_rooms` sees the caller's own writes
 

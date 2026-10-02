@@ -94,7 +94,7 @@ use hs_e2e::store::{DeviceKeyStore, E2eStore, FallbackKeyStore, OneTimeKeyStore,
 use hs_kv::KvBackend;
 use hs_model::Event;
 use hs_push::rulesets::RulesetStore;
-use hs_room::routes::render::{attach_replaced_state, client_event_json};
+use hs_room::routes::render::{attach_replaced_state, attach_transaction_id, client_event_json};
 use hs_room::timeline::{Direction, PaginationToken};
 use ruma::{OwnedDeviceId, OwnedRoomId, OwnedUserId, RoomId, UserId};
 use serde_json::{Value, json};
@@ -597,11 +597,27 @@ fn strip(event: &Event) -> Value {
     })
 }
 
+/// Which members a lazily loaded `state` section carries beyond the senders of the timeline
+/// (`room.state.lazy_load_members`; the spec's "Lazy-loading room members").
+#[derive(Debug, Clone, Copy)]
+struct LazyScope {
+    /// The requester's own membership too: a sync the client has no baseline for (initial,
+    /// `full_state`, a room new to it), so that it knows it is in the room. Synapse adds it on
+    /// exactly those; an incremental sync sends it only when the requester spoke, and Sytest's
+    /// "We do send redundant membership state across incremental syncs if asked" counts.
+    include_self: bool,
+    /// Members whose membership event sits after this room position: the gap of a limited
+    /// incremental sync, whose events the client is not sent and so whose joins and leaves
+    /// it would otherwise never hear of ("Members from the gap are included in gappy incr LL
+    /// sync", "Old leaves are present in gapped incremental syncs").
+    changed_after: Option<i64>,
+}
+
 /// Full current state, minus whatever event ids are already present in `timeline_events` (avoids
 /// duplicating a state event this response's timeline already carries -- see the module docs'
 /// caveat that this is an approximation of "state at the start of the timeline", not an exact
-/// one), optionally lazy-loaded (`m.room.member` restricted to timeline senders plus the
-/// requester's own membership, when `lazy` is set), optionally content-filtered by
+/// one), optionally lazy-loaded (`lazy`: `m.room.member` restricted to the members who sent
+/// timeline events, plus what the [`LazyScope`] adds), optionally content-filtered by
 /// `room.state.types`/`not_types`/`senders`/`not_senders` (`content_filter`). Unlike the timeline
 /// builders above, this has no `limit`/scan-bound concern: `full_state` is already the room's
 /// entire *current* state (one event per `(type, state_key)`, not a history), so filtering it is
@@ -609,7 +625,7 @@ fn strip(event: &Event) -> Value {
 fn build_state_section(
     actor: &hs_room::actor::RoomActor<impl KvBackend>,
     timeline_event_ids: &HashSet<String>,
-    lazy: bool,
+    lazy: Option<LazyScope>,
     timeline_senders: &HashSet<String>,
     self_user: &UserId,
     content_filter: Option<&crate::filter::RoomEventFilter>,
@@ -623,11 +639,22 @@ fn build_state_section(
         .into_iter()
         .filter(|e| !timeline_event_ids.contains(e.event_id().as_str()))
         .filter(|e| {
-            if !lazy || e.header().event_type != "m.room.member" {
+            let Some(scope) = lazy else {
+                return true;
+            };
+            if e.header().event_type != "m.room.member" {
                 return true;
             }
-            let is_self = e.header().state_key.as_deref() == Some(self_user.as_str());
-            is_self || timeline_senders.contains(e.header().sender.as_str())
+            // The *member* (its `state_key`), not the event's sender: an invite or a kick is
+            // sent by somebody else, and it is the member's event the client needs.
+            let member = e.header().state_key.as_deref().unwrap_or_default();
+            (scope.include_self && member == self_user.as_str())
+                || timeline_senders.contains(member)
+                || scope.changed_after.is_some_and(|since| {
+                    actor
+                        .timeline_position(e.event_id())
+                        .is_some_and(|pos| pos > since)
+                })
         })
         .filter(|e| {
             content_filter
@@ -644,7 +671,8 @@ fn build_state_section(
 /// client can synthesize a name for a room that has none of its own; a room that already has a
 /// name or alias gets an empty `m.heroes` list, matching every real client's own precedence (own
 /// name/alias always wins, heroes are a last resort) and saving the (cheap but pointless) work of
-/// picking candidates nobody will use. Ordering heroes lexicographically rather than by "oldest
+/// picking candidates nobody will use (the key is then left out altogether). Ordering heroes
+/// lexicographically rather than by "oldest
 /// membership" (Synapse's own tiebreak) is a documented simplification -- see
 /// `docs/status/05-sync.md` -- since nothing in this crate tracks per-member join order today and
 /// the spec does not mandate a particular order.
@@ -699,21 +727,76 @@ fn build_room_summary(
     let already_named =
         has_own_name("m.room.name", "name")? || has_own_name("m.room.canonical_alias", "alias")?;
 
-    let heroes: Vec<Value> = if already_named {
-        Vec::new()
-    } else {
-        hero_candidates
+    let mut summary = serde_json::Map::new();
+    if !already_named {
+        // No `m.heroes` key at all for a named room, not an empty list: Sytest's "Named room
+        // comes with just joined member count summary" compares the whole object.
+        let heroes: Vec<Value> = hero_candidates
             .into_iter()
             .take(5)
             .map(Value::String)
-            .collect()
-    };
+            .collect();
+        summary.insert("m.heroes".to_owned(), Value::Array(heroes));
+    }
+    summary.insert(
+        "m.joined_member_count".to_owned(),
+        json!(joined_member_count),
+    );
+    summary.insert(
+        "m.invited_member_count".to_owned(),
+        json!(invited_member_count),
+    );
+    Ok(Value::Object(summary))
+}
 
-    Ok(json!({
-        "m.heroes": heroes,
-        "m.joined_member_count": joined_member_count,
-        "m.invited_member_count": invited_member_count,
-    }))
+fn is_member_event(event: &Value) -> bool {
+    event.get("type").and_then(Value::as_str) == Some("m.room.member")
+}
+
+/// A rendered member event's `(state_key, event_id)`.
+fn member_key(event: &Value) -> Option<(&str, &str)> {
+    Some((
+        event.get("state_key").and_then(Value::as_str)?,
+        event.get("event_id").and_then(Value::as_str)?,
+    ))
+}
+
+/// Whom `user_id` ignores: the keys of `ignored_users` in their `m.ignored_user_list` account
+/// data, as strings for comparing with event senders. Empty when there is no such account data,
+/// or it is not the object the spec describes.
+async fn ignored_users_of(
+    store: &crate::store::DynUserStore,
+    user_id: &UserId,
+) -> Result<HashSet<String>, UserError> {
+    Ok(store
+        .get_global_account_data(user_id, "m.ignored_user_list")
+        .await?
+        .and_then(|record| record.content.get("ignored_users").cloned())
+        .and_then(|users| match users {
+            Value::Object(map) => Some(map.into_iter().map(|(user, _)| user).collect()),
+            _ => None,
+        })
+        .unwrap_or_default())
+}
+
+/// The sender of `recipient`'s own `m.room.member` event among an invite's stripped state, if
+/// `recipient` ignores them.
+fn invited_by_ignored<'a>(
+    stripped: &'a [Value],
+    recipient: &UserId,
+    ignored: &HashSet<String>,
+) -> Option<&'a str> {
+    if ignored.is_empty() {
+        return None;
+    }
+    stripped
+        .iter()
+        .find(|event| {
+            event.get("type").and_then(Value::as_str) == Some("m.room.member")
+                && event.get("state_key").and_then(Value::as_str) == Some(recipient.as_str())
+        })
+        .and_then(|event| event.get("sender").and_then(Value::as_str))
+        .filter(|sender| ignored.contains(*sender))
 }
 
 /// Builds a full `/sync` v2 response for `user_id`, long-polling as needed. Returns the response
@@ -752,6 +835,14 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
 
     let store = hub.store();
     let timeline_limit = params.filter.timeline_limit(DEFAULT_TIMELINE_LIMIT);
+    let ignored_users = ignored_users_of(store, user_id).await?;
+    let lazy = params.filter.lazy_load_members();
+    // Lazy loading's memory of sent members is per device (`crate::lazy_members`); a
+    // requester with no device gets the device-less key the feed cursor uses.
+    let lazy_device = cursor_device_id(device_id.as_deref()).to_owned();
+    if is_initial && lazy {
+        hub.lazy_members().forget(user_id, &lazy_device);
+    }
 
     // The positions the next token will carry are fixed *here*, before anything is read, and
     // not afterwards. Whatever arrives while this response is being put together then has a
@@ -963,7 +1054,6 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
         let room_id_owned = room_id.clone();
         let membership_value = membership.membership.clone();
         let full_state_requested = params.full_state;
-        let lazy = params.filter.lazy_load_members();
         let user_id_owned = user_id.to_owned();
         // Cloned per room (cheap: absent in the overwhelming common case, and even when present
         // this is a handful of small `Vec<String>`s) since the `move` closure below needs owned
@@ -971,6 +1061,8 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
         // requires a `'static` closure).
         let timeline_content_filter = params.filter.timeline_content_filter().cloned();
         let state_content_filter = params.filter.state_content_filter().cloned();
+        let ignored_for_room = ignored_users.clone();
+        let device_for_room = device_id.clone();
 
         match membership_value.as_str() {
             "invite" => {
@@ -978,6 +1070,13 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
                 let events = handle
                     .query(move |actor| stripped_state(actor, &user_for_invite))
                     .await?;
+                if let Some(inviter) = invited_by_ignored(&events, user_id, &ignored_users) {
+                    // An invitation from somebody this user ignores is not shown (the spec's
+                    // `m.ignored_user_list`: "invites from ignored users are not delivered").
+                    // It stays pending: un-ignoring them makes it appear.
+                    tracing::debug!(%user_id, %room_id, %inviter, "an invite from an ignored user; not shown");
+                    continue;
+                }
                 invite.insert(
                     room_id_owned.to_string(),
                     json!({"invite_state": {"events": events}}),
@@ -1035,12 +1134,21 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
             .map(|a| json!({"type": a.event_type, "content": a.content}))
             .collect();
 
-        let (timeline, state_events, summary) = handle
+        // What this device was already sent of the room's members, to leave out again --
+        // unless the client asked for the redundancy, or for everything.
+        let remembered: HashMap<String, String> =
+            if lazy && !force_full_state && !params.filter.include_redundant_members() {
+                hub.lazy_members().sent_in(user_id, &lazy_device, room_id)
+            } else {
+                HashMap::new()
+            };
+
+        let (timeline, mut state_events, summary) = handle
             .query(move |actor| {
-                let timeline = match resume {
+                let mut timeline = match &resume {
                     ResumeMode::Incremental(pos) => build_incremental_timeline(
                         actor,
-                        pos,
+                        *pos,
                         timeline_limit,
                         timeline_content_filter.as_ref(),
                         &user_id_owned,
@@ -1054,6 +1162,37 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
                         upto,
                     ),
                 };
+                // What an ignored user says is not delivered; what they do to the room's state
+                // (joining, leaving, renaming it) still is, or the client's picture of the room
+                // drifts. The window keeps its edges (`limited`, `prev_batch`): a batch with
+                // nothing left in it is a room with nothing to show, below.
+                if !ignored_for_room.is_empty() {
+                    timeline.events.retain(|event| {
+                        event.get("state_key").is_some()
+                            || !event
+                                .get("sender")
+                                .and_then(Value::as_str)
+                                .is_some_and(|sender| ignored_for_room.contains(sender))
+                    });
+                }
+                // The device that sent an event sees `unsigned.transaction_id` on it here, as it
+                // does from `/messages` and `/event` (the client-server API's local echo:
+                // `RoomActor::transaction_id_for` says which device that is). Sytest's "Can sync
+                // a room with a message with a transaction id" is a client matching its echo.
+                for event in &mut timeline.events {
+                    let txn_id = event
+                        .get("event_id")
+                        .and_then(Value::as_str)
+                        .and_then(|id| ruma::EventId::parse(id).ok())
+                        .and_then(|id| {
+                            actor
+                                .transaction_id_for(&id, &user_id_owned, device_for_room.as_deref())
+                                .map(str::to_owned)
+                        });
+                    if let Some(txn_id) = txn_id {
+                        *event = attach_transaction_id(std::mem::take(event), Some(&txn_id));
+                    }
+                }
                 let timeline_ids: HashSet<String> = timeline
                     .events
                     .iter()
@@ -1064,6 +1203,13 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
                     .iter()
                     .filter_map(|e| e.get("sender").and_then(Value::as_str).map(str::to_owned))
                     .collect();
+                let lazy_scope = lazy.then_some(LazyScope {
+                    include_self: force_full_state,
+                    changed_after: match (&resume, timeline.limited) {
+                        (ResumeMode::Incremental(pos), true) => Some(*pos),
+                        _ => None,
+                    },
+                });
                 let state = if force_full_state || timeline.limited {
                     // A room the client has no baseline for (an initial sync, `full_state`, a
                     // room new to it) or a gap: the client's idea of the room's state cannot be
@@ -1077,7 +1223,7 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
                     build_state_section(
                         actor,
                         &timeline_ids,
-                        lazy,
+                        lazy_scope,
                         &timeline_senders,
                         &user_id_owned,
                         state_content_filter.as_ref(),
@@ -1091,7 +1237,7 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
                     build_state_section(
                         actor,
                         &timeline_ids,
-                        lazy,
+                        lazy_scope,
                         &timeline_senders,
                         &user_id_owned,
                         state_content_filter.as_ref(),
@@ -1106,6 +1252,30 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
                 Ok::<_, hs_room::RoomError>((timeline, state, summary))
             })
             .await?;
+
+        if !remembered.is_empty() {
+            state_events.retain(|event| {
+                !is_member_event(event)
+                    || !member_key(event).is_some_and(|(state_key, event_id)| {
+                        remembered.get(state_key) == Some(&event_id.to_owned())
+                    })
+            });
+        }
+        if lazy {
+            // Member events in the state section and in the timeline alike: the client has
+            // both now, and the next incremental sync need not repeat either.
+            hub.lazy_members().record(
+                user_id,
+                &lazy_device,
+                room_id,
+                state_events
+                    .iter()
+                    .chain(timeline.events.iter())
+                    .filter(|event| is_member_event(event))
+                    .filter_map(member_key)
+                    .map(|(state_key, event_id)| (state_key.to_owned(), event_id.to_owned())),
+            );
+        }
 
         timeline_events += timeline.events.len();
         for event in &timeline.events {
@@ -1956,6 +2126,460 @@ mod tests {
             response["rooms"]["invite"].get(room_id.as_str()).is_some(),
             "bob's invite should show up: {response}"
         );
+    }
+
+    fn message_senders(response: &Value, room_id: &RoomId) -> Vec<String> {
+        response["rooms"]["join"][room_id.as_str()]["timeline"]["events"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|e| e["type"] == "m.room.message")
+            .map(|e| e["sender"].as_str().unwrap_or("").to_owned())
+            .collect()
+    }
+
+    /// Sytest's "Ignore user in existing room": once bob is on alice's `m.ignored_user_list`,
+    /// his messages are left out of her timelines (initial and incremental), a batch whose only
+    /// news was his says nothing about the room at all, and everybody else's messages still
+    /// arrive. His membership event stays: ignoring somebody does not make them leave.
+    #[tokio::test]
+    async fn an_ignored_users_messages_are_left_out_and_their_membership_is_kept() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let bob = user_id!("@bob:sync.test").to_owned();
+        let carol = user_id!("@carol:sync.test").to_owned();
+        let handle = hub
+            .rooms()
+            .create_room(alice.clone(), CreateRoomRequest::default(), 1)
+            .await
+            .unwrap();
+        hub.watch_room(handle.clone()).await;
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+        let mut ts = 2;
+        for user in [&bob, &carol] {
+            handle
+                .membership(alice.clone(), Action::Invite, user.clone(), json!({}), ts)
+                .await
+                .unwrap();
+            handle
+                .membership(user.clone(), Action::Join, user.clone(), json!({}), ts + 1)
+                .await
+                .unwrap();
+            ts += 2;
+        }
+        for user in [&alice, &bob, &carol] {
+            handle
+                .send_event(
+                    user.clone(),
+                    "m.room.message".to_owned(),
+                    None,
+                    json!({"msgtype": "m.text", "body": "Message"}),
+                    None,
+                    ts,
+                )
+                .await
+                .unwrap();
+            ts += 1;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let (first, _) = build(&hub, &e2e, &alice, params(None)).await.unwrap();
+        assert_eq!(
+            message_senders(&first, &room_id),
+            [alice.as_str(), bob.as_str(), carol.as_str()]
+        );
+
+        hub.store()
+            .put_global_account_data(
+                &alice,
+                "m.ignored_user_list",
+                json!({"ignored_users": {bob.as_str(): {}}}),
+            )
+            .await
+            .unwrap();
+        let (second, token) = build(&hub, &e2e, &alice, params(None)).await.unwrap();
+        assert_eq!(
+            message_senders(&second, &room_id),
+            [alice.as_str(), carol.as_str()],
+            "bob's message is gone from the initial sync: {second}"
+        );
+        // His join is a state event: still sent (here in the timeline, this window being the
+        // whole room; `state` carries what the timeline does not).
+        let room = &second["rooms"]["join"][room_id.as_str()];
+        let members: Vec<&str> = [&room["state"]["events"], &room["timeline"]["events"]]
+            .into_iter()
+            .filter_map(Value::as_array)
+            .flatten()
+            .filter(|e| e["type"] == "m.room.member")
+            .map(|e| e["state_key"].as_str().unwrap())
+            .collect();
+        assert!(
+            members.contains(&bob.as_str()),
+            "bob is still a member: {members:?}"
+        );
+
+        handle
+            .send_event(
+                bob.clone(),
+                "m.room.message".to_owned(),
+                None,
+                json!({"msgtype": "m.text", "body": "Message2"}),
+                None,
+                ts,
+            )
+            .await
+            .unwrap();
+        ts += 1;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let (third, token) = build(&hub, &e2e, &alice, params(Some(token)))
+            .await
+            .unwrap();
+        assert!(
+            third["rooms"]["join"]
+                .as_object()
+                .is_none_or(serde_json::Map::is_empty),
+            "a batch with nothing but an ignored user's message has no rooms: {third}"
+        );
+
+        handle
+            .send_event(
+                carol.clone(),
+                "m.room.message".to_owned(),
+                None,
+                json!({"msgtype": "m.text", "body": "Message3"}),
+                None,
+                ts,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let (fourth, _) = build(&hub, &e2e, &alice, params(Some(token)))
+            .await
+            .unwrap();
+        assert_eq!(message_senders(&fourth, &room_id), [carol.as_str()]);
+    }
+
+    /// Sytest's "Ignore invite in full sync" and "... in incremental sync": an invitation from
+    /// somebody the user ignores is not shown by either kind of sync, and is there once they
+    /// are no longer ignored -- it was pending all along.
+    #[tokio::test]
+    async fn an_invite_from_an_ignored_user_is_not_shown_until_they_are_unignored() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let bob = user_id!("@bob:sync.test").to_owned();
+        let handle = hub
+            .rooms()
+            .create_room(bob.clone(), CreateRoomRequest::default(), 1)
+            .await
+            .unwrap();
+        hub.watch_room(handle.clone()).await;
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+        let (_, token) = build(&hub, &e2e, &alice, params(None)).await.unwrap();
+
+        hub.store()
+            .put_global_account_data(
+                &alice,
+                "m.ignored_user_list",
+                json!({"ignored_users": {bob.as_str(): {}}}),
+            )
+            .await
+            .unwrap();
+        handle
+            .membership(bob.clone(), Action::Invite, alice.clone(), json!({}), 2)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let (incremental, _) = build(&hub, &e2e, &alice, params(Some(token)))
+            .await
+            .unwrap();
+        assert!(
+            incremental["rooms"]["invite"]
+                .get(room_id.as_str())
+                .is_none(),
+            "no invite from an ignored user in an incremental sync: {incremental}"
+        );
+        let (initial, _) = build(&hub, &e2e, &alice, params(None)).await.unwrap();
+        assert!(
+            initial["rooms"]["invite"].get(room_id.as_str()).is_none(),
+            "nor in an initial sync: {initial}"
+        );
+
+        // Un-ignored, the pending invite is shown (by an initial sync; an incremental one is
+        // past the invite's feed entry by now, as it would be on Synapse).
+        hub.store()
+            .put_global_account_data(&alice, "m.ignored_user_list", json!({"ignored_users": {}}))
+            .await
+            .unwrap();
+        let (initial, _) = build(&hub, &e2e, &alice, params(None)).await.unwrap();
+        assert!(
+            initial["rooms"]["invite"].get(room_id.as_str()).is_some(),
+            "un-ignored, the invite is there: {initial}"
+        );
+    }
+
+    fn state_members(response: &Value, room_id: &RoomId) -> Vec<(String, String)> {
+        let mut members: Vec<(String, String)> =
+            response["rooms"]["join"][room_id.as_str()]["state"]["events"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|e| e["type"] == "m.room.member")
+                .map(|e| {
+                    (
+                        e["state_key"].as_str().unwrap().to_owned(),
+                        e["content"]["membership"].as_str().unwrap().to_owned(),
+                    )
+                })
+                .collect();
+        members.sort();
+        members
+    }
+
+    async fn send_fillers(
+        handle: &hs_room::actor::RoomActorHandle<MemoryBackend>,
+        sender: &UserId,
+        count: usize,
+        ts: &mut i64,
+    ) {
+        for n in 0..count {
+            handle
+                .send_event(
+                    sender.to_owned(),
+                    "a.made.up.filler.type".to_owned(),
+                    None,
+                    json!({"filler": n}),
+                    None,
+                    *ts,
+                )
+                .await
+                .unwrap();
+            *ts += 1;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+
+    /// Sytest's `15lazy-members.pl`, in one walk. Under `lazy_load_members` with a timeline
+    /// limit of 10: the initial sync's `state` has the members who sent the timeline and the
+    /// requester; an incremental sync has only senders this device has not been sent
+    /// (nobody, when they all spoke before: "We don't send redundant membership state across
+    /// incremental syncs by default"); a gapped sync adds whoever joined or left inside the
+    /// gap ("Members from the gap are included in gappy incr LL sync", "Gapped incremental
+    /// syncs include all state changes"), and still not the members already sent.
+    #[tokio::test]
+    async fn lazily_loaded_members_are_sent_once_and_the_gaps_joins_and_leaves_too() {
+        let hub = hub();
+        let e2e = e2e_store();
+        std::mem::forget(hub.watch_all(hub.rooms().subscribe_global()));
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let bob = user_id!("@bob:sync.test").to_owned();
+        let charlie = user_id!("@charlie:sync.test").to_owned();
+        let dave = user_id!("@dave:sync.test").to_owned();
+        let handle = hub
+            .rooms()
+            .create_room(
+                alice.clone(),
+                CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    name: Some("A room name".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+        let mut ts = 2;
+        for user in [&bob, &charlie] {
+            handle
+                .membership(user.clone(), Action::Join, user.clone(), json!({}), ts)
+                .await
+                .unwrap();
+            ts += 1;
+        }
+        send_fillers(&handle, &bob, 10, &mut ts).await;
+        let filter: SyncFilter = serde_json::from_value(json!({
+            "room": {"state": {"lazy_load_members": true}, "timeline": {"limit": 10}}
+        }))
+        .unwrap();
+        let with_filter = |since: Option<SyncToken>| {
+            let mut p = params(since);
+            p.filter = filter.clone();
+            p
+        };
+
+        let (initial, token) = build(&hub, &e2e, &alice, with_filter(None)).await.unwrap();
+        assert_eq!(
+            state_members(&initial, &room_id),
+            [
+                (alice.to_string(), "join".to_owned()),
+                (bob.to_string(), "join".to_owned())
+            ],
+            "the timeline's sender and the requester: {initial}"
+        );
+
+        // Charlie speaks: only his membership, and the requester's not again.
+        send_fillers(&handle, &charlie, 1, &mut ts).await;
+        let (incremental, token) = build(&hub, &e2e, &alice, with_filter(Some(token)))
+            .await
+            .unwrap();
+        assert_eq!(
+            state_members(&incremental, &room_id),
+            [(charlie.to_string(), "join".to_owned())],
+            "{incremental}"
+        );
+
+        // Bob and charlie again: both already sent, so nothing.
+        send_fillers(&handle, &bob, 1, &mut ts).await;
+        send_fillers(&handle, &charlie, 1, &mut ts).await;
+        let (incremental, token) = build(&hub, &e2e, &alice, with_filter(Some(token)))
+            .await
+            .unwrap();
+        assert!(
+            incremental["rooms"]["join"][room_id.as_str()]["timeline"]["events"]
+                .as_array()
+                .is_some_and(|events| events.len() == 2),
+            "{incremental}"
+        );
+        assert_eq!(state_members(&incremental, &room_id), [], "{incremental}");
+
+        // Dave joins and charlie says twenty things: a gap. Dave joined inside it (and his
+        // join is not in the timeline), charlie sent the timeline but was sent before.
+        handle
+            .membership(dave.clone(), Action::Join, dave.clone(), json!({}), ts)
+            .await
+            .unwrap();
+        ts += 1;
+        send_fillers(&handle, &charlie, 20, &mut ts).await;
+        let (gapped, token) = build(&hub, &e2e, &alice, with_filter(Some(token)))
+            .await
+            .unwrap();
+        assert_eq!(
+            gapped["rooms"]["join"][room_id.as_str()]["timeline"]["limited"],
+            true,
+            "{gapped}"
+        );
+        assert_eq!(
+            state_members(&gapped, &room_id),
+            [(dave.to_string(), "join".to_owned())],
+            "{gapped}"
+        );
+
+        // Dave leaves inside another gap: his changed membership is sent, nobody else's.
+        handle
+            .membership(dave.clone(), Action::Leave, dave.clone(), json!({}), ts)
+            .await
+            .unwrap();
+        ts += 1;
+        send_fillers(&handle, &charlie, 20, &mut ts).await;
+        let (gapped, token) = build(&hub, &e2e, &alice, with_filter(Some(token)))
+            .await
+            .unwrap();
+        assert_eq!(
+            state_members(&gapped, &room_id),
+            [(dave.to_string(), "leave".to_owned())],
+            "{gapped}"
+        );
+
+        // Asked for the redundancy, an incremental sync has every sender again -- and not
+        // the requester, who did not speak.
+        let redundant: SyncFilter = serde_json::from_value(json!({
+            "room": {
+                "state": {"lazy_load_members": true, "include_redundant_members": true},
+                "timeline": {"limit": 10}
+            }
+        }))
+        .unwrap();
+        send_fillers(&handle, &bob, 1, &mut ts).await;
+        send_fillers(&handle, &charlie, 1, &mut ts).await;
+        let mut p = params(Some(token));
+        p.filter = redundant;
+        let (incremental, _) = build(&hub, &e2e, &alice, p).await.unwrap();
+        assert_eq!(
+            state_members(&incremental, &room_id),
+            [
+                (bob.to_string(), "join".to_owned()),
+                (charlie.to_string(), "join".to_owned())
+            ],
+            "{incremental}"
+        );
+
+        // A fresh initial sync forgets what was sent: everybody in the timeline is there again.
+        let (initial, _) = build(&hub, &e2e, &alice, with_filter(None)).await.unwrap();
+        assert_eq!(
+            state_members(&initial, &room_id),
+            [
+                (alice.to_string(), "join".to_owned()),
+                (bob.to_string(), "join".to_owned()),
+                (charlie.to_string(), "join".to_owned())
+            ],
+            "{initial}"
+        );
+    }
+
+    /// The device that sent an event with a transaction id sees it as `unsigned.transaction_id`
+    /// in its own `/sync` timeline (the client-server API's local echo; Sytest's "Can sync a
+    /// room with a message with a transaction id"), and no other device or user does.
+    #[tokio::test]
+    async fn the_sending_device_sees_its_transaction_id_in_sync_and_nobody_else_does() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let bob = user_id!("@bob:sync.test").to_owned();
+        let handle = hub
+            .rooms()
+            .create_room(
+                alice.clone(),
+                CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        hub.watch_room(handle.clone()).await;
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+        handle
+            .membership(bob.clone(), Action::Join, bob.clone(), json!({}), 2)
+            .await
+            .unwrap();
+        let event = handle
+            .send_event_txn(
+                alice.clone(),
+                Some(ruma::device_id!("PHONE").to_owned()),
+                "my_transaction_id".to_owned(),
+                "m.room.message".to_owned(),
+                json!({"msgtype": "m.text", "body": "A test message"}),
+                3,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let sent = |response: &Value, who: &str| -> Value {
+            response["rooms"]["join"][room_id.as_str()]["timeline"]["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["event_id"] == event.event_id().as_str())
+                .unwrap_or_else(|| panic!("{who} did not get the message: {response}"))["unsigned"]
+                ["transaction_id"]
+                .clone()
+        };
+        let mut phone = params(None);
+        phone.device_id = Some(ruma::device_id!("PHONE").to_owned());
+        let (response, _) = build(&hub, &e2e, &alice, phone).await.unwrap();
+        assert_eq!(sent(&response, "alice's phone"), "my_transaction_id");
+
+        let mut laptop = params(None);
+        laptop.device_id = Some(ruma::device_id!("LAPTOP").to_owned());
+        let (response, _) = build(&hub, &e2e, &alice, laptop).await.unwrap();
+        assert!(sent(&response, "alice's laptop").is_null());
+        let (response, _) = build(&hub, &e2e, &bob, params(None)).await.unwrap();
+        assert!(sent(&response, "bob").is_null());
     }
 
     #[tokio::test]
@@ -2901,8 +3525,8 @@ mod tests {
         let room_id = handle.query(|a| a.room_id().to_owned()).await;
         let summary = &response["rooms"]["join"][room_id.as_str()]["summary"];
         assert!(
-            summary["m.heroes"].as_array().unwrap().is_empty(),
-            "a named room needs no heroes: {summary}"
+            summary.get("m.heroes").is_none(),
+            "a named room needs no heroes, and has no key for them: {summary}"
         );
         assert_eq!(summary["m.joined_member_count"], 1);
     }

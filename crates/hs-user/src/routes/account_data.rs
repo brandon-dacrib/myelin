@@ -65,6 +65,7 @@ pub async fn put_global<B: KvBackend + 'static, R: RoomSource<B> + 'static>(
         .store()
         .put_global_account_data(&requester.user_id, &event_type, content)
         .await?;
+    state.hub.account_data_changed(&requester.user_id).await;
     Ok(Json(serde_json::json!({})).into_response())
 }
 
@@ -109,5 +110,6 @@ pub async fn put_room<B: KvBackend + 'static, R: RoomSource<B> + 'static>(
         .store()
         .put_room_account_data(&requester.user_id, &room_id, &event_type, content)
         .await?;
+    state.hub.account_data_changed(&requester.user_id).await;
     Ok(Json(serde_json::json!({})).into_response())
 }

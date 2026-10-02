@@ -1290,6 +1290,12 @@ impl<B: KvBackend> UserStore for TablesUserStore<B> {
     }
 
     async fn list_public_rooms(&self) -> Result<Vec<PublicRoomEntry>, StoreError> {
+        let mut rooms = self.list_directory_public_rooms().await?;
+        rooms.retain(|room| room.join_rule_public);
+        Ok(rooms)
+    }
+
+    async fn list_directory_public_rooms(&self) -> Result<Vec<PublicRoomEntry>, StoreError> {
         let snap = self.backend.snapshot();
         let spec = RangeSpec::full();
         let mut out = Vec::new();

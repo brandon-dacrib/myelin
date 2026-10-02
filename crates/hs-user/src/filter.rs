@@ -24,8 +24,12 @@
 //! - `room.state.types` / `not_types` / `senders` / `not_senders`: the equivalent content filter
 //!   for the `state` section.
 //! - `room.state.lazy_load_members`: when true, a room's `state` section includes only the
-//!   senders of events already in the returned `timeline`, plus (always) the requesting user's
-//!   own membership event -- the spec's minimum lazy-loading contract.
+//!   members who sent events in the returned `timeline`, plus the requesting user's own
+//!   membership on a sync the client has no baseline for, plus -- in a gapped incremental sync
+//!   -- whoever joined or left inside the gap (`crate::sync`'s `LazyScope`). A member event this
+//!   device was already sent is left out of later incremental syncs (`crate::lazy_members`).
+//! - `room.state.include_redundant_members`: when true, that memory is not consulted and every
+//!   sender's membership is sent again.
 //! - `room.include_leave`: when true, left rooms are included in an initial sync's room set (an
 //!   incremental sync always includes a room the user just left, regardless of this flag, since
 //!   the client needs to see the leave event itself).
@@ -43,8 +47,6 @@
 //!   already small, bounded sets (one typing/receipt snapshot per room, not a history), so this
 //!   crate does not apply `EventFilter`/`RoomEventFilter`'s `types`/`senders` restrictions to
 //!   them.
-//! - `room.state.include_redundant_members`: lazy loading here always includes only the minimal
-//!   set (never redundant members), so this flag has no effect either way.
 //!
 //! This asymmetry (timeline vs. state cannot independently restrict which rooms they cover) is a
 //! known simplification: the spec allows `room.timeline.rooms` and `room.state.rooms` to differ,
@@ -94,8 +96,8 @@ pub struct RoomEventFilter {
     /// Whether to send only the state necessary to display the timeline (lazy loading of room
     /// members, MSC1227 / the stable spec feature). Applied -- see the module docs.
     pub lazy_load_members: Option<bool>,
-    /// Whether a lazy-loaded response should still include a member's redundant re-appearance.
-    /// Parsed, not applied (this crate never sends redundant members either way).
+    /// Whether a lazy-loaded incremental sync should send a member's event again although this
+    /// device was sent it before. Applied -- see the module docs.
     pub include_redundant_members: Option<bool>,
     /// Whether to include events with a relation to another event that the filter would
     /// otherwise exclude. Parsed, not applied.
@@ -205,6 +207,67 @@ impl SyncFilter {
         Self::default()
     }
 
+    /// Checks that every entry of a `rooms`/`not_rooms` list is a room id and every entry of a
+    /// `senders`/`not_senders` list a user id, as the spec types them; serde has already checked
+    /// the shapes. A filter naming `"not_a_room_id"` used to be stored and then matched nothing
+    /// (Sytest's "Check creating invalid filters returns 4xx").
+    ///
+    /// # Errors
+    /// Names the first offending entry and the list it is in.
+    pub fn validate_ids(&self) -> Result<(), String> {
+        fn user_ids(list: Option<&Vec<String>>, section: &str) -> Result<(), String> {
+            match list
+                .into_iter()
+                .flatten()
+                .find(|s| ruma::UserId::parse(s).is_err())
+            {
+                Some(bad) => Err(format!("{section}: {bad:?} is not a user id")),
+                None => Ok(()),
+            }
+        }
+        fn room_ids(list: Option<&Vec<String>>, section: &str) -> Result<(), String> {
+            match list
+                .into_iter()
+                .flatten()
+                .find(|s| ruma::RoomId::parse(s).is_err())
+            {
+                Some(bad) => Err(format!("{section}: {bad:?} is not a room id")),
+                None => Ok(()),
+            }
+        }
+        for (name, section) in [
+            ("presence", &self.presence),
+            ("account_data", &self.account_data),
+        ] {
+            if let Some(filter) = section {
+                user_ids(filter.senders.as_ref(), &format!("{name}.senders"))?;
+                user_ids(filter.not_senders.as_ref(), &format!("{name}.not_senders"))?;
+            }
+        }
+        let Some(room) = &self.room else {
+            return Ok(());
+        };
+        room_ids(room.rooms.as_ref(), "room.rooms")?;
+        room_ids(room.not_rooms.as_ref(), "room.not_rooms")?;
+        for (name, section) in [
+            ("timeline", &room.timeline),
+            ("state", &room.state),
+            ("ephemeral", &room.ephemeral),
+            ("account_data", &room.account_data),
+        ] {
+            if let Some(filter) = section {
+                room_ids(filter.rooms.as_ref(), &format!("room.{name}.rooms"))?;
+                room_ids(filter.not_rooms.as_ref(), &format!("room.{name}.not_rooms"))?;
+                user_ids(filter.senders.as_ref(), &format!("room.{name}.senders"))?;
+                user_ids(
+                    filter.not_senders.as_ref(),
+                    &format!("room.{name}.not_senders"),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// The room-level allow/deny lists to apply uniformly across timeline and state (see the
     /// module docs on why they are not kept separate).
     #[must_use]
@@ -261,6 +324,18 @@ impl SyncFilter {
             .unwrap_or(false)
     }
 
+    /// Whether, under lazy loading, a member's event is to be sent again in an incremental
+    /// sync although this device was sent it before (`room.state.include_redundant_members`).
+    /// Meaningless without [`SyncFilter::lazy_load_members`].
+    #[must_use]
+    pub fn include_redundant_members(&self) -> bool {
+        self.room
+            .as_ref()
+            .and_then(|r| r.state.as_ref())
+            .and_then(|s| s.include_redundant_members)
+            .unwrap_or(false)
+    }
+
     /// Whether left rooms should appear in an initial sync's room set.
     #[must_use]
     pub fn include_leave(&self) -> bool {
@@ -313,6 +388,9 @@ pub async fn resolve(
     if raw.trim_start().starts_with('{') {
         let filter: SyncFilter = serde_json::from_str(raw)
             .map_err(|e| crate::error::UserError::InvalidFilter(e.to_string()))?;
+        filter
+            .validate_ids()
+            .map_err(crate::error::UserError::InvalidFilter)?;
         log_ignored_fields(&filter);
         return Ok(filter);
     }
@@ -350,13 +428,6 @@ fn log_ignored_fields(filter: &SyncFilter) {
         }
         if room.account_data.is_some() {
             ignored.push("room.account_data");
-        }
-        if room
-            .state
-            .as_ref()
-            .is_some_and(|s| s.include_redundant_members.is_some())
-        {
-            ignored.push("room.state.include_redundant_members");
         }
     }
     if !ignored.is_empty() {
@@ -450,6 +521,45 @@ mod tests {
         assert_eq!(f.timeline_limit(10), 10);
         assert!(!f.lazy_load_members());
         assert!(!f.include_leave());
+    }
+
+    /// Sytest's "Check creating invalid filters returns 4xx": a room list holding something
+    /// that is not a room id, or a sender list something that is not a user id, is rejected;
+    /// well-formed ids pass, wherever the list is.
+    #[test]
+    fn room_and_sender_lists_must_hold_ids() {
+        let parse = |v: serde_json::Value| serde_json::from_value::<SyncFilter>(v).unwrap();
+        assert!(
+            parse(serde_json::json!({"room": {"timeline": {"rooms": ["not_a_room_id"]}}}))
+                .validate_ids()
+                .is_err()
+        );
+        assert!(
+            parse(serde_json::json!({"room": {"state": {"senders": ["not_a_sender_id"]}}}))
+                .validate_ids()
+                .is_err()
+        );
+        assert!(
+            parse(serde_json::json!({"room": {"not_rooms": ["nope"]}}))
+                .validate_ids()
+                .is_err()
+        );
+        assert!(
+            parse(serde_json::json!({"presence": {"not_senders": ["@alice"]}}))
+                .validate_ids()
+                .is_err()
+        );
+        parse(serde_json::json!({
+            "presence": {"senders": ["@alice:example.org"]},
+            "room": {
+                "rooms": ["!room:example.org"],
+                "timeline": {"not_senders": ["@bob:example.org"], "rooms": ["!r:example.org"]},
+                "ephemeral": {"senders": ["@carol:example.org"]}
+            }
+        }))
+        .validate_ids()
+        .unwrap();
+        SyncFilter::none().validate_ids().unwrap();
     }
 
     #[test]

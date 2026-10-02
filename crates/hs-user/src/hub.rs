@@ -121,8 +121,10 @@ fn content_str(event: &Event, field: &str) -> Option<String> {
 }
 
 /// Builds this room's [`crate::store::PublicRoomEntry`] if it is currently public
-/// (`m.room.join_rules`'s `join_rule` is `"public"`), `None` otherwise -- the caller then removes
-/// any existing directory entry in the `None` case (a room can stop being public).
+/// (`m.room.join_rules`'s `join_rule` is `"public"`) or world-readable (`m.room.history_visibility`
+/// is `world_readable`; such a row has `join_rule_public: false` and is for the user directory
+/// only), `None` otherwise -- the caller then removes any existing directory entry in the `None`
+/// case (a room can stop being public).
 fn public_directory_entry<B: KvBackend>(
     actor: &hs_room::actor::RoomActor<B>,
 ) -> Result<Option<crate::store::PublicRoomEntry>, hs_room::RoomError> {
@@ -135,15 +137,17 @@ fn public_directory_entry<B: KvBackend>(
             .and_then(|e| content_str(e, name)))
     };
 
-    if field("m.room.join_rules", "join_rule")?.as_deref() != Some("public") {
-        return Ok(None);
-    }
+    let join_rule_public = field("m.room.join_rules", "join_rule")?.as_deref() == Some("public");
     let world_readable = field("m.room.history_visibility", "history_visibility")?.as_deref()
         == Some("world_readable");
+    if !join_rule_public && !world_readable {
+        return Ok(None);
+    }
     let guest_can_join =
         field("m.room.guest_access", "guest_access")?.as_deref() == Some("can_join");
     Ok(Some(crate::store::PublicRoomEntry {
         room_id: actor.room_id().to_owned(),
+        join_rule_public,
         name: field("m.room.name", "name")?,
         topic: field("m.room.topic", "topic")?,
         canonical_alias: field("m.room.canonical_alias", "alias")?,
@@ -315,6 +319,8 @@ pub struct SessionHub<B: KvBackend, R: RoomSource<B>> {
     hot_compacted_at: std::sync::atomic::AtomicU64,
     /// Whether [`FAN_OUT_UNBATCHED_ENV`] is set: each member written on their own.
     fan_out_unbatched: bool,
+    /// Which members each device was sent under lazy loading (`crate::lazy_members`).
+    lazy_members: crate::lazy_members::LazyMembersSent,
     _marker: std::marker::PhantomData<fn() -> B>,
 }
 
@@ -364,6 +370,7 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
             ),
             hot_compacted_at: std::sync::atomic::AtomicU64::new(0),
             fan_out_unbatched,
+            lazy_members: crate::lazy_members::LazyMembersSent::default(),
             _marker: std::marker::PhantomData,
         }
     }
@@ -888,6 +895,12 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         self.shutting_down.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// The per-device memory of lazily loaded members `/sync` consults and updates.
+    #[must_use]
+    pub fn lazy_members(&self) -> &crate::lazy_members::LazyMembersSent {
+        &self.lazy_members
+    }
+
     /// The waker a long-polling `/sync` call should register interest on *before* checking
     /// whether anything is already new (see `crate::sync`'s long-poll loop for why the ordering
     /// matters: registering after the check has a lost-wakeup race).
@@ -898,6 +911,14 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
                 .entry(user_id.to_owned())
                 .or_insert_with(|| Arc::new(Notify::new())),
         )
+    }
+
+    /// Tells `user_id`'s long-polling `/sync` that their account data changed. The routes that
+    /// write account data and tags call this after the store write: `crate::sync::has_new_data`
+    /// already noticed the counter move, but nothing woke the poll to look, so a tag set while
+    /// a client waited was only seen when the wait timed out or something else happened.
+    pub async fn account_data_changed(&self, user_id: &UserId) {
+        self.wake(user_id).await;
     }
 
     async fn wake(&self, user_id: &UserId) {
@@ -1332,8 +1353,11 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
     }
 
     /// Everyone `user_id` may find in the user directory: the people they share a joined room
-    /// with, and everyone joined to a public room (one whose join rule is `public`) -- the spec's
-    /// floor for `POST /user_directory/search`, and this server's ceiling.
+    /// with, and everyone joined to a public room (one whose join rule is `public` or whose
+    /// history is world-readable) that somebody on this server is in -- the spec's floor for
+    /// `POST /user_directory/search`, and this server's ceiling. The requester is in the answer
+    /// when they are in such a public room, as on Synapse: Sytest's directory tests search for
+    /// the requester's own name and expect to find it there, and not to once they have left.
     ///
     /// Read from the directory index in the store (`hs_user.room_members`: each room's joined
     /// members, kept up to date from the room updates this hub applies,
@@ -1370,7 +1394,7 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         &self,
         user_id: &UserId,
     ) -> Result<std::collections::BTreeSet<OwnedUserId>, UserError> {
-        let mut rooms: BTreeSet<ruma::OwnedRoomId> = self
+        let joined: BTreeSet<ruma::OwnedRoomId> = self
             .store
             .list_memberships(user_id)
             .await?
@@ -1378,24 +1402,36 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
             .filter(|m| m.membership == "join")
             .map(|m| m.room_id)
             .collect();
-        rooms.extend(
-            self.store
-                .list_public_rooms()
-                .await?
-                .into_iter()
-                .map(|room| room.room_id),
-        );
+        let public: BTreeSet<ruma::OwnedRoomId> = self
+            .store
+            .list_directory_public_rooms()
+            .await?
+            .into_iter()
+            .map(|room| room.room_id)
+            .collect();
         let mut visible = BTreeSet::new();
-        for room_id in &rooms {
+        for room_id in joined.union(&public) {
             let members = match self.store.room_member_ids(room_id).await? {
                 Some(members) => members,
                 None => self.index_room_by_reading_it(room_id).await?,
             };
-            visible.extend(
-                members
-                    .into_iter()
-                    .filter(|member| member.as_str() != user_id.as_str()),
-            );
+            if public.contains(room_id) {
+                // A public room counts while this server is in it -- somebody local is joined
+                // (Synapse's `users_in_public_rooms` is emptied for a room the server left).
+                // Everybody in it is offered, the requester included.
+                if members
+                    .iter()
+                    .any(|member| member.server_name() == user_id.server_name())
+                {
+                    visible.extend(members);
+                }
+            } else {
+                visible.extend(
+                    members
+                        .into_iter()
+                        .filter(|member| member.as_str() != user_id.as_str()),
+                );
+            }
         }
         Ok(visible)
     }
@@ -1542,7 +1578,7 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
                     let seq = update.global_seq;
                     let room_id = update.room_id.clone();
                     let room_pos = update.room_pos;
-                    let woken = match self.apply_room_update(update).await {
+                    let woken = match self.handle_room_update(update).await {
                         Ok(woken) => woken,
                         Err(e) => {
                             tracing::warn!(error = %e, "failed to process a room update into user feeds");
@@ -1590,7 +1626,7 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
                         };
                         let room_id = head.room_id.clone();
                         let room_pos = head.room_pos;
-                        match self.apply_room_update(head).await {
+                        match self.handle_room_update(head).await {
                             Ok(woken) => {
                                 if let Some(link) = self.cluster.get() {
                                     link.cluster.publish(RoomWake {
@@ -1622,7 +1658,14 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
     /// Returns [`UserError`] if the room's member list could not be read, or if a store write
     /// failed.
     pub async fn process_room_update(&self, update: RoomUpdate) -> Result<(), UserError> {
-        self.apply_room_update(update).await.map(|_| ())
+        self.handle_room_update(update).await.map(|_| ())
+    }
+
+    /// [`SessionHub::apply_room_update`] under the hub's own error handling: the wrapper the
+    /// watchers and [`SessionHub::process_room_update`] call. Copying tags and `m.direct` onto
+    /// an upgraded room's replacement happens inside, as the join is applied.
+    async fn handle_room_update(&self, update: RoomUpdate) -> Result<Vec<OwnedUserId>, UserError> {
+        self.apply_room_update(update).await
     }
 
     /// Copies what `user_id`'s account data says about `old_room_id` onto `new_room_id`, its
@@ -2500,6 +2543,110 @@ mod tests {
         member(handle, user, Action::Join, ts + 1).await;
     }
 
+    /// Joining the successor of an upgraded room brings the user's tags and `m.direct` entry for
+    /// the old room along -- once: a tag then removed in the new room stays removed through a
+    /// later join.
+    #[tokio::test]
+    async fn joining_an_upgraded_rooms_successor_copies_tags_and_m_direct() {
+        let (hub, rooms) = hub(500);
+        std::mem::forget(hub.watch_all(rooms.subscribe_global()));
+        let alice = user_id!("@alice:hub.test").to_owned();
+        let bob = user_id!("@bob:hub.test").to_owned();
+        let (old, old_id) = create(&rooms, &alice, "private_chat").await;
+        invite_and_join(&old, &alice, &bob, 2).await;
+        hub.store()
+            .put_room_account_data(
+                &bob,
+                &old_id,
+                "m.tag",
+                serde_json::json!({"tags": {"test_tag": {"order": 1}}}),
+            )
+            .await
+            .unwrap();
+        hub.store()
+            .put_global_account_data(
+                &bob,
+                "m.direct",
+                serde_json::json!({alice.as_str(): [old_id.as_str()]}),
+            )
+            .await
+            .unwrap();
+
+        // The successor as `/upgrade` makes it: its create event names the old room.
+        let new = rooms
+            .create_room(
+                alice.clone(),
+                CreateRoomRequest {
+                    preset: Some("private_chat".to_owned()),
+                    creation_content: serde_json::json!({
+                        "predecessor": {"room_id": old_id.as_str(), "event_id": "$tombstone:hub.test"}
+                    }),
+                    ..Default::default()
+                },
+                3,
+            )
+            .await
+            .unwrap();
+        let new_id = new.query(|a| a.room_id().to_owned()).await;
+        invite_and_join(&new, &alice, &bob, 4).await;
+
+        let tags_in = |room: ruma::OwnedRoomId| {
+            let hub = StdArc::clone(&hub);
+            let bob = bob.clone();
+            async move {
+                hub.store()
+                    .list_room_account_data(&bob, &room)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|a| a.event_type == "m.tag")
+                    .map(|a| a.content)
+            }
+        };
+        let mut copied = None;
+        for _ in 0..100 {
+            copied = tags_in(new_id.clone()).await;
+            if copied.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            copied,
+            Some(serde_json::json!({"tags": {"test_tag": {"order": 1}}})),
+            "bob's tag followed him into the new room"
+        );
+        let direct = hub
+            .store()
+            .get_global_account_data(&bob, "m.direct")
+            .await
+            .unwrap()
+            .unwrap()
+            .content;
+        assert_eq!(
+            direct,
+            serde_json::json!({alice.as_str(): [old_id.as_str(), new_id.as_str()]})
+        );
+        assert_eq!(
+            tags_in(old_id.clone()).await,
+            Some(serde_json::json!({"tags": {"test_tag": {"order": 1}}})),
+            "the old room keeps its tag"
+        );
+
+        // Removed in the new room, the tag does not come back on a later join.
+        hub.store()
+            .put_room_account_data(&bob, &new_id, "m.tag", serde_json::json!({"tags": {}}))
+            .await
+            .unwrap();
+        member(&new, &bob, Action::Leave, 6).await;
+        invite_and_join(&new, &alice, &bob, 7).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            tags_in(new_id.clone()).await,
+            Some(serde_json::json!({"tags": {}}))
+        );
+    }
+
     /// Who the directory shows follows membership -- a join, a leave, a room going from public
     /// to invite-only -- from the index the hub keeps, and no search reads a room to answer.
     #[tokio::test]
@@ -2523,6 +2670,9 @@ mod tests {
             [alice.as_str(), carol.as_str()]
         );
         assert_eq!(directory(&hub, &dave).await, [carol.as_str()]);
+        // Carol finds herself: she is in a public room (a search for one's own name is what
+        // Sytest's directory tests do), as alice, in a private room only, does not.
+        assert_eq!(directory(&hub, &carol).await, [carol.as_str()]);
 
         member(&private, &bob, Action::Leave, 3).await;
         member(&public, &dave, Action::Join, 4).await;
@@ -2531,6 +2681,10 @@ mod tests {
             [carol.as_str(), dave.as_str()]
         );
         assert_eq!(directory(&hub, &bob).await, [carol.as_str(), dave.as_str()]);
+        assert_eq!(
+            directory(&hub, &dave).await,
+            [carol.as_str(), dave.as_str()]
+        );
 
         // Carol's room stops being public: only who shares it with somebody sees them now.
         public
@@ -2756,6 +2910,132 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// A world-readable room is public to the user directory whatever its join rule (Sytest's
+    /// "Users appear/disappear from directory when history_visibility are changed" and "Users
+    /// stay in directory when join_rules are changed but history_visibility is world_readable"),
+    /// but is not in `/publicRooms` for that alone.
+    #[tokio::test]
+    async fn a_world_readable_room_is_public_to_the_directory_but_not_to_public_rooms() {
+        let (hub, rooms) = hub(500);
+        std::mem::forget(hub.watch_all(rooms.subscribe_global()));
+        let carol = user_id!("@carol:hub.test").to_owned();
+        let dave = user_id!("@dave:hub.test").to_owned();
+        let (room, room_id) = create(&rooms, &carol, "private_chat").await;
+        let set_state = |event_type: &'static str, content: serde_json::Value, ts: i64| {
+            let room = room.clone();
+            let carol = carol.clone();
+            async move {
+                room.send_event(
+                    carol,
+                    event_type.to_owned(),
+                    Some(String::new()),
+                    content,
+                    None,
+                    ts,
+                )
+                .await
+                .unwrap();
+            }
+        };
+        assert!(directory(&hub, &dave).await.is_empty());
+
+        set_state(
+            "m.room.history_visibility",
+            serde_json::json!({"history_visibility": "world_readable"}),
+            2,
+        )
+        .await;
+        assert_eq!(directory(&hub, &dave).await, [carol.as_str()]);
+        assert_eq!(
+            hub.store().list_public_rooms().await.unwrap(),
+            [],
+            "world-readable alone is not a /publicRooms listing"
+        );
+        let directory_rooms = hub.store().list_directory_public_rooms().await.unwrap();
+        assert_eq!(directory_rooms.len(), 1);
+        assert_eq!(directory_rooms[0].room_id, room_id);
+        assert!(!directory_rooms[0].join_rule_public);
+
+        set_state(
+            "m.room.join_rules",
+            serde_json::json!({"join_rule": "public"}),
+            3,
+        )
+        .await;
+        // (`directory` waits for the hub to catch up with the room; a bare store read does not.)
+        assert_eq!(directory(&hub, &dave).await, [carol.as_str()]);
+        assert_eq!(hub.store().list_public_rooms().await.unwrap().len(), 1);
+        set_state(
+            "m.room.history_visibility",
+            serde_json::json!({"history_visibility": "shared"}),
+            4,
+        )
+        .await;
+        assert_eq!(directory(&hub, &dave).await, [carol.as_str()]);
+
+        set_state(
+            "m.room.join_rules",
+            serde_json::json!({"join_rule": "invite"}),
+            5,
+        )
+        .await;
+        assert!(directory(&hub, &dave).await.is_empty());
+        assert!(
+            hub.store()
+                .list_directory_public_rooms()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A public room counts for the directory only while somebody on this server is in it:
+    /// once the last local member leaves, its remote members are no longer offered (Sytest's
+    /// "User in remote room doesn't appear in user directory after server left room").
+    #[tokio::test]
+    async fn a_public_room_nobody_local_is_in_offers_nobody() {
+        let (hub, _rooms) = hub(500);
+        let alice = user_id!("@alice:hub.test").to_owned();
+        let bob = user_id!("@bob:hub.test").to_owned();
+        let remote = user_id!("@remote:elsewhere.test").to_owned();
+        let room = ruma::room_id!("!public:elsewhere.test");
+        hub.store()
+            .upsert_public_room(crate::store::PublicRoomEntry {
+                room_id: room.to_owned(),
+                join_rule_public: true,
+                name: None,
+                topic: None,
+                canonical_alias: None,
+                avatar_url: None,
+                num_joined_members: 1,
+                world_readable: false,
+                guest_can_join: false,
+            })
+            .await
+            .unwrap();
+        assert!(
+            hub.store()
+                .index_room_members_if_absent(room, std::slice::from_ref(&remote))
+                .await
+                .unwrap()
+        );
+        assert!(directory(&hub, &alice).await.is_empty());
+
+        hub.store()
+            .apply_room_member_changes(room, &[(bob.clone(), true)])
+            .await
+            .unwrap();
+        assert_eq!(
+            directory(&hub, &alice).await,
+            [bob.as_str(), remote.as_str()]
+        );
+        hub.store()
+            .apply_room_member_changes(room, &[(bob.clone(), false)])
+            .await
+            .unwrap();
+        assert!(directory(&hub, &alice).await.is_empty());
     }
 
     /// The search answers from the index alone. Seeded here for a room the registry does not

@@ -37,8 +37,9 @@ pub async fn post_filter<B: KvBackend + 'static, R: RoomSource<B> + 'static>(
     PermissiveJson(body): PermissiveJson<serde_json::Value>,
 ) -> Result<Response, UserError> {
     require_self(&requester, &user_id)?;
-    let _validated: crate::filter::SyncFilter = serde_json::from_value(body.clone())
+    let validated: crate::filter::SyncFilter = serde_json::from_value(body.clone())
         .map_err(|e| UserError::InvalidFilter(e.to_string()))?;
+    validated.validate_ids().map_err(UserError::InvalidFilter)?;
     let filter_id = state
         .hub
         .store()

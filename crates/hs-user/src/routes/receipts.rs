@@ -100,6 +100,7 @@ pub async fn post_receipt<B: KvBackend + 'static, R: RoomSource<B> + 'static>(
                 json!({"event_id": event_id.as_str()}),
             )
             .await?;
+        state.hub.account_data_changed(&requester.user_id).await;
         return Ok(Json(json!({})).into_response());
     }
     let kind = ReceiptKind::parse(&receipt_type).ok_or_else(|| {
@@ -160,6 +161,9 @@ pub async fn post_read_markers<B: KvBackend + 'static, R: RoomSource<B> + 'stati
                 json!({"event_id": event_id.as_str()}),
             )
             .await?;
+        // Room account data, so the user's own waiting `/sync` is woken as `PUT
+        // .../account_data` wakes it (Sytest's read-marker helper waits for exactly that).
+        state.hub.account_data_changed(&requester.user_id).await;
     }
     if let Some(read) = &body.read {
         let event_id = parse_event_id(read)?;

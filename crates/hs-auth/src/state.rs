@@ -41,7 +41,8 @@ pub trait DeviceListChangeNotifier: Send + Sync {
 /// (`hs_user::hub::SessionHub`, installed by `hs serve`).
 #[async_trait::async_trait]
 pub trait UserDirectoryVisibility: Send + Sync {
-    /// Every user `requester` may find, not counting themself.
+    /// Every user `requester` may find -- themself included when they are in a public room, as
+    /// Synapse answers (Sytest's user-directory tests search for the requester's own name).
     ///
     /// # Errors
     /// A description of why the room layer could not answer. The search then fails rather than

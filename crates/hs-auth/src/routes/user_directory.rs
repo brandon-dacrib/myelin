@@ -94,8 +94,11 @@ pub async fn post_user_directory_search(
         .filter(|user| {
             // A deactivated account cannot be invited anywhere or log in again, so offering it as
             // somebody to talk to would be a dead end. The requester's own account is left out
-            // too: every client filters it back out, and nobody searches for themselves.
-            !user.deactivated && user.user_id != requester.user_id
+            // when there is no room layer to ask, or every account is searchable; with a room
+            // layer, whether they find themself is its answer -- they do while they are in a
+            // public room, as on Synapse. Sytest's user-directory tests search for the
+            // requester's own name and expect to find it after joining a public room.
+            !user.deactivated && (visible.is_some() || user.user_id != requester.user_id)
         })
         .filter(|user| visible.as_ref().is_none_or(|v| v.contains(&user.user_id)))
         .filter_map(|user| rank(&user, &needle).map(|rank| (rank, user)))

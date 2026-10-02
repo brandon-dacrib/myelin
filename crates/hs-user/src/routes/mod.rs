@@ -11,6 +11,7 @@ pub mod presence;
 pub mod receipts;
 pub mod rooms;
 pub mod sync;
+pub mod tags;
 pub mod typing;
 
 use hs_http::router::{AuthKind, Builder, RouteManifest, RouteMeta, Surface};
@@ -25,8 +26,8 @@ fn matrix_client(operation_id: &str) -> RouteMeta {
 
 /// This crate's endpoints and their `routes.json` manifest: `/sync`, the deprecated `/events`
 /// and `/initialSync` (`events`), `/joined_rooms`, account
-/// data (global and room-scoped), filters, typing, presence and read receipts (`m.receipt` and
-/// `m.fully_read`).
+/// data (global and room-scoped), room tags (`tags`), filters, typing, presence and read
+/// receipts (`m.receipt` and `m.fully_read`).
 ///
 /// `/publicRooms` (`crate::routes::rooms::get_public_rooms`/`post_public_rooms`) is deliberately
 /// **not** mounted here as of this session: `docs/workstreams/04-room-and-events.md` lists
@@ -77,6 +78,21 @@ pub fn router<B: KvBackend + 'static, R: RoomSource<B> + 'static>()
             "/user/{userId}/rooms/{roomId}/account_data/{type}",
             account_data::put_room::<B, R>,
             matrix_client("setRoomAccountData"),
+        )
+        .get(
+            "/user/{userId}/rooms/{roomId}/tags",
+            tags::get_tags::<B, R>,
+            matrix_client("getRoomTags"),
+        )
+        .put(
+            "/user/{userId}/rooms/{roomId}/tags/{tag}",
+            tags::put_tag::<B, R>,
+            matrix_client("setRoomTag"),
+        )
+        .delete(
+            "/user/{userId}/rooms/{roomId}/tags/{tag}",
+            tags::delete_tag::<B, R>,
+            matrix_client("deleteRoomTag"),
         )
         .post(
             "/user/{userId}/filter",
