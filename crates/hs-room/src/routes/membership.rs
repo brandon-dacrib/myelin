@@ -317,11 +317,23 @@ async fn act_join<B: KvBackend + 'static>(
     }
     // `third_party_signed`: the joiner claims a third-party invitation; it becomes an invite
     // first (`crate::third_party_invite::exchange`), as Synapse does, and the join follows it.
+    // A `third_party_signed` that is not a claim at all (no `mxid`) is a bad request, not a
+    // refusal: the key is not an unknown one to drop, it has a meaning, and a client sending
+    // something else under it should hear so.
     if let Some(signed) = body.get("third_party_signed") {
-        if signed.get("mxid").and_then(Value::as_str) != Some(sender.as_str()) {
-            return Err(RoomError::Forbidden(
-                "third_party_signed names somebody else".into(),
-            ));
+        match signed.get("mxid").and_then(Value::as_str) {
+            None => {
+                return Err(RoomError::BadRequest(
+                    "third_party_signed is not a signed third-party invitation: it has no mxid"
+                        .into(),
+                ));
+            }
+            Some(mxid) if mxid != sender.as_str() => {
+                return Err(RoomError::Forbidden(
+                    "third_party_signed names somebody else".into(),
+                ));
+            }
+            Some(_) => {}
         }
         crate::third_party_invite::exchange(state, &room_id, signed).await?;
     }

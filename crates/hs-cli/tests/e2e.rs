@@ -3298,13 +3298,26 @@ async fn rooms_refuse_what_the_spec_says_they_must_and_spell_out_their_defaults(
         .await
         .unwrap();
     let public_room = created["room_id"].as_str().unwrap().to_owned();
-    let joined = client
+    // `third_party_signed` is not an unknown key to drop: it claims a third-party invitation,
+    // and one that is no claim at all is a bad request (since 2026-10-01, with 3PID invites).
+    let junk_claim = client
         .post(format!(
             "{base}/_matrix/client/v3/join/{}",
             enc(&public_room)
         ))
         .bearer_auth(&bob)
         .json(&json!({"foo": "bar", "membership": "ban", "third_party_signed": {"x": 1}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(junk_claim.status(), reqwest::StatusCode::BAD_REQUEST);
+    let joined = client
+        .post(format!(
+            "{base}/_matrix/client/v3/join/{}",
+            enc(&public_room)
+        ))
+        .bearer_auth(&bob)
+        .json(&json!({"foo": "bar", "membership": "ban"}))
         .send()
         .await
         .unwrap();
