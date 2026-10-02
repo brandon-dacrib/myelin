@@ -98,7 +98,12 @@ describe("summarizeEvent, a message with no text", () => {
   it("says what kind it is rather than its msgtype", async () => {
     const { summarizeEvent } = await import("./rooms");
     expect(
-      summarizeEvent({ type: "m.room.message", content: { msgtype: "m.image" }, redacted: false }),
+      summarizeEvent({
+        type: "m.room.message",
+        content: { msgtype: "m.image" },
+        state_key: null,
+        redacted: false,
+      }),
     ).toBe("(an image, with no text)");
   });
 });
