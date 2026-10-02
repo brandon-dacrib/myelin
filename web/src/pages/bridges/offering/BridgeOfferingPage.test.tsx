@@ -64,13 +64,15 @@ describe("Bridge offering page", () => {
     expect(rows[0]).toHaveTextContent("@dave:example.org");
     expect(rows[0]).toHaveTextContent("Failed");
     expect(rows[0]).toHaveTextContent("ImagePullBackOff");
-    expect(rows[0]).toHaveTextContent("Degraded");
+    // The pod phase in words, not the operator's "Degraded".
+    expect(rows[0]).toHaveTextContent("Not running properly");
 
     // Retry only where there is something to retry.
     expect(within(table).getAllByRole("button", { name: /^Retry / })).toHaveLength(1);
     const alice = await rowFor("@alice:example.org");
-    // The state, the pod phase and the time it became ready.
-    expect(alice.getAllByText("Ready")).toHaveLength(3);
+    // The state and the time it became ready; the pod phase reads "Running".
+    expect(alice.getAllByText("Ready")).toHaveLength(2);
+    expect(alice.getByText("Running")).toBeInTheDocument();
     expect(alice.getByText("Healthy")).toBeInTheDocument();
   });
 
