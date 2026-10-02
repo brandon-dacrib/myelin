@@ -18,6 +18,16 @@
 //! redaction is tried as each of this server's joined members, most powerful first, and the
 //! first the room's auth rules accept is used. An event nobody here may redact is an error for
 //! that one event, reported by the task, never skipped silently.
+//!
+//! # Leaving every room
+//!
+//! `leave_all_rooms` (what `users.deactivate` with `erase: true` does before the account's data
+//! goes) leaves each room the user is joined to, invited to or knocking on, as the user, the way
+//! `POST /rooms/{id}/leave` does: through the room when a user of this server is joined to it,
+//! else through another server in the room ([`RemoteJoin::leave`], when the hook is installed
+//! with [`RoomRegistryUserActivity::with_remote_join`]), and if none will take it, the invite or
+//! knock is rejected here alone. A room that cannot be left is reported with its reason and the
+//! rest are still left; bans and earlier leaves are left as they are.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -25,7 +35,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use hs_admin::sources::SourceError;
 use hs_admin::user_moderation::{
-    AdminUserMembership, RedactTarget, UserActivityCounts, UserActivitySource,
+    AdminUserMembership, LeaveFailure, LeaveReport, RedactTarget, UserActivityCounts,
+    UserActivitySource,
 };
 use hs_kv::KvBackend;
 use hs_model::canonical::CanonicalJsonValue;
@@ -35,7 +46,9 @@ use ruma::{EventId, OwnedUserId, RoomId, UserId};
 use crate::actor::RoomActor;
 use crate::actor::RoomActorHandle;
 use crate::error::RoomError;
+use crate::membership::Action;
 use crate::registry::RoomRegistry;
+use crate::remote_join::RemoteJoin;
 
 /// How many senders a redaction is tried as before the event is reported as unredactable.
 const MAX_REDACTION_SENDERS: usize = 5;
@@ -93,13 +106,67 @@ fn redactable(event: &Event, user: &UserId) -> bool {
 /// Adapts a [`RoomRegistry`] to [`UserActivitySource`].
 pub struct RoomRegistryUserActivity<B: KvBackend> {
     registry: Arc<RoomRegistry<B>>,
+    /// How a leave reaches a room no user of this server is joined to (the same hook
+    /// `RoomState::remote_join` gives the client routes). `None`: such a room's invite or knock
+    /// is rejected here alone.
+    remote_join: Option<Arc<dyn RemoteJoin>>,
 }
 
 impl<B: KvBackend + 'static> RoomRegistryUserActivity<B> {
     /// Wraps `registry`.
     #[must_use]
     pub fn new(registry: Arc<RoomRegistry<B>>) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            remote_join: None,
+        }
+    }
+
+    /// Installs the federation hook `leave_all_rooms` sends a leave through for a room no user
+    /// of this server is joined to -- `RoomState::remote_join`, so that an erased user's
+    /// rejection of a remote invite reaches the inviting server the way their own
+    /// `POST /rooms/{id}/leave` would.
+    #[must_use]
+    pub fn with_remote_join(mut self, remote_join: Option<Arc<dyn RemoteJoin>>) -> Self {
+        self.remote_join = remote_join;
+        self
+    }
+
+    /// Leaves one room as `user`, the way `crate::routes::membership::act` does for
+    /// `Action::Leave`: through another server when nobody of this server is joined
+    /// (`servers_to_join_through`), rejecting an invite or knock locally if no server takes
+    /// the leave; through the room otherwise.
+    async fn leave_room(
+        &self,
+        handle: &RoomActorHandle<B>,
+        room_id: &RoomId,
+        user: &UserId,
+    ) -> Result<(), RoomError> {
+        if let Some(remote) = &self.remote_join
+            && let Some(servers) = handle.query(|actor| actor.servers_to_join_through()).await
+        {
+            if let Err(error) = remote
+                .leave(user, room_id, &servers, serde_json::json!({}))
+                .await
+            {
+                tracing::info!(%room_id, %user, %error, "no server in the room took the leave; rejecting locally");
+                handle
+                    .reject_out_of_band(user.to_owned(), serde_json::json!({}), now_ms())
+                    .await
+                    .map_err(|_| error)?;
+            }
+            return Ok(());
+        }
+        handle
+            .membership(
+                user.to_owned(),
+                Action::Leave,
+                user.to_owned(),
+                serde_json::json!({}),
+                now_ms(),
+            )
+            .await?;
+        Ok(())
     }
 
     /// Every room `user` has a membership event in, with its handle.
@@ -299,6 +366,38 @@ impl<B: KvBackend + 'static> UserActivitySource for RoomRegistryUserActivity<B> 
         Ok(targets)
     }
 
+    async fn leave_all_rooms(&self, user_id: &str) -> Result<LeaveReport, SourceError> {
+        let user = parse_user_id(user_id)?;
+        let mut report = LeaveReport::default();
+        for (room_id, handle) in self.rooms_of(&user).await? {
+            let who = user.clone();
+            let current = handle
+                .query(move |actor| {
+                    membership_of(actor, &who)
+                        .and_then(|e| content_str(e, "membership"))
+                        .map(str::to_owned)
+                })
+                .await;
+            if !matches!(current.as_deref(), Some("join" | "invite" | "knock")) {
+                continue;
+            }
+            match self.leave_room(&handle, &room_id, &user).await {
+                Ok(()) => {
+                    tracing::debug!(room = %room_id, %user, "left for an administrator");
+                    report.rooms_left.push(room_id.to_string());
+                }
+                Err(error) => {
+                    tracing::warn!(room = %room_id, %user, %error, "could not leave the room for an administrator");
+                    report.rooms_failed.push(LeaveFailure {
+                        room_id: room_id.to_string(),
+                        reason: error.to_string(),
+                    });
+                }
+            }
+        }
+        Ok(report)
+    }
+
     async fn redact_event(
         &self,
         target: &RedactTarget,
@@ -375,6 +474,188 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    /// A [`MemoryBackend`] whose writes fail while `fail` is set: how a room comes to be one
+    /// that cannot be left (a user's own leave is always authorised, so only the store can
+    /// refuse it).
+    #[derive(Clone)]
+    struct FailingWrites {
+        inner: MemoryBackend,
+        fail: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("the disk is full")]
+    struct DiskFull;
+
+    impl hs_kv::KvBackend for FailingWrites {
+        type Keyspace = <MemoryBackend as hs_kv::KvBackend>::Keyspace;
+        type Snapshot = <MemoryBackend as hs_kv::KvBackend>::Snapshot;
+        type Txn = <MemoryBackend as hs_kv::KvBackend>::Txn;
+
+        fn keyspace(&self, name: &str) -> Result<Self::Keyspace, hs_kv::KvError> {
+            self.inner.keyspace(name)
+        }
+
+        fn snapshot(&self) -> Self::Snapshot {
+            self.inner.snapshot()
+        }
+
+        fn begin(&self) -> Result<Self::Txn, hs_kv::KvError> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(hs_kv::KvError::backend(DiskFull));
+            }
+            self.inner.begin()
+        }
+
+        fn commit(&self, txn: Self::Txn) -> Result<Result<(), hs_kv::Conflict>, hs_kv::KvError> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(hs_kv::KvError::backend(DiskFull));
+            }
+            self.inner.commit(txn)
+        }
+
+        fn watch(&self, keyspace: &Self::Keyspace, key: &[u8]) -> hs_kv::watch::Watch {
+            self.inner.watch(keyspace, key)
+        }
+    }
+
+    async fn create<B: KvBackend + 'static>(
+        registry: &Arc<RoomRegistry<B>>,
+        creator: &ruma::UserId,
+        name: &str,
+    ) -> ruma::OwnedRoomId {
+        registry
+            .create_room(
+                creator.to_owned(),
+                CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    name: Some(name.to_owned()),
+                    ..CreateRoomRequest::default()
+                },
+                now_ms(),
+            )
+            .await
+            .unwrap()
+            .query(|a| a.room_id().to_owned())
+            .await
+    }
+
+    async fn membership_in<B: KvBackend + 'static>(
+        registry: &Arc<RoomRegistry<B>>,
+        room_id: &RoomId,
+        user: &ruma::UserId,
+    ) -> Option<String> {
+        let who = user.to_owned();
+        registry
+            .get_or_load(room_id)
+            .await
+            .unwrap()
+            .query(move |actor| {
+                membership_of(actor, &who)
+                    .and_then(|e| content_str(e, "membership"))
+                    .map(str::to_owned)
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn leave_all_rooms_leaves_joined_and_invited_rooms_and_reports_one_it_cannot() {
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let registry = Arc::new(
+            RoomRegistry::open(
+                FailingWrites {
+                    inner: MemoryBackend::new(),
+                    fail: fail.clone(),
+                },
+                HomeserverIdentity::for_tests("example.org"),
+            )
+            .unwrap(),
+        );
+        let alice = user_id!("@alice:example.org").to_owned();
+        let bob = user_id!("@bob:example.org").to_owned();
+        // Bob is joined to one room, invited to another, banned from a third and has left a
+        // fourth; only the first two are his to leave.
+        let joined = create(&registry, &alice, "Joined").await;
+        let invited = create(&registry, &alice, "Invited").await;
+        let banned = create(&registry, &alice, "Banned").await;
+        let gone = create(&registry, &alice, "Gone").await;
+        for (room, actions) in [
+            (&joined, vec![(Action::Join, &bob)]),
+            (&invited, vec![(Action::Invite, &alice)]),
+            (&banned, vec![(Action::Ban, &alice)]),
+            (&gone, vec![(Action::Join, &bob), (Action::Leave, &bob)]),
+        ] {
+            let handle = registry.get_or_load(room).await.unwrap();
+            for (action, sender) in actions {
+                handle
+                    .membership((*sender).clone(), action, bob.clone(), json!({}), now_ms())
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let source = RoomRegistryUserActivity::new(registry.clone());
+        let report = source.leave_all_rooms(bob.as_str()).await.unwrap();
+        let mut left = report.rooms_left.clone();
+        left.sort();
+        let mut expected = vec![joined.to_string(), invited.to_string()];
+        expected.sort();
+        assert_eq!(left, expected, "{report:?}");
+        assert!(report.rooms_failed.is_empty(), "{report:?}");
+        assert_eq!(
+            membership_in(&registry, &joined, &bob).await.as_deref(),
+            Some("leave")
+        );
+        assert_eq!(
+            membership_in(&registry, &invited, &bob).await.as_deref(),
+            Some("leave")
+        );
+        assert_eq!(
+            membership_in(&registry, &banned, &bob).await.as_deref(),
+            Some("ban")
+        );
+        // Alice is still in every room: leaving was bob's alone.
+        assert_eq!(
+            membership_in(&registry, &joined, &alice).await.as_deref(),
+            Some("join")
+        );
+
+        // Nothing left to leave: an empty report, not an error.
+        let again = source.leave_all_rooms(bob.as_str()).await.unwrap();
+        assert_eq!(again, LeaveReport::default());
+
+        // A room whose store refuses the write is reported with the reason and bob stays in it;
+        // once the store is well again the same call leaves it.
+        let stuck = create(&registry, &alice, "Stuck").await;
+        registry
+            .get_or_load(&stuck)
+            .await
+            .unwrap()
+            .membership(bob.clone(), Action::Join, bob.clone(), json!({}), now_ms())
+            .await
+            .unwrap();
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let report = source.leave_all_rooms(bob.as_str()).await.unwrap();
+        assert!(report.rooms_left.is_empty(), "{report:?}");
+        assert_eq!(report.rooms_failed.len(), 1, "{report:?}");
+        assert_eq!(report.rooms_failed[0].room_id, stuck.to_string());
+        assert!(
+            report.rooms_failed[0].reason.contains("disk is full"),
+            "{report:?}"
+        );
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            membership_in(&registry, &stuck, &bob).await.as_deref(),
+            Some("join")
+        );
+        let report = source.leave_all_rooms(bob.as_str()).await.unwrap();
+        assert_eq!(report.rooms_left, vec![stuck.to_string()]);
+        assert_eq!(
+            membership_in(&registry, &stuck, &bob).await.as_deref(),
+            Some("leave")
+        );
     }
 
     #[tokio::test]

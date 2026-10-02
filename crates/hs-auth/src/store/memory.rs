@@ -192,6 +192,16 @@ impl UserStore for InMemoryAuthStore {
         Ok(())
     }
 
+    async fn erase_user(&self, user_id: &UserId, erased_at_ms: u64) -> Result<(), StoreError> {
+        let mut inner = self.lock();
+        let user = inner
+            .users
+            .get_mut(user_id)
+            .ok_or_else(|| StoreError::NotFound(user_id.to_string()))?;
+        user.erase_in_place(erased_at_ms);
+        Ok(())
+    }
+
     async fn set_profile_display_name(
         &self,
         user_id: &UserId,

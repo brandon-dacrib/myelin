@@ -96,7 +96,58 @@ pub fn router(state: AdminProxyState) -> Router {
             "/_synapse/admin/v1/send_server_notice/{txn_id}",
             axum::routing::put(send_server_notice_txn),
         )
+        .route(
+            "/_synapse/admin/v1/deactivate/{user_id}",
+            axum::routing::post(deactivate_user),
+        )
         .with_state(state)
+}
+
+/// `POST /_synapse/admin/v1/deactivate/{user_id}` with `{"erase": bool}` (Synapse's "Deactivate
+/// Account" API), forwarded to the native `users.deactivate` with the same `erase`, so that a
+/// Synapse-era script's deactivation (or erasure) is this server's, audited like any other.
+/// Synapse's answer is `{"id_server_unbind_result": "success"}`; this server does not talk to
+/// identity servers, so it answers `"no-support"`, the spec's value for "not attempted".
+async fn deactivate_user(
+    State(state): State<AdminProxyState>,
+    Path(user_id): Path<String>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let request: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+    let erase = request
+        .get("erase")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let path = format!("/api/v1/users/{}/deactivate", urlencoding_light(&user_id));
+    let mut builder = Request::builder()
+        .method(Method::POST)
+        .uri(&path)
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(auth) = headers.get(header::AUTHORIZATION) {
+        builder = builder.header(header::AUTHORIZATION, auth.clone());
+    }
+    let Ok(request) = builder.body(Body::from(json!({ "erase": erase }).to_string())) else {
+        return translate_error_body(StatusCode::BAD_REQUEST, b"{}");
+    };
+    let response = state
+        .native
+        .clone()
+        .oneshot(request)
+        .await
+        .unwrap_or_else(|infallible: std::convert::Infallible| match infallible {});
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), MAX_NATIVE_RESPONSE_BYTES)
+        .await
+        .unwrap_or_default();
+    if status.is_success() {
+        return (
+            StatusCode::OK,
+            axum::Json(json!({ "id_server_unbind_result": "no-support" })),
+        )
+            .into_response();
+    }
+    translate_error_body(status, &bytes)
 }
 
 /// Forwards a `GET` request with no body to the native router at `path`, carrying over the
@@ -1120,6 +1171,83 @@ mod tests {
             Some(1_704_067_200_000)
         );
         assert_eq!(parse_rfc3339_ms("not a timestamp"), None);
+    }
+
+    #[tokio::test]
+    async fn synapse_deactivate_forwards_erase_to_the_native_operation() {
+        use std::sync::{Arc, Mutex};
+        let seen: Arc<Mutex<Vec<(String, Value)>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let native = Router::new().route(
+            "/api/v1/users/{user_id}/deactivate",
+            post(
+                move |Path(user_id): Path<String>, body: axum::body::Bytes| async move {
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    recorder.lock().unwrap().push((user_id.clone(), body));
+                    if user_id == "@alice:example.org" {
+                        axum::Json(json!({"user_id": user_id, "deactivated": true, "erased": true}))
+                            .into_response()
+                    } else {
+                        (
+                            StatusCode::NOT_FOUND,
+                            axum::Json(json!({"title": "not found", "status": 404, "detail": "no such user"})),
+                        )
+                            .into_response()
+                    }
+                },
+            ),
+        );
+        let app = router(AdminProxyState::new(native));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/_synapse/admin/v1/deactivate/%40alice%3Aexample.org")
+                    .header(header::AUTHORIZATION, "Bearer t")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"erase": true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), MAX_NATIVE_RESPONSE_BYTES)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["id_server_unbind_result"], "no-support");
+
+        // No body: Synapse's default is `erase: false`, and so is the forwarded one.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/_synapse/admin/v1/deactivate/%40bob%3Aexample.org")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body: Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), MAX_NATIVE_RESPONSE_BYTES)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["errcode"], "M_NOT_FOUND");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].0, "@alice:example.org");
+        assert_eq!(seen[0].1, json!({"erase": true}));
+        assert_eq!(seen[1].0, "@bob:example.org");
+        assert_eq!(seen[1].1, json!({"erase": false}));
     }
 
     #[test]

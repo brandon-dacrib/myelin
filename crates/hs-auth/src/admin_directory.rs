@@ -24,8 +24,11 @@
 //! - `user_type`, `consent_version`: user-type categorization is a Phase 1/2 gap noted in this
 //!   crate's own status file. (`appservice_id` is real: the appservice that registered the
 //!   account, if one did.)
-//! - `erased`: account erasure is a Phase 1/2 lifecycle feature this crate has not built yet (see
-//!   this track's brief's "account lifecycle" line).
+//!
+//! `erased` is real since 2026-10-02: [`crate::store::UserRecord::erased`], set by
+//! `UserDirectory::erase` ([`crate::erasure::erase_account`] plus the device-list announcement,
+//! so `hs-e2e` drops the devices' keys). An erased account answers `users.reactivate` and
+//! `users.reset_password` with `409 conflict`.
 //!
 //! The same type also implements `hs_admin::user_identity::UserIdentitySource`: one device read
 //! or renamed, several signed out at once, the account's 3PIDs and upstream-provider subject
@@ -42,7 +45,7 @@ use std::collections::BTreeMap;
 
 use hs_admin::model::{AdminDevice, AdminPasswordReset, AdminUser, ExternalId, ThreePid};
 use hs_admin::sources::{
-    SourceError, UserCreateRequest, UserDirectory, UserFilter, UserLookupQuery,
+    ErasureReport, SourceError, UserCreateRequest, UserDirectory, UserFilter, UserLookupQuery,
 };
 use hs_admin::user_identity::UserIdentitySource;
 
@@ -97,6 +100,7 @@ impl AuthStoreUserDirectory {
             avatar_url: record.avatar_url.clone(),
             admin: record.is_admin,
             deactivated: record.deactivated,
+            erased: record.erased,
             locked: record.locked,
             suspended: record.suspended,
             shadow_banned: record.shadow_banned,
@@ -758,14 +762,10 @@ impl UserDirectory for AuthStoreUserDirectory {
             ));
         };
         let uid = parse_user_id(user_id)?;
-        if self
-            .store
-            .get_user(&uid)
-            .await
-            .map_err(store_unavailable)?
-            .is_none()
-        {
-            return Err(SourceError::NotFound);
+        match self.store.get_user(&uid).await.map_err(store_unavailable)? {
+            None => return Err(SourceError::NotFound),
+            Some(record) if record.erased => return Err(SourceError::Conflict(ERASED.to_owned())),
+            Some(_) => {}
         }
         // The server's own password policy, the same one `/register` and a self-service change
         // apply; an administrator gets its reasons beside the field.
@@ -792,7 +792,34 @@ impl UserDirectory for AuthStoreUserDirectory {
             .await
             .map_err(map_set_error)
     }
+
+    /// `users.deactivate` with `erase: true`: [`crate::erasure::erase_account`], then the
+    /// device-list announcement if any device went, so that `/keys/query` stops serving the
+    /// account's keys the way it does after `delete_devices`.
+    async fn erase(&self, user_id: &str) -> Result<ErasureReport, SourceError> {
+        let uid = self.existing_user(user_id).await?;
+        let erased = crate::erasure::erase_account(self.store.as_ref(), &uid, self.now_ms())
+            .await
+            .map_err(map_set_error)?;
+        if erased.devices_deleted > 0 {
+            self.notify_devices_changed(&uid).await;
+        }
+        tracing::info!(
+            user = %uid,
+            devices_deleted = erased.devices_deleted,
+            threepids_removed = erased.threepids_removed,
+            external_ids_removed = erased.external_ids_removed,
+            "account erased"
+        );
+        Ok(ErasureReport {
+            devices_deleted: erased.devices_deleted as u64,
+        })
+    }
 }
+
+/// The `409` detail for `users.reactivate` and `users.reset_password` on an erased account.
+pub const ERASED: &str =
+    "this account is erased; its data is gone and it cannot be reactivated or signed in to";
 
 #[cfg(test)]
 mod tests {
@@ -1221,6 +1248,71 @@ mod tests {
         assert!(state.store.list_devices(uid).await.unwrap().is_empty());
         assert!(matches!(
             directory.get_device("@nobody:example.org", "A").await,
+            Err(SourceError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn erase_clears_the_account_and_the_record_says_so() {
+        let store = InMemoryAuthStore::new();
+        let uid = ruma::user_id!("@alice:example.org").to_owned();
+        store
+            .create_user(UserRecord::new(uid.clone(), 1))
+            .await
+            .unwrap();
+        store
+            .set_password_hash(&uid, Some("hash".into()))
+            .await
+            .unwrap();
+        store
+            .set_profile_display_name(&uid, Some("Alice".into()))
+            .await
+            .unwrap();
+        for device_id in ["A", "B"] {
+            store
+                .upsert_device(crate::store::DeviceRecord {
+                    user_id: uid.clone(),
+                    device_id: device_id.into(),
+                    display_name: None,
+                    last_seen_ms: None,
+                    last_seen_ip: None,
+                })
+                .await
+                .unwrap();
+        }
+        let directory = directory_with(store);
+
+        let report = directory.erase(uid.as_str()).await.unwrap();
+        assert_eq!(report.devices_deleted, 2);
+        let user = directory.get_user(uid.as_str()).await.unwrap().unwrap();
+        assert!(user.erased && user.deactivated);
+        assert_eq!(user.display_name, None);
+        assert_eq!(user.device_count, 0);
+        // The password is gone, and a new one is refused: the account is not coming back.
+        let refused = directory
+            .reset_password(
+                uid.as_str(),
+                AdminPasswordReset {
+                    password: "another-long-password".into(),
+                    logout_devices: true,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                SourceError::Conflict(_) | SourceError::Unavailable(_)
+            ),
+            "{refused:?}"
+        );
+        // Erasing again removes nothing and is not an error; a stranger is not found.
+        assert_eq!(
+            directory.erase(uid.as_str()).await.unwrap().devices_deleted,
+            0
+        );
+        assert!(matches!(
+            directory.erase("@ghost:example.org").await,
             Err(SourceError::NotFound)
         ));
     }

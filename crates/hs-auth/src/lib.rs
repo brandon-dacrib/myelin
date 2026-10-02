@@ -36,6 +36,7 @@ pub mod admin_verifier;
 pub mod appservice;
 pub mod clock;
 pub mod config;
+pub mod erasure;
 pub mod error;
 pub mod guest;
 pub mod local_user;

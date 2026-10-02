@@ -2,7 +2,8 @@
 
 Track brief: `docs/workstreams/07-auth-and-identity.md`. Owner crate: `hs-auth`.
 
-Last updated: 2026-10-01 (session 11: guest access and third-party invites, below; session 10: the
+Last updated: 2026-10-02 (session 12: account erasure, below; session 11: guest access and
+third-party invites; session 10: the
 setup link without `public_baseurl`; session 9:
 devices, 3PIDs, external ids). Session 7 (2026-09-19)
 audited the login handshake against a real browser client
@@ -11,6 +12,49 @@ found and fixed a real case-sensitivity bug in `POST /login`, re-confirmed `/cap
 unfixed (held by another track this session), checked for Element-Web findings in
 `docs/status/16-management-web-interface.md` (none landed as of this write-up), and designed
 (without implementing) a UIA session-correlation scheme left open at the end of session 5).
+
+## Session 12 (2026-10-02, branch `agent/user-erase`): account erasure
+
+An account can now be erased -- by an administrator (`users.deactivate` with `erase: true`,
+status 15 has the contract) or by its owner (`POST /account/deactivate` with the spec's `erase`
+field, which was parsed and ignored before). Both go through one function,
+`hs_auth::erasure::erase_account`, so that "erased" means one thing: the password hash; every
+access and refresh token; every device (then the device-list announcement, so `hs-e2e` drops the
+devices' keys and `/keys/query` stops serving them, the same path `delete_devices` uses); every
+3PID and external id; the profile display name and avatar URL; the experimental-feature flags.
+It keeps the user id (never registrable again), `created_at_ms`, `is_admin`, the moderation
+flags and `appservice_id`.
+
+- **Store.** `UserRecord.erased: bool` and `erased_at_ms: Option<u64>`, both `#[serde(default)]`
+  so rows written before today still read (a unit test deserialises such a row).
+  `UserStore::erase_user(user_id, erased_at_ms)` sets both, sets `deactivated`, and clears the
+  password hash, display name and avatar in one write (`UserRecord::erase_in_place` is the shared
+  body, so the memory and tables stores cannot drift). The shared store suite has
+  `erase_user_round_trips_and_is_permanent`, run against both stores: `set_deactivated(false)`
+  afterwards leaves `erased` set -- nothing un-erases an account.
+- **Directory.** `AuthStoreUserDirectory` implements `UserDirectory::erase`, maps
+  `UserRecord.erased` onto `AdminUser.erased` (real at last; the module doc no longer lists it
+  as unbuilt), and refuses `reset_password` on an erased account with `409 conflict` ("this
+  account is erased; its data is gone and it cannot be reactivated or signed in to").
+- **Client.** `post_account_deactivate` keeps its byte-for-byte behaviour (set deactivated, clear
+  the password, drop the tokens, `id_server_unbind_result: no-support`) and, with `erase: true`,
+  calls `erase_account` and the device-list announcement after. **It does not leave the user's
+  rooms**: this crate has no seam into `hs-room` except the read-only
+  `UserDirectoryVisibility`, and inventing one for this was out of scope; the admin API's
+  erasure does leave them (status 04). Synapse leaves them in a background job for both paths;
+  that is the gap to close if a self-service erasure should too.
+- **What already followed.** Login is refused for a deactivated account, so for an erased one.
+  `GET /profile/{userId}` answers `{}` for a user with no display name and avatar, so for an
+  erased one. The user directory search already excluded `deactivated` accounts, and erasure
+  sets `deactivated`, so an erased account is not offered either (the real-binary test checks).
+- **Observability.** `tracing::info!` lines: "account erased" (user, devices, 3PIDs, external
+  ids) from the directory, "account erased at its owner's request" from the client route. No
+  counter: `hs-auth` has no metrics registry of its own yet.
+- **Verified.** `cargo test -p hs-auth` (253, including `erasure::tests`,
+  `admin_directory::tests::erase_clears_the_account_and_the_record_says_so`, both store suites and
+  `routes::account::tests::deactivate_with_erase_erases_the_account`), and the real binary in
+  `crates/hs-cli/tests/user_erasure.rs` (status 15 lists what it asserts; bob erases himself
+  through `/account/deactivate` there).
 
 ## Session 11 (2026-10-01, branch `agent/sytest-client`): guest access, third-party invites
 

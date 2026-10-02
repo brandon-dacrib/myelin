@@ -673,7 +673,8 @@ fn admin_state<B: KvBackend + 'static>(
         hs_auth::admin_moderation::AuthStoreUserModeration::from_auth_state(auth),
     ))
     .with_user_activity(Arc::new(
-        hs_room::admin_users::RoomRegistryUserActivity::new(rooms.clone()),
+        hs_room::admin_users::RoomRegistryUserActivity::new(rooms.clone())
+            .with_remote_join(sources.remote_join),
     ))
     // What lets the management interface create this server's first administrator, instead of
     // that taking a shared secret, `hs register --admin`, a `curl` and a pasted token.
@@ -747,6 +748,9 @@ struct AdminSources {
     cluster: Arc<dyn hs_admin::cluster::ClusterSource>,
     user_data: Arc<dyn hs_admin::user_identity::UserDataSource>,
     room_content: Arc<dyn hs_admin::rooms::RoomContentSource>,
+    /// How an erased user's leave reaches a room nobody of this server is joined to: the same
+    /// hook as `RoomState::remote_join`, `None` without federation.
+    remote_join: Option<Arc<dyn hs_room::remote_join::RemoteJoin>>,
 }
 
 /// The `/api/v1` state for [`route_manifest`]'s throwaway router: routes are registered the same
@@ -1910,6 +1914,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             media: media_source,
             cluster: cluster_admin,
             user_data,
+            remote_join: room_state.remote_join.clone(),
             room_content: crate::room_admin::source(
                 rooms.clone(),
                 auth_state.clone(),

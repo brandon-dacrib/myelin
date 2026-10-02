@@ -89,6 +89,17 @@ pub struct UserRecord {
     /// field existed still read.
     #[serde(default)]
     pub rate_limit_override: Option<RateLimitOverrideRecord>,
+    /// Set by erasure (`hs-admin`'s `users.deactivate` with `erase: true`, or the user's own
+    /// `POST /account/deactivate` with `erase: true`): the account's data is gone -- password,
+    /// sessions, devices and their keys, 3PIDs, external ids, profile, experimental features --
+    /// and it can never be reactivated. Always `deactivated` too. `default` so that rows written
+    /// before the field existed still read.
+    #[serde(default)]
+    pub erased: bool,
+    /// When [`UserRecord::erased`] was set, milliseconds since the Unix epoch; `None` for an
+    /// account that is not erased.
+    #[serde(default)]
+    pub erased_at_ms: Option<u64>,
 }
 
 /// A per-user message rate limit set by an administrator ([`UserRecord::rate_limit_override`]).
@@ -119,7 +130,20 @@ impl UserRecord {
             avatar_url: None,
             appservice_id: None,
             rate_limit_override: None,
+            erased: false,
+            erased_at_ms: None,
         }
+    }
+
+    /// What [`UserStore::erase_user`] does to the record: the shared body of both stores'
+    /// implementations, so that they cannot drift on which fields erasure clears.
+    pub fn erase_in_place(&mut self, erased_at_ms: u64) {
+        self.erased = true;
+        self.erased_at_ms = Some(erased_at_ms);
+        self.deactivated = true;
+        self.password_hash = None;
+        self.display_name = None;
+        self.avatar_url = None;
     }
 }
 
@@ -268,6 +292,16 @@ pub trait UserStore: Send + Sync {
         user_id: &ruma::UserId,
         deactivated: bool,
     ) -> Result<(), StoreError>;
+
+    /// Erases the account's record in one write: sets [`UserRecord::erased`] and
+    /// [`UserRecord::erased_at_ms`] (to `erased_at_ms`), sets [`UserRecord::deactivated`], and
+    /// clears the password hash, the profile display name and the avatar URL. What lives in other
+    /// tables (tokens, devices, 3PIDs, external ids, experimental features) is the caller's to
+    /// remove -- [`crate::erasure::erase_account`] does all of it. Errors with
+    /// [`StoreError::NotFound`] if the user does not exist. Erasure is permanent: there is no
+    /// setter that clears the flag.
+    async fn erase_user(&self, user_id: &ruma::UserId, erased_at_ms: u64)
+    -> Result<(), StoreError>;
 
     /// Sets or clears the user's global profile display name
     /// ([`UserRecord::display_name`]). Errors with [`StoreError::NotFound`] if the user does not
@@ -655,4 +689,37 @@ pub trait AuthStore:
 impl<T: UserStore + DeviceStore + TokenStore + UiaStore + SetupStore + IdentityStore> AuthStore
     for T
 {
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UserRecord;
+
+    /// A row written before erasure existed has neither field; it reads as not erased.
+    #[test]
+    fn a_user_row_without_erasure_fields_reads_as_not_erased() {
+        let row = serde_json::json!({
+            "user_id": "@old:example.org",
+            "password_hash": null,
+            "is_admin": false,
+            "is_guest": false,
+            "deactivated": false,
+            "locked": false,
+            "suspended": false,
+            "shadow_banned": false,
+            "created_at_ms": 1,
+            "display_name": "Old",
+            "avatar_url": null
+        });
+        let record: UserRecord = serde_json::from_value(row).unwrap();
+        assert!(!record.erased);
+        assert_eq!(record.erased_at_ms, None);
+        let mut record = record;
+        record.erase_in_place(7);
+        let again: UserRecord =
+            serde_json::from_value(serde_json::to_value(&record).unwrap()).unwrap();
+        assert!(again.erased && again.deactivated);
+        assert_eq!(again.erased_at_ms, Some(7));
+        assert_eq!(again.display_name, None);
+    }
 }

@@ -4,12 +4,32 @@ Track brief: `docs/workstreams/04-room-and-events.md`. Owner crate: `hs-room`.
 
 Last updated: 2026-10-01 (session 16: upgrading a room to version 12; session 15: `POST
 /search`, below). Before that, 2026-09-30 (session
-Last updated: 2026-10-01 (session 17: a new room's id is new; session 15: `POST /search`,
-below). Before that, 2026-09-30 (session
+Last updated: 2026-10-02 (session 18: an erased user leaves every room; session 17: a new
+room's id is new; session 15: `POST /search`, below). Before that, 2026-09-30 (session
 14: a new room's id is placed on a shard the replica building it owns, version 12 included;
 session 13: the state at backfilled history is asked for; session 12: the history between a
 leave and a rejoin; session 11: the client space hierarchy) and 2026-09-28 (session 10: the
 admin API's room long tail).
+
+> **2026-10-02, session 18: an erased user leaves every room** (branch `agent/user-erase`).
+> `hs_room::admin_users::RoomRegistryUserActivity` implements the new
+> `UserActivitySource::leave_all_rooms(user_id) -> LeaveReport`, what `users.deactivate` with
+> `erase: true` calls before the account's data goes (status 15). It walks the user's rooms the
+> way `memberships` does (`rooms_of`, every room this server holds, one state lookup each) and,
+> for each where the user is `join`, `invite` or `knock`, leaves as the user the way
+> `POST /rooms/{id}/leave`'s `act` does: through another server in the room when no user of this
+> server is joined (`servers_to_join_through`, `RemoteJoin::leave`, installed with the new
+> `with_remote_join` -- `hs-cli` passes `RoomState::remote_join`), rejecting the invite or knock
+> here alone when none will (`reject_out_of_band`); through the room (`RoomActorHandle::membership`,
+> `Action::Leave`) otherwise. Bans and earlier leaves are left as they are. A room that cannot
+> be left goes into `rooms_failed` with the error's text and the walk continues; only an invalid
+> user id or an unreadable room list is an `Err`. Tested in `admin_users::tests::
+> leave_all_rooms_leaves_joined_and_invited_rooms_and_reports_one_it_cannot`: a joined room and
+> an invited room are left, a banned and a left one untouched, the other member still joined,
+> a second call is empty; and a room whose store refuses writes (a `KvBackend` wrapper whose
+> `begin`/`commit` fail on a flag -- a user's own leave is always authorised, so only the store
+> can refuse it) is reported with the reason and left once the store is well. Not done: the leave
+> events carry no `reason`; federation does not redact an erased user's events for other servers.
 
 > **2026-10-01, session 16: an upgrade to room version 12 tombstones the old room with the
 > replacement's real id** (branch `agent/room-cluster-small`, its first commit; known gap

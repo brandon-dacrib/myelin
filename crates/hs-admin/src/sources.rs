@@ -15,7 +15,7 @@ use std::sync::RwLock;
 use async_trait::async_trait;
 use hs_config::document::Origin;
 use hs_config::layered::{FileLayer, Layers, Resolved};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::model::{
@@ -238,6 +238,27 @@ pub trait UserDirectory: Send + Sync + 'static {
             "this user directory cannot reset passwords yet".to_string(),
         ))
     }
+
+    /// Erases the account (`users.deactivate` with `erase: true`), for good: the password,
+    /// every session and device (and, through the device-list hook, the devices' keys), every
+    /// 3PID and external id, the profile and the experimental features are removed, and the
+    /// user is marked [`AdminUser::erased`] and [`AdminUser::deactivated`]. What stays: the user
+    /// id, so it can never be registered again, and the events the account sent to its rooms.
+    /// `SourceError::NotFound` for an account that is not there; an already-erased account is
+    /// erased again with nothing to remove (the handler makes that a no-op before calling).
+    async fn erase(&self, user_id: &str) -> Result<ErasureReport, SourceError> {
+        let _ = user_id;
+        Err(SourceError::Unavailable(
+            "this user directory cannot erase accounts yet".to_string(),
+        ))
+    }
+}
+
+/// What [`UserDirectory::erase`] removed, for the audit record.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct ErasureReport {
+    /// Devices deleted, each with its sessions and keys.
+    pub devices_deleted: u64,
 }
 
 /// An in-memory [`UserDirectory`] for this crate's own handler tests. Not a production
@@ -442,13 +463,19 @@ impl UserDirectory for InMemoryUserDirectory {
         user_id: &str,
         request: AdminPasswordReset,
     ) -> Result<(), SourceError> {
-        if !self
+        match self
             .users
             .read()
             .expect("InMemoryUserDirectory lock poisoned")
-            .contains_key(user_id)
+            .get(user_id)
         {
-            return Err(SourceError::NotFound);
+            None => return Err(SourceError::NotFound),
+            Some(user) if user.erased => {
+                return Err(SourceError::Conflict(
+                    "this account is erased; its data is gone and it cannot be reactivated or signed in to".to_owned(),
+                ));
+            }
+            Some(_) => {}
         }
         if request.password.len() < 8 {
             return Err(SourceError::InvalidField {
@@ -464,6 +491,30 @@ impl UserDirectory for InMemoryUserDirectory {
             .expect("InMemoryUserDirectory lock poisoned")
             .insert(user_id.to_owned(), request.password);
         Ok(())
+    }
+
+    async fn erase(&self, user_id: &str) -> Result<ErasureReport, SourceError> {
+        let mut users = self
+            .users
+            .write()
+            .expect("InMemoryUserDirectory lock poisoned");
+        let user = users.get_mut(user_id).ok_or(SourceError::NotFound)?;
+        user.deactivated = true;
+        user.erased = true;
+        user.display_name = None;
+        user.avatar_url = None;
+        let devices_deleted = self
+            .devices
+            .write()
+            .expect("InMemoryUserDirectory lock poisoned")
+            .remove(user_id)
+            .map_or(0, |d| d.len() as u64);
+        user.device_count = 0;
+        self.passwords
+            .write()
+            .expect("InMemoryUserDirectory lock poisoned")
+            .remove(user_id);
+        Ok(ErasureReport { devices_deleted })
     }
 }
 

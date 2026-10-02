@@ -1021,7 +1021,7 @@ struct ReasonRequest {
 }
 
 /// The body of `POST .../deactivate` (OpenAPI's inline schema): like [`ReasonRequest`] plus
-/// `erase`, which this server cannot yet honor (no eraser is wired to [`UserDirectory`]).
+/// `erase`, which makes the deactivation an erasure ([`deactivate_and_erase`]).
 #[derive(Debug, Default, Deserialize)]
 struct DeactivateRequest {
     erase: Option<bool>,
@@ -1198,6 +1198,15 @@ async fn toggle_user_and_record(
         }
         Err(e) => return e.to_problem().with_instance(instance).into_response(),
     };
+
+    // An erased account's data is gone; clearing `deactivated` would make a shell that looks
+    // active and cannot be signed in to. `409`, the same answer `users.reset_password` gives.
+    if field == ToggleField::Deactivated && !target_value && before.erased {
+        return Problem::conflict()
+            .with_detail(ERASED_DETAIL)
+            .with_instance(instance)
+            .into_response();
+    }
 
     let already_set = field.current(&before) == target_value;
     if !already_set && let Err(e) = field.apply(users.as_ref(), &user_id, target_value).await {
@@ -1378,10 +1387,9 @@ async fn users_reactivate(
     }
 }
 
-/// `POST /api/v1/users/{user_id}/deactivate` (`admin:write`). `erase: true` is rejected with a
-/// `400 validation-failed` naming `/erase` rather than silently deactivating without erasing:
-/// no eraser is wired to [`UserDirectory`] yet, and a caller who asked for erasure and got a
-/// quiet no-op would believe data was gone that is not.
+/// `POST /api/v1/users/{user_id}/deactivate` (`admin:write`). Without `erase` it flips
+/// `deactivated` and nothing else ([`toggle_user_and_record`]); with `erase: true` it is
+/// [`deactivate_and_erase`].
 async fn users_deactivate(
     State(state): State<AdminState>,
     headers: HeaderMap,
@@ -1402,14 +1410,16 @@ async fn users_deactivate(
                 Err(p) => return p.with_instance(instance).into_response(),
             };
             if request.erase == Some(true) {
-                return Problem::validation_failed()
-                    .with_detail("erasure is not implemented yet")
-                    .with_errors(vec![ValidationError::new(
-                        "/erase",
-                        "this server cannot erase user data yet; deactivate without erase",
-                    )])
-                    .with_instance(instance)
-                    .into_response();
+                return deactivate_and_erase(
+                    &state,
+                    &headers,
+                    &body,
+                    principal,
+                    user_id,
+                    instance,
+                    request.reason,
+                )
+                .await;
             }
             toggle_user_and_record(
                 &state,
@@ -1429,6 +1439,161 @@ async fn users_deactivate(
         ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
         ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
     }
+}
+
+/// The `409` detail for `users.reactivate` on an erased account (the directory gives
+/// `users.reset_password` the same words).
+const ERASED_DETAIL: &str =
+    "this account is erased; its data is gone and it cannot be reactivated or signed in to";
+
+/// `users.deactivate` with `erase: true`: deactivates the account if it is not already (audited
+/// as `users.deactivate` with the `/deactivated` change and a `user.deactivated` event, exactly as
+/// a plain deactivation is), leaves every room the user is in
+/// ([`crate::user_moderation::UserActivitySource::leave_all_rooms`], while the account still
+/// exists to author the leaves; skipped when no activity source is wired), then erases it
+/// ([`UserDirectory::erase`]) and records a second `users.deactivate` audit entry with the
+/// `/erased` change and a `user.erased` event carrying `reason`, `rooms_left`, `rooms_failed`
+/// and `devices_deleted`. An account already erased is answered `200` with its current record
+/// and no new audit entry. The `idempotency-key` handling is [`toggle_user_and_record`]'s: the
+/// final response is what a replay gets.
+#[allow(clippy::too_many_arguments)]
+async fn deactivate_and_erase(
+    state: &AdminState,
+    headers: &HeaderMap,
+    raw_body: &[u8],
+    principal: Principal,
+    user_id: String,
+    instance: String,
+    reason: Option<String>,
+) -> Response {
+    const OPERATION_ID: &str = "users.deactivate";
+    let Some(users) = &state.users else {
+        return source_unavailable("user directory", &instance);
+    };
+
+    if let Some(key) = idempotency_key(headers) {
+        match state.idempotency.check(OPERATION_ID, key, raw_body) {
+            Replay::Same(stored) => return replay_response(stored),
+            Replay::Mismatch => {
+                return Problem::idempotency_key_payload_mismatch()
+                    .with_instance(instance)
+                    .into_response();
+            }
+            Replay::Fresh => {}
+        }
+    }
+
+    let before = match users.get_user(&user_id).await {
+        Ok(Some(u)) => u,
+        Ok(None) => {
+            return Problem::not_found()
+                .with_detail(format!("no such user: {user_id}"))
+                .with_instance(instance)
+                .into_response();
+        }
+        Err(e) => return e.to_problem().with_instance(instance).into_response(),
+    };
+    let target = ResourceRef::new("user", user_id.clone());
+    let reason_data = match &reason {
+        Some(r) => json!({ "reason": r }),
+        None => json!({}),
+    };
+
+    if !before.erased {
+        if !before.deactivated {
+            if let Err(e) = users.set_deactivated(&user_id, true).await {
+                return e.to_problem().with_instance(instance).into_response();
+            }
+            if let Err(resp) = record_mutation(
+                state,
+                &principal,
+                OPERATION_ID,
+                "user.deactivated",
+                target.clone(),
+                vec![AuditChange {
+                    pointer: "/deactivated".to_owned(),
+                    from: Some(json!(false)),
+                    to: Some(json!(true)),
+                }],
+                reason_data.clone(),
+            )
+            .await
+            {
+                return resp;
+            }
+        }
+
+        // Rooms first: the leaves are authored by an account that still exists.
+        let mut rooms = crate::user_moderation::LeaveReport::default();
+        if let Some(activity) = &state.user_activity {
+            rooms = match activity.leave_all_rooms(&user_id).await {
+                Ok(report) => report,
+                Err(e) => return e.to_problem().with_instance(instance).into_response(),
+            };
+        }
+        let erased = match users.erase(&user_id).await {
+            Ok(report) => report,
+            Err(e) => return e.to_problem().with_instance(instance).into_response(),
+        };
+        let actor = principal.to_actor();
+        tracing::info!(
+            user = %user_id,
+            by = %actor.id,
+            devices_deleted = erased.devices_deleted,
+            rooms_left = rooms.rooms_left.len(),
+            rooms_failed = rooms.rooms_failed.len(),
+            "user erased by an administrator"
+        );
+        let mut event_data = reason_data;
+        event_data["rooms_left"] = json!(rooms.rooms_left.len());
+        event_data["rooms_failed"] = json!(rooms.rooms_failed.len());
+        event_data["devices_deleted"] = json!(erased.devices_deleted);
+        if !rooms.rooms_failed.is_empty() {
+            event_data["failures"] = json!(rooms.rooms_failed);
+        }
+        if let Err(resp) = record_mutation(
+            state,
+            &principal,
+            OPERATION_ID,
+            "user.erased",
+            target,
+            vec![AuditChange {
+                pointer: "/erased".to_owned(),
+                from: Some(json!(false)),
+                to: Some(json!(true)),
+            }],
+            event_data,
+        )
+        .await
+        {
+            return resp;
+        }
+    }
+
+    let updated = match users.get_user(&user_id).await {
+        Ok(Some(u)) => u,
+        Ok(None) => before,
+        Err(e) => return e.to_problem().with_instance(instance).into_response(),
+    };
+    let response_body = serde_json::to_vec(&updated).unwrap_or_default();
+    if let Some(key) = idempotency_key(headers) {
+        state.idempotency.record(
+            OPERATION_ID,
+            key,
+            raw_body,
+            StoredResponse {
+                status: 200,
+                content_type: "application/json".to_string(),
+                body: response_body.clone(),
+            },
+        );
+    }
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        response_body,
+    )
+        .into_response()
 }
 
 /// The OpenAPI `UserUpdate` schema, read as `Option<Value>` per field (rather than `Option<T>`)
@@ -6067,25 +6232,244 @@ mod tests {
         assert_eq!(entries.len(), 1);
     }
 
-    #[tokio::test]
-    async fn users_deactivate_rejects_explicit_erase() {
-        let (router, _manifest) = build_router(state_with_users());
-        let response = router
+    /// [`state_with_users`] plus a device for alice and three rooms she is in (joined,
+    /// invited, and one the room layer cannot leave), for the erasure tests.
+    fn state_for_erasure() -> AdminState {
+        use crate::model::{AdminDevice, AdminUser};
+        use crate::sources::InMemoryUserDirectory;
+        use crate::user_moderation::{AdminUserMembership, InMemoryUserActivity};
+
+        let mut admin_user = AdminUser {
+            user_id: "@ops:example.org".to_string(),
+            ..Default::default()
+        };
+        admin_user.admin = true;
+        let alice = AdminUser {
+            user_id: "@alice:example.org".to_string(),
+            display_name: Some("Alice".to_string()),
+            avatar_url: Some("mxc://example.org/alice".to_string()),
+            device_count: 1,
+            ..Default::default()
+        };
+        let directory = InMemoryUserDirectory::new()
+            .with_user(admin_user)
+            .with_user(alice)
+            .with_device(
+                "@alice:example.org",
+                AdminDevice {
+                    device_id: "LAPTOP".to_string(),
+                    display_name: None,
+                    last_seen_ip: None,
+                    last_seen_at: None,
+                },
+            );
+        let membership = |room_id: &str, membership: &str| AdminUserMembership {
+            room_id: room_id.to_string(),
+            room_name: None,
+            user_id: "@alice:example.org".to_string(),
+            membership: membership.to_string(),
+            display_name: None,
+            avatar_url: None,
+        };
+        let activity = InMemoryUserActivity::new()
+            .with_membership(membership("!joined:example.org", "join"))
+            .with_membership(membership("!invited:example.org", "invite"))
+            .with_membership(membership("!stuck:example.org", "join"))
+            .with_membership(membership("!gone:example.org", "leave"))
+            .with_unleavable_room("!stuck:example.org");
+        test_state()
+            .with_users(Arc::new(directory))
+            .with_user_activity(Arc::new(activity))
+    }
+
+    async fn post_user(router: &axum::Router, user: &str, verb: &str, body: &str) -> Response {
+        router
+            .clone()
             .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/users/{user}/{verb}"))
+                    .header("authorization", "Bearer admin-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_owned()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn users_deactivate_with_erase_deactivates_leaves_rooms_and_erases() {
+        let state = state_for_erasure();
+        let mut rx = state.events.subscribe();
+        let (router, _manifest) = build_router(state);
+
+        let response = post_user(
+            &router,
+            "%40alice%3Aexample.org",
+            "deactivate",
+            r#"{"erase":true,"reason":"gdpr"}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let user: crate::model::AdminUser =
+            serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert!(user.deactivated && user.erased, "{user:?}");
+        assert_eq!(user.display_name, None);
+        assert_eq!(user.avatar_url, None);
+        assert_eq!(user.device_count, 0);
+
+        let deactivated = rx.recv().await.unwrap();
+        assert_eq!(deactivated.r#type, "user.deactivated");
+        let erased = rx.recv().await.unwrap();
+        assert_eq!(erased.r#type, "user.erased");
+        assert_eq!(erased.data["reason"], "gdpr");
+        assert_eq!(erased.data["rooms_left"], 2, "{}", erased.data);
+        assert_eq!(erased.data["rooms_failed"], 1);
+        assert_eq!(erased.data["failures"][0]["room_id"], "!stuck:example.org");
+        assert_eq!(erased.data["devices_deleted"], 1);
+
+        let entries = audit_entries_for_action(&router, "users.deactivate").await;
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        let pointers: Vec<&str> = entries
+            .iter()
+            .flat_map(|e| e.changes.iter().map(|c| c.pointer.as_str()))
+            .collect();
+        assert!(pointers.contains(&"/deactivated") && pointers.contains(&"/erased"));
+
+        // The directory's memberships reflect the leaves.
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/users/%40alice%3Aexample.org/memberships?membership=join")
+                    .header("authorization", "Bearer admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let page: serde_json::Value = serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(page["items"].as_array().unwrap().len(), 1, "{page}");
+        assert_eq!(page["items"][0]["room_id"], "!stuck:example.org");
+    }
+
+    #[tokio::test]
+    async fn users_deactivate_with_erase_on_a_deactivated_account_only_erases() {
+        let state = state_for_erasure();
+        let mut rx = state.events.subscribe();
+        let (router, _manifest) = build_router(state);
+
+        let response = post_user(&router, "%40alice%3Aexample.org", "deactivate", "{}").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(rx.recv().await.unwrap().r#type, "user.deactivated");
+
+        let response = post_user(
+            &router,
+            "%40alice%3Aexample.org",
+            "deactivate",
+            r#"{"erase":true}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let user: crate::model::AdminUser =
+            serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert!(user.erased);
+        let event = rx.recv().await.unwrap();
+        assert_eq!(event.r#type, "user.erased");
+        assert!(event.data.get("reason").is_none());
+        assert_eq!(
+            audit_entries_for_action(&router, "users.deactivate")
+                .await
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn users_deactivate_with_erase_is_a_no_op_the_second_time_and_closes_the_account() {
+        let state = state_for_erasure();
+        let (router, _manifest) = build_router(state);
+
+        let first = post_user(
+            &router,
+            "%40alice%3Aexample.org",
+            "deactivate",
+            r#"{"erase":true}"#,
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let before = audit_entries_for_action(&router, "users.deactivate")
+            .await
+            .len();
+        assert_eq!(before, 2);
+
+        let again = post_user(
+            &router,
+            "%40alice%3Aexample.org",
+            "deactivate",
+            r#"{"erase":true}"#,
+        )
+        .await;
+        assert_eq!(again.status(), StatusCode::OK);
+        let user: crate::model::AdminUser =
+            serde_json::from_slice(&body_bytes(again).await).unwrap();
+        assert!(user.erased && user.deactivated);
+        assert_eq!(
+            audit_entries_for_action(&router, "users.deactivate")
+                .await
+                .len(),
+            before,
+            "an already-erased account is not audited again"
+        );
+
+        // Reactivation and a new password are refused: the account is gone.
+        let response = post_user(&router, "%40alice%3Aexample.org", "reactivate", "{}").await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let problem: hs_http::Problem =
+            serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert!(
+            problem.detail.as_deref().unwrap_or("").contains("erased"),
+            "{problem:?}"
+        );
+        let response = post_user(
+            &router,
+            "%40alice%3Aexample.org",
+            "reset-password",
+            r#"{"password":"a-brand-new-password"}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(
+            audit_entries_for_action(&router, "users.reactivate")
+                .await
+                .is_empty()
+        );
+        assert!(
+            audit_entries_for_action(&router, "users.reset_password")
+                .await
+                .is_empty()
+        );
+
+        // An idempotency key replays the final answer.
+        let keyed = |router: &axum::Router| {
+            router.clone().oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/api/v1/users/%40alice%3Aexample.org/deactivate")
                     .header("authorization", "Bearer admin-token")
                     .header("content-type", "application/json")
+                    .header("idempotency-key", "erase-1")
                     .body(Body::from(r#"{"erase":true}"#))
                     .unwrap(),
             )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let problem: hs_http::Problem =
-            serde_json::from_slice(&body_bytes(response).await).unwrap();
-        assert!(problem.errors.iter().any(|e| e.pointer == "/erase"));
+        };
+        let first = keyed(&router).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert!(first.headers().get("idempotency-replayed").is_none());
+        let replay = keyed(&router).await.unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(replay.headers()["idempotency-replayed"], "true");
     }
 
     #[tokio::test]

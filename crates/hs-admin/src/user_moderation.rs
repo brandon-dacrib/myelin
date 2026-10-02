@@ -210,6 +210,36 @@ pub trait UserActivitySource: Send + Sync + 'static {
         target: &RedactTarget,
         reason: Option<&str>,
     ) -> Result<(), SourceError>;
+    /// Leaves every room the user is joined to, invited to or knocking on, as the user
+    /// themself, the way `POST /rooms/{id}/leave` does (through another server for a room no
+    /// user of this server is joined to). A room that cannot be left is reported in
+    /// [`LeaveReport::rooms_failed`], not an error: the caller (`users.deactivate` with
+    /// `erase: true`) goes on to erase the account either way. `Err` only when nothing could be
+    /// attempted (an invalid user id, the room store unavailable).
+    async fn leave_all_rooms(&self, user_id: &str) -> Result<LeaveReport, SourceError> {
+        let _ = user_id;
+        Err(SourceError::Unavailable(
+            "this activity source cannot leave rooms yet".to_string(),
+        ))
+    }
+}
+
+/// What [`UserActivitySource::leave_all_rooms`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaveReport {
+    /// The rooms left, by id.
+    pub rooms_left: Vec<String>,
+    /// The rooms the user is still in, with why each leave failed.
+    pub rooms_failed: Vec<LeaveFailure>,
+}
+
+/// One room [`UserActivitySource::leave_all_rooms`] could not leave.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaveFailure {
+    /// The room.
+    pub room_id: String,
+    /// The room layer's reason, as text.
+    pub reason: String,
 }
 
 /// An in-memory [`UserModerationSource`], for tests and the mock server.
@@ -351,6 +381,8 @@ pub struct InMemoryUserActivity {
     memberships: RwLock<Vec<AdminUserMembership>>,
     events: RwLock<Vec<(String, RedactTarget)>>,
     redacted: RwLock<Vec<RedactTarget>>,
+    /// Rooms `leave_all_rooms` reports as failed instead of leaving.
+    unleavable: RwLock<Vec<String>>,
 }
 
 impl InMemoryUserActivity {
@@ -381,6 +413,16 @@ impl InMemoryUserActivity {
                     event_id: event_id.to_owned(),
                 },
             ));
+        self
+    }
+
+    /// Makes `leave_all_rooms` fail for `room_id`, reporting it rather than leaving it.
+    #[must_use]
+    pub fn with_unleavable_room(self, room_id: &str) -> Self {
+        self.unleavable
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(room_id.to_owned());
         self
     }
 
@@ -460,6 +502,33 @@ impl UserActivitySource for InMemoryUserActivity {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(target.clone());
         Ok(())
+    }
+
+    async fn leave_all_rooms(&self, user_id: &str) -> Result<LeaveReport, SourceError> {
+        let unleavable = self
+            .unleavable
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let mut report = LeaveReport::default();
+        let mut memberships = self
+            .memberships
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for m in memberships.iter_mut().filter(|m| {
+            m.user_id == user_id && matches!(m.membership.as_str(), "join" | "invite" | "knock")
+        }) {
+            if unleavable.contains(&m.room_id) {
+                report.rooms_failed.push(LeaveFailure {
+                    room_id: m.room_id.clone(),
+                    reason: "cannot be left in this test".to_owned(),
+                });
+            } else {
+                m.membership = "leave".to_owned();
+                report.rooms_left.push(m.room_id.clone());
+            }
+        }
+        Ok(report)
     }
 }
 

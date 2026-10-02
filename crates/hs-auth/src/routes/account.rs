@@ -98,6 +98,24 @@ pub async fn post_account_deactivate(
         .delete_all_refresh_tokens_for_user(&requester.user_id)
         .await?;
 
+    // The spec's `erase` (MSC2438): the same erasure an administrator's `users.deactivate`
+    // with `erase: true` performs, minus leaving the account's rooms, which this crate cannot
+    // see (see `crate::erasure`); the devices' keys go with the devices, through the
+    // device-list hook.
+    if body.get("erase").and_then(Value::as_bool) == Some(true) {
+        let erased =
+            crate::erasure::erase_account(state.store.as_ref(), &requester.user_id, state.now_ms())
+                .await?;
+        if erased.devices_deleted > 0 {
+            state.notify_device_list_changed(&requester.user_id).await;
+        }
+        tracing::info!(
+            user = %requester.user_id,
+            devices_deleted = erased.devices_deleted,
+            "account erased at its owner's request"
+        );
+    }
+
     // We do not implement identity-server unbinding (no identity-server client in this crate
     // yet); "no-support" is the spec's documented value for "the server did not attempt it".
     Ok(Json(json!({"id_server_unbind_result": "no-support"})).into_response())
@@ -330,6 +348,43 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn deactivate_with_erase_erases_the_account() {
+        let (state, requester) = state_with_user("oldpassword1").await;
+        state
+            .store
+            .set_profile_display_name(&requester.user_id, Some("Alice".into()))
+            .await
+            .unwrap();
+        let body = json!({"erase": true, "auth": {"type": "m.login.password", "identifier": {"type": "m.id.user", "user": "alice"}, "password": "oldpassword1"}});
+        let response = post_account_deactivate(
+            State(state.clone()),
+            requester.clone(),
+            PermissiveJson(body),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let user = state
+            .store
+            .get_user(&requester.user_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(user.deactivated && user.erased);
+        assert!(user.erased_at_ms.is_some());
+        assert_eq!(user.display_name, None);
+        assert!(
+            state
+                .store
+                .list_devices(&requester.user_id)
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 

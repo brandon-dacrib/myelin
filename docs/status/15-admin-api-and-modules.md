@@ -2,6 +2,69 @@
 
 Track brief: `docs/workstreams/15-admin-api-and-modules.md`. Owner crates: `hs-admin`, `hs-modules`, `hs-identity`, `hs-http` (shared with 07 and 14).
 
+## 2026-10-02: a user can be erased
+
+Branch `agent/user-erase`. `POST /users/{user_id}/deactivate` with `erase: true` used to be a
+`400` ("erasure is not implemented yet"). It now deactivates the account if it is not already
+and then erases it; the web interface (another agent, same day) builds its "Delete user" flow on
+this contract.
+
+**Contract** (`openapi.yaml` 0.1.1 -- `agent/admin-token` also bumps the version, to 0.1.2;
+whichever merges second keeps the higher number). The operation's description says exactly what
+erasure removes and keeps; `User.erased` has a description. In short, erasure removes the
+password, every session, every device and its keys, every 3PID and external id, the profile, the
+experimental features, and the user's membership of every room they are joined to, invited to or
+knocking on; it keeps the user id, the account's flags and `appservice_id`, the events it sent
+(`users.redact_events`) and its media (`users.media.delete`). An already-deactivated account is
+erased (`200`); an already-erased one is a `200` no-op with no new audit entry;
+`users.reactivate` and `users.reset_password` answer `409 conflict` with "this account is erased;
+its data is gone and it cannot be reactivated or signed in to". The no-erase path is unchanged.
+
+**Handler** (`router.rs`, `deactivate_and_erase`): the idempotency check first, as the toggle
+path does; the user or `404`; if not yet deactivated, `set_deactivated(true)` and the same
+`users.deactivate` audit entry (`/deactivated` false→true) and `user.deactivated` event a plain
+deactivation writes; then, when an activity source is wired, `UserActivitySource::leave_all_rooms`
+(status 04) -- before the directory erase, so the leaves are authored while the account still
+exists; then `UserDirectory::erase`; then a second `users.deactivate` audit entry with the
+`/erased` change and a `user.erased` event with `{reason, rooms_left, rooms_failed,
+devices_deleted}` (and `failures: [{room_id, reason}]` when a room could not be left); an
+info-level log line (user, who, devices, rooms left and failed); the updated `User`; and the
+final response recorded under the idempotency key. The audit `action` stays `users.deactivate`
+for both entries because `AuditEntry.action` is documented as an operation id: an interface
+telling them apart reads `changes[].pointer`. A room that cannot be left is counted, not fatal;
+a `leave_all_rooms` call that fails outright (no room store) is the error, before anything is
+erased. No `hs_admin_user_erasures_total`: `hs-admin` has no metrics registry (only tracing); the
+log line and the audit entry are the record.
+
+**Seams.** `UserDirectory::erase(user_id) -> ErasureReport { devices_deleted }` in `sources.rs`
+(default body answers `503`, as the other newer methods do; `InMemoryUserDirectory` implements
+it) and `UserActivitySource::leave_all_rooms(user_id) -> LeaveReport { rooms_left, rooms_failed:
+[LeaveFailure { room_id, reason }] }` in `user_moderation.rs` (`InMemoryUserActivity` implements
+it, with `with_unleavable_room` for tests). `hs-auth` and `hs-room` implement them (statuses 07
+and 04); `hs-cli` wires the room side's federation hook (`RoomRegistryUserActivity::with_remote_join`,
+a new `AdminSources.remote_join`).
+
+**Synapse compatibility.** `POST /_synapse/admin/v1/deactivate/{user_id}` with `{"erase": bool}`
+is new in `hs-compat`'s admin proxy, forwarding the same `erase` to the native operation and
+answering `{"id_server_unbind_result": "no-support"}`. **The proxy is still not mounted by
+`hs serve`** (nothing in `serve.rs` builds `AdminProxyState`), so this is unit-tested against a
+fake native router only; mounting it is the open item it always was.
+
+**Verified.** `cargo test -p hs-admin` (`users_deactivate_with_erase_*`: an active account, a
+deactivated one, the idempotent repeat with reactivate and reset-password refused and an
+idempotency-key replay), `-p hs-compat`, and the real binary: `crates/hs-cli/tests/user_erasure.rs`
+registers alice, names her, uploads device keys, has her make a room bob joins, then the
+administrator erases her and the test asserts `GET /users/{id}` says deactivated and erased with
+no display name and no devices, `/keys/query` from bob has no keys for her, the room's
+`m.room.member` state is `leave`, her access token is `401 M_UNKNOWN_TOKEN`, `/profile` is
+empty, the directory search does not find her, the audit log holds the `/erased` change,
+`users.reactivate` and `users.reset_password` are `409`, login is `403`, a second erase changes
+nothing, and bob's own `/account/deactivate` with `erase` erases him.
+
+**Not done.** Federation does not yet redact an erased user's events when serving them to other
+servers (Synapse's `erased_users` table does); a self-service erasure does not leave rooms
+(status 07); the Synapse proxy is not mounted.
+
 ## 2026-10-01: every operation enforces the scope the document gives it
 
 Branch `agent/admin-scopes`. Handlers check their scope inline, so `operations.json` alone

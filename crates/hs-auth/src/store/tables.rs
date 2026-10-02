@@ -302,6 +302,11 @@ impl<B: KvBackend> UserStore for TablesAuthStore<B> {
             .await
     }
 
+    async fn erase_user(&self, user_id: &UserId, erased_at_ms: u64) -> Result<(), StoreError> {
+        self.update_user(user_id, |u| u.erase_in_place(erased_at_ms))
+            .await
+    }
+
     async fn set_profile_display_name(
         &self,
         user_id: &UserId,

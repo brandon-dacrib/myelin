@@ -138,6 +138,44 @@ pub(crate) async fn user_flag_setters_round_trip<S: AuthStore>(s: &S) {
     );
 }
 
+pub(crate) async fn erase_user_round_trips_and_is_permanent<S: AuthStore>(s: &S) {
+    let uid = user_id!("@erased:example.org").to_owned();
+    s.create_user(UserRecord::new(uid.clone(), 1))
+        .await
+        .unwrap();
+    s.set_password_hash(&uid, Some("hash".to_string()))
+        .await
+        .unwrap();
+    s.set_profile_display_name(&uid, Some("Erased Soon".to_string()))
+        .await
+        .unwrap();
+    s.set_profile_avatar_url(&uid, Some("mxc://example.org/x".to_string()))
+        .await
+        .unwrap();
+    let before = s.get_user(&uid).await.unwrap().unwrap();
+    assert!(!before.erased);
+    assert_eq!(before.erased_at_ms, None);
+
+    s.erase_user(&uid, 4_200).await.unwrap();
+
+    let got = s.get_user(&uid).await.unwrap().unwrap();
+    assert!(got.erased);
+    assert_eq!(got.erased_at_ms, Some(4_200));
+    assert!(got.deactivated);
+    assert_eq!(got.password_hash, None);
+    assert_eq!(got.display_name, None);
+    assert_eq!(got.avatar_url, None);
+    // The flag survives whatever else is set afterwards: nothing un-erases an account.
+    s.set_deactivated(&uid, false).await.unwrap();
+    let got = s.get_user(&uid).await.unwrap().unwrap();
+    assert!(got.erased);
+    assert!(
+        s.erase_user(user_id!("@ghost:example.org"), 1)
+            .await
+            .is_err()
+    );
+}
+
 pub(crate) async fn set_password_hash_on_missing_user_is_not_found<S: AuthStore>(s: &S) {
     let err = s
         .set_password_hash(user_id!("@ghost:example.org"), Some("x".to_string()))
@@ -755,6 +793,7 @@ pub(crate) async fn run_all<S: AuthStore>(make_store: impl Fn() -> S) {
     list_users_is_sorted_by_user_id(&make_store()).await;
     is_localpart_available_reflects_existing_users(&make_store()).await;
     user_flag_setters_round_trip(&make_store()).await;
+    erase_user_round_trips_and_is_permanent(&make_store()).await;
     set_password_hash_on_missing_user_is_not_found(&make_store()).await;
     upgrading_a_guest_clears_the_flag_and_sets_the_password(&make_store()).await;
     profile_fields_round_trip(&make_store()).await;
