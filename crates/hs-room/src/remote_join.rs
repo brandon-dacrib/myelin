@@ -125,4 +125,25 @@ pub trait RemoteJoin: Send + Sync {
             event.event_id()
         )))
     }
+
+    /// `server`'s public room directory (`GET`/`POST /_matrix/federation/v1/publicRooms`), the
+    /// page as that server answered it (`chunk`, `next_batch`, `prev_batch`,
+    /// `total_room_count_estimate`): what `GET /publicRooms?server=` passes through. `limit`
+    /// and `since` page it; `search` narrows it (a `POST` with `filter.generic_search_term`).
+    ///
+    /// # Errors
+    /// [`RoomError::RemoteJoinFailed`] if the server could not be asked or answered with
+    /// something other than a room list (`502` to the client).
+    async fn public_rooms(
+        &self,
+        server: &str,
+        limit: Option<usize>,
+        since: Option<&str>,
+        search: Option<&str>,
+    ) -> Result<Value, RoomError> {
+        let _ = (limit, since, search);
+        Err(RoomError::RemoteJoinFailed(format!(
+            "cannot fetch the public room list of {server}"
+        )))
+    }
 }

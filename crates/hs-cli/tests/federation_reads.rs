@@ -58,9 +58,6 @@ impl Harness {
         let identity = HomeserverIdentity::for_tests(US);
         let rooms = Arc::new(RoomRegistry::open(backend.clone(), identity).expect("registry"));
 
-        let user_store: hs_user::store::DynUserStore = Arc::new(
-            hs_user::store::tables::TablesUserStore::open(backend.clone()).expect("user store"),
-        );
         let auth_store: Arc<dyn hs_auth::store::AuthStore> = Arc::new(
             hs_auth::store::tables::TablesAuthStore::open(backend.clone()).expect("auth store"),
         );
@@ -70,10 +67,7 @@ impl Harness {
 
         let state = hs_federation::transport::FederationState {
             own_server_name: Arc::from(US),
-            rooms: Arc::new(hs_cli::federation::RegistryRoomSource::new(
-                rooms.clone(),
-                user_store,
-            )),
+            rooms: Arc::new(hs_cli::federation::RegistryRoomSource::new(rooms.clone())),
             queries: Arc::new(hs_cli::federation::ServerQuerySource::new(
                 auth_store,
                 e2e_store,
@@ -504,6 +498,52 @@ async fn backfill_walks_the_timeline_backwards_from_the_live_end() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let pdus = body["pdus"].as_array().expect("pdus");
     assert!(pdus.len() <= 3, "the server-side limit must be honoured");
+}
+
+/// Sytest's "Inbound federation can get public room list" and "Federation publicRoom Name/topic
+/// keys are correct": the federation directory lists the rooms published to it -- whatever
+/// their join rule -- with the client-server entry shape (a name or topic never set is left
+/// out), and nothing that is not published, public-join or not.
+#[tokio::test]
+async fn the_federation_directory_lists_the_published_rooms() {
+    let harness = Harness::new().await;
+    let (unpublished, _) = harness.room_with_a_message(false).await;
+    let creator = ruma::UserId::parse(format!("@alice:{US}")).unwrap();
+    let invite_only = harness
+        .rooms
+        .create_room(
+            creator.clone(),
+            hs_room::actor::CreateRoomRequest {
+                preset: Some("private_chat".to_owned()),
+                name: Some("Published, invite-only".to_owned()),
+                ..Default::default()
+            },
+            1_000,
+        )
+        .await
+        .expect("room creation");
+    let published_id = invite_only.query(|actor| actor.room_id().to_owned()).await;
+    harness
+        .rooms
+        .set_directory_visibility(&published_id, true)
+        .expect("published");
+
+    let (status, body) = harness.signed_get("/publicRooms").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let chunk = body["chunk"].as_array().expect("chunk");
+    assert_eq!(chunk.len(), 1, "{body}");
+    let entry = &chunk[0];
+    assert_eq!(entry["room_id"], published_id.as_str(), "{body}");
+    assert_eq!(entry["name"], "Published, invite-only", "{body}");
+    assert!(entry.get("topic").is_none(), "{body}");
+    assert_eq!(entry["num_joined_members"], 1, "{body}");
+    assert_eq!(entry["world_readable"], false, "{body}");
+    assert_eq!(entry["guest_can_join"], true, "{body}");
+    assert_eq!(entry["join_rule"], "invite", "{body}");
+    assert!(
+        !chunk.iter().any(|room| room["room_id"] == unpublished),
+        "an unpublished public-join room is not listed: {body}"
+    );
 }
 
 /// Sytest's "Backfill checks the events requested belong to the room": asked to walk back from

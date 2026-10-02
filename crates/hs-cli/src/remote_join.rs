@@ -246,6 +246,43 @@ fn map_outbound_error(error: &OutboundJoinError) -> RoomError {
     }
 }
 
+/// The method, path and body of a directory request to another server: `GET` with the paging
+/// in the query string, or `POST` carrying it with the search filter.
+fn public_rooms_request(
+    limit: Option<usize>,
+    since: Option<&str>,
+    search: Option<&str>,
+) -> (&'static str, String, Option<Value>) {
+    const PATH: &str = "/_matrix/federation/v1/publicRooms";
+    match search {
+        Some(term) => {
+            let mut body = serde_json::json!({"filter": {"generic_search_term": term}});
+            if let Some(limit) = limit {
+                body["limit"] = serde_json::json!(limit);
+            }
+            if let Some(since) = since {
+                body["since"] = serde_json::json!(since);
+            }
+            ("POST", PATH.to_owned(), Some(body))
+        }
+        None => {
+            let mut params = Vec::new();
+            if let Some(limit) = limit {
+                params.push(format!("limit={limit}"));
+            }
+            if let Some(since) = since {
+                params.push(format!("since={}", query_encode(since)));
+            }
+            let path = if params.is_empty() {
+                PATH.to_owned()
+            } else {
+                format!("{PATH}?{}", params.join("&"))
+            };
+            ("GET", path, None)
+        }
+    }
+}
+
 /// Percent-encodes `value` for a query string: everything but the unreserved characters.
 pub(crate) fn query_encode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
@@ -443,6 +480,39 @@ impl<B: KvBackend + 'static> hs_room::remote_join::RemoteJoin for FederationRemo
             .unwrap_or_default();
         Ok((room_id.to_owned(), servers))
     }
+
+    async fn public_rooms(
+        &self,
+        server: &str,
+        limit: Option<usize>,
+        since: Option<&str>,
+        search: Option<&str>,
+    ) -> Result<Value, RoomError> {
+        let (method, path, body) = public_rooms_request(limit, since, search);
+        let response = self
+            .client
+            .send(server, method, &path, body.as_ref())
+            .await
+            .map_err(|e| {
+                RoomError::RemoteJoinFailed(format!(
+                    "could not ask {server} for its room list: {e}"
+                ))
+            })?;
+        if response.status / 100 != 2 {
+            return Err(RoomError::RemoteJoinFailed(format!(
+                "{server} answered the room list request with HTTP {}: {}",
+                response.status, response.body
+            )));
+        }
+        if !response.body.get("chunk").is_some_and(Value::is_array) {
+            return Err(RoomError::RemoteJoinFailed(format!(
+                "{server} answered the room list request with something other than a room list: {}",
+                response.body
+            )));
+        }
+        tracing::debug!(server, "fetched another server's public room list");
+        Ok(response.body)
+    }
 }
 
 #[cfg(test)]
@@ -525,5 +595,29 @@ mod tests {
             map_outbound_error(&unable),
             RoomError::RemoteJoinFailed(_)
         ));
+    }
+
+    #[test]
+    fn a_directory_request_pages_in_the_query_string_and_a_search_makes_it_a_post() {
+        assert_eq!(
+            public_rooms_request(None, None, None),
+            ("GET", "/_matrix/federation/v1/publicRooms".to_owned(), None)
+        );
+        assert_eq!(
+            public_rooms_request(Some(5), Some("10"), None),
+            (
+                "GET",
+                "/_matrix/federation/v1/publicRooms?limit=5&since=10".to_owned(),
+                None
+            )
+        );
+        assert_eq!(
+            public_rooms_request(Some(5), None, Some("tea")),
+            (
+                "POST",
+                "/_matrix/federation/v1/publicRooms".to_owned(),
+                Some(serde_json::json!({"filter": {"generic_search_term": "tea"}, "limit": 5}))
+            )
+        );
     }
 }

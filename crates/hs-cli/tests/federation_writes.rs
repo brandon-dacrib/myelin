@@ -123,9 +123,6 @@ impl Harness {
         let us_keys = hs_federation::keys::OwnSigningKeys::from_keys(vec![us_signing_key.clone()]);
         let rooms = Arc::new(RoomRegistry::open(backend.clone(), identity).expect("registry"));
 
-        let user_store: hs_user::store::DynUserStore = Arc::new(
-            hs_user::store::tables::TablesUserStore::open(backend.clone()).expect("user store"),
-        );
         let auth_store: Arc<dyn hs_auth::store::AuthStore> = Arc::new(
             hs_auth::store::tables::TablesAuthStore::open(backend.clone()).expect("auth store"),
         );
@@ -157,10 +154,7 @@ impl Harness {
 
         let state = hs_federation::transport::FederationState {
             own_server_name: Arc::from(US),
-            rooms: Arc::new(hs_cli::federation::RegistryRoomSource::new(
-                rooms.clone(),
-                user_store,
-            )),
+            rooms: Arc::new(hs_cli::federation::RegistryRoomSource::new(rooms.clone())),
             queries: Arc::new(hs_cli::federation::ServerQuerySource::new(
                 auth_store,
                 e2e_store,
@@ -566,6 +560,15 @@ async fn send_rejects_a_new_event_whose_auth_events_do_not_authorize_it() {
     );
     let (status, fetched) = harness.signed_get(&format!("/event/{event_id}")).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{fetched}");
+    // Nor is there a state at it (Sytest's "/state[_ids] returns M_NOT_FOUND for a rejected
+    // message event"): until 2026-10-02 both answered the state before it.
+    for endpoint in ["state", "state_ids"] {
+        let (status, body) = harness
+            .signed_get(&format!("/{endpoint}/{room_id}?event_id={event_id}"))
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{endpoint}: {body}");
+        assert_eq!(body["errcode"], "M_NOT_FOUND", "{endpoint}: {body}");
+    }
 }
 
 #[tokio::test]

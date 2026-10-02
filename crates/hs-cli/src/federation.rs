@@ -66,18 +66,17 @@ const MAX_TIMESTAMP_SCAN: usize = 10_000;
 // Room data
 // ------------------------------------------------------------------------------------------
 
-/// [`RoomDataSource`] over `hs-room`'s [`RoomRegistry`] and `hs-user`'s published-room directory.
+/// [`RoomDataSource`] over `hs-room`'s [`RoomRegistry`], its published-room directory included.
 pub struct RegistryRoomSource<B: KvBackend> {
     rooms: Arc<RoomRegistry<B>>,
-    directory: hs_user::store::DynUserStore,
 }
 
 impl<B: KvBackend + 'static> RegistryRoomSource<B> {
     /// Wraps an already-open registry and user store. Both are shared handles: this adapter opens
     /// nothing of its own and sees exactly the data the client-server API sees.
     #[must_use]
-    pub fn new(rooms: Arc<RoomRegistry<B>>, directory: hs_user::store::DynUserStore) -> Self {
-        Self { rooms, directory }
+    pub fn new(rooms: Arc<RoomRegistry<B>>) -> Self {
+        Self { rooms }
     }
 
     /// Loads a room's actor handle. A room ID that does not parse is reported as
@@ -663,40 +662,46 @@ impl<B: KvBackend + 'static> RoomDataSource for RegistryRoomSource<B> {
     }
 
     async fn public_room_summary(&self, room_id: &str) -> Option<(Option<String>, bool)> {
-        let entries = self.directory.list_public_rooms().await.ok()?;
-        entries
-            .into_iter()
-            .find(|entry| entry.room_id.as_str() == room_id)
-            .map(|entry| (entry.canonical_alias, true))
+        let parsed = ruma::RoomId::parse(room_id).ok()?;
+        if !self.rooms.is_directory_public(&parsed).ok()? {
+            return None;
+        }
+        let handle = self.handle(room_id).await.ok()?;
+        let entry = handle
+            .query(hs_room::routes::directory::public_rooms_chunk_entry)
+            .await;
+        let alias = entry
+            .get("canonical_alias")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        Some((alias, true))
     }
 
     async fn list_public_rooms(&self, limit: usize, since: Option<&str>) -> Vec<EventJson> {
-        let Ok(mut entries) = self.directory.list_public_rooms().await else {
+        // The rooms published to the directory (`PUT /directory/list/room/{roomId}`,
+        // `createRoom`'s `visibility: "public"`): the same flag and the same entry shape the
+        // client-server `/publicRooms` answers (`hs_room::routes::directory`), so another
+        // server sees what a local client sees. Until 2026-10-02 this read `hs-user`'s
+        // join-rule proxy, which listed public-join rooms whether published or not and never a
+        // published invite-only one (Sytest's "Inbound federation can get public room list").
+        let Ok(mut room_ids) = self.rooms.list_published_room_ids() else {
             return Vec::new();
         };
-        // Same ordering and `since`-as-an-offset convention the client-server `/publicRooms`
-        // handler uses (`hs_user::routes::rooms`), so a room's position in the directory does not
-        // depend on which API asked.
-        entries.sort_by(|a, b| a.room_id.cmp(&b.room_id));
+        room_ids.sort();
         let offset: usize = since.and_then(|s| s.parse().ok()).unwrap_or(0);
-        entries
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .map(|entry| {
-                serde_json::json!({
-                    "room_id": entry.room_id,
-                    "name": entry.name,
-                    "topic": entry.topic,
-                    "canonical_alias": entry.canonical_alias,
-                    "avatar_url": entry.avatar_url,
-                    "num_joined_members": entry.num_joined_members,
-                    "world_readable": entry.world_readable,
-                    "guest_can_join": entry.guest_can_join,
-                    "join_rule": "public",
-                })
-            })
-            .collect()
+        let mut chunk = Vec::new();
+        for room_id in room_ids.into_iter().skip(offset).take(limit) {
+            // Unpublished and evicted between the scan and this load: skip it, not the listing.
+            let Ok(handle) = self.handle(room_id.as_str()).await else {
+                continue;
+            };
+            chunk.push(
+                handle
+                    .query(hs_room::routes::directory::public_rooms_chunk_entry)
+                    .await,
+            );
+        }
+        chunk
     }
 
     async fn room_version(&self, room_id: &str) -> Option<String> {
@@ -835,6 +840,12 @@ fn state_before_with_chain<B: KvBackend>(
     at: &str,
 ) -> Result<(Vec<hs_model::Event>, Vec<hs_model::Event>), RoomSourceError> {
     let event_id = ruma::EventId::parse(at).map_err(|_| RoomSourceError::NotFound)?;
+    // A rejected event is held (so that it is known again) but never accepted: there is no
+    // state "at" it to serve, as `/event` does not serve it (Sytest's "/state[_ids] returns
+    // M_NOT_FOUND for a rejected message/state event"). An outlier is `None` from the actor.
+    if actor.is_rejected_event(&event_id) {
+        return Err(RoomSourceError::NotFound);
+    }
     let at_state = actor
         .state_before_event(&event_id)
         .map_err(|_| RoomSourceError::NotFound)?
@@ -1306,7 +1317,7 @@ const KEY_VALIDITY_SECS: u64 = 24 * 60 * 60;
 /// # Errors
 /// Returns the backend's error if the destination-backoff or outbound-queue keyspaces cannot be
 /// opened.
-// Eight parameters: the stores this mount reads, plus the one test seam (`scheme`). A struct
+// Seven parameters: the stores this mount reads, plus the one test seam (`scheme`). A struct
 // of them would be built at exactly one call site and read at exactly one, which is the same
 // list twice.
 #[allow(clippy::too_many_arguments)]
@@ -1315,7 +1326,6 @@ pub fn build_mount<B: KvBackend + 'static>(
     identity: &hs_room::identity::HomeserverIdentity,
     backend: B,
     rooms: Arc<RoomRegistry<B>>,
-    directory: hs_user::store::DynUserStore,
     auth: Arc<dyn hs_auth::store::AuthStore>,
     e2e: hs_e2e::state::E2eState<B>,
     scheme: Option<&'static str>,
@@ -1384,7 +1394,7 @@ pub fn build_mount<B: KvBackend + 'static>(
 
     let state = hs_federation::transport::FederationState {
         own_server_name: Arc::from(server_name.as_str()),
-        rooms: Arc::new(RegistryRoomSource::new(rooms.clone(), directory)),
+        rooms: Arc::new(RegistryRoomSource::new(rooms.clone())),
         queries: Arc::new(
             ServerQuerySource::new(auth, e2e.store.clone(), rooms.clone(), server_name.clone())
                 .with_keys(e2e),

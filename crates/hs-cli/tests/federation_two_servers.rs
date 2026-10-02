@@ -34,7 +34,7 @@ fn config(port: u16, data_dir: &std::path::Path) -> hs_config::Config {
          storage:\n  backend: embedded\n  data_dir: {data_dir:?}\n\
          media:\n  storage:\n    backend: local\n    path: {media_dir:?}\n\
          auth:\n  enable_registration: true\n\
-         federation:\n  ip_range_blocklist: []\n\
+         federation:\n  ip_range_blocklist: []\n  allow_public_rooms_over_federation: true\n\
          rate_limits:\n  enabled: false\n"
     );
     // The server-wide send limit is off (decision 0016): this conversation is faster than a person.
@@ -892,10 +892,11 @@ async fn joining_through_a_server_that_does_not_know_the_room_is_not_found() {
     b.handle.shutdown().await;
 }
 
-/// Sytest's "Outbound/Inbound federation can query profile data" and "... room alias directory",
-/// between two real servers: a profile and an alias of A's user and room, read through B's
-/// client API, come from A over `/query/profile` and `/query/directory`; a user and an alias A
-/// does not have are `404`s on B too.
+/// Sytest's "Outbound/Inbound federation can query profile data", "... room alias directory"
+/// and "Can get remote public room list", between two real servers: a profile, an alias and
+/// the public room directory of A, read through B's client API, come from A over
+/// `/query/profile`, `/query/directory` and `/publicRooms`; a user and an alias A does not have
+/// are `404`s on B too.
 #[tokio::test]
 async fn a_remote_users_profile_and_a_remote_alias_are_asked_of_their_server() {
     let port_a = reserve_port();
@@ -920,7 +921,7 @@ async fn a_remote_users_profile_and_a_remote_alias_are_asked_of_their_server() {
     let created: Value = client
         .post(format!("{}/_matrix/client/v3/createRoom", a.base))
         .bearer_auth(&alice_token)
-        .json(&json!({"preset": "public_chat", "room_alias_name": "☕"}))
+        .json(&json!({"preset": "public_chat", "room_alias_name": "☕", "visibility": "public", "name": "Tea"}))
         .send()
         .await
         .unwrap()
@@ -976,6 +977,29 @@ async fn a_remote_users_profile_and_a_remote_alias_are_asked_of_their_server() {
         .unwrap();
     assert_eq!(directory["room_id"], room_id, "{directory}");
     assert_eq!(directory["servers"], json!([a.name]), "{directory}");
+
+    // And A's public room directory (Sytest's "Can get remote public room list").
+    let directory: Value = client
+        .get(format!(
+            "{}/_matrix/client/v3/publicRooms?server={}",
+            b.base, a.name
+        ))
+        .bearer_auth(&bob_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let listed = directory["chunk"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no chunk: {directory}"));
+    assert!(
+        listed
+            .iter()
+            .any(|room| room["room_id"] == room_id && room["name"] == "Tea"),
+        "{directory}"
+    );
 
     // What A does not have is not found on B either.
     let unknown = client

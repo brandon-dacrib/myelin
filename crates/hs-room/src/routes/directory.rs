@@ -57,7 +57,7 @@ fn content_str(event: Option<&hs_model::Event>, key: &str) -> Option<String> {
 /// current state. Optional fields (`name`, `topic`, `canonical_alias`, `avatar_url`) are omitted
 /// entirely when unset, matching `public_rooms_test.go`'s "Name/topic keys are correct" (a room
 /// with no name/topic must not report an empty-string value for it).
-fn public_rooms_chunk_entry<B: KvBackend>(actor: &RoomActor<B>) -> Value {
+pub fn public_rooms_chunk_entry<B: KvBackend>(actor: &RoomActor<B>) -> Value {
     let name = content_str(actor.state_event("m.room.name", "").ok().flatten(), "name");
     let topic = content_str(
         actor.state_event("m.room.topic", "").ok().flatten(),
@@ -165,6 +165,10 @@ pub struct PublicRoomsQuery {
     /// so a client that always sends one back from an earlier response does not break.
     #[allow(dead_code)]
     pub since: Option<String>,
+    /// Another server, whose directory is asked over federation
+    /// ([`crate::remote_join::RemoteJoin::public_rooms`]) and answered as it came. Absent, or
+    /// this server's own name: this server's directory.
+    pub server: Option<String>,
 }
 
 /// `filter.generic_search_term`, the one filter field `POST /publicRooms` defines.
@@ -184,8 +188,39 @@ pub struct PublicRoomsBody {
     /// See [`PublicRoomsQuery::since`].
     #[allow(dead_code)]
     pub since: Option<String>,
+    /// See [`PublicRoomsQuery::server`].
+    pub server: Option<String>,
     /// Search/filter criteria.
     pub filter: Option<PublicRoomsFilter>,
+}
+
+/// Another server's directory, when `server` names one (Sytest's "Can get remote public room
+/// list"); `None` when the listing is this server's own.
+async fn remote_public_rooms<B: KvBackend + 'static>(
+    state: &RoomState<B>,
+    server: Option<&str>,
+    limit: Option<usize>,
+    since: Option<&str>,
+    search_term: Option<&str>,
+) -> Result<Option<Response>, RoomError> {
+    let Some(server) = server.filter(|server| *server != state.identity.server_name.as_str())
+    else {
+        return Ok(None);
+    };
+    let Some(remote) = state.remote_join.as_ref() else {
+        tracing::info!(
+            server,
+            "another server's room list was asked for, and federation is off"
+        );
+        return Err(RoomError::RoomNotFound(format!(
+            "cannot fetch the public room list of {server}: federation is off"
+        )));
+    };
+    let body = remote
+        .public_rooms(server, limit, since, search_term)
+        .await?;
+    tracing::debug!(server, "answered another server's public room list");
+    Ok(Some(Json(body).into_response()))
 }
 
 async fn render_public_rooms<B: KvBackend + 'static>(
@@ -235,6 +270,17 @@ pub async fn get_public_rooms<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
     Query(query): Query<PublicRoomsQuery>,
 ) -> Result<Response, RoomError> {
+    if let Some(remote) = remote_public_rooms(
+        &state,
+        query.server.as_deref(),
+        query.limit,
+        query.since.as_deref(),
+        None,
+    )
+    .await?
+    {
+        return Ok(remote);
+    }
     render_public_rooms(&state, query.limit, None).await
 }
 
@@ -244,5 +290,180 @@ pub async fn post_public_rooms<B: KvBackend + 'static>(
     PermissiveJson(body): PermissiveJson<PublicRoomsBody>,
 ) -> Result<Response, RoomError> {
     let term = body.filter.and_then(|f| f.generic_search_term);
+    if let Some(remote) = remote_public_rooms(
+        &state,
+        body.server.as_deref(),
+        body.limit,
+        body.since.as_deref(),
+        term.as_deref(),
+    )
+    .await?
+    {
+        return Ok(remote);
+    }
     render_public_rooms(&state, body.limit, term).await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+    use hs_auth::AuthState;
+    use hs_kv::memory::MemoryBackend;
+    use ruma::{OwnedRoomId, UserId};
+
+    use super::*;
+    use crate::identity::HomeserverIdentity;
+    use crate::registry::RoomRegistry;
+
+    /// One recorded directory request: server, limit, since, search term.
+    type Asked = (String, Option<usize>, Option<String>, Option<String>);
+
+    /// Stands in for the other server: records what it was asked and answers one room.
+    #[derive(Default)]
+    struct RecordingRemoteJoin {
+        asked: Mutex<Vec<Asked>>,
+    }
+
+    #[async_trait]
+    impl crate::remote_join::RemoteJoin for RecordingRemoteJoin {
+        async fn join(
+            &self,
+            _user_id: &UserId,
+            room_id: &RoomId,
+            _via: &[String],
+            _content: Value,
+        ) -> Result<OwnedRoomId, RoomError> {
+            Ok(room_id.to_owned())
+        }
+
+        async fn resolve_alias(
+            &self,
+            alias: &ruma::RoomAliasId,
+        ) -> Result<(OwnedRoomId, Vec<String>), RoomError> {
+            Err(RoomError::RoomNotFound(alias.to_string()))
+        }
+
+        async fn public_rooms(
+            &self,
+            server: &str,
+            limit: Option<usize>,
+            since: Option<&str>,
+            search: Option<&str>,
+        ) -> Result<Value, RoomError> {
+            self.asked.lock().unwrap().push((
+                server.to_owned(),
+                limit,
+                since.map(str::to_owned),
+                search.map(str::to_owned),
+            ));
+            Ok(json!({
+                "chunk": [{"room_id": "!r:remote.example", "num_joined_members": 1,
+                           "world_readable": false, "guest_can_join": false}],
+                "total_room_count_estimate": 1,
+            }))
+        }
+    }
+
+    fn state(remote: Option<Arc<RecordingRemoteJoin>>) -> RoomState<MemoryBackend> {
+        let identity = HomeserverIdentity::for_tests("hs1");
+        let rooms = Arc::new(RoomRegistry::open(MemoryBackend::new(), identity.clone()).unwrap());
+        RoomState {
+            auth: AuthState::in_memory(),
+            rooms,
+            identity,
+            remote_join: remote.map(|r| r as Arc<dyn crate::remote_join::RemoteJoin>),
+        }
+    }
+
+    async fn body_json(response: Response) -> Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// Sytest's "Can get remote public room list": `?server=` names another server, whose
+    /// directory is asked and answered as it came; this server's own name, or no `server`, is
+    /// this server's directory.
+    #[tokio::test]
+    async fn another_servers_directory_is_asked_of_that_server() {
+        let remote = Arc::new(RecordingRemoteJoin::default());
+        let state = state(Some(remote.clone()));
+
+        let response = get_public_rooms(
+            State(state.clone()),
+            Query(PublicRoomsQuery {
+                limit: Some(5),
+                since: Some("10".to_owned()),
+                server: Some("remote.example".to_owned()),
+            }),
+        )
+        .await
+        .unwrap();
+        let body = body_json(response).await;
+        assert_eq!(body["chunk"][0]["room_id"], "!r:remote.example", "{body}");
+
+        let response = post_public_rooms(
+            State(state.clone()),
+            PermissiveJson(PublicRoomsBody {
+                limit: None,
+                since: None,
+                server: Some("remote.example".to_owned()),
+                filter: Some(PublicRoomsFilter {
+                    generic_search_term: Some("tea".to_owned()),
+                }),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(body_json(response).await["total_room_count_estimate"], 1);
+
+        // This server's own name is not another server.
+        let response = get_public_rooms(
+            State(state.clone()),
+            Query(PublicRoomsQuery {
+                limit: None,
+                since: None,
+                server: Some("hs1".to_owned()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(body_json(response).await["chunk"], json!([]));
+
+        assert_eq!(
+            *remote.asked.lock().unwrap(),
+            vec![
+                (
+                    "remote.example".to_owned(),
+                    Some(5),
+                    Some("10".to_owned()),
+                    None
+                ),
+                (
+                    "remote.example".to_owned(),
+                    None,
+                    None,
+                    Some("tea".to_owned())
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn another_servers_directory_without_federation_is_not_found() {
+        let err = get_public_rooms(
+            State(state(None)),
+            Query(PublicRoomsQuery {
+                limit: None,
+                since: None,
+                server: Some("remote.example".to_owned()),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, RoomError::RoomNotFound(_)), "{err:?}");
+    }
 }

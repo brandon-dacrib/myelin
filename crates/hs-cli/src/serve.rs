@@ -1637,7 +1637,6 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             &identity,
             backend.clone(),
             rooms.clone(),
-            user_state.hub.store().clone(),
             auth_state.store.clone(),
             e2e_state.clone(),
             options.federation_scheme,
@@ -1731,6 +1730,11 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             rooms.clone(),
             identity.clone(),
         )));
+        // And how `GET /profile/{userId}` reaches a user of another server
+        // (`crate::remote_profile`): the same client.
+        auth_state.install_remote_profiles(Arc::new(
+            crate::remote_profile::FederationRemoteProfile::new(mount.client.clone()),
+        ));
         // And how `GET /profile/{userId}` reaches a user of another server
         // (`crate::remote_profile`): the same client.
         auth_state.install_remote_profiles(Arc::new(
