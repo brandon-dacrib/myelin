@@ -30,21 +30,24 @@ survive a reboot.
 | `agent/bridge-names` | `d0e7ebce` | a person's bridge objects are `bridge-whatsapp-brandon`, not `bridge-<8 hex>`; `myelin.dev/owner` and type labels on pod, Deployment, Service, claim and `Bridge`; the name is stored on the instance row once and an instance deployed under the old hashed name is adopted, never renamed; `BridgeDeployment.name` documents the rule; OpenAPI 0.1.1. Status 11 and 12, RFC 0017 §4.1 | kind smoke passed with the real binary (`bridge-heisenbridge`, and a hand-applied per-user `Bridge` gave pod `bridge-whatsapp-brandon-…`); hs-bridges 21, hs-operator 92 | running at the reboot |
 | `agent/user-erase` | `fa1a1bb4` | **deleting a user**: `POST /users/{id}/deactivate {erase:true}` deactivates, leaves every room (`UserActivitySource::leave_all_rooms`, hs-room), then erases (hs-auth `erasure.rs`: password, tokens, devices through the device-list hook so hs-e2e drops keys, 3PIDs, external ids, profile, features; `UserRecord.erased`/`erased_at_ms`); audit `/erased`, event `user.erased`; reactivate and reset-password 409; the client's own `/account/deactivate {erase:true}` too; `/_synapse/admin/v1/deactivate` route added to hs-compat (the proxy is still not mounted by `hs serve`); OpenAPI 0.1.1 (**collides with bridge-names' 0.1.1 and admin-token's 0.1.2: rebase and take the next number**). Status 07, 15, 04 | real binary `crates/hs-cli/tests/user_erasure.rs`; hs-auth 253, hs-admin 293, hs-room 166 | not run; rebase onto main after bridge-names |
 | `agent/user-erase-web` | `749301c` | the UI: "Also erase their data" in the deactivate dialog with the plain-words explanation, an Erase box for deactivated accounts, Erased badges, Reactivate replaced by a why-not box; mocks; `web/e2e/user-erase.spec.ts`; `web/e2e-real/user-erase.spec.ts` to run on the merged binary. Status 16 | `npm run check` 504 tests, `test:e2e` 55 | gate it stacked with `agent/user-erase`: `tools/merge-queue.sh agent/user-erase,agent/user-erase-web`; then run the real spec |
-| `agent/bridge-login` | see its status entry | **why `login qr` does nothing** in a person's WhatsApp bridge chat: a reproduction with the real mautrix-whatsapp image and an encrypting client, told to stop for the reboot | whatever its status 11 entry says | not run |
+| `agent/bridge-login` | `64c8be4d` | **why `login qr` did nothing**: mautrix `bridgev2` takes a bare command only in the sender's management room, which is set when the *person invites the bot*; the manager created the chat as the bot and invited the person, so the bridge decrypted the message and dropped it with no notice (encryption was fine both ways). Fix: with double puppeting the chat is created as the owner with the bot invited; without, the first line says to start the chat yourself. New real-bridge test `crates/hs-bridge-conformance/tests/real_mautrix_login.rs` (encrypted and plain, asserts the QR). Status 11, `docs/bridges/mautrix.md` | real mautrix-whatsapp in Docker 2/2; hs-bridges, hs-cli `bridge_offerings` 3/3 | not run |
 
-**The owner's WhatsApp bridge** (`@brandon`, demo cluster): the personal bot's chat is created
-encrypted by default (`invite_owner`, `encryption.unwrap_or(true)`) and the bridge runs
-appservice-mode encryption; a typed encrypted message to a real bridge had never been exercised
-(status 11, 2026-09-30: "No phone, so no encrypted message"). The pod named
+**The owner's WhatsApp bridge** (`@brandon`, demo cluster): the chat the bot opened can never
+become its management room. **Today, no deploy needed:** type `!wa login qr` (or `!wa login
+phone`) in that chat; the bot says the room is not its management room and then shows the QR.
+Or start a new direct chat in Element and invite `@whatsappbot_brandon:myelin.dacrib.net`; the
+bot accepts and marks it, and `login qr` works there. After `agent/bridge-login` is deployed, a
+removed and re-added instance gets a chat started as the person. The pod named
 `myelin-hs-bridges-operator-…` is the chart's operator; the instance's pod is `bridge-<8 hex>`
-until `agent/bridge-names` merges and the instance is removed and re-added. **Workaround on the
-running server**: offering Settings, Encryption off, remove the person's bridge, add it again,
-accept the new invite, `login qr`. The `kubectl logs` of the instance pod, grepped for
-`decrypt`, confirms or refutes the suspicion; `agent/bridge-login`'s entry has the rest.
+until `agent/bridge-names` merges and the instance is removed and re-added. The server cannot
+see a bridge drop a delivered message (health and backlog say delivered, correctly); the
+bridge's log does: `Received command` means taken, `Event decrypted successfully` then nothing
+means dropped as not a management room.
 
-**Order to merge next:** `bridge-names` (if the reboot killed its gate), then
-`user-erase,user-erase-web` as one batch (rebase `user-erase` first for the OpenAPI version),
-then `bridge-login` when it is done, then the ten branches of the 14:25 section in their order.
+**Order to merge next:** `bridge-names` (if the reboot killed its gate), then `bridge-login`
+(hs-bridges manager and tests only; disjoint from the rest), then `user-erase,user-erase-web`
+as one batch (rebase `user-erase` first for the OpenAPI version), then the ten branches of the
+14:25 section in their order.
 Remove each worktree after its merge (`git worktree remove .claude/worktrees/<name>`).
 
 ## Earlier: 2026-10-02, 14:25 EDT -- ten branches pushed, one batch gate running, the machine reboots

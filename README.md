@@ -45,10 +45,12 @@ copy-as-message button, and "this is you" when it is the administrator's own. Ea
 has its own registration, ghosts and process, so one person's trouble touches nobody else. Verified against the real server, with a real heisenbridge started from
 the files the server rendered (`docs/rfcs/0017-the-server-deploys-its-own-bridges.md`). The
 server deploying each instance as a pod is built and waits for its first run on a cluster.
-What is not yet proven: a person typing `login qr` to their bridge in the **encrypted** chat
-it opens by default. The first owner to try it got no answer (2026-10-02); the reproduction with
-a real mautrix-whatsapp is on branch `agent/bridge-login`, and until it lands, turn the
-offering's Encryption setting off before adding someone's bridge.
+One thing was wrong until 2026-10-02: the chat the server opened for a person was created
+by the bot, and a mautrix bridge only takes bare commands in a chat the *person* started, so
+`login qr` typed there was decrypted and silently dropped. Reproduced with the real
+mautrix-whatsapp and an encrypting client (the appservice-mode encryption worked end to end
+both ways), fixed on branch `agent/bridge-login` so the chat is started as the person with the
+bot invited, and tested against the real bridge. In an existing chat, `!wa login qr` works today.
 
 **Removing a user is one checkbox.** Deactivating an account on its page offers "Also erase
 their data": the password and every session, every device and its encryption keys, email,
