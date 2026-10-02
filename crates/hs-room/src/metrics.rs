@@ -27,6 +27,12 @@ static CREATE_ROOM_ID_ATTEMPTS: LazyLock<Histogram> =
 /// is one of the attempts `hs_room_create_room_id_attempts` counts, and was built again.
 static CREATE_ROOM_ID_TAKEN: LazyLock<Counter> = LazyLock::new(Counter::default);
 
+/// `hs_room_outlier_state_rows_repaired_total`: outliers placed in a timeline before placement
+/// recorded the state at them (status 04 session 13), found on a room load with no
+/// `state_snapshots` row and given one (`RoomActor::load`, "Placed outliers without a state
+/// row"). Counts once per room load that found some, so a non-owner's copies count too.
+static OUTLIER_STATE_ROWS_REPAIRED: LazyLock<Counter> = LazyLock::new(Counter::default);
+
 /// `hs_room_search_indexed_events_total`: events whose words this replica wrote to the index.
 static SEARCH_INDEXED_EVENTS: LazyLock<Counter> = LazyLock::new(Counter::default);
 
@@ -86,6 +92,12 @@ pub(crate) fn count_create_room_id_taken() {
     CREATE_ROOM_ID_TAKEN.inc();
 }
 
+/// Counts `repaired` placed outliers given a state row on a room load in
+/// `hs_room_outlier_state_rows_repaired_total`.
+pub(crate) fn count_outlier_state_rows_repaired(repaired: usize) {
+    OUTLIER_STATE_ROWS_REPAIRED.inc_by(repaired as u64);
+}
+
 /// `hs_room_create_room_id_taken_total` as it stands, for tests.
 #[cfg(test)]
 pub(crate) fn create_room_id_taken() -> u64 {
@@ -137,6 +149,13 @@ pub fn register_metrics(registry: &mut prometheus_client::registry::Registry) {
         "Room IDs built for a new room that a room already had (the same creator and content \
          in the same millisecond), each built again",
         CREATE_ROOM_ID_TAKEN.clone(),
+    );
+    // Registered without `_total`: the text encoder appends it.
+    registry.register(
+        "hs_room_outlier_state_rows_repaired",
+        "Placed outliers found on a room load with no state row (placed before the state at \
+         backfilled history was recorded) and given one",
+        OUTLIER_STATE_ROWS_REPAIRED.clone(),
     );
     // Registered without `_total`: the text encoder appends it.
     registry.register(

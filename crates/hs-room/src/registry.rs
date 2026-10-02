@@ -405,6 +405,18 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
             return Err(RoomError::RoomNotFound(room_id.to_string()));
         };
         actor.set_fencing(self.fencing.get().cloned());
+        match actor.persist_repaired_outlier_states() {
+            Ok(0) => {}
+            Ok(written) => {
+                tracing::info!(%room_id, written, "wrote back the state rows of placed outliers the load repaired")
+            }
+            Err(RoomError::Fenced(msg)) => {
+                tracing::debug!(%room_id, %msg, "the state rows of placed outliers the load repaired stay unwritten: this replica does not own the room")
+            }
+            Err(error) => {
+                tracing::warn!(%room_id, %error, "could not write back the state rows of placed outliers the load repaired; they will be repaired again on the next load")
+            }
+        }
 
         let mut rooms = self.rooms.lock().await;
         let entry = match rooms.entry(room_id.to_owned()) {

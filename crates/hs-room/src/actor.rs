@@ -365,6 +365,11 @@ pub struct RoomActor<B: KvBackend> {
     /// `Tables::state_snapshots` row -- is held here as a root and read in its place
     /// ([`RoomActor::root_after`]).
     placed_outlier_roots: HashMap<EventSn, <ProductionStateStore<B> as StateStore>::Root>,
+    /// Placed outliers [`RoomActor::load`] found without a `Tables::state_snapshots` row and
+    /// gave a state in memory (`(outlier, the state before it)`), waiting to be written back
+    /// by [`RoomActor::persist_repaired_outlier_states`]. See [`RoomActor::load`]'s "Placed
+    /// outliers without a state row".
+    repaired_outlier_states: Vec<(EventSn, Vec<EventSn>)>,
     /// History events another server sent that failed authorization at their position
     /// (`history`): never stored, and never again counted as missing from a timeline gap.
     /// In-memory only; after a reload a gap that cites one asks for it once more and rejects it
@@ -721,6 +726,7 @@ impl<B: KvBackend> RoomActor<B> {
             next_room_pos: 1,
             gaps: BTreeMap::new(),
             placed_outlier_roots: HashMap::new(),
+            repaired_outlier_states: Vec::new(),
             rejected_history: HashSet::new(),
             relations_by_target: HashMap::new(),
             redactions_by_target: HashMap::new(),
@@ -789,6 +795,19 @@ impl<B: KvBackend> RoomActor<B> {
     /// an event with a `state_snapshots` row is fed to the state store the way it originally was
     /// ([`hs_state::kv_store::KvStateStore::add_event_with_state`]) rather than from its prev
     /// events, which this server does not hold. A reloaded room comes back identical either way.
+    ///
+    /// # Placed outliers without a state row
+    /// An outlier that backfill placed in the timeline before 2026-09-30's `agent/backfill-state`
+    /// work (status 04 session 13) has no `state_snapshots` row: placement wrote none then, and
+    /// the state after such an outlier read as the outlier alone. One found here is given the
+    /// state it would have been placed with -- the state after the timeline event before it,
+    /// or, for the room's oldest, its own `auth_events` -- in memory, and remembered
+    /// ([`RoomActor::repaired_outlier_states`]) so the registry can write the rows back once
+    /// the actor is fenced ([`RoomActor::persist_repaired_outlier_states`]); a non-owner's copy
+    /// repairs in memory alone. Counted in `hs_room_outlier_state_rows_repaired_total` and
+    /// logged at `info` per room. A lazy repair rather than a migration: a room's state rows
+    /// are read only by its actor, and loading every room at start-up to find the few is what
+    /// `PLAN.md` section 5.3's "derivable from the store on load" avoids.
     ///
     /// # Errors
     /// Returns [`RoomError::Store`] on a storage failure, or [`RoomError::InvalidEvent`] if a
@@ -907,10 +926,18 @@ impl<B: KvBackend> RoomActor<B> {
             // stays what it was; here it gets its position, and the state computed for it at
             // placement (its `state_snapshots` row) is what reads of the state after it see.
             if actor.events.contains_key(&event_sn) {
+                let state = match explicit_states.remove(&event_sn) {
+                    Some(state) => state,
+                    None => {
+                        let state = actor.state_before_placed_outlier(room_pos, event_sn)?;
+                        actor
+                            .repaired_outlier_states
+                            .push((event_sn, state.clone()));
+                        state
+                    }
+                };
                 actor.timeline.insert(room_pos, event_sn);
-                if let Some(state) = explicit_states.remove(&event_sn) {
-                    actor.record_placed_outlier_state(event_sn, &state)?;
-                }
+                actor.record_placed_outlier_state(event_sn, &state)?;
                 continue;
             }
             let Some((event, purged)) = read_event_row(event_sn)? else {
@@ -952,8 +979,94 @@ impl<B: KvBackend> RoomActor<B> {
         }
         actor.restore_gaps(gap_rows);
         actor.name_redactions_on_load();
+        if !actor.repaired_outlier_states.is_empty() {
+            let repaired = actor.repaired_outlier_states.len();
+            crate::metrics::count_outlier_state_rows_repaired(repaired);
+            tracing::info!(
+                room_id = %room_id,
+                repaired,
+                "placed outliers with no state row (placed before the state at backfilled \
+                 history was recorded) were given the state after the event before each; the \
+                 rows are written back once the room is fenced"
+            );
+        }
 
         Ok(Some(actor))
+    }
+
+    /// The state before an outlier placed at `room_pos` whose placement wrote no state row
+    /// ([`RoomActor::load`]'s "Placed outliers without a state row"): the state after the
+    /// timeline event before it, already replayed since the timeline is replayed in order --
+    /// or, for the oldest event held, the outlier's own `auth_events` (its create, power
+    /// levels, sender membership and join rules, which is what the walk gave an event at the
+    /// far edge of what is held).
+    ///
+    /// # Errors
+    /// [`RoomError::State`] if the state store fails.
+    fn state_before_placed_outlier(
+        &self,
+        room_pos: i64,
+        outlier: EventSn,
+    ) -> Result<Vec<EventSn>, RoomError> {
+        if let Some((_, &previous)) = self.timeline.range(..room_pos).next_back() {
+            let root = self.root_after(previous)?;
+            let diff = self
+                .store
+                .diff(self.store.empty_root(), root)
+                .map_err(|e| RoomError::State(e.to_string()))?;
+            return Ok(diff.added.values().copied().collect());
+        }
+        let Some(event) = self.events.get(&outlier) else {
+            return Ok(Vec::new());
+        };
+        Ok(pipeline::decode_event_ids(event.json().get("auth_events"))
+            .iter()
+            .filter_map(|id| self.event_id_index.get(id).copied())
+            .collect())
+    }
+
+    /// How many placed outliers the load found without a state row and repaired in memory,
+    /// whose rows [`RoomActor::persist_repaired_outlier_states`] has not yet written back.
+    #[must_use]
+    pub fn repaired_outlier_states(&self) -> usize {
+        self.repaired_outlier_states.len()
+    }
+
+    /// Writes the `Tables::state_snapshots` rows for the placed outliers the load repaired in
+    /// memory ([`RoomActor::load`]'s "Placed outliers without a state row"), in one fenced
+    /// transaction, so the next load finds them. Called by the registry once the actor is
+    /// fenced; a copy that is not this room's owner never calls it. Returns how many rows it
+    /// wrote; nothing to do is `Ok(0)`.
+    ///
+    /// # Errors
+    /// [`RoomError::Fenced`] when this replica no longer owns the room (the rows stay
+    /// unwritten, and the in-memory repair stands), or [`RoomError::Store`] on a storage
+    /// failure.
+    pub fn persist_repaired_outlier_states(&mut self) -> Result<usize, RoomError> {
+        if self.repaired_outlier_states.is_empty() {
+            return Ok(0);
+        }
+        let room_sn = self.room_sn;
+        let rows = std::mem::take(&mut self.repaired_outlier_states);
+        let fence_failure: std::cell::Cell<Option<String>> = std::cell::Cell::new(None);
+        let written = transact(&self.backend, TransactConfig::default(), |txn| {
+            for (sn, state) in &rows {
+                self.tables
+                    .state_snapshots
+                    .put(txn, &(room_sn, *sn), &encode_event_sns(state))
+                    .map_err(to_kv)?;
+            }
+            self.fence_check(txn, &fence_failure)?;
+            Ok(rows.len())
+        })
+        .map_err(|e| match fence_failure.take() {
+            Some(msg) => RoomError::Fenced(msg),
+            None => RoomError::from(e),
+        });
+        if written.is_err() {
+            self.repaired_outlier_states = rows;
+        }
+        written
     }
 
     /// Ingests `event` (already durably persisted under `event_sn`) into the room's production
@@ -4399,7 +4512,15 @@ impl<B: KvBackend> RoomActor<B> {
             .tables
             .state_snapshots
             .get(&self.backend.snapshot(), &(self.room_sn, sn))?
-            .and_then(|bytes| decode_event_sns(bytes.as_ref()));
+            .and_then(|bytes| decode_event_sns(bytes.as_ref()))
+            .or_else(|| {
+                // A placed outlier whose row the load repaired in memory and has not written
+                // back yet ([`RoomActor::persist_repaired_outlier_states`]).
+                self.repaired_outlier_states
+                    .iter()
+                    .find(|(repaired, _)| *repaired == sn)
+                    .map(|(_, state)| state.clone())
+            });
         let root = match explicit {
             Some(state) => self.root_from_sns(&state, None)?,
             None if event.header().flags.is_outlier() => return Ok(None),

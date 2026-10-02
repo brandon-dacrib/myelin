@@ -562,6 +562,12 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
   redact *then* -- a moderator demoted since still redacts, a member promoted since does not.
   Verified on the real binary around a power-level change, and in unit tests for the waiting
   and the federation cases.
+- **Rooms from before 2026-09-30 whose backfilled history held placed outliers answer the
+  state at them again** (2026-10-02). Placement wrote no state row for an outlier it placed
+  until the backfill-state work, so such a room's `/state_ids` at that event answered nothing
+  and the state after it read as the event alone. A room load now gives each such outlier the
+  state after the event before it, writes the rows back once the room is fenced, logs the count
+  per room and counts it in `hs_room_outlier_state_rows_repaired_total`.
 - Rooms: creation, membership, state, timeline, `/messages`, `/context`, relations, threads, room
   upgrade, aliases, the room directory, redactions, and idempotent state sends and joins.
 - **History visibility is enforced on every read path.** A user who has left a non-world-readable

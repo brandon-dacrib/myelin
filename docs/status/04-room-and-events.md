@@ -121,6 +121,43 @@ admin API's room long tail).
 >   and "a redaction that arrived before its event is not allowed to take effect" at `info`,
 >   now meaning "under the levels of its time".
 >
+> **Row 3: placed outliers before the backfill-state work have no state row** (next-steps:
+> "placed outliers before `ed3ad77` with no state row"; the commit named is the branch's
+> last, the work is session 13). Until `agent/backfill-state`, an outlier that backfill placed
+> in the timeline got no `Tables::state_snapshots` row; session 13 started writing one at
+> placement and reading it on load (`placed_outlier_roots`), so a room persisted before it has
+> placed outliers with no row: `root_after` fell through to the store's `state_at`, which for
+> an outlier is the outlier alone, and `state_before_event` -- what `/state_ids` and `/state`
+> serve -- answered `None` for them (an outlier with no explicit state), as the new test showed
+> before the fix.
+>
+> - **A lazy repair on load, not a migration.** `hs-tables` has a migration runner
+>   (`hs_tables::migrations`), but nothing in the workspace runs one, and a migration here would
+>   mean loading every room at start-up to find the few with such rows; a room's state rows are
+>   read by its actor alone, and `PLAN.md` section 5.3 has everything an actor holds derivable
+>   from the store on load. So `RoomActor::load` gives a placed outlier with no row the state
+>   it would have been placed with -- the state after the timeline event before it (replayed
+>   already, the timeline being replayed in order), or for the room's oldest event its own
+>   `auth_events` (`state_before_placed_outlier`) -- in memory, and remembers the pairs
+>   (`repaired_outlier_states`). `RoomRegistry::get_or_load` writes them back in one fenced
+>   transaction once the actor is fenced (`persist_repaired_outlier_states`, new); a copy that
+>   is not the room's owner (`hs-user`'s mirror, built by `RoomActor::load` too) keeps the
+>   repair in memory and writes nothing, and a fenced write is a `debug` line. Until the rows
+>   are written `state_before_event` reads the repair from memory.
+> - **Observability.** `info` per room load that repaired any ("placed outliers with no state
+>   row ... were given the state after the event before each", with `repaired`), `info` when
+>   the rows are written back (`written`), `warn` if that fails for a reason other than the
+>   fence; counter `hs_room_outlier_state_rows_repaired_total` (registered by
+>   `hs_room::metrics::register_metrics`).
+> - **Test.** `crates/hs-room/tests/backfill_state.rs::a_placed_outlier_without_a_state_row_is_repaired_on_load`:
+>   a joiner with two placed outliers has their rows deleted (what such a room's store looks
+>   like), reloads with `repaired_outlier_states() == 2`, the state at and before each is the
+>   resident's (the `state_before_event` half failed before the fix: `None`), the rows are
+>   written back (2), and a third load repairs nothing and still answers the same.
+> - **Left.** The repaired state is the linear walk's: in a forked history the state after the
+>   previous timeline event can differ from what a fetched state would have said, as the walk's
+>   did when it was the only way.
+>
 > - **Power levels 0/2.** Sytest's "Power Levels" group is unreachable from the server side:
 >   every test in it (and ten more, 13 skips in the night's run) requires the fixture
 >   `can_change_power_levels`, which was proven by `tests/10apidoc/36room-levels.pl`'s test

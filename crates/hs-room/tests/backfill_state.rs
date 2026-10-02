@@ -201,6 +201,14 @@ fn fetch_state(resident: &Resident, joiner: &Joiner, plan: &HistoryPlan) -> Fetc
     }
 }
 
+fn state_set(state: &StateAtEvent) -> BTreeSet<OwnedEventId> {
+    state
+        .state
+        .iter()
+        .map(|e| e.event_id().to_owned())
+        .collect()
+}
+
 fn state_ids(actor: &RoomActor<MemoryBackend>, event: &EventId) -> BTreeSet<OwnedEventId> {
     actor
         .state_at_event(event)
@@ -511,6 +519,115 @@ fn a_placed_outlier_answers_the_state_computed_for_it_not_itself() {
                 .state_before_event(outlier.event_id())
                 .expect("lookup")
                 .map(|s| s.state.len()),
+        );
+    }
+}
+
+/// A room persisted before placement recorded the state at placed outliers (status 04
+/// session 13): the rows are gone, and a load gives each placed outlier the state after the
+/// event before it -- the same state here, where the history is linear -- counts them, and
+/// writes the rows back when asked, so the next load repairs nothing.
+#[test]
+fn a_placed_outlier_without_a_state_row_is_repaired_on_load() {
+    use hs_kv::{KvBackend, TransactConfig, transact};
+
+    let resident = resident();
+    let mut joiner = joiner(&resident);
+    let batch = resident_backfill(&resident, &resident.join, 100);
+    joiner
+        .actor
+        .accept_backfilled_events(batch.clone())
+        .expect("placed");
+    let placed = [&resident.second_topic, &resident.mallory_leave];
+
+    // What the store looked like before: the placed outliers' state rows never written.
+    let snapshot = joiner.backend.snapshot();
+    let room_sn = joiner
+        .tables
+        .room_sn
+        .lookup(&snapshot, resident.room_id.as_bytes())
+        .expect("lookup")
+        .expect("the room is interned");
+    let sns: Vec<_> = placed
+        .iter()
+        .map(|event| {
+            joiner
+                .tables
+                .event_sn
+                .lookup(&snapshot, event.event_id().as_bytes())
+                .expect("lookup")
+                .expect("the event is interned")
+        })
+        .collect();
+    transact(&joiner.backend, TransactConfig::default(), |txn| {
+        for sn in &sns {
+            joiner
+                .tables
+                .state_snapshots
+                .delete(txn, &(room_sn, *sn))
+                .map_err(|e| {
+                    hs_kv::KvError::Aborted(Box::new(std::io::Error::other(e.to_string())))
+                })?;
+        }
+        Ok(())
+    })
+    .expect("rows deleted");
+
+    let mut reloaded = RoomActor::load(
+        joiner.backend.clone(),
+        joiner.tables.clone(),
+        joiner.identity.clone(),
+        &resident.room_id,
+    )
+    .expect("load")
+    .expect("the room exists");
+    assert_eq!(
+        reloaded.repaired_outlier_states(),
+        2,
+        "both rows were missing"
+    );
+    for outlier in placed {
+        assert_eq!(
+            state_ids(&reloaded, outlier.event_id()),
+            state_ids(&resident.actor, outlier.event_id()),
+            "the repaired state at {} is the room's state there",
+            outlier.event_id()
+        );
+        assert_eq!(
+            reloaded
+                .state_before_event(outlier.event_id())
+                .expect("lookup")
+                .map(|s| state_set(&s)),
+            resident
+                .actor
+                .state_before_event(outlier.event_id())
+                .expect("lookup")
+                .map(|s| state_set(&s)),
+            "the state before {} is the room's",
+            outlier.event_id()
+        );
+    }
+
+    assert_eq!(
+        reloaded
+            .persist_repaired_outlier_states()
+            .expect("rows written"),
+        2
+    );
+    assert_eq!(reloaded.repaired_outlier_states(), 0);
+    let again = RoomActor::load(
+        joiner.backend.clone(),
+        joiner.tables.clone(),
+        joiner.identity.clone(),
+        &resident.room_id,
+    )
+    .expect("load")
+    .expect("the room exists");
+    assert_eq!(again.repaired_outlier_states(), 0, "the rows are back");
+    for outlier in placed {
+        assert_eq!(
+            state_ids(&again, outlier.event_id()),
+            state_ids(&resident.actor, outlier.event_id())
         );
     }
 }
