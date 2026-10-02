@@ -883,3 +883,150 @@ async fn send_gives_up_when_the_remote_serves_an_endless_backfill_chain() {
         "expected the gap-shaped request plus exactly max_rounds backfill requests to the hostile peer"
     );
 }
+
+/// A PDU of `REMOTE`'s: `fields` hashed and signed as that server would, and its event ID.
+fn remote_pdu(harness: &Harness, fields: Value) -> (Value, String) {
+    let mut object = to_canonical_object(&fields, true).unwrap();
+    let hash = hs_model::hash::content_hash_base64(&object);
+    object.insert(
+        "hashes".to_owned(),
+        CanonicalJsonValue::Object(
+            [("sha256".to_owned(), CanonicalJsonValue::String(hash))]
+                .into_iter()
+                .collect(),
+        ),
+    );
+    let server = ruma::ServerName::parse(REMOTE).unwrap();
+    let rules = hs_model::room_version::rules_for(&ruma::RoomVersionId::V11).unwrap();
+    sign_over_redacted_form(&mut object, &server, &harness.remote_key, &rules.redaction);
+    let pdu: Value =
+        serde_json::from_slice(&CanonicalJsonValue::Object(object).to_canonical_bytes()).unwrap();
+    let event_id = hs_model::Event::parse(&pdu, ruma::RoomVersionId::V11)
+        .unwrap()
+        .event_id()
+        .to_string();
+    (pdu, event_id)
+}
+
+/// Joins `@bob:REMOTE` to `room_id` through `make_join`/`send_join` and returns the join's ID.
+async fn join_bob(harness: &Harness, room_id: &str) -> String {
+    let (status, template) = harness
+        .signed_get(&format!("/make_join/{room_id}/@bob:{REMOTE}?ver=11"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{template}");
+    let (signed, event_id) = remote_pdu(harness, template["event"].clone());
+    let (status, response) = harness
+        .signed_put(true, &format!("/send_join/{room_id}/{event_id}"), &signed)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    event_id
+}
+
+/// Sytest's "Room state after a rejected message event is the same as before" and the
+/// "/state[_ids] returns M_NOT_FOUND for a rejected ... event" pair: a PDU from a sender who is
+/// not in the room is rejected (`/send` answers `{}`, it is stored as rejected), and the next
+/// event citing it as a prev event is accepted as if it cited the rejected event's own prev
+/// events -- readable, in the timeline, and with the state before it unchanged.
+#[tokio::test]
+async fn an_event_citing_a_rejected_prev_event_is_accepted_at_the_state_before_the_rejected_one() {
+    let harness = Harness::new().await;
+    let (room_id, _) = harness.room_with_a_message().await;
+    let bob_join = join_bob(&harness, &room_id).await;
+    let (create, power, _alice) = harness.message_auth_event_ids(&room_id).await;
+
+    let (rejected, rejected_id) = remote_pdu(
+        &harness,
+        serde_json::json!({
+            "type": "m.room.message",
+            "room_id": room_id,
+            "sender": format!("@fake_sender:{REMOTE}"),
+            "origin_server_ts": 5_000,
+            "depth": 9,
+            "content": {"body": "Rejected"},
+            "prev_events": [bob_join],
+            "auth_events": [create, power],
+        }),
+    );
+    let (status, response) = harness
+        .signed_put(
+            false,
+            "/send/txn-rejected",
+            &serde_json::json!({"pdus": [rejected], "edus": []}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(
+        response["pdus"][rejected_id.as_str()],
+        serde_json::json!({}),
+        "{response}"
+    );
+
+    let (hi, hi_id) = remote_pdu(
+        &harness,
+        serde_json::json!({
+            "type": "m.room.message",
+            "room_id": room_id,
+            "sender": format!("@bob:{REMOTE}"),
+            "origin_server_ts": 6_000,
+            "depth": 10,
+            "content": {"body": "hi"},
+            "prev_events": [rejected_id],
+            "auth_events": [create, power, bob_join],
+        }),
+    );
+    let (status, response) = harness
+        .signed_put(
+            false,
+            "/send/txn-hi",
+            &serde_json::json!({"pdus": [hi], "edus": []}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(
+        response["pdus"][hi_id.as_str()],
+        serde_json::json!({}),
+        "{response}"
+    );
+
+    let (status, fetched) = harness.signed_get(&format!("/event/{hi_id}")).await;
+    assert_eq!(status, StatusCode::OK, "{fetched}");
+    let parsed = ruma::RoomId::parse(room_id.as_str()).unwrap();
+    let handle = harness.rooms.get_or_load(&parsed).await.unwrap();
+    let hi_for_timeline = hi_id.clone();
+    let in_timeline = handle
+        .query(move |actor| {
+            let id = ruma::EventId::parse(hi_for_timeline.as_str()).unwrap();
+            actor.event_by_id(&id).is_some() && !actor.is_rejected_event(&id)
+        })
+        .await;
+    assert!(
+        in_timeline,
+        "the event citing a rejected prev event is held and not rejected"
+    );
+
+    // The state before it is the state before the rejected event: the same four-plus events.
+    let (status, before_rejected) = harness
+        .signed_get(&format!("/state_ids/{room_id}?event_id={bob_join}"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{before_rejected}");
+    let (status, before_hi) = harness
+        .signed_get(&format!("/state_ids/{room_id}?event_id={hi_id}"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{before_hi}");
+    let mut expected: Vec<String> = before_rejected["pdu_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_owned())
+        .collect();
+    expected.push(bob_join.clone());
+    expected.sort();
+    let mut got: Vec<String> = before_hi["pdu_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_owned())
+        .collect();
+    got.sort();
+    assert_eq!(got, expected, "{before_hi}");
+}

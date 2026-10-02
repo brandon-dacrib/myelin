@@ -4530,7 +4530,8 @@ impl<B: KvBackend> RoomActor<B> {
                         .iter()
                         .filter_map(|id| self.event_id_index.get(id).copied())
                         .collect();
-                self.state_view(&prev_sns)?.root
+                // A rejected prev event stands for its own prev events (`rejected`).
+                self.state_view(&self.effective_prev_sns(&prev_sns))?.root
             }
         };
         self.state_and_auth_chain(root).map(Some)
@@ -4957,7 +4958,7 @@ impl<B: KvBackend> RoomActor<B> {
             .iter()
             .filter_map(|id| self.event_id_index.get(id).copied())
             .collect();
-        let before = self.state_view(&prev_sns)?;
+        let before = self.state_view(&self.effective_prev_sns(&prev_sns))?;
         let after = self.state_view_at_sn(sn)?;
 
         let hv_before = history_visibility::HistoryVisibility::parse(
@@ -5073,7 +5074,7 @@ impl<B: KvBackend> RoomActor<B> {
         if prev_sns.is_empty() {
             return Ok(None);
         }
-        self.state_view(&prev_sns)?
+        self.state_view(&self.effective_prev_sns(&prev_sns))?
             .event_for(&event.header().event_type, state_key)
             .map_err(|e| RoomError::State(e.to_string()))
     }
