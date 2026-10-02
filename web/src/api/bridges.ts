@@ -25,7 +25,7 @@
  *   only `q` (free text), `limit`, `cursor`, `include_total`; the bridges
  *   list filters by health client-side over the loaded page.
  */
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { queryOptions, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, newIdempotencyKey } from "./client";
 import { unwrap } from "./problem";
 import type { components } from "./schema";
@@ -149,8 +149,16 @@ export type BridgeLogin = components["schemas"]["BridgeLogin"];
  * told whom. The server keeps answers for 30 seconds, so this does too.
  */
 export function useAppserviceLogins(id: string | undefined, userId: string | undefined) {
-  return useQuery({
-    queryKey: ["appservice-logins", id, userId ?? null],
+  return useQuery(appserviceLoginsQueryOptions(id, userId));
+}
+
+/**
+ * The same query as `useAppserviceLogins`, for a list that asks about several bridges at once
+ * (`useQueries`): the offering page's next steps share each answer with the row that shows it.
+ */
+export function appserviceLoginsQueryOptions(id: string | undefined, userId: string | undefined) {
+  return queryOptions({
+    queryKey: ["appservice-logins", id, userId ?? null] as const,
     enabled: Boolean(id),
     queryFn: async () => {
       const result = await api.GET("/appservices/{id}/logins", {

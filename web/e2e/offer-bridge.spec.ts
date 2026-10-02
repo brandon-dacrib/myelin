@@ -103,6 +103,10 @@ test.describe("Offer a bridge", () => {
     await expectNoAxeViolations(page, "offering: add for a user");
     await add.getByLabel(/Matrix ID/).fill("@alice:example.org");
     await add.getByRole("button", { name: "Add bridge" }).click();
+    // The dialog becomes the wizard's second step and follows the bridge; Done leaves it.
+    await expect(add).toContainText("Setting up @alice:example.org's WhatsApp bridge");
+    await expectNoAxeViolations(page, "offering: added, setting up");
+    await add.getByRole("button", { name: "Done" }).click();
     await expect(add).toBeHidden();
 
     // It appears on its way, and the page follows it to ready without a reload.

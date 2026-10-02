@@ -1,6 +1,77 @@
 # 16. Management web interface: status
 
-Last updated: 2026-10-01 (the interface explains itself; branch `agent/web-admin-ui`).
+Last updated: 2026-10-02 (next steps after a bridge is set up for someone; branch `agent/bridge-next-steps`).
+
+## 2026-10-02: what to do after setting up someone's bridge (branch `agent/bridge-next-steps`)
+
+The owner set up a WhatsApp bridge for a person from the offering page ("Add for a user",
+`PUT /bridge-offerings/mautrix-whatsapp/instances/{user_id}`) and had no idea what came next:
+*"This should be a wizard in the UI or at minimum next step instructions for the user should be
+output somewhere."* RFC 0017 §4.1 and §4.2 already have the server do the right thing (at `ready`
+the person's own bot, `@whatsappbot_<localpart>:server`, invites them to a direct chat and posts the
+catalogue's sign-in steps; the front door says the bridge is ready), but the interface never said
+so, and an operator relaying it had nothing to copy. Now:
+
+**Done.**
+
+- **Next steps under the table** (`pages/bridges/offering/BridgeOfferingPage.tsx`,
+  `NextStepsSection`): for every person whose bridge is not signed in yet, a `<details>` disclosure
+  "Next steps for @carol:example.org" with a badge saying where it is ("Setting up", "Waiting to be
+  run", "Failed", "Ready: tell them how to sign in"). Signed-in people are left out; when everyone
+  has signed in it says so in one line. It asks the bridges through `useQueries` with the same
+  query options as the "Signed in to" column (`appserviceLoginsQueryOptions` in `api/bridges.ts`,
+  `useAppserviceLogins` now wraps it), so nothing is fetched twice.
+- **The words to relay** (`pages/bridges/offering/InstanceNextSteps.tsx`, by phase from
+  `lib/bridge-next-steps.ts::nextStepsPhase`): ready and not signed in (or the bridge could not be
+  asked, or this kind of bridge does not report it: the steps apply either way, and it says which)
+  shows the person's own bot (copyable), "Tell them: their WhatsApp bridge is ready, and its bot has
+  invited them to a direct chat. They should accept it, then:", the catalogue's steps with `{bot}`
+  filled with *their* bot, the catalogue's note, the lost-invite fallback (start a direct chat with
+  the bot yourself; mautrix treats it as the management room), the documentation link, and **"Copy
+  as a message to send them"**, which puts the whole thing on the clipboard as plain text
+  (`nextStepsMessage`). On its way: "Setting up @carol's WhatsApp bridge. This usually takes a
+  minute or two; this page follows it", the deployment's message, the bot that will invite them,
+  and that the steps appear here when it is ready. Elsewhere: use Files and run it. Failed: retry
+  or remove and add again. Signed in: "Signed in as +1 555…; nothing left to do".
+- **"This is you"**: when the person is the signed-in operator (`getSession().operator.subject`),
+  the block says "This is you: accept the invite from @whatsappbot_ops:example.org in your chat app
+  and send `login qr`" (the command is lifted from the catalogue's first step, `firstCommand`), and
+  the summary line is "Ready: sign in (this is you)".
+- **The Add dialog is a two-step wizard** (`AddInstanceDialog.tsx`): after the PUT succeeds it stays
+  open as "@erin:example.org's WhatsApp bridge", reads the instance list the page already polls
+  (`useBridgeInstances`, shared cache), shows the setting-up words with the live state badge, and
+  when the bridge turns ready replaces them with the sign-in steps; once the person signs in, the
+  same block says so. "Done" closes it; the same steps stay under the table.
+- **The bot's ID.** `BridgeInstance.bot` is already in the API and the mock. `instanceBotId` prefers
+  it and otherwise derives it per RFC 0017 §4.1 and §3 from the offering's `front_door` and the
+  owner's localpart (`encodeLocalpart`, the same `=hex` escaping as `hs_admin::bridge_types`), for
+  a server that does not say. `BridgeType` has no `bot` field in the API; the front door is the
+  source.
+- **Tests.** `lib/bridge-next-steps.test.ts` (encoding, derivation, every phase, the message);
+  `InstanceNextSteps.test.tsx` (ready and not signed in shows the steps with the right bot; the copy
+  text; this-is-you; signed in hides them; could-not-ask keeps them and says why; setting up;
+  elsewhere; failed; derived bot); `BridgeOfferingPage.test.tsx` (the section lists ops, carol and
+  dave and not alice; the dialog's second step and Done); `e2e/bridge-next-steps.spec.ts` (the
+  section with axe, and adding `@erin` watched from "Setting up" to the steps in the dialog without
+  a reload, then the row says "Not signed in" and the summary "Ready: tell them how to sign in");
+  `e2e/offer-bridge.spec.ts` clicks Done. Mocks were enough: the clock-driven instance already
+  reaches ready in ten seconds with its bot set.
+
+**Interfaces needed from the server (track 11 / 15), not built here.**
+
+- **"Send the invite again"**: `POST /bridge-offerings/{type}/instances/{user_id}/invite` (or a
+  `reinvite` action) that makes the manager re-create or re-invite to the direct chat and repost the
+  steps (`hs-bridges/src/manager.rs::invite_owner`). The interface says "If the invite is nowhere to
+  be found, they can start a direct chat with the bot themselves" because that is all it can offer
+  today; with the action it would be a button beside the steps.
+- **`BridgeInstance.dm_room`** (the store has it): with it the block could link the chat and say
+  whether the person has accepted the invite, which is the step most often missed.
+- `BridgeInstance.bot` is exposed already; keep it, the interface falls back to deriving it only
+  when it is null.
+
+**Where this stopped.** `npm run check` and `npm run test:e2e` green in the worktree (results in
+the branch's report). Not verified against the real `hs` binary this session: the offering page's
+real-binary flow needs a cluster deployment target, which a session does not have.
 
 ## 2026-10-01: the interface explains itself, by the owner's rule (branch `agent/web-admin-ui`)
 

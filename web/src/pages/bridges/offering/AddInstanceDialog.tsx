@@ -1,23 +1,35 @@
 import { useState, type FormEvent } from "react";
-import { usePutBridgeInstance, type BridgeOffering } from "@/api/bridges";
+import {
+  useBridgeInstances,
+  usePutBridgeInstance,
+  type BridgeInstance,
+  type BridgeOffering,
+  type BridgeType,
+} from "@/api/bridges";
 import { ApiProblemError } from "@/api/problem";
 import { Button } from "@/components/ui/button/Button";
 import { Dialog, DialogContent } from "@/components/ui/dialog/Dialog";
 import { Field, Input } from "@/components/ui/input/Input";
 import { toast } from "@/components/ui/toast/toast-store";
 import { looksLikeUserId } from "@/lib/bridge-offerings";
+import { InstanceNextSteps } from "./InstanceNextSteps";
 
 /**
  * Sets up a bridge for someone, exactly as their message to the front door would
- * (`PUT .../instances/{user_id}`). They are invited to it when it is ready.
+ * (`PUT .../instances/{user_id}`), then stays open as the second step of a small wizard: it
+ * follows the new bridge through the page's own polling of the instance list, and when the
+ * bridge is ready shows the sign-in steps for that person (`InstanceNextSteps`), so the operator
+ * who added it knows what to tell them. The same steps stay under the table after Done.
  */
 export function AddInstanceDialog({
   offering,
+  type,
   open,
   onOpenChange,
   serverName,
 }: {
   offering: BridgeOffering;
+  type?: BridgeType;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   serverName?: string;
@@ -25,12 +37,17 @@ export function AddInstanceDialog({
   const put = usePutBridgeInstance();
   const [userId, setUserId] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [added, setAdded] = useState<BridgeInstance | null>(null);
   const name = offering.name ?? offering.type;
+  // The page polls this list while any bridge is on its way; the dialog reads the same answer.
+  const { data: instances } = useBridgeInstances(added ? offering.type : undefined);
+  const live = added ? (instances?.find((i) => i.user_id === added.user_id) ?? added) : null;
 
   function handleOpenChange(next: boolean) {
     if (!next) {
       setUserId("");
       setError(null);
+      setAdded(null);
     }
     onOpenChange(next);
   }
@@ -44,9 +61,9 @@ export function AddInstanceDialog({
     }
     setError(null);
     try {
-      await put.mutateAsync({ type: offering.type, userId: id });
+      const instance = await put.mutateAsync({ type: offering.type, userId: id });
       toast({ title: `Setting up ${id}'s ${name} bridge` });
-      handleOpenChange(false);
+      setAdded(instance);
     } catch (err) {
       setError(
         err instanceof ApiProblemError
@@ -54,6 +71,29 @@ export function AddInstanceDialog({
           : "Couldn’t reach the server.",
       );
     }
+  }
+
+  if (live) {
+    return (
+      <Dialog open={open} onOpenChange={handleOpenChange}>
+        <DialogContent
+          size="form"
+          title={`${live.user_id}'s ${name} bridge`}
+          description={
+            live.state === "ready"
+              ? "It is running. Here is what they do next."
+              : "Watch it come up here, or close this: the same next steps stay under the table."
+          }
+          footer={
+            <Button type="button" onClick={() => handleOpenChange(false)}>
+              Done
+            </Button>
+          }
+        >
+          <InstanceNextSteps instance={live} offering={offering} type={type} />
+        </DialogContent>
+      </Dialog>
+    );
   }
 
   return (

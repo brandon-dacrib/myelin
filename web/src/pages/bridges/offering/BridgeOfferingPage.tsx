@@ -1,8 +1,10 @@
 import { InstanceSignIn } from "./InstanceSignIn";
 import { useMemo, useState, type ReactNode } from "react";
+import { useQueries } from "@tanstack/react-query";
 import { Link, useParams } from "@tanstack/react-router";
 import { ChevronLeft, Users } from "lucide-react";
 import {
+  appserviceLoginsQueryOptions,
   instanceUserSegment,
   useBridgeInstanceFiles,
   useBridgeInstances,
@@ -12,6 +14,7 @@ import {
   usePutBridgeInstance,
   type BridgeInstance,
   type BridgeOffering,
+  type BridgeType,
 } from "@/api/bridges";
 import { useServerInfo } from "@/api/dashboard";
 import { BridgeGlyph } from "@/components/BridgeGlyph";
@@ -26,7 +29,8 @@ import { ForbiddenState } from "@/components/ui/error-state/ErrorState";
 import { SkeletonText } from "@/components/ui/skeleton/Skeleton";
 import { DataTable, type Column } from "@/components/ui/table/DataTable";
 import { toast } from "@/components/ui/toast/toast-store";
-import { hasScope } from "@/lib/auth";
+import { getSession, hasScope } from "@/lib/auth";
+import { nextStepsPhase, phaseLabel } from "@/lib/bridge-next-steps";
 import {
   frontDoorSentence,
   imageTag,
@@ -37,6 +41,7 @@ import {
 } from "@/lib/bridge-offerings";
 import { AddInstanceDialog } from "./AddInstanceDialog";
 import { InstanceFilesDialog } from "./InstanceFilesDialog";
+import { InstanceNextSteps } from "./InstanceNextSteps";
 import { OfferingSettingsDialog } from "./OfferingSettingsDialog";
 import { RemoveOfferingDialog } from "./RemoveOfferingDialog";
 
@@ -383,6 +388,9 @@ export function BridgeOfferingPage() {
               />
             )}
           </div>
+          {!instancesQuery.isError && (
+            <NextStepsSection instances={instances} offering={offering} type={catalogueType} />
+          )}
         </section>
       )}
 
@@ -436,6 +444,7 @@ export function BridgeOfferingPage() {
 
       <AddInstanceDialog
         offering={offering}
+        type={catalogueType}
         open={adding}
         onOpenChange={setAdding}
         serverName={server?.name}
@@ -540,6 +549,88 @@ function Detail({ label, children }: { label: string; children: ReactNode }) {
       <dt className="text-xs text-text-muted">{label}</dt>
       <dd className="mt-0.5 text-text">{children}</dd>
     </div>
+  );
+}
+
+/**
+ * Beneath the table: who still has something to do, and the words to tell them (RFC 0017
+ * section 4.1: the bot invites them to a chat with the steps when the bridge is ready; this is the
+ * same for the operator to relay). One disclosure per person whose bridge is not signed in yet,
+ * so a server where everyone has signed in says so in one line. Asks the bridges through the same
+ * queries as the "Signed in to" column, so nothing is fetched twice.
+ */
+function NextStepsSection({
+  instances,
+  offering,
+  type,
+}: {
+  instances: BridgeInstance[];
+  offering: BridgeOffering;
+  type: BridgeType | undefined;
+}) {
+  const owned = instances.filter((i) => i.user_id && i.state !== "removing");
+  const logins = useQueries({
+    queries: owned.map((i) =>
+      appserviceLoginsQueryOptions(
+        i.state === "ready" ? (i.appservice_id ?? undefined) : undefined,
+        undefined,
+      ),
+    ),
+  });
+  const self = getSession()?.operator.subject;
+  const pending = owned
+    .map((instance, idx) => ({
+      instance,
+      phase: nextStepsPhase(instance, offering.runtime, logins[idx]),
+    }))
+    .filter(({ phase }) => phase.kind !== "signed-in");
+  if (owned.length === 0) return null;
+  const name = offering.name ?? offering.type;
+  return (
+    <section aria-labelledby="next-steps" className="mt-6">
+      <h3 id="next-steps" className="text-sm font-medium text-text">
+        Next steps
+      </h3>
+      <p className="mt-0.5 text-sm text-text-muted">
+        Who still has something to do, and the words to tell them. When a person&apos;s bridge is
+        ready, its bot invites them to a chat and posts the sign-in steps there; these are the same
+        steps, for you to relay when that message was missed.
+      </p>
+      {pending.length === 0 ? (
+        <p className="mt-3 text-sm text-text">
+          Everyone here has signed in to {name}. Nothing to tell anyone.
+        </p>
+      ) : (
+        <ul className="mt-3 flex flex-col gap-2">
+          {pending.map(({ instance, phase }) => {
+            const owner = instanceOwnerLabel(instance);
+            const isSelf = instance.user_id === self;
+            return (
+              <li key={instanceUserSegment(instance)}>
+                <details className="rounded-md border border-border bg-surface">
+                  <summary className="flex cursor-pointer flex-wrap items-center gap-2 px-4 py-3 text-sm text-text">
+                    <span>
+                      Next steps for <span className="font-identifier">{owner}</span>
+                    </span>
+                    <Badge
+                      status={
+                        phase.kind === "sign-in" ? "success" : instanceStateBadge(instance.state)
+                      }
+                    >
+                      {phaseLabel(phase, isSelf)}
+                    </Badge>
+                    {isSelf && <span className="text-text-muted">(this is you)</span>}
+                  </summary>
+                  <div className="border-t border-border px-4 py-4">
+                    <InstanceNextSteps instance={instance} offering={offering} type={type} />
+                  </div>
+                </details>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </section>
   );
 }
 

@@ -106,10 +106,54 @@ describe("Bridge offering page", () => {
     await userEvent.clear(input);
     await userEvent.type(input, "@erin:example.org");
     await userEvent.click(within(dialog).getByRole("button", { name: "Add bridge" }));
+
+    // The dialog stays as the wizard's second step: what is happening, and the bot that will
+    // invite them, until the bridge is ready and the steps replace it.
+    const watching = await screen.findByRole("dialog", {
+      name: "@erin:example.org's WhatsApp bridge",
+    });
+    expect(
+      within(watching).getByText(/Setting up @erin:example.org's WhatsApp bridge/),
+    ).toBeInTheDocument();
+    expect(within(watching).getByText(/the steps appear here too/)).toHaveTextContent(
+      "@whatsappbot_erin:example.org",
+    );
+    await userEvent.click(within(watching).getByRole("button", { name: "Done" }));
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
 
     const erin = await rowFor("@erin:example.org");
     expect(erin.getByText(/Requested|Registered|Deploying/)).toBeInTheDocument();
+    // And the same next steps wait under the table.
+    expect(
+      screen.getByText(
+        (_, el) =>
+          el?.tagName === "SUMMARY" &&
+          /Next steps for @erin:example.org/.test(el.textContent ?? ""),
+      ),
+    ).toHaveTextContent("Setting up");
+  });
+
+  it("lists next steps for everyone who has not signed in, with their own bot", async () => {
+    renderOffering("mautrix-whatsapp");
+    expect(await screen.findByRole("heading", { name: "Next steps" })).toBeInTheDocument();
+    const summaries = () => screen.getAllByText((_, el) => el?.tagName === "SUMMARY");
+    // Alice has signed in: nothing to tell her. Ops has not; carol is on its way; dave failed.
+    await waitFor(() => expect(summaries()).toHaveLength(3));
+    const text = summaries().map((s) => s.textContent ?? "");
+    expect(text.some((t) => t.includes("@alice:example.org"))).toBe(false);
+    expect(text.find((t) => t.includes("@ops:example.org"))).toContain("Ready: sign in");
+    expect(text.find((t) => t.includes("@ops:example.org"))).toContain("(this is you)");
+    expect(text.find((t) => t.includes("@carol:example.org"))).toContain("Setting up");
+    expect(text.find((t) => t.includes("@dave:example.org"))).toContain("Failed");
+
+    // The operator's own bridge: the invite to accept and the command to send.
+    const ops = summaries().find((s) => s.textContent?.includes("@ops:example.org"))!;
+    await userEvent.click(ops);
+    const details = ops.closest("details") as HTMLElement;
+    expect(within(details).getByText(/This is you: accept the invite from/)).toHaveTextContent(
+      "@whatsappbot_ops:example.org",
+    );
+    expect(within(details).getByRole("list")).toHaveTextContent("login qr");
   });
 
   it("says the server's reason when it refuses someone", async () => {
