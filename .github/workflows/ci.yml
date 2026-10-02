@@ -49,6 +49,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: clippy-${{ matrix.arch }}
+          # The key hashes the manifests' dependency sections, the lock file and the toolchain,
+          # not `[profile.*]` or `CARGO_INCREMENTAL`. When those change the old cache keeps
+          # being restored, every dependency is recompiled on every run, and the result is
+          # never saved because the key still "hits" (543 crates per run from 90061f9 until
+          # this bump, 2026-10-02). Bump the prefix whenever a profile or a build-affecting
+          # variable changes.
+          prefix-key: v1-rust
           # Save the compiled dependencies even when the job fails: they are the same ones the
           # fixing commit needs, and a red run that saves nothing makes the next run a cold build.
           cache-on-failure: true
@@ -71,6 +78,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: test-${{ matrix.arch }}
+          prefix-key: v1-rust
           cache-on-failure: true
       # hs-operator compares the `Homeserver` reconciler's objects with `helm template` of
       # deploy/helm/hs; HS_REQUIRE_HELM makes that test fail, rather than skip, without helm.
