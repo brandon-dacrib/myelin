@@ -18,6 +18,12 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
 
 ### Installing and administering it
 
+- **The fuzz targets run on every push again.** The `fuzz` workflow had been red since it was
+  split from `ci` on 2026-10-01: CI's prebuilt cargo-fuzz is a musl binary and cargo-fuzz builds
+  for the triple it was compiled for by default, so every build targeted
+  `x86_64-unknown-linux-musl`, where AddressSanitizer cannot link. The runner now builds for
+  rustc's host, and a failed build prints its errors instead of its last three lines
+  (2026-10-02, status 12; green run 37034728978).
 - **A migration from Synapse keeps people's encryption, notifications and rooms on other
   servers.** The importer now also copies each device's end-to-end keys (identity, one-time and
   fallback), cross-signing keys with the signatures on them, server-side key backups under the

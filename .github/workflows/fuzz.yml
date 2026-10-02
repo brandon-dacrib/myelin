@@ -5,10 +5,16 @@ name: fuzz
 # 10-minute baseline).
 #
 # Its own workflow, not a job in `ci`: a nightly toolchain can break the build for reasons that
-# are not this repository's (the first run, on 2026-10-01, could not compile `cfg-if` under the
-# sanitizer flags), and `cd`'s "require green ci" step reads the whole `ci` run's conclusion, so
-# a red fuzz job there blocked every image. Here it still fails red and uploads a crash's input,
-# so a finding is seen on the commit that exposed it, without deciding whether that commit ships.
+# are not this repository's, and `cd`'s "require green ci" step reads the whole `ci` run's
+# conclusion, so a red fuzz job there blocked every image. Here it still fails red and uploads a
+# crash's input, so a finding is seen on the commit that exposed it, without deciding whether
+# that commit ships.
+#
+# The red runs from 2026-10-01 to 2026-10-02 ("could not compile `cfg-if` due to 2 previous
+# errors") were not nightly's doing: install-action's prebuilt cargo-fuzz is a musl binary, and
+# cargo-fuzz defaults `--target` to the triple it was compiled for, so it built for
+# x86_64-unknown-linux-musl (no rust-std, and ASAN cannot link a static libc). The runner
+# script passes `--target` as rustc's host now; status 12 (2026-10-02) has the run ids.
 on:
   push:
     branches: [main]

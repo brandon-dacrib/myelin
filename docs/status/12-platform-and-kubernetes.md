@@ -141,6 +141,62 @@ The sccache gain in wall time is modest on a quiet 12-core machine because the u
 linking) is the critical path; the CPU time halves, which is what matters with ten agents
 building at once at a load of 60. The first warm build after populating the cache showed 409
 misses that a later identical build did not (808 hits); not understood, not reproduced.
+## 2026-10-02 (branch `agent/fuzz-nightly`): the `fuzz` workflow is green; the red runs were cargo-fuzz's target default, not nightly
+
+Every `fuzz` run on `main` since the job was split out of `ci` (66d99e0) failed in two seconds,
+both crates alike, with "could not compile `cfg-if` (lib) due to 2 previous errors" (last red
+run on `main`: 36958301315). `tests/fuzz/run_all.sh` piped the build through `tail -3`, so the
+log never showed the two errors. With the script changed to keep the build log and print its
+`error` blocks (run 37034520862 on this branch), they were:
+
+```
+error: sanitizer is incompatible with statically linked libc, disable it using `-C target-feature=-crt-static`
+error[E0463]: can't find crate for `core`
+  = note: the `x86_64-unknown-linux-musl` target may not be installed
+```
+
+and the command cargo-fuzz had assembled ended in `--target x86_64-unknown-linux-musl`. Nothing
+in the repository asks for musl. cargo-fuzz 0.13's default `--target` is
+`current_platform::CURRENT_PLATFORM` (`src/utils.rs`, "to workaround issue #11"): the triple
+cargo-fuzz *itself* was compiled for. `taiki-e/install-action` installs the project's prebuilt
+cargo-fuzz, which is a musl binary, so on an `x86_64-unknown-linux-gnu` runner every fuzz build
+targeted musl: no `rust-std` for it on the nightly, and AddressSanitizer cannot link against a
+static libc. Locally it never reproduced because `cargo install cargo-fuzz` builds it for the
+host (and the same probe on a Linux nightly of the same date, `aarch64-unknown-linux-gnu` in
+Docker, compiled `cfg-if` under the full cargo-fuzz flag set without complaint).
+
+### What changed
+
+- `tests/fuzz/run_all.sh`: `cargo +nightly fuzz build --target "$HOST"`, where `$HOST` is
+  `rustc +nightly -vV`'s host (the script already used it to find the built binaries). The
+  sanitizer stays on; nothing about the flags, the toolchain pin or the fuzz crates' manifests
+  changed. A failed build now keeps the whole cargo log at `$FUZZ_OUT/<crate>/build.log` (the
+  workflow uploads it on failure) and prints every `error` block.
+- `.github/workflows/fuzz.yml`: the header comment no longer blames nightly for the 2026-10-01
+  failure; it says what it was. No step changed; `workflow_dispatch` was already there.
+
+### Verified
+
+- GitHub, `workflow_dispatch` on `agent/fuzz-nightly`: run 37034520862 (diagnostic commit, red
+  with the real errors above), then run 37034728978 with the fix: **green**. All eight targets built on nightly 1.101.0
+  (2026-10-01) for `x86_64-unknown-linux-gnu` with ASAN and ran 60 s each from the seed corpus,
+  no crash: `well_known_body_parse` 9.8 M executions, `edu_parse` 4.8 M,
+  `key_server_response_parse` 4.0 M, `pdu_parse` 3.3 M, `xmatrix_header_parse` 2.5 M,
+  `thumbnail_generate` 2.3 M, `multipart_parse` 1.2 M, `decode_image` 0.5 M (28.4 M in all).
+- Locally, `tests/fuzz/run_all.sh 10` on nightly 2026-09-30 (`aarch64-apple-darwin`,
+  cargo-fuzz 0.13.2): all eight targets built and ran, no crash. Executions in 10 s:
+  `pdu_parse` 80,493; `xmatrix_header_parse` 26,588; `well_known_body_parse` 12,718;
+  `decode_image` 10,572; `thumbnail_generate` 7,757; `key_server_response_parse` 7,737;
+  `multipart_parse` 5,862; `edu_parse` 2,623.
+
+### Decisions made
+
+- Pass the host triple rather than switching install-action for `cargo install cargo-fuzz`:
+  the prebuilt binary is a 10-second install and a from-source build is several minutes per run,
+  and an explicit `--target` is also the right thing for the script on any machine where
+  cargo-fuzz's build triple differs from rustc's host.
+- Not `-Zbuild-std`, and not `-C target-feature=-crt-static` on musl: both would keep a target
+  nobody chose. The gnu host target is what the sanitizer runtime ships for.
 
 ## 2026-10-01 (branch `agent/platform-gaps`): the operator has run against an API server
 
