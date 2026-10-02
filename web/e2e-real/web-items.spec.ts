@@ -229,3 +229,77 @@ test.describe("Exact lookup and the username check against the real server", () 
     await page.screenshot({ path: "test-results/real-add-user-availability.png" });
   });
 });
+
+test.describe("Room lifecycle against the real server", () => {
+  test.skip(
+    !process.env.HS_REAL_SERVER_URL || !adminToken,
+    "HS_REAL_SERVER_URL and HS_REAL_ADMIN_TOKEN not set",
+  );
+
+  test("an upgraded room links its successor, guests are named, and Block keeps the reason", async ({
+    page,
+    request,
+  }) => {
+    const localpart = `room-${run}`;
+    await makeUser(request, localpart);
+    const login = await request.post("/_matrix/client/v3/login", {
+      data: {
+        type: "m.login.password",
+        identifier: { type: "m.id.user", user: localpart },
+        password: `hunter2-${localpart}-long-enough`,
+      },
+    });
+    expect(login.ok(), await login.text()).toBe(true);
+    const { access_token } = (await login.json()) as { access_token: string };
+    const client = { authorization: `Bearer ${access_token}` };
+    const created = await request.post("/_matrix/client/v3/createRoom", {
+      headers: client,
+      data: { name: `Lifecycle ${run}`, preset: "public_chat", room_version: "10" },
+    });
+    expect(created.ok(), await created.text()).toBe(true);
+    const { room_id } = (await created.json()) as { room_id: string };
+    const guests = await request.put(
+      `/_matrix/client/v3/rooms/${encodeURIComponent(room_id)}/state/m.room.guest_access`,
+      { headers: client, data: { guest_access: "can_join" } },
+    );
+    expect(guests.ok(), await guests.text()).toBe(true);
+    const upgraded = await request.post(
+      `/_matrix/client/v3/rooms/${encodeURIComponent(room_id)}/upgrade`,
+      { headers: client, data: { new_version: "11" } },
+    );
+    expect(upgraded.ok(), await upgraded.text()).toBe(true);
+    const { replacement_room } = (await upgraded.json()) as { replacement_room: string };
+
+    await signIn(page);
+    await page.goto(`/admin/rooms/${encodeURIComponent(room_id)}`);
+    await expect(page.getByRole("heading", { name: `Lifecycle ${run}`, level: 1 })).toBeVisible();
+    await expect(page.getByText("Upgraded", { exact: true })).toBeVisible();
+    await expect(page.getByText("Guests may join")).toBeVisible();
+    await expect(page.getByRole("link", { name: replacement_room }).first()).toBeVisible();
+
+    await page.getByRole("button", { name: "Block", exact: true }).click();
+    const dialog = page.getByRole("dialog");
+    await dialog.getByLabel(/^Reason/).fill(`Spam ring ${run}`);
+    await dialog.getByRole("button", { name: "Block" }).click();
+    await expect(page.getByText(`Blocked: Spam ring ${run}`)).toBeVisible();
+    const after = await request.get(`/api/v1/rooms/${encodeURIComponent(room_id)}`, {
+      headers: authed(),
+    });
+    const room = (await after.json()) as {
+      blocked: boolean;
+      blocked_reason: string | null;
+      tombstoned: boolean;
+      replacement_room_id: string | null;
+    };
+    expect(room.blocked).toBe(true);
+    expect(room.blocked_reason).toBe(`Spam ring ${run}`);
+    expect(room.tombstoned).toBe(true);
+    expect(room.replacement_room_id).toBe(replacement_room);
+    await settle(page);
+    await page.screenshot({ path: "test-results/real-room-lifecycle.png", fullPage: true });
+
+    await page.getByRole("link", { name: replacement_room }).first().click();
+    await expect(page.getByRole("heading", { name: `Lifecycle ${run}`, level: 1 })).toBeVisible();
+    await expect(page.getByText("Upgraded", { exact: true })).toHaveCount(0);
+  });
+});

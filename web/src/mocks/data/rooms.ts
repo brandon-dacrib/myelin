@@ -97,6 +97,31 @@ export const rooms: Room[] = [
     replacement_room_id: null,
     forgotten: false,
   },
+  {
+    // General before its upgrade: closed, pointing at the room that replaced it.
+    room_id: "!general-v6:example.org",
+    name: "General (old)",
+    topic: "Company-wide announcements",
+    avatar_url: null,
+    canonical_alias: null,
+    joined_members_count: 3,
+    local_members_count: 3,
+    state_events_count: 410,
+    version: "6",
+    creator: "@admin:example.org",
+    encrypted: false,
+    join_rule: "invite",
+    guest_access: "forbidden",
+    history_visibility: "shared",
+    federatable: true,
+    public: false,
+    room_type: null,
+    blocked: false,
+    blocked_reason: null,
+    tombstoned: true,
+    replacement_room_id: "!general:example.org",
+    forgotten: false,
+  },
 ];
 
 export const roomMembers: Record<string, RoomMember[]> = {

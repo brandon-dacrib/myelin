@@ -226,6 +226,21 @@ sentence, and Add user shows the 503 sentence (`test-results/real-add-user-avail
 directory (`crates/hs-admin/src/router.rs::users_availability`), and a phone or SSO lookup was
 seen only in the mock (the real walk had an email).
 
+**5. Room lifecycle** (`pages/RoomDetailPage.tsx`, `GUEST_ACCESS_LABELS` in `lib/rooms.ts`).
+An upgraded room (`tombstoned`) gets an "Upgraded" badge, a sentence under its name ("This room
+was upgraded and closed: its members were pointed at `!new:...`. Nothing new is sent here.")
+and an "Upgraded to" fact, both linking the successor (`replacement_room_id`); a successor the
+server does not name is said to be unnamed. "Guests" is a fact ("Guests may join" / "Guests
+may not join") with what a guest is. Block asks for a reason (optional, explained as shown on
+the badge and kept in the audit log); the badge then reads "Blocked: Spam ring" and a "Blocked
+because" fact repeats it, "No reason was given." when none was. The Block dialog also says what
+blocking does and does not do (members stay; delete removes them; Unblock reverses it). Mock:
+`!general-v6:example.org`, General before its upgrade, tombstoned to `!general`; block keeps
+the reason, unblock clears it. Verified against the real binary: a room made and upgraded
+through the client API shows Upgraded, "Guests may join" and the successor link, Block with a
+reason is read back as `blocked_reason` from `GET /rooms/{id}`, and the link opens the successor
+(`test-results/real-room-lifecycle.png`).
+
 ## 2026-10-01: the interface explains itself, by the owner's rule (branch `agent/web-admin-ui`)
 
 The owner's rule: *"Sane defaults, and all administration is done via the web UI, well
@@ -332,8 +347,8 @@ closes that and audits every page. Branched from `agent/config-hot` (for `applie
 4. ~~**Exact user lookup** (`users.lookup` by email, phone or SSO subject) and a live username
    check in Add user (`users.availability`).~~ Done 2026-10-02 (the live check needs the
    server's directory to support it; it says so meanwhile).
-5. **Room lifecycle**: an upgraded room's successor (`tombstoned`, `replacement_room_id`), guest
-   access, and the block reason (asked on Block, shown on the badge).
+5. ~~**Room lifecycle**: an upgraded room's successor (`tombstoned`, `replacement_room_id`), guest
+   access, and the block reason (asked on Block, shown on the badge).~~ Done 2026-10-02.
 6. **Federation and Overview at scale**: both read the first 50 destinations; the Overview
    counts failing ones from that page instead of `federation_destinations_failing_count`.
    Needs paging and a failing-first filter.

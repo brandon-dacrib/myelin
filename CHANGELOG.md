@@ -75,6 +75,10 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
   page's "Find by email, phone or sign-in provider" opens the one matching account or says
   nobody has it; the username check says free, taken, or that this server cannot check in
   advance (its directory answers 503 today), honestly. Verified against `hs serve`.
+- **A room's page shows its lifecycle** (2026-10-02, `agent/web-items`). An upgraded room says
+  it is closed and links the room that replaced it, guest access is a fact in words, and Block
+  asks why, showing the reason on the badge and keeping it with the room and in the audit log.
+  Verified against `hs serve` with a room upgraded through the client API.
 - **The management interface explains itself** (2026-10-01, `agent/web-admin-ui`). Every
   configuration setting carries a badge from the server's own classification (applies on save,
   needs a restart, or per replica from the file or environment), each class is explained once

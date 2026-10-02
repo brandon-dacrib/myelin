@@ -1856,14 +1856,16 @@ export const handlers = [
     return HttpResponse.json({ items, next_cursor, prev_cursor });
   }),
 
-  http.post(`${API}/rooms/:room_id/block`, ({ params }) => {
+  http.post(`${API}/rooms/:room_id/block`, async ({ params, request }) => {
     const room = findRoom(decodeURIComponent(String(params.room_id)));
     if (!room)
       return HttpResponse.json(
         { type: "urn:hs:problem:not-found", title: "Not found" },
         { status: 404 },
       );
+    const body = (await request.json().catch(() => null)) as { reason?: string } | null;
     room.blocked = true;
+    room.blocked_reason = body?.reason ?? null;
     return HttpResponse.json(room);
   }),
 
@@ -1875,6 +1877,7 @@ export const handlers = [
         { status: 404 },
       );
     room.blocked = false;
+    room.blocked_reason = null;
     return HttpResponse.json(room);
   }),
 

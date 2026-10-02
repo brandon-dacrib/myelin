@@ -1,10 +1,11 @@
 import {
+  GUEST_ACCESS_LABELS,
   HISTORY_VISIBILITY_LABELS,
   JOIN_RULE_LABELS,
   MEMBERSHIP_LABELS,
   roomWords,
 } from "@/lib/rooms";
-import { useState, type ReactNode } from "react";
+import { useId, useState, type FormEvent, type ReactNode } from "react";
 import { useParams, useSearch, useNavigate, Link } from "@tanstack/react-router";
 import { ChevronLeft } from "lucide-react";
 import {
@@ -18,7 +19,8 @@ import {
 import { useRoomHierarchy } from "@/api/room-contents";
 import { Button } from "@/components/ui/button/Button";
 import { Badge } from "@/components/ui/badge/Badge";
-import { Dialog, DialogTrigger, DialogClose, DialogContent } from "@/components/ui/dialog/Dialog";
+import { Dialog, DialogContent } from "@/components/ui/dialog/Dialog";
+import { Field, Textarea } from "@/components/ui/input/Input";
 import { ForbiddenState } from "@/components/ui/error-state/ErrorState";
 import { SkeletonText } from "@/components/ui/skeleton/Skeleton";
 import { QueryProblemState } from "@/components/QueryProblemState";
@@ -125,12 +127,40 @@ export function RoomDetailPage() {
                 Space
               </Badge>
             )}
-            {room.blocked && <Badge status="danger">Blocked</Badge>}
+            {room.tombstoned && (
+              <Badge status="warning" hideIcon>
+                Upgraded
+              </Badge>
+            )}
+            {room.blocked && (
+              <span title={room.blocked_reason ? `Blocked: ${room.blocked_reason}` : undefined}>
+                <Badge status="danger">
+                  {room.blocked_reason ? `Blocked: ${room.blocked_reason}` : "Blocked"}
+                </Badge>
+              </span>
+            )}
           </div>
           <p className="mt-1 text-sm text-text-muted">
             <CopyableId value={id} />
             {room.canonical_alias && ` · ${room.canonical_alias}`}
           </p>
+          {room.tombstoned && (
+            <p className="mt-2 text-sm text-text-muted">
+              This room was upgraded and closed: its members were pointed at{" "}
+              {room.replacement_room_id ? (
+                <Link
+                  to="/rooms/$roomId"
+                  params={{ roomId: room.replacement_room_id }}
+                  className="font-identifier text-accent hover:underline"
+                >
+                  {room.replacement_room_id}
+                </Link>
+              ) : (
+                "a successor this server does not name"
+              )}
+              . Nothing new is sent here.
+            </p>
+          )}
         </div>
         <div className="flex flex-wrap gap-2">
           <Button
@@ -178,8 +208,12 @@ export function RoomDetailPage() {
             <BlockButton
               room={room}
               disabled={!canModerate}
-              onBlock={() =>
-                block.mutate({ roomId: id }, { onSuccess: () => toast({ title: "Room blocked" }) })
+              pending={block.isPending}
+              onBlock={(reason) =>
+                block.mutate(
+                  { roomId: id, reason },
+                  { onSuccess: () => toast({ title: "Room blocked" }) },
+                )
               }
             />
           )}
@@ -241,39 +275,69 @@ export function RoomDetailPage() {
   );
 }
 
+/**
+ * Block, with the reason asked for: the server keeps it with the room, the badge shows it, and
+ * the audit entry carries it, so the next administrator knows why nobody can join.
+ */
 function BlockButton({
   room,
   disabled,
+  pending,
   onBlock,
 }: {
   room: Room;
   disabled: boolean;
-  onBlock: () => void;
+  pending: boolean;
+  onBlock: (reason: string | undefined) => void;
 }) {
+  const [open, setOpen] = useState(false);
+  const [reason, setReason] = useState("");
+  const formId = useId();
+  function submit(e: FormEvent) {
+    e.preventDefault();
+    onBlock(reason.trim() || undefined);
+    setOpen(false);
+    setReason("");
+  }
   return (
-    <Dialog>
-      <DialogTrigger asChild>
-        <Button variant="danger" disabled={disabled}>
-          Block
-        </Button>
-      </DialogTrigger>
-      <DialogContent
-        title={`Block ${room.name ?? room.room_id}?`}
-        description="Prevents new joins; current members remain and can still send messages."
-        footer={
-          <>
-            <DialogClose asChild>
-              <Button variant="secondary">Cancel</Button>
-            </DialogClose>
-            <DialogClose asChild>
-              <Button variant="danger" onClick={onBlock}>
+    <>
+      <Button variant="danger" disabled={disabled} onClick={() => setOpen(true)}>
+        Block
+      </Button>
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogContent
+          size="form"
+          title={`Block ${room.name ?? room.room_id}?`}
+          description="Nobody can join it any more, from this server or another. Current members stay and can still send messages; delete the room to remove them. Unblock on this page lets people join again."
+          footer={
+            <>
+              <Button variant="secondary" onClick={() => setOpen(false)}>
+                Cancel
+              </Button>
+              <Button variant="danger" type="submit" form={formId} disabled={pending}>
                 Block
               </Button>
-            </DialogClose>
-          </>
-        }
-      />
-    </Dialog>
+            </>
+          }
+        >
+          <form id={formId} onSubmit={submit} noValidate>
+            <Field
+              label="Reason"
+              hint="Optional. Shown on the room's badge and kept in the audit log, so whoever looks next knows why."
+            >
+              {(fieldProps) => (
+                <Textarea
+                  {...fieldProps}
+                  value={reason}
+                  onChange={(e) => setReason(e.target.value)}
+                  placeholder="Spam ring reported three times this week"
+                />
+              )}
+            </Field>
+          </form>
+        </DialogContent>
+      </Dialog>
+    </>
   );
 }
 
@@ -298,6 +362,11 @@ function RoomOverview({ room }: { room: Room }) {
           <Fact label="Topic" value={room.topic ?? "—"} />
           <Fact label="Who can join" value={roomWords(JOIN_RULE_LABELS, room.join_rule)} />
           <Fact
+            label="Guests"
+            value={roomWords(GUEST_ACCESS_LABELS, room.guest_access)}
+            hint="A guest is an account with no password, made while Configuration, Authentication, allow guest access is on."
+          />
+          <Fact
             label="Who can read its history"
             value={roomWords(HISTORY_VISIBILITY_LABELS, room.history_visibility)}
           />
@@ -311,6 +380,32 @@ function RoomOverview({ room }: { room: Room }) {
             hint="Room settings and membership records; a very large number makes joining slow."
           />
           <Fact label="People on other servers can join" value={room.federatable ? "Yes" : "No"} />
+          {room.tombstoned && (
+            <Fact
+              label="Upgraded to"
+              value={
+                room.replacement_room_id ? (
+                  <Link
+                    to="/rooms/$roomId"
+                    params={{ roomId: room.replacement_room_id }}
+                    className="font-identifier text-accent hover:underline"
+                  >
+                    {room.replacement_room_id}
+                  </Link>
+                ) : (
+                  "A successor this server does not name"
+                )
+              }
+              hint="The room that replaced this one; this one is closed to new messages."
+            />
+          )}
+          {room.blocked && (
+            <Fact
+              label="Blocked because"
+              value={room.blocked_reason ?? "No reason was given."}
+              hint="Nobody can join while it is blocked. Unblock is above."
+            />
+          )}
         </dl>
 
         <h2 className="mt-8 text-md font-medium text-text">Members</h2>

@@ -90,6 +90,12 @@ export const HISTORY_VISIBILITY_LABELS: Record<string, string> = {
   joined: "Members, from when they joined",
 };
 
+/** `m.room.guest_access`, in words: whether guests (accounts with no password) may join. */
+export const GUEST_ACCESS_LABELS: Record<string, string> = {
+  can_join: "Guests may join",
+  forbidden: "Guests may not join",
+};
+
 /** A membership state (`m.room.member`'s `membership`), in words. */
 export const MEMBERSHIP_LABELS: Record<string, string> = {
   join: "Joined",

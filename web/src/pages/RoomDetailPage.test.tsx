@@ -26,6 +26,40 @@ async function tab(name: string) {
 
 afterEach(() => signOut());
 
+describe("Room lifecycle", () => {
+  it("asks why on Block, shows the reason on the badge and in the facts, and clears it on Unblock", async () => {
+    await open("/rooms/!spam-central:example.org");
+    expect(screen.getByText("Guests may join")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Block" }));
+    const dialog = within(await screen.findByRole("dialog"));
+    expect(dialog.getByText(/Nobody can join it any more/)).toBeInTheDocument();
+    await userEvent.type(dialog.getByLabelText(/^Reason/), "Spam ring");
+    await userEvent.click(dialog.getByRole("button", { name: "Block" }));
+    expect(await screen.findByText("Blocked: Spam ring")).toBeInTheDocument();
+    expect(screen.getByText("Blocked because")).toBeInTheDocument();
+    expect(screen.getByText("Spam ring")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Unblock" }));
+    await waitFor(() => expect(screen.queryByText("Blocked: Spam ring")).toBeNull());
+  });
+
+  it("says an upgraded room is closed and links its successor", async () => {
+    const { router } = await open("/rooms/!general-v6:example.org");
+    expect(screen.getByText("Upgraded")).toBeInTheDocument();
+    expect(screen.getByText(/This room was upgraded and closed/)).toBeInTheDocument();
+    expect(screen.getByText("Upgraded to")).toBeInTheDocument();
+    const links = screen.getAllByRole("link", { name: "!general:example.org" });
+    expect(links.length).toBeGreaterThan(0);
+    await userEvent.click(links[0]!);
+    await waitFor(() =>
+      expect(decodeURIComponent(router.state.location.pathname)).toBe(
+        "/rooms/!general:example.org",
+      ),
+    );
+    expect(await screen.findByRole("heading", { name: "General" })).toBeInTheDocument();
+    expect(screen.queryByText("Upgraded")).toBeNull();
+  });
+});
+
 describe("RoomDetailPage", () => {
   it("shows the overview with members, and a Space tab only for a space", async () => {
     await open();
