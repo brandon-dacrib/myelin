@@ -45,6 +45,11 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
   `hs_admin_scope_refusals_total`. The mint and the revocation are in the audit log with the
   scopes. Verified on the real binary: a `bridges:read` token is served the bridge listings,
   refused the users list, and refused everything once revoked.
+- **The federation destinations list sorts and pages past 50, and the cluster reports its
+  heartbeat sequence** (2026-10-02, API only): `GET /api/v1/federation/destinations?sort=-failing_since`
+  and the other fields the document lists, failing first by default; `GET /api/v1/cluster`
+  carries `heartbeat_seq` and `drain_released_at_once_count`, and each replica its
+  `heartbeat_seq`. The pages that would show them are not built yet.
 - **Every admin API operation enforces the scope its OpenAPI document gives it** (2026-10-01):
   26 bridge operations took `admin:*` instead of `bridges:*` and `users.logout` `admin:write`
   instead of `moderation:write`; a test now asks the router about all 154 authenticated

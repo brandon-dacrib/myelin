@@ -64,6 +64,43 @@ nothing, and bob's own `/account/deactivate` with `erase` erases him.
 **Not done.** Federation does not yet redact an erased user's events when serving them to other
 servers (Synapse's `erased_users` table does); a self-service erasure does not leave rooms
 (status 07); the Synapse proxy is not mounted.
+## 2026-10-02: federation destinations at scale and the cluster series (branch `agent/admin-token`, part 2)
+
+Status 16's items 6 and 8, API and OpenAPI only (`x-hs-changelog` 0.1.2, additive):
+
+- **`GET /federation/destinations`** already paged with a cursor and `limit` up to 500 and put
+  failing destinations first; its `sort` was declared and ignored. It is honoured now:
+  `server_name`, `failing_since`, `last_successful_at`, `retry_last_at`, `pending_pdu_count`,
+  `pending_edu_count`, `-` for descending, a destination without the timestamp last either
+  way; anything else is `400 validation-failed` naming `param:sort`. The document says the
+  default order (failing first, then by name), the paging, and that `failing=true` with
+  `include_total=true` is the count the Overview carries as
+  `federation_destinations_failing_count`, which `hs serve`'s overview source already fills
+  from every destination, not the first page (`crates/hs-cli/src/overview.rs`). Router tests:
+  sort by name and by timestamp both ways, the bad field, and 120 destinations paged 50 at a
+  time with the 40 failing ones first across the page boundary.
+- **`GET /cluster`** carries `heartbeat_seq` (the answering replica's last heartbeat sequence
+  that reached the store, `hs_cluster_heartbeat_seq`) and `drain_released_at_once_count`
+  (`hs_cluster_drain_released_at_once_total`), read from `hs_cluster::metrics::ClusterMetrics`'s
+  snapshot, which `hs serve` hands the overview once the cluster starts
+  (`ServerOverview::set_cluster_metrics`); absent for a single node. **Each `Replica`** of
+  `GET /cluster/replicas` carries `heartbeat_seq`, from its registry row. The search-index lag
+  waits for `hs_room_search_rooms_behind` to exist.
+
+What the interface can now show: the Overview's failing-destinations tile from
+`federation_destinations_failing_count` instead of counting the first page; the Federation page
+sorted by how long a destination has been failing or by its backlog, and paged past 50; the
+Cluster page's replica rows with a heartbeat sequence (a stalled sequence beside a fresh
+timestamp is a replica whose clock moved but whose heartbeats did not) and the cluster header's
+own sequence and the count of drains that released at once.
+
+Verified on the real binary (single node): `GET /api/v1/federation/destinations?sort=-failing_since`
+is `200` with the envelope, `?sort=colour` is `400` naming `param:sort`, `GET /api/v1/cluster`
+answers `single-node` without the two new fields. The clustered values (two replicas on
+PostgreSQL) are a desktop item, as `crates/hs-cli/tests/cluster_admin.rs` is. Client
+regenerated. Verify: `cargo test -p hs-admin` (router tests `federation_destinations_*`),
+`cargo test -p hs-cli --lib -- cluster_admin overview`.
+
 ## 2026-10-02: admin tokens narrower than an administrator's (branch `agent/admin-token`)
 
 The gap yesterday's entry named: the six scopes were enforced on all 154 operations, but the

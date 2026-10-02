@@ -140,6 +140,14 @@ button. Settings tab, palette entry (`settings-admin-tokens`, gated `admin:read`
 page is served `/bridge-types`, refused `/users` naming `admin:read`, and `401` once revoked
 from the page). Client regenerated. Details in status 15's entry of the same date.
 
+Also by track 15 on the same branch, for items 6 and 8 of the 2026-10-01 list, API only: `GET
+/federation/destinations` honours `sort` (`-failing_since`, `pending_pdu_count`, ...) and
+documents its failing-first default and paging past 50; `GET /cluster` carries
+`heartbeat_seq` and `drain_released_at_once_count` and each replica `heartbeat_seq`; the
+Overview's `federation_destinations_failing_count` is filled from every destination on the
+real server. The Overview tile, the Federation sort control and the Cluster columns are the
+web items left; `schema.d.ts` has the fields.
+
 ## 2026-10-01: the interface explains itself, by the owner's rule (branch `agent/web-admin-ui`)
 
 The owner's rule: *"Sane defaults, and all administration is done via the web UI, well

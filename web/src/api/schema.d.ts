@@ -758,7 +758,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** List federation destinations */
+        /**
+         * List federation destinations
+         * @description Every remote server this one has tried to reach. Failing destinations come first, then the rest by name, unless `sort` says otherwise; `limit` goes up to 500 and `cursor` continues past it. `failing=true` with `include_total=true` is the count the Overview carries as `federation_destinations_failing_count`.
+         */
         get: operations["federation.destinations.list"];
         put?: never;
         post?: never;
@@ -2843,7 +2846,11 @@ export interface components {
             registration_yaml?: string;
         };
         ClusterStatus: {
+            /** @description How many times since the answering replica started a drain released every shard it owned at once rather than one lease at a time (`hs_cluster_drain_released_at_once_total`). Absent for a single node. */
+            drain_released_at_once_count?: number;
             epoch?: number;
+            /** @description The sequence number of the answering replica's last heartbeat that reached the store, which every heartbeat increments (`hs_cluster_heartbeat_seq`). Absent for a single node. */
+            heartbeat_seq?: number;
             mode?: string;
             /** @description How many replicas are registered and heartbeating, whatever their status (joining, active, draining or drained; a replica that has stopped heartbeating is not counted). A drained replica is counted, because it is still serving by forwarding. Without the replica registry, the number of replicas owning a shard. 1 for a single node. */
             replica_count?: number;
@@ -3284,6 +3291,8 @@ export interface components {
             drain_task_id?: string | null;
             /** @description The replica's generation, which changes each time it starts. */
             epoch: number;
+            /** @description The sequence number of that heartbeat, which every heartbeat increments and the other replicas watch for liveness. Absent for a single node. */
+            heartbeat_seq?: number;
             id: string;
             /**
              * Format: date-time
@@ -5541,13 +5550,14 @@ export interface operations {
             query?: {
                 /** @description Opaque keyset cursor from a previous page's next_cursor or prev_cursor. */
                 cursor?: components["parameters"]["Cursor"];
+                /** @description `true` for only the destinations whose requests are failing, `false` for only the healthy ones. */
                 failing?: boolean;
                 /** @description Ask for the total count. Only honoured where a count is cheap; otherwise total is omitted. */
                 include_total?: components["parameters"]["IncludeTotal"];
                 /** @description Page size. Values above the resource's max are clamped, not rejected. */
                 limit?: components["parameters"]["Limit"];
-                /** @description Sort field from the resource's allow-list. Prefix with - for descending. */
-                sort?: components["parameters"]["Sort"];
+                /** @description One of `server_name`, `failing_since`, `last_successful_at`, `retry_last_at`, `pending_pdu_count`, `pending_edu_count`, with `-` in front for descending; a destination without the timestamp sorts last either way. Absent means failing first, then by name. Anything else is `400 validation-failed` naming `param:sort`. */
+                sort?: string;
             };
             header?: never;
             path?: never;

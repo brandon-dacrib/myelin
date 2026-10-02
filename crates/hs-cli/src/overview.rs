@@ -53,6 +53,10 @@ pub struct ServerOverview<B: KvBackend> {
     single_node: bool,
     /// Set once the cluster has started, which is after the admin router is assembled.
     ownership: OnceLock<Arc<dyn Ownership>>,
+    /// This replica's cluster counters, for `GET /cluster`'s `heartbeat_seq` and
+    /// `drain_released_at_once_count`. Set once the cluster has started; absent for a single
+    /// node, whose `GET /cluster` carries neither.
+    cluster_metrics: OnceLock<Arc<hs_cluster::metrics::ClusterMetrics>>,
     /// Where the count of failing federation destinations comes from. Absent until set, and
     /// the count is then absent too rather than zero.
     federation: OnceLock<Arc<dyn hs_admin::sources::FederationSource>>,
@@ -74,6 +78,7 @@ impl<B: KvBackend + 'static> ServerOverview<B> {
             rooms,
             single_node,
             ownership: OnceLock::new(),
+            cluster_metrics: OnceLock::new(),
             federation: OnceLock::new(),
             reports: OnceLock::new(),
             media: OnceLock::new(),
@@ -92,6 +97,12 @@ impl<B: KvBackend + 'static> ServerOverview<B> {
     /// Hands over the cluster's ownership view once it exists. Later calls are ignored.
     pub fn set_ownership(&self, ownership: Arc<dyn Ownership>) {
         let _ = self.ownership.set(ownership);
+    }
+
+    /// Hands over this replica's cluster counters, so `GET /cluster` can report its heartbeat
+    /// sequence and the drains that released every shard at once.
+    pub fn set_cluster_metrics(&self, metrics: Arc<hs_cluster::metrics::ClusterMetrics>) {
+        let _ = self.cluster_metrics.set(metrics);
     }
 
     /// Hands over the federation source, so the overview can count failing destinations.
@@ -216,15 +227,22 @@ impl<B: KvBackend + 'static> OverviewSource for ServerOverview<B> {
                 epoch: None,
                 replica_count: Some(1),
                 shard_count: None,
+                heartbeat_seq: None,
+                drain_released_at_once_count: None,
             });
         }
         // The shard map is what this replica currently believes; the counts are of that belief.
         let map = self.ownership.get().map(|o| o.shard_map().borrow().clone());
+        // The same two numbers `/metrics` serves as `hs_cluster_heartbeat_seq` and
+        // `hs_cluster_drain_released_at_once_total`, for the Cluster page.
+        let counters = self.cluster_metrics.get().map(|m| m.snapshot());
         Ok(ClusterStatus {
             mode: "cluster".to_owned(),
             epoch: None,
             replica_count: map.as_ref().map(|m| m.owning_replica_count().max(1) as u64),
             shard_count: map.as_ref().map(|m| m.owned_shard_count() as u64),
+            heartbeat_seq: counters.as_ref().map(|c| c.heartbeat_seq),
+            drain_released_at_once_count: counters.as_ref().map(|c| c.drain_released_at_once),
         })
     }
 }

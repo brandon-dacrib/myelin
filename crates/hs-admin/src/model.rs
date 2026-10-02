@@ -279,6 +279,15 @@ pub struct ClusterStatus {
     pub replica_count: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shard_count: Option<u64>,
+    /// The sequence number of the answering replica's last heartbeat that reached the store
+    /// (`hs_cluster_heartbeat_seq`); absent for a single node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat_seq: Option<u64>,
+    /// How many times, since this replica started, a drain released every shard it owned at
+    /// once instead of one lease at a time (`hs_cluster_drain_released_at_once_total`);
+    /// absent for a single node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain_released_at_once_count: Option<u64>,
 }
 
 /// The OpenAPI `SetupStatus` schema: the body of `GET /setup`.

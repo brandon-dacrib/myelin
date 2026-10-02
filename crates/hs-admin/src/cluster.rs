@@ -108,6 +108,10 @@ pub struct Replica {
     pub zone: Option<String>,
     /// Its last heartbeat (RFC 3339); `None` for a single node.
     pub last_heartbeat_at: Option<String>,
+    /// The sequence number of that heartbeat, which every heartbeat increments: the liveness
+    /// signal the other replicas watch. `None` for a single node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat_seq: Option<u64>,
     /// When an administrator asked it to drain (RFC 3339), while that request is in force.
     pub drain_requested_at: Option<String>,
     /// Who asked it to drain.
@@ -419,6 +423,7 @@ impl InMemoryCluster {
             version: None,
             zone: None,
             last_heartbeat_at: None,
+            heartbeat_seq: None,
             drain_requested_at: None,
             drain_requested_by: None,
             drain_task_id: None,
@@ -452,6 +457,7 @@ impl InMemoryCluster {
             version: Some("0.0.1".into()),
             zone: None,
             last_heartbeat_at: Some(hs_http::time::now_rfc3339()),
+            heartbeat_seq: Some(1),
             drain_requested_at: None,
             drain_requested_by: None,
             drain_task_id: None,
@@ -1115,6 +1121,8 @@ mod tests {
                 epoch: None,
                 replica_count: Some(1),
                 shard_count: Some(4),
+                heartbeat_seq: None,
+                drain_released_at_once_count: None,
             },
         }));
         let (status, body) = request(

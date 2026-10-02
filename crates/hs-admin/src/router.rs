@@ -2618,13 +2618,70 @@ struct DestinationsQuery {
     limit: Option<usize>,
     cursor: Option<String>,
     include_total: Option<bool>,
-    #[allow(dead_code)]
     sort: Option<String>,
     failing: Option<bool>,
 }
 
-/// `GET /api/v1/federation/destinations`: failing ones first, then by name; `?failing=true`
-/// narrows to those.
+/// The fields `GET /federation/destinations` sorts by (`sort=<field>` or `sort=-<field>`).
+pub const DESTINATION_SORT_FIELDS: &[&str] = &[
+    "server_name",
+    "failing_since",
+    "last_successful_at",
+    "retry_last_at",
+    "pending_pdu_count",
+    "pending_edu_count",
+];
+
+/// Orders `items` by `sort`, or failing first then by name when `sort` is `None`. A field
+/// outside [`DESTINATION_SORT_FIELDS`] is `Err(field)`. Absent timestamps sort last in both
+/// directions, so `-failing_since` is "longest failing first, healthy last".
+fn sort_destinations(
+    items: &mut [crate::model::AdminDestination],
+    sort: Option<&str>,
+) -> Result<(), String> {
+    let Some(sort) = sort.map(str::trim).filter(|s| !s.is_empty()) else {
+        items.sort_by(|a, b| {
+            b.failing_since
+                .is_some()
+                .cmp(&a.failing_since.is_some())
+                .then_with(|| a.server_name.cmp(&b.server_name))
+        });
+        return Ok(());
+    };
+    let (descending, field) = match sort.strip_prefix('-') {
+        Some(field) => (true, field),
+        None => (false, sort),
+    };
+    if !DESTINATION_SORT_FIELDS.contains(&field) {
+        return Err(field.to_owned());
+    }
+    let timestamp = |d: &crate::model::AdminDestination| match field {
+        "failing_since" => d.failing_since.clone(),
+        "last_successful_at" => d.last_successful_at.clone(),
+        _ => d.retry_last_at.clone(),
+    };
+    let direction = |o: std::cmp::Ordering| if descending { o.reverse() } else { o };
+    items.sort_by(|a, b| {
+        let ordering = match field {
+            "server_name" => direction(a.server_name.cmp(&b.server_name)),
+            "pending_pdu_count" => direction(a.pending_pdu_count.cmp(&b.pending_pdu_count)),
+            "pending_edu_count" => direction(a.pending_edu_count.cmp(&b.pending_edu_count)),
+            _ => {
+                // Absent last whichever way the rest goes: presence is compared un-reversed.
+                let (a_at, b_at) = (timestamp(a), timestamp(b));
+                a_at.is_none()
+                    .cmp(&b_at.is_none())
+                    .then_with(|| direction(a_at.cmp(&b_at)))
+            }
+        };
+        ordering.then_with(|| a.server_name.cmp(&b.server_name))
+    });
+    Ok(())
+}
+
+/// `GET /api/v1/federation/destinations`: failing ones first, then by name, unless `sort`
+/// says otherwise; `?failing=true` narrows to those, and `include_total=true` with it is the
+/// count the Overview also carries as `federation_destinations_failing_count`.
 async fn federation_destinations_list(
     State(state): State<AdminState>,
     headers: HeaderMap,
@@ -2647,12 +2704,19 @@ async fn federation_destinations_list(
                     if let Some(failing) = query.failing {
                         items.retain(|d| d.failing_since.is_some() == failing);
                     }
-                    items.sort_by(|a, b| {
-                        b.failing_since
-                            .is_some()
-                            .cmp(&a.failing_since.is_some())
-                            .then_with(|| a.server_name.cmp(&b.server_name))
-                    });
+                    if let Err(field) = sort_destinations(&mut items, query.sort.as_deref()) {
+                        return Problem::validation_failed()
+                            .with_detail(format!(
+                                "unknown sort field {field:?}; the fields are {}",
+                                DESTINATION_SORT_FIELDS.join(", ")
+                            ))
+                            .with_errors(vec![hs_http::ValidationError::new(
+                                "param:sort",
+                                format!("unknown sort field {field:?}"),
+                            )])
+                            .with_instance(instance)
+                            .into_response();
+                    }
                     axum::Json(Page::paginate(
                         items,
                         query.cursor.as_deref(),
@@ -9254,6 +9318,8 @@ mod tests {
                 epoch: None,
                 replica_count: Some(1),
                 shard_count: None,
+                heartbeat_seq: None,
+                drain_released_at_once_count: None,
             },
         }));
         let (router, _manifest) = build_router(state);
@@ -10171,13 +10237,57 @@ mod tests {
         let (_, body, _) = call(
             &router,
             "GET",
-            "/api/v1/federation/destinations?failing=true",
+            "/api/v1/federation/destinations?failing=true&include_total=true",
             None,
             None,
         )
         .await;
         let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(page["items"].as_array().unwrap().len(), 1);
+        assert_eq!(page["total"], 1, "the failing count: {page}");
+
+        // `sort` is honoured: by name, and by a timestamp with absent values last either way.
+        let names = |page: &serde_json::Value| {
+            page["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| d["server_name"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        let (_, body, _) = call(
+            &router,
+            "GET",
+            "/api/v1/federation/destinations?sort=server_name",
+            None,
+            None,
+        )
+        .await;
+        let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(names(&page), ["alpha.example", "zeta.example"]);
+        for sort in ["failing_since", "-failing_since"] {
+            let (_, body, _) = call(
+                &router,
+                "GET",
+                &format!("/api/v1/federation/destinations?sort={sort}"),
+                None,
+                None,
+            )
+            .await;
+            let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(names(&page), ["zeta.example", "alpha.example"], "{sort}");
+        }
+        let (status, body, _) = call(
+            &router,
+            "GET",
+            "/api/v1/federation/destinations?sort=colour",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(problem["errors"][0]["pointer"], "param:sort", "{problem}");
 
         let (status, body, _) = call(
             &router,
@@ -10206,5 +10316,53 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn destinations_page_past_fifty_with_failing_first_on_every_page() {
+        let mut source = crate::sources::InMemoryFederationSource::new();
+        for i in 0..120 {
+            source = source.with_destination(crate::model::AdminDestination {
+                server_name: format!("srv{i:03}.example"),
+                // Every third one is failing, so the failing ones span more than one page.
+                failing_since: (i % 3 == 0).then(|| "2026-09-22T02:00:00.000Z".to_owned()),
+                ..Default::default()
+            });
+        }
+        let (router, _manifest) = build_router(test_state().with_federation(Arc::new(source)));
+        let mut seen = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let uri = match &cursor {
+                Some(c) => format!("/api/v1/federation/destinations?limit=50&cursor={c}"),
+                None => "/api/v1/federation/destinations?limit=50".to_owned(),
+            };
+            let (status, body, _) = call(&router, "GET", &uri, None, None).await;
+            assert_eq!(status, StatusCode::OK);
+            let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            for d in page["items"].as_array().unwrap() {
+                seen.push(d["failing_since"].is_string());
+            }
+            match page["next_cursor"].as_str() {
+                Some(next) => cursor = Some(next.to_owned()),
+                None => break,
+            }
+        }
+        assert_eq!(seen.len(), 120);
+        // The 40 failing ones come first, across the page boundary at 50 and nothing lost.
+        assert_eq!(seen.iter().filter(|f| **f).count(), 40);
+        assert!(seen[..40].iter().all(|f| *f) && seen[40..].iter().all(|f| !*f));
+
+        let (_, body, _) = call(
+            &router,
+            "GET",
+            "/api/v1/federation/destinations?failing=true&limit=10&include_total=true",
+            None,
+            None,
+        )
+        .await;
+        let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(page["total"], 40);
+        assert_eq!(page["items"].as_array().unwrap().len(), 10);
     }
 }

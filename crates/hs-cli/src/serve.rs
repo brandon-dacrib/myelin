@@ -1999,6 +1999,9 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     };
 
     overview.set_ownership(cluster_handles.cluster.ownership().clone());
+    if let Some(metrics) = &cluster_handles.metrics {
+        overview.set_cluster_metrics(metrics.clone());
+    }
 
     // A report somebody files goes out on the admin event stream as `report.created`, which is
     // what the Reports page and the sidebar count listen for instead of polling.

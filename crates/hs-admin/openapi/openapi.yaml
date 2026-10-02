@@ -28,6 +28,12 @@ info:
     notes: 'Additive: /admin-tokens (list, create, get, delete) mints admin API tokens that carry
       a chosen subset of the scopes (RFC 0004 section 8.1, service_account principals). A token
       lacking an operation''s scope gets 403 insufficient-scope naming the scope, as before.'
+  - version: 0.1.2
+    date: '2026-10-02'
+    notes: 'Additive: GET /federation/destinations honours sort (server_name, failing_since,
+      last_successful_at, retry_last_at, pending_pdu_count, pending_edu_count; - for
+      descending) and documents its default order and paging; Replica.heartbeat_seq;
+      ClusterStatus.heartbeat_seq and .drain_released_at_once_count.'
 servers:
 - url: /api/v1
   description: Same origin as /_matrix on the client listener.
@@ -1715,6 +1721,10 @@ paths:
   /federation/destinations:
     get:
       summary: List federation destinations
+      description: Every remote server this one has tried to reach. Failing destinations come
+        first, then the rest by name, unless `sort` says otherwise; `limit` goes up to 500 and
+        `cursor` continues past it. `failing=true` with `include_total=true` is the count the
+        Overview carries as `federation_destinations_failing_count`.
       operationId: federation.destinations.list
       tags:
       - Federation
@@ -1725,9 +1735,20 @@ paths:
       - $ref: '#/components/parameters/Limit'
       - $ref: '#/components/parameters/Cursor'
       - $ref: '#/components/parameters/IncludeTotal'
-      - $ref: '#/components/parameters/Sort'
+      - name: sort
+        in: query
+        description: One of `server_name`, `failing_since`, `last_successful_at`,
+          `retry_last_at`, `pending_pdu_count`, `pending_edu_count`, with `-` in front for
+          descending; a destination without the timestamp sorts last either way. Absent means
+          failing first, then by name. Anything else is `400 validation-failed` naming
+          `param:sort`.
+        required: false
+        schema:
+          type: string
       - name: failing
         in: query
+        description: '`true` for only the destinations whose requests are failing, `false` for
+          only the healthy ones.'
         schema:
           type: boolean
       responses:
@@ -8476,6 +8497,16 @@ components:
           description: How many replicas are registered and heartbeating, whatever their status (joining, active, draining or drained; a replica that has stopped heartbeating is not counted). A drained replica is counted, because it is still serving by forwarding. Without the replica registry, the number of replicas owning a shard. 1 for a single node.
         shard_count:
           type: integer
+        heartbeat_seq:
+          type: integer
+          description: The sequence number of the answering replica's last heartbeat that
+            reached the store, which every heartbeat increments (`hs_cluster_heartbeat_seq`).
+            Absent for a single node.
+        drain_released_at_once_count:
+          type: integer
+          description: How many times since the answering replica started a drain released
+            every shard it owned at once rather than one lease at a time
+            (`hs_cluster_drain_released_at_once_total`). Absent for a single node.
     Replica:
       type: object
       description: One replica of the cluster, as the replica answering the request sees it. A server not running as a cluster is a cluster of one (`role` is `single-node`).
@@ -8531,6 +8562,10 @@ components:
           - 'null'
           format: date-time
           description: Its last heartbeat; null for a single node, which has none.
+        heartbeat_seq:
+          type: integer
+          description: The sequence number of that heartbeat, which every heartbeat increments
+            and the other replicas watch for liveness. Absent for a single node.
         drain_requested_at:
           type:
           - string
