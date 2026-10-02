@@ -20,7 +20,8 @@ the hub, the store and the stream are as they were.
 
 Tested: `cargo test -p hs-user` (unchanged suite) and `cargo test -p hs-cli --test
 room_id_uniqueness` three times in a row on the desktop, where it had never failed; the proof is
-CI's arm64 leg going green on the merge, which this entry's next revision should record. The
+CI's arm64 leg going green on the merge: it did, on `1248b3b` (run 36957339514, every job green,
+the first green `ci` on `main` since `564f540`). The
 wait's own tests are session 10's (`a_sync_sent_the_moment_after_a_join_sees_the_join`, and the
 hub made to fall behind).
 
