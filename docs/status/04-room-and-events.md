@@ -74,7 +74,18 @@ admin API's room long tail).
 >   (`routes::upgrade::transfer_on_join`, from every successful `POST /join` of a held or remote
 >   room, not a knock; `info` line with `aliases_moved`/`directory_moved`; nothing fails the
 >   join). This is what Synapse does from its join handler, and what Sytest's remote-alias and
->   two-server directory tests need from the remote side.
+>   two-server directory tests need from the remote side. And the joining user's own account
+>   data about the old room follows them (`SessionHub::carry_account_data_on_upgrade`, new, in
+>   `crates/hs-user/src/hub.rs`, from `apply_room_update` on a join delta of a room whose
+>   create names a predecessor; Synapse's `copy_user_state_on_room_upgrade`): every `m.direct`
+>   list naming the old room gains the new one, and each piece of room account data on the old
+>   room (`m.tag` and the rest) the new room lacks is written for it, each write bumping the
+>   user's account-data counter so the next `/sync` carries it; `info` line per user with
+>   `direct_updated` and `room_account_data_copied`. This covers the local upgrader too, who
+>   joins the replacement by creating it. Test:
+>   `hub::tests::joining_a_replacement_room_carries_the_old_rooms_direct_flag_and_tags` (the
+>   direct flag and a tag copied, a piece the new room already had kept, bob with no account
+>   data and a room with no predecessor unchanged).
 > - **Tests.** `routes::upgrade::tests`: `an_upgrade_carries_the_old_rooms_bans` (to versions
 >   10 and 12; the reason kept, a stranger's ban too, the banned user refused),
 >   `an_upgrade_keeps_a_room_closed_to_federation`,

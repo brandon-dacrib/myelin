@@ -554,8 +554,9 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
   upgrades the room their old level back once the copied state is in. The copied state stands
   in for the preset's instead of following it. When one of this server's users joins a
   replacement another server made, this server's aliases for the old room and its directory
-  entry follow (as Synapse's do). Verified on the real binary; Sytest's room-upgrade file was
-  11 of 21 before (the count after is in status 04 session 18).
+  entry follow, and the joining user's own account data on the old room comes with them: a
+  direct chat stays one, and its tags come along (as in Synapse). Verified on the real binary;
+  Sytest's room-upgrade file was 11 of 21 before (the count after is in status 04 session 18).
 - **A redaction is judged by the power levels in force when it was sent** (2026-10-02), not
   when it is applied. A redaction that waits for its event (it arrived first, over federation or
   ahead of a backfill) or arrives late over federation now takes effect if its sender could

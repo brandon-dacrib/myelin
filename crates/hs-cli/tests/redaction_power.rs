@@ -164,21 +164,6 @@ impl Client {
             .unwrap_or_else(|| panic!("registration failed: {done}"))
             .to_owned()
     }
-
-    async fn metric(&self, sample: &str) -> u64 {
-        let text = self
-            .http
-            .get(format!("{}/metrics", self.base))
-            .send()
-            .await
-            .unwrap()
-            .text()
-            .await
-            .unwrap();
-        text.lines()
-            .find_map(|line| line.strip_prefix(sample)?.trim().parse::<f64>().ok())
-            .map_or(0, |v| v as u64)
-    }
 }
 
 /// A room ID or alias as one path segment.

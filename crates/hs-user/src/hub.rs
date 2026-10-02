@@ -1547,6 +1547,89 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         self.apply_room_update(update).await.map(|_| ())
     }
 
+    /// Copies what `user_id`'s account data says about `old_room_id` onto `new_room_id`, its
+    /// replacement, as they join it: every `m.direct` list naming the old room gains the new
+    /// one (the old entry is kept, as Synapse keeps it), and every piece of room account data
+    /// on the old room (`m.tag` and the rest) the new room does not have yet is written for
+    /// it. Nothing for a user with no account data here (another server's user, whose own
+    /// server does this). Each write bumps the user's account-data counter, so their next
+    /// `/sync` carries it.
+    ///
+    /// # Errors
+    /// Returns [`UserError`] if the account data could not be read or written.
+    async fn carry_account_data_on_upgrade(
+        &self,
+        user_id: &UserId,
+        old_room_id: &RoomId,
+        new_room_id: &RoomId,
+    ) -> Result<(), UserError> {
+        let mut direct_updated = false;
+        if let Some(record) = self
+            .store
+            .get_global_account_data(user_id, "m.direct")
+            .await?
+            && let Some(map) = record.content.as_object()
+        {
+            let mut content = record.content.clone();
+            for (other, rooms) in map {
+                let Some(rooms) = rooms.as_array() else {
+                    continue;
+                };
+                let names_old = rooms
+                    .iter()
+                    .any(|r| r.as_str() == Some(old_room_id.as_str()));
+                let names_new = rooms
+                    .iter()
+                    .any(|r| r.as_str() == Some(new_room_id.as_str()));
+                if names_old && !names_new {
+                    let mut rooms = rooms.clone();
+                    rooms.push(serde_json::Value::String(new_room_id.to_string()));
+                    content[other] = serde_json::Value::Array(rooms);
+                    direct_updated = true;
+                }
+            }
+            if direct_updated {
+                self.store
+                    .put_global_account_data(user_id, "m.direct", content)
+                    .await?;
+            }
+        }
+        let old_data = self
+            .store
+            .list_room_account_data(user_id, old_room_id)
+            .await?;
+        let mut copied = 0usize;
+        if !old_data.is_empty() {
+            let present: std::collections::HashSet<String> = self
+                .store
+                .list_room_account_data(user_id, new_room_id)
+                .await?
+                .into_iter()
+                .map(|record| record.event_type)
+                .collect();
+            for record in old_data {
+                if present.contains(&record.event_type) {
+                    continue;
+                }
+                self.store
+                    .put_room_account_data(user_id, new_room_id, &record.event_type, record.content)
+                    .await?;
+                copied += 1;
+            }
+        }
+        if direct_updated || copied > 0 {
+            tracing::info!(
+                user = %user_id,
+                %old_room_id,
+                %new_room_id,
+                direct_updated,
+                room_account_data_copied = copied,
+                "a user joined an upgraded room's replacement; their account data on the old room followed"
+            );
+        }
+        Ok(())
+    }
+
     /// [`SessionHub::process_room_update`], returning the users it woke -- what the other
     /// replicas are told (`crate::cluster::RoomWake::users`). Empty, and nothing written, for a
     /// room this replica does not own: its owner feeds it, and two hubs writing the same
@@ -1595,6 +1678,28 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
             .collect();
         for delta in &update.membership_deltas {
             targets.insert(delta.user_id.clone(), delta.membership.clone());
+        }
+
+        // Somebody joining an upgraded room's replacement brings their account data about the
+        // old room with them: the replacement is a direct chat if the old room was, and
+        // carries the old room's tags (Synapse's `copy_user_state_on_room_upgrade`, from its
+        // join handler; Sytest's "/upgrade preserves direct room state").
+        if update
+            .membership_deltas
+            .iter()
+            .any(|d| d.membership == "join")
+            && let Some(old_room_id) = handle.query(|actor| actor.predecessor_room_id()).await
+        {
+            for delta in &update.membership_deltas {
+                if delta.membership == "join" {
+                    self.carry_account_data_on_upgrade(
+                        &delta.user_id,
+                        &old_room_id,
+                        &update.room_id,
+                    )
+                    .await?;
+                }
+            }
         }
 
         // Somebody joining enters the presence audience of everyone already here, whose tokens
@@ -2319,6 +2424,124 @@ mod tests {
             [carol.as_str(), dave.as_str()]
         );
         assert_eq!(hub.directory_rooms_walked(), 1, "and indexed then");
+    }
+
+    /// Joining an upgraded room's replacement carries what the user's account data said about
+    /// the old room: a direct chat stays one, and its tags come along; account data the new
+    /// room already has is kept, and a join into a room with no predecessor changes nothing.
+    #[tokio::test]
+    async fn joining_a_replacement_room_carries_the_old_rooms_direct_flag_and_tags() {
+        let (hub, rooms) = hub(500);
+        std::mem::forget(hub.watch_all(rooms.subscribe_global()));
+        let alice = user_id!("@alice:hub.test").to_owned();
+        let bob = user_id!("@bob:hub.test").to_owned();
+        let (old, old_id) = create(&rooms, &bob, "private_chat").await;
+        invite_and_join(&old, &bob, &alice, 2).await;
+        hub.store()
+            .put_global_account_data(
+                &alice,
+                "m.direct",
+                serde_json::json!({bob.as_str(): [old_id.as_str()]}),
+            )
+            .await
+            .unwrap();
+        hub.store()
+            .put_room_account_data(
+                &alice,
+                &old_id,
+                "m.tag",
+                serde_json::json!({"tags": {"m.favourite": {"order": 0.1}}}),
+            )
+            .await
+            .unwrap();
+        hub.store()
+            .put_room_account_data(
+                &alice,
+                &old_id,
+                "org.example.note",
+                serde_json::json!({"n": 1}),
+            )
+            .await
+            .unwrap();
+
+        let replacement = rooms
+            .create_room(
+                bob.clone(),
+                CreateRoomRequest {
+                    preset: Some("private_chat".to_owned()),
+                    creation_content: serde_json::json!({"predecessor": {"room_id": old_id.as_str()}}),
+                    ..Default::default()
+                },
+                5,
+            )
+            .await
+            .unwrap();
+        let new_id = replacement.query(|a| a.room_id().to_owned()).await;
+        // Something alice already set on the new room is not overwritten by the old room's.
+        hub.store()
+            .put_room_account_data(
+                &alice,
+                &new_id,
+                "org.example.note",
+                serde_json::json!({"n": 2}),
+            )
+            .await
+            .unwrap();
+        invite_and_join(&replacement, &bob, &alice, 6).await;
+        hub.settle_before_read(crate::sync::READ_YOUR_WRITES_WAIT)
+            .await;
+
+        let direct = hub
+            .store()
+            .get_global_account_data(&alice, "m.direct")
+            .await
+            .unwrap()
+            .unwrap()
+            .content;
+        assert_eq!(
+            direct,
+            serde_json::json!({bob.as_str(): [old_id.as_str(), new_id.as_str()]}),
+            "the replacement is a direct chat with bob too"
+        );
+        let new_data: std::collections::BTreeMap<String, serde_json::Value> = hub
+            .store()
+            .list_room_account_data(&alice, &new_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.event_type, r.content))
+            .collect();
+        assert_eq!(
+            new_data.get("m.tag"),
+            Some(&serde_json::json!({"tags": {"m.favourite": {"order": 0.1}}})),
+            "the tag came along"
+        );
+        assert_eq!(
+            new_data.get("org.example.note"),
+            Some(&serde_json::json!({"n": 2})),
+            "what alice set on the new room herself is kept"
+        );
+
+        // Bob's m.direct says nothing about the old room, and the plain room has no predecessor:
+        // neither changes anything.
+        assert!(
+            hub.store()
+                .get_global_account_data(&bob, "m.direct")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let (plain, plain_id) = create(&rooms, &bob, "private_chat").await;
+        invite_and_join(&plain, &bob, &alice, 8).await;
+        hub.settle_before_read(crate::sync::READ_YOUR_WRITES_WAIT)
+            .await;
+        assert!(
+            hub.store()
+                .list_room_account_data(&alice, &plain_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// The search answers from the index alone. Seeded here for a room the registry does not
