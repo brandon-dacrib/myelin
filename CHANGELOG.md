@@ -568,6 +568,10 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
   and the state after it read as the event alone. A room load now gives each such outlier the
   state after the event before it, writes the rows back once the room is fenced, logs the count
   per room and counts it in `hs_room_outlier_state_rows_repaired_total`.
+- **Every `/sync`'s presence and device-list scope is read from the member index**
+  (2026-10-02): who shares a room with the syncing user comes from `hs_user.room_members`
+  (the index the user directory already reads), bounded by the user's own joined rooms, instead
+  of reading each shared room through its actor on every call.
 - Rooms: creation, membership, state, timeline, `/messages`, `/context`, relations, threads, room
   upgrade, aliases, the room directory, redactions, and idempotent state sends and joins.
 - **History visibility is enforced on every read path.** A user who has left a non-world-readable

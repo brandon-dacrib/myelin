@@ -1218,8 +1218,19 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
     /// -- which needs the identical scope for `device_lists` -- delegates to this rather than
     /// duplicating the membership walk.
     ///
+    /// Bounded by the user's own joined rooms (their membership records), never the server's,
+    /// and read from the member index (`hs_user.room_members`, the same index
+    /// [`SessionHub::users_visible_in_directory_to`] reads: each room's joined members, kept
+    /// current from the room updates this hub applies) rather than through each room's actor.
+    /// Every `/sync` asks this for its presence and device-list scope, and until 2026-10-02
+    /// each call read every shared room through the room itself -- a load, for a room not
+    /// resident. A room the index has nothing for (its last update came before the index
+    /// existed) is read once and indexed then ([`SessionHub::directory_rooms_walked`] counts
+    /// it, as for a search).
+    ///
     /// # Errors
-    /// Returns [`UserError`] if a room could not be loaded.
+    /// Returns [`UserError`] if the membership records, the index, or a room it had to read
+    /// could not be read.
     pub async fn users_sharing_room_with(
         &self,
         user_id: &UserId,
@@ -1229,11 +1240,15 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
             if m.membership != "join" {
                 continue;
             }
-            for member in self.joined_member_ids_if_present(&m.room_id).await? {
-                if member.as_str() != user_id.as_str() {
-                    shared.insert(member);
-                }
-            }
+            let members = match self.store.room_member_ids(&m.room_id).await? {
+                Some(members) => members,
+                None => self.index_room_by_reading_it(&m.room_id).await?,
+            };
+            shared.extend(
+                members
+                    .into_iter()
+                    .filter(|member| member.as_str() != user_id.as_str()),
+            );
         }
         Ok(shared)
     }
@@ -2215,6 +2230,95 @@ mod tests {
         assert_eq!(directory(&hub, &carol).await, [dave.as_str()]);
 
         assert_eq!(hub.directory_rooms_walked(), 0, "no search read a room");
+    }
+
+    /// Who shares a room with a user -- every `/sync`'s presence and device-list scope -- is
+    /// read from the member index, bounded by the user's own joined rooms: a join and a leave
+    /// in a live room change the answer through the index alone, a room alice is in that the
+    /// registry does not have answers from its index row without a load, and the hundred
+    /// rooms on the server alice is not in are never touched. Until 2026-10-02 every call read
+    /// each shared room through its actor.
+    #[tokio::test]
+    async fn users_sharing_room_with_is_read_from_the_index_within_the_users_rooms() {
+        let (hub, rooms) = hub(500);
+        std::mem::forget(hub.watch_all(rooms.subscribe_global()));
+        let alice = user_id!("@alice:hub.test").to_owned();
+        let bob = user_id!("@bob:hub.test").to_owned();
+        let carol = user_id!("@carol:hub.test").to_owned();
+        let dave = user_id!("@dave:hub.test").to_owned();
+        let sharing = |user: OwnedUserId| {
+            let hub = hub.clone();
+            async move {
+                hub.settle_before_read(crate::sync::READ_YOUR_WRITES_WAIT)
+                    .await;
+                hub.users_sharing_room_with(&user)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|u| u.to_string())
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        // A hundred rooms on the server alice is not in, each with members of its own.
+        for n in 0..100 {
+            let room = ruma::OwnedRoomId::try_from(format!("!other{n}:hub.test")).unwrap();
+            hub.store()
+                .set_membership(&carol, &room, "join", 1, false)
+                .await
+                .unwrap();
+            hub.store()
+                .index_room_members_if_absent(&room, &[carol.clone(), dave.clone()])
+                .await
+                .unwrap();
+        }
+        assert!(sharing(alice.clone()).await.is_empty());
+
+        // A live room: the answer follows bob's join and leave through the index.
+        let (private, _) = create(&rooms, &alice, "private_chat").await;
+        invite_and_join(&private, &alice, &bob, 2).await;
+        assert_eq!(sharing(alice.clone()).await, [bob.as_str()]);
+        assert_eq!(sharing(bob.clone()).await, [alice.as_str()]);
+        member(&private, &bob, Action::Leave, 4).await;
+        assert!(sharing(alice.clone()).await.is_empty());
+        assert!(sharing(bob.clone()).await.is_empty(), "bob left");
+
+        // A room alice is in that the registry does not have: its index row answers.
+        let indexed = ruma::room_id!("!indexed:hub.test");
+        hub.store()
+            .set_membership(&alice, indexed, "join", 1, false)
+            .await
+            .unwrap();
+        hub.store()
+            .index_room_members_if_absent(indexed, &[alice.clone(), dave.clone()])
+            .await
+            .unwrap();
+        assert_eq!(sharing(alice.clone()).await, [dave.as_str()]);
+        assert_eq!(
+            hub.directory_rooms_walked(),
+            0,
+            "no room was read to answer any of it"
+        );
+
+        // A room alice is in that the index has nothing for yet is read once and indexed.
+        let (unindexed, unindexed_id) = create(&rooms, &alice, "private_chat").await;
+        invite_and_join(&unindexed, &alice, &carol, 6).await;
+        hub.settle_before_read(crate::sync::READ_YOUR_WRITES_WAIT)
+            .await;
+        hub.store()
+            .forget_room_members(&unindexed_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            sharing(alice.clone()).await,
+            [carol.as_str(), dave.as_str()]
+        );
+        assert_eq!(hub.directory_rooms_walked(), 1, "read once");
+        assert_eq!(
+            sharing(alice.clone()).await,
+            [carol.as_str(), dave.as_str()]
+        );
+        assert_eq!(hub.directory_rooms_walked(), 1, "and indexed then");
     }
 
     /// The search answers from the index alone. Seeded here for a room the registry does not

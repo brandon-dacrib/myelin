@@ -158,6 +158,28 @@ admin API's room long tail).
 >   previous timeline event can differ from what a fetched state would have said, as the walk's
 >   did when it was the only way.
 >
+> **Row 4: `users_sharing_room_with` on the member index** (status 05 session 11's "left":
+> "`users_sharing_room_with` (every `/sync`'s presence and device-list scope) still reads
+> rooms"; `crates/hs-user`, track 05's crate, changed here with the coordinator's brief). The
+> index is `hs_user.room_members` (status 05 session 11): each room's joined members, written
+> by the session hub from the room updates it applies, read by
+> `SessionHub::users_visible_in_directory_to`. `SessionHub::users_sharing_room_with` now reads
+> it too: the user's joined rooms from their membership records (so it is bounded by the user's
+> rooms, never the server's), each room's members as one range read, a room the index has
+> nothing for read once through `index_room_by_reading_it` and indexed then (counted by
+> `directory_rooms_walked`, logged at `info` as a search's is). Before, each call read every
+> shared room through `joined_member_ids_if_present`, which loads a room not resident.
+>
+> - **Test**, failing on the old walk (checked):
+>   `hub::tests::users_sharing_room_with_is_read_from_the_index_within_the_users_rooms` -- a
+>   hundred rooms on the server alice is not in are never touched; a live room's join and
+>   leave change the answer through the index; a room alice is in that the registry does not
+>   have answers from its row (the old walk found no room and answered nobody); none of it
+>   reads a room (`directory_rooms_walked() == 0`); a room the index has nothing for is read
+>   once and indexed. `cargo test -p hs-user` (172), `cargo clippy -p hs-user --all-targets`.
+> - **Not changed.** The walk's privacy scope (joined rooms only) and `crate::sync::shared_users`,
+>   which delegates to it. Status 05's "left" line for this is now stale (track 05's file).
+>
 > - **Power levels 0/2.** Sytest's "Power Levels" group is unreachable from the server side:
 >   every test in it (and ten more, 13 skips in the night's run) requires the fixture
 >   `can_change_power_levels`, which was proven by `tests/10apidoc/36room-levels.pl`'s test
