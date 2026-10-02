@@ -16,6 +16,21 @@ continuously to `ghcr.io/brandon-dacrib/myelin` as `main` and `sha-<commit>`, an
 to `oci://ghcr.io/brandon-dacrib/charts/hs` as a pre-release, `0.1.0-main.<run>.g<commit>`, that
 pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
 
+### Encryption
+
+- **A remote user's device list is kept here while a room is shared** (2026-10-02,
+  `agent/e2ee-sytest`): fetched whole from their server's `/user/devices` on first need, kept
+  current from `m.device_list_update` and `m.signing_key_update` (an update that skipped a
+  position fetches the list again), and answers `/keys/query` without a request, so a client
+  still gets keys while the other server is down. A device renamed or added is announced to other
+  servers, `/keys/query` carries `unsigned.device_display_name`, a device created at login is a
+  device-list change, and resetting cross-signing keys that are already set up asks for
+  re-authentication (first-time setup does not). The client-server e2e routes answer under
+  `/_matrix/client/unstable` too, which is where Sytest's cross-signing tests call them.
+  Verified by `crates/hs-e2e/tests/remote_device_lists.rs` and the two-server tests in
+  `crates/hs-cli/tests/federation_edus.rs` on the real binary; the Sytest re-run is still owed
+  (`docs/status/08-e2ee.md`, 2026-10-02).
+
 ### Installing and administering it
 
 - **The fuzz targets run on every push again.** The `fuzz` workflow had been red since it was
