@@ -4,7 +4,73 @@ Written 2026-09-20 by the integration lead, last revised 2026-10-02, 18:25 EDT (
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
-## Resume here: 2026-10-02, 18:25 EDT -- the builds got faster, four branches merged, the machine reboots again
+## Resume here: 2026-10-02, 22:45 EDT -- every branch is merged, the bridge bot answers
+
+**Where `main` is.** `dd7afc8c`, **2,797 Rust tests**, every one of the ten branches of the 14:25
+section merged through the queue in this order, each gate green with both PostgreSQL servers
+(plain on 5462, TLS on 5463): `fuzz-nightly`+`admin-token`+`web-items` as one batch `7ef76e09`,
+`room-rows` with `merge-queue-reset` `89bdfdf1`, `sync-feed` `97ec9050`, `user-sytest`+`bridge-responds`
+`71d2b44b`, `push-rules` `9b996330`, `e2ee-sytest` `379130bf`, `federation-query` `e755d335`,
+`federation-synapse` `dd7afc8c`. **Nothing is unmerged** (`git branch -r --no-merged origin/main`
+is empty), no lock is held, no worktree but the queue's remains, the agent branches are deleted.
+OpenAPI is **0.1.5** and its changelog has an entry for every bump since 0.1.0. CI and CD are
+green on `379130bf` (**`sha-379130bf…` is the newest green image**, which carries the bridge
+fix below); `dd7afc8c`'s runs are in progress, and the `fuzz` workflow on `dd7afc8c` is the
+first since its fix merged.
+
+**The owner's WhatsApp bot, diagnosed on the live cluster** (`agent/bridge-responds`, merged in
+`71d2b44b`; status 11 dated entry, `docs/bridges/mautrix.md`): all eight of the owner's messages
+reached the bridge, were decrypted and dropped, because the chat was created by the bot and so
+is not brandon's management room. The bridge was healthy across the server restart; no pod
+restart was needed or done. **Today, in the existing chat, `!wa login qr` works** (the bridge
+says the room is not its management room, then shows the QR), or a new direct chat with
+`@whatsappbot_brandon:myelin.dacrib.net` and `login qr` there. **After the roll** to an image at
+or past `379130bf`, the manager repairs a bot-started chat in place within seconds (bot leaves,
+the owner's double puppet re-invites it, the bridge marks the room, the bot says why it had been
+silent), and `login qr` works in that same chat. The admin API says `chat_room`,
+`chat_started_by` and each type's `command_prefix`; the bridge page warns when a chat is the
+bot's. Proven with the real bridge (`real_mautrix_login.rs`, 3 of 3). Left: Signal, Slack and X
+have no `command_prefix`; changing an offering's `double_puppeting` after instances exist does
+not re-render their registration claim.
+
+**Resolved at the merges** (each on its branch, before its gate): OpenAPI 0.1.1-0.1.3 claimed
+by four branches (admin-token took 0.1.3+0.1.4, bridge-responds 0.1.5, and the two bumps `main`
+already had got the changelog entries they lacked); decision 0025 twice (sync-feed's is 0026);
+RFC 0021 twice (user-sytest's is 0022); `room-rows` and `user-sytest` each copied tags and
+`m.direct` onto an upgraded room (room-rows's `carry_account_data_on_upgrade` stays, user-sytest's
+test passes against it); the web's config-schema fixture and the generated client
+`web/src/api/schema.d.ts` were stale against `main`'s own OpenAPI and config types; two tests on
+`main` encoded behaviour the branches deliberately changed (a searcher in a public room now finds
+themself, as Synapse and Sytest; the next-steps box says "open your chat with" for a chat
+started as the owner). One gate failed on `postgres_tls`'s `verify-full` boot timing out while
+crate tests ran beside it; quiet, it passed. The queue now discards its worktree's tracked
+changes before every checkout (a web gate regenerates the client and left it dirty, twice).
+
+**What is next, in order:**
+
+1. **Roll the demo** to the first green `cd` image of `dd7afc8c` (or `sha-379130bf…` now):
+   `helm --kube-context admin@dacrib0 get values myelin -n myelin -o yaml > /tmp/myelin-values.yaml && helm --kube-context admin@dacrib0 upgrade myelin /Users/brandon/myelin/deploy/helm/hs -n myelin -f /tmp/myelin-values.yaml --set image.tag=sha-<commit> --wait --timeout 10m`.
+   Then watch the WhatsApp chat repair itself and type `login qr`. The instance's pod stays
+   `bridge-d2854412-…` until it is removed and re-added (bridge-names).
+2. **Sytest once, whole suite, on the merged tree, quiet machine**
+   (`tests/sytest/build.sh myelin-sytest:dev`, then the suite): it grades every "after
+   unmeasured" of the 14:25 table (status 04, 05, 06, 08, 10 say the exact files).
+3. **Desk items:** `docker pull ghcr.io/element-hq/synapse:latest`, then
+   `tests/federation-synapse/run.sh` -- the federation milestone, all its steps "not run" until
+   a Synapse image can be pulled; the two-pod run.
+4. **The halves left open** (unchanged from 18:25, below): the `/state_ids` fallback's
+   federation side; `device_lists.changed` for invited users and `/keys/changes`; RFC 0021's
+   bulk flush; the 303-member mirror measurement; `users.update` sources and `users.availability`;
+   email pushers; soft failure over federation; the bridge items above.
+5. **Then the table.**
+
+**For the queue:** the gate's PostgreSQL containers `hs-merge-queue-pg` (5462) and
+`hs-merge-queue-pg-tls` (5463, cert in this session's scratchpad) are still running; a reboot
+takes them (recreate per `tools/merge-queue.sh`'s header and `crates/hs-kv/tests/postgres_tls.rs`).
+Numbers collide every wave: check `main`'s OpenAPI version and the last decision and RFC before
+queuing a branch, and regenerate `web/src/api/schema.d.ts` whenever the OpenAPI changes.
+
+## Earlier: 2026-10-02, 18:25 EDT -- the builds got faster, four branches merged, the machine reboots again
 
 **Where `main` is.** `99589af3`: everything this session made, merged through the queue, each
 gate green, plus one direct push (the new real-bridge test needed `--add-host
