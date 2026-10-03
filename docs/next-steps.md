@@ -45,6 +45,19 @@ image); the chat is still the bot's until the roll (then it repairs itself: bot 
 rejoins, "marked as your management room", and a bare `help` answers). After the roll with the
 device names, re-link once to see the device name.
 
+**Later on 2026-10-03** (merged `a9f62fc7`, gate green): the owner rolled, the chat repaired
+itself ("looks like my code worked"), and the next layer showed: Element withheld the message's
+keys from the bot's unsigned device. **The manager now cross-signs each bridge bot's device**
+(`hs_bridges::cross_signing`, decision 0027, OpenAPI 0.1.7: `BridgeInstance.signed_bot_device`,
+`last_key_withheld` on instances and appservice health, shown on the bridge pages; the
+appservice scheduler counts `hs_appservice_key_withheld_total`); the real-bridge harness runs the
+person's client under Element's exclude-insecure rule and the message bridges. Also fixed: CI
+red since `66528ae3` because the device-name check read the bridge container's 0600 config from
+the host (Linux uid model); it reads it through `docker exec` now. **Roll to the first green
+image of `a9f62fc7` or later**; then the demo bot gets its identity on the manager's first ready
+step, and the owner's next encrypted message should bridge (watch for "cross-signed the bot's
+device" in the server log). Workarounds until then are in status 11.
+
 **What is next.** The known-gaps table at the end of this file has 81 rows closed and 10 open;
 the halves below are the rest. In order of what it buys:
 
