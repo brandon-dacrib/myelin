@@ -45,19 +45,53 @@ image); the chat is still the bot's until the roll (then it repairs itself: bot 
 rejoins, "marked as your management room", and a bare `help` answers). After the roll with the
 device names, re-link once to see the device name.
 
-**What is next, in order:**
+**What is next.** The known-gaps table at the end of this file has 81 rows closed and 10 open;
+the halves below are the rest. In order of what it buys:
 
-1. **Roll the demo** to `sha-a3af13a8…` or the first green later image (the command is in the
-   22:45 section). Then in the bot chat: watch the repair, type `help` bare; then `logout` and
-   `login qr` for the device name. Report what the chat does.
-2. **Sytest once, whole suite, on the merged tree, quiet machine**; then the "after unmeasured"
-   rows (status 04, 05, 06, 08, 10).
-3. **Desk items:** `docker pull ghcr.io/element-hq/synapse:latest` then
-   `tests/federation-synapse/run.sh` (the federation milestone); the two-pod run.
-4. **The halves left open** (22:45 section, item 4) plus: `hs-bridges`' own HTTP client and the
-   operator onto the outbound policy; rename the bot's Matrix device ("WhatsApp bridge",
-   hardcoded in mautrix-go) if wanted; `command_prefix` for Signal, Slack, X.
-5. **Then the table.**
+1. **Roll the demo** to `sha-a3af13a8…` or the first green later image (command in the 22:45
+   section). Then in the bot chat: watch the repair, type `help` bare; `logout` and `login qr`
+   for the device name. Report what the chat does. *Desk item.*
+2. **Measure once, properly.** One Sytest image from merged `main` (`tests/sytest/build.sh
+   myelin-sytest:dev`), the whole suite on a quiet machine, results into `docs/status/sytest/`
+   and status 14; then one Complement federation run. Last numbers: Sytest 548/772 on `09f24ee`
+   with a gate running beside it, Complement federation 225/314. Every "after unmeasured" of the
+   14:25 table (status 04, 05, 06, 08, 10) is graded by that one run; the coordinator runs it,
+   the tracks read it. *Coordinator, first thing, before any agent builds.*
+3. **The federation milestone** (track 06, the README's promise): `docker pull
+   ghcr.io/element-hq/synapse:latest` from the owner's terminal, then
+   `tests/federation-synapse/run.sh` and fix what its `results.tsv` says, step by step. Then the
+   halves: the `/state_ids` fallback's federation side (status 06 session 18 has the design, the
+   room side is in), soft failure over federation, an erased user's events redacted for other
+   servers, `device_lists.changed` for invited users and `/keys/changes` (05+08).
+4. **Operations on the cluster** (track 03 and 12; cluster work is desk items with the owner's
+   port-forwards): two pods with the handoff fix, `deploy/two-pod/failover.py` and `rolling.py`
+   during an upgrade; watch a bridge's delivery and the bridge manager across a handoff; fix
+   the `hs-cluster` row where a replica gives up every shard after one late tick
+   (`self_heartbeat_fresh`); the 303-member PostgreSQL mirror measurement
+   (`HS_MIRROR_BENCH_* cargo test --release -p hs-cli --test cluster_mirror`) and RFC 0021's bulk
+   flush in the PostgreSQL commit (track 01) that it will ask for.
+5. **Bridges** (track 11): replace the demo's shared WhatsApp registration with an offering (RFC
+   0017 §6); `command_prefix` for Signal, Slack and X; `hs-bridges`' HTTP client and the
+   operator onto `hs_http::outbound`; a second real mautrix bridge (Telegram or Signal) through
+   the conformance harness; the bot's Matrix device name if wanted.
+6. **Admin and web** (15, 16, 07): `users.update` data sources for display name, avatar and
+   kind, and `users.availability`; the web side of status 16 items 6 and 8 (the fields exist);
+   email pushers (track 10). *Every one of these is a UI feature too (the owner's rule).*
+7. **Synapse migration** (track 13): the importer's leftovers (end-to-end keys and backups, push
+   rules and pushers, receipts, filters, remote media, federated rooms) and a run against a
+   large Synapse; the `/_synapse/admin` proxy is still not mounted by `hs serve`.
+8. **Then the table**, and the parity dashboard regenerated.
+
+**The next wave, if agents run in parallel:** item 2 first, alone (one build, one quiet run).
+Then one agent per disjoint crate set: 06 (`/state_ids` federation side, soft failure), 05+08
+(`device_lists.changed` for invites, `/keys/changes`), 03 (`self_heartbeat_fresh`), 01 (RFC 0021),
+10 (email pushers), 15/07 (`users.update` sources, `users.availability`), 13 (importer
+leftovers), 11 (shared registration → offering, prefixes, outbound policy), 16 (items 6 and 8).
+Each agent pushes `agent/<name>` and reports; the coordinator merges serially with
+`tools/merge-queue.sh`, checking `main`'s OpenAPI version and the last decision and RFC number
+before each gate (the lesson of 2026-10-02, five collisions in one night). Cluster and Synapse
+items stay desk items: the owner runs `helm`, port-forwards and `docker pull`; agents drive
+scripts against `localhost`.
 
 ## Earlier: 2026-10-02, 22:45 EDT -- every branch is merged, the bridge bot answers
 
