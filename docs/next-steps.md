@@ -48,8 +48,13 @@ changes before every checkout (a web gate regenerates the client and left it dir
 
 **What is next, in order:**
 
-1. ~~**Roll the demo**~~ **Done, 2026-10-02 23:10 EDT:** the owner rolled to `sha-379130bf…` and the
-   WhatsApp chat repaired itself as designed ("the whatsapp changes worked"). CI on `main` is red
+1. **Roll the demo** to `sha-379130bf…` (command below). At 23:35 EDT the pod still ran
+   `sha-99589af3…`: the owner signed in with `!wa login qr` (the no-deploy path worked), so the
+   in-place repair is not yet seen on the cluster; after the roll a bare `help` in the chat
+   proves it. **Seen in the pod's log:** remote media from `maunium.net` fails with
+   `tcp connect error: Network unreachable (os error 101)` (three times in three hours), most
+   likely an IPv6 address with no IPv6 route in the pod and no fall-back to IPv4 -- a gap for
+   track 06/09 (the federation client should try every address, Happy Eyeballs). CI on `main` is red
    since `dd7afc8c` on the arm64 runner only, `federation_edus.rs`'s
    `a_device_added_on_one_server_is_a_device_list_change_on_the_other` (an empty device map from
    A's copy of bob's list before the EDU landed); `agent/device-list-timing` is on it. For later rolls:
