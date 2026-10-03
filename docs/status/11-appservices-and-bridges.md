@@ -36,7 +36,7 @@ database. Both are ordinary here.
 
 **What was built.** The manager owns the bot's identity
 (`crates/hs-bridges/src/cross_signing.rs`; decision
-`docs/decisions/2026-10-03-bridge-bot-cross-signing.md`):
+`docs/decisions/0027-the-manager-cross-signs-each-bridge-bots-device.md`):
 
 1. `BotIdentity::from_seeds` builds master and self-signing `ed25519` pairs from two 32-byte
    seeds; `upload_body` is the `/keys/device_signing/upload` body (a bare master key, a

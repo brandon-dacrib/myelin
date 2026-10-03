@@ -263,7 +263,7 @@ recreated for the same owner (the manager's `remove` keeps the bot user, and no 
 deletes cross-signing keys), a reset bridge database. The example config's note says as much.
 
 **What this server does instead.** The manager keeps the bot's identity
-(`hs_bridges::cross_signing`, decision `docs/decisions/2026-10-03-bridge-bot-cross-signing.md`):
+(`hs_bridges::cross_signing`, decision `docs/decisions/0027-the-manager-cross-signs-each-bridge-bots-device.md`):
 on an instance's first ready step it mints master and self-signing keys, stores the seeds on the
 instance row beside the pickle key, publishes the public keys with
 `POST /keys/device_signing/upload` as the appservice masquerading as the bot (no user-interactive

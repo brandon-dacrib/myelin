@@ -1,4 +1,4 @@
-# 2026-10-03: the bridge manager keeps each instance bot's cross-signing identity
+# 0027: 2026-10-03: the bridge manager keeps each instance bot's cross-signing identity
 
 Status: accepted (track 11; touches 08's routes as a consumer, 15's admin API and 16's pages).
 
