@@ -66,7 +66,7 @@ servers (Synapse's `erased_users` table does); a self-service erasure does not l
 (status 07); the Synapse proxy is not mounted.
 ## 2026-10-02: federation destinations at scale and the cluster series (branch `agent/admin-token`, part 2)
 
-Status 16's items 6 and 8, API and OpenAPI only (`x-hs-changelog` 0.1.2, additive):
+Status 16's items 6 and 8, API and OpenAPI only (`x-hs-changelog` 0.1.4, additive):
 
 - **`GET /federation/destinations`** already paged with a cursor and `limit` up to 500 and put
   failing destinations first; its `sort` was declared and ignored. It is honoured now:
@@ -111,7 +111,7 @@ holder needs, from the API, the CLI and the Settings page.
 - **API.** `crates/hs-admin/src/admin_tokens.rs`: `admin_tokens.list` and `.get`
   (`admin:read`), `.create` and `.delete` (`admin:write`) at `/admin-tokens`; OpenAPI
   `AdminToken`, `AdminTokenCreate`, `AdminTokenCreated`, `AdminTokenPage`, a `Scope` enum
-  schema and the `AdminTokens` tag (`x-hs-changelog` 0.1.1, additive). A mint takes a `name`,
+  schema and the `AdminTokens` tag (`x-hs-changelog` 0.1.3, additive). A mint takes a `name`,
   `scopes` (default `admin:read` and `admin:write`, a full administrator's, so a token minted
   without thinking about scopes does what the legacy credential does; empty is refused with
   `/scopes` named) and an optional `expires_at`. The `201` is the one place the token appears
