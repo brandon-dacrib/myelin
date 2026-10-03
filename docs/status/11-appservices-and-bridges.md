@@ -1,6 +1,7 @@
 # Status: track 11, appservices and bridges
 
-Last updated: 2026-10-02, evening (the bridge has a name in WhatsApp's Linked devices, and a
+Last updated: 2026-10-03 (CI's read of the bridge's rewritten config, below); before that
+2026-10-02, evening (the bridge has a name in WhatsApp's Linked devices, and a
 changed config now reaches a running bridge; below); before that, the same day, the owner's bot
 was silent on the demo cluster: diagnosed from the bridge's log, and a chat the bot started is
 now repaired in place; before that, the same
@@ -9,6 +10,26 @@ manager) and an instance's Kubernetes objects say whose bridge they are; before 
 (who has signed in to a bridge; the `cluster` runtime run on kind); before that 2026-09-30
 (ephemeral, to-device and device-list delivery); before that 2026-09-27 (RFC 0017 run against
 the real binary), 2026-09-27 (the bridge manager) and 2026-09-25.
+
+## Session 2026-10-03 (branch `agent/bridge-ci-config-read`): CI reads the bridge's rewritten config through the container
+
+`main` was red from `66528ae3`: `crates/hs-bridge-conformance/tests/real_mautrix_login.rs`'s
+`device_name_reached_the_bridge` read the bridge's rewritten `config.yaml` from the test's
+host temp dir, and on both GitHub runners (amd64 and arm64, run 37096260816) that read failed
+with `Permission denied (os error 13)`. The mautrix image runs as uid 1337 and its config
+upgrader writes the file as that user with a mode nobody else can read; the test's `chmod 777`
+on the directory lets the container write there but does not make the file readable by the
+runner's user. On the owner's Mac it passed because Docker Desktop maps every bind-mounted
+file's owner to the host user.
+
+The fix: `Bridge::read_file` reads a path under `/data` with `docker exec <container> cat`,
+the way `Bridge::log` reads the log with `docker logs`, and `device_name_reached_the_bridge`
+uses it. `docker exec` runs as the image's own user, which owns the file, so the read works
+under any uid model; nothing on the host reads the mount any more (the host only writes the two
+files before the container starts). The unused `Scene::bridge_dir` field went with it.
+Verified: `cargo test -p hs-bridge-conformance --test real_mautrix_login`, 3 of 3, 35 s, on
+Docker Desktop's Linux VM (arm64). Not run on a Linux host from this session; the reasoning
+above is why it holds there.
 
 ## Session 2026-10-02, evening (branch `agent/bridge-device-names`): the bridge is named in WhatsApp's Linked devices, and a changed config reaches a running bridge
 

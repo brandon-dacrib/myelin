@@ -430,6 +430,16 @@ impl Bridge {
             })
             .unwrap_or_default()
     }
+
+    /// A file under the bridge's `/data`, read from inside the container. The bridge rewrites
+    /// `config.yaml` as its own user (uid 1337) with a mode nobody else can read, so the host
+    /// copy in the test's temp dir is unreadable on Linux (GitHub's runners, run 37096260816:
+    /// "Permission denied (os error 13)") and readable on a Mac only because Docker Desktop
+    /// maps the uid. `docker exec cat` reads it the way `docker logs` reads the log.
+    fn read_file(&self, path: &str) -> Result<String> {
+        docker(&["exec", &self.name, "cat", path])
+            .with_context(|| format!("reading {path} from the bridge container"))
+    }
 }
 
 impl Drop for Bridge {
@@ -449,8 +459,6 @@ fn reserve_port() -> u16 {
 struct Scene {
     label: &'static str,
     _dir: tempfile::TempDir,
-    /// The bridge's `/data`: its files from the instance, and what it wrote over them.
-    bridge_dir: PathBuf,
     server: Server,
     admin: Admin,
     alice: Client,
@@ -585,7 +593,6 @@ async fn set_up(label: &'static str, options: Value) -> Result<Scene> {
     let scene = Scene {
         label,
         _dir: dir,
-        bridge_dir,
         server,
         admin,
         alice,
@@ -754,9 +761,7 @@ fn device_name_reached_the_bridge(scene: &Scene, instance: &Value) -> Result<()>
         instance["device_name"], expected,
         "the admin API names the device: {instance}"
     );
-    let path = scene.bridge_dir.join("config.yaml");
-    let config = std::fs::read_to_string(&path)
-        .with_context(|| format!("the bridge's config at {}", path.display()))?;
+    let config = scene.bridge.read_file("/data/config.yaml")?;
     assert!(
         !config.contains("pickle_key: generate")
             && config
