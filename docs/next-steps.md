@@ -48,7 +48,11 @@ changes before every checkout (a web gate regenerates the client and left it dir
 
 **What is next, in order:**
 
-1. **Roll the demo** to the first green `cd` image of `dd7afc8c` (or `sha-379130bf…` now):
+1. ~~**Roll the demo**~~ **Done, 2026-10-02 23:10 EDT:** the owner rolled to `sha-379130bf…` and the
+   WhatsApp chat repaired itself as designed ("the whatsapp changes worked"). CI on `main` is red
+   since `dd7afc8c` on the arm64 runner only, `federation_edus.rs`'s
+   `a_device_added_on_one_server_is_a_device_list_change_on_the_other` (an empty device map from
+   A's copy of bob's list before the EDU landed); `agent/device-list-timing` is on it. For later rolls:
    `helm --kube-context admin@dacrib0 get values myelin -n myelin -o yaml > /tmp/myelin-values.yaml && helm --kube-context admin@dacrib0 upgrade myelin /Users/brandon/myelin/deploy/helm/hs -n myelin -f /tmp/myelin-values.yaml --set image.tag=sha-<commit> --wait --timeout 10m`.
    Then watch the WhatsApp chat repair itself and type `login qr`. The instance's pod stays
    `bridge-d2854412-…` until it is removed and re-added (bridge-names).
