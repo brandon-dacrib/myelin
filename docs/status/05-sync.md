@@ -262,7 +262,7 @@ Known before any run, from reading the tests:
   user's server that copies), so it should pass with the local one -- unverified.
 - "User in remote room doesn't appear in user directory after server left room": its first
   assertion has a remote server's user find a user of another server they share a public room
-  with; remote members are not in `hs-auth`'s user list, so they are never ranked. RFC 0021.
+  with; remote members are not in `hs-auth`'s user list, so they are never ranked. RFC 0022.
 - "The only membership state included in a gapped incremental sync is for senders in the
   timeline" expects the gap's joiner alone and not the timeline's sender; Sytest's own comment
   marks it as expected to fail with lazy loading as Synapse does it, and this implementation
@@ -294,7 +294,7 @@ Known before any run, from reading the tests:
 - The lazy-loading memory is per device and in process memory, as Synapse's is. A replica that
   does not have it sends a member event once more, which is harmless; it is never a source of
   truth.
-- Remote members of shared and public rooms are not searchable: RFC 0021 proposes the trait
+- Remote members of shared and public rooms are not searchable: RFC 0022 proposes the trait
   change `hs-auth` would need.
 
 ### Interfaces provided (session 14)
@@ -308,7 +308,7 @@ Known before any run, from reading the tests:
 
 ### Interfaces needed (session 14)
 
-- RFC 0021: `UserDirectoryVisibility::visible_to` carrying names for remote members, and the
+- RFC 0022: `UserDirectoryVisibility::visible_to` carrying names for remote members, and the
   route ranking them (`hs-auth`).
 
 ## Session 13 (2026-10-02, branch `agent/joined-rooms-rywr`): `/joined_rooms` sees the caller's own writes

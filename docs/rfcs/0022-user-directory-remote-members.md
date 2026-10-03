@@ -1,4 +1,4 @@
-# 0021. The user directory should find the remote members of shared and public rooms
+# 0022. The user directory should find the remote members of shared and public rooms
 
 Status: **proposed**, 2026-10-02 (branch `agent/user-sytest`). Author: track 05 (sync). Owner of
 the change: track 07 (auth and identity), which serves `POST /user_directory/search`
