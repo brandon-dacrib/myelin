@@ -344,7 +344,7 @@
           "x-applies": "hot"
         },
         "sync": {
-          "description": "How much of each user's sync history this server keeps: the per-user feed that tells\n`/sync` which rooms changed, and the server-wide stream that does the same for very\nlarge rooms. Older history is compacted to each room's last position. A client whose\nsync token is older than what is kept is sent its rooms again; it never misses\nanything.",
+          "description": "How much of each user's sync history this server keeps: the per-user feed that tells\n`/sync` which rooms changed, and the server-wide stream that does the same for very\nlarge rooms. Older history is compacted to each room's last position. A client whose\nsync token is older than what is kept still learns of every room that changed, and\nis sent a room whole where its position as of the token is gone; it never misses\nanything.",
           "$ref": "#/$defs/SyncConfig",
           "default": {
             "feed_retention_entries": 10000,
@@ -363,7 +363,7 @@
       "type": "object",
       "properties": {
         "feed_retention_entries": {
-          "description": "How many feed entries to keep per user. A feed entry records that a room changed; one\nis written per room per update for rooms up to the fan-out threshold, and the entries\na client has not yet synced are merged, so a client that keeps up adds at most one\nentry per room between two syncs. Below the kept entries, each room's last position\nstays, so a token older than this is answered with every room, and a room is resumed\nfrom where the client last saw it or sent whole. `0` keeps every entry for ever. The\nfeed is compacted once it has grown to twice this, so it holds between one and two\ntimes this many entries.",
+          "description": "How many feed entries to keep per user. A feed entry records that a room changed; one\nis written per room per update for rooms up to the fan-out threshold, and the entries\na client has not yet synced are merged, so a client that keeps up adds at most one\nentry per room between two syncs. Below the kept entries, each room's last position\nstays, so a token older than this still finds every room that changed, each resumed\nfrom its last kept position or sent whole. `0` keeps every entry for ever. The\nfeed is compacted once it has grown to twice this, so it holds between one and two\ntimes this many entries.",
           "type": "integer",
           "format": "uint64",
           "minimum": 0,
