@@ -39,8 +39,15 @@ pub const ANNOTATION_APPSERVICE_ID: &str = "myelin.dev/appservice-id";
 pub const LABEL_OWNER: &str = "myelin.dev/owner";
 /// Annotation carrying the owner's exact Matrix ID; absent on a shared instance's objects.
 pub const ANNOTATION_OWNER: &str = "myelin.dev/owner";
-/// Pod-template annotation holding a hash of the `Bridge`'s spec, so a spec change rolls the pod.
+/// Pod-template annotation holding a hash of the `Bridge`'s spec (and of its files, when the
+/// `Bridge` carries [`ANNOTATION_FILES_HASH`]), so a spec or files change rolls the pod.
 pub const ANNOTATION_SPEC_HASH: &str = "myelin.dev/spec-hash";
+/// `Bridge` annotation holding a hash of the files in its Secret, written by whoever applies the
+/// `Bridge` and its Secret together (the homeserver's bridge manager, `deploy.rs`). The Secret's
+/// contents are not part of the spec, so without it a changed config would never reach the
+/// bridge; with it, [`spec_hash`] changes and the pod rolls, and the init container writes the
+/// new files into `/data` (see [`COPY_FILES_SCRIPT`]).
+pub const ANNOTATION_FILES_HASH: &str = "myelin.dev/files-hash";
 /// The `condition.type` [`status_from`] reports.
 pub const CONDITION_AVAILABLE: &str = "Available";
 /// Name of the bridge's container port, which the Service targets.
@@ -51,17 +58,40 @@ const DATA_DIR: &str = "/data";
 /// Where the files Secret is mounted, read-only, for the init container.
 const FILES_DIR: &str = "/files";
 
-/// The init container's script: copy each file from the Secret into `/data` unless it is already
-/// there. Never overwrite: a mautrix bridge rewrites its `config.yaml` on first start with secrets
-/// it generated (`encryption.pickle_key`); replacing it would make its crypto store unreadable.
-/// `/files/*` skips the Secret volume's dot-prefixed bookkeeping entries (`..data`), and `-f`
-/// follows the symlinks the kubelet puts in their place.
+/// The init container's script: write each file from the Secret into `/data`, so that a
+/// changed config reaches the bridge on every start. A mautrix bridge completes and rewrites
+/// its `config.yaml` on its first start, generating the secrets it was not given
+/// (`encryption.pickle_key`, `public_media.signing_key`, `direct_media.server_key`); replacing
+/// the file with one that lacks them would have the bridge generate new ones and make its
+/// crypto store unreadable. So where `/data` already has the file, the values of those three
+/// keys are carried from it into the new copy (keeping the new copy's indentation; a value of
+/// `generate` is the bridge's placeholder and is not carried), and the new copy is then
+/// written in its place. The homeserver renders `pickle_key` itself since 2026-10-02, so the
+/// carry matters for bridges first started before that. `/files/*` skips the Secret volume's
+/// dot-prefixed bookkeeping entries (`..data`), and `-f` follows the symlinks the kubelet puts
+/// in their place. POSIX `sh`, `grep`, `sed` and `awk` only: every bridge image has busybox or
+/// coreutils.
 const COPY_FILES_SCRIPT: &str = r#"set -eu
 for f in /files/*; do
   [ -f "$f" ] || continue
   t="/data/$(basename "$f")"
   if [ -e "$t" ]; then
-    echo "keeping $t"
+    cp "$f" "$t.new"
+    for key in pickle_key signing_key server_key; do
+      old=$(grep -m1 -E "^[[:space:]]*$key:" "$t" || true)
+      [ -n "$old" ] || continue
+      val=$(printf '%s' "${old#*:}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+      [ -n "$val" ] || continue
+      [ "$val" != "generate" ] || continue
+      awk -v key="$key" -v val="$val" '
+        !done && match($0, "^[ \t]*" key ":") { print substr($0, 1, RSTART + RLENGTH - 1) " " val; done = 1; next }
+        { print }
+      ' "$t.new" > "$t.tmp"
+      mv "$t.tmp" "$t.new"
+      echo "carried $key into $t"
+    done
+    mv "$t.new" "$t"
+    echo "replaced $t"
   else
     cp "$f" "$t"
     echo "wrote $t"
@@ -175,14 +205,26 @@ pub fn pod_selector(bridge_name: &str) -> String {
     parts.join(",")
 }
 
-/// A short, stable hash of the `Bridge`'s spec (16 hex digits of SHA-256 over its JSON).
+/// A short, stable hash of the `Bridge`'s spec (16 hex digits of SHA-256 over its JSON), and of
+/// its files' hash when the `Bridge` is annotated with one ([`ANNOTATION_FILES_HASH`]), so that
+/// new files in the Secret roll the pod the way a new spec does.
 #[must_use]
 pub fn spec_hash(bridge: &Bridge) -> String {
     // Serializing a plain data struct to JSON cannot fail; an empty input on the impossible path
     // still gives a stable (if uninformative) hash rather than a panic.
     let json = serde_json::to_vec(&bridge.spec).unwrap_or_default();
-    let digest = Sha256::digest(&json);
-    hex::encode(&digest[..8])
+    let mut hasher = Sha256::new();
+    hasher.update(&json);
+    if let Some(files) = bridge
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(ANNOTATION_FILES_HASH))
+    {
+        hasher.update([0]);
+        hasher.update(files.as_bytes());
+    }
+    hex::encode(&hasher.finalize()[..8])
 }
 
 fn metadata(bridge: &Bridge, name: String) -> ObjectMeta {
@@ -256,8 +298,9 @@ fn tcp_probe(initial_delay: i32, period: i32, failure_threshold: i32) -> Probe {
 }
 
 /// The bridge's Deployment, `<name>`: one replica, `Recreate` (two copies of a bridge must never
-/// overlap), an init container that seeds `/data` from the files Secret without overwriting, and
-/// the bridge container running the image's own entrypoint with `/data` on the claim.
+/// overlap), an init container that writes `/data`'s files from the files Secret on every start
+/// (carrying the secrets a mautrix bridge generated into them, [`COPY_FILES_SCRIPT`]), and the
+/// bridge container running the image's own entrypoint with `/data` on the claim.
 ///
 /// The pod does not force `runAsNonRoot`: mautrix's `docker-run.sh` starts as root to `chown
 /// /data` and then drops to UID 1337. It gets no service-account token; a bridge has no business
@@ -748,40 +791,106 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_copy_script_never_overwrites_and_skips_secret_bookkeeping() {
-        // Run the real script against a real directory pair when a POSIX shell is present.
+    /// Runs the real copy script against a real directory pair: `files` is the Secret, `data`
+    /// what the bridge has. Returns what `/data` holds afterwards, by file name.
+    fn run_copy_script(
+        label: &str,
+        files: &[(&str, &str)],
+        data: &[(&str, &str)],
+    ) -> Option<BTreeMap<String, String>> {
         let sh = "/bin/sh";
         if !std::path::Path::new(sh).exists() {
-            return;
+            return None;
         }
-        let root = std::env::temp_dir().join(format!("hs-operator-copy-{}", std::process::id()));
-        let files = root.join("files");
-        let data = root.join("data");
-        std::fs::create_dir_all(&files).unwrap();
-        std::fs::create_dir_all(&data).unwrap();
-        std::fs::write(files.join("config.yaml"), "fresh").unwrap();
-        std::fs::write(files.join("registration.yaml"), "reg").unwrap();
-        std::fs::create_dir_all(files.join("..data")).unwrap();
-        std::fs::write(data.join("config.yaml"), "rewritten by the bridge").unwrap();
+        let root =
+            std::env::temp_dir().join(format!("hs-operator-copy-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let files_dir = root.join("files");
+        let data_dir = root.join("data");
+        std::fs::create_dir_all(&files_dir).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        for (name, contents) in files {
+            std::fs::write(files_dir.join(name), contents).unwrap();
+        }
+        std::fs::create_dir_all(files_dir.join("..data")).unwrap();
+        for (name, contents) in data {
+            std::fs::write(data_dir.join(name), contents).unwrap();
+        }
         let script = COPY_FILES_SCRIPT
-            .replace("/files/", &format!("{}/", files.display()))
-            .replace("/data/", &format!("{}/", data.display()));
-        let status = std::process::Command::new(sh)
+            .replace("/files/", &format!("{}/", files_dir.display()))
+            .replace("/data/", &format!("{}/", data_dir.display()));
+        let output = std::process::Command::new(sh)
             .args(["-c", &script])
-            .status()
+            .output()
             .unwrap();
-        assert!(status.success());
-        assert_eq!(
-            std::fs::read_to_string(data.join("config.yaml")).unwrap(),
-            "rewritten by the bridge"
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
-        assert_eq!(
-            std::fs::read_to_string(data.join("registration.yaml")).unwrap(),
-            "reg"
-        );
-        assert!(!data.join("..data").exists());
+        let mut out = BTreeMap::new();
+        for entry in std::fs::read_dir(&data_dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            out.insert(name, std::fs::read_to_string(entry.path()).unwrap());
+        }
         std::fs::remove_dir_all(&root).unwrap();
+        Some(out)
+    }
+
+    #[test]
+    fn the_copy_script_writes_the_files_on_a_first_start_and_skips_secret_bookkeeping() {
+        let Some(data) = run_copy_script(
+            "first",
+            &[("config.yaml", "fresh\n"), ("registration.yaml", "reg\n")],
+            &[],
+        ) else {
+            return;
+        };
+        assert_eq!(data["config.yaml"], "fresh\n");
+        assert_eq!(data["registration.yaml"], "reg\n");
+        assert!(!data.contains_key("..data"));
+        assert_eq!(data.len(), 2, "{data:?}");
+    }
+
+    #[test]
+    fn the_copy_script_replaces_a_file_and_carries_the_secrets_the_bridge_generated() {
+        // What the homeserver rendered this time (two-space indentation, its own pickle key),
+        // and what the bridge wrote on its first start (four-space, the keys it generated).
+        let rendered = "homeserver:\n  address: http://new:8008\nnetwork:\n  os_name: \"Myelin WhatsApp bridge for alice (x)\"\nencryption:\n  allow: true\n  pickle_key: RENDERED\npublic_media:\n  signing_key: generate\n";
+        let bridge_written = "homeserver:\n    address: http://old:8008\nencryption:\n    allow: true\n    pickle_key: GENERATED_BY_THE_BRIDGE\npublic_media:\n    enabled: false\n    signing_key: \"quoted key\"\ndirect_media:\n    server_key: generate\n";
+        let Some(data) = run_copy_script(
+            "replace",
+            &[("config.yaml", rendered), ("registration.yaml", "reg\n")],
+            &[
+                ("config.yaml", bridge_written),
+                ("registration.yaml", "old reg\n"),
+            ],
+        ) else {
+            return;
+        };
+        assert_eq!(
+            data["config.yaml"],
+            "homeserver:\n  address: http://new:8008\nnetwork:\n  os_name: \"Myelin WhatsApp bridge for alice (x)\"\nencryption:\n  allow: true\n  pickle_key: GENERATED_BY_THE_BRIDGE\npublic_media:\n  signing_key: \"quoted key\"\n",
+            "the new file, with the bridge's pickle and signing keys in its place of the rendered ones, at the new file's indentation; `generate` is not a key to carry"
+        );
+        assert_eq!(data["registration.yaml"], "reg\n");
+        assert_eq!(
+            data.len(),
+            2,
+            "no bookkeeping entry, no leftover temporary file: {data:?}"
+        );
+
+        // A rendered file without the key keeps none: nothing to carry it into.
+        let Some(data) = run_copy_script(
+            "missing",
+            &[("config.yaml", "a: 1\n")],
+            &[("config.yaml", "a: 0\nencryption:\n    pickle_key: K\n")],
+        ) else {
+            return;
+        };
+        assert_eq!(data["config.yaml"], "a: 1\n");
     }
 
     #[test]
@@ -860,6 +969,33 @@ mod tests {
         };
         assert_ne!(hash(&a), hash(&b));
         assert_eq!(hash(&a), hash(&desired_deployment(&bridge())));
+
+        // New files in the Secret are not a spec change; the files hash the homeserver
+        // annotates the `Bridge` with makes them roll the pod all the same.
+        let mut files_changed = bridge();
+        files_changed
+            .metadata
+            .annotations
+            .get_or_insert_with(BTreeMap::new)
+            .insert(
+                ANNOTATION_FILES_HASH.to_owned(),
+                "0123456789abcdef".to_owned(),
+            );
+        let c = desired_deployment(&files_changed);
+        assert_ne!(hash(&a), hash(&c));
+        assert_ne!(hash(&b), hash(&c));
+        assert_eq!(hash(&c), hash(&desired_deployment(&files_changed)));
+        let mut files_changed_again = files_changed.clone();
+        files_changed_again
+            .metadata
+            .annotations
+            .as_mut()
+            .unwrap()
+            .insert(
+                ANNOTATION_FILES_HASH.to_owned(),
+                "fedcba9876543210".to_owned(),
+            );
+        assert_ne!(hash(&c), hash(&desired_deployment(&files_changed_again)));
     }
 
     #[test]

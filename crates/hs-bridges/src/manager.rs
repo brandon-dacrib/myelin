@@ -434,6 +434,11 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             ready_at: row.ready_at_ms.map(rfc3339),
             chat_room: row.dm_room.clone(),
             chat_started_by: row.dm_started_by.clone(),
+            device_name: bridge_types::device_name(
+                &row.bridge_type,
+                &self.server_name,
+                owner_of(row),
+            ),
         }
     }
 
@@ -478,7 +483,44 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             double_puppeting: offering.options.double_puppeting,
             backfill: offering.options.backfill,
             provisioning_secret: row.provisioning_secret.as_deref(),
+            pickle_key: row.pickle_key.as_deref(),
         })
+    }
+
+    /// Renders `row` and applies its deployment to the runtime, recording what was applied
+    /// ([`deploy_fingerprint`]) so that the next step can tell whether anything changed.
+    async fn apply_deployment(
+        &self,
+        row: &InstanceRow,
+        offering: &OfferingRow,
+        runtime: &Arc<dyn Runtime>,
+    ) -> Result<(), String> {
+        let render = self
+            .render(row, offering)
+            .ok_or("the instance has no registration")?;
+        let spec = Self::deploy_spec(row, &render).ok_or("the instance has no name")?;
+        let fingerprint = deploy_fingerprint(&spec);
+        runtime.apply(&spec).await?;
+        self.store
+            .update_instance(&row.bridge_type, &row.owner, |r| {
+                if r.applied_fingerprint.as_deref() == Some(fingerprint.as_str()) {
+                    return false;
+                }
+                r.applied_fingerprint = Some(fingerprint.clone());
+                true
+            })
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Whether what the runtime would be asked for now differs from what it was last asked
+    /// for: the offering's image tag or options changed, this server's address changed, or
+    /// the files are rendered differently (a bridge's device name, say). `None` where the
+    /// instance cannot be rendered yet.
+    fn deployment_changed(&self, row: &InstanceRow, offering: &OfferingRow) -> Option<bool> {
+        let render = self.render(row, offering)?;
+        let spec = Self::deploy_spec(row, &render)?;
+        Some(row.applied_fingerprint.as_deref() != Some(deploy_fingerprint(&spec).as_str()))
     }
 
     fn deploy_spec(row: &InstanceRow, render: &InstanceRender) -> Option<DeploySpec> {
@@ -539,6 +581,7 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
 
     async fn step(&self, row: &InstanceRow) -> Result<(), String> {
         let row = &self.settle_deploy_name(row).await?;
+        let row = &self.settle_pickle_key(row)?;
         let Some(offering) = self
             .store
             .offering(&row.bridge_type)
@@ -560,11 +603,7 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
                         .runtime
                         .clone()
                         .ok_or("this server cannot deploy bridges any more")?;
-                    let render = self
-                        .render(row, &offering)
-                        .ok_or("the instance has no registration")?;
-                    let spec = Self::deploy_spec(row, &render).ok_or("the instance has no name")?;
-                    runtime.apply(&spec).await?;
+                    self.apply_deployment(row, &offering, &runtime).await?;
                     self.set_state(
                         row,
                         InstanceState::Deploying,
@@ -580,6 +619,33 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
                         ),
                     );
                 }
+                self.wake();
+                Ok(())
+            }
+            InstanceState::Deploying | InstanceState::Starting | InstanceState::Ready
+                if offering.runtime == "cluster"
+                    && self.deployment_changed(row, &offering) == Some(true) =>
+            {
+                // The offering or this server changed under a deployed instance (an image tag,
+                // an option, the bridge's device name): ask the runtime for the new deployment,
+                // which updates its files Secret and rolls its pod, and watch it come back.
+                let runtime = self
+                    .runtime
+                    .clone()
+                    .ok_or("this server cannot deploy bridges any more")?;
+                tracing::info!(
+                    bridge_type = %row.bridge_type,
+                    owner = %row.owner,
+                    deploy_name = row.deploy_name.as_deref().unwrap_or_default(),
+                    from = row.state.as_str(),
+                    "the bridge instance's deployment changed: applying it, which restarts the pod"
+                );
+                self.apply_deployment(row, &offering, &runtime).await?;
+                self.set_state(
+                    row,
+                    InstanceState::Deploying,
+                    Some("its configuration changed: restarting the pod with it".into()),
+                );
                 self.wake();
                 Ok(())
             }
@@ -736,6 +802,31 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             .ok_or_else(|| "the instance was removed".to_owned())
     }
 
+    /// The row with a pickle key for its config. A registered row from before the manager
+    /// minted one gets one now, so that its config renders complete; the key the running
+    /// bridge generated is carried over the rendered one by the operator's init container
+    /// when the pod next restarts, so the bridge's crypto store stays readable.
+    fn settle_pickle_key(&self, row: &InstanceRow) -> Result<InstanceRow, String> {
+        if row.appservice_id.is_none() || row.pickle_key.is_some() {
+            return Ok(row.clone());
+        }
+        let key = crate::random_hex(32);
+        tracing::info!(bridge_type = %row.bridge_type, owner = %row.owner, "minted a pickle key for a bridge instance registered before the manager kept one");
+        self.store
+            .update_instance(&row.bridge_type, &row.owner, |r| {
+                if r.pickle_key.is_some() {
+                    return false;
+                }
+                r.pickle_key = Some(key.clone());
+                true
+            })
+            .map_err(|e| e.to_string())?;
+        self.store
+            .instance(&row.bridge_type, &row.owner)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "the instance was removed".to_owned())
+    }
+
     fn set_state(&self, row: &InstanceRow, state: InstanceState, reason: Option<String>) {
         let from = row.state;
         let now = now_ms();
@@ -802,6 +893,7 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
                     r.as_token = Some(crate::random_hex(32));
                     r.hs_token = Some(crate::random_hex(32));
                     r.provisioning_secret = Some(crate::random_hex(32));
+                    r.pickle_key = Some(crate::random_hex(32));
                     r.url = Some(url.clone());
                     true
                 })
@@ -1289,6 +1381,36 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
         self.remove(&row).await?;
         Ok(true)
     }
+}
+
+/// A fingerprint of what a deployment asks the runtime for: the image, the port, the arguments
+/// and every rendered file (16 hex digits of SHA-256). The manager keeps the last applied one
+/// on the row (`InstanceRow::applied_fingerprint`) and applies the deployment again when it
+/// changes. The name and labels are left out: they are decided once and never change.
+#[must_use]
+pub fn deploy_fingerprint(spec: &DeploySpec) -> String {
+    let mut hasher = Sha256::new();
+    for part in [
+        spec.image_repository.as_str(),
+        spec.image_tag.as_str(),
+        &spec.port.to_string(),
+        spec.owner.as_deref().unwrap_or_default(),
+        spec.storage_size.as_deref().unwrap_or_default(),
+    ] {
+        hasher.update(part.as_bytes());
+        hasher.update([0]);
+    }
+    for arg in &spec.args {
+        hasher.update(arg.as_bytes());
+        hasher.update([0]);
+    }
+    for (name, contents) in &spec.files {
+        hasher.update(name.as_bytes());
+        hasher.update([0]);
+        hasher.update(contents.as_bytes());
+        hasher.update([0]);
+    }
+    hex::encode(&hasher.finalize()[..8])
 }
 
 pub(crate) fn owner_of(row: &InstanceRow) -> Option<&str> {
@@ -1935,6 +2057,189 @@ mod tests {
         assert!(!spec.labels.contains_key("myelin.dev/owner"));
     }
 
+    #[tokio::test]
+    async fn a_deployed_instance_is_named_on_whatsapps_side_and_its_config_is_complete() {
+        let (manager, runtime) = cluster_manager();
+        manager.put("mautrix-whatsapp", cluster()).await.unwrap();
+        manager
+            .put_instance("mautrix-whatsapp", "@brandon:example.org")
+            .await
+            .unwrap();
+        manager.tick().await; // registered
+        manager.tick().await; // deploying
+        let row = manager
+            .store
+            .instance("mautrix-whatsapp", "@brandon:example.org")
+            .unwrap()
+            .unwrap();
+        let pickle_key = row.pickle_key.clone().expect("minted with the tokens");
+        assert_eq!(pickle_key.len(), 64);
+        assert!(
+            row.applied_fingerprint.is_some(),
+            "what was applied is kept"
+        );
+        let spec = runtime.spec("bridge-whatsapp-brandon").unwrap();
+        let config = &spec.files["config.yaml"];
+        assert!(
+            config.contains("  os_name: \"Myelin WhatsApp bridge for brandon (example.org)\"\n"),
+            "{config}"
+        );
+        assert!(config.contains("  browser_name: DESKTOP\n"), "{config}");
+        assert!(
+            config.contains(&format!("  pickle_key: {pickle_key}\n")),
+            "{config}"
+        );
+        // The admin API says the same name, so the interface can tell the person what to
+        // expect in WhatsApp's Linked devices.
+        let instance = manager
+            .instance("mautrix-whatsapp", "@brandon:example.org")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            instance.device_name.as_deref(),
+            Some("Myelin WhatsApp bridge for brandon (example.org)")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_changed_offering_is_applied_to_a_ready_instance_once_and_rolls_it() {
+        let (manager, runtime) = cluster_manager();
+        manager.put("mautrix-whatsapp", cluster()).await.unwrap();
+        manager
+            .put_instance("mautrix-whatsapp", "@brandon:example.org")
+            .await
+            .unwrap();
+        manager.tick().await; // registered
+        manager.tick().await; // deploying
+        let to_ready = |manager: &BridgeManager<MemoryBackend>| {
+            manager
+                .store
+                .update_instance("mautrix-whatsapp", "@brandon:example.org", |r| {
+                    r.enter(InstanceState::Ready, 5);
+                    r.reason = None;
+                    r.dm_room = Some("!chat:example.org".into());
+                    r.dm_started_by = Some(CHAT_BY_OWNER.into());
+                    true
+                })
+                .unwrap()
+                .unwrap()
+        };
+        let row = to_ready(&manager);
+        let applied = row.applied_fingerprint.clone().unwrap();
+
+        // Nothing changed: a ready instance is left alone.
+        manager.tick().await;
+        let row = manager
+            .store
+            .instance("mautrix-whatsapp", "@brandon:example.org")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, InstanceState::Ready);
+        assert_eq!(row.applied_fingerprint.as_deref(), Some(applied.as_str()));
+
+        // The administrator picks another image tag: the deployment is applied again with it
+        // and the instance watches its pod come back.
+        manager
+            .put(
+                "mautrix-whatsapp",
+                BridgeOfferingRequest {
+                    image_tag: Some("v0.13.0".into()),
+                    ..BridgeOfferingRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        manager.tick().await;
+        let row = manager
+            .store
+            .instance("mautrix-whatsapp", "@brandon:example.org")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, InstanceState::Deploying);
+        assert_eq!(
+            row.reason.as_deref(),
+            Some("its configuration changed: restarting the pod with it")
+        );
+        assert_ne!(row.applied_fingerprint.as_deref(), Some(applied.as_str()));
+        assert_eq!(
+            runtime.spec("bridge-whatsapp-brandon").unwrap().image_tag,
+            "v0.13.0"
+        );
+        // And it is not applied again for the same change: the deployment reports ready, so
+        // the instance moves on to waiting for the bridge.
+        manager.tick().await;
+        let row = manager
+            .store
+            .instance("mautrix-whatsapp", "@brandon:example.org")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, InstanceState::Starting);
+
+        // A row from before fingerprints were kept is applied once, so that a config rendered
+        // differently by a newer server (a device name, say) reaches its pod.
+        let row = to_ready(&manager);
+        let fresh = row.applied_fingerprint.clone().unwrap();
+        manager
+            .store
+            .update_instance("mautrix-whatsapp", "@brandon:example.org", |r| {
+                r.applied_fingerprint = None;
+                true
+            })
+            .unwrap()
+            .unwrap();
+        manager.tick().await;
+        let row = manager
+            .store
+            .instance("mautrix-whatsapp", "@brandon:example.org")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, InstanceState::Deploying);
+        assert_eq!(row.applied_fingerprint.as_deref(), Some(fresh.as_str()));
+    }
+
+    #[test]
+    fn a_deploy_fingerprint_changes_with_the_files_and_the_image_and_not_the_name() {
+        let base = DeploySpec {
+            name: "bridge-whatsapp-alice".into(),
+            labels: BTreeMap::from([("a".to_owned(), "b".to_owned())]),
+            bridge_type: "mautrix-whatsapp".into(),
+            appservice_id: "whatsapp-alice".into(),
+            owner: Some("@alice:example.org".into()),
+            image_repository: "dock.mau.dev/mautrix/whatsapp".into(),
+            image_tag: "latest".into(),
+            port: 29318,
+            args: Vec::new(),
+            files: BTreeMap::from([("config.yaml".to_owned(), "os_name: a\n".to_owned())]),
+            storage_size: Some("1Gi".into()),
+        };
+        let same = deploy_fingerprint(&base);
+        assert_eq!(same.len(), 16);
+        let renamed = DeploySpec {
+            name: "bridge-other".into(),
+            labels: BTreeMap::new(),
+            ..base.clone()
+        };
+        assert_eq!(deploy_fingerprint(&renamed), same);
+        let mut files = base.files.clone();
+        files.insert("config.yaml".to_owned(), "os_name: b\n".to_owned());
+        let changed = DeploySpec {
+            files,
+            ..base.clone()
+        };
+        assert_ne!(deploy_fingerprint(&changed), same);
+        let retagged = DeploySpec {
+            image_tag: "v0.13.0".into(),
+            ..base.clone()
+        };
+        assert_ne!(deploy_fingerprint(&retagged), same);
+        let with_args = DeploySpec {
+            args: vec!["-o".into()],
+            ..base
+        };
+        assert_ne!(deploy_fingerprint(&with_args), same);
+    }
+
     /// A row from before names were stored, whose objects run under the hashed name.
     async fn registered_without_a_name(manager: &BridgeManager<MemoryBackend>) -> (String, String) {
         manager.put("mautrix-whatsapp", cluster()).await.unwrap();
@@ -2186,11 +2491,14 @@ mod tests {
             .await
             .unwrap();
         manager.tick().await; // requested -> registered: tokens and a name
+        manager.tick().await; // registered -> deploying: its deployment applied
         manager
             .store
             .update_instance("mautrix-whatsapp", OWNER, |r| {
-                assert_eq!(r.state, InstanceState::Registered);
+                assert_eq!(r.state, InstanceState::Deploying);
+                assert!(r.applied_fingerprint.is_some());
                 r.enter(InstanceState::Ready, 2);
+                r.reason = None;
                 r.dm_room = Some(OLD_CHAT.into());
                 r.dm_started_by = None;
                 true

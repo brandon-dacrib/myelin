@@ -170,6 +170,8 @@ function seed() {
       created_at: iso(age),
       ready_at: iso(age - 90_000),
       chat_started_by: "owner",
+      // What the manager writes into the bridge's config as WhatsApp's device name.
+      device_name: `Myelin WhatsApp bridge for ${userId.slice(1).split(":")[0]} (${SERVER})`,
     });
     i.deployment = deploymentFor(whatsapp, i, "Ready", null);
     return i;

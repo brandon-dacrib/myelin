@@ -1,12 +1,102 @@
 # Status: track 11, appservices and bridges
 
-Last updated: 2026-10-02 (the owner's bot was silent on the demo cluster: diagnosed from the
-bridge's log, and a chat the bot started is now repaired in place; below); before that, the same
+Last updated: 2026-10-02, evening (the bridge has a name in WhatsApp's Linked devices, and a
+changed config now reaches a running bridge; below); before that, the same day, the owner's bot
+was silent on the demo cluster: diagnosed from the bridge's log, and a chat the bot started is
+now repaired in place; before that, the same
 day, `login qr` in the personal bot's chat did nothing (found with the real bridge, fixed in the
 manager) and an instance's Kubernetes objects say whose bridge they are; before that 2026-10-01
 (who has signed in to a bridge; the `cluster` runtime run on kind); before that 2026-09-30
 (ephemeral, to-device and device-list delivery); before that 2026-09-27 (RFC 0017 run against
 the real binary), 2026-09-27 (the bridge manager) and 2026-09-25.
+
+## Session 2026-10-02, evening (branch `agent/bridge-device-names`): the bridge is named in WhatsApp's Linked devices, and a changed config reaches a running bridge
+
+**Asked.** The owner's WhatsApp bridge shows in the phone's Linked devices as "other device",
+platform "Other device". Name it after the person and the server, with the word bridge in it.
+
+**Found** (sources fetched 2026-10-02; the full account with file names is in
+`docs/bridges/mautrix.md`, "2026-10-02, evening"):
+
+- The two strings are mautrix-whatsapp's `network.os_name` (free text) and `network.browser_name`
+  (a whatsmeow `PlatformType` name; `unknown` by default), handed to whatsmeow's `DeviceProps`
+  and sent **only in the pairing payload** (`getRegistrationPayload`); a linked device is never
+  told again. `UNKNOWN` makes the phone ignore the name and say "Other device" (whatsmeow
+  discussion #469, issue #89, and the owner's phone); a browser value shows "Google Chrome
+  (name)" and a browser's logo; `DESKTOP` shows the name alone with the desktop icon. So
+  `browser_name: DESKTOP`, one constant (`hs_admin::bridge_types::WHATSAPP_PLATFORM`).
+- Signal (`network.device_name`), Telegram (`network.device_info.device_model`) and Google
+  Messages (`network.device_meta.os`) have the equivalent; Meta, Discord, Slack, X, LinkedIn,
+  Bluesky and Google Voice have none (documented in `DeviceSetting`, so nobody looks twice).
+- The bot's Matrix device is named "WhatsApp bridge" by mautrix-go itself
+  (`bridgev2/matrix/crypto.go`), config cannot change it, the as_token double puppet has no
+  device; left as it is.
+- **There was no path for a changed config to reach a running instance.** The manager applied a
+  deployment once, in `registered`, and the operator's init container never replaced a file in
+  `/data` (the bridge's rewritten `config.yaml` holds the generated `encryption.pickle_key`).
+
+**Done.**
+
+- `crates/hs-admin/src/bridge_types.rs`: `device_name(type, server, owner)` is the one pattern
+  (`Myelin WhatsApp bridge for brandon (myelin.dacrib.net)`; shared: `Myelin WhatsApp bridge
+  (myelin.dacrib.net)`), `DeviceSetting` says which key each connector has, `network_section`
+  writes it, `WHATSAPP_PLATFORM = "DESKTOP"`; `InstanceSpec::pickle_key` is rendered as
+  `encryption.pickle_key`; `InstanceRender::device_name`. The wizard's hand-run bridge carries
+  the shared name. Test `an_instance_is_named_on_the_networks_side_after_its_owner_and_this_server`
+  covers a person's and a shared instance, every connector with a key, every one without, the
+  quoting and the pickle key.
+- `crates/hs-admin/src/model.rs` and `openapi/openapi.yaml`: `BridgeInstance.device_name`
+  (nullable); the web client regenerated (`npm run generate:client`).
+- `crates/hs-bridges`: `InstanceRow::pickle_key` (minted with the tokens; `settle_pickle_key`
+  mints one for an older row) and `InstanceRow::applied_fingerprint`; `deploy_fingerprint`
+  (image, port, arguments, files); `apply_deployment` records it; a deploying, starting or ready
+  cluster instance whose fingerprint differs is applied again and moved to `deploying` with
+  "its configuration changed: restarting the pod with it" (log line "the bridge instance's
+  deployment changed: applying it, which restarts the pod"). An instance from before is applied
+  once. Tests: `a_deployed_instance_is_named_on_whatsapps_side_and_its_config_is_complete`,
+  `a_changed_offering_is_applied_to_a_ready_instance_once_and_rolls_it`,
+  `a_deploy_fingerprint_changes_with_the_files_and_the_image_and_not_the_name`.
+- `crates/hs-operator`: `deploy.rs` annotates the `Bridge` with `myelin.dev/files-hash`
+  (`files_hash`); `bridge.rs` folds it into `spec_hash`, so the pod rolls; the init container's
+  script now replaces each file and carries `pickle_key`, `signing_key` and `server_key` from the
+  bridge's copy at the new file's indentation (POSIX sh, grep, sed, awk). Tests run the real
+  script. The `Bridge` CRD's `filesSecret` description changed with it: `deploy/crds/bridge.yaml`
+  and `deploy/helm/hs/crds/bridge.yaml` regenerated with `cargo run -p hs-operator --bin gen-crds`.
+- `web/src/pages/bridges/offering/InstanceNextSteps.tsx`: one line under the steps, "In
+  WhatsApp's own list of linked devices, this bridge is named …. A link made before that name was
+  set keeps its old name until the bridge is linked again." (tests added; mock data names its
+  ready instances).
+- `crates/hs-bridge-conformance/tests/real_mautrix_login.rs`: the encrypted and plain stories
+  now check `device_name` on the admin API and that the bridge's **rewritten** `config.yaml`
+  (its upgrader ran) still says the name, `browser_name: DESKTOP` and the rendered pickle key.
+- `docs/bridges/mautrix.md`: the section above, with what the owner will see.
+
+**What the owner will see.** The demo instance's pod rolls once (new config, pickle key carried,
+WhatsApp session and chat kept). The existing link stays "Other device": WhatsApp was told at
+pairing and is not told again. Log the bridge out (phone: Linked devices, the device, Log out;
+or `logout` to the bot) and `login qr` again; the new link shows `Myelin WhatsApp bridge for
+brandon (myelin.dacrib.net)` with a desktop icon. The next-steps box says so.
+
+**Verified.** `cargo test -p hs-admin --lib bridge_types`, `cargo test -p hs-bridges`,
+`cargo test -p hs-operator --lib`, `cargo clippy -p hs-admin -p hs-bridges -p hs-operator -p
+hs-cli -p hs-bridge-conformance --all-targets -- -D warnings`, `cargo fmt --all --check`; in
+`web/`: `npm run lint`, `npm run typecheck`, `npx vitest run` (567 tests), `npm run build`. The
+real-bridge harness, `cargo test -p hs-bridge-conformance --test real_mautrix_login`, against
+`dock.mau.dev/mautrix/whatsapp:latest` and this branch's debug binary: 3 passed in 35 s, so the
+bridge's own config upgrader keeps `network.os_name`, `browser_name: DESKTOP` and the rendered
+`pickle_key`, and the admin API names the device. Not on the cluster (unreachable from sessions
+today), so the roll itself (annotation, operator, init container) is verified by unit tests
+and the script run under `/bin/sh` only.
+
+**Decisions.** (1) The platform is `DESKTOP`, a per-type constant, not an option: it is the one
+value that shows a free-text name without claiming to be a browser. (2) The name puts the
+localpart before the server and the network's name in it, same pattern for every network, so a
+person with three bridges tells them apart in each app. (3) The Secret is now the config: a
+hand edit inside a pod's `/data/config.yaml` is replaced on the next roll, except the three
+generated keys, which are carried. (4) An offering change now restarts every deployed instance
+of that offering on its next step; there is no confirmation step, as there was none for the
+chart's own rollouts either. (5) Not done: renaming the bot's Matrix device; the bridge's own
+"WhatsApp bridge" is explicit enough and a client shows it under the person's bot.
 
 ## Session 2026-10-02 (branch `agent/bridge-responds`): the owner's bot was silent on the demo cluster; a chat the bot started is now repaired in place
 

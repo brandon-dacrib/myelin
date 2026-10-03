@@ -101,6 +101,14 @@ pub struct InstanceRow {
     /// manager minted one.
     #[serde(default)]
     pub provisioning_secret: Option<String>,
+    /// The key its crypto store is pickled with (`encryption.pickle_key` in its config), minted
+    /// with its tokens, so that its config can be rendered again, complete, and written over
+    /// the bridge's own copy on a restart without the bridge generating a new key. `None` for
+    /// an instance registered before the manager minted one: the manager mints it on the next
+    /// step, and the operator's init container carries the key the bridge generated over the
+    /// rendered one, so the first rolled restart keeps the crypto store readable.
+    #[serde(default)]
+    pub pickle_key: Option<String>,
     /// Where this server reaches it: the registration's `url`.
     pub url: Option<String>,
     /// The room its owner asked for it in, to tell them there when it is ready.
@@ -116,6 +124,13 @@ pub struct InstanceRow {
     /// (`manager::BridgeManager::settle_chat`).
     #[serde(default)]
     pub dm_started_by: Option<String>,
+    /// A fingerprint of the deployment last asked of the runtime (`manager::deploy_fingerprint`:
+    /// the image, the arguments and the rendered files). The manager renders every deployed
+    /// instance on each step and, when the fingerprint differs, applies the new deployment,
+    /// which updates the files Secret and rolls the pod. `None` until the first apply, or on a
+    /// row from before this was recorded: that one is applied again once.
+    #[serde(default)]
+    pub applied_fingerprint: Option<String>,
     pub created_at_ms: u64,
     /// When it entered its current state.
     pub state_since_ms: u64,
@@ -149,10 +164,12 @@ impl InstanceRow {
             as_token: None,
             hs_token: None,
             provisioning_secret: None,
+            pickle_key: None,
             url: None,
             front_door_room: None,
             dm_room: None,
             dm_started_by: None,
+            applied_fingerprint: None,
             created_at_ms: now_ms,
             state_since_ms: now_ms,
             ready_at_ms: None,

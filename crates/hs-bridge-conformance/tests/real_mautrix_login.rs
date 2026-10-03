@@ -449,6 +449,8 @@ fn reserve_port() -> u16 {
 struct Scene {
     label: &'static str,
     _dir: tempfile::TempDir,
+    /// The bridge's `/data`: its files from the instance, and what it wrote over them.
+    bridge_dir: PathBuf,
     server: Server,
     admin: Admin,
     alice: Client,
@@ -583,6 +585,7 @@ async fn set_up(label: &'static str, options: Value) -> Result<Scene> {
     let scene = Scene {
         label,
         _dir: dir,
+        bridge_dir,
         server,
         admin,
         alice,
@@ -736,7 +739,43 @@ async fn login_qr(encrypted: bool) -> Result<()> {
         "the manager started the chat as alice: {instance}"
     );
     assert_eq!(instance["chat_room"], room_id.as_str(), "{instance}");
+    device_name_reached_the_bridge(&scene, &instance)?;
     login_qr_in(&mut scene, &room_id).await
+}
+
+/// The name the instance's config gives the bridge on WhatsApp's side (`network.os_name`, with
+/// `browser_name: DESKTOP` so that the phone shows it) survived the bridge's own config
+/// upgrader: the bridge completed and rewrote `config.yaml` on its first start, and the
+/// rewritten file still says it. The admin API says the same name, for the interface. Nothing
+/// here links a phone; what WhatsApp then shows is documented in `docs/bridges/mautrix.md`.
+fn device_name_reached_the_bridge(scene: &Scene, instance: &Value) -> Result<()> {
+    let expected = format!("Myelin WhatsApp bridge for alice ({SERVER_NAME})");
+    assert_eq!(
+        instance["device_name"], expected,
+        "the admin API names the device: {instance}"
+    );
+    let path = scene.bridge_dir.join("config.yaml");
+    let config = std::fs::read_to_string(&path)
+        .with_context(|| format!("the bridge's config at {}", path.display()))?;
+    assert!(
+        !config.contains("pickle_key: generate")
+            && config
+                .lines()
+                .any(|l| l.trim_start().starts_with("pickle_key:")),
+        "the bridge kept the rendered pickle key rather than generating one; config:\n{config}"
+    );
+    assert!(
+        config.contains(&expected),
+        "the bridge's rewritten config names the device; config:\n{config}"
+    );
+    let platform = config
+        .lines()
+        .find(|l| l.trim_start().starts_with("browser_name:"));
+    assert!(
+        platform.is_some_and(|l| l.contains("DESKTOP")),
+        "browser_name is DESKTOP: {platform:?}\n{config}"
+    );
+    Ok(())
 }
 
 /// A chat the bot started, repaired in place. Without double puppeting the manager cannot act

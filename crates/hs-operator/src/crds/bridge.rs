@@ -57,10 +57,12 @@ pub struct BridgeSpec {
     /// The port the bridge listens on for the homeserver's appservice transactions. The Service
     /// exposes it under the same number, and the readiness probe is a TCP connect to it.
     pub port: i32,
-    /// A `Secret` in the same namespace whose every key is copied into `/data` as a file on the
-    /// first start, and only then: a mautrix bridge completes and rewrites its `config.yaml` and
-    /// generates secrets it was not given (`encryption.pickle_key`), so overwriting the file on a
-    /// later start would make its crypto store unreadable.
+    /// A `Secret` in the same namespace whose every key is written into `/data` as a file on
+    /// every start. A mautrix bridge completes and rewrites its `config.yaml` and generates
+    /// secrets it was not given (`encryption.pickle_key`), so the values of those keys are
+    /// carried from the file already there into the new copy, which keeps its crypto store
+    /// readable. The Secret's contents are not part of this spec: whoever changes them
+    /// annotates the `Bridge` with `myelin.dev/files-hash` so that the change rolls the pod.
     pub files_secret: String,
     /// Arguments passed to the image's entrypoint (heisenbridge takes its flags here). Empty
     /// means the image's default command.

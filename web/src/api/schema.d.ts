@@ -2692,6 +2692,8 @@ export interface components {
             /** Format: date-time */
             created_at?: string;
             deployment?: null | components["schemas"]["BridgeDeployment"];
+            /** @description What the network's own device list (WhatsApp's Linked devices, Signal's, Telegram's Devices, Google Messages' paired devices) calls this bridge, as its config names it, such as `Myelin WhatsApp bridge for alice (example.org)`. Null for a kind of bridge whose network has no such setting. A link made before the name was set keeps its old name until the bridge is linked again. */
+            device_name?: string | null;
             /** @description The registry's word for its ping health (`healthy`, `down`, ...). */
             health?: string | null;
             /** @description What went wrong, if the last ping failed. */

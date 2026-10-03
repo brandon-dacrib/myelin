@@ -784,6 +784,12 @@ pub struct BridgeInstance {
     /// until the manager has settled it.
     #[serde(default)]
     pub chat_started_by: Option<String>,
+    /// What the network's own device list (WhatsApp's Linked devices, say) calls this bridge,
+    /// as its config names it: `Myelin WhatsApp bridge for alice (example.org)`. `None` for a
+    /// kind of bridge whose network has no such setting. A link made before the name was set
+    /// keeps its old name until the bridge is linked again.
+    #[serde(default)]
+    pub device_name: Option<String>,
 }
 
 /// The OpenAPI `BridgeInstanceFiles` schema. Carries tokens; Debug shows none of it.

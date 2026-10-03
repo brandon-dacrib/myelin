@@ -305,6 +305,14 @@ function SignInSteps({
         </p>
       )}
 
+      {instance.device_name && (
+        <p className="text-text-muted" data-testid="device-name">
+          In {name}&apos;s own list of linked devices, this bridge is named{" "}
+          <span className="font-identifier">{instance.device_name}</span>. A link made before that
+          name was set keeps its old name until the bridge is linked again.
+        </p>
+      )}
+
       {bot && instance.chat_started_by !== "bot" && (
         <p className="text-text-muted">
           If the {chatStartedAsOwner ? "chat" : "invite"} is nowhere to be found,{" "}

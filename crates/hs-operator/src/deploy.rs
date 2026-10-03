@@ -16,8 +16,8 @@ use kube::{Api, Resource as _};
 use serde::Serialize;
 
 use crate::bridge::{
-    ANNOTATION_APPSERVICE_ID, ANNOTATION_OWNER, CONDITION_AVAILABLE, LABEL_APPSERVICE_ID,
-    LABEL_BRIDGE_TYPE, LABEL_OWNER, label_value,
+    ANNOTATION_APPSERVICE_ID, ANNOTATION_FILES_HASH, ANNOTATION_OWNER, CONDITION_AVAILABLE,
+    LABEL_APPSERVICE_ID, LABEL_BRIDGE_TYPE, LABEL_OWNER, label_value,
 };
 use crate::crds::{Bridge, BridgeSpec, BridgeStorage, ImageSpec, Phase};
 
@@ -47,8 +47,10 @@ pub struct BridgeInstanceSpec {
     pub port: i32,
     /// Arguments to the image's entrypoint; empty for its default command.
     pub args: Vec<String>,
-    /// File name to contents. Each becomes a file in the bridge's `/data` on its first start
-    /// (and is never overwritten after), through the Secret `<name>-files`.
+    /// File name to contents. Each becomes a file in the bridge's `/data` on every start,
+    /// through the Secret `<name>-files`; the `Bridge` is annotated with a hash of them
+    /// ([`ANNOTATION_FILES_HASH`]) so that a change rolls the pod, and the operator's init
+    /// container carries the secrets a mautrix bridge generated into the new copy.
     pub files: BTreeMap<String, String>,
     /// The volume size, a Kubernetes quantity; `1Gi` when unset.
     pub storage_size: Option<String>,
@@ -354,6 +356,26 @@ fn bridge_object(spec: &BridgeInstanceSpec, namespace: &str) -> Bridge {
     );
     bridge.metadata = object_meta(spec.name.clone(), spec, namespace);
     bridge
+        .metadata
+        .annotations
+        .get_or_insert_with(BTreeMap::new)
+        .insert(ANNOTATION_FILES_HASH.to_owned(), files_hash(&spec.files));
+    bridge
+}
+
+/// A short, stable hash of a set of files (16 hex digits of SHA-256 over names and contents),
+/// what [`ANNOTATION_FILES_HASH`] carries.
+#[must_use]
+pub fn files_hash(files: &BTreeMap<String, String>) -> String {
+    use sha2::{Digest as _, Sha256};
+    let mut hasher = Sha256::new();
+    for (name, contents) in files {
+        hasher.update(name.as_bytes());
+        hasher.update([0]);
+        hasher.update(contents.as_bytes());
+        hasher.update([0]);
+    }
+    hex::encode(&hasher.finalize()[..8])
 }
 
 fn files_secret(spec: &BridgeInstanceSpec, namespace: &str) -> Secret {
@@ -487,6 +509,31 @@ mod tests {
         assert!(bridge.status.is_none());
         let secret: Secret = serde_yaml_ng::from_value(docs[0].clone()).unwrap();
         assert_eq!(secret.string_data.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn the_bridge_carries_a_hash_of_its_files_so_a_change_rolls_the_pod() {
+        let a = bridge_object(&spec(), "ns");
+        let hash =
+            |b: &Bridge| b.metadata.annotations.as_ref().unwrap()[ANNOTATION_FILES_HASH].clone();
+        assert_eq!(hash(&a).len(), 16);
+        assert_eq!(hash(&a), hash(&bridge_object(&spec(), "ns")));
+        let mut changed = spec();
+        changed.files.insert(
+            "config.yaml".to_owned(),
+            "network:\n  os_name: renamed\n".to_owned(),
+        );
+        assert_ne!(hash(&a), hash(&bridge_object(&changed, "ns")));
+        // The Secret is not annotated with it: it is the Bridge's pod that has to roll.
+        assert!(
+            !files_secret(&spec(), "ns")
+                .metadata
+                .annotations
+                .unwrap()
+                .contains_key(ANNOTATION_FILES_HASH)
+        );
+        let yaml = KubeBridgeClient::manifest_yaml(&spec(), "myelin");
+        assert!(yaml.contains(ANNOTATION_FILES_HASH), "{yaml}");
     }
 
     #[test]

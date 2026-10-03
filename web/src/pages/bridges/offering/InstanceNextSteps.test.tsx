@@ -84,6 +84,25 @@ describe("InstanceNextSteps", () => {
     expect(screen.getByText(/If the chat is nowhere to be found/)).toBeInTheDocument();
   });
 
+  it("says what the network's own device list will call the bridge, when the server named it", async () => {
+    renderSteps(
+      instance("@carol:example.org", {
+        device_name: "Myelin WhatsApp bridge for carol (example.org)",
+      }),
+    );
+    const line = await screen.findByTestId("device-name");
+    expect(line).toHaveTextContent(
+      "In WhatsApp's own list of linked devices, this bridge is named Myelin WhatsApp bridge for carol (example.org).",
+    );
+    expect(line).toHaveTextContent("keeps its old name until the bridge is linked again");
+  });
+
+  it("says nothing about a device name for a kind of bridge that has none", async () => {
+    renderSteps(instance("@carol:example.org", { device_name: null }));
+    await screen.findByText(/Tell them: their WhatsApp bridge is ready/);
+    expect(screen.queryByTestId("device-name")).toBeNull();
+  });
+
   it("warns, with the prefix, when the chat was started by the bot", async () => {
     renderSteps(instance("@carol:example.org", { chat_started_by: "bot" }));
     const warning = await screen.findByTestId("chat-started-by-bot");

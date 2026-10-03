@@ -8477,6 +8477,11 @@ components:
           - bot
           - null
           description: Who the bot is in that chat for. `owner` when the owner invited it, so the bridge takes bare commands there; `bot` when the bot started it and nobody could act as the owner, so commands there need the bridge's prefix (or a new chat the owner starts); null until the manager has settled it.
+        device_name:
+          type:
+          - string
+          - 'null'
+          description: What the network's own device list (WhatsApp's Linked devices, Signal's, Telegram's Devices, Google Messages' paired devices) calls this bridge, as its config names it, such as `Myelin WhatsApp bridge for alice (example.org)`. Null for a kind of bridge whose network has no such setting. A link made before the name was set keeps its old name until the bridge is linked again.
     BridgeDeployment:
       type: object
       required:

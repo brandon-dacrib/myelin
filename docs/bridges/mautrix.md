@@ -147,6 +147,99 @@ WhatsApp `!wa`, Telegram `!tg`, Google Messages `!gm`, Google Voice `!gv`, Messe
 Instagram `!fb`, Discord `!discord`, Bluesky `!bsky`. Signal, Slack and X set none in their
 connector, so none is claimed for them.
 
+## 2026-10-02, evening: the bridge has a name in WhatsApp's Linked devices
+
+The owner's bridge showed up on the phone as "other device", platform "Other device". Branch
+`agent/bridge-device-names`.
+
+**Where the two strings come from.** In mautrix-whatsapp (the `bridgev2` connector the
+catalogue's image `dock.mau.dev/mautrix/whatsapp:latest` runs) they are the config's
+`network.os_name` and `network.browser_name` (`pkg/connector/config.go`, `OSName`/`BrowserName`;
+the example config says "Device name that's shown in the 'WhatsApp Web' section" and "Browser
+name that determines the logo"; defaults `Mautrix-WhatsApp bridge` and `unknown`).
+`connector.go` copies them into whatsmeow's `store.DeviceProps.Os` and, after uppercasing and a
+lookup in `DeviceProps_PlatformType_value`, `.PlatformType`. whatsmeow marshals `DeviceProps`
+into the client payload's `DevicePairingRegistrationData` **only when the device has no ID yet**
+(`store/clientpayload.go`, `getRegistrationPayload`); a linked device's `getLoginPayload`
+carries nothing of it. So WhatsApp learns both strings when the bridge is linked and never
+again. The pairing-code route is unaffected by either: `login.go` calls `PairPhone(...,
+whatsmeow.PairClientChrome, "Chrome (Linux)")`, which is what the phone's "link with phone
+number" prompt says before the link exists; the linked device afterwards is named from
+`DeviceProps`.
+
+**What each platform shows.** `PlatformType` (whatsmeow `proto/waCompanionReg/WACompanionReg.proto`)
+is `UNKNOWN`, `CHROME`, `FIREFOX`, `IE`, `OPERA`, `SAFARI`, `EDGE`, `DESKTOP`, `IPAD`,
+`ANDROID_TABLET`, `OHANA`, `ALOHA`, `CATALINA`, `TCL_TV`, `IOS_PHONE`, `IOS_CATALYST`,
+`ANDROID_PHONE`, `ANDROID_AMBIGUOUS`, `WEAR_OS`, `AR_WRIST`, `AR_DEVICE`, `UWP`, `VR`, `CLOUD_API`.
+What the phone makes of them is not in any source; it is in whatsmeow's own discussion #469 and
+issue #89, which match what the owner saw: with `UNKNOWN` the phone **ignores the os name** and
+shows "Other device"; with a browser it shows "Google Chrome (os name)" and that browser's logo;
+with `DESKTOP` it shows **the os name by itself**, with the desktop app's icon. `DESKTOP` is
+therefore the one constant, `hs_admin::bridge_types::WHATSAPP_PLATFORM`. The QR code's client
+type does not follow it (`pair.go`, `getQRClientType` has no `DESKTOP` arm and falls through to
+"other web client"), which changes nothing visible. Neither whatsmeow nor the bridge limits the
+name's length; the phone's list cuts long names short, which is why the name below puts the
+person before the server.
+
+**The name, in one place.** `hs_admin::bridge_types::device_name(type, server, owner)`:
+`Myelin WhatsApp bridge for brandon (myelin.dacrib.net)` for a person's instance,
+`Myelin WhatsApp bridge (myelin.dacrib.net)` for a shared one (and for the wizard's hand-run
+bridge). Every mautrix instance's `config.yaml` now carries a `network:` section where the
+connector has a setting for it (read from each bridge's `pkg/connector/config.go` and
+`example-config.yaml` the same day):
+
+| Bridge | Key | Sent to the network |
+|---|---|---|
+| WhatsApp | `network.os_name`, `network.browser_name: DESKTOP` | at linking only |
+| Signal | `network.device_name` ("Default device name that shows up in the Signal app") | at linking only (`signalmeow/provisioning.go`, encrypted) |
+| Telegram | `network.device_info.device_model` (its Devices list) | on every connection |
+| Google Messages | `network.device_meta.os` ("the name that shows up in the paired devices list"; `browser` and `type` keep the defaults) | at pairing only |
+| Messenger and Instagram, Discord, Slack, X, LinkedIn, Bluesky, Google Voice | none: they sign in with cookies, tokens or an app password and list no device the bridge names | — |
+
+The admin API's `BridgeInstance` says the name (`device_name`, null for a kind without one),
+and the person's next-steps box in the interface shows it with one line saying it is what the
+network's own device list will call the bridge, and that an earlier link keeps its old name.
+
+**The Matrix side is the bridge's own.** The bot's device is named by mautrix-go, not by the
+config: `bridgev2/matrix/crypto.go` builds `"<network> bridge"` ("WhatsApp bridge") and passes it
+both to `CreateDeviceMSC4190` and to the login it falls back to. Nothing in `config.yaml` sets
+it. The double-puppet intent in `as_token` mode (`bridgev2/matrix/doublepuppet.go`) logs nothing
+in and so names no device. The manager could rename the bot's device through
+`PUT /_matrix/client/v3/devices/{id}` with the instance's own token once it has read the device
+ID from the bot's device list; it does not, since "WhatsApp bridge" already says what it is and
+a client lists it under the bot, whose name already carries the person.
+
+**A changed config now reaches a running bridge.** Until this day nothing did: an offering's new
+image tag or options were rendered for new instances only, and the operator's init container
+never replaced a file already in `/data` (the bridge rewrites `config.yaml` with a generated
+`encryption.pickle_key`; losing it makes its crypto store unreadable). Now:
+
+1. The manager mints `pickle_key` with the instance's tokens and renders it into
+   `encryption.pickle_key`, so the rendered file is complete; an instance from before gets one
+   on its next step.
+2. The manager keeps a fingerprint of what it last applied (image, port, arguments, every
+   rendered file) on the instance row and, on every step of a deploying, starting or ready
+   instance, applies the deployment again when the fingerprint differs, moving the instance to
+   `deploying` with "its configuration changed: restarting the pod with it" and watching it
+   come back. An instance from before this (no fingerprint) is applied once.
+3. `hs-operator`'s client annotates the `Bridge` with `myelin.dev/files-hash`; the operator folds
+   it into the pod template's `myelin.dev/spec-hash`, so new files in the Secret roll the pod.
+4. The init container writes every file from the Secret over `/data`'s copy, carrying the
+   values of `pickle_key`, `signing_key` and `server_key` from the bridge's copy into the new
+   one (a `generate` placeholder is not carried). From here the Secret is the config: an edit
+   made by hand inside the pod is gone on the next roll.
+
+Verified with the unit tests named in status 11 and the operator's test that runs the real
+script with `/bin/sh`; on a cluster this has not run yet (unreachable from sessions today).
+
+**What the owner will see.** The demo instance rolls once when this ships (its pod restarts
+with the new config, its pickle key carried over, its WhatsApp session and its chat with the bot
+untouched). The phone keeps calling the existing link "Other device": WhatsApp learnt that name
+at pairing and is never told again. To see `Myelin WhatsApp bridge for brandon
+(myelin.dacrib.net)` with a desktop icon, log the bridge out on the phone (Linked devices, the
+device, Log out) or with `logout` in the bot's chat, then `login qr` again; chats carry on under
+the new link. The page and this document say the same.
+
 ## 2026-10-01: the server asks the bridge who has signed in
 
 The render now writes a `provisioning.shared_secret` of its own into `config.yaml` and keeps the

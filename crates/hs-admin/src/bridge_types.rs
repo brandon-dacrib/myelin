@@ -445,6 +445,141 @@ fn command_prefix(entry: &Entry) -> Option<&'static str> {
     }
 }
 
+/// Where a connector's config names the bridge among a person's linked or paired devices on
+/// the network's side. Read from each bridge's `pkg/connector/config.go` and
+/// `example-config.yaml` on 2026-10-02. The networks without one, so that nobody looks again:
+/// Messenger and Instagram, Discord, Slack, X, LinkedIn, Bluesky and Google Voice sign in with
+/// cookies, tokens or an app password and have no device the network lists under a name the
+/// bridge chooses (Discord's identify payload claims a fixed browser; nothing in its config
+/// names it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeviceSetting {
+    /// mautrix-whatsapp: `network.os_name` (free text, the device's name) and
+    /// `network.browser_name` (a whatsmeow `PlatformType`, which picks the icon and whether the
+    /// name is shown at all; [`WHATSAPP_PLATFORM`]). Both go to WhatsApp in the pairing payload
+    /// (whatsmeow `store/clientpayload.go`, `getRegistrationPayload`) and never afterwards.
+    WhatsApp,
+    /// mautrix-signal: `network.device_name`, sent encrypted when the bridge is linked as a
+    /// secondary device (`signalmeow/provisioning.go`).
+    Signal,
+    /// mautrix-telegram: `network.device_info.device_model`, Telegram's "device model" in its
+    /// Devices list, sent on every connection.
+    Telegram,
+    /// mautrix-gmessages: `network.device_meta.os`, "the name that shows up in the paired
+    /// devices list". `browser` and `type` pick the icon and the session slot and keep the
+    /// bridge's defaults.
+    GoogleMessages,
+}
+
+fn device_setting(entry: &Entry) -> Option<DeviceSetting> {
+    match entry.id {
+        "mautrix-whatsapp" => Some(DeviceSetting::WhatsApp),
+        "mautrix-signal" => Some(DeviceSetting::Signal),
+        "mautrix-telegram" => Some(DeviceSetting::Telegram),
+        "mautrix-gmessages" => Some(DeviceSetting::GoogleMessages),
+        _ => None,
+    }
+}
+
+/// The whatsmeow `PlatformType` a WhatsApp bridge links as (`network.browser_name`). The
+/// phone's Linked devices list is driven by it: `UNKNOWN` (the bridge's default) shows "Other
+/// device" and hides the device name; the browsers (`CHROME`, `FIREFOX`, `SAFARI`, `EDGE`,
+/// `OPERA`) show "Google Chrome (name)" and that browser's icon, which is a lie for a bridge;
+/// `DESKTOP` shows the name by itself with the desktop app's icon
+/// (whatsmeow discussion #469 and issue #89, 2026-10-02). The QR code's client type does not
+/// change with it (`pair.go`, `getQRClientType`): it stays "other web client".
+pub const WHATSAPP_PLATFORM: &str = "DESKTOP";
+
+/// What a bridge is called among a person's devices on the network's side (WhatsApp's and
+/// Signal's Linked devices, Telegram's Devices, Google Messages' paired devices), the one
+/// pattern for every type that has such a setting ([`DeviceSetting`]):
+/// `Myelin WhatsApp bridge for alice (example.org)` for a person's instance and
+/// `Myelin WhatsApp bridge (example.org)` for a shared one. The owner's localpart rather than
+/// the whole Matrix ID, so that the phone's list, which cuts long names short, shows whose it is
+/// before the server. `None` for a type without such a setting.
+#[must_use]
+pub fn device_name(type_id: &str, server_name: &str, owner: Option<&str>) -> Option<String> {
+    let entry = entry(type_id)?;
+    device_setting(entry)?;
+    Some(device_name_for(entry.name, server_name, owner))
+}
+
+fn device_name_for(network: &str, server_name: &str, owner: Option<&str>) -> String {
+    match owner.map(localpart_of) {
+        Some(localpart) => format!("Myelin {network} bridge for {localpart} ({server_name})"),
+        None => format!("Myelin {network} bridge ({server_name})"),
+    }
+}
+
+/// A YAML double-quoted scalar.
+fn yaml_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// The `network:` section of a mautrix config that names the bridge on the network's side, or
+/// `None` for a connector without such a setting. Every other key of the section keeps the
+/// bridge's default: its config upgrader copies them key by key.
+fn network_section(entry: &Entry, device_name: &str) -> Option<String> {
+    let name = yaml_string(device_name);
+    let mut out = String::from("network:\n");
+    match device_setting(entry)? {
+        DeviceSetting::WhatsApp => {
+            out.push_str(
+                "  # What the phone's Linked devices list calls this bridge, and what it\n",
+            );
+            out.push_str(
+                "  # shows it as: DESKTOP shows the name by itself; the bridge's default,\n",
+            );
+            out.push_str(
+                "  # unknown, shows \"Other device\" and hides the name. WhatsApp learns\n",
+            );
+            out.push_str(
+                "  # both when the bridge is linked, so a link made before a change keeps\n",
+            );
+            out.push_str("  # its old name until the bridge is linked again.\n");
+            out.push_str(&format!("  os_name: {name}\n"));
+            out.push_str(&format!("  browser_name: {WHATSAPP_PLATFORM}\n"));
+        }
+        DeviceSetting::Signal => {
+            out.push_str(
+                "  # What the phone's Linked devices list calls this bridge. Signal learns it\n",
+            );
+            out.push_str(
+                "  # when the bridge is linked, so a link made before a change keeps its old\n",
+            );
+            out.push_str("  # name until the bridge is linked again.\n");
+            out.push_str(&format!("  device_name: {name}\n"));
+        }
+        DeviceSetting::Telegram => {
+            out.push_str(
+                "  # What Telegram's Devices list calls this bridge (its \"device model\").\n",
+            );
+            out.push_str("  device_info:\n");
+            out.push_str(&format!("    device_model: {name}\n"));
+        }
+        DeviceSetting::GoogleMessages => {
+            out.push_str(
+                "  # What the phone's paired devices list calls this bridge; the icon and\n",
+            );
+            out.push_str("  # the session slot (browser, type) keep the bridge's defaults.\n");
+            out.push_str("  device_meta:\n");
+            out.push_str(&format!("    os: {name}\n"));
+        }
+    }
+    Some(out)
+}
+
 /// Whether an instance runs from what a render writes alone. Not matrix-appservice-irc or
 /// hookshot, whose configs name networks and services only an operator knows; not Telegram,
 /// whose config needs the operator's own API ID and hash.
@@ -734,6 +869,9 @@ pub fn render(type_id: &str, server_name: &str, values: &Value) -> Option<Bridge
             double_puppeting,
             encryption: c.encryption,
             provisioning_secret: provisioning_secret.as_deref(),
+            pickle_key: None,
+            // The wizard's bridge is one for the server, run by hand: the shared name.
+            network: network_section(entry, &device_name_for(entry.name, server_name, None)),
         })
     });
     let compose_yaml = compose(entry, &c, &image, server_name);
@@ -768,6 +906,14 @@ struct MautrixParams<'a> {
     encryption: bool,
     /// `provisioning.shared_secret`, when this server is to read the bridge's sign-ins.
     provisioning_secret: Option<&'a str>,
+    /// `encryption.pickle_key`: the key the bridge's crypto store is pickled with. Written when
+    /// whoever keeps the instance minted one, so that the rendered config is complete and can
+    /// replace the bridge's own copy on a later start without the bridge generating a new key
+    /// (which would make its crypto store unreadable). `None` leaves it to the bridge.
+    pickle_key: Option<&'a str>,
+    /// The `network:` section naming the bridge on the network's side
+    /// ([`network_section`]), when the connector has such a setting.
+    network: Option<String>,
 }
 
 /// The `config.yaml` a mautrix `bridgev2` bridge reads, with everything that ties it to this
@@ -820,6 +966,9 @@ fn mautrix_config(p: &MautrixParams<'_>) -> String {
     }
     out.push_str("backfill:\n");
     out.push_str(&format!("  enabled: {}\n", p.backfill));
+    if let Some(network) = &p.network {
+        out.push_str(network);
+    }
     if p.double_puppeting {
         out.push_str(
             "# The bridge sends as your users through its own token: the registration's\n",
@@ -847,6 +996,15 @@ fn mautrix_config(p: &MautrixParams<'_>) -> String {
         out.push_str("  msc4190: true\n");
     } else {
         out.push_str("  allow: false\n");
+    }
+    if let Some(key) = p.pickle_key {
+        out.push_str(
+            "  # The key its crypto store is pickled with, minted with its tokens so that\n",
+        );
+        out.push_str(
+            "  # this file can be written again without the bridge generating a new one.\n",
+        );
+        out.push_str(&format!("  pickle_key: {key}\n"));
     }
     if let Some(secret) = p.provisioning_secret {
         out.push_str(
@@ -989,6 +1147,10 @@ pub struct InstanceSpec<'a> {
     /// registration ([`PROVISIONING_SECRET_KEY`]); `None` for an instance made before the
     /// manager minted one, or a type whose provisioning API this server does not read.
     pub provisioning_secret: Option<&'a str>,
+    /// The key the bridge's crypto store is pickled with (`encryption.pickle_key`), minted and
+    /// kept by whoever keeps the instance so that its config can be rendered again, complete;
+    /// `None` for an instance made before the manager minted one, or a type without one.
+    pub pickle_key: Option<&'a str>,
 }
 
 /// An instance, rendered: its registration, the files its process reads from `/data`, and how
@@ -1012,6 +1174,9 @@ pub struct InstanceRender {
     pub ghost_prefix: String,
     /// The catalogue's sign-in steps, with `{server}` filled in and `{bot}` left for the caller.
     pub sign_in: Vec<String>,
+    /// What the network's own device list calls this bridge ([`device_name`]), written into the
+    /// config; `None` for a type without such a setting.
+    pub device_name: Option<String>,
 }
 
 impl std::fmt::Debug for InstanceRender {
@@ -1120,6 +1285,7 @@ pub fn render_instance(spec: &InstanceSpec<'_>) -> Option<InstanceRender> {
 
     let mut files = std::collections::BTreeMap::new();
     let mut args = Vec::new();
+    let device_name = device_name(spec.type_id, spec.server_name, spec.owner);
     let config_yaml = match entry.runtime {
         Runtime::Mautrix => {
             let permissions = match spec.owner {
@@ -1145,6 +1311,10 @@ pub fn render_instance(spec: &InstanceSpec<'_>) -> Option<InstanceRender> {
                 double_puppeting,
                 encryption,
                 provisioning_secret,
+                pickle_key: spec.pickle_key.filter(|k| !k.trim().is_empty()),
+                network: device_name
+                    .as_deref()
+                    .and_then(|name| network_section(entry, name)),
             });
             files.insert("config.yaml".to_owned(), config.clone());
             Some(config)
@@ -1224,6 +1394,7 @@ pub fn render_instance(spec: &InstanceSpec<'_>) -> Option<InstanceRender> {
             .iter()
             .map(|s| s.replace("{server}", spec.server_name))
             .collect(),
+        device_name,
     })
 }
 
@@ -1544,6 +1715,7 @@ mod tests {
             double_puppeting: None,
             backfill: None,
             provisioning_secret: Some("p".repeat(64).as_str()),
+            pickle_key: Some("k".repeat(64).as_str()),
         })
         .unwrap();
         let reg = &r.registration;
@@ -1614,6 +1786,7 @@ mod tests {
                 double_puppeting: None,
                 backfill: None,
                 provisioning_secret: Some("ignored"),
+                pickle_key: None,
             }
         })
         .unwrap();
@@ -1632,6 +1805,153 @@ mod tests {
             crate::bridge_offerings::SHARED_INSTANCE
         );
         assert_eq!(heisen.image_tag, "latest");
+    }
+
+    fn instance_config(type_id: &str, owner: Option<&str>, pickle_key: Option<&str>) -> Value {
+        let r = render_instance(&InstanceSpec {
+            type_id,
+            server_name: "chat.example.net",
+            appservice_id: "id",
+            owner,
+            as_token: "a",
+            hs_token: "h",
+            url: "http://b:1",
+            homeserver_address: "http://hs:8008",
+            image_tag: "",
+            encryption: None,
+            double_puppeting: None,
+            backfill: None,
+            provisioning_secret: None,
+            pickle_key,
+        })
+        .unwrap();
+        serde_yaml_ng::from_str(r.config_yaml.as_deref().expect("a mautrix config")).unwrap()
+    }
+
+    #[test]
+    fn an_instance_is_named_on_the_networks_side_after_its_owner_and_this_server() {
+        // A person's WhatsApp bridge: the phone's Linked devices list gets the name, and the
+        // platform that makes WhatsApp show it (DESKTOP; unknown shows "Other device").
+        let config = instance_config(
+            "mautrix-whatsapp",
+            Some("@brandon:chat.example.net"),
+            Some("k"),
+        );
+        assert_eq!(
+            config["network"]["os_name"],
+            "Myelin WhatsApp bridge for brandon (chat.example.net)"
+        );
+        assert_eq!(config["network"]["browser_name"], "DESKTOP");
+        assert_eq!(WHATSAPP_PLATFORM, "DESKTOP");
+        assert_eq!(
+            device_name(
+                "mautrix-whatsapp",
+                "chat.example.net",
+                Some("@brandon:chat.example.net")
+            )
+            .as_deref(),
+            Some("Myelin WhatsApp bridge for brandon (chat.example.net)")
+        );
+        // The render says what it wrote, for the admin API and the interface.
+        let r = render_instance(&InstanceSpec {
+            type_id: "mautrix-whatsapp",
+            server_name: "chat.example.net",
+            appservice_id: "whatsapp-brandon",
+            owner: Some("@brandon:chat.example.net"),
+            as_token: "a",
+            hs_token: "h",
+            url: "http://b:1",
+            homeserver_address: "http://hs:8008",
+            image_tag: "",
+            encryption: None,
+            double_puppeting: None,
+            backfill: None,
+            provisioning_secret: None,
+            pickle_key: None,
+        })
+        .unwrap();
+        assert_eq!(
+            r.device_name.as_deref(),
+            Some("Myelin WhatsApp bridge for brandon (chat.example.net)")
+        );
+
+        // A shared instance names no person.
+        let shared = instance_config("mautrix-whatsapp", None, None);
+        assert_eq!(
+            shared["network"]["os_name"],
+            "Myelin WhatsApp bridge (chat.example.net)"
+        );
+        assert_eq!(
+            device_name("mautrix-whatsapp", "chat.example.net", None).as_deref(),
+            Some("Myelin WhatsApp bridge (chat.example.net)")
+        );
+
+        // The same name, in each connector's own key.
+        let signal = instance_config("mautrix-signal", Some("@alice:chat.example.net"), None);
+        assert_eq!(
+            signal["network"]["device_name"],
+            "Myelin Signal bridge for alice (chat.example.net)"
+        );
+        let telegram = instance_config("mautrix-telegram", Some("@alice:chat.example.net"), None);
+        assert_eq!(
+            telegram["network"]["device_info"]["device_model"],
+            "Myelin Telegram bridge for alice (chat.example.net)"
+        );
+        assert!(
+            telegram["network"]["device_info"]
+                .get("app_version")
+                .is_none(),
+            "the other device_info keys keep the bridge's defaults"
+        );
+        let gmessages = instance_config("mautrix-gmessages", Some("@alice:chat.example.net"), None);
+        assert_eq!(
+            gmessages["network"]["device_meta"]["os"],
+            "Myelin Google Messages bridge for alice (chat.example.net)"
+        );
+        assert!(gmessages["network"]["device_meta"].get("browser").is_none());
+
+        // A network with no such setting gets no `network:` section and no name.
+        for type_id in [
+            "mautrix-meta",
+            "mautrix-discord",
+            "mautrix-slack",
+            "mautrix-twitter",
+            "mautrix-bluesky",
+            "mautrix-linkedin",
+            "mautrix-gvoice",
+        ] {
+            let config = instance_config(type_id, Some("@alice:chat.example.net"), None);
+            assert!(config.get("network").is_none(), "{type_id}");
+            assert_eq!(
+                device_name(type_id, "chat.example.net", Some("@alice:chat.example.net")),
+                None,
+                "{type_id}"
+            );
+        }
+        assert_eq!(device_name("heisenbridge", "x.org", None), None);
+
+        // A name with a quote in it is still one YAML string.
+        assert_eq!(yaml_string(r#"a "b" \c"#), r#""a \"b\" \\c""#);
+        let section = network_section(entry("mautrix-signal").unwrap(), "a \"b\" \\c").unwrap();
+        let odd: Value = serde_yaml_ng::from_str(&section).unwrap();
+        assert_eq!(odd["network"]["device_name"], "a \"b\" \\c");
+
+        // The pickle key the manager minted is written, so the file is complete; without one
+        // the bridge generates its own.
+        assert_eq!(config["encryption"]["pickle_key"], "k");
+        assert!(shared["encryption"].get("pickle_key").is_none());
+        let blank = instance_config("mautrix-whatsapp", None, Some("  "));
+        assert!(blank["encryption"].get("pickle_key").is_none());
+
+        // The wizard's bridge, run by hand for the server, carries the shared name.
+        let wizard = render("mautrix-whatsapp", "chat.example.net", &json!({})).unwrap();
+        let config: Value =
+            serde_yaml_ng::from_str(wizard.config_yaml.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            config["network"]["os_name"],
+            "Myelin WhatsApp bridge (chat.example.net)"
+        );
+        assert_eq!(config["network"]["browser_name"], "DESKTOP");
     }
 
     #[test]
