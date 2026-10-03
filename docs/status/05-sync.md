@@ -196,9 +196,10 @@ noticed the account-data counter move, but nothing woke a waiting long-poll to l
 account data or read marker set while a client waited was seen when the wait timed out or
 something else happened. The account-data, tag and `m.fully_read` routes now wake the user.
 
-**Tags and `m.direct` follow a room upgrade** (`SessionHub::copy_account_data_from_predecessor`,
-called from the new `handle_room_update`, which wraps `apply_room_update` on the live path and
-in `process_room_update`). When somebody joins a room whose `m.room.create` names a
+**Tags and `m.direct` follow a room upgrade** (this session wrote
+`SessionHub::copy_account_data_from_predecessor`; at the merge on 2026-10-02 it was dropped for
+`agent/room-rows`'s `carry_account_data_on_upgrade`, which had landed first and does the same
+inside `apply_room_update`, and this session's unit test passes against it). When somebody joins a room whose `m.room.create` names a
 `predecessor`, their `m.tag` for the old room becomes the new room's (unless the new room
 already has one) and every `m.direct` list naming the old room gains the new one -- the spec's
 room-upgrade step that belongs to the users' server, which Synapse does on a local join.
