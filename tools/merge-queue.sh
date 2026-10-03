@@ -36,6 +36,10 @@
 # If main moves during a gate and the new commits touch only docs/, the branch is rebased again
 # and pushed; if they touch code, the branch is left for the next run.
 #
+# A gate's `npm run check` regenerates web/src/api/schema.d.ts, so the reused worktree is dirty
+# after any web gate; tracked changes are discarded before every checkout (a dirty generated
+# file refused the next branch's checkout twice on 2026-10-02).
+#
 # Written for the bash 3.2 that macOS ships.
 set -u
 ROOT=$(git rev-parse --path-format=absolute --git-common-dir) || exit 1
@@ -104,7 +108,7 @@ merge_one_locked() {
   cd "$W" || return 1
   git fetch -q origin || return 1
   git rev-parse -q --verify "origin/$b^{commit}" >/dev/null || { echo "no such branch"; return 1; }
-  git checkout -q --detach "origin/$b" || return 1
+  git checkout -q -- . && git checkout -q --detach "origin/$b" || return 1
   git rebase -q origin/main || { git rebase --abort; echo "rebase conflict with main"; return 2; }
   gate "$log" || return $?
   push_main "$b"
@@ -131,7 +135,7 @@ merge_group_locked() {
     if ! git rev-parse -q --verify "origin/$b^{commit}" >/dev/null; then
       echo "$b: no such branch; left out of the group"; continue
     fi
-    git checkout -q --detach "origin/$b" || return 1
+    git checkout -q -- . && git checkout -q --detach "origin/$b" || return 1
     if git rebase -q "$base" >/dev/null 2>&1; then
       STACKED[${#STACKED[@]}]=$b; base=$(git rev-parse HEAD); last=$b
       echo "$b: stacked, $(git rev-list --count origin/main..HEAD) commits over main"

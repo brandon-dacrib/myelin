@@ -2001,7 +2001,32 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Deactivate a user */
+        /**
+         * Deactivate a user
+         * @description Without `erase`, flips `deactivated` and nothing else: the user can no longer sign in
+         *     or be invited, their sessions keep working until signed out, and `users.reactivate`
+         *     undoes it.
+         *
+         *     With `erase: true`, deactivates the account (if it is not already) and then erases it,
+         *     for good. Erasure removes: the password; every access and refresh token; every device
+         *     and its end-to-end keys (`/keys/query` stops serving them); every 3PID and external id;
+         *     the profile display name and avatar; the experimental-feature flags; and the user's
+         *     membership of every room they are joined to, invited to or knocking on (each left as
+         *     the user would, through another server when nobody of this server is in the room).
+         *     Erasure keeps: the user id, so it can never be registered again; the account's
+         *     `created_at`, `admin`, `locked`, `suspended` and `shadow_banned` flags and its
+         *     `appservice_id`; the events the account sent to its rooms (redact them with
+         *     `users.redact_events`); and its media (delete it with `users.media.delete`). The audit
+         *     log holds a `users.deactivate` entry with the `/deactivated` change (if the account was
+         *     active) and a second with the `/erased` change; the event stream carries
+         *     `user.deactivated` and then `user.erased` with `reason`, `rooms_left`, `rooms_failed` and
+         *     `devices_deleted`. A room that could not be left is counted in `rooms_failed` and named
+         *     in `failures`; the account is erased regardless.
+         *
+         *     An already-deactivated account is erased the same way. An already-erased account answers
+         *     `200` with its record and nothing is changed or audited. After erasure,
+         *     `users.reactivate` and `users.reset_password` answer `409`.
+         */
         post: operations["users.deactivate"];
         delete?: never;
         options?: never;
@@ -2255,7 +2280,11 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Reactivate a deactivated user */
+        /**
+         * Reactivate a deactivated user
+         * @description Clears `deactivated`. An erased account (`erased: true`) cannot be reactivated: its data
+         *     is gone, and the answer is `409` with a problem detail saying so.
+         */
         post: operations["users.reactivate"];
         delete?: never;
         options?: never;
@@ -2292,7 +2321,11 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Reset a user's password */
+        /**
+         * Reset a user's password
+         * @description Sets a new password, signing the user out everywhere first if `logout_devices`. An
+         *     erased account (`erased: true`) is refused with `409`: it cannot be signed in to again.
+         */
         post: operations["users.reset_password"];
         delete?: never;
         options?: never;
@@ -2629,7 +2662,7 @@ export interface components {
             image?: string;
             /** @description What the operator last said (a pull failure, a crash loop, waiting for the pod). */
             message?: string | null;
-            /** @description The `Bridge` resource's name, which its Deployment and Service share. */
+            /** @description The `Bridge` resource's name, which its Deployment, Service and pods share (`bridge-whatsapp-alice-<replicaset>-<pod>`): `bridge-<short type>-<owner localpart>` (`bridge-whatsapp-alice`), or `bridge-<short type>` for a shared instance (`bridge-heisenbridge`), made a DNS-1123 label (lowercase, `[a-z0-9-]`, at most 46 characters) with `-<6 hex of sha256(appservice id)>` appended only where that changed or shortened the id. Decided when the instance is first named and kept until it is removed; an instance deployed before 2026-10-02 keeps its `bridge-<8 hex>` name. Its Secret is `<name>-files` and its volume claim `<name>-data`. */
             name: string;
             namespace: string;
             /** @enum {string} */
@@ -3665,6 +3698,14 @@ export interface components {
             deactivated?: boolean;
             device_count?: number;
             display_name?: string | null;
+            /**
+             * @description The account was erased (`users.deactivate` with `erase: true`, or the user's own
+             *     `POST /_matrix/client/v3/account/deactivate` with `erase: true`): its password,
+             *     sessions, devices and keys, 3PIDs, external ids, profile and experimental features
+             *     are gone and it has left its rooms; the user id, its flags and the events it sent
+             *     remain. Always `deactivated` too, and permanent: `users.reactivate` and
+             *     `users.reset_password` answer `409`.
+             */
             erased?: boolean;
             /** @description A guest account, made by POST /register?kind=guest while auth.allow_guest_access is on. It has no password and may only read and talk in rooms that let guests in. */
             is_guest?: boolean;
