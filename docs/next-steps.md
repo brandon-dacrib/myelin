@@ -4,7 +4,62 @@ Written 2026-09-20 by the integration lead, last revised 2026-10-02, 18:25 EDT (
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
-## Resume here: 2026-10-02, 22:45 EDT -- every branch is merged, the bridge bot answers
+## Resume here: 2026-10-03, 00:25 EDT -- the night's follow-ups are merged; roll to a3af13a8 or later
+
+**Where `main` is.** `b2fcfade`, four more branches through the queue after the 22:45 section,
+each gate green: `device-list-timing` `a3af13a8`, `bridge-device-names` `66528ae3` (OpenAPI
+0.1.6), `outbound-ipv4-only` `b2fcfade`. **Nothing is unmerged, no lock, no agent worktree, no
+agent process.** **CI, CD and `fuzz` are all green on `a3af13a8`** -- the first green tip since
+the merges and the fuzz workflow's first green on `main`; `sha-a3af13a8…` is the image to roll
+(`66528ae3` and `b2fcfade` were still building at 00:25; take theirs when green). The pod ran
+`sha-99589af3…` at 23:35.
+
+**What the four hold:**
+
+- **CI's arm64 failure was a test** (status 08): `federation_edus.rs`'s device-list test queried
+  `/keys/query` between the two `m.device_list_update` EDUs a slow runner sends for a login
+  (keyless device, then its keys); the server's copy was right to name nothing. The test waits
+  for both; an in-process test pins the behaviour.
+- **Bridge device names** (status 11, `docs/bridges/mautrix.md`): WhatsApp's Linked devices shows
+  `Myelin WhatsApp bridge for brandon (myelin.dacrib.net)` with the desktop icon (platform
+  `DESKTOP`, a constant: `UNKNOWN` shows "Other device" whatever the name); Signal, Telegram and
+  Google Messages get the same pattern; Meta, Discord, Slack, X, Bluesky, Google Voice have no
+  such setting. **The owner's existing link keeps "Other device"**: whatsmeow sends the name at
+  pairing only; log the bridge out (`logout` to the bot, or the phone) and `login qr` again.
+  Also found: **offering changes never reached deployed instances**; now a changed render rolls
+  the instance's pod once (`applied_fingerprint`, `myelin.dev/files-hash` on the `Bridge`, the
+  init script writes every Secret file over `/data`, keys carried); the Secret is authoritative.
+  The demo instance rolls once on its first step after the deploy.
+- **`network.outbound.ipv4_only`, default `true`, hot** (status 06 and 09, `docs/config.md`, the
+  README, the Synapse table): the maunium.net failure was `FederationClient::client_for` pinning
+  each destination to the *first* resolved address (an AAAA), so hyper's Happy Eyeballs had
+  nothing to fall back to; URL previews had the same shape. Every outbound client now goes
+  through `hs_http::client::builder()` / `hs_http::outbound` (the policy point: a new client
+  that bypasses it bypasses the policy), hyper gets the whole address list, `hs_outbound_connections_total{family}`
+  and `hs_outbound_connect_failures_total{family}` count what happened, and the startup line
+  says `outbound: IPv4 only` or `IPv4 and IPv6`. Not covered on purpose: ICAP, the cluster
+  mesh, `hs-bridges`' client, the operator. Real-binary test `crates/hs-cli/tests/outbound_address_policy.rs`.
+
+**The owner's WhatsApp bridge**, as of 00:25: signed in (`+1646…`, via `!wa login qr` on the old
+image); the chat is still the bot's until the roll (then it repairs itself: bot leaves and
+rejoins, "marked as your management room", and a bare `help` answers). After the roll with the
+device names, re-link once to see the device name.
+
+**What is next, in order:**
+
+1. **Roll the demo** to `sha-a3af13a8…` or the first green later image (the command is in the
+   22:45 section). Then in the bot chat: watch the repair, type `help` bare; then `logout` and
+   `login qr` for the device name. Report what the chat does.
+2. **Sytest once, whole suite, on the merged tree, quiet machine**; then the "after unmeasured"
+   rows (status 04, 05, 06, 08, 10).
+3. **Desk items:** `docker pull ghcr.io/element-hq/synapse:latest` then
+   `tests/federation-synapse/run.sh` (the federation milestone); the two-pod run.
+4. **The halves left open** (22:45 section, item 4) plus: `hs-bridges`' own HTTP client and the
+   operator onto the outbound policy; rename the bot's Matrix device ("WhatsApp bridge",
+   hardcoded in mautrix-go) if wanted; `command_prefix` for Signal, Slack, X.
+5. **Then the table.**
+
+## Earlier: 2026-10-02, 22:45 EDT -- every branch is merged, the bridge bot answers
 
 **Where `main` is.** `dd7afc8c`, **2,797 Rust tests**, every one of the ten branches of the 14:25
 section merged through the queue in this order, each gate green with both PostgreSQL servers
