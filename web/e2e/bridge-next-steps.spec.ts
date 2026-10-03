@@ -28,7 +28,7 @@ test.describe("bridge next steps", () => {
     await expect(ops).toContainText("(this is you)");
     await ops.click();
     const opsSteps = page.locator("details").filter({ has: ops });
-    await expect(opsSteps.getByText(/This is you: accept the invite from/)).toContainText(
+    await expect(opsSteps.getByText(/This is you: open your chat with/)).toContainText(
       "@whatsappbot_ops:example.org",
     );
     await expect(opsSteps.getByRole("list")).toContainText("login qr");
