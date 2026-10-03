@@ -5,7 +5,7 @@ Status: proposed (track 05 asks track 01). Date: 2026-10-02.
 ## What track 05 needs
 
 A room update's fan-out is now one store transaction per batch of up to 100 members
-(decision 0025, `hs_user::store::UserStore::apply_fan_out`): the reads of a batch are four
+(decision 0026, `hs_user::store::UserStore::apply_fan_out`): the reads of a batch are four
 multi-gets, each one `SELECT ... WHERE k = ANY($1)`, and its writes are two or three puts per
 member -- the feed row, the `feed_by_room` pointer when a row is added, and the user's feed head.
 On PostgreSQL that leaves the writes as the whole cost: `postgres_backend::flush_pending` runs one
@@ -47,7 +47,7 @@ This is a second-order cost next to the per-write statements and is mentioned, n
 A 300-member fan-out on PostgreSQL goes from ~900 statements to about 10 (four multi-gets, three
 tables' upserts, `BEGIN`, `COMMIT`), which on a local PostgreSQL is a few milliseconds instead of
 a few hundred. The owner's wake latency in the brief's 303-member room (8 s before decision
-0025, status 05 session 12) is then the room's own cost, not the feed's.
+0026, status 05 session 12) is then the room's own cost, not the feed's.
 
 ## What track 05 does meanwhile
 

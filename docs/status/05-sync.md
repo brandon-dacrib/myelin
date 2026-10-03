@@ -9,7 +9,7 @@ the integration note follow; sessions 1-6 are preserved unchanged further down.)
 
 Two rows: the known gap "The owner's session hub writes each member's record and feed entry
 one store round trip at a time" (found in session 12), and the next-steps item "the hot-room
-stream and feed pruning" (session 11 left both unbounded). Decision 0025 records both.
+stream and feed pruning" (session 11 left both unbounded). Decision 0026 records both.
 
 **The fan-out.** `SessionHub::apply_room_update` read each active member's membership record
 (a snapshot and a `get`) and appended each member's feed entry (a transaction of two ranges,
@@ -134,13 +134,13 @@ no change) are the next sequential round trips on the owner's path.
 **Files.** `crates/hs-user/src/{hub,metrics}.rs`, `crates/hs-user/src/store/{mod,tables}.rs`,
 `crates/hs-user/src/sync/mod.rs` (a comment), `crates/hs-config/src/{server,reload,lib}.rs`,
 `crates/hs-cli/src/serve.rs`, `docs/config.md`, `web/src/test/fixtures/hs-config-schema.json`,
-`docs/decisions/0025-sync-feeds-are-compacted-to-a-floor.md`,
+`docs/decisions/0026-sync-feeds-are-compacted-to-a-floor.md`,
 `docs/rfcs/0021-postgres-commit-flushes-writes-in-bulk.md`.
 
 **Verify.** `cargo test -p hs-user`, `cargo test -p hs-config`, `cargo clippy -p hs-user -p
 hs-config -p hs-cli --all-targets -- -D warnings`; the measurement as above.
 
-**Decisions made.** Decision 0025 (batches of 100 with a per-member fallback; the floor and
+**Decisions made.** Decision 0026 (batches of 100 with a per-member fallback; the floor and
 the kept entry per room; compaction at twice the retention; `server.sync` under `server`;
 the two summary rows recovered from the rows). The hub's defaults
 (`hub::DEFAULT_FEED_RETENTION_ENTRIES`, `DEFAULT_HOT_STREAM_RETENTION_ENTRIES`) equal the

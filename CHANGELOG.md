@@ -657,7 +657,7 @@ pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
   hot-room stream are now kept to `server.sync.feed_retention_entries` (10,000) and
   `server.sync.hot_room_stream_retention_entries` (100,000), hot settings; below the kept part
   each room's last position stays, so a client with an older token is sent a room whole rather
-  than anything missed (decision 0025). Verified on the real binary: the startup line, a
+  than anything missed (decision 0026). Verified on the real binary: the startup line, a
   `PATCH /api/v1/config/server` taking effect at once, and `hs_user_pruned_entries_total`
   counting what went.
 - **A first boot is as quick as any other.** Over an empty data directory the embedded backend

@@ -1,4 +1,4 @@
-# 0025: Sync feeds and the hot-room stream are compacted to a floor, and a room update is fanned out in batches (2026-10-02)
+# 0026: Sync feeds and the hot-room stream are compacted to a floor, and a room update is fanned out in batches (2026-10-02)
 
 Status: accepted (track 05; the setting is in track 13's `hs-config`). Closes the
 `docs/next-steps.md` gaps "The owner's session hub writes each member's record and feed entry
