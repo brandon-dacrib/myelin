@@ -70,6 +70,9 @@ pub struct Health {
     pub consecutive_failures: u32,
     /// When a transaction was last delivered successfully.
     pub last_success_at_ms: Option<u64>,
+    /// The last `m.room_key.withheld` delivered to one of the appservice's users
+    /// (`AppServiceHealth.last_key_withheld`).
+    pub last_key_withheld: Option<crate::store::KeyWithheldRow>,
 }
 
 fn compute_status(paused: bool, health: &HealthRow, threshold: u32) -> HealthStatus {
@@ -401,6 +404,7 @@ impl<B: KvBackend> Registry<B> {
             last_error: health_row.last_error,
             consecutive_failures: health_row.consecutive_failures,
             last_success_at_ms: health_row.last_success_at_ms,
+            last_key_withheld: health_row.last_key_withheld,
         })
     }
 

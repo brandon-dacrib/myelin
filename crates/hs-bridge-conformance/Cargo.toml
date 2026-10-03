@@ -25,6 +25,8 @@ tower = { workspace = true }
 # The real-bridge test (`tests/real_mautrix_login.rs`): a person on an encrypting client talking
 # to a real mautrix-whatsapp through a real `hs serve`. Skipped without Docker or the binary.
 matrix-sdk = { workspace = true }
+# `CollectStrategy::IdentityBasedStrategy`: alice excludes insecure devices, as Element does.
+matrix-sdk-crypto = { workspace = true }
 reqwest = { workspace = true }
 tempfile = { workspace = true }
 anyhow = { workspace = true }

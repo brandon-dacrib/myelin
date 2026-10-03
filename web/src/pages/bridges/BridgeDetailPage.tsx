@@ -292,6 +292,24 @@ export function BridgeDetailPage() {
         </div>
       )}
 
+      {health?.last_key_withheld && (
+        <div
+          className="mt-4 rounded-md border border-warning-border bg-warning-bg px-4 py-3 text-sm text-warning"
+          data-testid="key-withheld"
+        >
+          <RelativeTime at={health.last_key_withheld.at} />,{" "}
+          <span className="font-identifier">{health.last_key_withheld.sender}</span>&apos;s chat app
+          refused to share a message&apos;s keys with this bridge&apos;s{" "}
+          <span className="font-identifier">{health.last_key_withheld.to_user_id}</span> (
+          <code className="font-identifier">{health.last_key_withheld.code}</code>
+          {health.last_key_withheld.reason ? `, ${health.last_key_withheld.reason}` : ""}), so the
+          bridge could not read that message and said so in the chat.{" "}
+          {health.last_key_withheld.code === "m.unverified"
+            ? "The chat app excludes devices their owner has not cross-signed. A bridge the server manages gets its bot's device cross-signed; for one run by hand, its bot needs a cross-signing identity (a mautrix bridge: encryption.self_sign), or the person relaxes that rule for this chat."
+            : "That code is the chat app's own rule for the bridge's device; its encryption settings say which."}
+        </div>
+      )}
+
       <Root
         value={activeTab}
         onValueChange={(v) => setActiveTab(v as (typeof TABS)[number])}

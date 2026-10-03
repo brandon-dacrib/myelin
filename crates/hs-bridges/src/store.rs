@@ -109,6 +109,19 @@ pub struct InstanceRow {
     /// rendered one, so the first rolled restart keeps the crypto store readable.
     #[serde(default)]
     pub pickle_key: Option<String>,
+    /// The seeds of the bot's cross-signing master and self-signing keys
+    /// (`crate::cross_signing`), hex, minted on the instance's first ready step and kept here
+    /// so the identity outlives the bridge's own database. `None` on a row from before this:
+    /// the manager mints them on its next step.
+    #[serde(default)]
+    pub cross_signing_master_seed: Option<String>,
+    #[serde(default)]
+    pub cross_signing_self_signing_seed: Option<String>,
+    /// The bot's device the manager last found signed by that self-signing key, for the admin
+    /// API; `None` until it has signed one (or found one signed). A bridge with a reset
+    /// database makes a new device, which the manager signs on a later step and records here.
+    #[serde(default)]
+    pub signed_bot_device: Option<String>,
     /// Where this server reaches it: the registration's `url`.
     pub url: Option<String>,
     /// The room its owner asked for it in, to tell them there when it is ready.
@@ -165,6 +178,9 @@ impl InstanceRow {
             hs_token: None,
             provisioning_secret: None,
             pickle_key: None,
+            cross_signing_master_seed: None,
+            cross_signing_self_signing_seed: None,
+            signed_bot_device: None,
             url: None,
             front_door_room: None,
             dm_room: None,

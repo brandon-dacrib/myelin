@@ -240,6 +240,85 @@ at pairing and is never told again. To see `Myelin WhatsApp bridge for brandon
 device, Log out) or with `logout` in the bot's chat, then `login qr` again; chats carry on under
 the new link. The page and this document say the same.
 
+## 2026-10-03: the owner's Element refused to share keys with the bridge, so the bot is now cross-signed
+
+In the repaired chat on the demo, the owner typed and the bot answered "⚠️ Your message was
+not bridged: your client refused to share decryption keys with the bridge". That is
+mautrix-go's wording (`bridgev2/matrix/cryptoerror.go`, `errorToHumanMessage`) for an
+`m.room_key.withheld` from the person's client, whatever the code but `m.unverified` is the one
+here: the bot's device had no cross-signing identity behind it, and a client that excludes
+insecure devices shares a room's keys only with devices signed by their owner's self-signing key
+(`matrix-sdk-crypto`'s `CollectStrategy::IdentityBasedStrategy`: "if a user has no published
+identity he will not receive any room keys"; Element Web's Labs flag "Exclude insecure devices
+when sending/receiving messages", off by default in Element Web; Element X's invisible crypto;
+MSC4153). Branch `agent/bridge-bot-verified`.
+
+**What mautrix does by itself.** `encryption.self_sign: true` (`bridgev2/matrix/crypto.go`,
+`doSelfSign`) has the bot generate a recovery key and SSSS, upload its master, self-signing and
+user-signing keys with `POST /keys/device_signing/upload` and no UIA callback (a `401` is fatal),
+and sign its own device and master key. It keeps the recovery key in its own database
+(`kv_store.recovery_key`) and exits (34: "Server already has cross-signing keys, but no key in
+database") whenever the server has the bot's keys and the database does not: an instance
+recreated for the same owner (the manager's `remove` keeps the bot user, and no client API
+deletes cross-signing keys), a reset bridge database. The example config's note says as much.
+
+**What this server does instead.** The manager keeps the bot's identity
+(`hs_bridges::cross_signing`, decision `docs/decisions/2026-10-03-bridge-bot-cross-signing.md`):
+on an instance's first ready step it mints master and self-signing keys, stores the seeds on the
+instance row beside the pickle key, publishes the public keys with
+`POST /keys/device_signing/upload` as the appservice masquerading as the bot (no user-interactive
+auth for an appservice, MSC4190; `hs-e2e` already did this, the same rule as Synapse's), and
+signs the bot's device (`POST /keys/signatures/upload`) with the self-signing key. It looks again
+every minute and signs a device the bridge made since; an instance recreated for the same owner
+replaces the keys. `config.yaml` is unchanged (`self_sign` stays at its default, off); mautrix-go
+tolerates its own user's keys on the server when it does not self-sign (`crypto/devicelist.go`
+only compares them). The server announces a device-list change on both uploads, so a client
+already tracking the bot (the owner's) re-fetches the identity and the signature.
+
+**What the server now says about a refusal.** The scheduler keeps the last
+`m.room_key.withheld` it delivers to an appservice's device in the appservice's health
+(`AppServiceHealth.last_key_withheld`, `BridgeInstance.last_key_withheld`: when, who, the code,
+the reason, the room, the device), logs it at `WARN` ("a client withheld a room's keys from an
+appservice's device") and counts `hs_appservice_key_withheld_total{appservice,code}`. The bridge
+page and the person's instance page show it beside what the bridge said in the chat, with what it
+means and what happens next; the instance page also says which bot device is cross-signed.
+
+**Proof.** `crates/hs-bridge-conformance/tests/real_mautrix_login.rs`: alice's `matrix-sdk`
+client is built with `with_room_key_recipient_strategy(CollectStrategy::IdentityBasedStrategy)`,
+the exact rule the owner's client applied; `bot_is_cross_signed` waits for the instance's
+`signed_bot_device`, then reads `/keys/query` as alice and asserts the bot's master key, its
+self-signing key signed by the master key, and the signed device carrying the self-signing key's
+signature beside its own; the encrypted stories then assert `login qr` is answered with a QR (a
+"refused to share decryption keys" answer is named as such) and that the appservice's health has
+no `last_key_withheld`. Run on 2026-10-03: 3 of 3 in 31 s, the bot's devices `X3HXCGJKPK` and
+`I36QDLYXYI` cross-signed, `login qr` decrypted and answered with the QR in both encrypted
+stories, nothing withheld. Alice's own cross-signing has to be bootstrapped first: that
+strategy refuses to send at all otherwise ("Encryption failed because cross-signing is not set
+up on your account"), as the owner's Element has it. (No run against a binary without the
+manager change was made from this session; the rule that client applies is the documented one,
+"no published identity, no room keys", which is what the owner's client did to the demo's bot.)
+
+**The owner's way out until this ships, in Element's own words.** The warning comes from one of
+two settings, and which one decides what to do:
+
+- Settings → Labs → Encryption → **"Exclude insecure devices when sending/receiving messages"**
+  (`feature_exclude_insecure_devices`; a per-device Labs flag, off unless turned on). This one
+  ignores manual verification of a single device (`IdentityBasedStrategy` wants the bot's own
+  identity), so the only relief is to turn it off, which puts the client back to Element's
+  default, or wait for this fix. Element X's equivalent is its invisible-crypto setting under
+  Advanced settings.
+- Settings → Security & Privacy → **"Only send messages to verified users"**
+  (`blacklistUnverifiedDevices`, `OnlyTrustedDevices`; also per room under the room's Settings
+  → Security & Privacy with the same name). This one honours a manually verified device: open the
+  bot's profile, its session "WhatsApp bridge" → **"Manually verify by text"**, compare the
+  session key with the one shown on the bridge page's appservice (`/keys/query` for the bot) and
+  confirm. That is the safer workaround, since it relaxes nothing; turning the setting off for
+  the bot's chat only (the room override) is the next safest, as that room holds the person and
+  their own bot and nobody else.
+
+Running it: `cargo build -p hs-cli --bin hs`, then `cargo test -p hs-bridge-conformance --test
+real_mautrix_login -- --nocapture` with Docker reachable.
+
 ## 2026-10-01: the server asks the bridge who has signed in
 
 The render now writes a `provisioning.shared_secret` of its own into `config.yaml` and keeps the

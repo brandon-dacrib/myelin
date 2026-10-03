@@ -434,6 +434,33 @@ impl<B: KvBackend> Scheduler<B> {
                 health.last_error = None;
                 health.last_success_at_ms = Some(now);
                 health.last_success_seq = Some(through_seq);
+                // A client refusing to share a room's keys with the bridge is the one thing
+                // that makes a healthy bridge drop a person's message; keep the last one where
+                // the admin API can show it, beside the bridge's own warning in the chat.
+                for withheld in crate::transaction::key_withheld_in(&merged) {
+                    tracing::warn!(
+                        appservice = %appservice_id,
+                        sender = %withheld.sender,
+                        code = %withheld.code,
+                        reason = withheld.reason.as_deref().unwrap_or_default(),
+                        room_id = withheld.room_id.as_deref().unwrap_or_default(),
+                        to_user_id = %withheld.to_user_id,
+                        to_device_id = %withheld.to_device_id,
+                        "a client withheld a room's keys from an appservice's device"
+                    );
+                    if let Some(metrics) = &self.metrics {
+                        metrics.record_key_withheld(appservice_id, &withheld.code);
+                    }
+                    health.last_key_withheld = Some(crate::store::KeyWithheldRow {
+                        at_ms: now,
+                        sender: withheld.sender,
+                        code: withheld.code,
+                        reason: withheld.reason,
+                        room_id: withheld.room_id,
+                        to_user_id: withheld.to_user_id,
+                        to_device_id: withheld.to_device_id,
+                    });
+                }
                 self.registry.store().put_health(appservice_id, &health)?;
                 Ok(DrainOutcome::Delivered {
                     count: batch.len(),

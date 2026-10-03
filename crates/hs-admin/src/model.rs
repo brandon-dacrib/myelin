@@ -790,6 +790,34 @@ pub struct BridgeInstance {
     /// keeps its old name until the bridge is linked again.
     #[serde(default)]
     pub device_name: Option<String>,
+    /// The bot's device the manager has cross-signed with the bot's own self-signing key (the
+    /// manager keeps the bot's cross-signing identity, so a client that excludes insecure
+    /// devices still shares keys with the bridge); `null` until it has. A bridge with a reset
+    /// database makes a new device, which is signed on a later step.
+    #[serde(default)]
+    pub signed_bot_device: Option<String>,
+    /// The last time a client refused to share a room's keys with this bridge
+    /// (`m.room_key.withheld` delivered to its bot), from the appservice's health; the bridge
+    /// then answers the person that their message was not bridged.
+    #[serde(default)]
+    pub last_key_withheld: Option<AdminKeyWithheld>,
+}
+
+/// The OpenAPI `KeyWithheld` schema: the last `m.room_key.withheld` an appservice was sent.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AdminKeyWithheld {
+    /// RFC 3339 millisecond-precision UTC.
+    pub at: String,
+    /// The client's user, who withheld.
+    pub sender: String,
+    /// The event's `code`: `m.unverified` for a device its owner has not cross-signed,
+    /// `m.blacklisted`, `m.unauthorised`, `m.unavailable`, `m.no_olm`.
+    pub code: String,
+    pub reason: Option<String>,
+    pub room_id: Option<String>,
+    /// The appservice user and device it was addressed to.
+    pub to_user_id: String,
+    pub to_device_id: String,
 }
 
 /// The OpenAPI `BridgeInstanceFiles` schema. Carries tokens; Debug shows none of it.
@@ -879,6 +907,10 @@ pub struct AdminAppserviceHealth {
     pub status: String,
     pub last_ping_at: Option<String>,
     pub last_error: Option<String>,
+    /// The last `m.room_key.withheld` delivered to one of the appservice's users: a client
+    /// refused to share a room's keys with the bridge, so the bridge could not read the message.
+    #[serde(default)]
+    pub last_key_withheld: Option<AdminKeyWithheld>,
 }
 
 /// The OpenAPI `AppServiceBacklogEntry` schema: one queued or dead-lettered transaction.

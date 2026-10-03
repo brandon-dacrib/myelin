@@ -36,6 +36,7 @@ use matrix_sdk::ruma::api::client::account::register::v3::Request as RegisterReq
 use matrix_sdk::ruma::api::client::uiaa;
 use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
 use matrix_sdk::ruma::{OwnedRoomId, RoomId};
+use matrix_sdk_crypto::CollectStrategy;
 use serde_json::{Value, json};
 
 const IMAGE: &str = "dock.mau.dev/mautrix/whatsapp:latest";
@@ -273,14 +274,34 @@ async fn claim_server(server: &Server) -> Result<Admin> {
 
 // ---- the person --------------------------------------------------------------------------------
 
+/// Alice, on a client that excludes insecure devices: `matrix-sdk`'s
+/// `CollectStrategy::IdentityBasedStrategy`, the rule behind Element's "Exclude insecure devices
+/// when sending/receiving messages" and Element X's invisible crypto (MSC4153), which shares a
+/// room's keys only with devices cross-signed by their owner and with no device of a user who
+/// has no identity. The owner's Element did this to the demo bridge on 2026-10-03 and the bot
+/// answered "⚠️ Your message was not bridged: your client refused to share decryption keys with
+/// the bridge"; with the bot's device unsigned, every encrypted story here would end the same
+/// way.
 async fn register(base: &str, username: &str) -> Result<Client> {
-    let client = Client::builder().homeserver_url(base).build().await?;
+    let client = Client::builder()
+        .homeserver_url(base)
+        .with_room_key_recipient_strategy(CollectStrategy::IdentityBasedStrategy)
+        .build()
+        .await?;
     let mut request = RegisterRequest::new();
     request.username = Some(username.to_owned());
     request.password = Some("a-password-for-the-test".to_owned());
     request.initial_device_display_name = Some("hs-bridge-conformance".to_owned());
     request.auth = Some(uiaa::AuthData::Dummy(uiaa::Dummy::new()));
     client.matrix_auth().register(request).await?;
+    // That strategy refuses to send at all until the sender's own cross-signing exists
+    // ("Encryption failed because cross-signing is not set up on your account"), as the
+    // owner's Element has it; a first upload needs no re-authentication on this server.
+    client
+        .encryption()
+        .bootstrap_cross_signing(None)
+        .await
+        .context("alice's own cross-signing")?;
     Ok(client)
 }
 
@@ -714,6 +735,17 @@ async fn login_qr_in(scene: &mut Scene, room_id: &RoomId) -> Result<()> {
                     .is_some_and(|b| b.to_ascii_lowercase().contains("qr") || b.contains("scan")))
     });
     if !qr {
+        let refused = replies.iter().any(|r| {
+            r.event["content"]["body"]
+                .as_str()
+                .is_some_and(|b| b.contains("refused to share decryption keys"))
+        });
+        if refused {
+            bail!(
+                "{bot} said alice's client refused to share the room's keys with it: the bot's device is not cross-signed, or alice's client has not seen that it is\n--- bridge log (tail) ---\n{}",
+                tail(&scene.bridge.log(), 60)
+            );
+        }
         bail!(
             "{bot} answered, but not with a QR code: {:?}\n--- bridge log (tail) ---\n{}",
             replies
@@ -747,7 +779,36 @@ async fn login_qr(encrypted: bool) -> Result<()> {
     );
     assert_eq!(instance["chat_room"], room_id.as_str(), "{instance}");
     device_name_reached_the_bridge(&scene, &instance)?;
-    login_qr_in(&mut scene, &room_id).await
+    // A bridge with encryption off makes no device keys, so there is nothing to sign there.
+    let signed_device = if encrypted {
+        bot_is_cross_signed(&scene).await?
+    } else {
+        String::new()
+    };
+    login_qr_in(&mut scene, &room_id).await?;
+    // Alice's client excluded insecure devices, and the bridge decrypted `login qr` all the
+    // same: it shared the room's keys with the bot's signed device and nothing was withheld.
+    if encrypted {
+        let health = scene
+            .admin
+            .ok(
+                reqwest::Method::GET,
+                &format!("/appservices/{}/health", scene.appservice_id),
+                None,
+            )
+            .await?;
+        assert!(
+            health["last_key_withheld"].is_null(),
+            "nothing was withheld from the bridge: {health}"
+        );
+        let instance = scene
+            .admin
+            .ok(reqwest::Method::GET, &scene.instance_path, None)
+            .await?;
+        assert_eq!(instance["signed_bot_device"], signed_device, "{instance}");
+        assert!(instance["last_key_withheld"].is_null(), "{instance}");
+    }
+    Ok(())
 }
 
 /// The name the instance's config gives the bridge on WhatsApp's side (`network.os_name`, with
@@ -781,6 +842,77 @@ fn device_name_reached_the_bridge(scene: &Scene, instance: &Value) -> Result<()>
         "browser_name is DESKTOP: {platform:?}\n{config}"
     );
     Ok(())
+}
+
+/// The bot has a cross-signing identity and its device is signed by it, the way a client that
+/// excludes insecure devices needs it (`register` above): the manager minted the keys,
+/// published them as the appservice and signed the bridge's device
+/// (`hs_bridges::cross_signing`). Waits for the manager's step (the instance's
+/// `signed_bot_device`), then reads `/keys/query` as alice: the bot's master key, its
+/// self-signing key signed by the master key, and the signed device carrying the self-signing
+/// key's signature beside its own. Returns the device ID.
+async fn bot_is_cross_signed(scene: &Scene) -> Result<String> {
+    let label = scene.label;
+    let bot = scene.bot.clone();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let signed_device = loop {
+        let instance = scene
+            .admin
+            .ok(reqwest::Method::GET, &scene.instance_path, None)
+            .await?;
+        if let Some(device) = instance["signed_bot_device"].as_str() {
+            break device.to_owned();
+        }
+        if Instant::now() > deadline {
+            bail!(
+                "the manager never signed the bot's device: {instance}\n--- server log (tail) ---\n{}",
+                tail(&scene.server.log(), 40)
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    let token = scene.alice.access_token().context("alice's access token")?;
+    let keys: Value = reqwest::Client::new()
+        .post(format!(
+            "{}/_matrix/client/v3/keys/query",
+            scene.server.base
+        ))
+        .bearer_auth(token)
+        .json(&json!({"device_keys": {bot.clone(): []}}))
+        .send()
+        .await?
+        .json()
+        .await?;
+    let master = &keys["master_keys"][&bot];
+    let master_key_id = master["keys"]
+        .as_object()
+        .and_then(|k| k.keys().next())
+        .cloned()
+        .with_context(|| format!("the bot has a master key: {keys}"))?;
+    assert_eq!(master["usage"], json!(["master"]), "{master}");
+    let ssk = &keys["self_signing_keys"][&bot];
+    let ssk_key_id = ssk["keys"]
+        .as_object()
+        .and_then(|k| k.keys().next())
+        .cloned()
+        .with_context(|| format!("the bot has a self-signing key: {keys}"))?;
+    assert!(
+        ssk["signatures"][&bot][&master_key_id].is_string(),
+        "the self-signing key is signed by the master key: {ssk}"
+    );
+    let device = &keys["device_keys"][&bot][&signed_device];
+    assert!(
+        device["signatures"][&bot][&ssk_key_id].is_string(),
+        "the bot's device {signed_device} is signed by the self-signing key: {device}"
+    );
+    assert!(
+        device["signatures"][&bot][format!("ed25519:{signed_device}")].is_string(),
+        "the device's own signature is kept: {device}"
+    );
+    eprintln!(
+        "[{label}] {bot}'s device {signed_device} is cross-signed (master {master_key_id}, self-signing {ssk_key_id})"
+    );
+    Ok(signed_device)
 }
 
 /// A chat the bot started, repaired in place. Without double puppeting the manager cannot act
@@ -884,6 +1016,7 @@ async fn repaired_chat() -> Result<()> {
     assert_eq!(members.len(), 2, "alice and the bot");
     let _ = alice_id;
 
+    bot_is_cross_signed(&scene).await?;
     login_qr_in(&mut scene, &room_id).await
 }
 

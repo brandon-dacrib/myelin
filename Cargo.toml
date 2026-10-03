@@ -139,6 +139,9 @@ ipnet = "2"
 # needs a backend selected to build its HTTP client at all). `e2e-encryption` (vodozemac) was added
 # by track 08 for `hs-loadgen`'s encrypted scenario (in-memory crypto store; no `sqlite` needed).
 matrix-sdk = { version = "0.19", default-features = false, features = ["rustls-aws-lc-rs", "e2e-encryption"] }
+# Added by track 11 (2026-10-03): `CollectStrategy`, which matrix-sdk takes but does not
+# re-export, for a test client that excludes insecure devices the way Element does.
+matrix-sdk-crypto = { version = "0.19", default-features = false }
 
 [profile.dev]
 opt-level = 0

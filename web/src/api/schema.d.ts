@@ -2603,6 +2603,8 @@ export interface components {
         };
         AppServiceHealth: {
             last_error?: string | null;
+            /** @description The last `m.room_key.withheld` delivered to one of the appservice's users. A client refused to share a room's keys with the bridge, so the bridge could not read a message and told the person so; `m.unverified` means the person's client excludes devices their owner has not cross-signed, which the manager settles for its own instances' bots. Null until one has been delivered. */
+            last_key_withheld?: components["schemas"]["KeyWithheld"] | null;
             /** Format: date-time */
             last_ping_at?: string | null;
             /** @enum {string} */
@@ -2698,6 +2700,8 @@ export interface components {
             health?: string | null;
             /** @description What went wrong, if the last ping failed. */
             last_error?: string | null;
+            /** @description The last time a client refused to share a room's keys with this instance's bridge (`m.room_key.withheld` delivered to its bot), from its appservice's health. The bridge answers the person in the chat that their message was not bridged; this says the same to the operator. */
+            last_key_withheld?: components["schemas"]["KeyWithheld"] | null;
             /**
              * Format: date-time
              * @description When this server last pinged the instance's bridge.
@@ -2707,6 +2711,8 @@ export interface components {
             ready_at?: string | null;
             /** @description Why it failed, or what it is waiting for. */
             reason?: string | null;
+            /** @description The bot's device the manager has cross-signed with the bot's own self-signing key. The manager keeps the bot's cross-signing identity (master and self-signing keys, published as the appservice), so a client that excludes insecure devices (Element's "Exclude insecure devices", Element X's invisible crypto) still shares room keys with the bridge. Null until a device has been signed; a bridge with a reset database makes a new device, which is signed on a later step. */
+            signed_bot_device?: string | null;
             /** @enum {string} */
             state: "requested" | "registered" | "deploying" | "starting" | "ready" | "failed" | "removing";
             type: string;
@@ -3090,6 +3096,20 @@ export interface components {
             sender: string;
             state_key?: string | null;
             type: string;
+        };
+        KeyWithheld: {
+            /** Format: date-time */
+            at: string;
+            /** @description The event's `code`. `m.unverified` for a device its owner has not cross-signed; `m.blacklisted`, `m.unauthorised`, `m.unavailable`, `m.no_olm` as the spec defines them; `unknown` when the event carried none. */
+            code: string;
+            reason?: string | null;
+            room_id?: string | null;
+            /** @description The client's user, who withheld. */
+            sender: string;
+            /** @description The device it was addressed to. */
+            to_device_id: string;
+            /** @description The appservice user it was addressed to. */
+            to_user_id: string;
         };
         MediaItem: {
             content_type: string | null;

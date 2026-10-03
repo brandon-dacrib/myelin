@@ -24,8 +24,8 @@
 //! step: if the runtime has an object under the hashed name, that name is adopted so nothing
 //! already running is orphaned or deployed twice; otherwise it gets the readable name.
 
-use std::collections::BTreeMap;
-use std::sync::{Arc, OnceLock};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -40,6 +40,7 @@ use hs_kv::KvBackend;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
+use crate::cross_signing::{BotIdentity, Seeds};
 use crate::matrix::MatrixClient;
 use crate::runtime::{DeploySpec, Runtime, manifest_yaml};
 use crate::store::{
@@ -60,6 +61,12 @@ const DEPLOY_TIMEOUT_MS: u64 = 15 * 60 * 1000;
 const START_TIMEOUT_MS: u64 = 10 * 60 * 1000;
 /// How often the state machine runs when nothing wakes it.
 const TICK: Duration = Duration::from_secs(3);
+/// How often a ready instance whose bot device is signed has its bot's keys looked at again,
+/// for a device the bridge made since (a reset database): one `/keys/query` over loopback.
+const IDENTITY_RECHECK_MS: u64 = 60_000;
+/// The start of the reason [`BridgeManager::settle_bot_identity`] leaves on a row when it
+/// cannot, so that its next success clears only its own.
+const IDENTITY_REASON: &str = "the bot's cross-signing";
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -164,6 +171,10 @@ pub struct BridgeManager<B: KvBackend> {
     loopback: OnceLock<String>,
     pub(crate) client: OnceLock<MatrixClient>,
     wake: tokio::sync::Notify,
+    /// When each instance's bot identity was last looked at ([`Self::settle_bot_identity`]):
+    /// a settled one is looked at again every [`IDENTITY_RECHECK_MS`], for a device the bridge
+    /// made since. In memory: a restart looks once more, which is cheap.
+    identity_checked_ms: Mutex<HashMap<(String, String), u64>>,
 }
 
 impl<B: KvBackend> std::fmt::Debug for BridgeManager<B> {
@@ -209,6 +220,7 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             loopback: OnceLock::new(),
             client: OnceLock::new(),
             wake: tokio::sync::Notify::new(),
+            identity_checked_ms: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -429,7 +441,7 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             deployment,
             health: health.as_ref().map(|h| h.status.clone()),
             last_ping_at: health.as_ref().and_then(|h| h.last_ping_at.clone()),
-            last_error: health.and_then(|h| h.last_error),
+            last_error: health.as_ref().and_then(|h| h.last_error.clone()),
             created_at: rfc3339(row.created_at_ms),
             ready_at: row.ready_at_ms.map(rfc3339),
             chat_room: row.dm_room.clone(),
@@ -439,6 +451,8 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
                 &self.server_name,
                 owner_of(row),
             ),
+            signed_bot_device: row.signed_bot_device.clone(),
+            last_key_withheld: health.and_then(|h| h.last_key_withheld),
         }
     }
 
@@ -743,6 +757,24 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
                 Ok(())
             }
             InstanceState::Ready => {
+                // The bot's identity first, so that it is published before the owner's client
+                // ever looks at the bot. A failure here is noted on the row and does not stop
+                // the chat from being made.
+                match self.settle_bot_identity(row).await {
+                    Ok(()) => {
+                        if row
+                            .reason
+                            .as_deref()
+                            .is_some_and(|r| r.starts_with(IDENTITY_REASON))
+                        {
+                            self.set_reason(row, None);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(bridge_type = %row.bridge_type, owner = %row.owner, error = %e, "could not settle the bot's cross-signing identity");
+                        self.set_reason(row, Some(format!("{IDENTITY_REASON}: {e}")));
+                    }
+                }
                 if owner_of(row).is_some() {
                     if row.dm_room.is_none() {
                         self.invite_owner(row, &offering).await?;
@@ -825,6 +857,135 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             .instance(&row.bridge_type, &row.owner)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "the instance was removed".to_owned())
+    }
+
+    /// The row with the seeds of its bot's cross-signing keys, minted now if it had none and
+    /// stored before anything is published, so that a crash between the two leaves keys the
+    /// next step publishes again rather than a second identity.
+    fn settle_cross_signing_seeds(&self, row: &InstanceRow) -> Result<InstanceRow, String> {
+        if row.cross_signing_master_seed.is_some() && row.cross_signing_self_signing_seed.is_some()
+        {
+            return Ok(row.clone());
+        }
+        let seeds = Seeds::generate();
+        tracing::info!(bridge_type = %row.bridge_type, owner = %row.owner, "minted the cross-signing keys of a bridge instance's bot");
+        self.store
+            .update_instance(&row.bridge_type, &row.owner, |r| {
+                if r.cross_signing_master_seed.is_some()
+                    && r.cross_signing_self_signing_seed.is_some()
+                {
+                    return false;
+                }
+                r.cross_signing_master_seed = Some(seeds.master.clone());
+                r.cross_signing_self_signing_seed = Some(seeds.self_signing.clone());
+                r.signed_bot_device = None;
+                true
+            })
+            .map_err(|e| e.to_string())?;
+        self.store
+            .instance(&row.bridge_type, &row.owner)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "the instance was removed".to_owned())
+    }
+
+    /// Gives the instance's bot a cross-signing identity and signs its device with it
+    /// (`crate::cross_signing`), so that a client which excludes insecure devices still shares
+    /// room keys with the bridge. On every step of a ready instance until a device is signed,
+    /// then every [`IDENTITY_RECHECK_MS`]: `/keys/query` as the bot; the master and
+    /// self-signing keys published when the server's are not this identity's (none yet, or
+    /// another instance's for the same owner, which the appservice may replace without
+    /// user-interactive auth); each device of the bot without the self-signing key's signature
+    /// signed. Records the signed device on the row for the admin API.
+    async fn settle_bot_identity(&self, row: &InstanceRow) -> Result<(), String> {
+        let now = now_ms();
+        let key = (row.bridge_type.clone(), row.owner.clone());
+        if row.signed_bot_device.is_some()
+            && self
+                .identity_checked_ms
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&key)
+                .is_some_and(|at| now.saturating_sub(*at) < IDENTITY_RECHECK_MS)
+        {
+            return Ok(());
+        }
+        let client = self.client.get().ok_or("not started")?.clone();
+        let token = row.as_token.clone().ok_or("the instance has no token")?;
+        let (bot_localpart, _) = bridge_types::instance_names(&row.bridge_type, owner_of(row))
+            .ok_or("its bridge type is no longer in the catalogue")?;
+        let bot = self.mxid(&bot_localpart);
+        let row = &self.settle_cross_signing_seeds(row)?;
+        let seeds = Seeds {
+            master: row
+                .cross_signing_master_seed
+                .clone()
+                .ok_or("no master seed")?,
+            self_signing: row
+                .cross_signing_self_signing_seed
+                .clone()
+                .ok_or("no self-signing seed")?,
+        };
+        let identity = BotIdentity::from_seeds(&bot, &seeds)?;
+        let keys = client
+            .keys_query(&token, &bot)
+            .await
+            .map_err(|e| format!("could not read the bot's keys: {e}"))?;
+        if !identity.is_published_master(keys["master_keys"].get(&bot)) {
+            client
+                .upload_cross_signing_keys(&token, &bot, identity.upload_body()?)
+                .await
+                .map_err(|e| format!("could not publish the bot's cross-signing keys: {e}"))?;
+            tracing::info!(
+                bridge_type = %row.bridge_type,
+                owner = %row.owner,
+                bot,
+                master_key = identity.master_key_id(),
+                "published the bot's cross-signing keys"
+            );
+        }
+        let devices = keys["device_keys"]
+            .get(&bot)
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let mut signed = None;
+        for (device_id, device_keys) in &devices {
+            if identity.has_signed_device(device_keys) {
+                signed = Some(device_id.clone());
+                continue;
+            }
+            if device_keys.get("keys").is_none() {
+                continue; // a device without keys yet (nothing to sign)
+            }
+            client
+                .upload_signatures(&token, &bot, identity.sign_device(device_id, device_keys)?)
+                .await
+                .map_err(|e| format!("could not sign the bot's device {device_id}: {e}"))?;
+            tracing::info!(
+                bridge_type = %row.bridge_type,
+                owner = %row.owner,
+                bot,
+                device = %device_id,
+                "cross-signed the bot's device with its own self-signing key"
+            );
+            signed = Some(device_id.clone());
+        }
+        self.identity_checked_ms
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key, now);
+        if signed.is_some() && signed != row.signed_bot_device {
+            let _ = self
+                .store
+                .update_instance(&row.bridge_type, &row.owner, |r| {
+                    if r.signed_bot_device == signed {
+                        return false;
+                    }
+                    r.signed_bot_device = signed.clone();
+                    true
+                });
+        }
+        Ok(())
     }
 
     fn set_state(&self, row: &InstanceRow, state: InstanceState, reason: Option<String>) {
@@ -2342,11 +2503,29 @@ mod tests {
         join_fails: Mutex<bool>,
         calls: Mutex<Vec<String>>,
         notices: Mutex<Vec<String>>,
+        /// What `/keys/query` answers: `device_keys` and `master_keys`/`self_signing_keys` by
+        /// user, kept up to date by the two upload routes the way the real server would.
+        keys: Mutex<serde_json::Value>,
     }
 
     impl FakeMatrix {
         fn calls(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
+        }
+
+        /// Gives `user` a device with keys (unsigned by any cross-signing key).
+        fn add_device(&self, user: &str, device_id: &str) {
+            self.keys.lock().unwrap()["device_keys"][user][device_id] = json!({
+                "user_id": user,
+                "device_id": device_id,
+                "algorithms": ["m.olm.v1.curve25519-aes-sha2", "m.megolm.v1.aes-sha2"],
+                "keys": {format!("curve25519:{device_id}"): "c", format!("ed25519:{device_id}"): "e"},
+                "signatures": {user: {format!("ed25519:{device_id}"): "own"}},
+            });
+        }
+
+        fn keys(&self) -> serde_json::Value {
+            self.keys.lock().unwrap().clone()
         }
 
         fn take_calls(&self) -> Vec<String> {
@@ -2439,6 +2618,23 @@ mod tests {
                 }
                 "m.direct" => ok(json!({})),
                 "register" => ok(json!({"user_id": "@x:example.org"})),
+                "keys/query" => ok(fake.keys()),
+                "keys/device_signing/upload" => {
+                    let mut keys = fake.keys.lock().unwrap();
+                    keys["master_keys"][as_user.clone()] = body["master_key"].clone();
+                    keys["self_signing_keys"][as_user.clone()] = body["self_signing_key"].clone();
+                    ok(json!({}))
+                }
+                "keys/signatures/upload" => {
+                    let mut keys = fake.keys.lock().unwrap();
+                    for (user, by_device) in body.as_object().cloned().unwrap_or_default() {
+                        for (device, signed) in by_device.as_object().cloned().unwrap_or_default() {
+                            keys["device_keys"][&user][&device]["signatures"] =
+                                signed["signatures"].clone();
+                        }
+                    }
+                    ok(json!({"failures": {}}))
+                }
                 _ => (
                     StatusCode::NOT_FOUND,
                     axum::Json(json!({"errcode": "M_UNRECOGNIZED"})),
@@ -2501,10 +2697,21 @@ mod tests {
                 r.reason = None;
                 r.dm_room = Some(OLD_CHAT.into());
                 r.dm_started_by = None;
+                // The bot's identity settled already, and looked at just now, so that the
+                // chat stories below see the chat's calls only.
+                let seeds = Seeds::generate();
+                r.cross_signing_master_seed = Some(seeds.master);
+                r.cross_signing_self_signing_seed = Some(seeds.self_signing);
+                r.signed_bot_device = Some("DEVICE".into());
                 true
             })
             .unwrap()
             .unwrap();
+        manager
+            .identity_checked_ms
+            .lock()
+            .unwrap()
+            .insert(("mautrix-whatsapp".into(), OWNER.into()), now_ms());
         fake.take_calls(); // the front doors' registration and names
         manager
     }
@@ -2515,6 +2722,172 @@ mod tests {
             .instance("mautrix-whatsapp", OWNER)
             .unwrap()
             .unwrap()
+    }
+
+    /// Brandon's instance ready with its chat settled and its bot's identity not: the row a
+    /// server from before 2026-10-03 has, or a fresh instance the moment it became ready.
+    async fn ready_with_an_unsigned_bot(
+        fake: &Arc<FakeMatrix>,
+    ) -> Arc<BridgeManager<MemoryBackend>> {
+        let manager = ready_with_an_unsettled_chat(fake, None).await;
+        manager
+            .store
+            .update_instance("mautrix-whatsapp", OWNER, |r| {
+                r.dm_started_by = Some(CHAT_BY_OWNER.into());
+                r.cross_signing_master_seed = None;
+                r.cross_signing_self_signing_seed = None;
+                r.signed_bot_device = None;
+                true
+            })
+            .unwrap()
+            .unwrap();
+        manager.identity_checked_ms.lock().unwrap().clear();
+        manager
+    }
+
+    #[tokio::test]
+    async fn a_ready_instances_bot_gets_a_cross_signing_identity_and_its_device_signed() {
+        let fake = Arc::new(FakeMatrix::default());
+        fake.add_device(BOT, "IEXNEKZESJ");
+        let manager = ready_with_an_unsigned_bot(&fake).await;
+
+        manager.tick().await;
+        assert_eq!(
+            fake.take_calls(),
+            vec![
+                format!("POST keys/query as={BOT}"),
+                format!("POST keys/device_signing/upload as={BOT}"),
+                format!("POST keys/signatures/upload as={BOT}"),
+            ]
+        );
+        let row = row_of(&manager);
+        let seeds = Seeds {
+            master: row
+                .cross_signing_master_seed
+                .clone()
+                .expect("a master seed"),
+            self_signing: row
+                .cross_signing_self_signing_seed
+                .clone()
+                .expect("a self-signing seed"),
+        };
+        let identity = BotIdentity::from_seeds(BOT, &seeds).unwrap();
+        let keys = fake.keys();
+        assert!(identity.is_published_master(keys["master_keys"].get(BOT)));
+        assert_eq!(
+            keys["self_signing_keys"][BOT]["usage"],
+            json!(["self_signing"])
+        );
+        assert!(
+            keys["self_signing_keys"][BOT]["signatures"][BOT][identity.master_key_id()].is_string(),
+            "the self-signing key is signed by the master key"
+        );
+        assert!(identity.has_signed_device(&keys["device_keys"][BOT]["IEXNEKZESJ"]));
+        assert_eq!(
+            keys["device_keys"][BOT]["IEXNEKZESJ"]["signatures"][BOT]["ed25519:IEXNEKZESJ"], "own",
+            "the device's own signature is kept"
+        );
+        assert_eq!(row.signed_bot_device.as_deref(), Some("IEXNEKZESJ"));
+        assert!(row.reason.is_none(), "{:?}", row.reason);
+        let view = manager
+            .instance("mautrix-whatsapp", OWNER)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(view.signed_bot_device.as_deref(), Some("IEXNEKZESJ"));
+
+        // Settled: the next steps do not ask again (for a minute).
+        manager.tick().await;
+        manager.tick().await;
+        assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+
+        // A device the bridge makes later (a reset database) is signed on the next look,
+        // with the same identity: no second upload of the keys.
+        fake.add_device(BOT, "NEWDEVICE1");
+        manager.identity_checked_ms.lock().unwrap().clear();
+        manager.tick().await;
+        assert_eq!(
+            fake.take_calls(),
+            vec![
+                format!("POST keys/query as={BOT}"),
+                format!("POST keys/signatures/upload as={BOT}"),
+            ]
+        );
+        let keys = fake.keys();
+        assert!(identity.has_signed_device(&keys["device_keys"][BOT]["NEWDEVICE1"]));
+        assert!(identity.has_signed_device(&keys["device_keys"][BOT]["IEXNEKZESJ"]));
+    }
+
+    #[tokio::test]
+    async fn an_instance_recreated_for_the_same_owner_replaces_the_bots_old_keys() {
+        let fake = Arc::new(FakeMatrix::default());
+        // The server still has the previous instance's identity for the same bot, and its
+        // device signed by it.
+        let old = BotIdentity::from_seeds(BOT, &Seeds::generate()).unwrap();
+        let old_body = old.upload_body().unwrap();
+        fake.keys.lock().unwrap()["master_keys"][BOT] = old_body["master_key"].clone();
+        fake.keys.lock().unwrap()["self_signing_keys"][BOT] = old_body["self_signing_key"].clone();
+        fake.add_device(BOT, "OLDDEVICE1");
+        let old_device = fake.keys()["device_keys"][BOT]["OLDDEVICE1"].clone();
+        let signed = old.sign_device("OLDDEVICE1", &old_device).unwrap();
+        fake.keys.lock().unwrap()["device_keys"][BOT]["OLDDEVICE1"] =
+            signed[BOT]["OLDDEVICE1"].clone();
+        let manager = ready_with_an_unsigned_bot(&fake).await;
+
+        manager.tick().await;
+        assert_eq!(
+            fake.take_calls(),
+            vec![
+                format!("POST keys/query as={BOT}"),
+                format!("POST keys/device_signing/upload as={BOT}"),
+                format!("POST keys/signatures/upload as={BOT}"),
+            ],
+            "the new identity replaces the old one (no user-interactive auth for an appservice), and the device is signed by it"
+        );
+        let row = row_of(&manager);
+        let seeds = Seeds {
+            master: row.cross_signing_master_seed.clone().unwrap(),
+            self_signing: row.cross_signing_self_signing_seed.clone().unwrap(),
+        };
+        let new = BotIdentity::from_seeds(BOT, &seeds).unwrap();
+        let keys = fake.keys();
+        assert!(new.is_published_master(keys["master_keys"].get(BOT)));
+        assert!(!old.is_published_master(keys["master_keys"].get(BOT)));
+        assert!(new.has_signed_device(&keys["device_keys"][BOT]["OLDDEVICE1"]));
+        assert_eq!(row.signed_bot_device.as_deref(), Some("OLDDEVICE1"));
+    }
+
+    #[tokio::test]
+    async fn a_bot_without_a_device_yet_gets_its_keys_and_is_looked_at_again_each_step() {
+        let fake = Arc::new(FakeMatrix::default());
+        let manager = ready_with_an_unsigned_bot(&fake).await;
+
+        manager.tick().await;
+        assert_eq!(
+            fake.take_calls(),
+            vec![
+                format!("POST keys/query as={BOT}"),
+                format!("POST keys/device_signing/upload as={BOT}"),
+            ]
+        );
+        assert!(row_of(&manager).signed_bot_device.is_none());
+        // Not settled: asked again next step, and the keys (already there) not re-uploaded.
+        manager.tick().await;
+        assert_eq!(fake.take_calls(), vec![format!("POST keys/query as={BOT}")]);
+        // The bridge starts and makes its device: signed.
+        fake.add_device(BOT, "LATEDEVICE");
+        manager.tick().await;
+        assert_eq!(
+            fake.take_calls(),
+            vec![
+                format!("POST keys/query as={BOT}"),
+                format!("POST keys/signatures/upload as={BOT}"),
+            ]
+        );
+        assert_eq!(
+            row_of(&manager).signed_bot_device.as_deref(),
+            Some("LATEDEVICE")
+        );
     }
 
     #[tokio::test]

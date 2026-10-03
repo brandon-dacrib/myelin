@@ -1,6 +1,8 @@
 # Status: track 11, appservices and bridges
 
-Last updated: 2026-10-03 (CI's read of the bridge's rewritten config, below); before that
+Last updated: 2026-10-03 (the bot's device is cross-signed by the manager, so a client that
+excludes insecure devices shares keys with the bridge; a withheld key is a health line; and
+CI's read of the bridge's rewritten config; both below); before that
 2026-10-02, evening (the bridge has a name in WhatsApp's Linked devices, and a
 changed config now reaches a running bridge; below); before that, the same day, the owner's bot
 was silent on the demo cluster: diagnosed from the bridge's log, and a chat the bot started is
@@ -10,6 +12,105 @@ manager) and an instance's Kubernetes objects say whose bridge they are; before 
 (who has signed in to a bridge; the `cluster` runtime run on kind); before that 2026-09-30
 (ephemeral, to-device and device-list delivery); before that 2026-09-27 (RFC 0017 run against
 the real binary), 2026-09-27 (the bridge manager) and 2026-09-25.
+
+## Session 2026-10-03 (branch `agent/bridge-bot-verified`): the owner's Element refused to share keys with the bridge; the manager now cross-signs the bot's device
+
+**What happened.** In the repaired chat on the demo the owner typed and the bot answered
+"⚠️ Your message was not bridged: your client refused to share decryption keys with the
+bridge": mautrix-go's wording (`bridgev2/matrix/cryptoerror.go`) for an `m.room_key.withheld`
+from the owner's client. The code behind it is `m.unverified`: a client that excludes insecure
+devices (Element Web's Labs "Exclude insecure devices when sending/receiving messages", Element
+X's invisible crypto; `matrix-sdk-crypto`'s `CollectStrategy::IdentityBasedStrategy`, MSC4153)
+shares a room's Megolm keys only with devices signed by their owner's self-signing key, and with
+no device at all of a user without a published identity. The bot had none: a mautrix bridge
+self-signs only with `encryption.self_sign: true`, which the rendered config never set.
+
+**What mautrix offers, and why it was not used.** `self_sign: true` (`bridgev2/matrix/crypto.go`,
+`doSelfSign`) generates SSSS and a recovery key, uploads master, self-signing and user-signing
+keys with no UIA callback (a `401` is fatal, exit 34), signs its device and master key, and keeps
+the recovery key in the bridge's own database (`kv_store.recovery_key`). When the server has the
+bot's keys and that database does not, startup is fatal ("Server already has cross-signing keys,
+but no key in database"): an instance recreated for the same owner (`remove` deletes the
+registration and keeps the bot user; no client API deletes cross-signing keys), a reset bridge
+database. Both are ordinary here.
+
+**What was built.** The manager owns the bot's identity
+(`crates/hs-bridges/src/cross_signing.rs`; decision
+`docs/decisions/2026-10-03-bridge-bot-cross-signing.md`):
+
+1. `BotIdentity::from_seeds` builds master and self-signing `ed25519` pairs from two 32-byte
+   seeds; `upload_body` is the `/keys/device_signing/upload` body (a bare master key, a
+   self-signing key signed by it; no user-signing key, the bot vouches for nobody);
+   `sign_device` adds the self-signing key's signature to a device-keys object, keeping the
+   device's own, for `/keys/signatures/upload`; `is_published_master` and `has_signed_device`
+   read `/keys/query`. Signatures are over canonical JSON with `signatures` and `unsigned`
+   stripped (`hs_model::signing`), the way `hs-e2e` verifies them.
+2. `InstanceRow` carries `cross_signing_master_seed`, `cross_signing_self_signing_seed` (minted
+   on the first ready step, stored before anything is published, beside `pickle_key`) and
+   `signed_bot_device`.
+3. `BridgeManager::settle_bot_identity` runs first in every ready step: `/keys/query` as the bot
+   (`MatrixClient::keys_query`, over loopback with the instance's token and `user_id`); the
+   keys published when the server's master key is not this identity's (none yet, or a previous
+   instance's for the same owner; the appservice replaces them without user-interactive auth,
+   MSC4190, which `hs-e2e` already allowed, the same rule as Synapse's); every device of the bot
+   without the self-signing signature signed. Until a device is signed it looks every tick; once
+   settled every minute (`IDENTITY_RECHECK_MS`, in memory), for a device the bridge makes after
+   a reset database. A failure is a reason on the row (`the bot's cross-signing: ...`) and does
+   not stop the chat from being made; the next success clears it.
+4. `BridgeInstance.signed_bot_device` in the admin API (OpenAPI 0.1.7), and the person's instance
+   page says which device is cross-signed.
+
+**A withheld key is now a health line.** `hs-appservice`'s scheduler reads every delivered body
+for `m.room_key.withheld` to-device events (`transaction::key_withheld_in`), logs each at
+`WARN` ("a client withheld a room's keys from an appservice's device": sender, code, reason,
+room, device), counts `hs_appservice_key_withheld_total{appservice,code}`, and keeps the last
+one in the appservice's health (`HealthRow.last_key_withheld`; the admin API's
+`AppServiceHealth.last_key_withheld` and `BridgeInstance.last_key_withheld`, schema
+`KeyWithheld`). The bridge page and the instance page show it, with what the code means and what
+happens next (`m.unverified` with a signed device: a message sent again goes through).
+
+**Server unchanged.** `hs-e2e`'s `/keys/device_signing/upload` already skipped UIA for an
+appservice requester with keys set up, accepted a bare master key, verified the self-signing
+key's signature by the master key, and recorded a device-list change on both uploads; nothing in
+`hs-auth` needed touching. Status 08 is not edited; the exemption is now relied on by a real
+deployment and proven below.
+
+**Verified.** `cargo test -p hs-bridges`: `cross_signing` (seeds, the upload body's signatures,
+a device signed with its own signature kept and `unsigned` outside the signature) and the
+manager against its fake server (`a_ready_instances_bot_gets_a_cross_signing_identity_and_its_device_signed`,
+with a later device signed on the next look and no second key upload;
+`an_instance_recreated_for_the_same_owner_replaces_the_bots_old_keys`;
+`a_bot_without_a_device_yet_gets_its_keys_and_is_looked_at_again_each_step`); `cargo test -p
+hs-appservice` (`key_withheld_in_reads_the_withheld_events_under_either_spelling`); clippy clean
+on `hs-bridges`, `hs-appservice`, `hs-admin`, `hs-bridge-conformance`; `npm run check` in `web/`
+(569 unit tests, two new for the instance page). The real bridge
+(`dock.mau.dev/mautrix/whatsapp:latest`, `cargo test -p hs-bridge-conformance --test
+real_mautrix_login`): alice's `matrix-sdk` client built with
+`with_room_key_recipient_strategy(CollectStrategy::IdentityBasedStrategy)` and her own
+cross-signing bootstrapped (that strategy refuses to send at all without it, as the owner's
+Element has it); 3 of 3 in 31 s. In the encrypted and repaired stories `bot_is_cross_signed`
+saw, through `/keys/query` as alice, the bot's master key, its self-signing key signed by it,
+and the bridge's device (`X3HXCGJKPK`, `I36QDLYXYI`) signed by the self-signing key beside its
+own signature; `login qr` was decrypted by the bridge and answered with the QR notice and image,
+decrypted by alice; the appservice's health had `last_key_withheld: null`. Before alice's own
+cross-signing was bootstrapped the same client failed with "Encryption failed because
+cross-signing is not set up on your account", which is the harness's job to know, not the
+server's.
+
+**The owner's workaround until the image rolls.** Which Element setting withholds decides it:
+Labs → "Exclude insecure devices when sending/receiving messages" ignores manual device
+verification and can only be turned off (Element's default) or waited out; "Only send messages
+to verified users" (Settings → Security & Privacy, or per room) honours a manually verified
+device: open the bot's profile → its "WhatsApp bridge" session → "Manually verify by text" and
+confirm, which relaxes nothing and is the safer one; turning that setting off for the bot's chat
+only (the room override, a room with just the owner and their bot) is next. Details in
+`docs/bridges/mautrix.md` (2026-10-03).
+
+**Not done.** No run against a binary without the manager change from this session (the
+negative control is the owner's demo). The demo instance gets its identity on the manager's
+first ready step after the image rolls; the owner's Element re-fetches the bot's keys on the
+device-list change and the next message goes through. The user-signing key is not published,
+so the bot cannot verify people; nothing needs it.
 
 ## Session 2026-10-03 (branch `agent/bridge-ci-config-read`): CI reads the bridge's rewritten config through the container
 
@@ -1119,6 +1220,11 @@ to anything broken.
 
 ## Shared dependencies added
 
+- `matrix-sdk-crypto = { version = "0.19", default-features = false }` to
+  `[workspace.dependencies]` (2026-10-03): `CollectStrategy`, which `matrix-sdk` takes in
+  `with_room_key_recipient_strategy` but does not re-export, for `hs-bridge-conformance`'s
+  real-bridge test client that excludes insecure devices. Already in the lock through
+  `matrix-sdk`; no new crate compiled.
 - `fancy-regex = "0.19"` to `[workspace.dependencies]` (`Cargo.toml`), for namespace patterns using
   lookaround/backreferences the `regex` crate cannot express (see `src/regexp.rs`). Only this
   track's own crates currently depend on it.

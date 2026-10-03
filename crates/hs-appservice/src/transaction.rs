@@ -295,6 +295,53 @@ impl BodyCounts {
     }
 }
 
+/// One `m.room_key.withheld` found in a wire body by [`key_withheld_in`]: a client telling one
+/// of the appservice's devices that it will not get a room's keys, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyWithheld {
+    /// The client's user.
+    pub sender: String,
+    /// The event's `code` (`m.unverified`, `m.blacklisted`, `m.unauthorised`, `m.unavailable`,
+    /// `m.no_olm`), or `unknown` when it carries none.
+    pub code: String,
+    /// The event's `reason`, when it carried one.
+    pub reason: Option<String>,
+    /// The event's `room_id`, when it carried one.
+    pub room_id: Option<String>,
+    /// The appservice user it was addressed to (the MSC4203 addressing key).
+    pub to_user_id: String,
+    /// The device it was addressed to.
+    pub to_device_id: String,
+}
+
+/// The `m.room_key.withheld` to-device events `body` (a wire body, possibly several merged)
+/// carries, in order: the stable `to_device` key where present, the legacy one otherwise, as
+/// [`body_counts`] reads them. A bridge that is sent one answers the person that their message
+/// was not bridged; the scheduler keeps the last one in the appservice's health so that an
+/// operator sees the same without the bridge's log.
+#[must_use]
+pub fn key_withheld_in(body: &Value) -> Vec<KeyWithheld> {
+    body.get("to_device")
+        .or_else(|| body.get("de.sorunome.msc2409.to_device"))
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice)
+        .iter()
+        .filter(|e| e.get("type").and_then(Value::as_str) == Some("m.room_key.withheld"))
+        .map(|e| {
+            let content = e.get("content").cloned().unwrap_or(Value::Null);
+            let text = |v: &Value, key: &str| v.get(key).and_then(Value::as_str).map(str::to_owned);
+            KeyWithheld {
+                sender: text(e, "sender").unwrap_or_default(),
+                code: text(&content, "code").unwrap_or_else(|| "unknown".to_owned()),
+                reason: text(&content, "reason"),
+                room_id: text(&content, "room_id"),
+                to_user_id: text(e, "to_user_id").unwrap_or_default(),
+                to_device_id: text(e, "to_device_id").unwrap_or_default(),
+            }
+        })
+        .collect()
+}
+
 /// Counts what `body` (a wire body from [`Transaction::to_wire_json`], possibly several merged
 /// by the scheduler) carries. The stable key is read where present, the legacy one otherwise,
 /// so a body gated to either spelling counts the same.
@@ -617,5 +664,46 @@ mod tests {
             ..Default::default()
         };
         assert!(!with_event.is_empty());
+    }
+
+    #[test]
+    fn key_withheld_in_reads_the_withheld_events_under_either_spelling() {
+        let withheld = json!({
+            "type": "m.room_key.withheld",
+            "sender": "@alice:x",
+            "content": {
+                "algorithm": "m.megolm.v1.aes-sha2",
+                "code": "m.unverified",
+                "reason": "The sender has disabled encrypting to unverified devices.",
+                "room_id": "!chat:x",
+                "sender_key": "k",
+                "session_id": "s",
+            },
+            "to_user_id": "@whatsappbot_alice:x",
+            "to_device_id": "IEXNEKZESJ",
+        });
+        let request = json!({
+            "type": "m.room_key_request", "sender": "@alice:x", "content": {},
+            "to_user_id": "@whatsappbot_alice:x", "to_device_id": "IEXNEKZESJ",
+        });
+        let found = key_withheld_in(&json!({"to_device": [request, withheld]}));
+        assert_eq!(
+            found,
+            vec![KeyWithheld {
+                sender: "@alice:x".into(),
+                code: "m.unverified".into(),
+                reason: Some("The sender has disabled encrypting to unverified devices.".into()),
+                room_id: Some("!chat:x".into()),
+                to_user_id: "@whatsappbot_alice:x".into(),
+                to_device_id: "IEXNEKZESJ".into(),
+            }]
+        );
+        // The legacy key alone, and an event with no code.
+        let bare = json!({"type": "m.room_key.withheld", "sender": "@b:x", "content": {}});
+        let found = key_withheld_in(&json!({"de.sorunome.msc2409.to_device": [bare]}));
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].code, "unknown");
+        assert_eq!(found[0].to_device_id, "");
+        assert!(key_withheld_in(&json!({"events": []})).is_empty());
     }
 }

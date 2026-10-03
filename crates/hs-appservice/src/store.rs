@@ -129,6 +129,31 @@ pub struct HealthRow {
     pub consecutive_failures: u32,
     /// The most recent delivery error, if any.
     pub last_error: Option<String>,
+    /// The last `m.room_key.withheld` delivered to one of this appservice's users (a client
+    /// refused to share a room's keys with the bridge, so the bridge could not read a message),
+    /// recorded by the scheduler as it delivers. `None` until one has been.
+    #[serde(default)]
+    pub last_key_withheld: Option<KeyWithheldRow>,
+}
+
+/// One `m.room_key.withheld` as delivered to an appservice, the admin API's `KeyWithheld`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyWithheldRow {
+    /// When it was delivered.
+    pub at_ms: u64,
+    /// The client's user, who withheld.
+    pub sender: String,
+    /// The event's `code` (`m.unverified`, `m.blacklisted`, `m.unauthorised`, `m.unavailable`,
+    /// `m.no_olm`).
+    pub code: String,
+    /// The event's `reason`, when it carried one.
+    pub reason: Option<String>,
+    /// The event's `room_id`, when it carried one.
+    pub room_id: Option<String>,
+    /// The appservice user it was addressed to.
+    pub to_user_id: String,
+    /// The device it was addressed to.
+    pub to_device_id: String,
 }
 
 /// One transaction's delivery status, as stored in the per-appservice queue.

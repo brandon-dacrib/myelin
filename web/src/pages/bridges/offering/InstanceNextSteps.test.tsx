@@ -103,6 +103,36 @@ describe("InstanceNextSteps", () => {
     expect(screen.queryByTestId("device-name")).toBeNull();
   });
 
+  it("says the bot's device is cross-signed, so a strict chat app still shares keys", async () => {
+    renderSteps(instance("@carol:example.org", { signed_bot_device: "IEXNEKZESJ" }));
+    const line = await screen.findByTestId("signed-bot-device");
+    expect(line).toHaveTextContent("The bot's device IEXNEKZESJ is cross-signed");
+    expect(screen.queryByTestId("key-withheld")).toBeNull();
+  });
+
+  it("warns when the person's chat app refused to share keys with the bridge, and what happens next", async () => {
+    renderSteps(
+      instance("@carol:example.org", {
+        signed_bot_device: "IEXNEKZESJ",
+        last_key_withheld: {
+          at: "2026-10-03T08:00:00.000Z",
+          sender: "@carol:example.org",
+          code: "m.unverified",
+          reason: null,
+          room_id: "!chat:example.org",
+          to_user_id: "@whatsappbot_carol:example.org",
+          to_device_id: "IEXNEKZESJ",
+        },
+      }),
+    );
+    const line = await screen.findByTestId("key-withheld");
+    expect(line).toHaveTextContent(
+      "@carol:example.org's chat app refused to share a message's keys with the bridge (m.unverified)",
+    );
+    expect(line).toHaveTextContent("IEXNEKZESJ has been cross-signed since");
+    expect(screen.queryByTestId("signed-bot-device")).toBeNull();
+  });
+
   it("warns, with the prefix, when the chat was started by the bot", async () => {
     renderSteps(instance("@carol:example.org", { chat_started_by: "bot" }));
     const warning = await screen.findByTestId("chat-started-by-bot");

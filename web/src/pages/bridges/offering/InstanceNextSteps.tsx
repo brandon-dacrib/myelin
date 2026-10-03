@@ -313,6 +313,34 @@ function SignInSteps({
         </p>
       )}
 
+      {instance.last_key_withheld && (
+        <p
+          className="rounded-md border border-warning-border bg-warning-bg px-3 py-2 text-warning"
+          data-testid="key-withheld"
+        >
+          {new Date(instance.last_key_withheld.at).toLocaleString()}:{" "}
+          <span className="font-identifier">{instance.last_key_withheld.sender}</span>&apos;s chat
+          app refused to share a message&apos;s keys with the bridge (
+          <code className="font-identifier">{instance.last_key_withheld.code}</code>
+          {instance.last_key_withheld.reason ? `, ${instance.last_key_withheld.reason}` : ""}), so
+          the bridge could not read that message and said so in the chat.{" "}
+          {instance.last_key_withheld.code === "m.unverified"
+            ? instance.signed_bot_device
+              ? `The bot's device ${instance.signed_bot_device} has been cross-signed since; a chat app that excludes insecure devices shares keys with it once it has seen that, so a message sent again now should go through.`
+              : "The chat app excludes devices their owner has not cross-signed; the server is about to cross-sign the bot's device, after which a message sent again goes through."
+            : "That code is the chat app's own rule for the bridge's device; its encryption settings say which."}
+        </p>
+      )}
+
+      {instance.signed_bot_device && !instance.last_key_withheld && (
+        <p className="text-text-muted" data-testid="signed-bot-device">
+          The bot&apos;s device{" "}
+          <span className="font-identifier">{instance.signed_bot_device}</span> is cross-signed by
+          the bot&apos;s own identity, so a chat app that excludes insecure devices still shares
+          keys with the bridge.
+        </p>
+      )}
+
       {bot && instance.chat_started_by !== "bot" && (
         <p className="text-text-muted">
           If the {chatStartedAsOwner ? "chat" : "invite"} is nowhere to be found,{" "}

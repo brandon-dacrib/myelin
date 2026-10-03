@@ -10,9 +10,12 @@ description = "Bridge offerings and per-user bridge instances: the manager, the 
 [dependencies]
 hs-admin = { path = "../hs-admin" }
 hs-kv = { path = "../hs-kv" }
+hs-model = { path = "../hs-model" }
 hs-tables = { path = "../hs-tables" }
 async-trait = { workspace = true }
 axum = { workspace = true }
+base64 = { workspace = true }
+ed25519-dalek = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }

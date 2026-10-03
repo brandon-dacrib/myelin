@@ -56,6 +56,15 @@ pub struct BridgeLoginLabels {
     pub outcome: String,
 }
 
+/// Labels of `hs_appservice_key_withheld_total`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, prometheus_client::encoding::EncodeLabelSet)]
+pub struct KeyWithheldLabels {
+    /// The registration id.
+    pub appservice: String,
+    /// The `m.room_key.withheld` event's `code` (`m.unverified`, `m.blacklisted`, ...).
+    pub code: String,
+}
+
 /// The delivery metric families. Cheap to clone; every clone counts into the same families.
 #[derive(Clone, Default)]
 pub struct AppserviceMetrics {
@@ -65,6 +74,8 @@ pub struct AppserviceMetrics {
     pub delivered_items_total: Family<DeliveredItemLabels, Counter>,
     /// `hs_admin_bridge_login_queries_total{type,outcome}`.
     pub bridge_login_queries_total: Family<BridgeLoginLabels, Counter>,
+    /// `hs_appservice_key_withheld_total{appservice,code}`.
+    pub key_withheld_total: Family<KeyWithheldLabels, Counter>,
 }
 
 impl AppserviceMetrics {
@@ -93,7 +104,23 @@ impl AppserviceMetrics {
              refused, invalid_answer)",
             metrics.bridge_login_queries_total.clone(),
         );
+        registry.register(
+            "hs_appservice_key_withheld",
+            "m.room_key.withheld events delivered to an appservice's users (a client refused \
+             to share a room's keys with the bridge), by appservice and the event's code",
+            metrics.key_withheld_total.clone(),
+        );
         metrics
+    }
+
+    /// Counts one `m.room_key.withheld` delivered to `appservice`.
+    pub fn record_key_withheld(&self, appservice: &str, code: &str) {
+        self.key_withheld_total
+            .get_or_create(&KeyWithheldLabels {
+                appservice: appservice.to_owned(),
+                code: code.to_owned(),
+            })
+            .inc();
     }
 
     /// Counts one `appservices.logins` answer.

@@ -122,6 +122,79 @@ impl MatrixClient {
         .map(|_| ())
     }
 
+    /// `user`'s own keys as `/keys/query` lists them, asked as `user`: the whole response
+    /// (`device_keys`, `master_keys`, `self_signing_keys`, ...).
+    ///
+    /// # Errors
+    /// On failure.
+    pub async fn keys_query(&self, token: &str, user: &str) -> Result<Value, MatrixError> {
+        self.call(
+            reqwest::Method::POST,
+            self.url(&["keys", "query"], Some(user)),
+            token,
+            Some(json!({"device_keys": {user: []}})),
+            "keys/query",
+        )
+        .await
+    }
+
+    /// Publishes `user`'s cross-signing keys (`body` from
+    /// [`crate::cross_signing::BotIdentity::upload_body`]) as the appservice, which this
+    /// server lets replace existing keys without user-interactive auth (MSC4190).
+    ///
+    /// # Errors
+    /// On failure, including a `401` from a server that asks for user-interactive auth.
+    pub async fn upload_cross_signing_keys(
+        &self,
+        token: &str,
+        user: &str,
+        body: Value,
+    ) -> Result<(), MatrixError> {
+        self.call(
+            reqwest::Method::POST,
+            self.url(&["keys", "device_signing", "upload"], Some(user)),
+            token,
+            Some(body),
+            "keys/device_signing/upload",
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Uploads signatures (`body` from [`crate::cross_signing::BotIdentity::sign_device`]) as
+    /// `user`. A `200` whose `failures` names a key is an error here: nothing was signed.
+    ///
+    /// # Errors
+    /// On failure, or when the server reported a failure for any key.
+    pub async fn upload_signatures(
+        &self,
+        token: &str,
+        user: &str,
+        body: Value,
+    ) -> Result<(), MatrixError> {
+        let answer = self
+            .call(
+                reqwest::Method::POST,
+                self.url(&["keys", "signatures", "upload"], Some(user)),
+                token,
+                Some(body),
+                "keys/signatures/upload",
+            )
+            .await?;
+        let failures = answer.get("failures").and_then(Value::as_object);
+        match failures {
+            Some(f) if !f.is_empty() => Err(MatrixError {
+                context: format!(
+                    "keys/signatures/upload: the server refused the signature: {}",
+                    Value::Object(f.clone())
+                ),
+                status: 200,
+                errcode: "M_INVALID_SIGNATURE".to_owned(),
+            }),
+            _ => Ok(()),
+        }
+    }
+
     /// Joins `room_id` as `user`.
     ///
     /// # Errors

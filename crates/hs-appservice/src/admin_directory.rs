@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use hs_admin::model::{
     AdminAppservice, AdminAppserviceBacklogEntry, AdminAppserviceCreate, AdminAppserviceHealth,
     AdminAppserviceLinks, AdminAppserviceReplay, AdminAppserviceTokens, AdminBridgeLogins,
+    AdminKeyWithheld,
 };
 use hs_admin::sources::{AdminAppserviceRegistration, AppserviceDirectory, SourceError};
 use hs_kv::KvBackend;
@@ -105,6 +106,15 @@ fn admin_health(health: Health) -> AdminAppserviceHealth {
             .last_ping_at_ms
             .map(|ms| hs_http::time::rfc3339_from_millis(i64::try_from(ms).unwrap_or(i64::MAX))),
         last_error: health.last_error,
+        last_key_withheld: health.last_key_withheld.map(|w| AdminKeyWithheld {
+            at: hs_http::time::rfc3339_from_millis(i64::try_from(w.at_ms).unwrap_or(i64::MAX)),
+            sender: w.sender,
+            code: w.code,
+            reason: w.reason,
+            room_id: w.room_id,
+            to_user_id: w.to_user_id,
+            to_device_id: w.to_device_id,
+        }),
     }
 }
 
