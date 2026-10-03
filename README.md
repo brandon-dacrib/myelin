@@ -120,6 +120,14 @@ first administrator through the setup link, before the image is tagged or the ch
 
 Without Docker, `hs serve --data-dir ./data --server-name example.org` is the same thing.
 
+The server reaches other hosts over IPv4 only unless you say otherwise. Many container
+networks resolve a dual-stack host's IPv6 address and have no route to it, and a server that
+connects to the first address it is given fails the request. On a host with working IPv6, turn
+`network.outbound.ipv4_only` off in the Configuration section (it applies at once, no restart);
+the server then tries every address a name resolves to and falls back to the next when one does
+not connect. The startup log says which it is (`outbound: IPv4 only`), and `/metrics` counts
+connections and addresses that did not connect by family.
+
 On Kubernetes it is one value:
 
 ```sh

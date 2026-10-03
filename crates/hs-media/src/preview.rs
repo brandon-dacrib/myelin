@@ -261,14 +261,19 @@ pub async fn guarded_fetch(
             .port_or_known_default()
             .ok_or(FetchError::UnsupportedScheme)?;
 
-        let connect_addr = resolve_and_check(&host, port, policy).await?;
+        let connect_addrs: Vec<SocketAddr> = resolve_and_check(&host, port, policy)
+            .await?
+            .into_iter()
+            .map(|ip| SocketAddr::new(ip, port))
+            .collect();
 
-        // Built per request because the resolved address is pinned per host; the shared
-        // builder keeps that from re-reading the root store every time.
-        let client = hs_http::client::builder()
+        // Built per request because the checked addresses are pinned per host; the shared
+        // builder keeps that from re-reading the root store every time. Every checked address
+        // is pinned, not the first, so the connector can fall back across them (and the
+        // outbound address policy drops the IPv6 ones when it is IPv4 only).
+        let client = hs_http::client::pinned_builder(&host, &connect_addrs)
             .timeout(limits.timeout)
             .redirect(reqwest::redirect::Policy::none())
-            .resolve(&host, SocketAddr::new(connect_addr, port))
             .build()
             .map_err(|e| FetchError::Request(e.to_string()))?;
 
@@ -314,11 +319,13 @@ pub async fn guarded_fetch(
 /// Resolves `host` (or parses it directly if it is already an IP literal), checks *every*
 /// candidate address against `policy`, and returns one allowed address to pin the connection to.
 /// Refuses if *any* resolved address is blocked, not just if all are — see the module doc.
+/// Every address `host` resolves to, in the resolver's order, once every one of them passed
+/// `policy`; the caller pins its connection to exactly these.
 async fn resolve_and_check(
     host: &str,
     port: u16,
     policy: &PreviewIpPolicy,
-) -> Result<IpAddr, FetchError> {
+) -> Result<Vec<IpAddr>, FetchError> {
     let candidates: Vec<IpAddr> = if let Ok(literal) = host.parse::<IpAddr>() {
         vec![literal]
     } else {
@@ -334,7 +341,7 @@ async fn resolve_and_check(
     if !candidates.iter().all(|ip| policy.allows(*ip)) {
         return Err(FetchError::Blocked(host.to_string()));
     }
-    Ok(candidates[0])
+    Ok(candidates)
 }
 
 async fn read_capped(mut response: reqwest::Response, cap: usize) -> Result<Bytes, FetchError> {

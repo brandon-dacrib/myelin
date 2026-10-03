@@ -137,6 +137,7 @@ Native field paths are dotted `hs-config` `Config` paths, e.g. `federation.domai
 | `allow_profile_lookup_over_federation` | Unsupported | — | R-PHASE1 (hs-federation, profile-query policy). |
 | `allow_device_name_lookup_over_federation` | Mapped | `federation.allow_device_name_lookup_over_federation` | |
 | `federation` | Mapped (diff) | `federation.client_timeout`, `federation.max_retry_backoff` | Synapse tunes the short-retry (interactive) and long-retry (background) algorithms independently (`max_short_retry_delay`, `max_long_retry_delay`); the native schema exposes one backoff ceiling for both. |
+| *(no Synapse option)* | — | `network.outbound.ipv4_only` | Native only. Whether every connection this server opens (federation, remote media, link previews, push gateways, appservices, identity servers) uses IPv4 only -- the default, since many container networks have no IPv6 route -- or every address a name resolves to, falling back across them. Synapse has no setting to turn IPv6 off for outbound connections (Twisted tries every address); `federation_ip_range_blacklist` is a different thing, addresses never connected to at all. |
 
 ## Caching
 

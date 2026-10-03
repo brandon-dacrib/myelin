@@ -50,7 +50,9 @@ impl HttpIdentityService {
                  for test harnesses only"
             );
         }
-        let client = reqwest::Client::builder()
+        // The shared builder: the operating system's roots loaded once, and the outbound
+        // address policy (`network.outbound.ipv4_only`, fall-back across addresses).
+        let client = hs_http::client::builder()
             .timeout(REQUEST_TIMEOUT)
             .danger_accept_invalid_certs(insecure)
             .build()?;

@@ -1,5 +1,99 @@
 # 06 Federation: status
 
+## 2026-10-02 (branch `agent/outbound-ipv4-only`): the outbound address policy, and why `maunium.net` failed
+
+**What was wrong.** The demo pod logged `could not fetch remote media ... origin=maunium.net ...
+tcp connect error: Network unreachable (os error 101)` three times in three hours. `maunium.net`
+delegates to `federation.mau.chat`, which has an A record (`95.216.50.134`) and an AAAA record
+(`2a01:4f9:3a:ff34::`); the pod has no IPv6 route. The owner reproduced it on the desktop, which
+has no IPv6 route either: `curl -6` fails in 7 ms, `curl -4` connects, plain `curl` connects
+over IPv4 because it tries both. The server did not, and the reason was not hyper: hyper-util's
+connector does Happy Eyeballs by itself (the first address's family in order, the other family
+after 300 ms or at once when the first fails). The reason was `FederationClient::client_for`,
+which pinned each destination's pooled client with `.resolve(tls_server_name, first address)`
+-- a single `SocketAddr` chosen upstream from discovery, the AAAA record hickory listed first --
+so the connector had one address and nothing to fall back to. `hs-media`'s URL previewer did the
+same (`resolve_and_check` checked every address and returned `candidates[0]`). No custom
+resolver and no short connect timeout were involved; it was the pinned address.
+
+**What landed.**
+
+- `hs-config`: a `network` section, `network.outbound.ipv4_only` (`crates/hs-config/src/network.rs`),
+  on by default, classified **hot** in `reload::SETTINGS` (every outbound client's resolver
+  reads it per new connection). `docs/config.md` regenerated (`network` is a fully hot
+  section); the web schema fixture regenerated and `npm run check` passes, so the settings page
+  renders it as a plain toggle with the doc comment as its explanation.
+- `hs-http::outbound` (`crates/hs-http/src/outbound.rs`), the one place the policy lives:
+  `set_ipv4_only`/`ipv4_only`/`describe`; `select` (duplicates dropped, IPv6 dropped when the
+  policy says so, the resolver's order kept, a `ResolveError::OnlyIpv6` that names the setting
+  when nothing is left); `Resolver`, a `reqwest::dns::Resolve` over `tokio::net::lookup_host`
+  (the same `getaddrinfo` reqwest's own resolver uses) or over a caller's pinned addresses,
+  which hands hyper the *whole* list; and `ObserveLayer`, a `connector_layer` that reads the
+  address that connected from hyper-util's `HttpInfo` and the candidates the resolver offered
+  (a task-local), logs each passed-over address and its family at `debug`, and counts
+  `hs_outbound_connections_total{family}` and `hs_outbound_connect_failures_total{family}` (a
+  connection that fails altogether counts every address). `hs_http::client::builder()` and
+  the new `pinned_builder(host, addrs)` install both.
+- Every outbound client goes through it: the federation client (`client_for` pins every
+  resolved address with the connect port, and rebuilds the pooled client when the addresses
+  change, not only the server), the `.well-known` fetcher and key fetches (the former through
+  the shared builder, the latter through the client), remote media and URL previews (the
+  previewer pins every checked address), push (`hs-push` already used the shared builder),
+  appservice query/ping/scheduler (already) and provisioning (now), modules' HTTP callbacks
+  (now, `hs-modules` gained the `hs-http` dependency), identity servers
+  (`hs-cli/src/identity_service.rs`, now).
+- `hs-cli`: `live_config::apply_network` sets the policy at boot and on a change to `network`
+  and logs `outbound: IPv4 only` / `outbound: IPv4 and IPv6`; the counters are registered into
+  `/metrics`; `ServeOptions::federation_resolvers` is the test seam for discovery's resolvers.
+- Not covered, on purpose: the ICAP scanner (`icap-rs` owns its TCP; the host is an in-cluster
+  service), the cluster mesh (`hs-cluster`'s forwarder connects to replica addresses the
+  registry holds as literals), `hs-bridges`' client (another agent's crate today),
+  `hs-operator` (a separate binary), the CLI subcommands that talk to the local server, and a
+  URL whose host is an IP literal (hyper parses those without asking the resolver).
+
+**What hyper gives, and what was added.** reqwest 0.12.28 over hyper-util 0.1.20: the connector
+already tries every address it is given with a 300 ms family fall-back
+(`set_happy_eyeballs_timeout` is hyper-util's default; reqwest does not expose it, so the
+default stands). What it does not give is a per-address view: its connect error type is
+private, its per-attempt log is `trace!` behind a feature reqwest does not enable, and a
+`connector_layer` cannot re-call the inner connector (the request type is not `Clone`). So the
+layer infers: the address that connected (public, `HttpInfo`) against the candidates in the
+connector's attempt order. A slow first family that loses the 300 ms race is counted as passed
+over like a dead one; the module doc says so.
+
+**Verified.**
+
+- `cargo test -p hs-http`: six unit tests (the policy filter and ordering, the error text, the
+  attempt order, pins, the system resolver, the connect-error classification) and
+  `tests/outbound.rs`, which pins `dual-stack.test` to `[2001:db8::1]:port` and a listener on
+  `127.0.0.1`: under the default the IPv6 address is never tried (the listener's connection
+  count and the counters say so); with IPv6 on the request succeeds over IPv4 in 0.14 s with
+  one IPv6 failure counted; IPv4 only against an IPv6-only pin fails naming the setting; every
+  address dead counts both families.
+- `cargo test -p hs-cli --test outbound_address_policy` (2.3 s): server A named
+  `dual-stack.test:{port}`, servers B and C resolve it to `2001:db8::1` then `127.0.0.1`; B
+  (default) reads alice's profile from A over federation with no IPv6 failure counted; C
+  (`ipv4_only: false`) reads it too, with `hs_outbound_connect_failures_total{family="ipv6"}`
+  up by one and `hs_outbound_connections_total{family="ipv4"}` up by one on its `/metrics`.
+- `cargo test -p hs-config` (the classification tests, the web fixture), `cargo fmt --all
+  --check`, `cargo clippy --all-targets -- -D warnings` on hs-http, hs-config, hs-federation,
+  hs-media, hs-modules, hs-appservice and hs-cli; `npm run check` in `web/`.
+
+**Decisions made.**
+
+- The policy is **IPv4 only by default**; the owner asked for it and the demo cluster is the
+  reason. An operator with working IPv6 turns it off; the setting is hot.
+- The flag is **process-wide** (an atomic in `hs-http`), like the network the process is on;
+  every client reads it per new connection, and open connections are kept. Tests that change it
+  run their cases in sequence in one test function.
+- Fall-back stays hyper-util's; the fix is giving it every address. Nothing reimplements
+  connect attempts.
+- Synapse has no equivalent setting (Twisted tries every address); the translation table says
+  so in its Federation section.
+
+**Next.** Roll the demo and watch the `maunium.net` fetch succeed, and read
+`hs_outbound_connect_failures_total` on the pod.
+
 ## 2026-10-02 (branch `agent/federation-synapse`): the first attempt at a real Synapse
 
 **Goal.** Federate a Myelin built from this tree with a real Synapse in Docker, both directions,

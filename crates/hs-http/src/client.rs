@@ -55,8 +55,27 @@ pub async fn warm_native_roots() {
 
 /// A [`reqwest::ClientBuilder`] trusting the public (webpki) roots compiled in and the
 /// operating system's, loaded once -- the same trust `reqwest::Client::builder()` gives in this
-/// workspace, without the reload. Set a timeout and build, as with that.
+/// workspace, without the reload -- and connecting under the outbound address policy
+/// ([`crate::outbound`]: IPv4 only unless `network.outbound.ipv4_only` is off, every address
+/// tried, fall-backs logged and counted). Set a timeout and build, as with that.
 pub fn builder() -> reqwest::ClientBuilder {
+    crate::outbound::configure(trusting_builder(), crate::outbound::Resolver::default())
+}
+
+/// As [`builder`], for a client whose connections to `host` go to `addrs` -- every one of them,
+/// in this order, under the policy -- rather than to whatever `host` resolves to at connect
+/// time. For a caller that resolved and checked the addresses itself (the federation client
+/// after server discovery, the URL previewer after its blocklist check) and must connect to
+/// exactly what it checked. The addresses carry the port to connect to.
+pub fn pinned_builder(host: &str, addrs: &[std::net::SocketAddr]) -> reqwest::ClientBuilder {
+    crate::outbound::configure(
+        trusting_builder(),
+        crate::outbound::Resolver::pinned(host, addrs),
+    )
+}
+
+/// The trust half of [`builder`]: webpki's roots and the operating system's, loaded once.
+fn trusting_builder() -> reqwest::ClientBuilder {
     let mut builder = reqwest::Client::builder()
         .tls_built_in_webpki_certs(true)
         .tls_built_in_native_certs(false);

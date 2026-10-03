@@ -40,6 +40,7 @@ pub mod listeners;
 pub mod live;
 pub mod media;
 pub mod migration;
+pub mod network;
 pub mod ratelimit;
 pub mod reload;
 pub mod scanning;
@@ -68,6 +69,7 @@ pub use listeners::ListenersConfig;
 pub use live::Live;
 pub use media::MediaConfig;
 pub use migration::MigrationConfig;
+pub use network::{NetworkConfig, OutboundConfig};
 pub use ratelimit::RateLimitConfig;
 pub use secret::SecretString;
 pub use server::{ServerConfig, SyncConfig};
@@ -125,6 +127,11 @@ pub struct Config {
     /// migration is set up there.
     #[serde(default)]
     pub migration: MigrationConfig,
+    /// How this server reaches other hosts: whether its outbound connections use IPv4 only
+    /// (the default, since many container networks have no IPv6 route) or every address a
+    /// name resolves to.
+    #[serde(default)]
+    pub network: NetworkConfig,
 }
 
 impl Config {
@@ -206,6 +213,7 @@ impl Config {
         self.telemetry.validate("telemetry", &mut errors);
         self.cluster.validate("cluster", &mut errors);
         self.migration.validate("migration", &mut errors);
+        self.network.validate("network", &mut errors);
         errors.into_result()
     }
 }

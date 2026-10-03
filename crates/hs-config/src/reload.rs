@@ -186,6 +186,11 @@ pub const SETTINGS: &[Setting] = &[
         "/media/scanning",
         "the scan engine, its provider connections and verdict cache are built once",
     ),
+    // network
+    hot(
+        "/network/outbound/ipv4_only",
+        "every outbound client's resolver reads it per new connection (hs_http::outbound)",
+    ),
     // federation
     restart(
         "/federation/enabled",
@@ -560,6 +565,7 @@ pub const SECTION_NAMES: &[&str] = &[
     "telemetry",
     "cluster",
     "migration",
+    "network",
 ];
 
 #[cfg(test)]
@@ -700,7 +706,10 @@ mod tests {
     fn the_reloadable_sections_are_those_with_only_hot_administered_settings() {
         let mut sections = RELOADABLE_SECTIONS.clone();
         sections.sort_unstable();
-        assert_eq!(sections, vec!["migration", "rate_limits", "server"]);
+        assert_eq!(
+            sections,
+            vec!["migration", "network", "rate_limits", "server"]
+        );
     }
 
     #[test]

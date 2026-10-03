@@ -17,6 +17,8 @@
 //! - `federation` (its allow and block lists) — the outbound client's
 //!   [`hs_federation::client::DomainPolicy`] and [`hs_federation::client::IpPolicy`] are
 //!   replaced in place. Only when federation is enabled.
+//! - `network` (`outbound.ipv4_only`) — [`apply_network`] puts the outbound address policy in
+//!   force for every client in the process (`hs_http::outbound`, read per new connection).
 //! - `telemetry` (its log level) — [`hs_telemetry::LogLevelHandle::set_level`], wired in
 //!   `crate::cli`'s `run_serve`, which owns the telemetry guard. Not when `RUST_LOG` set the
 //!   filter: the change then waits for a restart and is reported so.
@@ -100,6 +102,18 @@ pub fn register_metrics(registry: &mut prometheus_client::registry::Registry) {
         "Hot configuration settings that changed, by setting (a JSON Pointer from \
          hs_config::reload::SETTINGS) and outcome: applied, failed or unwired",
         SETTINGS_APPLIED.clone(),
+    );
+}
+
+/// Puts `config.network.outbound` in force for every outbound client in this process
+/// (`hs_http::outbound`, read per new connection) and logs the policy as `outbound: IPv4 only`
+/// or `outbound: IPv4 and IPv6`. Called at boot and by the `network` section's applier.
+pub fn apply_network(config: &Config) {
+    hs_http::outbound::set_ipv4_only(config.network.outbound.ipv4_only);
+    let policy = hs_http::outbound::describe();
+    tracing::info!(
+        ipv4_only = config.network.outbound.ipv4_only,
+        "outbound: {policy}"
     );
 }
 

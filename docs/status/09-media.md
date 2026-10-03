@@ -8,6 +8,18 @@ closed the two Complement gaps — MSC2246 async upload's real `/_matrix/media/v
 `GET .../preview_url` — plus the content-scanning durability gap session 3 flagged. Sessions 1-4's
 records are unchanged below.
 
+## 2026-10-02 (branch `agent/outbound-ipv4-only`): remote media and previews reach dual-stack hosts
+
+Remote media from `maunium.net` failed on the demo pod with `Network unreachable`: the
+federation client pinned its connection to the first address it resolved, the AAAA record, and
+the pod has no IPv6 route. `hs-media`'s URL previewer had the same shape -- `resolve_and_check`
+checked every address and returned the first -- so a dual-stack page would have failed the same
+way. Both now pin every checked address (`hs_http::client::pinned_builder`), the connector
+falls back across them, and the new `network.outbound.ipv4_only` (on by default, hot) drops
+IPv6 first; the scanning HTTP provider already used the shared builder and gets the policy with
+it. The ICAP scanner (`icap-rs` owns its TCP) is not covered. Status 06 has the full entry and
+the verification.
+
 ## Session 6 (2026-09-28): media across servers
 
 Closes the known gap "Federation media fetch broken: remote avatars and attachments fail"

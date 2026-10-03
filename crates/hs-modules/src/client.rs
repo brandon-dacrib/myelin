@@ -40,7 +40,9 @@ impl HttpCallbackClient {
     }
 
     pub fn with_timeout(base_url: impl Into<String>, timeout: Duration) -> Self {
-        let http = reqwest::Client::builder()
+        // The shared builder: the operating system's roots loaded once, and the outbound
+        // address policy (`network.outbound.ipv4_only`, fall-back across addresses).
+        let http = hs_http::client::builder()
             .timeout(timeout)
             .build()
             .unwrap_or_default();

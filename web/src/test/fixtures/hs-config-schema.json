@@ -282,6 +282,15 @@
       "default": {
         "synapse": null
       }
+    },
+    "network": {
+      "description": "How this server reaches other hosts: whether its outbound connections use IPv4 only\n(the default, since many container networks have no IPv6 route) or every address a\nname resolves to.",
+      "$ref": "#/$defs/NetworkConfig",
+      "default": {
+        "outbound": {
+          "ipv4_only": true
+        }
+      }
     }
   },
   "additionalProperties": false,
@@ -2265,6 +2274,33 @@
         "database",
         "user"
       ]
+    },
+    "NetworkConfig": {
+      "description": "How this server connects to other hosts: other Matrix servers, push gateways, bridges and\nother appservices, identity servers, sign-in providers, and the sites it fetches link\npreviews from.",
+      "type": "object",
+      "properties": {
+        "outbound": {
+          "description": "Connections this server opens to other hosts.",
+          "$ref": "#/$defs/OutboundConfig",
+          "default": {
+            "ipv4_only": true
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "OutboundConfig": {
+      "description": "The address policy of every connection this server opens.",
+      "type": "object",
+      "properties": {
+        "ipv4_only": {
+          "description": "Connect to other servers over IPv4 only. On by default because many container networks\nhave no IPv6 route, and a server whose IPv6 address is unreachable would otherwise fail\nto fetch from it. Turn it off on a host with working IPv6; the server then tries every\naddress a name resolves to, and falls back to the next address when one does not\nconnect. Applies to every connection this server opens: to other Matrix servers,\npush gateways, bridges, identity servers, sign-in providers and link previews.\nSynapse has no equivalent setting.",
+          "type": "boolean",
+          "default": true,
+          "x-applies": "hot"
+        }
+      },
+      "additionalProperties": false
     }
   }
 }

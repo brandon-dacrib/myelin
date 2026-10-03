@@ -25,6 +25,7 @@ pub mod cors;
 pub mod error;
 pub mod fallback;
 pub mod listener;
+pub mod outbound;
 pub mod problem;
 pub mod ratelimit;
 pub mod router;

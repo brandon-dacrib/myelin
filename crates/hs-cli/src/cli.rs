@@ -1039,6 +1039,7 @@ async fn run_serve(args: &ServeArgs) -> i32 {
         ))),
         media_bulk_pause: std::time::Duration::ZERO,
         live_config: Some(live_config),
+        federation_resolvers: None,
     };
     let setup_link_hint =
         crate::serve::setup_link_host_hint(config.server.public_baseurl.as_deref());

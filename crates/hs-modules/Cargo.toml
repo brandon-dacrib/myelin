@@ -14,6 +14,8 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 reqwest = { workspace = true }
+# The shared outbound client builder (`hs_http::client`): one root store, one address policy.
+hs-http = { path = "../hs-http" }
 tokio = { workspace = true }
 
 [dev-dependencies]

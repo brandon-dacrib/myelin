@@ -166,7 +166,19 @@ pub struct ServeOptions {
     /// every change to. `None` wires nothing: the server runs on the configuration it was given
     /// until it stops, which is what an in-process test that never changes it wants.
     pub live_config: Option<Arc<crate::live_config::LiveConfig>>,
+    /// The DNS resolvers server discovery uses (SRV and A/AAAA). `None` is the system's
+    /// (`/etc/resolv.conf`), the only thing a real deployment ever has. A test that needs a
+    /// name to resolve to addresses of its choosing -- an unreachable IPv6 one beside a
+    /// listener of its own, say -- sets its own; nothing in a configuration file can.
+    pub federation_resolvers: Option<FederationResolvers>,
 }
+
+/// The SRV and A/AAAA resolvers server discovery uses: see
+/// [`ServeOptions::federation_resolvers`].
+pub type FederationResolvers = (
+    Arc<dyn hs_federation::discovery::SrvResolver>,
+    Arc<dyn hs_federation::discovery::AddrResolver>,
+);
 
 impl std::fmt::Debug for ServeOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -178,6 +190,7 @@ impl std::fmt::Debug for ServeOptions {
             .field("federation_scheme", &self.federation_scheme)
             .field("media_bulk_pause", &self.media_bulk_pause)
             .field("live_config", &self.live_config.is_some())
+            .field("federation_resolvers", &self.federation_resolvers.is_some())
             .finish()
     }
 }
@@ -1340,6 +1353,9 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     // (`hs_http::client`). Read on demand instead, the first one built -- on the runtime
     // thread, at boot -- stalled it for seconds on macOS.
     let roots = tokio::spawn(hs_http::client::warm_native_roots());
+    // The outbound address policy (`network.outbound.ipv4_only`), before the first client is
+    // built; logged as `outbound: IPv4 only` or `outbound: IPv4 and IPv6`.
+    crate::live_config::apply_network(&config);
 
     // Wired by the integration lead per docs/status/07-auth-and-identity.md "For track 12":
     // the persistent store replaces the in-memory one, so users, devices and tokens survive a
@@ -1383,6 +1399,9 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     metrics.with_registry(crate::backfill::register_metrics);
     // Federation requests a room's server ACL refused, and notary key queries.
     metrics.with_registry(hs_federation::metrics::register_transport_metrics);
+    // Outbound connections made and addresses that did not connect, by address family
+    // (`hs_http::outbound`): every outbound client of this server is counted.
+    metrics.with_registry(hs_http::outbound::register_metrics);
 
     // The first HTTP client is built in here (the ping transport); the roots are ready by now
     // on any machine that is not very slow, and on one that is, waiting beats blocking.
@@ -1441,6 +1460,11 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     );
     rooms.install_identity_service(identity_service.clone());
     if let Some(live) = &options.live_config {
+        // `network.outbound.ipv4_only`: every outbound client reads it per new connection.
+        live.on_change("network", |config| {
+            crate::live_config::apply_network(config);
+            Ok(())
+        });
         let rooms = rooms.clone();
         let limits = auth_state.limits.clone();
         live.on_change("rate_limits", move |config| {
@@ -1640,6 +1664,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             auth_state.store.clone(),
             e2e_state.clone(),
             options.federation_scheme,
+            options.federation_resolvers.clone(),
         )?;
         let mut mount = mount;
         // `rate_limits.federation`: inbound transactions per origin server.

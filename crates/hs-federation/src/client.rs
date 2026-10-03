@@ -922,26 +922,54 @@ impl FederationClient {
         })
     }
 
-    /// Returns a pooled `reqwest::Client` pinned (via `.resolve()`) so that connecting to
-    /// `outcome.server.tls_server_name` actually opens a TCP connection to
-    /// `outcome.server.connect_host`'s resolved address, while TLS SNI / the HTTP `Host` header
+    /// Returns a pooled `reqwest::Client` pinned (`hs_http::client`'s pinned resolver) so that
+    /// connecting to `outcome.server.tls_server_name` actually opens a TCP connection to one of
+    /// `outcome.server.connect_host`'s resolved addresses, while TLS SNI / the HTTP `Host` header
     /// still present `tls_server_name` — the separation the spec's delegation model requires.
     /// Rebuilds the pinned client if `outcome` differs from what is cached for this destination.
+    ///
+    /// Every resolved address is pinned, not the first: the connector then falls back across
+    /// them (Happy Eyeballs), and the outbound address policy (`network.outbound.ipv4_only`)
+    /// drops the IPv6 ones when it is on. Pinning the first address alone is how remote media
+    /// from a dual-stack server failed with `Network unreachable` on a cluster with no IPv6
+    /// route (2026-10-02): the AAAA record came first and nothing tried the A record.
     fn client_for(&self, destination: &str, outcome: &ResolveOutcome) -> reqwest::Client {
         let mut clients = self.http_clients.lock().unwrap();
         if let Some((cached_outcome, client)) = clients.get(destination)
             && cached_outcome.server == outcome.server
+            && cached_outcome.addresses == outcome.addresses
         {
             return client.clone();
         }
 
-        let connect_addr: Option<IpAddr> = outcome
+        let port = outcome.server.connect_port;
+        let mut connect_addrs: Vec<std::net::SocketAddr> = outcome
             .addresses
-            .first()
-            .copied()
-            .or_else(|| outcome.server.connect_host.parse().ok());
+            .iter()
+            .map(|ip| std::net::SocketAddr::new(*ip, port))
+            .collect();
+        if connect_addrs.is_empty()
+            && let Ok(ip) = outcome.server.connect_host.parse::<IpAddr>()
+        {
+            connect_addrs.push(std::net::SocketAddr::new(ip, port));
+        }
 
-        let mut builder = reqwest::Client::builder()
+        let base = if connect_addrs.is_empty() {
+            // Nothing resolved and no literal: the system resolver and the policy decide.
+            hs_http::outbound::configure(
+                reqwest::Client::builder(),
+                hs_http::outbound::Resolver::default(),
+            )
+        } else {
+            hs_http::outbound::configure(
+                reqwest::Client::builder(),
+                hs_http::outbound::Resolver::pinned(
+                    &outcome.server.tls_server_name,
+                    &connect_addrs,
+                ),
+            )
+        };
+        let mut builder = base
             .timeout(self.config.request_timeout)
             .danger_accept_invalid_certs(!self.config.verify_certificates)
             // The ~140 public webpki roots are always trusted (this call never disables them);
@@ -959,16 +987,9 @@ impl FederationClient {
             builder = builder.add_root_certificate(cert.clone());
         }
 
-        if let Some(ip) = connect_addr {
-            builder = builder.resolve(
-                &outcome.server.tls_server_name,
-                std::net::SocketAddr::new(ip, outcome.server.connect_port),
-            );
-        }
-
         let client = builder
             .build()
-            .expect("reqwest client with only timeout/resolve overrides always builds");
+            .expect("reqwest client with only timeout/resolver overrides always builds");
         clients.insert(
             destination.to_string(),
             (clone_outcome(outcome), client.clone()),

@@ -1329,6 +1329,7 @@ pub fn build_mount<B: KvBackend + 'static>(
     auth: Arc<dyn hs_auth::store::AuthStore>,
     e2e: hs_e2e::state::E2eState<B>,
     scheme: Option<&'static str>,
+    resolver_override: Option<crate::serve::FederationResolvers>,
 ) -> Result<FederationMount, hs_kv::KvError> {
     let server_name = identity.server_name.to_string();
     let own_keys = Arc::new(hs_federation::keys::OwnSigningKeys::from_keys(vec![
@@ -1351,7 +1352,9 @@ pub fn build_mount<B: KvBackend + 'static>(
     let well_known = Arc::new(hs_federation::discovery::CachingWellKnownFetcher::new(
         hs_federation::discovery::HttpWellKnownFetcher::new(),
     ));
-    let (srv, addr) = resolvers();
+    // The system's resolvers, unless a test gave the server its own
+    // (`ServeOptions::federation_resolvers`).
+    let (srv, addr) = resolver_override.unwrap_or_else(resolvers);
 
     let client = Arc::new(hs_federation::client::FederationClient::new(
         server_name.clone(),
