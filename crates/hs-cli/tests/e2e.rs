@@ -2034,10 +2034,13 @@ async fn the_user_directory_shows_a_searcher_only_who_they_could_already_see() {
         vec!["@dir-alice:example.org"],
         "bob sees alice and not eve"
     );
+    // Alice is in a public room, so she finds herself too: Synapse answers so, and Sytest's
+    // directory tests search for the requester's own name after a join and expect it (status 05
+    // session 14). Bob and eve are in no public room and do not find themselves.
     assert_eq!(
         search(alice.clone(), "dir-").await,
-        vec!["@dir-bob:example.org"],
-        "alice sees bob (their private room) and not eve, who is in no room with her"
+        vec!["@dir-alice:example.org", "@dir-bob:example.org"],
+        "alice sees herself (public room) and bob (their private room), and not eve, who is in no room with her"
     );
 
     handle.shutdown().await;
