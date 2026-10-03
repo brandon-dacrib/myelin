@@ -2,8 +2,8 @@
 //! binary, and a real encrypting client (`matrix-sdk` with `e2e-encryption`).
 //!
 //! This is the moment RFC 0017 was built for and the one nothing had exercised: an administrator
-//! enables the WhatsApp offering, an instance is made for a person, its personal bot invites them
-//! to a chat, and they type `login qr`. The bridge answers with a QR code (an `m.image`, or the
+//! enables the WhatsApp offering, an instance is made for a person, a chat with its personal bot
+//! appears, and they type `login qr`. The bridge answers with a QR code (an `m.image`, or the
 //! code as text when it cannot upload) without any phone being involved, so the whole path from
 //! a person's keyboard to the bridge's command handler and back is checked here, with the chat
 //! encrypted (the offering's default) and in the clear.
@@ -17,7 +17,10 @@
 //!
 //! What it caught (2026-10-02): the bridge decrypted `login qr` and dropped it, because the
 //! chat had been started by its bot, which a mautrix bridge never takes as a person's
-//! management room; the manager now starts the chat as the person.
+//! management room; the manager now starts the chat as the person. And the same day, on the
+//! demo server: the chat of an instance from before that fix was still the bot's, and typing in
+//! it still did nothing. The third test here is that chat: started by the bot, repaired by the
+//! manager in place (the bot leaves, the person re-invites it), and answered.
 
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
@@ -364,7 +367,50 @@ async fn wait_for_reply(
     Ok(replies)
 }
 
-// ---- the run -----------------------------------------------------------------------------------
+/// The bodies of what the bot says in `room` from now on, until one line per needle has been
+/// seen (each needle in some message, decrypted or plain), or `wait` is up. Returns every body
+/// seen, in order.
+async fn wait_for_bot_lines(
+    client: &Client,
+    since: &mut String,
+    room: &RoomId,
+    bot: &str,
+    needles: &[&str],
+    wait: Duration,
+) -> Result<Vec<String>> {
+    let deadline = Instant::now() + wait;
+    let mut bodies: Vec<String> = Vec::new();
+    while Instant::now() < deadline {
+        let response = client
+            .sync_once(
+                SyncSettings::default()
+                    .token(since.clone())
+                    .timeout(Duration::from_secs(3)),
+            )
+            .await?;
+        *since = response.next_batch.clone();
+        if let Some(joined) = response.rooms.joined.get(room) {
+            for event in &joined.timeline.events {
+                let (how, json) = classify(event);
+                if json["sender"].as_str() == Some(bot) && json["type"] == "m.room.message" {
+                    bodies.push(format!(
+                        "[{how}] {}",
+                        json["content"]["body"].as_str().unwrap_or_default()
+                    ));
+                }
+            }
+        }
+        if needles
+            .iter()
+            .all(|needle| bodies.iter().any(|b| b.contains(needle)))
+        {
+            return Ok(bodies);
+        }
+    }
+    Ok(bodies)
+}
+
+// ---- the scene -----------------------------------------------------------------------------------
 
 struct Bridge {
     name: String,
@@ -399,37 +445,73 @@ fn reserve_port() -> u16 {
         .unwrap_or(0)
 }
 
-fn keep_logs(label: &str, server: &Server, bridge: &Bridge) {
-    if let Ok(dir) = std::env::var("HS_BRIDGE_LOGIN_LOG_DIR") {
-        let dir = Path::new(&dir);
-        let _ = std::fs::create_dir_all(dir);
-        let _ = std::fs::write(dir.join(format!("{label}-hs.log")), server.log());
-        let _ = std::fs::write(dir.join(format!("{label}-bridge.log")), bridge.log());
+/// The server, the administrator, alice, her instance and its bridge, up and ready.
+struct Scene {
+    label: &'static str,
+    _dir: tempfile::TempDir,
+    server: Server,
+    admin: Admin,
+    alice: Client,
+    alice_id: String,
+    since: String,
+    instance_path: String,
+    appservice_id: String,
+    bot: String,
+    bridge: Bridge,
+}
+
+impl Scene {
+    fn keep_logs(&self) {
+        if let Ok(dir) = std::env::var("HS_BRIDGE_LOGIN_LOG_DIR") {
+            let dir = Path::new(&dir);
+            let _ = std::fs::create_dir_all(dir);
+            let _ = std::fs::write(
+                dir.join(format!("{}-hs.log", self.label)),
+                self.server.log(),
+            );
+            let _ = std::fs::write(
+                dir.join(format!("{}-bridge.log", self.label)),
+                self.bridge.log(),
+            );
+        }
+    }
+
+    async fn sync(&mut self, timeout: Duration) -> Result<matrix_sdk::sync::SyncResponse> {
+        let response = self
+            .alice
+            .sync_once(
+                SyncSettings::default()
+                    .token(self.since.clone())
+                    .timeout(timeout),
+            )
+            .await?;
+        self.since = response.next_batch.clone();
+        Ok(response)
     }
 }
 
-/// The whole story for one chat, encrypted or not. Returns the bot's replies to `login qr`.
-async fn login_qr(encrypted: bool) -> Result<()> {
-    let label = if encrypted { "encrypted" } else { "plain" };
+/// Everything up to "ready": the offering with `options`, alice's instance, its files, the
+/// container, the registration pointed at it.
+async fn set_up(label: &'static str, options: Value) -> Result<Scene> {
     let dir = tempfile::tempdir()?;
     let port = reserve_port();
     let server = Server::start(dir.path(), port)?;
     let admin = claim_server(&server).await?;
     let alice = register(&server.base, "alice").await?;
-    let alice_id = alice.user_id().context("alice's id")?.to_owned();
-    let mut since = alice.sync_once(SyncSettings::default()).await?.next_batch;
+    let alice_id = alice.user_id().context("alice's id")?.to_string();
+    let since = alice.sync_once(SyncSettings::default()).await?.next_batch;
 
     // The offering, as an administrator sets it up; the instance for alice; its files.
     admin
         .ok(
             reqwest::Method::PUT,
             "/bridge-offerings/mautrix-whatsapp",
-            Some(json!({"runtime": "elsewhere", "options": {"encryption": encrypted}})),
+            Some(json!({"runtime": "elsewhere", "options": options})),
         )
         .await?;
     let instance_path = format!(
         "/bridge-offerings/mautrix-whatsapp/instances/{}",
-        alice_id.as_str().replace('@', "%40").replace(':', "%3A")
+        alice_id.replace('@', "%40").replace(':', "%3A")
     );
     admin.ok(reqwest::Method::PUT, &instance_path, None).await?;
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -498,39 +580,53 @@ async fn login_qr(encrypted: bool) -> Result<()> {
             Some(json!({"url": format!("http://127.0.0.1:{bridge_port}")})),
         )
         .await?;
+    let scene = Scene {
+        label,
+        _dir: dir,
+        server,
+        admin,
+        alice,
+        alice_id,
+        since,
+        instance_path,
+        appservice_id,
+        bot,
+        bridge,
+    };
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
-        let instance = admin.ok(reqwest::Method::GET, &instance_path, None).await?;
+        let instance = scene
+            .admin
+            .ok(reqwest::Method::GET, &scene.instance_path, None)
+            .await?;
         if instance["state"] == "ready" {
             break;
         }
         if instance["state"] == "failed" || Instant::now() > deadline {
-            keep_logs(label, &server, &bridge);
+            scene.keep_logs();
             bail!(
                 "the instance never became ready: {instance}\n--- bridge log ---\n{}",
-                bridge.log()
+                scene.bridge.log()
             );
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+    Ok(scene)
+}
 
-    // Alice's chat with her bot appears: started as her, with the bot invited (the manager
-    // acting through the instance's claim on her), or, where it cannot act as her, an
-    // invitation from the bot that she accepts. Then she types `login qr`.
+/// Alice's chat with her bot appears: started as her, with the bot invited (the manager acting
+/// through the instance's claim on her), or, where it cannot act as her, an invitation from
+/// the bot that she accepts. Returns the room, after the join and the bot's first words have
+/// settled.
+async fn join_chat(scene: &mut Scene) -> Result<OwnedRoomId> {
     let deadline = Instant::now() + Duration::from_secs(60);
     let room_id: OwnedRoomId = loop {
-        let response = alice
-            .sync_once(
-                SyncSettings::default()
-                    .token(since.clone())
-                    .timeout(Duration::from_secs(2)),
-            )
-            .await?;
-        since = response.next_batch.clone();
+        let response = scene.sync(Duration::from_secs(2)).await?;
         if let Some(room_id) = response.rooms.invited.keys().next() {
-            alice.join_room_by_id(room_id).await?;
+            scene.alice.join_room_by_id(room_id).await?;
             break room_id.clone();
         }
+        let bot = scene.bot.clone();
         if let Some((room_id, _)) = response.rooms.joined.iter().find(|(_, joined)| {
             joined.timeline.events.iter().any(|event| {
                 let (_, json) = classify(event);
@@ -540,25 +636,22 @@ async fn login_qr(encrypted: bool) -> Result<()> {
             break room_id.clone();
         }
         if Instant::now() > deadline {
-            keep_logs(label, &server, &bridge);
-            bail!("no chat with {bot} ever reached alice");
+            scene.keep_logs();
+            bail!("no chat with {} ever reached alice", scene.bot);
         }
     };
-    let room = alice.get_room(&room_id).context("the joined room")?;
     // Let the join and the bot's welcome settle, and the client see the room's members.
-    since = alice
-        .sync_once(
-            SyncSettings::default()
-                .token(since.clone())
-                .timeout(Duration::from_secs(2)),
-        )
-        .await?
-        .next_batch;
+    scene.sync(Duration::from_secs(2)).await?;
+    Ok(room_id)
+}
+
+/// Alice types `login qr` (or `HS_BRIDGE_LOGIN_TEXT`) in `room_id` and the bot answers with a
+/// QR code.
+async fn login_qr_in(scene: &mut Scene, room_id: &RoomId) -> Result<()> {
+    let label = scene.label;
+    let bot = scene.bot.clone();
+    let room = scene.alice.get_room(room_id).context("the joined room")?;
     let is_encrypted = room.latest_encryption_state().await?.is_encrypted();
-    assert_eq!(
-        is_encrypted, encrypted,
-        "the chat's encryption should follow the offering's option"
-    );
     // `HS_BRIDGE_LOGIN_TEXT` types something else, to see how the bridge takes it (for
     // example `!wa login qr`, the prefixed form a mautrix bridge takes in any room).
     let text = std::env::var("HS_BRIDGE_LOGIN_TEXT").unwrap_or_else(|_| "login qr".into());
@@ -571,18 +664,27 @@ async fn login_qr(encrypted: bool) -> Result<()> {
         "[{label}] alice sent `{text}` as {sent_id} in {room_id} (encrypted: {is_encrypted})"
     );
 
-    let replies = wait_for_reply(&alice, &mut since, &room_id, &bot, &sent_id, REPLY_WAIT).await?;
-    keep_logs(label, &server, &bridge);
+    let replies = wait_for_reply(
+        &scene.alice,
+        &mut scene.since,
+        room_id,
+        &bot,
+        &sent_id,
+        REPLY_WAIT,
+    )
+    .await?;
+    scene.keep_logs();
     for r in &replies {
         eprintln!(
             "[{label}] {bot} answered ({}): type={} msgtype={} body={}",
             r.how, r.event["type"], r.event["content"]["msgtype"], r.event["content"]["body"]
         );
     }
-    let health = admin
+    let health = scene
+        .admin
         .ok(
             reqwest::Method::GET,
-            &format!("/appservices/{appservice_id}/health"),
+            &format!("/appservices/{}/health", scene.appservice_id),
             None,
         )
         .await?;
@@ -590,8 +692,8 @@ async fn login_qr(encrypted: bool) -> Result<()> {
     if replies.is_empty() {
         bail!(
             "{bot} said nothing within {REPLY_WAIT:?} of `login qr` ({label} chat). health: {health}\n--- bridge log (tail) ---\n{}\n--- server log (tail) ---\n{}",
-            tail(&bridge.log(), 60),
-            tail(&server.log(), 60)
+            tail(&scene.bridge.log(), 60),
+            tail(&scene.server.log(), 60)
         );
     }
     let qr = replies.iter().any(|r| {
@@ -608,10 +710,137 @@ async fn login_qr(encrypted: bool) -> Result<()> {
                 .iter()
                 .map(|r| (r.how, r.event["content"].clone()))
                 .collect::<Vec<_>>(),
-            tail(&bridge.log(), 60)
+            tail(&scene.bridge.log(), 60)
         );
     }
     Ok(())
+}
+
+/// The whole story for one chat, encrypted or not.
+async fn login_qr(encrypted: bool) -> Result<()> {
+    let label = if encrypted { "encrypted" } else { "plain" };
+    let mut scene = set_up(label, json!({"encryption": encrypted})).await?;
+    let room_id = join_chat(&mut scene).await?;
+    let room = scene.alice.get_room(&room_id).context("the joined room")?;
+    let is_encrypted = room.latest_encryption_state().await?.is_encrypted();
+    assert_eq!(
+        is_encrypted, encrypted,
+        "the chat's encryption should follow the offering's option"
+    );
+    let instance = scene
+        .admin
+        .ok(reqwest::Method::GET, &scene.instance_path, None)
+        .await?;
+    assert_eq!(
+        instance["chat_started_by"], "owner",
+        "the manager started the chat as alice: {instance}"
+    );
+    assert_eq!(instance["chat_room"], room_id.as_str(), "{instance}");
+    login_qr_in(&mut scene, &room_id).await
+}
+
+/// A chat the bot started, repaired in place. Without double puppeting the manager cannot act
+/// as alice, so the bot starts the chat and invites her: the shape of every chat from before
+/// 2026-10-02, and the bridge drops what she types there. Then the instance is allowed to act
+/// as her (the registration's claim on her, and the offering's option), and the manager's next
+/// step has the bot leave and alice re-invite it; the bridge accepts, marks the room as her
+/// management room and says so; the bot says why it had been silent; and `login qr` is answered.
+async fn repaired_chat() -> Result<()> {
+    let mut scene = set_up(
+        "repaired",
+        json!({"encryption": true, "double_puppeting": false}),
+    )
+    .await?;
+    let room_id = join_chat(&mut scene).await?;
+    let instance = scene
+        .admin
+        .ok(reqwest::Method::GET, &scene.instance_path, None)
+        .await?;
+    assert_eq!(
+        instance["chat_started_by"], "bot",
+        "without double puppeting the bot starts the chat: {instance}"
+    );
+    let bot = scene.bot.clone();
+    let alice_id = scene.alice_id.clone();
+    let appservice_id = scene.appservice_id.clone();
+
+    // What the registration would carry had double puppeting been on from the start: the
+    // non-exclusive claim on alice (`bridge_types::render_instance`). Arrays replace under a
+    // merge patch, so the whole list is sent.
+    let escaped = SERVER_NAME.replace('.', "\\.");
+    scene
+        .admin
+        .ok(
+            reqwest::Method::PATCH,
+            &format!("/appservices/{appservice_id}"),
+            Some(json!({"namespaces": {"users": [
+                {"regex": format!("@whatsapp_alice_.*:{escaped}"), "exclusive": true},
+                {"regex": format!("@whatsappbot_alice:{escaped}"), "exclusive": true},
+                {"regex": format!("@alice:{escaped}"), "exclusive": false},
+            ]}})),
+        )
+        .await?;
+    scene
+        .admin
+        .ok(
+            reqwest::Method::PUT,
+            "/bridge-offerings/mautrix-whatsapp",
+            Some(json!({"options": {"double_puppeting": true}})),
+        )
+        .await?;
+
+    // The bridge: "This room has been marked as your management room" (encrypted, since the
+    // room is). The bot, through the manager: why it had been silent (plain).
+    let lines = wait_for_bot_lines(
+        &scene.alice,
+        &mut scene.since,
+        &room_id,
+        &bot,
+        &["management room", "come back on your invitation"],
+        Duration::from_secs(60),
+    )
+    .await?;
+    scene.keep_logs();
+    for line in &lines {
+        eprintln!("[repaired] {bot}: {line}");
+    }
+    if !lines.iter().any(|l| l.contains("management room")) {
+        bail!(
+            "the bridge never marked the chat as alice's management room; it said {lines:?}\n--- bridge log (tail) ---\n{}\n--- server log (tail) ---\n{}",
+            tail(&scene.bridge.log(), 80),
+            tail(&scene.server.log(), 40)
+        );
+    }
+    if !lines
+        .iter()
+        .any(|l| l.contains("come back on your invitation"))
+    {
+        bail!("the bot never said why it had been silent; it said {lines:?}");
+    }
+    let instance = scene
+        .admin
+        .ok(reqwest::Method::GET, &scene.instance_path, None)
+        .await?;
+    assert_eq!(instance["chat_started_by"], "owner", "{instance}");
+    assert_eq!(instance["chat_room"], room_id.as_str(), "{instance}");
+    let server_log = scene.server.log();
+    assert!(
+        server_log.contains("repaired the owner's chat with their bridge's bot"),
+        "the server says what it did"
+    );
+    let bridge_log = scene.bridge.log();
+    assert!(
+        bridge_log.contains("Accepted invite to room as bot"),
+        "the bridge accepted alice's invitation; its log (tail):\n{}",
+        tail(&bridge_log, 60)
+    );
+    // The room's state agrees: the bot's membership is on alice's invitation now.
+    let room = scene.alice.get_room(&room_id).context("the room")?;
+    let members = room.members(matrix_sdk::RoomMemberships::JOIN).await?;
+    assert_eq!(members.len(), 2, "alice and the bot");
+    let _ = alice_id;
+
+    login_qr_in(&mut scene, &room_id).await
 }
 
 fn tail(s: &str, n: usize) -> String {
@@ -619,14 +848,17 @@ fn tail(s: &str, n: usize) -> String {
     lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
-fn run(encrypted: bool) {
+fn run<F>(story: F)
+where
+    F: std::future::Future<Output = Result<()>>,
+{
     let _guard = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(reason) = skip_reason() {
         eprintln!("SKIP: {reason}");
         return;
     }
     let runtime = tokio::runtime::Runtime::new().expect("a tokio runtime");
-    if let Err(e) = runtime.block_on(login_qr(encrypted)) {
+    if let Err(e) = runtime.block_on(story) {
         panic!("{e:#}");
     }
 }
@@ -634,11 +866,17 @@ fn run(encrypted: bool) {
 /// The offering's default: an end-to-end encrypted chat with the personal bot.
 #[test]
 fn a_person_types_login_qr_in_the_encrypted_chat_and_gets_a_qr_code() {
-    run(true);
+    run(login_qr(true));
 }
 
 /// The same with `options.encryption: false`.
 #[test]
 fn a_person_types_login_qr_in_a_plain_chat_and_gets_a_qr_code() {
-    run(false);
+    run(login_qr(false));
+}
+
+/// A chat the bot started (every chat from before 2026-10-02) is repaired in place and answers.
+#[test]
+fn a_chat_the_bot_started_is_repaired_in_place_and_login_qr_gets_a_qr_code() {
+    run(repaired_chat());
 }

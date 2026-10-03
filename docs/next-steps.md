@@ -36,17 +36,23 @@ The OpenAPI version on `main` is **0.1.2**; `agent/admin-token` must take 0.1.3.
 | `agent/user-erase-web` | `749301c` | the UI: "Also erase their data" in the deactivate dialog with the plain-words explanation, an Erase box for deactivated accounts, Erased badges, Reactivate replaced by a why-not box; mocks; `web/e2e/user-erase.spec.ts`; `web/e2e-real/user-erase.spec.ts` to run on the merged binary. Status 16 | `npm run check` 504 tests, `test:e2e` 55; **the real spec 2/2 on the erasure binary**, which found and fixed a stale device list after erasing | merged `914ad7ae` |
 | `agent/bridge-login` | `64c8be4d` | **why `login qr` did nothing**: mautrix `bridgev2` takes a bare command only in the sender's management room, which is set when the *person invites the bot*; the manager created the chat as the bot and invited the person, so the bridge decrypted the message and dropped it with no notice (encryption was fine both ways). Fix: with double puppeting the chat is created as the owner with the bot invited; without, the first line says to start the chat yourself. New real-bridge test `crates/hs-bridge-conformance/tests/real_mautrix_login.rs` (encrypted and plain, asserts the QR). Status 11, `docs/bridges/mautrix.md` | real mautrix-whatsapp in Docker 2/2; hs-bridges, hs-cli `bridge_offerings` 3/3 | merged `d0642a05` |
 
-**The owner's WhatsApp bridge** (`@brandon`, demo cluster): the chat the bot opened can never
-become its management room. **Today, no deploy needed:** type `!wa login qr` (or `!wa login
-phone`) in that chat; the bot says the room is not its management room and then shows the QR.
-Or start a new direct chat in Element and invite `@whatsappbot_brandon:myelin.dacrib.net`; the
-bot accepts and marks it, and `login qr` works there. After `agent/bridge-login` is deployed, a
-removed and re-added instance gets a chat started as the person. The pod named
-`myelin-hs-bridges-operator-…` is the chart's operator; the instance's pod is `bridge-<8 hex>`
-until `agent/bridge-names` merges and the instance is removed and re-added. The server cannot
-see a bridge drop a delivered message (health and backlog say delivered, correctly); the
-bridge's log does: `Received command` means taken, `Event decrypted successfully` then nothing
-means dropped as not a management room.
+**The owner's WhatsApp bridge** (`@brandon`, demo cluster): diagnosed on the live cluster on
+2026-10-02 evening (status 11, "the owner's bot was silent"): the bridge was healthy across the
+server's restart (no restart needed or done), every one of the eight messages was delivered and
+**decrypted and dropped**, because the chat is the bot's (`m.room.create` sender
+`@whatsappbot_brandon`); `!wh` is not `!wa`. **Branch `agent/bridge-responds`** (unmerged at
+this writing) makes the manager repair such a chat in place at the next roll: the bot leaves,
+brandon re-invites it (double puppeting), the bridge marks the room and says so, the bot says why
+it had been silent; `login qr` then works in the same chat. Proven with the real bridge
+(`real_mautrix_login.rs`, 3 of 3). **Today, no deploy needed:** type `!wa login qr` (or `!wa
+login phone`) in that chat; the bot says the room is not its management room and then shows the
+QR. Or start a new direct chat in Element and invite `@whatsappbot_brandon:myelin.dacrib.net`;
+the bot accepts and marks it, and `login qr` works there. After the roll, just `login qr` in the
+existing chat once the bot has rejoined. The pod named `myelin-hs-bridges-operator-…` is the
+chart's operator; the instance's pod is `bridge-<8 hex>` until the instance is removed and
+re-added (bridge-names is merged). The server cannot see a bridge drop a delivered message
+(health and backlog say delivered, correctly); the bridge's log does: `Received command` means
+taken, `Event decrypted successfully` then nothing means dropped as not a management room.
 
 **Order to merge next:** the ten branches of the 14:25 section in their order, one Sytest
 measurement after them. Remove each worktree after its merge (`git worktree remove

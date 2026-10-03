@@ -43,6 +43,11 @@ pub struct OfferingRow {
     pub created_at_ms: u64,
 }
 
+/// [`InstanceRow::dm_started_by`]: the bot is in the chat on the owner's invitation.
+pub const CHAT_BY_OWNER: &str = "owner";
+/// [`InstanceRow::dm_started_by`]: the bot started the chat and nobody invited it.
+pub const CHAT_BY_BOT: &str = "bot";
+
 /// Where an instance is in its life (RFC 0017 section 4.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -102,6 +107,15 @@ pub struct InstanceRow {
     pub front_door_room: Option<String>,
     /// The direct chat between the owner and the instance's bot, once made.
     pub dm_room: Option<String>,
+    /// Who the bot is in that chat for: [`CHAT_BY_OWNER`] when the owner invited it (the
+    /// owner started the chat, or the manager had the bot leave and the owner re-invite it:
+    /// either way the bridge marks the room as the owner's management room and takes bare
+    /// commands there), [`CHAT_BY_BOT`] when the bot started it and the owner could not be
+    /// acted for (commands there need the bridge's prefix). `None` on a row from before this
+    /// was recorded: the manager reads the room's creator and settles it
+    /// (`manager::BridgeManager::settle_chat`).
+    #[serde(default)]
+    pub dm_started_by: Option<String>,
     pub created_at_ms: u64,
     /// When it entered its current state.
     pub state_since_ms: u64,
@@ -138,6 +152,7 @@ impl InstanceRow {
             url: None,
             front_door_room: None,
             dm_room: None,
+            dm_started_by: None,
             created_at_ms: now_ms,
             state_since_ms: now_ms,
             ready_at_ms: None,

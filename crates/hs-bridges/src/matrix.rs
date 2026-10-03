@@ -138,6 +138,88 @@ impl MatrixClient {
         .map(|_| ())
     }
 
+    /// Leaves `room_id` as `user`; one not in it is fine.
+    ///
+    /// # Errors
+    /// On any other failure.
+    pub async fn leave(&self, token: &str, user: &str, room_id: &str) -> Result<(), MatrixError> {
+        let result = self
+            .call(
+                reqwest::Method::POST,
+                self.url(&["rooms", room_id, "leave"], Some(user)),
+                token,
+                Some(json!({})),
+                "leave",
+            )
+            .await;
+        match result {
+            Err(e) if e.status == 403 && e.errcode == "M_FORBIDDEN" => Ok(()), // not in it
+            other => other.map(|_| ()),
+        }
+    }
+
+    /// The joined members of `room_id`, as `user` sees them.
+    ///
+    /// # Errors
+    /// On failure, a 403 included when `user` is not in the room.
+    pub async fn joined_members(
+        &self,
+        token: &str,
+        user: &str,
+        room_id: &str,
+    ) -> Result<Vec<String>, MatrixError> {
+        let body = self
+            .call(
+                reqwest::Method::GET,
+                self.url(&["rooms", room_id, "joined_members"], Some(user)),
+                token,
+                None,
+                "joined_members",
+            )
+            .await?;
+        Ok(body["joined"]
+            .as_object()
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default())
+    }
+
+    /// Who created `room_id`: the sender of its `m.room.create`, read from the room's state as
+    /// `user` (room version 11 dropped `creator` from the event's content, so the content
+    /// alone does not say).
+    ///
+    /// # Errors
+    /// On failure, or when the state has no create event.
+    pub async fn room_creator(
+        &self,
+        token: &str,
+        user: &str,
+        room_id: &str,
+    ) -> Result<String, MatrixError> {
+        let state = self
+            .call(
+                reqwest::Method::GET,
+                self.url(&["rooms", room_id, "state"], Some(user)),
+                token,
+                None,
+                "state",
+            )
+            .await?;
+        state
+            .as_array()
+            .and_then(|events| {
+                events
+                    .iter()
+                    .find(|e| e["type"] == "m.room.create")
+                    .and_then(|e| e["sender"].as_str())
+                    .map(str::to_owned)
+            })
+            .ok_or_else(|| MatrixError {
+                context: "state: no m.room.create".into(),
+                status: 200,
+                errcode: String::new(),
+            })
+    }
+
     /// Sends a notice (plain text and HTML) to `room_id` as `user`.
     ///
     /// # Errors

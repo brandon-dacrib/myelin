@@ -169,6 +169,7 @@ function seed() {
       health: "healthy",
       created_at: iso(age),
       ready_at: iso(age - 90_000),
+      chat_started_by: "owner",
     });
     i.deployment = deploymentFor(whatsapp, i, "Ready", null);
     return i;

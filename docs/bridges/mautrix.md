@@ -119,6 +119,34 @@ real_mautrix_login -- --nocapture` with Docker reachable (it pulls the image fro
 is missing, and skips, saying why, when it cannot). `HS_BRIDGE_LOGIN_LOG_DIR=<dir>` keeps the
 server's and the bridge's logs; `HS_BRIDGE_LOGIN_TEXT='!wa login qr'` types something else.
 
+## 2026-10-02, later: a chat the bot started is repaired in place
+
+The demo cluster's bridge for `@brandon` was made before the fix above, and its chat was the
+bot's: eight messages typed there were each decrypted by the bridge (`Event decrypted
+successfully`) and dropped, with the bridge healthy, its keys fine and every transaction
+delivered. Nothing in the server could see that; the bridge's log could. So the manager now
+settles every owned instance's chat (`hs_bridges::manager::BridgeManager::settle_chat`): it
+reads who created the room, and where the bot did and the instance may act as the owner
+(double puppeting), **the bot leaves and the owner re-invites it**, which is the one thing
+`bridgev2` takes as "mark this room as the person's management room"
+(`handleBotInvite`: an invitation for the bot from someone allowed commands, accepted, two
+members). The bridge says "This room has been marked as your management room", the bot says
+why it had been silent and lists the steps again, and `login qr` works in the same chat. Where
+the instance cannot act as the owner, the bot says once that commands there need its prefix
+(`!wa login qr`), or a chat the person starts; the bridge page says the same, and the admin
+API carries `chat_room`, `chat_started_by` and the type's `command_prefix`.
+
+The third story in `crates/hs-bridge-conformance/tests/real_mautrix_login.rs` is that chat:
+made with `double_puppeting: false` so the bot starts it, then the instance allowed to act as
+alice (the registration's claim on her, and the option), the repair, the bridge's own
+"management room" line decrypted by her client, `Accepted invite to room as bot` in the
+bridge's log, and the QR. Status 11 has the cluster's evidence and what the owner types.
+
+The command prefixes the catalogue knows (from each bridge's `pkg/connector/connector.go`):
+WhatsApp `!wa`, Telegram `!tg`, Google Messages `!gm`, Google Voice `!gv`, Messenger and
+Instagram `!fb`, Discord `!discord`, Bluesky `!bsky`. Signal, Slack and X set none in their
+connector, so none is claimed for them.
+
 ## 2026-10-01: the server asks the bridge who has signed in
 
 The render now writes a `provisioning.shared_secret` of its own into `config.yaml` and keeps the

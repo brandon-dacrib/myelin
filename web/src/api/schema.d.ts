@@ -2682,6 +2682,13 @@ export interface components {
             appservice_id?: string | null;
             /** @description The instance's own bot, which the user talks to. */
             bot?: string | null;
+            /** @description The direct chat between the owner and the bot, once the manager has made it. */
+            chat_room?: string | null;
+            /**
+             * @description Who the bot is in that chat for. `owner` when the owner invited it, so the bridge takes bare commands there; `bot` when the bot started it and nobody could act as the owner, so commands there need the bridge's prefix (or a new chat the owner starts); null until the manager has settled it.
+             * @enum {string|null}
+             */
+            chat_started_by?: "owner" | "bot" | null;
             /** Format: date-time */
             created_at?: string;
             deployment?: null | components["schemas"]["BridgeDeployment"];
@@ -2818,6 +2825,8 @@ export interface components {
              * @enum {string}
              */
             category?: "messaging" | "social" | "irc" | "integrations";
+            /** @description What a command to the bot starts with to be taken anywhere the bot is (`!wa`), where the bridge has one; a bare command is taken only in the person's management room. */
+            command_prefix?: string | null;
             config_keys?: {
                 description?: string;
                 key?: string;

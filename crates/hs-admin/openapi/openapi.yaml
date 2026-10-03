@@ -10,7 +10,7 @@ openapi: 3.1.0
 info:
   title: hs-admin API
   summary: The native administration and moderation API for the homeserver.
-  version: 0.1.4
+  version: 0.1.5
   description: 'The only API the management interface (track 16) talks to. See docs/rfcs/0004-admin-api.md for the full design rationale: resource modeling, naming, pagination, filtering, errors, idempotency, scopes, versioning and the event stream. This document is the contract; the hs-admin router''s contract tests assert the router and this document agree on paths and methods (RFC 0004 section 1, decision D15.16).'
   contact:
     name: 'Track 15: Admin API and modules'
@@ -46,6 +46,11 @@ info:
       last_successful_at, retry_last_at, pending_pdu_count, pending_edu_count; - for
       descending) and documents its default order and paging; Replica.heartbeat_seq;
       ClusterStatus.heartbeat_seq and .drain_released_at_once_count.'
+  - version: 0.1.5
+    date: '2026-10-02'
+    notes: 'Additive: BridgeInstance.chat_room and chat_started_by (owner or bot) say which
+      direct chat a person has with their bridge''s bot and who opened it; BridgeType.command_prefix
+      is the prefix the bridge''s bot takes commands with outside its management room.'
 servers:
 - url: /api/v1
   description: Same origin as /_matrix on the client listener.
@@ -8105,6 +8110,11 @@ components:
                 type: boolean
         supports_double_puppeting:
           type: boolean
+        command_prefix:
+          type:
+          - string
+          - 'null'
+          description: What a command to the bot starts with to be taken anywhere the bot is (`!wa`), where the bridge has one; a bare command is taken only in the person's management room.
         required_features:
           type: array
           items:
@@ -8453,6 +8463,20 @@ components:
           - string
           - 'null'
           format: date-time
+        chat_room:
+          type:
+          - string
+          - 'null'
+          description: The direct chat between the owner and the bot, once the manager has made it.
+        chat_started_by:
+          type:
+          - string
+          - 'null'
+          enum:
+          - owner
+          - bot
+          - null
+          description: Who the bot is in that chat for. `owner` when the owner invited it, so the bridge takes bare commands there; `bot` when the bot started it and nobody could act as the owner, so commands there need the bridge's prefix (or a new chat the owner starts); null until the manager has settled it.
     BridgeDeployment:
       type: object
       required:

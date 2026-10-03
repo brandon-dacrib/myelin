@@ -517,6 +517,10 @@ pub struct BridgeType {
     pub default_namespaces: serde_json::Value,
     pub config_keys: Vec<BridgeTypeConfigKey>,
     pub supports_double_puppeting: bool,
+    /// What a command to the bot starts with to be taken anywhere the bot is (`!wa`), where
+    /// the bridge has one; a bare command is taken only in the person's management room.
+    #[serde(default)]
+    pub command_prefix: Option<String>,
     pub required_features: Vec<String>,
     /// Whether a render of this type produces a `config_yaml` the bridge reads as it is
     /// (mautrix bridges), or only the registration and the notes to run it.
@@ -771,6 +775,15 @@ pub struct BridgeInstance {
     pub last_error: Option<String>,
     pub created_at: String,
     pub ready_at: Option<String>,
+    /// The direct chat between the owner and the bot, once the manager has made it.
+    #[serde(default)]
+    pub chat_room: Option<String>,
+    /// Who the bot is in that chat for: `owner` when the owner invited it (the bridge takes
+    /// bare commands there), `bot` when the bot started it and nobody could act as the owner
+    /// (commands there need the bridge's prefix, or a new chat the owner starts); `null`
+    /// until the manager has settled it.
+    #[serde(default)]
+    pub chat_started_by: Option<String>,
 }
 
 /// The OpenAPI `BridgeInstanceFiles` schema. Carries tokens; Debug shows none of it.

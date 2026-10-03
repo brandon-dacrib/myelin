@@ -75,6 +75,26 @@ describe("InstanceNextSteps", () => {
     expect(screen.queryByText(/This is you/)).toBeNull();
   });
 
+  it("says the chat was started for them when the manager could act as them", async () => {
+    renderSteps(instance("@carol:example.org", { chat_started_by: "owner" }));
+    expect(
+      await screen.findByText(/is in a direct chat started for them\. They should open it/),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId("chat-started-by-bot")).toBeNull();
+    expect(screen.getByText(/If the chat is nowhere to be found/)).toBeInTheDocument();
+  });
+
+  it("warns, with the prefix, when the chat was started by the bot", async () => {
+    renderSteps(instance("@carol:example.org", { chat_started_by: "bot" }));
+    const warning = await screen.findByTestId("chat-started-by-bot");
+    expect(warning).toHaveTextContent("That chat was started by the bot");
+    expect(warning).toHaveTextContent("!wa login qr rather than login qr");
+    expect(warning).toHaveTextContent(
+      "they can start a new direct chat with @whatsappbot_carol:example.org",
+    );
+    expect(screen.queryByText(/nowhere to be found/)).toBeNull();
+  });
+
   it("copies the steps as one message to paste to the person", async () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
     Object.assign(navigator, { clipboard: { writeText } });

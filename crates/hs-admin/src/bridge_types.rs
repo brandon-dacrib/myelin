@@ -425,6 +425,26 @@ pub fn provisioning(type_id: &str) -> Option<(ProvisioningApi, &'static str)> {
     entry(type_id).map(provisioning_of)
 }
 
+/// The prefix a command to the bot takes to be understood anywhere the bot is: a mautrix
+/// bridge's `DefaultCommandPrefix` (its connector's `GetName()`; `!wa` for WhatsApp), which
+/// the config this server renders leaves at the bridge's default. A bare command is taken only
+/// in the person's management room, the chat they invited the bot into. `None` where the
+/// bridge has no such prefix, or it is not known here. Read from each bridge's source on
+/// 2026-10-02 (`pkg/connector/connector.go`, or the example config for Discord); Signal, Slack
+/// and X set none there, so theirs are not claimed.
+fn command_prefix(entry: &Entry) -> Option<&'static str> {
+    match entry.id {
+        "mautrix-whatsapp" => Some("!wa"),
+        "mautrix-telegram" => Some("!tg"),
+        "mautrix-gmessages" => Some("!gm"),
+        "mautrix-gvoice" => Some("!gv"),
+        "mautrix-meta" => Some("!fb"),
+        "mautrix-discord" => Some("!discord"),
+        "mautrix-bluesky" => Some("!bsky"),
+        _ => None,
+    }
+}
+
 /// Whether an instance runs from what a render writes alone. Not matrix-appservice-irc or
 /// hookshot, whose configs name networks and services only an operator knows; not Telegram,
 /// whose config needs the operator's own API ID and hash.
@@ -496,6 +516,7 @@ fn bridge_type(entry: &Entry, server_name: &str) -> BridgeType {
             })
             .collect(),
         supports_double_puppeting: entry.double_puppeting,
+        command_prefix: command_prefix(entry).map(str::to_owned),
         required_features: entry.features.iter().map(|f| (*f).to_owned()).collect(),
         renders_config: entry.runtime == Runtime::Mautrix,
         mode: mode(entry).to_owned(),

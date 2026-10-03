@@ -198,6 +198,9 @@ function SignInSteps({
   const owner = instance.user_id ?? "";
   const steps = signInSteps(type, bot ?? "its bot");
   const command = firstCommand(steps);
+  // The manager starts the chat as the person where it can act as them (double puppeting), so
+  // there is nothing to accept; a chat its bot started needs the bridge's command prefix.
+  const chatStartedAsOwner = instance.chat_started_by === "owner";
   const [copied, setCopied] = useState(false);
 
   async function copyMessage() {
@@ -228,7 +231,7 @@ function SignInSteps({
 
       {isSelf ? (
         <p className="rounded-md border border-info-border bg-info-bg px-3 py-2 text-info">
-          This is you: accept the invite from{" "}
+          This is you: {chatStartedAsOwner ? "open your chat with" : "accept the invite from"}{" "}
           {bot ? <CopyableId value={bot} /> : "your bridge's bot"} in your chat app
           {command ? (
             <>
@@ -247,7 +250,33 @@ function SignInSteps({
               , <CopyableId value={bot} />,
             </>
           )}{" "}
-          has invited them to a direct chat. They should accept it, then:
+          {chatStartedAsOwner
+            ? "is in a direct chat started for them. They should open it, then:"
+            : "has invited them to a direct chat. They should accept it, then:"}
+        </p>
+      )}
+
+      {instance.chat_started_by === "bot" && (
+        <p
+          className="rounded-md border border-warning-border bg-warning-bg px-3 py-2 text-warning"
+          data-testid="chat-started-by-bot"
+        >
+          That chat was started by the bot, and a {name} bridge only takes bare commands in a chat
+          the person invited it to, so there {isSelf ? "you" : "they"} must prefix commands
+          {type?.command_prefix ? (
+            <>
+              :{" "}
+              <code className="font-identifier">
+                {type.command_prefix} {command ?? "login"}
+              </code>{" "}
+              rather than <code className="font-identifier">{command ?? "login"}</code>.
+            </>
+          ) : (
+            " with the bridge's command prefix (its documentation says which)."
+          )}{" "}
+          Or {isSelf ? "start" : "they can start"} a new direct chat with{" "}
+          {bot ? <span className="font-identifier">{bot}</span> : "the bot"}: the bridge takes bare
+          commands there. The bot has said the same in the chat.
         </p>
       )}
 
@@ -276,11 +305,12 @@ function SignInSteps({
         </p>
       )}
 
-      {bot && (
+      {bot && instance.chat_started_by !== "bot" && (
         <p className="text-text-muted">
-          If the invite is nowhere to be found, {isSelf ? "start" : "they can start"} a direct chat
-          with <span className="font-identifier">{bot}</span> {isSelf ? "yourself" : "themselves"}:
-          the bridge treats it the same way.
+          If the {chatStartedAsOwner ? "chat" : "invite"} is nowhere to be found,{" "}
+          {isSelf ? "start" : "they can start"} a direct chat with{" "}
+          <span className="font-identifier">{bot}</span> {isSelf ? "yourself" : "themselves"}: the
+          bridge treats it the same way.
         </p>
       )}
 

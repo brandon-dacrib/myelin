@@ -42,7 +42,10 @@ use sha2::{Digest, Sha256};
 
 use crate::matrix::MatrixClient;
 use crate::runtime::{DeploySpec, Runtime, manifest_yaml};
-use crate::store::{BridgeStore, InstanceRow, InstanceState, ManagerRow, OfferingRow, StoreError};
+use crate::store::{
+    BridgeStore, CHAT_BY_BOT, CHAT_BY_OWNER, InstanceRow, InstanceState, ManagerRow, OfferingRow,
+    StoreError,
+};
 
 /// The manager's own appservice id.
 pub const MANAGER_ID: &str = "myelin-bridges";
@@ -429,6 +432,8 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             last_error: health.and_then(|h| h.last_error),
             created_at: rfc3339(row.created_at_ms),
             ready_at: row.ready_at_ms.map(rfc3339),
+            chat_room: row.dm_room.clone(),
+            chat_started_by: row.dm_started_by.clone(),
         }
     }
 
@@ -672,8 +677,12 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
                 Ok(())
             }
             InstanceState::Ready => {
-                if row.dm_room.is_none() && owner_of(row).is_some() {
-                    self.invite_owner(row, &offering).await?;
+                if owner_of(row).is_some() {
+                    if row.dm_room.is_none() {
+                        self.invite_owner(row, &offering).await?;
+                    } else if row.dm_started_by.as_deref() != Some(CHAT_BY_OWNER) {
+                        self.settle_chat(row, &offering).await?;
+                    }
                 }
                 Ok(())
             }
@@ -905,8 +914,7 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
         // here as well so the steps can be posted at once; the bridge accepts the invite it is
         // sent, finds two members and marks the room. Without that claim the chat can only be
         // started by the bot, and the steps say to start one.
-        let as_owner = kind.as_ref().is_some_and(|k| k.supports_double_puppeting)
-            && offering.options.double_puppeting.unwrap_or(true);
+        let as_owner = may_act_as_owner(kind.as_ref(), offering);
         let room = if as_owner {
             let room = client
                 .create_dm(&token, owner, &bot, encrypted)
@@ -941,6 +949,7 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
                     return false;
                 }
                 r.dm_room = Some(room.clone());
+                r.dm_started_by = Some(if as_owner { CHAT_BY_OWNER } else { CHAT_BY_BOT }.into());
                 true
             })
             .map_err(|e| e.to_string())?;
@@ -948,15 +957,7 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             return Ok(()); // another replica got there first
         }
         let name = bridge_types::display_name(&row.bridge_type).unwrap_or(&row.bridge_type);
-        let steps: Vec<String> = kind
-            .map(|k| {
-                k.sign_in
-                    .steps
-                    .iter()
-                    .map(|s| s.replace("{bot}", "me"))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let steps = sign_in_steps(kind.as_ref());
         let mut text = format!("This is your own {name} bridge. To sign in:\n");
         let mut html = format!("<p>This is your own {name} bridge. To sign in:</p><ol>");
         if !as_owner {
@@ -971,12 +972,10 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             );
         }
         for step in steps.iter() {
-            // "Start a direct chat with me and send `login qr`" reads oddly in the chat itself.
-            let step = step.replace("Start a direct chat with me and send", "Send");
             text.push_str(&format!("- {step}\n"));
             html.push_str(&format!(
                 "<li>{}</li>",
-                crate::front_door::inline_html(&step)
+                crate::front_door::inline_html(step)
             ));
         }
         html.push_str("</ol>");
@@ -1011,6 +1010,168 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
                 .await;
         }
         Ok(())
+    }
+
+    /// Settles whose the owner's chat is, and repairs one the bot started where it can.
+    ///
+    /// A mautrix bridge takes bare commands only in the person's management room, which it
+    /// marks when *the person invites its bot* into a chat of two (bridgev2's
+    /// `handleBotInvite`); a chat its bot started is never one, however long the person types
+    /// in it. Every chat the manager made before 2026-10-02 was such a chat, and so is one made
+    /// without double puppeting. Here, for a row whose chat has not been settled
+    /// ([`InstanceRow::dm_started_by`] not `owner`):
+    ///
+    /// 1. If the bot is not in the chat any more, there is nothing to repair: the chat is
+    ///    forgotten and the next step starts a new one.
+    /// 2. If the owner started it, it is recorded as theirs. Nothing else to do.
+    /// 3. If the bot started it and the instance may act as the owner (double puppeting), it is
+    ///    repaired in place: the bot leaves, the owner re-invites it, the bot rejoins. The
+    ///    bridge is sent the invitation, accepts it, finds two members and marks the room; the
+    ///    bot then says why it had been silent and what to type. Should the owner's invitation
+    ///    fail with the bot already out, the chat is forgotten and a new one is started as the
+    ///    owner.
+    /// 4. If the bot started it and the instance cannot act as the owner, the bot says so in
+    ///    the chat, once: commands there need the bridge's prefix, or a chat the owner starts.
+    ///
+    /// The owner must be in the chat for 3: until they are (an invitation never accepted),
+    /// the chat is recorded as the bot's and looked at again each step.
+    async fn settle_chat(&self, row: &InstanceRow, offering: &OfferingRow) -> Result<(), String> {
+        let kind = bridge_types::get(&row.bridge_type, &self.server_name);
+        let as_owner = may_act_as_owner(kind.as_ref(), offering);
+        let said_already = row.dm_started_by.as_deref() == Some(CHAT_BY_BOT);
+        if said_already && !as_owner {
+            return Ok(()); // case 4 was done; nothing more the manager can do
+        }
+        let client = self.client.get().ok_or("not started")?.clone();
+        let owner = owner_of(row).ok_or("a shared instance has no owner")?;
+        let token = row.as_token.clone().ok_or("the instance has no token")?;
+        let room = row.dm_room.clone().ok_or("the instance has no chat")?;
+        let (bot_localpart, _) = bridge_types::instance_names(&row.bridge_type, Some(owner))
+            .ok_or("its bridge type is no longer in the catalogue")?;
+        let bot = self.mxid(&bot_localpart);
+        let name = bridge_types::display_name(&row.bridge_type).unwrap_or(&row.bridge_type);
+        let members = match client.joined_members(&token, &bot, &room).await {
+            Ok(members) => members,
+            Err(e) if e.status == 403 || e.status == 404 => {
+                tracing::info!(
+                    bridge_type = %row.bridge_type,
+                    owner,
+                    room,
+                    error = %e,
+                    "the bot is not in the owner's chat any more: forgetting it, a new chat will be started"
+                );
+                self.forget_chat(row, &room);
+                return Ok(());
+            }
+            Err(e) => return Err(format!("could not read the owner's chat: {e}")),
+        };
+        let creator = if said_already {
+            bot.clone()
+        } else {
+            client
+                .room_creator(&token, &bot, &room)
+                .await
+                .map_err(|e| format!("could not read who started the owner's chat: {e}"))?
+        };
+        if creator == owner {
+            self.record_chat(row, &room, CHAT_BY_OWNER);
+            tracing::debug!(bridge_type = %row.bridge_type, owner, room, "the owner's chat was started by the owner");
+            return Ok(());
+        }
+        if !members.iter().any(|m| m == owner) {
+            if self.record_chat(row, &room, CHAT_BY_BOT) {
+                tracing::info!(
+                    bridge_type = %row.bridge_type,
+                    owner,
+                    room,
+                    "the owner's chat was started by its bot and the owner is not in it; it will be repaired once they are"
+                );
+            }
+            return Ok(());
+        }
+        if !as_owner {
+            self.record_chat(row, &room, CHAT_BY_BOT);
+            tracing::info!(
+                bridge_type = %row.bridge_type,
+                owner,
+                room,
+                "the owner's chat was started by its bot and the instance cannot act as the owner: saying there that commands need the bridge's prefix"
+            );
+            let prefix = kind.as_ref().and_then(|k| k.command_prefix.clone());
+            let (text, html) = prefixed_commands_notice(name, &bot, prefix.as_deref());
+            let _ = client.notice(&token, &bot, &room, &text, &html).await;
+            return Ok(());
+        }
+        // Case 3: the repair.
+        client
+            .leave(&token, &bot, &room)
+            .await
+            .map_err(|e| format!("the bot could not leave the chat it started: {e}"))?;
+        let back = async {
+            client
+                .invite(&token, owner, &room, &bot)
+                .await
+                .map_err(|e| format!("the owner could not invite the bot back: {e}"))?;
+            client
+                .join(&token, &bot, &room)
+                .await
+                .map_err(|e| format!("the bot could not rejoin the chat: {e}"))
+        }
+        .await;
+        if let Err(e) = back {
+            tracing::warn!(
+                bridge_type = %row.bridge_type,
+                owner,
+                room,
+                error = %e,
+                "could not repair the owner's chat; forgetting it, a new chat will be started as the owner"
+            );
+            self.forget_chat(row, &room);
+            return Err(format!("{e}; a new chat will be started as the owner"));
+        }
+        self.record_chat(row, &room, CHAT_BY_OWNER);
+        tracing::info!(
+            bridge_type = %row.bridge_type,
+            owner,
+            room,
+            "repaired the owner's chat with their bridge's bot: the bot left and came back on the owner's invitation, so the bridge takes commands there"
+        );
+        let steps = sign_in_steps(kind.as_ref());
+        let (text, html) = repaired_chat_notice(name, &steps);
+        let _ = client.notice(&token, &bot, &room, &text, &html).await;
+        Ok(())
+    }
+
+    /// Records whose `room` is on the row, if the row still names it. `true` when that changed
+    /// anything.
+    fn record_chat(&self, row: &InstanceRow, room: &str, by: &str) -> bool {
+        self.store
+            .update_instance(&row.bridge_type, &row.owner, |r| {
+                if r.dm_room.as_deref() != Some(room) || r.dm_started_by.as_deref() == Some(by) {
+                    return false;
+                }
+                r.dm_started_by = Some(by.to_owned());
+                true
+            })
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
+    /// Forgets `room` as the owner's chat, if the row still names it, so the next step starts
+    /// a new one.
+    fn forget_chat(&self, row: &InstanceRow, room: &str) {
+        let _ = self
+            .store
+            .update_instance(&row.bridge_type, &row.owner, |r| {
+                if r.dm_room.as_deref() != Some(room) {
+                    return false;
+                }
+                r.dm_room = None;
+                r.dm_started_by = None;
+                true
+            });
+        self.wake();
     }
 
     async fn remove(&self, row: &InstanceRow) -> Result<(), String> {
@@ -1420,6 +1581,64 @@ impl<B: KvBackend + 'static> BridgeOfferingSource for BridgeManager<B> {
     }
 }
 
+/// Whether an instance of `offering` may act as its owner: the type supports double puppeting
+/// and the offering has it on (its default), which is the registration's non-exclusive claim on
+/// the owner.
+fn may_act_as_owner(kind: Option<&hs_admin::model::BridgeType>, offering: &OfferingRow) -> bool {
+    kind.is_some_and(|k| k.supports_double_puppeting)
+        && offering.options.double_puppeting.unwrap_or(true)
+}
+
+/// The catalogue's sign-in steps as the bot says them in its own chat: `{bot}` is "me", and
+/// "Start a direct chat with me and send" reads oddly there, so it is just "Send".
+fn sign_in_steps(kind: Option<&hs_admin::model::BridgeType>) -> Vec<String> {
+    kind.map(|k| {
+        k.sign_in
+            .steps
+            .iter()
+            .map(|s| {
+                s.replace("{bot}", "me")
+                    .replace("Start a direct chat with me and send", "Send")
+            })
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// What the bot says in a chat it started once it has left and come back on the owner's
+/// invitation: why it had been silent, and the steps again. `(text, html)`.
+fn repaired_chat_notice(name: &str, steps: &[String]) -> (String, String) {
+    let why = format!(
+        "I started this chat myself, so I did not take what you typed here: a {name} bridge only takes commands in a chat you invited it to. I have left and come back on your invitation, so this chat is one now. To sign in:"
+    );
+    let mut text = format!("{why}\n");
+    let mut html = format!("<p>{}</p><ol>", crate::front_door::inline_html(&why));
+    for step in steps {
+        text.push_str(&format!("- {step}\n"));
+        html.push_str(&format!(
+            "<li>{}</li>",
+            crate::front_door::inline_html(step)
+        ));
+    }
+    html.push_str("</ol>");
+    (text, html)
+}
+
+/// What the bot says in a chat it started when nothing can make the bridge take bare commands
+/// there (no double puppeting): use the prefix, or start a chat. `(text, html)`.
+fn prefixed_commands_notice(name: &str, bot: &str, prefix: Option<&str>) -> (String, String) {
+    let line = match prefix {
+        Some(prefix) => format!(
+            "I started this chat myself, so I only take commands here with my prefix: `{prefix} login qr` rather than `login qr`, and so on. For bare commands, invite me ({bot}) to a new direct chat: a {name} bridge takes them only in a chat you invited it to."
+        ),
+        None => format!(
+            "I started this chat myself, so I only take commands here with my command prefix (`!` and the bridge's short name, as its documentation says). For bare commands, invite me ({bot}) to a new direct chat: a {name} bridge takes them only in a chat you invited it to."
+        ),
+    };
+    let html = format!("<p>{}</p>", crate::front_door::inline_html(&line));
+    (line, html)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -1803,5 +2022,424 @@ mod tests {
     fn label_safe_makes_an_owner_a_label_value() {
         assert_eq!(label_safe("@alice:example.org"), "alice-example.org");
         assert_eq!(label_safe("@al_ice:ex.org"), "al_ice-ex.org");
+    }
+
+    // ---- settling and repairing the owner's chat ------------------------------------------
+
+    /// This server's client API, as far as settling a chat needs it: who created the room, who
+    /// is in it, and the bot's leave, the owner's invite, the bot's join and what the bot says,
+    /// each remembered as `METHOD path as=user`.
+    #[derive(Default)]
+    struct FakeMatrix {
+        creator: Mutex<String>,
+        members: Mutex<Vec<String>>,
+        bot_in_room: Mutex<bool>,
+        join_fails: Mutex<bool>,
+        calls: Mutex<Vec<String>>,
+        notices: Mutex<Vec<String>>,
+    }
+
+    impl FakeMatrix {
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        fn take_calls(&self) -> Vec<String> {
+            std::mem::take(&mut *self.calls.lock().unwrap())
+        }
+
+        fn notices(&self) -> Vec<String> {
+            self.notices.lock().unwrap().clone()
+        }
+    }
+
+    async fn fake_matrix(fake: Arc<FakeMatrix>) -> String {
+        use axum::body::Bytes;
+        use axum::http::{Method, StatusCode, Uri};
+        async fn handle(
+            axum::extract::State(fake): axum::extract::State<Arc<FakeMatrix>>,
+            method: Method,
+            uri: Uri,
+            body: Bytes,
+        ) -> (StatusCode, axum::Json<serde_json::Value>) {
+            let path = uri
+                .path()
+                .trim_start_matches("/_matrix/client/v3")
+                .to_owned();
+            let as_user = reqwest::Url::parse(&format!("http://x{uri}"))
+                .ok()
+                .and_then(|u| {
+                    u.query_pairs()
+                        .find(|(k, _)| k == "user_id")
+                        .map(|(_, v)| v.into_owned())
+                })
+                .unwrap_or_default();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            let short = match path.split('/').collect::<Vec<_>>().as_slice() {
+                ["", "rooms", _, "send", ..] => "send".to_owned(),
+                ["", "rooms", _, what] => (*what).to_owned(),
+                ["", "join", _] => "join".to_owned(),
+                ["", "user", _, "account_data", _] => "m.direct".to_owned(),
+                _ => path.trim_start_matches('/').to_owned(),
+            };
+            fake.calls
+                .lock()
+                .unwrap()
+                .push(format!("{method} {short} as={as_user}"));
+            let forbidden = (
+                StatusCode::FORBIDDEN,
+                axum::Json(json!({"errcode": "M_FORBIDDEN", "error": "no"})),
+            );
+            let ok = |v: serde_json::Value| (StatusCode::OK, axum::Json(v));
+            match short.as_str() {
+                "joined_members" => {
+                    if !*fake.bot_in_room.lock().unwrap() {
+                        return forbidden;
+                    }
+                    let joined: serde_json::Map<String, serde_json::Value> = fake
+                        .members
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|m| (m.clone(), json!({})))
+                        .collect();
+                    ok(json!({"joined": joined}))
+                }
+                "state" => ok(json!([
+                    {"type": "m.room.create", "state_key": "", "sender": *fake.creator.lock().unwrap(), "content": {"room_version": "11"}},
+                    {"type": "m.room.encryption", "state_key": "", "sender": *fake.creator.lock().unwrap(), "content": {}}
+                ])),
+                "leave" => {
+                    *fake.bot_in_room.lock().unwrap() = false;
+                    ok(json!({}))
+                }
+                "invite" => ok(json!({})),
+                "join" => {
+                    if *fake.join_fails.lock().unwrap() {
+                        return forbidden;
+                    }
+                    *fake.bot_in_room.lock().unwrap() = true;
+                    ok(json!({}))
+                }
+                "send" => {
+                    fake.notices
+                        .lock()
+                        .unwrap()
+                        .push(body["body"].as_str().unwrap_or_default().to_owned());
+                    ok(json!({"event_id": "$e"}))
+                }
+                "createRoom" => {
+                    *fake.bot_in_room.lock().unwrap() = true;
+                    ok(json!({"room_id": "!new:example.org"}))
+                }
+                "m.direct" => ok(json!({})),
+                "register" => ok(json!({"user_id": "@x:example.org"})),
+                _ => (
+                    StatusCode::NOT_FOUND,
+                    axum::Json(json!({"errcode": "M_UNRECOGNIZED"})),
+                ),
+            }
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().fallback(handle).with_state(fake);
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        url
+    }
+
+    const OWNER: &str = "@brandon:example.org";
+    const BOT: &str = "@whatsappbot_brandon:example.org";
+    const OLD_CHAT: &str = "!old:example.org";
+
+    /// A manager against the fake, with brandon's instance ready and its chat recorded the way
+    /// every row from before 2026-10-02 is: the room, and nothing about who started it.
+    async fn ready_with_an_unsettled_chat(
+        fake: &Arc<FakeMatrix>,
+        double_puppeting: Option<bool>,
+    ) -> Arc<BridgeManager<MemoryBackend>> {
+        let runtime = Arc::new(FakeRuntime::default());
+        let manager = BridgeManager::new(
+            MemoryBackend::new(),
+            Arc::new(InMemoryAppserviceDirectory::new()),
+            Some(runtime),
+            "example.org",
+            "https://example.org",
+        )
+        .unwrap();
+        manager.attach(&fake_matrix(fake.clone()).await);
+        manager
+            .put(
+                "mautrix-whatsapp",
+                BridgeOfferingRequest {
+                    runtime: Some("cluster".into()),
+                    options: Some(hs_admin::model::BridgeOfferingOptions {
+                        double_puppeting,
+                        ..Default::default()
+                    }),
+                    ..BridgeOfferingRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        manager
+            .put_instance("mautrix-whatsapp", OWNER)
+            .await
+            .unwrap();
+        manager.tick().await; // requested -> registered: tokens and a name
+        manager
+            .store
+            .update_instance("mautrix-whatsapp", OWNER, |r| {
+                assert_eq!(r.state, InstanceState::Registered);
+                r.enter(InstanceState::Ready, 2);
+                r.dm_room = Some(OLD_CHAT.into());
+                r.dm_started_by = None;
+                true
+            })
+            .unwrap()
+            .unwrap();
+        fake.take_calls(); // the front doors' registration and names
+        manager
+    }
+
+    fn row_of(manager: &BridgeManager<MemoryBackend>) -> InstanceRow {
+        manager
+            .store
+            .instance("mautrix-whatsapp", OWNER)
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_chat_the_bot_started_is_repaired_by_a_leave_and_the_owners_invitation() {
+        let fake = Arc::new(FakeMatrix::default());
+        *fake.creator.lock().unwrap() = BOT.into();
+        *fake.members.lock().unwrap() = vec![BOT.into(), OWNER.into()];
+        *fake.bot_in_room.lock().unwrap() = true;
+        let manager = ready_with_an_unsettled_chat(&fake, None).await;
+
+        manager.tick().await;
+        assert_eq!(
+            fake.take_calls(),
+            vec![
+                format!("GET joined_members as={BOT}"),
+                format!("GET state as={BOT}"),
+                format!("POST leave as={BOT}"),
+                format!("POST invite as={OWNER}"),
+                format!("POST join as={BOT}"),
+                format!("PUT send as={BOT}"),
+            ]
+        );
+        let said = fake.notices().join("\n");
+        assert!(said.contains("I started this chat myself"), "{said}");
+        assert!(said.contains("come back on your invitation"), "{said}");
+        assert!(said.contains("login qr"), "{said}");
+        let row = row_of(&manager);
+        assert_eq!(row.dm_room.as_deref(), Some(OLD_CHAT), "the same chat");
+        assert_eq!(row.dm_started_by.as_deref(), Some(CHAT_BY_OWNER));
+        assert!(row.reason.is_none(), "{:?}", row.reason);
+        let view = manager
+            .instance("mautrix-whatsapp", OWNER)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(view.chat_room.as_deref(), Some(OLD_CHAT));
+        assert_eq!(view.chat_started_by.as_deref(), Some("owner"));
+
+        // Settled: later steps leave the chat alone.
+        manager.tick().await;
+        manager.tick().await;
+        assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+    }
+
+    #[tokio::test]
+    async fn a_chat_the_owner_started_is_recorded_as_theirs_and_left_alone() {
+        let fake = Arc::new(FakeMatrix::default());
+        *fake.creator.lock().unwrap() = OWNER.into();
+        *fake.members.lock().unwrap() = vec![BOT.into(), OWNER.into()];
+        *fake.bot_in_room.lock().unwrap() = true;
+        let manager = ready_with_an_unsettled_chat(&fake, None).await;
+
+        manager.tick().await;
+        assert_eq!(
+            fake.take_calls(),
+            vec![
+                format!("GET joined_members as={BOT}"),
+                format!("GET state as={BOT}"),
+            ]
+        );
+        assert!(fake.notices().is_empty());
+        assert_eq!(
+            row_of(&manager).dm_started_by.as_deref(),
+            Some(CHAT_BY_OWNER)
+        );
+        manager.tick().await;
+        assert!(fake.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn without_double_puppeting_the_bot_says_commands_need_its_prefix_once() {
+        let fake = Arc::new(FakeMatrix::default());
+        *fake.creator.lock().unwrap() = BOT.into();
+        *fake.members.lock().unwrap() = vec![BOT.into(), OWNER.into()];
+        *fake.bot_in_room.lock().unwrap() = true;
+        let manager = ready_with_an_unsettled_chat(&fake, Some(false)).await;
+
+        manager.tick().await;
+        assert_eq!(
+            fake.take_calls(),
+            vec![
+                format!("GET joined_members as={BOT}"),
+                format!("GET state as={BOT}"),
+                format!("PUT send as={BOT}"),
+            ],
+            "no leave, no invite: the instance cannot act as the owner"
+        );
+        let said = fake.notices().join("\n");
+        assert!(
+            said.contains("`!wa login qr` rather than `login qr`"),
+            "{said}"
+        );
+        assert!(said.contains(BOT), "{said}");
+        let row = row_of(&manager);
+        assert_eq!(row.dm_started_by.as_deref(), Some(CHAT_BY_BOT));
+        let view = manager
+            .instance("mautrix-whatsapp", OWNER)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(view.chat_started_by.as_deref(), Some("bot"));
+        // Said once.
+        manager.tick().await;
+        manager.tick().await;
+        assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+        assert_eq!(fake.notices().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_chat_the_bot_is_no_longer_in_is_forgotten_and_a_new_one_started_as_the_owner() {
+        let fake = Arc::new(FakeMatrix::default());
+        *fake.creator.lock().unwrap() = BOT.into();
+        *fake.bot_in_room.lock().unwrap() = false;
+        let manager = ready_with_an_unsettled_chat(&fake, None).await;
+
+        manager.tick().await;
+        assert_eq!(
+            fake.take_calls(),
+            vec![format!("GET joined_members as={BOT}")]
+        );
+        let row = row_of(&manager);
+        assert!(row.dm_room.is_none(), "forgotten");
+        assert!(row.reason.is_none(), "{:?}", row.reason);
+
+        // The next step starts a chat the way a new instance gets one: as the owner.
+        manager.tick().await;
+        let calls = fake.take_calls();
+        assert_eq!(calls[0], "POST register as=", "{calls:?}");
+        assert!(
+            calls.contains(&format!("POST createRoom as={OWNER}")),
+            "{calls:?}"
+        );
+        let row = row_of(&manager);
+        assert_eq!(row.dm_room.as_deref(), Some("!new:example.org"));
+        assert_eq!(row.dm_started_by.as_deref(), Some(CHAT_BY_OWNER));
+    }
+
+    #[tokio::test]
+    async fn when_the_bot_cannot_get_back_in_the_chat_is_forgotten_and_the_reason_says_so() {
+        let fake = Arc::new(FakeMatrix::default());
+        *fake.creator.lock().unwrap() = BOT.into();
+        *fake.members.lock().unwrap() = vec![BOT.into(), OWNER.into()];
+        *fake.bot_in_room.lock().unwrap() = true;
+        *fake.join_fails.lock().unwrap() = true;
+        let manager = ready_with_an_unsettled_chat(&fake, None).await;
+
+        manager.tick().await;
+        let calls = fake.take_calls();
+        assert!(calls.contains(&format!("POST leave as={BOT}")), "{calls:?}");
+        assert!(calls.contains(&format!("POST join as={BOT}")), "{calls:?}");
+        assert!(fake.notices().is_empty(), "nothing promised");
+        let row = row_of(&manager);
+        assert!(row.dm_room.is_none(), "forgotten");
+        let reason = row.reason.clone().unwrap_or_default();
+        assert!(reason.contains("could not rejoin"), "{reason}");
+        assert!(reason.contains("a new chat will be started"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn a_bots_chat_the_owner_has_not_joined_waits_for_them() {
+        let fake = Arc::new(FakeMatrix::default());
+        *fake.creator.lock().unwrap() = BOT.into();
+        *fake.members.lock().unwrap() = vec![BOT.into()];
+        *fake.bot_in_room.lock().unwrap() = true;
+        let manager = ready_with_an_unsettled_chat(&fake, None).await;
+
+        manager.tick().await;
+        let calls = fake.take_calls();
+        assert!(!calls.iter().any(|c| c.contains("leave")), "{calls:?}");
+        assert!(fake.notices().is_empty());
+        assert_eq!(row_of(&manager).dm_started_by.as_deref(), Some(CHAT_BY_BOT));
+
+        // They accept the old invitation: the next step repairs the chat.
+        *fake.members.lock().unwrap() = vec![BOT.into(), OWNER.into()];
+        manager.tick().await;
+        let calls = fake.take_calls();
+        assert_eq!(
+            calls,
+            vec![
+                format!("GET joined_members as={BOT}"),
+                format!("POST leave as={BOT}"),
+                format!("POST invite as={OWNER}"),
+                format!("POST join as={BOT}"),
+                format!("PUT send as={BOT}"),
+            ],
+            "the creator is known by then: no second look at the state"
+        );
+        assert_eq!(
+            row_of(&manager).dm_started_by.as_deref(),
+            Some(CHAT_BY_OWNER)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_chat_records_who_started_it() {
+        let fake = Arc::new(FakeMatrix::default());
+        let manager = ready_with_an_unsettled_chat(&fake, None).await;
+        manager
+            .store
+            .update_instance("mautrix-whatsapp", OWNER, |r| {
+                r.dm_room = None;
+                true
+            })
+            .unwrap();
+        manager.tick().await;
+        let row = row_of(&manager);
+        assert_eq!(row.dm_room.as_deref(), Some("!new:example.org"));
+        assert_eq!(row.dm_started_by.as_deref(), Some(CHAT_BY_OWNER));
+        let calls = fake.take_calls();
+        assert!(
+            calls.contains(&format!("POST createRoom as={OWNER}")),
+            "{calls:?}"
+        );
+        // Settled from the start: no further look.
+        manager.tick().await;
+        assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+    }
+
+    #[test]
+    fn the_notices_say_what_to_type() {
+        let (text, html) = prefixed_commands_notice("WhatsApp", BOT, Some("!wa"));
+        assert!(
+            text.contains("`!wa login qr` rather than `login qr`"),
+            "{text}"
+        );
+        assert!(html.contains("<code>!wa login qr</code>"), "{html}");
+        let (text, _) = prefixed_commands_notice("Thing", BOT, None);
+        assert!(text.contains("command prefix"), "{text}");
+        let (text, html) = repaired_chat_notice("WhatsApp", &["Send `login qr`".into()]);
+        assert!(text.ends_with("- Send `login qr`\n"), "{text}");
+        assert!(
+            html.ends_with("<ol><li>Send <code>login qr</code></li></ol>"),
+            "{html}"
+        );
     }
 }

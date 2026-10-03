@@ -39,6 +39,20 @@ const PORTS: Record<string, number> = {
   "mautrix-imessage": 29337,
 };
 
+/**
+ * Each mautrix type's default command prefix, as `bridge_types.rs`'s `command_prefix`: what a
+ * command needs anywhere but the person's management room.
+ */
+const COMMAND_PREFIXES: Record<string, string> = {
+  "mautrix-whatsapp": "!wa",
+  "mautrix-telegram": "!tg",
+  "mautrix-gmessages": "!gm",
+  "mautrix-gvoice": "!gv",
+  "mautrix-meta": "!fb",
+  "mautrix-discord": "!discord",
+  "mautrix-bluesky": "!bsky",
+};
+
 /** Each type's provisioning surface and its note, as `bridge_types.rs`'s `provisioning_of`. */
 function provisioning(id: string): Pick<BridgeType, "provisioning_api" | "provisioning_note"> {
   if (id === "heisenbridge")
@@ -103,6 +117,7 @@ function type(spec: Spec): BridgeType {
     } as unknown as Record<string, never>,
     config_keys: [{ key: spec.needs[0], description: spec.needs[1], required: true }],
     supports_double_puppeting: mautrix,
+    command_prefix: COMMAND_PREFIXES[spec.id] ?? null,
     required_features: mautrix
       ? ["de.sorunome.msc2409.push_ephemeral", "org.matrix.msc3202", "io.element.msc4190"]
       : [],

@@ -1,15 +1,146 @@
 # Status: track 11, appservices and bridges
 
-Last updated: 2026-10-02 (an instance's Kubernetes objects say whose bridge they are, below);
-before that 2026-10-01 (who has signed in to a bridge; the `cluster` runtime run on kind;
-both below); before that 2026-09-30 (ephemeral, to-device and device-list delivery); before that
-2026-09-27 (RFC 0017 run against the real binary), 2026-09-27 (the bridge manager) and
-2026-09-25.
-Last updated: 2026-10-02 (`login qr` in the personal bot's chat did nothing: found with the
-real bridge, fixed in the manager; below); before that 2026-10-01 (who has signed in to a bridge;
-the `cluster` runtime run on kind); before that 2026-09-30 (ephemeral, to-device and device-list
-delivery); before that 2026-09-27 (RFC 0017 run against the real binary), 2026-09-27 (the bridge
-manager) and 2026-09-25.
+Last updated: 2026-10-02 (the owner's bot was silent on the demo cluster: diagnosed from the
+bridge's log, and a chat the bot started is now repaired in place; below); before that, the same
+day, `login qr` in the personal bot's chat did nothing (found with the real bridge, fixed in the
+manager) and an instance's Kubernetes objects say whose bridge they are; before that 2026-10-01
+(who has signed in to a bridge; the `cluster` runtime run on kind); before that 2026-09-30
+(ephemeral, to-device and device-list delivery); before that 2026-09-27 (RFC 0017 run against
+the real binary), 2026-09-27 (the bridge manager) and 2026-09-25.
+
+## Session 2026-10-02 (branch `agent/bridge-responds`): the owner's bot was silent on the demo cluster; a chat the bot started is now repaired in place
+
+**What the owner saw.** On the demo cluster (image `sha-99589af3…`, which carries
+`agent/bridge-login`), as `@brandon:myelin.dacrib.net`, in the chat with
+`@whatsappbot_brandon`: `login phone`, `login qr` (four times), `!wh login qr`, `hello`. Nothing
+back to any of it.
+
+**What the cluster said** (read-only: `kubectl logs`, the Bridge object, the files Secret, and
+the client API through a port-forward with the instance's own token; the logs are kept in the
+session's scratchpad as `bridge-before.log`, `hs-before.log`, `operator-before.log`):
+
+- The bridge pod `bridge-d2854412-9d44fdb54-wrnpd` (3 h old, never restarted) was healthy
+  across the server's restart: its pings worked, its device `BSLXZIVKIV` and 51 one-time keys
+  were uploaded, and transactions 35–44 were delivered after the new server came up
+  (`delivered a transaction to an appservice appservice=whatsapp-brandon txn_id=44 events=1`).
+  **No restart was needed, and none was done.**
+- **Every one of the eight messages reached the bridge and was decrypted**, and not one was
+  taken: eight times `Decrypting received event … session_id=0KytEOpisOcHE6LOLpPEVt…` then
+  `Event decrypted successfully decrypted_event_type="m.room.message (message)"`
+  (`message_index` 0 through 7, the last at 00:14:48Z), and never `Received command`. Nothing
+  was sent by the bot; nothing failed to send. The server's side agrees: `hs_appservice`
+  delivered each one, `appservices.health` healthy.
+- The chat `!Zsl5rtFMYQNrkT7I9X:myelin.dacrib.net` was **created by the bot**
+  (`m.room.create` sender `@whatsappbot_brandon`, then `m.room.encryption`, then the bot's
+  invitation to brandon and its sign-in notice; brandon joined; eight `m.room.encrypted` from
+  brandon). Two joined members, power levels 100 each (`trusted_private_chat`), encrypted.
+  Double puppeting is on (the registration's non-exclusive claim on `@brandon`), brandon is
+  the bridge's `admin` in `bridge.permissions`.
+
+**Root cause.** The known one, unchanged by the roll: a mautrix `bridgev2` bridge takes a bare
+command only in the sender's management room, which it marks only in `handleBotInvite`, when
+*the person invites its bot* into a chat of two (`bridgev2/matrixinvite.go`; `queue.go`:
+`strings.HasPrefix(msg.Body, CommandPrefix) || evt.RoomID == sender.ManagementRoom`). The
+owner's instance was made before `agent/bridge-login` and its chat is the bot's. `!wh` is not
+WhatsApp's prefix (`!wa` is), so it was dropped as text too. Encryption, the appservice
+connection, keys, the server restart: all fine.
+
+**What the server does now** (`hs_bridges::manager::BridgeManager::settle_chat`, run on every
+step of a ready owned instance whose chat is not yet recorded as the owner's;
+`InstanceRow::dm_started_by`, `owner` or `bot`, new on the row and `None` on every row from
+before today):
+
+1. The bot is no longer in the chat (403/404 on `joined_members`): the chat is forgotten and
+   the next step starts a new one, as the owner.
+2. The room's creator (`GET /rooms/{id}/state`, the `m.room.create` sender; room v11 has no
+   `creator` in the content) is the owner: recorded as `owner`, left alone.
+3. The creator is the bot and the instance may act as the owner (double puppeting): **repaired
+   in place**. The bot leaves, the owner (double-puppeted through the instance's token)
+   re-invites it, the bot rejoins. The bridge is sent the invitation, accepts it (`Accepted
+   invite to room as bot`), counts two members, marks the room and says "This room has been
+   marked as your management room"; then the bot says why it had been silent and lists the
+   steps again ("I started this chat myself, so I did not take what you typed here … I have
+   left and come back on your invitation, so this chat is one now. To sign in: …"). The
+   chat's history stays. If the invitation or the rejoin fails with the bot already out, the
+   chat is forgotten and a new one is started as the owner; the step's reason says so.
+   If the owner is not in the chat (an invitation never accepted), it waits and looks again
+   each step. Log: `repaired the owner's chat with their bridge's bot`.
+4. The creator is the bot and the instance cannot act as the owner (no double puppeting):
+   the bot says so in the chat, once ("I started this chat myself, so I only take commands
+   here with my prefix: `!wa login qr` rather than `login qr` … For bare commands, invite me
+   (…) to a new direct chat"), and the row records `bot`.
+
+A new chat records who started it at once, so nothing is looked at twice. The admin API shows
+it: `BridgeInstance.chat_room` and `chat_started_by` (`owner` | `bot` | null), and
+`BridgeType.command_prefix` (`!wa`, `!tg`, `!gm`, `!gv`, `!fb`, `!discord`, `!bsky`, read from
+each bridge's `pkg/connector/connector.go` on 2026-10-02; Signal, Slack and X set none there,
+so none is claimed). OpenAPI 0.1.5. The bridge page's next steps say "is in a direct chat
+started for them: open it" for `owner`, and for `bot` a warning box: started by the bot, prefix
+commands with `!wa login qr` rather than `login qr`, or start a new direct chat with the bot;
+"This is you" says "open your chat with" rather than "accept the invite from".
+
+**Verified.**
+
+- `cargo test -p hs-bridges`: 23 unit tests (7 new, against a fake client API that records
+  every call: the leave/invite/join/notice sequence as the right users; a chat the owner
+  started is left alone after two reads; no double puppeting says the prefix once; a chat the
+  bot is out of is forgotten and the next step creates one as the owner; a failed rejoin
+  forgets the chat and the reason says "a new chat will be started"; an unaccepted invitation
+  waits, then repairs without a second look at the state; a new chat is recorded `owner` and
+  never looked at again; the notices' text and HTML), 6 integration tests.
+- `cargo test -p hs-bridge-conformance --test real_mautrix_login`: the real binary and the
+  real `dock.mau.dev/mautrix/whatsapp:latest` in Docker, **3 of 3**: the two existing stories
+  (now also asserting `chat_started_by: owner` and `chat_room`), and the new
+  `a_chat_the_bot_started_is_repaired_in_place_and_login_qr_gets_a_qr_code`: the offering
+  with `double_puppeting: false` so the bot starts the chat (the exact shape of the owner's),
+  alice accepts, `chat_started_by: bot`; then the registration is given the claim on her
+  (`PATCH /appservices/{id}` `namespaces.users`) and the offering `double_puppeting: true`;
+  the manager's next step repairs the chat; alice's client sees, decrypted, the bridge's
+  "This room has been marked as your management room" and, plain, the bot's "come back on your
+  invitation"; the bridge's log has `Accepted invite to room as bot`; the server's has
+  `repaired the owner's chat`; `login qr` is `Received command`, and the QR comes back.
+  All three in one run: `3 passed`, 32.7 s with the image present (the repaired story alone,
+  15.3 s). The bridge's log for it is `repaired-bridge.log` under `HS_BRIDGE_LOGIN_LOG_DIR`.
+- `web`: `InstanceNextSteps` 11 tests (2 new), `bridge-next-steps` 13; `tsc -b`, eslint,
+  prettier on the changed files; `BridgeOfferingPage.test.tsx` now expects "This is you: open
+  your chat with" (the mock's ready instances carry `chat_started_by: owner`); `npm run check`
+  green (529 tests; the four eslint warnings are pre-existing, in files this branch does not
+  touch).
+- `cargo test -p hs-admin` (293), `cargo test -p hs-cli --test bridge_offerings` (3 of 3 on the
+  real binary, the chat started as alice as before), `cargo clippy -p hs-bridges -p hs-admin -p
+  hs-bridge-conformance --all-targets -- -D warnings`, `cargo fmt --all --check`. The workspace
+  gate was not run (merge queue's job).
+
+**For the owner, now.** The repair reaches the demo with the next roll of `main` after this
+branch merges; until then nothing on the cluster has changed. The by-hand repair (the bot
+leaves, brandon re-invites it, with the instance's own token through a port-forward) was
+written and ready (`repair.sh` in the scratchpad) but **not run**: the session's classifier
+declined the change to the owner's live chat, and it is not pursued. So, either:
+
+- **Today, in the existing chat:** type `!wa login qr`. The bridge answers "⚠️ This is not
+  your management room …" and then the QR (the handover's answer; `!wh` was a typo for this).
+- **Or, from Element:** start a new direct chat and invite `@whatsappbot_brandon:myelin.dacrib.net`;
+  the bot says the room is marked as the management room; `login qr` works there.
+- **After the roll** (`helm --kube-context admin@dacrib0 upgrade myelin deploy/helm/hs -n
+  myelin -f /tmp/myelin-values.yaml --set image.tag=sha-<the merged commit> --wait --timeout
+  10m`): within a few seconds of the server starting, the existing chat gets a leave and a
+  rejoin of the bot, the bridge's "marked as your management room" line and the bot's
+  explanation; then `login qr` there. The bridge page shows the chat as the owner's. If
+  instead the page shows the chat as the bot's, the instance is one without double puppeting
+  and the chat says what to type.
+
+**Decisions.** Repair in place rather than a new chat: the person's history and `m.direct`
+entry stay, and nothing new appears in their room list. The bot is a member of the same room
+twice over in its history, which is what the repair looks like in a client. The catalogue
+claims a command prefix only where a bridge's source states one. The live chat was not
+touched by hand.
+
+**Left.** Signal, Slack and X have no `command_prefix` yet (the notice falls back to "with my
+command prefix"). Changing an offering's `double_puppeting` after instances exist does not
+update their registrations (the real-bridge test patches `namespaces` by hand; the manager
+could re-render the claim). The repair's cluster run awaits the roll; the owner types in the
+chat after it. The unit-test fake answers `joined_members` and `state` only as the bot, which
+is all the manager asks.
 
 ## Session 2026-10-02 (branch `agent/bridge-login`): typing `login qr` to the personal bot did nothing
 

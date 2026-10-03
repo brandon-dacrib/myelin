@@ -152,7 +152,8 @@ describe("Bridge offering page", () => {
     const ops = summaries().find((s) => s.textContent?.includes("@ops:example.org"))!;
     await userEvent.click(ops);
     const details = ops.closest("details") as HTMLElement;
-    expect(within(details).getByText(/This is you: accept the invite from/)).toHaveTextContent(
+    // The mock's ready instances have their chat started as the person (chat_started_by: owner).
+    expect(within(details).getByText(/This is you: open your chat with/)).toHaveTextContent(
       "@whatsappbot_ops:example.org",
     );
     expect(within(details).getByRole("list")).toHaveTextContent("login qr");
