@@ -1,7 +1,7 @@
 //! Ephemeral data between two in-process servers (`federation_two_servers.rs` is the pattern):
 //! typing, read receipts and presence cross in both directions, a device added on either
 //! server is a device-list change for the other's users, and the other's `/keys/query` for that
-//! user returns the new device, asked of the server that holds it. To-device messages cross in
+//! user returns the new device, from the copy of the list it keeps. To-device messages cross in
 //! both directions and arrive once, and a cross-signing key change is an `m.signing_key_update`
 //! that makes the user a device-list change on the other server, whose `/keys/query` then returns
 //! the new master key. Each server's `/metrics` counts the EDUs it sent and received.
@@ -466,8 +466,26 @@ async fn a_device_added_on_one_server_is_a_device_list_change_on_the_other() {
     .await;
     let laptop = login["device_id"].as_str().unwrap().to_owned();
     let laptop_token = login["access_token"].as_str().unwrap().to_owned();
-    let laptop_key = upload_keys(&client, &b.base, &bob, &laptop_token, &laptop).await;
 
+    // The sign-in alone is a device-list change on B (a device with no keys yet), announced to
+    // A, which has no copy of bob's list and fetches it. Alice is told. On a fast machine the
+    // key upload below would land in the same announcer tick and go out in the same EDU; the
+    // test waits here so that it is a second EDU every time, as it was on the CI machine where
+    // querying after the first one found the laptop without keys.
+    let signed_in = sync_until(
+        &client,
+        &a.base,
+        &alice.token,
+        Some(&since),
+        "bob's new device on A",
+        |s| device_list_changed(s, &bob.id),
+    )
+    .await;
+    let since = signed_in["next_batch"].as_str().unwrap().to_owned();
+
+    // The laptop uploads its keys, as every client does: the second change, applied to A's copy
+    // in sequence, and alice is told again.
+    let laptop_key = upload_keys(&client, &b.base, &bob, &laptop_token, &laptop).await;
     sync_until(
         &client,
         &a.base,
@@ -477,21 +495,10 @@ async fn a_device_added_on_one_server_is_a_device_list_change_on_the_other() {
         |s| device_list_changed(s, &bob.id),
     )
     .await;
-    // And alice's client, told to, asks: A asks B, and the new device is there.
-    let keys = call(
-        &client,
-        reqwest::Method::POST,
-        format!("{}/_matrix/client/v3/keys/query", a.base),
-        &alice.token,
-        json!({"device_keys": {bob.id.clone(): []}}),
-    )
-    .await;
-    assert_eq!(
-        keys["device_keys"][&bob.id][&laptop]["keys"][format!("ed25519:{laptop}")],
-        laptop_key.as_str(),
-        "A's /keys/query for bob: {keys}"
-    );
-    assert_eq!(keys["failures"], json!({}), "{keys}");
+    // And alice's client, told to, asks: A answers from its copy, and the keys are there. Asked
+    // until they are, with the deadline every wait here has, since the sync is told of a change
+    // and the copy is what the query reads; a query that could not be answered is wrong at once.
+    keys_query_until(&client, &a, &alice.token, &bob.id, &laptop, &laptop_key).await;
 
     // The other direction: alice's phone uploads keys on A; bob, on B, is told.
     let bob_caught_up = sync_until(
@@ -514,18 +521,54 @@ async fn a_device_added_on_one_server_is_a_device_list_change_on_the_other() {
         |s| device_list_changed(s, &alice.id),
     )
     .await;
-    let keys = call(
+    keys_query_until(
         &client,
-        reqwest::Method::POST,
-        format!("{}/_matrix/client/v3/keys/query", b.base),
+        &b,
         &bob.token,
-        json!({"device_keys": {alice.id.clone(): []}}),
+        &alice.id,
+        &alice.device,
+        &alice_key,
     )
     .await;
-    assert_eq!(
-        keys["device_keys"][&alice.id][&alice.device]["keys"][format!("ed25519:{}", alice.device)],
-        alice_key.as_str(),
-        "B's /keys/query for alice: {keys}"
+}
+
+/// Asks `server`'s `/keys/query` for `user` until it names `device` with the ed25519 key
+/// `key`. An answer with a `failures` entry is wrong at once: a copy that is behind is waited
+/// for, a server that could not be asked is not.
+async fn keys_query_until(
+    client: &reqwest::Client,
+    server: &Server,
+    token: &str,
+    user: &str,
+    device: &str,
+    key: &str,
+) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut last = Value::Null;
+    while Instant::now() < deadline {
+        let keys = call(
+            client,
+            reqwest::Method::POST,
+            format!("{}/_matrix/client/v3/keys/query", server.base),
+            token,
+            json!({"device_keys": {user: []}}),
+        )
+        .await;
+        assert_eq!(
+            keys["failures"],
+            json!({}),
+            "{}'s /keys/query for {user}: {keys}",
+            server.name
+        );
+        if keys["device_keys"][user][device]["keys"][format!("ed25519:{device}")] == key {
+            return;
+        }
+        last = keys;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!(
+        "{}'s /keys/query never named {user}'s device {device} with key {key}; the last one said: {last}",
+        server.name
     );
 }
 

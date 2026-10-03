@@ -323,6 +323,76 @@ async fn an_update_for_an_unknown_user_fetches_the_list_and_one_in_sequence_is_a
     assert_eq!(remote.asked().len(), 1, "served from the copy");
 }
 
+/// A client signs in (a device with no keys yet) and uploads its keys a moment later, and the
+/// user's server announces that as two updates when its announcer looks between them. The
+/// first adds the device to the copy without keys, so `/keys/query` names nothing for it yet:
+/// the copy is complete and current, and nothing is fetched or asked; the second brings the
+/// keys, and the next query serves them, still from the copy. (The two-server test in `hs-cli`,
+/// `federation_edus::a_device_added_on_one_server_is_a_device_list_change_on_the_other`, failed
+/// on a slow CI machine by querying between the two; it waits for the second now.)
+#[tokio::test]
+async fn a_device_added_without_keys_is_keyed_by_the_next_update_and_nothing_is_fetched_between() {
+    let remote = Arc::new(FakeRemote::default());
+    remote.set_devices(bobs_list(1, vec![device("ROVER", "k1", None)]));
+    let (router, state) = app(remote.clone(), true);
+    let mut scenario = Scenario::new(router);
+    register_alice(&mut scenario).await;
+    assert_eq!(
+        query_bob(&mut scenario).await["device_keys"][BOB]["ROVER"]["keys"]["ed25519:ROVER"],
+        "k1"
+    );
+    assert_eq!(remote.asked().len(), 1, "fetched once");
+
+    // The sign-in: a device with no keys, announced on its own.
+    let login = receive_device_list_update(
+        &state,
+        "there.example",
+        &json!({"user_id": BOB, "device_id": "LAPTOP", "stream_id": 2, "prev_id": [1]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(login, InboundDeviceList::Applied);
+    let between = query_bob(&mut scenario).await;
+    assert_eq!(
+        between["device_keys"][BOB]["ROVER"]["keys"]["ed25519:ROVER"],
+        "k1"
+    );
+    assert_eq!(
+        between["device_keys"][BOB]["LAPTOP"],
+        Value::Null,
+        "a device without keys is not in the answer: {between}"
+    );
+    assert_eq!(between["failures"], json!({}));
+    assert_eq!(
+        remote.asked().len(),
+        1,
+        "the copy is current; nothing fetched or asked"
+    );
+
+    // The key upload, in sequence.
+    let keyed = receive_device_list_update(
+        &state,
+        "there.example",
+        &json!({
+            "user_id": BOB, "device_id": "LAPTOP", "stream_id": 3, "prev_id": [2],
+            "keys": {"keys": {"ed25519:LAPTOP": "k2"}},
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(keyed, InboundDeviceList::Applied);
+    let after = query_bob(&mut scenario).await;
+    assert_eq!(
+        after["device_keys"][BOB]["LAPTOP"]["keys"]["ed25519:LAPTOP"],
+        "k2"
+    );
+    assert_eq!(
+        after["device_keys"][BOB]["ROVER"]["keys"]["ed25519:ROVER"],
+        "k1"
+    );
+    assert_eq!(remote.asked().len(), 1, "served from the copy");
+}
+
 /// Sytest's "If a device list update goes missing, the server resyncs on the next one": an
 /// update whose `prev_id` is past the copy's position means one was missed, so the whole list
 /// is fetched again and the keys the missed update carried are known afterwards.
