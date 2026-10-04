@@ -1,10 +1,87 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-10-02, 18:25 EDT (the builds got faster, four branches merged, the machine reboots again). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+Written 2026-09-20 by the integration lead, last revised 2026-10-04, afternoon EDT (measured on a quiet machine, nine branches of one wave merged). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
-## Resume here: 2026-10-03, 00:25 EDT -- the night's follow-ups are merged; roll to a3af13a8 or later
+## Resume here: 2026-10-04, afternoon EDT -- the wave is merged; roll to the first green image of `1e262118` or later
+
+**Where `main` is.** `1e262118`. Every branch of the wave named in the next section is merged
+through the queue, each gate green with both PostgreSQL servers (plain on 5462, TLS on 5463):
+`cluster-heartbeat` `a802724a`, `device-list-invites` `5fc19dc5`, `lease-ttl-doc` `8db8a5e2`,
+`fed-state-ids` `f0712bde`, `web-scale-items` `6c95f7a5`, `email-pushers` `da2f3003`,
+`importer-leftovers` `48f9de93`, `postgres-bulk-flush` `7d70cb37`, `bridge-offering-demo`
+`d9c6e5e1`, `users-update-sources` `1e262118`. **Nothing is unmerged, no lock, no agent worktree,
+no agent process.** OpenAPI is **0.1.9** (0.1.8 bridges, 0.1.9 users; 0.1.7 got the changelog
+entry it lacked); the last decision is **0029**, the last RFC **0022** (0021 is accepted and done).
+A usage-credit outage stopped seven agents mid-task at about 02:15; they were resumed on a
+different model at 10:50 with their worktrees intact, and each pushed its work in progress first.
+
+**What the wave holds** (detail in each track's status file, dated 2026-10-04):
+
+- **Federation** (06): an event whose missing prev event nobody sends is taken with the state the
+  sender answers at it (`/state_ids`, then `/event`; `hs_federation_state_fallbacks_total`); an
+  event the current state refuses is **soft failed** (stored, served to federation, never shown
+  to clients, never an extremity; `hs_room_soft_failed_events_total`); float in a v6 PDU is
+  `400`, not `401`; a bad `additional_creators` is `400`. Sytest's federation files 118/130 on
+  the branch (108 on main before).
+- **Device lists** (05+08): both Sytest regressions fixed (the member index built from an
+  invite's stub named nobody, so the joiner looked alone); invitees in `device_lists.changed`,
+  `/keys/changes` answers `left` from the membership walk, a remote copy goes stale when no room
+  is shared any more, a user-signing key is its owner's change alone. The four device-list and
+  cross-signing files 33/36 (20 before).
+- **Cluster** (03, decision 0028): a replica keeps its shards until its lease lapses, not after
+  one late heartbeat; it only stops claiming new ones.
+- **PostgreSQL** (01, RFC 0021): a commit flushes its writes as one `unnest` upsert and one
+  `DELETE` per table (300 puts: 77 ms to 3-7 ms); `hs_kv_postgres_flush_*` on `/metrics`. The
+  first gate found a pre-existing failure the branch now fixes: under SERIALIZABLE a sequential
+  scan of a one-page table (`hs_auth.access_tokens`) locked the whole table, so writers of
+  different keys cancelled each other until ten retries ran out (a `500` on any request); write
+  transactions now `SET LOCAL enable_seqscan = off` and retry with per-call jitter
+  (`crates/hs-kv/tests/postgres_contention.rs`).
+- **Email pushers** (10): delivered over SMTP (`email` config section, hot; Synapse's templates and
+  throttling; `hs_push_email_sent_total`); an email pusher needs an address bound to the account.
+- **Admin and web** (15, 07, 16): `users.update` sets display name, avatar and kind through the
+  user's own profile path (member events re-sent), `users.availability` is real, the user page
+  edits them inline; the Federation page pages, filters and sorts on the server, the Overview's
+  failing count is the server's field, Cluster and Statistics show heartbeat sequence and drains.
+- **Synapse import** (13): other servers' cached media is copied (stream 14 of 14); the
+  `/_synapse/admin` routes `hs serve` mounts are logged at startup and listed in
+  `docs/compat/synapse-admin-routes.md`. Item 7 of the list below was stale: push rules,
+  pushers, receipts, filters, keys, backups and federated rooms were already copied, and the
+  proxy already mounted.
+- **Bridges** (11, decision 0029): the demo declares its WhatsApp offering
+  (`deploy/demo/values-bridges.yaml`, chart `bridges.offerings`) instead of a shared registration,
+  and a bridge registered by hand beside an offering is named on both pages; Signal, Slack, X and
+  LinkedIn have command prefixes; `hs-bridges` and the operator go through `hs_http::outbound`; a
+  changed `double_puppeting` re-renders each instance once; **mautrix-signal is the second real
+  bridge** through the real-bridge test.
+
+**Measured** (the paragraph below): Sytest 643/772, Complement federation 235/314 and csapi
+346/384 on `1372c71f`, before the wave. The wave is not measured as a whole yet.
+
+**What is next, in order:**
+
+1. **Roll the demo** to the first green image of `1e262118` or later, then the owner's bridge
+   migration in `docs/bridges/mautrix.md` ("2026-10-04"). *Desk item.*
+2. **Measure the wave**: `tests/sytest/build.sh myelin-sytest:dev` and the whole suite on a quiet
+   machine, then Complement federation and csapi (`tests/complement/build.sh` now uses BuildKit),
+   as status 14 session 8 did.
+3. **The federation milestone** against a real Synapse (`docker pull ghcr.io/element-hq/synapse`
+   from the owner's terminal; `tests/federation-synapse/run.sh`). *Desk item.*
+4. **What the wave left**, by track: 06 auth_events in the wrong room, cross-room redaction,
+   erased users' events for other servers, the version-12 MSC tests (4289, 4291, 4297, 4311),
+   `TestInboundCanReturnMissingEvents`; 05/06 `Visible_shared_history_after_re-joining_room`
+   (not reproduced); 08 two `40devicelists.pl` tests (remote server down, missed update) and a
+   likely race in "If remote user leaves room we no longer receive device updates"; 15/04 an
+   admin field for search-index lag; 10 queued emails survive a restart, Synapse's `email` block
+   in the translator, password-reset email; 13 a large Synapse on a quiet machine; 11 Telegram
+   (needs an `api_id`), the catalogue's LinkedIn port (29325 vs the source's 29341); 16 the
+   Cluster page's Epoch column overflows at 1280 px, `e2e-real/cluster.spec.ts` assumes one node,
+   `e2e-real/reports-tasks-statistics.spec.ts` rewrites committed screenshots.
+5. **Operations on the cluster** (item 4 of the list below, unchanged) and **the table**.
+
+## Earlier: 2026-10-03, 00:25 EDT -- the night's follow-ups are merged; roll to a3af13a8 or later
 
 **Measured 2026-10-04** (01:45 EDT, the coordinator's measurement agent, on `main` at `1372c71f`,
 code `a9f62fc7`, nothing else running): **Sytest 643 / 772 (85.8%)**, client-server 453 / 537,
@@ -2569,7 +2646,7 @@ Refreshed 2026-09-28 against the code: closed rows are struck through with the c
 | ~~The operator has never run against an API server~~ | `hs-operator` | **Closed** 2026-10-01 (`agent/platform-gaps`, status 12): `deploy/operator/ci/kind-smoke.sh` (in CD's amd64 image leg) runs the chart's bridge operator on kind -- a `Bridge` becomes a claim, Deployment and Service it owns, `Ready`, `Degraded` (`ErrImagePull`) and `Ready` again, deletion removes all of it -- and `hs operator --homeservers` on a single-node `Homeserver`: the chart's objects, `Ready`, an image roll through the partition, deletion. Transcript in `docs/status/transcripts/`. Found and fixed: the `Bridge` controller took a `Homeserver`'s pods for a `Bridge`'s (both are `managed-by=myelin-operator`). Left: the `Homeserver`'s cluster mode -- replicas, the PodDisruptionBudget and drain-before-evict through the admin API -- has still only run against the in-memory cluster |
 | ~~RFC 0017's `cluster` runtime has never run~~ | `hs-bridges`, `hs-operator`, desktop | **Closed** 2026-10-01 (`agent/platform-gaps`, status 11): on kind, the heisenbridge offering made with `"runtime":"cluster"` through the admin API went `requested → registered → deploying → starting → ready` in 47 s with a real pod (`bridge-19a1359c-7c8c8964c7-9rhgf`), its bot registered through the server, and removing it deleted everything; no `hs-bridges` change was needed. `kind-smoke.sh --heisenbridge`, by hand (not in CD: it pulls `hif1/heisenbridge:latest`). Left: no per-user offering (mautrix) deployed this way, no multi-node cluster |
 | ~~`/sync` can repeat an event across two consecutive incremental batches~~ | `hs-user` | **Closed** (91c116f): the token's feed position was fixed before the batch was read, but each room's timeline was read to its live end, so an event landing during assembly was in that batch and, being past the token, in the next one too (initial batches included). A batch now carries the rooms with a feed entry at or before its token and each room's timeline stops at the position its entry had then (`UserStore::room_pos_at_token`). `sync::tests::an_event_that_arrives_during_assembly_is_in_exactly_one_batch` races a 300-event writer against a syncing device: 159 of 300 repeated on the old code, none now, none lost. `bridge_offerings.rs`'s client no longer de-duplicates and fails on a repeat. Before: an event that arrives while the earlier batch is being assembled appears in it and in the next one (seen with appservice-sent notices, 2026-09-27); clients dedupe by event id, and the bridge test does too |
-| The demo still runs a shared WhatsApp registration | demo | RFC 0017 section 6 says an offering replaces it; not done |
+| ~~The demo still runs a shared WhatsApp registration~~ | demo | **Closed** 2026-10-04 (`cff1dc81`, decision 0029, status 11): `deploy/demo/values-bridges.yaml` declares the offering; a hand-registered bridge beside it is named on both pages. The roll and the owner's steps in `docs/bridges/mautrix.md` are a desk item |
 | The bridge manager runs on one replica only | `hs-cli` | gated to the owner of the global shard, so a handoff pauses provisioning for a tick; never watched on a cluster |
 | ~~A first boot over an empty data directory takes about five seconds~~ | `hs-cli`, `hs-kv` | **Closed** 2026-10-01 (`agent/boot-time`, status 01, decision 0024): every `hs-kv` keyspace on Fjall is a `[len][name]` prefix in one shared Fjall keyspace, so a fresh store creates one Fjall keyspace instead of 109 (Fjall has no batched creation and serializes creations under a lock); old data directories are read in their per-table layout, unmigrated. Launch to `listening`, five runs, load 11-18: debug cold 8.8 s → 0.72 s, release cold 9.4 s (20.7 s in a second, busier run) → 0.62 s, warm 0.4 to 0.8 s. The `listening` line says `boot_ms`, `cold`, `keyspaces_created`; `hs_boot_duration_seconds{cold}`. Guards: `hs-kv/tests/fjall_keyspace_creation.rs` (one Fjall keyspace for ninety tables; a crash right after a first boot loses nothing; the old layout still read) and `hs-cli/tests/boot_time.rs` (the real binary, `SIGKILL` after the first boot, account still there). The chart's startup probe (150 s budget) already tolerated it and is unchanged; its very first probe can still be refused as the container starts, one event inside the budget |
 | ~~User-directory scope is computed by walking rooms on every search~~ | `hs-user` | **Closed** 2026-09-30 (`agent/user-gaps`, status 05 session 11): a search reads `hs_user.room_members` (each room's joined members, kept by the session hub from the room updates it already applies) for the searcher's joined rooms and the public ones, and loads no room; a room the index has nothing for (last updated before it existed) is read once and indexed, counted by `SessionHub::directory_rooms_walked` and logged. Same answers (`e2e.rs`'s directory test unchanged). Timing, one public room of 5,001 members, release, in-memory: 2.7 ms from the index against 2.3 ms reading a resident room and 125 ms loading one -- the win is never loading or queuing on a room, not a resident room's read. Left: `users_sharing_room_with` (every `/sync`'s presence and device-list scope) still reads rooms |
@@ -2582,10 +2659,10 @@ Refreshed 2026-09-28 against the code: closed rows are struck through with the c
 | ~~The PostgreSQL backend logs `WARNING: there is no transaction in progress` at INFO~~ | `hs-kv` | **Closed** 2026-09-30 (`agent/cli-small-gaps`, status 01): `commit` sent `ROLLBACK` after a failed `COMMIT`, which has already ended the transaction (SSI cancels some transactions at commit under contention); now only a failed flush is rolled back. The driver's notices are logged at their own severity under `hs_kv::postgres` (a `WARNING` is a `warn`) and counted (`PostgresBackend::notices_received`). `postgres_conformance.rs::a_commit_that_fails_at_commit_time_draws_no_warning` fails a `COMMIT` with a deferred trigger and fails on the old code; the conformance breakdown asserts no scenario draws a warning. Left: not yet watched on the cluster. Before: seen many times an hour on the two-pod cluster's `hs-0`, logged at INFO |
 | ~~A released shard keeps its fencing epoch until the next owner acquires it~~ | `hs-cluster` | **Closed** 2026-10-01 (`agent/room-cluster-small`, decision 0023, status 03): `release_shard` advances the epoch in the transaction that clears the owner, so a fence from before the release fails while the shard has no owner; a handoff moves the epoch twice. `fence::tests::a_stale_fence_fails_while_the_released_shard_has_no_owner`; the two-replica `cluster_admin.rs` and `cluster_create_room.rs` pass on PostgreSQL |
 | ~~`heartbeat_seq` is derived from wall-clock milliseconds~~ | `hs-cluster` | **Closed** 2026-09-30 (`agent/cluster-gaps`, status 03): a counter per replica process, one step per heartbeat, started above the highest value any earlier process of the replica wrote (its registry row, or a `seq/<id>` key kept when a drain deregisters it); the wall clock stays in `heartbeat_unix_ms` for operators; `hs_cluster_heartbeat_seq` gauge. `ownership::tests::heartbeats_in_one_millisecond_are_each_a_step_of_progress` and `a_restart_continues_the_heartbeat_seq_above_the_previous_process` fail on the old code. Before: two ticks in one millisecond read as "no progress", i.e. death |
-| A replica gives up every shard when one tick runs two heartbeat intervals after its last good heartbeat | `hs-cluster` | found 2026-10-01 chasing a flaky `cluster_create_room.rs` (status 03): `converge` wants shards only while `self_heartbeat_fresh` (last good heartbeat under `2 * heartbeat_interval`, 2 s at the defaults), so one slow or failed heartbeat under load releases everything the replica holds; the peer takes it and gives it back, and requests in between are forwarded, retried or fenced. Now logged (`warn`, with the gap); whether a replica should keep its shards until `lease_ttl`, as `is_mine` and its peers' judgement do, is a decision not yet taken |
+| ~~A replica gives up every shard when one tick runs two heartbeat intervals after its last good heartbeat~~ | `hs-cluster` | **Closed** 2026-10-04 (`a802724a`, decision 0028, status 03): a replica keeps a shard it holds while its last good heartbeat is under `lease_ttl` and only stops claiming new ones once it is stale |
 | ~~Appservice delivery carries events only~~ | `hs-appservice`, `hs-user`, `hs-e2e` | **Closed** 2026-09-30 (branch `agent/as-ephemeral`, decision 0019, status 11): MSC2409 typing, receipts and presence, MSC2409/MSC4203 to-device messages and MSC3202 device lists with one-time-key counts reach a registration that asked for them, from server-wide receipt, presence and to-device streams read at a durable position per appservice and stream (queued in one store transaction with the body, so a restart resends nothing); typing through the hub's new ephemeral observer. `hs-cli/tests/appservice_ephemeral.rs` drives the real binary through all of it, a restart and a pause; mautrix-whatsapp in appservice-mode encryption received its device-list change, key counts, ephemeral events and a to-device message (`docs/bridges/mautrix.md`). Left: `device_lists.left` is never filled (as Synapse), a never-syncing bot device's to-device queue is not pruned, key counts cost one device listing per interesting user per transaction (unmeasured), and no cluster run of the ephemeral pump yet |
-| Only heisenbridge has been run against it | `hs-appservice` | a mautrix-* bridge with an external service (and its media, double puppeting, MSC3202) is the next real-bridge check |
-| The Synapse importer leaves some things behind | `hs-compat`, `hs-cli` | end-to-end keys and key backups, push rules and pushers, receipts, filters, remote media, and rooms this server's users joined over federation (skipped and logged; their members rejoin) are not copied (`docs/compat/synapse-migration-runbook.md`, "What does not move yet") |
+| ~~Only heisenbridge has been run against it~~ | `hs-appservice` | **Closed**: mautrix-whatsapp (2026-10-02, `real_mautrix_login.rs`) and mautrix-signal (2026-10-04, `d9c6e5e1`) run through the real-bridge test with appservice-mode encryption and a cross-signed bot device |
+| The Synapse importer leaves some things behind | `hs-compat`, `hs-cli` | Narrowed 2026-10-04 (`48f9de93`, status 13): everything but thumbnails (this server makes its own), receipts in threads other than `main` (no thread dimension in `hs-user`'s receipts), a backed-up key deleted in Synapse after an earlier pass (no per-key delete in `hs-e2e`), and rooms people were only invited to or have all left (skipped and logged) is copied, other servers' cached media included |
 | The Synapse importer has only met a small Synapse | `hs-compat`, `hs-cli` | verified end to end against a real Synapse 1.161 with four accounts and two rooms; a room is replayed whole, in memory, so a very large room will be slow and memory-hungry, and nothing measures throughput yet |
 | ~~Sytest never run~~ | `tests/sytest` | **Closed** 2026-10-01 (`agent/test-infra-gaps`, status 14 session 5): runs in Docker on Sytest's own image (no CPAN on the host) with a new plugin, haproxy for TLS and certificates verified against Sytest's CA. Whole suite: **407 of 772 pass, 317 fail, 48 skip**; client-server 59%, appservices 40%, federation 14% (`docs/status/sytest/2026-10-01-results.txt` per test, `-summary.txt` for reasons and groups). It found the Argon2 leak and the redaction hole below, both fixed. Left: no blacklist yet, and the rows below |
 | ~~Guest access cannot be switched on~~ | `hs-config`, `hs-auth`, `hs-room` | **Closed** 2026-10-01 (`agent/sytest-client`, status 07 session 11): `auth.allow_guest_access` (default off, hot); one table of what a guest may call (`hs_auth::guest`), `M_GUEST_ACCESS_FORBIDDEN` for the rest; `m.room.guest_access` honoured on join and on revocation (guests leave); upgrade with `guest_access_token`; `is_guest` in the admin API and a Users-page badge. `hs-cli/tests/guest_access.rs`. Sytest guest APIs 0 → 23 of 24. Left: "...kicked ... over federation" passes in one run of three (the guest's join times out under load) |
