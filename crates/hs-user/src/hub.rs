@@ -265,10 +265,16 @@ impl<B: KvBackend + 'static, R: RoomSource<B> + 'static> hs_e2e::state::SyncToke
             },
             None => None,
         };
-        crate::sync::device_lists::changes_between(&self.hub, &self.e2e, user_id, &from, to.as_ref())
-            .await
-            .map(Some)
-            .map_err(|error| hs_e2e::store::StoreError::Backend(error.to_string()).into())
+        crate::sync::device_lists::changes_between(
+            &self.hub,
+            &self.e2e,
+            user_id,
+            &from,
+            to.as_ref(),
+        )
+        .await
+        .map(Some)
+        .map_err(|error| hs_e2e::store::StoreError::Backend(error.to_string()).into())
     }
 }
 
@@ -2481,6 +2487,159 @@ mod tests {
             .expect("bob's invite must be recorded even though he never called anything");
         assert_eq!(membership.membership, "invite");
         assert!(hub.store().latest_feed_seq(&bob).await.unwrap() > 0);
+    }
+
+    /// The regression behind Sytest's "If remote user leaves room, changes device and rejoins
+    /// we see update in sync": on the invitee's server the member index of a room is made
+    /// from the invite's stub, with nobody in it, and the room's state arrives whole with the
+    /// join, whose update names only the joiner. The index then said the joiner was alone, so
+    /// `users_sharing_room_with` found nobody and the joiner's key changes were announced to
+    /// no server at all. A join now makes the index match the room.
+    #[tokio::test]
+    async fn a_join_makes_a_member_index_that_was_behind_the_room_match_it() {
+        let (hub, rooms) = hub(500);
+        let alice = user_id!("@alice:hub.test").to_owned();
+        let bob = user_id!("@bob:hub.test").to_owned();
+        let handle = rooms
+            .create_room(
+                alice.clone(),
+                CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+        // The invite stub's index: the room is indexed, and nobody is in it.
+        hub.store().forget_room_members(&room_id).await.unwrap();
+        assert!(
+            hub.store()
+                .index_room_members_if_absent(&room_id, &[])
+                .await
+                .unwrap()
+        );
+        hub.watch_room(handle.clone()).await;
+        handle
+            .membership(
+                bob.clone(),
+                Action::Join,
+                bob.clone(),
+                serde_json::json!({}),
+                2,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let shared = hub.users_sharing_room_with(&bob).await.unwrap();
+        assert!(
+            shared.contains(&alice),
+            "bob shares the room with alice, whom the stale index did not name: {shared:?}"
+        );
+        let mut members = hub
+            .store()
+            .room_member_ids(&room_id)
+            .await
+            .unwrap()
+            .unwrap();
+        members.sort();
+        assert_eq!(members, vec![alice, bob]);
+    }
+
+    /// Sytest's "Server correctly resyncs when server leaves and rejoins a room" and
+    /// Complement's `TestDeviceListUpdates/when_remote_user_rejoins_a_room`: once no local user
+    /// shares a room with a remote user, nothing keeps this server's copy of their device list
+    /// current, so the membership change that ends the last shared room marks it stale -- from
+    /// either side: the remote user leaving, or the last local user leaving. A copy of somebody
+    /// still sharing a room is left alone.
+    #[tokio::test]
+    async fn a_remote_users_device_list_goes_stale_when_no_room_is_shared_any_more() {
+        use hs_e2e::store::RemoteDeviceListStore;
+        let (hub, rooms) = hub(500);
+        let e2e =
+            StdArc::new(hs_e2e::store::tables::TablesE2eStore::open(MemoryBackend::new()).unwrap());
+        hub.install_remote_device_lists(e2e.clone(), "hub.test".try_into().unwrap());
+        let alice = user_id!("@alice:hub.test").to_owned();
+        let bob = user_id!("@bob:remote.test").to_owned();
+        let carol = user_id!("@carol:remote.test").to_owned();
+        let held = |stale| hs_e2e::store::RemoteUserRow {
+            stream_id: 1,
+            master: None,
+            self_signing: None,
+            stale,
+        };
+        for user in [&bob, &carol] {
+            e2e.replace_remote_device_list(user, held(false), Vec::new())
+                .await
+                .unwrap();
+        }
+        let handle = rooms
+            .create_room(
+                alice.clone(),
+                CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        hub.watch_room(handle.clone()).await;
+        for (user, ts) in [(&bob, 2), (&carol, 3)] {
+            handle
+                .membership(
+                    user.clone(),
+                    Action::Join,
+                    user.clone(),
+                    serde_json::json!({}),
+                    ts,
+                )
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let stale = |user: OwnedUserId| {
+            let e2e = e2e.clone();
+            async move { e2e.get_remote_user(&user).await.unwrap().unwrap().stale }
+        };
+        assert!(!stale(bob.clone()).await && !stale(carol.clone()).await);
+
+        // Bob leaves: his copy is stale; carol, still in the room with alice, keeps hers.
+        handle
+            .membership(
+                bob.clone(),
+                Action::Leave,
+                bob.clone(),
+                serde_json::json!({}),
+                4,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(stale(bob.clone()).await, "bob shares no room here any more");
+        assert!(
+            !stale(carol.clone()).await,
+            "carol still shares the room with alice"
+        );
+
+        // Alice, the last local user, leaves: carol's copy is stale too.
+        handle
+            .membership(
+                alice.clone(),
+                Action::Leave,
+                alice.clone(),
+                serde_json::json!({}),
+                5,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            stale(carol).await,
+            "no local user is left in the room carol is in"
+        );
     }
 
     #[tokio::test]

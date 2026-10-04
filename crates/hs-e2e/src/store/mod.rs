@@ -203,6 +203,23 @@ pub trait DeviceKeyStore: Send + Sync {
     /// cross-signing key changes, which the spec also requires to appear in `/keys/changes`).
     async fn record_device_list_change(&self, user_id: &UserId) -> Result<u64, StoreError>;
 
+    /// Records a change only `user_id` themself is told about: a stream position is assigned
+    /// (so their syncs wake and their token moves on), but the entry is theirs alone --
+    /// [`DeviceKeyStore::changed_users_since`] skips it, so no other user, server or appservice
+    /// hears of it, and [`DeviceKeyStore::user_stream_pos`] does not move. What a user-signing
+    /// key upload is: that key is private to its owner (the spec; Synapse notifies only the
+    /// owner's own devices), and Sytest's "Changing user-signing key notifies local users"
+    /// fails if anyone else is told.
+    async fn record_own_device_list_change(&self, user_id: &UserId) -> Result<u64, StoreError>;
+
+    /// The users with a change of their own ([`DeviceKeyStore::record_own_device_list_change`])
+    /// at a stream position greater than `since` and at most `upto` (`None`: no upper bound).
+    async fn own_changes_since(
+        &self,
+        since: u64,
+        upto: Option<u64>,
+    ) -> Result<std::collections::BTreeSet<OwnedUserId>, StoreError>;
+
     /// The current (most recently assigned) device-list stream position, or `0` if nothing has
     /// ever changed.
     async fn current_stream_pos(&self) -> Result<u64, StoreError>;
@@ -216,7 +233,8 @@ pub trait DeviceKeyStore: Send + Sync {
 
     /// Every distinct user whose device list changed with a stream position greater than `since`
     /// and at most `upto` (`upto = None` means "no upper bound", i.e. up to
-    /// [`DeviceKeyStore::current_stream_pos`]).
+    /// [`DeviceKeyStore::current_stream_pos`]). A change only its user is told about
+    /// ([`DeviceKeyStore::record_own_device_list_change`]) is not among them.
     async fn changed_users_since(
         &self,
         since: u64,

@@ -16,8 +16,8 @@
 //! - A room they were already in: every `m.room.member` event after `from`'s position (and at
 //!   or before `to`'s, when `to` resolves) is read, bounded by [`MEMBER_WALK_LIMIT`]; a join,
 //!   invite or knock puts its subject among the possibly changed, a leave or ban among the
-//!   possibly left (the later event wins, as in `/sync`). Past the bound, every current member
-//!   is possibly changed -- more than the minimum, and the direction that costs a key query
+//!   possibly left (the later event wins, as in `/sync`). The user's own leave and return
+//!   within the walk, or the bound being reached, make every current member possibly changed -- more than the minimum, and the direction that costs a key query
 //!   rather than a message nobody can read.
 //! - A room they left or were banned from after `from`: everyone still in it is possibly left.
 //!
@@ -79,6 +79,17 @@ pub async fn changes_between<B: KvBackend + 'static, R: RoomSource<B>>(
         .into_iter()
         .filter(|u| shared.contains(u) || u.as_str() == user_id.as_str())
         .collect();
+    // A change only its user hears of (`DeviceKeyStore::record_own_device_list_change`).
+    if DeviceKeyStore::own_changes_since(
+        &**e2e,
+        from.device_list_seq,
+        to.map(|t| t.device_list_seq),
+    )
+    .await?
+    .contains(user_id)
+    {
+        changed.insert(user_id.to_owned());
+    }
 
     // The walk: the rooms with a feed entry between the tokens, and the hot rooms.
     let memberships: HashMap<OwnedRoomId, MembershipRecord> = store
@@ -154,8 +165,17 @@ pub async fn changes_between<B: KvBackend + 'static, R: RoomSource<B>>(
                         (changes, limited)
                     })
                     .await;
+                // The user's own leave followed by their own join within the walk: back in a
+                // room they were out of, so everyone in it now is possibly changed.
+                let mut own_left = false;
+                let mut own_rejoined = false;
                 for (other, membership) in changes {
                     if other.as_str() == user_id.as_str() {
+                        match membership.as_str() {
+                            "leave" | "ban" => own_left = true,
+                            "join" if own_left => own_rejoined = true,
+                            _ => {}
+                        }
                         continue;
                     }
                     match membership.as_str() {
@@ -169,7 +189,7 @@ pub async fn changes_between<B: KvBackend + 'static, R: RoomSource<B>>(
                         }
                     }
                 }
-                if limited {
+                if limited || own_rejoined {
                     for (other, membership) in current_members(&handle).await? {
                         note_arrival(&other, &membership, &mut possibly_changed, &mut pending);
                     }
@@ -283,5 +303,249 @@ fn note_arrival(
             pending.insert(other.clone());
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::filter::SyncFilter;
+    use crate::room_source::test_support::registry;
+    use crate::store::DynUserStore;
+    use crate::store::tables::TablesUserStore;
+    use crate::sync::{SyncParams, build};
+    use hs_e2e::store::tables::TablesE2eStore;
+    use hs_kv::memory::MemoryBackend;
+    use hs_room::actor::{CreateRoomRequest, RoomActorHandle};
+    use hs_room::membership::Action;
+    use ruma::user_id;
+    use std::time::Duration;
+
+    type TestHub = SessionHub<MemoryBackend, Arc<hs_room::registry::RoomRegistry<MemoryBackend>>>;
+
+    struct World {
+        hub: Arc<TestHub>,
+        e2e: Arc<dyn E2eStore>,
+        alice: OwnedUserId,
+        bob: OwnedUserId,
+        room: RoomActorHandle<MemoryBackend>,
+        ts: std::sync::atomic::AtomicI64,
+    }
+
+    impl World {
+        /// Alice's public room, watched by the hub; nobody else in it yet.
+        async fn new() -> Self {
+            let rooms = registry("keys.test");
+            let store: DynUserStore =
+                Arc::new(TablesUserStore::open(MemoryBackend::new()).unwrap());
+            let hub = Arc::new(SessionHub::new(store, rooms, 500));
+            let alice = user_id!("@alice:keys.test").to_owned();
+            let room = hub
+                .rooms()
+                .create_room(
+                    alice.clone(),
+                    CreateRoomRequest {
+                        preset: Some("public_chat".to_owned()),
+                        ..Default::default()
+                    },
+                    1,
+                )
+                .await
+                .unwrap();
+            hub.watch_room(room.clone()).await;
+            Self {
+                hub,
+                e2e: Arc::new(TablesE2eStore::open(MemoryBackend::new()).unwrap()),
+                alice,
+                bob: user_id!("@bob:keys.test").to_owned(),
+                room,
+                ts: std::sync::atomic::AtomicI64::new(10),
+            }
+        }
+
+        async fn act(&self, sender: &OwnedUserId, action: Action, target: &OwnedUserId) {
+            let ts = self.ts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.room
+                .membership(
+                    sender.clone(),
+                    action,
+                    target.clone(),
+                    serde_json::json!({}),
+                    ts,
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+
+        /// One of alice's syncs, as a client makes it: the response and its `next_batch`, with
+        /// the device's cursor recorded so the next change lands in a new feed entry.
+        async fn sync(&self, since: Option<SyncToken>) -> (serde_json::Value, SyncToken) {
+            let params = SyncParams {
+                since,
+                full_state: false,
+                timeout: Duration::from_millis(20),
+                filter: SyncFilter::none(),
+                device_id: Some("DEV".into()),
+            };
+            build(&self.hub, &self.e2e, &self.alice, params)
+                .await
+                .unwrap()
+        }
+
+        async fn changes(&self, from: &SyncToken, to: Option<&SyncToken>) -> DeviceListChanges {
+            changes_between(&self.hub, &self.e2e, &self.alice, from, to)
+                .await
+                .unwrap()
+        }
+    }
+
+    fn named(list: &serde_json::Value, user: &UserId) -> bool {
+        list.as_array()
+            .is_some_and(|l| l.iter().any(|u| u.as_str() == Some(user.as_str())))
+    }
+
+    /// Synapse puts a user newly invited to (or knocking on) a room the syncer is in into
+    /// `device_lists.changed`, before they join; Sytest's cross-signing federation tests
+    /// wait for exactly that. This server named only joiners.
+    #[tokio::test]
+    async fn an_invite_puts_the_invitee_in_sync_and_keys_changes_before_they_join() {
+        let w = World::new().await;
+        let (_, from) = w.sync(None).await;
+        w.act(&w.alice, Action::Invite, &w.bob).await;
+        let (response, to) = w.sync(Some(from)).await;
+        assert!(
+            named(&response["device_lists"]["changed"], &w.bob),
+            "the invitee is in changed: {response}"
+        );
+        let changes = w.changes(&from, Some(&to)).await;
+        assert_eq!(changes.changed, vec![w.bob.clone()]);
+        assert!(changes.left.is_empty());
+    }
+
+    /// Sytest's "New users appear in /keys/changes": somebody joining after `from` is
+    /// `changed` between the tokens, though they never touched a key.
+    #[tokio::test]
+    async fn a_user_who_joined_between_the_tokens_is_changed() {
+        let w = World::new().await;
+        let (_, from) = w.sync(None).await;
+        w.act(&w.bob, Action::Join, &w.bob).await;
+        let (response, to) = w.sync(Some(from)).await;
+        assert!(named(&response["device_lists"]["changed"], &w.bob));
+        assert_eq!(
+            w.changes(&from, Some(&to)).await.changed,
+            vec![w.bob.clone()]
+        );
+        // With no `to`: up to now, the same.
+        assert_eq!(w.changes(&from, None).await.changed, vec![w.bob.clone()]);
+        // And from `to` on, nothing happened.
+        assert_eq!(w.changes(&to, None).await, DeviceListChanges::default());
+    }
+
+    /// Sytest's two "Get left notifs ... in sync and /keys/changes" tests: the other user
+    /// leaving, and the syncing user leaving, both make the other user `left` between the
+    /// tokens, as the sync between them said.
+    #[tokio::test]
+    async fn a_leave_from_either_side_is_left_between_the_tokens() {
+        for alice_leaves in [false, true] {
+            let w = World::new().await;
+            w.act(&w.bob, Action::Join, &w.bob).await;
+            let (_, warm) = w.sync(None).await;
+            let (_, from) = w.sync(Some(warm)).await;
+            if alice_leaves {
+                w.act(&w.alice, Action::Leave, &w.alice).await;
+            } else {
+                w.act(&w.bob, Action::Leave, &w.bob).await;
+            }
+            let (response, to) = w.sync(Some(from)).await;
+            assert!(
+                named(&response["device_lists"]["left"], &w.bob),
+                "alice_leaves={alice_leaves}: {response}"
+            );
+            let changes = w.changes(&from, Some(&to)).await;
+            assert_eq!(
+                changes.left,
+                vec![w.bob.clone()],
+                "alice_leaves={alice_leaves}"
+            );
+            assert!(changes.changed.is_empty(), "alice_leaves={alice_leaves}");
+        }
+    }
+
+    /// Sytest's "If user leaves room, remote user changes device and rejoins we see update in
+    /// /sync and /keys/changes": the syncing user leaves and comes back within one batch. The
+    /// others in the room are `changed` (their devices may have changed unheard), in `/sync`
+    /// and between the tokens, and nobody -- the user least of all -- is `left`.
+    #[tokio::test]
+    async fn the_users_own_leave_and_return_makes_the_others_changed() {
+        let w = World::new().await;
+        w.act(&w.bob, Action::Join, &w.bob).await;
+        let (_, warm) = w.sync(None).await;
+        let (_, from) = w.sync(Some(warm)).await;
+        w.act(&w.alice, Action::Leave, &w.alice).await;
+        w.act(&w.alice, Action::Join, &w.alice).await;
+        let (response, to) = w.sync(Some(from)).await;
+        assert!(
+            named(&response["device_lists"]["changed"], &w.bob),
+            "bob is changed: {response}"
+        );
+        assert_eq!(response["device_lists"]["left"], serde_json::json!([]));
+        let changes = w.changes(&from, Some(&to)).await;
+        assert_eq!(changes.changed, vec![w.bob.clone()]);
+        assert!(changes.left.is_empty());
+    }
+
+    /// A user-signing key change is the user's alone: it is in their own `changed`, and no one
+    /// else's.
+    #[tokio::test]
+    async fn a_change_of_the_users_own_is_theirs_alone() {
+        let w = World::new().await;
+        w.act(&w.bob, Action::Join, &w.bob).await;
+        let (_, warm) = w.sync(None).await;
+        let (_, from) = w.sync(Some(warm)).await;
+        DeviceKeyStore::record_own_device_list_change(&*w.e2e, &w.bob)
+            .await
+            .unwrap();
+        let (response, to) = w.sync(Some(from)).await;
+        assert_eq!(response["device_lists"]["changed"], serde_json::json!([]));
+        assert!(w.changes(&from, Some(&to)).await.changed.is_empty());
+
+        DeviceKeyStore::record_own_device_list_change(&*w.e2e, &w.alice)
+            .await
+            .unwrap();
+        let (response, _) = w.sync(Some(to)).await;
+        assert!(named(&response["device_lists"]["changed"], &w.alice));
+        assert_eq!(w.changes(&to, None).await.changed, vec![w.alice.clone()]);
+    }
+
+    /// Sytest's "If remote user leaves room, changes device and rejoins we see update in
+    /// /keys/changes": somebody who left and came back between the tokens is `changed`, not
+    /// `left`; and a device change by somebody sharing a room is `changed` from the stream.
+    #[tokio::test]
+    async fn a_leave_and_rejoin_between_the_tokens_is_changed() {
+        let w = World::new().await;
+        w.act(&w.bob, Action::Join, &w.bob).await;
+        let (_, warm) = w.sync(None).await;
+        let (_, from) = w.sync(Some(warm)).await;
+        w.act(&w.bob, Action::Leave, &w.bob).await;
+        w.act(&w.bob, Action::Join, &w.bob).await;
+        let (_, to) = w.sync(Some(from)).await;
+        let changes = w.changes(&from, Some(&to)).await;
+        assert_eq!(changes.changed, vec![w.bob.clone()]);
+        assert!(changes.left.is_empty());
+
+        DeviceKeyStore::record_device_list_change(&*w.e2e, &w.bob)
+            .await
+            .unwrap();
+        let stranger = user_id!("@stranger:keys.test");
+        DeviceKeyStore::record_device_list_change(&*w.e2e, stranger)
+            .await
+            .unwrap();
+        let changes = w.changes(&to, None).await;
+        assert_eq!(
+            changes.changed,
+            vec![w.bob.clone()],
+            "a stranger's device change is not alice's to hear about"
+        );
     }
 }

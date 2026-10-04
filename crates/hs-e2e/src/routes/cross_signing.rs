@@ -171,7 +171,12 @@ pub async fn post_device_signing_upload<B: KvBackend + 'static>(
             .map_err(|msg| E2eError::InvalidSignature(format!("{field}: {msg}")))?;
     }
 
-    let mut changed = false;
+    // A master or self-signing key is public: everyone sharing a room with the user, and other
+    // servers, are told. A user-signing key is the user's own business (the spec: it is only
+    // ever returned to its owner), so an upload of that alone tells only the user's own
+    // devices, as Synapse's `notify_user_signature_update` does.
+    let mut public_change = false;
+    let mut own_change = false;
     for (field, key_type) in [
         ("master_key", CrossSigningKeyType::Master),
         ("self_signing_key", CrossSigningKeyType::SelfSigning),
@@ -182,13 +187,22 @@ pub async fn post_device_signing_upload<B: KvBackend + 'static>(
                 .store
                 .put_cross_signing_key(&requester.user_id, key_type, key.clone())
                 .await?;
-            changed = true;
+            if key_type == CrossSigningKeyType::UserSigning {
+                own_change = true;
+            } else {
+                public_change = true;
+            }
         }
     }
-    if changed {
+    if public_change {
         state
             .store
             .record_device_list_change(&requester.user_id)
+            .await?;
+    } else if own_change {
+        state
+            .store
+            .record_own_device_list_change(&requester.user_id)
             .await?;
     }
     Ok(Json(json!({})).into_response())

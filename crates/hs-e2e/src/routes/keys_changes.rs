@@ -57,6 +57,19 @@ pub async fn get_keys_changes<B: KvBackend + 'static>(
     E2eRequester(requester): E2eRequester,
     Query(query): Query<KeysChangesQuery>,
 ) -> Result<Json<serde_json::Value>, E2eError> {
+    keys_changes_answer(&state, &requester.user_id, &query.from, query.to.as_deref())
+        .await
+        .map(Json)
+}
+
+/// [`get_keys_changes`]'s answer for `user_id`, split out so a test can call it without an
+/// authenticated request (as [`resolve_stream_pos`] is).
+pub(crate) async fn keys_changes_answer<B: KvBackend + 'static>(
+    state: &E2eState<B>,
+    user_id: &UserId,
+    from: &str,
+    to: Option<&str>,
+) -> Result<serde_json::Value, E2eError> {
     // The installed resolver's own answer, when it makes the membership walk between two of
     // its tokens (`hs-user` does: `crate::state::SyncTokenResolver::device_list_changes_between`).
     // That is the only way to answer `left`, and `changed` for a user who merely started sharing
@@ -64,32 +77,32 @@ pub async fn get_keys_changes<B: KvBackend + 'static>(
     // doc comment for the same limitation on the appservice-facing side.
     if let Some(resolver) = state.sync_token_resolver()
         && let Some(changes) = resolver
-            .device_list_changes_between(&requester.user_id, &query.from, query.to.as_deref())
+            .device_list_changes_between(user_id, from, to)
             .await?
     {
         tracing::debug!(
-            user_id = %requester.user_id,
+            %user_id,
             changed = changes.changed.len(),
             left = changes.left.len(),
             "/keys/changes answered from the membership walk between two sync tokens"
         );
-        return Ok(Json(json!({
+        return Ok(json!({
             "changed": changes.changed.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "left": changes.left.iter().map(ToString::to_string).collect::<Vec<_>>(),
-        })));
+        }));
     }
     // A plain stream position (this crate's own token format), or a resolver that only decodes
     // positions: the device-list stream alone, with `left` necessarily empty.
-    let from = resolve_stream_pos(&state, &requester.user_id, &query.from).await?;
-    let to = match query.to.as_deref() {
-        Some(raw) => Some(resolve_stream_pos(&state, &requester.user_id, raw).await?),
+    let from = resolve_stream_pos(state, user_id, from).await?;
+    let to = match to {
+        Some(raw) => Some(resolve_stream_pos(state, user_id, raw).await?),
         None => None,
     };
     let changed = state.store.changed_users_since(from, to).await?;
-    Ok(Json(json!({
+    Ok(json!({
         "changed": changed.into_iter().map(|u| u.to_string()).collect::<Vec<_>>(),
         "left": Vec::<String>::new(),
-    })))
+    }))
 }
 
 #[cfg(test)]
@@ -164,6 +177,58 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, E2eError::BadRequest(_)));
+    }
+
+    /// A resolver that also makes the membership walk: its answer is the route's, `left`
+    /// included; a plain decimal still goes to the stream, where `left` is empty.
+    struct WalkingResolver;
+
+    #[async_trait::async_trait]
+    impl crate::state::SyncTokenResolver for WalkingResolver {
+        async fn resolve_device_list_position(
+            &self,
+            _user_id: &UserId,
+            raw: &str,
+        ) -> Result<Option<u64>, E2eError> {
+            Ok(raw.strip_prefix("walk_").and_then(|n| n.parse().ok()))
+        }
+
+        async fn device_list_changes_between(
+            &self,
+            _user_id: &UserId,
+            from: &str,
+            _to: Option<&str>,
+        ) -> Result<Option<crate::state::DeviceListChanges>, E2eError> {
+            if !from.starts_with("walk_") {
+                return Ok(None);
+            }
+            Ok(Some(crate::state::DeviceListChanges {
+                changed: vec![ruma::user_id!("@new:example.org").to_owned()],
+                left: vec![ruma::user_id!("@gone:example.org").to_owned()],
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn the_resolvers_walk_answers_changed_and_left_when_it_has_one() {
+        let state = state();
+        state.install_sync_token_resolver(Arc::new(WalkingResolver));
+        let alice = user_id!("@alice:example.org");
+        let answer = keys_changes_answer(&state, alice, "walk_1", Some("walk_2"))
+            .await
+            .unwrap();
+        assert_eq!(
+            answer,
+            json!({"changed": ["@new:example.org"], "left": ["@gone:example.org"]})
+        );
+
+        // A plain decimal is not the walk's: the stream answers it, with `left` empty.
+        state.store.record_device_list_change(alice).await.unwrap();
+        let answer = keys_changes_answer(&state, alice, "0", None).await.unwrap();
+        assert_eq!(
+            answer,
+            json!({"changed": ["@alice:example.org"], "left": []})
+        );
     }
 
     #[tokio::test]

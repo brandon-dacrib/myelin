@@ -1306,6 +1306,19 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
                 // list it was no longer being kept up to date on.
                 if matches!(membership, Some("leave") | Some("ban")) {
                     left_candidates.extend(hub.joined_member_ids_if_present(room_id).await?);
+                } else if membership == Some("join")
+                    && membership_record_is_join
+                    && event
+                        .pointer("/unsigned/prev_content/membership")
+                        .and_then(Value::as_str)
+                        != Some("join")
+                {
+                    // Their own return to a room they were out of when the token was issued
+                    // (left and came back within this batch, or invited back): everyone in it is
+                    // somebody whose devices they have not been hearing about. `resume_mode`
+                    // resumes such a room incrementally when they were joined at the token, so
+                    // the fresh-room rule above does not catch it.
+                    newly_shared.extend(hub.joined_member_ids_if_present(room_id).await?);
                 }
                 continue;
             }
@@ -1543,18 +1556,32 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
         // on hears about the one they have just signed in on. `newly_shared` is not narrowed
         // to `shared`: it was built only from rooms this user is joined to, and an invitee is
         // in it before they are anybody's joined co-member.
+        // A change only its user hears of (a user-signing key) is this user's if it is theirs.
+        let own_change =
+            DeviceKeyStore::own_changes_since(&**e2e, baseline.device_list_seq, Some(upto))
+                .await?
+                .contains(user_id);
         let changed: BTreeSet<&OwnedUserId> = changed_all
             .iter()
             .filter(|u| shared.contains(*u) || u.as_str() == user_id.as_str())
             .chain(newly_shared.iter())
             .collect();
+        let mut changed = changed;
+        let own_id = user_id.to_owned();
+        if own_change {
+            changed.insert(&own_id);
+        }
         let changed: Vec<Value> = changed
             .into_iter()
             .map(|u| Value::String(u.to_string()))
             .collect();
+        // Never the user themself, and never somebody they have come to share a room with
+        // again within the batch.
         let left: Vec<Value> = left_candidates
             .iter()
-            .filter(|u| !shared.contains(*u))
+            .filter(|u| {
+                !shared.contains(*u) && !newly_shared.contains(*u) && u.as_str() != user_id.as_str()
+            })
             .map(|u| Value::String(u.to_string()))
             .collect();
         (Some(json!({"changed": changed, "left": left})), upto)

@@ -317,6 +317,27 @@ impl<B: KvBackend> DeviceKeyStore for TablesE2eStore<B> {
         .map_err(store_err)
     }
 
+    async fn record_own_device_list_change(&self, user_id: &UserId) -> Result<u64, StoreError> {
+        let value = format!("{OWN_CHANGE_PREFIX}{user_id}");
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            let counter_key = ("device_list_seq".to_string(),).encode();
+            let pos = next_counter(txn, &self.counters, &counter_key)?;
+            self.device_list_stream
+                .put(txn, &(pos,), value.as_bytes())
+                .map_err(to_kv)?;
+            Ok(pos)
+        })
+        .map_err(store_err)
+    }
+
+    async fn own_changes_since(
+        &self,
+        since: u64,
+        upto: Option<u64>,
+    ) -> Result<BTreeSet<OwnedUserId>, StoreError> {
+        Ok(self.stream_entries(since, upto)?.1)
+    }
+
     async fn current_stream_pos(&self) -> Result<u64, StoreError> {
         let snap = self.backend.snapshot();
         let counter_key = ("device_list_seq".to_string(),).encode();
@@ -358,6 +379,24 @@ impl<B: KvBackend> DeviceKeyStore for TablesE2eStore<B> {
         since: u64,
         upto: Option<u64>,
     ) -> Result<BTreeSet<OwnedUserId>, StoreError> {
+        Ok(self.stream_entries(since, upto)?.0)
+    }
+}
+
+/// How an entry of `hs_e2e.device_list_stream` that only its user is told about
+/// (`DeviceKeyStore::record_own_device_list_change`) is written: this prefix, then the user id.
+/// No user id starts with it (they start with `@`), so an older reader would fail on it loudly
+/// rather than misread it.
+const OWN_CHANGE_PREFIX: &str = "own ";
+
+impl<B: KvBackend> TablesE2eStore<B> {
+    /// The device-list stream between `since` (exclusive) and `upto` (inclusive): the users with
+    /// a change everyone sharing a room hears of, and those with a change of their own.
+    fn stream_entries(
+        &self,
+        since: u64,
+        upto: Option<u64>,
+    ) -> Result<(BTreeSet<OwnedUserId>, BTreeSet<OwnedUserId>), StoreError> {
         let snap = self.backend.snapshot();
         let start = Bound::Excluded(Bytes::from((since,).encode()));
         let end = match upto {
@@ -365,16 +404,21 @@ impl<B: KvBackend> DeviceKeyStore for TablesE2eStore<B> {
             None => Bound::Unbounded,
         };
         let spec = RangeSpec::new(start, end);
-        let mut out = BTreeSet::new();
+        let mut shared = BTreeSet::new();
+        let mut own = BTreeSet::new();
         for item in self.device_list_stream.range(&snap, spec) {
             let (_k, value) = item.map_err(|e| StoreError::Backend(e.to_string()))?;
             let raw = std::str::from_utf8(&value)
                 .map_err(|e| StoreError::Backend(format!("non-utf8 user id in stream: {e}")))?;
+            let (into, raw) = match raw.strip_prefix(OWN_CHANGE_PREFIX) {
+                Some(rest) => (&mut own, rest),
+                None => (&mut shared, raw),
+            };
             let user_id = UserId::parse(raw)
                 .map_err(|e| StoreError::Backend(format!("invalid user id in stream: {e}")))?;
-            out.insert(user_id.to_owned());
+            into.insert(user_id.to_owned());
         }
-        Ok(out)
+        Ok((shared, own))
     }
 }
 
@@ -1380,6 +1424,33 @@ mod tests {
         let changed = s.changed_users_since(after_alice, None).await.unwrap();
         assert!(changed.contains(&bob));
         assert!(!changed.contains(&alice));
+    }
+
+    #[tokio::test]
+    async fn a_change_of_ones_own_moves_the_stream_but_is_only_theirs() {
+        let s = store();
+        let alice = uid("@alice:example.org");
+        let before = s.current_stream_pos().await.unwrap();
+        let alice_pos = s.user_stream_pos(&alice).await.unwrap();
+        let pos = s.record_own_device_list_change(&alice).await.unwrap();
+        assert!(pos > before);
+        assert_eq!(s.current_stream_pos().await.unwrap(), pos);
+        assert!(
+            s.changed_users_since(before, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            s.own_changes_since(before, None).await.unwrap(),
+            BTreeSet::from([alice.clone()])
+        );
+        assert!(s.own_changes_since(pos, None).await.unwrap().is_empty());
+        assert_eq!(
+            s.user_stream_pos(&alice).await.unwrap(),
+            alice_pos,
+            "the position other servers are told of does not move"
+        );
     }
 
     #[tokio::test]

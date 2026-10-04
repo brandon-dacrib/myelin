@@ -413,7 +413,27 @@ async fn upload_keys(
     token: &str,
     device: &str,
 ) -> String {
-    let key = format!("key-of-{device}");
+    upload_keys_with(
+        client,
+        base,
+        user,
+        token,
+        device,
+        &format!("key-of-{device}"),
+    )
+    .await
+}
+
+/// As [`upload_keys`], claiming the ed25519 key `key`.
+async fn upload_keys_with(
+    client: &reqwest::Client,
+    base: &str,
+    user: &User,
+    token: &str,
+    device: &str,
+    key: &str,
+) -> String {
+    let key = key.to_owned();
     call(
         client,
         reqwest::Method::POST,
@@ -853,4 +873,236 @@ async fn a_cross_signing_key_change_is_a_signing_key_update_on_the_other_server(
         keys["master_keys"][&alice.id]["keys"]["ed25519:alicemasterkey"], "alicemasterkey",
         "B's /keys/query for alice: {keys}"
     );
+}
+
+fn device_list_left(sync: &Value, user: &str) -> bool {
+    sync["device_lists"]["left"]
+        .as_array()
+        .is_some_and(|l| l.iter().any(|u| u == user))
+}
+
+fn member_event_in(sync: &Value, room_id: &str, user: &str, membership: &str) -> bool {
+    ["join", "leave"].iter().any(|section| {
+        sync["rooms"][section][room_id]["timeline"]["events"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|e| {
+                e["type"] == "m.room.member"
+                    && e["state_key"] == user
+                    && e["content"]["membership"] == membership
+            })
+    })
+}
+
+async fn keys_changes(
+    client: &reqwest::Client,
+    server: &Server,
+    token: &str,
+    from: &str,
+    to: &str,
+) -> Value {
+    call(
+        client,
+        reqwest::Method::GET,
+        format!(
+            "{}/_matrix/client/v3/keys/changes?from={from}&to={to}",
+            server.base
+        ),
+        token,
+        Value::Null,
+    )
+    .await
+}
+
+/// A remote user is followed from their invite to after a rejoin, which is what Sytest's
+/// `06-device-lists.pl` and Complement's `TestDeviceListUpdates` do and the public-room join
+/// above does not:
+///
+/// - invited, bob is in alice's `device_lists.changed` before he joins (as on Synapse);
+/// - having joined through the invite, his key upload on B reaches A: B's member index of the
+///   room, made from the invite's stub, used to say bob was alone in it, so B announced his
+///   keys to nobody (the two Sytest regressions of 2026-10-04);
+/// - his leave is in `/sync`'s and `/keys/changes`' `left`, and `/keys/changes` between two
+///   sync tokens names him `changed` after he comes back;
+/// - the keys he uploads while out, which nobody tells A about, are what A's `/keys/query`
+///   answers once he is back: A's copy of his list went stale when no room was shared any
+///   more, instead of being served as it was (Complement's `when_remote_user_rejoins_a_room`).
+#[tokio::test]
+async fn an_invited_remote_user_is_followed_from_the_invite_to_after_a_rejoin() {
+    let a = start(reserve_port()).await;
+    let b = start(reserve_port()).await;
+    let client = reqwest::Client::new();
+    let alice = register(&client, &a.base, "alice").await;
+    let bob = register(&client, &b.base, "bob").await;
+
+    let created = call(
+        &client,
+        reqwest::Method::POST,
+        format!("{}/_matrix/client/v3/createRoom", a.base),
+        &alice.token,
+        json!({"preset": "private_chat", "room_version": "11"}),
+    )
+    .await;
+    let room_id = created["room_id"].as_str().unwrap().to_owned();
+    let start_sync = sync_until(
+        &client,
+        &a.base,
+        &alice.token,
+        None,
+        "an initial sync",
+        |_| true,
+    )
+    .await;
+    let since = start_sync["next_batch"].as_str().unwrap().to_owned();
+
+    let invite = |token: String| {
+        let client = client.clone();
+        let url = format!("{}/_matrix/client/v3/rooms/{room_id}/invite", a.base);
+        let bob_id = bob.id.clone();
+        async move {
+            call(
+                &client,
+                reqwest::Method::POST,
+                url,
+                &token,
+                json!({"user_id": bob_id}),
+            )
+            .await;
+        }
+    };
+    let join = || {
+        let client = client.clone();
+        let url = format!(
+            "{}/_matrix/client/v3/join/{room_id}?server_name={}",
+            b.base, a.name
+        );
+        let token = bob.token.clone();
+        async move {
+            // The invite may still be on its way to B.
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                let response = client
+                    .post(&url)
+                    .bearer_auth(&token)
+                    .json(&json!({}))
+                    .send()
+                    .await
+                    .unwrap();
+                if response.status().is_success() {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "bob could not join: {}",
+                    response.text().await.unwrap_or_default()
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    };
+
+    // The invite alone puts bob in alice's `changed`.
+    invite(alice.token.clone()).await;
+    let invited = sync_until(
+        &client,
+        &a.base,
+        &alice.token,
+        Some(&since),
+        "bob invited, in changed",
+        |s| device_list_changed(s, &bob.id),
+    )
+    .await;
+    let since = invited["next_batch"].as_str().unwrap().to_owned();
+
+    // Bob joins through the invite; alice sees it.
+    join().await;
+    let joined = sync_until(
+        &client,
+        &a.base,
+        &alice.token,
+        Some(&since),
+        "bob's join on A",
+        |s| member_event_in(s, &room_id, &bob.id, "join"),
+    )
+    .await;
+    let since = joined["next_batch"].as_str().unwrap().to_owned();
+
+    // His key upload on B reaches A, and A's copy answers with it.
+    let first_key =
+        upload_keys_with(&client, &b.base, &bob, &bob.token, &bob.device, "first-key").await;
+    let told = sync_until(
+        &client,
+        &a.base,
+        &alice.token,
+        Some(&since),
+        "bob's key upload on A",
+        |s| device_list_changed(s, &bob.id),
+    )
+    .await;
+    let before_leave = told["next_batch"].as_str().unwrap().to_owned();
+    keys_query_until(&client, &a, &alice.token, &bob.id, &bob.device, &first_key).await;
+
+    // Bob leaves: `left`, in `/sync` and in `/keys/changes` between the two tokens.
+    call(
+        &client,
+        reqwest::Method::POST,
+        format!("{}/_matrix/client/v3/rooms/{room_id}/leave", b.base),
+        &bob.token,
+        json!({}),
+    )
+    .await;
+    let left = sync_until(
+        &client,
+        &a.base,
+        &alice.token,
+        Some(&before_leave),
+        "bob in left on A",
+        |s| device_list_left(s, &bob.id),
+    )
+    .await;
+    let after_leave = left["next_batch"].as_str().unwrap().to_owned();
+    let changes = keys_changes(&client, &a, &alice.token, &before_leave, &after_leave).await;
+    assert!(
+        changes["left"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|u| u == bob.id.as_str()),
+        "/keys/changes names bob left: {changes}"
+    );
+
+    // While out he changes his keys; nothing tells A. Then he is invited back and rejoins.
+    let second_key = upload_keys_with(
+        &client,
+        &b.base,
+        &bob,
+        &bob.token,
+        &bob.device,
+        "second-key",
+    )
+    .await;
+    invite(alice.token.clone()).await;
+    join().await;
+    let back = sync_until(
+        &client,
+        &a.base,
+        &alice.token,
+        Some(&after_leave),
+        "bob back, in changed",
+        |s| device_list_changed(s, &bob.id),
+    )
+    .await;
+    let after_rejoin = back["next_batch"].as_str().unwrap().to_owned();
+    let changes = keys_changes(&client, &a, &alice.token, &before_leave, &after_rejoin).await;
+    assert!(
+        changes["changed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|u| u == bob.id.as_str()),
+        "/keys/changes across the leave and rejoin names bob changed: {changes}"
+    );
+    // A's copy went stale with the last shared room, so the query fetches his list again.
+    keys_query_until(&client, &a, &alice.token, &bob.id, &bob.device, &second_key).await;
 }

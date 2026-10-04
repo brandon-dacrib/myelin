@@ -346,6 +346,12 @@ async fn announce<B: KvBackend + 'static>(
         .filter(|server| server != user_id.server_name().as_str())
         .collect();
     if destinations.is_empty() {
+        // Said, because a server that should have been told and was not is otherwise silent.
+        tracing::debug!(
+            %user_id,
+            audience = audience.len(),
+            "a device-list change with no other server sharing a room with the user"
+        );
         return Some(after);
     }
     for (edu_type, content) in edus {
