@@ -147,11 +147,21 @@ function PushersPanel({ userId }: { userId: string }) {
                 <span className="text-text-muted"> · {p.app_display_name ?? p.app_id}</span>
               </p>
               <p className="text-xs text-text-muted">
-                {p.kind === "email" ? "Email" : "HTTP"}
-                {p.data?.url && (
+                {p.kind === "email" ? (
                   <>
-                    {" to "}
-                    <span className="font-identifier">{p.data.url}</span>
+                    {"Email to "}
+                    <span className="font-identifier">{p.pushkey}</span>
+                    {" · notification emails about unread messages"}
+                  </>
+                ) : (
+                  <>
+                    HTTP
+                    {p.data?.url && (
+                      <>
+                        {" to "}
+                        <span className="font-identifier">{p.data.url}</span>
+                      </>
+                    )}
                   </>
                 )}
               </p>

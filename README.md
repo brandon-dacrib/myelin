@@ -63,6 +63,14 @@ real binary and in the browser against it (`web/e2e-real/user-erase.spec.ts`).
 encryption enabled: keys upload, cross-signing bootstraps, one-time keys are claimed atomically,
 Megolm establishes, the recipient decrypts. `cargo test -p hs-loadgen --test real_client_encrypted`.
 
+**Unread messages reach an inbox.** A client that registers an email pusher (Element's
+"Enable email notifications") gets the email Synapse sends: the room's name linked to the room
+in the configured web client, the sender and a snippet of each message (none in an encrypted
+room), and the unread count. The first email goes at once; while a room stays unread, the
+next waits ten minutes, then an hour, up to a day, and reading the room starts it over. Set
+up in the `email` section of Configuration (`docs/config.md`); verified on the real binary
+against a real SMTP server (`crates/hs-cli/tests/email_pushers.rs`).
+
 **Measured against the official suite, not against itself.**
 
 | | |

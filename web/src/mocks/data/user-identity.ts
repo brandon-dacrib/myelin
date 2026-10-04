@@ -37,5 +37,14 @@ export const userPushers: Record<string, Pusher[]> = {
       lang: "en",
       data: { url: "https://push.example.org/_matrix/push/v1/notify" },
     },
+    {
+      pushkey: "alice@example.org",
+      kind: "email",
+      app_id: "m.email",
+      app_display_name: "Email Notifications",
+      device_display_name: "alice@example.org",
+      lang: "en",
+      data: {},
+    },
   ],
 };

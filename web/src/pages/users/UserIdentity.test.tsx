@@ -167,5 +167,9 @@ describe("A user's features and client data", SUITE, () => {
     renderRoutes(ROUTES, ALICE, KNOWN);
     expect(await screen.findByText("Pixel 8", {}, SLOW)).toBeInTheDocument();
     expect(await screen.findByText("m.direct", {}, SLOW)).toBeInTheDocument();
+    // An email pusher says it is one, and where the emails go.
+    expect(screen.getByText(/^Email to/)).toHaveTextContent(
+      "Email to alice@example.org · notification emails about unread messages",
+    );
   });
 });

@@ -28,6 +28,7 @@ import {
   Image,
   KeyRound,
   type LucideIcon,
+  Mail,
   Network,
   RefreshCw,
   Search,
@@ -74,6 +75,7 @@ const SECTION_ICONS: Record<string, LucideIcon> = {
   appservices: Cable,
   telemetry: Activity,
   cluster: Boxes,
+  email: Mail,
 };
 
 interface SectionCard {

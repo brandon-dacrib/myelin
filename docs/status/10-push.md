@@ -1,5 +1,115 @@
 # 10 Push: status
 
+## Session 3 (2026-10-04): email pushers deliver
+
+**Starting point.** Email pushers were "stored, never delivered to" (session 2's Next;
+`docs/next-steps.md` item 6). No crate sent mail; `hs-testkit`'s `FakeSmtpSink` was a recorder
+with no trait behind it.
+
+### Done
+
+- **SMTP sender** (`crates/hs-push/src/email/smtp.rs`): `SmtpMailer` over `lettre` 0.11
+  (async, tokio, rustls with the ring provider and the system's roots), one connection per
+  email, `multipart/alternative` text and HTML. `starttls` (required, never opportunistic),
+  `tls` (implicit) or `none`; optional credentials and `tls_name`; 30 s timeout. Its settings
+  are replaced in place (`SmtpMailer::set`) when the configuration changes.
+- **The `email` configuration section** (`crates/hs-config/src/email.rs`): `smtp.{host, port,
+  security, username, password(_file), tls_name}`, `from`, `app_name`, `client_base_url`,
+  `notifications.{enabled, delay_before_mail, throttle_start, throttle_max,
+  throttle_multiplier, throttle_reset_after, subjects.*}`. Synapse's key names and subject
+  placeholders are kept where the meaning matches; each doc comment names its Synapse key.
+  Validated (a host needs `from`, a username needs a password and the other way round, `from`
+  must be an address, `client_base_url` must be http(s), the throttle must be increasing).
+  Every setting is **hot**: the mailer and the worker read them per email, wired in
+  `hs-cli`'s `live.on_change("email")`. `docs/config.md` regenerated; the web's schema
+  fixture regenerated.
+- **The email** (`crates/hs-push/src/email/template.rs`): subject chosen as Synapse chooses
+  (one message from a person in a named room, messages in a room, several rooms, an
+  invitation, with or without a room name); text and HTML bodies with one section per room:
+  the room's name linked to `<client_base_url>/#/room/<id>` (else `matrix.to`), the unread
+  count from `CountsStore`, each message as sender's display name, time (UTC) and a snippet
+  of at most 200 characters, "an encrypted message" in place of ciphertext, "and N more"
+  past ten lines. Every interpolated string is HTML-escaped.
+- **Batching and throttling** (`crates/hs-push/src/email/mod.rs`, `throttle.rs`): the
+  pipeline hands each notification for an email pusher to a worker, which holds it per
+  `(user, address)`; one email carries every room held by its due time. First email in a room
+  after `delay_before_mail` (0 by default); then the room waits `throttle_start` (10 min),
+  times `throttle_multiplier` (6) per email, capped at `throttle_max` (1 day), reset by a read
+  receipt or by `throttle_reset_after` (12 h) without a notification. A receipt also drops the
+  room from a held email; a room whose counts are zero by send time is left out, and an email
+  with nothing left is not sent. Throttle state is stored (`hs_push.email_throttle`); held
+  emails are in memory. A failed send is retried twice, a minute apart.
+- **`POST /pushers/set` with `kind: email`** now requires the pushkey to be an email address
+  bound to the account (Synapse does the same; otherwise any account could have the server
+  email room traffic anywhere). `M_INVALID_PARAM` otherwise.
+- **Observability**: `hs_push_email_sent_total{outcome=sent|failed|skipped}`; a boot line and
+  a line per configuration change saying where mail goes (`email: notification emails go
+  through this SMTP server` with host, port, security), or that none is configured; `info`
+  per email sent, `warn` per failed attempt and when one is given up, `debug` per held
+  notification.
+- **Web**: the Configuration page gets the `email` section from the schema like every other
+  section (a mail icon added); the Users page's push notifications list shows an email
+  pusher as "Email to <address>" (`web/src/pages/users/UserClientDataSection.tsx`, mock and
+  test updated).
+
+### Verified
+
+- `cargo test -p hs-push` (71: template, subject choice, escaping, throttle stores, the worker
+  with paused time: first email at once, 10 min then 60 min, read receipt cancels and resets,
+  several rooms in one email, encrypted rooms quote no ciphertext, retry then give up, no
+  server/disabled/pusher removed sends nothing, the spawned worker; the `/pushers/set`
+  address check), `cargo test -p hs-config` (the section's validation; every setting
+  classified; the web fixture), `cargo test -p hs-cli --lib` (the config-to-settings mapping),
+  per-crate clippy clean.
+- **Real binary, real SMTP**: `cargo test -p hs-cli --test email_pushers` starts Mailpit
+  (`mirror.gcr.io/axllent/mailpit`) on Docker-chosen ports, boots `hs serve` with an `email`
+  section, binds Alice's address through the admin API, has her set an email pusher (refused
+  before the binding), has Bob send a message in "Lunch", and reads the mail back from
+  Mailpit's API: subject `[Myelin] You have a message on Myelin from Bob in the Lunch
+  room...`, the snippet in text and escaped in HTML, the room link, `From` the configured
+  address; then a second message is held by the throttle, and `/metrics` shows
+  `hs_push_email_sent_total{outcome="sent"} 1`. Removes the container; prints `SKIP` without
+  Docker (or use `HS_TEST_MAILPIT=<smtp port>,<api port>` for a running one).
+- Sytest: `tests/61push/` has no email-pusher test, so there was nothing to rerun.
+- Web: `npm run check` (569 tests) and `npm run test:e2e` (64) pass;
+  `web/e2e-real/configuration.spec.ts`'s new case, run against a real `hs serve` from this
+  branch, opens Configuration > Email (every setting a control, no JSON box), saves an SMTP
+  host and sender through the page, and finds them stored and
+  `hs_config_reloads_total{section="email",outcome="applied"}` counted; the server logged the
+  new mail route. `email` and `network` were added to the web's `KNOWN_SECTION_ORDER`.
+
+### Left
+
+- Synapse's `email` block is not translated by `hs-compat` (track 13); the row in
+  `docs/compat/synapse-config-table.md` stays Unsupported until a translator function
+  exists. The mapping is in each `hs-config` field's doc comment.
+- Password-reset and 3PID-validation email (track 07) can use `hs_push::email::Mailer`;
+  nothing does yet. Users bind an address only through an administrator.
+- Held emails are lost on restart (the next notification starts another); Synapse persists
+  them. Synapse's ten-minute wait before the first email is `delay_before_mail: 10m`.
+- No unsubscribe link (Synapse's carries a macaroon-signed one); the footer says to remove
+  the email notification in the client.
+- The Configuration page's mock (`npm run dev:mock`) has no `email` section, as it has no
+  `network` one; the real server's page renders it from the schema.
+
+### Decisions made
+
+- **`lettre` with rustls/ring, no pool**: the workspace already uses ring; a connection per
+  email avoids a pool to keep healthy and makes a configuration change take effect on the
+  next email.
+- **STARTTLS is required, not opportunistic**: `security: starttls` refuses to send in the
+  clear. `none` is an explicit choice.
+- **The first email goes at once by default** (Synapse waits ten minutes). Configurable.
+- **Email pushers need a bound address** (above).
+- **`hs-push` does not depend on `hs-config`**: `hs_push::email::Settings` and
+  `smtp::SmtpSettings` restate what they need; `hs-cli/src/push_delivery.rs` maps the section.
+
+### Shared dependencies added
+
+- `lettre = 0.11` to `[workspace.dependencies]` (`default-features = false`, features
+  `smtp-transport, builder, hostname, tokio1, tokio1-rustls, rustls-native-certs, ring`).
+  `hs-push` also uses `time` (already in the workspace).
+
 ## Session 2 (2026-10-02): Sytest's push group, 19 of 53 before; the fixes are built and unit-tested, not yet rerun under Sytest
 
 **Starting point.** `docs/status/sytest/2026-10-02-results.txt` had 19 of the 53 push-group
@@ -121,7 +231,7 @@ and fix whatever the server logs under `server-0/hs.log` show for anything still
   MSC3664 (reply), MSC4028 and MSC3381 remain as session 1 left them.
 - Thread receipts (MSC3771): a receipt resets the whole room, threads included, because
   `hs-user` has no thread receipts yet.
-- Email pushers: stored, never delivered to.
+- Email pushers: delivered since session 3 (above).
 - The cluster: each room's owner evaluates its events (`RegistrySource` returns nothing for a
   room this replica does not own); the pipeline's cursors and counts are in the shared store.
   Rule-cache invalidation across replicas is still the session 1 gap.

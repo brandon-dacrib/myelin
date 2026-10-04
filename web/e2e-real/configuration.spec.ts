@@ -269,4 +269,35 @@ test.describe("configuration against the real server", () => {
     // Tidy up.
     expect((await api("PATCH", "/config/rate_limits", { message: before })).status).toBe(200);
   });
+
+  test("the email section is a form, and an SMTP server saved on it applies at once", async ({
+    page,
+  }) => {
+    test.setTimeout(90_000);
+    // Start from no SMTP server, whatever an earlier run left behind.
+    const clean = { smtp: { host: null, username: null, password: null }, from: null };
+    expect((await api("PATCH", "/config/email", clean)).status).toBe(200);
+    await signIn(page);
+    await page.goto("/admin/configuration/email");
+    // Every setting has a control of its own: no raw JSON box anywhere.
+    await expect(page.locator("textarea")).toHaveCount(0);
+    await expect(page.locator("#setting-smtp-host").getByRole("textbox")).toBeVisible();
+    await expect(page.locator("#setting-smtp-security").getByRole("combobox")).toBeVisible();
+    await expect(page.locator("#setting-notifications-throttle_start")).toBeVisible();
+    await shot(page, "email");
+
+    await page.locator("#setting-smtp-host").getByRole("textbox").fill("mail.example.org");
+    await page.locator("#setting-from").getByRole("textbox").fill("Matrix <noreply@example.org>");
+    await page.locator("#setting-from").getByRole("textbox").blur();
+    await saveSection(page, "Email");
+    await shot(page, "email-saved");
+    const stored = (await api("GET", "/config/email")).json.values;
+    expect(stored.smtp.host).toBe("mail.example.org");
+    expect(stored.from).toBe("Matrix <noreply@example.org>");
+    const metrics = await (await fetch(`${server}/metrics`)).text();
+    expect(metrics).toMatch(/hs_config_reloads_total\{section="email",outcome="applied"\} \d+/);
+
+    // Tidy up: a mail server that does not exist would be tried for every notification email.
+    expect((await api("PATCH", "/config/email", clean)).status).toBe(200);
+  });
 });

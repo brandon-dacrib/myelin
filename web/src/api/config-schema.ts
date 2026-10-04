@@ -96,6 +96,8 @@ export const KNOWN_SECTION_ORDER: readonly string[] = [
   "telemetry",
   "cluster",
   "migration",
+  "network",
+  "email",
 ];
 
 /** The JSON Schema keywords this interface renders from. Anything else is ignored, not rejected. */
