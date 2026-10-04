@@ -19,6 +19,19 @@ if ! command -v docker >/dev/null 2>&1; then
   echo "build.sh: docker is not installed; nothing to do" >&2
   exit 1
 fi
+if [ -z "${DOCKER_HOST:-}" ] && [ -S "$HOME/.orbstack/run/docker.sock" ]; then
+  export DOCKER_HOST="unix://$HOME/.orbstack/run/docker.sock"
+fi
+# A DOCKER_CONFIG with no credential helper (Docker Hub pulls through the desktop's keychain
+# helper fail in agent sessions), with the buildx plugin linked in so `docker build` is
+# BuildKit: Dockerfile.template's cache mounts need it, and the classic builder rejects them.
+# The same arrangement as tests/sytest/build.sh.
+if [ -z "${DOCKER_CONFIG:-}" ]; then
+  DOCKER_CONFIG="$(mktemp -d)"
+  echo '{"auths":{}}' >"$DOCKER_CONFIG/config.json"
+  [ -d "$HOME/.docker/cli-plugins" ] && ln -s "$HOME/.docker/cli-plugins" "$DOCKER_CONFIG/cli-plugins"
+  export DOCKER_CONFIG
+fi
 if ! docker info >/dev/null 2>&1; then
   echo "build.sh: SKIP: Docker is installed but not running (\`docker info\` failed)." >&2
   echo "See tests/complement/README.md for how to run this once Docker is available." >&2
@@ -34,6 +47,6 @@ tar \
   --exclude='./media-store' \
   --exclude='./.conformance-run' \
   -cf - . \
-  | docker build -t "$IMAGE_TAG" -f tests/complement/Dockerfile.template -
+  | DOCKER_BUILDKIT=1 docker build -t "$IMAGE_TAG" -f tests/complement/Dockerfile.template -
 
 echo "built $IMAGE_TAG" >&2

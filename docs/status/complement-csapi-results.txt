@@ -1,7 +1,7 @@
 # Complement tests/csapi, top-level results. One line per test so that two runs can be compared
 # by name: a change is worth something when it moves a *named* test and that survives a re-run.
 # Written and read by tools/complement_triage.py (--write-baseline, --diff).
-# Run 13, 2026-10-01, 2a0b362 (run 14, same image: TestRoomState failed once, a flap): 343 of 384 assertions, 82 of 106 top-level (0 skipped).
+# Run 15, 2026-10-04, a9f62fc7 (run 13 of 2026-10-01 was 343 of 384, 82 of 106): 346 of 384 assertions, 86 of 106 top-level (0 skipped).
 PASS TestAddAccountData
 PASS TestArchivedRoomsHistory
 PASS TestAsyncUpload
@@ -10,13 +10,13 @@ PASS TestCanRegisterAdmin
 PASS TestCannotKickLeftUser
 PASS TestCannotKickNonPresentUser
 PASS TestChangePassword
-FAIL TestChangePasswordPushers
+PASS TestChangePasswordPushers
 PASS TestContent
 PASS TestContentCSAPIMediaV1
 PASS TestCumulativeJoinLeaveJoinSync
 PASS TestDeactivateAccount
 PASS TestDemotingUsersViaUsersDefault
-PASS TestDeviceListUpdates
+FAIL TestDeviceListUpdates
 FAIL TestDeviceManagement
 PASS TestDisplayNameUpdate
 PASS TestE2EKeyBackupReplaceRoomKeyRules
@@ -29,12 +29,12 @@ PASS TestFetchHistoricalInvitedEventFromBetweenInvite
 PASS TestFetchHistoricalJoinedEventDenied
 PASS TestFetchHistoricalSharedEvent
 PASS TestFetchMessagesFromNonExistentRoom
-FAIL TestFilter
+PASS TestFilter
 PASS TestGappedSyncLeaveSection
 PASS TestGetFilteredRoomMembers
 PASS TestGetRoomMembers
 FAIL TestGetRoomMembersAtPoint
-FAIL TestInviteFromIgnoredUsersDoesNotAppearInSync
+PASS TestInviteFromIgnoredUsersDoesNotAppearInSync
 PASS TestJson
 PASS TestKeyChangesLocal
 PASS TestKeyClaimOrdering
@@ -42,13 +42,13 @@ PASS TestKeysQueryWithDeviceIDAsObjectFails
 PASS TestLeakyTyping
 PASS TestLeaveEventInviteRejection
 PASS TestLeaveEventVisibility
-FAIL TestLeftRoomFixture
+PASS TestLeftRoomFixture
 PASS TestLogin
 PASS TestLogout
 PASS TestMediaConfig
 PASS TestMembersLocal
 FAIL TestMembershipOnEvents
-PASS TestMessagesOverFederation
+FAIL TestMessagesOverFederation
 PASS TestNotPresentUserCannotBanOthers
 PASS TestOlderLeftRoomsNotInLeaveSection
 PASS TestPowerLevels
@@ -97,11 +97,11 @@ FAIL TestThreadReceiptsInSyncMSC4102
 FAIL TestThreadedReceipts
 PASS TestThreadsEndpoint
 PASS TestToDeviceMessages
-FAIL TestTxnIdWithRefreshToken
+PASS TestTxnIdWithRefreshToken
 PASS TestTxnIdempotency
 PASS TestTxnIdempotencyScopedToDevice
 PASS TestTxnInEvent
-FAIL TestTxnScopeOnLocalEcho
+PASS TestTxnScopeOnLocalEcho
 PASS TestTyping
 PASS TestUploadKey
 PASS TestUploadKeyIdempotency

@@ -1,9 +1,9 @@
 # Complement tests, top-level results. One line per test so that two runs can be compared
 # by name: a change is worth something when it moves a *named* test and that survives a re-run.
 # Written and read by tools/complement_triage.py (--write-baseline, --diff).
-# Run 8, 2026-10-01, 2a0b362 (run 9, same image: 49 of 90, TestKnockRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11 lost its race): 225 of 314 assertions, 50 of 90 top-level (1 skipped).
-FAIL TestACLs
-FAIL TestACLsForEDUs
+# Run 10, 2026-10-04, a9f62fc7 (run 8 of 2026-10-01 was 225 of 314, 50 of 90; the four NoCreators tests lost their race this run): 235 of 314 assertions, 56 of 90 top-level (1 skipped).
+PASS TestACLs
+PASS TestACLsForEDUs
 PASS TestBannedUserCannotSendJoin
 PASS TestCannotSendKnockViaSendKnockInMSC3787Room
 PASS TestCannotSendNonJoinViaSendJoinV1
@@ -20,7 +20,7 @@ FAIL TestDeviceListsUpdateOverFederation
 FAIL TestDeviceListsUpdateOverFederationOnRoomJoin
 PASS TestEventAuth
 PASS TestFederatedClientSpaces
-FAIL TestFederationKeyUploadQuery
+PASS TestFederationKeyUploadQuery
 FAIL TestFederationRedactSendsWithoutEvent
 PASS TestFederationRejectInvite
 PASS TestFederationRoomsInvite
@@ -37,7 +37,7 @@ FAIL TestJoinFederatedRoomFromApplicationServiceBridgeUser
 PASS TestJoinFederatedRoomWithUnverifiableEvents
 PASS TestJoinViaRoomIDAndServerName
 FAIL TestJumpToDateEndpoint
-PASS TestKnockRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11
+FAIL TestKnockRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11
 FAIL TestKnockRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV12
 PASS TestKnockRoomsInPublicRoomsDirectory
 PASS TestKnockRoomsInPublicRoomsDirectoryInMSC3787Room
@@ -49,12 +49,12 @@ FAIL TestMSC4289PrivilegedRoomCreators_Additional
 FAIL TestMSC4289PrivilegedRoomCreators_AdditionalCreatorsAndInvited
 FAIL TestMSC4289PrivilegedRoomCreators_AdditionalValidation
 FAIL TestMSC4289PrivilegedRoomCreators_InvitedAreCreators
-FAIL TestMSC4289PrivilegedRoomCreators_Upgrades
+PASS TestMSC4289PrivilegedRoomCreators_Upgrades
 PASS TestMSC4291RoomIDAsHashOfCreateEvent
 PASS TestMSC4291RoomIDAsHashOfCreateEvent_AuthEventsOmitsCreateEvent
 FAIL TestMSC4291RoomIDAsHashOfCreateEvent_CannotSendCreateEvent
 FAIL TestMSC4291RoomIDAsHashOfCreateEvent_RoomIDIsOnCreateEvent
-FAIL TestMSC4291RoomIDAsHashOfCreateEvent_UpgradedRooms
+PASS TestMSC4291RoomIDAsHashOfCreateEvent_UpgradedRooms
 FAIL TestMSC4297StateResolutionV2_1_includes_conflicted_subgraph
 FAIL TestMSC4297StateResolutionV2_1_starts_from_empty_set
 FAIL TestMSC4311FullEventsOnStrippedStateFederation
@@ -66,16 +66,16 @@ PASS TestMediaWithoutFileNameCSMediaV1
 PASS TestNetworkPartitionOrdering
 PASS TestOutboundFederationEventSizeGetMissingEvents
 FAIL TestOutboundFederationIgnoresMissingEventWithBadJSONForRoomVersion6
-FAIL TestOutboundFederationProfile
+PASS TestOutboundFederationProfile
 FAIL TestOutboundFederationSend
-FAIL TestRemoteAliasRequestsUnderstandUnicode
+PASS TestRemoteAliasRequestsUnderstandUnicode
 FAIL TestRemotePngThumbnail
 PASS TestRemotePresence
 PASS TestRemoteTyping
 PASS TestRestrictedRoomsLocalJoin
 PASS TestRestrictedRoomsLocalJoinInMSC3787Room
 FAIL TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11
-PASS TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV12
+FAIL TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV12
 PASS TestRestrictedRoomsRemoteJoin
 PASS TestRestrictedRoomsRemoteJoinFailOver
 PASS TestRestrictedRoomsRemoteJoinFailOverInMSC3787Room
@@ -89,7 +89,7 @@ SKIP TestSendJoinPartialStateResponse
 FAIL TestSyncOmitsStateChangeOnFilteredEvents
 FAIL TestToDeviceMessagesOverFederation
 PASS TestUnbanViaInvite
-FAIL TestUnknownEndpoints
+PASS TestUnknownEndpoints
 PASS TestUnrejectRejectedEvents
 PASS TestUserAppearsInChangedDeviceListOnJoinOverFederation
 PASS TestWriteMDirectAccountData

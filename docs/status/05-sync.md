@@ -161,10 +161,25 @@ Sytest image's Debian with `SYTEST_HS_BINARY`, `tests/sytest/README.md`), before
 
 | Group | Files | Before (`09f24ee`, whole suite) | After (this branch, the files alone) |
 |---|---|---|---|
-| Tagging | `42tags.pl` | 0/8 | 6/8 (binary from mid-session, before the upgrade copy: see below) |
-| Ignore users | `49ignore.pl` | 0/3 | not run |
-| User directory | `52user-directory/*.pl` | 5/11 | not run |
-| Sync API | `31sync/*.pl`, `80torture/10filters.pl` | 57/84 | not run |
+| Tagging | `42tags.pl` | 0/8 | 6/8 (binary from mid-session, before the upgrade copy: see below); **8/8 measured 2026-10-04** |
+| Ignore users | `49ignore.pl` | 0/3 | not run; **3/3 measured 2026-10-04** |
+| User directory | `52user-directory/*.pl` | 5/11 | not run; **10/11 measured 2026-10-04** (left: "User in remote room doesn't appear in user directory after server left room", `01public.pl` line 373) |
+| Sync API | `31sync/*.pl`, `80torture/10filters.pl` | 57/84 | not run; **61/84 measured 2026-10-04** by these files (the `are-we-synapse-yet` "Sync API" group, which draws its names differently, 57/84 -> 68/84) |
+
+**Measured 2026-10-04** (status 14 session 8: the whole suite on merged `main` `a9f62fc7`, quiet
+machine, `docs/status/sytest/2026-10-04-results.txt`), the "after" column above. What moved in the
+sync files: all six lazy-loading tests of `15lazy-members.pl` that were failing, both room-summary
+tests of `16room-summary.pl`, the two `04timeline.pl` tests (transaction id in the timeline, a
+message after an initial sync) and `80torture/10filters.pl`. **Still failing (23 in `31sync/`)**,
+by file: `17peeking.pl` 6 (`/peek` is 404), `06state.pl` 5 ("No join for joined user" x3 in the
+private-history timeline tests, "Expected only one state event" in a gapped sync, the
+join-and-leave-in-one-batch full state), `03joined.pl` 4 (full-state sync shape, the limited
+flag on a newly joined room, presence for newly joined members x2), `14read-markers.pl` 3 (all
+time out), `04timeline.pl` 2 (`prev_batch`/`next_batch` into `/messages`), `15lazy-members.pl` 2
+(state ordering and a redundant membership in gapped incremental sync), `13filtered_sync.pl` 1
+(federation event format). Also in this crate's area: `44account_data.pl` "Latest account data
+appears in v2 /sync" (two events where one is expected), the two `06-device-lists.pl`
+regressions listed in status 14 session 8 (rejoin after a device change, shared with 08).
 
 **Where this stopped (2026-10-02, the owner's reboot).** The Linux `hs` for `SYTEST_HS_BINARY`
 took 94 minutes to build in Docker under a load average of 60 (three other agents' release
@@ -173,7 +188,8 @@ the tag routes, not the upgrade copy, and an unknown part of the rest. `tests/42
 it: 6/8, the two upgrade-copy tests failing for want of the code (the server log has no
 "copied account data" line; `hs_room::routes::upgrade` did write the predecessor). The rebuild
 of the final tree was stopped for the reboot at `Compiling hs-auth`. Every other number in the
-table is unmeasured on the real binary: the unit tests in this crate cover each change
+table was unmeasured on the real binary until 2026-10-04 (the "after" column now carries the
+measured counts): the unit tests in this crate cover each change
 (`cargo test -p hs-user`, 185 + 6), the Sytest runs are the next step. To finish: rebuild the
 bookworm binary (the cargo cache is in the Docker volume `user-sytest-cargo-target`, kept; rustup
 auto-installs `stable` into the container, do not set `RUSTUP_AUTO_INSTALL=0`), then

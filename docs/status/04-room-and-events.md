@@ -110,6 +110,14 @@ admin API's room long tail).
 >   tests' reason was read from the baseline TAP and has a change above -- the expected count is
 >   18 of 21 (the three skips are `can_change_power_levels`, below), but that is a reading, not
 >   a measurement.
+>   **Measured 2026-10-04** (status 14 session 8: the whole suite on merged `main` `a9f62fc7`,
+>   quiet machine, `docs/status/sytest/2026-10-04-results.txt`): **17 of 21** (1 failed, 3
+>   skipped). Six of the seven moved FAIL -> PASS (visibility, important state, bans, remote
+>   aliases, federation ability, the two-server directory test); the one left is "/upgrade
+>   preserves direct room state" ("Expected upgraded room to be a direct room",
+>   `60version_upgrade.pl` line 848): the `m.direct` copy on the join side did not reach the
+>   upgraded room on the merged tree (`room-rows` and `user-sytest` both carried account data
+>   on a join to an upgraded room; one was kept at merge time -- check which, and that it runs).
 >
 > **Where this stopped and what is left (2026-10-02, stopped for a reboot).** All four rows
 > and the account-data carry are implemented, unit-tested, lint-clean (`cargo fmt --all

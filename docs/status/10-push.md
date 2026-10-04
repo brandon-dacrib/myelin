@@ -99,6 +99,15 @@ causes above is most of the 36, with `Rejected events are not pushed` and the tw
 federation-invite tests the least certain (they depend on the stub room an out-of-band
 invite creates answering `members()` with the invitee, which was read in the code, not run).
 
+**Measured 2026-10-04** (status 14 session 8: the whole suite on merged `main` `a9f62fc7`, quiet
+machine, `docs/status/sytest/2026-10-04-results.txt`): **`tests/61push/*.pl` 50 pass, 1 fail, 1
+skip** (the `are-we-synapse-yet` "Push APIs" group: 19/53 -> 50/51), `14account/01change-password.pl`
+7/7. `02add_rules.pl` 11/11, `80torture.pl` 22/22, `03_unread_count.pl` 2/2 with the MSC2625
+`mark_unread` test skipped by its fixture, `09_notifications_api.pl` 1/1, `08_rejected_pushers.pl`
+1/1, "Rejected events are not pushed" passes. The one failure: "Invites over federation are
+correctly pushed with name" (`01message-pushed.pl` line 731: `room_name` is undef in the push for
+a federated invite, whose name is only in the invite's stripped state).
+
 To finish: `tests/sytest/build.sh myelin-sytest:push-rules` from this branch, then
 `SYTEST_IMAGE_TAG=myelin-sytest:push-rules tests/sytest/run.sh tests/61push/01message-pushed.pl
 tests/61push/02add_rules.pl tests/61push/03_unread_count.pl tests/61push/05_set_actions.pl

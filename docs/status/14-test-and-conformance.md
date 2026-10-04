@@ -1,5 +1,179 @@
 # 14 Test and conformance (integration lead): status
 
+## Session 8 (2026-10-04, on `main`): the measurement, on a quiet machine
+
+The whole suite on merged `main` at `1372c71f` (code tip `a9f62fc7`; image `myelin-sytest:dev`
+built from that tree in 3m36s with the cache mounts, Sytest `747315856d24eee846c6923b696fff9fae55ca0f`,
+run `target/sytest/20261004-main-3`, nothing else on the desktop, 8 minutes): **643 / 772** (23
+skipped, 106 failed, no expected failures), **85.8%** of tests run. Client-server **453 / 537**,
+federation **89 / 105**, application services 11 / 23, non-spec 86 / 103 (the groups are
+`are-we-synapse-yet.py`'s and six tests moved from client-server to "unknown" between the two
+runs' name lists; the files below are counted directly). The 2026-10-02 run on `09f24ee`, with a
+gate beside it, was 548. `results.txt`, `summary.txt` and `are-we-synapse-yet.txt` are
+`docs/status/sytest/2026-10-04-*`.
+
+**Two runs before it were the harness, not the server.** The first run (444) found that haproxy
+in the Sytest image binds `localhost` on `::1` only, which the server's new IPv4-only outbound
+default (`network.outbound.ipv4_only`, 2026-10-02) cannot reach, so every federation request the
+other server made was refused (`502` on `/invite` and `/join`). The second (542), with haproxy on
+both loopback families, found the same on the inbound side: Sytest's own federation server
+listens on `::1` too, so the key fetch failed and every signed request from it was `401`. The
+plugin (`tests/sytest/plugins/myelin/lib/SyTest/Homeserver/Myelin.pm`, this commit) now binds
+haproxy on `127.0.0.1` and `[::1]` when the bind host is `localhost` and sets
+`network.outbound.ipv4_only: false` in the generated configuration, each with a comment saying
+why. The lesson for an operator is in `docs/next-steps.md`: a peer or proxy reachable on `::1`
+only is unreachable from the default configuration.
+
+**What moved since 2026-10-02**, by name (`diff` of the two `results.txt`): 89 FAIL -> PASS, 10
+SKIP -> PASS, 1 FAIL -> SKIP, and **four the wrong way**: PASS -> FAIL "If remote user leaves
+room, changes device and rejoins we see update in sync" and "If user leaves room, remote user
+changes device and rejoins we see update in /sync and /keys/changes" (`41end-to-end-keys/06-device-lists.pl`,
+both timeouts; tracks 05 and 08), and, reachable now that the cross-signing routes answer,
+SKIP -> FAIL "Changing user-signing key notifies local users" (the uploader is in `changed`
+where it must not be) and "uploading self-signing key notifies over federation" (a timeout;
+status 08 expected this one) (`08-cross-signing.pl`; track 08).
+
+The "after unmeasured" rows of `docs/next-steps.md`'s 14:25 table, graded by this run (each
+status file has the detail under "Measured 2026-10-04"):
+
+| Branch | Files | Before | After |
+|---|---|---|---|
+| `room-rows` (04) | `30rooms/60version_upgrade.pl` | 11/21 | **17/21**; left: direct-room state |
+| `user-sytest` (05) | `42tags.pl`, `49ignore.pl`, `52user-directory/*`, `31sync/*` + `80torture/10filters.pl` | 0/8, 0/3, 5/11, 57/84 | **8/8, 3/3, 10/11, 61/84** (group "Sync API" 68/84) |
+| `push-rules` (10) | `61push/*.pl`, `14account/01change-password.pl` | 19/55 | **50/52** (1 fail, 1 skip), 7/7 |
+| `e2ee-sytest` (08) | `08-cross-signing.pl`, `06-device-lists.pl`, `01-upload-key.pl`, `50federation/40devicelists.pl` | 0/7 group, 6/15, 5/6, 2/7 | **4/7, 6/15 (two regressions), 6/6, 4/7** |
+| `federation-query` (06) | `50federation/*.pl`, `30rooms/05aliases.pl`, `30rooms/70publicroomslist.pl` | 88/130 | **108/130** (query API 5/5, `36state.pl` 7/18 -> 13/18) |
+
+At 100% now: registration's `11register.pl` aside, every `10apidoc` file but four, create room,
+room state, membership, history visibility (30/30), room versions (96/96), tags, ignore users,
+send-to-device, server ACL endpoints (11/11), push's `02add_rules.pl` and `80torture.pl`, the
+query and key APIs. Push APIs 36% -> 98%, tagging 0 -> 100%, ignore users 0 -> 100%,
+cross-signing 0 -> 57%, room upgrades 52% -> 81%, user directory 45% -> 86%, sync 68% -> 81%,
+federation's query API 20% -> 100%, device-key API 44% -> 67%, state 70% (unchanged).
+
+**The 106 failures, by owning track and file** (reason: the first line of Sytest's message;
+`summary.txt` has the counts):
+
+- **06 federation (22 + 2):** `50federation/36state.pl` 5, `50no-deextrem-outliers.pl`,
+  `33room-get-missing-events.pl`, `34room-backfill.pl`, `31room-send.pl` 1 -- the nine
+  "Unexpected response from /send", all the `/state_ids` fallback for a missing prev event
+  (status 06 session 18 item 6, half done); `30room-join.pl`, `35room-invite.pl` 2 -- invalid
+  JSON for room version 6 answered `401`, not `400`; `32room-getevent.pl` erased users' events
+  not redacted over federation; `39redactions.pl` the cross-room redaction accepted;
+  `52soft-fail.pl` "accepts a second soft-failed event" (prev_event ids); `31room-send.pl`
+  ephemeral messages (MSC2228); `44presence.pl` presence for a new federated private chat;
+  `30rooms/07ban.pl` "Remote banned user is kicked and may not rejoin until unbanned";
+  `30rooms/12thirdpartyinvite.pl` 3 (`/3pid/onbind` 404 x2, a timeout);
+  `30rooms/13guestaccess.pl` guest kicked on revocation over federation (timeout).
+- **05 sync (23 + 2):** `31sync/17peeking.pl` 6 (`/peek` 404), `06state.pl` 5, `03joined.pl` 4
+  (full-state shape, `limited`, presence of newly joined members x2), `14read-markers.pl` 3
+  (timeouts), `04timeline.pl` 2 (`prev_batch`/`next_batch` in `/messages`), `15lazy-members.pl` 2,
+  `13filtered_sync.pl` 1; `44account_data.pl` "Latest account data appears in v2 /sync";
+  `10apidoc/34room-messages.pl` 2 (`/messages?dir=b` is `400`).
+- **08 e2ee (12):** `41end-to-end-keys/06-device-lists.pl` 9 (`/keys/changes` and `left`
+  lists, the two regressions, deletion over federation, a timeout waiting for a remote query),
+  `08-cross-signing.pl` 3, `07-backup.pl` "Responds correctly when backup is empty" (`400` for
+  a bogus version); with 06: `50federation/40devicelists.pl` 3 timeouts (resync after leave
+  and rejoin, remote server down, a missed update).
+- **07 auth (12):** `11register.pl` 6 (recaptcha, idempotent registration x2, remembered
+  parameters, `inhibit_login`, email), `12login/01threepid-and-password.pl` (`requestToken`
+  404), `12login/02cas.pl` 2 (SSO), `14account/02deactivate.pl` (UIA `completed`),
+  `10apidoc/12device_management.pl` and `13ui-auth.pl` (UIA user must match the session owner,
+  `403` expected), `10apidoc/45server-capabilities.pl` (`/capabilities` without a token is `401`);
+  `54identity.pl` 6 (`/account/3pid/bind` 404, `/3pid/delete` 404); `45openid.pl` (`/openid/request_token` 404).
+- **11 appservices (10):** `60app-services/01as-create.pl` 2 (a regular user inside an
+  exclusive namespace is not refused), `03passive.pl` 3 (invites, aliases and events do not
+  ask the appservice), `05lookup3pe.pl` 2 (`/thirdparty/protocols` 404), `06publicroomlist.pl`
+  2 (`/directory/list/appservice/...` 404), `07deactivate.pl` (`/account/deactivate` with
+  `user_id` masquerading is `401`).
+- **04 room (7):** `30rooms/60version_upgrade.pl` direct-room state; `05aliases.pl` "Can delete
+  canonical alias"; `70publicroomslist.pl` "Can paginate public room list" (3 of 23 rooms);
+  `10redactions.pl` a redaction of an event in another room is not `400`; `04messages.pl`
+  ephemeral messages; `50context.pl` 2 (`/context` on a non-world-readable room is `404`, lazy
+  loading in `/context`); `32erasure.pl` an erased user's message still has its `msgtype`.
+- **10 push (1):** `61push/01message-pushed.pl` "Invites over federation are correctly pushed
+  with name".
+- **05/14 user directory (1):** `52user-directory/01public.pl` "User in remote room doesn't
+  appear in user directory after server left room".
+- **09 media (1):** `51media/20urlpreview.pl` (`og:type` missing from a preview).
+- **15 admin (1):** `48admin.pl` `/admin/whois` 404.
+
+The 23 skips: 13 `can_change_power_levels` (`30rooms/08levels.pl`, unreachable: Sytest's
+proving test was deleted upstream, status 04), 4 CAS, 2 `can_get_messages`, 2 `can_get_3pe_metadata`,
+1 `can_upload_media` (`51media/48admin-quarantine.pl`), 1 MSC2625 `mark_unread`. 16 failures are
+"Timed out waiting for test" (33 on 2026-10-02): the three `14read-markers.pl`, the device-list
+tests above, two cross-signing, two federation invites and guest access over federation; none
+is load, every one waits for something the server does not send.
+
+**Complement, federation package (run 10)**, image `complement-hs-main:a9f62fc7` from
+`tests/complement/build.sh` (BuildKit with the cache mounts: 8 minutes), Complement `61af675`
+(the checkout of runs 8 and 9, re-cloned: `refs/complement` was gone from the host), `go test -v
+-count=1 -p 1 -timeout 30m ./tests` with `COMPLEMENT_SPAWN_HS_TIMEOUT_SECS=120`, 857 s on the
+quiet machine: **235 / 314 assertions, 56 / 90 top-level** (1 skipped). Was 225 / 314 and 50 / 90
+(run 8). By name (`tools/complement_triage.py --diff`): **8 FAIL -> PASS**: `TestACLs` and
+`TestACLsForEDUs` (server ACLs), `TestFederationKeyUploadQuery`, `TestMSC4289PrivilegedRoomCreators_Upgrades`
+and `TestMSC4291RoomIDAsHashOfCreateEvent_UpgradedRooms` (the version-12 upgrade, `room-rows`),
+`TestOutboundFederationProfile` and `TestRemoteAliasRequestsUnderstandUnicode` (`federation-query`),
+`TestUnknownEndpoints` (the notary's `405`); **2 PASS -> FAIL**: `TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV12`
+and `TestKnockRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11`, the NoCreators race of
+session 6 (`restricted_rooms_test.go:554`, charlie's join through hs2 answered before hs2 has
+alice's power-levels change; all four siblings lost it this run, two of them won it in run 8).
+The baseline `docs/status/complement-federation-results.txt` is run 10.
+
+**Left in federation, 34, by owning track:** 06: version 12's MSCs (12: `TestMSC4289PrivilegedRoomCreators`
+and `_AdditionalValidation`, `_Additional`, `_AdditionalCreatorsAndInvited`, `_InvitedAreCreators`
+-- `403` where `400` is expected for a bad `additional_creators`, with 02 --, `TestMSC4291*` x2,
+`TestMSC4297StateResolutionV2_1_*` x2, `TestMSC4311*` x3), `/get_missing_events`, auth chains and
+outbound `/send` (7: `TestInboundCanReturnMissingEvents`, `TestCorruptedAuthChain`,
+`TestInboundFederationRejectsEventsWithRejectedAuthEvents`, `TestOutboundFederationIgnoresMissingEventWithBadJSONForRoomVersion6`,
+`TestOutboundFederationSend`, `TestFederationRedactSendsWithoutEvent`, `TestSyncOmitsStateChangeOnFilteredEvents`),
+`TestInboundFederationProfile` (2 of 3 subtests), the NoCreators race (4, with 14);
+04: `TestJumpToDateEndpoint` (`/timestamp_to_event`, 14 subtests), `TestRoomSummaryAllowedRoomIDs`
+(`/room_summary` 404); 08: `TestDeviceListsUpdateOverFederation`, `TestDeviceListsUpdateOverFederationOnRoomJoin`,
+`TestToDeviceMessagesOverFederation` (2 of 4); 09: `TestLocalPngThumbnail`, `TestRemotePngThumbnail`,
+`TestFederationThumbnail` (`400` for `method=scale` 32x32), `TestMediaWithoutFileName` (`502` on a
+remote download without a filename); 11: `TestJoinFederatedRoomFromApplicationServiceBridgeUser`
+(`401 M_UNKNOWN_TOKEN` for Complement's appservice user).
+
+**Complement, csapi package (run 15)**, the same image and checkout, 664 s: **346 / 384
+assertions, 86 / 106 top-level** (0 skipped). Was 343 / 384 and 82 / 106 (run 13). By name:
+**6 FAIL -> PASS**: `TestChangePasswordPushers` (push-rules), `TestFilter`,
+`TestInviteFromIgnoredUsersDoesNotAppearInSync`, `TestLeftRoomFixture` (user-sytest),
+`TestTxnIdWithRefreshToken`, `TestTxnScopeOnLocalEcho` (`transaction_id` in `unsigned`);
+**2 PASS -> FAIL**, both at the rejoin of a remote user, and both the same shape as the Sytest
+regressions above: `TestDeviceListUpdates/when_remote_user_rejoins_a_room`
+(`device_lists_test.go:442`: bob of hs2 leaves, changes his device keys, rejoins, and hs1's
+`/keys/query` answers his *old* ed25519 key -- the copy of remote device lists that
+`e2ee-sytest` serves while a room is shared is not refreshed when the user comes back; track 08)
+and `TestMessagesOverFederation/Visible_shared_history_after_re-joining_room_(backfill)`
+(`room_messages_test.go:376`: bob's leave over federation never reaches alice's `/sync` within
+5 s, so the rejoin's backfill is never checked; tracks 05 and 06; it passed in runs 13 and 14).
+The baseline `docs/status/complement-csapi-results.txt` is run 15.
+
+**Left in csapi, 20, by owning track:** 04: `TestPushRuleRoomUpgrade` (push rules carried by an
+upgrade, with 10), `TestRoomDeleteAlias`, `TestRoomForget` and `TestSync` (one subtest each
+waiting at `SendEventSynced`), `TestGetRoomMembersAtPoint`, `TestMembershipOnEvents`,
+`TestRelationsPagination`, `TestRelationsPaginationSync`, `TestRoomMessagesLazyLoading{,LocalUser}`,
+`TestSyncTimelineGap`, `TestThreadedReceipts`, `TestThreadReceiptsInSyncMSC4102`; 07:
+`TestRegistration` (4 of 25: `/_synapse/admin/v1/register` accepts a username with a comma),
+`TestDeviceManagement` (`401` where `403` is expected when UIA names another user),
+`TestServerCapabilities`; 08: `TestDeviceListUpdates` (the regression); 09:
+`TestRoomImageRoundtrip`, `TestUrlPreview`; 06/05: `TestMessagesOverFederation` (the regression).
+
+**How it was run, and what to keep.** Sytest: `tests/sytest/build.sh myelin-sytest:dev`, then
+`tests/sytest/run.sh` (the whole suite; `SYTEST_LOGS` set to `target/sytest/20261004-main-3`).
+Complement: `tests/complement/build.sh complement-hs-main:a9f62fc7` (this commit makes it
+BuildKit with a keychain-free `DOCKER_CONFIG`, as the Sytest build already was; the Dockerfile's
+cache mounts need BuildKit and the classic builder of session 6 would refuse them now), then in
+`refs/complement` the two `go test` lines above, federation first, then csapi, 05:14 to 05:40
+UTC; logs are scratch. Nothing else ran on the desktop during any of it (load 2 to 5).
+`tools/dashboard.py` was not regenerated: its Sytest and Complement rows are hard-coded and it
+runs cargo (a row in `docs/next-steps.md`'s gaps table).
+
+**Left for this track:** the NoCreators race (a wait in Complement's test, or a blacklist line
+with the reason); the dashboard generator; the "unknown" group drift in `are-we-synapse-yet.py`'s
+name list (six client-server tests fell out of their groups between the two runs).
+
 ## Session 7 (2026-10-02, branch `agent/joined-rooms-rywr`): Sytest on the merged tree
 
 The whole suite on `main` at `09f24ee`, with every branch of the 2026-10-01 night merged (image

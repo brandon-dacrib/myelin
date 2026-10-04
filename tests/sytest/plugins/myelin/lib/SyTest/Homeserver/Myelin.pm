@@ -130,6 +130,13 @@ sub _get_config
          enable_legacy_login        => JSON::true,
          registration_shared_secret => "reg_secret",
       },
+      network => {
+         # Sytest's own federation server and identity server listen on `localhost`, which
+         # the image's Perl binds on `::1`; the server's default (IPv4 only, decision of
+         # 2026-10-02) could not reach them, so its key fetches failed and every signed request
+         # from Sytest's server was answered `401` (inbound federation 0 of ~60).
+         outbound => { ipv4_only => JSON::false },
+      },
       federation => {
          custom_ca_certificates             => [ _sytest_ca() ],
          ip_range_blocklist                 => [],
@@ -228,6 +235,16 @@ sub _start_haproxy
    my $unsecure  = $self->unsecure_port;
    my $pem       = $self->{paths}{pem};
 
+   # Listen on both loopback families when Sytest's bind host is `localhost`. haproxy binds the
+   # first address the name resolves to, which on the Sytest image is `::1`, and since
+   # 2026-10-02 the server's outbound connections are IPv4 only by default
+   # (`network.outbound.ipv4_only`), so a proxy on `::1` alone refused every federation request
+   # the other server made (444/772 on 2026-10-04, "Connection refused" on `/invite`), while
+   # Sytest's own client reached it over IPv6 and saw nothing wrong.
+   my $binds = $bind_host eq "localhost"
+      ? "    bind 127.0.0.1:${secure} ssl crt ${pem}\n    bind [::1]:${secure} ssl crt ${pem}"
+      : "    bind ${bind_host}:${secure} ssl crt ${pem}";
+
    # Timeouts longer than Sytest's longest long-poll (/sync and /events wait up to 60 s, and
    # some tests ask for more); `option http-server-close` so a client's keep-alive does not pin
    # a backend connection the server already closed.
@@ -248,7 +265,7 @@ defaults
     option forwardfor
 
 frontend https-in
-    bind ${bind_host}:${secure} ssl crt ${pem}
+${binds}
     http-request set-header X-Forwarded-Proto https
     default_backend myelin
 

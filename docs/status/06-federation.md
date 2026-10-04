@@ -176,6 +176,25 @@ notice, so every count here is the baseline, run this session with the federatio
 and `-summary.txt`): **88 of 130, 42 failing** (13 of them timeouts, 9 "Unexpected response from
 /send"). A directory argument to `run-tests.pl` is ignored; the files must be listed.
 
+**Measured 2026-10-04** (status 14 session 8: the whole suite on merged `main` `a9f62fc7`, quiet
+machine, `docs/status/sytest/2026-10-04-results.txt`), the same 130 tests: **108 of 130, 22
+failing** (4 timeouts, 9 "Unexpected response from /send"). The query API is 5/5 (`10query-profile.pl`
+2/2, `11query-directory.pl` 2/2, "Non-numeric ports in server names are rejected"), `36state.pl`
+7/18 -> 13/18, `35room-invite.pl` 12/14, `34room-backfill.pl` 4/5, `37public-rooms.pl` and
+`40publicroomlist.pl` 1/1 each, `52soft-fail.pl` 2/3 (both inbound soft-fail tests pass; "accepts
+a second soft-failed event" fails on the prev_event ids), `50server-acl-endpoints.pl` 11/11.
+**Still failing, by family:** the nine "Unexpected response from /send" are the `/state_ids`
+fallback of item 6 (`36state.pl` x5, `50no-deextrem-outliers.pl`, `33room-get-missing-events.pl`,
+`34room-backfill.pl`'s cross-room back-pagination, `31room-send.pl`'s wrong-room auth_events);
+`40devicelists.pl` 3 timeouts (resync after leave and rejoin, remote server down, a missed
+update; with 08); invalid JSON for room version 6 is answered `401` instead of `400` in
+`send_join`, `/invite` and `send_leave` (3: the request is refused before its body is judged;
+the server's `info` log has no line for it, so which check answered is still to be read);
+erased users' events over federation (`32room-getevent.pl`), the cross-room redaction
+(`39redactions.pl`), ephemeral messages (`31room-send.pl`), "New federated private chats get
+full presence information" (`44presence.pl`), "Can delete canonical alias" and "Can paginate
+public room list" (hs-room).
+
 Done, each with a Rust test that fails without it, in commit order:
 
 1. **The query API** (`fqu` 1/4 -> expected 4/4). `GET /profile/{userId}[/field]` for a user of
