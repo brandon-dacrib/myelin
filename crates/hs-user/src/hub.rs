@@ -89,7 +89,7 @@ pub const DEFAULT_HOT_STREAM_RETENTION_ENTRIES: u64 = 100_000;
 /// `docs/status/05-sync.md` (session 14), and an escape hatch.
 pub const FAN_OUT_UNBATCHED_ENV: &str = "HS_SYNC_FAN_OUT_UNBATCHED";
 
-fn membership_of(event: &Event) -> Option<String> {
+pub(crate) fn membership_of(event: &Event) -> Option<String> {
     event
         .json()
         .get("content")
@@ -213,22 +213,34 @@ impl hs_room::registry::GlobalTokenResolver for FeedTokenResolver {
     }
 }
 
-/// Implements [`hs_e2e::state::SyncTokenResolver`] for `GET /keys/changes`: decodes `raw` as this
-/// crate's own [`SyncToken`] and reports its `device_list_seq` field directly, with no store
-/// lookup at all -- unlike [`FeedTokenResolver`] (which needs `crate::store::UserStore` to turn a
-/// `feed_seq` into a room-local position), a device-list stream position *is* one of the token's
-/// own fields verbatim, so decoding the token answers the question outright. `user_id` is unused
-/// (a `SyncToken` carries no user scope of its own; the caller already knows whose token this is
-/// from the authenticated request), kept only to satisfy the trait signature.
+/// Implements [`hs_e2e::state::SyncTokenResolver`] for `GET /keys/changes`.
+///
+/// `resolve_device_list_position` decodes `raw` as this crate's own [`SyncToken`] and reports
+/// its `device_list_seq` field directly, with no store lookup at all -- unlike
+/// [`FeedTokenResolver`] (which needs `crate::store::UserStore` to turn a `feed_seq` into a
+/// room-local position), a device-list stream position *is* one of the token's own fields
+/// verbatim, so decoding the token answers the question outright. `user_id` is unused there (a
+/// `SyncToken` carries no user scope of its own; the caller already knows whose token this is
+/// from the authenticated request).
+///
+/// `device_list_changes_between` is the whole answer: the device-list stream between the two
+/// tokens *and* the membership walk `/sync` makes between them
+/// ([`crate::sync::device_lists::changes_between`]), which is what puts a user who merely
+/// started sharing a room into `changed` and anyone into `left`.
 ///
 /// Installed by [`SessionHub::install_device_list_token_resolver`] -- see that method's doc
 /// comment for why installation is a separate call rather than a side effect of
 /// [`SessionHub::new`] the way [`FeedTokenResolver`] is (this one needs an `E2eState` handle that
 /// `new` does not take).
-struct DeviceListTokenResolver;
+struct DeviceListTokenResolver<B: KvBackend, R: RoomSource<B>> {
+    hub: Arc<SessionHub<B, R>>,
+    e2e: Arc<dyn hs_e2e::store::E2eStore>,
+}
 
 #[async_trait::async_trait]
-impl hs_e2e::state::SyncTokenResolver for DeviceListTokenResolver {
+impl<B: KvBackend + 'static, R: RoomSource<B> + 'static> hs_e2e::state::SyncTokenResolver
+    for DeviceListTokenResolver<B, R>
+{
     async fn resolve_device_list_position(
         &self,
         _user_id: &UserId,
@@ -236,6 +248,36 @@ impl hs_e2e::state::SyncTokenResolver for DeviceListTokenResolver {
     ) -> Result<Option<u64>, hs_e2e::error::E2eError> {
         Ok(SyncToken::decode(raw).ok().map(|t| t.device_list_seq))
     }
+
+    async fn device_list_changes_between(
+        &self,
+        user_id: &UserId,
+        from: &str,
+        to: Option<&str>,
+    ) -> Result<Option<hs_e2e::state::DeviceListChanges>, hs_e2e::error::E2eError> {
+        let Ok(from) = SyncToken::decode(from) else {
+            return Ok(None);
+        };
+        let to = match to {
+            Some(raw) => match SyncToken::decode(raw) {
+                Ok(token) => Some(token),
+                Err(_) => return Ok(None),
+            },
+            None => None,
+        };
+        crate::sync::device_lists::changes_between(&self.hub, &self.e2e, user_id, &from, to.as_ref())
+            .await
+            .map(Some)
+            .map_err(|error| hs_e2e::store::StoreError::Backend(error.to_string()).into())
+    }
+}
+
+/// What [`SessionHub::install_remote_device_lists`] installs: where the copies of other servers'
+/// users' device lists are kept, and which server this is, so the hub can tell a remote user
+/// from a local one.
+struct RemoteDeviceLists {
+    store: Arc<dyn hs_e2e::store::RemoteDeviceListStore>,
+    own_server: ruma::OwnedServerName,
 }
 
 /// The per-process hub: one [`crate::store::UserStore`] shared by every user, a [`RoomSource`]
@@ -288,6 +330,11 @@ pub struct SessionHub<B: KvBackend, R: RoomSource<B>> {
     /// once `hs-cli` installs it ([`SessionHub::install_edu_outbox`]). `None`: nothing leaves
     /// this server, which is what federation being off means.
     edu_outbox: OnceLock<Arc<dyn EduOutbox>>,
+    /// The copies of remote users' device lists this server keeps, once `hs-cli` installs them
+    /// ([`SessionHub::install_remote_device_lists`]), so a membership change that ends the last
+    /// room a remote user shares with this server marks their copy stale. `None`: no copies are
+    /// kept (federation off).
+    remote_device_lists: OnceLock<RemoteDeviceLists>,
     /// Told of every local user's read receipt, so push counts reset and badges update
     /// (`hs_push::pipeline`), once installed ([`SessionHub::install_read_receipt_sink`]).
     read_receipt_sink: OnceLock<Arc<dyn hs_push::pipeline::ReadReceiptSink>>,
@@ -361,6 +408,7 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
             shutting_down: std::sync::atomic::AtomicBool::new(false),
             typing: Arc::new(TypingRegistry::new()),
             edu_outbox: OnceLock::new(),
+            remote_device_lists: OnceLock::new(),
             read_receipt_sink: OnceLock::new(),
             ephemeral_observer: OnceLock::new(),
             presence,
@@ -506,8 +554,100 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
     /// [`SessionHub::install_push_rules_store`] isn't: the `E2eState` this needs is built by
     /// `hs-cli`'s `build_session_mounts` as a sibling of this hub, not an input to it -- see
     /// `docs/status/05-sync.md` for the exact call site and line this needs added.
-    pub fn install_device_list_token_resolver(&self, e2e: &hs_e2e::state::E2eState<B>) {
-        e2e.install_sync_token_resolver(Arc::new(DeviceListTokenResolver));
+    pub fn install_device_list_token_resolver(self: &Arc<Self>, e2e: &hs_e2e::state::E2eState<B>)
+    where
+        R: 'static,
+    {
+        e2e.install_sync_token_resolver(Arc::new(DeviceListTokenResolver {
+            hub: Arc::clone(self),
+            e2e: e2e.store.clone(),
+        }));
+    }
+
+    /// Tells this hub where the copies of other servers' users' device lists are kept
+    /// (`hs_e2e::store::RemoteDeviceListStore`) and which server this is, so that when a
+    /// membership change ends the last room a remote user shares with a user of this server,
+    /// their copy is marked stale ([`SessionHub::process_room_update`]). Without this a copy was
+    /// only dropped at a `/keys/query` made while no room was shared: a user who left, changed a
+    /// device and came back with no query in between was served the old list. Same idempotent
+    /// install convention as [`SessionHub::install_edu_outbox`].
+    pub fn install_remote_device_lists(
+        &self,
+        store: Arc<dyn hs_e2e::store::RemoteDeviceListStore>,
+        own_server: ruma::OwnedServerName,
+    ) {
+        if self
+            .remote_device_lists
+            .set(RemoteDeviceLists { store, own_server })
+            .is_err()
+        {
+            tracing::warn!("remote device lists were already installed on this hub; ignoring");
+        }
+    }
+
+    /// After `update`'s membership records are written: every remote user a leave or ban in it
+    /// may have taken the last shared room from -- the leaver themself if they are remote, or
+    /// every remote member of the room if a local user left -- whose device list this server
+    /// holds a copy of and who shares no room with a local user any more, has that copy marked
+    /// stale, so the next `/keys/query` (after they come back, say) fetches it again. Nothing
+    /// without [`SessionHub::install_remote_device_lists`]; a failure is logged, never the
+    /// update's.
+    async fn mark_unshared_remote_lists_stale(
+        &self,
+        update: &RoomUpdate,
+        targets: &HashMap<OwnedUserId, String>,
+    ) {
+        let Some(link) = self.remote_device_lists.get() else {
+            return;
+        };
+        let mut candidates: std::collections::BTreeSet<OwnedUserId> =
+            std::collections::BTreeSet::new();
+        for delta in &update.membership_deltas {
+            if !matches!(delta.membership.as_str(), "leave" | "ban") {
+                continue;
+            }
+            if delta.user_id.server_name() == link.own_server {
+                candidates.extend(
+                    targets
+                        .keys()
+                        .filter(|user| user.server_name() != link.own_server)
+                        .cloned(),
+                );
+            } else {
+                candidates.insert(delta.user_id.clone());
+            }
+        }
+        for user_id in candidates {
+            // The cheap question first: most remote users have no copy here at all.
+            match link.store.get_remote_user(&user_id).await {
+                Ok(Some(_)) => {}
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::warn!(%user_id, %error, "cannot read whether a remote user's device list is held");
+                    continue;
+                }
+            }
+            let shares = match self.users_sharing_room_with(&user_id).await {
+                Ok(users) => users.iter().any(|u| u.server_name() == link.own_server),
+                Err(error) => {
+                    tracing::warn!(%user_id, %error, "cannot work out whether a remote user still shares a room here");
+                    continue;
+                }
+            };
+            if shares {
+                continue;
+            }
+            match link.store.mark_remote_user_stale(&user_id).await {
+                Ok(()) => tracing::info!(
+                    %user_id,
+                    room_id = %update.room_id,
+                    "a remote user shares no room here any more; the copy of their device list is stale until they do"
+                ),
+                Err(error) => {
+                    tracing::warn!(%user_id, %error, "cannot mark a remote user's device list stale");
+                }
+            }
+        }
     }
 
     /// Makes this hub one replica of a cluster (`crate::cluster`'s module docs): rooms this
@@ -1505,31 +1645,61 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         update: &RoomUpdate,
         members: &[(OwnedUserId, String)],
     ) -> Result<(), UserError> {
-        let changes: Vec<(OwnedUserId, bool)> = update
-            .membership_deltas
-            .iter()
-            .map(|delta| {
-                let now = members
-                    .iter()
-                    .find(|(user, _)| user == &delta.user_id)
-                    .map_or(delta.membership.as_str(), |(_, membership)| {
-                        membership.as_str()
-                    });
-                (delta.user_id.clone(), now == "join")
-            })
-            .collect();
-        if self
-            .store
-            .apply_room_member_changes(&update.room_id, &changes)
-            .await?
-        {
-            return Ok(());
-        }
         let joined: Vec<OwnedUserId> = members
             .iter()
             .filter(|(_, membership)| membership == "join")
             .map(|(user, _)| user.clone())
             .collect();
+        let joins = update
+            .membership_deltas
+            .iter()
+            .filter(|delta| delta.membership == "join")
+            .count();
+        if joins > 0 {
+            // A join is when a room's state can have arrived whole, with only the join itself
+            // in the deltas: a room this server was invited to (indexed from a stub with no
+            // members at the invite) is joined through another server, or rejoined after this
+            // server was out of it. The index is made to match the room, not just the deltas.
+            // The room's member list was read for this update anyway; this is one more pass
+            // over it on a join, never on a message.
+            if let Some((added, removed)) = self
+                .store
+                .reconcile_room_members(&update.room_id, &joined)
+                .await?
+            {
+                if added > joins || removed > 0 {
+                    tracing::info!(
+                        room_id = %update.room_id,
+                        added,
+                        removed,
+                        members = joined.len(),
+                        "a room's member index was behind the room on a join; made it match"
+                    );
+                }
+                return Ok(());
+            }
+        } else {
+            let changes: Vec<(OwnedUserId, bool)> = update
+                .membership_deltas
+                .iter()
+                .map(|delta| {
+                    let now = members
+                        .iter()
+                        .find(|(user, _)| user == &delta.user_id)
+                        .map_or(delta.membership.as_str(), |(_, membership)| {
+                            membership.as_str()
+                        });
+                    (delta.user_id.clone(), now == "join")
+                })
+                .collect();
+            if self
+                .store
+                .apply_room_member_changes(&update.room_id, &changes)
+                .await?
+            {
+                return Ok(());
+            }
+        }
         if self
             .store
             .index_room_members_if_absent(&update.room_id, &joined)
@@ -1889,6 +2059,11 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
             fan_out.report.transactions,
             fan_out.report.fallbacks,
         );
+        // The membership records say who shares a room with whom now: a remote user this
+        // update took the last shared room from has their device-list copy marked stale,
+        // before anyone is woken to ask for it.
+        self.mark_unshared_remote_lists_stale(&update, &targets)
+            .await;
         // And everyone is woken last, once everything a woken `/sync` will read is written.
         for user_id in targets.keys() {
             self.wake(user_id).await;

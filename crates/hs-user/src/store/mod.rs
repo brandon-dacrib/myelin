@@ -344,6 +344,20 @@ pub trait UserStore: Send + Sync {
         changes: &[(ruma::OwnedUserId, bool)],
     ) -> Result<bool, StoreError>;
 
+    /// Makes an indexed room's joined-member rows exactly `joined`: adds the rows missing and
+    /// removes the rows of users not in `joined`. Returns how many rows were added and removed,
+    /// or `None`, writing nothing, if the room is not indexed. For a room whose state arrived
+    /// whole (joined through another server after an invite, or rejoined after this server was
+    /// out of it), where the update's own membership deltas name only the joiner.
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] on a storage failure.
+    async fn reconcile_room_members(
+        &self,
+        room_id: &ruma::RoomId,
+        joined: &[ruma::OwnedUserId],
+    ) -> Result<Option<(usize, usize)>, StoreError>;
+
     /// An indexed room's joined members; `None` if the room is not indexed.
     ///
     /// # Errors

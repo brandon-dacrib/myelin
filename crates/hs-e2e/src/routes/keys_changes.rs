@@ -7,7 +7,9 @@
 //! `hs-user` issues real opaque tokens (`hsu1_...`), anything that doesn't parse as a plain
 //! decimal is instead handed to [`crate::state::SyncTokenResolver`] if one has been installed
 //! (see that trait's doc comment for why this crate cannot just decode `hs-user`'s token format
-//! itself). See `docs/status/08-e2ee.md`.
+//! itself). A resolver that also makes the membership walk between two of its tokens
+//! ([`crate::state::SyncTokenResolver::device_list_changes_between`]) answers the whole request,
+//! `left` included; without one, `left` is always empty. See `docs/status/08-e2ee.md`.
 
 use axum::Json;
 use axum::extract::{Query, State};
@@ -55,15 +57,35 @@ pub async fn get_keys_changes<B: KvBackend + 'static>(
     E2eRequester(requester): E2eRequester,
     Query(query): Query<KeysChangesQuery>,
 ) -> Result<Json<serde_json::Value>, E2eError> {
+    // The installed resolver's own answer, when it makes the membership walk between two of
+    // its tokens (`hs-user` does: `crate::state::SyncTokenResolver::device_list_changes_between`).
+    // That is the only way to answer `left`, and `changed` for a user who merely started sharing
+    // a room, since this crate has no notion of room membership -- see `crate::appservice_feed`'s
+    // doc comment for the same limitation on the appservice-facing side.
+    if let Some(resolver) = state.sync_token_resolver()
+        && let Some(changes) = resolver
+            .device_list_changes_between(&requester.user_id, &query.from, query.to.as_deref())
+            .await?
+    {
+        tracing::debug!(
+            user_id = %requester.user_id,
+            changed = changes.changed.len(),
+            left = changes.left.len(),
+            "/keys/changes answered from the membership walk between two sync tokens"
+        );
+        return Ok(Json(json!({
+            "changed": changes.changed.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "left": changes.left.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        })));
+    }
+    // A plain stream position (this crate's own token format), or a resolver that only decodes
+    // positions: the device-list stream alone, with `left` necessarily empty.
     let from = resolve_stream_pos(&state, &requester.user_id, &query.from).await?;
     let to = match query.to.as_deref() {
         Some(raw) => Some(resolve_stream_pos(&state, &requester.user_id, raw).await?),
         None => None,
     };
     let changed = state.store.changed_users_since(from, to).await?;
-    // This crate has no notion of room membership, so it cannot compute `left` (users who
-    // stopped sharing an encrypted room) -- see `crate::appservice_feed`'s doc comment for the
-    // same limitation on the appservice-facing side. Always empty here, documented as a seam.
     Ok(Json(json!({
         "changed": changed.into_iter().map(|u| u.to_string()).collect::<Vec<_>>(),
         "left": Vec::<String>::new(),

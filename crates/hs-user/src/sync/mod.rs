@@ -84,7 +84,12 @@
 //!   this crate's own membership data says `user_id` currently shares a joined room with. This is
 //!   both the spec's privacy requirement (a user must not learn about devices belonging to
 //!   strangers) and what makes the field usable at all on a server with more than a handful of
-//!   users.
+//!   users. The one addition to that scope is who the user *came to* share a room with in this
+//!   batch, read from the timelines of their joined rooms: whoever joined, was invited or
+//!   knocked there, and everyone in a room they joined -- an invitee is in `changed` before
+//!   they are anybody's joined co-member, as on Synapse, so a client has their keys before the
+//!   first message. `GET /keys/changes` makes the same walk between two tokens
+//!   ([`device_lists::changes_between`]).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -98,6 +103,8 @@ use hs_room::routes::render::{attach_replaced_state, attach_transaction_id, clie
 use hs_room::timeline::{Direction, PaginationToken};
 use ruma::{OwnedDeviceId, OwnedRoomId, OwnedUserId, RoomId, UserId};
 use serde_json::{Value, json};
+
+pub mod device_lists;
 
 use crate::error::UserError;
 use crate::filter::SyncFilter;
@@ -1278,6 +1285,7 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
         }
 
         timeline_events += timeline.events.len();
+        let membership_record_is_join = membership.membership == "join";
         for event in &timeline.events {
             if event.get("type").and_then(Value::as_str) != Some("m.room.member") {
                 continue;
@@ -1304,19 +1312,34 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
             if matches!(membership, Some("leave") | Some("ban"))
                 && let Ok(other) = ruma::UserId::parse(state_key)
             {
+                // Somebody who joined and left within this batch counts as left, not as
+                // newly shared (Synapse's `calculate_user_changes` makes the same two calls).
+                newly_shared.remove(&other);
                 left_candidates.insert(other);
             }
             // Somebody else arriving -- and not merely changing their display name, which is
             // also a `join` event, and in a big room would have every member re-fetching the
-            // keys of anyone who so much as changed their avatar.
+            // keys of anyone who so much as changed their avatar. An invite or a knock counts
+            // too, as on Synapse: a client that is about to share an encrypted room with the
+            // invitee needs their keys before the first message, not after their join
+            // (Sytest's cross-signing tests wait for the invitee in `changed` before the join).
+            // Only in a room this user is joined to: what is seen in a left room's timeline
+            // is not somebody they share a room with.
             let was_joined = event
                 .pointer("/unsigned/prev_content/membership")
                 .and_then(Value::as_str)
                 == Some("join");
-            if membership == Some("join")
-                && !was_joined
+            let arriving = match membership {
+                Some("join") => !was_joined,
+                Some("invite") | Some("knock") => true,
+                _ => false,
+            };
+            if arriving
+                && membership_record_is_join
                 && let Ok(other) = ruma::UserId::parse(state_key)
             {
+                // And somebody who left and came back within the batch is newly shared.
+                left_candidates.remove(&other);
                 newly_shared.insert(other);
             }
         }
@@ -1517,11 +1540,13 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
             DeviceKeyStore::changed_users_since(&**e2e, baseline.device_list_seq, Some(upto))
                 .await?;
         // The user's own id belongs here too: it is how the device they are already signed in
-        // on hears about the one they have just signed in on.
+        // on hears about the one they have just signed in on. `newly_shared` is not narrowed
+        // to `shared`: it was built only from rooms this user is joined to, and an invitee is
+        // in it before they are anybody's joined co-member.
         let changed: BTreeSet<&OwnedUserId> = changed_all
             .iter()
             .filter(|u| shared.contains(*u) || u.as_str() == user_id.as_str())
-            .chain(newly_shared.iter().filter(|u| shared.contains(*u)))
+            .chain(newly_shared.iter())
             .collect();
         let changed: Vec<Value> = changed
             .into_iter()

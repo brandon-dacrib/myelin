@@ -58,6 +58,46 @@ pub trait SyncTokenResolver: Send + Sync {
         user_id: &UserId,
         raw: &str,
     ) -> Result<Option<u64>, E2eError>;
+
+    /// The whole answer to `GET /keys/changes?from=&to=` for `user_id`, if this resolver can
+    /// give one: who to query again (`changed`) and who the user no longer shares a room with
+    /// (`left`), between the two tokens. `to` is `None` when the request had no `to` ("up to
+    /// now").
+    ///
+    /// `changed` and `left` need the membership walk `/sync` makes between two of its tokens
+    /// (who joined, was invited to or left a room the user is in, and the rooms the user joined
+    /// or left), which only the token-minting crate can make: the device-list stream alone
+    /// (`crate::store::DeviceKeyStore::changed_users_since`) knows nothing about rooms, and
+    /// answering from it alone leaves `left` empty and `changed` without anyone who merely
+    /// started sharing a room. `GET /keys/changes` prefers this answer when it is `Some`.
+    ///
+    /// Returns:
+    /// - `Ok(None)` if `from` or `to` is not a token this resolver mints, or the resolver does
+    ///   not make the walk at all (the default): the route falls back to
+    ///   [`SyncTokenResolver::resolve_device_list_position`] and the stream.
+    /// - `Ok(Some(changes))` with the answer.
+    /// - `Err` only for a genuine backing-store failure.
+    async fn device_list_changes_between(
+        &self,
+        user_id: &UserId,
+        from: &str,
+        to: Option<&str>,
+    ) -> Result<Option<DeviceListChanges>, E2eError> {
+        let _ = (user_id, from, to);
+        Ok(None)
+    }
+}
+
+/// What `GET /keys/changes` answers: the users whose device lists the asking user should query
+/// again, and the users they stopped sharing a room with. See
+/// [`SyncTokenResolver::device_list_changes_between`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeviceListChanges {
+    /// Users who changed a device, or who now share a room with the asking user (or were
+    /// invited to one of theirs), since `from`.
+    pub changed: Vec<ruma::OwnedUserId>,
+    /// Users the asking user shared a room with at `from` and shares none with now.
+    pub left: Vec<ruma::OwnedUserId>,
 }
 
 /// This crate's axum shared state: the e2e store and an embedded [`AuthState`] so

@@ -754,6 +754,48 @@ impl<B: KvBackend> UserStore for TablesUserStore<B> {
         .map_err(StoreError::Kv)
     }
 
+    async fn reconcile_room_members(
+        &self,
+        room_id: &RoomId,
+        joined: &[ruma::OwnedUserId],
+    ) -> Result<Option<(usize, usize)>, StoreError> {
+        let rid = room_id.to_string();
+        let wanted: std::collections::BTreeSet<String> =
+            joined.iter().map(ToString::to_string).collect();
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            let spec = TypedKeyspace::<B::Keyspace, (String, String)>::prefix(&(rid.clone(),));
+            let mut indexed = false;
+            let mut present = std::collections::BTreeSet::new();
+            for item in self.room_members.range(&*txn, spec) {
+                let ((_, user), _) = item.map_err(to_kv)?;
+                if user == INDEXED_MARKER {
+                    indexed = true;
+                } else {
+                    present.insert(user);
+                }
+            }
+            if !indexed {
+                return Ok(None);
+            }
+            let mut added = 0usize;
+            for user in wanted.difference(&present) {
+                self.room_members
+                    .put(txn, &(rid.clone(), user.clone()), &[])
+                    .map_err(to_kv)?;
+                added += 1;
+            }
+            let mut removed = 0usize;
+            for user in present.difference(&wanted) {
+                self.room_members
+                    .delete(txn, &(rid.clone(), user.clone()))
+                    .map_err(to_kv)?;
+                removed += 1;
+            }
+            Ok(Some((added, removed)))
+        })
+        .map_err(StoreError::Kv)
+    }
+
     async fn room_member_ids(
         &self,
         room_id: &RoomId,

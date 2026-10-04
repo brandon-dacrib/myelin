@@ -1738,6 +1738,11 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             user_state.hub.clone(),
             server_name.clone(),
         )));
+        // And the hub marks a copy stale when a membership change ends the last room its user
+        // shares with this server (`hs_user::hub::SessionHub::install_remote_device_lists`).
+        user_state
+            .hub
+            .install_remote_device_lists(e2e_state.store.clone(), server_name.clone());
         // Another server's avatars and attachments: fetched over the same client, cached in
         // the media repository (`hs_media::remote`).
         crate::media::install_remote_media(&media_state.repository, mount.client.clone(), &metrics);
