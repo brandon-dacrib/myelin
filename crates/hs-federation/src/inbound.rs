@@ -340,6 +340,44 @@ pub trait RoomWriteSink: Send + Sync {
         event_id: &str,
         event_json: &Value,
     ) -> Result<WriteOutcome, WriteRejected>;
+
+    /// Which of `event_ids` this server does not hold in `room_id` in any form (in the
+    /// timeline, as an outlier, or as rejected): what the `/state_ids` fallback
+    /// (`crate::state_fallback`) must fetch. The default knows nothing, so everything is
+    /// fetched; a sink over a real room store answers from its index.
+    async fn unknown_events(&self, room_id: &str, event_ids: &[String]) -> Vec<String> {
+        let _ = room_id;
+        event_ids.to_vec()
+    }
+
+    /// Holds `prev_event` -- a prev event of a received event, which this server could not walk
+    /// back to -- with the state before it as another server answered `/state_ids`
+    /// (`state_before`, event IDs), and the events of that state, its auth chain and
+    /// `prev_event`'s own auth events that this server lacked (`fetched`). Every event handed
+    /// over is already hash- and signature-verified ([`verify_pdu`]); what the sink does with
+    /// them (authorise each against its own auth events, hold what passes as outliers, store
+    /// what fails as rejected, hold `prev_event` with the state) is `hs-room`'s
+    /// `RoomActor::accept_prev_event_with_state`. See `crate::state_fallback`.
+    ///
+    /// The default refuses: a sink that cannot hold an event with a fetched state.
+    ///
+    /// # Errors
+    /// [`WriteRejected::auth`] when `prev_event` fails authorisation at that state (it is then
+    /// stored rejected, and an event citing it is judged at the state before it);
+    /// [`WriteRejected::other`] when it cannot be held at all.
+    async fn accept_prev_event_with_state(
+        &self,
+        room_id: &str,
+        prev_event_id: &str,
+        prev_event: &Value,
+        state_before: &[String],
+        fetched: &[Value],
+    ) -> Result<WriteOutcome, WriteRejected> {
+        let _ = (room_id, prev_event_id, prev_event, state_before, fetched);
+        Err(WriteRejected::other(
+            "this sink cannot hold a prev event with a fetched state",
+        ))
+    }
 }
 
 /// A [`RoomWriteSink`] that already knows every event it will ever be asked about (for this

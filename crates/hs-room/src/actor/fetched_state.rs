@@ -19,7 +19,8 @@
 //!   "Should not be able to take over the room by pretending there is no PL event") gains
 //!   nothing;
 //! - the missing prev event itself is an outlier too, authorised against its own `auth_events`
-//!   and against the fetched state before it, and held **with that state**: a
+//!   (as Synapse's outliers are; not also against the fetched state, which may lack an event
+//!   that did not verify), and held **with that state**: a
 //!   `Tables::state_snapshots` row (durable; `RoomActor::load` reads it back) and a root in
 //!   [`RoomActor::placed_outlier_roots`], so the state after it -- what an event citing it is
 //!   resolved from ([`RoomActor::root_after`]) -- is the fetched state with the prev event over
@@ -111,21 +112,12 @@ impl<B: KvBackend> RoomActor<B> {
             .filter(|sn| !self.rejected.contains(sn))
             .collect();
 
-        // 3. `prev` itself, at that state.
-        let prev_sns: Vec<EventSn> = pipeline::decode_event_ids(prev.json().get("prev_events"))
-            .iter()
-            .filter_map(|id| self.event_id_index.get(id).copied())
-            .collect();
-        let auth_sns: Vec<EventSn> = pipeline::decode_event_ids(prev.json().get("auth_events"))
-            .iter()
-            .filter_map(|id| self.event_id_index.get(id).copied())
-            .collect();
-        if let Err(error) = self.authorize_remote_at(
-            &prev,
-            &prev_sns,
-            &auth_sns,
-            StateBefore::Explicit(&state_sns),
-        ) {
+        // 3. `prev` itself, an outlier like the rest: judged by its own auth events, as
+        //    Synapse judges a fetched prev event (`_auth_and_persist_outliers`). Not also at the
+        //    fetched state: a state event of it that does not verify (Sytest's made-up power
+        //    levels in "... asks for /state_ids and resolves the state") leaves the state
+        //    without that key, and an honest prev event would then be refused for it.
+        if let Err(error) = self.authorize_outlier(&prev) {
             if let RoomError::Forbidden(reason) = &error {
                 self.store_rejected(prev, reason)?;
             }

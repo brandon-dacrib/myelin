@@ -922,6 +922,40 @@ async fn create_room_validates_request_shape() {
         .await
         .assert_matrix_error(StatusCode::BAD_REQUEST, "M_BAD_JSON");
 
+    // Complement's `TestMSC4289PrivilegedRoomCreators_AdditionalValidation`: in a room of
+    // version 12, `creation_content.additional_creators` must be an array of user IDs.
+    for bad in [
+        json!("not-an-array"),
+        json!(["@foo:example.com", 42]),
+        json!(["@foo:example.com", "not-a-user-id"]),
+        json!(["@invalid:dom$ain$.com"]),
+    ] {
+        scenario
+            .send(
+                Some("alice"),
+                Method::POST,
+                "/createRoom",
+                Some(json!({
+                    "preset": "public_chat", "room_version": "12",
+                    "creation_content": {"additional_creators": bad},
+                })),
+            )
+            .await
+            .assert_matrix_error(StatusCode::BAD_REQUEST, "M_BAD_JSON");
+    }
+    scenario
+        .send(
+            Some("alice"),
+            Method::POST,
+            "/createRoom",
+            Some(json!({
+                "preset": "public_chat", "room_version": "12",
+                "creation_content": {"additional_creators": ["@foo:example.com", "@bar:baz.code"]},
+            })),
+        )
+        .await
+        .assert_ok();
+
     // A well-formed request still works after all that.
     scenario
         .send(

@@ -875,12 +875,16 @@ async fn send_gives_up_when_the_remote_serves_an_endless_backfill_chain() {
 
     // Bounded: one gap-shaped `/get_missing_events` request (this peer answers it with no
     // `events`, so it closes nothing), then exactly `max_rounds` `/backfill` rounds -- not one
-    // per hop of the (literally endless) chain it kept offering.
+    // per hop of the (literally endless) chain it kept offering -- then the `/state_ids`
+    // fallback for at most `MAX_PENDING_EVENTS` of the events it fetched and could not place:
+    // `/state_ids` and `/state` each, both answered with something that is not a state, so no
+    // `/event` follows.
     let limits = hs_federation::backfill::BackfillLimits::default();
     assert_eq!(
         calls.load(Ordering::SeqCst),
-        limits.max_rounds + 1,
-        "expected the gap-shaped request plus exactly max_rounds backfill requests to the hostile peer"
+        limits.max_rounds + 1 + 2 * hs_federation::state_fallback::MAX_PENDING_EVENTS,
+        "expected the gap-shaped request, exactly max_rounds backfill requests and the bounded \
+         state fallback to the hostile peer"
     );
 }
 

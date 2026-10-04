@@ -1,5 +1,165 @@
 # 06 Federation: status
 
+## 2026-10-04 (branch `agent/fed-state-ids`): the `/state_ids` fallback's federation side, soft failure, and float bodies
+
+Closes session 18 item 6 (the half left open), the soft-failure half of `docs/next-steps.md`
+item 3, the coordinator's "invalid JSON for room version 6 is `401`" item, and Complement's
+`TestMSC4289PrivilegedRoomCreators_AdditionalValidation` `403`. Crates: `hs-federation`,
+`hs-room`, `hs-cli` (wiring and tests). `hs-model` and `hs-state` needed no change (the
+soft-failed flag was already in `EventFlags`).
+
+**1. The `/state_ids` fallback** (`hs-federation`, new `state_fallback`). When
+`backfill::resolve_missing_ancestors` gives up with events it fetched but could not place
+(their own prev events unknown: the peer answered `/get_missing_events` with one hop and
+`/backfill` with `404`, as Sytest's does), it now hands those events to
+`state_fallback::resolve_through_state`: oldest first, each is offered to the room again, and
+one still missing a prev event gets, for each such prev event (at most 5), `GET /state_ids` at
+it (`GET /state` when that is not answered), `GET /event` for the prev event, then `GET /event`
+for what the state, its auth chain, the prev event's auth events and the citing event's
+missing auth events name that the room lacks (the whole `/state` once instead when more than
+100 or a tenth of what is named is missing), one more round for those events' own auth events,
+then `RoomWriteSink::accept_prev_event_with_state` (the room side, `hs-room`
+`actor::fetched_state`, unchanged), then the pending event again. Then
+`inbound::process_transaction` retries the received event as before. Every fetched event is
+verified (`verify_pdu`), must be the event asked for and of the room (an event of another room
+named in a state is dropped). At most 5 pending events cost a state fetch; the fallback has its
+own `max_duration`. **The received event's own missing prev events never get the fallback**:
+Sytest's "Federation rejects inbound events where the prev_events cannot be found" fails if the
+state at such a prev event is asked, and Synapse refuses that event the same way (an event
+pushed to us must not bring a state its sender made up). New interfaces:
+`AncestorFetcher::{fetch_state_ids, fetch_state, fetch_event}` (defaults answer an error;
+`FederationClient` implements them over `state_ids`, `room_state`, `event`),
+`RoomWriteSink::{unknown_events, accept_prev_event_with_state}` (defaults: everything unknown,
+refuse), `BackfillGiveUpReason::StateFallbackFailed { backfill, state }`. `hs-cli`'s
+`RegistryWriteSink` implements both sink methods over `RoomActor::events_not_held` and
+`RoomActorHandle::accept_prev_event_with_state`. Observability: `info` per prev event taken
+("took a missing prev event with the state another server answered for it", with room, event,
+`state_events`, `fetched`) or refused, `info` when backfill hands over to the fallback, and
+`hs_federation_state_fallbacks_total{outcome=resolved|rejected|no_state|no_event|refused|timed_out}`
+(registered with the transport metrics).
+
+**2. Soft failure over federation** (`hs-room`, new `actor::soft_fail`; the flag
+`EventFlags::is_soft_failed` was already in `hs-model`). `accept_remote_event` runs the third
+receipt check: the auth rules against the room's current state, resolved across the forward
+extremities and the state before the event (as Synapse's `_check_for_soft_fail`), skipped when
+the event's prev events are the extremities and for the importer's quiet copies. An event that
+fails only this is stored with the flag, placed in the timeline, fed to the state store, and
+answered `RemoteEventOutcome::SoftFailed` (`/send` answers `{}`): it is **not a forward
+extremity and supersedes none**, **not published** (so `/sync`, push, appservices and the
+federation sender never hear of it), not in the relations or joined-rooms index, and hidden
+from `event_by_id`, `event_at`, `events_around`, `events_after`, the `/messages` and `/sync`
+pages and `head_update`; it stays hidden after a load and in a replica's catch-up. Federation
+still serves it (`RoomActor::held_event`, which `hs_cli::federation`'s `/event`, `/state`,
+`/state_ids` and auth-chain reads use now). A later accepted event citing a soft-failed (or
+rejected) event supersedes the extremities beneath it (`RoomActor::superseded_extremities`,
+Synapse's `_get_prevs_before_rejected`). Logged at `info` ("soft failed an event received over
+federation"), counted `hs_room_soft_failed_events_total`. New: `RemoteEventOutcome::SoftFailed`
+(callers in `hs-cli` updated), `RoomActor::{is_soft_failed_event, held_event}`.
+
+**3. Found on the way, in `hs-room`'s room side (`actor::fetched_state`).** The missing prev
+event is now judged by its own `auth_events` only, like the rest of the fetched events and as
+Synapse judges a fetched prev event (`_auth_and_persist_outliers`); it was also checked at the
+fetched state, and Sytest's state for "... asks for /state_ids and resolves the state" contains
+a power-levels event whose signature does not verify (so the state had no power levels and the
+honest prev event was refused). `StateBefore::Explicit` went with it. And **an outlier in room
+version 12 was refused for "no create event"**: with no state before it, the auth-events
+selection looked for the create event among its `auth_events`, where MSC4291 never puts it;
+it now asks whether the room holds it. That broke the fallback (and any outlier) in version-12
+rooms, which is what Sytest's fixtures create.
+
+**4. `/state` and `/state_ids` at an outlier are `404`** (`hs-cli`,
+`federation::state_before_with_chain`: an event with no timeline position), as Synapse
+answers, though the room holds a state for a fetched prev event.
+
+**5. A request body with a float is authenticated, then judged** (`hs-federation`,
+`xmatrix`): the X-Matrix signature is checked over the body canonicalised leniently about
+numbers (as Synapse), so `send_join`/`/invite`/`send_leave` with a float in a version-6 room
+reach the handler and its `400 M_BAD_JSON`, instead of failing the signature check with `401`.
+A body other than the one signed still fails.
+
+**6. `createRoom` judges `creation_content.additional_creators`** (`hs-room`,
+`routes::create_room`): in a room version with additional creators (12), anything but an array
+of user IDs is `400 M_BAD_JSON`; it was left to the create event's auth check, a `403`.
+
+**Verified.**
+
+- `cargo test -p hs-federation` (218): new `state_fallback::tests::{a_fetched_event_whose_prev_event_is_missing_is_placed_through_the_state_at_it,
+  the_received_events_own_missing_prev_event_never_gets_the_state_fallback,
+  a_prev_event_that_cannot_be_fetched_fails_and_an_event_of_another_room_is_dropped}`,
+  `xmatrix::tests::a_signed_body_with_a_float_is_authenticated_and_left_to_the_handler`;
+  `backfill::tests::gives_up_cleanly_on_an_endless_chain_instead_of_looping_forever` now
+  expects the fallback's give-up too.
+- `cargo test -p hs-room` (lib 182, every integration file; `scenario::create_room_validates_request_shape`
+  now covers Complement's four bad `additional_creators` and the good one): new
+  `actor::soft_fail::tests::{soft_failed_events_are_held_hidden_and_never_extremities` (all
+  three `52soft-fail.pl` graphs, extremities after each step, the next local event's
+  `prev_events`, across a reload), `an_event_citing_a_soft_failed_one_is_accepted_and_supersedes_what_it_stands_on}`.
+- `hs-cli`, new `tests/federation_state_fallback.rs` on the full `hs serve` (`spawn_serve`)
+  and a stand-in for Sytest's server over HTTP (its own key, `/get_missing_events` one hop,
+  `/backfill` and `/state` `404`, `/state_ids` and `/event`):
+  `a_missing_prev_event_is_taken_with_the_state_the_sending_server_answers_for_it` and
+  `..._with_its_state_in_room_version_12` (36state's C/X/Y/T graph: X and C in alice's
+  `/sync`, Y and T in the room's state, the state at X has them, `/state[_ids]` at Y is `404`,
+  the counter on `/metrics`; the version-12 one fails without the create-event fix), `an_event_whose_prev_event_nobody_divulges_is_refused_without_asking_the_state`,
+  `an_event_the_current_state_refuses_is_soft_failed_and_kept_from_clients` (C not in alice's
+  sync and `404` to her, served over federation `/event`, D in her sync, the counter). With
+  the fallback and the soft-fail check disabled, the first and third fail (checked).
+  The whole `cargo test -p hs-cli` (53 result lines, all `ok`), including `federation_writes` (9; the endless-chain bound now includes the fallback's
+  `2 x MAX_PENDING_EVENTS` requests), `federation_two_servers`, `federation_reads`,
+  `federation_room_versions`, `federation_membership`, `federation_catch_up`,
+  `federation_sender`, `federation_edus`: pass.
+- `cargo fmt --all --check`; `cargo clippy -p hs-federation -p hs-room -p hs-cli --all-targets
+  -- -D warnings`: clean. Not run: the workspace gate.
+- **Sytest**, the federation set of session 18 (`tests/50federation/*.pl`,
+  `30rooms/05aliases.pl`, `30rooms/70publicroomslist.pl`; release `hs` on bookworm built from
+  this branch rebased on `a802724a`, through `SYTEST_HS_BINARY`, image `myelin-sytest:dev`):
+  **118 of 130** (108 on `main` `a9f62fc7`, 2026-10-04 run 3).
+  `docs/status/sytest/2026-10-04-fed-state-ids-results.txt` and `-summary.txt`. Newly passing
+  (11): "Outbound federation requests missing prev_events and then asks for /state_ids and
+  resolves the state", "Federation handles empty auth_events in state_ids sanely", "Should not
+  be able to take over the room by pretending there is no PL event", "Forward extremities
+  remain so even after the next events are populated as outliers", "outliers whose auth_events
+  are in a different room are correctly rejected", "/state returns M_NOT_FOUND for an outlier",
+  "/state_ids returns M_NOT_FOUND for an outlier", "Inbound federation accepts a second
+  soft-failed event", and the three "... invalid JSON for room version 6" (`send_join`,
+  `/invite`, invite rejections). "Federation rejects inbound events where the prev_events cannot
+  be found" and both other soft-failure tests still pass. **One test moved the other way:**
+  "Local device key changes get to remote servers" failed in two of three runs of this branch
+  and passed in the third (it receives the previous test's user's `m.device_list_update`; device
+  lists are track 08's, and this branch changes nothing they send). A first run without the
+  rebase measured 15/130: the branch predated `main`'s Sytest-plugin fix (`ipv4_only: false`,
+  haproxy on both loopback families), so every key fetch from Sytest's server failed.
+
+**Decisions made.**
+
+- The fallback runs only for events backfill fetched, never for the event received over
+  `/send` (see 1). Sytest's tests and Synapse agree.
+- Soft-failed events take a timeline position (so a load and catch-up find them in order and
+  the state store is fed in order) and every client read skips them, rather than being held as
+  outliers: they are in the graph, cited by later events, and their state takes part in
+  resolution.
+- The soft-failure check is skipped for history (backfill, gap fills: judged at their
+  position, as Synapse's `backfilled` events skip it) and for the importer.
+- Request signatures are checked over lenient canonical JSON; the event's own canonical JSON
+  stays strict, judged where the room version is known.
+- A missing prev event fetched for the fallback is an outlier like the state fetched with it:
+  judged by its own auth events only (Synapse's rule). What a made-up state can do is still
+  bounded by every fetched state event passing its own auth events, and by the state
+  resolution of the event that cites it (Sytest's take-over test passes).
+
+**Left.** Of the coordinator's version-12 MSC Complement tests only the `additional_creators`
+`400` was reached (not run under Complement here); `TestMSC4289*`'s others, `TestMSC4291*`,
+`TestMSC4297*` and `TestMSC4311*` were not. Complement's `TestInboundCanReturnMissingEvents`
+was not run. In Sytest's set, still failing and in this track: "Events whose auth_events are in
+the wrong room do not mess up the room state" (an auth event of another room is a missing
+ancestor; Synapse fetches the auth chain and judges the event without it),
+"Backfilled events whose prev_events are in a different room do not allow cross-room
+back-pagination" (a timeout in the `/messages` backfill), the cross-room redaction, erased
+users' events, ephemeral messages. A soft-failed event that later becomes part of the current
+state through resolution is shown in state reads but not in the timeline (the spec allows
+either; Synapse does the same). Erased users' events over federation, the cross-room
+redaction, ephemeral messages and federated presence are untouched.
+
 ## 2026-10-02 (branch `agent/outbound-ipv4-only`): the outbound address policy, and why `maunium.net` failed
 
 **What was wrong.** The demo pod logged `could not fetch remote media ... origin=maunium.net ...

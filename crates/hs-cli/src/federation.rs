@@ -324,7 +324,7 @@ fn prev_event_ids(event: &Event) -> Vec<String> {
 /// Looks one event up in a resident actor by its string ID.
 fn event_by_str<'a, B: KvBackend>(actor: &'a RoomActor<B>, event_id: &str) -> Option<&'a Event> {
     let parsed = ruma::EventId::parse(event_id).ok()?;
-    actor.event_by_id(&parsed)
+    actor.held_event(&parsed)
 }
 
 /// The transitive closure of `roots`' `auth_events`, breadth-first and bounded by
@@ -842,8 +842,11 @@ fn state_before_with_chain<B: KvBackend>(
     let event_id = ruma::EventId::parse(at).map_err(|_| RoomSourceError::NotFound)?;
     // A rejected event is held (so that it is known again) but never accepted: there is no
     // state "at" it to serve, as `/event` does not serve it (Sytest's "/state[_ids] returns
-    // M_NOT_FOUND for a rejected message/state event"). An outlier is `None` from the actor.
-    if actor.is_rejected_event(&event_id) {
+    // M_NOT_FOUND for a rejected message/state event"). Nor at an outlier, an event with no
+    // timeline position (a join's state, a missing prev event held with a fetched state):
+    // Synapse answers `404` for one ("/state[_ids] returns M_NOT_FOUND for an outlier"), though
+    // this server holds a state for some (`hs_room::actor::fetched_state`).
+    if actor.is_rejected_event(&event_id) || actor.timeline_position(&event_id).is_none() {
         return Err(RoomSourceError::NotFound);
     }
     let at_state = actor
@@ -929,7 +932,12 @@ impl<B: KvBackend + 'static> hs_federation::inbound::RoomWriteSink for RegistryW
 
         let out_of_room = event.clone();
         match handle.accept_remote_event(event).await {
-            Ok(hs_room::actor::RemoteEventOutcome::Stored(_)) => Ok(WriteOutcome::Stored),
+            // A soft-failed event (`hs_room::actor::soft_fail`) was received and processed:
+            // held, in the graph, out of every client read. `/send` answers `{}` for it.
+            Ok(
+                hs_room::actor::RemoteEventOutcome::Stored(_)
+                | hs_room::actor::RemoteEventOutcome::SoftFailed(_),
+            ) => Ok(WriteOutcome::Stored),
             Ok(hs_room::actor::RemoteEventOutcome::AlreadyKnown) => Ok(WriteOutcome::AlreadyKnown),
             // The end of an invite or a knock, sent here by a server in a room this server is
             // not in: nothing it cites is held, and nothing ever will be. See
@@ -938,7 +946,10 @@ impl<B: KvBackend + 'static> hs_federation::inbound::RoomWriteSink for RegistryW
                 if out_of_room_ending(&handle, &out_of_room).await =>
             {
                 match handle.accept_out_of_room_membership(out_of_room).await {
-                    Ok(hs_room::actor::RemoteEventOutcome::Stored(_)) => Ok(WriteOutcome::Stored),
+                    Ok(
+                        hs_room::actor::RemoteEventOutcome::Stored(_)
+                        | hs_room::actor::RemoteEventOutcome::SoftFailed(_),
+                    ) => Ok(WriteOutcome::Stored),
                     Ok(hs_room::actor::RemoteEventOutcome::AlreadyKnown) => {
                         Ok(WriteOutcome::AlreadyKnown)
                     }
@@ -963,6 +974,72 @@ impl<B: KvBackend + 'static> hs_federation::inbound::RoomWriteSink for RegistryW
             }
             // Event authorization refused it: processed and rejected, which `/send` answers
             // `{}` for (`WriteRejected::auth_rejected`).
+            Err(e @ hs_room::RoomError::Forbidden(_)) => Err(WriteRejected::auth(e.to_string())),
+            Err(e) => Err(WriteRejected::other(e.to_string())),
+        }
+    }
+
+    async fn unknown_events(&self, room_id: &str, event_ids: &[String]) -> Vec<String> {
+        let Some(handle) = self.handle(room_id).await else {
+            return event_ids.to_vec();
+        };
+        let ids: Vec<ruma::OwnedEventId> = event_ids
+            .iter()
+            .filter_map(|id| ruma::OwnedEventId::try_from(id.as_str()).ok())
+            .collect();
+        handle
+            .query(move |actor| actor.events_not_held(&ids))
+            .await
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect()
+    }
+
+    async fn accept_prev_event_with_state(
+        &self,
+        room_id: &str,
+        prev_event_id: &str,
+        prev_event: &Value,
+        state_before: &[String],
+        fetched: &[Value],
+    ) -> Result<hs_federation::inbound::WriteOutcome, hs_federation::inbound::WriteRejected> {
+        use hs_federation::inbound::{WriteOutcome, WriteRejected};
+
+        let Some(handle) = self.handle(room_id).await else {
+            return Err(WriteRejected::other("unknown room"));
+        };
+        let room_version = handle.query(|actor| actor.room_version().clone()).await;
+        let prev = hs_model::Event::parse(prev_event, room_version.clone()).map_err(|e| {
+            WriteRejected::other(format!(
+                "the missing prev event is not parseable at this room's version: {e}"
+            ))
+        })?;
+        if prev.event_id() != prev_event_id {
+            return Err(WriteRejected::other(format!(
+                "the event fetched for {prev_event_id} is {}",
+                prev.event_id()
+            )));
+        }
+        let state_before: Vec<ruma::OwnedEventId> = state_before
+            .iter()
+            .filter_map(|id| ruma::OwnedEventId::try_from(id.as_str()).ok())
+            .collect();
+        let mut events = Vec::with_capacity(fetched.len());
+        for raw in fetched {
+            match hs_model::Event::parse(raw, room_version.clone()) {
+                Ok(event) => events.push(event),
+                Err(error) => {
+                    tracing::debug!(room_id, %error, "an event fetched for a state is not parseable at this room's version; left out");
+                }
+            }
+        }
+        match handle
+            .accept_prev_event_with_state(prev, state_before, events)
+            .await
+        {
+            Ok(hs_room::actor::RemoteEventOutcome::Stored(_)) => Ok(WriteOutcome::Stored),
+            Ok(hs_room::actor::RemoteEventOutcome::SoftFailed(_)) => Ok(WriteOutcome::Stored),
+            Ok(hs_room::actor::RemoteEventOutcome::AlreadyKnown) => Ok(WriteOutcome::AlreadyKnown),
             Err(e @ hs_room::RoomError::Forbidden(_)) => Err(WriteRejected::auth(e.to_string())),
             Err(e) => Err(WriteRejected::other(e.to_string())),
         }

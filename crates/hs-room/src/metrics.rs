@@ -36,6 +36,22 @@ static OUTLIER_STATE_ROWS_REPAIRED: LazyLock<Counter> = LazyLock::new(Counter::d
 /// `hs_room_search_indexed_events_total`: events whose words this replica wrote to the index.
 static SEARCH_INDEXED_EVENTS: LazyLock<Counter> = LazyLock::new(Counter::default);
 
+/// `hs_room_soft_failed_events_total`: events received over federation that passed the auth
+/// rules at the state before them and failed them at the room's current state
+/// (`crate::actor::soft_fail`): held, kept from clients.
+static SOFT_FAILED_EVENTS: LazyLock<Counter> = LazyLock::new(Counter::default);
+
+/// Counts one soft-failed event.
+pub(crate) fn record_soft_failed_event() {
+    SOFT_FAILED_EVENTS.inc();
+}
+
+/// `hs_room_soft_failed_events_total` as it stands.
+#[must_use]
+pub fn soft_failed_events() -> u64 {
+    SOFT_FAILED_EVENTS.get()
+}
+
 /// `hs_room_search_index_documents`: events the index holds, as of this replica's last write.
 static SEARCH_INDEX_DOCUMENTS: LazyLock<Gauge<i64, AtomicI64>> = LazyLock::new(Gauge::default);
 
@@ -156,6 +172,13 @@ pub fn register_metrics(registry: &mut prometheus_client::registry::Registry) {
         "Placed outliers found on a room load with no state row (placed before the state at \
          backfilled history was recorded) and given one",
         OUTLIER_STATE_ROWS_REPAIRED.clone(),
+    );
+    // Registered without `_total`: the text encoder appends it.
+    registry.register(
+        "hs_room_soft_failed_events",
+        "Events received over federation that the auth rules allow at the state before them \
+         and refuse at the room's current state: held, kept from clients",
+        SOFT_FAILED_EVENTS.clone(),
     );
     // Registered without `_total`: the text encoder appends it.
     registry.register(

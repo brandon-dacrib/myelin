@@ -323,6 +323,44 @@ static ACL_REFUSALS: std::sync::LazyLock<Family<AclRefusalLabels, Counter>> =
     std::sync::LazyLock::new(Family::default);
 static NOTARY_QUERIES: std::sync::LazyLock<Family<NotaryLabels, Counter>> =
     std::sync::LazyLock::new(Family::default);
+static STATE_FALLBACKS: std::sync::LazyLock<Family<StateFallbackLabels, Counter>> =
+    std::sync::LazyLock::new(Family::default);
+
+/// Labels of `hs_federation_state_fallbacks_total`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, prometheus_client::encoding::EncodeLabelSet)]
+pub struct StateFallbackLabels {
+    /// One of [`STATE_FALLBACK_OUTCOMES`].
+    pub outcome: &'static str,
+}
+
+/// The outcomes `hs_federation_state_fallbacks_total` is counted under, one per missing prev
+/// event the `/state_ids` fallback (`crate::state_fallback`) tried: `resolved` (held with its
+/// state), `rejected` (fetched and authorisation refused it; stored rejected), `no_state`
+/// (neither `/state_ids` nor `/state` answered), `no_event` (the prev event itself could not be
+/// fetched or did not verify), `refused` (the room could not hold it), `timed_out`.
+pub const STATE_FALLBACK_OUTCOMES: [&str; 6] = [
+    "resolved",
+    "rejected",
+    "no_state",
+    "no_event",
+    "refused",
+    "timed_out",
+];
+
+/// Counts one missing prev event the `/state_ids` fallback tried, by outcome.
+pub fn record_state_fallback(outcome: &'static str) {
+    STATE_FALLBACKS
+        .get_or_create(&StateFallbackLabels { outcome })
+        .inc();
+}
+
+/// How many `/state_ids` fallbacks ended in `outcome`, in this process.
+#[must_use]
+pub fn state_fallbacks(outcome: &'static str) -> u64 {
+    STATE_FALLBACKS
+        .get_or_create(&StateFallbackLabels { outcome })
+        .get()
+}
 
 /// Counts one federation request refused because the room's `m.room.server_acl` denies the
 /// requesting server (for `/send`, one PDU), by endpoint.
@@ -357,6 +395,9 @@ pub fn record_notary_answer(answered: bool) {
 ///   server dropped from a transaction (`crate::acl::filter_edu`).
 /// - `hs_federation_notary_queries_total{outcome}`: servers asked about through
 ///   `/_matrix/key/v2/query`, `answered` or `none` (nothing held and the server unreachable).
+/// - `hs_federation_state_fallbacks_total{outcome}`: missing prev events the `/state_ids`
+///   fallback tried to take with the state another server answered for them, by outcome
+///   ([`STATE_FALLBACK_OUTCOMES`]).
 pub fn register_transport_metrics(registry: &mut Registry) {
     // Registered without `_total`: the text encoder appends it.
     registry.register(
@@ -369,6 +410,13 @@ pub fn register_transport_metrics(registry: &mut Registry) {
         "hs_federation_notary_queries",
         "Servers asked about through the notary key query, by outcome (answered, none)",
         NOTARY_QUERIES.clone(),
+    );
+    registry.register(
+        "hs_federation_state_fallbacks",
+        "Missing prev events the /state_ids fallback tried to take with the state another \
+         server answered for them, by outcome (resolved, rejected, no_state, no_event, refused, \
+         timed_out)",
+        STATE_FALLBACKS.clone(),
     );
 }
 

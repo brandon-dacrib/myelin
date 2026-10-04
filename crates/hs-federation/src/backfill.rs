@@ -163,6 +163,54 @@ pub trait AncestorFetcher: Send + Sync {
             "this fetcher does not implement /get_missing_events".to_owned(),
         ))
     }
+
+    /// `GET /state_ids/{roomId}?event_id=` against `destination`: the IDs of the room's state
+    /// before `event_id` and of that state's auth chain, as `(pdu_ids, auth_chain_ids)`. The
+    /// `/state_ids` fallback (`crate::state_fallback`) asks it for a prev event this server could
+    /// not walk back to. The default answers an error, which the fallback treats as "ask
+    /// [`AncestorFetcher::fetch_state`] instead".
+    async fn fetch_state_ids(
+        &self,
+        destination: &str,
+        room_id: &str,
+        event_id: &str,
+    ) -> Result<(Vec<String>, Vec<String>), AncestorFetchError> {
+        let _ = (destination, room_id, event_id);
+        Err(AncestorFetchError(
+            "this fetcher does not implement /state_ids".to_owned(),
+        ))
+    }
+
+    /// `GET /state/{roomId}?event_id=` against `destination`: the state before `event_id` and
+    /// its auth chain as raw (unverified) PDUs, `(pdus, auth_chain)`. The fallback for when
+    /// `/state_ids` is not answered, or when so much of the state is missing here that one
+    /// request beats one [`AncestorFetcher::fetch_event`] per event. The default answers an
+    /// error.
+    async fn fetch_state(
+        &self,
+        destination: &str,
+        room_id: &str,
+        event_id: &str,
+    ) -> Result<(Vec<Value>, Vec<Value>), AncestorFetchError> {
+        let _ = (destination, room_id, event_id);
+        Err(AncestorFetchError(
+            "this fetcher does not implement /state".to_owned(),
+        ))
+    }
+
+    /// `GET /event/{eventId}` against `destination`: one raw (unverified) PDU. The same trust
+    /// contract as [`AncestorFetcher::fetch_backfill`]: the caller verifies it, and checks it is
+    /// the event asked for. The default answers an error.
+    async fn fetch_event(
+        &self,
+        destination: &str,
+        event_id: &str,
+    ) -> Result<Value, AncestorFetchError> {
+        let _ = (destination, event_id);
+        Err(AncestorFetchError(
+            "this fetcher does not implement /event".to_owned(),
+        ))
+    }
 }
 
 #[async_trait]
@@ -199,6 +247,38 @@ impl AncestorFetcher for FederationClient {
         .await
         .map_err(|e: ClientError| AncestorFetchError(e.to_string()))
     }
+
+    async fn fetch_state_ids(
+        &self,
+        destination: &str,
+        room_id: &str,
+        event_id: &str,
+    ) -> Result<(Vec<String>, Vec<String>), AncestorFetchError> {
+        self.state_ids(destination, room_id, event_id)
+            .await
+            .map_err(|e: ClientError| AncestorFetchError(e.to_string()))
+    }
+
+    async fn fetch_state(
+        &self,
+        destination: &str,
+        room_id: &str,
+        event_id: &str,
+    ) -> Result<(Vec<Value>, Vec<Value>), AncestorFetchError> {
+        self.room_state(destination, room_id, event_id)
+            .await
+            .map_err(|e: ClientError| AncestorFetchError(e.to_string()))
+    }
+
+    async fn fetch_event(
+        &self,
+        destination: &str,
+        event_id: &str,
+    ) -> Result<Value, AncestorFetchError> {
+        self.event(destination, event_id)
+            .await
+            .map_err(|e: ClientError| AncestorFetchError(e.to_string()))
+    }
 }
 
 /// Why [`resolve_missing_ancestors`] gave up before closing the gap. Every variant means the
@@ -218,6 +298,15 @@ pub enum BackfillGiveUpReason {
     /// response, or a response containing only events already seen in an earlier round of this
     /// same attempt.
     StillMissing(Vec<String>),
+    /// Backfill left events it fetched but could not place (their own prev events are still
+    /// unknown), and the `/state_ids` fallback (`crate::state_fallback`) could not take any of
+    /// them either: `backfill` is why the backfill rounds stopped, `state` why the fallback did.
+    StateFallbackFailed {
+        /// The backfill rounds' own give-up reason.
+        backfill: Box<BackfillGiveUpReason>,
+        /// The fallback's reason.
+        state: String,
+    },
 }
 
 impl std::fmt::Display for BackfillGiveUpReason {
@@ -233,6 +322,10 @@ impl std::fmt::Display for BackfillGiveUpReason {
                 ids.len(),
                 ids.join(", ")
             ),
+            Self::StateFallbackFailed { backfill, state } => write!(
+                f,
+                "{backfill}; the state at the missing prev event(s) could not be taken either: {state}"
+            ),
         }
     }
 }
@@ -246,11 +339,20 @@ impl std::fmt::Display for BackfillGiveUpReason {
 /// The first request is the gap-shaped `/get_missing_events` when `context` can describe the
 /// gap (see the module docs); the `/backfill` rounds follow only if that did not close it.
 ///
+/// When the rounds give up with events fetched but not placed -- their own prev events are
+/// still unknown, and the peer will not walk further back -- the `/state_ids` fallback
+/// ([`crate::state_fallback::resolve_through_state`]) takes each such prev event with the
+/// state the peer answers for it, so the fetched event can be placed; `Ok(())` then means at
+/// least one fetched event was placed and the caller's retry is worth making. The received
+/// event's own missing prev events never get the fallback (see that module's docs).
+///
 /// # Errors
 /// Returns [`BackfillGiveUpReason`] if any limit in `limits` is hit, the remote could not be
-/// reached, or the remote's response does not close the gap. Never blocks past
-/// [`BackfillLimits::max_duration`] wall-clock time, enforced by wrapping the whole attempt in
-/// [`tokio::time::timeout`].
+/// reached, or the remote's response does not close the gap (and, when backfill left fetched
+/// events unplaced, the fallback could not place any:
+/// [`BackfillGiveUpReason::StateFallbackFailed`]). Never blocks past
+/// [`BackfillLimits::max_duration`] wall-clock time for the rounds, and the same again for the
+/// fallback, each enforced with [`tokio::time::timeout`].
 #[allow(clippy::too_many_arguments)]
 pub async fn resolve_missing_ancestors(
     origin: &str,
@@ -263,7 +365,7 @@ pub async fn resolve_missing_ancestors(
     sink: &dyn RoomWriteSink,
     limits: &BackfillLimits,
 ) -> Result<(), BackfillGiveUpReason> {
-    tokio::time::timeout(
+    let (reason, pending) = match tokio::time::timeout(
         limits.max_duration,
         resolve_inner(
             origin,
@@ -278,7 +380,39 @@ pub async fn resolve_missing_ancestors(
         ),
     )
     .await
-    .unwrap_or(Err(BackfillGiveUpReason::TimedOut))
+    {
+        Ok(Ok(())) => return Ok(()),
+        Ok(Err(gave_up)) => gave_up,
+        Err(_elapsed) => return Err(BackfillGiveUpReason::TimedOut),
+    };
+    if pending.is_empty() {
+        return Err(reason);
+    }
+    tracing::info!(
+        origin,
+        room_id,
+        pending = pending.len(),
+        %reason,
+        "backfill left fetched events it could not place; asking for the state at their missing prev events"
+    );
+    match crate::state_fallback::resolve_through_state(
+        origin,
+        room_id,
+        room_version,
+        pending,
+        fetcher,
+        key_cache,
+        sink,
+        limits,
+    )
+    .await
+    {
+        Ok(()) => Ok(()),
+        Err(state) => Err(BackfillGiveUpReason::StateFallbackFailed {
+            backfill: Box::new(reason),
+            state: state.to_string(),
+        }),
+    }
 }
 
 /// The bookkeeping one resolution attempt carries across its rounds, whichever endpoint a round
@@ -386,8 +520,47 @@ enum Persisted {
     NoForwardingAddress(Vec<String>),
 }
 
+/// The rounds of [`resolve_missing_ancestors`]. On give-up, the verified events fetched but
+/// not placed (their own ancestors still missing) come back with the reason, for the
+/// `/state_ids` fallback.
 #[allow(clippy::too_many_arguments)]
 async fn resolve_inner(
+    origin: &str,
+    room_id: &str,
+    room_version: &RoomVersionId,
+    frontier: Vec<String>,
+    context: &GapContext,
+    fetcher: &dyn AncestorFetcher,
+    key_cache: &DynRemoteKeyCache,
+    sink: &dyn RoomWriteSink,
+    limits: &BackfillLimits,
+) -> Result<(), (BackfillGiveUpReason, Vec<hs_model::Event>)> {
+    let mut attempt = Attempt {
+        already_fetched: HashSet::new(),
+        fetched_total: 0,
+        pending: Vec::new(),
+    };
+    match resolve_rounds(
+        origin,
+        room_id,
+        room_version,
+        frontier,
+        context,
+        fetcher,
+        key_cache,
+        sink,
+        limits,
+        &mut attempt,
+    )
+    .await
+    {
+        Ok(()) => Ok(()),
+        Err(reason) => Err((reason, std::mem::take(&mut attempt.pending))),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resolve_rounds(
     origin: &str,
     room_id: &str,
     room_version: &RoomVersionId,
@@ -397,13 +570,8 @@ async fn resolve_inner(
     key_cache: &DynRemoteKeyCache,
     sink: &dyn RoomWriteSink,
     limits: &BackfillLimits,
+    attempt: &mut Attempt,
 ) -> Result<(), BackfillGiveUpReason> {
-    let mut attempt = Attempt {
-        already_fetched: HashSet::new(),
-        fetched_total: 0,
-        pending: Vec::new(),
-    };
-
     // The gap-shaped request first (module docs). Not a round against `max_rounds` -- it is the
     // request that should make the rounds unnecessary -- but every event it yields counts
     // against `max_total_events` like any other, and its failure is a reason to ask the other
@@ -497,7 +665,7 @@ async fn resolve_inner(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::inbound::{WriteOutcome, WriteRejected};
     use crate::keys::{
@@ -514,12 +682,12 @@ mod tests {
         }
     }
 
-    fn key_cache(keys: &OwnSigningKeys, origin: &str) -> DynRemoteKeyCache {
+    pub(crate) fn key_cache(keys: &OwnSigningKeys, origin: &str) -> DynRemoteKeyCache {
         let doc = build_server_key_response(origin, keys, &[], 3600).unwrap();
         RemoteKeyCache::new(Box::new(FixedFetcher(doc)) as Box<dyn KeyServerFetcher>)
     }
 
-    fn signed_message(
+    pub(crate) fn signed_message(
         keys: &OwnSigningKeys,
         room_id: &str,
         sender: &str,
@@ -827,8 +995,14 @@ mod tests {
             &limits,
         )
         .await;
+        // The rounds give up; the `/state_ids` fallback then has nothing to ask (this fetcher
+        // answers no state), so the reason is both.
         assert!(
-            matches!(result, Err(BackfillGiveUpReason::TooManyRounds)),
+            matches!(
+                &result,
+                Err(BackfillGiveUpReason::StateFallbackFailed { backfill, .. })
+                    if matches!(**backfill, BackfillGiveUpReason::TooManyRounds)
+            ),
             "{result:?}"
         );
         // Bounded: exactly `max_rounds` round-trips happened, not one per hop of the chain the

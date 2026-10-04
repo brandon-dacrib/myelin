@@ -201,6 +201,18 @@ pub fn signing_object(
     obj
 }
 
+/// The canonical form a request's signature is over: **lenient** about numbers (a float, an
+/// integer out of the canonical range), as Synapse is. Whether a body's JSON is valid for a
+/// room version is the handler's to judge (`send_join`, `/invite` and `send_leave` answer `400
+/// M_BAD_JSON` for a float in a room of version 6 or later); judging it here made the
+/// signature check fail first, and the answer `401`. The signature is still checked over the
+/// same rendering of the same body, so a body that differs from what was signed still fails.
+fn request_canonical(
+    object: &serde_json::Value,
+) -> Result<hs_model::canonical::CanonicalJsonObject, hs_model::error::SigningError> {
+    Ok(hs_model::canonical::to_canonical_object(object, false)?)
+}
+
 /// Signs an outbound federation request, returning the `Authorization` header value to send.
 ///
 /// # Errors
@@ -215,7 +227,7 @@ pub fn sign_request(
     key: &SigningKeyPair,
 ) -> Result<String, hs_model::error::SigningError> {
     let object = signing_object(method, uri, origin, destination, content);
-    let mut canonical = signing::to_signable_object(&object)?;
+    let mut canonical = request_canonical(&object)?;
     let origin_ruma = ruma::ServerName::parse(origin)
         .map_err(|_| hs_model::error::SigningError::MissingServerSignature(origin.to_string()))?;
     signing::sign_object(&mut canonical, origin_ruma.as_ref(), key)?;
@@ -370,8 +382,7 @@ async fn do_verify(ctx: &XMatrixContext, req: Request<Body>) -> Result<Request<B
     );
     object["signatures"] =
         serde_json::json!({ auth.origin.clone(): { auth.key_id.clone(): auth.sig.clone() } });
-    let canonical =
-        signing::to_signable_object(&object).map_err(|_| VerifyError::SignatureInvalid)?;
+    let canonical = request_canonical(&object).map_err(|_| VerifyError::SignatureInvalid)?;
     signing::verify_object(&canonical, &auth.origin, &auth.key_id, &verifying_key)
         .map_err(|_| VerifyError::SignatureInvalid)?;
 
@@ -524,6 +535,49 @@ mod tests {
                     .body(Body::from(r#"{"pdus": [1, 2, 3]}"#))
                     .unwrap(),
             )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Sytest's "... rejects invalid JSON for room version 6" for `send_join`, `/invite` and
+    /// `send_leave`: a body with a float is signed and verified over the JSON as it came, so
+    /// the request reaches the handler (which answers `400 M_BAD_JSON`), not a `401`.
+    #[tokio::test]
+    async fn a_signed_body_with_a_float_is_authenticated_and_left_to_the_handler() {
+        let (keys, _dir) = origin_keys();
+        let key_cache = cache_with_origin("origin.example.org", &keys).await;
+        let ctx = Arc::new(XMatrixContext {
+            own_server_name: "dest.example.org".to_string(),
+            key_cache,
+        });
+        let app = test_app(ctx);
+        let body = r#"{"content":{"bad_val":1.1},"pdus":[]}"#;
+        let content: serde_json::Value = serde_json::from_str(body).unwrap();
+        let header = sign_request(
+            "POST",
+            "/_matrix/federation/v1/send/1",
+            "origin.example.org",
+            "dest.example.org",
+            Some(&content),
+            keys.primary(),
+        )
+        .unwrap();
+        let send = |body: &'static str, header: String| {
+            app.clone().oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_matrix/federation/v1/send/1")
+                    .header(AUTHORIZATION, header)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+        };
+        let response = send(body, header.clone()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // Another float than the one signed still fails.
+        let response = send(r#"{"content":{"bad_val":1.2},"pdus":[]}"#, header)
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);

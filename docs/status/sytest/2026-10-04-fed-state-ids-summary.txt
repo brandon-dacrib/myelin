@@ -1,0 +1,23 @@
+process exits during the run (the last few are the shutdown):
+287:WARN: haproxy-0 process failed - code=2
+288:WARN: haproxy-1 process failed - code=2
+
+tests: 130
+pass: 118
+fail: 12
+expected fail (Sytest's own marking): 0
+skip: 0
+pass rate (of tests run, skips excluded): 90.8%
+
+most common failure reasons (first line of the message, normalised):
+     4  Timed out waiting for test at run-tests.pl line N.
+     1  Expected canonical alias to be empty at tests/30rooms/05aliases.pl line N.
+     1  Got N, expected N for number of rooms at tests/30rooms/70publicroomslist.pl line N.
+     1  Expected N message at tests/50federation/31room-send.pl line N.
+     1  Unexpected response from /send: {
+     1  Event was not redacted at tests/50federation/32room-getevent.pl line N.
+     1  redaction was not rejected at tests/50federation/39redactions.pl line N.
+     1  Got "\@USER", expected "\@USER" for at tests/50federation/40devicelists.pl line N.
+     1  Timed out waiting for @USER to receive all presence at run-tests.pl line N.
+
+skip reasons:

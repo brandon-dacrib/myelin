@@ -898,7 +898,9 @@ impl<B: KvBackend + 'static> MigrationTarget for StoreTarget<B> {
             .import_remote_join(state, auth_chain, join_event)
             .await
         {
-            Ok(RemoteEventOutcome::Stored(_)) => Ok(Imported::Created),
+            Ok(RemoteEventOutcome::Stored(_) | RemoteEventOutcome::SoftFailed(_)) => {
+                Ok(Imported::Created)
+            }
             Ok(RemoteEventOutcome::AlreadyKnown) => Ok(Imported::AlreadyThere),
             Err(RoomError::Store(e)) => Err(fatal(e)),
             Err(e) => {
@@ -938,7 +940,9 @@ impl<B: KvBackend + 'static> MigrationTarget for StoreTarget<B> {
                 continue;
             }
             match handle.import_event(parsed).await {
-                Ok(RemoteEventOutcome::Stored(_)) => outcome.stored += 1,
+                Ok(RemoteEventOutcome::Stored(_) | RemoteEventOutcome::SoftFailed(_)) => {
+                    outcome.stored += 1;
+                }
                 Ok(RemoteEventOutcome::AlreadyKnown) => outcome.already_there += 1,
                 Err(RoomError::MissingAncestors(_)) => outcome.waiting.push(event.event_id.clone()),
                 Err(RoomError::Store(e)) => return Err(fatal(e)),

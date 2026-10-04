@@ -16,8 +16,9 @@
 //!   event whose auth event was rejected), which is stored the same way;
 //! - sent again, it is already known (`{}` in `/send`).
 //!
-//! Soft failure is not this: an event that passes its own `auth_events` but not the room's
-//! current state is still refused outright (status 06, "Left").
+//! Soft failure is not this: an event that passes its own `auth_events` and the state before
+//! it but not the room's current state is held and placed, and kept from clients
+//! (`soft_fail`).
 
 use std::collections::HashSet;
 

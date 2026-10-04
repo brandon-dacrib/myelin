@@ -24,6 +24,7 @@ pub mod outbound_membership;
 pub mod outbound_store;
 pub mod room_source;
 pub mod sender;
+pub mod state_fallback;
 pub mod stripped;
 pub mod transport;
 pub mod xmatrix;

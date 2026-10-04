@@ -138,6 +138,15 @@ pub async fn post_create_room<B: KvBackend + 'static>(
             ));
         }
     };
+    // MSC4289 (room version 12): `additional_creators` must be an array of user IDs. Judged
+    // here, as Synapse does, so a bad one is `400`; left to the create event's auth check it
+    // was a `403`. A version without additional creators keeps the key as plain content.
+    let has_additional_creators = room_version.as_ref().is_none_or(|v| {
+        hs_model::room_version::rules_for(v).is_some_and(|rules| rules.additional_room_creators)
+    });
+    if has_additional_creators {
+        parse_user_list(&creation_content, "additional_creators")?;
+    }
 
     // The override is merged key-by-key over the generated power-levels content, so anything
     // that is not a JSON object has no meaning at all -- reject it rather than ignore it.

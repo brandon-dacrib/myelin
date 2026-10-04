@@ -38,6 +38,7 @@ mod history;
 mod new_room_ids;
 pub mod redactions;
 mod rejected;
+mod soft_fail;
 
 /// Timeline events with their room-local positions, as [`RoomActor::events_around`] answers.
 pub type PositionedEvents<'a> = Vec<(i64, &'a Event)>;
@@ -153,6 +154,11 @@ pub enum RemoteEventOutcome {
     AlreadyKnown,
     /// Newly authorized and durably persisted, at this room-local [`EventSn`].
     Stored(EventSn),
+    /// Persisted at this room-local [`EventSn`] but **soft failed** (`actor::soft_fail`): it
+    /// passed the auth rules at the state before it and failed them at the room's current
+    /// state. Held in the graph and the state store, out of every client read, never a forward
+    /// extremity, never published.
+    SoftFailed(EventSn),
 }
 
 /// A canonical JSON value as plain JSON.
@@ -303,13 +309,11 @@ enum PersistKind {
 /// Which state [`RoomActor::authorize_remote_at`] checks an event against, besides the one its
 /// own `auth_events` imply.
 #[derive(Clone, Copy)]
-enum StateBefore<'a> {
+enum StateBefore {
     /// The state resolved from the event's prev events, as held: the ordinary case.
     FromPrevEvents,
-    /// An explicit snapshot: the state before an event this server could not walk back to, as
-    /// another server answered it.
-    Explicit(&'a [EventSn]),
-    /// No state before: the event is checked against its own `auth_events` only.
+    /// No state before: the event is checked against its own `auth_events` only (an outlier:
+    /// a state fetched for a missing prev event, and that prev event, `fetched_state`).
     None,
 }
 
@@ -438,6 +442,9 @@ pub struct RoomActor<B: KvBackend> {
     /// Events held as rejected by event authorization (`rejected`): indexed by ID, hidden from
     /// every read, placed nowhere.
     rejected: HashSet<EventSn>,
+    /// Events held soft failed (`soft_fail`): in the timeline and the state store, out of every
+    /// client read, never a forward extremity.
+    soft_failed: HashSet<EventSn>,
     /// Set once an administrator has deleted this room (`crate::actor::admin_ops`). A handle
     /// somebody still holds refuses every write from then on, so nothing can be written into a
     /// room whose records are being removed.
@@ -760,6 +767,7 @@ impl<B: KvBackend> RoomActor<B> {
             forgotten: HashSet::new(),
             purged: HashSet::new(),
             rejected: HashSet::new(),
+            soft_failed: HashSet::new(),
             deleted: false,
             publish,
             global: None,
@@ -1267,7 +1275,11 @@ impl<B: KvBackend> RoomActor<B> {
         room_pos: i64,
         explicit_state: Option<&[EventSn]>,
     ) -> Result<(), RoomError> {
-        self.index_relation(&event, event_sn);
+        if event.header().flags.is_soft_failed() {
+            self.soft_failed.insert(event_sn);
+        } else {
+            self.index_relation(&event, event_sn);
+        }
         self.event_id_index
             .insert(event.event_id().to_owned(), event_sn);
         self.timeline.insert(room_pos, event_sn);
@@ -1725,8 +1737,8 @@ impl<B: KvBackend> RoomActor<B> {
     ///
     /// # Authorization: which of the spec's three snapshots this checks
     /// The server-server spec's "Checks performed on receipt of a PDU" runs event authorization
-    /// against three different state snapshots. This method implements the first two -- both
-    /// **hard** rejections -- and does not implement the third:
+    /// against three different state snapshots. This method implements all three; the first two
+    /// are **hard** rejections, the third a **soft failure**:
     ///
     /// 1. **Implemented** -- *the state implied by the event's own `auth_events`*: builds a
     ///    [`FlatState`] directly from the bodies of the events `event.auth_events` names (exactly
@@ -1738,11 +1750,11 @@ impl<B: KvBackend> RoomActor<B> {
     ///    `event`'s own `prev_events` (via [`StateStore::current_state`], the same resolution
     ///    [`RoomActor::send_event_citing`] authorizes newly-built events against) and runs
     ///    [`auth::check_event_auth`] against that.
-    /// 3. **Not implemented** -- *the room's current state at receipt time*: the spec treats a
-    ///    failure here as a **soft failure** (the event is still stored, just excluded from some
-    ///    views/forward-extremity consideration), which needs a persisted-but-excluded event
-    ///    representation this crate does not have. Every rejection this method produces is
-    ///    therefore a hard rejection.
+    /// 3. *the room's current state at receipt time* (resolved across the forward extremities
+    ///    and the state before the event, `soft_fail`): an event refused only here is stored,
+    ///    placed and fed to the state store, flagged soft failed, and answered
+    ///    [`RemoteEventOutcome::SoftFailed`]: never a forward extremity, never published, out of
+    ///    every client read. Not checked for the importer's quiet copies.
     ///
     /// A failure of either implemented check means the event is **refused** (`RoomError::Forbidden`)
     /// and, since 2026-10-01, **stored as rejected** (`rejected`): flagged, placed nowhere,
@@ -1800,14 +1812,37 @@ impl<B: KvBackend> RoomActor<B> {
             Err(other) => return Err(other),
         }
 
+        // The third check, against the room's current state (`soft_fail`): a failure there
+        // is a soft failure, not a rejection. The importer's copies were judged by Synapse.
+        let mut event = event;
+        let soft_failed = if self.quiet {
+            None
+        } else {
+            self.soft_fail_reason(&event, &prev_sns)?
+        };
+        if soft_failed.is_some() {
+            event.flags_mut().set_soft_failed(true);
+        }
+
         let redaction = (event.header().event_type == "m.room.redaction")
             .then(|| (event.header().sender.clone(), extract_redacts(&event)));
         let redaction_id = event.event_id().to_owned();
+        let event_id = event.event_id().to_owned();
         let kind = match self.fetched_state_snapshot_for(&prev_sns)? {
             Some(snapshot) => PersistKind::AfterFetchedState { snapshot },
             None => PersistKind::Ordinary,
         };
         let event_sn = self.persist_with(event, kind)?;
+        if let Some(reason) = soft_failed {
+            crate::metrics::record_soft_failed_event();
+            tracing::info!(
+                room_id = %self.room_id,
+                %event_id,
+                %reason,
+                "soft failed an event received over federation: the current state refuses it"
+            );
+            return Ok(RemoteEventOutcome::SoftFailed(event_sn));
+        }
         // The importer applies the redactions it copies itself (`import_redaction`).
         if let Some((sender, Some(target))) = redaction
             && !self.quiet
@@ -1835,10 +1870,9 @@ impl<B: KvBackend> RoomActor<B> {
     }
 
     /// [`RoomActor::authorize_remote`] with the state before the event chosen by the caller
-    /// ([`StateBefore`]): resolved from `prev_sns` as usual, an explicit snapshot (what another
-    /// server answered as the state at an event this server could not walk back to,
-    /// `fetched_state`), or none at all (an outlier held for the state it is part of, which is
-    /// checked against its own `auth_events` only, as a `send_join` snapshot's events are).
+    /// ([`StateBefore`]): resolved from `prev_sns` as usual, or none at all (an outlier: an
+    /// event of a fetched state, or the missing prev event held with it, `fetched_state`, which
+    /// is checked against its own `auth_events` only, as a `send_join` snapshot's events are).
     ///
     /// # Errors
     /// [`RoomActor::authorize_remote`]'s.
@@ -1847,7 +1881,7 @@ impl<B: KvBackend> RoomActor<B> {
         event: &Event,
         prev_sns: &[EventSn],
         auth_sns: &[EventSn],
-        at: StateBefore<'_>,
+        at: StateBefore,
     ) -> Result<(), RoomError> {
         let mut auth_flat = FlatState::new();
         let mut auth_event_refs = Vec::with_capacity(auth_sns.len());
@@ -1912,11 +1946,11 @@ impl<B: KvBackend> RoomActor<B> {
             room_id: Some(&self.room_id),
             state_key: event.header().state_key.as_deref(),
             content: &content_obj,
-            // An event whose prev events this server does not hold (`StateBefore::Explicit`,
-            // `StateBefore::None`) is judged by the prev events it declares, not those held.
+            // An event whose prev events this server does not hold (`StateBefore::None`) is
+            // judged by the prev events it declares, not those held.
             prev_event_count: match at {
                 StateBefore::FromPrevEvents => prev_sns.len(),
-                StateBefore::Explicit(_) | StateBefore::None => {
+                StateBefore::None => {
                     pipeline::decode_event_ids(event.json().get("prev_events")).len()
                 }
             },
@@ -1929,16 +1963,18 @@ impl<B: KvBackend> RoomActor<B> {
             StateBefore::FromPrevEvents => {
                 Some(self.state_view(&self.effective_prev_sns(prev_sns))?)
             }
-            StateBefore::Explicit(state_sns) => Some(RoomStateView {
-                store: &self.store,
-                root: self.root_from_sns(state_sns, None)?,
-                bodies: EventMap(&self.events),
-            }),
             StateBefore::None => None,
         };
         let create_lookup = || match &state_before {
             Some(state_before) => state_before
                 .event_for("m.room.create", "")
+                .map(|found| found.is_some())
+                .map_err(|e| AuthError::reject(e.to_string())),
+            // From room version 12 (MSC4291) the create event is never among `auth_events`:
+            // the room ID names it, and it is found if this room holds it. Before, an outlier
+            // in such a room was refused for "no create event".
+            None if self.rules.room_create_event_id_as_room_id => self
+                .state_event("m.room.create", "")
                 .map(|found| found.is_some())
                 .map_err(|e| AuthError::reject(e.to_string())),
             None => Ok(auth_event_refs
@@ -2037,15 +2073,19 @@ impl<B: KvBackend> RoomActor<B> {
             .get("content")
             .cloned()
             .unwrap_or(serde_json::Value::Null);
-        let relation = relations::relation_of(&content);
+        // A soft-failed event (`soft_fail`) is held in the graph and the state store and
+        // nowhere a client reads: not an extremity, not in the relations or joined-rooms
+        // indexes, not published.
+        let soft_failed = event.header().flags.is_soft_failed();
+        let relation = relations::relation_of(&content).filter(|_| !soft_failed);
 
         // Computed up front (rather than alongside `membership_deltas` below, which runs after
         // the KV transaction commits) so the `Tables::joined_rooms` write can happen *inside* that
         // same transaction: `Some((target, true))` means the target's new membership is `join`
         // (index them), `Some((target, false))` means it changed away from `join` (remove them),
         // `None` means this event is not an `m.room.member` event at all.
-        let member_join_index_update: Option<(String, bool)> = if event.header().event_type
-            == "m.room.member"
+        let member_join_index_update: Option<(String, bool)> = if !soft_failed
+            && event.header().event_type == "m.room.member"
             && let Some(state_key) = &event.header().state_key
         {
             content
@@ -2123,13 +2163,10 @@ impl<B: KvBackend> RoomActor<B> {
             .copied()
             .collect();
         let old_extremities: Vec<EventSn> = match &kind {
+            _ if soft_failed => Vec::new(),
             PersistKind::Ordinary
             | PersistKind::NewRoom
-            | PersistKind::AfterFetchedState { .. } => prev_sns
-                .iter()
-                .copied()
-                .filter(|sn| self.forward_extremities.contains(sn))
-                .collect(),
+            | PersistKind::AfterFetchedState { .. } => self.superseded_extremities(&prev_sns),
             PersistKind::RemoteJoin { .. } => self.forward_extremities_vec(),
         };
         let snapshot_bytes = match &kind {
@@ -2195,10 +2232,12 @@ impl<B: KvBackend> RoomActor<B> {
                     .delete(txn, &(room_sn, *old))
                     .map_err(to_kv)?;
             }
-            self.tables
-                .extremities_fwd
-                .put(txn, &(room_sn, event_sn), b"")
-                .map_err(to_kv)?;
+            if !soft_failed {
+                self.tables
+                    .extremities_fwd
+                    .put(txn, &(room_sn, event_sn), b"")
+                    .map_err(to_kv)?;
+            }
             if let Some(rel) = &relation {
                 let target_sn = self
                     .tables
@@ -2288,7 +2327,11 @@ impl<B: KvBackend> RoomActor<B> {
         for old in &old_extremities {
             self.forward_extremities.remove(old);
         }
-        self.forward_extremities.insert(event_sn);
+        if soft_failed {
+            self.soft_failed.insert(event_sn);
+        } else {
+            self.forward_extremities.insert(event_sn);
+        }
         self.timeline.insert(room_pos, event_sn);
         self.next_room_pos = room_pos + 1;
         self.event_id_index
@@ -2319,6 +2362,10 @@ impl<B: KvBackend> RoomActor<B> {
         // A redaction that arrived before this event takes effect now (`redactions`). The
         // importer, quiet, applies the redactions it copies itself.
         self.apply_waiting_redactions(&update.event_id);
+        // Nobody is told of a soft-failed event (`soft_fail`).
+        if soft_failed {
+            return Ok(event_sn);
+        }
         // A broadcast send fails only when there are no subscribers, which is not an error: a
         // room with nobody listening yet (or right now) is normal.
         if let Some(global) = &self.global {
@@ -4054,7 +4101,12 @@ impl<B: KvBackend> RoomActor<B> {
     /// [`crate::registry::RoomRegistry::subscribe_global`].
     #[must_use]
     pub fn head_update(&self) -> Option<RoomUpdate> {
-        let (&room_pos, &event_sn) = self.timeline.iter().next_back()?;
+        // The newest event a client may see: a soft-failed one (`soft_fail`) is nobody's news.
+        let (&room_pos, &event_sn) = self
+            .timeline
+            .iter()
+            .rev()
+            .find(|(_, sn)| !self.hidden_from_clients(**sn))?;
         let event = self.events.get(&event_sn)?;
         Some(RoomUpdate {
             room_sn: self.room_sn,
@@ -4655,11 +4707,13 @@ impl<B: KvBackend> RoomActor<B> {
         self.event_id_index.get(event_id).copied()
     }
 
-    /// One event by ID, if this actor holds it (its own room's events only).
+    /// One event by ID, if this actor holds it (its own room's events only) in a form a
+    /// client may be shown: purged, rejected and soft-failed events are not. Federation reads
+    /// use [`RoomActor::held_event`], which includes soft-failed events.
     #[must_use]
     pub fn event_by_id(&self, event_id: &EventId) -> Option<&Event> {
         let sn = self.event_id_index.get(event_id)?;
-        if self.purged.contains(sn) || self.rejected.contains(sn) {
+        if self.purged.contains(sn) || self.rejected.contains(sn) || self.soft_failed.contains(sn) {
             return None;
         }
         self.events.get(sn)
@@ -4888,6 +4942,9 @@ impl<B: KvBackend> RoomActor<B> {
                 continue;
             }
             cursor = pos;
+            if self.hidden_from_clients(*sn) {
+                continue;
+            }
             if let Some(event) = self.events.get(sn) {
                 out.push((pos, event));
             }
@@ -4900,7 +4957,7 @@ impl<B: KvBackend> RoomActor<B> {
     #[must_use]
     pub fn event_at(&self, pos: i64) -> Option<&Event> {
         let sn = self.timeline.get(&pos)?;
-        if self.purged.contains(sn) {
+        if self.purged.contains(sn) || self.hidden_from_clients(*sn) {
             return None;
         }
         self.events.get(sn)
@@ -4920,14 +4977,14 @@ impl<B: KvBackend> RoomActor<B> {
             .timeline
             .range(..pos)
             .rev()
-            .filter(|(_, sn)| !self.purged.contains(*sn))
+            .filter(|(_, sn)| !self.purged.contains(*sn) && !self.hidden_from_clients(**sn))
             .filter_map(|(p, sn)| Some((*p, self.events.get(sn)?)))
             .take(before)
             .collect();
         let newer = self
             .timeline
             .range((std::ops::Bound::Excluded(pos), std::ops::Bound::Unbounded))
-            .filter(|(_, sn)| !self.purged.contains(*sn))
+            .filter(|(_, sn)| !self.purged.contains(*sn) && !self.hidden_from_clients(**sn))
             .filter_map(|(p, sn)| Some((*p, self.events.get(sn)?)))
             .take(after)
             .collect();
@@ -5274,17 +5331,20 @@ impl<B: KvBackend> RoomActor<B> {
         // Backward: collected newest-first (descending `room_pos`), which is exactly the order
         // the spec wants `chunk` in for `dir=b` -- no re-sort needed. Forward: collected
         // oldest-first (ascending), already the order `dir=f` wants.
+        // Soft-failed events (`soft_fail`) hold a position and are not a client's to see.
         let positions: Vec<i64> = match direction {
             Direction::Backward => self
                 .timeline
                 .range(lowest..start.max(lowest))
                 .rev()
+                .filter(|(_, sn)| !self.hidden_from_clients(**sn))
                 .take(limit)
                 .map(|(pos, _)| *pos)
                 .collect(),
             Direction::Forward => self
                 .timeline
                 .range((std::ops::Bound::Excluded(start), std::ops::Bound::Unbounded))
+                .filter(|(_, sn)| !self.hidden_from_clients(**sn))
                 .take(limit)
                 .map(|(pos, _)| *pos)
                 .collect(),
