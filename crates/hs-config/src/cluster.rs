@@ -133,8 +133,11 @@ pub struct ClusterConfig {
     #[serde(default = "default_heartbeat_interval")]
     pub heartbeat_interval: Duration,
     /// How long a replica may go without a heartbeat before the others take over its rooms and
-    /// users. Shorter recovers sooner from a crash; too short and a replica that only paused
-    /// (a long garbage collection, a busy node) loses its work for nothing.
+    /// users. The replica itself keeps what it owns for the same time (a late or failed
+    /// heartbeat shorter than this moves nothing; it only stops the replica taking on more until
+    /// the next good one), and gives it up once the time has passed. Shorter recovers sooner from
+    /// a crash; too short and a replica that only paused (a long garbage collection, a busy node)
+    /// loses its work for nothing.
     #[serde(default = "default_lease_ttl")]
     pub lease_ttl: Duration,
 }

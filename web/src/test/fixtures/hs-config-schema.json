@@ -2101,7 +2101,7 @@
           "x-applies": "restart"
         },
         "lease_ttl": {
-          "description": "How long a replica may go without a heartbeat before the others take over its rooms and\nusers. Shorter recovers sooner from a crash; too short and a replica that only paused\n(a long garbage collection, a busy node) loses its work for nothing.",
+          "description": "How long a replica may go without a heartbeat before the others take over its rooms and\nusers. The replica itself keeps what it owns for the same time (a late or failed\nheartbeat shorter than this moves nothing; it only stops the replica taking on more until\nthe next good one), and gives it up once the time has passed. Shorter recovers sooner from\na crash; too short and a replica that only paused (a long garbage collection, a busy node)\nloses its work for nothing.",
           "$ref": "#/$defs/Duration",
           "default": "10s",
           "x-applies": "restart"
