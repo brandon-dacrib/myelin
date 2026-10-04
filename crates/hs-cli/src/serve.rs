@@ -1975,6 +1975,8 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     let bridge_runtime = crate::bridges::runtime()
         .await
         .map_err(|e| ServeError::Sessions(std::io::Error::other(e).into()))?;
+    let declared_offerings = crate::bridges::declared_offerings()
+        .map_err(|e| ServeError::Sessions(std::io::Error::other(e).into()))?;
     let bridge_manager = hs_bridges::manager::BridgeManager::new(
         backend.clone(),
         appservice_delivery.admin_directory(),
@@ -1983,6 +1985,21 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         config.server.public_baseurl.as_deref().unwrap_or(""),
     )
     .map_err(|e| ServeError::Sessions(Box::new(e)))?;
+    if !declared_offerings.is_empty() {
+        tracing::info!(
+            offerings = ?declared_offerings.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(),
+            "the deployment declares bridge offerings; each is created once the manager runs"
+        );
+    }
+    bridge_manager.set_declared(declared_offerings);
+    // The admin API's view of appservices, with the manager's knowledge of its offerings: a
+    // bridge registered by hand for a network now offered says so in its health.
+    let appservice_directory: Arc<dyn hs_admin::sources::AppserviceDirectory> = Arc::new(
+        hs_bridges::directory::OfferingAwareDirectory::new(
+            appservice_delivery.admin_directory(),
+            bridge_manager.clone(),
+        ),
+    );
 
     // Server notices, sent as `@_server:<server name>` into each recipient's own room. Opened
     // here, after the appservice registry has replaced `auth_state`'s and before the room
@@ -2084,7 +2101,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             setup: setup.clone(),
             recovery: recovery.clone(),
             overview: overview.clone(),
-            appservices: appservice_delivery.admin_directory(),
+            appservices: appservice_directory,
             federation: federation_source.clone(),
             server_notices: server_notices.clone(),
             reports,

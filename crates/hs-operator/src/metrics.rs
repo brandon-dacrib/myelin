@@ -109,6 +109,11 @@ impl OperatorMetrics {
                 "Drain steps the operator took, by outcome",
                 drains.clone(),
             );
+            // The admin-API client (`homeserver::admin::HttpAdminApi`) is built by
+            // `hs_http::client::builder()`, so its connections are counted by the
+            // process-wide `hs_outbound_*` counters; they are served here, as `hs serve`
+            // serves them.
+            hs_http::outbound::register_metrics(r);
         });
         Self {
             registry,
@@ -234,6 +239,16 @@ pub async fn serve(metrics: OperatorMetrics, address: SocketAddr) -> std::io::Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The outbound connection counters are served beside the operator's own, since its
+    /// admin-API client is counted by them.
+    #[test]
+    fn the_outbound_counters_are_served_too() {
+        let metrics = OperatorMetrics::default();
+        let text = metrics.registry().encode_to_string().unwrap();
+        assert!(text.contains("hs_outbound_connections"), "{text}");
+        assert!(text.contains("hs_outbound_connect_failures"), "{text}");
+    }
 
     #[test]
     fn families_render_under_their_documented_names() {

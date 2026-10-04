@@ -737,6 +737,12 @@ pub struct BridgeOffering {
     /// Instance counts by state.
     pub instances: std::collections::BTreeMap<String, u64>,
     pub created_at: String,
+    /// Bridges of this network registered by hand (through the wizard, or a registration file)
+    /// whose namespace covers this offering's instances, so a message for a ghost user reaches
+    /// both. Empty once every such registration is removed, which is the migration RFC 0017
+    /// section 6 asks for.
+    #[serde(default)]
+    pub overlapping_appservices: Vec<AdminAppserviceOverlap>,
 }
 
 /// The OpenAPI `BridgeDeployment` schema: the `Bridge` resource running an instance.
@@ -911,6 +917,37 @@ pub struct AdminAppserviceHealth {
     /// refused to share a room's keys with the bridge, so the bridge could not read the message.
     #[serde(default)]
     pub last_key_withheld: Option<AdminKeyWithheld>,
+    /// Set when this appservice was registered by hand for a network this server now offers
+    /// (RFC 0017): its namespace covers the ghosts of every instance the offering makes, so a
+    /// message for one of them reaches both bridges. Says which offering and what to do.
+    #[serde(default)]
+    pub overlaps_offering: Option<AdminOfferingOverlap>,
+}
+
+/// The OpenAPI `OfferingOverlap` schema: the bridge offering a hand-registered appservice
+/// overlaps (`AppServiceHealth.overlaps_offering`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AdminOfferingOverlap {
+    /// The offering's bridge type (catalogue id).
+    #[serde(rename = "type")]
+    pub bridge_type: String,
+    /// The catalogue's name for it.
+    pub name: String,
+    /// The Matrix ID people message to get their own instance; `None` for a shared type.
+    pub front_door: Option<String>,
+    /// What overlaps and what to do about it, in words for an administrator.
+    pub detail: String,
+}
+
+/// The OpenAPI `AppServiceOverlap` schema: an appservice registered by hand whose namespace
+/// covers an offering's instances (`BridgeOffering.overlapping_appservices`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AdminAppserviceOverlap {
+    /// The appservice's id (`GET /appservices/{id}`).
+    pub id: String,
+    pub sender_localpart: String,
+    /// Why it overlaps and what to do about it, in words for an administrator.
+    pub detail: String,
 }
 
 /// The OpenAPI `AppServiceBacklogEntry` schema: one queued or dead-lettered transaction.

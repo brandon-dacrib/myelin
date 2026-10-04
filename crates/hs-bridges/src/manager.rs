@@ -24,7 +24,7 @@
 //! step: if the runtime has an object under the hashed name, that name is adopted so nothing
 //! already running is orphaned or deployed twice; otherwise it gets the readable name.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -32,16 +32,17 @@ use async_trait::async_trait;
 use hs_admin::bridge_offerings::{BridgeOfferingSource, SHARED_INSTANCE};
 use hs_admin::bridge_types::{self, BRIDGE_INSTANCE_KEY, InstanceRender, InstanceSpec};
 use hs_admin::model::{
-    AdminAppserviceCreate, BridgeDeploymentTarget, BridgeInstance, BridgeInstanceFiles,
-    BridgeOffering, BridgeOfferingRequest,
+    AdminAppserviceCreate, AdminOfferingOverlap, BridgeDeploymentTarget, BridgeInstance,
+    BridgeInstanceFiles, BridgeOffering, BridgeOfferingRequest,
 };
 use hs_admin::sources::{AppserviceDirectory, SourceError};
 use hs_kv::KvBackend;
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::cross_signing::{BotIdentity, Seeds};
 use crate::matrix::MatrixClient;
+use crate::overlap::{self, Overlap};
 use crate::runtime::{DeploySpec, Runtime, manifest_yaml};
 use crate::store::{
     BridgeStore, CHAT_BY_BOT, CHAT_BY_OWNER, InstanceRow, InstanceState, ManagerRow, OfferingRow,
@@ -67,6 +68,12 @@ const IDENTITY_RECHECK_MS: u64 = 60_000;
 /// The start of the reason [`BridgeManager::settle_bot_identity`] leaves on a row when it
 /// cannot, so that its next success clears only its own.
 const IDENTITY_REASON: &str = "the bot's cross-signing";
+/// How often the manager looks for bridges registered by hand that overlap an offering
+/// ([`crate::overlap`]), to log the ones that appeared or went.
+const OVERLAP_LOG_MS: u64 = 60_000;
+/// The reason an instance run elsewhere carries once its registration changed under it.
+const REREGISTERED_REASON: &str =
+    "its registration changed: download its files again and restart it with them";
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -175,6 +182,13 @@ pub struct BridgeManager<B: KvBackend> {
     /// a settled one is looked at again every [`IDENTITY_RECHECK_MS`], for a device the bridge
     /// made since. In memory: a restart looks once more, which is cheap.
     identity_checked_ms: Mutex<HashMap<(String, String), u64>>,
+    /// The offerings the deployment declares ([`Self::set_declared`]), applied once per
+    /// ownership of the global shard by [`Self::apply_declared`].
+    declared: Mutex<Vec<(String, BridgeOfferingRequest)>>,
+    /// When the overlaps were last looked for, and the `(offering, appservice)` pairs found
+    /// then, so that each one is logged when it appears and when it goes. In memory: a restart
+    /// logs the current ones once more.
+    overlaps_logged: Mutex<(u64, BTreeSet<(String, String)>)>,
 }
 
 impl<B: KvBackend> std::fmt::Debug for BridgeManager<B> {
@@ -221,7 +235,65 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             client: OnceLock::new(),
             wake: tokio::sync::Notify::new(),
             identity_checked_ms: Mutex::new(HashMap::new()),
+            declared: Mutex::new(Vec::new()),
+            overlaps_logged: Mutex::new((0, BTreeSet::new())),
         }))
+    }
+
+    /// The offerings the deployment declares (`MYELIN_BRIDGES_OFFERINGS`, the chart's
+    /// `bridges.offerings`): each is created as `request` says the first time the manager runs
+    /// with it declared and no offering of that type exists, then left to the admin API
+    /// (`ManagerRow::declared`). Set before [`Self::start`].
+    pub fn set_declared(&self, declared: Vec<(String, BridgeOfferingRequest)>) {
+        *self
+            .declared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = declared;
+    }
+
+    /// Creates the declared offerings not created before ([`Self::set_declared`]). One that
+    /// already exists (made through the admin API first, as the demo's was) is adopted as it
+    /// is; one that cannot be created now (the type needs a cluster this server has not got)
+    /// is logged and tried again on the next start.
+    ///
+    /// # Errors
+    /// On a store failure.
+    pub async fn apply_declared(&self) -> Result<(), SourceError> {
+        let declared = self
+            .declared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if declared.is_empty() {
+            return Ok(());
+        }
+        let mut row = self.tokens().map_err(store_err)?;
+        for (bridge_type, request) in declared {
+            if row.declared.contains(&bridge_type) {
+                continue;
+            }
+            if self
+                .store
+                .offering(&bridge_type)
+                .map_err(store_err)?
+                .is_some()
+            {
+                tracing::info!(bridge_type = %bridge_type, "the deployment declares a bridge offering that already exists: keeping it as the admin API has it");
+            } else {
+                match self.put(&bridge_type, request).await {
+                    Ok(offering) => {
+                        tracing::info!(bridge_type = %bridge_type, runtime = %offering.runtime, "created the bridge offering the deployment declares");
+                    }
+                    Err(e) => {
+                        tracing::warn!(bridge_type = %bridge_type, error = %e, "the deployment declares a bridge offering this server could not create; it will be tried again at the next start");
+                        continue;
+                    }
+                }
+            }
+            row.declared.push(bridge_type);
+            self.store.put_manager(&row).map_err(store_err)?;
+        }
+        Ok(())
     }
 
     /// Tells the manager where this server's own client API is (`http://127.0.0.1:8008`): what
@@ -244,6 +316,7 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
         let manager = self.clone();
         tokio::spawn(async move {
             let mut registered = false;
+            let mut declared = false;
             loop {
                 if is_owner() {
                     if !registered {
@@ -254,11 +327,20 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
                             }
                         }
                     }
+                    if registered && !declared {
+                        match manager.apply_declared().await {
+                            Ok(()) => declared = true,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "the bridge manager could not apply the offerings the deployment declares")
+                            }
+                        }
+                    }
                     if registered {
                         manager.tick().await;
                     }
                 } else {
                     registered = false;
+                    declared = false;
                 }
                 let _ = tokio::time::timeout(TICK, manager.wake.notified()).await;
             }
@@ -273,6 +355,7 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
         self.store.manager(|| ManagerRow {
             as_token: crate::random_hex(32),
             hs_token: crate::random_hex(32),
+            declared: Vec::new(),
         })
     }
 
@@ -383,9 +466,15 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
 
     // ---- views ------------------------------------------------------------------------------
 
-    fn offering_view(&self, row: &OfferingRow) -> Result<BridgeOffering, SourceError> {
+    async fn offering_view(&self, row: &OfferingRow) -> Result<BridgeOffering, SourceError> {
         let kind =
             bridge_types::get(&row.bridge_type, &self.server_name).ok_or(SourceError::NotFound)?;
+        let overlapping_appservices = self
+            .overlaps_of(row)
+            .await?
+            .iter()
+            .map(|o| overlap::for_offering(o, &kind.name, &self.server_name))
+            .collect();
         let mut counts = BTreeMap::new();
         for i in self
             .store
@@ -413,7 +502,115 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             options: row.options.clone(),
             instances: counts,
             created_at: rfc3339(row.created_at_ms),
+            overlapping_appservices,
         })
+    }
+
+    /// The bridges registered by hand that overlap `offering`'s instances
+    /// ([`crate::overlap::overlaps`]): every registration but the manager's own and the
+    /// instances'.
+    ///
+    /// # Errors
+    /// On a store or directory failure.
+    pub async fn overlaps_of(&self, offering: &OfferingRow) -> Result<Vec<Overlap>, SourceError> {
+        let instance_ids: HashSet<String> = self
+            .store
+            .instances(Some(&offering.bridge_type))
+            .map_err(store_err)?
+            .into_iter()
+            .filter_map(|i| i.appservice_id)
+            .collect();
+        let appservices = self.directory.list().await?;
+        Ok(overlap::overlaps(
+            &offering.bridge_type,
+            &self.server_name,
+            &appservices,
+            &instance_ids,
+            MANAGER_ID,
+        )
+        .unwrap_or_default())
+    }
+
+    /// The health line for appservice `id`, when it is a bridge registered by hand that an
+    /// offering's instances overlap; `None` for any other appservice.
+    ///
+    /// # Errors
+    /// On a store or directory failure.
+    pub async fn overlap_of_appservice(
+        &self,
+        id: &str,
+    ) -> Result<Option<AdminOfferingOverlap>, SourceError> {
+        for offering in self.store.offerings().map_err(store_err)? {
+            let Some(found) = self
+                .overlaps_of(&offering)
+                .await?
+                .into_iter()
+                .find(|o| o.appservice_id == id)
+            else {
+                continue;
+            };
+            let Some(kind) = bridge_types::get(&offering.bridge_type, &self.server_name) else {
+                continue;
+            };
+            let front_door = (kind.mode == "per_user")
+                .then(|| {
+                    bridge_types::front_door_localpart(&offering.bridge_type)
+                        .map(|l| self.mxid(l))
+                })
+                .flatten();
+            return Ok(Some(overlap::for_appservice(
+                &found,
+                &offering.bridge_type,
+                &kind.name,
+                front_door.as_deref(),
+            )));
+        }
+        Ok(None)
+    }
+
+    /// Logs the overlaps that appeared or went since the last look, at most every
+    /// [`OVERLAP_LOG_MS`]: a `WARN` for a hand-registered bridge an offering's instances
+    /// overlap, an `INFO` once it is gone.
+    async fn log_overlaps(&self) {
+        let now = now_ms();
+        let due = {
+            let logged = self
+                .overlaps_logged
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            logged.0 == 0 || now.saturating_sub(logged.0) >= OVERLAP_LOG_MS
+        };
+        if !due {
+            return;
+        }
+        let Ok(offerings) = self.store.offerings() else {
+            return;
+        };
+        let mut current = BTreeSet::new();
+        for offering in &offerings {
+            match self.overlaps_of(offering).await {
+                Ok(found) => {
+                    for o in found {
+                        current.insert((offering.bridge_type.clone(), o.appservice_id));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(bridge_type = %offering.bridge_type, error = %e, "could not look for bridges registered by hand that overlap the offering");
+                    return;
+                }
+            }
+        }
+        let mut logged = self
+            .overlaps_logged
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (bridge_type, id) in current.difference(&logged.1) {
+            tracing::warn!(bridge_type = %bridge_type, appservice = %id, "a bridge registered by hand overlaps the offering's instances: its page says what to do");
+        }
+        for (bridge_type, id) in logged.1.difference(&current) {
+            tracing::info!(bridge_type = %bridge_type, appservice = %id, "the bridge registered by hand that overlapped the offering's instances is gone");
+        }
+        *logged = (now, current);
     }
 
     async fn instance_view(&self, row: &InstanceRow) -> BridgeInstance {
@@ -569,6 +766,7 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
 
     /// Advances every instance one step.
     pub async fn tick(&self) {
+        self.log_overlaps().await;
         let rows = match self.store.instances(None) {
             Ok(rows) => rows,
             Err(e) => {
@@ -608,6 +806,7 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             }
             return self.remove(row).await;
         };
+        let row = &self.settle_registration(row, &offering).await?;
         let now = now_ms();
         match row.state {
             InstanceState::Requested => self.allocate_and_register(row, &offering).await,
@@ -1068,6 +1267,7 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             .render(&row, offering)
             .ok_or("the instance could not be rendered")?;
         let id = row.appservice_id.clone().unwrap_or_default();
+        let fingerprint = registration_fingerprint(&render.registration);
         match self
             .directory
             .create(AdminAppserviceCreate {
@@ -1096,9 +1296,86 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             }
             Err(e) => return Err(format!("could not register it: {e}")),
         }
+        let _ = self
+            .store
+            .update_instance(&row.bridge_type, &row.owner, |r| {
+                r.registered_fingerprint = Some(fingerprint.clone());
+                true
+            });
         self.set_state(&row, InstanceState::Registered, None);
         self.wake();
         Ok(())
+    }
+
+    /// The row with the registry's copy of its registration brought up to date: when the
+    /// offering's options change what the registration claims (double puppeting is the
+    /// owner's non-exclusive namespace; encryption is the MSC3202 and MSC4190 flags), the
+    /// namespaces and the flags are patched on the server's side, once per change
+    /// (`InstanceRow::registered_fingerprint`). The files change with it, which rolls a
+    /// deployed instance's pod through the deployment fingerprint; an instance run elsewhere
+    /// gets a reason saying to fetch its files again. A row from before the fingerprint was
+    /// kept is patched once, with what it already has.
+    async fn settle_registration(
+        &self,
+        row: &InstanceRow,
+        offering: &OfferingRow,
+    ) -> Result<InstanceRow, String> {
+        if !matches!(
+            row.state,
+            InstanceState::Registered
+                | InstanceState::Deploying
+                | InstanceState::Starting
+                | InstanceState::Ready
+        ) {
+            return Ok(row.clone());
+        }
+        let (Some(id), Some(render)) = (row.appservice_id.clone(), self.render(row, offering))
+        else {
+            return Ok(row.clone());
+        };
+        let fingerprint = registration_fingerprint(&render.registration);
+        if row.registered_fingerprint.as_deref() == Some(fingerprint.as_str()) {
+            return Ok(row.clone());
+        }
+        let kind = bridge_types::get(&row.bridge_type, &self.server_name)
+            .ok_or("its bridge type is no longer in the catalogue")?;
+        let mut patch = serde_json::Map::new();
+        patch.insert(
+            "namespaces".to_owned(),
+            render.registration["namespaces"].clone(),
+        );
+        for feature in &kind.required_features {
+            patch.insert(
+                feature.clone(),
+                render.registration.get(feature).cloned().unwrap_or(Value::Null),
+            );
+        }
+        self.directory
+            .update(&id, Value::Object(patch))
+            .await
+            .map_err(|e| format!("could not update its registration: {e}"))?;
+        let changed = row.registered_fingerprint.is_some();
+        let elsewhere = offering.runtime != "cluster";
+        tracing::info!(
+            bridge_type = %row.bridge_type,
+            owner = %row.owner,
+            appservice = %id,
+            double_puppeting = offering.options.double_puppeting.unwrap_or(true),
+            encryption = offering.options.encryption.unwrap_or(true),
+            first_time = !changed,
+            "the bridge instance's registration changed: updated this server's copy of it"
+        );
+        let updated = self
+            .store
+            .update_instance(&row.bridge_type, &row.owner, |r| {
+                r.registered_fingerprint = Some(fingerprint.clone());
+                if changed && elsewhere && r.state != InstanceState::Registered {
+                    r.reason = Some(REREGISTERED_REASON.to_owned());
+                }
+                true
+            })
+            .map_err(|e| e.to_string())?;
+        Ok(updated.unwrap_or_else(|| row.clone()))
     }
 
     /// `whatsapp-alice`, or `whatsapp-alice-2` if that is somebody else's.
@@ -1574,6 +1851,22 @@ pub fn deploy_fingerprint(spec: &DeploySpec) -> String {
     hex::encode(&hasher.finalize()[..8])
 }
 
+/// A fingerprint of what a rendered registration claims on this server: everything in it but
+/// `url` (an administrator may point an instance run elsewhere at where it really listens, and
+/// that is theirs to keep), 16 hex digits of SHA-256. The manager keeps the last one written
+/// to the registry on the row (`InstanceRow::registered_fingerprint`) and patches the
+/// registry's copy when it changes.
+#[must_use]
+pub fn registration_fingerprint(registration: &Value) -> String {
+    let mut claims: BTreeMap<String, Value> = registration
+        .as_object()
+        .map(|o| o.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        .unwrap_or_default();
+    claims.remove("url");
+    let canonical = serde_json::to_string(&claims).unwrap_or_default();
+    hex::encode(&Sha256::digest(canonical.as_bytes())[..8])
+}
+
 pub(crate) fn owner_of(row: &InstanceRow) -> Option<&str> {
     (row.owner != SHARED_INSTANCE).then_some(row.owner.as_str())
 }
@@ -1618,17 +1911,18 @@ impl<B: KvBackend + 'static> BridgeOfferingSource for BridgeManager<B> {
     }
 
     async fn list(&self) -> Result<Vec<BridgeOffering>, SourceError> {
-        self.store
-            .offerings()
-            .map_err(store_err)?
-            .iter()
-            .map(|row| self.offering_view(row))
-            .collect()
+        let rows = self.store.offerings().map_err(store_err)?;
+        let rows = rows.iter();
+        let mut views = Vec::new();
+        for row in rows {
+            views.push(self.offering_view(row).await?);
+        }
+        Ok(views)
     }
 
     async fn get(&self, bridge_type: &str) -> Result<Option<BridgeOffering>, SourceError> {
         match self.store.offering(bridge_type).map_err(store_err)? {
-            Some(row) => Ok(Some(self.offering_view(&row)?)),
+            Some(row) => Ok(Some(self.offering_view(&row).await?)),
             None => Ok(None),
         }
     }
@@ -1725,7 +2019,7 @@ impl<B: KvBackend + 'static> BridgeOfferingSource for BridgeManager<B> {
             self.request(bridge_type, SHARED_INSTANCE, None)
                 .map_err(store_err)?;
         }
-        self.offering_view(&row)
+        self.offering_view(&row).await
     }
 
     async fn delete(&self, bridge_type: &str, remove_instances: bool) -> Result<(), SourceError> {
@@ -2357,6 +2651,333 @@ mod tests {
             .unwrap();
         assert_eq!(row.state, InstanceState::Deploying);
         assert_eq!(row.applied_fingerprint.as_deref(), Some(fresh.as_str()));
+    }
+
+    /// A cluster manager whose directory the test keeps, to read what was registered.
+    fn cluster_manager_with_directory() -> (
+        Arc<BridgeManager<MemoryBackend>>,
+        Arc<FakeRuntime>,
+        Arc<InMemoryAppserviceDirectory>,
+    ) {
+        let runtime = Arc::new(FakeRuntime::default());
+        let directory = Arc::new(InMemoryAppserviceDirectory::new());
+        let manager = BridgeManager::new(
+            MemoryBackend::new(),
+            directory.clone(),
+            Some(runtime.clone()),
+            "example.org",
+            "https://example.org",
+        )
+        .unwrap();
+        manager.attach("http://127.0.0.1:9");
+        (manager, runtime, directory)
+    }
+
+    /// The `users` rules of `id`'s registration as the directory holds it.
+    async fn users_claimed(directory: &InMemoryAppserviceDirectory, id: &str) -> Vec<Value> {
+        directory.get(id).await.unwrap().unwrap().namespaces["users"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn claims_owner(users: &[Value]) -> bool {
+        users
+            .iter()
+            .any(|u| u["regex"] == "@brandon:example\\.org" && u["exclusive"] == false)
+    }
+
+    /// Double puppeting is the owner's non-exclusive claim in the instance's registration.
+    /// Switching it off on the offering patches the registry's copy once, and the changed
+    /// files roll the pod, as any other change does; switching it back on does the same.
+    #[tokio::test]
+    async fn a_changed_double_puppeting_updates_the_instances_claim_once_and_rolls_it() {
+        let (manager, _runtime, directory) = cluster_manager_with_directory();
+        manager.put("mautrix-whatsapp", cluster()).await.unwrap();
+        manager
+            .put_instance("mautrix-whatsapp", "@brandon:example.org")
+            .await
+            .unwrap();
+        manager.tick().await; // registered: the claim is on the server
+        let users = users_claimed(&directory, "whatsapp-brandon").await;
+        assert!(claims_owner(&users), "{users:?}");
+        let row = manager
+            .store
+            .instance("mautrix-whatsapp", "@brandon:example.org")
+            .unwrap()
+            .unwrap();
+        let registered = row.registered_fingerprint.clone().unwrap();
+        manager.tick().await; // deploying
+        manager
+            .store
+            .update_instance("mautrix-whatsapp", "@brandon:example.org", |r| {
+                r.enter(InstanceState::Ready, 5);
+                r.reason = None;
+                r.dm_room = Some("!chat:example.org".into());
+                r.dm_started_by = Some(CHAT_BY_OWNER.into());
+                true
+            })
+            .unwrap()
+            .unwrap();
+
+        // Off: the registry no longer lets the bridge act as brandon, and the pod rolls.
+        manager
+            .put(
+                "mautrix-whatsapp",
+                BridgeOfferingRequest {
+                    options: Some(hs_admin::model::BridgeOfferingOptions {
+                        double_puppeting: Some(false),
+                        ..Default::default()
+                    }),
+                    ..BridgeOfferingRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        manager.tick().await;
+        let users = users_claimed(&directory, "whatsapp-brandon").await;
+        assert!(!claims_owner(&users), "{users:?}");
+        let row = manager
+            .store
+            .instance("mautrix-whatsapp", "@brandon:example.org")
+            .unwrap()
+            .unwrap();
+        assert_ne!(row.registered_fingerprint.as_deref(), Some(registered.as_str()));
+        assert_eq!(row.state, InstanceState::Deploying);
+        assert_eq!(
+            row.reason.as_deref(),
+            Some("its configuration changed: restarting the pod with it")
+        );
+        let after_off = row.registered_fingerprint.clone().unwrap();
+        // Once: the next step finds nothing to patch and the instance moves on.
+        manager.tick().await;
+        let row = manager
+            .store
+            .instance("mautrix-whatsapp", "@brandon:example.org")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, InstanceState::Starting);
+        assert_eq!(row.registered_fingerprint.as_deref(), Some(after_off.as_str()));
+
+        // On again: the claim is back.
+        manager
+            .put(
+                "mautrix-whatsapp",
+                BridgeOfferingRequest {
+                    options: Some(hs_admin::model::BridgeOfferingOptions {
+                        double_puppeting: Some(true),
+                        ..Default::default()
+                    }),
+                    ..BridgeOfferingRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        manager.tick().await;
+        let users = users_claimed(&directory, "whatsapp-brandon").await;
+        assert!(claims_owner(&users), "{users:?}");
+        let row = manager
+            .store
+            .instance("mautrix-whatsapp", "@brandon:example.org")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.registered_fingerprint.as_deref(), Some(registered.as_str()));
+        assert_eq!(row.state, InstanceState::Deploying);
+    }
+
+    /// An instance run elsewhere has nobody to roll it: its registration is patched the same
+    /// way and its reason says to fetch the files again. A row from before the fingerprint
+    /// was kept is patched once with what it already claims, and nothing is said.
+    #[tokio::test]
+    async fn an_instance_run_elsewhere_is_told_to_fetch_its_files_when_its_claim_changes() {
+        // Nobody has run the bridge yet: its pings fail and it waits in `starting`.
+        let directory = Arc::new(InMemoryAppserviceDirectory::new().with_unreachable("whatsapp-brandon"));
+        let manager = BridgeManager::new(
+            MemoryBackend::new(),
+            directory.clone(),
+            None,
+            "example.org",
+            "https://example.org",
+        )
+        .unwrap();
+        manager.attach("http://127.0.0.1:9");
+        manager
+            .put(
+                "mautrix-whatsapp",
+                BridgeOfferingRequest {
+                    runtime: Some("elsewhere".into()),
+                    ..BridgeOfferingRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        manager
+            .put_instance("mautrix-whatsapp", "@brandon:example.org")
+            .await
+            .unwrap();
+        manager.tick().await; // registered
+        manager.tick().await; // starting, waiting for someone to run it
+        let row = manager
+            .store
+            .instance("mautrix-whatsapp", "@brandon:example.org")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, InstanceState::Starting);
+        let registered = row.registered_fingerprint.clone().unwrap();
+
+        // From before: patched once, silently.
+        manager
+            .store
+            .update_instance("mautrix-whatsapp", "@brandon:example.org", |r| {
+                r.registered_fingerprint = None;
+                true
+            })
+            .unwrap();
+        manager.tick().await;
+        let row = manager
+            .store
+            .instance("mautrix-whatsapp", "@brandon:example.org")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.registered_fingerprint.as_deref(), Some(registered.as_str()));
+        assert_ne!(row.reason.as_deref(), Some(REREGISTERED_REASON));
+
+        manager
+            .put(
+                "mautrix-whatsapp",
+                BridgeOfferingRequest {
+                    options: Some(hs_admin::model::BridgeOfferingOptions {
+                        double_puppeting: Some(false),
+                        ..Default::default()
+                    }),
+                    ..BridgeOfferingRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        manager.tick().await;
+        let users = users_claimed(&directory, "whatsapp-brandon").await;
+        assert!(!claims_owner(&users), "{users:?}");
+        let row = manager
+            .store
+            .instance("mautrix-whatsapp", "@brandon:example.org")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.reason.as_deref(), Some(REREGISTERED_REASON));
+        assert_eq!(row.state, InstanceState::Starting);
+    }
+
+    /// The deployment's declared offerings (`MYELIN_BRIDGES_OFFERINGS`) are created the first
+    /// time the manager runs with them, adopted when they exist already, and not created
+    /// again once an administrator removes one.
+    #[tokio::test]
+    async fn declared_offerings_are_created_once_and_an_existing_one_is_adopted() {
+        let (manager, _runtime) = cluster_manager();
+        // The demo's case: the offering was made through the admin API before the chart
+        // declared it, with its own image tag.
+        manager
+            .put(
+                "mautrix-whatsapp",
+                BridgeOfferingRequest {
+                    runtime: Some("cluster".into()),
+                    image_tag: Some("v0.12.0".into()),
+                    ..BridgeOfferingRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        manager.set_declared(vec![
+            ("mautrix-whatsapp".into(), cluster()),
+            ("mautrix-signal".into(), cluster()),
+        ]);
+        manager.apply_declared().await.unwrap();
+        let whatsapp = manager.get("mautrix-whatsapp").await.unwrap().unwrap();
+        assert_eq!(whatsapp.image_tag, "v0.12.0");
+        let signal = manager.get("mautrix-signal").await.unwrap().unwrap();
+        assert_eq!(signal.runtime, "cluster");
+        assert_eq!(
+            manager.tokens().unwrap().declared,
+            vec!["mautrix-whatsapp".to_owned(), "mautrix-signal".to_owned()]
+        );
+        // Removed by an administrator: the declaration does not bring it back.
+        manager.delete("mautrix-signal", false).await.unwrap();
+        manager.apply_declared().await.unwrap();
+        assert!(manager.get("mautrix-signal").await.unwrap().is_none());
+        // One this server cannot create is left for the next start.
+        let elsewhere_only = BridgeManager::new(
+            MemoryBackend::new(),
+            Arc::new(InMemoryAppserviceDirectory::new()),
+            None,
+            "example.org",
+            "https://example.org",
+        )
+        .unwrap();
+        elsewhere_only.attach("http://127.0.0.1:9");
+        elsewhere_only.set_declared(vec![("mautrix-telegram".into(), cluster())]);
+        elsewhere_only.apply_declared().await.unwrap();
+        assert!(elsewhere_only.get("mautrix-telegram").await.unwrap().is_none());
+        assert!(elsewhere_only.tokens().unwrap().declared.is_empty());
+    }
+
+    /// The demo's shared registration from 2026-09-25 beside the offering that replaces it:
+    /// the offering names it, its health names the offering and what to do, the instance's
+    /// own registration is not mistaken for one, and removing it clears both.
+    #[tokio::test]
+    async fn a_bridge_registered_by_hand_is_named_on_its_health_and_on_the_offering() {
+        let directory = Arc::new(
+            InMemoryAppserviceDirectory::new().with_registration(json!({
+                "id": "whatsapp",
+                "url": "http://mautrix-whatsapp:29318",
+                "as_token": "a",
+                "hs_token": "h",
+                "sender_localpart": "whatsappbot_shared",
+                "namespaces": {
+                    "users": [
+                        {"regex": "@whatsapp_.*:example\\.org", "exclusive": true},
+                        {"regex": "@.*:example\\.org", "exclusive": false}
+                    ],
+                    "aliases": [], "rooms": []
+                },
+                "io.myelin.bridge_type": "mautrix-whatsapp"
+            })),
+        );
+        let runtime = Arc::new(FakeRuntime::default());
+        let manager = BridgeManager::new(
+            MemoryBackend::new(),
+            directory.clone(),
+            Some(runtime),
+            "example.org",
+            "https://example.org",
+        )
+        .unwrap();
+        manager.attach("http://127.0.0.1:9");
+        manager.put("mautrix-whatsapp", cluster()).await.unwrap();
+        manager
+            .put_instance("mautrix-whatsapp", "@brandon:example.org")
+            .await
+            .unwrap();
+        manager.tick().await; // registered
+
+        let offering = manager.get("mautrix-whatsapp").await.unwrap().unwrap();
+        assert_eq!(offering.overlapping_appservices.len(), 1, "{offering:?}");
+        let line = &offering.overlapping_appservices[0];
+        assert_eq!(line.id, "whatsapp");
+        assert_eq!(line.sender_localpart, "whatsappbot_shared");
+        assert!(line.detail.contains("catalogue's WhatsApp entry"), "{}", line.detail);
+
+        let aware = crate::directory::OfferingAwareDirectory::new(directory.clone(), manager.clone());
+        let health = aware.health("whatsapp").await.unwrap();
+        let overlap = health.overlaps_offering.expect("the hand-registered bridge is told");
+        assert_eq!(overlap.bridge_type, "mautrix-whatsapp");
+        assert_eq!(overlap.name, "WhatsApp");
+        assert_eq!(overlap.front_door.as_deref(), Some("@whatsappbot:example.org"));
+        assert!(overlap.detail.contains("messaging @whatsappbot:example.org"), "{}", overlap.detail);
+        assert!(aware.health("whatsapp-brandon").await.unwrap().overlaps_offering.is_none());
+        assert!(aware.ping("whatsapp").await.unwrap().overlaps_offering.is_some());
+
+        directory.delete("whatsapp").await.unwrap();
+        let offering = manager.get("mautrix-whatsapp").await.unwrap().unwrap();
+        assert!(offering.overlapping_appservices.is_empty(), "{offering:?}");
     }
 
     #[test]

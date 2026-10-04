@@ -39,6 +39,9 @@ hex = { workspace = true }
 rustls = { workspace = true }
 # The `Homeserver` reconciler drains replicas through the server's admin API.
 reqwest = { workspace = true }
+# Its client is built by `hs_http::client::builder()`: the outbound address policy and the
+# `hs_outbound_*` counters, the same as every other outbound client in the workspace.
+hs-http = { path = "../hs-http" }
 # `hs_operator_*` metrics, in the project's registry and naming conventions, served on
 # `/metrics` by a small axum listener (`src/metrics.rs`).
 hs-telemetry = { path = "../hs-telemetry" }

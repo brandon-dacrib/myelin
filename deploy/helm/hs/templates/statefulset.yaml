@@ -212,6 +212,12 @@ spec:
                   fieldPath: metadata.namespace
             - name: MYELIN_BRIDGES_HOMESERVER_URL
               value: {{ printf "http://%s.%s.svc:%v" (include "hs.fullname" .) .Release.Namespace .Values.service.clientPort | quote }}
+            {{- if .Values.bridges.offerings }}
+            ## The offerings the deployment declares (values.yaml `bridges.offerings`): created
+            ## once, then the admin interface's.
+            - name: MYELIN_BRIDGES_OFFERINGS
+              value: {{ toJson .Values.bridges.offerings | quote }}
+            {{- end }}
             {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}

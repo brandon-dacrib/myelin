@@ -148,12 +148,14 @@ pub struct HttpAdminApi {
 }
 
 impl HttpAdminApi {
-    /// A client with a ten-second timeout per call.
+    /// A client with a ten-second timeout per call, built by `hs_http::client::builder()`: the
+    /// outbound address policy (IPv4 first, every address tried) and the `hs_outbound_*`
+    /// counters, as every other outbound client in the workspace.
     ///
     /// # Errors
     /// When the TLS backend cannot be initialised.
     pub fn new() -> Result<Self, AdminError> {
-        let client = reqwest::Client::builder()
+        let client = hs_http::client::builder()
             .timeout(Duration::from_secs(10))
             .user_agent(concat!("hs-operator/", env!("CARGO_PKG_VERSION")))
             .build()

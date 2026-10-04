@@ -115,6 +115,9 @@ fn admin_health(health: Health) -> AdminAppserviceHealth {
             to_user_id: w.to_user_id,
             to_device_id: w.to_device_id,
         }),
+        // The bridge manager's directory wrapper (`hs_bridges::directory`) fills this in; the
+        // registry alone does not know the offerings.
+        overlaps_offering: None,
     }
 }
 

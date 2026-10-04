@@ -9,6 +9,8 @@ description = "Bridge offerings and per-user bridge instances: the manager, the 
 
 [dependencies]
 hs-admin = { path = "../hs-admin" }
+# `hs_http::client::builder()`: the one outbound HTTP client, under the outbound address policy.
+hs-http = { path = "../hs-http" }
 hs-kv = { path = "../hs-kv" }
 hs-model = { path = "../hs-model" }
 hs-tables = { path = "../hs-tables" }
@@ -18,6 +20,7 @@ base64 = { workspace = true }
 ed25519-dalek = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
+regex = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

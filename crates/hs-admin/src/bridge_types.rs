@@ -429,9 +429,20 @@ pub fn provisioning(type_id: &str) -> Option<(ProvisioningApi, &'static str)> {
 /// bridge's `DefaultCommandPrefix` (its connector's `GetName()`; `!wa` for WhatsApp), which
 /// the config this server renders leaves at the bridge's default. A bare command is taken only
 /// in the person's management room, the chat they invited the bot into. `None` where the
-/// bridge has no such prefix, or it is not known here. Read from each bridge's source on
-/// 2026-10-02 (`pkg/connector/connector.go`, or the example config for Discord); Signal, Slack
-/// and X set none there, so theirs are not claimed.
+/// bridge has no such prefix, or it is not known here.
+///
+/// Read from each bridge's source on 2026-10-02 (`pkg/connector/connector.go`, or the example
+/// config for Discord). Signal, Slack and X set no `DefaultCommandPrefix` there, and on
+/// 2026-10-04 the framework's fallback was read: mautrix-go's
+/// `bridgev2/matrix/mxmain/example-config.yaml` writes
+/// `command_prefix: '$<<or .DefaultCommandPrefix (printf "!%s" .NetworkID)>>'`, and
+/// `bridgev2/networkinterface.go` says of `DefaultCommandPrefix` "defaults to NetworkID if
+/// unset. Must include the ! prefix". So a connector without one takes `!` and its
+/// `NetworkID`: `signal` (mautrix-signal `pkg/connector/connector.go`, `GetName`), `slack`
+/// (mautrix-slack, the same file) and `twitter` (mautrix-twitter, the same file: the
+/// `NetworkID` stays `twitter` when the display name is `X`). A bridge whose config an
+/// administrator wrote by hand may say otherwise; an instance this server renders keeps the
+/// default.
 fn command_prefix(entry: &Entry) -> Option<&'static str> {
     match entry.id {
         "mautrix-whatsapp" => Some("!wa"),
@@ -441,6 +452,9 @@ fn command_prefix(entry: &Entry) -> Option<&'static str> {
         "mautrix-meta" => Some("!fb"),
         "mautrix-discord" => Some("!discord"),
         "mautrix-bluesky" => Some("!bsky"),
+        "mautrix-signal" => Some("!signal"),
+        "mautrix-slack" => Some("!slack"),
+        "mautrix-twitter" => Some("!twitter"),
         _ => None,
     }
 }
@@ -1435,6 +1449,35 @@ mod tests {
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), CATALOGUE.len());
+    }
+
+    /// Every mautrix `bridgev2` bridge in the catalogue has a command prefix, the connector's
+    /// own or mautrix-go's fallback of `!` and the network id (see [`command_prefix`]); the
+    /// other runtimes have none claimed.
+    #[test]
+    fn every_mautrix_bridge_has_its_command_prefix() {
+        let prefixes: Vec<(String, Option<String>)> = list("chat.example.net")
+            .into_iter()
+            .map(|t| (t.id, t.command_prefix))
+            .collect();
+        for (id, prefix) in &prefixes {
+            let mautrix = entry(id).unwrap().runtime == Runtime::Mautrix;
+            assert_eq!(prefix.is_some(), mautrix, "{id}: {prefix:?}");
+            if let Some(prefix) = prefix {
+                assert!(prefix.starts_with('!'), "{id}: {prefix}");
+            }
+        }
+        let of = |id: &str| {
+            prefixes
+                .iter()
+                .find(|(i, _)| i == id)
+                .and_then(|(_, p)| p.clone())
+        };
+        assert_eq!(of("mautrix-whatsapp").as_deref(), Some("!wa"));
+        assert_eq!(of("mautrix-signal").as_deref(), Some("!signal"));
+        assert_eq!(of("mautrix-slack").as_deref(), Some("!slack"));
+        assert_eq!(of("mautrix-twitter").as_deref(), Some("!twitter"));
+        assert_eq!(of("heisenbridge"), None);
     }
 
     /// The wizard's guidance is complete for every entry: a description, a category the

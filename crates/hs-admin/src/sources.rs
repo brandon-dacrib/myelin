@@ -2687,6 +2687,7 @@ impl AppserviceDirectory for InMemoryAppserviceDirectory {
                 last_ping_at: Some(hs_http::time::now_rfc3339()),
                 last_error: unreachable.then(|| "connection refused".to_owned()),
                 last_key_withheld: None,
+                overlaps_offering: None,
             };
             let mut health = row.health.clone();
             if row.paused {

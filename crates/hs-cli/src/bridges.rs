@@ -1,9 +1,10 @@
-//! Connects the bridge manager's runtime to the operator's Kubernetes client (RFC 0017).
+//! Connects the bridge manager's runtime to the operator's Kubernetes client (RFC 0017), and
+//! reads the offerings the deployment declares.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use hs_admin::model::{BridgeDeployment, BridgeDeploymentTarget};
+use hs_admin::model::{BridgeDeployment, BridgeDeploymentTarget, BridgeOfferingRequest};
 use hs_bridges::runtime::{DeploySpec, Runtime};
 use hs_operator::crds::{ImageSpec, Phase};
 use hs_operator::deploy::{BridgeInstanceSpec, BridgeInstanceStatus, KubeBridgeClient};
@@ -38,6 +39,53 @@ pub async fn runtime() -> Result<Option<Arc<dyn Runtime>>, String> {
         }
         _ => Err("set both MYELIN_BRIDGES_NAMESPACE and MYELIN_BRIDGES_HOMESERVER_URL".into()),
     }
+}
+
+/// The environment variable the chart's `bridges.offerings` arrives in: a JSON list of
+/// `{"type": <catalogue id>, ...}` where the rest is a `BridgeOfferingRequest` (`runtime`,
+/// `image_tag`, `access`, `options`; absent fields take the defaults a `PUT` would).
+pub const DECLARED_OFFERINGS_ENV: &str = "MYELIN_BRIDGES_OFFERINGS";
+
+/// The offerings the deployment declares ([`DECLARED_OFFERINGS_ENV`]), for
+/// `hs_bridges::manager::BridgeManager::set_declared`: each is created the first time the
+/// server runs with it declared, then left to the admin API. Unset or blank: none.
+///
+/// # Errors
+/// When the value is not a JSON list of objects naming a `type` the catalogue has: a
+/// deployment that declares a bridge it misspells should not boot as if it declared nothing.
+pub fn declared_offerings() -> Result<Vec<(String, BridgeOfferingRequest)>, String> {
+    parse_declared_offerings(std::env::var(DECLARED_OFFERINGS_ENV).ok().as_deref())
+}
+
+fn parse_declared_offerings(
+    value: Option<&str>,
+) -> Result<Vec<(String, BridgeOfferingRequest)>, String> {
+    let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let items: Vec<serde_json::Map<String, serde_json::Value>> = serde_json::from_str(value)
+        .map_err(|e| format!("{DECLARED_OFFERINGS_ENV} is not a JSON list of objects: {e}"))?;
+    let mut declared = Vec::new();
+    for mut item in items {
+        let bridge_type = item
+            .remove("type")
+            .and_then(|t| t.as_str().map(str::to_owned))
+            .ok_or_else(|| format!("{DECLARED_OFFERINGS_ENV}: every entry needs a \"type\""))?;
+        if hs_admin::bridge_types::get(&bridge_type, "example.org").is_none() {
+            return Err(format!(
+                "{DECLARED_OFFERINGS_ENV}: {bridge_type} is not a bridge type in the catalogue"
+            ));
+        }
+        let request: BridgeOfferingRequest =
+            serde_json::from_value(serde_json::Value::Object(item)).map_err(|e| {
+                format!("{DECLARED_OFFERINGS_ENV}: {bridge_type}'s settings do not parse: {e}")
+            })?;
+        if declared.iter().any(|(t, _)| t == &bridge_type) {
+            return Err(format!("{DECLARED_OFFERINGS_ENV}: {bridge_type} is declared twice"));
+        }
+        declared.push((bridge_type, request));
+    }
+    Ok(declared)
 }
 
 fn deployment(status: BridgeInstanceStatus) -> BridgeDeployment {
@@ -106,5 +154,48 @@ impl Runtime for KubernetesRuntime {
 
     async fn delete(&self, name: &str) -> Result<(), String> {
         self.client.delete(name).await.map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn declared_offerings_parse_as_the_put_body_with_a_type() {
+        assert!(parse_declared_offerings(None).unwrap().is_empty());
+        assert!(parse_declared_offerings(Some("  ")).unwrap().is_empty());
+        let declared = parse_declared_offerings(Some(
+            r#"[{"type": "mautrix-whatsapp", "runtime": "cluster", "options": {"double_puppeting": true}},
+                {"type": "heisenbridge"}]"#,
+        ))
+        .unwrap();
+        assert_eq!(declared.len(), 2);
+        assert_eq!(declared[0].0, "mautrix-whatsapp");
+        assert_eq!(declared[0].1.runtime.as_deref(), Some("cluster"));
+        assert_eq!(
+            declared[0].1.options.as_ref().and_then(|o| o.double_puppeting),
+            Some(true)
+        );
+        assert_eq!(declared[1].0, "heisenbridge");
+        assert_eq!(declared[1].1, BridgeOfferingRequest::default());
+    }
+
+    #[test]
+    fn a_misspelt_or_malformed_declaration_is_refused() {
+        let unknown = parse_declared_offerings(Some(r#"[{"type": "mautrix-whatsap"}]"#)).unwrap_err();
+        assert!(unknown.contains("not a bridge type in the catalogue"), "{unknown}");
+        let untyped = parse_declared_offerings(Some(r#"[{"runtime": "cluster"}]"#)).unwrap_err();
+        assert!(untyped.contains("needs a \"type\""), "{untyped}");
+        let twice = parse_declared_offerings(Some(
+            r#"[{"type": "heisenbridge"}, {"type": "heisenbridge"}]"#,
+        ))
+        .unwrap_err();
+        assert!(twice.contains("declared twice"), "{twice}");
+        let not_a_list = parse_declared_offerings(Some(r#"{"type": "heisenbridge"}"#)).unwrap_err();
+        assert!(not_a_list.contains("not a JSON list"), "{not_a_list}");
+        let bad_field = parse_declared_offerings(Some(r#"[{"type": "heisenbridge", "enabled": "yes"}]"#))
+            .unwrap_err();
+        assert!(bad_field.contains("do not parse"), "{bad_field}");
     }
 }

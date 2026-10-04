@@ -137,6 +137,15 @@ pub struct InstanceRow {
     /// (`manager::BridgeManager::settle_chat`).
     #[serde(default)]
     pub dm_started_by: Option<String>,
+    /// A fingerprint of the registration last written to this server's appservice registry
+    /// (`manager::registration_fingerprint`: the namespaces and the feature flags, which the
+    /// offering's options decide; a double-puppeting claim on the owner, say). The manager
+    /// renders every registered instance on each step and, when the fingerprint differs,
+    /// patches the registry's copy, so a changed option reaches the server's side as well as
+    /// the bridge's files. `None` on a row from before this was recorded: that one is patched
+    /// once.
+    #[serde(default)]
+    pub registered_fingerprint: Option<String>,
     /// A fingerprint of the deployment last asked of the runtime (`manager::deploy_fingerprint`:
     /// the image, the arguments and the rendered files). The manager renders every deployed
     /// instance on each step and, when the fingerprint differs, applies the new deployment,
@@ -185,6 +194,7 @@ impl InstanceRow {
             front_door_room: None,
             dm_room: None,
             dm_started_by: None,
+            registered_fingerprint: None,
             applied_fingerprint: None,
             created_at_ms: now_ms,
             state_since_ms: now_ms,
@@ -206,6 +216,12 @@ impl InstanceRow {
 pub struct ManagerRow {
     pub as_token: String,
     pub hs_token: String,
+    /// The bridge types the deployment declared (`MYELIN_BRIDGES_OFFERINGS`, the chart's
+    /// `bridges.offerings`) that the manager has already created an offering for. A declared
+    /// type is created once; after that the admin API owns it, so one an administrator removes
+    /// stays removed across restarts.
+    #[serde(default)]
+    pub declared: Vec<String>,
 }
 
 /// The tables.
@@ -419,6 +435,19 @@ impl<B: KvBackend> BridgeStore<B> {
         Ok(first)
     }
 
+    /// Replaces the manager's row.
+    ///
+    /// # Errors
+    /// On a store failure.
+    pub fn put_manager(&self, row: &ManagerRow) -> Result<(), StoreError> {
+        let key = ("manager".to_owned(),);
+        let value = encode(row);
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            self.meta.put(txn, &key, &value).map_err(kv)
+        })?;
+        Ok(())
+    }
+
     /// The manager's tokens, minted by `mint` the first time and kept.
     ///
     /// # Errors
@@ -486,14 +515,29 @@ mod tests {
             .manager(|| ManagerRow {
                 as_token: "a".into(),
                 hs_token: "b".into(),
+                declared: Vec::new(),
             })
             .unwrap();
         let m2 = store
             .manager(|| ManagerRow {
                 as_token: "c".into(),
                 hs_token: "d".into(),
+                declared: Vec::new(),
             })
             .unwrap();
         assert_eq!(m1.as_token, m2.as_token);
+        // What the deployment declared is kept with the tokens, and a row from before the
+        // list was kept reads as an empty one.
+        store
+            .put_manager(&ManagerRow {
+                declared: vec!["mautrix-whatsapp".into()],
+                ..m1.clone()
+            })
+            .unwrap();
+        let m3 = store.manager(|| unreachable!()).unwrap();
+        assert_eq!(m3.as_token, "a");
+        assert_eq!(m3.declared, vec!["mautrix-whatsapp".to_owned()]);
+        let old: ManagerRow = decode(br#"{"as_token":"x","hs_token":"y"}"#).unwrap();
+        assert!(old.declared.is_empty());
     }
 }

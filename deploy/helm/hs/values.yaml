@@ -464,6 +464,20 @@ bridges:
   ## cluster's default. Passed to the operator (`--default-storage-class`). A claim's class
   ## cannot change once it exists, so this applies to bridges created after it is set.
   defaultStorageClassName: ""
+  ## Bridge offerings the deployment declares (RFC 0017): each entry is a catalogue `type`
+  ## (`GET /api/v1/bridge-types`: `mautrix-whatsapp`, `mautrix-signal`, `heisenbridge`, ...)
+  ## plus the fields of the admin API's `PUT /bridge-offerings/{type}` body -- `runtime`
+  ## (`cluster`, the default here), `image_tag`, `access`, `options` (`encryption`,
+  ## `double_puppeting`, `backfill`). The server creates each offering once, the first time it
+  ## runs with it declared (`MYELIN_BRIDGES_OFFERINGS`); from then on the admin interface owns
+  ## it, so an offering an administrator removes stays removed, and one that already exists is
+  ## kept exactly as it is. People then get their own bridge by messaging the offering's bot
+  ## (`@whatsappbot`); this replaces registering one shared bridge by hand for everyone.
+  ##
+  ##   offerings:
+  ##     - type: mautrix-whatsapp
+  ##       options: { encryption: true, double_puppeting: true }
+  offerings: []
 
 extraEnv: []
 extraVolumes: []

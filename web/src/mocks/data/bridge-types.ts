@@ -51,6 +51,10 @@ const COMMAND_PREFIXES: Record<string, string> = {
   "mautrix-meta": "!fb",
   "mautrix-discord": "!discord",
   "mautrix-bluesky": "!bsky",
+  // No `DefaultCommandPrefix` in their connectors: mautrix-go falls back to `!` + NetworkID.
+  "mautrix-signal": "!signal",
+  "mautrix-slack": "!slack",
+  "mautrix-twitter": "!twitter",
 };
 
 /** Each type's provisioning surface and its note, as `bridge_types.rs`'s `provisioning_of`. */

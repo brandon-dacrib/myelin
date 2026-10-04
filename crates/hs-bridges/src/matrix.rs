@@ -22,14 +22,16 @@ pub struct MatrixError {
 }
 
 impl MatrixClient {
-    /// Against `base` (`http://127.0.0.1:8008`).
+    /// Against `base` (`http://127.0.0.1:8008`). The client is `hs_http::client::builder()`'s,
+    /// so the loopback connection goes through the outbound address policy and is counted with
+    /// every other outbound connection (`hs_outbound_connections_total`).
     ///
     /// # Panics
     /// If `base` is not a URL; the caller builds it from a bound socket address.
     #[must_use]
     pub fn new(base: &str) -> Self {
         Self {
-            http: reqwest::Client::builder()
+            http: hs_http::client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .unwrap_or_default(),
