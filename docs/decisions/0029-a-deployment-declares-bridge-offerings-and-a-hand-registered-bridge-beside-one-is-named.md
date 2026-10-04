@@ -1,4 +1,4 @@
-# 0028: 2026-10-04: a deployment declares bridge offerings once, and a bridge registered by hand beside an offering is named, not paused
+# 0029: 2026-10-04: a deployment declares bridge offerings once, and a bridge registered by hand beside an offering is named, not paused
 
 Status: accepted (track 11; touches 12's chart, 15's admin API and 16's pages).
 

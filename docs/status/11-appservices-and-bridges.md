@@ -20,7 +20,7 @@ the real binary), 2026-09-27 (the bridge manager) and 2026-09-25.
 ## Session 2026-10-04 (branch `agent/bridge-offering-demo`): the demo's shared WhatsApp registration becomes an offering
 
 `docs/next-steps.md` item 5; RFC 0017 section 6. Decision
-`docs/decisions/0028-a-deployment-declares-bridge-offerings-and-a-hand-registered-bridge-beside-one-is-named.md`.
+`docs/decisions/0029-a-deployment-declares-bridge-offerings-and-a-hand-registered-bridge-beside-one-is-named.md`.
 OpenAPI 0.1.7 → **0.1.8** (additive; client regenerated).
 
 **1. The demo declares the offering; nothing in `deploy/` registers a shared bridge.**
@@ -51,7 +51,7 @@ OpenAPI 0.1.7 → **0.1.8** (additive; client regenerated).
   directory the admin API reads (`serve.rs`), so `hs-appservice` stays unaware of offerings.
   `BridgeOffering.overlapping_appservices` (schema `AppServiceOverlap`) is the same from the
   offering. The manager logs each at `WARN` when it appears and at `INFO` when it goes (looked
-  at once a minute at most). **It is not paused or removed by the server** (decision 0028): the
+  at once a minute at most). **It is not paused or removed by the server** (decision 0029): the
   line offers Pause. Web: the bridge page's warning line links to the offering; the offering
   page's "Also registered by hand" links to each.
 - **The owner's steps** (save the registration, roll with the overlay, Pause, people move to
