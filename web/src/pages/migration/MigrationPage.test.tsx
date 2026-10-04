@@ -51,8 +51,9 @@ describe("Migration", () => {
     const details = summary.closest("details")!;
     expect(details).toHaveAttribute("open");
     const moves = within(within(details).getByRole("region", { name: "Copied, in this order" }));
-    expect(moves.getAllByRole("listitem")).toHaveLength(13);
+    expect(moves.getAllByRole("listitem")).toHaveLength(14);
     expect(moves.getByText("Sessions (access tokens)")).toBeInTheDocument();
+    expect(moves.getByText("Other servers' media")).toBeInTheDocument();
     const stays = within(within(details).getByRole("region", { name: "Not copied" }));
     expect(stays.getByText("Thumbnails")).toBeInTheDocument();
     expect(stays.getByText("Presence")).toBeInTheDocument();

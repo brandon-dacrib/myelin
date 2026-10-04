@@ -43,7 +43,10 @@ admin router). What was real, done tonight:
   pull ghcr.io/element-hq/synapse` fails in a session (the keychain), as the brief expected.
 - Web: `remote_media` has its label and explanation on the Migration page (`web/src/lib/
   migration.ts`), the "Other servers' media" entry of "Not copied" is now "Thumbnails" (which
-  were never copied and were not listed), the mock has the stream.
+  were never copied and were not listed), the mock has the stream; the page's unit test, the
+  mock flow (`web/e2e/migration.spec.ts`) and the real-server tour
+  (`web/e2e-real/explained-pages.spec.ts`, not run here: it needs a booted server) expect 14
+  copied streams with "Other servers' media" among them and "Thumbnails" under "Not copied".
 - Docs: the runbook's copy order, "What moves" row, "What does not move" (thumbnails; file-less
   entries), the verify paragraph; the mapping table's `remote_media_cache` row.
 
@@ -77,7 +80,7 @@ admin router). What was real, done tonight:
   something other than `M_UNRECOGNIZED` (which is what caught the register pair's dependence on
   the secret, and would catch a manifest entry without a route).
 - `cargo test -p hs-cli --lib`: the shim manifest count (8), the layout round trip.
-- `cd web && npm run check && npm run test:e2e`.
+- `cd web && npm run check` (569 unit tests) and `npm run test:e2e` (64 flows).
 
 **Left:** thumbnails (made on demand here, by design); a receipt in a thread other than `main`
 (`hs-user`'s receipt store has no thread dimension); a backed-up room key deleted in Synapse
