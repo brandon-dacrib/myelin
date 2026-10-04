@@ -178,7 +178,10 @@ pub(crate) async fn local_keys_query<B: KvBackend + 'static>(
             .get_cross_signing_key(user_id, CrossSigningKeyType::Master)
             .await?
         {
-            master_keys.insert(user_id.to_string(), key);
+            master_keys.insert(
+                user_id.to_string(),
+                signatures_visible_to(key, user_id, requesting_user),
+            );
         }
         if let Some(key) = state
             .store
@@ -205,6 +208,25 @@ pub(crate) async fn local_keys_query<B: KvBackend + 'static>(
     })
 }
 
+/// `key` (a master key of `owner`'s) with only the signatures `requesting_user` may see: the
+/// owner's own, and the requester's. Another user's signature on a master key is made with
+/// their user-signing key, and who someone has verified is theirs alone (the spec's
+/// user-signing key privacy; Synapse returns such signatures only to their signer, and Sytest's
+/// "Changing user-signing key notifies local users" checks the owner does not see one). A
+/// remote server asking (`None`) sees only the owner's.
+fn signatures_visible_to(
+    mut key: Value,
+    owner: &UserId,
+    requesting_user: Option<&UserId>,
+) -> Value {
+    if let Some(signatures) = key.get_mut("signatures").and_then(Value::as_object_mut) {
+        signatures.retain(|signer, _| {
+            signer == owner.as_str() || requesting_user.is_some_and(|r| signer == r.as_str())
+        });
+    }
+    key
+}
+
 /// `POST /keys/query`.
 pub async fn post_keys_query<B: KvBackend + 'static>(
     State(state): State<E2eState<B>>,
@@ -214,4 +236,38 @@ pub async fn post_keys_query<B: KvBackend + 'static>(
     let device_keys_req = body.get("device_keys").cloned().unwrap_or(json!({}));
     let response = build_keys_query_response(&state, &requester.user_id, &device_keys_req).await?;
     Ok(Json(response))
+}
+
+#[cfg(test)]
+mod signature_visibility_tests {
+    use super::*;
+
+    #[test]
+    fn a_master_keys_signatures_are_the_owners_and_the_requesters_only() {
+        let owner = ruma::user_id!("@bob:example.org");
+        let signer = ruma::user_id!("@alice:example.org");
+        let key = json!({
+            "user_id": owner,
+            "usage": ["master"],
+            "keys": {"ed25519:K": "K"},
+            "signatures": {
+                owner.as_str(): {"ed25519:DEV": "by bob"},
+                signer.as_str(): {"ed25519:USK": "by alice"},
+                "@carol:example.org": {"ed25519:USK2": "by carol"},
+            },
+        });
+        let seen = |r| signatures_visible_to(key.clone(), owner, r)["signatures"].clone();
+        assert_eq!(
+            seen(Some(signer)),
+            json!({owner.as_str(): {"ed25519:DEV": "by bob"}, signer.as_str(): {"ed25519:USK": "by alice"}})
+        );
+        assert_eq!(
+            seen(Some(owner)),
+            json!({owner.as_str(): {"ed25519:DEV": "by bob"}})
+        );
+        assert_eq!(
+            seen(None),
+            json!({owner.as_str(): {"ed25519:DEV": "by bob"}})
+        );
+    }
 }

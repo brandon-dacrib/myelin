@@ -1564,7 +1564,12 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
         let changed: BTreeSet<&OwnedUserId> = changed_all
             .iter()
             .filter(|u| shared.contains(*u) || u.as_str() == user_id.as_str())
-            .chain(newly_shared.iter())
+            // Themself excepted: a room they have just joined counts them among its members.
+            .chain(
+                newly_shared
+                    .iter()
+                    .filter(|u| u.as_str() != user_id.as_str()),
+            )
             .collect();
         let mut changed = changed;
         let own_id = user_id.to_owned();

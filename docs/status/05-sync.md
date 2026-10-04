@@ -1,9 +1,97 @@
 # 05 Sync: status
 
-Last updated: 2026-10-02 (session 14: the owner's fan-out in batches, and feed retention.
+Last updated: 2026-10-04 (session 15: `device_lists` counts invites and rejoins, `/keys/changes` walks memberships between two tokens, a remote copy goes stale with the last shared room. Session 14: the owner's fan-out in batches, and feed retention.
 Session 13: `/joined_rooms` read-your-writes. Session 12: RFC 0018, a non-owner's room copy
 catches up instead of reloading. Session 11, session 10, session 9, session 8, session 7 and
 the integration note follow; sessions 1-6 are preserved unchanged further down.)
+
+## Session 15 (2026-10-04, branch `agent/device-list-invites`): who is in `device_lists`, and `/keys/changes` between two sync tokens
+
+From `docs/status/08-e2ee.md`'s "Expected to still fail" list, `docs/next-steps.md` item 3, and
+the coordinator's measurement of `a9f62fc7` (two Sytest regressions in
+`41end-to-end-keys/06-device-lists.pl`; Complement's `TestDeviceListUpdates/when_remote_user_rejoins_a_room`).
+
+**The regressions' cause: the member index on the invitee's server.** `users_sharing_room_with`
+reads `hs_user.room_members` (since `40cd3563`). On the server of a user invited to another
+server's room, that index is made from the invite's stub, which has no members. The room's state
+then arrives whole with the join, and the join's update names only the joiner, so the index said
+the joiner was alone. The device-list announcer (`hs-cli`'s `edus::announce`) found no
+destination and said nothing, so the joiner's key changes reached no server. Now a join makes
+the index match the room: `UserStore::reconcile_room_members` adds what is missing and removes
+what is not joined, in one transaction (`SessionHub::index_members_for_directory`, info line
+"a room's member index was behind the room on a join; made it match"). A message costs nothing
+extra; a join costs one pass over the member list already read for the update.
+
+**`device_lists.changed`** (`crate::sync`):
+- counts an `invite` or `knock` in a room the syncer is joined to, as Synapse's
+  `calculate_user_changes` does: a client has the invitee's keys before the first message;
+- counts the syncer's own return to a room within one batch (left and came back, or invited
+  back): everyone in it is `changed`. `resume_mode` resumes such a room incrementally, so the
+  fresh-room rule missed it;
+- a join followed by a leave in one batch is `left`, a leave followed by a join is `changed`;
+- the syncer's own id is never in `left`, and is in `changed` only from the device-list stream
+  (or a change only they hear of, below), never because a room they joined counts them.
+
+**`GET /keys/changes` between two sync tokens** (`crate::sync::device_lists::changes_between`,
+installed through the extended `hs_e2e::state::SyncTokenResolver::device_list_changes_between`).
+It is the membership walk `/sync` makes, between any two tokens: the rooms with a feed entry
+between them (and the hot rooms); in a room joined since `from`, every member; in a room already
+joined, each `m.room.member` event after `from`'s position (bounded by `MEMBER_WALK_LIMIT`, past
+which every member counts); in a room left since `from`, everyone still in it as possibly left.
+Then the possibly changed who share a room now (or were invited to one of the user's rooms) are
+`changed`, the rest `left`. The stream's users are scoped as `/sync` scopes them. A debug line
+per answer gives rooms walked and the counts.
+
+**A remote copy goes stale when no room is shared** (`SessionHub::install_remote_device_lists`,
+installed by `hs serve`): after a room update's membership records are written, every remote user
+whose last shared room a leave or ban took (the leaver, or every remote member when a local user
+left), and whose device list this server holds, is marked stale. The next `/keys/query` fetches
+the list again. Info line: "a remote user shares no room here any more; the copy of their device
+list is stale until they do". Before this, a copy was dropped only at a query made while no room
+was shared, and a user who left, changed keys and rejoined with no query in between was served
+the old keys.
+
+Verified:
+- unit: `sync::device_lists::tests` (6: invitee before the join, a new member, a leave from
+  either side, the user's own leave and return, a rejoin between tokens, a change of the user's
+  own), `hub::tests::{a_join_makes_a_member_index_that_was_behind_the_room_match_it,
+  a_remote_users_device_list_goes_stale_when_no_room_is_shared_any_more}`; `cargo test -p
+  hs-user` 201 + integration all pass;
+- real binary, two servers: `crates/hs-cli/tests/federation_edus.rs::an_invited_remote_user_is_followed_from_the_invite_to_after_a_rejoin`
+  (invite, then `changed`; join through the invite, then key upload reaches A; leave, then `left` in
+  `/sync` and `/keys/changes`; keys changed while out, rejoin, then A's `/keys/query` answers the
+  new key); `e2e`, `federation_membership`, `federation_keys`, `appservice_ephemeral`,
+  `invites_and_notices`, `federation_two_servers` still pass;
+- Sytest, release bookworm `hs` of this branch, the four files run alone
+  (`06-device-lists.pl`, `08-cross-signing.pl`, `01-upload-key.pl`, `50federation/40devicelists.pl`):
+  **33 of 36**, against 20 of 36 on `a9f62fc7` (`06-device-lists.pl` 6/15 to **14/15**, both
+  regressions pass; cross-signing 4/7 to **7/7**; `40devicelists.pl` 4/7 to **5/7**, "Server
+  correctly resyncs when server leaves and rejoins a room" passes; `01-upload-key.pl` 6/6).
+  Note: run `tests/sytest/run.sh` from the main checkout. A worktree made from `origin/main`
+  lacks the uncommitted `Myelin.pm` edit there (`network.outbound.ipv4_only: false`), and every
+  federation test fails with connection refused.
+
+Left:
+- "If remote user leaves room we no longer receive device updates" (`06-device-lists.pl`)
+  failed before too, and I believe it is a race in the test. After the leave, its sync resumes
+  from a token taken before it (`await_sync_timeline_contains` does not move `next_batch`), so
+  it returns at once with the leave. The check passes only if remote2's second key upload has
+  already crossed over, about 2 ms after it was made.
+- `40devicelists.pl` "Device list doesn't change if remote server is down" and "If a device
+  list update goes missing, the server resyncs on the next one": not looked at (track 08's list).
+- Complement `TestMessagesOverFederation/Visible_shared_history_after_re-joining_room_(backfill)`
+  (bob's remote leave not in alice's `/sync` within 5 s; passed in runs 13 and 14): not
+  reproduced, and no logs from the failing run survive. It is not the member index: the sender
+  picks destinations from the room actor (`hs-cli`'s `federation_sender::remote_servers_for`).
+  The leave over federation reaching `/sync` is pinned by the new real-binary test above.
+- `cluster::two_replica_tests::a_second_wake_for_a_mirrored_room_reads_only_the_new_positions`
+  failed once under load (a release build running), and passed 5 of 5 alone. Its hub does not
+  own the room, so none of this change runs in it.
+
+Interfaces provided: `hs_e2e::state::SyncTokenResolver::device_list_changes_between` (default
+`None`) and `hs_e2e::state::DeviceListChanges`, implemented here; `SessionHub::install_remote_device_lists`;
+`SessionHub::install_device_list_token_resolver` now takes `self: &Arc<Self>`;
+`UserStore::reconcile_room_members`. No new configuration, no shared dependency.
 
 ## Session 14 (2026-10-02, branch `agent/sync-feed`): a room update's fan-out in batches, and retention for the feeds and the hot-room stream
 
