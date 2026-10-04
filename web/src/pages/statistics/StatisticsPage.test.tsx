@@ -161,8 +161,8 @@ describe("Statistics", () => {
     const section = within(
       (await screen.findByRole("heading", { name: "Cluster" })).closest("section")!,
     );
-    expect(section.getByText("Replicas")).toBeInTheDocument();
-    expect(await section.findByText("3")).toBeInTheDocument();
+    expect(await section.findByText("Replicas")).toBeInTheDocument();
+    expect(section.getByText("3")).toBeInTheDocument();
     expect(section.getByText("Heartbeat sequence")).toBeInTheDocument();
     expect(section.getByText("Drains released at once")).toBeInTheDocument();
     expect(section.getByText("0")).toBeInTheDocument();

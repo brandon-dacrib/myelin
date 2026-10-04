@@ -73,8 +73,7 @@ test.describe("Cluster", () => {
       .getByRole("row")
       .filter({ hasText: "hs-0" });
     await expect(hs0).toContainText(/seq [\d,]+/);
-    await expect(page.getByText("Heartbeat", { exact: true })).toBeVisible();
-    await expect(page.getByText("Drains released at once", { exact: true })).toBeVisible();
+    // The drains tile, by its note (the column key repeats its label).
     await expect(page.getByText("Since this replica started")).toBeVisible();
     // The next poll (15 s) reads a higher number: the mock heartbeats every two seconds.
     await expect(hs0).toContainText(/\+\d+ since the last poll/, { timeout: 30_000 });

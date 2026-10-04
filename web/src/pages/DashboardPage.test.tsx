@@ -133,29 +133,28 @@ describe("Overview", () => {
       ),
       http.get("/api/v1/federation/destinations", ({ request }) => {
         const q = new URL(request.url).searchParams;
-        // The failing list, longest failing first, holds one of the seven; the rest are only
-        // counted. The other query only asks how many destinations there are at all.
+        // The failing list, longest failing first: a page of four, all down for hours, with
+        // more pages behind it.
         if (q.get("failing") === "true") {
           expect(q.get("sort")).toBe("failing_since");
           return HttpResponse.json({
-            items: [
-              {
-                server_name: "down.example",
-                failing_since: new Date(Date.now() - 2 * 3_600_000).toISOString(),
-                last_successful_at: null,
-                retry_last_at: null,
-                retry_interval_ms: 60_000,
-                pending_pdu_count: 1,
-                pending_edu_count: 0,
-              },
-            ],
+            items: ["a", "b", "c", "d"].map((n) => ({
+              server_name: `${n}.down.example`,
+              failing_since: new Date(Date.now() - 2 * 3_600_000).toISOString(),
+              last_successful_at: null,
+              retry_last_at: null,
+              retry_interval_ms: 60_000,
+              pending_pdu_count: 1,
+              pending_edu_count: 0,
+            })),
             next_cursor: "more",
             prev_cursor: null,
             total: 7,
           });
         }
+        expect(q.get("failing")).toBe("false");
         expect(q.get("limit")).toBe("1");
-        return HttpResponse.json({ items: [], next_cursor: null, prev_cursor: null, total: 65 });
+        return HttpResponse.json({ items: [], next_cursor: null, prev_cursor: null, total: 58 });
       }),
     );
     renderDashboard();
@@ -163,14 +162,24 @@ describe("Overview", () => {
     const failing = await tile("Failing");
     expect(failing.getByText("7")).toBeInTheDocument();
     expect((await tile("Not failing")).getByText("58")).toBeInTheDocument();
-    expect(screen.getByText(/65 servers this one has sent to/)).toBeInTheDocument();
+    expect(screen.getByText(/counted by the server/)).toBeInTheDocument();
+    // Four hour-old failures are one row, not four, and the full page says "at least".
     expect(
-      screen.getByText("Federation with down.example has been failing for over an hour."),
+      screen.getByText("At least 4 servers have been failing for over an hour."),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Federation with a\.down\.example/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "See the failing servers" })).toBeInTheDocument();
+  });
+
+  it("names each server failing for over an hour when there are few", async () => {
+    renderDashboard();
+    expect(
+      await screen.findByText("Federation with kde.org has been failing for over an hour."),
     ).toBeInTheDocument();
     expect(
-      screen.getByText("6 more servers are failing; only the 1 longest-failing are checked here."),
+      screen.getByText("Federation with mozilla.org has been failing for over an hour."),
     ).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "See every failing server" })).toBeInTheDocument();
+    expect(screen.queryByText(/servers have been failing/)).not.toBeInTheDocument();
   });
 
   it("uses the failing list's own total when the Overview's counts cannot be read", async () => {
@@ -178,7 +187,7 @@ describe("Overview", () => {
       http.get("/api/v1/statistics/overview", notImplemented),
       http.get("/api/v1/federation/destinations", ({ request }) => {
         const q = new URL(request.url).searchParams;
-        const total = q.get("failing") === "true" ? 2 : 65;
+        const total = q.get("failing") === "true" ? 2 : 63;
         return HttpResponse.json({ items: [], next_cursor: null, prev_cursor: null, total });
       }),
     );

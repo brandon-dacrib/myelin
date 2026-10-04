@@ -27,6 +27,9 @@ import { bridgeHealthMeta, healthKeyOf } from "@/lib/bridge-state";
 import { healthSummary } from "@/lib/server-health";
 import { ServerHealthCard } from "./dashboard/ServerHealthCard";
 
+/** Failing servers listed one row each under Attention; more than this are one row. */
+const HOUR_OLD_ROWS = 3;
+
 interface AttentionRow {
   id: string;
   severity: "danger" | "warning";
@@ -50,15 +53,15 @@ export function DashboardPage() {
   const cluster = useClusterStatus();
   const appservices = useAppservices({ limit: 50 });
   // The failing destinations, longest failing first, for the attention rows, with how many
-  // there are in all; and how many destinations there are at all. The counts shown are the
-  // server's totals (`include_total`), never the length of a page.
+  // there are in all; and how many are not failing. The counts shown are the server's totals
+  // (`include_total`), never the length of a page.
   const failing = useFederationDestinations({
     failing: true,
     sort: "failing_since",
     limit: 50,
     include_total: true,
   });
-  const destinations = useFederationDestinations({ limit: 1, include_total: true });
+  const notFailing = useFederationDestinations({ failing: false, limit: 1, include_total: true });
   const auditLog = useRecentAuditEntries(5);
   const failedTasks = useTasks({ status: "failed", limit: 20 });
   const health = useServerHealth();
@@ -97,7 +100,7 @@ export function DashboardPage() {
     () => (failing.data?.items ?? []).filter((d) => d.failing_since),
     [failing.data],
   );
-  const failingTotal = failing.data?.total;
+  const failingMore = Boolean(failing.data?.next_cursor);
 
   const attention: AttentionRow[] = useMemo(() => {
     const rows: AttentionRow[] = [];
@@ -119,31 +122,33 @@ export function DashboardPage() {
         actionHref: `/bridges/${b.id}`,
       });
     }
-    for (const d of failingDestinations) {
-      if (!d.failing_since) continue;
-      // Date.now() is intentionally impure here, same as RelativeTime: "has
-      // this been failing over an hour" must read the current time. This
-      // memo re-runs on every federation poll (30s), a fine enough clock.
-      // eslint-disable-next-line react-hooks/purity -- see comment above
-      const nowMs = Date.now();
-      const hourOld = nowMs - new Date(d.failing_since).getTime() > 3_600_000;
-      if (!hourOld) continue;
+    // Date.now() is intentionally impure here, same as RelativeTime: "has this been failing
+    // over an hour" must read the current time. This memo re-runs on every federation poll
+    // (30s), a fine enough clock.
+    // eslint-disable-next-line react-hooks/purity -- see comment above
+    const nowMs = Date.now();
+    // The page is longest failing first, so the hour-old ones are its start.
+    const hourOld = failingDestinations.filter(
+      (d) => d.failing_since && nowMs - new Date(d.failing_since).getTime() > 3_600_000,
+    );
+    if (hourOld.length <= HOUR_OLD_ROWS) {
+      for (const d of hourOld) {
+        rows.push({
+          id: `destination-${d.server_name}`,
+          severity: "warning",
+          summary: `Federation with ${d.server_name} has been failing for over an hour.`,
+          actionLabel: `Open ${d.server_name}`,
+          actionHref: `/federation/${encodeURIComponent(d.server_name ?? "")}`,
+        });
+      }
+    } else {
+      // Every one on the page, and more pages behind it: there may be more than it holds.
+      const atLeast = hourOld.length === failingDestinations.length && failingMore;
       rows.push({
-        id: `destination-${d.server_name}`,
+        id: "destinations-hour-old",
         severity: "warning",
-        summary: `Federation with ${d.server_name} has been failing for over an hour.`,
-        actionLabel: `Open ${d.server_name}`,
-        actionHref: `/federation/${encodeURIComponent(d.server_name ?? "")}`,
-      });
-    }
-    if (failingTotal != null && failingTotal > failingDestinations.length) {
-      // The page above holds the longest-failing ones; the rest are only counted.
-      const more = failingTotal - failingDestinations.length;
-      rows.push({
-        id: "destinations-more",
-        severity: "warning",
-        summary: `${more} more ${more === 1 ? "server is" : "servers are"} failing; only the ${failingDestinations.length} longest-failing are checked here.`,
-        actionLabel: "See every failing server",
+        summary: `${atLeast ? "At least " : ""}${hourOld.length} servers have been failing for over an hour.`,
+        actionLabel: "See the failing servers",
         actionHref: "/federation",
         actionSearch: { show: "failing" },
       });
@@ -176,7 +181,7 @@ export function DashboardPage() {
     health.data,
     unhealthyBridges,
     failingDestinations,
-    failingTotal,
+    failingMore,
     stats.data,
     failedTasks.data,
   ]);
@@ -406,15 +411,15 @@ export function DashboardPage() {
           <FederationStrip
             loading={isLoading}
             failingCount={stats.data?.federation_destinations_failing_count ?? failing.data?.total}
-            total={destinations.data?.total}
+            notFailingCount={notFailing.data?.total}
             errors={{
-              count: stats.isError && failing.isError ? (stats.error ?? failing.error) : null,
-              total: destinations.isError ? destinations.error : null,
+              failing: stats.isError && failing.isError ? (stats.error ?? failing.error) : null,
+              notFailing: notFailing.isError ? notFailing.error : null,
             }}
             onRetry={() => {
               stats.refetch();
               failing.refetch();
-              destinations.refetch();
+              notFailing.refetch();
             }}
           />
         </div>
@@ -474,38 +479,38 @@ export function DashboardPage() {
 /**
  * How federation is going, in two numbers that are the server's own totals: how many
  * destinations are failing (`federation_destinations_failing_count`, with the failing list's
- * `total` as a stand-in when the Overview's counts cannot be read) and how many are not (every
- * destination less the failing). Each opens the Federation page filtered to those servers.
+ * `total` as a stand-in when the Overview's counts cannot be read) and how many are not (the
+ * `failing=false` list's `total`). Each opens the Federation page filtered to those servers.
+ * Not one subtracted from the other: the Overview's counts are a snapshot the server recounts
+ * about once a minute, and a difference of a snapshot and a live count can be neither.
  */
 function FederationStrip({
   loading,
   failingCount,
-  total,
+  notFailingCount,
   errors,
   onRetry,
 }: {
   loading: boolean;
   failingCount: number | undefined;
-  total: number | undefined;
-  errors: { count: unknown; total: unknown };
+  notFailingCount: number | undefined;
+  errors: { failing: unknown; notFailing: unknown };
   onRetry: () => void;
 }) {
   const navigate = useNavigate();
-  const notFailing =
-    total != null && failingCount != null ? Math.max(total - failingCount, 0) : undefined;
   const tiles = [
     {
       label: "Failing",
       status: "danger" as const,
       count: failingCount,
-      error: errors.count,
+      error: errors.failing,
       show: "failing" as const,
     },
     {
       label: "Not failing",
       status: "success" as const,
-      count: notFailing,
-      error: errors.total ?? errors.count,
+      count: notFailingCount,
+      error: errors.notFailing,
       show: "not-failing" as const,
     },
   ];
@@ -514,10 +519,10 @@ function FederationStrip({
       <h2 id="federation-strip-heading" className="text-md font-medium text-text">
         Federation
       </h2>
-      {!loading && errors.count && errors.total ? (
+      {!loading && errors.failing && errors.notFailing ? (
         <div className="mt-3">
           <QueryProblemState
-            error={errors.count}
+            error={errors.failing}
             resource="federation destinations"
             scope="admin:read"
             compact
@@ -553,9 +558,8 @@ function FederationStrip({
           </div>
           {!loading && (
             <p className="mt-2 text-xs text-text-muted">
-              {total != null
-                ? `${formatCount(total)} ${total === 1 ? "server" : "servers"} this one has sent to, counted by the server, not by the page.`
-                : "How many servers there are in all could not be read."}
+              Every server this one has tried to reach, counted by the server. Failing means its
+              requests are failing now; the failing count is refreshed about once a minute.
             </p>
           )}
         </>

@@ -74,6 +74,7 @@ describe("Federation at scale", () => {
     await waitFor(() => expect(router.state.location.search).toEqual({ show: "failing" }));
     await waitFor(async () => expect(await serverNames()).toEqual(["kde.org", "mozilla.org"]));
     expect(screen.getByText("2 servers failing")).toBeInTheDocument();
+    expect(screen.getByText("Longest failing first.")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Failing" })).toHaveAttribute("aria-pressed", "true");
 
     await userEvent.click(screen.getByRole("button", { name: "Not failing" }));

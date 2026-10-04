@@ -263,7 +263,8 @@ function Summary({
       />
       <SummaryTile
         label="Heartbeat"
-        value={singleNode ? "—" : (heartbeatSeq?.toLocaleString() ?? "—")}
+        // This replica's row is polled more often than `GET /cluster`; read the same number.
+        value={singleNode ? "—" : ((me?.heartbeat_seq ?? heartbeatSeq)?.toLocaleString() ?? "—")}
         note={heartbeatNote}
         warn={trend?.advancing === false}
       />

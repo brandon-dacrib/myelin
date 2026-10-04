@@ -76,6 +76,15 @@ afterEach(() => {
   signOut();
 });
 
+/** The value of the summary tile labelled `label` (the column key repeats some labels). */
+function summaryValue(label: string): string | null {
+  const tile = screen
+    .getAllByText(label, { selector: "dt" })
+    .map((dt) => dt.parentElement!)
+    .find((parent) => parent.querySelector("dd.text-2xl"));
+  return tile?.querySelector("dd.text-2xl")?.textContent ?? null;
+}
+
 /** The replicas with a heartbeat sequence that `seq` gives at each read. */
 function replicasWithSeq(seq: (read: number) => number) {
   let reads = 0;
@@ -125,10 +134,9 @@ describe("Cluster heartbeats", () => {
     const hs0 = await replicaRow("hs-0");
     expect(hs0.getByText(/seq [\d,]+/)).toBeInTheDocument();
     expect(hs0.queryByText(/since the last poll/)).not.toBeInTheDocument();
-    expect(screen.getByText("Heartbeat", { selector: "dt" })).toBeInTheDocument();
-    expect(screen.getByText("Drains released at once", { selector: "dt" })).toBeInTheDocument();
+    await waitFor(() => expect(summaryValue("Heartbeat")).toMatch(/^[\d,]+$/));
+    expect(summaryValue("Drains released at once")).toBe("0");
     expect(screen.getByText("Since this replica started")).toBeInTheDocument();
-    expect(screen.getByText("0", { selector: "dd" })).toBeInTheDocument();
   });
 
   it("says the sequence is advancing once a second poll shows a higher number", async () => {
@@ -153,7 +161,8 @@ describe("Cluster heartbeats", () => {
     await client.refetchQueries({ queryKey: ["cluster-replicas"] });
     expect(await hs0.findByText(/No new heartbeat since/)).toBeInTheDocument();
     expect(screen.getByText(/This replica: no new heartbeat since/)).toBeInTheDocument();
-    expect(screen.getByText("2", { selector: "dd" })).toBeInTheDocument();
+    expect(summaryValue("Heartbeat")).toBe("42");
+    expect(summaryValue("Drains released at once")).toBe("2");
   });
 
   it("has no heartbeats or drains to count on a single node, and says why", async () => {

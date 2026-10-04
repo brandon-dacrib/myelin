@@ -69,8 +69,6 @@ export function StatisticsPage() {
 
       <NowTiles />
 
-      <ClusterNow />
-
       <section aria-labelledby="activity-heading" className="space-y-3">
         <h2 id="activity-heading" className="text-md font-medium text-text">
           Activity
@@ -125,6 +123,8 @@ export function StatisticsPage() {
         <LargestRooms search={search} update={update} />
         <MediaByUser search={search} update={update} />
       </div>
+
+      <ClusterNow />
     </div>
   );
 }

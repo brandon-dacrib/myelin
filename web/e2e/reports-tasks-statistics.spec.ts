@@ -128,6 +128,7 @@ test.describe("Statistics", () => {
     const chart = page.getByRole("img", { name: /New accounts, last 30 days: \d+ points/ });
     await expect(chart).toBeVisible();
 
+    await chart.scrollIntoViewIfNeeded();
     const box = (await chart.boundingBox())!;
     await page.mouse.move(box.x + box.width * 0.5, box.y + box.height * 0.5);
     await expect(page.getByRole("tooltip")).toBeVisible();

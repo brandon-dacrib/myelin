@@ -189,8 +189,11 @@ export function FederationPage() {
               ))}
             </div>
             <p className="text-sm text-text-muted" aria-live="polite">
-              {!sort && "Failing servers first, then the rest by name."}
-              {sort && "Sorted by the column you chose; click it again to turn the order round."}
+              {search.sort
+                ? "Sorted by the column you chose; click it again to turn the order round."
+                : sort
+                  ? "Longest failing first."
+                  : "Failing servers first, then the rest by name."}
             </p>
           </div>
           <DataTable

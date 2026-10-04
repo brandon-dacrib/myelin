@@ -141,6 +141,30 @@ export const WithPagination: StoryObj = {
   ),
 };
 
+/**
+ * A list the server sorts and pages (the Federation page): the sorted column is marked, and the
+ * footer counts the whole list rather than the page.
+ */
+export const SortedAndPagedWithTotal: StoryObj = {
+  render: () => (
+    <DataTable
+      columns={columns}
+      rows={rows}
+      getRowId={(r) => r.id}
+      caption="Bridges"
+      sort={{ key: "name", direction: "desc" }}
+      onSortChange={() => {}}
+      pagination={{
+        hasPrevious: true,
+        hasNext: true,
+        onPrevious: () => {},
+        onNext: () => {},
+        pageLabel: "1,204 bridges",
+      }}
+    />
+  ),
+};
+
 export const Compact: StoryObj = {
   render: () => (
     <DataTable

@@ -1,6 +1,92 @@
 # 16. Management web interface: status
 
-Last updated: 2026-10-02 (next steps after a bridge is set up for someone; branch `agent/bridge-next-steps`).
+Last updated: 2026-10-04 (Federation and Overview at scale, cluster series; branch `agent/web-scale-items`).
+
+## 2026-10-04: Federation and Overview at scale, and the cluster series (branch `agent/web-scale-items`)
+
+Items 6 and 8 of the audit list below. The admin API already had what both needed
+(OpenAPI 0.1.4: `federation.destinations.list` takes `sort`, `failing`, `cursor` and
+`include_total`; `Replica.heartbeat_seq`, `ClusterStatus.heartbeat_seq` and
+`.drain_released_at_once_count`), so **no `hs-admin` change and no OpenAPI bump**.
+
+**Done.**
+
+- **Federation pages through the server** (`web/src/pages/FederationPage.tsx`, URL state in
+  `pages/federation/federation-search.ts`): a Show filter (Every server, Failing, Not failing:
+  `failing=true|false`), sortable columns sent as the API's `sort` (Server, Status as
+  `failing_since`, Last success, Waiting to send as `pending_pdu_count`; a second click reverses),
+  Previous/Next on the server's cursor, and the footer counts the whole list from `total`
+  ("65 servers", "2 servers failing"), never the page. Filter, sort and cursor live in the URL;
+  an unknown `sort` is dropped by the route's validator rather than sent. Failing alone is
+  ordered longest failing first. A line above the table says what the order is, the status key
+  explains order and pages, and an empty filter says so in its own words ("No failing servers",
+  "Every known server is failing"). The page no longer re-sorts the server's page client-side.
+- **The Overview's federation strip** (`DashboardPage.tsx`, `FederationStrip`): Failing is
+  `federation_destinations_failing_count` (the failing list's `total` when the Overview's counts
+  cannot be read); Not failing is the `failing=false` list's `total`. Not one subtracted from the
+  other: the Overview's counts are recounted at most once a minute, so a difference of a snapshot
+  and a live count could be neither (the page says the failing count refreshes about once a
+  minute). Each tile opens Federation filtered. The attention rows read the failing list longest
+  failing first (`failing=true&sort=failing_since`): up to three servers failing for over an
+  hour get a row each; more are one row ("12 servers have been failing for over an hour", "At
+  least 50 ..." when the whole page is and more pages follow), opening Federation filtered.
+- **Cluster series** (`pages/cluster/ClusterPage.tsx`, `api/cluster.ts`): each replica's
+  Last heartbeat cell shows `seq N`, "+N since the last poll" or "No new heartbeat since ..."
+  (warning colour), and a sparkline of heartbeats per poll. The server keeps no history of the
+  sequence, so the page remembers its own readings per replica (`recordHeartbeats`,
+  `heartbeatTrend`, 40 readings, about ten minutes at the 15 s poll). Two summary tiles:
+  Heartbeat (this replica's sequence, read from its polled row so it matches the table, with
+  "still arriving" or since when it stopped) and Drains released at once
+  (`drain_released_at_once_count`, "Since this replica started"), both explained in the
+  column key; a single node says it sends no heartbeats and has nothing to drain.
+- **Statistics** (`pages/statistics/StatisticsPage.tsx`, `ClusterNow`, at the bottom): Replicas,
+  Heartbeat sequence and Drains released at once from `GET /cluster`, each with a sentence, and a
+  note that the server keeps no history of them so there is no chart (the Cluster page follows
+  heartbeats while open); a single node says these appear when it runs as a cluster.
+- **Mocks** (`web/src/mocks/`): 60 more destinations (65 in all, two failing, four backing off)
+  so the list pages; the handler filters by `failing`, sorts as `sort_destinations` in
+  `crates/hs-admin/src/router.rs` (refusing an unknown field with `param:sort`) and answers
+  `total`; the Overview's failing count is computed from the fixture. Mock replicas heartbeat
+  every two seconds (`heartbeat_seq`), and `GET /cluster` carries both fields.
+- **Stories**: `components/Sparkline.stories.tsx` (activity trend, heartbeats arriving,
+  heartbeats stopped) and `DataTable` "Sorted and paged with total".
+- `lib/sort-param.ts` is the `sort` parameter to table state and back, now shared with Statistics.
+
+**Verified.**
+
+- `npm run check`: lint, types, **595 unit tests**, build. New: `FederationPage.test.tsx` (7),
+  `mocks/data/federation.test.ts` (5, the mock orders like the server), `api/cluster.test.ts` (5,
+  heartbeat trend), Cluster heartbeats (4), Statistics cluster (2), Overview (3).
+- `npm run test:e2e`: **67 of 67** (new `e2e/federation-scale.spec.ts`, 2; a heartbeat test in
+  `e2e/cluster.spec.ts`). The Statistics tooltip test now scrolls the chart into view before
+  hovering (it relied on where the chart sat).
+- **Against `hs serve`** built from this branch (`web/e2e-real/scale.spec.ts`, 3 tests), on a
+  single node (`test.local`, embedded) and on **two replicas on one PostgreSQL 17**
+  (`cluster.single_node: false`, the config shape of `crates/hs-cli/tests/cluster_admin.rs`): 3
+  of 3 on each. The spec makes 55 real failing destinations (it sets
+  `federation.ip_range_allowlist` to loopback through the admin API, which applies to the running
+  server, invites a user on each of 55 closed local ports, and puts the setting back), checks the
+  page's counts, pages, filter and sorts against the same server's API, waits for the Overview's
+  `federation_destinations_failing_count` to recount and checks the strip, and on the cluster
+  sees the heartbeat sequence advance between polls on the page. With it on the single node:
+  `e2e-real/cluster.spec.ts`, `explained-pages.spec.ts`, `reports-tasks-statistics.spec.ts`,
+  10 of 10. Screenshots: `docs/design/screenshots/scale-{federation,federation-failing,overview,cluster,statistics-cluster}-real.png`.
+
+**Left.**
+
+- A real healthy destination (needs a reachable remote server with TLS); the real runs have only
+  failing ones, so "Not failing" was seen empty against the server and populated only on the mock.
+- A real non-zero `drain_released_at_once_count` on the page: it counts on the replica that
+  released, which is the one stopping, so the page reading it has to be served by a replica that
+  did so earlier; the cluster test in `crates/hs-cli` covers the counter.
+- **Search-index lag** (`hs_room_search_rooms_behind`, `crates/hs-room/src/metrics.rs`) is a
+  Prometheus gauge only; no admin API field carries it, so neither page shows it. It needs a
+  field (for example `ClusterStatus.search_rooms_behind`, per replica) from track 15 and 04.
+- Heartbeat history survives only while the page is open; a server-side series would need new
+  `statistics.timeseries` metrics.
+- `e2e-real/cluster.spec.ts` is for a single node only (it fails by design against a cluster).
+- Found, out of scope: the Cluster page's Epoch column shows the raw generation (a millisecond
+  timestamp, `1,791,125,919,05...`) and overflows the table at 1280 px wide on a real cluster.
 
 ## 2026-10-02: what to do after setting up someone's bridge (branch `agent/bridge-next-steps`)
 
@@ -385,14 +471,15 @@ closes that and audits every page. Branched from `agent/config-hot` (for `applie
    server's directory to support it; it says so meanwhile).
 5. ~~**Room lifecycle**: an upgraded room's successor (`tombstoned`, `replacement_room_id`), guest
    access, and the block reason (asked on Block, shown on the badge).~~ Done 2026-10-02.
-6. **Federation and Overview at scale**: both read the first 50 destinations; the Overview
+6. ~~**Federation and Overview at scale**: both read the first 50 destinations; the Overview
    counts failing ones from that page instead of `federation_destinations_failing_count`.
-   Needs paging and a failing-first filter.
+   Needs paging and a failing-first filter.~~ Done 2026-10-04.
 7. **Effective server-wide values beside per-user overrides** (a user's rate limit section) and
    bridge option defaults ("applies to bridges created after saving").
-8. **Cluster series in the admin API**: drains that released at once, heartbeat sequence, and a
+8. ~~**Cluster series in the admin API**: drains that released at once, heartbeat sequence, and a
    search index lag (`hs_room_search_rooms_behind`, once it exists) need admin API fields before
-   the Cluster or Statistics page can show them.
+   the Cluster or Statistics page can show them.~~ Done 2026-10-04 for the heartbeat sequence
+   and drains released at once; the search-index lag still has no admin API field.
 9. **Settings with no reader** (listed above) should either get one or leave the schema; the UI
    says "has no effect yet" meanwhile. **Erase on deactivate** waits for an eraser on the
    server (`erase: true` is refused).

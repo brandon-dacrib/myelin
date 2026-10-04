@@ -12,7 +12,7 @@ test.describe("Federation at scale", () => {
     const strip = page.getByRole("region", { name: "Federation" });
     await expect(strip.getByRole("button", { name: /^2 Failing$/ })).toBeVisible();
     await expect(strip.getByRole("button", { name: /^63 Not failing$/ })).toBeVisible();
-    await expect(strip).toContainText("65 servers this one has sent to");
+    await expect(strip).toContainText("counted by the server");
     await expectNoAxeViolations(page, "overview federation strip");
 
     await strip.getByRole("button", { name: /^2 Failing$/ }).click();
@@ -21,7 +21,7 @@ test.describe("Federation at scale", () => {
     await expect(table.getByRole("row")).toHaveCount(3);
     await expect(table.getByRole("row").nth(1)).toContainText("kde.org");
     await expect(page.getByText("2 servers failing")).toBeVisible();
-    await expect(page.getByRole("button", { name: "Failing" })).toHaveAttribute(
+    await expect(page.getByRole("button", { name: "Failing", exact: true })).toHaveAttribute(
       "aria-pressed",
       "true",
     );
