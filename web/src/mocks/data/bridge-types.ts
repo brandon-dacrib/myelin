@@ -55,6 +55,7 @@ const COMMAND_PREFIXES: Record<string, string> = {
   "mautrix-signal": "!signal",
   "mautrix-slack": "!slack",
   "mautrix-twitter": "!twitter",
+  "mautrix-linkedin": "!linkedin",
 };
 
 /** Each type's provisioning surface and its note, as `bridge_types.rs`'s `provisioning_of`. */

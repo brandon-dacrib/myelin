@@ -1,0 +1,28 @@
+# The demo's bridges (`admin@dacrib0`, release `myelin`, namespace `myelin`,
+# https://myelin.dacrib.net), layered over the release's own values:
+#
+#   helm --kube-context admin@dacrib0 get values myelin -n myelin -o yaml > /tmp/myelin-values.yaml
+#   helm --kube-context admin@dacrib0 upgrade myelin deploy/helm/hs -n myelin \
+#     -f /tmp/myelin-values.yaml -f deploy/demo/values-bridges.yaml \
+#     --set image.tag=sha-<commit> --wait --timeout 10m
+#
+# WhatsApp is an offering (RFC 0017): each person gets their own bridge by messaging
+# @whatsappbot:myelin.dacrib.net, and the server deploys it as a `Bridge` in this namespace.
+# This replaces the shared `mautrix-whatsapp` registration the demo got on 2026-09-25 through
+# the wizard; nothing in this file registers one, and the steps to remove that one are in
+# docs/bridges/mautrix.md ("2026-10-04: the demo's shared WhatsApp registration becomes an
+# offering"). The demo already has the offering (made through the admin interface before this
+# file existed, with brandon's instance `bridge-d2854412-...`): declaring it here keeps it as
+# it is, and makes a fresh install of the demo come up with it.
+
+bridges:
+  enabled: true
+  offerings:
+    - type: mautrix-whatsapp
+      runtime: cluster
+      access:
+        all_local_users: true
+      options:
+        encryption: true
+        double_puppeting: true
+        backfill: true

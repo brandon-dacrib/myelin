@@ -2607,8 +2607,17 @@ export interface components {
             last_key_withheld?: components["schemas"]["KeyWithheld"] | null;
             /** Format: date-time */
             last_ping_at?: string | null;
+            /** @description Set when this appservice was registered by hand (through the wizard or a registration file) for a network this server now offers as a bridge offering. Its namespace covers the ghost users of every instance the offering makes, so a message for one of them reaches both bridges. Says which offering and what to do; null for any other appservice. */
+            overlaps_offering?: components["schemas"]["OfferingOverlap"] | null;
             /** @enum {string} */
             status?: "healthy" | "degraded" | "down" | "paused" | "unknown";
+        };
+        AppServiceOverlap: {
+            /** @description Why it overlaps the offering and what to do about it, in words for an administrator. */
+            detail: string;
+            /** @description The appservice's id. */
+            id: string;
+            sender_localpart: string;
         };
         AppServicePage: components["schemas"]["PageEnvelope"] & {
             items: components["schemas"]["AppService"][];
@@ -2796,6 +2805,8 @@ export interface components {
             mode: "per_user" | "shared";
             name?: string;
             options?: components["schemas"]["BridgeOfferingOptions"];
+            /** @description Bridges of this network registered by hand whose namespace covers this offering's instances, so a message for a ghost user reaches both. Empty once every such registration is removed (RFC 0017 section 6). */
+            overlapping_appservices?: components["schemas"]["AppServiceOverlap"][];
             /** @enum {string} */
             runtime: "cluster" | "elsewhere";
             /** @description The bridge type (catalogue id). */
@@ -3199,6 +3210,16 @@ export interface components {
                 /** @description Of those, how many are here. */
                 target_count?: number;
             }[];
+        };
+        OfferingOverlap: {
+            /** @description What overlaps and what to do about it, in words for an administrator. */
+            detail: string;
+            /** @description The Matrix ID people message to get their own instance; null for a shared type. */
+            front_door?: string | null;
+            /** @description The catalogue's name for it. */
+            name: string;
+            /** @description The offering's bridge type (catalogue id). */
+            type: string;
         };
         PageEnvelope: {
             next_cursor: string | null;

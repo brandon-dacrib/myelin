@@ -319,6 +319,99 @@ two settings, and which one decides what to do:
 Running it: `cargo build -p hs-cli --bin hs`, then `cargo test -p hs-bridge-conformance --test
 real_mautrix_login -- --nocapture` with Docker reachable.
 
+## 2026-10-04: the demo's shared WhatsApp registration becomes an offering
+
+RFC 0017 section 6: the shared `mautrix-whatsapp` registration the demo got on 2026-09-25
+(one bridge, registered by hand through the wizard, for everyone) is replaced by the WhatsApp
+offering, where each person gets their own instance by messaging `@whatsappbot`. The demo has
+both today: the offering, with brandon's instance (`whatsapp-brandon`, pod `bridge-d2854412-…`
+or, once renamed, `bridge-whatsapp-brandon`), and the shared registration (appservice id
+`whatsapp` or whatever the wizard was told; bot `@whatsappbot…`, ghosts `@whatsapp_.*`). Branch
+`agent/bridge-offering-demo`.
+
+**What the server does with both.** It keeps delivering to both. The shared registration's
+exclusive `@whatsapp_.*` covers every instance's ghosts (`@whatsapp_brandon_.*`), so a message
+for one of them reaches the shared bridge too. The registry allows that: neither claims the
+other's bot, and the patterns are not identical. Since this branch the server says so instead
+of letting it pass unnoticed:
+
+- the shared bridge's page (Bridges → Registrations → it) has a warning line: "WhatsApp is
+  offered on this server now: people get their own WhatsApp bridge by messaging
+  @whatsappbot:… This bridge was registered by hand and …, so a message for a WhatsApp ghost
+  user is delivered to it and to the person's own instance. Pause it here to stop delivering
+  to it now; …". In the admin API it is `AppServiceHealth.overlaps_offering`;
+- the WhatsApp offering's page has "Also registered by hand", naming it with a link
+  (`BridgeOffering.overlapping_appservices`);
+- the server's log says it once a minute at most when one appears (`WARN a bridge registered by
+  hand overlaps the offering's instances: its page says what to do`, with `bridge_type` and
+  `appservice`) and again when it is gone (`INFO … is gone`).
+
+A registration counts as the offering's network when it was created from the same catalogue
+entry (`io.myelin.bridge_type`), uses the catalogue's bot name, or has an exclusive user
+namespace that covers the catalogue's ghosts (`crates/hs-bridges/src/overlap.rs`). It is not
+paused or removed automatically: someone may still be signed in through it, and cutting it off
+silently would lose their messages.
+
+**The offering is declared in the deployment.** `deploy/demo/values-bridges.yaml` sets the
+chart's new `bridges.offerings` (the server reads it from `MYELIN_BRIDGES_OFFERINGS`): WhatsApp
+on the cluster runtime, everyone allowed, encryption, double puppeting and backfill. The server
+creates a declared offering once, the first time it runs with it; one that exists already (the
+demo's) is kept exactly as the admin interface has it; one an administrator removes later stays
+removed. Nothing in `deploy/` registers a shared bridge.
+
+**The roll, step by step** (a desk item: the session cannot reach the cluster).
+
+1. Before anything, save the shared registration in case it has to come back: Bridges →
+   Registrations → the shared WhatsApp bridge → Registration tab → download (or
+   `curl -H "authorization: Bearer $ADMIN" https://myelin.dacrib.net/api/v1/appservices/<id>/registration`).
+   Note its `url`: that is where the shared bridge runs.
+2. Roll the image with the overlay:
+
+   ```sh
+   helm --kube-context admin@dacrib0 get values myelin -n myelin -o yaml > /tmp/myelin-values.yaml
+   helm --kube-context admin@dacrib0 upgrade myelin /Users/brandon/myelin/deploy/helm/hs -n myelin \
+     -f /tmp/myelin-values.yaml -f /Users/brandon/myelin/deploy/demo/values-bridges.yaml \
+     --set image.tag=sha-<commit> --wait --timeout 10m
+   ```
+
+   The server's log says `the deployment declares bridge offerings` and then `the deployment
+   declares a bridge offering that already exists: keeping it as the admin API has it`.
+3. Open the shared bridge's page: the warning line is there. The WhatsApp offering's page says
+   "Also registered by hand".
+4. Press **Pause** on the shared bridge's page. Delivery to it stops at once and its queue keeps
+   growing, so nothing is lost if it has to be resumed.
+5. Anyone who still used the shared bridge messages `@whatsappbot:myelin.dacrib.net`, gets their
+   own bridge, and signs in to it (`login qr`). Then they log the shared bridge out on their
+   phone: WhatsApp → Linked devices → the old device → Log out.
+6. Stop the shared bridge where it runs, from its `url` in step 1. If it is in the cluster,
+   `kubectl -n myelin get deploy,svc | grep -i whatsapp` shows it beside the instances'
+   `bridge-…` objects, which belong to the operator and stay. Scale it to zero, then delete it.
+7. Remove the registration: **Remove** on its page (or
+   `DELETE /api/v1/appservices/<id>`). The warning line and "Also registered by hand" go, and
+   the log says `the bridge registered by hand that overlapped the offering's instances is
+   gone`.
+8. Check: brandon's chat with `@whatsappbot_brandon` still answers `help`, and a WhatsApp
+   message still arrives through his instance.
+
+To undo: re-add the saved registration through Bridges → Add (or `POST /api/v1/appservices`),
+resume, and start the shared bridge again.
+
+**Also in this branch.**
+
+- An offering's options changed after instances exist reach their registrations: the manager
+  renders each registered instance on every step and, when what its registration claims
+  differs from what it last wrote (`registered_fingerprint`), patches the namespaces and the
+  feature flags on the server. Switching double puppeting off drops the owner's non-exclusive
+  claim at once; the files change with it, so a deployed instance rolls once, as a changed image
+  tag already did. An instance run elsewhere keeps running with its old files and is told
+  "its registration changed: download its files again and restart it with them". The offering
+  settings dialog says what saving a changed double puppeting will do, for how many bridges.
+- `command_prefix` for Signal, Slack, X and LinkedIn: their connectors set no
+  `DefaultCommandPrefix`, and mautrix-go's example config
+  (`bridgev2/matrix/mxmain/example-config.yaml`) falls back to `!` and the network id:
+  `!signal`, `!slack`, `!twitter` (the network id stays `twitter` for X), `!linkedin`. The
+  offering page shows the prefix.
+
 ## 2026-10-01: the server asks the bridge who has signed in
 
 The render now writes a `provisioning.shared_secret` of its own into `config.yaml` and keeps the

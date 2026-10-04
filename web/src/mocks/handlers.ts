@@ -22,6 +22,7 @@ import {
   listOfferings,
   offeringRefusal,
   offeringView,
+  overlapOfAppservice,
   putInstance,
   putOffering,
 } from "./data/bridge-offerings";
@@ -946,7 +947,7 @@ export const handlers = [
         { type: "urn:hs:problem:not-found", title: "Appservice not found", status: 404 },
         { status: 404 },
       );
-    return HttpResponse.json(health);
+    return HttpResponse.json({ ...health, overlaps_offering: overlapOfAppservice(id) });
   }),
 
   http.get(`${API}/appservices/:id/logins`, ({ params, request }) => {

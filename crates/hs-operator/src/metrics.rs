@@ -245,6 +245,9 @@ mod tests {
     #[test]
     fn the_outbound_counters_are_served_too() {
         let metrics = OperatorMetrics::default();
+        // A family with no label set yet renders nothing; reading one creates it at zero.
+        let _ = hs_http::outbound::connections("ipv4");
+        let _ = hs_http::outbound::connect_failures("ipv4");
         let text = metrics.registry().encode_to_string().unwrap();
         assert!(text.contains("hs_outbound_connections"), "{text}");
         assert!(text.contains("hs_outbound_connect_failures"), "{text}");

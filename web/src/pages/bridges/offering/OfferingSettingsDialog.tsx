@@ -44,8 +44,10 @@ function draftOf(offering: BridgeOffering): Draft {
 
 /**
  * Changes an offering: the whole `BridgeOfferingRequest` again (`PUT` replaces it), starting
- * from what the offering is now. A new image tag or options apply to bridges started from now
- * on; a changed runtime does not move the bridges people already have.
+ * from what the offering is now. A new image tag or options reach the bridges people already
+ * have: the server re-renders each one's files and registration, and restarts the ones it runs
+ * once (a changed double puppeting is the registration's claim to act as its owner); a changed
+ * runtime does not move them.
  */
 export function OfferingSettingsDialog({
   offering,
@@ -137,7 +139,7 @@ function SettingsForm({
     <DialogContent
       size="form"
       title={`${name} settings`}
-      description="New settings apply to bridges started from now on. Bridges people already have keep running as they are."
+      description="A new image or options reach the bridges people already have: the server re-renders each one and restarts the ones it runs, once. A changed runtime applies to bridges started from now on."
     >
       <form onSubmit={handleSubmit} noValidate className="flex flex-col gap-6">
         <SettingSwitch
@@ -177,6 +179,12 @@ function SettingsForm({
             Options
           </h3>
           <OptionFields values={draft} onChange={patch} type={type} />
+          <DoublePuppetingChange
+            from={offering.options?.double_puppeting ?? false}
+            to={draft.doublePuppeting}
+            existing={Object.values(offering.instances ?? {}).reduce((a, b) => a + b, 0)}
+            runtime={offering.runtime}
+          />
         </section>
         {error && (
           <p role="alert" className="text-sm text-danger">
@@ -193,5 +201,36 @@ function SettingsForm({
         </div>
       </form>
     </DialogContent>
+  );
+}
+
+/**
+ * What saving a changed double puppeting does to the bridges people already have: each one's
+ * registration on this server gains or loses its claim to act as its owner, and its config the
+ * matching secret, so a bridge the server runs is restarted once with them; one run elsewhere
+ * needs its files downloaded again. Nothing when it is unchanged or nobody has a bridge yet.
+ */
+function DoublePuppetingChange({
+  from,
+  to,
+  existing,
+  runtime,
+}: {
+  from: boolean;
+  to: boolean;
+  existing: number;
+  runtime: BridgeOfferingRuntime;
+}) {
+  if (from === to || existing === 0) return null;
+  const who = existing === 1 ? "the 1 bridge people have" : `the ${existing} bridges people have`;
+  return (
+    <p className="mt-3 text-sm text-text-muted" data-testid="double-puppeting-change">
+      {to
+        ? `Saving re-registers ${who} so each may act as its owner (their messages from other apps appear as them, not as a ghost).`
+        : `Saving re-registers ${who} without the claim to act as their owners: messages they send from other apps appear as ghost users.`}{" "}
+      {runtime === "cluster"
+        ? "Each restarts once with its new config."
+        : "They run elsewhere: download each one's files again and restart it with them; its row says so until then."}
+    </p>
   );
 }

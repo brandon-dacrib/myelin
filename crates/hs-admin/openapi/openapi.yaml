@@ -10,7 +10,7 @@ openapi: 3.1.0
 info:
   title: hs-admin API
   summary: The native administration and moderation API for the homeserver.
-  version: 0.1.7
+  version: 0.1.8
   description: 'The only API the management interface (track 16) talks to. See docs/rfcs/0004-admin-api.md for the full design rationale: resource modeling, naming, pagination, filtering, errors, idempotency, scopes, versioning and the event stream. This document is the contract; the hs-admin router''s contract tests assert the router and this document agree on paths and methods (RFC 0004 section 1, decision D15.16).'
   contact:
     name: 'Track 15: Admin API and modules'
@@ -56,6 +56,14 @@ info:
     notes: 'Additive: BridgeInstance.device_name, the name the bridge presents to its network
       as a linked device (Myelin <Network> bridge for <localpart> (<server>), or without the
       person for a shared instance); a network that has no such setting has none.'
+  - version: 0.1.8
+    date: '2026-10-04'
+    notes: 'Additive: AppServiceHealth.overlaps_offering (schema OfferingOverlap), set on a
+      bridge registered by hand for a network this server now offers, saying which offering and
+      what to do; BridgeOffering.overlapping_appservices (schema AppServiceOverlap), the same
+      registrations seen from the offering. BridgeType.command_prefix is now set for Signal,
+      Slack, X and LinkedIn (!signal, !slack, !twitter, !linkedin: mautrix-go''s fallback of
+      ! and the network id).'
 servers:
 - url: /api/v1
   description: Same origin as /_matrix on the client listener.
@@ -8051,6 +8059,47 @@ components:
           - $ref: '#/components/schemas/KeyWithheld'
           - type: 'null'
           description: The last `m.room_key.withheld` delivered to one of the appservice's users. A client refused to share a room's keys with the bridge, so the bridge could not read a message and told the person so; `m.unverified` means the person's client excludes devices their owner has not cross-signed, which the manager settles for its own instances' bots. Null until one has been delivered.
+        overlaps_offering:
+          oneOf:
+          - $ref: '#/components/schemas/OfferingOverlap'
+          - type: 'null'
+          description: Set when this appservice was registered by hand (through the wizard or a registration file) for a network this server now offers as a bridge offering. Its namespace covers the ghost users of every instance the offering makes, so a message for one of them reaches both bridges. Says which offering and what to do; null for any other appservice.
+    OfferingOverlap:
+      type: object
+      required:
+      - type
+      - name
+      - detail
+      properties:
+        type:
+          type: string
+          description: The offering's bridge type (catalogue id).
+        name:
+          type: string
+          description: The catalogue's name for it.
+        front_door:
+          type:
+          - string
+          - 'null'
+          description: The Matrix ID people message to get their own instance; null for a shared type.
+        detail:
+          type: string
+          description: What overlaps and what to do about it, in words for an administrator.
+    AppServiceOverlap:
+      type: object
+      required:
+      - id
+      - sender_localpart
+      - detail
+      properties:
+        id:
+          type: string
+          description: The appservice's id.
+        sender_localpart:
+          type: string
+        detail:
+          type: string
+          description: Why it overlaps the offering and what to do about it, in words for an administrator.
     KeyWithheld:
       type: object
       required:
@@ -8439,6 +8488,11 @@ components:
         created_at:
           type: string
           format: date-time
+        overlapping_appservices:
+          type: array
+          description: Bridges of this network registered by hand whose namespace covers this offering's instances, so a message for a ghost user reaches both. Empty once every such registration is removed (RFC 0017 section 6).
+          items:
+            $ref: '#/components/schemas/AppServiceOverlap'
     BridgeInstance:
       type: object
       required:

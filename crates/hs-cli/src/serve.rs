@@ -1994,12 +1994,11 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     bridge_manager.set_declared(declared_offerings);
     // The admin API's view of appservices, with the manager's knowledge of its offerings: a
     // bridge registered by hand for a network now offered says so in its health.
-    let appservice_directory: Arc<dyn hs_admin::sources::AppserviceDirectory> = Arc::new(
-        hs_bridges::directory::OfferingAwareDirectory::new(
+    let appservice_directory: Arc<dyn hs_admin::sources::AppserviceDirectory> =
+        Arc::new(hs_bridges::directory::OfferingAwareDirectory::new(
             appservice_delivery.admin_directory(),
             bridge_manager.clone(),
-        ),
-    );
+        ));
 
     // Server notices, sent as `@_server:<server name>` into each recipient's own room. Opened
     // here, after the appservice registry has replaced `auth_state`'s and before the room

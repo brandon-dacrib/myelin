@@ -1183,3 +1183,137 @@ async fn a_shared_offering_has_its_one_instance_from_the_start_and_heisenbridge_
 
     handle.shutdown().await;
 }
+
+/// The demo's migration (RFC 0017 section 6) against the real binary: a shared WhatsApp
+/// bridge registered by hand, as the wizard made one on 2026-09-25, and then the WhatsApp
+/// offering that replaces it. The server does not run both silently: the hand-registered
+/// bridge's health and the offering each say which and what to do, until it is removed. And an
+/// offering's double puppeting changed after an instance exists re-renders the instance's
+/// claim on the server and in its files, once, with the reason saying to fetch them again.
+#[tokio::test]
+async fn a_shared_registration_beside_its_offering_is_named_and_a_changed_double_puppeting_reaches_the_instance()
+ {
+    let dir = tempfile::tempdir().unwrap();
+    let (handle, admin, _users) = boot(dir.path(), &["alice"]).await;
+    let alice_id = "@alice:example.org";
+
+    // The shared registration, as the wizard's render of the catalogue's WhatsApp entry has it.
+    admin
+        .admin(
+            POST,
+            "/appservices",
+            Some(json!({"registration": {
+                "id": "whatsapp",
+                "url": "http://127.0.0.1:9",
+                "as_token": format!("as-{}", rand_suffix()),
+                "hs_token": format!("hs-{}", rand_suffix()),
+                "sender_localpart": "whatsappbot_shared",
+                "rate_limited": false,
+                "namespaces": {
+                    "users": [
+                        {"regex": "@whatsapp_.*:example\\.org", "exclusive": true},
+                        {"regex": "@whatsappbot_shared:example\\.org", "exclusive": true},
+                        {"regex": "@.*:example\\.org", "exclusive": false}
+                    ],
+                    "aliases": [{"regex": "#whatsapp_.*:example\\.org", "exclusive": true}],
+                    "rooms": []
+                },
+                "io.myelin.bridge_type": "mautrix-whatsapp"
+            }})),
+        )
+        .await;
+    let health = admin.admin(GET, "/appservices/whatsapp/health", None).await;
+    assert!(health["overlaps_offering"].is_null(), "{health}");
+
+    // The offering beside it, with alice's instance.
+    let offering = admin
+        .admin(
+            PUT,
+            "/bridge-offerings/mautrix-whatsapp",
+            Some(json!({"runtime": "elsewhere"})),
+        )
+        .await;
+    let overlaps = offering["overlapping_appservices"].as_array().unwrap();
+    assert_eq!(overlaps.len(), 1, "{offering}");
+    assert_eq!(overlaps[0]["id"], "whatsapp");
+    assert_eq!(overlaps[0]["sender_localpart"], "whatsappbot_shared");
+    let path = format!(
+        "/bridge-offerings/mautrix-whatsapp/instances/{}",
+        escape(alice_id)
+    );
+    admin.admin(PUT, &path, None).await;
+    until_state(&admin, &path, "starting").await;
+    // Her instance's own registration is not mistaken for a hand-registered one.
+    let offering = admin
+        .admin(GET, "/bridge-offerings/mautrix-whatsapp", None)
+        .await;
+    assert_eq!(
+        offering["overlapping_appservices"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "{offering}"
+    );
+    let health = admin.admin(GET, "/appservices/whatsapp/health", None).await;
+    let overlap = &health["overlaps_offering"];
+    assert_eq!(overlap["type"], "mautrix-whatsapp", "{health}");
+    assert_eq!(overlap["front_door"], "@whatsappbot:example.org");
+    assert!(
+        overlap["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("messaging @whatsappbot:example.org")),
+        "{health}"
+    );
+    let theirs = admin
+        .admin(GET, "/appservices/whatsapp-alice/health", None)
+        .await;
+    assert!(theirs["overlaps_offering"].is_null(), "{theirs}");
+
+    // Double puppeting off: alice's registration loses its claim on her, and her files the
+    // secret, once; the reason says to fetch them again.
+    let claims_alice = |appservice: &Value| {
+        user_namespaces(appservice)
+            .iter()
+            .any(|r| r == "@alice:example\\.org")
+    };
+    let mine = admin.admin(GET, "/appservices/whatsapp-alice", None).await;
+    assert!(claims_alice(&mine), "{mine}");
+    admin
+        .admin(
+            PUT,
+            "/bridge-offerings/mautrix-whatsapp",
+            Some(json!({"options": {"double_puppeting": false}})),
+        )
+        .await;
+    until("alice's registration loses its claim on her", || async {
+        !claims_alice(&admin.admin(GET, "/appservices/whatsapp-alice", None).await)
+    })
+    .await;
+    let seen = admin.admin(GET, &path, None).await;
+    assert_eq!(seen["state"], "starting", "{seen}");
+    assert!(
+        seen["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("download its files again")),
+        "{seen}"
+    );
+    let files = admin.admin(POST, &format!("{path}/files"), None).await;
+    let config = files["config_yaml"].as_str().unwrap();
+    assert!(!config.contains("double_puppet:"), "{config}");
+
+    // The shared registration removed: nothing overlaps any more.
+    admin
+        .admin_expect(
+            DELETE,
+            "/appservices/whatsapp",
+            None,
+            reqwest::StatusCode::NO_CONTENT,
+        )
+        .await;
+    let offering = admin
+        .admin(GET, "/bridge-offerings/mautrix-whatsapp", None)
+        .await;
+    assert_eq!(offering["overlapping_appservices"], json!([]), "{offering}");
+    handle.shutdown().await;
+}

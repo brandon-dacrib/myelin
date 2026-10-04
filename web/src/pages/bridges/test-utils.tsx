@@ -27,6 +27,7 @@ export function renderBridgesRoute(
     "/bridges/new",
     "/bridges/registrations",
     "/bridges/offerings/$type",
+    "/bridges/$bridgeId",
   ].filter((p) => p !== routePath);
   const router = createRouter({
     routeTree: rootRoute.addChildren([

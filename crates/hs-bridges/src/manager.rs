@@ -554,8 +554,7 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             };
             let front_door = (kind.mode == "per_user")
                 .then(|| {
-                    bridge_types::front_door_localpart(&offering.bridge_type)
-                        .map(|l| self.mxid(l))
+                    bridge_types::front_door_localpart(&offering.bridge_type).map(|l| self.mxid(l))
                 })
                 .flatten();
             return Ok(Some(overlap::for_appservice(
@@ -1347,7 +1346,11 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
         for feature in &kind.required_features {
             patch.insert(
                 feature.clone(),
-                render.registration.get(feature).cloned().unwrap_or(Value::Null),
+                render
+                    .registration
+                    .get(feature)
+                    .cloned()
+                    .unwrap_or(Value::Null),
             );
         }
         self.directory
@@ -2742,7 +2745,10 @@ mod tests {
             .instance("mautrix-whatsapp", "@brandon:example.org")
             .unwrap()
             .unwrap();
-        assert_ne!(row.registered_fingerprint.as_deref(), Some(registered.as_str()));
+        assert_ne!(
+            row.registered_fingerprint.as_deref(),
+            Some(registered.as_str())
+        );
         assert_eq!(row.state, InstanceState::Deploying);
         assert_eq!(
             row.reason.as_deref(),
@@ -2757,7 +2763,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(row.state, InstanceState::Starting);
-        assert_eq!(row.registered_fingerprint.as_deref(), Some(after_off.as_str()));
+        assert_eq!(
+            row.registered_fingerprint.as_deref(),
+            Some(after_off.as_str())
+        );
 
         // On again: the claim is back.
         manager
@@ -2781,7 +2790,10 @@ mod tests {
             .instance("mautrix-whatsapp", "@brandon:example.org")
             .unwrap()
             .unwrap();
-        assert_eq!(row.registered_fingerprint.as_deref(), Some(registered.as_str()));
+        assert_eq!(
+            row.registered_fingerprint.as_deref(),
+            Some(registered.as_str())
+        );
         assert_eq!(row.state, InstanceState::Deploying);
     }
 
@@ -2791,7 +2803,8 @@ mod tests {
     #[tokio::test]
     async fn an_instance_run_elsewhere_is_told_to_fetch_its_files_when_its_claim_changes() {
         // Nobody has run the bridge yet: its pings fail and it waits in `starting`.
-        let directory = Arc::new(InMemoryAppserviceDirectory::new().with_unreachable("whatsapp-brandon"));
+        let directory =
+            Arc::new(InMemoryAppserviceDirectory::new().unreachable("whatsapp-brandon"));
         let manager = BridgeManager::new(
             MemoryBackend::new(),
             directory.clone(),
@@ -2839,7 +2852,10 @@ mod tests {
             .instance("mautrix-whatsapp", "@brandon:example.org")
             .unwrap()
             .unwrap();
-        assert_eq!(row.registered_fingerprint.as_deref(), Some(registered.as_str()));
+        assert_eq!(
+            row.registered_fingerprint.as_deref(),
+            Some(registered.as_str())
+        );
         assert_ne!(row.reason.as_deref(), Some(REREGISTERED_REASON));
 
         manager
@@ -2915,7 +2931,13 @@ mod tests {
         elsewhere_only.attach("http://127.0.0.1:9");
         elsewhere_only.set_declared(vec![("mautrix-telegram".into(), cluster())]);
         elsewhere_only.apply_declared().await.unwrap();
-        assert!(elsewhere_only.get("mautrix-telegram").await.unwrap().is_none());
+        assert!(
+            elsewhere_only
+                .get("mautrix-telegram")
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(elsewhere_only.tokens().unwrap().declared.is_empty());
     }
 
@@ -2924,23 +2946,21 @@ mod tests {
     /// own registration is not mistaken for one, and removing it clears both.
     #[tokio::test]
     async fn a_bridge_registered_by_hand_is_named_on_its_health_and_on_the_offering() {
-        let directory = Arc::new(
-            InMemoryAppserviceDirectory::new().with_registration(json!({
-                "id": "whatsapp",
-                "url": "http://mautrix-whatsapp:29318",
-                "as_token": "a",
-                "hs_token": "h",
-                "sender_localpart": "whatsappbot_shared",
-                "namespaces": {
-                    "users": [
-                        {"regex": "@whatsapp_.*:example\\.org", "exclusive": true},
-                        {"regex": "@.*:example\\.org", "exclusive": false}
-                    ],
-                    "aliases": [], "rooms": []
-                },
-                "io.myelin.bridge_type": "mautrix-whatsapp"
-            })),
-        );
+        let directory = Arc::new(InMemoryAppserviceDirectory::new().with_registration(json!({
+            "id": "whatsapp",
+            "url": "http://mautrix-whatsapp:29318",
+            "as_token": "a",
+            "hs_token": "h",
+            "sender_localpart": "whatsappbot_shared",
+            "namespaces": {
+                "users": [
+                    {"regex": "@whatsapp_.*:example\\.org", "exclusive": true},
+                    {"regex": "@.*:example\\.org", "exclusive": false}
+                ],
+                "aliases": [], "rooms": []
+            },
+            "io.myelin.bridge_type": "mautrix-whatsapp"
+        })));
         let runtime = Arc::new(FakeRuntime::default());
         let manager = BridgeManager::new(
             MemoryBackend::new(),
@@ -2963,17 +2983,47 @@ mod tests {
         let line = &offering.overlapping_appservices[0];
         assert_eq!(line.id, "whatsapp");
         assert_eq!(line.sender_localpart, "whatsappbot_shared");
-        assert!(line.detail.contains("catalogue's WhatsApp entry"), "{}", line.detail);
+        assert!(
+            line.detail.contains("catalogue's WhatsApp entry"),
+            "{}",
+            line.detail
+        );
 
-        let aware = crate::directory::OfferingAwareDirectory::new(directory.clone(), manager.clone());
+        let aware =
+            crate::directory::OfferingAwareDirectory::new(directory.clone(), manager.clone());
         let health = aware.health("whatsapp").await.unwrap();
-        let overlap = health.overlaps_offering.expect("the hand-registered bridge is told");
+        let overlap = health
+            .overlaps_offering
+            .expect("the hand-registered bridge is told");
         assert_eq!(overlap.bridge_type, "mautrix-whatsapp");
         assert_eq!(overlap.name, "WhatsApp");
-        assert_eq!(overlap.front_door.as_deref(), Some("@whatsappbot:example.org"));
-        assert!(overlap.detail.contains("messaging @whatsappbot:example.org"), "{}", overlap.detail);
-        assert!(aware.health("whatsapp-brandon").await.unwrap().overlaps_offering.is_none());
-        assert!(aware.ping("whatsapp").await.unwrap().overlaps_offering.is_some());
+        assert_eq!(
+            overlap.front_door.as_deref(),
+            Some("@whatsappbot:example.org")
+        );
+        assert!(
+            overlap
+                .detail
+                .contains("messaging @whatsappbot:example.org"),
+            "{}",
+            overlap.detail
+        );
+        assert!(
+            aware
+                .health("whatsapp-brandon")
+                .await
+                .unwrap()
+                .overlaps_offering
+                .is_none()
+        );
+        assert!(
+            aware
+                .ping("whatsapp")
+                .await
+                .unwrap()
+                .overlaps_offering
+                .is_some()
+        );
 
         directory.delete("whatsapp").await.unwrap();
         let offering = manager.get("mautrix-whatsapp").await.unwrap().unwrap();

@@ -439,8 +439,9 @@ pub fn provisioning(type_id: &str) -> Option<(ProvisioningApi, &'static str)> {
 /// `bridgev2/networkinterface.go` says of `DefaultCommandPrefix` "defaults to NetworkID if
 /// unset. Must include the ! prefix". So a connector without one takes `!` and its
 /// `NetworkID`: `signal` (mautrix-signal `pkg/connector/connector.go`, `GetName`), `slack`
-/// (mautrix-slack, the same file) and `twitter` (mautrix-twitter, the same file: the
-/// `NetworkID` stays `twitter` when the display name is `X`). A bridge whose config an
+/// (mautrix-slack, the same file), `twitter` (mautrix-twitter, the same file: the
+/// `NetworkID` stays `twitter` when the display name is `X`) and `linkedin` (mautrix-linkedin,
+/// the same file). A bridge whose config an
 /// administrator wrote by hand may say otherwise; an instance this server renders keeps the
 /// default.
 fn command_prefix(entry: &Entry) -> Option<&'static str> {
@@ -455,6 +456,7 @@ fn command_prefix(entry: &Entry) -> Option<&'static str> {
         "mautrix-signal" => Some("!signal"),
         "mautrix-slack" => Some("!slack"),
         "mautrix-twitter" => Some("!twitter"),
+        "mautrix-linkedin" => Some("!linkedin"),
         _ => None,
     }
 }

@@ -225,6 +225,29 @@ describe("Bridge offering page", () => {
     ).toBeInTheDocument();
   });
 
+  it("names the WhatsApp bridge registered by hand beside the offering, and the prefix", async () => {
+    renderOffering("mautrix-whatsapp");
+    const overlaps = await screen.findByTestId("overlapping-registrations");
+    expect(within(overlaps).getByRole("link", { name: "whatsapp" })).toBeInTheDocument();
+    expect(overlaps).toHaveTextContent(/registered by hand/);
+    expect(overlaps).toHaveTextContent(/remove it from its page/);
+    // The instances' own registrations are not listed.
+    expect(overlaps).not.toHaveTextContent("whatsapp-alice");
+    expect(screen.getByText("Command prefix")).toBeInTheDocument();
+    expect(screen.getByText("!wa")).toBeInTheDocument();
+  });
+
+  it("says what a changed double puppeting does to the bridges people have", async () => {
+    renderOffering("mautrix-whatsapp");
+    await userEvent.click(await screen.findByRole("button", { name: "Edit settings" }));
+    const dialog = await screen.findByRole("dialog", { name: "WhatsApp settings" });
+    expect(within(dialog).queryByTestId("double-puppeting-change")).toBeNull();
+    await userEvent.click(within(dialog).getByRole("switch", { name: /Double puppeting/ }));
+    const note = await within(dialog).findByTestId("double-puppeting-change");
+    expect(note).toHaveTextContent(/without the claim to act as their owners/);
+    expect(note).toHaveTextContent(/Each restarts once/);
+  });
+
   it("shows a shared bridge as one status panel, not a table", async () => {
     putOffering("heisenbridge", { runtime: "cluster", enabled: true });
     renderOffering("heisenbridge");

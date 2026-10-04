@@ -5,6 +5,7 @@ import type {
   BridgeOffering,
   BridgeOfferingRequest,
 } from "@/api/bridges";
+import { appservices } from "./appservices";
 import { bridgeTypes } from "./bridge-types";
 
 /**
@@ -303,6 +304,39 @@ export function getInstance(type: string, userSegment: string): BridgeInstance |
   return offering && instance ? publicInstance(advance(offering, instance)) : undefined;
 }
 
+/**
+ * Appservices registered by hand for `type`'s network (the catalogue key, as the manager's
+ * first test of `hs_bridges::overlap`), not one of its instances: the demo's shared WhatsApp
+ * bridge beside the offering that replaces it.
+ */
+export function handRegisteredOverlaps(type: string) {
+  const instanceIds = new Set(instancesOf(type).map((i) => i.appservice_id));
+  const name = catalogueEntry(type)?.name ?? type;
+  return appservices
+    .filter((a) => a.bridge_type === type && !instanceIds.has(a.id))
+    .map((a) => ({ id: a.id ?? "", sender_localpart: a.sender_localpart ?? "", name }));
+}
+
+/** `AppServiceHealth.overlaps_offering` for appservice `id`, as the server words it. */
+export function overlapOfAppservice(id: string) {
+  for (const offering of state.offerings) {
+    const found = handRegisteredOverlaps(offering.type).find((o) => o.id === id);
+    if (!found) continue;
+    const mode = catalogueEntry(offering.type)?.mode ?? "per_user";
+    const door = mode === "per_user" ? `@${short(offering.type)}bot:${SERVER}` : null;
+    const getOne = door
+      ? `people get their own ${found.name} bridge by messaging ${door}`
+      : `one ${found.name} bridge is run for everyone`;
+    return {
+      type: offering.type,
+      name: found.name,
+      front_door: door,
+      detail: `${found.name} is offered on this server now: ${getOne}. This bridge was registered by hand and it was created from the catalogue's ${found.name} entry, so a message for a ${found.name} ghost user is delivered to it and to the person's own instance. Pause it here to stop delivering to it now; once everyone who used it has their own instance, stop it where it runs and remove it here. docs/bridges/mautrix.md has the steps.`,
+    };
+  }
+  return null;
+}
+
 export function offeringView(offering: MockOffering): BridgeOffering {
   const entry = catalogueEntry(offering.type);
   const mode = entry?.mode ?? "per_user";
@@ -320,6 +354,11 @@ export function offeringView(offering: MockOffering): BridgeOffering {
     options: offering.options,
     instances: counts,
     created_at: offering.created_at,
+    overlapping_appservices: handRegisteredOverlaps(offering.type).map((o) => ({
+      id: o.id,
+      sender_localpart: o.sender_localpart,
+      detail: `${o.id} (bot @${o.sender_localpart}:${SERVER}) was registered by hand and it was created from the catalogue's ${o.name} entry, so a message for a ${o.name} ghost user is delivered to it as well as to the person's own instance. Once everyone who used it has their own instance, stop it where it runs and remove it from its page.`,
+    })),
   };
 }
 

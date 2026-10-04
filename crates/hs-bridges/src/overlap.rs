@@ -6,8 +6,10 @@
 //! The registry allows both: neither claims the other's bot, and the patterns are not
 //! identical. So a message for an instance's ghost is delivered to the hand-registered bridge
 //! too, and whichever of the two is signed in to that account on the network's side bridges it.
-//! Nothing here stops that -- the hand-registered bridge may still be the one people are using
-//! -- but the server says so, on the appservice's health and on the offering, with what to do.
+//! Nothing here stops that on its own -- the hand-registered bridge may still be the one people
+//! are using, and cutting it off silently would lose their messages -- but the server says so,
+//! on the appservice's health and on the offering, with what to do: pause it now (its page has
+//! the control), then stop and remove it once everyone has their own instance.
 
 use std::collections::HashSet;
 
@@ -50,7 +52,10 @@ pub fn overlaps(
         let why = if appservice.bridge_type.as_deref() == Some(bridge_type) {
             format!("it was created from the catalogue's {} entry", kind.name)
         } else if appservice.sender_localpart == bot {
-            format!("its bot is @{bot}:{server_name}, the name {}'s front door takes", kind.name)
+            format!(
+                "its bot is @{bot}:{server_name}, the name {}'s front door takes",
+                kind.name
+            )
         } else if let Some(rule) = covering_rule(&appservice.namespaces, &sample_ghost) {
             format!(
                 "its user namespace `{rule}` covers the ghost users of every {} instance (@{ghost_prefix}…:{server_name})",
@@ -105,7 +110,7 @@ pub fn for_appservice(
         name: name.to_owned(),
         front_door: front_door.map(str::to_owned),
         detail: format!(
-            "{name} is offered on this server now: {get_one}. This bridge was registered by hand and {why}, so a message for a {name} ghost user is delivered to it and to the person's own instance. Once everyone who used it has their own instance, stop it where it runs and remove it here; docs/bridges/mautrix.md has the steps.",
+            "{name} is offered on this server now: {get_one}. This bridge was registered by hand and {why}, so a message for a {name} ghost user is delivered to it and to the person's own instance. Pause it here to stop delivering to it now; once everyone who used it has their own instance, stop it where it runs and remove it here. docs/bridges/mautrix.md has the steps.",
             why = overlap.why
         ),
     }
@@ -131,7 +136,12 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn appservice(id: &str, sender: &str, users: Value, bridge_type: Option<&str>) -> AdminAppservice {
+    fn appservice(
+        id: &str,
+        sender: &str,
+        users: Value,
+        bridge_type: Option<&str>,
+    ) -> AdminAppservice {
         AdminAppservice {
             id: id.to_owned(),
             sender_localpart: sender.to_owned(),
@@ -174,19 +184,44 @@ mod tests {
             ),
         ];
         let instances = HashSet::from(["whatsapp-brandon".to_owned()]);
-        let found = overlaps("mautrix-whatsapp", "example.org", &list, &instances, "myelin-bridges")
-            .unwrap();
+        let found = overlaps(
+            "mautrix-whatsapp",
+            "example.org",
+            &list,
+            &instances,
+            "myelin-bridges",
+        )
+        .unwrap();
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].appservice_id, "whatsapp");
         assert_eq!(found[0].sender_localpart, "whatsappbot");
-        assert!(found[0].why.contains("catalogue's WhatsApp entry"), "{}", found[0].why);
+        assert!(
+            found[0].why.contains("catalogue's WhatsApp entry"),
+            "{}",
+            found[0].why
+        );
         assert_eq!(
-            overlaps("mautrix-telegram", "example.org", &list, &instances, "myelin-bridges")
-                .unwrap()
-                .len(),
+            overlaps(
+                "mautrix-telegram",
+                "example.org",
+                &list,
+                &instances,
+                "myelin-bridges"
+            )
+            .unwrap()
+            .len(),
             1
         );
-        assert!(overlaps("mautrix-fax", "example.org", &list, &instances, "myelin-bridges").is_none());
+        assert!(
+            overlaps(
+                "mautrix-fax",
+                "example.org",
+                &list,
+                &instances,
+                "myelin-bridges"
+            )
+            .is_none()
+        );
     }
 
     /// A registration file written by hand (no catalogue key, another id and bot name) is
@@ -214,20 +249,38 @@ mod tests {
                 None,
             ),
         ];
-        let found =
-            overlaps("mautrix-whatsapp", "example.org", &list, &HashSet::new(), "myelin-bridges")
-                .unwrap();
+        let found = overlaps(
+            "mautrix-whatsapp",
+            "example.org",
+            &list,
+            &HashSet::new(),
+            "myelin-bridges",
+        )
+        .unwrap();
         let ids: Vec<&str> = found.iter().map(|o| o.appservice_id.as_str()).collect();
         assert_eq!(ids, vec!["wa-old"], "{found:?}");
-        assert!(found[0].why.contains("`@whatsapp_.*:example\\.org`"), "{}", found[0].why);
+        assert!(
+            found[0].why.contains("`@whatsapp_.*:example\\.org`"),
+            "{}",
+            found[0].why
+        );
         // Signal's registration is caught by its bot name first; its pattern that does not
         // compile is never reached, and WhatsApp's broad non-exclusive rule does not make it a
         // Signal bridge.
-        let signal =
-            overlaps("mautrix-signal", "example.org", &list, &HashSet::new(), "myelin-bridges")
-                .unwrap();
+        let signal = overlaps(
+            "mautrix-signal",
+            "example.org",
+            &list,
+            &HashSet::new(),
+            "myelin-bridges",
+        )
+        .unwrap();
         assert_eq!(signal.len(), 1, "{signal:?}");
-        assert!(signal[0].why.contains("@signalbot:example.org"), "{}", signal[0].why);
+        assert!(
+            signal[0].why.contains("@signalbot:example.org"),
+            "{}",
+            signal[0].why
+        );
         // The pattern that does not compile is skipped when it is what is looked at.
         let broken = vec![appservice(
             "odd",
@@ -235,9 +288,14 @@ mod tests {
             json!([{"regex": "(broken", "exclusive": true}, {"regex": "@signal_.*:example\\.org", "exclusive": true}]),
             None,
         )];
-        let found =
-            overlaps("mautrix-signal", "example.org", &broken, &HashSet::new(), "myelin-bridges")
-                .unwrap();
+        let found = overlaps(
+            "mautrix-signal",
+            "example.org",
+            &broken,
+            &HashSet::new(),
+            "myelin-bridges",
+        )
+        .unwrap();
         assert_eq!(found.len(), 1, "{found:?}");
     }
 
@@ -255,14 +313,39 @@ mod tests {
             Some("@whatsappbot:example.org"),
         );
         assert_eq!(health.bridge_type, "mautrix-whatsapp");
-        assert_eq!(health.front_door.as_deref(), Some("@whatsappbot:example.org"));
-        assert!(health.detail.contains("messaging @whatsappbot:example.org"), "{}", health.detail);
-        assert!(health.detail.contains("remove it here"), "{}", health.detail);
+        assert_eq!(
+            health.front_door.as_deref(),
+            Some("@whatsappbot:example.org")
+        );
+        assert!(
+            health.detail.contains("messaging @whatsappbot:example.org"),
+            "{}",
+            health.detail
+        );
+        assert!(
+            health.detail.contains("remove it here"),
+            "{}",
+            health.detail
+        );
+        assert!(health.detail.contains("Pause it here"), "{}", health.detail);
         let shared = for_appservice(&overlap, "heisenbridge", "heisenbridge", None);
-        assert!(shared.detail.contains("run for everyone"), "{}", shared.detail);
+        assert!(
+            shared.detail.contains("run for everyone"),
+            "{}",
+            shared.detail
+        );
         let line = for_offering(&overlap, "WhatsApp", "example.org");
         assert_eq!(line.id, "whatsapp");
-        assert!(line.detail.starts_with("whatsapp (bot @whatsappbot:example.org)"), "{}", line.detail);
-        assert!(line.detail.contains("remove it from its page"), "{}", line.detail);
+        assert!(
+            line.detail
+                .starts_with("whatsapp (bot @whatsappbot:example.org)"),
+            "{}",
+            line.detail
+        );
+        assert!(
+            line.detail.contains("remove it from its page"),
+            "{}",
+            line.detail
+        );
     }
 }

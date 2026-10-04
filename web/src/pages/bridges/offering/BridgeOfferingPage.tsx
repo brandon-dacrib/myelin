@@ -309,7 +309,9 @@ export function BridgeOfferingPage() {
 
       <FrontDoor offering={offering} />
 
-      <SettingsSummary offering={offering} />
+      <OverlappingRegistrations offering={offering} />
+
+      <SettingsSummary offering={offering} type={catalogueType} />
 
       {shared ? (
         <section aria-labelledby="shared-bridge" className="mt-8">
@@ -512,7 +514,48 @@ function FrontDoor({ offering }: { offering: BridgeOffering }) {
   );
 }
 
-function SettingsSummary({ offering }: { offering: BridgeOffering }) {
+/**
+ * Bridges of this network registered by hand (the wizard's, or a registration file) whose
+ * namespace covers this offering's instances: a message for a ghost reaches both, so each is
+ * named with what to do (RFC 0017 section 6). Nothing once they are removed.
+ */
+function OverlappingRegistrations({ offering }: { offering: BridgeOffering }) {
+  const overlaps = offering.overlapping_appservices ?? [];
+  if (overlaps.length === 0) return null;
+  return (
+    <section
+      aria-labelledby="overlapping"
+      className="mt-6 rounded-md border border-warning-border bg-warning-bg px-4 py-3 text-sm text-warning"
+      data-testid="overlapping-registrations"
+    >
+      <h2 id="overlapping" className="font-medium">
+        Also registered by hand
+      </h2>
+      <ul className="mt-1 flex flex-col gap-1">
+        {overlaps.map((o) => (
+          <li key={o.id}>
+            <Link
+              to="/bridges/$bridgeId"
+              params={{ bridgeId: o.id }}
+              className="font-identifier underline underline-offset-2"
+            >
+              {o.id}
+            </Link>
+            : {o.detail}
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+function SettingsSummary({
+  offering,
+  type,
+}: {
+  offering: BridgeOffering;
+  type: BridgeType | undefined;
+}) {
   const options = [
     offering.options?.encryption && "Encryption",
     offering.options?.double_puppeting && "Double puppeting",
@@ -539,6 +582,15 @@ function SettingsSummary({ offering }: { offering: BridgeOffering }) {
             : "Everyone on this server"}
         </Detail>
         <Detail label="Options">{options.length > 0 ? options.join(", ") : "None"}</Detail>
+        {type?.command_prefix && (
+          <Detail label="Command prefix">
+            <code className="font-identifier">{type.command_prefix}</code>
+            <span className="mt-0.5 block text-xs text-text-muted">
+              Bare commands (<code className="font-identifier">login</code>) work in the chat a
+              person invited the bot to; anywhere else they start with this.
+            </span>
+          </Detail>
+        )}
       </dl>
     </section>
   );

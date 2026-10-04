@@ -81,7 +81,9 @@ fn parse_declared_offerings(
                 format!("{DECLARED_OFFERINGS_ENV}: {bridge_type}'s settings do not parse: {e}")
             })?;
         if declared.iter().any(|(t, _)| t == &bridge_type) {
-            return Err(format!("{DECLARED_OFFERINGS_ENV}: {bridge_type} is declared twice"));
+            return Err(format!(
+                "{DECLARED_OFFERINGS_ENV}: {bridge_type} is declared twice"
+            ));
         }
         declared.push((bridge_type, request));
     }
@@ -174,7 +176,11 @@ mod tests {
         assert_eq!(declared[0].0, "mautrix-whatsapp");
         assert_eq!(declared[0].1.runtime.as_deref(), Some("cluster"));
         assert_eq!(
-            declared[0].1.options.as_ref().and_then(|o| o.double_puppeting),
+            declared[0]
+                .1
+                .options
+                .as_ref()
+                .and_then(|o| o.double_puppeting),
             Some(true)
         );
         assert_eq!(declared[1].0, "heisenbridge");
@@ -183,8 +189,12 @@ mod tests {
 
     #[test]
     fn a_misspelt_or_malformed_declaration_is_refused() {
-        let unknown = parse_declared_offerings(Some(r#"[{"type": "mautrix-whatsap"}]"#)).unwrap_err();
-        assert!(unknown.contains("not a bridge type in the catalogue"), "{unknown}");
+        let unknown =
+            parse_declared_offerings(Some(r#"[{"type": "mautrix-whatsap"}]"#)).unwrap_err();
+        assert!(
+            unknown.contains("not a bridge type in the catalogue"),
+            "{unknown}"
+        );
         let untyped = parse_declared_offerings(Some(r#"[{"runtime": "cluster"}]"#)).unwrap_err();
         assert!(untyped.contains("needs a \"type\""), "{untyped}");
         let twice = parse_declared_offerings(Some(
@@ -194,8 +204,9 @@ mod tests {
         assert!(twice.contains("declared twice"), "{twice}");
         let not_a_list = parse_declared_offerings(Some(r#"{"type": "heisenbridge"}"#)).unwrap_err();
         assert!(not_a_list.contains("not a JSON list"), "{not_a_list}");
-        let bad_field = parse_declared_offerings(Some(r#"[{"type": "heisenbridge", "enabled": "yes"}]"#))
-            .unwrap_err();
+        let bad_field =
+            parse_declared_offerings(Some(r#"[{"type": "heisenbridge", "enabled": "yes"}]"#))
+                .unwrap_err();
         assert!(bad_field.contains("do not parse"), "{bad_field}");
     }
 }

@@ -292,6 +292,22 @@ export function BridgeDetailPage() {
         </div>
       )}
 
+      {health?.overlaps_offering && (
+        <div
+          className="mt-4 rounded-md border border-warning-border bg-warning-bg px-4 py-3 text-sm text-warning"
+          data-testid="overlaps-offering"
+        >
+          {health.overlaps_offering.detail}{" "}
+          <Link
+            to="/bridges/offerings/$type"
+            params={{ type: health.overlaps_offering.type }}
+            className="underline underline-offset-2"
+          >
+            The {health.overlaps_offering.name} offering
+          </Link>
+        </div>
+      )}
+
       {health?.last_key_withheld && (
         <div
           className="mt-4 rounded-md border border-warning-border bg-warning-bg px-4 py-3 text-sm text-warning"
