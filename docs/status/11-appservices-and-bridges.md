@@ -1,6 +1,10 @@
 # Status: track 11, appservices and bridges
 
-Last updated: 2026-10-03 (the bot's device is cross-signed by the manager, so a client that
+Last updated: 2026-10-04 (the demo's shared WhatsApp registration becomes a declared offering,
+and the server names a bridge registered by hand beside an offering; a changed double puppeting
+reaches each instance's registration; Signal, Slack, X and LinkedIn have their command prefix;
+`hs-bridges` and the operator connect under the outbound policy; mautrix-signal is the second
+real bridge; below); before that 2026-10-03 (the bot's device is cross-signed by the manager, so a client that
 excludes insecure devices shares keys with the bridge; a withheld key is a health line; and
 CI's read of the bridge's rewritten config; both below); before that
 2026-10-02, evening (the bridge has a name in WhatsApp's Linked devices, and a
@@ -12,6 +16,113 @@ manager) and an instance's Kubernetes objects say whose bridge they are; before 
 (who has signed in to a bridge; the `cluster` runtime run on kind); before that 2026-09-30
 (ephemeral, to-device and device-list delivery); before that 2026-09-27 (RFC 0017 run against
 the real binary), 2026-09-27 (the bridge manager) and 2026-09-25.
+
+## Session 2026-10-04 (branch `agent/bridge-offering-demo`): the demo's shared WhatsApp registration becomes an offering
+
+`docs/next-steps.md` item 5; RFC 0017 section 6. Decision
+`docs/decisions/0028-a-deployment-declares-bridge-offerings-and-a-hand-registered-bridge-beside-one-is-named.md`.
+OpenAPI 0.1.7 → **0.1.8** (additive; client regenerated).
+
+**1. The demo declares the offering; nothing in `deploy/` registers a shared bridge.**
+
+- `deploy/demo/values-bridges.yaml` (new): the demo release's bridges overlay, WhatsApp on the
+  cluster runtime, everyone allowed, encryption, double puppeting and backfill. Layered over
+  `helm get values` (the demo's values are not in the repository; there never was a file
+  carrying the shared registration: it was made through the wizard and lives in the database).
+- The chart: `bridges.offerings` in `deploy/helm/hs/values.yaml` (documented there), rendered
+  into `MYELIN_BRIDGES_OFFERINGS` as JSON in `templates/statefulset.yaml`, only with
+  `bridges.enabled` and a non-empty list. `helm lint` clean; rendered with and without, and with
+  `bridges.enabled=false` (absent).
+- `hs serve` (`crates/hs-cli/src/bridges.rs`, `declared_offerings`): parses it; a list that
+  does not parse, an entry without `type`, a type not in the catalogue or a type twice fails
+  startup. `BridgeManager::set_declared` / `apply_declared` (`crates/hs-bridges/src/manager.rs`)
+  create each once, after the manager registers its front doors on the replica owning the
+  global shard, and record it in `ManagerRow.declared`; an existing offering is adopted
+  unchanged (the demo's); a removed one is not recreated; one this server cannot create is
+  logged at `WARN` and tried at the next start. Log lines: `the deployment declares bridge
+  offerings`, `created the bridge offering the deployment declares`, `... already exists:
+  keeping it as the admin API has it`.
+- **The health line.** `crates/hs-bridges/src/overlap.rs`: a registration that is a bridge of
+  an offered network without being the manager or one of the offering's instances (same
+  `io.myelin.bridge_type`, the catalogue's bot name, or an exclusive user rule covering the
+  catalogue's ghosts, matched as the registry matches) is named. `AppServiceHealth.overlaps_offering`
+  (schema `OfferingOverlap`: type, name, front door, what to do) is filled by
+  `crates/hs-bridges/src/directory.rs`, `OfferingAwareDirectory`, which wraps the appservice
+  directory the admin API reads (`serve.rs`), so `hs-appservice` stays unaware of offerings.
+  `BridgeOffering.overlapping_appservices` (schema `AppServiceOverlap`) is the same from the
+  offering. The manager logs each at `WARN` when it appears and at `INFO` when it goes (looked
+  at once a minute at most). **It is not paused or removed by the server** (decision 0028): the
+  line offers Pause. Web: the bridge page's warning line links to the offering; the offering
+  page's "Also registered by hand" links to each.
+- **The owner's steps** (save the registration, roll with the overlay, Pause, people move to
+  their own instance, stop the shared bridge, Remove, check): `docs/bridges/mautrix.md`,
+  "2026-10-04: the demo's shared WhatsApp registration becomes an offering". A desk item.
+
+**2. `command_prefix` for Signal, Slack and X** (and LinkedIn, found missing by the new test).
+Their connectors (`pkg/connector/connector.go`, `GetName`, fetched 2026-10-04) set no
+`DefaultCommandPrefix`; mautrix-go's `bridgev2/matrix/mxmain/example-config.yaml` writes
+`command_prefix: '$<<or .DefaultCommandPrefix (printf "!%s" .NetworkID)>>'` and
+`bridgev2/networkinterface.go` documents the fallback. So `!signal`, `!slack`, `!twitter` (the
+`NetworkID` stays `twitter` when the display name is X), `!linkedin`; cited in
+`hs_admin::bridge_types::command_prefix`. Test `every_mautrix_bridge_has_its_command_prefix`
+(every mautrix entry has one, nothing else does). The real Signal bridge's rewritten config says
+`!signal` (below). The offering page shows the prefix with what it is for.
+
+**3. Outbound policy.** `hs_bridges::matrix::MatrixClient` and the operator's `HttpAdminApi`
+are built by `hs_http::client::builder()`: IPv4 first, every address tried, counted in
+`hs_outbound_connections_total` / `hs_outbound_connect_failures_total`. The operator now
+registers those counters in its own `/metrics` (`OperatorMetrics::new`; test
+`the_outbound_counters_are_served_too`); `hs serve` already did. `hs-http` added to both
+crates' dependencies (workspace path dependency; nothing new in `[workspace.dependencies]`).
+
+**4. A changed double puppeting re-renders the instances' claim.** `InstanceRow.registered_fingerprint`
+(`manager::registration_fingerprint`: the rendered registration without `url`) is set at
+registration; `settle_registration`, run on every step of a registered, deploying, starting or
+ready instance, patches the registry's namespaces and feature flags when it differs, once (log
+line `the bridge instance's registration changed: updated this server's copy of it`). The files
+change with it, so a cluster instance rolls through the existing deployment fingerprint; an
+instance run elsewhere gets the reason "its registration changed: download its files again and
+restart it with them". A row from before is patched once, silently. The settings dialog says
+what saving a changed double puppeting will do and to how many bridges (it also no longer
+claims new settings only apply to new bridges, which stopped being true on 2026-10-02).
+
+**5. A second real bridge: mautrix-signal.** `crates/hs-bridge-conformance/tests/real_mautrix_login.rs`
+is parametrised by `Network` (type, image, port, the login text); the new story
+`a_person_types_login_to_their_signal_bridge_and_gets_a_qr_code` runs
+`dock.mau.dev/mautrix/signal:latest` from its rendered files: encrypted chat started as alice,
+`device_name` in the admin API and in the bridge's rewritten config (`Myelin Signal bridge for
+alice (test.local)`), `command_prefix` `!signal` in both, the bot cross-signed, `login`
+answered with a QR code, nothing withheld. The harness now syncs once before typing: in one of
+three full runs, under load, the repaired story sent `login qr` before alice's client had synced
+the manager's signature of the bot's device, and the key was withheld as `m.unverified`; a
+client that is running has synced.
+
+**Verified.** `cargo test -p hs-bridges` (39 unit + 6; new: `overlap::tests` ×3,
+`a_changed_double_puppeting_updates_the_instances_claim_once_and_rolls_it`,
+`an_instance_run_elsewhere_is_told_to_fetch_its_files_when_its_claim_changes`,
+`declared_offerings_are_created_once_and_an_existing_one_is_adopted`,
+`a_bridge_registered_by_hand_is_named_on_its_health_and_on_the_offering`, the store's
+`put_manager`); `cargo test -p hs-admin` (303), `-p hs-operator` (95), `-p hs-appservice`,
+`-p hs-cli --lib bridges` (2, the declaration's parsing). **Real binary:** `cargo test -p hs-cli
+--test bridge_offerings` 4 of 4, the new
+`a_shared_registration_beside_its_offering_is_named_and_a_changed_double_puppeting_reaches_the_instance`
+(a wizard-shaped `whatsapp` registration, then the offering and alice's instance: both lines
+present, alice's own registration not counted; double puppeting off drops `@alice` from her
+registration and `double_puppet:` from her files with the reason set; the shared registration
+removed and the offering's list empty). `cargo test -p hs-bridge-conformance --test
+real_mautrix_login` 4 of 4 after the sync fix (WhatsApp encrypted, plain, repaired;
+Signal), 56 s; before it, 3 of 4 then 4 of 4, and the repaired story alone 2 of 2. Clippy `-D warnings` on hs-bridges, hs-admin, hs-operator, hs-appservice,
+hs-bridge-conformance, hs-cli; `cargo fmt --all --check`. `web/`: `npm run check` (573 unit
+tests; the four lint warnings are in files this branch does not touch), `npm run test:e2e` 64
+of 64.
+
+**Not done.** The roll on the demo (desk item; the steps are in `docs/bridges/mautrix.md`). The
+server does not stop delivering to a hand-registered bridge on its own (by choice). The
+catalogue's LinkedIn port (29325) differs from mautrix-linkedin's `DefaultPort` (29341); a
+rendered config sets the port explicitly, so it works, but the catalogue should say 29341. No
+Telegram (it needs an `api_id`, so it is not deployable from rendered files). The operator's
+reconciler still talks to Kubernetes through `kube`'s own client, which the outbound policy does
+not cover (it is not a reqwest client).
 
 ## Session 2026-10-03 (branch `agent/bridge-bot-verified`): the owner's Element refused to share keys with the bridge; the manager now cross-signs the bot's device
 

@@ -42,7 +42,7 @@ server; a person gets their own bridge by messaging `@whatsappbot`, which sets i
 invites them to it with the sign-in steps; the administrator sees everybody's bridge on one
 page, and under it "Next steps for <person>": their own bot's name, the steps to relay, a
 copy-as-message button, and "this is you" when it is the administrator's own. Each instance
-has its own registration, ghosts and process, so one person's trouble touches nobody else. Verified against the real server, with a real heisenbridge started from
+has its own registration, ghosts and process, so one person's trouble touches nobody else. A Helm deployment can declare its offerings (`bridges.offerings` in the chart's values: a catalogue type and the offering's settings), created once and then administered in the interface; a bridge registered by hand for a network that is now offered is named on its page and on the offering's, with what to do. Verified against the real server, with a real heisenbridge started from
 the files the server rendered (`docs/rfcs/0017-the-server-deploys-its-own-bridges.md`). The
 server deploying each instance as a pod is built and waits for its first run on a cluster.
 One thing was wrong until 2026-10-02: the chat the server opened for a person was created

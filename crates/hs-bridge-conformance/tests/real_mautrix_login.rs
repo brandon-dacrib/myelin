@@ -1,5 +1,8 @@
 //! A person signs in to their own mautrix-whatsapp bridge: the real bridge, the real `hs`
-//! binary, and a real encrypting client (`matrix-sdk` with `e2e-encryption`).
+//! binary, and a real encrypting client (`matrix-sdk` with `e2e-encryption`). Since
+//! 2026-10-04 also a second real bridge, mautrix-signal (`dock.mau.dev/mautrix/signal:latest`),
+//! through the same story: offered, run from its rendered files, `login` answered with a QR
+//! code in the encrypted chat.
 //!
 //! This is the moment RFC 0017 was built for and the one nothing had exercised: an administrator
 //! enables the WhatsApp offering, an instance is made for a person, a chat with its personal bot
@@ -40,6 +43,34 @@ use matrix_sdk_crypto::CollectStrategy;
 use serde_json::{Value, json};
 
 const IMAGE: &str = "dock.mau.dev/mautrix/whatsapp:latest";
+
+/// Which mautrix bridge a story runs: its catalogue type, its image, the port it listens on
+/// (its `DefaultPort`, which the catalogue renders), and what a person types to sign in.
+#[derive(Debug, Clone, Copy)]
+struct Network {
+    type_id: &'static str,
+    image: &'static str,
+    port: u16,
+    /// What is typed to get a QR code: `login qr` for WhatsApp (it has two flows, so the
+    /// flow is named); `login` for Signal, whose only flow is linking by QR code.
+    login: &'static str,
+}
+
+const WHATSAPP: Network = Network {
+    type_id: "mautrix-whatsapp",
+    image: IMAGE,
+    port: 29318,
+    login: "login qr",
+};
+
+/// The second real mautrix bridge (2026-10-04): mautrix-signal, `bridgev2` like WhatsApp, from
+/// mau.dev's registry as well.
+const SIGNAL: Network = Network {
+    type_id: "mautrix-signal",
+    image: "dock.mau.dev/mautrix/signal:latest",
+    port: 29328,
+    login: "login",
+};
 const SERVER_NAME: &str = "test.local";
 /// How long the bridge gets to answer `login qr`. It answers in well under a second when it
 /// understands the message.
@@ -79,7 +110,7 @@ fn docker(args: &[&str]) -> Result<String> {
 }
 
 /// `None` when the test can run; otherwise why it cannot.
-fn skip_reason() -> Option<String> {
+fn skip_reason(image: &str) -> Option<String> {
     if hs_binary().is_none() {
         return Some(
             "no hs binary under target/{debug,release}; run `cargo build -p hs-cli --bin hs` or set HS_BIN"
@@ -89,10 +120,10 @@ fn skip_reason() -> Option<String> {
     if let Err(e) = docker(&["version", "--format", "{{.Server.Version}}"]) {
         return Some(format!("Docker is not reachable: {e}"));
     }
-    if docker(&["image", "inspect", IMAGE, "--format", "{{.Id}}"]).is_err()
-        && let Err(e) = docker(&["pull", IMAGE])
+    if docker(&["image", "inspect", image, "--format", "{{.Id}}"]).is_err()
+        && let Err(e) = docker(&["pull", image])
     {
-        return Some(format!("could not pull {IMAGE}: {e}"));
+        return Some(format!("could not pull {image}: {e}"));
     }
     None
 }
@@ -479,6 +510,7 @@ fn reserve_port() -> u16 {
 /// The server, the administrator, alice, her instance and its bridge, up and ready.
 struct Scene {
     label: &'static str,
+    network: Network,
     _dir: tempfile::TempDir,
     server: Server,
     admin: Admin,
@@ -524,6 +556,11 @@ impl Scene {
 /// Everything up to "ready": the offering with `options`, alice's instance, its files, the
 /// container, the registration pointed at it.
 async fn set_up(label: &'static str, options: Value) -> Result<Scene> {
+    set_up_for(WHATSAPP, label, options).await
+}
+
+/// [`set_up`] for `network`'s bridge.
+async fn set_up_for(network: Network, label: &'static str, options: Value) -> Result<Scene> {
     let dir = tempfile::tempdir()?;
     let port = reserve_port();
     let server = Server::start(dir.path(), port)?;
@@ -536,12 +573,13 @@ async fn set_up(label: &'static str, options: Value) -> Result<Scene> {
     admin
         .ok(
             reqwest::Method::PUT,
-            "/bridge-offerings/mautrix-whatsapp",
+            &format!("/bridge-offerings/{}", network.type_id),
             Some(json!({"runtime": "elsewhere", "options": options})),
         )
         .await?;
     let instance_path = format!(
-        "/bridge-offerings/mautrix-whatsapp/instances/{}",
+        "/bridge-offerings/{}/instances/{}",
+        network.type_id,
         alice_id.replace('@', "%40").replace(':', "%3A")
     );
     admin.ok(reqwest::Method::PUT, &instance_path, None).await?;
@@ -598,10 +636,10 @@ async fn set_up(label: &'static str, options: Value) -> Result<Scene> {
         "--add-host",
         "host.docker.internal:host-gateway",
         "-p",
-        &format!("127.0.0.1:{bridge_port}:29318"),
+        &format!("127.0.0.1:{bridge_port}:{}", network.port),
         "-v",
         &format!("{}:/data", bridge_dir.display()),
-        IMAGE,
+        network.image,
     ])?;
     let bridge = Bridge { name };
     admin
@@ -613,6 +651,7 @@ async fn set_up(label: &'static str, options: Value) -> Result<Scene> {
         .await?;
     let scene = Scene {
         label,
+        network,
         _dir: dir,
         server,
         admin,
@@ -681,11 +720,16 @@ async fn join_chat(scene: &mut Scene) -> Result<OwnedRoomId> {
 async fn login_qr_in(scene: &mut Scene, room_id: &RoomId) -> Result<()> {
     let label = scene.label;
     let bot = scene.bot.clone();
+    // One sync first, as a client that is running would have done: the manager may have
+    // signed the bot's device a moment ago, and alice's client learns that from the
+    // device-list change in a sync. Sending before it did withheld the room's key from the
+    // bot as `m.unverified` (seen once on 2026-10-04 in the repaired story, under load).
+    scene.sync(Duration::from_secs(1)).await?;
     let room = scene.alice.get_room(room_id).context("the joined room")?;
     let is_encrypted = room.latest_encryption_state().await?.is_encrypted();
     // `HS_BRIDGE_LOGIN_TEXT` types something else, to see how the bridge takes it (for
     // example `!wa login qr`, the prefixed form a mautrix bridge takes in any room).
-    let text = std::env::var("HS_BRIDGE_LOGIN_TEXT").unwrap_or_else(|_| "login qr".into());
+    let text = std::env::var("HS_BRIDGE_LOGIN_TEXT").unwrap_or_else(|_| scene.network.login.into());
     let sent = room
         .send(RoomMessageEventContent::text_plain(&text))
         .await
@@ -722,7 +766,7 @@ async fn login_qr_in(scene: &mut Scene, room_id: &RoomId) -> Result<()> {
     eprintln!("[{label}] health: {health}");
     if replies.is_empty() {
         bail!(
-            "{bot} said nothing within {REPLY_WAIT:?} of `login qr` ({label} chat). health: {health}\n--- bridge log (tail) ---\n{}\n--- server log (tail) ---\n{}",
+            "{bot} said nothing within {REPLY_WAIT:?} of `{text}` ({label} chat). health: {health}\n--- bridge log (tail) ---\n{}\n--- server log (tail) ---\n{}",
             tail(&scene.bridge.log(), 60),
             tail(&scene.server.log(), 60)
         );
@@ -1029,8 +1073,16 @@ fn run<F>(story: F)
 where
     F: std::future::Future<Output = Result<()>>,
 {
+    run_with(IMAGE, story);
+}
+
+/// [`run`] for a story whose bridge is `image`.
+fn run_with<F>(image: &str, story: F)
+where
+    F: std::future::Future<Output = Result<()>>,
+{
     let _guard = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(reason) = skip_reason() {
+    if let Some(reason) = skip_reason(image) {
         eprintln!("SKIP: {reason}");
         return;
     }
@@ -1052,8 +1104,56 @@ fn a_person_types_login_qr_in_a_plain_chat_and_gets_a_qr_code() {
     run(login_qr(false));
 }
 
+/// The second real bridge: mautrix-signal, offered and run from the files this server
+/// rendered, in the encrypted chat with its personal bot. `login` (Signal's one flow, linking
+/// as a secondary device) is answered with a QR code; the bot's device is cross-signed by the
+/// manager; nothing is withheld; and the rewritten config still names the device after alice
+/// and this server (`network.device_name`).
+async fn signal_login() -> Result<()> {
+    let mut scene = set_up_for(SIGNAL, "signal", json!({"encryption": true})).await?;
+    let room_id = join_chat(&mut scene).await?;
+    let instance = scene
+        .admin
+        .ok(reqwest::Method::GET, &scene.instance_path, None)
+        .await?;
+    assert_eq!(instance["chat_started_by"], "owner", "{instance}");
+    let expected = format!("Myelin Signal bridge for alice ({SERVER_NAME})");
+    assert_eq!(instance["device_name"], expected, "{instance}");
+    let config = scene.bridge.read_file("/data/config.yaml")?;
+    assert!(
+        config.contains(&expected),
+        "the bridge's rewritten config names the device; config:\n{config}"
+    );
+    let signal = scene
+        .admin
+        .ok(reqwest::Method::GET, "/bridge-types/mautrix-signal", None)
+        .await?;
+    assert_eq!(signal["command_prefix"], "!signal", "{signal}");
+    assert!(
+        config.contains("command_prefix: '!signal'")
+            || config.contains("command_prefix: \"!signal\"")
+            || config.contains("command_prefix: !signal"),
+        "the bridge's own default prefix is the one the catalogue claims; config:\n{config}"
+    );
+    let signed_device = bot_is_cross_signed(&scene).await?;
+    login_qr_in(&mut scene, &room_id).await?;
+    let instance = scene
+        .admin
+        .ok(reqwest::Method::GET, &scene.instance_path, None)
+        .await?;
+    assert_eq!(instance["signed_bot_device"], signed_device, "{instance}");
+    assert!(instance["last_key_withheld"].is_null(), "{instance}");
+    Ok(())
+}
+
 /// A chat the bot started (every chat from before 2026-10-02) is repaired in place and answers.
 #[test]
 fn a_chat_the_bot_started_is_repaired_in_place_and_login_qr_gets_a_qr_code() {
     run(repaired_chat());
+}
+
+/// The second real bridge, Signal, signed in to the same way.
+#[test]
+fn a_person_types_login_to_their_signal_bridge_and_gets_a_qr_code() {
+    run_with(SIGNAL.image, signal_login());
 }
