@@ -43,11 +43,16 @@ pub enum Stream {
     /// Local media: the records and, when the media store is mounted, the files
     /// (`local_media_repository`, `media_store_path/local_content`).
     Media,
+    /// Other servers' media Synapse had cached: each entry with its file, when the media store
+    /// is mounted and the file is there (`remote_media_cache`,
+    /// `media_store_path/remote_content/<server>`). An entry without its file is left out: it
+    /// is a cache, fetched again from its server the first time somebody asks.
+    RemoteMedia,
 }
 
 impl Stream {
     /// Every stream, in copy order.
-    pub const ALL: [Stream; 13] = [
+    pub const ALL: [Stream; 14] = [
         Stream::Users,
         Stream::Devices,
         Stream::AccessTokens,
@@ -61,6 +66,7 @@ impl Stream {
         Stream::Rooms,
         Stream::Receipts,
         Stream::Media,
+        Stream::RemoteMedia,
     ];
 
     /// The wire name (`MigrationStatus.streams[].name`, `MigrationLogEntry.stream`).
@@ -80,6 +86,7 @@ impl Stream {
             Stream::Rooms => "rooms",
             Stream::Receipts => "receipts",
             Stream::Media => "media",
+            Stream::RemoteMedia => "remote_media",
         }
     }
 
@@ -413,6 +420,42 @@ pub struct SynapseMedia {
     pub quarantined_by: Option<String>,
     /// Protected from quarantine.
     pub safe_from_quarantine: bool,
+}
+
+/// One of another server's media items Synapse had cached (`remote_media_cache`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SynapseRemoteMedia {
+    /// The server it belongs to (the host of `mxc://<origin>/<media_id>`).
+    pub origin: String,
+    /// Its media id there.
+    pub media_id: String,
+    /// Its content type, as that server said.
+    pub content_type: Option<String>,
+    /// Its size in bytes.
+    pub length: Option<u64>,
+    /// When Synapse fetched it, in milliseconds.
+    pub created_ms: u64,
+    /// The file name that server gave it.
+    pub upload_name: Option<String>,
+    /// When somebody last asked for it, in milliseconds.
+    pub last_access_ms: Option<u64>,
+    /// Who quarantined it here, if anybody did.
+    pub quarantined_by: Option<String>,
+}
+
+impl SynapseRemoteMedia {
+    /// The checkpoint key a copy carries on from: the origin and the media id, which together
+    /// are the row's key (a server name never holds a space).
+    #[must_use]
+    pub fn key(&self) -> String {
+        format!("{} {}", self.origin, self.media_id)
+    }
+
+    /// The `(origin, media_id)` a [`SynapseRemoteMedia::key`] names.
+    #[must_use]
+    pub fn parse_key(key: &str) -> Option<(&str, &str)> {
+        key.split_once(' ')
+    }
 }
 
 /// Where a migration is. The OpenAPI `MigrationStatus.status` enum.

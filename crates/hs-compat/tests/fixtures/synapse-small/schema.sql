@@ -239,3 +239,30 @@ CREATE TABLE user_filters (
     filter_id bigint NOT NULL,
     filter_json bytea NOT NULL
 );
+
+-- Other servers' media Synapse had cached (Synapse's remote_media_cache, with the columns later
+-- deltas added: authenticated, sha256). Rows added by hand on 2026-10-04 (see README).
+CREATE TABLE remote_media_cache (
+    media_origin text,
+    media_id text,
+    media_type text,
+    created_ts bigint,
+    upload_name text,
+    media_length integer,
+    filesystem_id text,
+    last_access_ts bigint,
+    quarantined_by text,
+    authenticated boolean NOT NULL DEFAULT false,
+    sha256 text
+);
+
+CREATE TABLE remote_media_cache_thumbnails (
+    media_origin text,
+    media_id text,
+    thumbnail_width integer,
+    thumbnail_height integer,
+    thumbnail_method text,
+    thumbnail_type text,
+    thumbnail_length integer,
+    filesystem_id text
+);

@@ -25,8 +25,8 @@ use hs_compat::migration::engine::MigratorParts;
 use hs_compat::migration::model::{
     MigrationRecord, Phase, Stream, SynapseAccessToken, SynapseAccountData, SynapseBackupVersion,
     SynapseCrossSigning, SynapseDevice, SynapseDeviceKeys, SynapseEvent, SynapseFilter,
-    SynapseMedia, SynapsePushRules, SynapsePusher, SynapseReceipt, SynapseRemoteJoin, SynapseRoom,
-    SynapseRoomKey, SynapseUser,
+    SynapseMedia, SynapsePushRules, SynapsePusher, SynapseReceipt, SynapseRemoteJoin,
+    SynapseRemoteMedia, SynapseRoom, SynapseRoomKey, SynapseUser,
 };
 use hs_compat::migration::rooms::{EventPages, copy_room};
 use hs_compat::migration::source::EventKey;
@@ -201,6 +201,7 @@ struct MemoryTarget {
     receipts: Mutex<Receipts>,
     rooms: Mutex<HashMap<String, MemoryRoom>>,
     media: Mutex<HashMap<String, TargetMedia>>,
+    remote_media: Mutex<HashMap<(String, String), TargetMedia>>,
     /// The most events any one call to `import_room_events` was given.
     largest_page: AtomicUsize,
     gate: Option<Arc<Semaphore>>,
@@ -501,6 +502,21 @@ impl MigrationTarget for MemoryTarget {
         Ok(Imported::Created)
     }
 
+    async fn import_remote_media(
+        &self,
+        media: &SynapseRemoteMedia,
+        bytes: Vec<u8>,
+    ) -> Result<Imported, TargetError> {
+        Ok(upsert(
+            &self.remote_media,
+            (media.origin.clone(), media.media_id.clone()),
+            TargetMedia {
+                content_type: media.content_type.clone().unwrap_or_default(),
+                bytes: Some(bytes),
+            },
+        ))
+    }
+
     async fn user(&self, user_id: &str) -> Result<Option<TargetUser>, TargetError> {
         Ok(self.users.lock().unwrap().get(user_id).cloned())
     }
@@ -568,6 +584,19 @@ impl MigrationTarget for MemoryTarget {
 
     async fn media(&self, media_id: &str) -> Result<Option<TargetMedia>, TargetError> {
         Ok(self.media.lock().unwrap().get(media_id).cloned())
+    }
+
+    async fn remote_media(
+        &self,
+        origin: &str,
+        media_id: &str,
+    ) -> Result<Option<TargetMedia>, TargetError> {
+        Ok(self
+            .remote_media
+            .lock()
+            .unwrap()
+            .get(&(origin.to_owned(), media_id.to_owned()))
+            .cloned())
     }
 
     async fn verify_device_keys(&self, keys: &SynapseDeviceKeys) -> Result<Check, TargetError> {
@@ -908,6 +937,49 @@ async fn the_reader_sees_what_synapse_holds() {
     assert_eq!(filters[0].0.user_id, "@alice:fixture.test");
     assert_eq!(filters[0].0.filter_id, "0");
     assert_eq!(filters[0].0.filter["room"]["timeline"]["limit"], 20);
+
+    // Other servers' media Synapse had cached: one with its file under remote_content/<server>,
+    // one whose file is gone (Synapse's cache eviction leaves the row, as the fixture does).
+    let remote = source.remote_media(None, 10).await.unwrap();
+    assert_eq!(
+        remote
+            .iter()
+            .map(|m| format!("mxc://{}/{}", m.origin, m.media_id))
+            .collect::<Vec<_>>(),
+        [
+            facts["remote_picture"].as_str().unwrap(),
+            facts["remote_missing"].as_str().unwrap()
+        ]
+    );
+    let picture = source
+        .remote_media_bytes(&remote[0].origin, &remote[0].media_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(Some(picture.len() as u64), remote[0].length);
+    assert!(
+        source
+            .remote_media_file_exists(&remote[0].origin, &remote[0].media_id)
+            .await
+    );
+    assert_eq!(
+        source
+            .remote_media_bytes(&remote[1].origin, &remote[1].media_id)
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(
+        !source
+            .remote_media_file_exists(&remote[1].origin, &remote[1].media_id)
+            .await
+    );
+    // The copy carries on from the checkpoint it last wrote.
+    let key = remote[0].key();
+    let after = SynapseRemoteMedia::parse_key(&key).unwrap();
+    let rest = source.remote_media(Some(after), 10).await.unwrap();
+    assert_eq!(rest.len(), 1);
+    assert_eq!(rest[0].media_id, remote[1].media_id);
 }
 
 #[tokio::test]
@@ -938,7 +1010,19 @@ async fn a_copy_is_verified_and_cut_over_and_nothing_can_follow_it() {
     assert_eq!(copied(&record, Stream::Rooms), 2);
     assert_eq!(copied(&record, Stream::Receipts), 2);
     assert_eq!(copied(&record, Stream::Media), 2);
+    let remote = record.stream(Stream::RemoteMedia).unwrap();
+    assert_eq!((remote.copied, remote.skipped), (1, 1), "{remote:?}");
     assert!(record.streams.iter().all(|s| s.done && s.failed == 0));
+    assert_eq!(
+        rig.target
+            .remote_media
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        [("other.test".to_owned(), "RemoteCachedPictureOne".to_owned())]
+    );
 
     // What landed: the keys, the backup's three room keys, the rules, the receipt.
     let target = &rig.target;

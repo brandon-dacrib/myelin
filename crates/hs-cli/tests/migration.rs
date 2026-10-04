@@ -431,6 +431,11 @@ async fn a_synapse_database_is_migrated_verified_and_cut_over_through_the_admin_
     assert_eq!(stream("rooms")["copied_count"], 2);
     assert_eq!(stream("rooms")["failed_count"], 0, "{ready}");
     assert_eq!(stream("media")["copied_count"], 2);
+    // Other servers' media: the one whose file is in the store is copied, the one whose file is
+    // gone is left out on purpose.
+    assert_eq!(stream("remote_media")["copied_count"], 1, "{ready}");
+    assert_eq!(stream("remote_media")["skipped_count"], 1, "{ready}");
+    assert_eq!(stream("remote_media")["failed_count"], 0, "{ready}");
     assert_eq!(stream("account_data")["copied_count"], 3);
     for (name, count) in [
         ("e2e_keys", 2),
@@ -622,6 +627,49 @@ async fn a_synapse_database_is_migrated_verified_and_cut_over_through_the_admin_
     )
     .unwrap();
     assert_eq!(bytes, original);
+
+    // The picture from another server that Synapse had cached: served from the copy, byte for
+    // byte, with the content type Synapse recorded. Nothing resolves `other.test`, so bytes here
+    // can only have come from the import. The one whose file was gone is not here, and asking
+    // for it is a fetch from its server, which fails as it would have in Synapse.
+    let remote = facts["remote_picture"].as_str().unwrap();
+    let (origin, remote_id) = remote
+        .strip_prefix("mxc://")
+        .unwrap()
+        .split_once('/')
+        .unwrap();
+    let (status, bytes) = alice
+        .bytes(&format!(
+            "/_matrix/client/v1/media/download/{origin}/{remote_id}"
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let original = std::fs::read(
+        fixture_dir()
+            .join("media_store/remote_content")
+            .join(origin)
+            .join(&remote_id[0..2])
+            .join(&remote_id[2..4])
+            .join(&remote_id[4..]),
+    )
+    .unwrap();
+    assert_eq!(bytes, original);
+    let missing = facts["remote_missing"].as_str().unwrap();
+    let (_, missing_id) = missing
+        .strip_prefix("mxc://")
+        .unwrap()
+        .split_once('/')
+        .unwrap();
+    let (status, _) = alice
+        .bytes(&format!(
+            "/_matrix/client/v1/media/download/{origin}/{missing_id}"
+        ))
+        .await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "a cache entry without its file was copied"
+    );
 
     // End-to-end keys: alice's phone as her client uploaded it to Synapse, signed by her
     // self-signing key; her cross-signing keys; bob's master key with her signature on it.

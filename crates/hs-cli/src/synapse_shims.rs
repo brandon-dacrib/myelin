@@ -62,6 +62,13 @@ pub fn routes() -> Vec<Route> {
                 "synapseAdminSendServerNoticeTxn",
             )
         },
+        Route {
+            method: "POST".to_owned(),
+            ..route(
+                "/_synapse/admin/v1/deactivate/{user_id}",
+                "synapseAdminDeactivateUser",
+            )
+        },
     ]
 }
 
@@ -72,7 +79,7 @@ mod tests {
     #[test]
     fn mirrors_every_shimmed_route_on_the_compat_surface() {
         let routes = routes();
-        assert_eq!(routes.len(), 7);
+        assert_eq!(routes.len(), 8);
         assert_eq!(routes.iter().filter(|r| r.method == "GET").count(), 5);
         assert!(
             routes

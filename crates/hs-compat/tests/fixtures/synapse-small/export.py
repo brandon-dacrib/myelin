@@ -47,6 +47,8 @@ ORDER = {
     "pushers": "id",
     "receipts_linearized": "stream_id",
     "user_filters": "full_user_id, filter_id",
+    "remote_media_cache": "media_origin, media_id",
+    "remote_media_cache_thumbnails": "media_origin, media_id, thumbnail_width, thumbnail_height, thumbnail_type",
 }
 
 

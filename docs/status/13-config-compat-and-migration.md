@@ -4,6 +4,98 @@ Track brief: `docs/workstreams/13-config-compat-and-migration.md`. Owner
 crates/files: `crates/hs-config`, `crates/hs-compat`,
 `tools/synapse_inventory.py`, `docs/synapse-inventory.md`.
 
+## 2026-10-04: other servers' media is copied, and the `/_synapse/admin` surface says what it serves (branch `agent/importer-leftovers`)
+
+`docs/next-steps.md` item 7 named the importer's leftovers as "end-to-end keys and backups, push
+rules and pushers, receipts, filters, remote media, federated rooms" and said the `/_synapse/admin`
+proxy "is still not mounted". Checked against `main` first: all of those but remote media were
+copied and verified on 2026-10-01 (the section below), and the proxy has been mounted by
+`crate::synapse_shims` in `hs serve` since then (`serve.rs` merges it right after the native
+admin router). What was real, done tonight:
+
+**Other servers' media is copied** (new stream `remote_media`, after `media`):
+
+- `SynapseSource::remote_media` reads `remote_media_cache` in `(media_origin, media_id)` order
+  (the checkpoint is `"<origin> <media_id>"`, `SynapseRemoteMedia::key`); the table is optional
+  (a fixture without it reads as empty). `remote_media_bytes` reads the file at
+  `remote_content/<origin>/ab/cd/rest` (`source::remote_content_path`, which refuses an origin
+  that is not a plain path component); `remote_media_file_exists` stats it. **Through the
+  layout adapter:** `hs-compat` does not depend on `hs-media` (its tree carries `image`,
+  `reqwest`, `icap-rs`), so the path is built here and `hs-cli`'s test
+  `the_importer_reads_media_files_where_the_layout_adapter_puts_them` holds it to what
+  `hs_media::synapse_layout::classify_relative_path` reads back (`RemoteContent`, the same
+  origin and id), for the local path too.
+- `MigrationTarget::import_remote_media(&SynapseRemoteMedia, bytes)` and `remote_media(origin,
+  id)`; `StoreTarget` writes the bytes under `content_object_key(origin, id)` first and then the
+  `MediaRecord` keyed by `(origin, id)` with `uploader: None` and Synapse's `last_access_ts`,
+  exactly as `hs-media` stores a copy it fetched itself, so `/media/download/<origin>/<id>`
+  serves it with no fetch. An entry for this server's own name is left out (local media covers
+  it).
+- The engine offers the target only entries whose file is there: one whose file is gone, or
+  with no media store mounted, is `Skipped` with the reason in the log (a cache miss after
+  cutover is a fetch from the origin, as in Synapse). Verification (now 9 steps) looks up every
+  entry whose file is in the store, compares the content type and a sample byte for byte, and
+  counts file-less entries as left out, never as a difference.
+- The fixture `synapse-small` has the two tables (Synapse's schema 72 plus the `authenticated`
+  and `sha256` deltas) and two entries of a server `other.test` that never existed, one with a
+  2x2 PNG under `remote_content/other.test/Re/mo/`, one whose file is gone; `synapse-federated`
+  has the tables, empty; `export.py` keeps them on a regeneration. No Synapse was run: `docker
+  pull ghcr.io/element-hq/synapse` fails in a session (the keychain), as the brief expected.
+- Web: `remote_media` has its label and explanation on the Migration page (`web/src/lib/
+  migration.ts`), the "Other servers' media" entry of "Not copied" is now "Thumbnails" (which
+  were never copied and were not listed), the mock has the stream.
+- Docs: the runbook's copy order, "What moves" row, "What does not move" (thumbnails; file-less
+  entries), the verify paragraph; the mapping table's `remote_media_cache` row.
+
+**The `/_synapse/admin` surface says what it serves:**
+
+- `hs serve` logs at startup `the Synapse admin compatibility surface is mounted under
+  /_synapse/admin, behind the admin API's own tokens and scopes` with `routes=` and
+  `operations=` (every `routes.json` entry of the `synapse-admin-compat` surface).
+- `crate::synapse_shims::routes()` had 7 entries for the proxy's 8 routes: `POST
+  /_synapse/admin/v1/deactivate/{user_id}` was mounted but missing from `routes.json`. Added.
+- `docs/compat/synapse-admin-routes.md` has a new section "What `hs serve` serves today": the ten
+  routes, their shapes, what each needs (the register pair needs
+  `auth.registration_shared_secret`, else `404 M_UNRECOGNIZED` by design), and that every other
+  row of its tables is a mapping only.
+
+**Verified by:**
+
+- `cargo test -p hs-cli --test migration` (2 tests, the real binary, PostgreSQL at 5439): the
+  `remote_media` stream copies 1 and skips 1 with 0 failed; after the cutover alice downloads
+  `mxc://other.test/RemoteCachedPictureOne` byte for byte (nothing resolves `other.test`, so the
+  bytes can only be the import's), and the file-less entry is not served.
+- `cargo test -p hs-compat` (62 unit, 7 corpus, 7 engine): `remote_content_path` escapes;
+  the source reads both entries, the bytes of one, `None` and `false` for the other, and carries
+  on from the checkpoint; the engine copies 1 and skips 1, the target holds exactly
+  `("other.test", "RemoteCachedPictureOne")`, verification passes.
+- `cargo test -p hs-cli --test synapse_admin` (new, the real binary): `server_version`; no token
+  and a plain user's token are `401 M_FORBIDDEN`; the v2 user list with `total`, `admin` and
+  `deactivated`; one user and `404 M_NOT_FOUND`; the room list and one room (`joined_members`,
+  `creator`); deactivation through the Synapse route signs alice out and shows in the listing;
+  `GET register` answers a nonce; and every `routes.json` entry of the compat surface answers
+  something other than `M_UNRECOGNIZED` (which is what caught the register pair's dependence on
+  the secret, and would catch a manifest entry without a route).
+- `cargo test -p hs-cli --lib`: the shim manifest count (8), the layout round trip.
+- `cd web && npm run check && npm run test:e2e`.
+
+**Left:** thumbnails (made on demand here, by design); a receipt in a thread other than `main`
+(`hs-user`'s receipt store has no thread dimension); a backed-up room key deleted in Synapse
+after an earlier pass (`hs-e2e` has no per-key delete); a room this server's users were only
+invited to or have all left (skipped and logged; joining again after cutover); a run against a
+large Synapse on a quiet machine (`synapse-big`'s scripts; a desk item, it needs a Synapse);
+`remote_media_cache.authenticated` is not carried (this server's own policy decides). The
+stale comment in `crates/hs-cli/tests/e2e.rs` ("no track has mounted that route") is wrong
+since the register route was mounted; left for its owner.
+
+**Decisions made:** remote media is a stream of its own rather than rows of `media`, so its
+counts, log lines and `hs_migration_rows_*{stream="remote_media"}` are its own and an operator
+sees what a cache cost; a cache entry without its file is never written (a `MediaRecord`
+without bytes would be served as not-found anyway, and `hs-media` would not refetch it); the
+layout is held to `hs-media`'s adapter by a test rather than a dependency.
+
+**Shared dependencies added:** none.
+
 ## 2026-10-01: the importer leaves nothing a migrating user needs behind, and copies a room in bounded memory (branch `agent/importer-gaps`)
 
 Closes the two importer rows of `docs/next-steps.md`'s Known gaps, as far as was real tonight.

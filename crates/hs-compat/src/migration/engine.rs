@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 use super::MigrationError;
 use super::model::{
     LogEntry, LogLevel, MigrationRecord, Phase, Stream, StreamProgress, StreamVerification,
-    VerificationReport,
+    SynapseRemoteMedia, VerificationReport,
 };
 use super::rooms::{RoomFailure, SynapseRoomPages, copy_room};
 use super::source::{
@@ -1137,6 +1137,38 @@ impl Migrator {
                     }
                 }
             }
+            Stream::RemoteMedia => {
+                let after = after.and_then(SynapseRemoteMedia::parse_key);
+                for media in source.remote_media(after, limit).await? {
+                    if ctx.is_cancelled() {
+                        break;
+                    }
+                    batch.next = Some(media.key());
+                    let key = format!("mxc://{}/{}", media.origin, media.media_id);
+                    let outcome = match source
+                        .remote_media_bytes(&media.origin, &media.media_id)
+                        .await?
+                    {
+                        Some(bytes) => self.target.import_remote_media(&media, bytes).await,
+                        None if config.media_store_path.is_some() => {
+                            Ok(Imported::Skipped(format!(
+                                "its file is not in the media store; fetched again from {} when \
+                                 somebody asks for it",
+                                media.origin
+                            )))
+                        }
+                        None => Ok(Imported::Skipped(format!(
+                            "Synapse's media store is not mounted; fetched again from {} when \
+                             somebody asks for it",
+                            media.origin
+                        ))),
+                    };
+                    batch.tally(stream, &key, outcome);
+                    if batch.fatal.is_some() {
+                        break;
+                    }
+                }
+            }
         }
         Ok(batch)
     }
@@ -1225,7 +1257,7 @@ impl Migrator {
     ) -> Result<VerificationReport, MigrationError> {
         let target_err = |e: TargetError| MigrationError::Target(e.message);
         let mut streams = Vec::new();
-        let steps = 8;
+        let steps = 9;
 
         // Accounts: all looked up, a sample compared.
         let mut users = StreamVerification::new(Stream::Users.as_str());
@@ -1730,6 +1762,67 @@ impl Migrator {
         streams.push(media);
         ctx.progress(8, Some(steps), Some("streams"), Some("media checked"))
             .await;
+
+        // Other servers' media Synapse had cached: each entry whose file is in the media store
+        // is here; one whose file is not (or with no media store mounted) was left out on
+        // purpose and is counted as such. A sample's bytes compared.
+        let mut remote = StreamVerification::new(Stream::RemoteMedia.as_str());
+        let mut after: Option<(String, String)> = None;
+        let mut bytes_checked = 0;
+        loop {
+            let page = source
+                .remote_media(after.as_ref().map(|(o, m)| (o.as_str(), m.as_str())), 500)
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            for item in &page {
+                let name = format!("mxc://{}/{}", item.origin, item.media_id);
+                if !source
+                    .remote_media_file_exists(&item.origin, &item.media_id)
+                    .await
+                {
+                    remote.skipped_count += 1;
+                    continue;
+                }
+                remote.source_count += 1;
+                let Some(here) = self
+                    .target
+                    .remote_media(&item.origin, &item.media_id)
+                    .await
+                    .map_err(target_err)?
+                else {
+                    remote.mismatch(format!("{name} is missing"));
+                    continue;
+                };
+                remote.target_count += 1;
+                if let Some(theirs) = &item.content_type
+                    && theirs != &here.content_type
+                {
+                    remote.mismatch(format!("{name}: content type differs"));
+                }
+                if bytes_checked < self.sample_size
+                    && let Some(theirs) = source
+                        .remote_media_bytes(&item.origin, &item.media_id)
+                        .await?
+                {
+                    bytes_checked += 1;
+                    remote.sampled += 1;
+                    if here.bytes.as_deref() != Some(theirs.as_slice()) {
+                        remote.mismatch(format!("{name}: the file differs"));
+                    }
+                }
+            }
+            after = page.last().map(|m| (m.origin.clone(), m.media_id.clone()));
+        }
+        streams.push(remote);
+        ctx.progress(
+            9,
+            Some(steps),
+            Some("streams"),
+            Some("other servers' media checked"),
+        )
+        .await;
 
         let passed = streams
             .iter()

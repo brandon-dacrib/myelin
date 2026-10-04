@@ -25,6 +25,15 @@ with changed actions) and a pusher; a sync filter each for alice and bob.
 Regenerated on 2026-10-01 with the end-to-end keys, push rules, pushers, receipts and filters
 (the earlier one lacked them); the counts the tests assert are unchanged.
 
+Added by hand on 2026-10-04, from Synapse's schema (`synapse/storage/schema/main/full_schemas/
+72/full.sql.postgres` and its later deltas; no Synapse was run): `remote_media_cache` and
+`remote_media_cache_thumbnails`, with two entries of a server `other.test` that never existed:
+`RemoteCachedPictureOne` (a 2x2 PNG, under `media_store/remote_content/other.test/Re/mo/`, with
+a thumbnail row) and `RemoteMissingFileTwo`, whose file is gone, as Synapse's cache eviction
+leaves the row. `facts.json` names both (`remote_picture`, `remote_missing`). `export.py` keeps
+both tables on a regeneration; a Synapse that had fetched another server's media writes the
+same rows.
+
 Used by `crates/hs-compat/tests/migration.rs` (the engine, against an in-memory target) and
 `crates/hs-cli/tests/migration.rs` (the real `hs` binary, through the admin API), which load
 `schema.sql` and `data.sql` into a fresh PostgreSQL database each.

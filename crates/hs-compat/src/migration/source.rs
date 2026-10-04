@@ -17,14 +17,14 @@ use super::MigrationError;
 use super::model::{
     RoomShape, Stream, SynapseAccessToken, SynapseAccountData, SynapseBackupVersion,
     SynapseCrossSigning, SynapseDevice, SynapseDeviceKeys, SynapseEvent, SynapseFilter,
-    SynapseMedia, SynapsePushRules, SynapsePusher, SynapseReceipt, SynapseRemoteJoin, SynapseRoom,
-    SynapseRoomKey, SynapseUser,
+    SynapseMedia, SynapsePushRules, SynapsePusher, SynapseReceipt, SynapseRemoteJoin,
+    SynapseRemoteMedia, SynapseRoom, SynapseRoomKey, SynapseUser,
 };
 use super::rows;
 
 /// Tables a Synapse may not have (an older one, or one that never had the feature), each read
 /// as empty when it is absent rather than failing the copy.
-const OPTIONAL_TABLES: [&str; 16] = [
+const OPTIONAL_TABLES: [&str; 17] = [
     "e2e_device_keys_json",
     "e2e_one_time_keys_json",
     "e2e_fallback_keys_json",
@@ -41,6 +41,7 @@ const OPTIONAL_TABLES: [&str; 16] = [
     "event_to_state_groups",
     "state_groups_state",
     "state_group_edges",
+    "remote_media_cache",
 ];
 
 /// The key a room's events are paged on: `(topological_ordering, stream_ordering)`, which is
@@ -138,6 +139,28 @@ pub fn local_content_path(media_id: &str) -> Option<PathBuf> {
             .join(&media_id[0..2])
             .join(&media_id[2..4])
             .join(&media_id[4..]),
+    )
+}
+
+/// Where Synapse keeps its cached copy of another server's media item, relative to its
+/// `media_store_path`: `remote_content/<origin>/ab/cd/efgh...` for `mxc://<origin>/abcdefgh...`
+/// (`hs_media::synapse_layout`'s `RemoteContent` subtree, whose classifier reads this path back;
+/// `hs-cli`'s `migration` tests hold the two to each other). `None` for an origin or a media id
+/// that is not a plain path component, so nothing escapes the store.
+#[must_use]
+pub fn remote_content_path(origin: &str, media_id: &str) -> Option<PathBuf> {
+    if origin.is_empty()
+        || !origin.is_ascii()
+        || origin.starts_with('.')
+        || origin.contains(['/', '\\', ' '])
+    {
+        return None;
+    }
+    let local = local_content_path(media_id)?;
+    Some(
+        Path::new("remote_content")
+            .join(origin)
+            .join(local.strip_prefix("local_content").ok()?),
     )
 }
 
@@ -263,6 +286,7 @@ impl SynapseSource {
             Stream::Pushers => &["pushers"],
             Stream::Filters => &["user_filters"],
             Stream::Receipts => &["receipts_linearized"],
+            Stream::RemoteMedia => &["remote_media_cache"],
             _ => &[],
         };
         if needs.iter().any(|t| !self.has(t)) {
@@ -291,6 +315,7 @@ impl SynapseSource {
             Stream::Rooms => "SELECT count(*) FROM rooms".to_owned(),
             Stream::Receipts => "SELECT count(*) FROM receipts_linearized".to_owned(),
             Stream::Media => "SELECT count(*) FROM local_media_repository".to_owned(),
+            Stream::RemoteMedia => "SELECT count(*) FROM remote_media_cache".to_owned(),
         };
         let n: i64 = self.client.query_one(&sql, &[]).await.map_err(db)?.get(0);
         Ok(u64::try_from(n).unwrap_or(0))
@@ -1029,6 +1054,92 @@ impl SynapseSource {
         }
     }
 
+    /// Other servers' media Synapse had cached, after `after` (an origin and a media id), in
+    /// `(origin, media_id)` order. Empty for a Synapse without the table.
+    ///
+    /// # Errors
+    /// [`MigrationError::Source`] on a database error.
+    pub async fn remote_media(
+        &self,
+        after: Option<(&str, &str)>,
+        limit: i64,
+    ) -> Result<Vec<SynapseRemoteMedia>, MigrationError> {
+        if !self.has("remote_media_cache") {
+            return Ok(Vec::new());
+        }
+        let (after_origin, after_id) = match after {
+            Some((origin, id)) => (Some(origin), Some(id)),
+            None => (None, None),
+        };
+        let rows = self
+            .client
+            .query(
+                "SELECT to_jsonb(m)::text FROM remote_media_cache m \
+                 WHERE m.media_origin IS NOT NULL AND m.media_id IS NOT NULL \
+                 AND ($1::text IS NULL OR (m.media_origin, m.media_id) > ($1, $2)) \
+                 ORDER BY m.media_origin, m.media_id LIMIT $3",
+                &[&after_origin, &after_id, &limit],
+            )
+            .await
+            .map_err(db)?;
+        rows.iter()
+            .map(|row| {
+                let r = parse_row(row.get(0))?;
+                Ok(SynapseRemoteMedia {
+                    origin: text(&r, "media_origin").unwrap_or_default(),
+                    media_id: text(&r, "media_id").unwrap_or_default(),
+                    content_type: text(&r, "media_type"),
+                    length: unsigned(&r, "media_length"),
+                    created_ms: unsigned(&r, "created_ts").unwrap_or(0),
+                    upload_name: text(&r, "upload_name"),
+                    last_access_ms: unsigned(&r, "last_access_ts"),
+                    quarantined_by: text(&r, "quarantined_by"),
+                })
+            })
+            .collect()
+    }
+
+    /// A cached remote media item's file from the media store: `Ok(None)` when no media store
+    /// is mounted, the item's origin or id cannot name a file, or the file is not there.
+    ///
+    /// # Errors
+    /// [`MigrationError::Source`] when the file exists but cannot be read.
+    pub async fn remote_media_bytes(
+        &self,
+        origin: &str,
+        media_id: &str,
+    ) -> Result<Option<Vec<u8>>, MigrationError> {
+        let (Some(root), Some(relative)) =
+            (&self.media_store, remote_content_path(origin, media_id))
+        else {
+            return Ok(None);
+        };
+        let path = root.join(relative);
+        match tokio::fs::read(&path).await {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(MigrationError::Source(format!(
+                "could not read {}: {e}",
+                path.display()
+            ))),
+        }
+    }
+
+    /// Whether a cached remote media item's file is in the mounted media store (without reading
+    /// it): what verification uses to tell an entry the copy had to leave out from one it
+    /// should have copied.
+    pub async fn remote_media_file_exists(&self, origin: &str, media_id: &str) -> bool {
+        let (Some(root), Some(relative)) =
+            (&self.media_store, remote_content_path(origin, media_id))
+        else {
+            return false;
+        };
+        tokio::fs::metadata(root.join(relative))
+            .await
+            .map(|m| m.is_file())
+            .unwrap_or(false)
+    }
+
     /// A random sample of up to `limit` keys of `stream`'s rows, for verification's field-by-field
     /// comparison. Streams verification compares whole have no sample (an empty list).
     ///
@@ -1046,7 +1157,8 @@ impl SynapseSource {
             | Stream::PushRules
             | Stream::Pushers
             | Stream::Filters
-            | Stream::Receipts => return Ok(Vec::new()),
+            | Stream::Receipts
+            | Stream::RemoteMedia => return Ok(Vec::new()),
             Stream::Users => {
                 "SELECT name FROM users WHERE name IS NOT NULL ORDER BY random() LIMIT $1"
             }
@@ -1537,6 +1649,22 @@ mod tests {
         );
         assert_eq!(local_content_path("../../etc/passwd"), None);
         assert_eq!(local_content_path("ab"), None);
+    }
+
+    #[test]
+    fn a_remote_media_file_is_under_its_server_and_nothing_escapes_the_store() {
+        assert_eq!(
+            remote_content_path("other.test", "QRfDgyLujIkTamUPGRmOJeRy").unwrap(),
+            Path::new("remote_content/other.test/QR/fD/gyLujIkTamUPGRmOJeRy")
+        );
+        assert_eq!(
+            remote_content_path("127.0.0.1:18302", "abcdefgh").unwrap(),
+            Path::new("remote_content/127.0.0.1:18302/ab/cd/efgh")
+        );
+        assert_eq!(remote_content_path("..", "QRfDgyLujIkTamUPGRmOJeRy"), None);
+        assert_eq!(remote_content_path("a/b", "QRfDgyLujIkTamUPGRmOJeRy"), None);
+        assert_eq!(remote_content_path("", "QRfDgyLujIkTamUPGRmOJeRy"), None);
+        assert_eq!(remote_content_path("other.test", "../../etc/passwd"), None);
     }
 
     #[test]

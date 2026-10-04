@@ -12,5 +12,7 @@
   "backup_version": "2",
   "alice_master_key": "IWEeNJ0ivbzB/gnZgHJiOzX4fRbEHfh1l7hK9jAnMVY",
   "bob_master_key": "5o2aNmMjNaOcCt9PNGuHS+Iu8WOzIFzjNBUEvM0ES1s",
-  "alice_self_signing_key": "aZOp/zQkWrbG/7lUc3c2JDyZEFl+z9mzsMWHxfA8A34"
+  "alice_self_signing_key": "aZOp/zQkWrbG/7lUc3c2JDyZEFl+z9mzsMWHxfA8A34",
+  "remote_picture": "mxc://other.test/RemoteCachedPictureOne",
+  "remote_missing": "mxc://other.test/RemoteMissingFileTwo"
 }

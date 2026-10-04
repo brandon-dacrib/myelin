@@ -16,6 +16,35 @@ updates and the manhole have no native concept (see reason codes below);
 everything else that names a real operator action has a native home, even
 where the shape differs.
 
+## What `hs serve` serves today
+
+`hs serve` mounts the compatibility surface on every listener with the `client` resource
+(`crates/hs-cli/src/serve.rs`: `hs_auth::synapse_admin_router` for the shared-secret
+registration protocol, `crate::synapse_shims` for everything else, which forwards each request
+into the native `/api/v1` router in-process, behind the native tokens and scope checks, and
+reshapes the answer). At startup the log says so, with the list: `the Synapse admin
+compatibility surface is mounted under /_synapse/admin ...` with `routes=` and `operations=`;
+`routes.json` (`--routes-manifest`) lists the same under the `synapse-admin-compat` surface.
+Real-binary test: `crates/hs-cli/tests/synapse_admin.rs` (and `invites_and_notices.rs` for
+server notices, `e2e.rs` for registration).
+
+| Route | Answers | Needs |
+|---|---|---|
+| `GET /_synapse/admin/v1/server_version` | `{server_version, python_version: "n/a"}` | an administrator's token |
+| `GET /_synapse/admin/v2/users` | `{users: [{name, admin, deactivated, ...}], total, next_token?}` | an administrator's token (`users.read`) |
+| `GET /_synapse/admin/v2/users/{user_id}` | the user record, `404 M_NOT_FOUND` for nobody | an administrator's token |
+| `POST /_synapse/admin/v1/deactivate/{user_id}` | `{"erase": bool}` → `{id_server_unbind_result: "no-support"}`; the native deactivation, audited | an administrator's token (`users.write`) |
+| `GET /_synapse/admin/v1/rooms` | `{rooms: [{room_id, name, joined_members, creator, ...}], total_rooms, next_batch?}` (`order_by`/`dir` accepted, not honoured) | an administrator's token |
+| `GET /_synapse/admin/v1/rooms/{room_id}` | the room's details | an administrator's token |
+| `POST /_synapse/admin/v1/send_server_notice`, `PUT .../send_server_notice/{txn_id}` | `{event_id}` | an administrator's token |
+| `GET`, `POST /_synapse/admin/v1/register` | the shared-secret registration protocol (`docs/compat/cli-shims.md`) | `auth.registration_shared_secret` set; without it both answer `404 M_UNRECOGNIZED` |
+
+A caller without an administrator's token gets the native status (`401` for no token or a
+token the admin API does not know, `403` for one without the scope) with `errcode
+M_FORBIDDEN`. Every other row of the tables below is a mapping only: the native resource exists,
+the `/_synapse/admin` path for it is not mounted, and a tool that calls it gets `404
+M_UNRECOGNIZED`.
+
 ## How to read the table
 
 - **Synapse route** is the exact regex from `docs/synapse-inventory.md`
@@ -42,7 +71,7 @@ where the shape differs.
 |---|---|---|---|---|---|
 | `/account_validity/validity$` | POST | `{user_id, expiration_ts?}` → `{expiration_ts}` | unsupported | — | R-PHASE1 (hs-auth). Account-validity (expiring accounts) is not in the Phase 0 auth schema; see `docs/compat/synapse-config-table.md`'s `email` row for the related email-delivery gap. |
 | `/auth_providers/(?P<provider>[^/]*)/users/(?P<external_id>[^/]*)$` | GET | `{user_id}` | mapped (diff) | `GET /users/lookup` | Native lookup is one generic endpoint (query params select the identifier kind: `external_id` + `provider`, `threepid`, etc.) rather than one route per provider. |
-| `/deactivate/(?P<target_user_id>[^/]*)$` | POST | `{erase?}` → `{id_server_unbind_result}` | mapped | `POST /users/{user_id}/deactivate` | Legacy v1 path; same body/response shape as the v2 route below it in Synapse itself. |
+| `/deactivate/(?P<target_user_id>[^/]*)$` | POST | `{erase?}` → `{id_server_unbind_result}` | mapped | `POST /users/{user_id}/deactivate` | **Implemented** (`crates/hs-compat/src/admin_proxy.rs`'s `deactivate_user`, mounted at `/_synapse/admin/v1/deactivate/{user_id}`; answers `"no-support"`, the spec's value for an identity-server unbind not attempted). Legacy v1 path; same body/response shape as the v2 route below it in Synapse itself. |
 | `/experimental_features/(?P<user_id>[^/]*)$` | GET, PUT | `{features: {msc...: bool}}` | mapped | `GET`/`PUT /users/{user_id}/experimental-features` | Synapse's per-user MSC opt-ins have no native equivalent set of flags yet (this server does not gate features per-user by MSC number, see `docs/compat/synapse-config-table.md`'s reason code R-NOFLAG); the route exists so tooling that reads/writes it does not 404, and returns an empty object. |
 | `/register$` | GET, POST | `GET` → `{nonce}`; `POST {nonce, username, password, admin?, mac, user_type?}` → `{access_token, user_id, home_server, device_id}` | unsupported | — | R-COMPAT-PROTOCOL. Served by `hs-compat`'s own shared-secret registration protocol (`crates/hs-compat/src/shared_secret.rs`, `docs/compat/cli-shims.md`), authenticated by nonce+HMAC rather than a bearer token — there is no `/api/v1` resource for this because native account creation goes through `POST /users` under normal admin auth instead. This route is the one place the compat surface does *not* forward to a native resource. |
 | `/reset_password/(?P<target_user_id>[^/]*)$` | POST | `{new_password, logout_devices?}` → `{}` | mapped | `POST /users/{user_id}/reset-password` | |

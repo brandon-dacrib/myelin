@@ -16,7 +16,8 @@ use serde_json::Value;
 use super::model::{
     SynapseAccessToken, SynapseAccountData, SynapseBackupVersion, SynapseCrossSigning,
     SynapseDevice, SynapseDeviceKeys, SynapseEvent, SynapseFilter, SynapseMedia, SynapsePushRules,
-    SynapsePusher, SynapseReceipt, SynapseRemoteJoin, SynapseRoom, SynapseRoomKey, SynapseUser,
+    SynapsePusher, SynapseReceipt, SynapseRemoteJoin, SynapseRemoteMedia, SynapseRoom,
+    SynapseRoomKey, SynapseUser,
 };
 
 /// What importing one row did.
@@ -208,6 +209,14 @@ pub trait MigrationTarget: Send + Sync + 'static {
         media: &SynapseMedia,
         bytes: Option<Vec<u8>>,
     ) -> Result<Imported, TargetError>;
+    /// Imports Synapse's cached copy of another server's media item, with its bytes. The
+    /// engine never offers one without its file: a cache entry without its bytes is nothing to
+    /// serve, and this server fetches the item again from its server when somebody asks.
+    async fn import_remote_media(
+        &self,
+        media: &SynapseRemoteMedia,
+        bytes: Vec<u8>,
+    ) -> Result<Imported, TargetError>;
 
     /// An account, for verification.
     async fn user(&self, user_id: &str) -> Result<Option<TargetUser>, TargetError>;
@@ -239,6 +248,12 @@ pub trait MigrationTarget: Send + Sync + 'static {
     ) -> Result<Vec<String>, TargetError>;
     /// A local media item, for verification.
     async fn media(&self, media_id: &str) -> Result<Option<TargetMedia>, TargetError>;
+    /// A cached copy of another server's media item, for verification.
+    async fn remote_media(
+        &self,
+        origin: &str,
+        media_id: &str,
+    ) -> Result<Option<TargetMedia>, TargetError>;
     /// Whether one device's end-to-end keys are here as in Synapse (identity keys the same,
     /// as many one-time keys of each algorithm, the fallback keys there).
     async fn verify_device_keys(&self, keys: &SynapseDeviceKeys) -> Result<Check, TargetError>;

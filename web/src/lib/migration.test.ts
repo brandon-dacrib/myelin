@@ -18,6 +18,7 @@ describe("streamLabel", () => {
       "rooms",
       "receipts",
       "media",
+      "remote_media",
     ];
     for (const name of wire) {
       expect(STREAMS[name]?.explanation, name).toBeTruthy();
@@ -36,7 +37,8 @@ describe("streamLabel", () => {
 describe("WHAT_DOES_NOT_MOVE", () => {
   it("keeps the runbook's list, each with why", () => {
     const titles = WHAT_DOES_NOT_MOVE.map((item) => item.title);
-    expect(titles).toContain("Other servers' media");
+    expect(titles).toContain("Thumbnails");
+    expect(titles).not.toContain("Other servers' media");
     expect(titles).toContain("Presence");
     expect(titles).toContain("Bridges");
     for (const item of WHAT_DOES_NOT_MOVE) expect(item.detail.length).toBeGreaterThan(40);

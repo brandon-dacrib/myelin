@@ -54,7 +54,7 @@ describe("Migration", () => {
     expect(moves.getAllByRole("listitem")).toHaveLength(13);
     expect(moves.getByText("Sessions (access tokens)")).toBeInTheDocument();
     const stays = within(within(details).getByRole("region", { name: "Not copied" }));
-    expect(stays.getByText("Other servers' media")).toBeInTheDocument();
+    expect(stays.getByText("Thumbnails")).toBeInTheDocument();
     expect(stays.getByText("Presence")).toBeInTheDocument();
     expect(stays.getByText("Receipts in threads")).toBeInTheDocument();
     expect(stays.getByText("Bridges")).toBeInTheDocument();

@@ -2209,6 +2209,25 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
 
     let app = app.merge(hs_bridges::front_door::router(bridge_manager.clone()));
 
+    // An operator pointing Synapse-era tooling (synapse-admin, Draupnir, a register script) at
+    // this server wants to know, from the log, which of Synapse's admin operations it answers:
+    // the compat surface's routes forward into the native `/api/v1` router behind the same
+    // tokens and scope checks (`crate::synapse_shims`), plus the shared-secret `register`
+    // (`hs_auth::synapse_admin_router`). The table of every Synapse admin route and where it
+    // maps is `docs/compat/synapse-admin-routes.md`.
+    let synapse_admin: Vec<String> = manifest
+        .routes
+        .iter()
+        .filter(|r| r.surface == hs_http::router::Surface::SynapseAdminCompat)
+        .map(|r| format!("{} {}", r.method, r.path))
+        .collect();
+    tracing::info!(
+        routes = synapse_admin.len(),
+        operations = ?synapse_admin,
+        "the Synapse admin compatibility surface is mounted under /_synapse/admin, behind the \
+         admin API's own tokens and scopes (docs/compat/synapse-admin-routes.md)"
+    );
+
     // The mesh listener replays a forwarded request against this exact router (see
     // `crate::cluster::ClusterHandles::spawn_mesh`'s doc comment): a `None` in single-node mode,
     // where nothing should ever dial in.

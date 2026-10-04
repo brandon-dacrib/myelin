@@ -40,7 +40,7 @@ use hs_compat::migration::model::{
     LogEntry, MigrationRecord, Phase, Stream, SynapseAccessToken, SynapseAccountData,
     SynapseBackupVersion, SynapseCrossSigning, SynapseDevice, SynapseDeviceKeys, SynapseEvent,
     SynapseFilter, SynapseMedia, SynapsePushRules, SynapsePusher, SynapseReceipt,
-    SynapseRemoteJoin, SynapseRoom, SynapseRoomKey, SynapseUser,
+    SynapseRemoteJoin, SynapseRemoteMedia, SynapseRoom, SynapseRoomKey, SynapseUser,
 };
 use hs_compat::migration::{
     Check, CurrentState, Imported, MigrationError, MigrationObserver, MigrationStore,
@@ -1114,6 +1114,62 @@ impl<B: KvBackend + 'static> MigrationTarget for StoreTarget<B> {
         Ok(Imported::Created)
     }
 
+    async fn import_remote_media(
+        &self,
+        media: &SynapseRemoteMedia,
+        bytes: Vec<u8>,
+    ) -> Result<Imported, TargetError> {
+        let id = MediaId::parse(&media.media_id).map_err(|e| {
+            row(format!(
+                "mxc://{}/{} is not a media id here: {e}",
+                media.origin, media.media_id
+            ))
+        })?;
+        if media.origin == self.media.server_name() {
+            return Ok(Imported::Skipped(
+                "a cache entry for this server's own media, which is copied as local media"
+                    .to_owned(),
+            ));
+        }
+        let existing = self
+            .media
+            .metadata()
+            .get_media(&media.origin, &media.media_id)
+            .map_err(fatal)?;
+        if existing.as_ref().is_some_and(|m| m.completed) {
+            return Ok(Imported::AlreadyThere);
+        }
+        let length = bytes.len() as u64;
+        // Bytes first, then the row, as `hs-media` writes a copy it fetched itself: a row is
+        // only ever written for bytes that are there.
+        self.media
+            .object_store()
+            .put(&content_object_key(&media.origin, &id), bytes.into())
+            .await
+            .map_err(fatal)?;
+        self.media
+            .metadata()
+            .put_media(&MediaRecord {
+                server_name: media.origin.clone(),
+                media_id: media.media_id.clone(),
+                content_type: media
+                    .content_type
+                    .clone()
+                    .unwrap_or_else(|| "application/octet-stream".to_owned()),
+                upload_name: media.upload_name.clone(),
+                byte_length: Some(length),
+                created_ms: media.created_ms,
+                uploader: None,
+                completed: true,
+                expires_at_ms: None,
+                quarantined_by: media.quarantined_by.clone(),
+                safe_from_quarantine: false,
+                last_accessed_ms: media.last_access_ms,
+            })
+            .map_err(fatal)?;
+        Ok(Imported::Created)
+    }
+
     async fn user(&self, user_id_raw: &str) -> Result<Option<TargetUser>, TargetError> {
         let Ok(id) = ruma::OwnedUserId::try_from(user_id_raw) else {
             return Ok(None);
@@ -1262,6 +1318,37 @@ impl<B: KvBackend + 'static> MigrationTarget for StoreTarget<B> {
                 .media
                 .object_store()
                 .get(&content_object_key(&server, &id))
+                .await
+            {
+                Ok(found) => found.bytes().await.ok().map(|b| b.to_vec()),
+                Err(_) => None,
+            },
+            Err(_) => None,
+        };
+        Ok(Some(TargetMedia {
+            content_type: record.content_type,
+            bytes,
+        }))
+    }
+
+    async fn remote_media(
+        &self,
+        origin: &str,
+        media_id: &str,
+    ) -> Result<Option<TargetMedia>, TargetError> {
+        let Some(record) = self
+            .media
+            .metadata()
+            .get_media(origin, media_id)
+            .map_err(fatal)?
+        else {
+            return Ok(None);
+        };
+        let bytes = match MediaId::parse(media_id) {
+            Ok(id) => match self
+                .media
+                .object_store()
+                .get(&content_object_key(origin, &id))
                 .await
             {
                 Ok(found) => found.bytes().await.ok().map(|b| b.to_vec()),
@@ -1822,4 +1909,32 @@ pub fn build<B: KvBackend + 'static>(
             sample_size: 25,
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use hs_media::synapse_layout::{SynapseMediaKind, classify_relative_path};
+
+    /// The importer reads a cached remote item's file at the path `hs-media`'s Synapse
+    /// media-layout adapter classifies as that item (and a local one's likewise): the two
+    /// crates agree on Synapse's layout, so a file the adapter would list is the file the
+    /// importer copies.
+    #[test]
+    fn the_importer_reads_media_files_where_the_layout_adapter_puts_them() {
+        let remote = hs_compat::migration::source::remote_content_path(
+            "other.test",
+            "QRfDgyLujIkTamUPGRmOJeRy",
+        )
+        .unwrap();
+        let entry = classify_relative_path(&remote).unwrap();
+        assert_eq!(entry.kind, SynapseMediaKind::RemoteContent);
+        assert_eq!(entry.server_name.as_deref(), Some("other.test"));
+        assert_eq!(entry.media_id, "QRfDgyLujIkTamUPGRmOJeRy");
+
+        let local =
+            hs_compat::migration::source::local_content_path("QRfDgyLujIkTamUPGRmOJeRy").unwrap();
+        let entry = classify_relative_path(&local).unwrap();
+        assert_eq!(entry.kind, SynapseMediaKind::LocalContent);
+        assert_eq!(entry.media_id, "QRfDgyLujIkTamUPGRmOJeRy");
+    }
 }

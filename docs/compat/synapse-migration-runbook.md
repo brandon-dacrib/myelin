@@ -52,9 +52,9 @@ server name before anything is copied; an unreachable database or a wrong name i
 order: accounts (with password hashes, flags and profiles), devices, access tokens, account data
 and room tags, end-to-end keys (`e2e_keys`, one row per device), cross-signing keys
 (`cross_signing`, per account), key backups (`key_backups`, per version), push rules
-(`push_rules`, per account), pushers, filters, rooms, receipts, media. The page shows each
-stream's rows copied, not copied on purpose, failed, and the rate, and an estimate of the time
-left.
+(`push_rules`, per account), pushers, filters, rooms, receipts, media, other servers' media
+(`remote_media`). The page shows each stream's rows copied, not copied on purpose, failed, and
+the rate, and an estimate of the time left.
 
 A room is copied a page of `batch_size` events at a time, so a room of any size is copied in
 bounded memory. When each room is done the log says how long it took, its events and bytes per
@@ -81,7 +81,9 @@ every access token signs in, each piece of account data, each device's identity 
 key counts and unused fallback keys, each account's cross-signing keys, each backup version and
 how many room keys it holds, each account's push rules, each pusher, filter and receipt, every
 room's events (from its join, for a room joined over federation) and its current state against
-Synapse's `current_state_events`, and media files byte for byte (a sample). The
+Synapse's `current_state_events`, media files byte for byte (a sample), and other servers'
+media whose file Synapse still had (each here, a sample byte for byte; an entry whose file is
+gone counts as left out, not as a difference). The
 findings are on the page and in `GET /api/v1/migration` (`verification`). Run it as often as you
 like while Synapse is still in service; a difference is a bug report, not something to live with.
 
@@ -124,6 +126,7 @@ servers must never answer for the same name at once.
 | `events`, `event_to_state_groups`, `state_groups_state` (rooms made on another server) | each room this server's users joined over federation: held from the first such join as the join made it held in Synapse (the state before the join and its auth chain, as the other server's `send_join` answered), then every event after it, as above; a room Synapse backfilled to its beginning is replayed whole |
 | `receipts_linearized` | read receipts, public and private, after the rooms they are in |
 | `local_media_repository`, `media_store/local_content` | local media under the same `mxc://` ids, with their files |
+| `remote_media_cache`, `media_store/remote_content/<server>` | other servers' media Synapse had cached, under the same `mxc://<server>/<id>`, with their files: a picture people have already seen opens without a fetch from its server (and still opens after that server is gone). An entry whose file Synapse had evicted is left out and logged; this server fetches it again when somebody asks |
 
 ## What does not move
 
@@ -133,8 +136,11 @@ servers must never answer for the same name at once.
   (a faster join still fetching its state) is skipped and logged until Synapse has finished; a
   room this server's users were only invited to, or have all left, is skipped and logged, and is
   joined again after cutover.
-- **Remote media** (`remote_media_cache`): by design. It is a cache of other servers' media, and
-  this server fetches each item again the first time someone asks for it.
+- **Thumbnails** (`local_media_repository_thumbnails`, `remote_media_cache_thumbnails`,
+  `media_store/*_thumbnail*`): this server makes its own, at its own `media.thumbnail_sizes`,
+  the first time one is asked for. **Other servers' media whose file Synapse no longer had**
+  (the row outlived the file, or the media store is not mounted) is left out and logged, and
+  fetched again from its server when somebody asks, as a cache miss would have been in Synapse.
 - **Presence**: by design. It is how people are right now, and starts again as they come back.
 - **Receipts in threads** (other than the main timeline) are left out and logged: this server
   keeps one receipt per person and type in a room. **Pushers turned off** in Synapse are left

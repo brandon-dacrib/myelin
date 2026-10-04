@@ -94,6 +94,11 @@ export const STREAMS: Record<string, StreamInfo> = {
     explanation:
       "Files uploaded here, under the same mxc:// addresses, with their contents when Synapse's media store is mounted.",
   },
+  remote_media: {
+    label: "Other servers' media",
+    explanation:
+      "Files from other servers that Synapse had cached, with their contents when Synapse's media store is mounted: pictures people have already seen open without a fetch. An entry whose file is gone is left out and fetched again when needed.",
+  },
   // Before 2026-10-01 a server copied room events as a stream of their own.
   events: {
     label: "Room events",
@@ -132,9 +137,9 @@ export const WHAT_DOES_NOT_MOVE: readonly NotMoved[] = [
       "For a room hosted on another server, only what Synapse held from its users' join onwards is copied; this server fetches older history from the other servers when someone scrolls back, as Synapse did. A room Synapse is still joining is skipped until Synapse has finished, and a room people were only invited to, or have all left, is skipped and logged: they join it again after the cutover.",
   },
   {
-    title: "Other servers' media",
+    title: "Thumbnails",
     detail:
-      "Synapse's cache of other servers' files is left behind on purpose: this server fetches each again the first time someone opens it.",
+      "Synapse's thumbnails, of its own media and of other servers', are not copied: this server makes its own the first time one is asked for.",
   },
   {
     title: "Presence",

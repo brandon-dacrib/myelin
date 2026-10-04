@@ -32,6 +32,7 @@ const TOTALS: Record<string, number> = {
   rooms: 318,
   receipts: 22_964,
   media: 7_730,
+  remote_media: 3_418,
 };
 const STREAM_COUNT = Object.keys(TOTALS).length;
 
