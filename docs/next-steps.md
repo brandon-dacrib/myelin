@@ -60,6 +60,12 @@ different model at 10:50 with their worktrees intact, and each pushed its work i
 **Measured** (the paragraph below): Sytest 643/772, Complement federation 235/314 and csapi
 346/384 on `1372c71f`, before the wave. The wave is not measured as a whole yet.
 
+**CI on `f1cc1d56`**: `ci` green; `fuzz` red: `hs-media`'s `thumbnail_generate` found an
+out-of-memory (a crafted image asks the decoder for 16 GiB; one upload and a thumbnail request
+could take a server down). `agent/thumbnail-oom` (track 09) is on it: decode limits, a
+configurable pixel bound, the input as a regression test. Pre-existing; nothing in the wave
+touched `hs-media`'s decoding. Roll after it merges if the demo takes uploads from strangers.
+
 **What is next, in order:**
 
 1. **Roll the demo** to the first green image of `1e262118` or later, then the owner's bridge
