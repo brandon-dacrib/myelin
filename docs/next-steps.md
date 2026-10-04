@@ -26,6 +26,23 @@ families and switched the setting off, `tests/sytest/plugins/myelin/.../Myelin.p
 whose peer resolves to a loopback or link-local IPv6 address only sees "connection refused" and
 nothing else, and the startup line `outbound: IPv4 only` is the hint.
 
+**The wave of 2026-10-04** (launched 01:45 EDT, right after the measurement; main `746505d2`),
+nine agents in disjoint crate sets, each pushing `agent/<name>` when done, merged serially by
+the coordinator with `tools/merge-queue.sh`. If this list still names a branch and `git branch
+-r --no-merged origin/main` shows it, it is unmerged work; its gate state is in its last commit
+and its track's status file. `fed-state-ids` (06: the `/state_ids` fallback's federation side,
+soft failure over federation), `device-list-invites` (05+08: `device_lists.changed` for invites,
+`/keys/changes` from the membership walk, stale remote copies on leave; the two Sytest and one
+Complement device-list regressions), `cluster-heartbeat` (03: shards kept until `lease_ttl`,
+decision 0028), `postgres-bulk-flush` (01: RFC 0021), `email-pushers` (10), `users-update-sources`
+(15+07+16: `users.update` display name, avatar, kind; `users.availability`; the user page),
+`importer-leftovers` (13: push rules, pushers, receipts, filters, E2EE keys and backups, remote
+media, federated rooms; mounting `/_synapse/admin`), `bridge-offering-demo` (11: the demo's shared
+WhatsApp registration becomes an offering, `command_prefix` for Signal, Slack and X, `hs-bridges`
+and the operator on `hs_http::outbound`, re-rendering on a `double_puppeting` change),
+`web-scale-items` (16: Federation paging and failing-first, cluster series). The briefs name the
+measured Sytest and Complement tests each one is graded by.
+
 **Where `main` is.** `b2fcfade`, four more branches through the queue after the 22:45 section,
 each gate green: `device-list-timing` `a3af13a8`, `bridge-device-names` `66528ae3` (OpenAPI
 0.1.6), `outbound-ipv4-only` `b2fcfade`. **Nothing is unmerged, no lock, no agent worktree, no
