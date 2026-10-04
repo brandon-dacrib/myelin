@@ -227,7 +227,7 @@ replicas, and how fast a lost replica's work moves to the others.
 | `user_shards` | integer | `256` | restart (fixed at cluster creation) | How many parts users' sessions are split into for sharing between replicas. Fixed when the server is first set up, like `room_shards`. |
 | `mesh` *(bootstrap)* | object | `{"port":8449,"advertise_address":null,"tls":null,"shared_secret":null,"shared_secret_file":null}` | bootstrap (this replica's own mesh identity) | Internal replica-to-replica mesh. |
 | `heartbeat_interval` | string \| integer | `"2s"` | restart (agreed with every replica; changed by a rolling restart) | How often each replica tells the others it is alive. Shorter notices a lost replica sooner, at the cost of more writes to the database; keep it well under `lease_ttl`. |
-| `lease_ttl` | string \| integer | `"10s"` | restart (agreed with every replica; changed by a rolling restart) | How long a replica may go without a heartbeat before the others take over its rooms and users. Shorter recovers sooner from a crash; too short and a replica that only paused (a long garbage collection, a busy node) loses its work for nothing. |
+| `lease_ttl` | string \| integer | `"10s"` | restart (agreed with every replica; changed by a rolling restart) | How long a replica may go without a heartbeat before the others take over its rooms and users. The replica itself keeps what it owns for the same time (a late or failed heartbeat shorter than this moves nothing; it only stops the replica taking on more until the next good one), and gives it up once the time has passed. Shorter recovers sooner from a crash; too short and a replica that only paused (a long garbage collection, a busy node) loses its work for nothing. |
 
 
 ## `migration`
