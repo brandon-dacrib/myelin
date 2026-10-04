@@ -95,6 +95,11 @@ impl HsProcess {
                 .lines()
                 .map_while(Result::ok)
             {
+                // A server's errors reach the test's own output, so a failure that is a
+                // server's 500 says why (the log is otherwise only read on a settle timeout).
+                if line.contains(" ERROR ") {
+                    eprintln!("hs: {line}");
+                }
                 if tx.send(line).is_err() {
                     break;
                 }

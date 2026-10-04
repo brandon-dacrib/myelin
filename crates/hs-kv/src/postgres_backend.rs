@@ -1410,8 +1410,20 @@ impl KvBackend for PostgresBackend {
             .expect("PostgresBackend used after Inner was dropped, which cannot happen: Inner is owned by an Arc this handle holds a strong reference to");
         let conn = run_isolated(move || {
             let mut conn = pool.get().map_err(KvError::backend)?;
+            // `enable_seqscan = off`: every read this backend sends is by `k`, the primary key,
+            // so an index scan is always possible, and under SERIALIZABLE it is the difference
+            // between fine and coarse conflict tracking. A sequential scan (which the planner
+            // picks for a table of a page or two) takes a relation-level SIREAD lock, so any
+            // two transactions that read and write *different* keys of one small table form a
+            // read/write cycle and one is cancelled; with index scans they lock the tuples and
+            // index pages they touch, and an update of `v` alone (a HOT update) touches no index
+            // page. PostgreSQL's own documentation on serializable isolation recommends steering
+            // the planner off sequential scans for this reason. Without it, concurrent request
+            // authentications on `hs_auth.access_tokens` ran out of `transact`'s retries under
+            // load (a merge gate, 2026-10-04; `tests/postgres_contention.rs`).
             conn.batch_execute(&format!(
-                "BEGIN ISOLATION LEVEL SERIALIZABLE; SET LOCAL lock_timeout = '{WRITE_LOCK_TIMEOUT}'"
+                "BEGIN ISOLATION LEVEL SERIALIZABLE; SET LOCAL lock_timeout = '{WRITE_LOCK_TIMEOUT}'; \
+                 SET LOCAL enable_seqscan = off"
             ))
             .map_err(pg_error)?;
             Ok::<_, KvError>(conn)

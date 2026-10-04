@@ -36,6 +36,36 @@ buffered write, 300 statements for a batch of 100 members.
   verifying mode, which is the test failing on a fresh container until the certificate is
   regenerated. The test itself is unchanged and passes.
 
+### The gate's `cluster_mirror` 500, and two fixes it led to
+
+The first merge gate of this branch failed `crates/hs-cli/tests/cluster_mirror.rs`: a send
+answered `500 M_UNKNOWN`, which on that route is the auth middleware's store error
+(`hs_room::state::auth_error_to_matrix_error` of `hs_auth`'s `internal()`). The gate's
+PostgreSQL log at the moment the test's database was dropped showed two connections each
+cancelled ten times within a few milliseconds ("canceled on identification as a pivot") on
+`hs_auth.access_tokens`, which every request writes (`mark_access_token_used`): `transact` ran
+out of its ten attempts. Not the bulk flush: `crates/hs-kv/tests/postgres_contention.rs` (four
+threads, each reading and writing its own key of a 30-row table, 100 times, default
+`TransactConfig`) ran out of retries 1-15 times in 400 with the old per-row flush too, and 1-5
+with the bulk flush. Two causes, both in `hs-kv`:
+
+- **Sequential scans made SSI conflicts coarse.** The planner scans a one-page table
+  sequentially, and under `SERIALIZABLE` a sequential scan takes a relation-level SIREAD lock,
+  so two transactions on *different* keys of one small table form a read/write cycle. `begin`
+  now also sends `SET LOCAL enable_seqscan = off` (every read is by the primary key, so an index
+  scan is always there; PostgreSQL's serializable-isolation docs recommend steering off
+  sequential scans for this reason). With it the contention test drew **0** serialization
+  failures in five runs (it had drawn 97-235 per run), and the conformance breakdown is
+  unchanged (the one structural divergence still diverges).
+- **The retry backoff was the same for everyone.** `retry::backoff`'s "jitter" was a function of
+  the attempt number alone, so every party to a conflict retried on the same schedule. Each
+  `transact` call now draws from its own SplitMix64 stream seeded from `RandomState`, the thread
+  and the time (`retry::tests::two_retrying_transactions_draw_different_waits`). Alone it did not
+  cure the contention test (still 0-4 exhausted), which is why the first fix is the real one.
+
+`cluster_mirror.rs` also now echoes each server's `ERROR` log lines to the test output, so a
+500 there says why.
+
 ### Measured
 
 `crates/hs-kv/tests/postgres_bulk_flush.rs::fan_out_shaped_commit_timing` (the RFC's shape: 100
@@ -70,6 +100,13 @@ HS_KV_TEST_POSTGRES_TLS_DSN=... HS_KV_TEST_POSTGRES_TLS_CERT=... HS_KV_TEST_POST
 cargo clippy -p hs-kv --all-targets -- -D warnings; cargo clippy -p hs-tables --all-targets -- -D warnings
 cargo test -p hs-tables
 ```
+
+`postgres_contention.rs`: `concurrent_writers_of_disjoint_keys_in_a_small_table_all_commit`
+(fails without `enable_seqscan = off`). `cluster_mirror` against my own PostgreSQL (with
+`HS_CLUSTER_TEST_POSTGRES_DSN`, rebased on `a802724a`): passed three times before the fix
+(9-164 serialization failures per run, depending on the machine's load) and twice after (12 and
+16, none ran out of retries); the gate's failure did not reproduce here, the contention test is
+what pins it.
 
 `postgres_bulk_flush.rs`: `a_commit_larger_than_a_chunk_applies_every_put_and_delete` (3,000
 seeded rows; then 1,500 overwrites, 1,500 deletes and 2,500 inserts in one table plus a
