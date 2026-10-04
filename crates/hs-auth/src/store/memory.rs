@@ -230,6 +230,20 @@ impl UserStore for InMemoryAuthStore {
         Ok(())
     }
 
+    async fn set_user_type(
+        &self,
+        user_id: &UserId,
+        user_type: Option<String>,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.lock();
+        let user = inner
+            .users
+            .get_mut(user_id)
+            .ok_or_else(|| StoreError::NotFound(user_id.to_string()))?;
+        user.user_type = user_type;
+        Ok(())
+    }
+
     async fn get_user_by_threepid(
         &self,
         medium: &str,

@@ -233,6 +233,51 @@ pub(crate) async fn profile_fields_round_trip<S: AuthStore>(s: &S) {
     assert_eq!(cleared.avatar_url.as_deref(), Some("mxc://example.org/abc"));
 }
 
+/// `UserStore::set_user_type` round-trips through `get_user`, is `None` on a fresh account,
+/// clears back to `None`, and survives erasure (the kind of account is a flag, like
+/// `is_admin`, not data about the person).
+pub(crate) async fn user_type_round_trips_and_outlives_erasure<S: AuthStore>(s: &S) {
+    let uid = user_id!("@kind:example.org").to_owned();
+    s.create_user(UserRecord::new(uid.clone(), 1))
+        .await
+        .unwrap();
+    assert_eq!(s.get_user(&uid).await.unwrap().unwrap().user_type, None);
+
+    s.set_user_type(&uid, Some("bot".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(
+        s.get_user(&uid)
+            .await
+            .unwrap()
+            .unwrap()
+            .user_type
+            .as_deref(),
+        Some("bot")
+    );
+    s.set_user_type(&uid, None).await.unwrap();
+    assert_eq!(s.get_user(&uid).await.unwrap().unwrap().user_type, None);
+
+    s.set_user_type(&uid, Some("support".to_string()))
+        .await
+        .unwrap();
+    s.erase_user(&uid, 5).await.unwrap();
+    assert_eq!(
+        s.get_user(&uid)
+            .await
+            .unwrap()
+            .unwrap()
+            .user_type
+            .as_deref(),
+        Some("support")
+    );
+
+    let err = s
+        .set_user_type(user_id!("@ghost:example.org"), Some("bot".to_string()))
+        .await;
+    assert!(matches!(err, Err(StoreError::NotFound(_))));
+}
+
 pub(crate) async fn set_profile_fields_on_missing_user_is_not_found<S: AuthStore>(s: &S) {
     let err = s
         .set_profile_display_name(user_id!("@ghost:example.org"), Some("x".to_string()))
@@ -798,6 +843,7 @@ pub(crate) async fn run_all<S: AuthStore>(make_store: impl Fn() -> S) {
     upgrading_a_guest_clears_the_flag_and_sets_the_password(&make_store()).await;
     profile_fields_round_trip(&make_store()).await;
     set_profile_fields_on_missing_user_is_not_found(&make_store()).await;
+    user_type_round_trips_and_outlives_erasure(&make_store()).await;
     device_and_token_lifecycle(&make_store()).await;
     device_display_name_and_seen_round_trip(&make_store()).await;
     set_display_name_on_missing_device_is_not_found(&make_store()).await;

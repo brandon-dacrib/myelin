@@ -69,7 +69,7 @@ describe("EditUserDialog", () => {
     expect(alice().admin).toBe(false);
   });
 
-  it("shows a field the server cannot change yet beside that field, in its words", async () => {
+  it("shows a field the server refuses beside that field, in its words", async () => {
     const user = userEvent.setup();
     server.use(
       http.patch("*/api/v1/users/:user_id", () =>
@@ -79,9 +79,7 @@ describe("EditUserDialog", () => {
             title: "Validation failed",
             status: 400,
             detail: "one or more fields in the request cannot be applied",
-            errors: [
-              { pointer: "/display_name", detail: "no data source can change this field yet" },
-            ],
+            errors: [{ pointer: "/display_name", detail: "must be a string or null" }],
           },
           { status: 400 },
         ),
@@ -92,7 +90,7 @@ describe("EditUserDialog", () => {
     await user.type(dialog.getByLabelText(/display name/i), " L");
     await user.click(dialog.getByRole("button", { name: "Save" }));
     const alert = await dialog.findByRole("alert");
-    expect(alert).toHaveTextContent("This server says: no data source can change this field yet.");
+    expect(alert).toHaveTextContent("This server says: must be a string or null.");
     expect(dialog.getByLabelText(/display name/i)).toHaveAttribute("aria-invalid", "true");
     expect(onOpenChange).not.toHaveBeenCalled();
   });

@@ -1087,6 +1087,7 @@ export const handlers = [
       password?: string;
       display_name?: string;
       admin?: boolean;
+      user_type?: string | null;
     };
     const localpart = (body.localpart ?? "").replace(/^@/, "").split(":")[0]!.toLowerCase();
     if (!/^[a-z0-9._=\-/+]+$/.test(localpart)) {
@@ -1110,6 +1111,7 @@ export const handlers = [
       user_id,
       display_name: body.display_name ?? null,
       admin: body.admin ?? false,
+      user_type: body.user_type ?? null,
       created_at: new Date().toISOString(),
       last_seen_at: null,
       device_count: 0,
@@ -1156,7 +1158,23 @@ export const handlers = [
       return problem(400, "validation-failed", "Validation failed", {
         errors: [{ pointer: "param:localpart", detail: "localpart is required" }],
       });
-    return HttpResponse.json({ available: !findUser(`@${localpart.toLowerCase()}:example.org`) });
+    // As the server judges it (`hs_auth::local_user::local_user_id`): `@name:example.org` and
+    // `name` are the same, case does not matter, and the new-account grammar applies.
+    const [name, domain] = localpart.trim().replace(/^@/, "").split(":");
+    const lower = (name ?? "").toLowerCase();
+    const refuse = (detail: string) =>
+      problem(400, "validation-failed", "Validation failed", {
+        detail,
+        errors: [{ pointer: "param:localpart", detail }],
+      });
+    if (domain !== undefined && domain !== "example.org")
+      return refuse(`this server is example.org, not ${domain}`);
+    if (!lower) return refuse("choose a username");
+    if (!/^[a-z0-9._=\-/+]+$/.test(lower))
+      return refuse(
+        `"${lower}" cannot be a username: use lowercase letters, digits, and any of . _ = - /`,
+      );
+    return HttpResponse.json({ available: !findUser(`@${lower}:example.org`) });
   }),
   http.get(`${API}/users/:user_id`, ({ params }) => {
     const user = findUser(decodeURIComponent(String(params.user_id)));
@@ -1180,27 +1198,43 @@ export const handlers = [
     const errors: { pointer: string; detail: string }[] = [];
     if ("admin" in body && typeof body.admin !== "boolean")
       errors.push({ pointer: "/admin", detail: "must be a boolean" });
-    if ("display_name" in body && typeof body.display_name !== "string")
-      errors.push({ pointer: "/display_name", detail: "must be a string" });
-    if ("avatar_url" in body && typeof body.avatar_url !== "string")
-      errors.push({ pointer: "/avatar_url", detail: "must be a string" });
+    // As the server answers (`hs_admin::router::users_update`): null or "" clears a text field,
+    // an avatar is an mxc:// address, and the kind is bot, support or null.
+    const text = (v: unknown) => v === null || typeof v === "string";
+    if ("display_name" in body && !text(body.display_name))
+      errors.push({ pointer: "/display_name", detail: "must be a string or null" });
+    if ("avatar_url" in body && !text(body.avatar_url))
+      errors.push({ pointer: "/avatar_url", detail: "must be a string or null" });
     if (
-      "avatar_url" in body &&
-      body.avatar_url !== "" &&
-      !/^mxc:\/\//.test(String(body.avatar_url))
+      typeof body.avatar_url === "string" &&
+      body.avatar_url.trim() !== "" &&
+      !body.avatar_url.trim().startsWith("mxc://")
     )
-      errors.push({ pointer: "/avatar_url", detail: "must be an mxc:// URL" });
-    if ("user_type" in body && body.user_type !== null && typeof body.user_type !== "string")
+      errors.push({
+        pointer: "/avatar_url",
+        detail: "must be the mxc:// address of an uploaded image",
+      });
+    if ("user_type" in body && !text(body.user_type))
       errors.push({ pointer: "/user_type", detail: "must be a string or null" });
+    else if (
+      typeof body.user_type === "string" &&
+      body.user_type.trim() !== "" &&
+      !["bot", "support"].includes(body.user_type.trim().toLowerCase())
+    )
+      errors.push({
+        pointer: "/user_type",
+        detail: `"${body.user_type}" is not a kind of account; use bot or support, or none for a person`,
+      });
     if (errors.length > 0)
       return problem(400, "validation-failed", "Validation failed", {
         detail: "one or more fields in the request cannot be applied",
         errors,
       });
     if (typeof body.admin === "boolean") user.admin = body.admin;
-    if (typeof body.display_name === "string") user.display_name = body.display_name || null;
-    if (typeof body.avatar_url === "string") user.avatar_url = body.avatar_url || null;
-    if ("user_type" in body) user.user_type = (body.user_type as string | null) || null;
+    const cleared = (v: unknown) => (typeof v === "string" ? v.trim() || null : null);
+    if ("display_name" in body) user.display_name = cleared(body.display_name);
+    if ("avatar_url" in body) user.avatar_url = cleared(body.avatar_url);
+    if ("user_type" in body) user.user_type = cleared(body.user_type)?.toLowerCase() ?? null;
     return HttpResponse.json(user);
   }),
 

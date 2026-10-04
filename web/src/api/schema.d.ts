@@ -1971,7 +1971,10 @@ export interface paths {
         delete?: never;
         options?: never;
         head?: never;
-        /** Update a user */
+        /**
+         * Update a user
+         * @description Changes the account's own fields. Only the fields the request names are touched, and only when they differ from the current value; the audit entry names each field that changed. display_name and avatar_url change the user's profile the way their own PUT /profile/{userId}/... would: the stored profile changes and their m.room.member event is re-sent with the new values in every room they are joined to, which is how other clients and other servers learn of it (the re-send is asynchronous; a room may show the old name for a moment). user_type records the kind of account (bot or support, null for a person) and changes nothing about what it may do. A field the server's user directory cannot change answers 503.
+         */
         patch: operations["users.update"];
         trace?: never;
     };
@@ -2494,7 +2497,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Check whether a localpart is available */
+        /**
+         * Check whether a localpart is available
+         * @description Whether an account with this localpart could be created now: false when one exists (case does not matter: Carol and carol are the same account), true when the name is free. A localpart that could never be a username on this server (an uppercase or stray character, another server's domain) is 400 naming param:localpart, with the same reason users.create would give, so it can be shown while the name is typed.
+         */
         get: operations["users.availability"];
         put?: never;
         post?: never;
@@ -3795,8 +3801,11 @@ export interface components {
         };
         UserUpdate: {
             admin?: boolean;
-            avatar_url?: string;
-            display_name?: string;
+            /** @description The mxc:// address of an uploaded image; null or empty clears it. Anything that is not an mxc:// address is 400. */
+            avatar_url?: string | null;
+            /** @description What other people see in rooms; null or empty clears it, and their user id is shown instead. */
+            display_name?: string | null;
+            /** @description bot or support, or null for a person. Anything else is 400 naming the field. */
             user_type?: string | null;
         };
         ValidationError: {

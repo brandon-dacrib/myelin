@@ -264,7 +264,7 @@ export function UserDetailPage() {
           </dl>
 
           <UserDevicesSection userId={id} canWrite={canWrite} canModerate={canModerate} />
-          <UserIdentitySection userId={id} canWrite={canWrite} />
+          <UserIdentitySection userId={id} user={user} canWrite={canWrite} />
           <UserClientDataSection userId={id} canWrite={canWrite} />
 
           <div className="mt-8">

@@ -150,6 +150,41 @@ describe("AddUserDialog", () => {
     expect(await dialog.findByText("@carol:example.org is free.")).toBeInTheDocument();
   });
 
+  it("says as you type why a name can never be a username, in the server's words", async () => {
+    const user = userEvent.setup();
+    renderDialog();
+    const dialog = within(await screen.findByRole("dialog", { name: "Add a user" }));
+    await user.type(dialog.getByLabelText(/^Username/), "bad name");
+    expect(
+      await dialog.findByText(/^"bad name" cannot be a username: use lowercase letters/),
+    ).toBeInTheDocument();
+    await user.clear(dialog.getByLabelText(/^Username/));
+    await user.type(dialog.getByLabelText(/^Username/), "carol:elsewhere.org");
+    expect(
+      await dialog.findByText("This server is example.org, not elsewhere.org."),
+    ).toBeInTheDocument();
+    // Case is not a different account: Alice is alice, and taken.
+    await user.clear(dialog.getByLabelText(/^Username/));
+    await user.type(dialog.getByLabelText(/^Username/), "Alice");
+    expect(await dialog.findByText("@alice:example.org is taken.")).toBeInTheDocument();
+  });
+
+  it("records the kind of account it makes, explained", async () => {
+    const user = userEvent.setup();
+    renderDialog();
+    const dialog = within(await screen.findByRole("dialog", { name: "Add a user" }));
+    const kind = dialog.getByRole("combobox", { name: /Kind of account/ });
+    expect(kind).toHaveAccessibleDescription(/does not change what the account can do/);
+    kind.focus();
+    await user.keyboard("{Enter}");
+    await user.click(await screen.findByRole("option", { name: "Support account" }));
+    await user.type(dialog.getByLabelText(/^Username/), "helpdesk");
+    await user.type(dialog.getByLabelText(/^Password/), "hunter2-helpdesk");
+    await user.click(dialog.getByRole("button", { name: "Create account" }));
+    await screen.findByRole("dialog", { name: "Account created" });
+    expect(users.find((u) => u.user_id === "@helpdesk:example.org")?.user_type).toBe("support");
+  });
+
   it("says when this server cannot check usernames in advance", async () => {
     server.use(
       http.get("*/api/v1/users/availability", () =>

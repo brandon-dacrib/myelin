@@ -64,6 +64,25 @@ pub trait UserDirectoryVisibility: Send + Sync {
     ) -> Result<std::collections::BTreeSet<ruma::OwnedUserId>, String>;
 }
 
+/// Where a profile change an administrator makes (`hs-admin`'s `users.update`, through
+/// [`crate::admin_directory::AuthStoreUserDirectory`]) is carried into the user's rooms: the
+/// same re-stamping of their `m.room.member` event in every joined room that the client's own
+/// `PUT /profile/{userId}/displayname` does (`hs_room::routes::profile`), which is the only way
+/// other clients, and other servers, ever learn a name or avatar changed. This crate cannot
+/// reach rooms (`hs-room` depends on it, not the reverse), so, like [`RemoteProfileSource`],
+/// the fan-out is a trait defined here and installed by `hs serve` through
+/// [`AuthState::install_profile_refresh`]. Unset, the record changes and the rooms do not
+/// (a test of this crate alone); the directory logs that at debug level.
+pub trait ProfileRefresh: Send + Sync {
+    /// `user_id`'s stored profile changed; re-stamp their membership in every room they are
+    /// joined to. Fire-and-forget: the implementation spawns the work and returns at once, and
+    /// reads the profile itself (from `auth`) rather than taking the values, so two quick
+    /// changes cannot race to write a stale one. `auth` is passed per call, not held, because
+    /// this hook lives inside an [`AuthState`]: holding one would be a reference cycle that keeps
+    /// the stores alive after shutdown.
+    fn profile_changed(&self, auth: &AuthState, user_id: &UserId);
+}
+
 /// Where `GET /profile/{userId}`, `/displayname` and `/avatar_url` get the profile of a user of
 /// another server: that server, over federation (`GET /_matrix/federation/v1/query/profile`).
 /// This crate cannot speak federation (`hs-federation` is a peer, and `hs serve` is where the
@@ -133,6 +152,8 @@ pub struct AuthState {
     pub(crate) session_revocation_observer: Arc<OnceLock<Arc<dyn SessionRevocationObserver>>>,
     /// See [`RemoteProfileSource`] and [`AuthState::install_remote_profiles`].
     pub(crate) remote_profiles: Arc<OnceLock<Arc<dyn RemoteProfileSource>>>,
+    /// See [`ProfileRefresh`] and [`AuthState::install_profile_refresh`].
+    pub(crate) profile_refresh: Arc<OnceLock<Arc<dyn ProfileRefresh>>>,
 }
 
 impl AuthState {
@@ -155,6 +176,7 @@ impl AuthState {
             user_directory_visibility: Arc::new(OnceLock::new()),
             session_revocation_observer: Arc::new(OnceLock::new()),
             remote_profiles: Arc::new(OnceLock::new()),
+            profile_refresh: Arc::new(OnceLock::new()),
         }
     }
 
@@ -305,6 +327,25 @@ impl AuthState {
     #[must_use]
     pub fn remote_profiles(&self) -> Option<&Arc<dyn RemoteProfileSource>> {
         self.remote_profiles.get()
+    }
+
+    /// Installs where an administrator's profile change is carried into the user's rooms
+    /// (`hs serve`, from the room layer). Same one-installer convention as
+    /// [`AuthState::install_remote_profiles`].
+    pub fn install_profile_refresh(&self, refresh: Arc<dyn ProfileRefresh>) {
+        if self.profile_refresh.set(refresh).is_err() {
+            tracing::warn!(
+                "a profile refresh was already installed on this auth state; ignoring the \
+                 second install"
+            );
+        }
+    }
+
+    /// The installed [`ProfileRefresh`], if any. `None` means this process has no room layer
+    /// (a test of this crate alone), so a profile change stays in the record.
+    #[must_use]
+    pub fn profile_refresh(&self) -> Option<&Arc<dyn ProfileRefresh>> {
+        self.profile_refresh.get()
     }
 
     /// The installed [`DeviceListChangeNotifier`], if any.

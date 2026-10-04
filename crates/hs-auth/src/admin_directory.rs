@@ -21,9 +21,16 @@
 //! - `room_count`, `media_count`: this crate has no view onto rooms (track 04) or media (track
 //!   09). Wiring those in is those tracks' data-source seam to add, not this one's -- see
 //!   `docs/status/07-auth-and-identity.md`'s "Interfaces needed".
-//! - `user_type`, `consent_version`: user-type categorization is a Phase 1/2 gap noted in this
-//!   crate's own status file. (`appservice_id` is real: the appservice that registered the
-//!   account, if one did.)
+//! - `consent_version`: nothing records consent yet. (`appservice_id` is real: the appservice
+//!   that registered the account, if one did; `user_type` is real since 2026-10-04:
+//!   [`crate::store::UserRecord::user_type`], set by `users.create`/`users.update` and shown
+//!   on the account.)
+//!
+//! A profile change (`UserDirectory::update_profile`) is written to the record and then handed
+//! to the installed [`crate::state::ProfileRefresh`], which re-stamps the user's membership in
+//! every room they are joined to -- the same fan-out `hs_room::routes::profile` does for the
+//! user's own `PUT /profile/...`, so other clients and other servers see the new name. Without
+//! one installed (a test of this crate alone) the record changes and the rooms do not.
 //!
 //! `erased` is real since 2026-10-02: [`crate::store::UserRecord::erased`], set by
 //! `UserDirectory::erase` ([`crate::erasure::erase_account`] plus the device-list announcement,
@@ -45,7 +52,8 @@ use std::collections::BTreeMap;
 
 use hs_admin::model::{AdminDevice, AdminPasswordReset, AdminUser, ExternalId, ThreePid};
 use hs_admin::sources::{
-    ErasureReport, SourceError, UserCreateRequest, UserDirectory, UserFilter, UserLookupQuery,
+    ErasureReport, ProfileUpdate, SourceError, UserCreateRequest, UserDirectory, UserFilter,
+    UserLookupQuery,
 };
 use hs_admin::user_identity::UserIdentitySource;
 
@@ -109,6 +117,7 @@ impl AuthStoreUserDirectory {
             last_seen_at,
             device_count: devices.len() as u64,
             appservice_id: record.appservice_id.clone(),
+            user_type: record.user_type.clone(),
             ..AdminUser::default()
         })
     }
@@ -478,6 +487,97 @@ impl UserDirectory for AuthStoreUserDirectory {
             .map_err(map_set_error)
     }
 
+    /// `users.update`'s display name and avatar: the record first, then the rooms through the
+    /// installed [`crate::state::ProfileRefresh`] (see the module docs).
+    async fn update_profile(
+        &self,
+        user_id: &str,
+        update: ProfileUpdate,
+    ) -> Result<(), SourceError> {
+        let uid = parse_user_id(user_id)?;
+        if update.is_empty() {
+            return Ok(());
+        }
+        // Erasure removed the profile for good; giving the account one back would undo it.
+        match self.store.get_user(&uid).await.map_err(store_unavailable)? {
+            None => return Err(SourceError::NotFound),
+            Some(record) if record.erased => return Err(SourceError::Conflict(ERASED.to_owned())),
+            Some(_) => {}
+        }
+        if let Some(display_name) = update.display_name.clone() {
+            self.store
+                .set_profile_display_name(&uid, display_name)
+                .await
+                .map_err(map_set_error)?;
+        }
+        if let Some(avatar_url) = update.avatar_url.clone() {
+            self.store
+                .set_profile_avatar_url(&uid, avatar_url)
+                .await
+                .map_err(map_set_error)?;
+        }
+        match self
+            .accounts
+            .as_ref()
+            .and_then(|state| state.profile_refresh().map(|refresh| (state, refresh)))
+        {
+            Some((state, refresh)) => {
+                refresh.profile_changed(state, &uid);
+                tracing::info!(
+                    user = %uid,
+                    display_name_changed = update.display_name.is_some(),
+                    avatar_changed = update.avatar_url.is_some(),
+                    "an administrator changed a user's profile; their rooms are being told"
+                );
+            }
+            None => tracing::debug!(
+                user = %uid,
+                "an administrator changed a user's profile; no room layer is installed, so \
+                 their rooms are not told"
+            ),
+        }
+        Ok(())
+    }
+
+    async fn set_user_type(
+        &self,
+        user_id: &str,
+        user_type: Option<String>,
+    ) -> Result<(), SourceError> {
+        let uid = parse_user_id(user_id)?;
+        let kind = crate::user_type::parse_user_type(user_type.as_deref()).map_err(|detail| {
+            SourceError::InvalidField {
+                pointer: "/user_type",
+                detail,
+            }
+        })?;
+        self.store
+            .set_user_type(&uid, kind)
+            .await
+            .map_err(map_set_error)
+    }
+
+    /// `users.availability`: whether `localpart` could be registered here. One that could never
+    /// be a username on this server (uppercase, a stray character, another server's domain) is
+    /// refused with the same sentence `users.create` would give, so the interface can show it
+    /// while the name is being typed rather than on Create.
+    async fn check_localpart_available(&self, localpart: &str) -> Result<bool, SourceError> {
+        let localpart = match &self.accounts {
+            Some(state) => crate::local_user::local_user_id(state.server_name(), localpart)
+                .map_err(|detail| SourceError::InvalidField {
+                    pointer: "param:localpart",
+                    detail,
+                })?
+                .localpart()
+                .to_owned(),
+            None => localpart.trim().to_ascii_lowercase(),
+        };
+        self.store
+            .is_localpart_available(&localpart)
+            .await
+            .map_err(store_unavailable)
+    }
+
     /// `users.create`. With registration closed, which is the default, this is how every account
     /// after the first administrator comes to exist -- and until it was written the trait's
     /// default answered `503`, so on a real server nothing in the admin API or the interface
@@ -487,9 +587,9 @@ impl UserDirectory for AuthStoreUserDirectory {
     /// SSO, which this server does not offer yet; creating one would be creating an account
     /// nobody can use. `threepids` and `external_ids` are bound as `users.threepids.add` and
     /// `users.external_ids.add` would bind them, after checking that no other account has any of
-    /// them (a `409` then, and no account is made). `user_type` is refused rather than ignored,
-    /// for the same reason `users.update` refuses the fields it cannot apply: a `201` that
-    /// silently dropped part of the request would be a lie about what now exists.
+    /// them (a `409` then, and no account is made). `user_type` is `bot`, `support` or none
+    /// ([`crate::user_type::parse_user_type`]); anything else is refused by name, never
+    /// silently dropped.
     async fn create_user(&self, request: UserCreateRequest) -> Result<AdminUser, SourceError> {
         let Some(state) = &self.accounts else {
             return Err(SourceError::Unavailable(
@@ -497,12 +597,13 @@ impl UserDirectory for AuthStoreUserDirectory {
                     .to_string(),
             ));
         };
-        if request.user_type.is_some() {
-            return Err(SourceError::InvalidField {
-                pointer: "/user_type",
-                detail: "this server cannot set this when creating an account yet".to_string(),
-            });
-        }
+        let user_type =
+            crate::user_type::parse_user_type(request.user_type.as_deref()).map_err(|detail| {
+                SourceError::InvalidField {
+                    pointer: "/user_type",
+                    detail,
+                }
+            })?;
         // 3PIDs and external ids are bound after the account exists; check first that nobody
         // else has any of them, so a refusal leaves no half-made account behind.
         let mut threepids = Vec::with_capacity(request.threepids.len());
@@ -613,6 +714,7 @@ impl UserDirectory for AuthStoreUserDirectory {
                 .map_err(|e| SourceError::Unavailable(e.to_string()))?,
         );
         record.is_admin = request.admin;
+        record.user_type = user_type;
         record.display_name = request
             .display_name
             .map(|name| name.trim().to_owned())
@@ -1116,7 +1218,7 @@ mod tests {
             ),
             (
                 UserCreateRequest {
-                    user_type: Some("bot".to_owned()),
+                    user_type: Some("admin".to_owned()),
                     ..create("carol", "hunter2-carol")
                 },
                 "/user_type",
@@ -1326,5 +1428,248 @@ mod tests {
                 .await,
             Err(SourceError::Unavailable(_))
         ));
+    }
+    // ---------------------------------------------------------------------------------------
+    // users.update: profile and kind; users.availability
+    // ---------------------------------------------------------------------------------------
+
+    /// A stand-in for the room layer: remembers who it was told about.
+    #[derive(Default)]
+    struct RecordingRefresh {
+        told: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl crate::state::ProfileRefresh for RecordingRefresh {
+        fn profile_changed(&self, _auth: &AuthState, user_id: &ruma::UserId) {
+            self.told.lock().unwrap().push(user_id.to_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn update_profile_writes_the_record_and_tells_the_rooms_once() {
+        let (state, directory) = creating_directory();
+        let refresh = Arc::new(RecordingRefresh::default());
+        state.install_profile_refresh(refresh.clone());
+        directory
+            .create_user(create("carol", "hunter2-carol"))
+            .await
+            .unwrap();
+
+        directory
+            .update_profile(
+                "@carol:example.org",
+                ProfileUpdate {
+                    display_name: Some(Some("Carol D".to_owned())),
+                    avatar_url: Some(Some("mxc://example.org/carol".to_owned())),
+                },
+            )
+            .await
+            .unwrap();
+        let user = directory
+            .get_user("@carol:example.org")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(user.display_name.as_deref(), Some("Carol D"));
+        assert_eq!(user.avatar_url.as_deref(), Some("mxc://example.org/carol"));
+        // Both fields, one fan-out.
+        assert_eq!(*refresh.told.lock().unwrap(), vec!["@carol:example.org"]);
+
+        // One field clears, the other is left alone.
+        directory
+            .update_profile(
+                "@carol:example.org",
+                ProfileUpdate {
+                    display_name: Some(None),
+                    avatar_url: None,
+                },
+            )
+            .await
+            .unwrap();
+        let user = directory
+            .get_user("@carol:example.org")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(user.display_name, None);
+        assert_eq!(user.avatar_url.as_deref(), Some("mxc://example.org/carol"));
+        assert_eq!(refresh.told.lock().unwrap().len(), 2);
+
+        // Nothing named, nothing told.
+        directory
+            .update_profile("@carol:example.org", ProfileUpdate::default())
+            .await
+            .unwrap();
+        assert_eq!(refresh.told.lock().unwrap().len(), 2);
+
+        assert!(matches!(
+            directory
+                .update_profile(
+                    "@ghost:example.org",
+                    ProfileUpdate {
+                        display_name: Some(Some("Ghost".to_owned())),
+                        avatar_url: None,
+                    }
+                )
+                .await,
+            Err(SourceError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_erased_account_cannot_be_given_a_profile_again() {
+        let (state, directory) = creating_directory();
+        let refresh = Arc::new(RecordingRefresh::default());
+        state.install_profile_refresh(refresh.clone());
+        directory
+            .create_user(create("carol", "hunter2-carol"))
+            .await
+            .unwrap();
+        directory.erase("@carol:example.org").await.unwrap();
+        assert!(matches!(
+            directory
+                .update_profile(
+                    "@carol:example.org",
+                    ProfileUpdate {
+                        display_name: Some(Some("Back".to_owned())),
+                        avatar_url: None,
+                    }
+                )
+                .await,
+            Err(SourceError::Conflict(_))
+        ));
+        assert!(refresh.told.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_profile_without_a_room_layer_still_changes_the_record() {
+        let directory = directory_with(InMemoryAuthStore::new());
+        let uid = ruma::user_id!("@alice:example.org");
+        directory
+            .store
+            .create_user(UserRecord::new(uid.to_owned(), 1))
+            .await
+            .unwrap();
+        directory
+            .update_profile(
+                uid.as_str(),
+                ProfileUpdate {
+                    display_name: Some(Some("Alice".to_owned())),
+                    avatar_url: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            directory
+                .get_user(uid.as_str())
+                .await
+                .unwrap()
+                .unwrap()
+                .display_name
+                .as_deref(),
+            Some("Alice")
+        );
+    }
+
+    #[tokio::test]
+    async fn set_user_type_records_a_kind_and_refuses_one_it_does_not_know() {
+        let directory = directory_with(InMemoryAuthStore::new());
+        let uid = ruma::user_id!("@alice:example.org");
+        directory
+            .store
+            .create_user(UserRecord::new(uid.to_owned(), 1))
+            .await
+            .unwrap();
+        directory
+            .set_user_type(uid.as_str(), Some("Bot".to_owned()))
+            .await
+            .unwrap();
+        assert_eq!(
+            directory
+                .get_user(uid.as_str())
+                .await
+                .unwrap()
+                .unwrap()
+                .user_type
+                .as_deref(),
+            Some("bot")
+        );
+        match directory
+            .set_user_type(uid.as_str(), Some("wizard".to_owned()))
+            .await
+        {
+            Err(SourceError::InvalidField { pointer, detail }) => {
+                assert_eq!(pointer, "/user_type");
+                assert!(detail.contains("bot or support"), "{detail}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        directory.set_user_type(uid.as_str(), None).await.unwrap();
+        assert_eq!(
+            directory
+                .get_user(uid.as_str())
+                .await
+                .unwrap()
+                .unwrap()
+                .user_type,
+            None
+        );
+        assert!(matches!(
+            directory
+                .set_user_type("@ghost:example.org", Some("bot".to_owned()))
+                .await,
+            Err(SourceError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn create_user_records_the_kind_of_account() {
+        let (_state, directory) = creating_directory();
+        let created = directory
+            .create_user(UserCreateRequest {
+                user_type: Some("support".to_owned()),
+                ..create("helpdesk", "hunter2-helpdesk")
+            })
+            .await
+            .unwrap();
+        assert_eq!(created.user_type.as_deref(), Some("support"));
+    }
+
+    #[tokio::test]
+    async fn availability_knows_taken_free_and_impossible_names() {
+        let (_state, directory) = creating_directory();
+        directory
+            .create_user(create("carol", "hunter2-carol"))
+            .await
+            .unwrap();
+        assert!(!directory.check_localpart_available("carol").await.unwrap());
+        // Case does not make a different account.
+        assert!(!directory.check_localpart_available("Carol").await.unwrap());
+        assert!(directory.check_localpart_available("dave").await.unwrap());
+        assert!(
+            directory
+                .check_localpart_available("@dave:example.org")
+                .await
+                .unwrap()
+        );
+        match directory.check_localpart_available("not a name").await {
+            Err(SourceError::InvalidField { pointer, .. }) => {
+                assert_eq!(pointer, "param:localpart")
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        match directory
+            .check_localpart_available("@dave:elsewhere.org")
+            .await
+        {
+            Err(SourceError::InvalidField { pointer, .. }) => {
+                assert_eq!(pointer, "param:localpart")
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        // Over a bare store there is no server name to hold the name to; it is only looked up.
+        let bare = directory_with(InMemoryAuthStore::new());
+        assert!(bare.check_localpart_available("Anyone").await.unwrap());
     }
 }

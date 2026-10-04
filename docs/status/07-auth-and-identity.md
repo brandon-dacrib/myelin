@@ -13,6 +13,20 @@ unfixed (held by another track this session), checked for Element-Web findings i
 `docs/status/16-management-web-interface.md` (none landed as of this write-up), and designed
 (without implementing) a UIA session-correlation scheme left open at the end of session 5).
 
+## 2026-10-04: an administrator changes a user's profile and kind (branch `agent/users-update-sources`)
+
+For `hs-admin`'s `users.update` (status 15, 2026-10-04). `UserRecord.user_type` (`bot`,
+`support` or none; `#[serde(default)]`, so old rows read) with `UserStore::set_user_type` in
+both stores and a shared test (it survives erasure, like `is_admin`); `crate::user_type` holds
+the vocabulary. `AuthStoreUserDirectory` now overrides `update_profile` (record first, then the
+new `state::ProfileRefresh` hook that `hs serve` answers from `hs-room`, so the user's
+membership is re-sent in every joined room; an erased account is `409`), `set_user_type`, and
+`check_localpart_available` (through `local_user::local_user_id`: case-insensitive, and `400`
+with the reason for a name that can never be one). `create_user` records `user_type` instead of
+refusing it, and the shared-secret registration keeps the `user_type` it was sent instead of
+dropping it. Verified by the `admin_directory` tests and `crates/hs-cli/tests/admin_user_profile.rs`
+against the real binary.
+
 ## Session 12 (2026-10-02, branch `agent/user-erase`): account erasure
 
 An account can now be erased -- by an administrator (`users.deactivate` with `erase: true`,

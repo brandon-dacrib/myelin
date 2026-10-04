@@ -87,6 +87,40 @@ Items 6 and 8 of the audit list below. The admin API already had what both neede
 - `e2e-real/cluster.spec.ts` is for a single node only (it fails by design against a cluster).
 - Found, out of scope: the Cluster page's Epoch column shows the raw generation (a millisecond
   timestamp, `1,791,125,919,05...`) and overflows the table at 1280 px wide on a real cluster.
+Last updated: 2026-10-04 (how a user appears, edited in place; branch `agent/users-update-sources`).
+
+## 2026-10-04: how a user appears, edited in place; the username check gives the reason (branch `agent/users-update-sources`)
+
+The server now changes a display name, avatar and kind through `users.update` (status 15,
+2026-10-04), so the user's page shows them as editable.
+
+- **"How they appear"** (`src/pages/users/UserProfilePanel.tsx`), first in the identity section:
+  display name, avatar URL and kind of account, edited in place with one "Save profile" (only
+  what changed is sent; `null` clears) and "Undo changes". It says what a change does: "every
+  room they are in gets an update to their membership, which the other members and other
+  servers see"; the kind's hint says it is recorded and changes nothing the account can do
+  (`src/pages/users/user-type.ts`, shared with the Edit dialog and Add user). A refusal sits
+  beside its field in the server's words; read-only without `admin:write`; an erased account
+  says it has no profile. The Edit dialog keeps the same fields, with the same explanation.
+- **Add user** asks the server about whatever is typed (it lower-cases and judges the domain),
+  so "Alice" is "taken", and a name that can never be one shows the server's reason ("\"bad
+  name\" cannot be a username: ..."; "This server is example.org, not elsewhere.org."). It also
+  sets the kind of account.
+- MSW handlers answer as the server does (null clears, `mxc://` only, `bot`/`support` only, the
+  availability reasons).
+
+**Verified.** `npm run check` (575 unit tests: `UserProfilePanel.test.tsx` new,
+`AddUserDialog.test.tsx` two new cases); `npm run test:e2e` (`edit-user.spec.ts` new in-place
+flow with axe, `add-user.spec.ts` the typed reason); against the real binary
+`e2e-real/users-profile.spec.ts` (new: the name set in place is the person's `/profile` and
+their `m.room.member` event as a room-mate reads it; the kind reads back; the typed-name
+checks), `web-items.spec.ts` (its "refused display name" case is now a refused avatar and a
+rename that works), `users-devices-and-identity.spec.ts`. Screenshots
+`docs/design/screenshots/users-profile-{editing,saved,availability}-real.png`.
+
+**Left.** No avatar preview (it would need an authenticated thumbnail fetch). The header's Edit
+dialog and the in-place panel both edit the profile; folding the dialog down to the
+administrator switch is a design call left open.
 
 ## 2026-10-02: what to do after setting up someone's bridge (branch `agent/bridge-next-steps`)
 

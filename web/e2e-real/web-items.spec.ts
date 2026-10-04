@@ -3,8 +3,8 @@ import { settle } from "./settle";
 
 /**
  * The 2026-10-02 web items against a real `hs serve`, nothing mocked: editing an account
- * (administrator granted after creation; a field the server cannot change yet refused beside
- * the field in the server's words), editing and testing a bridge, the Overview's server health,
+ * (administrator granted after creation; a refused avatar beside the field in the server's
+ * words; a display name changed, since 2026-10-04), editing and testing a bridge, the Overview's server health,
  * the exact user lookup and the live username check, and a room's lifecycle facts.
  *
  * Needs `HS_REAL_SERVER_URL` and `HS_REAL_ADMIN_TOKEN` (playwright.real.config.ts). Names carry
@@ -62,17 +62,28 @@ test.describe("Web items against the real server", () => {
     });
     expect(((await after.json()) as { admin: boolean }).admin).toBe(true);
 
-    // A display name is a field this server cannot change yet: refused beside the field.
+    // An avatar that is not an mxc:// address is refused beside the field, in the server's words.
     await page.getByRole("button", { name: "Edit", exact: true }).click();
-    await dialog.getByLabel(/^Display name/).fill("Edited Name");
+    await dialog.getByLabel(/^Avatar/).fill("https://example.org/me.png");
     await dialog.getByRole("button", { name: "Save" }).click();
     await expect(dialog.getByRole("alert")).toContainText(
-      "This server says: no data source can change this field yet.",
+      "This server says: must be the mxc:// address of an uploaded image.",
     );
     await settle(page);
     await page.screenshot({ path: "test-results/real-edit-account-refused.png" });
     await dialog.getByRole("button", { name: "Cancel" }).click();
     await expect(page.getByRole("heading", { name: "Edit Me" })).toBeVisible();
+
+    // A display name the server now changes: renamed, here and in their profile.
+    await page.getByRole("button", { name: "Edit", exact: true }).click();
+    await dialog.getByLabel(/^Display name/).fill("Edited Name");
+    await dialog.getByRole("button", { name: "Save" }).click();
+    await expect(dialog).toBeHidden();
+    await expect(page.getByRole("heading", { name: "Edited Name" })).toBeVisible();
+    const profile = await request.get(
+      `/_matrix/client/v3/profile/${encodeURIComponent(user_id)}/displayname`,
+    );
+    expect(((await profile.json()) as { displayname: string }).displayname).toBe("Edited Name");
   });
 });
 

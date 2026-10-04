@@ -10,7 +10,7 @@ openapi: 3.1.0
 info:
   title: hs-admin API
   summary: The native administration and moderation API for the homeserver.
-  version: 0.1.8
+  version: 0.1.9
   description: 'The only API the management interface (track 16) talks to. See docs/rfcs/0004-admin-api.md for the full design rationale: resource modeling, naming, pagination, filtering, errors, idempotency, scopes, versioning and the event stream. This document is the contract; the hs-admin router''s contract tests assert the router and this document agree on paths and methods (RFC 0004 section 1, decision D15.16).'
   contact:
     name: 'Track 15: Admin API and modules'
@@ -56,6 +56,12 @@ info:
     notes: 'Additive: BridgeInstance.device_name, the name the bridge presents to its network
       as a linked device (Myelin <Network> bridge for <localpart> (<server>), or without the
       person for a shared instance); a network that has no such setting has none.'
+  - version: 0.1.7
+    date: '2026-10-03'
+    notes: 'Additive: BridgeInstance.signed_bot_device (the bridge manager cross-signs each
+      bridge bot''s device, decision 0027); last_key_withheld on bridge instances and on
+      appservice health, the last time a client withheld a room key from the bot. (Entry
+      written 2026-10-04; the bump had none.)'
   - version: 0.1.8
     date: '2026-10-04'
     notes: 'Additive: AppServiceHealth.overlaps_offering (schema OfferingOverlap), set on a
@@ -64,6 +70,15 @@ info:
       registrations seen from the offering. BridgeType.command_prefix is now set for Signal,
       Slack, X and LinkedIn (!signal, !slack, !twitter, !linkedin: mautrix-go''s fallback of
       ! and the network id).'
+  - version: 0.1.9
+    date: '2026-10-04'
+    notes: 'users.update applies display_name, avatar_url and user_type for real (they were
+      refused with 400 naming the field): a name or avatar change takes the path the user''s own
+      PUT /profile does, so their m.room.member event is re-sent in every joined room and other
+      servers see it; UserUpdate.display_name and avatar_url accept null (clear), as user_type
+      did; user_type is bot, support or null, on users.create too. users.availability answers
+      for real, and refuses a localpart that could never be a username with 400 naming
+      param:localpart and the reason.'
 servers:
 - url: /api/v1
   description: Same origin as /_matrix on the client listener.
@@ -4814,6 +4829,11 @@ paths:
   /users/availability:
     get:
       summary: Check whether a localpart is available
+      description: 'Whether an account with this localpart could be created now: false when
+        one exists (case does not matter: Carol and carol are the same account), true when the
+        name is free. A localpart that could never be a username on this server (an uppercase
+        or stray character, another server''s domain) is 400 naming param:localpart, with the
+        same reason users.create would give, so it can be shown while the name is typed.'
       operationId: users.availability
       tags:
       - Users
@@ -4928,6 +4948,15 @@ paths:
     patch:
       summary: Update a user
       operationId: users.update
+      description: 'Changes the account''s own fields. Only the fields the request names are
+        touched, and only when they differ from the current value; the audit entry names each
+        field that changed. display_name and avatar_url change the user''s profile the way their
+        own PUT /profile/{userId}/... would: the stored profile changes and their m.room.member
+        event is re-sent with the new values in every room they are joined to, which is how
+        other clients and other servers learn of it (the re-send is asynchronous; a room may
+        show the old name for a moment). user_type records the kind of account (bot or support,
+        null for a person) and changes nothing about what it may do. A field the server''s user
+        directory cannot change answers 503.'
       tags:
       - Users
       security:
@@ -7162,12 +7191,22 @@ components:
       type: object
       properties:
         display_name:
-          type: string
+          description: What other people see in rooms; null or empty clears it, and their user
+            id is shown instead.
+          type:
+          - string
+          - 'null'
         avatar_url:
-          type: string
+          description: The mxc:// address of an uploaded image; null or empty clears it. Anything
+            that is not an mxc:// address is 400.
+          type:
+          - string
+          - 'null'
         admin:
           type: boolean
         user_type:
+          description: bot or support, or null for a person. Anything else is 400 naming the
+            field.
           type:
           - string
           - 'null'

@@ -128,6 +128,10 @@ async fn post_register(
         return Err(MatrixError::user_in_use());
     }
 
+    // `hs register --user-type bot` and Synapse's `register_new_matrix_user --user-type`: the
+    // kind is recorded on the account (`hs-admin` shows it), never silently dropped.
+    let user_type = crate::user_type::parse_user_type(req.user_type.as_deref())
+        .map_err(MatrixError::invalid_param)?;
     let password_hash =
         password::hash_password(&req.password).map_err(|_| MatrixError::internal())?;
 
@@ -147,6 +151,7 @@ async fn post_register(
             let mut r = UserRecord::new(user_id.clone(), state.now_ms());
             r.password_hash = Some(password_hash);
             r.is_admin = req.admin;
+            r.user_type = user_type;
             r
         })
         .await?;

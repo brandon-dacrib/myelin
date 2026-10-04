@@ -10,13 +10,16 @@ import { Button } from "@/components/ui/button/Button";
 import { Dialog, DialogContent } from "@/components/ui/dialog/Dialog";
 import { Field, Input } from "@/components/ui/input/Input";
 import { Switch } from "@/components/ui/switch/Switch";
+import { Select } from "@/components/ui/select/Select";
+import { USER_TYPE_HINT, USER_TYPE_OPTIONS, userTypeWire } from "./user-type";
 import { CopyableId } from "@/components/CopyableId";
 
 type FieldName = "username" | "password";
 
 /**
- * The live username check in a sentence: free, taken, or that this server cannot say in
- * advance (its user directory answers `503`), in which case a taken name is refused on Create.
+ * The live username check in a sentence: free, taken, why it can never be a username (the
+ * server's reason), or that this server cannot say in advance (its user directory answers
+ * `503`), in which case a taken name is refused on Create.
  */
 function describeAvailability(
   localpart: string,
@@ -24,12 +27,15 @@ function describeAvailability(
   availability: { data?: boolean | null; isError: boolean; error: unknown; isFetching: boolean },
 ): string | null {
   if (!localpart) return null;
-  const id = `@${localpart}:${serverName ?? "this server"}`;
+  const name = localpart.replace(/^@/, "").split(":")[0]!.toLowerCase();
+  const id = `@${name}:${serverName ?? "this server"}`;
   if (availability.isError) {
-    const { kind } = classifyError(availability.error);
-    return kind === "unavailable" || kind === "not-implemented"
-      ? "This server can’t check usernames in advance; a taken one is refused on Create."
-      : null;
+    const { kind, problem } = classifyError(availability.error);
+    if (kind === "unavailable" || kind === "not-implemented")
+      return "This server can’t check usernames in advance; a taken one is refused on Create.";
+    // A name that can never be one: the server says why, in the words Create would use.
+    const reason = problem?.errors?.find((e) => e.pointer === "param:localpart")?.detail;
+    return reason ? `${reason.charAt(0).toUpperCase()}${reason.slice(1)}.` : null;
   }
   if (availability.data === true) return `${id} is free.`;
   if (availability.data === false) return `${id} is taken.`;
@@ -66,14 +72,14 @@ export function AddUserDialog({
   const [password, setPassword] = useState("");
   const [passwordVisible, setPasswordVisible] = useState(false);
   const [admin, setAdmin] = useState(false);
+  const [userType, setUserType] = useState("person");
   const [error, setError] = useState<{ message: string; field: FieldName | null } | null>(null);
   const [created, setCreated] = useState<{ user: User; password: string } | null>(null);
   const serverName = useServerInfo().data?.name;
-  // Asked once the typing pauses, for a username that could be one at all.
-  const localpart = useDebouncedValue(username.trim().replace(/^@/, "").split(":")[0] ?? "", 400);
-  const availability = useLocalpartAvailability(
-    /^[a-z0-9._=\-/+]+$/.test(localpart) ? localpart : "",
-  );
+  // Asked once the typing pauses. The server is the judge of what can be a username (it
+  // lower-cases, and refuses another server's domain), so whatever was typed is asked about.
+  const localpart = useDebouncedValue(username.trim(), 400);
+  const availability = useLocalpartAvailability(localpart);
   const availabilityNote = describeAvailability(localpart, serverName, availability);
 
   function reset() {
@@ -82,6 +88,7 @@ export function AddUserDialog({
     setPassword("");
     setPasswordVisible(false);
     setAdmin(false);
+    setUserType("person");
     setError(null);
     setCreated(null);
   }
@@ -109,6 +116,7 @@ export function AddUserDialog({
         password,
         display_name: displayName.trim() || undefined,
         admin,
+        user_type: userTypeWire(userType) ?? undefined,
       });
       setCreated({ user, password });
     } catch (err) {
@@ -244,6 +252,16 @@ export function AddUserDialog({
                   Generate
                 </Button>
               </div>
+            )}
+          </Field>
+          <Field label="Kind of account" hint={USER_TYPE_HINT}>
+            {(fieldProps) => (
+              <Select
+                {...fieldProps}
+                options={USER_TYPE_OPTIONS}
+                value={userType}
+                onValueChange={setUserType}
+              />
             )}
           </Field>
           <div className="flex items-start justify-between gap-4">

@@ -55,6 +55,7 @@ pub mod state;
 pub mod store;
 pub mod token;
 pub mod uia;
+pub mod user_type;
 
 pub use error::{ErrCode, MatrixError};
 pub use requester::{AppserviceIdentity, Requester, RequesterContext};

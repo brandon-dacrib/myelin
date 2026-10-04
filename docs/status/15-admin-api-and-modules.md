@@ -2,6 +2,63 @@
 
 Track brief: `docs/workstreams/15-admin-api-and-modules.md`. Owner crates: `hs-admin`, `hs-modules`, `hs-identity`, `hs-http` (shared with 07 and 14).
 
+## 2026-10-04: `users.update` changes the name, avatar and kind; `users.availability` is real
+
+Branch `agent/users-update-sources` (tracks 15, 07, 16). `PATCH /users/{user_id}` used to refuse
+`display_name`, `avatar_url` and `user_type` with `400 validation-failed` ("no data source can
+change this field yet"). All three now apply.
+
+**Contract** (`openapi.yaml` **0.1.9**; 0.1.8 is `agent/bridge-offering-demo`'s; 0.1.7 had no changelog entry, noted in 0.1.9's). The
+operation has a description; `UserUpdate.display_name` and `avatar_url` are nullable (null or
+`""` clears) and each field says what it does; `users.availability` documents its `400` for a
+name that can never be one. `web/src/api/schema.d.ts` regenerated.
+
+**Handler** (`router.rs`, `users_update`): the body is read so that `null` stays distinct from
+absent (a `present` deserializer: serde turns a JSON `null` into `None` for an `Option<Value>`,
+which made `{"display_name": null}` read as `{}`). Shape checks first (a text field is a string
+or null; an avatar is an `mxc://` address), then `If-Match`, then the writes, each only when the
+value differs: the kind first (the directory can still refuse it, `400` at `/user_type`, before
+anything is written), then the profile in one `UserDirectory::update_profile` call (one room
+fan-out for both fields), then `admin`. One audit entry with a change per field and one
+`user.updated` event carrying `admin`, `display_name`, `avatar_url` and `user_type`.
+
+**Seams** (`sources.rs`): `ProfileUpdate { display_name, avatar_url: Option<Option<String>> }`,
+`UserDirectory::update_profile` and `UserDirectory::set_user_type`, both with `503` default
+bodies as the other later methods have; `InMemoryUserDirectory` implements both. A directory that
+does not override them answers `503` for those fields only (tested).
+
+**Track 07's side** (`hs-auth`): `UserRecord.user_type` (serde default) and
+`UserStore::set_user_type` in both stores (shared test); `user_type::parse_user_type` (`bot`,
+`support`, none; anything else refused by name). `AuthStoreUserDirectory` overrides
+`update_profile` (refuses an erased account with `409`; writes the record, then calls the
+installed `hs_auth::state::ProfileRefresh`, logging at info), `set_user_type`, and
+`check_localpart_available` (held to `local_user::local_user_id`, so `Carol` is `carol` and a
+name that can never be one is `400` at `param:localpart` with the reason `users.create` gives).
+`users.create` records `user_type` instead of refusing it; the shared-secret `/_synapse/admin/v1/register`
+records it instead of dropping it. `users.lookup` and `users.create` were already real.
+
+**The fan-out** is the user's own: `hs serve` installs `hs_cli::profile_refresh::RoomProfileRefresh`,
+which calls `hs_room::routes::profile::spawn_refresh` (made `pub`, otherwise unchanged): the
+user's `m.room.member` event is re-sent with the new values in every joined room, which other
+clients' `/sync` and the federation sender carry. `serve.rs` also installed the remote-profile
+source twice; the duplicate is gone.
+
+**Web** (track 16's pages): see `docs/status/16-management-web-interface.md`, 2026-10-04.
+
+**Verified.** `cargo test -p hs-auth` (263), `-p hs-admin` (305 + contract), `-p hs-room --
+profile`, `-p hs-cli --lib`; clippy `-D warnings` on hs-auth, hs-admin, hs-room, hs-cli,
+hs-compat. Real binary: `crates/hs-cli/tests/admin_user_profile.rs` (new) patches alice's name,
+avatar and kind, then reads her `/profile`, her `m.room.member` event as bob reads it, the admin
+user and the audit entry; clears the name with `null` and sees it gone from both; refusals by
+field write nothing; availability for taken, differently-cased, free and impossible names;
+`users.create` with a kind. `admin_user_identity`, `user_moderation`, `user_erasure` still pass.
+
+**Left.** The federation leg is the existing send path and is not separately tested here (a
+two-server test of a rename would be `federation_membership.rs`'s to extend). `user_type` is
+recorded and shown only: nothing yet reads it (the user directory search and statistics could
+exclude support accounts). `UserCreate.user_type` is not nullable in the contract (a person is
+sent as absent).
+
 ## 2026-10-02: a user can be erased
 
 Branch `agent/user-erase`. `POST /users/{user_id}/deactivate` with `erase: true` used to be a

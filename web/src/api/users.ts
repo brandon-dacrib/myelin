@@ -230,9 +230,9 @@ export type UserUpdate = components["schemas"]["UserUpdate"];
 
 /**
  * Changes an account's own fields (`PATCH /users/{user_id}`): server administrator, display
- * name, avatar and kind of account. Send only the fields that changed: a server that cannot
- * change a field yet answers `400 validation-failed` naming it, even when it is sent unchanged,
- * so a form that resends everything would be refused for a field it did not touch.
+ * name, avatar and kind of account. A name or avatar change reaches every room the user is in
+ * (the server re-sends their membership). Send only the fields that changed: the server touches
+ * only what a request names, and `null` clears a field.
  */
 export function useUpdateUser() {
   const qc = useQueryClient();
@@ -271,8 +271,9 @@ export async function lookupUser(lookup: UserLookup): Promise<User | null> {
 
 /**
  * Whether `localpart` is free (`GET /users/availability`), asked while an administrator types a
- * username. A server whose user directory cannot check in advance answers `503`; the caller
- * says so instead of pretending to know.
+ * username. A name that could never be one is `400` with the server's reason (`param:localpart`),
+ * which the caller shows; a server whose user directory cannot check in advance answers `503`,
+ * and the caller says so instead of pretending to know.
  */
 export function useLocalpartAvailability(localpart: string) {
   return useQuery({

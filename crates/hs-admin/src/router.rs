@@ -1619,19 +1619,29 @@ async fn deactivate_and_erase(
 }
 
 /// The OpenAPI `UserUpdate` schema, read as `Option<Value>` per field (rather than `Option<T>`)
-/// so presence can be distinguished from absence: `{"display_name": null}` and `{}` must be told
-/// apart, since only the former is a (rejected) attempt to change a field this server cannot
-/// change yet.
+/// so presence can be distinguished from absence: `{"display_name": null}` clears the display
+/// name and `{}` leaves it alone, and only the fields a request names are applied.
 #[derive(Debug, Default, Deserialize)]
 struct UserUpdateRequest {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present")]
     display_name: Option<serde_json::Value>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present")]
     avatar_url: Option<serde_json::Value>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present")]
     admin: Option<serde_json::Value>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present")]
     user_type: Option<serde_json::Value>,
+}
+
+/// A field that is in the body at all, `null` included: serde reads a JSON `null` into an
+/// `Option<Value>` as `None`, which would make `{"display_name": null}` (clear it) read the same
+/// as `{}` (leave it alone). This keeps the `null` as `Some(Value::Null)`; `#[serde(default)]`
+/// still supplies `None` for a field that is absent.
+fn present<'de, D>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde_json::Value::deserialize(deserializer).map(Some)
 }
 
 /// A weak-or-strong ETag derived from a user's own fields (RFC 0004's `If-Match` parameter),
@@ -1649,10 +1659,36 @@ fn normalize_etag(raw: &str) -> &str {
     raw.trim().trim_start_matches("W/").trim_matches('"')
 }
 
-/// `PATCH /api/v1/users/{user_id}` (`admin:write`): today, only the `admin` field has a data
-/// source that can change it ([`UserDirectory::set_admin`]). Any other field present in the
-/// request body — even set to its current value, even `null` — is a `400 validation-failed`
-/// naming that field, rather than a `200` that silently ignored it.
+/// A `UserUpdate` text field as the request gave it: absent (leave alone), `null` or empty
+/// (clear), or a trimmed string (set). Anything else is `400` naming the field.
+fn optional_text(
+    raw: &Option<serde_json::Value>,
+    pointer: &'static str,
+    errors: &mut Vec<ValidationError>,
+) -> Option<Option<String>> {
+    match raw {
+        None => None,
+        Some(serde_json::Value::Null) => Some(None),
+        Some(serde_json::Value::String(text)) => {
+            let trimmed = text.trim();
+            Some((!trimmed.is_empty()).then(|| trimmed.to_owned()))
+        }
+        Some(_) => {
+            errors.push(ValidationError::new(pointer, "must be a string or null"));
+            None
+        }
+    }
+}
+
+/// `PATCH /api/v1/users/{user_id}` (`admin:write`): the account's own fields. `display_name`
+/// and `avatar_url` go through [`UserDirectory::update_profile`], the same path the user's own
+/// `PUT /profile/...` takes, so the change reaches their rooms and other servers; `user_type`
+/// through [`UserDirectory::set_user_type`]; `admin` through [`UserDirectory::set_admin`]. Only
+/// the fields the request names are touched, and only when they differ from the current value.
+/// A field the wired directory cannot change is an honest `503` from its default method body,
+/// never a `200` that silently ignored it. Everything is validated before anything is written;
+/// a directory failure after that (unavailable, vanished) leaves the fields already written in
+/// place, which the next read shows.
 async fn users_update(
     State(state): State<AdminState>,
     headers: HeaderMap,
@@ -1677,24 +1713,17 @@ async fn users_update(
             };
 
             let mut errors = Vec::new();
-            if request.display_name.is_some() {
-                errors.push(ValidationError::new(
-                    "/display_name",
-                    "no data source can change this field yet",
-                ));
-            }
-            if request.avatar_url.is_some() {
+            let display_name = optional_text(&request.display_name, "/display_name", &mut errors);
+            let avatar_url = optional_text(&request.avatar_url, "/avatar_url", &mut errors);
+            if let Some(Some(url)) = &avatar_url
+                && !url.starts_with("mxc://")
+            {
                 errors.push(ValidationError::new(
                     "/avatar_url",
-                    "no data source can change this field yet",
+                    "must be the mxc:// address of an uploaded image",
                 ));
             }
-            if request.user_type.is_some() {
-                errors.push(ValidationError::new(
-                    "/user_type",
-                    "no data source can change this field yet",
-                ));
-            }
+            let user_type = optional_text(&request.user_type, "/user_type", &mut errors);
             let admin_value = match &request.admin {
                 None => None,
                 Some(serde_json::Value::Bool(b)) => Some(*b),
@@ -1736,6 +1765,45 @@ async fn users_update(
             }
 
             let mut changes = Vec::new();
+            // The kind first: it is the one field the directory can still refuse on its
+            // vocabulary (`400` at `/user_type`), so a refused kind leaves everything untouched.
+            if let Some(new_kind) = user_type
+                && new_kind != current.user_type
+            {
+                if let Err(e) = users.set_user_type(&user_id, new_kind.clone()).await {
+                    return e.to_problem().with_instance(instance).into_response();
+                }
+                changes.push(AuditChange {
+                    pointer: "/user_type".to_string(),
+                    from: Some(json!(current.user_type)),
+                    to: Some(json!(new_kind)),
+                });
+            }
+            // Then the profile: one call for both fields, so a user in many rooms is re-stamped
+            // once, not once per field.
+            let profile = crate::sources::ProfileUpdate {
+                display_name: display_name.filter(|new| *new != current.display_name),
+                avatar_url: avatar_url.filter(|new| *new != current.avatar_url),
+            };
+            if !profile.is_empty() {
+                if let Err(e) = users.update_profile(&user_id, profile.clone()).await {
+                    return e.to_problem().with_instance(instance).into_response();
+                }
+                if let Some(new) = profile.display_name {
+                    changes.push(AuditChange {
+                        pointer: "/display_name".to_string(),
+                        from: Some(json!(current.display_name)),
+                        to: Some(json!(new)),
+                    });
+                }
+                if let Some(new) = profile.avatar_url {
+                    changes.push(AuditChange {
+                        pointer: "/avatar_url".to_string(),
+                        from: Some(json!(current.avatar_url)),
+                        to: Some(json!(new)),
+                    });
+                }
+            }
             if let Some(new_admin) = admin_value
                 && new_admin != current.admin
             {
@@ -1762,7 +1830,12 @@ async fn users_update(
                 "user.updated",
                 ResourceRef::new("user", user_id.clone()),
                 changes,
-                json!({ "admin": updated.admin }),
+                json!({
+                    "admin": updated.admin,
+                    "display_name": updated.display_name,
+                    "avatar_url": updated.avatar_url,
+                    "user_type": updated.user_type,
+                }),
             )
             .await
             {
@@ -6645,25 +6718,198 @@ mod tests {
         assert_eq!(entries[0].changes[0].pointer, "/admin");
     }
 
-    #[tokio::test]
-    async fn users_update_rejects_a_field_no_source_can_change_yet() {
-        let (router, _manifest) = build_router(state_with_users());
+    /// `user_id` as `GET /users/{user_id}` answers it.
+    async fn state_user(router: &axum::Router, user_id: &str) -> crate::model::AdminUser {
         let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/users/{}",
+                        user_id.replace('@', "%40").replace(':', "%3A")
+                    ))
+                    .header("authorization", "Bearer admin-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        serde_json::from_slice(&body_bytes(response).await).unwrap()
+    }
+
+    async fn patch_user(router: &axum::Router, body: &str) -> Response {
+        router
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("PATCH")
                     .uri("/api/v1/users/%40alice%3Aexample.org")
                     .header("authorization", "Bearer admin-token")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"display_name":"New Name"}"#))
+                    .body(Body::from(body.to_owned()))
                     .unwrap(),
             )
             .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn users_update_changes_the_profile_and_kind_with_one_audit_entry_naming_each_field() {
+        let state = state_with_users();
+        let mut rx = state.events.subscribe();
+        let (router, _manifest) = build_router(state);
+
+        let response = patch_user(
+            &router,
+            r#"{"display_name":"  Alice Liddell ","avatar_url":"mxc://example.org/alice","user_type":"bot"}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let user: crate::model::AdminUser =
+            serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(user.display_name.as_deref(), Some("Alice Liddell"));
+        assert_eq!(user.avatar_url.as_deref(), Some("mxc://example.org/alice"));
+        assert_eq!(user.user_type.as_deref(), Some("bot"));
+        assert!(!user.admin);
+
+        let event = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("an event should be published")
             .unwrap();
+        assert_eq!(event.r#type, "user.updated");
+        assert_eq!(event.data["display_name"], "Alice Liddell");
+        assert_eq!(event.data["user_type"], "bot");
+
+        let entries = audit_entries_for_action(&router, "users.update").await;
+        assert_eq!(entries.len(), 1);
+        let pointers: Vec<&str> = entries[0]
+            .changes
+            .iter()
+            .map(|c| c.pointer.as_str())
+            .collect();
+        assert_eq!(pointers, ["/user_type", "/display_name", "/avatar_url"]);
+        assert_eq!(entries[0].changes[0].to, Some(json!("bot")));
+        assert_eq!(entries[0].changes[1].from, Some(json!("Alice")));
+        assert_eq!(entries[0].changes[1].to, Some(json!("Alice Liddell")));
+    }
+
+    #[tokio::test]
+    async fn users_update_clears_with_null_or_empty_and_skips_an_unchanged_field() {
+        let (router, _manifest) = build_router(state_with_users());
+
+        // Alice is "Alice" already: sending it again is not a change.
+        let response = patch_user(&router, r#"{"display_name":"Alice","user_type":null}"#).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let entries = audit_entries_for_action(&router, "users.update").await;
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].changes.is_empty(), "{:?}", entries[0].changes);
+
+        let response = patch_user(&router, r#"{"display_name":null}"#).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let user: crate::model::AdminUser =
+            serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(user.display_name, None);
+
+        let response = patch_user(&router, r#"{"display_name":"Alice","avatar_url":""}"#).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let user: crate::model::AdminUser =
+            serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(user.display_name.as_deref(), Some("Alice"));
+        assert_eq!(user.avatar_url, None);
+    }
+
+    #[tokio::test]
+    async fn users_update_refuses_a_bad_avatar_kind_or_type_by_field_before_writing_anything() {
+        let (router, _manifest) = build_router(state_with_users());
+        let response = patch_user(
+            &router,
+            r#"{"display_name":7,"avatar_url":"https://example.org/a.png","user_type":"wizard","admin":true}"#,
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let problem: hs_http::Problem =
             serde_json::from_slice(&body_bytes(response).await).unwrap();
-        assert!(problem.errors.iter().any(|e| e.pointer == "/display_name"));
+        let pointers: Vec<&str> = problem.errors.iter().map(|e| e.pointer.as_str()).collect();
+        assert!(pointers.contains(&"/display_name"), "{pointers:?}");
+        assert!(pointers.contains(&"/avatar_url"), "{pointers:?}");
+        // The kind is the directory's to judge, after the shape checks.
+        assert!(!pointers.contains(&"/user_type"), "{pointers:?}");
+
+        let response = patch_user(
+            &router,
+            r#"{"user_type":"wizard","display_name":"Wiz","admin":true}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let problem: hs_http::Problem =
+            serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert!(problem.errors.iter().any(|e| e.pointer == "/user_type"));
+
+        // Nothing was written and nothing recorded.
+        let alice = state_user(&router, "@alice:example.org").await;
+        assert!(!alice.admin);
+        assert_eq!(alice.user_type, None);
+        assert_eq!(alice.display_name.as_deref(), Some("Alice"));
+        assert!(
+            audit_entries_for_action(&router, "users.update")
+                .await
+                .is_empty()
+        );
+    }
+
+    /// A directory that has not taken up the profile methods: the trait's default bodies.
+    struct FlagsOnlyUserDirectory {
+        inner: crate::sources::InMemoryUserDirectory,
+    }
+
+    #[async_trait::async_trait]
+    impl UserDirectory for FlagsOnlyUserDirectory {
+        async fn get_user(
+            &self,
+            user_id: &str,
+        ) -> Result<Option<crate::model::AdminUser>, SourceError> {
+            self.inner.get_user(user_id).await
+        }
+        async fn list_users(
+            &self,
+            filter: &UserFilter,
+        ) -> Result<Vec<crate::model::AdminUser>, SourceError> {
+            self.inner.list_users(filter).await
+        }
+        async fn set_admin(&self, user_id: &str, admin: bool) -> Result<(), SourceError> {
+            self.inner.set_admin(user_id, admin).await
+        }
+        async fn set_locked(&self, user_id: &str, locked: bool) -> Result<(), SourceError> {
+            self.inner.set_locked(user_id, locked).await
+        }
+        async fn set_deactivated(
+            &self,
+            user_id: &str,
+            deactivated: bool,
+        ) -> Result<(), SourceError> {
+            self.inner.set_deactivated(user_id, deactivated).await
+        }
+    }
+
+    #[tokio::test]
+    async fn users_update_is_503_for_a_directory_that_cannot_change_profiles() {
+        let directory = FlagsOnlyUserDirectory {
+            inner: crate::sources::InMemoryUserDirectory::new().with_user(
+                crate::model::AdminUser {
+                    user_id: "@alice:example.org".to_string(),
+                    ..Default::default()
+                },
+            ),
+        };
+        let (router, _manifest) = build_router(test_state().with_users(Arc::new(directory)));
+        let response = patch_user(&router, r#"{"display_name":"New Name"}"#).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let response = patch_user(&router, r#"{"user_type":"bot"}"#).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // The flag it can change still works.
+        let response = patch_user(&router, r#"{"admin":true}"#).await;
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

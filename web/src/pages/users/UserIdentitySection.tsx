@@ -16,6 +16,8 @@ import { QueryProblemState } from "@/components/QueryProblemState";
 import { MutationError } from "@/components/MutationError";
 import { RelativeTime } from "@/components/RelativeTime";
 import { toast } from "@/components/ui/toast/toast-store";
+import type { User } from "@/api/users";
+import { UserProfilePanel } from "./UserProfilePanel";
 
 const MEDIUM_LABEL: Record<string, string> = { email: "Email", msisdn: "Phone" };
 
@@ -27,13 +29,31 @@ function fieldError(error: unknown, pointer: string): string | undefined {
 }
 
 /**
- * How this account is identified besides its Matrix ID: the email addresses and phone numbers
- * bound to it (each signs them in and finds them in a lookup), and the accounts at upstream
- * identity providers (OIDC, SAML, LDAP) linked to it.
+ * Who this account is: how it appears (display name, avatar and kind, edited in place), the
+ * email addresses and phone numbers bound to it (each signs them in and finds them in a
+ * lookup), and the accounts at upstream identity providers (OIDC, SAML, LDAP) linked to it.
  */
-export function UserIdentitySection({ userId, canWrite }: { userId: string; canWrite: boolean }) {
+export function UserIdentitySection({
+  userId,
+  user,
+  canWrite,
+}: {
+  userId: string;
+  /** The account, for the profile editor; without it only 3PIDs and linked identities show. */
+  user?: User;
+  canWrite: boolean;
+}) {
   return (
     <>
+      {user && (
+        // Keyed on what it edits, so a change made elsewhere (the Edit dialog, another tab)
+        // replaces what the form holds rather than leaving it stale.
+        <UserProfilePanel
+          key={`${user.display_name ?? ""}|${user.avatar_url ?? ""}|${user.user_type ?? ""}`}
+          user={user}
+          canWrite={canWrite}
+        />
+      )}
       <ThreepidsPanel userId={userId} canWrite={canWrite} />
       <ExternalIdsPanel userId={userId} canWrite={canWrite} />
     </>

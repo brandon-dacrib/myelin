@@ -84,7 +84,11 @@ fn now_ms() -> i64 {
 /// rapid second profile change before the first fan-out finishes is reflected correctly rather
 /// than racing to overwrite with a stale value). Never awaited by the caller -- see the module
 /// docs.
-fn spawn_refresh<B: KvBackend + 'static>(
+///
+/// Public so that an administrator's profile change takes the same path: `hs serve` installs it
+/// as `hs-auth`'s `ProfileRefresh` (`hs_cli::profile_refresh`), which `hs-admin`'s
+/// `users.update` reaches through the user directory.
+pub fn spawn_refresh<B: KvBackend + 'static>(
     rooms: Arc<RoomRegistry<B>>,
     auth: hs_auth::state::AuthState,
     user_id: String,

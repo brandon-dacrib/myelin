@@ -37,6 +37,7 @@ pub mod media;
 pub mod metrics_layer;
 pub mod migration;
 pub mod overview;
+pub mod profile_refresh;
 pub mod push_delivery;
 pub mod recover;
 pub mod register;

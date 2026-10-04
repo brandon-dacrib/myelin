@@ -152,6 +152,26 @@ pub struct UserFilter {
     pub guests: Option<bool>,
 }
 
+/// What `users.update` changes about how a user appears: the fields of their profile that
+/// `PUT /profile/{userId}/...` lets the user change themself. Each field is `None` to leave it
+/// alone, `Some(None)` to clear it, `Some(Some(value))` to set it, so a request that names one
+/// field never touches the other.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProfileUpdate {
+    /// The display name other people see in rooms; cleared, their user id is shown instead.
+    pub display_name: Option<Option<String>>,
+    /// The `mxc://` URI of the avatar; cleared, they have none.
+    pub avatar_url: Option<Option<String>>,
+}
+
+impl ProfileUpdate {
+    /// Whether this update names any field at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.display_name.is_none() && self.avatar_url.is_none()
+    }
+}
+
 /// The user-directory seam `hs-admin`'s `/users` handlers call. Implemented by track 07 against
 /// its real user store; [`InMemoryUserDirectory`] below is a fake for this crate's own tests.
 ///
@@ -169,6 +189,37 @@ pub trait UserDirectory: Send + Sync + 'static {
     async fn set_admin(&self, user_id: &str, admin: bool) -> Result<(), SourceError>;
     async fn set_locked(&self, user_id: &str, locked: bool) -> Result<(), SourceError>;
     async fn set_deactivated(&self, user_id: &str, deactivated: bool) -> Result<(), SourceError>;
+
+    /// Changes the user's display name and avatar (`users.update`) the way the user changing
+    /// them through `PUT /profile/{userId}/...` would: the stored profile changes, and the
+    /// user's `m.room.member` event is re-sent with the new values in every room they are joined
+    /// to, which is how other clients and other servers learn of it. The values arrive
+    /// normalised (trimmed, an empty string already turned into a clear); the implementation
+    /// stores what it is given. `SourceError::NotFound` for an account that is not there.
+    async fn update_profile(
+        &self,
+        user_id: &str,
+        update: ProfileUpdate,
+    ) -> Result<(), SourceError> {
+        let _ = (user_id, update);
+        Err(SourceError::Unavailable(
+            "this user directory cannot change profiles yet".to_string(),
+        ))
+    }
+
+    /// Marks the account as a `bot` or `support` account, or `None` for a person
+    /// (`users.update`'s `user_type`). `SourceError::InvalidField` at `/user_type` for a value
+    /// outside that vocabulary; `SourceError::NotFound` for an account that is not there.
+    async fn set_user_type(
+        &self,
+        user_id: &str,
+        user_type: Option<String>,
+    ) -> Result<(), SourceError> {
+        let _ = (user_id, user_type);
+        Err(SourceError::Unavailable(
+            "this user directory cannot change the kind of an account yet".to_string(),
+        ))
+    }
 
     /// Creates a new user (`users.create`). A real implementation resolves `request.localpart`
     /// (plus its own homeserver domain, which this crate does not know) or `request.user_id` into
@@ -407,6 +458,47 @@ impl UserDirectory for InMemoryUserDirectory {
             .expect("InMemoryUserDirectory lock poisoned");
         let user = users.get_mut(user_id).ok_or(SourceError::NotFound)?;
         user.deactivated = deactivated;
+        Ok(())
+    }
+
+    async fn update_profile(
+        &self,
+        user_id: &str,
+        update: ProfileUpdate,
+    ) -> Result<(), SourceError> {
+        let mut users = self
+            .users
+            .write()
+            .expect("InMemoryUserDirectory lock poisoned");
+        let user = users.get_mut(user_id).ok_or(SourceError::NotFound)?;
+        if let Some(display_name) = update.display_name {
+            user.display_name = display_name;
+        }
+        if let Some(avatar_url) = update.avatar_url {
+            user.avatar_url = avatar_url;
+        }
+        Ok(())
+    }
+
+    async fn set_user_type(
+        &self,
+        user_id: &str,
+        user_type: Option<String>,
+    ) -> Result<(), SourceError> {
+        if let Some(kind) = user_type.as_deref()
+            && !matches!(kind, "bot" | "support")
+        {
+            return Err(SourceError::InvalidField {
+                pointer: "/user_type",
+                detail: format!("{kind:?} is not a kind of account; use bot or support"),
+            });
+        }
+        let mut users = self
+            .users
+            .write()
+            .expect("InMemoryUserDirectory lock poisoned");
+        let user = users.get_mut(user_id).ok_or(SourceError::NotFound)?;
+        user.user_type = user_type;
         Ok(())
     }
 

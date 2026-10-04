@@ -7,6 +7,7 @@ import { Dialog, DialogContent } from "@/components/ui/dialog/Dialog";
 import { Field, Input } from "@/components/ui/input/Input";
 import { Select } from "@/components/ui/select/Select";
 import { Switch } from "@/components/ui/switch/Switch";
+import { USER_TYPE_HINT, USER_TYPE_OPTIONS } from "./user-type";
 
 type FieldName = "display_name" | "avatar_url" | "user_type" | "admin";
 
@@ -17,22 +18,15 @@ const FIELD_FOR_POINTER: Record<string, FieldName> = {
   "/admin": "admin",
 };
 
-/** The kinds of account `User.user_type` can name, in words; "" is an ordinary person. */
-const USER_TYPE_OPTIONS = [
-  { value: "person", label: "Person" },
-  { value: "bot", label: "Bot" },
-  { value: "support", label: "Support account" },
-];
-
 /**
  * Edits an account's own fields (`PATCH /users/{user_id}`): display name, avatar, kind of
  * account and whether they are a server administrator. Until now administrator was set only
  * when the account was made.
  *
- * Only the fields that changed are sent. That is not an optimisation: a server that cannot
- * change a field yet refuses the whole request naming that field, so resending a display name
- * unchanged would stop an administrator grant from going through. A refusal of that kind is
- * shown beside the field it names, in the server's words.
+ * Only the fields that changed are sent, so a field left alone is never touched (and a server
+ * whose directory cannot change one field does not refuse a request about another). A refusal
+ * is shown beside the field it names, in the server's words. The same profile fields are
+ * edited in place in the page's "How they appear" section (`UserProfilePanel`).
  */
 export function EditUserDialog({
   user,
@@ -116,7 +110,7 @@ export function EditUserDialog({
         <form className="flex flex-col gap-4" onSubmit={handleSubmit} noValidate>
           <Field
             label="Display name"
-            hint="What other people see in rooms. Empty means their user ID is shown instead."
+            hint="What other people see in rooms. Changing it updates their membership in every room they are in, as if they had changed it themself. Empty shows their user ID instead."
             error={errors.display_name}
           >
             {(fieldProps) => (
@@ -145,11 +139,7 @@ export function EditUserDialog({
               />
             )}
           </Field>
-          <Field
-            label="Kind of account"
-            hint="A bot or support account is run by software or by this server's staff rather than being a person; statistics and the user directory treat it accordingly."
-            error={errors.user_type}
-          >
+          <Field label="Kind of account" hint={USER_TYPE_HINT} error={errors.user_type}>
             {(fieldProps) => (
               <Select
                 {...fieldProps}

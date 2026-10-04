@@ -39,7 +39,7 @@ function recordDeactivations(): unknown[] {
 describe("A user's page", () => {
   it("names the kind of account and the bridge that made it, in words", async () => {
     open("@whatsapp_15551234:example.org");
-    expect(await screen.findByText("Kind of account")).toBeInTheDocument();
+    expect(await screen.findByText("Kind of account", { selector: "dt" })).toBeInTheDocument();
     expect(screen.getByText("Made by a bridge")).toBeInTheDocument();
   });
 

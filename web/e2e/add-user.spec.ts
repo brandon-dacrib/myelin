@@ -29,6 +29,10 @@ test.describe("add user", () => {
     await expect(dialog.getByText("@alice:example.org already exists")).toBeVisible();
     await expectNoAxeViolations(page, "add user dialog, username taken");
 
+    // A name that can never be one says why while it is typed, in the server's words.
+    await dialog.getByLabel(/^Username/).fill("carol smith");
+    await expect(dialog.getByText(/^"carol smith" cannot be a username/)).toBeVisible();
+
     await dialog.getByLabel(/^Username/).fill("carol");
     await expect(dialog.getByText("@carol:example.org is free.")).toBeVisible();
     await dialog.getByLabel(/^Display name/).fill("Carol D");

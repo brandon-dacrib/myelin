@@ -1488,6 +1488,13 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     rooms
         .send_limiter()
         .set_server_limit(crate::live_config::message_limit(&config.rate_limits));
+    // An administrator's change to a user's display name or avatar (`users.update`) is carried
+    // into the user's rooms the way their own `PUT /profile/...` is: the record changes in
+    // `hs-auth`, and the room layer re-stamps their membership everywhere they are joined.
+    // Weakly: the hook lives in the auth state the room registry holds.
+    auth_state.install_profile_refresh(Arc::new(crate::profile_refresh::RoomProfileRefresh::new(
+        &rooms,
+    )));
     metrics.with_registry(crate::live_config::register_metrics);
     metrics.with_registry(hs_http::buckets::register_metrics);
     // Admin API requests refused for lacking their operation's scope, by scope.
@@ -1818,11 +1825,6 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             rooms.clone(),
             identity.clone(),
         )));
-        // And how `GET /profile/{userId}` reaches a user of another server
-        // (`crate::remote_profile`): the same client.
-        auth_state.install_remote_profiles(Arc::new(
-            crate::remote_profile::FederationRemoteProfile::new(mount.client.clone()),
-        ));
         // And how `GET /profile/{userId}` reaches a user of another server
         // (`crate::remote_profile`): the same client.
         auth_state.install_remote_profiles(Arc::new(

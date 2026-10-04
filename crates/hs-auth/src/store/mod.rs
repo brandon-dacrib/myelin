@@ -83,6 +83,13 @@ pub struct UserRecord {
     /// a person. `default` so that rows written before the field existed still read.
     #[serde(default)]
     pub appservice_id: Option<String>,
+    /// The kind of account, when it is not a person: `bot` or `support` (Synapse's two
+    /// `user_type` values, which `hs-admin`'s `User.user_type` carries unchanged). `None` for a
+    /// person. Set by an administrator (`users.create`, `users.update`) or by `hs register
+    /// --user-type`; recorded and shown, it does not change what the account may do. `default`
+    /// so that rows written before the field existed still read.
+    #[serde(default)]
+    pub user_type: Option<String>,
     /// An administrator's override of how fast this user may send events
     /// (`hs-admin`'s `users.rate_limit.*`), replacing the server's `rate_limits.message` bucket
     /// for this one account. `None` means no override. `default` so that rows written before the
@@ -129,6 +136,7 @@ impl UserRecord {
             display_name: None,
             avatar_url: None,
             appservice_id: None,
+            user_type: None,
             rate_limit_override: None,
             erased: false,
             erased_at_ms: None,
@@ -322,6 +330,16 @@ pub trait UserStore: Send + Sync {
         &self,
         user_id: &ruma::UserId,
         avatar_url: Option<String>,
+    ) -> Result<(), StoreError>;
+
+    /// Sets or clears the kind of account ([`UserRecord::user_type`]): `Some("bot")`,
+    /// `Some("support")`, or `None` for a person. The value's vocabulary is the caller's to
+    /// check ([`crate::user_type::parse_user_type`]); the store records what it is given.
+    /// Errors with [`StoreError::NotFound`] if the user does not exist.
+    async fn set_user_type(
+        &self,
+        user_id: &ruma::UserId,
+        user_type: Option<String>,
     ) -> Result<(), StoreError>;
 
     /// Looks up the user bound to a third-party identifier, if any. The address is matched

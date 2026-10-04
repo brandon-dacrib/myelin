@@ -325,6 +325,15 @@ impl<B: KvBackend> UserStore for TablesAuthStore<B> {
             .await
     }
 
+    async fn set_user_type(
+        &self,
+        user_id: &UserId,
+        user_type: Option<String>,
+    ) -> Result<(), StoreError> {
+        self.update_user(user_id, |u| u.user_type = user_type.clone())
+            .await
+    }
+
     async fn get_user_by_threepid(
         &self,
         medium: &str,
