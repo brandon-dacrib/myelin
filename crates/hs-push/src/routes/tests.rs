@@ -353,3 +353,60 @@ async fn notifications_page_newest_first_with_a_token() {
     assert_eq!(rest.len(), 1);
     assert_eq!(rest[0]["event"]["event_id"], "$1:example.org");
 }
+
+/// An email pusher is refused unless its address is bound to the account, and comes back as
+/// `kind: email` once it is.
+#[tokio::test]
+async fn an_email_pusher_needs_an_address_the_account_owns() {
+    let state = state().await;
+    let body = |address: &str| {
+        json!({
+            "pushkey": address,
+            "app_id": "m.email",
+            "kind": "email",
+            "app_display_name": "Email Notifications",
+            "device_display_name": address,
+            "lang": "en",
+            "data": {},
+        })
+    };
+    let (status, error) = call(
+        &state,
+        "POST",
+        "/pushers/set",
+        Some(body("alice@example.org")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+    assert_eq!(error["errcode"], "M_INVALID_PARAM");
+    let (status, error) = call(&state, "POST", "/pushers/set", Some(body("not-an-address"))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+
+    state
+        .auth
+        .store
+        .add_threepid(hs_auth::store::ThreepidRecord {
+            user_id: user_id!("@alice:example.org").to_owned(),
+            medium: "email".to_owned(),
+            address: "alice@example.org".to_owned(),
+            added_at_ms: 1,
+            validated_at_ms: 1,
+        })
+        .await
+        .unwrap();
+    let (status, _) = call(
+        &state,
+        "POST",
+        "/pushers/set",
+        Some(body("Alice@Example.org")),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the address compares case-insensitively"
+    );
+    let (_, pushers) = call(&state, "GET", "/pushers", None).await;
+    assert_eq!(pushers["pushers"][0]["kind"], "email");
+    assert_eq!(pushers["pushers"][0]["pushkey"], "Alice@Example.org");
+}

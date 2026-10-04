@@ -578,12 +578,14 @@ fn build_session_mounts<B: KvBackend>(
     backend: &B,
     auth: &AuthState,
     rooms: &Arc<hs_room::registry::RoomRegistry<B>>,
+    email: Option<&hs_config::EmailConfig>,
 ) -> Result<
     (
         UserState<B, Arc<hs_room::registry::RoomRegistry<B>>>,
         hs_e2e::state::E2eState<B>,
         hs_push::state::PushState<B>,
         hs_push::pipeline::PipelineWorker,
+        Option<EmailWiring>,
     ),
     ServeError,
 > {
@@ -627,6 +629,33 @@ fn build_session_mounts<B: KvBackend>(
     let http_pushers = Arc::new(hs_push::pushers::http::HttpPusherClient::new(
         hs_push::pushers::http::RetryPolicy::default(),
     ));
+    // Email pushers (`hs_push::email`): the mailer and the worker that holds, batches and
+    // throttles notification emails. Its worker is returned with the pipeline's, to start on
+    // the runtime; a configuration change replaces the mailer's server and the settings in
+    // place (`email` is a hot section).
+    let email_wiring = email.map(|section| {
+        let mailer = Arc::new(hs_push::email::smtp::SmtpMailer::new(
+            crate::push_delivery::smtp_settings(section),
+        ));
+        let (handle, worker) = hs_push::email::channel(
+            hs_push::email::EmailDeps {
+                pushers: pushers.clone(),
+                counts: counts.clone(),
+                throttle: Arc::new(
+                    hs_push::email::throttle::TablesThrottleStore::open(backend.clone())
+                        .map_err(opening)?,
+                ),
+                mailer: mailer.clone(),
+            },
+            crate::push_delivery::email_settings(section),
+        );
+        Ok::<_, ServeError>(EmailWiring {
+            handle,
+            worker,
+            mailer,
+        })
+    });
+    let email_wiring = email_wiring.transpose()?;
     // The pipeline that turns room events into counts, `/notifications` entries and HTTP pushes
     // (`hs_push::pipeline`'s module docs). Its worker is returned for the caller to start on
     // the runtime, and the room stream is forwarded to it there too.
@@ -641,6 +670,7 @@ fn build_session_mounts<B: KvBackend>(
             hs_push::cursors::TablesCursorStore::open(backend.clone()).map_err(opening)?,
         ),
         http: http_pushers.clone(),
+        email: email_wiring.as_ref().map(|e| e.handle.clone()),
     });
     let push = hs_push::state::PushState {
         auth: auth.clone(),
@@ -667,7 +697,15 @@ fn build_session_mounts<B: KvBackend>(
     ));
     user.hub.install_device_list_token_resolver(&e2e);
 
-    Ok((user, e2e, push, pipeline_worker))
+    Ok((user, e2e, push, pipeline_worker, email_wiring))
+}
+
+/// Email pushers as [`build_session_mounts`] wires them: the handle the pipeline feeds, the
+/// worker to start, and the mailer a configuration change re-points.
+struct EmailWiring {
+    handle: hs_push::email::EmailPushersHandle,
+    worker: hs_push::email::EmailPushersWorker,
+    mailer: Arc<hs_push::email::smtp::SmtpMailer>,
 }
 
 /// The `/api/v1` state a real `hs serve` runs on: admin credentials are verified against this
@@ -844,8 +882,9 @@ fn throwaway_mounts() -> Mounts<hs_kv::memory::MemoryBackend> {
         identity,
         remote_join: None,
     };
-    let (user, e2e, push, _pipeline_worker) = build_session_mounts(&backend, &auth, &rooms)
-        .expect("opening in-memory session/e2e/push keyspaces cannot fail");
+    let (user, e2e, push, _pipeline_worker, _email) =
+        build_session_mounts(&backend, &auth, &rooms, None)
+            .expect("opening in-memory session/e2e/push keyspaces cannot fail");
 
     let (federation_state, x_matrix) = crate::federation::manifest_only_mount();
     let federation = Some((
@@ -1395,6 +1434,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     // The copies a replica keeps of rooms it does not own, to answer /sync (decision 0022).
     metrics.with_registry(hs_user::metrics::register_metrics);
     metrics.with_registry(hs_push::pipeline::register_metrics);
+    metrics.with_registry(hs_push::email::register_metrics);
     // History fetched from other servers into rooms' timelines (`crate::backfill`).
     metrics.with_registry(crate::backfill::register_metrics);
     // Federation requests a room's server ACL refused, and notary key queries.
@@ -1507,8 +1547,24 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             live.on_change("migration", |_| Ok(()));
         }
     }
-    let (user_state, e2e_state, push_state, push_worker) =
-        build_session_mounts(&backend, &auth_state, &rooms)?;
+    let (user_state, e2e_state, push_state, push_worker, email_wiring) =
+        build_session_mounts(&backend, &auth_state, &rooms, Some(&config.email))?;
+    crate::push_delivery::describe_email(&config.email);
+    if let Some(email) = email_wiring {
+        tokio::spawn(email.worker.run());
+        if let Some(live) = &options.live_config {
+            // Every `email` setting is read per email sent: the mailer takes the server, the
+            // worker the rest, and the next email uses them.
+            let mailer = email.mailer.clone();
+            let handle = email.handle.clone();
+            live.on_change("email", move |config| {
+                mailer.set(crate::push_delivery::smtp_settings(&config.email));
+                handle.set_settings(crate::push_delivery::email_settings(&config.email));
+                crate::push_delivery::describe_email(&config.email);
+                Ok(())
+            });
+        }
+    }
     // `server.sync`: how much of the feeds and the hot-room stream the hub keeps, read on every
     // room update, so a change is in force at once (below, with the other `server` settings).
     let sync_hub = user_state.hub.clone();

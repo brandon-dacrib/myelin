@@ -291,6 +291,42 @@
           "ipv4_only": true
         }
       }
+    },
+    "email": {
+      "description": "Outbound email: the SMTP server this server sends through, and the notification emails\nthat email pushers receive. Until an SMTP host is set, no email is sent.",
+      "$ref": "#/$defs/EmailConfig",
+      "default": {
+        "smtp": {
+          "host": null,
+          "port": 587,
+          "security": "starttls",
+          "username": null,
+          "password": null,
+          "password_file": null,
+          "tls_name": null
+        },
+        "from": null,
+        "app_name": "",
+        "client_base_url": null,
+        "notifications": {
+          "enabled": true,
+          "delay_before_mail": "0s",
+          "throttle_start": "10m",
+          "throttle_max": "1d",
+          "throttle_multiplier": 6,
+          "throttle_reset_after": "12h",
+          "subjects": {
+            "message_from_person_in_room": "[%(app)s] You have a message on %(app)s from %(person)s in the %(room)s room...",
+            "message_from_person": "[%(app)s] You have a message on %(app)s from %(person)s...",
+            "messages_from_person": "[%(app)s] You have messages on %(app)s from %(person)s...",
+            "messages_in_room": "[%(app)s] You have messages on %(app)s in the %(room)s room...",
+            "messages_in_room_and_others": "[%(app)s] You have messages on %(app)s in the %(room)s room and others...",
+            "messages_from_person_and_others": "[%(app)s] You have messages on %(app)s from %(person)s and others...",
+            "invite_from_person": "[%(app)s] %(person)s has invited you to chat on %(app)s...",
+            "invite_from_person_to_room": "[%(app)s] %(person)s has invited you to join the %(room)s room on %(app)s..."
+          }
+        }
+      }
     }
   },
   "additionalProperties": false,
@@ -2298,6 +2334,251 @@
           "type": "boolean",
           "default": true,
           "x-applies": "hot"
+        }
+      },
+      "additionalProperties": false
+    },
+    "EmailConfig": {
+      "description": "Outbound email and notification emails.",
+      "type": "object",
+      "properties": {
+        "smtp": {
+          "description": "The SMTP server mail is sent through. Until `smtp.host` is set, no email is sent:\nemail pushers are stored and nothing is delivered to them.",
+          "$ref": "#/$defs/SmtpConfig",
+          "default": {
+            "host": null,
+            "port": 587,
+            "security": "starttls",
+            "username": null,
+            "password": null,
+            "password_file": null,
+            "tls_name": null
+          },
+          "x-applies": "hot"
+        },
+        "from": {
+          "description": "The sender of every email, as `Name <address>` or a bare address, for example\n`Matrix <noreply@example.org>`. Required once `smtp.host` is set. Corresponds to\nSynapse's `notif_from`; its `%(app)s` placeholder is replaced with `app_name`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null,
+          "x-applies": "hot"
+        },
+        "app_name": {
+          "description": "What this service is called in emails: the subject's `[Matrix]` prefix and the\nsender's name. Corresponds to Synapse's `app_name`.",
+          "type": "string",
+          "default": "Matrix",
+          "x-applies": "hot"
+        },
+        "client_base_url": {
+          "description": "The web client the links in a notification email open, for example\n`https://app.example.org`: a room is linked as `<client_base_url>/#/room/<room id>`.\nUnset, links go to `https://matrix.to`, which opens the reader's own client.\nCorresponds to Synapse's `client_base_url`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null,
+          "x-applies": "hot"
+        },
+        "notifications": {
+          "description": "The notification emails that email pushers receive: when they are sent and what their\nsubject says.",
+          "$ref": "#/$defs/NotificationEmailConfig",
+          "default": {
+            "enabled": true,
+            "delay_before_mail": "0s",
+            "throttle_start": "10m",
+            "throttle_max": "1d",
+            "throttle_multiplier": 6,
+            "throttle_reset_after": "12h",
+            "subjects": {
+              "message_from_person_in_room": "[%(app)s] You have a message on %(app)s from %(person)s in the %(room)s room...",
+              "message_from_person": "[%(app)s] You have a message on %(app)s from %(person)s...",
+              "messages_from_person": "[%(app)s] You have messages on %(app)s from %(person)s...",
+              "messages_in_room": "[%(app)s] You have messages on %(app)s in the %(room)s room...",
+              "messages_in_room_and_others": "[%(app)s] You have messages on %(app)s in the %(room)s room and others...",
+              "messages_from_person_and_others": "[%(app)s] You have messages on %(app)s from %(person)s and others...",
+              "invite_from_person": "[%(app)s] %(person)s has invited you to chat on %(app)s...",
+              "invite_from_person_to_room": "[%(app)s] %(person)s has invited you to join the %(room)s room on %(app)s..."
+            }
+          },
+          "x-applies": "hot"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SmtpConfig": {
+      "description": "The SMTP server mail is sent through.",
+      "type": "object",
+      "properties": {
+        "host": {
+          "description": "The SMTP server's host name or address. Unset, no email is sent. Corresponds to\nSynapse's `smtp_host`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "port": {
+          "description": "The SMTP server's port: 587 for STARTTLS submission, 465 for implicit TLS, 25 for a\nlocal relay. Corresponds to Synapse's `smtp_port`.",
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0,
+          "maximum": 65535,
+          "default": 587
+        },
+        "security": {
+          "description": "How the connection is secured: `starttls` (the default), `tls` or `none`. Corresponds\nto Synapse's `enable_tls`, `require_transport_security` and `force_tls` together:\n`force_tls: true` is `tls`; `enable_tls: false` is `none`; otherwise `starttls`, which\nalways requires the upgrade (Synapse's `require_transport_security: true`).",
+          "$ref": "#/$defs/SmtpSecurity",
+          "default": "starttls"
+        },
+        "username": {
+          "description": "The user name to authenticate with, if the server wants one. Corresponds to Synapse's\n`smtp_user`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "password": {
+          "description": "The password for `username`. Prefer `password_file`. Corresponds to Synapse's\n`smtp_pass`.",
+          "$ref": "#/$defs/SecretString",
+          "default": null
+        },
+        "password_file": {
+          "description": "Path to a file holding the SMTP password, read in place of `password` so the secret\nstays out of the database. Corresponds to Synapse's `smtp_pass_path`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "tls_name": {
+          "description": "The name the server's TLS certificate is checked against, when it is not `host` (a\nrelay reached by address, say). Corresponds to Synapse's `tlsname`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false
+    },
+    "SmtpSecurity": {
+      "description": "How a mail connection is secured.",
+      "oneOf": [
+        {
+          "description": "Connect in the clear and upgrade with STARTTLS; refuse to send if the server does not\noffer it. The usual choice for port 587.",
+          "type": "string",
+          "const": "starttls"
+        },
+        {
+          "description": "TLS from the first byte (implicit TLS). The usual choice for port 465.",
+          "type": "string",
+          "const": "tls"
+        },
+        {
+          "description": "No encryption, nor an attempt at it. Only for a relay on the same host or a private\nnetwork, or a test mail catcher.",
+          "type": "string",
+          "const": "none"
+        }
+      ]
+    },
+    "NotificationEmailConfig": {
+      "description": "When notification emails are sent, and what they say.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Whether email pushers are delivered to at all. On by default; mail still needs\n`smtp.host`. Off, email pushers are stored and nothing is sent. Corresponds to\nSynapse's `enable_notifs`.",
+          "type": "boolean",
+          "default": true
+        },
+        "delay_before_mail": {
+          "description": "How long the first unread notification in a room waits before its email goes, so\nsomeone who reads the message in a client meanwhile gets no email (a read receipt\ncancels it). Zero sends the first email at once. Synapse waits ten minutes.",
+          "$ref": "#/$defs/Duration",
+          "default": "0s"
+        },
+        "throttle_start": {
+          "description": "After an email about a room, how long before the next one about that room may go,\nwhile its messages stay unread. Each further email waits `throttle_multiplier` times\nlonger than the last, up to `throttle_max`; reading the room resets it. Synapse's\nvalues: ten minutes, times six, up to a day.",
+          "$ref": "#/$defs/Duration",
+          "default": "10m"
+        },
+        "throttle_max": {
+          "description": "The longest wait between two emails about one room whose messages go unread.",
+          "$ref": "#/$defs/Duration",
+          "default": "1d"
+        },
+        "throttle_multiplier": {
+          "description": "How much longer each successive email about an unread room waits.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "default": 6
+        },
+        "throttle_reset_after": {
+          "description": "After this long without a notification in a room, its wait goes back to\n`throttle_start`.",
+          "$ref": "#/$defs/Duration",
+          "default": "12h"
+        },
+        "subjects": {
+          "description": "The subject line of each kind of email. `%(app)s` is `app_name`, `%(person)s` the\nsender's name and `%(room)s` the room's. The same keys and placeholders as Synapse's\n`subjects`.",
+          "$ref": "#/$defs/SubjectsConfig",
+          "default": {
+            "message_from_person_in_room": "[%(app)s] You have a message on %(app)s from %(person)s in the %(room)s room...",
+            "message_from_person": "[%(app)s] You have a message on %(app)s from %(person)s...",
+            "messages_from_person": "[%(app)s] You have messages on %(app)s from %(person)s...",
+            "messages_in_room": "[%(app)s] You have messages on %(app)s in the %(room)s room...",
+            "messages_in_room_and_others": "[%(app)s] You have messages on %(app)s in the %(room)s room and others...",
+            "messages_from_person_and_others": "[%(app)s] You have messages on %(app)s from %(person)s and others...",
+            "invite_from_person": "[%(app)s] %(person)s has invited you to chat on %(app)s...",
+            "invite_from_person_to_room": "[%(app)s] %(person)s has invited you to join the %(room)s room on %(app)s..."
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "SubjectsConfig": {
+      "description": "The subject of each kind of notification email. Synapse's `subjects` keys, with Synapse's\ndefaults.",
+      "type": "object",
+      "properties": {
+        "message_from_person_in_room": {
+          "description": "One message, from one person, in a named room.",
+          "type": "string",
+          "default": "[%(app)s] You have a message on %(app)s from %(person)s in the %(room)s room..."
+        },
+        "message_from_person": {
+          "description": "One message from one person in a room with no name (a direct chat).",
+          "type": "string",
+          "default": "[%(app)s] You have a message on %(app)s from %(person)s..."
+        },
+        "messages_from_person": {
+          "description": "Several messages from one person in a room with no name.",
+          "type": "string",
+          "default": "[%(app)s] You have messages on %(app)s from %(person)s..."
+        },
+        "messages_in_room": {
+          "description": "Several messages in one named room.",
+          "type": "string",
+          "default": "[%(app)s] You have messages on %(app)s in the %(room)s room..."
+        },
+        "messages_in_room_and_others": {
+          "description": "Messages in several rooms, the first of them named.",
+          "type": "string",
+          "default": "[%(app)s] You have messages on %(app)s in the %(room)s room and others..."
+        },
+        "messages_from_person_and_others": {
+          "description": "Messages in several rooms, from one person in the first of them.",
+          "type": "string",
+          "default": "[%(app)s] You have messages on %(app)s from %(person)s and others..."
+        },
+        "invite_from_person": {
+          "description": "An invitation to a room with no name.",
+          "type": "string",
+          "default": "[%(app)s] %(person)s has invited you to chat on %(app)s..."
+        },
+        "invite_from_person_to_room": {
+          "description": "An invitation to a named room.",
+          "type": "string",
+          "default": "[%(app)s] %(person)s has invited you to join the %(room)s room on %(app)s..."
         }
       },
       "additionalProperties": false

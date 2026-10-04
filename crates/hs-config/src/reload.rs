@@ -186,6 +186,18 @@ pub const SETTINGS: &[Setting] = &[
         "/media/scanning",
         "the scan engine, its provider connections and verdict cache are built once",
     ),
+    // email: every setting is read per email sent (hs_push::email), so each is hot.
+    hot("/email/smtp", "the mailer connects per email sent"),
+    hot("/email/from", "the mailer reads it per email sent"),
+    hot("/email/app_name", "the mailer reads it per email sent"),
+    hot(
+        "/email/client_base_url",
+        "the mailer reads it per email sent",
+    ),
+    hot(
+        "/email/notifications",
+        "the email pusher worker reads it per notification",
+    ),
     // network
     hot(
         "/network/outbound/ipv4_only",
@@ -566,6 +578,7 @@ pub const SECTION_NAMES: &[&str] = &[
     "cluster",
     "migration",
     "network",
+    "email",
 ];
 
 #[cfg(test)]
@@ -708,7 +721,7 @@ mod tests {
         sections.sort_unstable();
         assert_eq!(
             sections,
-            vec!["migration", "network", "rate_limits", "server"]
+            vec!["email", "migration", "network", "rate_limits", "server"]
         );
     }
 

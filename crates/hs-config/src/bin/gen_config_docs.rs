@@ -31,6 +31,7 @@ const SECTIONS: &[&str] = &[
     "cluster",
     "migration",
     "network",
+    "email",
 ];
 
 fn main() {

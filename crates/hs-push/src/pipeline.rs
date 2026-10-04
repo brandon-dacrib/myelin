@@ -26,7 +26,8 @@
 //! Evaluation, counting and logging happen in order on one task, so a user's counts are exact
 //! as of each event. HTTP delivery is spawned per push: a slow or down gateway delays nothing
 //! but its own pushes. A gateway that answers with `rejected` pushkeys gets those pushers
-//! deleted, per the Push Gateway API.
+//! deleted, per the Push Gateway API. An email pusher's notifications go to
+//! [`crate::email`], which holds and batches them into notification emails.
 
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -44,6 +45,7 @@ use tokio::sync::mpsc;
 use crate::context::{PushEvaluationInput, PushEvaluationMember, build_room_ctx};
 use crate::counts::{CountsStore, Scope};
 use crate::cursors::CursorStore;
+use crate::email::EmailPushersHandle;
 use crate::engine::{EvaluationOutcome, evaluate, flatten_event};
 use crate::error::StoreError;
 use crate::notification_log::{NewNotification, NotificationLogStore};
@@ -217,6 +219,9 @@ pub struct PipelineDeps {
     pub cursors: Arc<dyn CursorStore>,
     /// The gateway client.
     pub http: Arc<HttpPusherClient>,
+    /// Email pushers, when email is wired in this process (`None`: email pushers are stored
+    /// and not delivered to).
+    pub email: Option<EmailPushersHandle>,
 }
 
 /// The pipeline's worker. [`spawn`] runs it on its own task; tests drive
@@ -452,23 +457,37 @@ impl Pipeline {
             .await
             .map_err(|e| e.to_string())?;
         for pusher in pushers {
-            let PusherKind::Http(data) = &pusher.kind else {
-                continue;
-            };
-            let payload = event_notification(
-                described,
-                &member.user_id,
-                outcome,
-                unread,
-                &pusher,
-                data.format.as_ref() == Some(&PushFormat::EventIdOnly),
-            );
-            self.spawn_delivery(
-                member.user_id.clone(),
-                pusher.clone(),
-                data.url.clone(),
-                payload,
-            );
+            match &pusher.kind {
+                PusherKind::Http(data) => {
+                    let payload = event_notification(
+                        described,
+                        &member.user_id,
+                        outcome,
+                        unread,
+                        &pusher,
+                        data.format.as_ref() == Some(&PushFormat::EventIdOnly),
+                    );
+                    self.spawn_delivery(
+                        member.user_id.clone(),
+                        pusher.clone(),
+                        data.url.clone(),
+                        payload,
+                    );
+                }
+                PusherKind::Email(_) => {
+                    if let Some(email) = &self.deps.email {
+                        email.notified(crate::email::Notification {
+                            user_id: member.user_id.clone(),
+                            address: pusher.ids.pushkey.clone(),
+                            room_id: room_id.to_owned(),
+                            room_name: room_name_for(described),
+                            sender_display_name: sender_display_name_for(described),
+                            event: event.clone(),
+                        });
+                    }
+                }
+                _ => {}
+            }
         }
         Ok(())
     }
@@ -489,6 +508,9 @@ impl Pipeline {
             .mark_room_read(user_id, room_id)
             .await
             .map_err(|e| e.to_string())?;
+        if let Some(email) = &self.deps.email {
+            email.room_read(user_id, room_id);
+        }
         let pushers = self
             .deps
             .pushers
@@ -804,6 +826,7 @@ mod tests {
                 base_backoff: std::time::Duration::from_millis(1),
                 max_backoff: std::time::Duration::from_millis(1),
             })),
+            email: None,
         };
         Harness {
             pipeline: Pipeline::new(deps),

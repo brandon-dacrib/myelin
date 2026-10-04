@@ -31,6 +31,7 @@ pub mod bootstrap;
 pub mod cluster;
 pub mod document;
 pub mod duration;
+pub mod email;
 pub mod env;
 pub mod error;
 pub mod federation;
@@ -62,6 +63,7 @@ pub use auth::AuthConfig;
 pub use cluster::ClusterConfig;
 pub use document::{Origin, merge_patch};
 pub use duration::{Duration, DurationParseError};
+pub use email::EmailConfig;
 pub use error::{ConfigError, Validate, ValidationError, ValidationErrors};
 pub use federation::FederationConfig;
 pub use layered::{FileLayer, Layers, Resolved};
@@ -132,6 +134,10 @@ pub struct Config {
     /// name resolves to.
     #[serde(default)]
     pub network: NetworkConfig,
+    /// Outbound email: the SMTP server this server sends through, and the notification emails
+    /// that email pushers receive. Until an SMTP host is set, no email is sent.
+    #[serde(default)]
+    pub email: EmailConfig,
 }
 
 impl Config {
@@ -195,6 +201,7 @@ impl Config {
         self.auth.resolve_secrets("auth")?;
         self.telemetry.resolve_secrets("telemetry")?;
         self.cluster.resolve_secrets("cluster")?;
+        self.email.resolve_secrets("email")?;
         Ok(())
     }
 
@@ -214,6 +221,7 @@ impl Config {
         self.cluster.validate("cluster", &mut errors);
         self.migration.validate("migration", &mut errors);
         self.network.validate("network", &mut errors);
+        self.email.validate("email", &mut errors);
         errors.into_result()
     }
 }

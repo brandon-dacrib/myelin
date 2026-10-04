@@ -15,10 +15,10 @@ Decision 0010: this server is administered through the admin API and the web int
 Every setting is one of three kinds (decision 0016; `hs_config::reload::SETTINGS` is the table, and the schema the admin API serves carries it as `x-applies` on each setting):
 
 - **bootstrap** (7): set at install, per process, never stored in the database;
-- **hot** (43): applies to the running server at once -- a save reports it as reloaded;
+- **hot** (48): applies to the running server at once -- a save reports it as reloaded;
 - **restart** (25): stored at once, read at the next start -- a save reports it as waiting for a restart.
 
-The **Applies** column below gives each setting's kind and what reads it. Sections in which every administered setting is hot: `server`, `rate_limits`, `migration`, `network`.
+The **Applies** column below gives each setting's kind and what reads it. Sections in which every administered setting is hot: `server`, `rate_limits`, `migration`, `network`, `email`.
 
 ## `server`
 
@@ -253,5 +253,21 @@ name resolves to.
 | Field | Type | Default | Applies | Description |
 |---|---|---|---|---|
 | `outbound` | object | `{"ipv4_only":true}` | `ipv4_only`: hot | Connections this server opens to other hosts. |
+
+
+## `email`
+
+Outbound email: the SMTP server this server sends through, and the notification emails
+that email pushers receive. Until an SMTP host is set, no email is sent.
+
+**Every administered setting here applies to the running server at once.**
+
+| Field | Type | Default | Applies | Description |
+|---|---|---|---|---|
+| `smtp` | object | `{"host":null,"port":587,"security":"starttls","username":null,"password":null,"password_file":null,"tls_name":null}` | hot (the mailer connects per email sent) | The SMTP server mail is sent through. Until `smtp.host` is set, no email is sent: email pushers are stored and nothing is delivered to them. |
+| `from` | string \| null | — | hot (the mailer reads it per email sent) | The sender of every email, as `Name <address>` or a bare address, for example `Matrix <noreply@example.org>`. Required once `smtp.host` is set. Corresponds to Synapse's `notif_from`; its `%(app)s` placeholder is replaced with `app_name`. |
+| `app_name` | string | `"Matrix"` | hot (the mailer reads it per email sent) | What this service is called in emails: the subject's `[Matrix]` prefix and the sender's name. Corresponds to Synapse's `app_name`. |
+| `client_base_url` | string \| null | — | hot (the mailer reads it per email sent) | The web client the links in a notification email open, for example `https://app.example.org`: a room is linked as `<client_base_url>/#/room/<room id>`. Unset, links go to `https://matrix.to`, which opens the reader's own client. Corresponds to Synapse's `client_base_url`. |
+| `notifications` | object | `{"enabled":true,"delay_before_mail":"0s","throttle_start":"10m","throttle_max":"1d","throttle_multiplier":6,"throttle_reset_after":"12h","subjects":{"message_from_person_in_room":"[%(app)s] You have a message on %(app)s from %(person)s in the %(room)s room...","message_from_person":"[%(app)s] You have a message on %(app)s from %(person)s...","messages_from_person":"[%(app)s] You have messages on %(app)s from %(person)s...","messages_in_room":"[%(app)s] You have messages on %(app)s in the %(room)s room...","messages_in_room_and_others":"[%(app)s] You have messages on %(app)s in the %(room)s room and others...","messages_from_person_and_others":"[%(app)s] You have messages on %(app)s from %(person)s and others...","invite_from_person":"[%(app)s] %(person)s has invited you to chat on %(app)s...","invite_from_person_to_room":"[%(app)s] %(person)s has invited you to join the %(room)s room on %(app)s..."}}` | hot (the email pusher worker reads it per notification) | The notification emails that email pushers receive: when they are sent and what their subject says. |
 
 

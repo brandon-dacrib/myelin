@@ -90,6 +90,37 @@ pub async fn post_pushers_set<B: KvBackend + 'static>(
             PusherKind::Http(http_data)
         }
         "email" => {
+            // The pushkey is the address the emails go to. Only an address bound to this
+            // account may be used (as Synapse requires): otherwise any account could have the
+            // server email its room traffic to anyone.
+            if !crate::email::smtp::is_valid_address(&body.pushkey) {
+                return Err(hs_http::error::MatrixError::custom(
+                    axum::http::StatusCode::BAD_REQUEST,
+                    hs_http::error::MatrixErrorCode::InvalidParam,
+                    "an email pusher's pushkey must be an email address",
+                ));
+            }
+            let owned = state
+                .auth
+                .store
+                .list_threepids(&requester.user_id)
+                .await
+                .map_err(|e| {
+                    hs_http::error::MatrixError::custom(
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        hs_http::error::MatrixErrorCode::Unknown,
+                        e.to_string(),
+                    )
+                })?
+                .iter()
+                .any(|t| t.medium == "email" && t.address.eq_ignore_ascii_case(&body.pushkey));
+            if !owned {
+                return Err(hs_http::error::MatrixError::custom(
+                    axum::http::StatusCode::BAD_REQUEST,
+                    hs_http::error::MatrixErrorCode::InvalidParam,
+                    "an email pusher may only be set for an email address bound to this account",
+                ));
+            }
             let mut email_data = EmailPusherData::new();
             email_data.data = body.data.clone();
             PusherKind::Email(email_data)

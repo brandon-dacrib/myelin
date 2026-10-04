@@ -26,6 +26,8 @@ reqwest = { workspace = true }
 rand = { workspace = true }
 bytes = { workspace = true }
 prometheus-client = { workspace = true }
+lettre = { workspace = true }
+time = { workspace = true }
 
 [dev-dependencies]
 hs-testkit = { path = "../hs-testkit" }

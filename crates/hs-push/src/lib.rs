@@ -31,6 +31,9 @@
 //!   API client with retry and backoff.
 //! - [`pipeline`]: the worker that turns room events into counts, log entries and pushes, and
 //!   read receipts into resets and badge updates; [`cursors`] is its per-room position.
+//! - [`email`]: email pushers, the notification emails about unread messages: held, batched
+//!   and throttled per room, rendered from [`email::template`], sent through [`email::Mailer`]
+//!   ([`email::smtp`] over `lettre`).
 //! - [`routes`]: the client-server HTTP endpoints, as a router fragment ([`routes::router`]).
 //! - [`state`]: [`state::PushState`], this crate's axum shared state, and
 //!   [`state::PushRequester`], the `hs-auth` `Requester` bridge.
@@ -52,6 +55,7 @@ pub mod compiled;
 pub mod context;
 pub mod counts;
 pub mod cursors;
+pub mod email;
 pub mod engine;
 pub mod error;
 pub mod notification_log;

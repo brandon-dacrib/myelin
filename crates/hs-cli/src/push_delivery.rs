@@ -1,7 +1,8 @@
 //! The room side of the push pipeline (`hs_push::pipeline`): describes events out of the room
 //! registry, and forwards the registry's global stream into the pipeline. `hs-push` does not
 //! depend on `hs-room`; this is where the two meet, the way `crate::appservice_delivery` joins
-//! `hs-appservice` to the rooms.
+//! `hs-appservice` to the rooms. Also where `hs_config::email` becomes `hs_push::email`'s
+//! settings, since `hs-push` does not depend on `hs-config` either.
 
 use std::sync::Arc;
 
@@ -183,4 +184,116 @@ pub fn forward_room_updates<B: KvBackend + 'static>(
             }
         }
     })
+}
+
+/// `hs_push::email`'s settings from the `email` configuration section.
+#[must_use]
+pub fn email_settings(config: &hs_config::EmailConfig) -> hs_push::email::Settings {
+    let n = &config.notifications;
+    let s = &n.subjects;
+    hs_push::email::Settings {
+        enabled: n.enabled,
+        from: config.from.clone().unwrap_or_default(),
+        app_name: config.app_name.clone(),
+        client_base_url: config.client_base_url.clone(),
+        delay_before_mail: n.delay_before_mail.into(),
+        throttle_start: n.throttle_start.into(),
+        throttle_max: n.throttle_max.into(),
+        throttle_multiplier: n.throttle_multiplier,
+        throttle_reset_after: n.throttle_reset_after.into(),
+        subjects: hs_push::email::Subjects {
+            message_from_person_in_room: s.message_from_person_in_room.clone(),
+            message_from_person: s.message_from_person.clone(),
+            messages_from_person: s.messages_from_person.clone(),
+            messages_in_room: s.messages_in_room.clone(),
+            messages_in_room_and_others: s.messages_in_room_and_others.clone(),
+            messages_from_person_and_others: s.messages_from_person_and_others.clone(),
+            invite_from_person: s.invite_from_person.clone(),
+            invite_from_person_to_room: s.invite_from_person_to_room.clone(),
+        },
+    }
+}
+
+/// The SMTP server from the `email` configuration section: `None` until `smtp.host` and
+/// `from` are set, when no email can be sent.
+#[must_use]
+pub fn smtp_settings(
+    config: &hs_config::EmailConfig,
+) -> Option<hs_push::email::smtp::SmtpSettings> {
+    use hs_config::email::SmtpSecurity;
+    use hs_push::email::smtp::Security;
+    if !config.is_configured() {
+        return None;
+    }
+    let host = config.smtp.host.clone()?;
+    let credentials = match (&config.smtp.username, config.smtp.password.as_str()) {
+        (Some(user), Some(pass)) => Some((user.clone(), pass.to_owned())),
+        _ => None,
+    };
+    Some(hs_push::email::smtp::SmtpSettings {
+        host,
+        port: config.smtp.port,
+        security: match config.smtp.security {
+            SmtpSecurity::Starttls => Security::Starttls,
+            SmtpSecurity::Tls => Security::Tls,
+            SmtpSecurity::None => Security::None,
+        },
+        credentials,
+        tls_name: config.smtp.tls_name.clone(),
+        timeout: std::time::Duration::from_secs(30),
+    })
+}
+
+/// Logs what the `email` section amounts to, at boot and after a change.
+pub fn describe_email(config: &hs_config::EmailConfig) {
+    match smtp_settings(config) {
+        Some(smtp) if config.notifications.enabled => tracing::info!(
+            host = %smtp.host,
+            port = smtp.port,
+            security = ?smtp.security,
+            authenticated = smtp.credentials.is_some(),
+            from = config.from.as_deref().unwrap_or_default(),
+            "email: notification emails go through this SMTP server"
+        ),
+        Some(_) => tracing::info!(
+            "email: an SMTP server is configured, but notification emails are off \
+             (email.notifications.enabled); email pushers are stored, not delivered to"
+        ),
+        None => tracing::info!(
+            "email: no SMTP server is configured (email.smtp.host); email pushers are stored, \
+             not delivered to"
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_email_section_maps_onto_the_pushers_settings() {
+        let config: hs_config::EmailConfig = serde_yaml_ng::from_str(
+            "smtp:\n  host: mail.example.org\n  port: 465\n  security: tls\n  username: u\n  password: p\n\
+             from: Myelin <noreply@example.org>\napp_name: Myelin\nclient_base_url: https://app.example.org\n\
+             notifications:\n  delay_before_mail: 5m\n  throttle_multiplier: 2\n",
+        )
+        .unwrap();
+        let settings = email_settings(&config);
+        assert_eq!(settings.from, "Myelin <noreply@example.org>");
+        assert_eq!(settings.app_name, "Myelin");
+        assert_eq!(
+            settings.delay_before_mail,
+            std::time::Duration::from_secs(300)
+        );
+        assert_eq!(settings.throttle_multiplier, 2);
+        assert_eq!(
+            settings.throttle_max,
+            std::time::Duration::from_secs(86_400)
+        );
+        let smtp = smtp_settings(&config).unwrap();
+        assert_eq!(smtp.port, 465);
+        assert_eq!(smtp.security, hs_push::email::smtp::Security::Tls);
+        assert_eq!(smtp.credentials, Some(("u".to_owned(), "p".to_owned())));
+        assert!(smtp_settings(&hs_config::EmailConfig::default()).is_none());
+    }
 }
