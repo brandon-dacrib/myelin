@@ -93,7 +93,17 @@ fn decompression_bomb_is_rejected_without_a_huge_allocation() {
     let bytes = fixture("decompression_bomb.png");
     assert!(bytes.len() < 200, "the bomb fixture itself must stay tiny");
     let err = decode_with_limits(&bytes, DecodeLimits::default()).unwrap_err();
-    assert!(matches!(err, hs_media::MediaError::DecodeFailed(_)));
+    assert!(
+        matches!(
+            err,
+            hs_media::MediaError::ImageRefused {
+                width: 50_000,
+                height: 50_000,
+                reason: hs_media::sniff::RefusalReason::Dimensions
+            }
+        ),
+        "{err:?}"
+    );
 }
 
 #[test]

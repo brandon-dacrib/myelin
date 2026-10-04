@@ -155,6 +155,18 @@ pub const SETTINGS: &[Setting] = &[
         "the media repository reads it per thumbnail request",
     ),
     hot(
+        "/media/max_image_pixels",
+        "the media repository reads it per thumbnail it makes",
+    ),
+    hot(
+        "/media/max_image_dimension",
+        "the media repository reads it per thumbnail it makes",
+    ),
+    hot(
+        "/media/max_image_decode_memory",
+        "the media repository reads it per thumbnail it makes",
+    ),
+    hot(
         "/media/url_preview_enabled",
         "the media repository reads it per preview request",
     ),

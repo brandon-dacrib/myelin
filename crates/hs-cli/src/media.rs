@@ -81,7 +81,8 @@ pub fn build_media_state<B: KvBackend>(
         thumbnail_policy,
         server_name,
         now_ms,
-    );
+    )
+    .with_thumbnail_metrics(hs_media::thumbnail::ThumbnailMetrics::register(metrics));
 
     let scanning = match media_scanning_config {
         Some(path) => {

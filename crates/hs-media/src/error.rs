@@ -53,6 +53,21 @@ pub enum MediaError {
     #[error("could not decode image: {0}")]
     DecodeFailed(String),
 
+    /// The image's header declares a picture this server will not make a thumbnail of: empty,
+    /// or over the `media` settings' pixel, side or decoding-memory limits (see
+    /// [`crate::sniff::decode_with_limits`]). Refused before any pixel is decoded. Answered as
+    /// Synapse answers an image over its `max_image_pixels`: `400 M_UNKNOWN` "Failed to
+    /// generate thumbnail".
+    #[error("image of {width}x{height} refused for a thumbnail ({reason})")]
+    ImageRefused {
+        /// Declared width, pixels.
+        width: u32,
+        /// Declared height, pixels.
+        height: u32,
+        /// Which limit refused it.
+        reason: crate::sniff::RefusalReason,
+    },
+
     /// The requested thumbnail size or method is not one this server generates and dynamic
     /// thumbnailing is disabled or the size is outside the configured bounds.
     #[error("unsupported thumbnail size or method")]
@@ -173,6 +188,11 @@ impl MediaError {
                 axum::http::StatusCode::BAD_REQUEST,
                 MatrixErrorCode::Unknown,
                 format!("Could not decode image: {msg}"),
+            ),
+            MediaError::ImageRefused { .. } => MatrixError::custom(
+                axum::http::StatusCode::BAD_REQUEST,
+                MatrixErrorCode::Unknown,
+                format!("Failed to generate thumbnail: {self}"),
             ),
             MediaError::UnsupportedThumbnail => MatrixError::custom(
                 axum::http::StatusCode::BAD_REQUEST,

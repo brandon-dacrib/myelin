@@ -27,7 +27,7 @@ use crate::scanning::config::ScanMode;
 use crate::scanning::{EngineDecision, ScanContext, ScanEngine, ScanSourceKind};
 use crate::security::{ByteRange, RangeOutcome, parse_range};
 use crate::sniff::DecodeLimits;
-use crate::thumbnail::{self, ThumbnailMethod, ThumbnailPolicy};
+use crate::thumbnail::{self, ThumbnailMethod, ThumbnailMetrics, ThumbnailPolicy};
 
 /// The `quarantined_by` marker `defer` mode uses while a scan is still in flight (RFC 0008
 /// section 5: "the upload succeeds but the media is not retrievable... until a verdict arrives").
@@ -106,7 +106,14 @@ pub struct MediaRepository<B: KvBackend> {
     policy: Arc<dyn UploadPolicy>,
     /// Replaced with `config` (its `thumbnail_sizes`), so the size table is in force at once.
     thumbnail_policy: hs_config::Live<ThumbnailPolicy>,
-    decode_limits: DecodeLimits,
+    /// `hs_media_thumbnail_refused_total`; unregistered (counted, not exported) until
+    /// [`MediaRepository::with_thumbnail_metrics`].
+    thumbnail_metrics: ThumbnailMetrics,
+    /// Thumbnails being made at once, shared by every clone. Each holds a decoded source (up to
+    /// `media.max_image_decode_memory`) while it runs, so this bounds the memory of many
+    /// concurrent requests for different large images; it is the machine's parallelism, at
+    /// least two.
+    thumbnail_permits: Arc<tokio::sync::Semaphore>,
     /// This homeserver's own name (used as `server_name` for locally uploaded media).
     server_name: String,
     clock: Arc<dyn Fn() -> u64 + Send + Sync>,
@@ -143,7 +150,10 @@ impl<B: KvBackend> MediaRepository<B> {
             config: hs_config::Live::from_arc(config),
             policy,
             thumbnail_policy: hs_config::Live::new(thumbnail_policy),
-            decode_limits: DecodeLimits::default(),
+            thumbnail_metrics: ThumbnailMetrics::default(),
+            thumbnail_permits: Arc::new(tokio::sync::Semaphore::new(
+                std::thread::available_parallelism().map_or(2, |n| n.get().max(2)),
+            )),
             server_name,
             clock: Arc::new(now_ms),
             scanning: None,
@@ -158,6 +168,14 @@ impl<B: KvBackend> MediaRepository<B> {
     #[must_use]
     pub fn with_scanning(mut self, engine: ScanEngine<B>) -> Self {
         self.scanning = Some(Arc::new(engine));
+        self
+    }
+
+    /// Counts refused thumbnails into `metrics` (`hs_media_thumbnail_refused_total`, see
+    /// [`ThumbnailMetrics`]); `hs serve` registers it on its `/metrics` registry.
+    #[must_use]
+    pub fn with_thumbnail_metrics(mut self, metrics: ThumbnailMetrics) -> Self {
+        self.thumbnail_metrics = metrics;
         self
     }
 
@@ -924,8 +942,55 @@ impl<B: KvBackend> MediaRepository<B> {
             .bytes()
             .await
             .map_err(MediaError::from)?;
-        let (thumb_bytes, mime) =
-            thumbnail::generate(&source_bytes, width, height, method, self.decode_limits)?;
+        // The limits in force now (they are hot), decoding and resizing on a blocking thread
+        // (a large image is seconds of CPU), at most `thumbnail_permits` at once.
+        let limits = DecodeLimits::from_config(&self.config.get());
+        let _permit = self
+            .thumbnail_permits
+            .acquire()
+            .await
+            .map_err(|e| MediaError::Store(format!("thumbnail permits closed: {e}")))?;
+        let generated = tokio::task::spawn_blocking(move || {
+            thumbnail::generate(&source_bytes, width, height, method, limits)
+        })
+        .await
+        .map_err(|e| MediaError::Store(format!("thumbnail task failed: {e}")))?;
+        let (thumb_bytes, mime) = match generated {
+            Ok(generated) => generated,
+            Err(err) => {
+                match &err {
+                    MediaError::ImageRefused {
+                        width: image_width,
+                        height: image_height,
+                        reason,
+                    } => {
+                        tracing::info!(
+                            server_name = %record.server_name,
+                            media_id = %record.media_id,
+                            image_width,
+                            image_height,
+                            reason = reason.as_str(),
+                            max_pixels = limits.max_pixels,
+                            max_dimension = limits.max_width,
+                            max_decode_bytes = limits.max_alloc_bytes,
+                            "image refused for a thumbnail"
+                        );
+                        self.thumbnail_metrics.refused(reason.as_str());
+                    }
+                    MediaError::DecodeFailed(error) => {
+                        tracing::info!(
+                            server_name = %record.server_name,
+                            media_id = %record.media_id,
+                            %error,
+                            "image could not be decoded for a thumbnail"
+                        );
+                        self.thumbnail_metrics.refused("undecodable");
+                    }
+                    _ => {}
+                }
+                return Err(err);
+            }
+        };
 
         let variant = ThumbnailRecord::variant_key(width, height, method, mime);
         let key = crate::store::thumbnail_key(&record.server_name, &media_id, &variant);
@@ -1394,6 +1459,71 @@ mod tests {
             .unwrap();
         assert_eq!(thumb1, thumb2);
         assert_eq!(bytes1, bytes2);
+    }
+
+    #[tokio::test]
+    async fn an_image_over_the_live_pixel_limit_is_refused_counted_and_not_cached() {
+        let metrics = ThumbnailMetrics::default();
+        let repo = repo().with_thumbnail_metrics(metrics.clone());
+        let id = repo
+            .upload(
+                &ctx(),
+                "image/png",
+                None,
+                Bytes::from(crate::test_fixtures::valid_png()),
+            )
+            .await
+            .unwrap();
+        let record = repo.get_record("example.org", id.as_str()).unwrap();
+        // The limits are hot: a lowered `max_image_pixels` applies to the next thumbnail.
+        repo.set_config(MediaConfig {
+            max_image_pixels: 1,
+            ..MediaConfig::default()
+        });
+        let err = repo
+            .get_thumbnail(&record, 32, 32, ThumbnailMethod::Crop)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                MediaError::ImageRefused {
+                    reason: crate::sniff::RefusalReason::Pixels,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        let refused = |reason: &str| {
+            metrics
+                .refused
+                .get_or_create(&crate::thumbnail::RefusedLabels {
+                    reason: reason.into(),
+                })
+                .get()
+        };
+        assert_eq!(refused("pixels"), 1);
+        // Raised again, the same request makes the thumbnail: nothing was cached by the refusal.
+        repo.set_config(MediaConfig::default());
+        let (thumb, _) = repo
+            .get_thumbnail(&record, 32, 32, ThumbnailMethod::Crop)
+            .await
+            .unwrap();
+        assert_eq!((thumb.width, thumb.height), (32, 32));
+        assert_eq!(refused("pixels"), 1);
+
+        // An upload that is not an image at all is counted as undecodable.
+        let id = repo
+            .upload(&ctx(), "image/png", None, Bytes::from_static(b"not a png"))
+            .await
+            .unwrap();
+        let record = repo.get_record("example.org", id.as_str()).unwrap();
+        let err = repo
+            .get_thumbnail(&record, 32, 32, ThumbnailMethod::Crop)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MediaError::DecodeFailed(_)), "{err:?}");
+        assert_eq!(refused("undecodable"), 1);
     }
 
     #[tokio::test]

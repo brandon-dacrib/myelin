@@ -89,6 +89,9 @@
             "method": "scale"
           }
         ],
+        "max_image_pixels": 33554432,
+        "max_image_dimension": 32768,
+        "max_image_decode_memory": "256M",
         "url_preview_enabled": false,
         "url_preview_ip_range_blocklist": [
           "127.0.0.0/8",
@@ -785,6 +788,28 @@
               "method": "scale"
             }
           ],
+          "x-applies": "hot"
+        },
+        "max_image_pixels": {
+          "description": "The largest image, in pixels (width times height), this server makes a thumbnail of. A\nbigger image is still stored and downloadable; only its thumbnail is refused (the client\ngets `400 M_UNKNOWN` and shows a placeholder). The image's header is checked before any\npixel is decoded, so a small file that claims a huge picture costs nothing. Larger lets\npeople see previews of very large photos at the cost of memory per thumbnail (about four\nbytes per pixel while it is made). Corresponds to Synapse's `max_image_pixels`, whose\ndefault `32M` is this one (32 x 1024 x 1024).",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 33554432,
+          "x-applies": "hot"
+        },
+        "max_image_dimension": {
+          "description": "The widest or tallest image, in pixels, this server makes a thumbnail of, whatever its\npixel count. Guards against a picture thousands of times wider than it is tall. Synapse\nhas no separate setting for this.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "default": 32768,
+          "x-applies": "hot"
+        },
+        "max_image_decode_memory": {
+          "description": "The most memory one image may take while it is decoded for a thumbnail (`256M`). An\nimage whose decoded pixels need more is refused before they are decoded. It should be at\nleast four bytes times `max_image_pixels` (eight for 16-bit PNGs), or some images under\nthe pixel limit are refused anyway. Synapse has no separate setting for this.",
+          "$ref": "#/$defs/ByteSize",
+          "default": "256M",
           "x-applies": "hot"
         },
         "url_preview_enabled": {

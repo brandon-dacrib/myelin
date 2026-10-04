@@ -2,11 +2,104 @@
 
 Track brief: `docs/workstreams/09-media.md`. Owner crate: `hs-media`.
 
-Last updated: 2026-09-28 (session 6: media across servers, below). Session 5 (2026-09-27) built
+Last updated: 2026-10-04 (thumbnail limits after the fuzz OOM, below). Session 6 (2026-09-28): media across servers. Session 5 (2026-09-27) built
 the admin API's Media area. Session 4 (2026-09-19)
 closed the two Complement gaps — MSC2246 async upload's real `/_matrix/media/v1/create` path and
 `GET .../preview_url` — plus the content-scanning durability gap session 3 flagged. Sessions 1-4's
 records are unchanged below.
+
+## 2026-10-04 (branch `agent/thumbnail-oom`): one crafted image no longer takes a thumbnail to 16 GiB
+
+The `fuzz` workflow on `f1cc1d56` found `libFuzzer: out-of-memory (malloc(17179869180))` in
+the `thumbnail_generate` target. Reproduced locally with `cargo +nightly fuzz` on the CI
+artifact. The input is a 61-byte GIF87a whose logical screen is 1326 x 0. The decode limits
+passed it, because only an upper bound was checked, and it decoded to an empty image.
+`DynamicImage::resize_to_fill` to 27 x 11 then scaled it by 11 / 0 = infinity and asked for a
+4,294,967,295 x 1 RGBA intermediate (`0x3_FFFF_FFFC` bytes). The allocation is in the resize
+step, not the decoder. On a server, one upload (or one remote fetch) plus one thumbnail request
+did this. A second shape was found while fixing the first. A 20000 x 1 image is within every
+limit, but `resize_to_fill` scaled it to 1,920,000 x 96 for a 96 x 96 crop, and Lanczos3's
+float pass costs 16 bytes per source column times the new height.
+
+### Done
+
+- **Limits from the header, before any pixels are decoded** (`crates/hs-media/src/sniff.rs`).
+  `decode_with_limits` builds the decoder through `ImageReader::limits`. Only the allocation
+  ceiling applies while the decoder reads the header. The declared width and height are then
+  checked: zero on either side, either side over `max_image_dimension`, width times height over
+  `max_image_pixels`, and the decoded size reserved against `max_image_decode_memory`. Only
+  after that are the full `image::Limits` set on the decoder and the pixels decoded. A refusal
+  is the new `MediaError::ImageRefused { width, height, reason }`, where `RefusalReason` is
+  `pixels`, `dimensions`, `memory` or `empty`. It answers `400 M_UNKNOWN` "Failed to generate
+  thumbnail: ...", which is what Synapse answers for an image over `max_image_pixels`
+  (`refs/synapse/synapse/media/thumbnailer.py`: `SynapseError(400, "Failed to generate
+  thumbnail.")`). Nothing is cached for a refusal, so a raised limit applies at once.
+- **Resizing is bounded by the source and the target** (`crates/hs-media/src/thumbnail.rs`).
+  Crop cuts out the centred region with the target's aspect ratio first, then resizes only
+  that region. It no longer scales the whole source to cover the box. Any side more than twice
+  the target is first box-filtered down to twice the target (`thumbnail_exact` allocates only
+  its output), so the Lanczos3 intermediate is at most 2 x width x height pixels. An empty
+  source is returned unchanged. The output is the same as before: an exact `w x h` centred
+  crop, and scale never upscales.
+- **Settings, all hot** (`crates/hs-config/src/media.rs`, `reload.rs`):
+  - `media.max_image_pixels`, default `33554432`. This is Synapse's `32M`, and `hs-compat` now
+    maps Synapse's `max_image_pixels` to it.
+  - `media.max_image_dimension`, default `32768`.
+  - `media.max_image_decode_memory`, default `256M`.
+
+  `MediaRepository::get_thumbnail` reads them per thumbnail through
+  `DecodeLimits::from_config`. `docs/config.md` and the web schema fixture are regenerated. The
+  Configuration page renders the three settings from the schema. The mock schema
+  (`web/src/mocks/data/config.ts`) has them too. In `docs/compat/synapse-config-table.md` the
+  row is now Mapped, and the summary counts are recounted to 27 / 25 / 177. They had already
+  drifted by one.
+- **Thumbnails are made off the async runtime, a few at a time.** Each one runs in
+  `spawn_blocking`. A shared semaphore, sized to the machine's parallelism and at least 2,
+  bounds how many decoded sources are held at once. Many concurrent requests for different
+  large images now queue instead of multiplying memory.
+- **Observable.** A refusal logs `image refused for a thumbnail` at `info`. The log line carries
+  `media_id`, `server_name`, the declared `image_width` and `image_height`, the `reason` and the
+  limits. A source that cannot be decoded logs `image could not be decoded for a thumbnail`. The
+  metric is `hs_media_thumbnail_refused_total{reason}`, where `reason` is one of `pixels`,
+  `dimensions`, `memory`, `empty` or `undecodable`. It is registered by `hs serve`
+  (`crates/hs-cli/src/media.rs`, `MediaRepository::with_thumbnail_metrics`).
+
+### Verified
+
+- Regression unit tests in `hs-media`:
+  - `thumbnail::tests::the_fuzz_oom_input_is_refused_as_empty_at_every_size` runs the
+    artifact's bytes. It is refused as `empty` at every default size and at the harness's
+    27 x 11, in milliseconds.
+  - `crop_of_an_extreme_aspect_ratio_stays_small`, `resize_of_an_empty_image_allocates_nothing`,
+    `crop_keeps_the_centre_of_the_longer_axis` and
+    `a_large_source_shrinks_through_the_box_filter_to_the_exact_size` cover the resize.
+  - `sniff::tests::each_limit_refuses_from_the_header_with_its_reason` and
+    `limits_follow_the_media_settings` cover the limits.
+  - `repository::tests::an_image_over_the_live_pixel_limit_is_refused_counted_and_not_cached`
+    covers the hot limit, the metric and the absence of caching.
+- The input is in the seed corpus as `crates/hs-media/fuzz/corpus/thumbnail_generate/oom-2026-10-04-empty-gif`.
+  Its image bytes are also in `corpus/decode_image/oom-2026-10-04-empty.gif`.
+- The rebuilt target runs the artifact cleanly. Two fuzz runs from the corpus used
+  `-rss_limit_mb=2048`: 5 minutes (460,836 executions), then 7 more (252,120). Neither found a
+  crash or an OOM. Peak RSS was under 500 MB.
+- Real binary: `crates/hs-cli/tests/media_thumbnail_limits.rs` boots `hs serve` and uploads
+  the fuzz GIF and a PNG whose header declares 8000 x 8000. It asks for both at four default
+  sizes and both methods, and every request gets `400 M_UNKNOWN`. The test then checks:
+  - the log lines name each media id with `1326`/`empty` and `8000`/`pixels`;
+  - a real PNG still thumbnails afterwards;
+  - `/metrics` shows `{reason="empty"} 4` and `{reason="pixels"} 4`;
+  - the process is still running.
+- Checks: `cargo clippy -p hs-media -p hs-config -p hs-compat -p hs-cli --all-targets -- -D
+  warnings`, `cargo test -p hs-media`, `-p hs-config`, `-p hs-compat`, and in `web/`
+  `npm run check` and `npm run test:e2e`.
+
+### Left
+
+- URL previews do not decode images. The `og:image` is fetched and stored but never measured.
+  Nothing else in this crate decodes untrusted images today. If previews start reporting
+  `og:image:width`/`height` from the bytes, that code must go through `decode_with_limits`.
+- Dynamic-thumbnail bounds (`ThumbnailPolicy::max_dynamic_*`, 1600) are still constants, not
+  settings.
 
 ## 2026-10-02 (branch `agent/outbound-ipv4-only`): remote media and previews reach dual-stack hosts
 

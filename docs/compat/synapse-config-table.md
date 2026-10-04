@@ -12,7 +12,7 @@ Native field paths are dotted `hs-config` `Config` paths, e.g. `federation.domai
 
 | List | Mapped | Mapped (diff) | Unsupported | Total |
 |---|---|---|---|---|
-| Top-level options | 25 | 25 | 179 | 229 |
+| Top-level options | 27 | 25 | 177 | 229 |
 | `experimental_features` flags | 0 | 1 | 50 | 51 |
 
 (Counts are exact against the tables below; regenerate this summary whenever a row changes. See "Keeping this current".)
@@ -195,7 +195,7 @@ Native field paths are dotted `hs-config` `Config` paths, e.g. `federation.domai
 | `media_storage_providers` | Mapped (diff) | `media.storage` | Synapse's pluggable provider-module list (including the S3 storage provider) collapses to one native backend selection; `object_store` already covers S3/GCS/Azure/local (`PLAN.md` D6). Multiple simultaneous providers or write-through caching between them are not supported. |
 | `max_upload_size` | Mapped | `media.max_upload_size` | |
 | `media_upload_limits` | Unsupported | — | R-PHASE1 (hs-media). Per-mimetype upload size limits are not modeled; only the global `media.max_upload_size`. |
-| `max_image_pixels` | Unsupported | — | R-PHASE1 (hs-media, decompression-bomb protection). |
+| `max_image_pixels` | Mapped | `media.max_image_pixels` | Same default (`32M`, 33,554,432 pixels). The native side also bounds either side (`media.max_image_dimension`) and the decoded size (`media.max_image_decode_memory`), checked from the image header before decoding. |
 | `remote_media_download_burst_count` | Unsupported | — | R-PHASE1 (hs-media). |
 | `remote_media_download_per_second` | Unsupported | — | R-PHASE1 (hs-media). |
 | `prevent_media_downloads_from` | Unsupported | — | R-PHASE1 (hs-media, per-server remote-media block list). |

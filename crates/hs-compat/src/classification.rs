@@ -693,9 +693,9 @@ pub const OPTIONS: &[KeyInfo] = &[
     },
     KeyInfo {
         key: "max_image_pixels",
-        classification: Classification::Unsupported,
-        native: "",
-        note: "R-PHASE1 (hs-media, decompression-bomb protection).",
+        classification: Classification::Mapped,
+        native: "`media.max_image_pixels`",
+        note: "Same default (`32M`, 33,554,432 pixels). The native side also bounds either side (`media.max_image_dimension`) and the decoded size (`media.max_image_decode_memory`), checked from the image header before decoding.",
     },
     KeyInfo {
         key: "remote_media_download_burst_count",

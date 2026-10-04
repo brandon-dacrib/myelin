@@ -21,37 +21,83 @@ use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader};
 
 use crate::error::MediaError;
 
-/// Decoding ceilings passed to every decoder this crate constructs. The defaults are generous
-/// for a legitimate photo (up to roughly a 64-megapixel image, comparable to a 40MP camera RAW
-/// converted to a bitmap) while still bounding worst-case memory: `64_000_000 px * 4 bytes/px`
-/// (RGBA8) is 256 MiB, which is also this struct's default `max_alloc_bytes`.
-#[derive(Debug, Clone, Copy)]
+/// Decoding ceilings passed to every decoder this crate constructs, normally built from the
+/// `media` settings in force ([`DecodeLimits::from_config`]: `max_image_pixels`,
+/// `max_image_dimension`, `max_image_decode_memory`). The defaults are those settings' defaults:
+/// Synapse's `max_image_pixels` of `32M` (33,554,432 pixels), 32,768 pixels on either side, and
+/// 256 MiB of decoded pixels (a 32-megapixel RGBA8 image is 128 MiB, a 16-bit one 256 MiB).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodeLimits {
     /// Maximum width, pixels.
     pub max_width: u32,
     /// Maximum height, pixels.
     pub max_height: u32,
+    /// Maximum width times height, pixels.
+    pub max_pixels: u64,
     /// Maximum total allocation the decoder may perform, bytes.
     pub max_alloc_bytes: u64,
 }
 
 impl Default for DecodeLimits {
     fn default() -> Self {
-        Self {
-            max_width: 10_000,
-            max_height: 10_000,
-            max_alloc_bytes: 256 * 1024 * 1024,
-        }
+        Self::from_config(&hs_config::media::MediaConfig::default())
     }
 }
 
 impl DecodeLimits {
+    /// The limits a `media` configuration sets.
+    #[must_use]
+    pub fn from_config(config: &hs_config::media::MediaConfig) -> Self {
+        Self {
+            max_width: config.max_image_dimension,
+            max_height: config.max_image_dimension,
+            max_pixels: config.max_image_pixels,
+            max_alloc_bytes: config.max_image_decode_memory.as_u64(),
+        }
+    }
+
     fn to_image_limits(self) -> image::Limits {
         let mut limits = image::Limits::default();
         limits.max_image_width = Some(self.max_width);
         limits.max_image_height = Some(self.max_height);
         limits.max_alloc = Some(self.max_alloc_bytes);
         limits
+    }
+}
+
+/// Why an image was refused before its pixels were decoded ([`MediaError::ImageRefused`]). The
+/// wire label ([`RefusalReason::as_str`]) is the `reason` of
+/// `hs_media_thumbnail_refused_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RefusalReason {
+    /// Width times height is over [`DecodeLimits::max_pixels`].
+    Pixels,
+    /// Width or height is over [`DecodeLimits::max_width`] / [`DecodeLimits::max_height`].
+    Dimensions,
+    /// The decoded pixels would need more than [`DecodeLimits::max_alloc_bytes`].
+    Memory,
+    /// The image declares a width or height of zero: there is nothing to thumbnail, and a
+    /// resize of it divides by zero (the 2026-10-04 fuzz finding asked for a 16 GiB buffer
+    /// that way).
+    Empty,
+}
+
+impl RefusalReason {
+    /// The metric label and log value: `pixels`, `dimensions`, `memory` or `empty`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pixels => "pixels",
+            Self::Dimensions => "dimensions",
+            Self::Memory => "memory",
+            Self::Empty => "empty",
+        }
+    }
+}
+
+impl std::fmt::Display for RefusalReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -113,29 +159,61 @@ pub fn mime_for_format(format: ImageFormat) -> &'static str {
 /// `image` build), this yields only the first frame — this crate never thumbnails past frame
 /// zero, matching Synapse's observed behavior of always producing static thumbnails.
 ///
+/// The order is the defense: the decoder is built with only the allocation ceiling in force
+/// (`ImageReader::limits`, so whatever it reads while parsing the header is bounded), the
+/// header's declared width and height are then checked against `limits` — zero, either side,
+/// the pixel count and the decoded size against the allocation ceiling — and only then are the
+/// full `image::Limits` set on the decoder and the pixels decoded.
+///
 /// # Errors
-/// Returns [`MediaError::DecodeFailed`] if the format is unrecognized, the header cannot be
-/// parsed, or the declared dimensions/allocation exceed `limits` — this last case is exactly the
-/// decompression-bomb defense: the error fires from the header check, before any large buffer is
-/// allocated.
+/// [`MediaError::ImageRefused`] if the declared image is empty or over `limits` (from the header,
+/// before any large buffer is allocated); [`MediaError::DecodeFailed`] if the format is
+/// unrecognized or the bytes cannot be decoded.
 pub fn decode_with_limits(
     bytes: &[u8],
     limits: DecodeLimits,
 ) -> Result<(DynamicImage, ImageFormat), MediaError> {
-    let reader = ImageReader::new(Cursor::new(bytes))
+    let mut reader = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|e| MediaError::DecodeFailed(e.to_string()))?;
     let format = reader
         .format()
         .ok_or_else(|| MediaError::DecodeFailed("unrecognized image format".into()))?;
+    let mut header_limits = image::Limits::default();
+    header_limits.max_alloc = Some(limits.max_alloc_bytes);
+    reader.limits(header_limits);
     let mut decoder = reader
         .into_decoder()
         .map_err(|e| MediaError::DecodeFailed(e.to_string()))?;
-    decoder
-        .set_limits(limits.to_image_limits())
-        .map_err(|e| MediaError::DecodeFailed(format!("rejected by decode limits: {e}")))?;
-    let image =
-        DynamicImage::from_decoder(decoder).map_err(|e| MediaError::DecodeFailed(e.to_string()))?;
+    let (width, height) = decoder.dimensions();
+    let refuse = |reason| MediaError::ImageRefused {
+        width,
+        height,
+        reason,
+    };
+    if width == 0 || height == 0 {
+        return Err(refuse(RefusalReason::Empty));
+    }
+    if width > limits.max_width || height > limits.max_height {
+        return Err(refuse(RefusalReason::Dimensions));
+    }
+    if u64::from(width) * u64::from(height) > limits.max_pixels {
+        return Err(refuse(RefusalReason::Pixels));
+    }
+    let mut image_limits = limits.to_image_limits();
+    // What `ImageReader::decode` does: the output buffer counts against the ceiling, and the
+    // decoder's own working buffers get what is left.
+    image_limits
+        .reserve(decoder.total_bytes())
+        .map_err(|_| refuse(RefusalReason::Memory))?;
+    decoder.set_limits(image_limits).map_err(|e| match e {
+        image::ImageError::Limits(_) => refuse(RefusalReason::Memory),
+        other => MediaError::DecodeFailed(other.to_string()),
+    })?;
+    let image = DynamicImage::from_decoder(decoder).map_err(|e| match e {
+        image::ImageError::Limits(_) => refuse(RefusalReason::Memory),
+        other => MediaError::DecodeFailed(other.to_string()),
+    })?;
     Ok((image, format))
 }
 
@@ -215,13 +293,100 @@ mod tests {
         // data: the point of this test is that rejection happens from the *header*, without the
         // decoder ever trying to allocate gigabytes of pixel buffer.
         let bomb = crate::test_fixtures::decompression_bomb_png(60_000, 60_000);
-        let limits = DecodeLimits {
-            max_width: 10_000,
-            max_height: 10_000,
-            max_alloc_bytes: 256 * 1024 * 1024,
+        let err = decode_with_limits(&bomb, DecodeLimits::default()).unwrap_err();
+        assert!(matches!(
+            err,
+            MediaError::ImageRefused {
+                width: 60_000,
+                height: 60_000,
+                reason: RefusalReason::Dimensions
+            }
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "test-fixtures")]
+    fn each_limit_refuses_from_the_header_with_its_reason() {
+        let limits = DecodeLimits::default();
+        // 8000 x 8000 is under the side limit and 64 megapixels, over 32Mi.
+        let err = decode_with_limits(
+            &crate::test_fixtures::decompression_bomb_png(8_000, 8_000),
+            limits,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            MediaError::ImageRefused {
+                reason: RefusalReason::Pixels,
+                ..
+            }
+        ));
+        // Under both, but the decoded RGB8 buffer (3 x 4000 x 4000 = 48 MB) is over a 1 MiB
+        // ceiling.
+        let err = decode_with_limits(
+            &crate::test_fixtures::decompression_bomb_png(4_000, 4_000),
+            DecodeLimits {
+                max_alloc_bytes: 1024 * 1024,
+                ..limits
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            MediaError::ImageRefused {
+                reason: RefusalReason::Memory,
+                ..
+            }
+        ));
+        // A side over the dimension limit, however few pixels.
+        let err = decode_with_limits(
+            &crate::test_fixtures::decompression_bomb_png(40_000, 1),
+            limits,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            MediaError::ImageRefused {
+                reason: RefusalReason::Dimensions,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn limits_follow_the_media_settings() {
+        let config = hs_config::media::MediaConfig {
+            max_image_pixels: 100,
+            max_image_dimension: 50,
+            max_image_decode_memory: hs_config::ByteSize::kib(64),
+            ..Default::default()
         };
-        let err = decode_with_limits(&bomb, limits).unwrap_err();
-        assert!(matches!(err, MediaError::DecodeFailed(_)));
+        assert_eq!(
+            DecodeLimits::from_config(&config),
+            DecodeLimits {
+                max_width: 50,
+                max_height: 50,
+                max_pixels: 100,
+                max_alloc_bytes: 65_536,
+            }
+        );
+        // 4 x 4 is 16 pixels; a limit of 10 refuses it.
+        let err = decode_with_limits(
+            &tiny_png(),
+            DecodeLimits {
+                max_pixels: 10,
+                ..DecodeLimits::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            MediaError::ImageRefused {
+                width: 4,
+                height: 4,
+                reason: RefusalReason::Pixels
+            }
+        ));
     }
 
     #[test]

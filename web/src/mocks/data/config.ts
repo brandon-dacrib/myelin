@@ -633,6 +633,25 @@ const properties: Record<string, JsonSchemaNode> = {
         description:
           "Thumbnail sizes to pre-generate/serve on demand. Corresponds to Synapse's thumbnail_sizes.",
       },
+      max_image_pixels: {
+        type: "integer",
+        format: "uint64",
+        minimum: 0,
+        default: 33554432,
+        description:
+          "The largest image, in pixels (width times height), this server makes a thumbnail of; a bigger one is stored but gets no thumbnail. Corresponds to Synapse's max_image_pixels (32M).",
+      },
+      max_image_dimension: {
+        type: "integer",
+        format: "uint32",
+        minimum: 0,
+        default: 32768,
+        description: "The widest or tallest image, in pixels, this server makes a thumbnail of.",
+      },
+      max_image_decode_memory: {
+        $ref: "#/$defs/ByteSize",
+        description: "The most memory one image may take while it is decoded for a thumbnail.",
+      },
       url_preview_enabled: {
         type: "boolean",
         default: false,
@@ -1196,6 +1215,9 @@ export const configValues: Record<string, Record<string, JsonValue>> = {
     storage: { backend: "local", path: "/var/lib/myelin/media" },
     max_upload_size: "100M",
     thumbnail_sizes: DEFAULT_THUMBNAIL_SIZES,
+    max_image_pixels: 33554432,
+    max_image_dimension: 32768,
+    max_image_decode_memory: "256M",
     url_preview_enabled: true,
     url_preview_ip_range_blocklist: DEFAULT_IP_BLOCKLIST,
     url_preview_timeout: "10s",
@@ -1610,6 +1632,7 @@ export function validateSection(
   if (section === "media") {
     checkBytes(at("max_upload_size"), "/max_upload_size", out);
     checkBytes(at("url_preview_max_fetch_size"), "/url_preview_max_fetch_size", out);
+    checkBytes(at("max_image_decode_memory"), "/max_image_decode_memory", out);
     checkDuration(at("url_preview_timeout"), "/url_preview_timeout", out);
     checkDuration(at("url_preview_cache_lifetime"), "/url_preview_cache_lifetime", out);
     checkDuration(at("remote_media_retention"), "/remote_media_retention", out);

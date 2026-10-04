@@ -156,6 +156,26 @@ pub struct MediaConfig {
     /// Synapse's `thumbnail_sizes`.
     #[serde(default = "default_thumbnail_sizes")]
     pub thumbnail_sizes: Vec<ThumbnailSize>,
+    /// The largest image, in pixels (width times height), this server makes a thumbnail of. A
+    /// bigger image is still stored and downloadable; only its thumbnail is refused (the client
+    /// gets `400 M_UNKNOWN` and shows a placeholder). The image's header is checked before any
+    /// pixel is decoded, so a small file that claims a huge picture costs nothing. Larger lets
+    /// people see previews of very large photos at the cost of memory per thumbnail (about four
+    /// bytes per pixel while it is made). Corresponds to Synapse's `max_image_pixels`, whose
+    /// default `32M` is this one (32 x 1024 x 1024).
+    #[serde(default = "default_max_image_pixels")]
+    pub max_image_pixels: u64,
+    /// The widest or tallest image, in pixels, this server makes a thumbnail of, whatever its
+    /// pixel count. Guards against a picture thousands of times wider than it is tall. Synapse
+    /// has no separate setting for this.
+    #[serde(default = "default_max_image_dimension")]
+    pub max_image_dimension: u32,
+    /// The most memory one image may take while it is decoded for a thumbnail (`256M`). An
+    /// image whose decoded pixels need more is refused before they are decoded. It should be at
+    /// least four bytes times `max_image_pixels` (eight for 16-bit PNGs), or some images under
+    /// the pixel limit are refused anyway. Synapse has no separate setting for this.
+    #[serde(default = "default_max_image_decode_memory")]
+    pub max_image_decode_memory: ByteSize,
     /// Whether this server fetches web pages to show a preview (title, description, image) of a
     /// link someone posts. Off by default: the server then visits every link people share,
     /// which reveals to those sites that someone here posted them. Corresponds to Synapse's
@@ -213,6 +233,18 @@ pub struct MediaConfig {
     pub scanning: crate::scanning::ScanningConfig,
 }
 
+fn default_max_image_pixels() -> u64 {
+    32 * 1024 * 1024
+}
+
+fn default_max_image_dimension() -> u32 {
+    32_768
+}
+
+fn default_max_image_decode_memory() -> ByteSize {
+    ByteSize::mib(256)
+}
+
 fn default_url_preview_timeout() -> Duration {
     Duration::from_secs(30)
 }
@@ -245,6 +277,9 @@ impl Default for MediaConfig {
             storage: MediaStorageBackend::default(),
             max_upload_size: default_max_upload_size(),
             thumbnail_sizes: default_thumbnail_sizes(),
+            max_image_pixels: default_max_image_pixels(),
+            max_image_dimension: default_max_image_dimension(),
+            max_image_decode_memory: default_max_image_decode_memory(),
             url_preview_enabled: false,
             url_preview_ip_range_blocklist: default_preview_blocklist(),
             remote_media_retention: default_remote_media_retention(),
@@ -276,6 +311,18 @@ impl Validate for MediaConfig {
                         t.width, t.height
                     ),
                 );
+            }
+        }
+        for (field, zero) in [
+            ("max_image_pixels", self.max_image_pixels == 0),
+            ("max_image_dimension", self.max_image_dimension == 0),
+            (
+                "max_image_decode_memory",
+                self.max_image_decode_memory.as_u64() == 0,
+            ),
+        ] {
+            if zero {
+                errors.push(format!("{prefix}.{field}"), "must be greater than 0");
             }
         }
         for (i, cidr) in self.url_preview_ip_range_blocklist.iter().enumerate() {
@@ -453,6 +500,27 @@ mod tests {
         assert_eq!(cfg.url_preview_timeout, Duration::from_secs(30));
         assert_eq!(cfg.url_preview_max_fetch_size, ByteSize::mib(10));
         assert_eq!(cfg.url_preview_cache_lifetime, Duration::from_hours(1));
+    }
+
+    #[test]
+    fn image_limits_default_to_synapse_and_reject_zero() {
+        let cfg = MediaConfig::default();
+        assert_eq!(cfg.max_image_pixels, 33_554_432);
+        assert_eq!(cfg.max_image_dimension, 32_768);
+        assert_eq!(cfg.max_image_decode_memory, ByteSize::mib(256));
+        let yaml = "max_image_pixels: 0\nmax_image_dimension: 0\nmax_image_decode_memory: \"0\"\n";
+        let cfg: MediaConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        let mut errors = ValidationErrors::new();
+        cfg.validate("media", &mut errors);
+        let paths: Vec<&str> = errors.0.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "media.max_image_pixels",
+                "media.max_image_dimension",
+                "media.max_image_decode_memory"
+            ]
+        );
     }
 
     #[test]

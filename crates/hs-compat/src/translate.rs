@@ -521,6 +521,12 @@ fn translate_key(key: &str, v: &Value, config: &mut Config) {
                     .collect();
             }
         }
+        "max_image_pixels" => {
+            // A Synapse "byte size" (`32M` is 32 x 1024 x 1024), counting pixels here.
+            if let Some(sz) = get_bytesize_value(v) {
+                config.media.max_image_pixels = sz.as_u64();
+            }
+        }
         "max_spider_size" => {
             if let Some(sz) = get_bytesize_value(v) {
                 config.media.url_preview_max_fetch_size = sz;
@@ -1093,6 +1099,13 @@ experimental_features:
             vec!["myCA1.pem".to_string(), "myCA2.pem".to_string()]
         );
         assert!(!report.has_blocking());
+    }
+
+    #[test]
+    fn translates_max_image_pixels() {
+        let yaml = "server_name: example.org\nmax_image_pixels: 35M\n";
+        let (config, _) = translate(yaml, TranslateOptions::default()).unwrap();
+        assert_eq!(config.media.max_image_pixels, 35 * 1024 * 1024);
     }
 
     #[test]
