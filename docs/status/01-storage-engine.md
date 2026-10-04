@@ -26,9 +26,10 @@ buffered write, 300 statements for a batch of 100 members.
   New module `hs_kv::metrics` (`prometheus-client`, already a workspace dependency):
   `hs_kv_postgres_flush_writes` and `hs_kv_postgres_flush_duration_seconds` histograms and
   `hs_kv_postgres_flush_statements_total`, registered by `register_metrics` in the pattern of
-  `hs_user::metrics`. **Left for `hs-cli`** (not track 01's crate): one line,
-  `metrics.with_registry(hs_kv::metrics::register_metrics);` beside the others in `serve.rs`,
-  for them to appear on `/metrics`.
+  `hs_user::metrics` and registered by `crates/hs-cli/src/serve.rs` beside the other crates'
+  metrics, so they are on `/metrics` whatever the backend (zero on the embedded one).
+  `crates/hs-cli/tests/boot_time.rs` scrapes the real binary's `/metrics` and asserts the three
+  names are there.
 - `crates/hs-kv/tests/postgres_tls.rs`: the header's `openssl req` now adds
   `basicConstraints=critical,CA:FALSE`. OpenSSL 3's `-x509` marks a self-signed certificate
   `CA:TRUE` by default and `rustls` refuses it as a server's own (`CaUsedAsEndEntity`) in every
@@ -81,7 +82,6 @@ notice), `fan_out_shaped_commit_timing`.
 
 ### Left
 
-- The `hs-cli` registration line above, so the three metrics reach `/metrics`.
 - Track 05's 303-member measurement on PostgreSQL (`docs/status/05-sync.md`, session 14,
   "Left") can now be repeated; the feed's share should be the numbers above.
 - The debug line is not asserted by a test (`hs-kv` has no `tracing-subscriber` dev-dependency

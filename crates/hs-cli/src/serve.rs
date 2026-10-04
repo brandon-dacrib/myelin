@@ -1433,6 +1433,8 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     metrics.with_registry(hs_room::metrics::register_metrics);
     // The copies a replica keeps of rooms it does not own, to answer /sync (decision 0022).
     metrics.with_registry(hs_user::metrics::register_metrics);
+    // What the PostgreSQL backend's commits flush in bulk (RFC 0021).
+    metrics.with_registry(hs_kv::metrics::register_metrics);
     metrics.with_registry(hs_push::pipeline::register_metrics);
     metrics.with_registry(hs_push::email::register_metrics);
     // History fetched from other servers into rooms' timelines (`crate::backfill`).

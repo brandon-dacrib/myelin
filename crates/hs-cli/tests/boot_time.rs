@@ -191,6 +191,18 @@ async fn a_cold_boot_is_quick_and_a_kill_right_after_it_loses_nothing() {
         metrics.contains("hs_boot_duration_seconds{cold=\"true\"}"),
         "{metrics}"
     );
+    // The store's flush metrics (RFC 0021) are registered whatever the backend: on the
+    // embedded one they stay at zero, but an operator can see they exist.
+    for name in [
+        "hs_kv_postgres_flush_writes_count",
+        "hs_kv_postgres_flush_duration_seconds_count",
+        "hs_kv_postgres_flush_statements_total",
+    ] {
+        assert!(
+            metrics.contains(name),
+            "{name} missing from /metrics:\n{metrics}"
+        );
+    }
     let token = register(&base, "alice").await;
     assert_eq!(whoami(&base, &token).await["user_id"], "@alice:example.org");
 

@@ -40,10 +40,9 @@ size.
 `deletes`, `tables`, `statements`, `elapsed_us`); `PostgresBackend::flush_stats()` counts
 flushes, writes and statements per backend; `hs_kv::metrics::register_metrics` puts
 `hs_kv_postgres_flush_writes` (histogram), `hs_kv_postgres_flush_duration_seconds` (histogram)
-and `hs_kv_postgres_flush_statements_total` on a registry. `hs-cli` has to call
-`metrics.with_registry(hs_kv::metrics::register_metrics)` next to the other crates' registrations
-in `serve.rs` for them to appear on `/metrics`; that one line is outside track 01's crates and
-is left for the coordinator or track 12.
+and `hs_kv_postgres_flush_statements_total` on a registry; `hs-cli`'s `serve.rs` registers them
+with the other crates' metrics, and `crates/hs-cli/tests/boot_time.rs` asserts the real binary's
+`/metrics` shows the three names.
 
 **Tests:** `postgres_bulk_flush.rs` (a commit larger than a chunk with puts and deletes to the
 same table, put-then-delete and delete-then-put of one key, the exact statement count; an empty
