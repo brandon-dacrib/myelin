@@ -158,8 +158,10 @@ cluster:
   userShards: 256
   ## Liveness. A replica rewrites its heartbeat row every `heartbeatInterval`; one whose row has
   ## not changed for `leaseTtl` is judged dead and its shards are taken over by the survivors.
-  ## The TTL must be more than twice the interval. Shorter means faster failover and more
-  ## database writes; these defaults fail over in about ten seconds.
+  ## The replica keeps its own shards for the same `leaseTtl` after its last good heartbeat (a
+  ## heartbeat late by a few intervals moves nothing; it only stops the replica claiming more
+  ## until the next good one). The TTL must be more than twice the interval. Shorter means
+  ## faster failover and more database writes; these defaults fail over in about ten seconds.
   heartbeatInterval: 2s
   leaseTtl: 10s
   ## The cluster's DNS domain, as the kubelet's `--cluster-domain`. Only the pod's advertised

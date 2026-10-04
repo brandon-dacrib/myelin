@@ -1,3 +1,52 @@
+## 2026-10-04: a replica keeps its shards until its lease lapses (branch `agent/cluster-heartbeat`, decision 0028)
+
+Closes the `hs-cluster` row of the known gaps: "a replica gives up every shard when one tick
+runs two heartbeat intervals after its last good heartbeat". `converge` wanted a shard only
+while `self_heartbeat_fresh` (last good heartbeat under `2 * heartbeat_interval`), so one
+failed heartbeat under load, followed by a tick, released everything the replica held; a peer
+took the shards and gave them back, and the requests between were forwarded, retried or fenced.
+
+The decision (`docs/decisions/0028-a-replica-keeps-its-shards-until-its-lease-lapses.md`):
+a replica *claims* a new shard only while its heartbeat is fresh (as before, and the same
+freshness it needs to judge a peer dead), but *keeps* a shard it holds while its lease is alive
+(`self_lease_alive`: last good heartbeat under `lease_ttl`), which is exactly as long as
+`is_mine` answers for it and strictly before any peer can have judged it dead. Past the lease it
+releases them in its next tick. `is_mine` and `Drainable::ready` share the predicate. The two
+`warn` lines in `tick` (a failed heartbeat; a gap over two intervals after a good one) stay,
+reworded for the new rule, with `since_last_heartbeat_ms`, `lease_ttl_ms` and (after a gap)
+`lease_expired`. No config key, public type or admin field changes; `docs/config.md`'s
+`lease_ttl` row and the chart's `leaseTtl` comment say the replica holds on for the lease.
+
+Tests (`ownership::tests`, paused clock, 50 ms heartbeats and a 500 ms lease, on a backend that
+refuses heartbeat commits on demand and nothing else):
+
+- `a_late_heartbeat_keeps_the_shards_until_the_lease_lapses`: four refused heartbeats (stale,
+  lease alive) move nothing in memory or in the store; the heartbeat recovers and still nothing
+  moves (no `Released`/`Lost`/`Acquired` events); eleven refused heartbeats lapse the lease and
+  every shard is released and announced; the heartbeat recovers and they come back at a newer
+  epoch. On the old gating it fails at the first phase: "room/0 was given up after one late
+  heartbeat".
+- `a_replica_with_a_stale_heartbeat_claims_no_new_shard`: while stale, a shard a peer took and
+  let go is dropped (`Lost`) and left ownerless until the heartbeat is fresh again, and the
+  other shards stay held.
+
+Verified: `cargo test -p hs-cluster --all-targets` (56 unit, 21 integration, `chaos.rs`
+included) and `cargo clippy -p hs-cluster --all-targets -- -D warnings` pass;
+`crates/hs-cli/tests/cluster_admin.rs` (both tests, 20.5 s) and `cluster_create_room.rs`
+(132 s) pass with `HS_CLUSTER_TEST_POSTGRES_DSN` against a private `postgres:17`, with no
+heartbeat-gap `warn` in either run. `cargo fmt --all --check` is clean.
+
+Observability check for the "bridge manager runs on one replica only" row: a stale heartbeat
+is already visible without a change. `hs_cluster_lease_age_seconds` is the time since this
+replica's last successful heartbeat (set every tick), `hs_cluster_heartbeat_seq` the last seq
+that reached the store; the admin API's replica objects carry `last_heartbeat_at` and
+`heartbeat_seq` (OpenAPI 0.1.7), and the Cluster page's "Last heartbeat" column shows the
+former as a relative time. Nothing added.
+
+Left: nothing from this row. `cluster_mirror.rs`'s note that shards still move for several
+seconds right after the last of three replicas turns `active` is the ordinary rebalance on a
+new member, not this gap.
+
 ## 2026-10-01: `cluster_create_room.rs` stops flaking (branch `agent/cluster-create-room-flake`)
 
 The two-replica test `crates/hs-cli/tests/cluster_create_room.rs` failed the merge gate on

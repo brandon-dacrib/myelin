@@ -433,9 +433,13 @@ impl<B: KvBackend> KvOwnership<B> {
             Ok(Err(e)) => tracing::warn!(
                 replica = %self.me,
                 error = %e,
-                "this replica's heartbeat failed; a tick more than twice heartbeat_interval \
-                 after the last good one gives up its shards, and after lease_ttl it stops \
-                 acting as their owner"
+                since_last_heartbeat_ms = previous_ok
+                    .map(|t| t.elapsed().as_millis() as u64)
+                    .unwrap_or(0),
+                lease_ttl_ms = self.config.lease_ttl.as_millis() as u64,
+                "this replica's heartbeat failed; it keeps the shards it holds until lease_ttl \
+                 after its last good heartbeat (claiming no new ones meanwhile), and past that \
+                 it releases them and stops acting as their owner"
             ),
             Err(e) => tracing::warn!(
                 replica = %self.me,
@@ -444,24 +448,27 @@ impl<B: KvBackend> KvOwnership<B> {
             ),
             Ok(Ok(())) => {}
         }
-        // A late heartbeat costs this replica its shards silently: a tick whose last good
-        // heartbeat is `2 * heartbeat_interval` old does not want them and releases them
-        // (`converge`), and past `lease_ttl` `Ownership::is_mine` refuses them at read time
-        // (self-suspicion). Say afterwards that it happened, and for how long, so an operator
-        // can match the `421`s and fenced writes of that window to a cause.
+        // A gap in the heartbeats is silent otherwise: while it lasts the replica claims no
+        // new shards (`converge`), and once it reaches `lease_ttl` the replica releases the
+        // ones it holds and `Ownership::is_mine` refuses them at read time (self-suspicion,
+        // decision 0028). Say afterwards that it happened, and for how long, so an operator can
+        // match the `421`s and fenced writes of that window to a cause. Until 2026-10-04 a tick
+        // in the gap released every shard the replica held.
         if heartbeat_ok
             && let Some(previous) = previous_ok
             && previous.elapsed() >= self.config.heartbeat_interval * 2
         {
+            let gap = previous.elapsed();
             tracing::warn!(
                 replica = %self.me,
-                since_last_heartbeat_ms = previous.elapsed().as_millis() as u64,
+                since_last_heartbeat_ms = gap.as_millis() as u64,
                 this_heartbeat_ms = hb_started.elapsed().as_millis() as u64,
                 heartbeat_interval_ms = self.config.heartbeat_interval.as_millis() as u64,
                 lease_ttl_ms = self.config.lease_ttl.as_millis() as u64,
-                "this replica went more than twice heartbeat_interval without a heartbeat: a \
-                 tick in that gap gives up its shards, and past lease_ttl it refuses to act as \
-                 their owner"
+                lease_expired = gap >= self.config.lease_ttl,
+                "this replica went more than twice heartbeat_interval without a heartbeat: it \
+                 claimed no new shards in that gap, and if the gap reached lease_ttl it released \
+                 the ones it held and refused to act as their owner"
             );
         }
         if heartbeat_ok {
@@ -480,6 +487,7 @@ impl<B: KvBackend> KvOwnership<B> {
         let Ok(Ok(replicas)) = replicas else { return };
 
         let self_heartbeat_fresh = self.self_heartbeat_fresh();
+        let self_lease_alive = self.self_lease_alive();
         let live = self.observe_live(&replicas, self_heartbeat_fresh);
         self.metrics.set_live_replicas(live.len() as u64);
         if let Some(age) = *self
@@ -490,7 +498,8 @@ impl<B: KvBackend> KvOwnership<B> {
             self.metrics.set_lease_age(age.elapsed());
         }
 
-        self.converge(&live, self_heartbeat_fresh, started).await;
+        self.converge(&live, self_heartbeat_fresh, self_lease_alive, started)
+            .await;
     }
 
     /// Whether this replica's own last successful heartbeat is recent enough for it to judge
@@ -500,6 +509,19 @@ impl<B: KvBackend> KvOwnership<B> {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .map(|t| t.elapsed() <= self.config.heartbeat_interval * 2)
+            .unwrap_or(false)
+    }
+
+    /// Whether this replica's own lease is still in force: its last successful heartbeat is
+    /// less than `lease_ttl` old, so no peer can yet have judged it dead (a peer judges by the
+    /// same `lease_ttl` on its own clock, from the moment it last saw the heartbeat change).
+    /// While it is, the replica keeps the shards it holds (decision 0028); past it, it releases
+    /// them in [`Self::converge`] and [`Ownership::is_mine`] refuses them at read time.
+    fn self_lease_alive(&self) -> bool {
+        self.last_heartbeat_ok
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .map(|t| t.elapsed() < self.config.lease_ttl)
             .unwrap_or(false)
     }
 
@@ -580,7 +602,24 @@ impl<B: KvBackend> KvOwnership<B> {
     ///   the peers' liveness are observed at the start of every tick, so a long convergence can
     ///   neither let this replica's own lease lapse nor make a live peer look dead by comparing
     ///   against an observation taken seconds ago.
-    async fn converge(&self, live: &[ReplicaId], self_heartbeat_fresh: bool, started: Instant) {
+    ///
+    /// And one keeps it steady (decision 0028): this replica's own heartbeat gates what it
+    /// *takes* and what it *keeps* differently. It claims a new shard only while
+    /// `self_heartbeat_fresh` (its last good heartbeat under `2 * heartbeat_interval`, the same
+    /// freshness it needs to judge a peer dead). It keeps a shard it holds while
+    /// `self_lease_alive` (under `lease_ttl`), which is when [`Ownership::is_mine`] still
+    /// answers for it and before any peer can have taken it, and releases it once the lease has
+    /// lapsed. Until 2026-10-04 both were gated on freshness, so one heartbeat late by two
+    /// intervals, common on a loaded host, released every shard the replica held; a peer took
+    /// them and handed them straight back, and the requests in between were forwarded, retried
+    /// or fenced for nothing.
+    async fn converge(
+        &self,
+        live: &[ReplicaId],
+        self_heartbeat_fresh: bool,
+        self_lease_alive: bool,
+        started: Instant,
+    ) {
         let am_i_live = live.contains(&self.me);
         let store = self.store.clone();
         let rows = tokio::task::spawn_blocking(move || store.list_shards()).await;
@@ -606,22 +645,20 @@ impl<B: KvBackend> KvOwnership<B> {
             } else {
                 hash::desired_owner(shard, live.iter()).cloned()
             };
-            let i_want_it = desired.as_ref() == Some(&self.me)
-                && !draining
-                && am_i_live
-                && self_heartbeat_fresh;
+            let i_want_it = desired.as_ref() == Some(&self.me) && !draining && am_i_live;
             let i_hold_it = self
                 .owned
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .contains_key(&shard);
 
-            let change = i_want_it != i_hold_it;
-            if change && started.elapsed() >= self.config.heartbeat_interval {
+            let acquire = i_want_it && !i_hold_it && self_heartbeat_fresh;
+            let release = i_hold_it && (!i_want_it || !self_lease_alive);
+            if (acquire || release) && started.elapsed() >= self.config.heartbeat_interval {
                 work_left = true;
-            } else if i_want_it && !i_hold_it {
+            } else if acquire {
                 self.try_acquire(shard).await;
-            } else if !i_want_it && i_hold_it {
+            } else if release {
                 self.release(shard).await;
             }
         }
@@ -839,11 +876,7 @@ impl<B: KvBackend> Ownership for KvOwnership<B> {
         }
         // Self-suspicion (RFC 0001 section 4): if my own heartbeats have failed for `lease_ttl`,
         // stop claiming ownership for reads even though the store row has not changed yet.
-        self.last_heartbeat_ok
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .map(|t| t.elapsed() < self.config.lease_ttl)
-            .unwrap_or(false)
+        self.self_lease_alive()
     }
 
     fn fence(&self, shard: ShardId) -> Option<Fence> {
@@ -872,13 +905,7 @@ impl<B: KvBackend> Drainable for KvOwnership<B> {
         if self.draining.load(Ordering::SeqCst) {
             return Readiness::NotReady("draining".into());
         }
-        let heartbeat_fresh = self
-            .last_heartbeat_ok
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .map(|t| t.elapsed() < self.config.lease_ttl)
-            .unwrap_or(false);
-        if !heartbeat_fresh {
+        if !self.self_lease_alive() {
             return Readiness::NotReady("no recent successful heartbeat".into());
         }
         Readiness::Ready
@@ -1077,7 +1104,7 @@ mod tests {
     use hs_kv::memory::MemoryBackend;
 
     use super::*;
-    use crate::test_clock::settle_until;
+    use crate::test_clock::{settle, settle_until};
     use crate::types::ShardLayout;
 
     fn config(me: &str) -> ClusterConfig {
@@ -1548,5 +1575,288 @@ mod tests {
             "hs-0 never took shards back after its drain was withdrawn"
         );
         assert!(!a.is_admin_drained());
+    }
+
+    /// A backend that, while told to, fails every commit that writes a replica's heartbeat row
+    /// (and only those: shard rows still commit, so a release or an acquisition in the gap
+    /// lands and is visible). A heartbeat that cannot reach the store is what one slow or
+    /// failed round trip under load looks like to the replica.
+    #[derive(Clone)]
+    struct FlakyHeartbeats {
+        inner: MemoryBackend,
+        fail_heartbeats: Arc<AtomicBool>,
+    }
+
+    struct FlakyTxn {
+        inner: <MemoryBackend as KvBackend>::Txn,
+        writes_heartbeat: bool,
+    }
+
+    impl hs_kv::KvRead for FlakyTxn {
+        type Keyspace = <MemoryBackend as KvBackend>::Keyspace;
+
+        fn get(
+            &self,
+            keyspace: &Self::Keyspace,
+            key: &[u8],
+        ) -> Result<Option<bytes::Bytes>, hs_kv::KvError> {
+            self.inner.get(keyspace, key)
+        }
+
+        fn range<'a>(
+            &'a self,
+            keyspace: &Self::Keyspace,
+            spec: hs_kv::RangeSpec,
+        ) -> hs_kv::RangeIter<'a> {
+            self.inner.range(keyspace, spec)
+        }
+    }
+
+    impl hs_kv::KvWrite for FlakyTxn {
+        fn put(
+            &mut self,
+            keyspace: &Self::Keyspace,
+            key: &[u8],
+            value: &[u8],
+        ) -> Result<(), hs_kv::KvError> {
+            if key.starts_with(b"replica/") {
+                self.writes_heartbeat = true;
+            }
+            self.inner.put(keyspace, key, value)
+        }
+
+        fn delete(&mut self, keyspace: &Self::Keyspace, key: &[u8]) -> Result<(), hs_kv::KvError> {
+            self.inner.delete(keyspace, key)
+        }
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("the store refused this heartbeat (test)")]
+    struct HeartbeatRefused;
+
+    impl KvBackend for FlakyHeartbeats {
+        type Keyspace = <MemoryBackend as KvBackend>::Keyspace;
+        type Snapshot = <MemoryBackend as KvBackend>::Snapshot;
+        type Txn = FlakyTxn;
+
+        fn keyspace(&self, name: &str) -> Result<Self::Keyspace, hs_kv::KvError> {
+            self.inner.keyspace(name)
+        }
+
+        fn snapshot(&self) -> Self::Snapshot {
+            self.inner.snapshot()
+        }
+
+        fn begin(&self) -> Result<Self::Txn, hs_kv::KvError> {
+            Ok(FlakyTxn {
+                inner: self.inner.begin()?,
+                writes_heartbeat: false,
+            })
+        }
+
+        fn commit(&self, txn: Self::Txn) -> Result<Result<(), hs_kv::Conflict>, hs_kv::KvError> {
+            if txn.writes_heartbeat && self.fail_heartbeats.load(Ordering::SeqCst) {
+                return Err(hs_kv::KvError::backend(HeartbeatRefused));
+            }
+            self.inner.commit(txn.inner)
+        }
+
+        fn watch(&self, keyspace: &Self::Keyspace, key: &[u8]) -> hs_kv::Watch {
+            self.inner.watch(keyspace, key)
+        }
+    }
+
+    /// A config whose lease is ten heartbeats, so that "stale" (two heartbeats) and "lease
+    /// lapsed" are far enough apart to tell apart under the paused clock.
+    fn config_with_long_lease(me: &str) -> ClusterConfig {
+        let mut c = config(me);
+        c.heartbeat_interval = Duration::from_millis(50);
+        c.lease_ttl = Duration::from_millis(500);
+        c
+    }
+
+    /// The owner each shard's store row names, with its epoch.
+    fn rows_of<B: KvBackend>(store: &ClusterStore<B>) -> Vec<(ShardId, Option<String>, Epoch)> {
+        let mut rows: Vec<_> = store
+            .list_shards()
+            .unwrap()
+            .into_iter()
+            .map(|(s, r)| (s, r.owner.map(|(o, _)| o.as_str().to_owned()), r.epoch))
+            .collect();
+        rows.sort_by_key(|(s, _, _)| *s);
+        rows
+    }
+
+    /// Decision 0028. One heartbeat late by more than two intervals (here: a few that the
+    /// store refuses) does not cost a replica its shards: it keeps every one of them, in memory
+    /// and in the store, until its lease would lapse, and once the heartbeats resume nothing has
+    /// moved. Only a gap of a whole `lease_ttl` releases them, which is when `is_mine` and its
+    /// peers' judgement give them up too. On the code before 2026-10-04 the first phase fails:
+    /// the first tick two intervals after the last good heartbeat released all four shards.
+    #[tokio::test(start_paused = true)]
+    async fn a_late_heartbeat_keeps_the_shards_until_the_lease_lapses() {
+        let backend = FlakyHeartbeats {
+            inner: MemoryBackend::new(),
+            fail_heartbeats: Arc::new(AtomicBool::new(false)),
+        };
+        let (mgr, _handle) = KvOwnership::start(config_with_long_lease("hs-0"), backend.clone())
+            .await
+            .unwrap();
+        let store = ClusterStore::open(backend.clone()).unwrap();
+        let shards: Vec<ShardId> = mgr.layout().all_shards().collect();
+        assert!(
+            settle_until(Duration::from_millis(60), 200, || {
+                shards.iter().all(|s| mgr.is_mine(*s))
+            })
+            .await,
+            "the solo replica never acquired every shard"
+        );
+        let before = rows_of(&store);
+        assert!(before.iter().all(|(_, o, _)| o.as_deref() == Some("hs-0")));
+        let mut events = mgr.subscribe();
+        while events.try_recv().is_ok() {}
+
+        // Phase 1: heartbeats fail for four intervals -- stale (> 2 intervals) but well inside
+        // the lease (10 intervals). The replica keeps everything.
+        backend.fail_heartbeats.store(true, Ordering::SeqCst);
+        settle(Duration::from_millis(50), 4).await;
+        assert!(
+            mgr.self_lease_alive() && !mgr.self_heartbeat_fresh(),
+            "the test wanted a stale heartbeat inside a live lease"
+        );
+        for s in &shards {
+            assert!(mgr.is_mine(*s), "{s} was given up after one late heartbeat");
+        }
+        assert_eq!(rows_of(&store), before, "a store row changed in the gap");
+
+        // Phase 2: the heartbeats come back. Nothing moved, so nothing moves now.
+        backend.fail_heartbeats.store(false, Ordering::SeqCst);
+        assert!(
+            settle_until(Duration::from_millis(50), 50, || mgr.self_heartbeat_fresh()).await,
+            "the heartbeat never recovered"
+        );
+        settle(Duration::from_millis(50), 4).await;
+        assert_eq!(
+            rows_of(&store),
+            before,
+            "a shard moved after the heartbeat recovered"
+        );
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                matches!(event, OwnershipEvent::MembershipChanged),
+                "a shard changed hands around one late heartbeat: {event:?}"
+            );
+        }
+
+        // Phase 3: heartbeats fail for longer than the lease. Now the replica cannot know that
+        // no peer has taken its shards, so it gives them up: in memory at once (`is_mine`), and
+        // in the store at its next tick.
+        backend.fail_heartbeats.store(true, Ordering::SeqCst);
+        assert!(
+            settle_until(Duration::from_millis(50), 50, || {
+                !mgr.self_lease_alive()
+                    && shards.iter().all(|s| !mgr.is_mine(*s))
+                    && rows_of(&store).iter().all(|(_, o, _)| o.is_none())
+            })
+            .await,
+            "the shards were not released once the lease lapsed: {:?}",
+            rows_of(&store)
+        );
+        let released = events
+            .try_recv()
+            .ok()
+            .into_iter()
+            .chain(std::iter::from_fn(|| events.try_recv().ok()))
+            .filter(|e| matches!(e, OwnershipEvent::Released(_)))
+            .count();
+        assert_eq!(
+            released,
+            shards.len(),
+            "every shard is announced as released"
+        );
+
+        // Phase 4: heartbeats resume; the replica takes its shards back at a newer epoch.
+        backend.fail_heartbeats.store(false, Ordering::SeqCst);
+        assert!(
+            settle_until(Duration::from_millis(50), 100, || {
+                shards.iter().all(|s| mgr.is_mine(*s))
+            })
+            .await,
+            "the shards were never taken back after the lease lapsed and the heartbeat returned"
+        );
+        for ((s, owner, epoch), (_, _, old_epoch)) in rows_of(&store).iter().zip(&before) {
+            assert_eq!(owner.as_deref(), Some("hs-0"), "{s}");
+            assert!(epoch > old_epoch, "{s} came back at the same epoch");
+        }
+    }
+
+    /// Decision 0028, the other half: while its heartbeat is stale a replica claims no new
+    /// shard, even one hashing says is its own. A peer took a shard and let it go again; the
+    /// replica notices the loss but leaves the row ownerless until its heartbeat is fresh.
+    #[tokio::test(start_paused = true)]
+    async fn a_replica_with_a_stale_heartbeat_claims_no_new_shard() {
+        let backend = FlakyHeartbeats {
+            inner: MemoryBackend::new(),
+            fail_heartbeats: Arc::new(AtomicBool::new(false)),
+        };
+        let (mgr, _handle) = KvOwnership::start(config_with_long_lease("hs-0"), backend.clone())
+            .await
+            .unwrap();
+        let store = ClusterStore::open(backend.clone()).unwrap();
+        let shards: Vec<ShardId> = mgr.layout().all_shards().collect();
+        assert!(
+            settle_until(Duration::from_millis(60), 200, || {
+                shards.iter().all(|s| mgr.is_mine(*s))
+            })
+            .await,
+            "the solo replica never acquired every shard"
+        );
+        let shard = ShardId::new(crate::types::ShardKind::Room, 1);
+
+        backend.fail_heartbeats.store(true, Ordering::SeqCst);
+        settle(Duration::from_millis(50), 4).await;
+        assert!(mgr.self_lease_alive() && !mgr.self_heartbeat_fresh());
+
+        // A peer that judged hs-0 dead takes the shard and lets it go: the row is ownerless.
+        let thief = ReplicaId::new("hs-9");
+        store
+            .acquire_shard(shard, &thief, Generation(1), |_| true)
+            .unwrap()
+            .unwrap();
+        let released = store.release_shard(shard, &thief, Generation(1)).unwrap();
+        assert!(released.is_some());
+
+        // hs-0 drops it (the row is the truth) but does not take it back while stale.
+        assert!(
+            settle_until(Duration::from_millis(50), 50, || !mgr.is_mine(shard)).await,
+            "hs-0 never noticed the shard was taken"
+        );
+        settle(Duration::from_millis(50), 4).await;
+        assert!(!mgr.is_mine(shard));
+        assert!(
+            store.get_shard(shard).unwrap().owner.is_none(),
+            "a replica with a stale heartbeat claimed a shard"
+        );
+        // ...and it still holds the others: a stale heartbeat is not a lapsed lease.
+        for s in shards.iter().filter(|s| **s != shard) {
+            assert!(
+                mgr.is_mine(*s),
+                "{s} was given up while the heartbeat was stale"
+            );
+        }
+
+        // Fresh again: it claims the shard.
+        backend.fail_heartbeats.store(false, Ordering::SeqCst);
+        assert!(
+            settle_until(Duration::from_millis(50), 100, || mgr.is_mine(shard)).await,
+            "hs-0 never took the shard back once its heartbeat was fresh"
+        );
+        assert!(
+            store
+                .get_shard(shard)
+                .unwrap()
+                .owner
+                .is_some_and(|(o, _)| o.as_str() == "hs-0")
+        );
     }
 }
