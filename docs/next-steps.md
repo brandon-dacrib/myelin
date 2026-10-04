@@ -4,9 +4,9 @@ Written 2026-09-20 by the integration lead, last revised 2026-10-04, afternoon E
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
-## Resume here: 2026-10-04, afternoon EDT -- the wave is merged; roll to the first green image of `1e262118` or later
+## Resume here: 2026-10-04, afternoon EDT -- the wave is merged; roll to the first green image of `8ec77d0f` or later
 
-**Where `main` is.** `1e262118`. Every branch of the wave named in the next section is merged
+**Where `main` is.** `8ec77d0f` (the wave, then the fuzz fix below). Every branch of the wave named in the next section is merged
 through the queue, each gate green with both PostgreSQL servers (plain on 5462, TLS on 5463):
 `cluster-heartbeat` `a802724a`, `device-list-invites` `5fc19dc5`, `lease-ttl-doc` `8db8a5e2`,
 `fed-state-ids` `f0712bde`, `web-scale-items` `6c95f7a5`, `email-pushers` `da2f3003`,
@@ -60,15 +60,19 @@ different model at 10:50 with their worktrees intact, and each pushed its work i
 **Measured** (the paragraph below): Sytest 643/772, Complement federation 235/314 and csapi
 346/384 on `1372c71f`, before the wave. The wave is not measured as a whole yet.
 
-**CI on `f1cc1d56`**: `ci` green; `fuzz` red: `hs-media`'s `thumbnail_generate` found an
-out-of-memory (a crafted image asks the decoder for 16 GiB; one upload and a thumbnail request
-could take a server down). `agent/thumbnail-oom` (track 09) is on it: decode limits, a
-configurable pixel bound, the input as a regression test. Pre-existing; nothing in the wave
-touched `hs-media`'s decoding. Roll after it merges if the demo takes uploads from strangers.
+**CI on `f1cc1d56`**: `ci` green; `fuzz` found a thumbnail out-of-memory (a GIF declaring
+1326 x 0 made `resize_to_fill` ask for a 4,294,967,295 x 1 buffer, 16 GiB; one upload and a
+thumbnail request could take a server down). **Fixed in `8ec77d0f`** (`agent/thumbnail-oom`,
+status 09): the declared size is checked from the header before decoding (zero sides, pixels,
+dimension, decode memory; `media.max_image_pixels` 32M as Synapse, `max_image_dimension`,
+`max_image_decode_memory`, all hot, Synapse's key translated), crops cut before they scale,
+thumbnailing runs on blocking threads, at most one per CPU; a refusal is `400` "Failed to
+generate thumbnail" and `hs_media_thumbnail_refused_total{reason}`. **Roll to the first green
+image of `8ec77d0f` or later**, not `1e262118`.
 
 **What is next, in order:**
 
-1. **Roll the demo** to the first green image of `1e262118` or later, then the owner's bridge
+1. **Roll the demo** to the first green image of `8ec77d0f` or later, then the owner's bridge
    migration in `docs/bridges/mautrix.md` ("2026-10-04"). *Desk item.*
 2. **Measure the wave**: `tests/sytest/build.sh myelin-sytest:dev` and the whole suite on a quiet
    machine, then Complement federation and csapi (`tests/complement/build.sh` now uses BuildKit),
@@ -2613,6 +2617,7 @@ Refreshed 2026-09-28 against the code: closed rows are struck through with the c
 
 | Gap | Where | Consequence |
 |---|---|---|
+| ~~A crafted image makes a thumbnail request allocate 16 GiB~~ | `hs-media`, `hs-config`, `hs-compat` | **Closed** 2026-10-04 (`8ec77d0f`, status 09): found by the `fuzz` job on `f1cc1d56`; refused from the header (`media.max_image_*`, hot), bounded resize, `hs_media_thumbnail_refused_total`. Left: URL previews do not decode images today and must use `decode_with_limits` if they ever do; the dynamic-thumbnail cap (1600) is a constant |
 | `tools/dashboard.py` cannot report Sytest or Complement | `tools/dashboard.py`, `docs/status/dashboard.md` | Found 2026-10-04 (status 14 session 8): the generator's L3/L4 rows are hard-coded "scaffold, untested" with a "no server binary" note, its Complement/Sytest section says "not yet populated", and it runs `hs-spec-coverage` through cargo, so it cannot be run on a machine kept quiet for a measurement. The dashboard is from 2026-09-27 and was left alone. Needed: read `docs/status/sytest/<date>-summary.txt` and the two `complement-*-results.txt` baselines, and a `--skip-coverage` default that reuses the last coverage output |
 | ~~Remote media from a dual-stack server fails with `Network unreachable` in a pod with no IPv6 route~~ | `hs-http`, `hs-federation`, `hs-media`, `hs-config`, `hs-cli` | **Closed** 2026-10-02 (`agent/outbound-ipv4-only`, status 06): the federation client and the URL previewer pinned their connection to the first address they resolved (the AAAA record of `federation.mau.chat`), so hyper's own fall-back across addresses had nothing to fall back to. Now every resolved address is pinned, in order, and hyper-util's Happy Eyeballs falls back across them; `network.outbound.ipv4_only` (on by default, hot) drops IPv6 for every outbound client, through `hs_http::outbound`; the startup log says `outbound: IPv4 only`; `hs_outbound_connect_failures_total{family}` counts addresses that did not connect, with a `debug` line each. `hs-cli/tests/outbound_address_policy.rs` resolves a server to `2001:db8::1` and `127.0.0.1` and reaches it under both policies. Not yet watched on the cluster |
 | ~~A local user's join to a restricted room is refused~~ | `hs-room` | **Closed** (cafb74d): `RoomActor::restricted_join` names the authoriser, and the join goes through another server when nobody here may invite; `federation_membership.rs::a_local_user_joins_a_restricted_room_without_naming_an_authoriser`. Complement's `TestRestrictedRooms*` not re-measured yet |
