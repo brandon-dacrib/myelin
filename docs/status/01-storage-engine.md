@@ -1,5 +1,93 @@
 # 01 Storage engine: status
 
+## The PostgreSQL commit flushes its writes in bulk (2026-10-04, branch `agent/postgres-bulk-flush`)
+
+RFC 0021, now accepted: track 05's batched fan-out (decision 0026) left the writes as the whole
+cost of a room update on PostgreSQL, one `INSERT ... ON CONFLICT` or `DELETE` round trip per
+buffered write, 300 statements for a batch of 100 members.
+
+### What changed
+
+- **`crates/hs-kv/src/postgres_backend.rs`: `flush_pending` groups the transaction's pending
+  writes by table and sends one multi-row upsert (`INSERT ... SELECT FROM unnest($1::bytea[],
+  $2::bytea[]) ON CONFLICT (k) DO UPDATE`) and one multi-key delete (`DELETE ... WHERE k =
+  ANY($1::bytea[])`) per table, prepared once and executed in chunks of `FLUSH_CHUNK_ROWS`
+  (2,000) rows.** Two parameters whatever the batch size; at most five chunks per table and
+  kind, since a transaction is at most `MAX_TXN_MUTATIONS` (10,000) writes. `pending` is a map
+  keyed by `(table, key)`, so a key appears once, in the upsert or the delete, which is what `ON
+  CONFLICT DO UPDATE` requires and why statement order within the commit does not matter; tables
+  go in name order so two transactions writing the same tables lock in the same table order.
+  The transaction model is untouched: `SERIALIZABLE`, the conflict classification, the write
+  budget, the watch notifications after commit, one isolated-thread trip for flush plus
+  `COMMIT`, and a failed statement still rolled back before the error is reported.
+- **Observable.** Each flush with writes is a `debug` line under `hs_kv::postgres` (`puts`,
+  `deletes`, `tables`, `statements`, `elapsed_us`). `PostgresBackend::flush_stats()` returns
+  `FlushStats { flushes, writes, statements }` for one backend, next to `notices_received()`.
+  New module `hs_kv::metrics` (`prometheus-client`, already a workspace dependency):
+  `hs_kv_postgres_flush_writes` and `hs_kv_postgres_flush_duration_seconds` histograms and
+  `hs_kv_postgres_flush_statements_total`, registered by `register_metrics` in the pattern of
+  `hs_user::metrics`. **Left for `hs-cli`** (not track 01's crate): one line,
+  `metrics.with_registry(hs_kv::metrics::register_metrics);` beside the others in `serve.rs`,
+  for them to appear on `/metrics`.
+- `crates/hs-kv/tests/postgres_tls.rs`: the header's `openssl req` now adds
+  `basicConstraints=critical,CA:FALSE`. OpenSSL 3's `-x509` marks a self-signed certificate
+  `CA:TRUE` by default and `rustls` refuses it as a server's own (`CaUsedAsEndEntity`) in every
+  verifying mode, which is the test failing on a fresh container until the certificate is
+  regenerated. The test itself is unchanged and passes.
+
+### Measured
+
+`crates/hs-kv/tests/postgres_bulk_flush.rs::fan_out_shaped_commit_timing` (the RFC's shape: 100
+members, three puts each over `hs_user.feed`, `hs_user.feed_by_room`, `hs_user.feed_heads`, one
+commit; `HS_KV_FLUSH_BENCH_ITERS` rounds, default 20), PostgreSQL 17 in Docker on the desktop,
+the old and the new flush built as two test binaries and run alternately, 50 rounds each:
+
+| flush | statements per commit | median per commit | mean per commit |
+|---|---|---|---|
+| before, one statement per write, load average ~4 | 300 | 77-79 ms | 78-79 ms |
+| before, while other agents built, load 9-21 | 300 | 87-274 ms | 98-293 ms |
+| after, bulk, interleaved with the row above | 3 | 3.2-7.3 ms | 3.5-8.5 ms |
+
+A 300-put commit is some 20-25 times quicker; a 303-member room's fan-out (three batches) is
+about 10-20 ms of store time. The per-call thread spawn the RFC mentions as second-order stays
+so: a flush of any size is one `run_isolated` trip.
+
+### Verified
+
+```sh
+docker run --rm -d --name hs-bulk-flush-pg -p 127.0.0.1:5471:5432 -e POSTGRES_PASSWORD=hs \
+    public.ecr.aws/docker/library/postgres:17
+HS_KV_TEST_POSTGRES_DSN=postgres://postgres:hs@127.0.0.1:5471/postgres cargo test -p hs-kv
+#   lib 16 (incl. metrics::the_metrics_register_and_encode), fjall 2+5, memory 1,
+#   postgres_bulk_flush 4, postgres_conformance 8 (the breakdown: 10/12 scenarios, the two
+#   documented divergences), doc 1
+HS_KV_TEST_POSTGRES_DSN=... HS_KV_FLUSH_BENCH_ITERS=50 \
+    cargo test -p hs-kv --test postgres_bulk_flush fan_out -- --nocapture   # prints the timing
+# postgres_tls: a second container with ssl=on per the test file's header (CA:FALSE), then
+HS_KV_TEST_POSTGRES_TLS_DSN=... HS_KV_TEST_POSTGRES_TLS_CERT=... HS_KV_TEST_POSTGRES_DSN=... \
+    cargo test -p hs-kv --test postgres_tls
+cargo clippy -p hs-kv --all-targets -- -D warnings; cargo clippy -p hs-tables --all-targets -- -D warnings
+cargo test -p hs-tables
+```
+
+`postgres_bulk_flush.rs`: `a_commit_larger_than_a_chunk_applies_every_put_and_delete` (3,000
+seeded rows; then 1,500 overwrites, 1,500 deletes and 2,500 inserts in one table plus a
+put-then-delete and a delete-then-put of one key and a second table emptied but for one
+overwritten row, in one commit; the end state row for row and the exact statement count, 9),
+`an_empty_commit_sends_no_write_statement`,
+`a_failed_bulk_flush_rolls_back_and_the_next_commit_succeeds` (a check constraint added behind
+the backend's back fails the upsert; nothing lands, the next commit succeeds, no warning
+notice), `fan_out_shaped_commit_timing`.
+
+### Left
+
+- The `hs-cli` registration line above, so the three metrics reach `/metrics`.
+- Track 05's 303-member measurement on PostgreSQL (`docs/status/05-sync.md`, session 14,
+  "Left") can now be repeated; the feed's share should be the numbers above.
+- The debug line is not asserted by a test (`hs-kv` has no `tracing-subscriber` dev-dependency
+  and adding one for a log assertion was not worth the tree); the counts it prints are the ones
+  `flush_stats()` asserts.
+
 ## No `ROLLBACK` after a failed `COMMIT`, and PostgreSQL's notices at their own level (2026-09-30, branch `agent/cli-small-gaps`)
 
 Closes the known gap "The PostgreSQL backend logs `WARNING: there is no transaction in progress`

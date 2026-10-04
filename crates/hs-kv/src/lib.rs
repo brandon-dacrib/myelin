@@ -152,6 +152,7 @@ pub mod watch;
 pub mod conformance;
 pub mod fjall_backend;
 pub mod memory;
+pub mod metrics;
 pub mod postgres_backend;
 pub mod postgres_tls;
 

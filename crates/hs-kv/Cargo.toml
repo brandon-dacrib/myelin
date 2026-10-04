@@ -16,6 +16,8 @@ bytes = { workspace = true }
 thiserror = { workspace = true }
 fjall = { workspace = true }
 tracing = { workspace = true }
+# `src/metrics.rs`: the PostgreSQL backend's flush metrics (RFC 0021), registered by `hs-cli`.
+prometheus-client = { workspace = true }
 postgres = { workspace = true }
 r2d2 = { workspace = true }
 r2d2_postgres = { workspace = true }

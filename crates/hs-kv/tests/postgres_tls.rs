@@ -8,11 +8,14 @@
 //! - `HS_KV_TEST_POSTGRES_DSN`: a server with no TLS (the conformance suite's; defaults as
 //!   there).
 //!
-//! Start the TLS server with something like:
+//! Start the TLS server with something like (the `CA:FALSE` matters: OpenSSL 3's `req -x509`
+//! marks a self-signed certificate `CA:TRUE` by default, and `rustls` refuses a CA certificate
+//! as a server's own, `CaUsedAsEndEntity`, in every verifying mode):
 //!
 //! ```sh
 //! openssl req -x509 -newkey rsa:2048 -nodes -keyout server.key -out server.crt -days 30 \
-//!     -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost"
+//!     -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost" \
+//!     -addext "basicConstraints=critical,CA:FALSE"
 //! docker run -d --name hs-kv-pg-tls -e POSTGRES_PASSWORD=hspg -p 127.0.0.1:5463:5432 \
 //!     -v $PWD/server.crt:/certs/server.crt:ro -v $PWD/server.key:/certs/server.key:ro \
 //!     --entrypoint bash public.ecr.aws/docker/library/postgres:17 -c '

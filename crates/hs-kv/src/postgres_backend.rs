@@ -53,8 +53,13 @@
 //! not**: [`KvWrite::put`] and [`KvWrite::delete`] only record the mutation in an in-memory buffer
 //! (checked by every subsequent read on the same [`PgTxn`], so a transaction still reads its own
 //! writes) and touch the database for the first time inside [`KvBackend::commit`], which flushes
-//! the whole buffer as a burst of `INSERT ... ON CONFLICT DO UPDATE` / `DELETE` statements
-//! immediately followed by `COMMIT`.
+//! the whole buffer in bulk -- per table, one multi-row `INSERT ... SELECT FROM unnest(...) ON
+//! CONFLICT DO UPDATE` for the puts and one `DELETE ... WHERE k = ANY(...)` for the deletes, in
+//! chunks of [`FLUSH_CHUNK_ROWS`] (RFC 0021; see `flush_pending`) -- immediately followed by
+//! `COMMIT`. A fan-out batch's three hundred puts over three tables are three statements, not
+//! three hundred: about 3-5 ms against a local server instead of about 80 ms. Each flush is a
+//! `debug` line under `hs_kv::postgres` with its counts, [`PostgresBackend::flush_stats`] and
+//! the `hs_kv_postgres_flush_*` metrics (`crate::metrics`).
 //!
 //! This is not an optimization, it is a correctness requirement, discovered by actually running
 //! this crate's conformance suite against a real server rather than assuming the SQL translation
@@ -165,11 +170,12 @@
 //! runs a real transaction, and drops it, all from inside `#[tokio::test]`'s ambient
 //! multi-threaded runtime.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
+use std::time::Instant;
 
 use bytes::Bytes;
 use postgres::error::{DbError, Severity, SqlState};
@@ -487,6 +493,28 @@ struct NoticeCounters {
     others: AtomicU64,
 }
 
+/// How many commits this backend has flushed since it was opened, and what they sent; see
+/// [`PostgresBackend::flush_stats`]. The same numbers go to the process-wide
+/// `hs_kv_postgres_flush_*` metrics (`crate::metrics`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FlushStats {
+    /// Commits whose buffered writes were flushed (a read-only commit counts, with no writes).
+    pub flushes: u64,
+    /// Buffered writes (puts and deletes) flushed, over every commit.
+    pub writes: u64,
+    /// Write statements sent while flushing: with bulk flushes, one per table and kind (upsert,
+    /// delete) per commit, plus one per further chunk of [`FLUSH_CHUNK_ROWS`] rows.
+    pub statements: u64,
+}
+
+/// The counters behind [`FlushStats`], one set per backend.
+#[derive(Debug, Default)]
+struct FlushCounters {
+    flushes: AtomicU64,
+    writes: AtomicU64,
+    statements: AtomicU64,
+}
+
 /// Where a session's notices go: to this process's log at the notice's own severity, under the
 /// target `hs_kv::postgres`, and into `counters`. The `postgres` crate's default logs every
 /// notice at `INFO` under `postgres::config`, whatever its severity -- which is how a stream of
@@ -562,6 +590,7 @@ struct Inner {
     tables: Mutex<HashMap<String, Arc<str>>>,
     info: PostgresConnectionInfo,
     notices: Arc<NoticeCounters>,
+    flushes: FlushCounters,
 }
 
 impl Drop for Inner {
@@ -783,6 +812,7 @@ impl PostgresBackend {
                         tables: Mutex::new(HashMap::new()),
                         info: info.clone(),
                         notices,
+                        flushes: FlushCounters::default(),
                     }),
                 },
                 info,
@@ -799,6 +829,20 @@ impl PostgresBackend {
         NoticesReceived {
             warnings: self.inner.notices.warnings.load(Ordering::Relaxed),
             others: self.inner.notices.others.load(Ordering::Relaxed),
+        }
+    }
+
+    /// How many commits this backend has flushed since it was opened, how many buffered writes
+    /// they carried and how many write statements that took (RFC 0021: one multi-row upsert and
+    /// one multi-key delete per table, not one statement per write). Also on `/metrics` as
+    /// `hs_kv_postgres_flush_writes`, `hs_kv_postgres_flush_duration_seconds` and
+    /// `hs_kv_postgres_flush_statements_total` (`crate::metrics::register_metrics`).
+    #[must_use]
+    pub fn flush_stats(&self) -> FlushStats {
+        FlushStats {
+            flushes: self.inner.flushes.flushes.load(Ordering::Relaxed),
+            writes: self.inner.flushes.writes.load(Ordering::Relaxed),
+            statements: self.inner.flushes.statements.load(Ordering::Relaxed),
         }
     }
 
@@ -1207,29 +1251,83 @@ impl KvWrite for PgTxn {
     }
 }
 
-/// Applies every buffered write in `pending` against `conn`, in one go, immediately before
+/// What one flush sent: the counts behind the `debug` line, [`FlushStats`] and the
+/// `hs_kv_postgres_flush_*` metrics.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct FlushReport {
+    puts: usize,
+    deletes: usize,
+    tables: usize,
+    statements: usize,
+}
+
+/// The most rows one flush statement carries (RFC 0021). A statement is two `bytea[]`
+/// parameters whatever its row count, so this bounds the size of the arrays one statement
+/// builds and the server unpacks, not a parameter count; a transaction is at most
+/// [`crate::MAX_TXN_MUTATIONS`] writes, so at most five chunks per table and kind.
+pub const FLUSH_CHUNK_ROWS: usize = 2_000;
+
+/// Applies every buffered write in `pending` against `conn`, in bulk, immediately before
 /// `COMMIT` — see the module docs on why writes are deferred this far rather than applied as each
 /// `put`/`delete` call happens.
+///
+/// The writes are grouped by table; each table gets one multi-row upsert for its puts
+/// (`INSERT ... SELECT FROM unnest($1::bytea[], $2::bytea[]) ON CONFLICT (k) DO UPDATE`) and one
+/// multi-key delete for its deletes (`DELETE ... WHERE k = ANY($1::bytea[])`), each in chunks of
+/// at most [`FLUSH_CHUNK_ROWS`] rows (RFC 0021). `pending` is a map keyed by `(table, key)`, so a
+/// key appears once in exactly one of the two, which is what `ON CONFLICT DO UPDATE` needs (it
+/// refuses to touch one row twice in a statement) and why the order of the statements within
+/// the transaction does not matter. Tables are flushed in name order, so two transactions that
+/// write the same tables take their row locks in the same table order.
 fn flush_pending(
     conn: &mut postgres::Client,
     pending: &PendingWrites,
-) -> Result<(), postgres::Error> {
+) -> Result<FlushReport, postgres::Error> {
+    // Per table, in name order: the keys and values to upsert, the keys to delete.
+    type TableWrites<'a> = (Vec<&'a [u8]>, Vec<&'a [u8]>, Vec<&'a [u8]>);
+    let mut by_table: BTreeMap<&str, TableWrites<'_>> = BTreeMap::new();
     for ((qualified, key), value) in pending {
+        let (keys, values, deletes) = by_table.entry(qualified.as_ref()).or_default();
         match value {
             Some(v) => {
-                let sql = format!(
-                    "INSERT INTO {qualified} (k, v) VALUES ($1, $2) \
-                     ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v"
-                );
-                conn.execute(&sql, &[key, v])?;
+                keys.push(key.as_slice());
+                values.push(v.as_slice());
             }
-            None => {
-                let sql = format!("DELETE FROM {qualified} WHERE k = $1");
-                conn.execute(&sql, &[key])?;
-            }
+            None => deletes.push(key.as_slice()),
         }
     }
-    Ok(())
+    let mut report = FlushReport {
+        tables: by_table.len(),
+        ..FlushReport::default()
+    };
+    for (qualified, (keys, values, deletes)) in &by_table {
+        if !keys.is_empty() {
+            let sql = format!(
+                "INSERT INTO {qualified} (k, v) SELECT u.k, u.v \
+                 FROM unnest($1::bytea[], $2::bytea[]) AS u(k, v) \
+                 ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v"
+            );
+            let statement = conn.prepare(&sql)?;
+            for (keys, values) in keys
+                .chunks(FLUSH_CHUNK_ROWS)
+                .zip(values.chunks(FLUSH_CHUNK_ROWS))
+            {
+                conn.execute(&statement, &[&keys, &values])?;
+                report.statements += 1;
+            }
+            report.puts += keys.len();
+        }
+        if !deletes.is_empty() {
+            let sql = format!("DELETE FROM {qualified} WHERE k = ANY($1::bytea[])");
+            let statement = conn.prepare(&sql)?;
+            for keys in deletes.chunks(FLUSH_CHUNK_ROWS) {
+                conn.execute(&statement, &[&keys])?;
+                report.statements += 1;
+            }
+            report.deletes += deletes.len();
+        }
+    }
+    Ok(report)
 }
 
 impl KvBackend for PostgresBackend {
@@ -1341,10 +1439,37 @@ impl KvBackend for PostgresBackend {
         // `postgres` calls — one isolated-thread trip covers the whole sequence.
         let pending = &txn.pending;
         let outcome = run_isolated(move || {
-            if let Err(error) = flush_pending(&mut conn, pending) {
-                // A failed statement leaves the transaction open, and aborted: end it here.
-                let _ = conn.batch_execute("ROLLBACK");
-                return Err(error);
+            let started = Instant::now();
+            let report = match flush_pending(&mut conn, pending) {
+                Ok(report) => report,
+                Err(error) => {
+                    // A failed statement leaves the transaction open, and aborted: end it here.
+                    let _ = conn.batch_execute("ROLLBACK");
+                    return Err(error);
+                }
+            };
+            let elapsed = started.elapsed();
+            let writes = report.puts + report.deletes;
+            self.inner.flushes.flushes.fetch_add(1, Ordering::Relaxed);
+            self.inner
+                .flushes
+                .writes
+                .fetch_add(writes as u64, Ordering::Relaxed);
+            self.inner
+                .flushes
+                .statements
+                .fetch_add(report.statements as u64, Ordering::Relaxed);
+            crate::metrics::observe_flush(writes, report.statements, elapsed);
+            if writes > 0 {
+                tracing::debug!(
+                    target: "hs_kv::postgres",
+                    puts = report.puts,
+                    deletes = report.deletes,
+                    tables = report.tables,
+                    statements = report.statements,
+                    elapsed_us = elapsed.as_micros() as u64,
+                    "flushed a transaction's buffered writes"
+                );
             }
             // A `COMMIT` that fails (a serialization failure detected at commit, the common case
             // under contention) has already ended the transaction -- PostgreSQL rolls it back as
