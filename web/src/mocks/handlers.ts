@@ -49,7 +49,12 @@ import {
   validateDocument,
   validateSection,
 } from "./data/config";
-import { statisticsOverview, serverInfo, federationDestinations } from "./data/dashboard";
+import {
+  statisticsOverview,
+  serverInfo,
+  federationDestinations,
+  failingDestinationCount,
+} from "./data/dashboard";
 import {
   clusterSummary,
   drainReplica,
@@ -81,7 +86,14 @@ import {
 } from "./data/reports";
 import { cancelTask, getTask, listTasks, putTask } from "./data/tasks";
 import { mockEventStream, publishMockEvent } from "./data/events";
-import { cachedKeys, destinationRooms, ownKeys, startKeyRefresh } from "./data/federation";
+import {
+  cachedKeys,
+  destinationRooms,
+  ownKeys,
+  startKeyRefresh,
+  filterDestinations,
+  sortDestinations,
+} from "./data/federation";
 import { roomStatistics, sortStatistics, timeseries, userMediaStatistics } from "./data/statistics";
 import type { ReportResolve } from "@/api/reports";
 import { succeeded } from "@/lib/audit";
@@ -410,7 +422,11 @@ export const handlers = [
 
   // ---- Dashboard ----
   http.get(`${API}/statistics/overview`, () =>
-    HttpResponse.json({ ...statisticsOverview, pending_reports_count: openReportCount() }),
+    HttpResponse.json({
+      ...statisticsOverview,
+      pending_reports_count: openReportCount(),
+      federation_destinations_failing_count: failingDestinationCount(),
+    }),
   ),
 
   // ---- Statistics (crates/hs-admin/src/statistics.rs) ----
@@ -559,8 +575,20 @@ export const handlers = [
   http.post(`${API}/migration/cutover`, () => migrationTask(cutoverMigration())),
   http.get(`${API}/federation/destinations`, ({ request }) => {
     const url = new URL(request.url);
-    const { items, next_cursor, prev_cursor } = paginate(federationDestinations, url);
-    return HttpResponse.json({ items, next_cursor, prev_cursor });
+    const q = url.searchParams;
+    const filtered = filterDestinations(federationDestinations, q.get("failing"));
+    const sorted = sortDestinations(filtered, q.get("sort"));
+    if (!sorted) {
+      const field = (q.get("sort") ?? "").replace(/^-/, "");
+      return problem(400, "validation-failed", "Validation failed", {
+        detail: `unknown sort field "${field}"; the fields are server_name, failing_since, last_successful_at, retry_last_at, pending_pdu_count, pending_edu_count`,
+        errors: [{ pointer: "param:sort", detail: `unknown sort field "${field}"` }],
+      });
+    }
+    const page = paginate(sorted, url);
+    return HttpResponse.json(
+      q.get("include_total") === "true" ? { ...page, total: sorted.length } : page,
+    );
   }),
   http.get(`${API}/audit-log`, ({ request }) => {
     const url = new URL(request.url);

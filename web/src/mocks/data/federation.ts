@@ -2,6 +2,7 @@ import type { components } from "@/api/schema";
 import { federationDestinations } from "./dashboard";
 import { getTask, putTask } from "./tasks";
 
+type Destination = components["schemas"]["Destination"];
 type DestinationRoom = components["schemas"]["DestinationRoom"];
 type SigningKey = components["schemas"]["ServerSigningKey"];
 type RemoteServerKeys = components["schemas"]["RemoteServerKeys"];
@@ -11,6 +12,67 @@ type RemoteServerKeys = components["schemas"]["RemoteServerKeys"];
  * the rooms shared with each destination, this server's own signing keys, the key cache, and a
  * refetch that runs as a task (`federation.refetch_keys`) and fails for a server that is down.
  */
+
+/** The fields `GET /federation/destinations` sorts by, as `crates/hs-admin/src/router.rs` has them. */
+const SORT_FIELDS = [
+  "server_name",
+  "failing_since",
+  "last_successful_at",
+  "retry_last_at",
+  "pending_pdu_count",
+  "pending_edu_count",
+];
+
+/**
+ * `GET /federation/destinations`' order (`sort_destinations` in `crates/hs-admin/src/router.rs`):
+ * without a sort, failing first then by name; with one, by that field, `-` for descending, a
+ * destination without the timestamp last either way, ties by name. `null` for an unknown field.
+ */
+export function sortDestinations(
+  items: readonly Destination[],
+  sort: string | null,
+): Destination[] | null {
+  const sorted = [...items];
+  const byName = (a: Destination, b: Destination) =>
+    (a.server_name ?? "").localeCompare(b.server_name ?? "");
+  const trimmed = sort?.trim();
+  if (!trimmed) {
+    return sorted.sort(
+      (a, b) => Number(Boolean(b.failing_since)) - Number(Boolean(a.failing_since)) || byName(a, b),
+    );
+  }
+  const descending = trimmed.startsWith("-");
+  const field = descending ? trimmed.slice(1) : trimmed;
+  if (!SORT_FIELDS.includes(field)) return null;
+  const direction = (o: number) => (descending ? -o : o);
+  const compare = (a: Destination, b: Destination): number => {
+    switch (field) {
+      case "server_name":
+        return direction(byName(a, b));
+      case "pending_pdu_count":
+        return direction((a.pending_pdu_count ?? 0) - (b.pending_pdu_count ?? 0));
+      case "pending_edu_count":
+        return direction((a.pending_edu_count ?? 0) - (b.pending_edu_count ?? 0));
+      default: {
+        const key = field as "failing_since" | "last_successful_at" | "retry_last_at";
+        const [x, y] = [a[key], b[key]];
+        // Absent last whichever way the rest goes.
+        if (!x || !y) return Number(!x) - Number(!y);
+        return direction(x.localeCompare(y));
+      }
+    }
+  };
+  return sorted.sort((a, b) => compare(a, b) || byName(a, b));
+}
+
+/** `failing=true` keeps the failing destinations, `failing=false` the rest, absent keeps all. */
+export function filterDestinations(
+  items: readonly Destination[],
+  failing: string | null,
+): Destination[] {
+  if (failing !== "true" && failing !== "false") return [...items];
+  return items.filter((d) => Boolean(d.failing_since) === (failing === "true"));
+}
 
 const DAY = 86_400_000;
 const iso = (msFromNow: number) => new Date(Date.now() + msFromNow).toISOString();

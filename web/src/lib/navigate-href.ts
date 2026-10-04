@@ -7,7 +7,11 @@ import type { useNavigate } from "@tanstack/react-router";
  * `navigate` cannot verify a runtime string against its route union, so this
  * is the one sanctioned place that casts around it.
  */
-export function navigateToHref(navigate: ReturnType<typeof useNavigate>, href: string): void {
+export function navigateToHref(
+  navigate: ReturnType<typeof useNavigate>,
+  href: string,
+  search?: Record<string, string>,
+): void {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any -- see doc comment above
-  navigate({ to: href as any });
+  navigate({ to: href as any, search: search as any });
 }

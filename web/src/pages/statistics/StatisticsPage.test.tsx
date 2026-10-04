@@ -156,6 +156,31 @@ describe("Statistics", () => {
     expect(within(rows[0]).getByText("14.2 GiB")).toBeInTheDocument();
   });
 
+  it("shows the cluster's numbers now, and says there is no history of them", async () => {
+    open();
+    const section = within(
+      (await screen.findByRole("heading", { name: "Cluster" })).closest("section")!,
+    );
+    expect(section.getByText("Replicas")).toBeInTheDocument();
+    expect(await section.findByText("3")).toBeInTheDocument();
+    expect(section.getByText("Heartbeat sequence")).toBeInTheDocument();
+    expect(section.getByText("Drains released at once")).toBeInTheDocument();
+    expect(section.getByText("0")).toBeInTheDocument();
+    expect(section.getByText(/keeps no history of these yet/)).toBeInTheDocument();
+    expect(section.getByRole("link", { name: "Cluster page" })).toBeInTheDocument();
+  });
+
+  it("says a single node has no cluster numbers", async () => {
+    server.use(
+      http.get("/api/v1/cluster", () =>
+        HttpResponse.json({ mode: "single-node", replica_count: 1, shard_count: 3 }),
+      ),
+    );
+    open();
+    expect(await screen.findByText(/runs as a single node/)).toBeInTheDocument();
+    expect(screen.queryByText("Heartbeat sequence")).not.toBeInTheDocument();
+  });
+
   it("is not shown without admin:read", async () => {
     await signIn(["moderation:read"]);
     open();

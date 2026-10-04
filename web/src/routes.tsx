@@ -15,6 +15,7 @@ import { validateReportsSearch } from "@/pages/reports/reports-search";
 import { validateTasksSearch } from "@/pages/tasks/tasks-search";
 import { validateStatisticsSearch } from "@/pages/statistics/statistics-search";
 import { validateClusterSearch } from "@/pages/cluster/cluster-search";
+import { validateFederationSearch } from "@/pages/federation/federation-search";
 import { validateRoomSearch } from "@/pages/rooms/room-search";
 
 // Route-level code splitting: each page (and its own dependency graph —
@@ -274,6 +275,7 @@ const roomDetailRoute = createRoute({
 const federationRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/federation",
+  validateSearch: validateFederationSearch,
   component: FederationPage,
 });
 const federationDestinationRoute = createRoute({

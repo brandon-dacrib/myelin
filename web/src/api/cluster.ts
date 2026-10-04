@@ -46,6 +46,72 @@ async function fetchAll<T>(
   return all;
 }
 
+/** One reading of a replica's heartbeat sequence, as this browser saw it. */
+export interface HeartbeatSample {
+  /** When the reading was taken (`Date.now()`). */
+  at: number;
+  seq: number;
+}
+
+/** What the readings of one replica's heartbeat sequence say. */
+export interface HeartbeatTrend {
+  samples: HeartbeatSample[];
+  /** Heartbeats between consecutive readings, oldest first; one fewer than the samples. */
+  increments: number[];
+  /**
+   * Whether the sequence moved on since the reading before: the liveness the other replicas
+   * watch for. `null` with fewer than two readings.
+   */
+  advancing: boolean | null;
+  /** The reading that last showed a new number, or the first reading when none did. */
+  lastAdvanceAt: number | null;
+}
+
+/** How many readings are kept per replica: forty polls, ten minutes at the slow interval. */
+const HEARTBEAT_HISTORY = 40;
+
+/**
+ * The heartbeat sequence of each replica at each poll, kept for the session. The server keeps
+ * no history of the sequence (`Replica.heartbeat_seq` is the latest number), so the page
+ * remembers what it read and can say whether a replica's heartbeats are still arriving:
+ * one whose number has not moved since the last poll (15 seconds, against a heartbeat every
+ * two by default) has stopped reaching the store.
+ */
+const heartbeatHistory = new Map<string, HeartbeatSample[]>();
+
+/** Forgets every reading (tests, and a sign-out). */
+export function resetHeartbeatHistory(): void {
+  heartbeatHistory.clear();
+}
+
+/** Remembers the sequence each replica reports; a replica without one (a single node) is skipped. */
+export function recordHeartbeats(replicas: Replica[], at: number = Date.now()): void {
+  for (const replica of replicas) {
+    if (!replica.id || replica.heartbeat_seq == null) continue;
+    const samples = heartbeatHistory.get(replica.id) ?? [];
+    if (samples.at(-1)?.at === at) continue;
+    samples.push({ at, seq: replica.heartbeat_seq });
+    if (samples.length > HEARTBEAT_HISTORY) samples.splice(0, samples.length - HEARTBEAT_HISTORY);
+    heartbeatHistory.set(replica.id, samples);
+  }
+}
+
+/** The readings of `id`'s heartbeat sequence so far, and what they say. */
+export function heartbeatTrend(id: string): HeartbeatTrend {
+  const samples = heartbeatHistory.get(id) ?? [];
+  const increments = samples.slice(1).map((s, i) => Math.max(s.seq - samples[i].seq, 0));
+  let lastAdvanceAt: number | null = samples[0]?.at ?? null;
+  samples.forEach((s, i) => {
+    if (i > 0 && s.seq > samples[i - 1].seq) lastAdvanceAt = s.at;
+  });
+  return {
+    samples,
+    increments,
+    advancing: increments.length === 0 ? null : increments[increments.length - 1] > 0,
+    lastAdvanceAt,
+  };
+}
+
 /** Whether a replica is in the middle of something the page should follow closely. */
 export function replicaIsMoving(replica: Pick<Replica, "status">): boolean {
   return replica.status === "draining" || replica.status === "joining";
@@ -56,14 +122,17 @@ export function useReplicas() {
   return useQuery({
     queryKey: ["cluster-replicas"],
     enabled: hasScope("admin:read"),
-    queryFn: () =>
-      fetchAll(async (cursor) =>
+    queryFn: async () => {
+      const replicas = await fetchAll(async (cursor) =>
         unwrap(
           await api.GET("/cluster/replicas", {
             params: { query: { limit: PAGE_LIMIT, cursor } },
           }),
         ),
-      ),
+      );
+      recordHeartbeats(replicas);
+      return replicas;
+    },
     refetchInterval: (query) =>
       query.state.data?.some(replicaIsMoving) ? FAST_POLL_MS : SLOW_POLL_MS,
   });

@@ -33,6 +33,8 @@ interface AttentionRow {
   summary: string;
   actionLabel: string;
   actionHref: string;
+  /** Search parameters for the href (a filtered list). */
+  actionSearch?: Record<string, string>;
 }
 
 /**
@@ -47,7 +49,16 @@ export function DashboardPage() {
   const server = useServerInfo();
   const cluster = useClusterStatus();
   const appservices = useAppservices({ limit: 50 });
-  const federation = useFederationDestinations(50);
+  // The failing destinations, longest failing first, for the attention rows, with how many
+  // there are in all; and how many destinations there are at all. The counts shown are the
+  // server's totals (`include_total`), never the length of a page.
+  const failing = useFederationDestinations({
+    failing: true,
+    sort: "failing_since",
+    limit: 50,
+    include_total: true,
+  });
+  const destinations = useFederationDestinations({ limit: 1, include_total: true });
   const auditLog = useRecentAuditEntries(5);
   const failedTasks = useTasks({ status: "failed", limit: 20 });
   const health = useServerHealth();
@@ -57,7 +68,7 @@ export function DashboardPage() {
     server.isLoading ||
     cluster.isLoading ||
     appservices.isLoading ||
-    federation.isLoading;
+    failing.isLoading;
 
   // Deliberately no single page-wide `isError` gate: against a real server, `/server` (this
   // page's uptime/version tiles) may well answer while `/statistics/overview`, `/cluster`,
@@ -66,14 +77,14 @@ export function DashboardPage() {
   // renders what it has and reports its own gap honestly instead of the whole page going blank
   // because one of six independent queries failed (docs/status/16-management-web-interface.md,
   // "Degrade honestly").
-  const attentionSourcesFailed = stats.isError && appservices.isError && federation.isError;
+  const attentionSourcesFailed = stats.isError && appservices.isError && failing.isError;
 
   // What an all-clear below cannot vouch for, because the source that would have said so could
   // not be asked. Without this, "Nothing needs your attention" is shown over a server whose
   // bridges and federation answered 501 -- an all-clear about things nobody looked at.
   const unchecked: string[] = [];
   if (appservices.isError) unchecked.push("bridges");
-  if (federation.isError) unchecked.push("federation");
+  if (failing.isError) unchecked.push("federation");
   if (stats.isError || stats.data?.pending_reports_count == null) unchecked.push("reports");
   if (failedTasks.isError) unchecked.push("tasks");
   if (health.isError) unchecked.push("server health");
@@ -83,9 +94,10 @@ export function DashboardPage() {
     [appservices.data],
   );
   const failingDestinations = useMemo(
-    () => (federation.data?.items ?? []).filter((d) => d.failing_since),
-    [federation.data],
+    () => (failing.data?.items ?? []).filter((d) => d.failing_since),
+    [failing.data],
   );
+  const failingTotal = failing.data?.total;
 
   const attention: AttentionRow[] = useMemo(() => {
     const rows: AttentionRow[] = [];
@@ -124,6 +136,18 @@ export function DashboardPage() {
         actionHref: `/federation/${encodeURIComponent(d.server_name ?? "")}`,
       });
     }
+    if (failingTotal != null && failingTotal > failingDestinations.length) {
+      // The page above holds the longest-failing ones; the rest are only counted.
+      const more = failingTotal - failingDestinations.length;
+      rows.push({
+        id: "destinations-more",
+        severity: "warning",
+        summary: `${more} more ${more === 1 ? "server is" : "servers are"} failing; only the ${failingDestinations.length} longest-failing are checked here.`,
+        actionLabel: "See every failing server",
+        actionHref: "/federation",
+        actionSearch: { show: "failing" },
+      });
+    }
     for (const task of failedTasks.data?.items ?? []) {
       // Same deliberate clock read as above: "failed in the last day" is about now.
       // eslint-disable-next-line react-hooks/purity -- see comment above
@@ -148,7 +172,14 @@ export function DashboardPage() {
       });
     }
     return rows;
-  }, [health.data, unhealthyBridges, failingDestinations, stats.data, failedTasks.data]);
+  }, [
+    health.data,
+    unhealthyBridges,
+    failingDestinations,
+    failingTotal,
+    stats.data,
+    failedTasks.data,
+  ]);
 
   const singleNode = (cluster.data?.replica_count ?? 1) <= 1;
 
@@ -170,13 +201,13 @@ export function DashboardPage() {
             )}
             {!isLoading && attentionSourcesFailed && (
               <QueryProblemState
-                error={stats.error ?? appservices.error ?? federation.error}
+                error={stats.error ?? appservices.error ?? failing.error}
                 resource="what needs attention"
                 compact
                 onRetry={() => {
                   stats.refetch();
                   appservices.refetch();
-                  federation.refetch();
+                  failing.refetch();
                 }}
               />
             )}
@@ -220,7 +251,7 @@ export function DashboardPage() {
                           ? document
                               .getElementById(item.actionHref.slice(1))
                               ?.scrollIntoView({ block: "start" })
-                          : navigateToHref(navigate, item.actionHref)
+                          : navigateToHref(navigate, item.actionHref, item.actionSearch)
                       }
                       className="rounded-sm px-2 py-1 text-sm font-medium text-accent hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--color-focus)]"
                     >
@@ -372,60 +403,20 @@ export function DashboardPage() {
           </section>
 
           {/* Federation strip */}
-          <section aria-labelledby="federation-strip-heading">
-            <h2 id="federation-strip-heading" className="text-md font-medium text-text">
-              Federation
-            </h2>
-            <div className="mt-3 flex gap-3">
-              {!isLoading && federation.isError && (
-                <QueryProblemState
-                  error={federation.error}
-                  resource="federation destinations"
-                  scope="admin:read"
-                  compact
-                  onRetry={() => federation.refetch()}
-                  className="w-full"
-                />
-              )}
-              {!isLoading &&
-                !federation.isError &&
-                (
-                  [
-                    {
-                      label: "Healthy",
-                      status: "success" as const,
-                      count: (federation.data?.items ?? []).filter(
-                        (d) => !d.failing_since && !d.retry_interval_ms,
-                      ).length,
-                    },
-                    {
-                      label: "Backing off",
-                      status: "warning" as const,
-                      count: (federation.data?.items ?? []).filter(
-                        (d) => !d.failing_since && d.retry_interval_ms,
-                      ).length,
-                    },
-                    {
-                      label: "Failing",
-                      status: "danger" as const,
-                      count: (federation.data?.items ?? []).filter((d) => d.failing_since).length,
-                    },
-                  ] as const
-                ).map((tile) => (
-                  <button
-                    key={tile.label}
-                    type="button"
-                    onClick={() => navigate({ to: "/federation" })}
-                    className="flex-1 rounded-md border border-border bg-surface p-4 text-left hover:bg-surface-sunken focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--color-focus)]"
-                  >
-                    <p className="text-2xl text-text">{tile.count}</p>
-                    <Badge status={tile.status} className="mt-1">
-                      {tile.label}
-                    </Badge>
-                  </button>
-                ))}
-            </div>
-          </section>
+          <FederationStrip
+            loading={isLoading}
+            failingCount={stats.data?.federation_destinations_failing_count ?? failing.data?.total}
+            total={destinations.data?.total}
+            errors={{
+              count: stats.isError && failing.isError ? (stats.error ?? failing.error) : null,
+              total: destinations.isError ? destinations.error : null,
+            }}
+            onRetry={() => {
+              stats.refetch();
+              failing.refetch();
+              destinations.refetch();
+            }}
+          />
         </div>
 
         {/* Recent audit */}
@@ -477,6 +468,99 @@ export function DashboardPage() {
         </section>
       </div>
     </div>
+  );
+}
+
+/**
+ * How federation is going, in two numbers that are the server's own totals: how many
+ * destinations are failing (`federation_destinations_failing_count`, with the failing list's
+ * `total` as a stand-in when the Overview's counts cannot be read) and how many are not (every
+ * destination less the failing). Each opens the Federation page filtered to those servers.
+ */
+function FederationStrip({
+  loading,
+  failingCount,
+  total,
+  errors,
+  onRetry,
+}: {
+  loading: boolean;
+  failingCount: number | undefined;
+  total: number | undefined;
+  errors: { count: unknown; total: unknown };
+  onRetry: () => void;
+}) {
+  const navigate = useNavigate();
+  const notFailing =
+    total != null && failingCount != null ? Math.max(total - failingCount, 0) : undefined;
+  const tiles = [
+    {
+      label: "Failing",
+      status: "danger" as const,
+      count: failingCount,
+      error: errors.count,
+      show: "failing" as const,
+    },
+    {
+      label: "Not failing",
+      status: "success" as const,
+      count: notFailing,
+      error: errors.total ?? errors.count,
+      show: "not-failing" as const,
+    },
+  ];
+  return (
+    <section aria-labelledby="federation-strip-heading">
+      <h2 id="federation-strip-heading" className="text-md font-medium text-text">
+        Federation
+      </h2>
+      {!loading && errors.count && errors.total ? (
+        <div className="mt-3">
+          <QueryProblemState
+            error={errors.count}
+            resource="federation destinations"
+            scope="admin:read"
+            compact
+            onRetry={onRetry}
+            className="w-full"
+          />
+        </div>
+      ) : (
+        <>
+          <div className="mt-3 flex gap-3">
+            {!loading &&
+              tiles.map((tile) => (
+                <button
+                  key={tile.label}
+                  type="button"
+                  onClick={() => navigate({ to: "/federation", search: { show: tile.show } })}
+                  className="flex-1 rounded-md border border-border bg-surface p-4 text-left hover:bg-surface-sunken focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--color-focus)]"
+                >
+                  <p className="text-2xl text-text tabular-nums">
+                    {tile.count != null ? (
+                      formatCount(tile.count)
+                    ) : tile.error ? (
+                      <TileProblem error={tile.error} />
+                    ) : (
+                      "—"
+                    )}
+                  </p>
+                  <Badge status={tile.status} className="mt-1">
+                    {tile.label}
+                  </Badge>
+                </button>
+              ))}
+          </div>
+          {!loading && (
+            <p className="mt-2 text-xs text-text-muted">
+              {total != null
+                ? `${formatCount(total)} ${total === 1 ? "server" : "servers"} this one has sent to, counted by the server, not by the page.`
+                : "How many servers there are in all could not be read."}
+            </p>
+          )}
+        </>
+      )}
+    </section>
   );
 }
 

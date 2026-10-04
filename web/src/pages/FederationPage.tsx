@@ -1,5 +1,4 @@
-import { useMemo } from "react";
-import { useNavigate, Link } from "@tanstack/react-router";
+import { Link, useNavigate, useSearch } from "@tanstack/react-router";
 import { Globe } from "lucide-react";
 import { useFederationDestinations } from "@/api/dashboard";
 import type { Destination } from "@/api/federation";
@@ -10,22 +9,52 @@ import { ForbiddenState } from "@/components/ui/error-state/ErrorState";
 import { QueryProblemState } from "@/components/QueryProblemState";
 import { RelativeTime } from "@/components/RelativeTime";
 import { hasScope } from "@/lib/auth";
-import { destinationHealth, destinationSeverity } from "@/lib/federation";
+import { cn } from "@/lib/cn";
+import { DESTINATION_PAGE_SIZE, destinationHealth } from "@/lib/federation";
+import { formatCount } from "@/lib/format";
+import { fromSortState, toSortState } from "@/lib/sort-param";
 import { useFederationQueueLimit } from "@/api/federation";
 import { CatchUpBadge } from "./federation/CatchUp";
+import {
+  failingParam,
+  type DestinationShow,
+  type FederationSearch,
+} from "./federation/federation-search";
 import { OwnKeysPanel } from "./federation/FederationPanels";
 
-/** `/federation` — flows.md flow 4: watch federation health. */
-export function FederationPage() {
-  const navigate = useNavigate();
-  const canRead = hasScope("admin:read");
-  const { data, isLoading, isError, error, refetch } = useFederationDestinations(50);
+const SHOW_OPTIONS: { value: DestinationShow | "all"; label: string }[] = [
+  { value: "all", label: "Every server" },
+  { value: "failing", label: "Failing" },
+  { value: "not-failing", label: "Not failing" },
+];
 
-  const rows = useMemo(() => {
-    const items = data?.items ?? [];
-    // Attention first: failing, then catching up or backing off, then healthy.
-    return [...items].sort((a, b) => destinationSeverity(a) - destinationSeverity(b));
-  }, [data]);
+/**
+ * `/federation` — flows.md flow 4: watch federation health. The server does the filtering
+ * (`failing`), the ordering (`sort`) and the paging (`cursor`), so a server with thousands of
+ * destinations is read a page at a time and the counts are the whole list's, never a page's.
+ */
+export function FederationPage() {
+  const search = useSearch({ from: "/federation" });
+  const navigate = useNavigate({ from: "/federation" });
+  const canRead = hasScope("admin:read");
+  const update = (patch: Partial<FederationSearch>) =>
+    navigate({ search: { ...search, ...patch } });
+
+  // Without a sort the server lists failing servers first, then the rest by name; among only
+  // the failing ones, longest failing first is the order an operator wants.
+  const sort = search.sort ?? (search.show === "failing" ? "failing_since" : undefined);
+  const { data, isLoading, isError, error, refetch, isPlaceholderData } = useFederationDestinations(
+    {
+      limit: DESTINATION_PAGE_SIZE,
+      cursor: search.cursor,
+      sort,
+      failing: failingParam(search.show),
+      include_total: true,
+    },
+  );
+
+  const rows = data?.items ?? [];
+  const paged = Boolean(search.cursor || data?.next_cursor);
   const catchingUp = rows.filter((d) => d.catch_up_since).length;
 
   const columns: Column<Destination>[] = [
@@ -34,6 +63,7 @@ export function FederationPage() {
       header: "Server",
       priority: 1,
       interactive: true,
+      sortable: true,
       render: (d) => (
         <Link
           to="/federation/$serverName"
@@ -45,9 +75,12 @@ export function FederationPage() {
       ),
     },
     {
-      key: "status",
+      // Sorted by when the failures began: longest failing first, then the servers that are
+      // not failing (which have no such time and sort last either way).
+      key: "failing_since",
       header: "Status",
       priority: 1,
+      sortable: true,
       render: (d) => {
         const meta = destinationHealth(d);
         return (
@@ -66,13 +99,16 @@ export function FederationPage() {
       key: "last_successful_at",
       header: "Last success",
       priority: 2,
+      sortable: true,
       render: (d) => <RelativeTime at={d.last_successful_at} />,
     },
     {
-      key: "pending",
+      // Sorted by queued events (PDUs); the other messages (EDUs) ride along.
+      key: "pending_pdu_count",
       header: "Waiting to send",
       priority: 3,
       align: "end",
+      sortable: true,
       render: (d) =>
         d.catch_up_since ? (
           <span className="text-text-muted">not queued</span>
@@ -91,6 +127,15 @@ export function FederationPage() {
     );
   }
 
+  const show = search.show ?? "all";
+  const total = data?.total;
+  const countLabel =
+    total == null
+      ? undefined
+      : `${formatCount(total)} ${total === 1 ? "server" : "servers"}${
+          show === "failing" ? " failing" : show === "not-failing" ? " not failing" : ""
+        }`;
+
   return (
     <div className="mx-auto max-w-[90rem] p-6">
       <h1 className="text-xl text-text">Federation</h1>
@@ -100,7 +145,7 @@ export function FederationPage() {
         signing keys and its retry state.
       </p>
 
-      <StatusKey catchingUp={catchingUp} />
+      <StatusKey catchingUp={catchingUp} paged={paged} />
 
       {isError && (
         <div className="mt-6">
@@ -115,25 +160,62 @@ export function FederationPage() {
 
       {!isError && (
         <div className="mt-4">
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+            <div
+              role="group"
+              aria-label="Show"
+              className="inline-flex h-9 overflow-hidden rounded-sm border border-border-strong"
+            >
+              {SHOW_OPTIONS.map((option) => (
+                <button
+                  key={option.value}
+                  type="button"
+                  aria-pressed={show === option.value}
+                  onClick={() =>
+                    update({
+                      show: option.value === "all" ? undefined : option.value,
+                      cursor: undefined,
+                    })
+                  }
+                  className={cn(
+                    "px-3 text-sm font-medium focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-[var(--color-focus)]",
+                    show === option.value
+                      ? "bg-accent-muted text-accent"
+                      : "bg-surface text-text-muted hover:bg-surface-sunken hover:text-text",
+                  )}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+            <p className="text-sm text-text-muted" aria-live="polite">
+              {!sort && "Failing servers first, then the rest by name."}
+              {sort && "Sorted by the column you chose; click it again to turn the order round."}
+            </p>
+          </div>
           <DataTable
             caption="Federation destinations"
             columns={columns}
             rows={rows}
             getRowId={(d) => d.server_name ?? ""}
             loading={isLoading}
+            className={cn(isPlaceholderData && "opacity-60 transition-opacity")}
+            sort={sort ? toSortState(sort) : undefined}
+            onSortChange={(next) => update({ sort: fromSortState(next), cursor: undefined })}
             onRowClick={(d) =>
               navigate({
                 to: "/federation/$serverName",
                 params: { serverName: d.server_name ?? "" },
               })
             }
-            empty={
-              <EmptyState
-                icon={<Globe aria-hidden="true" />}
-                title="No federation traffic yet"
-                description="When your users join rooms on other servers, those servers appear here."
-              />
-            }
+            pagination={{
+              hasPrevious: Boolean(search.cursor),
+              hasNext: Boolean(data?.next_cursor),
+              onPrevious: () => update({ cursor: data?.prev_cursor ?? undefined }),
+              onNext: () => update({ cursor: data?.next_cursor ?? undefined }),
+              pageLabel: countLabel,
+            }}
+            empty={<NoDestinations show={show} />}
           />
         </div>
       )}
@@ -143,18 +225,47 @@ export function FederationPage() {
   );
 }
 
+function NoDestinations({ show }: { show: DestinationShow | "all" }) {
+  if (show === "failing")
+    return (
+      <EmptyState
+        variant="filtered"
+        icon={<Globe aria-hidden="true" />}
+        title="No failing servers"
+        description="Every server this one sends to answered its last request."
+      />
+    );
+  if (show === "not-failing")
+    return (
+      <EmptyState
+        variant="filtered"
+        icon={<Globe aria-hidden="true" />}
+        title="Every known server is failing"
+        description="No server this one sends to has answered its last request."
+      />
+    );
+  return (
+    <EmptyState
+      icon={<Globe aria-hidden="true" />}
+      title="No federation traffic yet"
+      description="When your users join rooms on other servers, those servers appear here."
+    />
+  );
+}
+
 /**
  * What each status means, once, above the table: an operator should not need the docs to read
  * a badge. Catch-up is explained in full when a destination is in it.
  */
-function StatusKey({ catchingUp }: { catchingUp: number }) {
+function StatusKey({ catchingUp, paged }: { catchingUp: number; paged: boolean }) {
   const { limit } = useFederationQueueLimit();
+  const where = paged ? " on this page" : "";
   return (
     <details className="mt-3 max-w-3xl text-sm text-text-muted" open={catchingUp > 0}>
       <summary className="cursor-pointer text-accent hover:underline">
         What the statuses mean
         {catchingUp > 0 &&
-          ` (${catchingUp} ${catchingUp === 1 ? "server is" : "servers are"} catching up)`}
+          ` (${catchingUp} ${catchingUp === 1 ? "server is" : "servers are"} catching up${where})`}
       </summary>
       <dl className="mt-2 grid gap-2 sm:grid-cols-[10rem_1fr]">
         {(["success", "warning", "danger"] as const).map((status) => {
@@ -192,6 +303,15 @@ function StatusKey({ catchingUp }: { catchingUp: number }) {
           <dd>
             Events (PDUs) and other messages (EDUs: typing, read receipts, presence, device updates)
             queued for the server, sent as soon as it answers.
+          </dd>
+        </div>
+        <div className="contents">
+          <dt className="text-text">Order and pages</dt>
+          <dd>
+            Failing servers come first, then the rest by name; sort by a column to change that.
+            &ldquo;Status&rdquo; sorts by when the failures began, longest first; &ldquo;Waiting to
+            send&rdquo; by queued events. The list is read {DESTINATION_PAGE_SIZE} servers at a
+            time, and the count under it is the whole list&apos;s.
           </dd>
         </div>
       </dl>

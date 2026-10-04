@@ -59,6 +59,29 @@ test.describe("Cluster", () => {
     guard.assertClean();
   });
 
+  test("each replica's heartbeat sequence, and whether its heartbeats still arrive", async ({
+    page,
+  }) => {
+    test.setTimeout(60_000);
+    await signInAsOperator(page);
+    await page
+      .getByRole("navigation", { name: "Primary" })
+      .getByRole("link", { name: "Cluster" })
+      .click();
+    const hs0 = page
+      .getByRole("table", { name: "Replicas" })
+      .getByRole("row")
+      .filter({ hasText: "hs-0" });
+    await expect(hs0).toContainText(/seq [\d,]+/);
+    await expect(page.getByText("Heartbeat", { exact: true })).toBeVisible();
+    await expect(page.getByText("Drains released at once", { exact: true })).toBeVisible();
+    await expect(page.getByText("Since this replica started")).toBeVisible();
+    // The next poll (15 s) reads a higher number: the mock heartbeats every two seconds.
+    await expect(hs0).toContainText(/\+\d+ since the last poll/, { timeout: 30_000 });
+    await expect(page.getByText("This replica, still arriving")).toBeVisible();
+    await expectNoAxeViolations(page, "cluster heartbeats");
+  });
+
   test("the shard table filters by kind and pages, and the page works at phone width", async ({
     page,
   }) => {

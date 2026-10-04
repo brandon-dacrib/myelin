@@ -12,6 +12,24 @@ export const DEFAULT_MAX_QUEUED_PDUS = 10_000;
 /** The configuration row that holds the queue limit, for a link from the explanation. */
 export const MAX_QUEUED_PDUS_SETTING = "max_queued_pdus_per_destination";
 
+/**
+ * The fields `GET /federation/destinations` sorts by (`DESTINATION_SORT_FIELDS` in
+ * `crates/hs-admin/src/router.rs`); `-` in front for descending. A destination without the
+ * timestamp sorts last either way. Without `sort`, failing destinations come first, then the
+ * rest by name.
+ */
+export const DESTINATION_SORT_FIELDS = [
+  "server_name",
+  "failing_since",
+  "last_successful_at",
+  "retry_last_at",
+  "pending_pdu_count",
+  "pending_edu_count",
+] as const;
+
+/** How many destinations the Federation page asks for at a time. */
+export const DESTINATION_PAGE_SIZE = 50;
+
 export interface DestinationHealth {
   status: BadgeStatus;
   label: string;

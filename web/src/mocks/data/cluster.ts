@@ -205,15 +205,33 @@ export function settleCluster(now = Date.now()): void {
   recount(state);
 }
 
+/** When the mock started: its replicas have been heartbeating since. */
+const BOOT = Date.now();
+/** How often a mock replica heartbeats, as the server's default (`cluster.heartbeat_interval`). */
+const HEARTBEAT_MS = 2_000;
+
+/**
+ * A replica's heartbeat sequence: one more every two seconds since the mock started, on top of
+ * a number that stands for the heartbeats before (a replica that has run longer has sent more).
+ * One that is unreachable stopped a minute and a half ago and its number stands still.
+ */
+function heartbeatSeq(replica: Replica, now: number): number {
+  const before = 10_000 * (replica.epoch ?? 1);
+  const until = replica.status === "unreachable" ? BOOT : now;
+  return before + Math.floor((until - BOOT) / HEARTBEAT_MS);
+}
+
 /** A replica as the wire has it: a heartbeat a moment ago for a replica that is up. */
 function wire(replica: Replica): Replica {
+  const now = Date.now();
   const offset = replica.this_replica ? 800 : 1_600 + (replica.epoch ?? 0) * 300;
   return {
     ...replica,
     last_heartbeat_at:
       replica.status === "unreachable"
-        ? new Date(Date.now() - 90_000).toISOString()
-        : new Date(Date.now() - offset).toISOString(),
+        ? new Date(now - 90_000).toISOString()
+        : new Date(now - offset).toISOString(),
+    heartbeat_seq: heartbeatSeq(replica, now),
   };
 }
 
@@ -235,11 +253,15 @@ export function listShards(kind: string | null): Shard[] {
 
 export function clusterSummary(): ClusterStatus {
   settleCluster();
+  const me = state.replicas.find((r) => r.this_replica);
   return {
     mode: "cluster",
     epoch: 7,
     replica_count: state.replicas.length,
     shard_count: state.shards.length,
+    heartbeat_seq: me ? heartbeatSeq(me, Date.now()) : undefined,
+    // The mock hands shards off one at a time; it never releases them at once.
+    drain_released_at_once_count: 0,
   };
 }
 

@@ -4,6 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { server } from "@/mocks/node";
 import { drainReplica, getReplica, listShards, setDrainDuration } from "@/mocks/data/cluster";
+import { resetHeartbeatHistory } from "@/api/cluster";
 import { signIn, signOut } from "@/lib/auth";
 import { renderRoutes } from "@/test/render-route";
 import { ClusterPage } from "./ClusterPage";
@@ -70,7 +71,99 @@ function singleNode() {
 beforeEach(async () => {
   await signIn();
 });
-afterEach(() => signOut());
+afterEach(() => {
+  resetHeartbeatHistory();
+  signOut();
+});
+
+/** The replicas with a heartbeat sequence that `seq` gives at each read. */
+function replicasWithSeq(seq: (read: number) => number) {
+  let reads = 0;
+  server.use(
+    http.get("/api/v1/cluster/replicas", () => {
+      reads += 1;
+      return HttpResponse.json({
+        items: [
+          {
+            ...SINGLE_NODE_REPLICA,
+            id: "hs-0",
+            role: "replica",
+            mesh_addr: "10.0.1.10:7600",
+            last_heartbeat_at: new Date().toISOString(),
+            heartbeat_seq: seq(reads),
+          },
+          {
+            ...SINGLE_NODE_REPLICA,
+            id: "hs-1",
+            role: "replica",
+            this_replica: false,
+            mesh_addr: "10.0.1.11:7600",
+            last_heartbeat_at: new Date().toISOString(),
+            heartbeat_seq: 500,
+          },
+        ],
+        next_cursor: null,
+        prev_cursor: null,
+      });
+    }),
+    http.get("/api/v1/cluster", () =>
+      HttpResponse.json({
+        mode: "cluster",
+        replica_count: 2,
+        shard_count: 3,
+        epoch: 1,
+        heartbeat_seq: seq(reads),
+        drain_released_at_once_count: 2,
+      }),
+    ),
+  );
+}
+
+describe("Cluster heartbeats", () => {
+  it("shows each replica's heartbeat sequence, and the answering replica's drains released at once", async () => {
+    open();
+    const hs0 = await replicaRow("hs-0");
+    expect(hs0.getByText(/seq [\d,]+/)).toBeInTheDocument();
+    expect(hs0.queryByText(/since the last poll/)).not.toBeInTheDocument();
+    expect(screen.getByText("Heartbeat", { selector: "dt" })).toBeInTheDocument();
+    expect(screen.getByText("Drains released at once", { selector: "dt" })).toBeInTheDocument();
+    expect(screen.getByText("Since this replica started")).toBeInTheDocument();
+    expect(screen.getByText("0", { selector: "dd" })).toBeInTheDocument();
+  });
+
+  it("says the sequence is advancing once a second poll shows a higher number", async () => {
+    replicasWithSeq((read) => 100 + read * 7);
+    const { client } = open();
+    const hs0 = await replicaRow("hs-0");
+    expect(hs0.getByText("seq 107")).toBeInTheDocument();
+    await client.refetchQueries({ queryKey: ["cluster-replicas"] });
+    expect(await hs0.findByText("seq 114")).toBeInTheDocument();
+    expect(hs0.getByText("+7 since the last poll")).toBeInTheDocument();
+    expect(screen.getByText("This replica, still arriving")).toBeInTheDocument();
+    // hs-1's number did not move between the polls.
+    const hs1 = await replicaRow("hs-1");
+    expect(hs1.getByText(/No new heartbeat since/)).toBeInTheDocument();
+  });
+
+  it("warns when a replica's sequence stopped moving", async () => {
+    replicasWithSeq(() => 42);
+    const { client } = open();
+    const hs0 = await replicaRow("hs-0");
+    expect(hs0.getByText("seq 42")).toBeInTheDocument();
+    await client.refetchQueries({ queryKey: ["cluster-replicas"] });
+    expect(await hs0.findByText(/No new heartbeat since/)).toBeInTheDocument();
+    expect(screen.getByText(/This replica: no new heartbeat since/)).toBeInTheDocument();
+    expect(screen.getByText("2", { selector: "dd" })).toBeInTheDocument();
+  });
+
+  it("has no heartbeats or drains to count on a single node, and says why", async () => {
+    singleNode();
+    open();
+    await replicaRow("hs-single");
+    expect(screen.getByText("A single node sends no heartbeats")).toBeInTheDocument();
+    expect(screen.getByText("Nothing to drain on a single node")).toBeInTheDocument();
+  });
+});
 
 describe("Cluster", () => {
   it("summarises the cluster and lists each replica with its shards", async () => {

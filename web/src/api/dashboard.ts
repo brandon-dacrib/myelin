@@ -14,8 +14,10 @@
  *   Kubernetes deployment card).
  * - `GET /appservices` — the bridges strip and "unhealthy bridge" attention
  *   rows (first page only, `health !== "healthy"`).
- * - `GET /federation/destinations` — the federation strip and "failing over
- *   an hour" attention rows.
+ * - `GET /federation/destinations` — the "failing over an hour" attention rows, from the
+ *   failing destinations longest-failing first (`failing=true&sort=failing_since`), and the
+ *   number of destinations in all (`include_total=true`); the failing count itself is the
+ *   Overview's `federation_destinations_failing_count`, never a page's length.
  * - `GET /audit-log` — the five most recent entries.
  *
  * - `GET /statistics/timeseries?metric=...` — the "Activity" sparklines, through
@@ -23,7 +25,7 @@
  *   `metric` enum).
  * - `GET /tasks?status=failed` — the "task failed" attention rows.
  */
-import { useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { api } from "./client";
 import { useLiveEvents } from "./events";
 import { unwrap } from "./problem";
@@ -69,15 +71,29 @@ export function useClusterStatus() {
   });
 }
 
-export function useFederationDestinations(limit = 50) {
+/** `GET /federation/destinations`'s query string (`federation.destinations.list`). */
+export interface DestinationListQuery {
+  limit?: number;
+  cursor?: string;
+  /** A field of `DESTINATION_SORT_FIELDS` (`@/lib/federation`), `-` in front for descending. */
+  sort?: string;
+  /** `true` for only the failing destinations, `false` for only the rest. */
+  failing?: boolean;
+  include_total?: boolean;
+}
+
+/**
+ * One page of destinations, in the server's order: failing first, then by name, unless `sort`
+ * says otherwise. Polled every 30 seconds; a page keeps showing while the next one loads.
+ */
+export function useFederationDestinations(query: DestinationListQuery = { limit: 50 }) {
   return useQuery({
-    queryKey: ["federation-destinations", limit],
+    queryKey: ["federation-destinations", query],
     queryFn: async () => {
-      const result = await api.GET("/federation/destinations", {
-        params: { query: { limit } },
-      });
+      const result = await api.GET("/federation/destinations", { params: { query } });
       return unwrap(result);
     },
+    placeholderData: keepPreviousData,
     refetchInterval: 30_000,
   });
 }

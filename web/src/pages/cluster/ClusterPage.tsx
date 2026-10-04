@@ -2,6 +2,7 @@ import { useState, type ReactNode } from "react";
 import { Link, useNavigate, useSearch } from "@tanstack/react-router";
 import { Boxes, Server } from "lucide-react";
 import {
+  heartbeatTrend,
   replicaIsMoving,
   useAllShards,
   useRefreshShardsWhenSettled,
@@ -15,6 +16,7 @@ import { useClusterStatus } from "@/api/dashboard";
 import { useTask } from "@/api/tasks";
 import { QueryProblemState } from "@/components/QueryProblemState";
 import { RelativeTime } from "@/components/RelativeTime";
+import { Sparkline } from "@/components/Sparkline";
 import { Badge } from "@/components/ui/badge/Badge";
 import { Button } from "@/components/ui/button/Button";
 import { EmptyState } from "@/components/ui/empty-state/EmptyState";
@@ -92,6 +94,8 @@ export function ClusterPage() {
         replicaCount={status.data?.replica_count}
         shards={allShards.data}
         shardCount={status.data?.shard_count}
+        heartbeatSeq={status.data?.heartbeat_seq}
+        drainsReleasedAtOnce={status.data?.drain_released_at_once_count}
       />
 
       <section aria-labelledby="replicas-heading" className="space-y-3">
@@ -115,7 +119,19 @@ export function ClusterPage() {
             <dt className="text-text">Last heartbeat</dt>
             <dd>
               When it last told the others it is alive. One silent for longer than the lease
-              (cluster.lease_ttl) is treated as gone.
+              (cluster.lease_ttl) is treated as gone. The number under it (seq) goes up by one with
+              every heartbeat that reaches the store, and is what the others watch. This page
+              remembers the number from each poll (every 15 seconds while it is open; the server
+              keeps no history of it), so it can say whether the heartbeats are still arriving: one
+              whose number stops moving is about to be treated as gone. The small chart is
+              heartbeats per poll since the page opened.
+            </dd>
+            <dt className="text-text">Drains released at once</dt>
+            <dd>
+              How many times, since the replica answering this page started, a drain let go of every
+              shard it owned at once instead of handing them over one lease at a time: what the last
+              replica does when it stops, because nobody is left to take them. Some on a server that
+              was not shut down whole means a replica found itself alone.
             </dd>
             <dt className="text-text">Mesh address</dt>
             <dd>
@@ -185,6 +201,8 @@ function Summary({
   replicaCount,
   shards,
   shardCount,
+  heartbeatSeq,
+  drainsReleasedAtOnce,
 }: {
   singleNode: boolean;
   statusKnown: boolean;
@@ -192,6 +210,8 @@ function Summary({
   replicaCount: number | undefined;
   shards: Shard[] | undefined;
   shardCount: number | undefined;
+  heartbeatSeq: number | undefined;
+  drainsReleasedAtOnce: number | undefined;
 }) {
   const byStatus = new Map<ReplicaStatus, number>();
   for (const r of replicas ?? []) {
@@ -204,9 +224,18 @@ function Summary({
   const owned = shards?.filter((s) => s.owner).length;
   const total = shards?.length ?? shardCount;
   const ownerless = shards ? shards.length - (owned ?? 0) : undefined;
+  const me = replicas?.find((r) => r.this_replica);
+  const trend = me?.id ? heartbeatTrend(me.id) : null;
+  const heartbeatNote = singleNode
+    ? "A single node sends no heartbeats"
+    : trend?.advancing === false && trend.lastAdvanceAt != null
+      ? `This replica: no new heartbeat since ${new Date(trend.lastAdvanceAt).toLocaleTimeString()}`
+      : trend?.advancing
+        ? "This replica, still arriving"
+        : "This replica";
 
   return (
-    <dl className="grid gap-3 sm:grid-cols-3">
+    <dl className="grid gap-3 sm:grid-cols-3 xl:grid-cols-5">
       <SummaryTile
         label="Mode"
         value={!statusKnown && !replicas ? "—" : singleNode ? "Single node" : "Cluster"}
@@ -232,16 +261,40 @@ function Summary({
               : `${plural(ownerless, "shard", "shards")} without an owner`
         }
       />
+      <SummaryTile
+        label="Heartbeat"
+        value={singleNode ? "—" : (heartbeatSeq?.toLocaleString() ?? "—")}
+        note={heartbeatNote}
+        warn={trend?.advancing === false}
+      />
+      <SummaryTile
+        label="Drains released at once"
+        value={singleNode ? "—" : (drainsReleasedAtOnce?.toLocaleString() ?? "—")}
+        note={singleNode ? "Nothing to drain on a single node" : "Since this replica started"}
+      />
     </dl>
   );
 }
 
-function SummaryTile({ label, value, note }: { label: string; value: string; note?: string }) {
+function SummaryTile({
+  label,
+  value,
+  note,
+  warn,
+}: {
+  label: string;
+  value: string;
+  note?: string;
+  /** The note is a warning (a heartbeat that stopped). */
+  warn?: boolean;
+}) {
   return (
     <div className="rounded-md border border-border bg-surface p-4">
       <dt className="text-xs font-medium uppercase tracking-wide text-text-muted">{label}</dt>
       <dd className="mt-1 text-2xl text-text tabular-nums">{value}</dd>
-      {note && <dd className="mt-0.5 text-xs text-text-muted">{note}</dd>}
+      {note && (
+        <dd className={cn("mt-0.5 text-xs", warn ? "text-warning" : "text-text-muted")}>{note}</dd>
+      )}
     </div>
   );
 }
@@ -303,16 +356,13 @@ function ReplicasTable({
       key: "heartbeat",
       header: "Last heartbeat",
       priority: 2,
-      render: (r) =>
-        r.last_heartbeat_at ? (
-          <RelativeTime at={r.last_heartbeat_at} />
-        ) : r.role === "single-node" ? (
-          <span className="text-text-faint" title="A single node sends no heartbeats">
-            —
-          </span>
-        ) : (
-          <span className="whitespace-nowrap text-text-muted">Not running</span>
-        ),
+      render: (r) => <HeartbeatCell replica={r} />,
+      renderCompact: (r) =>
+        r.last_heartbeat_at
+          ? `${r.last_heartbeat_at}${r.heartbeat_seq != null ? ` (seq ${r.heartbeat_seq})` : ""}`
+          : r.role === "single-node"
+            ? "—"
+            : "Not running",
     },
     {
       key: "version",
@@ -370,6 +420,51 @@ function ReplicasTable({
         />
       }
     />
+  );
+}
+
+/**
+ * When the replica last heartbeat, the sequence number of that heartbeat, and whether the number
+ * is still moving: the page's readings of it (`heartbeatTrend`) say how many heartbeats arrived
+ * since the last poll, or since when none has; the sparkline is heartbeats per poll.
+ */
+function HeartbeatCell({ replica }: { replica: Replica }) {
+  if (!replica.last_heartbeat_at) {
+    return replica.role === "single-node" ? (
+      <span className="text-text-faint" title="A single node sends no heartbeats">
+        —
+      </span>
+    ) : (
+      <span className="whitespace-nowrap text-text-muted">Not running</span>
+    );
+  }
+  const trend = replica.id ? heartbeatTrend(replica.id) : null;
+  const last = trend?.increments.at(-1);
+  return (
+    <div className="flex flex-col gap-0.5">
+      <RelativeTime at={replica.last_heartbeat_at} />
+      {replica.heartbeat_seq != null && (
+        <span className="whitespace-nowrap text-xs text-text-muted">
+          seq {replica.heartbeat_seq.toLocaleString()}
+        </span>
+      )}
+      {trend?.advancing === true && (
+        <span className="whitespace-nowrap text-xs text-text-muted">
+          +{last?.toLocaleString()} since the last poll
+        </span>
+      )}
+      {trend?.advancing === false && trend.lastAdvanceAt != null && (
+        <span className="text-xs text-warning">
+          No new heartbeat since <RelativeTime at={new Date(trend.lastAdvanceAt).toISOString()} />
+        </span>
+      )}
+      {trend && trend.increments.length > 1 && (
+        <Sparkline
+          points={trend.increments.map((value) => ({ value }))}
+          className="h-4 w-24 text-accent"
+        />
+      )}
+    </div>
   );
 }
 

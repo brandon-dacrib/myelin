@@ -121,6 +121,72 @@ describe("Overview", () => {
     expect(screen.queryByText(/can.t check/)).not.toBeInTheDocument();
   });
 
+  it("counts failing destinations from the server's field, not from a page", async () => {
+    server.use(
+      http.get("/api/v1/statistics/overview", () =>
+        HttpResponse.json({
+          users_count: 3,
+          rooms_count: 2,
+          pending_reports_count: 0,
+          federation_destinations_failing_count: 7,
+        }),
+      ),
+      http.get("/api/v1/federation/destinations", ({ request }) => {
+        const q = new URL(request.url).searchParams;
+        // The failing list, longest failing first, holds one of the seven; the rest are only
+        // counted. The other query only asks how many destinations there are at all.
+        if (q.get("failing") === "true") {
+          expect(q.get("sort")).toBe("failing_since");
+          return HttpResponse.json({
+            items: [
+              {
+                server_name: "down.example",
+                failing_since: new Date(Date.now() - 2 * 3_600_000).toISOString(),
+                last_successful_at: null,
+                retry_last_at: null,
+                retry_interval_ms: 60_000,
+                pending_pdu_count: 1,
+                pending_edu_count: 0,
+              },
+            ],
+            next_cursor: "more",
+            prev_cursor: null,
+            total: 7,
+          });
+        }
+        expect(q.get("limit")).toBe("1");
+        return HttpResponse.json({ items: [], next_cursor: null, prev_cursor: null, total: 65 });
+      }),
+    );
+    renderDashboard();
+
+    const failing = await tile("Failing");
+    expect(failing.getByText("7")).toBeInTheDocument();
+    expect((await tile("Not failing")).getByText("58")).toBeInTheDocument();
+    expect(screen.getByText(/65 servers this one has sent to/)).toBeInTheDocument();
+    expect(
+      screen.getByText("Federation with down.example has been failing for over an hour."),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("6 more servers are failing; only the 1 longest-failing are checked here."),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "See every failing server" })).toBeInTheDocument();
+  });
+
+  it("uses the failing list's own total when the Overview's counts cannot be read", async () => {
+    server.use(
+      http.get("/api/v1/statistics/overview", notImplemented),
+      http.get("/api/v1/federation/destinations", ({ request }) => {
+        const q = new URL(request.url).searchParams;
+        const total = q.get("failing") === "true" ? 2 : 65;
+        return HttpResponse.json({ items: [], next_cursor: null, prev_cursor: null, total });
+      }),
+    );
+    renderDashboard();
+    expect((await tile("Failing")).getByText("2")).toBeInTheDocument();
+    expect((await tile("Not failing")).getByText("63")).toBeInTheDocument();
+  });
+
   it("shows each of the server's health checks in words, and an ok server gives no row", async () => {
     server.use(
       http.get("/api/v1/server/health", () =>

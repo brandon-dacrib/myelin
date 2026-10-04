@@ -9,17 +9,6 @@ type Destination = components["schemas"]["Destination"];
 const now = Date.now();
 const iso = (msAgo: number) => new Date(now - msAgo).toISOString();
 
-export const statisticsOverview: StatisticsOverview = {
-  users_count: 642,
-  rooms_count: 118,
-  media_count: 4_302,
-  media_bytes: 38 * 1024 * 1024 * 1024,
-  daily_active_users: 214,
-  monthly_active_users: 580,
-  federation_destinations_failing_count: 2,
-  pending_reports_count: 2,
-};
-
 export const serverInfo: ServerInfo = {
   name: "example.org",
   version: "0.1.0-dev",
@@ -37,6 +26,11 @@ export const serverInfo: ServerInfo = {
  */
 export const clusterStatus: ClusterStatus = clusterSummary();
 
+/**
+ * The destinations with a story (failing, backing off, catching up), then sixty quiet ones, so
+ * the Federation page pages (fifty at a time) and the Overview's counts cannot come from one
+ * page. Two of the quiet ones are backing off, so a sort by last attempt has something to show.
+ */
 export const federationDestinations: Destination[] = [
   {
     server_name: "matrix.org",
@@ -87,4 +81,33 @@ export const federationDestinations: Destination[] = [
     pending_edu_count: 0,
     catch_up_since: iso(26 * 3_600_000),
   },
+  ...Array.from({ length: 60 }, (_, i): Destination => {
+    const n = i + 1;
+    const backingOff = n === 5 || n === 17;
+    return {
+      server_name: `srv-${String(n).padStart(2, "0")}.example.net`,
+      last_successful_at: iso(n * 90_000),
+      failing_since: null,
+      retry_last_at: backingOff ? iso(n * 10_000) : null,
+      retry_interval_ms: backingOff ? 120_000 : null,
+      pending_pdu_count: backingOff ? n : 0,
+      pending_edu_count: 0,
+    };
+  }),
 ];
+
+/** How many destinations are failing: the Overview's `federation_destinations_failing_count`. */
+export function failingDestinationCount(): number {
+  return federationDestinations.filter((d) => d.failing_since).length;
+}
+
+export const statisticsOverview: StatisticsOverview = {
+  users_count: 642,
+  rooms_count: 118,
+  media_count: 4_302,
+  media_bytes: 38 * 1024 * 1024 * 1024,
+  daily_active_users: 214,
+  monthly_active_users: 580,
+  federation_destinations_failing_count: failingDestinationCount(),
+  pending_reports_count: 2,
+};

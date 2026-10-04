@@ -1,6 +1,6 @@
 import { Link, useNavigate, useSearch } from "@tanstack/react-router";
 import { DoorOpen, Image } from "lucide-react";
-import { useStatisticsOverview } from "@/api/dashboard";
+import { useClusterStatus, useStatisticsOverview } from "@/api/dashboard";
 import {
   RANGES,
   useRoomStatistics,
@@ -68,6 +68,8 @@ export function StatisticsPage() {
       </div>
 
       <NowTiles />
+
+      <ClusterNow />
 
       <section aria-labelledby="activity-heading" className="space-y-3">
         <h2 id="activity-heading" className="text-md font-medium text-text">
@@ -163,6 +165,83 @@ function NowTiles() {
             ),
           )}
         </div>
+      )}
+    </section>
+  );
+}
+
+/**
+ * The cluster's numbers now, from `GET /cluster`: how many replicas, the answering replica's
+ * heartbeat sequence and how many drains released at once. The server keeps no history of these
+ * (they are not among `statistics.timeseries`' metrics), so there is no chart; the Cluster page
+ * follows each replica's heartbeat while it is open.
+ */
+function ClusterNow() {
+  const cluster = useClusterStatus();
+  const singleNode = cluster.data?.mode === "single-node";
+  const tiles: { label: string; value: string; description: string }[] = [
+    {
+      label: "Replicas",
+      value: formatCount(cluster.data?.replica_count),
+      description: "Registered and heartbeating, whatever their status.",
+    },
+    {
+      label: "Heartbeat sequence",
+      value: formatCount(cluster.data?.heartbeat_seq),
+      description:
+        "The answering replica's last heartbeat to reach the store; one more per heartbeat.",
+    },
+    {
+      label: "Drains released at once",
+      value: formatCount(cluster.data?.drain_released_at_once_count),
+      description:
+        "Drains that let go of every shard at once rather than one lease at a time, since the answering replica started.",
+    },
+  ];
+  return (
+    <section aria-labelledby="cluster-now-heading" className="space-y-3">
+      <h2 id="cluster-now-heading" className="text-md font-medium text-text">
+        Cluster
+      </h2>
+      {cluster.isError ? (
+        <QueryProblemState
+          error={cluster.error}
+          resource="the cluster's numbers"
+          scope="admin:read"
+          compact
+          onRetry={() => cluster.refetch()}
+        />
+      ) : cluster.isLoading ? (
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+          {tiles.map((tile) => (
+            <Skeleton key={tile.label} className="h-24 rounded-md" />
+          ))}
+        </div>
+      ) : singleNode ? (
+        <p className="text-sm text-text-muted">
+          This server runs as a single node: one replica with no heartbeats to count and nothing to
+          drain. These numbers appear when it runs as a cluster.
+        </p>
+      ) : (
+        <>
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+            {tiles.map((tile) => (
+              <div key={tile.label} className="rounded-md border border-border bg-surface p-4">
+                <p className="text-xs text-text-muted">{tile.label}</p>
+                <p className="mt-1 text-2xl text-text tabular-nums">{tile.value}</p>
+                <p className="mt-1 text-xs text-text-faint">{tile.description}</p>
+              </div>
+            ))}
+          </div>
+          <p className="text-xs text-text-faint">
+            As the replica answering this page sees them now. The server keeps no history of these
+            yet, so there is no chart; the{" "}
+            <Link to="/cluster" search={{}} className="text-accent hover:underline">
+              Cluster page
+            </Link>{" "}
+            follows every replica&apos;s heartbeat while it is open.
+          </p>
+        </>
       )}
     </section>
   );
