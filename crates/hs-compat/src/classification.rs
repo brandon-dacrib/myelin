@@ -267,9 +267,9 @@ pub const OPTIONS: &[KeyInfo] = &[
     },
     KeyInfo {
         key: "email",
-        classification: Classification::Unsupported,
-        native: "",
-        note: "R-PHASE1 (hs-auth/hs-push). Outbound email delivery (SMTP settings, templates, notification emails) is not implemented in Phase 0; password reset and email notifications are deferred to Phase 1.",
+        classification: Classification::MappedDiff,
+        native: "email",
+        note: "SMTP settings and notification emails map onto the native `email` section (`smtp.host`/`port`/`username`/`password`/`tls_name`, `from` from `notif_from` with `%(app)s` filled in, `app_name`, `client_base_url` (or `riot_base_url`), `notifications.enabled` from `enable_notifs`, `notifications.delay_before_mail` from `notif_delay_before_mail`, `notifications.subjects` from `subjects`), keeping Synapse's defaults (`localhost`, port 25 or 465 with `force_tls`, notifications off, a ten-minute first delay). The three TLS booleans become one `smtp.security`: `force_tls` is `tls`, `enable_tls: false` is `none`, otherwise `starttls`, which always requires the upgrade (Synapse without `require_transport_security` falls back to plain text). Unsupported sub-keys, each reported as `email.<key>`: the email-validation settings (`validation_token_lifetime`, `invite_client_location`, the password-reset, registration and add-threepid templates; R-PHASE1, hs-auth), the template overrides (`template_dir`, `notif_template_*`, `expiry_template_*`; R-PHASE1, hs-push), and `notif_for_new_users` unless `false` (no email pusher is made for a new user automatically).",
     },
     KeyInfo {
         key: "max_event_delay_duration",

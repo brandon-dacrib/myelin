@@ -173,6 +173,54 @@ pub fn decode_with_limits(
     bytes: &[u8],
     limits: DecodeLimits,
 ) -> Result<(DynamicImage, ImageFormat), MediaError> {
+    let (decoder, format, image_limits, (width, height)) = checked_decoder(bytes, limits)?;
+    let refuse = |reason| MediaError::ImageRefused {
+        width,
+        height,
+        reason,
+    };
+    let mut decoder = decoder;
+    decoder.set_limits(image_limits).map_err(|e| match e {
+        image::ImageError::Limits(_) => refuse(RefusalReason::Memory),
+        other => MediaError::DecodeFailed(other.to_string()),
+    })?;
+    let image = DynamicImage::from_decoder(decoder).map_err(|e| match e {
+        image::ImageError::Limits(_) => refuse(RefusalReason::Memory),
+        other => MediaError::DecodeFailed(other.to_string()),
+    })?;
+    Ok((image, format))
+}
+
+/// The width, height and format `bytes` declare, read from the image header alone, once they
+/// pass every check [`decode_with_limits`] makes before it decodes (empty, either side, the pixel
+/// count, the decoded size): what a URL preview reports as `og:image:width`/`og:image:height`
+/// without decoding a single pixel, and refuses the same images a thumbnail refuses.
+///
+/// # Errors
+/// As [`decode_with_limits`]: [`MediaError::ImageRefused`] for an empty or over-limit image,
+/// [`MediaError::DecodeFailed`] for an unrecognized format or an unreadable header.
+pub fn probe_with_limits(
+    bytes: &[u8],
+    limits: DecodeLimits,
+) -> Result<(u32, u32, ImageFormat), MediaError> {
+    let (_, format, _, (width, height)) = checked_decoder(bytes, limits)?;
+    Ok((width, height, format))
+}
+
+/// The decoder for `bytes` with its header checked against `limits`, and the full limits to set
+/// on it before decoding. See [`decode_with_limits`] for the order of the checks.
+fn checked_decoder(
+    bytes: &[u8],
+    limits: DecodeLimits,
+) -> Result<
+    (
+        impl ImageDecoder + '_,
+        ImageFormat,
+        image::Limits,
+        (u32, u32),
+    ),
+    MediaError,
+> {
     let mut reader = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|e| MediaError::DecodeFailed(e.to_string()))?;
@@ -182,7 +230,7 @@ pub fn decode_with_limits(
     let mut header_limits = image::Limits::default();
     header_limits.max_alloc = Some(limits.max_alloc_bytes);
     reader.limits(header_limits);
-    let mut decoder = reader
+    let decoder = reader
         .into_decoder()
         .map_err(|e| MediaError::DecodeFailed(e.to_string()))?;
     let (width, height) = decoder.dimensions();
@@ -206,15 +254,7 @@ pub fn decode_with_limits(
     image_limits
         .reserve(decoder.total_bytes())
         .map_err(|_| refuse(RefusalReason::Memory))?;
-    decoder.set_limits(image_limits).map_err(|e| match e {
-        image::ImageError::Limits(_) => refuse(RefusalReason::Memory),
-        other => MediaError::DecodeFailed(other.to_string()),
-    })?;
-    let image = DynamicImage::from_decoder(decoder).map_err(|e| match e {
-        image::ImageError::Limits(_) => refuse(RefusalReason::Memory),
-        other => MediaError::DecodeFailed(other.to_string()),
-    })?;
-    Ok((image, format))
+    Ok((decoder, format, image_limits, (width, height)))
 }
 
 #[cfg(test)]
@@ -350,6 +390,27 @@ mod tests {
                 reason: RefusalReason::Dimensions,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "test-fixtures")]
+    fn probe_reads_the_header_and_refuses_what_a_decode_refuses() {
+        assert_eq!(
+            probe_with_limits(&tiny_png(), DecodeLimits::default()).unwrap(),
+            (4, 4, ImageFormat::Png)
+        );
+        let bomb = crate::test_fixtures::decompression_bomb_png(60_000, 60_000);
+        assert!(matches!(
+            probe_with_limits(&bomb, DecodeLimits::default()),
+            Err(MediaError::ImageRefused {
+                reason: RefusalReason::Dimensions,
+                ..
+            })
+        ));
+        assert!(matches!(
+            probe_with_limits(b"not an image", DecodeLimits::default()),
+            Err(MediaError::DecodeFailed(_))
         ));
     }
 

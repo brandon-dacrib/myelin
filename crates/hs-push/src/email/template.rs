@@ -17,8 +17,9 @@ use super::Subjects;
 /// How much of a message's body a snippet shows.
 const SNIPPET_CHARS: usize = 200;
 
-/// One notification as the mail shows it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One notification as the mail shows it. Serialized when the email it is in is held
+/// (`super::held`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NotificationLine {
     /// The sender's display name, else their user id.
     pub sender: String,
@@ -29,7 +30,8 @@ pub struct NotificationLine {
 }
 
 /// What a notification line says.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "text")]
 pub enum LineText {
     /// A readable message: its body, cut to [`SNIPPET_CHARS`].
     Snippet(String),

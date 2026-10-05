@@ -91,6 +91,7 @@ use hs_kv::KvBackend;
 use crate::error::MediaError;
 use crate::id::MediaId;
 use crate::metadata::{MediaRecord, MetadataStore};
+use crate::sniff::DecodeLimits;
 
 /// How long a URL preview response stays cached before it is fetched again. The spec leaves this
 /// entirely to the server; this is a conservative middle ground between "never refetch a link
@@ -364,6 +365,13 @@ async fn read_capped(mut response: reqwest::Response, cap: usize) -> Result<Byte
     Ok(Bytes::from(buf))
 }
 
+/// Synapse's `OG_TAG_NAME_MAXLEN`: a longer tag name is dropped from a preview.
+pub const OG_TAG_NAME_MAXLEN: usize = 50;
+/// Synapse's `OG_TAG_VALUE_MAXLEN`: a longer value is dropped from a preview.
+pub const OG_TAG_VALUE_MAXLEN: usize = 1000;
+/// How many `og:` tags one page may contribute, as Synapse caps it (`_get_meta_tags`).
+const MAX_OG_TAGS: usize = 50;
+
 /// OpenGraph metadata pulled out of a fetched HTML page.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OgTags {
@@ -373,6 +381,11 @@ pub struct OgTags {
     pub description: Option<String>,
     /// `og:image`, resolved to an absolute URL against the page's own URL if it was relative.
     pub image: Option<String>,
+    /// Every other `og:` property the page sets (`og:type`, `og:url`, `og:site_name`, ...),
+    /// entity-decoded, first occurrence of each, at most 50: a preview carries them as they are,
+    /// as Synapse's does. The `og:image:` ones describe the remote image and are replaced when
+    /// the image is cached here.
+    pub other: std::collections::BTreeMap<String, String>,
 }
 
 /// Extracts [`OgTags`] from `html`. A deliberately lenient, attribute-order-independent
@@ -382,6 +395,7 @@ pub fn extract_og_tags(html: &str, base_url: &str) -> OgTags {
     let mut title = None;
     let mut description = None;
     let mut image = None;
+    let mut other = std::collections::BTreeMap::new();
 
     for tag in META_TAG_RE.find_iter(html) {
         let attrs = parse_attrs(tag.as_str());
@@ -401,6 +415,15 @@ pub fn extract_og_tags(html: &str, base_url: &str) -> OgTags {
                 let raw = decode_entities(content);
                 image = Some(resolve_url(base_url, &raw).unwrap_or(raw));
             }
+            // A second `og:title`/`og:description`/`og:image`: the first one stands.
+            Some("og:title" | "og:description" | "og:image") => {}
+            Some(key)
+                if key.starts_with("og:")
+                    && other.len() < MAX_OG_TAGS
+                    && !other.contains_key(key) =>
+            {
+                other.insert(key.to_owned(), decode_entities(content));
+            }
             _ => {}
         }
     }
@@ -418,6 +441,7 @@ pub fn extract_og_tags(html: &str, base_url: &str) -> OgTags {
         title,
         description,
         image,
+        other,
     }
 }
 
@@ -539,57 +563,80 @@ pub async fn preview_url<B: KvBackend>(
     let page = guarded_fetch(url, &policy, &limits)
         .await
         .map_err(to_media_error)?;
-    let html = String::from_utf8_lossy(&page.bytes);
-    let tags = extract_og_tags(&html, &page.final_url);
+    let decode_limits = DecodeLimits::from_config(config);
 
     let mut response = Map::new();
-    if let Some(t) = tags.title {
-        response.insert("og:title".to_string(), Value::String(t));
-    }
-    if let Some(d) = tags.description {
-        response.insert("og:description".to_string(), Value::String(d));
-    }
-    if let Some(image_url) = tags.image {
-        // A failed or non-image `og:image` fetch is not fatal to the whole preview -- Synapse's
-        // own behavior, and the spec does not require `og:image` to be present at all -- so a
-        // guard/sniff failure here just omits the image fields rather than failing the request.
-        if let Ok(image) = guarded_fetch(&image_url, &policy, &limits).await
-            && let Some(format) = crate::sniff::sniff_format(&image.bytes)
-        {
-            let media_id = MediaId::generate();
-            let key = crate::store::content_key(server_name, &media_id);
-            if object_store
-                .put(&key, image.bytes.clone().into())
-                .await
-                .is_ok()
-            {
-                let record = MediaRecord {
-                    server_name: server_name.to_string(),
-                    media_id: media_id.as_str().to_string(),
-                    content_type: crate::sniff::mime_for_format(format).to_string(),
-                    upload_name: None,
-                    byte_length: Some(image.bytes.len() as u64),
-                    created_ms: now_ms,
-                    uploader: None,
-                    completed: true,
-                    expires_at_ms: None,
-                    quarantined_by: None,
-                    safe_from_quarantine: false,
-                    last_accessed_ms: None,
-                };
-                if metadata.put_media(&record).is_ok() {
-                    response.insert(
-                        "og:image".to_string(),
-                        Value::String(format!("mxc://{server_name}/{}", media_id.as_str())),
-                    );
-                    response.insert(
-                        "matrix:image:size".to_string(),
-                        Value::Number(image.bytes.len().into()),
-                    );
+    if is_image(&page) {
+        // The URL is an image itself: Synapse's answer is the image, cached, described by its
+        // own name.
+        let name = reqwest::Url::parse(&page.final_url).ok().and_then(|u| {
+            u.path_segments()
+                .and_then(|mut segments| segments.next_back().map(str::to_owned))
+                .filter(|s| !s.is_empty())
+        });
+        if let Some(name) = name {
+            response.insert("og:description".to_string(), Value::String(name));
+        }
+        cache_image(
+            metadata,
+            object_store,
+            server_name,
+            now_ms,
+            &page,
+            decode_limits,
+            &mut response,
+        )
+        .await;
+    } else {
+        let html = String::from_utf8_lossy(&page.bytes);
+        let tags = extract_og_tags(&html, &page.final_url);
+        for (key, value) in tags.other {
+            response.insert(key, Value::String(value));
+        }
+        if let Some(t) = tags.title {
+            response.insert("og:title".to_string(), Value::String(t));
+        }
+        if let Some(d) = tags.description {
+            response.insert("og:description".to_string(), Value::String(d));
+        }
+        if let Some(image_url) = tags.image {
+            // What the page says about its image describes the remote copy; what is served is
+            // the copy cached here, described below, or nothing.
+            response.retain(|key, _| !key.starts_with("og:image:"));
+            // A failed or non-image `og:image` fetch is not fatal to the whole preview --
+            // Synapse's own behavior, and the spec does not require `og:image` to be present at
+            // all -- so a guard/sniff failure here just omits the image fields rather than
+            // failing the request.
+            match guarded_fetch(&image_url, &policy, &limits).await {
+                Ok(image) => {
+                    cache_image(
+                        metadata,
+                        object_store,
+                        server_name,
+                        now_ms,
+                        &image,
+                        decode_limits,
+                        &mut response,
+                    )
+                    .await;
                 }
+                Err(error) => tracing::debug!(
+                    %error,
+                    "a URL preview's og:image could not be fetched; previewing without it"
+                ),
             }
         }
     }
+    // Synapse drops overlong tags rather than let a page fill the cache and every client's
+    // timeline with them.
+    response.retain(|key, value| {
+        let long = key.len() > OG_TAG_NAME_MAXLEN
+            || match value {
+                Value::String(s) => s.len() > OG_TAG_VALUE_MAXLEN,
+                _ => false,
+            };
+        !long
+    });
 
     let value = Value::Object(response);
     let serialized = serde_json::to_string(&value)
@@ -601,6 +648,93 @@ pub async fn preview_url<B: KvBackend>(
         config.url_preview_cache_lifetime.as_millis(),
     )?;
     Ok(value)
+}
+
+/// Whether a fetched resource is an image: its bytes say so, whatever its `Content-Type`
+/// claims (a page is never "an image" by header alone, and an image served as
+/// `application/octet-stream` is still one).
+fn is_image(resource: &FetchedResource) -> bool {
+    crate::sniff::sniff_format(&resource.bytes).is_some()
+}
+
+/// Stores `image` as local media and describes it in `response` (`og:image` as an `mxc://` URI,
+/// `og:image:type`, `og:image:width`/`og:image:height` from its header, `matrix:image:size`).
+/// An image that is not one of the formats this server reads, or that declares more than the
+/// `media` decode limits allow (`max_image_pixels`, `max_image_dimension`,
+/// `max_image_decode_memory`, the same check a thumbnail makes, read from the header without
+/// decoding a pixel), is refused: not stored, not described, and the preview goes without it.
+async fn cache_image<B: KvBackend>(
+    metadata: &MetadataStore<B>,
+    object_store: &Arc<dyn ObjectStore>,
+    server_name: &str,
+    now_ms: u64,
+    image: &FetchedResource,
+    limits: DecodeLimits,
+    response: &mut Map<String, Value>,
+) {
+    let (width, height, format) = match crate::sniff::probe_with_limits(&image.bytes, limits) {
+        Ok(probed) => probed,
+        Err(MediaError::ImageRefused {
+            width,
+            height,
+            reason,
+        }) => {
+            tracing::info!(
+                url = %image.final_url,
+                image_width = width,
+                image_height = height,
+                reason = reason.as_str(),
+                max_pixels = limits.max_pixels,
+                max_dimension = limits.max_width,
+                "a URL preview's image is over the image limits; previewing without it"
+            );
+            return;
+        }
+        Err(error) => {
+            tracing::debug!(
+                url = %image.final_url,
+                %error,
+                "a URL preview's image is not one this server reads; previewing without it"
+            );
+            return;
+        }
+    };
+    let media_id = MediaId::generate();
+    let key = crate::store::content_key(server_name, &media_id);
+    if let Err(error) = object_store.put(&key, image.bytes.clone().into()).await {
+        tracing::warn!(%error, "could not store a URL preview's image");
+        return;
+    }
+    let content_type = crate::sniff::mime_for_format(format).to_string();
+    let record = MediaRecord {
+        server_name: server_name.to_string(),
+        media_id: media_id.as_str().to_string(),
+        content_type: content_type.clone(),
+        upload_name: None,
+        byte_length: Some(image.bytes.len() as u64),
+        created_ms: now_ms,
+        uploader: None,
+        completed: true,
+        expires_at_ms: None,
+        quarantined_by: None,
+        safe_from_quarantine: false,
+        last_accessed_ms: None,
+    };
+    if let Err(error) = metadata.put_media(&record) {
+        tracing::warn!(%error, "could not record a URL preview's image");
+        return;
+    }
+    response.insert(
+        "og:image".to_string(),
+        Value::String(format!("mxc://{server_name}/{}", media_id.as_str())),
+    );
+    response.insert("og:image:type".to_string(), Value::String(content_type));
+    response.insert("og:image:width".to_string(), Value::Number(width.into()));
+    response.insert("og:image:height".to_string(), Value::Number(height.into()));
+    response.insert(
+        "matrix:image:size".to_string(),
+        Value::Number(image.bytes.len().into()),
+    );
 }
 
 fn to_media_error(e: FetchError) -> MediaError {
@@ -818,5 +952,171 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(cached, value);
+    }
+
+    /// Serves `router` on a loopback port; the server stops when the handle is aborted or
+    /// dropped with the runtime.
+    async fn serve(router: axum::Router) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        addr
+    }
+
+    /// Previews `url` against a fresh store, with previews on and loopback allowed.
+    async fn preview_of(
+        url: &str,
+        config: MediaConfig,
+    ) -> (Value, MetadataStore<hs_kv::memory::MemoryBackend>) {
+        let metadata = MetadataStore::open(hs_kv::memory::MemoryBackend::new()).unwrap();
+        let object_store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let config = MediaConfig {
+            url_preview_enabled: true,
+            url_preview_ip_range_blocklist: vec![],
+            ..config
+        };
+        let value = preview_url(&metadata, &object_store, "example.org", &config, 1_000, url)
+            .await
+            .unwrap();
+        (value, metadata)
+    }
+
+    fn png_route(bytes: Bytes) -> axum::routing::MethodRouter {
+        use axum::response::IntoResponse;
+        axum::routing::get(move || {
+            let bytes = bytes.clone();
+            async move { ([(reqwest::header::CONTENT_TYPE, "image/png")], bytes).into_response() }
+        })
+    }
+
+    /// Sytest's `51media/20urlpreview.pl` and Complement's `TestUrlPreview`, exactly: every
+    /// `og:` tag the page sets comes back (`og:type` and `og:url` too, not only the three this
+    /// module once kept), and the image's own size from its header. The PNG is Sytest's
+    /// `tests/51media/test.png` (Apache-2.0, matrix-org/sytest), 279 x 129, 2239 bytes.
+    #[tokio::test]
+    async fn sytest_preview_page_comes_back_with_every_tag_and_the_image_size() {
+        const SYTEST_PNG: &[u8] = include_bytes!("../tests/fixtures/images/sytest_preview.png");
+        let router = axum::Router::new()
+            .route(
+                "/test.html",
+                axum::routing::get(|| async {
+                    axum::response::Html(
+                        r#"<html prefix="og: http://ogp.me/ns#">
+<head>
+<title>The Rock (1996)</title>
+<meta property="og:title" content="The Rock" />
+<meta property="og:type" content="video.movie" />
+<meta property="og:url" content="http://www.imdb.com/title/tt0117500/" />
+<meta property="og:image" content="test.png" />
+</head>
+<body></body>
+</html>"#,
+                    )
+                }),
+            )
+            .route("/test.png", png_route(Bytes::from_static(SYTEST_PNG)));
+        let addr = serve(router).await;
+        let (value, _) =
+            preview_of(&format!("http://{addr}/test.html"), MediaConfig::default()).await;
+        assert_eq!(value["og:title"], "The Rock");
+        assert_eq!(value["og:type"], "video.movie");
+        assert_eq!(value["og:url"], "http://www.imdb.com/title/tt0117500/");
+        assert_eq!(value["matrix:image:size"], 2239);
+        assert_eq!(value["og:image:width"], 279);
+        assert_eq!(value["og:image:height"], 129);
+        assert_eq!(value["og:image:type"], "image/png");
+        assert!(
+            value["og:image"]
+                .as_str()
+                .unwrap()
+                .starts_with("mxc://example.org/")
+        );
+    }
+
+    /// An `og:image` that declares more pixels than the `media` decode limits allow is refused
+    /// from its header, the same check a thumbnail makes: not stored, not described, and the
+    /// page's own `og:image:*` claims about it are dropped with it.
+    #[tokio::test]
+    async fn a_preview_of_a_huge_image_is_refused() {
+        let bomb = Bytes::from(crate::test_fixtures::decompression_bomb_png(60_000, 60_000));
+        let router = axum::Router::new()
+            .route(
+                "/page",
+                axum::routing::get(|| async {
+                    axum::response::Html(format!(
+                        r#"<meta property="og:title" content="Huge">
+                           <meta property="og:image" content="/huge.png">
+                           <meta property="og:image:width" content="60000">
+                           <meta property="og:site_name" content="{}">"#,
+                        "x".repeat(OG_TAG_VALUE_MAXLEN + 1)
+                    ))
+                }),
+            )
+            .route("/huge.png", png_route(bomb.clone()));
+        let addr = serve(router).await;
+        let (value, metadata) =
+            preview_of(&format!("http://{addr}/page"), MediaConfig::default()).await;
+        assert_eq!(value["og:title"], "Huge");
+        for key in [
+            "og:image",
+            "og:image:width",
+            "og:image:height",
+            "matrix:image:size",
+            // Overlong, dropped as Synapse drops it.
+            "og:site_name",
+        ] {
+            assert!(value.get(key).is_none(), "{key} must be absent: {value}");
+        }
+        assert!(
+            metadata.list_media().unwrap().is_empty(),
+            "nothing is stored for a refused image"
+        );
+
+        // A URL that is the huge image itself is refused the same way.
+        let (direct, _) =
+            preview_of(&format!("http://{addr}/huge.png"), MediaConfig::default()).await;
+        assert!(direct.get("og:image").is_none(), "{direct}");
+
+        // And the limit is the setting in force: a 4 x 4 image over a 10-pixel limit.
+        let small = Bytes::from(crate::test_fixtures::valid_png());
+        let addr = serve(axum::Router::new().route("/small.png", png_route(small))).await;
+        let (limited, _) = preview_of(
+            &format!("http://{addr}/small.png"),
+            MediaConfig {
+                max_image_pixels: 10,
+                ..MediaConfig::default()
+            },
+        )
+        .await;
+        assert!(limited.get("og:image").is_none(), "{limited}");
+    }
+
+    /// A URL that is an image is previewed as the image: cached, with its size and its name.
+    #[tokio::test]
+    async fn a_url_that_is_an_image_is_previewed_as_one() {
+        let png = Bytes::from(crate::test_fixtures::valid_png());
+        let addr = serve(axum::Router::new().route("/cat.png", png_route(png.clone()))).await;
+        let (value, _) =
+            preview_of(&format!("http://{addr}/cat.png"), MediaConfig::default()).await;
+        assert!(
+            value["og:image"]
+                .as_str()
+                .unwrap()
+                .starts_with("mxc://example.org/")
+        );
+        assert_eq!(value["og:image:width"], 4);
+        assert_eq!(value["og:image:height"], 4);
+        assert_eq!(value["og:description"], "cat.png");
+        assert_eq!(value["matrix:image:size"], png.len());
+    }
+
+    #[test]
+    fn a_repeated_tag_keeps_its_first_value() {
+        let html = r#"<meta property="og:type" content="first">
+               <meta property="og:type" content="second">"#;
+        let tags = extract_og_tags(html, "http://example.org/");
+        assert_eq!(tags.other.get("og:type").map(String::as_str), Some("first"));
     }
 }

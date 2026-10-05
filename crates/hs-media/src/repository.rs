@@ -95,6 +95,16 @@ pub struct ContentBytes {
     pub range: Option<ByteRange>,
 }
 
+/// Which client media API a request came in on, where that changes how another server's media
+/// is fetched ([`MediaRepository::resolve_record_via`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientRoute {
+    /// `/_matrix/client/v1/media`: the origin's federation media API first.
+    Authenticated,
+    /// The legacy, unauthenticated `/_matrix/media/v3`: the origin's legacy path first.
+    Legacy,
+}
+
 /// The media repository.
 #[derive(Clone)]
 pub struct MediaRepository<B: KvBackend> {
@@ -738,6 +748,28 @@ impl<B: KvBackend> MediaRepository<B> {
         media_id: &str,
         allow_remote: bool,
     ) -> Result<MediaRecord, MediaError> {
+        self.resolve_record_via(
+            server_name,
+            media_id,
+            allow_remote,
+            ClientRoute::Authenticated,
+        )
+        .await
+    }
+
+    /// [`MediaRepository::resolve_record`] for a request that came in on `route`: a remote item
+    /// asked for on the legacy, unauthenticated media API is fetched from its origin's legacy
+    /// path first ([`crate::remote::fetch_remote_legacy_first`]), as Synapse does.
+    ///
+    /// # Errors
+    /// As [`MediaRepository::resolve_record`].
+    pub async fn resolve_record_via(
+        &self,
+        server_name: &str,
+        media_id: &str,
+        allow_remote: bool,
+        route: ClientRoute,
+    ) -> Result<MediaRecord, MediaError> {
         if server_name == self.server_name {
             return self.get_record(server_name, media_id);
         }
@@ -768,7 +800,9 @@ impl<B: KvBackend> MediaRepository<B> {
             return self.get_record(server_name, media_id);
         }
         remote.metrics.miss();
-        let outcome = self.fetch_and_store(remote, origin.as_str(), &id).await;
+        let outcome = self
+            .fetch_and_store(remote, origin.as_str(), &id, route)
+            .await;
         remote.release(origin.as_str(), id.as_str());
         outcome
     }
@@ -778,6 +812,7 @@ impl<B: KvBackend> MediaRepository<B> {
         remote: &RemoteMedia,
         origin: &str,
         media_id: &MediaId,
+        route: ClientRoute,
     ) -> Result<MediaRecord, MediaError> {
         let config = self.config.get();
         let limits = RemoteFetchLimits {
@@ -786,7 +821,20 @@ impl<B: KvBackend> MediaRepository<B> {
             redirect_timeout: Duration::from_secs(60),
         };
         let started = Instant::now();
-        let fetched = fetch_remote(remote.transport.as_ref(), origin, media_id, &limits).await;
+        let fetched = match route {
+            ClientRoute::Authenticated => {
+                fetch_remote(remote.transport.as_ref(), origin, media_id, &limits).await
+            }
+            ClientRoute::Legacy => {
+                crate::remote::fetch_remote_legacy_first(
+                    remote.transport.as_ref(),
+                    origin,
+                    media_id,
+                    &limits,
+                )
+                .await
+            }
+        };
         remote.metrics.fetched(&fetched);
         let fetched = match fetched {
             Ok(fetched) => fetched,
@@ -888,11 +936,14 @@ impl<B: KvBackend> MediaRepository<B> {
         }
     }
 
-    /// Fetches (generating and caching if necessary) one thumbnail variant.
+    /// Fetches (generating and caching if necessary) one thumbnail variant: the one
+    /// [`ThumbnailPolicy::select`] picks for `(width, height, method)`, which is the request
+    /// itself for a configured size and otherwise the nearest configured one (what Synapse
+    /// serves), so the same request always gets the same bytes, locally and over federation.
     ///
     /// # Errors
-    /// [`MediaError::UnsupportedThumbnail`] if `(width, height, method)` is not allowed by this
-    /// repository's [`ThumbnailPolicy`]; otherwise as [`MediaRepository::get_record`] plus
+    /// [`MediaError::UnsupportedThumbnail`] if no thumbnail size is configured, or the request
+    /// asks for a zero width or height; otherwise as [`MediaRepository::get_record`] plus
     /// [`MediaError::DecodeFailed`]/[`MediaError::Store`].
     pub async fn get_thumbnail(
         &self,
@@ -901,9 +952,22 @@ impl<B: KvBackend> MediaRepository<B> {
         height: u32,
         method: ThumbnailMethod,
     ) -> Result<(ThumbnailRecord, Bytes), MediaError> {
-        if !self.thumbnail_policy.get().allows(width, height, method) {
+        let Some(selected) = self.thumbnail_policy.get().select(width, height, method) else {
             return Err(MediaError::UnsupportedThumbnail);
+        };
+        if (selected.width, selected.height, selected.method) != (width, height, method) {
+            tracing::debug!(
+                media_id = %record.media_id,
+                width,
+                height,
+                method = thumbnail::method_str(method),
+                served_width = selected.width,
+                served_height = selected.height,
+                served_method = thumbnail::method_str(selected.method),
+                "serving the nearest configured thumbnail size"
+            );
         }
+        let (width, height, method) = (selected.width, selected.height, selected.method);
         let media_id = parse_media_id(&record.media_id)?;
         self.note_access(record);
 
@@ -1527,7 +1591,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unconfigured_thumbnail_size_is_rejected_by_default() {
+    async fn unconfigured_thumbnail_size_is_served_from_the_nearest_configured_one() {
         let repo = repo();
         let png = crate::test_fixtures::valid_png();
         let id = repo
@@ -1535,8 +1599,21 @@ mod tests {
             .await
             .unwrap();
         let record = repo.get_record("example.org", id.as_str()).unwrap();
-        let err = repo
+        let (nearest, nearest_bytes) = repo
             .get_thumbnail(&record, 123, 123, ThumbnailMethod::Crop)
+            .await
+            .unwrap();
+        assert_eq!(
+            (nearest.width, nearest.height, nearest.method),
+            (96, 96, ThumbnailMethod::Crop)
+        );
+        let (_, exact_bytes) = repo
+            .get_thumbnail(&record, 96, 96, ThumbnailMethod::Crop)
+            .await
+            .unwrap();
+        assert_eq!(nearest_bytes, exact_bytes, "one variant, generated once");
+        let err = repo
+            .get_thumbnail(&record, 0, 123, ThumbnailMethod::Crop)
             .await
             .unwrap_err();
         assert!(matches!(err, MediaError::UnsupportedThumbnail));

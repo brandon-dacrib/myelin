@@ -56,6 +56,36 @@ fn state_content_str<B: KvBackend>(
         .and_then(|e| content_str(e, field))
 }
 
+/// `field` of the stripped state event `event_type`/`state_key` that `event` (a membership
+/// event received from another server) carries in `unsigned.invite_room_state` or
+/// `knock_room_state`, when it is a non-empty string.
+fn stripped_state_str(
+    event: &Event,
+    event_type: &str,
+    state_key: &str,
+    field: &str,
+) -> Option<String> {
+    let unsigned = event
+        .json()
+        .get("unsigned")
+        .and_then(CanonicalJsonValue::as_object)?;
+    hs_room::routes::render::STRIPPED_STATE_KEYS
+        .iter()
+        .filter_map(|key| unsigned.get(*key).and_then(CanonicalJsonValue::as_array))
+        .flatten()
+        .filter_map(CanonicalJsonValue::as_object)
+        .find(|entry| {
+            entry.get("type").and_then(CanonicalJsonValue::as_str) == Some(event_type)
+                && entry.get("state_key").and_then(CanonicalJsonValue::as_str) == Some(state_key)
+        })
+        .and_then(|entry| entry.get("content"))
+        .and_then(CanonicalJsonValue::as_object)
+        .and_then(|content| content.get(field))
+        .and_then(CanonicalJsonValue::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
 /// Everything the pipeline needs about `event_id`, read off the actor.
 fn describe<B: KvBackend>(
     actor: &RoomActor<B>,
@@ -110,13 +140,21 @@ fn describe<B: KvBackend>(
         None => None,
     };
 
+    // An invite from another server comes with the room's stripped state, the only state
+    // this server has of the room; the rendered event leaves it out, so it is read here.
+    let stripped = |event_type: &str, state_key: &str, field: &str| {
+        stripped_state_str(event, event_type, state_key, field)
+    };
     let room_name = state_content_str(actor, "m.room.name", "", "name")
         .filter(|n| !n.is_empty())
+        .or_else(|| stripped("m.room.name", "", "name"))
         .or_else(|| state_content_str(actor, "m.room.canonical_alias", "", "alias"))
-        .filter(|n| !n.is_empty());
+        .filter(|n| !n.is_empty())
+        .or_else(|| stripped("m.room.canonical_alias", "", "alias"));
     let sender_display_name =
         state_content_str(actor, "m.room.member", sender.as_str(), "displayname")
-            .filter(|n| !n.is_empty());
+            .filter(|n| !n.is_empty())
+            .or_else(|| stripped("m.room.member", sender.as_str(), "displayname"));
 
     Ok(Some(DescribedEvent {
         event: json,

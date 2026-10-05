@@ -112,6 +112,12 @@ auth:
 federation:
 $FEDERATION_CA_CONFIG
   ip_range_blocklist: []
+# URL previews on, and allowed to reach the test's own web server on the Docker host (a private
+# address the default blocklist refuses): what Synapse's Complement image sets
+# (refs/synapse/docker/complement/conf/workers-shared-extra.yaml.j2), for TestUrlPreview.
+media:
+  url_preview_enabled: true
+  url_preview_ip_range_blocklist: []
 # Complement's tests send faster than any person does; Synapse's Complement image lifts its
 # rc_message limit the same way. Decision 0015: the server-wide send limit is enforced.
 rate_limits:

@@ -22,6 +22,10 @@
 //!    A `404 M_NOT_FOUND` from the federation API is an answer, not a sign of an old server,
 //!    and is not retried on the legacy path.
 //!
+//! A client that asked on the legacy, unauthenticated `/_matrix/media/v3` paths gets the
+//! reverse order ([`fetch_remote_legacy_first`]): the origin's legacy path first, then the
+//! federation API, as Synapse routes that client API.
+//!
 //! Every path is capped at `media.max_upload_size`: nothing arrives from another server that
 //! this server would not have accepted from its own user.
 //!
@@ -204,6 +208,37 @@ pub async fn fetch_remote(
             "the origin answered {status}: {}",
             snippet(&response.body)
         ))),
+    }
+}
+
+/// Fetches `media_id` from `origin` for a client that asked on the legacy, unauthenticated
+/// `/_matrix/media/v3/download` (or `thumbnail`) path: the origin's own legacy path is asked
+/// first, as Synapse does for that route (`use_federation_endpoint=False` in its media
+/// repository, read for behaviour), and the federation media API only if that gives nothing.
+/// A server that serves its media only one way is reached either way; the order follows the
+/// client's own choice of API.
+///
+/// # Errors
+/// See [`RemoteFetchError`]: [`RemoteFetchError::TooLarge`] from the legacy path is final; any
+/// other legacy failure is followed by the federation API, whose error is the one returned.
+pub async fn fetch_remote_legacy_first(
+    transport: &dyn RemoteMediaTransport,
+    origin: &str,
+    media_id: &MediaId,
+    limits: &RemoteFetchLimits,
+) -> Result<FetchedMedia, RemoteFetchError> {
+    match fetch_legacy(transport, origin, media_id, limits).await {
+        Ok(fetched) => Ok(fetched),
+        Err(RemoteFetchError::TooLarge(limit)) => Err(RemoteFetchError::TooLarge(limit)),
+        Err(legacy_error) => {
+            tracing::debug!(
+                origin,
+                media_id = %media_id,
+                error = %legacy_error,
+                "the origin's legacy media path gave nothing; trying the federation media API"
+            );
+            fetch_remote(transport, origin, media_id, limits).await
+        }
     }
 }
 
@@ -682,6 +717,63 @@ pub(crate) mod tests {
         assert_eq!(asked.len(), 2);
         assert!(asked[1].0.contains("allow_remote=false"));
         assert!(!asked[1].1, "the legacy path is not signed");
+    }
+
+    /// Complement's `TestMediaWithoutFileName` over federation: its origin answers the legacy
+    /// path and refuses the federation API with a bare 400, so a legacy client download must
+    /// ask the legacy path first, as Synapse does.
+    #[tokio::test]
+    async fn a_legacy_client_download_asks_the_legacy_path_first() {
+        let transport = ScriptedTransport::default();
+        transport.answer(
+            "/_matrix/media/v3/download/a.example/abc",
+            RemoteResponse {
+                status: 200,
+                content_type: Some("text/plain".into()),
+                body: Bytes::from_static(b"Hello from the other side"),
+                ..RemoteResponse::default()
+            },
+        );
+        transport.answer(
+            "/_matrix/federation/v1/media/download/abc",
+            RemoteResponse {
+                status: 400,
+                body: Bytes::from_static(b"complement: Invalid Origin"),
+                ..RemoteResponse::default()
+            },
+        );
+        let got = fetch_remote_legacy_first(&transport, "a.example", &id("abc"), &limits())
+            .await
+            .unwrap();
+        assert_eq!(got.via, FetchVia::Legacy);
+        assert_eq!(got.content_type, "text/plain");
+        assert_eq!(transport.asked().len(), 1);
+        assert!(!transport.asked()[0].1, "the legacy path is not signed");
+    }
+
+    #[tokio::test]
+    async fn a_legacy_client_download_falls_back_to_the_federation_api() {
+        let transport = ScriptedTransport::default();
+        transport.answer(
+            "/_matrix/media/v3/download/a.example/abc",
+            RemoteResponse {
+                status: 404,
+                body: Bytes::from_static(br#"{"errcode":"M_NOT_FOUND"}"#),
+                ..RemoteResponse::default()
+            },
+        );
+        transport.answer(
+            "/_matrix/federation/v1/media/download/abc",
+            multipart_answer("image/png", "cat.png", b"png bytes"),
+        );
+        let got = fetch_remote_legacy_first(&transport, "a.example", &id("abc"), &limits())
+            .await
+            .unwrap();
+        assert_eq!(got.via, FetchVia::Federation);
+        assert_eq!(
+            transport.asked().last().unwrap(),
+            &("/_matrix/federation/v1/media/download/abc".to_owned(), true)
+        );
     }
 
     #[tokio::test]

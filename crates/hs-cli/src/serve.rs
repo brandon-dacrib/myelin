@@ -578,7 +578,7 @@ fn build_session_mounts<B: KvBackend>(
     backend: &B,
     auth: &AuthState,
     rooms: &Arc<hs_room::registry::RoomRegistry<B>>,
-    email: Option<&hs_config::EmailConfig>,
+    email: Option<(&hs_config::EmailConfig, String)>,
 ) -> Result<
     (
         UserState<B, Arc<hs_room::registry::RoomRegistry<B>>>,
@@ -633,7 +633,9 @@ fn build_session_mounts<B: KvBackend>(
     // throttles notification emails. Its worker is returned with the pipeline's, to start on
     // the runtime; a configuration change replaces the mailer's server and the settings in
     // place (`email` is a hot section).
-    let email_wiring = email.map(|section| {
+    // The emails waiting to be sent are stored under `holder` (`hs_push::email::held`), this
+    // process's task-runner name: fixed for a single node, the replica's identity in a cluster.
+    let email_wiring = email.map(|(section, holder)| {
         let mailer = Arc::new(hs_push::email::smtp::SmtpMailer::new(
             crate::push_delivery::smtp_settings(section),
         ));
@@ -646,6 +648,11 @@ fn build_session_mounts<B: KvBackend>(
                         .map_err(opening)?,
                 ),
                 mailer: mailer.clone(),
+                held: Arc::new(
+                    hs_push::email::held::TablesHeldMailStore::open(backend.clone())
+                        .map_err(opening)?,
+                ),
+                holder,
             },
             crate::push_delivery::email_settings(section),
         );
@@ -1556,8 +1563,12 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             live.on_change("migration", |_| Ok(()));
         }
     }
-    let (user_state, e2e_state, push_state, push_worker, email_wiring) =
-        build_session_mounts(&backend, &auth_state, &rooms, Some(&config.email))?;
+    let (user_state, e2e_state, push_state, push_worker, email_wiring) = build_session_mounts(
+        &backend,
+        &auth_state,
+        &rooms,
+        Some((&config.email, crate::cluster::task_runner_name(&config))),
+    )?;
     crate::push_delivery::describe_email(&config.email);
     if let Some(email) = email_wiring {
         tokio::spawn(email.worker.run());

@@ -1,5 +1,54 @@
 # 10 Push: status
 
+## Session 4 (2026-10-04, branch `agent/push-media-gaps`): invites pushed with their room's name, held emails survive a restart
+
+### Done
+
+- **An invite over federation is pushed with the room's name** (Sytest "Invites over
+  federation are correctly pushed with name", `61push/01message-pushed.pl`). The invitee's
+  server holds nothing of the room but the invite and the stripped state it carried
+  (`unsigned.invite_room_state`), and `hs_room::routes::render::client_event_json` leaves that
+  out of the rendered event, so `hs_push::pipeline`'s own fallback never saw it.
+  `crates/hs-cli/src/push_delivery.rs`'s `describe` now reads the room name (then the
+  canonical alias) and the inviter's display name from the stored event's stripped state
+  when the room's state has none.
+- **Notification emails waiting to be sent survive a restart** (`crates/hs-push/src/email/held.rs`):
+  `HeldMailStore` (in-memory and `TablesHeldMailStore`, keyspace `hs_push.email_held`, key
+  `(holder, user, address)`, value the held email as JSON with a wall-clock `due_ms`). The
+  worker writes every change through (hold, room read, sent, retried, given up) and, when it
+  starts, restores its holder's rows: due when they were, at once if that passed while the
+  server was down. The holder is `hs_cli::cluster::task_runner_name` (`single-node`, or the
+  replica's identity in a cluster), so a replica restores only what it held and two replicas
+  never overwrite each other's rows. A row goes as soon as the SMTP server accepts its email,
+  so delivery is at least once (a stop in that instant sends it again). `NotificationLine`/
+  `LineText` are serde now.
+  `EmailDeps` has two new fields, `held` and `holder` (wired in `hs-cli`'s `serve.rs`).
+- **Observability**: `info` "restored the notification emails left waiting at the last stop"
+  with the count; `warn` when a held email cannot be stored or the rows cannot be read.
+
+### Verified
+
+- `cargo test -p hs-push` (75; new: both stores round-trip every line kind and keep holders
+  apart; `a_waiting_email_survives_a_restart`; `an_email_that_fell_due_while_stopped_goes_at_once_and_reads_still_cancel_it`).
+- Real binary: `cargo test -p hs-cli --test push_federated_invite`: two in-process servers,
+  a push gateway in the test, charlie on B invites alice on A to "Test Name"; the push A sends
+  carries `room_name: "Test Name"` and `sender_display_name: "Charlie"` (fails on `main` with
+  `room_name` absent, the Sytest failure exactly).
+- Real binary: `cargo test -p hs-cli --test email_held_restart`: `hs serve` with an SMTP sink
+  in the test and `delay_before_mail: 20s` holds Alice's email, is `SIGKILL`ed, and the next
+  `hs` on the same data directory logs `restored ... emails=1` and sends it once; a third
+  start restores and sends nothing. `--test email_pushers` (Mailpit) still passes.
+- Sytest, image of this branch (`tests/sytest/run.sh tests/61push/01message-pushed.pl`):
+  all nine pass, "Invites over federation are correctly pushed with name" among them.
+
+### Left
+
+- Password-reset and 3PID-validation email (track 07, `hs-auth`) still send nothing: there is
+  no `requestToken` endpoint to use `hs_push::email::Mailer` from. Not done here (the brief
+  gave it to `auth-gaps`).
+- A mail held by a replica that never returns under the same identity is not sent.
+- No unsubscribe link (unchanged from session 3).
+
 ## Session 3 (2026-10-04): email pushers deliver
 
 **Starting point.** Email pushers were "stored, never delivered to" (session 2's Next;
@@ -80,13 +129,11 @@ with no trait behind it.
 
 ### Left
 
-- Synapse's `email` block is not translated by `hs-compat` (track 13); the row in
-  `docs/compat/synapse-config-table.md` stays Unsupported until a translator function
-  exists. The mapping is in each `hs-config` field's doc comment.
+- ~~Synapse's `email` block is not translated by `hs-compat`~~ (done in session 4, see
+  `docs/status/13-config-compat-and-migration.md`).
 - Password-reset and 3PID-validation email (track 07) can use `hs_push::email::Mailer`;
   nothing does yet. Users bind an address only through an administrator.
-- Held emails are lost on restart (the next notification starts another); Synapse persists
-  them. Synapse's ten-minute wait before the first email is `delay_before_mail: 10m`.
+- ~~Held emails are lost on restart~~ (stored since session 4). Synapse's ten-minute wait before the first email is `delay_before_mail: 10m`.
 - No unsubscribe link (Synapse's carries a macaroon-signed one); the footer says to remove
   the email notification in the client.
 - The Configuration page's mock (`npm run dev:mock`) has no `email` section, as it has no

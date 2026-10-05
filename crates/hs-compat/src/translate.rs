@@ -108,6 +108,10 @@ pub fn translate(
             translate_experimental(v, &mut config, &mut report);
             continue;
         }
+        if key == "email" {
+            translate_email(v, &mut config, &mut report);
+            continue;
+        }
         apply_and_report(key, v, &mut config, &mut report);
     }
 
@@ -161,6 +165,193 @@ fn translate_experimental(value: &Value, config: &mut Config, report: &mut Trans
             translate_experimental_key(flag, v, config);
         }
         report.record(dotted, info.classification.into(), info.native, info.note);
+    }
+}
+
+// ---------------------------------------------------------------------
+// The `email` block
+// ---------------------------------------------------------------------
+
+/// Synapse's `email` sub-keys this translator writes onto the native `email` section.
+const EMAIL_MAPPED: &[&str] = &[
+    "smtp_host",
+    "smtp_port",
+    "smtp_user",
+    "smtp_pass",
+    "force_tls",
+    "require_transport_security",
+    "enable_tls",
+    "tlsname",
+    "notif_from",
+    "app_name",
+    "enable_notifs",
+    "client_base_url",
+    "riot_base_url",
+    "notif_delay_before_mail",
+    "subjects",
+];
+
+/// Synapse's email-validation settings (password reset, registration and adding an address by
+/// email), which go with a feature this server does not have.
+const EMAIL_VALIDATION: &[&str] = &[
+    "validation_token_lifetime",
+    "invite_client_location",
+    "password_reset_template_html",
+    "password_reset_template_text",
+    "registration_template_html",
+    "registration_template_text",
+    "already_in_use_template_html",
+    "already_in_use_template_text",
+    "add_threepid_template_html",
+    "add_threepid_template_text",
+    "password_reset_template_failure_html",
+    "registration_template_failure_html",
+    "add_threepid_template_failure_html",
+    "password_reset_template_success_html",
+    "registration_template_success_html",
+    "add_threepid_template_success_html",
+];
+
+/// Synapse's template overrides for the notification and account-expiry emails.
+const EMAIL_TEMPLATES: &[&str] = &[
+    "template_dir",
+    "notif_template_html",
+    "notif_template_text",
+    "expiry_template_html",
+    "expiry_template_text",
+];
+
+/// Synapse's `email.subjects` keys, which the native `email.notifications.subjects` keeps.
+const EMAIL_SUBJECTS: &[&str] = &[
+    "message_from_person_in_room",
+    "message_from_person",
+    "messages_from_person",
+    "messages_in_room",
+    "messages_in_room_and_others",
+    "messages_from_person_and_others",
+    "invite_from_person",
+    "invite_from_person_to_room",
+];
+
+/// Translates Synapse's `email` block onto the native `email` section, recording `email`
+/// itself and, for each sub-key that cannot be honoured, an `email.<key>` entry of its own
+/// (unsupported, so it blocks without `--allow-unsupported-synapse-config`, as a top-level key
+/// would).
+///
+/// Synapse's own defaults are carried over where the native ones differ, so a translated
+/// server mails as the Synapse one did: `smtp_host` defaults to `localhost` and `smtp_port` to
+/// 25 (465 with `force_tls`); notification emails are off unless `enable_notifs` is set; the
+/// first email waits `notif_delay_before_mail`, ten minutes by default. `%(app)s` in
+/// `notif_from` is replaced by `app_name`. The TLS booleans become one `smtp.security`:
+/// `force_tls` is `tls`, `enable_tls: false` is `none`, and anything else `starttls`, which
+/// here always requires the upgrade where Synapse, without `require_transport_security`, would
+/// send in the clear to a server that does not offer it.
+fn translate_email(value: &Value, config: &mut Config, report: &mut TranslationReport) {
+    use hs_config::email::SmtpSecurity;
+
+    let note = classification::lookup_option("email").map_or("", |info| info.note);
+    report.record("email", OutcomeClassification::MappedDiff, "email", note);
+    let Some(mapping) = value.as_mapping() else {
+        return;
+    };
+    for (k, v) in mapping {
+        let Some(sub) = k.as_str() else { continue };
+        let dotted = format!("email.{sub}");
+        if EMAIL_MAPPED.contains(&sub) {
+            continue;
+        }
+        if sub == "notif_for_new_users" {
+            // Synapse adds an email pusher for each new user who registers with an address;
+            // nothing here does, which is what `false` asks for.
+            if v.as_bool() != Some(false) {
+                report.record(
+                    dotted,
+                    OutcomeClassification::Unsupported,
+                    "",
+                    "R-PHASE1 (hs-auth/hs-push). New users get no email pusher automatically:                      a user sets one (or an administrator binds their address and they do).",
+                );
+            }
+            continue;
+        }
+        let (classification, note) = if EMAIL_VALIDATION.contains(&sub) {
+            (
+                OutcomeClassification::Unsupported,
+                "R-PHASE1 (hs-auth). Email validation (password reset, registration and adding                  an address by email) is not implemented; the `email` section sends                  notification emails only.",
+            )
+        } else if EMAIL_TEMPLATES.contains(&sub) {
+            (
+                OutcomeClassification::Unsupported,
+                "R-PHASE1 (hs-push). The notification email is built by the server, not from                  templates; only its subjects (`email.notifications.subjects`) are configurable.",
+            )
+        } else {
+            (
+                OutcomeClassification::Unrecognized,
+                "not an `email` option of the pinned Synapse release",
+            )
+        };
+        report.record(dotted, classification, "", note);
+    }
+
+    let email = &mut config.email;
+    let force_tls = get_bool(value, "force_tls").unwrap_or(false);
+    let enable_tls = get_bool(value, "enable_tls").unwrap_or(true);
+    email.smtp.host = Some(get_str(value, "smtp_host").unwrap_or_else(|| "localhost".to_owned()));
+    email.smtp.port = get_u64(value, "smtp_port")
+        .and_then(|p| u16::try_from(p).ok())
+        .unwrap_or(if force_tls { 465 } else { 25 });
+    email.smtp.security = if force_tls {
+        SmtpSecurity::Tls
+    } else if enable_tls {
+        SmtpSecurity::Starttls
+    } else {
+        SmtpSecurity::None
+    };
+    // Synapse authenticates only with both; a password alone is ignored there, and refused here.
+    if let (Some(user), Some(pass)) = (get_str(value, "smtp_user"), get_str(value, "smtp_pass")) {
+        email.smtp.username = Some(user);
+        email.smtp.password = SecretString::from(pass);
+    }
+    email.smtp.tls_name = get_str(value, "tlsname");
+    if let Some(app_name) = get_str(value, "app_name") {
+        email.app_name = app_name;
+    }
+    email.from = get_str(value, "notif_from").map(|from| from.replace("%(app)s", &email.app_name));
+    email.client_base_url =
+        get_str(value, "client_base_url").or_else(|| get_str(value, "riot_base_url"));
+    let notifications = &mut email.notifications;
+    notifications.enabled = get_bool(value, "enable_notifs").unwrap_or(false);
+    notifications.delay_before_mail =
+        get_duration(value, "notif_delay_before_mail").unwrap_or(Duration::from_mins(10));
+    if let Some(subjects) = get(value, "subjects") {
+        let target = &mut notifications.subjects;
+        for key in EMAIL_SUBJECTS {
+            let Some(subject) = get_str(subjects, key) else {
+                continue;
+            };
+            let field = match *key {
+                "message_from_person_in_room" => &mut target.message_from_person_in_room,
+                "message_from_person" => &mut target.message_from_person,
+                "messages_from_person" => &mut target.messages_from_person,
+                "messages_in_room" => &mut target.messages_in_room,
+                "messages_in_room_and_others" => &mut target.messages_in_room_and_others,
+                "messages_from_person_and_others" => &mut target.messages_from_person_and_others,
+                "invite_from_person" => &mut target.invite_from_person,
+                _ => &mut target.invite_from_person_to_room,
+            };
+            *field = subject;
+        }
+        if let Some(map) = subjects.as_mapping() {
+            for k in map.keys().filter_map(Value::as_str) {
+                if !EMAIL_SUBJECTS.contains(&k) {
+                    report.record(
+                        format!("email.subjects.{k}"),
+                        OutcomeClassification::Unrecognized,
+                        "",
+                        "not an `email.subjects` key of the pinned Synapse release",
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -817,6 +1008,131 @@ mod tests {
         .unwrap();
         assert_eq!(config.server.server_name, "example.org");
         assert!(report.has_blocking());
+    }
+
+    /// A Synapse `email` block as its documentation shows one, with notifications on.
+    const SYNAPSE_EMAIL: &str = "server_name: example.org
+email:
+  smtp_host: mail.example.org
+  smtp_port: 587
+  smtp_user: exampleusername
+  smtp_pass: examplepassword
+  require_transport_security: true
+  tlsname: smtp.example.com
+  notif_from: \"Your Friendly %(app)s homeserver <noreply@example.com>\"
+  app_name: my_branded_matrix_server
+  enable_notifs: true
+  notif_for_new_users: false
+  client_base_url: \"http://localhost/riot\"
+  notif_delay_before_mail: 5m
+  subjects:
+    message_from_person_in_room: \"[%(app)s] You have a message from %(person)s...\"
+";
+
+    #[test]
+    fn the_email_block_becomes_the_email_section() {
+        use hs_config::email::SmtpSecurity;
+        let (config, report) = translate(SYNAPSE_EMAIL, TranslateOptions::default()).unwrap();
+        let email = &config.email;
+        assert_eq!(email.smtp.host.as_deref(), Some("mail.example.org"));
+        assert_eq!(email.smtp.port, 587);
+        assert_eq!(email.smtp.security, SmtpSecurity::Starttls);
+        assert_eq!(email.smtp.username.as_deref(), Some("exampleusername"));
+        assert_eq!(email.smtp.password.as_str(), Some("examplepassword"));
+        assert_eq!(email.smtp.tls_name.as_deref(), Some("smtp.example.com"));
+        assert_eq!(
+            email.from.as_deref(),
+            Some("Your Friendly my_branded_matrix_server homeserver <noreply@example.com>"),
+            "%(app)s is filled in"
+        );
+        assert_eq!(email.app_name, "my_branded_matrix_server");
+        assert_eq!(
+            email.client_base_url.as_deref(),
+            Some("http://localhost/riot")
+        );
+        assert!(email.notifications.enabled);
+        assert_eq!(
+            email.notifications.delay_before_mail,
+            Duration::from_mins(5)
+        );
+        assert_eq!(
+            email.notifications.subjects.message_from_person_in_room,
+            "[%(app)s] You have a message from %(person)s..."
+        );
+        assert_eq!(
+            email.notifications.subjects.messages_in_room,
+            hs_config::email::SubjectsConfig::default().messages_in_room,
+            "an unset subject keeps the default"
+        );
+        assert!(!report.has_blocking(), "{}", report.to_markdown());
+        assert!(
+            report
+                .outcomes
+                .iter()
+                .any(|o| o.key == "email" && o.classification == OutcomeClassification::MappedDiff)
+        );
+    }
+
+    #[test]
+    fn synapses_email_defaults_carry_over() {
+        use hs_config::email::SmtpSecurity;
+        let yaml = "server_name: example.org\nemail:\n  notif_from: noreply@example.org\n";
+        let (config, _) = translate(yaml, TranslateOptions::default()).unwrap();
+        let email = &config.email;
+        assert_eq!(email.smtp.host.as_deref(), Some("localhost"));
+        assert_eq!(email.smtp.port, 25);
+        assert_eq!(email.smtp.security, SmtpSecurity::Starttls);
+        assert!(
+            !email.notifications.enabled,
+            "Synapse's enable_notifs is off by default"
+        );
+        assert_eq!(
+            email.notifications.delay_before_mail,
+            Duration::from_mins(10)
+        );
+        let yaml =
+            "server_name: example.org\nemail:\n  notif_from: n@example.org\n  force_tls: true\n";
+        let (config, _) = translate(yaml, TranslateOptions::default()).unwrap();
+        assert_eq!(config.email.smtp.port, 465);
+        assert_eq!(config.email.smtp.security, SmtpSecurity::Tls);
+        let yaml =
+            "server_name: example.org\nemail:\n  notif_from: n@example.org\n  enable_tls: false\n";
+        let (config, _) = translate(yaml, TranslateOptions::default()).unwrap();
+        assert_eq!(config.email.smtp.security, SmtpSecurity::None);
+        // No email block: no SMTP server, as before.
+        let (config, _) =
+            translate("server_name: example.org\n", TranslateOptions::default()).unwrap();
+        assert!(config.email.smtp.host.is_none());
+    }
+
+    #[test]
+    fn email_settings_with_no_counterpart_block_by_default() {
+        for (sub, value) in [
+            ("validation_token_lifetime", "15m"),
+            ("template_dir", "/templates"),
+            ("notif_for_new_users", "true"),
+            ("not_an_email_option", "1"),
+        ] {
+            let yaml = format!(
+                "server_name: example.org\nemail:\n  notif_from: n@example.org\n  {sub}: {value}\n"
+            );
+            let err = translate(&yaml, TranslateOptions::default()).unwrap_err();
+            let TranslateError::Unsupported { keys } = err else {
+                panic!("{sub}: expected a blocking report");
+            };
+            assert!(
+                keys.iter().any(|k| k.contains(&format!("email.{sub}"))),
+                "{sub}: {keys:?}"
+            );
+            let (config, _) = translate(
+                &yaml,
+                TranslateOptions {
+                    allow_unsupported: true,
+                },
+            )
+            .unwrap();
+            assert_eq!(config.email.from.as_deref(), Some("n@example.org"));
+        }
     }
 
     #[test]

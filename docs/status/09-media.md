@@ -8,6 +8,70 @@ closed the two Complement gaps — MSC2246 async upload's real `/_matrix/media/v
 `GET .../preview_url` — plus the content-scanning durability gap session 3 flagged. Sessions 1-4's
 records are unchanged below.
 
+## 2026-10-04 (branch `agent/push-media-gaps`): nearest-size thumbnails, full URL previews, legacy remote downloads
+
+Graded by Complement (`TestLocalPngThumbnail`, `TestRemotePngThumbnail`,
+`TestFederationThumbnail`, `TestMediaWithoutFileName`, `TestUrlPreview`) and Sytest ("Test URL
+preview", `51media/20urlpreview.pl`).
+
+### Done
+
+- **A thumbnail size nobody configured is served from the nearest configured one**
+  (`crates/hs-media/src/thumbnail.rs` `ThumbnailPolicy::select`, used by
+  `MediaRepository::get_thumbnail`): what Synapse serves without `dynamic_thumbnails`
+  (`_select_thumbnail`, read for behaviour). Among the requested method's sizes, those at
+  least as big on one side come first, then the least `|(w - tw) * (h - th)|`; a crop also
+  prefers the closest aspect ratio; bigger than every size gets the biggest; a method with no
+  size falls back to the other. `32x32 scale` (Complement's request) is the `320x240` scale.
+  Only a zero width/height, or no configured sizes at all, still answers
+  `400 Unsupported thumbnail size or method`. The same variant (and so the same bytes) is
+  served on the authenticated, legacy and federation paths. `debug` log when a nearer size is
+  substituted.
+- **URL previews carry every `og:` tag** (`crates/hs-media/src/preview.rs`): `OgTags::other`
+  keeps `og:type`, `og:url`, `og:site_name`, ... (first of each, at most 50); tags over
+  Synapse's `OG_TAG_NAME_MAXLEN` (50) / `OG_TAG_VALUE_MAXLEN` (1000) are dropped. The cached
+  image is described with `og:image:type`, `og:image:width` and `og:image:height`, read from
+  its header by the new `sniff::probe_with_limits` (the same checks `decode_with_limits`
+  makes, sharing its code, without decoding a pixel). The page's own `og:image:*` claims are
+  replaced. A URL that is an image is previewed as the image (cached, with its name as
+  `og:description`), as Synapse does.
+- **A preview's image over the decode limits is refused** (`max_image_pixels`,
+  `max_image_dimension`, `max_image_decode_memory`, the settings in force): not stored, not
+  described, `info` log with the declared size and reason. Before this, preview images were
+  never decoded (only sniffed), so the gap was dimensions, not a bomb.
+- **A remote item asked for on the legacy `/_matrix/media/v3` paths is fetched from its
+  origin's legacy path first** (`remote::fetch_remote_legacy_first`,
+  `MediaRepository::resolve_record_via` with `ClientRoute::Legacy`), then the federation media
+  API; the authenticated client API keeps the federation API first. Synapse routes them the
+  same way (`use_federation_endpoint`). Complement's federation stand-in answers the
+  federation media API with a bare `400 Invalid Origin` (its `{origin}` route variable is
+  missing on that path), which is why `TestMediaWithoutFileName` failed.
+- `tests/complement/startup.sh` turns URL previews on with an empty blocklist, as Synapse's
+  Complement image does (TestUrlPreview's web server is on the Docker host, a private address).
+
+### Verified
+
+- `cargo test -p hs-media` (285 unit; new: nearest-size selection, repository and route
+  tests, `probe_reads_the_header_and_refuses_what_a_decode_refuses`, the Sytest page with
+  Sytest's own `test.png` (copied, Apache-2.0, to `tests/fixtures/images/sytest_preview.png`),
+  `a_preview_of_a_huge_image_is_refused`, `a_url_that_is_an_image_is_previewed_as_one`, the
+  legacy-first fetch both ways).
+- Real binary: `cargo test -p hs-cli --test media_complement_gaps` (32x32 scale on both paths,
+  same bytes, 320 wide; a legacy download from a stand-in origin that 400s the federation API;
+  the Sytest preview with 279x129 and 2239 bytes, the cached image downloadable; the bomb
+  page previewed without an image). `federation_media` and `media_thumbnail_limits` still pass.
+- Complement, image of this branch, under the shared lock: `TestLocalPngThumbnail`,
+  `TestRemotePngThumbnail`, `TestFederationThumbnail`, `TestMediaWithoutFileName`,
+  `TestMediaWithoutFileNameCSMediaV1`, `TestUrlPreview` pass.
+- Sytest, image of this branch: `tests/51media/20urlpreview.pl` "Test URL preview" passes
+  (4 subtests).
+
+### Left
+
+- `TestRoomImageRoundtrip` still fails, and not in media: `/messages` ignores the filter's
+  `contains_url` (all eight events come back) and leaves out `end` (`hs-room`, track 04).
+- No oEmbed, no `<img>`/body-text fallbacks for a page without `og:image`/`og:description`.
+
 ## 2026-10-04 (branch `agent/thumbnail-oom`): one crafted image no longer takes a thumbnail to 16 GiB
 
 The `fuzz` workflow on `f1cc1d56` found `libFuzzer: out-of-memory (malloc(17179869180))` in

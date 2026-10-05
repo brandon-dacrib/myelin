@@ -109,7 +109,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unconfigured_dynamic_size_is_rejected() {
+    async fn an_unconfigured_size_is_served_from_the_nearest_configured_one() {
         let (app, state) = router();
         let token = seed_token(&state, "@alice:example.org").await;
         let media_id = upload_fixture(&state, "@alice:example.org", "image/png", None).await;
@@ -118,7 +118,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!(
-                        "/thumbnail/example.org/{media_id}?width=13&height=13&method=crop"
+                        "/thumbnail/example.org/{media_id}?width=32&height=32&method=scale"
                     ))
                     .header(header::AUTHORIZATION, format!("Bearer {token}"))
                     .body(Body::empty())
@@ -126,7 +126,9 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        // Complement's `TestLocalPngThumbnail` request: no 32x32 scale size is configured, so
+        // the 320x240 scale is served, as Synapse does.
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

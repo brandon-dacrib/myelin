@@ -97,6 +97,60 @@ impl ThumbnailPolicy {
             && width > 0
             && height > 0
     }
+
+    /// The size to serve for a request of `(width, height, method)`: the request itself when
+    /// [`ThumbnailPolicy::allows`] it, otherwise the nearest of `configured_sizes`, the way
+    /// Synapse serves a server without `dynamic_thumbnails` (`ThumbnailProvider._select_thumbnail`
+    /// in `synapse/media/thumbnailer.py`, read for behaviour): among the sizes of the requested
+    /// method, those at least as wide or as tall as asked come first, and of those the one whose
+    /// width and height differ least from the request (`|(w - tw) * (h - th)|`); a crop request
+    /// also prefers the closest aspect ratio, and a request bigger than every size gets the
+    /// biggest. A method no size is configured for falls back to the other method's sizes.
+    /// `None` only when nothing is configured, or for a zero width or height.
+    #[must_use]
+    pub fn select(
+        &self,
+        width: u32,
+        height: u32,
+        method: ThumbnailMethod,
+    ) -> Option<ThumbnailSize> {
+        if width == 0 || height == 0 {
+            return None;
+        }
+        if self.allows(width, height, method) {
+            return Some(ThumbnailSize {
+                width,
+                height,
+                method,
+            });
+        }
+        let of_method: Vec<&ThumbnailSize> = self
+            .configured_sizes
+            .iter()
+            .filter(|s| s.method == method)
+            .collect();
+        let candidates = if of_method.is_empty() {
+            self.configured_sizes.iter().collect()
+        } else {
+            of_method
+        };
+        let (w, h) = (i64::from(width), i64::from(height));
+        candidates
+            .into_iter()
+            .min_by_key(|s| {
+                let (tw, th) = (i64::from(s.width), i64::from(s.height));
+                // Sizes at least as big on one side as the request sort before smaller ones.
+                let too_small = !(tw >= w || th >= h);
+                let aspect = if method == ThumbnailMethod::Crop {
+                    (w * th - h * tw).abs()
+                } else {
+                    0
+                };
+                let size = ((w - tw) * (h - th)).abs();
+                (too_small, aspect, size, tw, th)
+            })
+            .copied()
+    }
 }
 
 /// Resizes `image` to `(width, height)` using `method`:
@@ -315,6 +369,53 @@ mod tests {
         assert!(policy.allows(200, 200, ThumbnailMethod::Crop));
         assert!(!policy.allows(5000, 5000, ThumbnailMethod::Crop));
         assert!(!policy.allows(0, 100, ThumbnailMethod::Crop));
+    }
+
+    #[test]
+    fn an_unconfigured_size_is_served_from_the_nearest_configured_one() {
+        let policy = ThumbnailPolicy::default();
+        let size = |w, h, method| ThumbnailSize {
+            width: w,
+            height: h,
+            method,
+        };
+        // Complement's request (`TestLocalPngThumbnail`): 32x32 scale, where only crops are
+        // that small. The smallest scale size covers it.
+        assert_eq!(
+            policy.select(32, 32, ThumbnailMethod::Scale),
+            Some(size(320, 240, ThumbnailMethod::Scale))
+        );
+        assert_eq!(
+            policy.select(32, 32, ThumbnailMethod::Crop),
+            Some(size(32, 32, ThumbnailMethod::Crop))
+        );
+        assert_eq!(
+            policy.select(50, 50, ThumbnailMethod::Crop),
+            Some(size(96, 96, ThumbnailMethod::Crop))
+        );
+        assert_eq!(
+            policy.select(700, 500, ThumbnailMethod::Scale),
+            Some(size(800, 600, ThumbnailMethod::Scale))
+        );
+        // Bigger than every size: the biggest.
+        assert_eq!(
+            policy.select(4000, 3000, ThumbnailMethod::Scale),
+            Some(size(800, 600, ThumbnailMethod::Scale))
+        );
+        assert_eq!(policy.select(0, 32, ThumbnailMethod::Scale), None);
+        let crops_only = ThumbnailPolicy {
+            configured_sizes: vec![size(64, 64, ThumbnailMethod::Crop)],
+            ..ThumbnailPolicy::default()
+        };
+        assert_eq!(
+            crops_only.select(320, 240, ThumbnailMethod::Scale),
+            Some(size(64, 64, ThumbnailMethod::Crop))
+        );
+        let none = ThumbnailPolicy {
+            configured_sizes: Vec::new(),
+            ..ThumbnailPolicy::default()
+        };
+        assert_eq!(none.select(32, 32, ThumbnailMethod::Scale), None);
     }
 
     #[test]

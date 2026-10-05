@@ -4,6 +4,34 @@ Track brief: `docs/workstreams/13-config-compat-and-migration.md`. Owner
 crates/files: `crates/hs-config`, `crates/hs-compat`,
 `tools/synapse_inventory.py`, `docs/synapse-inventory.md`.
 
+## 2026-10-04 (branch `agent/push-media-gaps`): Synapse's `email` block is translated
+
+The `email` row of `docs/compat/synapse-config-table.md` was Unsupported although the native
+`email` section (track 10, session 3) has had a home for nearly all of it. It is **Mapped
+(diff)** now (summary counts updated: 27 / 26 / 176 top-level).
+
+- `crates/hs-compat/src/translate.rs` `translate_email`: `smtp_host`/`smtp_port`/`smtp_user`/
+  `smtp_pass`/`tlsname` onto `email.smtp.*`; `notif_from` onto `email.from` with `%(app)s`
+  filled in; `app_name`; `client_base_url` (or `riot_base_url`); `enable_notifs` onto
+  `notifications.enabled`; `notif_delay_before_mail` onto `notifications.delay_before_mail`;
+  `subjects` onto `notifications.subjects`. Synapse's defaults are carried over where the
+  native ones differ (`localhost`, port 25 or 465 with `force_tls`, notifications off, a
+  ten-minute first delay), so a translated server mails as the Synapse one did. The three TLS
+  booleans become one `smtp.security` (`force_tls` is `tls`, `enable_tls: false` is `none`,
+  else `starttls`, which requires the upgrade where Synapse without
+  `require_transport_security` falls back to plain text: the "diff").
+- Sub-keys with no counterpart are reported one by one as `email.<key>`, and block without
+  `--allow-unsupported-synapse-config` as a top-level key would: the email-validation
+  settings (`validation_token_lifetime`, `invite_client_location`, the password-reset,
+  registration and add-threepid templates; R-PHASE1, hs-auth), the template overrides
+  (`template_dir`, `notif_template_*`, `expiry_template_*`), `notif_for_new_users` unless
+  `false`, and anything unknown (Unrecognized).
+- Verified: `cargo test -p hs-compat` (67 unit, new: `the_email_block_becomes_the_email_section`
+  on Synapse's documented example, `synapses_email_defaults_carry_over`,
+  `email_settings_with_no_counterpart_block_by_default`; corpus and migration suites
+  unchanged), clippy clean.
+- Left: email validation itself (hs-auth), and so its keys stay unsupported.
+
 ## 2026-10-04: other servers' media is copied, and the `/_synapse/admin` surface says what it serves (branch `agent/importer-leftovers`)
 
 `docs/next-steps.md` item 7 named the importer's leftovers as "end-to-end keys and backups, push

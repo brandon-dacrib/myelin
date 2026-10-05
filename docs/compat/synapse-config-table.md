@@ -12,7 +12,7 @@ Native field paths are dotted `hs-config` `Config` paths, e.g. `federation.domai
 
 | List | Mapped | Mapped (diff) | Unsupported | Total |
 |---|---|---|---|---|
-| Top-level options | 27 | 25 | 177 | 229 |
+| Top-level options | 27 | 26 | 176 | 229 |
 | `experimental_features` flags | 0 | 1 | 50 | 51 |
 
 (Counts are exact against the tables below; regenerate this summary whenever a row changes. See "Keeping this current".)
@@ -83,7 +83,7 @@ Native field paths are dotted `hs-config` `Config` paths, e.g. `federation.domai
 | `matrix_authentication_service` | Mapped (diff) | `auth.mas_delegation` | Field names differ (`secret`/`secret_path` → `shared_secret`/`shared_secret_file`); `enabled` is implicit in the block being present rather than a separate boolean; `force_http2` (H2C to MAS) has no native equivalent. |
 | `dummy_events_threshold` | Unsupported | — | R-PHASE1 (hs-room, forward-extremity maintenance). |
 | `delete_stale_devices_after` | Unsupported | — | R-PHASE1 (hs-e2e, device hygiene). |
-| `email` | Unsupported | — | R-PHASE1 (hs-auth/hs-push). Outbound email delivery (SMTP settings, templates, notification emails) is not implemented in Phase 0; password reset and email notifications are deferred to Phase 1. |
+| `email` | Mapped (diff) | `email` | SMTP settings and notification emails map onto the native `email` section: `smtp_host`/`smtp_port`/`smtp_user`/`smtp_pass`/`tlsname` onto `smtp.*`, `notif_from` onto `from` (with `%(app)s` filled in), `app_name`, `client_base_url` (or `riot_base_url`), `enable_notifs` onto `notifications.enabled`, `notif_delay_before_mail` onto `notifications.delay_before_mail`, `subjects` onto `notifications.subjects`. Synapse's defaults are kept where the native ones differ: `localhost`, port 25 (465 with `force_tls`), notifications off, a ten-minute first delay. The three TLS booleans become one `smtp.security`: `force_tls` is `tls`, `enable_tls: false` is `none`, otherwise `starttls`, which always requires the upgrade (Synapse without `require_transport_security` falls back to plain text). Unsupported sub-keys, each reported (and blocking) as `email.<key>`: the email-validation settings (`validation_token_lifetime`, `invite_client_location`, the password-reset, registration and add-threepid templates; R-PHASE1, hs-auth), the template overrides (`template_dir`, `notif_template_*`, `expiry_template_*`; R-PHASE1, hs-push), and `notif_for_new_users` unless `false` (no email pusher is made for a new user automatically). |
 | `max_event_delay_duration` | Unsupported | — | R-PHASE1 (hs-room). MSC4140 delayed events is on the required MSC list (`PLAN.md` 10.4) but its config surface is not yet in `hs-config`. |
 | `user_types` | Unsupported | — | R-PHASE1 (hs-auth, custom user-type registry). |
 

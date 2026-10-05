@@ -18,9 +18,10 @@
 //! `throttle_start`, then `throttle_multiplier` times as long each time, up to
 //! `throttle_max`, while the room's messages stay unread; reading the room resets it, and so
 //! does `throttle_reset_after` without a notification. These are Synapse's rules and values,
-//! except that Synapse also waits ten minutes before the first email. The throttle state is
-//! stored ([`throttle`]); what is held for an email is in memory, so a restart loses a pending
-//! email (the next notification starts another).
+//! except that Synapse also waits ten minutes before the first email. Both the throttle state
+//! ([`throttle`]) and what is held for an email ([`held`]) are stored, so an email waiting when
+//! the server stops is sent after it starts again (at once if it fell due meanwhile), and a
+//! restart does not re-mail a room that was just mailed.
 //!
 //! # Sending
 //!
@@ -28,6 +29,7 @@
 //! A failed send is retried twice, a minute apart, then given up with a warning. Metrics:
 //! `hs_push_email_sent_total{outcome=sent|failed|skipped}`.
 
+pub mod held;
 pub mod smtp;
 pub mod template;
 pub mod throttle;
@@ -47,7 +49,8 @@ use tokio::time::Instant;
 
 use crate::counts::CountsStore;
 use crate::pushers::PusherStore;
-use template::{LineText, MailInput, NotificationLine, RoomSection};
+use held::{HeldMail, HeldMailStore, HeldRoom};
+use template::{LineText, MailInput, RoomSection};
 use throttle::{ThrottleState, ThrottleStore};
 
 /// How many messages per room an email shows; the rest is "and N more".
@@ -271,19 +274,30 @@ pub struct EmailDeps {
     pub throttle: Arc<dyn ThrottleStore>,
     /// What sends the mail.
     pub mailer: Arc<dyn Mailer>,
+    /// Where the emails waiting to be sent are kept, so a restart sends them.
+    pub held: Arc<dyn HeldMailStore>,
+    /// Whose held emails these are in [`EmailDeps::held`]: this replica's identity (each replica
+    /// holds the emails for the notifications it evaluated), or one fixed name for a single
+    /// node. A worker restores only its holder's emails.
+    pub holder: String,
 }
 
-#[derive(Debug)]
-struct PendingRoom {
-    name: Option<String>,
-    lines: Vec<NotificationLine>,
-}
-
+/// An email held in memory: when it is due on the runtime's clock, and the stored form.
 #[derive(Debug)]
 struct PendingMail {
     due: Instant,
-    attempts: u32,
-    rooms: BTreeMap<OwnedRoomId, PendingRoom>,
+    held: HeldMail,
+}
+
+/// The wall-clock time `due` stands for, for the stored form.
+fn due_ms_for(due: Instant) -> u64 {
+    let wait = due.saturating_duration_since(Instant::now());
+    now_ms().saturating_add(u64::try_from(wait.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// The runtime instant a stored wall-clock time stands for: now, if it has passed.
+fn due_for_ms(due_ms: u64) -> Instant {
+    Instant::now() + Duration::from_millis(due_ms.saturating_sub(now_ms()))
 }
 
 /// The worker: holds notifications and sends the emails when they are due. [`spawn`] runs it;
@@ -349,8 +363,10 @@ pub fn spawn(deps: EmailDeps, settings: Settings) -> EmailPushersHandle {
 }
 
 impl EmailPushersWorker {
-    /// Handles jobs and sends due emails until the last handle is dropped.
+    /// Handles jobs and sends due emails until the last handle is dropped, after restoring the
+    /// emails this worker's holder left waiting ([`EmailPushersWorker::restore`]).
     pub async fn run(mut self) {
+        self.restore().await;
         loop {
             let next = self.next_due();
             tokio::select! {
@@ -367,6 +383,72 @@ impl EmailPushersWorker {
             }
         }
         tracing::info!("the email pusher worker stopped: every handle was dropped");
+    }
+
+    /// Takes back the emails this worker's holder had waiting when it last stopped: each is due
+    /// when it was (at once, if that has passed). A notification already held in memory for
+    /// the same address keeps its own. Returns how many were restored.
+    pub async fn restore(&mut self) -> usize {
+        let rows = match self.deps.held.held_by(&self.deps.holder).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(
+                    holder = %self.deps.holder,
+                    error = %e,
+                    "could not read the notification emails left waiting; they are not sent"
+                );
+                return 0;
+            }
+        };
+        let mut restored = 0;
+        for (user_id, address, held) in rows {
+            let key = (user_id, address);
+            if self.pending.contains_key(&key) {
+                continue;
+            }
+            self.pending.insert(
+                key,
+                PendingMail {
+                    due: due_for_ms(held.due_ms),
+                    held,
+                },
+            );
+            restored += 1;
+        }
+        if restored > 0 {
+            tracing::info!(
+                holder = %self.deps.holder,
+                emails = restored,
+                "restored the notification emails left waiting at the last stop"
+            );
+        }
+        restored
+    }
+
+    /// Writes the held email for `key` through to the store, or forgets it if none is held.
+    async fn persist(&self, key: &(OwnedUserId, String)) {
+        let (user_id, address) = key;
+        let result = match self.pending.get(key) {
+            Some(pending) => {
+                self.deps
+                    .held
+                    .put(&self.deps.holder, user_id, address, &pending.held)
+                    .await
+            }
+            None => {
+                self.deps
+                    .held
+                    .remove(&self.deps.holder, user_id, address)
+                    .await
+            }
+        };
+        if let Err(e) = result {
+            tracing::warn!(
+                user = %user_id,
+                error = %e,
+                "could not store a waiting notification email; a restart would lose it"
+            );
+        }
     }
 
     /// When the earliest held email is due, if any.
@@ -431,16 +513,24 @@ impl EmailPushersWorker {
             }
         }
         let key = (notification.user_id.clone(), notification.address.clone());
-        let pending = self.pending.entry(key).or_insert_with(|| PendingMail {
-            due,
-            attempts: 0,
-            rooms: BTreeMap::new(),
-        });
+        let pending = self
+            .pending
+            .entry(key.clone())
+            .or_insert_with(|| PendingMail {
+                due,
+                held: HeldMail {
+                    due_ms: 0,
+                    attempts: 0,
+                    rooms: BTreeMap::new(),
+                },
+            });
         pending.due = pending.due.min(due);
+        pending.held.due_ms = due_ms_for(pending.due);
         let room = pending
+            .held
             .rooms
             .entry(notification.room_id.clone())
-            .or_insert_with(|| PendingRoom {
+            .or_insert_with(|| HeldRoom {
                 name: None,
                 lines: Vec::new(),
             });
@@ -457,16 +547,28 @@ impl EmailPushersWorker {
             due_in_ms = pending.due.saturating_duration_since(now).as_millis(),
             "holding a notification for an email"
         );
+        self.persist(&key).await;
     }
 
     /// Takes the room out of everything held for the user and forgets its throttle.
     pub async fn room_read(&mut self, user_id: &UserId, room_id: &RoomId) {
+        let touched: Vec<(OwnedUserId, String)> = self
+            .pending
+            .iter()
+            .filter(|((user, _), pending)| {
+                user == user_id && pending.held.rooms.contains_key(room_id)
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
         self.pending.retain(|(user, _), pending| {
             if user == user_id {
-                pending.rooms.remove(room_id);
+                pending.held.rooms.remove(room_id);
             }
-            !pending.rooms.is_empty()
+            !pending.held.rooms.is_empty()
         });
+        for key in &touched {
+            self.persist(key).await;
+        }
         if let Err(e) = self.deps.throttle.reset_room(user_id, room_id).await {
             tracing::warn!(user = %user_id, room = %room_id, error = %e, "could not reset the email throttle");
         }
@@ -488,19 +590,23 @@ impl EmailPushersWorker {
             let (user_id, address) = &key;
             match self.send_one(user_id, address, &pending).await {
                 Ok(()) => {}
-                Err(e) if pending.attempts + 1 < SEND_ATTEMPTS => {
+                Err(e) if pending.held.attempts + 1 < SEND_ATTEMPTS => {
                     tracing::warn!(
                         user = %user_id,
-                        attempt = pending.attempts + 1,
+                        attempt = pending.held.attempts + 1,
                         error = %e,
                         "a notification email could not be sent; trying again"
                     );
+                    let due = now + RETRY_AFTER;
                     self.pending.insert(
-                        key,
+                        key.clone(),
                         PendingMail {
-                            due: now + RETRY_AFTER,
-                            attempts: pending.attempts + 1,
-                            rooms: pending.rooms,
+                            due,
+                            held: HeldMail {
+                                due_ms: due_ms_for(due),
+                                attempts: pending.held.attempts + 1,
+                                rooms: pending.held.rooms,
+                            },
                         },
                     );
                 }
@@ -514,6 +620,8 @@ impl EmailPushersWorker {
                     );
                 }
             }
+            // Sent, skipped or given up, the stored row goes; retried, it is replaced.
+            self.persist(&key).await;
         }
     }
 
@@ -547,7 +655,7 @@ impl EmailPushersWorker {
             return Ok(());
         }
         let mut rooms = Vec::new();
-        for (room_id, room) in &pending.rooms {
+        for (room_id, room) in &pending.held.rooms {
             let unread = self
                 .deps
                 .counts
@@ -588,6 +696,20 @@ impl EmailPushersWorker {
             html: template::render_html(&input),
         };
         self.deps.mailer.send(&mail).await?;
+        // Forgotten as soon as it went, before anything else is written: a stop between the
+        // send and this can send it again after the restart (at least once), never lose it.
+        if let Err(e) = self
+            .deps
+            .held
+            .remove(&self.deps.holder, user_id, address)
+            .await
+        {
+            tracing::warn!(
+                user = %user_id,
+                error = %e,
+                "a notification email was sent but is still stored; a restart would send it again"
+            );
+        }
         count("sent");
         tracing::info!(
             user = %user_id,
@@ -693,6 +815,9 @@ mod tests {
         mailer: Arc<RecordingMailer>,
         counts: Arc<InMemoryCountsStore>,
         pushers: Arc<InMemoryPusherStore>,
+        throttle: Arc<throttle::InMemoryThrottleStore>,
+        held: Arc<held::InMemoryHeldMailStore>,
+        settings: Settings,
     }
 
     const ADDRESS: &str = "alice@example.org";
@@ -717,14 +842,18 @@ mod tests {
             .set_pusher(user_id!("@alice:example.org"), email_pusher(ADDRESS), None)
             .await
             .unwrap();
+        let throttle = Arc::new(throttle::InMemoryThrottleStore::new());
+        let held = Arc::new(held::InMemoryHeldMailStore::new());
         let (handle, worker) = channel(
             EmailDeps {
                 pushers: pushers.clone(),
                 counts: counts.clone(),
-                throttle: Arc::new(throttle::InMemoryThrottleStore::new()),
+                throttle: throttle.clone(),
                 mailer: mailer.clone(),
+                held: held.clone(),
+                holder: "hs-0".to_owned(),
             },
-            settings,
+            settings.clone(),
         );
         Harness {
             worker,
@@ -732,7 +861,26 @@ mod tests {
             mailer,
             counts,
             pushers,
+            throttle,
+            held,
+            settings,
         }
+    }
+
+    /// A new worker over `h`'s stores, as after a restart: nothing in memory.
+    fn restarted(h: &Harness) -> EmailPushersWorker {
+        channel(
+            EmailDeps {
+                pushers: h.pushers.clone(),
+                counts: h.counts.clone(),
+                throttle: h.throttle.clone(),
+                mailer: h.mailer.clone(),
+                held: h.held.clone(),
+                holder: "hs-0".to_owned(),
+            },
+            h.settings.clone(),
+        )
+        .1
     }
 
     fn settings() -> Settings {
@@ -906,6 +1054,97 @@ mod tests {
         assert!(!sent[0].text.contains("psst"), "ciphertext is never quoted");
     }
 
+    /// The wave-1 leftover: an email waiting when the server stops is sent after it starts
+    /// again, when it was due, with what it held; and once sent it is not sent again.
+    #[tokio::test(start_paused = true)]
+    async fn a_waiting_email_survives_a_restart() {
+        let mut h = harness(Settings {
+            delay_before_mail: Duration::from_secs(600),
+            ..settings()
+        })
+        .await;
+        let room = room_id!("!lunch:example.org");
+        notify(&mut h, room, "are you coming?").await;
+        assert_eq!(h.worker.pending_count(), 1);
+        assert_eq!(
+            h.held.held_by("hs-0").await.unwrap().len(),
+            1,
+            "held in the store as well as in memory"
+        );
+        let fresh = restarted(&h);
+        drop(std::mem::replace(&mut h.worker, fresh));
+        assert_eq!(h.worker.pending_count(), 0, "a new worker holds nothing");
+        assert_eq!(h.worker.restore().await, 1);
+        let wait = h
+            .worker
+            .next_due()
+            .unwrap()
+            .saturating_duration_since(Instant::now());
+        assert!(
+            wait > Duration::from_secs(590) && wait <= Duration::from_secs(600),
+            "still due when it was: {wait:?}"
+        );
+        h.worker.send_due().await;
+        assert!(h.mailer.sent().is_empty(), "not before it is due");
+        tokio::time::advance(Duration::from_secs(601)).await;
+        h.worker.send_due().await;
+        let sent = h.mailer.sent();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].text.contains("are you coming?"), "{}", sent[0].text);
+        assert!(h.held.held_by("hs-0").await.unwrap().is_empty());
+        let mut again = restarted(&h);
+        assert_eq!(again.restore().await, 0, "a sent email is not restored");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_email_that_fell_due_while_stopped_goes_at_once_and_reads_still_cancel_it() {
+        let h = harness(settings()).await;
+        let room = room_id!("!lunch:example.org");
+        let alice = user_id!("@alice:example.org");
+        let line = template::NotificationLine {
+            sender: "Bob".to_owned(),
+            ts_ms: 1,
+            text: LineText::Snippet("missed you".to_owned()),
+        };
+        let mut rooms = BTreeMap::new();
+        rooms.insert(
+            room.to_owned(),
+            HeldRoom {
+                name: Some("Lunch".to_owned()),
+                lines: vec![line],
+            },
+        );
+        let stale = HeldMail {
+            due_ms: now_ms().saturating_sub(60_000),
+            attempts: 0,
+            rooms,
+        };
+        h.held.put("hs-0", alice, ADDRESS, &stale).await.unwrap();
+        // Another replica's email is not this one's to send.
+        h.held.put("hs-1", alice, ADDRESS, &stale).await.unwrap();
+        h.counts
+            .record_notification(alice, room, Scope::Main, false)
+            .await
+            .unwrap();
+        let mut worker = restarted(&h);
+        assert_eq!(worker.restore().await, 1);
+        assert!(worker.next_due().unwrap() <= Instant::now());
+        worker.room_read(alice, room).await;
+        assert_eq!(worker.pending_count(), 0);
+        assert!(
+            h.held.held_by("hs-0").await.unwrap().is_empty(),
+            "reading the room drops it from the store too"
+        );
+        assert_eq!(h.held.held_by("hs-1").await.unwrap().len(), 1);
+
+        h.held.put("hs-0", alice, ADDRESS, &stale).await.unwrap();
+        let mut worker = restarted(&h);
+        worker.restore().await;
+        worker.send_due().await;
+        assert_eq!(h.mailer.sent().len(), 1);
+        assert!(h.mailer.sent()[0].text.contains("missed you"));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_failed_send_is_retried_and_then_given_up() {
         let mut h = harness(settings()).await;
@@ -988,6 +1227,8 @@ mod tests {
                 counts,
                 throttle: Arc::new(throttle::InMemoryThrottleStore::new()),
                 mailer: mailer.clone(),
+                held: Arc::new(held::InMemoryHeldMailStore::new()),
+                holder: "hs-0".to_owned(),
             },
             settings(),
         );

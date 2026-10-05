@@ -28,6 +28,7 @@ use hs_kv::KvBackend;
 
 use crate::error::MediaError;
 use crate::metadata::MediaRecord;
+use crate::repository::ClientRoute;
 use crate::state::MediaState;
 
 use super::download::{DownloadQuery, build_response as build_download_response};
@@ -64,7 +65,12 @@ pub(crate) async fn legacy_download<B: KvBackend>(
 ) -> Result<Response, MediaError> {
     let record = state
         .repository
-        .resolve_record(&server_name, &media_id, query.allow_remote())
+        .resolve_record_via(
+            &server_name,
+            &media_id,
+            query.allow_remote(),
+            ClientRoute::Legacy,
+        )
         .await?;
     check_not_frozen(&state, &record)?;
     build_download_response(
@@ -85,7 +91,12 @@ pub(crate) async fn legacy_download_with_filename<B: KvBackend>(
 ) -> Result<Response, MediaError> {
     let record = state
         .repository
-        .resolve_record(&server_name, &media_id, query.allow_remote())
+        .resolve_record_via(
+            &server_name,
+            &media_id,
+            query.allow_remote(),
+            ClientRoute::Legacy,
+        )
         .await?;
     check_not_frozen(&state, &record)?;
     build_download_response(
@@ -105,7 +116,12 @@ pub(crate) async fn legacy_thumbnail<B: KvBackend>(
 ) -> Result<Response, MediaError> {
     let record = state
         .repository
-        .resolve_record(&server_name, &media_id, query.allow_remote())
+        .resolve_record_via(
+            &server_name,
+            &media_id,
+            query.allow_remote(),
+            ClientRoute::Legacy,
+        )
         .await?;
     check_not_frozen(&state, &record)?;
     build_thumbnail_response(&state.repository, &record, &query).await
