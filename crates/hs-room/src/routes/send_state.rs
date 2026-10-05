@@ -1,11 +1,12 @@
 //! `PUT /rooms/{roomId}/send/{eventType}/{txnId}`, `PUT /rooms/{roomId}/state/{eventType}(/{stateKey})`.
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::response::{IntoResponse, Response};
 use hs_http::body::PermissiveJson;
 use hs_kv::KvBackend;
 use ruma::RoomId;
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::error::RoomError;
@@ -21,6 +22,32 @@ fn now_ms() -> i64 {
     .unwrap_or(i64::MAX)
 }
 
+/// The query string `PUT .../send` and `PUT .../state` take.
+#[derive(Debug, Default, Deserialize)]
+pub struct SendQuery {
+    /// The application service API's timestamp massaging: the `origin_server_ts` (milliseconds
+    /// since the Unix epoch) to give the event instead of now. Honoured only for a request made
+    /// with an application service's token, as Synapse does; anyone else's is ignored.
+    pub ts: Option<i64>,
+}
+
+/// The `origin_server_ts` an event sent by `requester` is given: the `ts` they asked for if
+/// they are an application service (a bridge importing history, Complement's
+/// `TestJumpToDateEndpoint`), now otherwise.
+fn sent_at(requester: &hs_auth::Requester, query: &SendQuery) -> i64 {
+    match query.ts {
+        Some(ts) if requester.appservice.is_some() => {
+            tracing::debug!(
+                user_id = %requester.user_id,
+                ts,
+                "appservice send with a massaged timestamp"
+            );
+            ts
+        }
+        _ => now_ms(),
+    }
+}
+
 fn parse_room_id(raw: &str) -> Result<ruma::OwnedRoomId, RoomError> {
     RoomId::parse(raw)
         .map(|r| r.to_owned())
@@ -34,6 +61,7 @@ fn parse_room_id(raw: &str) -> Result<ruma::OwnedRoomId, RoomError> {
 pub async fn put_send<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
     Path((room_id, event_type, txn_id)): Path<(String, String, String)>,
+    Query(query): Query<SendQuery>,
     RoomRequester(requester): RoomRequester,
     PermissiveJson(content): PermissiveJson<Value>,
 ) -> Result<Response, RoomError> {
@@ -52,7 +80,7 @@ pub async fn put_send<B: KvBackend + 'static>(
             txn_id,
             event_type,
             content,
-            now_ms(),
+            sent_at(&requester, &query),
         )
         .await?;
     Ok(Json(json!({"event_id": event.event_id().to_string()})).into_response())
@@ -62,6 +90,7 @@ pub async fn put_send<B: KvBackend + 'static>(
 pub async fn put_state<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
     Path((room_id, event_type, state_key)): Path<(String, String, String)>,
+    Query(query): Query<SendQuery>,
     RoomRequester(requester): RoomRequester,
     PermissiveJson(mut content): PermissiveJson<Value>,
 ) -> Result<Response, RoomError> {
@@ -95,7 +124,7 @@ pub async fn put_state<B: KvBackend + 'static>(
             Some(state_key),
             content,
             None,
-            now_ms(),
+            sent_at(&requester, &query),
         )
         .await?;
     Ok(Json(json!({"event_id": event.event_id().to_string()})).into_response())
@@ -209,12 +238,14 @@ async fn check_canonical_alias<B: KvBackend + 'static>(
 pub async fn put_state_no_key<B: KvBackend + 'static>(
     state: State<RoomState<B>>,
     Path((room_id, event_type)): Path<(String, String)>,
+    query: Query<SendQuery>,
     requester: RoomRequester,
     body: PermissiveJson<Value>,
 ) -> Result<Response, RoomError> {
     put_state(
         state,
         Path((room_id, event_type, String::new())),
+        query,
         requester,
         body,
     )

@@ -2,7 +2,9 @@
 
 Track brief: `docs/workstreams/04-room-and-events.md`. Owner crate: `hs-room`.
 
-Last updated: 2026-10-04 (session 19: the room read endpoints a client pages and previews with, below).
+Last updated: 2026-10-05 (session 20: a version-12 create event's `room_id`, appservice `?ts=`,
+push rules follow an upgrade, below). Before that, 2026-10-04 (session 19: the room read
+endpoints a client pages and previews with, below).
 Before that, 2026-10-01 (session 16: upgrading a room to version 12; session 15: `POST
 /search`, below). Before that, 2026-09-30 (session
 Last updated: 2026-10-02 (session 18: an erased user leaves every room; session 17: a new
@@ -15,6 +17,55 @@ version 12; session 15: `POST /search`, below) and 2026-09-30 (session
 session 13: the state at backfilled history is asked for; session 12: the history between a
 leave and a rejoin; session 11: the client space hierarchy) and 2026-09-28 (session 10: the
 admin API's room long tail).
+
+> **2026-10-05, session 20: how a room's events render, and what follows a member to an
+> upgraded room** (branch `agent/room-render`). Verified in unit tests, against the real binary
+> in `crates/hs-cli/tests/room_render.rs` (`events_render_and_follow_an_upgrade_as_synapse_does`,
+> one server with an appservice registered), and in Complement (below).
+>
+> - **A version-12 `m.room.create` carries its `room_id`** in every client read
+>   (`routes/render.rs`'s `client_form` via `create_event_room_id`: MSC4291's create event has
+>   none in its JSON, and the room ID is the event ID with `!` for `$`). `/state`, `/messages`,
+>   `/event`, `/context` (the event, `events_before`, `state`), `/state?format=event`, and
+>   `/sync` and the admin API too, which render through the same function. Complement federation
+>   `TestMSC4291RoomIDAsHashOfCreateEvent_RoomIDIsOnCreateEvent`.
+> - **Appservice timestamp massaging**: `PUT .../send/{type}/{txnId}?ts=` and `PUT
+>   .../state/...?ts=` give the event that `origin_server_ts` when the request is made with an
+>   appservice's token (`routes/send_state.rs`, `SendQuery`, `sent_at`, a `debug` log line per
+>   use); anyone else's `ts` is ignored, as Synapse does, and a `ts` that is not an integer is
+>   `400`. This is what `TestJumpToDateEndpoint`'s three appservice subtests were missing: the
+>   registration now reaches the server (`appservice-gaps`), but every event was stamped now.
+>   `/timestamp_to_event` already breaks a tie by timeline order (the later backwards, the
+>   earlier forwards); pinned in the real-binary test.
+> - **Push rules follow an upgrade** (Complement csapi `TestPushRuleRoomUpgrade`, all four
+>   subtests: `/upgrade` and a room created by hand with a `predecessor`, local users and a remote
+>   server's users joining the replacement). The copy lives in `hs-user`'s join hook beside
+>   `carry_account_data_on_upgrade` (`crates/hs-user/src/hub.rs`, private
+>   `SessionHub::copy_room_push_rules` and its one call; agreed with the coordinator, since
+>   `sync-polling` owns the rest of `hs-user` and `push-gaps` owns `hs-push`, which is not
+>   changed): the room rule named after the old room, and every user override/underride rule
+>   with an `event_match` on `room_id` for the old room (its ID and pattern rewritten), keeping
+>   actions and `enabled`. A rule the new room already has is kept; an override rule whose ID
+>   does not name the old room is not copied (Synapse would overwrite it in place). The write
+>   bumps the push-rules seq, so the joiner's next `/sync` carries `m.push_rules`; an `info` log
+>   line per user.
+> - **Sytest `34room-messages.pl` "returns a message" and "lazy loads members correctly"**
+>   (both "Expected a 'end' key"): the cause is `hs-user`'s fresh-sync `prev_batch`, not
+>   `/messages`. Since `731d2433` a fresh timeline that reaches the room's first event hands out
+>   `b<first>` (before `m.room.create`), so paging back from it is empty. Synapse
+>   (`handlers/sync.py` `_load_filtered_recents`) moves `prev_batch` off the sync position only
+>   when it truncated the timeline, so its `prev_batch` for a whole room is the sync position
+>   and the page from it has the room's events. Handed to `sync-polling` (owner of `hs-user`
+>   this wave) by the coordinator; the same change answers Complement's
+>   `TestGetRoomMembersAtPoint`, and `/members?at=` in `hs-room` needs nothing.
+>
+> Complement, on this branch's image (`complement-hs-room-render:dev`, built from
+> `a51f480c` plus this branch): `TestMSC4291RoomIDAsHashOfCreateEvent_RoomIDIsOnCreateEvent`
+> PASS; `TestJumpToDateEndpoint` PASS, all 15 subtests (the three appservice ones included);
+> csapi `TestPushRuleRoomUpgrade` PASS, all four subtests.
+>
+> Left: nothing of this session's list on the `hs-room` side; the two Sytest `/messages` tests
+> wait on `sync-polling`'s `prev_batch` change.
 
 > **2026-10-04, session 19: the room read endpoints a client pages and previews with**
 > (branch `agent/room-client-gaps`; decision 0031; OpenAPI 0.1.10). The Sytest and Complement

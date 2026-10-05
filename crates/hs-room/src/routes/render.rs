@@ -207,6 +207,9 @@ fn client_form(mut pdu: serde_json::Value, event_id: &str) -> serde_json::Value 
         );
         obj.entry("unsigned")
             .or_insert_with(|| serde_json::json!({}));
+        if let Some(room_id) = create_event_room_id(obj, event_id) {
+            obj.insert("room_id".to_owned(), serde_json::Value::String(room_id));
+        }
         if obj.get("type").and_then(serde_json::Value::as_str) == Some("m.room.redaction")
             && !obj.contains_key("redacts")
             && let Some(redacts) = obj
@@ -218,6 +221,25 @@ fn client_form(mut pdu: serde_json::Value, event_id: &str) -> serde_json::Value 
         }
     }
     pdu
+}
+
+/// The `room_id` a room-version-12 (MSC4291) `m.room.create` event is shown with, when the event
+/// itself carries none: the room's ID *is* the create event's reference hash, so it is the event
+/// ID with `!` for `$`. Every client-server read that returns events shows a create event with
+/// its `room_id`, as any other event has one (Complement's
+/// `TestMSC4291RoomIDAsHashOfCreateEvent_RoomIDIsOnCreateEvent`: `/state`, `/messages`,
+/// `/event`, `/context`, `/state?format=event`). `None` for any other event, or one that has a
+/// `room_id` already.
+fn create_event_room_id(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    event_id: &str,
+) -> Option<String> {
+    if obj.contains_key("room_id")
+        || obj.get("type").and_then(serde_json::Value::as_str) != Some("m.room.create")
+    {
+        return None;
+    }
+    event_id.strip_prefix('$').map(|hash| format!("!{hash}"))
 }
 
 /// `unsigned.redacted_by` and `unsigned.redacted_because` for a redacted `event`, from what
@@ -301,4 +323,55 @@ pub fn client_event_json_bundled(event: &Event, bundle: &Bundle) -> serde_json::
         unsigned.insert("m.relations".to_owned(), bundle_json);
     }
     value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ruma::RoomVersionId;
+    use serde_json::json;
+
+    /// MSC4291: a version-12 create event carries no `room_id`; a client is shown the room's ID
+    /// on it all the same, the event ID with `!` for `$`.
+    #[test]
+    fn a_version_12_create_event_is_shown_with_its_room_id() {
+        let create = json!({
+            "type": "m.room.create",
+            "sender": "@creator:example.org",
+            "origin_server_ts": 1,
+            "depth": 1,
+            "state_key": "",
+            "content": {"room_version": "12"},
+            "prev_events": [],
+            "auth_events": [],
+        });
+        let event = Event::parse(&create, RoomVersionId::V12).unwrap();
+        assert!(!event.json().contains_key("room_id"));
+        let rendered = client_event_json(&event);
+        let event_id = event.event_id().as_str();
+        assert_eq!(
+            rendered["room_id"].as_str().unwrap(),
+            format!("!{}", &event_id[1..])
+        );
+        assert_eq!(rendered["event_id"], event_id);
+    }
+
+    /// An event that names its room keeps the room it names.
+    #[test]
+    fn an_older_create_event_keeps_its_own_room_id() {
+        let create = json!({
+            "event_id": "$a:example.org",
+            "room_id": "!r:example.org",
+            "type": "m.room.create",
+            "sender": "@creator:example.org",
+            "origin_server_ts": 1,
+            "depth": 1,
+            "state_key": "",
+            "content": {"creator": "@creator:example.org"},
+            "prev_events": [],
+            "auth_events": [],
+        });
+        let event = Event::parse(&create, RoomVersionId::V1).unwrap();
+        assert_eq!(client_event_json(&event)["room_id"], "!r:example.org");
+    }
 }

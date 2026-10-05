@@ -1967,6 +1967,118 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         Ok(())
     }
 
+    /// Copies `user_id`'s push rules about `old_room_id` onto `new_room_id`, its replacement, as
+    /// they join it: the room rule named after the old room, and every override or underride
+    /// rule with an `event_match` on `room_id` for the old room (its ID and that condition
+    /// rewritten for the new room), each keeping its actions and whether it is enabled. A rule
+    /// the new room already has is left as it is. Synapse's
+    /// `copy_push_rules_from_room_to_room_for_user`, run from the same join as
+    /// [`SessionHub::carry_account_data_on_upgrade`] (Complement's `TestPushRuleRoomUpgrade`:
+    /// a local upgrade, a manual one, and a remote server's users joining the replacement). The
+    /// write bumps the user's push-rules change-seq, so their next `/sync` carries
+    /// `m.push_rules`. Nothing for a user who never changed their rules, or with no push-rules
+    /// store installed.
+    ///
+    /// # Errors
+    /// Returns [`UserError::Push`] if the ruleset could not be read or written.
+    async fn copy_room_push_rules(
+        &self,
+        user_id: &UserId,
+        old_room_id: &RoomId,
+        new_room_id: &RoomId,
+    ) -> Result<(), UserError> {
+        use hs_push::ruleset::{NewRule, RuleKind};
+        use hs_push::rulesets::RulesetStore as _;
+        use ruma::push::PushCondition;
+
+        let Some(store) = self.push_rules.get() else {
+            return Ok(());
+        };
+        let Some(mut ruleset) = store.store().get_ruleset(user_id).await? else {
+            return Ok(());
+        };
+        let (old, new) = (old_room_id.as_str(), new_room_id.as_str());
+        // (kind, new rule, enabled), collected first: the ruleset is edited after the reads.
+        let mut copies: Vec<(NewRule, bool)> = Vec::new();
+        if let Some(rule) = ruleset.room.iter().find(|r| r.rule_id == old)
+            && !ruleset.room.iter().any(|r| r.rule_id == new)
+        {
+            copies.push((
+                NewRule {
+                    kind: RuleKind::Room,
+                    rule_id: new.to_owned(),
+                    actions: rule.actions.clone(),
+                    conditions: Vec::new(),
+                    pattern: None,
+                },
+                rule.enabled,
+            ));
+        }
+        for (kind, list) in [
+            (RuleKind::Override, &ruleset.override_),
+            (RuleKind::Underride, &ruleset.underride),
+        ] {
+            for rule in list.iter().filter(|r| !r.default) {
+                let names_old_room = rule.conditions.iter().any(|c| {
+                    matches!(c, PushCondition::EventMatch(data)
+                        if data.key == "room_id" && data.pattern == old)
+                });
+                if !names_old_room {
+                    continue;
+                }
+                let rule_id = rule.rule_id.replace(old, new);
+                if rule_id == rule.rule_id || list.iter().any(|r| r.rule_id == rule_id) {
+                    continue;
+                }
+                let mut conditions = rule.conditions.clone();
+                for condition in &mut conditions {
+                    if let PushCondition::EventMatch(data) = condition
+                        && data.key == "room_id"
+                        && data.pattern == old
+                    {
+                        new.clone_into(&mut data.pattern);
+                    }
+                }
+                copies.push((
+                    NewRule {
+                        kind,
+                        rule_id,
+                        actions: rule.actions.clone(),
+                        conditions,
+                        pattern: None,
+                    },
+                    rule.enabled,
+                ));
+            }
+        }
+        if copies.is_empty() {
+            return Ok(());
+        }
+        let mut copied = 0usize;
+        for (rule, enabled) in copies {
+            let (kind, rule_id) = (rule.kind, rule.rule_id.clone());
+            if let Err(error) = ruleset.insert(rule, None, None) {
+                tracing::warn!(user = %user_id, %rule_id, %error, "a push rule could not be copied onto an upgraded room's replacement");
+                continue;
+            }
+            if !enabled {
+                let _ = ruleset.set_enabled(kind, &rule_id, false);
+            }
+            copied += 1;
+        }
+        if copied > 0 {
+            store.set_ruleset(user_id, &ruleset).await?;
+            tracing::info!(
+                user = %user_id,
+                %old_room_id,
+                %new_room_id,
+                push_rules_copied = copied,
+                "a user joined an upgraded room's replacement; their push rules for the old room followed"
+            );
+        }
+        Ok(())
+    }
+
     /// [`SessionHub::process_room_update`], returning the users it woke -- what the other
     /// replicas are told (`crate::cluster::RoomWake::users`). Empty, and nothing written, for a
     /// room this replica does not own: its owner feeds it, and two hubs writing the same
@@ -2040,6 +2152,8 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
                         &update.room_id,
                     )
                     .await?;
+                    self.copy_room_push_rules(&delta.user_id, &old_room_id, &update.room_id)
+                        .await?;
                 }
             }
         }
