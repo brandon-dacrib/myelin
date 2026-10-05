@@ -63,9 +63,20 @@ make it a script in `tests/complement/` next wave).
   fresh `refs/complement`); the Cluster page's Epoch is a time and the table fits 1280 px; e2e-real
   screenshots go to `test-results/`; one warning when IPv4-only meets an IPv6-only peer.
 
+**Measured 2026-10-05 evening** (status 14 session 10): Sytest **742 / 772**, Complement
+federation **82 / 90**, csapi **102 / 106** top-level. One regression, a ban failing the whole
+`/sync`, fixed in `a70a5975` (roll to that or later). **Wave 3** (launched 2026-10-05, 19:45 EDT),
+five agents: `sync-polling` (05: two `/sync` polling regressions, gapped membership state, members
+at a point), `room-render` (04: `/messages` `end` on merged main, `room_id` on the v12 create event,
+push rules on upgrade), `fed-wave3` (06: the ACL `/invite` and outlier regressions, 3PID and guest
+tests, `TestCorruptedAuthChain`, RFC 0023 durable EDUs), `push-gaps` (10: MSC4306 `postcontent`,
+threaded receipts, the mailer's HELO fallback), `auth-leftovers` (07: email password reset, CAS and
+appservice namespaces, deactivation unbinds, `/openid/userinfo` outside X-Matrix). Unmerged work
+shows in `git branch -r --no-merged origin/main`.
+
 **What is next, in order:**
 
-1. **Roll the demo** to the first green image of `731d2433` or later, then the bridge migration in
+1. **Roll the demo** to the first green image of `a70a5975` or later, then the bridge migration in
    `docs/bridges/mautrix.md` ("2026-10-04"). *Desk item.*
 2. **Measure wave 2**: Sytest whole suite and Complement federation and csapi on a quiet machine
    (run `tests/complement/apply_patches.sh refs/complement` first), into status 14 session 10.
