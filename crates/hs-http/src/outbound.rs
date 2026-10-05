@@ -36,6 +36,13 @@
 //!   count it in `hs_outbound_connect_failures_total{family}`; a connection that fails
 //!   altogether counts every address it tried. `hs_outbound_connections_total{family}` counts
 //!   what did connect. An operator reading `/metrics` sees "every failure is IPv6" at a glance.
+//! - **A policy that hid the address that would have worked is a warning.** When a host's
+//!   IPv4 addresses all fail and the policy dropped IPv6 addresses it also has, or when a host
+//!   has only IPv6 addresses, the server logs one `warn` naming the host, the addresses tried,
+//!   the IPv6 addresses not tried and the setting, at most once per host every
+//!   [`DROPPED_IPV6_WARNING_INTERVAL`] (later ones are `debug`). A peer that listens on `::1`
+//!   alone, reached as `localhost`, fails that way: the IPv4 connect is refused, and without
+//!   the warning the log says only "connection refused" (the Sytest failure of 2026-10-04).
 //!
 //! # What it cannot see
 //!
@@ -58,6 +65,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use hyper_util::client::legacy::connect::{Connection, HttpInfo};
 use prometheus_client::encoding::EncodeLabelSet;
@@ -189,11 +197,36 @@ impl Resolver {
         &self,
         host: &str,
     ) -> Result<Vec<SocketAddr>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.offer(host).await?.candidates)
+    }
+
+    /// [`Self::candidates`], with the IPv6 addresses the policy dropped.
+    async fn offer(&self, host: &str) -> Result<Offered, Box<dyn std::error::Error + Send + Sync>> {
         let raw: Vec<SocketAddr> = match self.pins.get(&host.to_ascii_lowercase()) {
             Some(pinned) => pinned.clone(),
             None => tokio::net::lookup_host((host, 0)).await?.collect(),
         };
-        Ok(select(host, raw)?)
+        match select(host, raw.iter().copied()) {
+            Ok(candidates) => {
+                let mut dropped_ipv6: Vec<SocketAddr> = Vec::new();
+                for addr in raw.iter().filter(|addr| addr.is_ipv6()) {
+                    if !candidates.contains(addr) && !dropped_ipv6.contains(addr) {
+                        dropped_ipv6.push(*addr);
+                    }
+                }
+                Ok(Offered {
+                    host: host.to_owned(),
+                    candidates,
+                    dropped_ipv6,
+                })
+            }
+            Err(error) => {
+                if let ResolveError::OnlyIpv6 { .. } = error {
+                    warn_dropped_ipv6(host, &[], &raw, &error);
+                }
+                Err(error.into())
+            }
+        }
     }
 }
 
@@ -201,10 +234,85 @@ impl Resolve for Resolver {
     fn resolve(&self, name: Name) -> Resolving {
         let resolver = self.clone();
         Box::pin(async move {
-            let chosen = resolver.candidates(name.as_str()).await?;
-            Attempt::record(&chosen);
+            let offered = resolver.offer(name.as_str()).await?;
+            let chosen = offered.candidates.clone();
+            Attempt::record(offered);
             Ok(Box::new(chosen.into_iter()) as Addrs)
         })
+    }
+}
+
+/// What the resolver offered the connector for one host: the addresses to try, in order, and
+/// the IPv6 addresses the policy dropped.
+#[derive(Clone, Debug, Default)]
+struct Offered {
+    host: String,
+    candidates: Vec<SocketAddr>,
+    dropped_ipv6: Vec<SocketAddr>,
+}
+
+/// How often the "IPv6 not tried" warning is logged per host; repeats inside the interval are
+/// `debug`, so a federation retry loop does not flood the log.
+pub const DROPPED_IPV6_WARNING_INTERVAL: Duration = Duration::from_secs(600);
+
+/// When each host's "IPv6 not tried" warning was last logged.
+static DROPPED_IPV6_WARNED: LazyLock<Mutex<HashMap<String, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Whether `host`'s "IPv6 not tried" warning is due (and if so, notes that it was given now).
+fn dropped_ipv6_warning_due(host: &str) -> bool {
+    let key = host.to_ascii_lowercase();
+    let now = Instant::now();
+    let Ok(mut warned) = DROPPED_IPV6_WARNED.lock() else {
+        return true;
+    };
+    match warned.get(&key) {
+        Some(last) if now.duration_since(*last) < DROPPED_IPV6_WARNING_INTERVAL => false,
+        _ => {
+            warned.insert(key, now);
+            true
+        }
+    }
+}
+
+fn join_addrs(addrs: &[SocketAddr]) -> String {
+    addrs
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Logs that `host` was not reached over IPv4 (`tried`, empty when it has no IPv4 address)
+/// while the policy kept its IPv6 addresses (`ipv6`) from being tried: once per host per
+/// [`DROPPED_IPV6_WARNING_INTERVAL`] at `warn`, otherwise at `debug`.
+fn warn_dropped_ipv6(
+    host: &str,
+    tried: &[SocketAddr],
+    ipv6: &[SocketAddr],
+    error: &(dyn std::error::Error + 'static),
+) {
+    let tried = join_addrs(tried);
+    let ipv6 = join_addrs(ipv6);
+    if dropped_ipv6_warning_due(host) {
+        tracing::warn!(
+            host,
+            tried_ipv4 = %tried,
+            not_tried_ipv6 = %ipv6,
+            %error,
+            "an outbound connection to {host} failed over IPv4, and its IPv6 addresses ({ipv6}) \
+             were not tried: this server connects over IPv4 only \
+             (`network.outbound.ipv4_only`). If {host} listens on IPv6 alone and this host has \
+             working IPv6, set it to false"
+        );
+    } else {
+        tracing::debug!(
+            host,
+            tried_ipv4 = %tried,
+            not_tried_ipv6 = %ipv6,
+            %error,
+            "an outbound connection failed over IPv4; IPv6 not tried (`network.outbound.ipv4_only`)"
+        );
     }
 }
 
@@ -212,17 +320,17 @@ tokio::task_local! {
     /// The addresses the resolver offered for the connection being made, written by
     /// [`Resolver::resolve`] and read by [`Observe`] once the connector is done. Set only while
     /// an [`Observe`] call runs; a resolver used elsewhere records nothing.
-    static ATTEMPT: Arc<Mutex<Vec<SocketAddr>>>;
+    static ATTEMPT: Arc<Mutex<Offered>>;
 }
 
 /// The record of one connection's candidates, kept in [`ATTEMPT`].
 struct Attempt;
 
 impl Attempt {
-    fn record(candidates: &[SocketAddr]) {
+    fn record(offered: Offered) {
         let _ = ATTEMPT.try_with(|slot| {
             if let Ok(mut guard) = slot.lock() {
-                *guard = candidates.to_vec();
+                *guard = offered;
             }
         });
     }
@@ -307,17 +415,17 @@ where
     }
 
     fn call(&mut self, req: Req) -> Self::Future {
-        let candidates = Arc::new(Mutex::new(Vec::new()));
-        let connecting = ATTEMPT.scope(candidates.clone(), self.inner.call(req));
+        let offered = Arc::new(Mutex::new(Offered::default()));
+        let connecting = ATTEMPT.scope(offered.clone(), self.inner.call(req));
         Box::pin(async move {
             let result = connecting.await;
-            let candidates = candidates
+            let offered = offered
                 .lock()
                 .map(|guard| guard.clone())
                 .unwrap_or_default();
             match &result {
-                Ok(conn) => note_connected(remote_addr(conn), &candidates),
-                Err(error) => note_failed(error.as_ref(), &candidates),
+                Ok(conn) => note_connected(remote_addr(conn), &offered.candidates),
+                Err(error) => note_failed(error.as_ref(), &offered),
             }
             result
         })
@@ -375,9 +483,13 @@ fn note_connected(remote: Option<SocketAddr>, candidates: &[SocketAddr]) {
     }
 }
 
-fn note_failed(error: &(dyn std::error::Error + Send + Sync + 'static), candidates: &[SocketAddr]) {
+fn note_failed(error: &(dyn std::error::Error + Send + Sync + 'static), offered: &Offered) {
+    let candidates = &offered.candidates;
     if candidates.is_empty() || !is_connect_failure(error) {
         return;
+    }
+    if !offered.dropped_ipv6.is_empty() {
+        warn_dropped_ipv6(&offered.host, candidates, &offered.dropped_ipv6, error);
     }
     for addr in attempt_order(candidates) {
         FAILURES
@@ -479,6 +591,60 @@ mod tests {
             count: 1,
         };
         assert!(error.to_string().contains("network.outbound.ipv4_only"));
+    }
+
+    #[test]
+    fn the_ipv6_warning_is_given_once_per_host_per_interval() {
+        assert!(dropped_ipv6_warning_due("once.example"));
+        assert!(
+            !dropped_ipv6_warning_due("once.example"),
+            "a repeat is debug"
+        );
+        assert!(
+            !dropped_ipv6_warning_due("ONCE.example"),
+            "hosts are case-insensitive"
+        );
+        assert!(dropped_ipv6_warning_due("other.example"), "per host");
+        // Once the interval has passed, it is due again.
+        if let Some(long_ago) = Instant::now().checked_sub(DROPPED_IPV6_WARNING_INTERVAL) {
+            DROPPED_IPV6_WARNED
+                .lock()
+                .unwrap()
+                .insert("once.example".into(), long_ago);
+            assert!(dropped_ipv6_warning_due("once.example"));
+        }
+    }
+
+    #[test]
+    fn an_offer_names_the_ipv6_addresses_the_policy_dropped() {
+        let _serial = POLICY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = ipv4_only();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let resolver = Resolver::pinned("dual.example", &[v6(1), v4(1), v6(1), v6(2)]);
+
+        set_ipv4_only(true);
+        let offered = runtime.block_on(resolver.offer("dual.example")).unwrap();
+        assert_eq!(offered.host, "dual.example");
+        assert_eq!(offered.candidates, vec![v4(1)]);
+        assert_eq!(
+            offered.dropped_ipv6,
+            vec![v6(1), v6(2)],
+            "each once, in order"
+        );
+
+        set_ipv4_only(false);
+        let offered = runtime.block_on(resolver.offer("dual.example")).unwrap();
+        assert_eq!(offered.candidates, vec![v6(1), v4(1), v6(2)]);
+        assert!(
+            offered.dropped_ipv6.is_empty(),
+            "nothing dropped with IPv6 on"
+        );
+        set_ipv4_only(before);
     }
 
     #[test]

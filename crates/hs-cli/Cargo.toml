@@ -67,6 +67,9 @@ time = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# `tests/outbound_ipv6_only_peer.rs` captures the server's log to check the warning an operator
+# sees when the outbound address policy hides a peer's only working address.
+tracing-subscriber = { workspace = true }
 # `tests/cluster_admin.rs`: two real `hs serve` processes on one PostgreSQL need a database of
 # their own per run, made and dropped with a plain client.
 postgres = { workspace = true }

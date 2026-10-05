@@ -134,7 +134,10 @@ connects to the first address it is given fails the request. On a host with work
 `network.outbound.ipv4_only` off in the Configuration section (it applies at once, no restart);
 the server then tries every address a name resolves to and falls back to the next when one does
 not connect. The startup log says which it is (`outbound: IPv4 only`), and `/metrics` counts
-connections and addresses that did not connect by family.
+connections and addresses that did not connect by family. When the policy hides the only
+address a peer answers on (a peer that listens on IPv6 alone, reached by a name with both
+families), the log says so: one warning per host every ten minutes, naming the host, the IPv4
+addresses that failed, the IPv6 addresses it did not try, and the setting.
 
 On Kubernetes it is one value:
 
