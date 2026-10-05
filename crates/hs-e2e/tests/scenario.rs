@@ -258,6 +258,83 @@ async fn key_backup_version_and_session_round_trip() {
         )
         .await;
     wrong.assert_matrix_error(StatusCode::FORBIDDEN, "M_WRONG_ROOM_KEYS_VERSION");
+    let not_a_number = scenario
+        .send(
+            Some("carol"),
+            Method::PUT,
+            "/room_keys/keys/%21room%3Aexample.org/session2?version=bogusversion",
+            Some(json!({
+                "first_message_index": 0,
+                "forwarded_count": 0,
+                "is_verified": true,
+                "session_data": {},
+            })),
+        )
+        .await;
+    not_a_number.assert_matrix_error(StatusCode::FORBIDDEN, "M_WRONG_ROOM_KEYS_VERSION");
+}
+
+/// Sytest's "Responds correctly when backup is empty": nothing backed up reads as empty, and a
+/// version that is not a number names no backup -- `404 M_NOT_FOUND` on every read, as for a
+/// number that names none, not `400 M_BAD_JSON`.
+#[tokio::test]
+async fn an_empty_backup_reads_empty_and_a_version_that_is_not_a_number_is_not_found() {
+    let mut scenario = Scenario::new(app());
+    scenario
+        .register("dave", "dave", "correct horse battery staple")
+        .await
+        .assert_ok();
+    let create = scenario
+        .send(
+            Some("dave"),
+            Method::POST,
+            "/room_keys/version",
+            Some(json!({"algorithm": "m.megolm_backup.v1", "auth_data": "opaque"})),
+        )
+        .await;
+    create.assert_ok();
+    let version = create.str_field("version").to_string();
+
+    for (path, want) in [
+        (
+            format!("/room_keys/keys/%21notaroom/notassession?version={version}"),
+            None,
+        ),
+        (
+            format!("/room_keys/keys/%21notaroom?version={version}"),
+            Some(json!({"sessions": {}})),
+        ),
+        (
+            format!("/room_keys/keys?version={version}"),
+            Some(json!({"rooms": {}})),
+        ),
+        ("/room_keys/keys?version=bogusversion".to_owned(), None),
+        (
+            "/room_keys/keys/%21notaroom?version=bogusversion".to_owned(),
+            None,
+        ),
+        ("/room_keys/version/bogusversion".to_owned(), None),
+    ] {
+        let answer = scenario.send(Some("dave"), Method::GET, &path, None).await;
+        match want {
+            Some(body) => {
+                answer.assert_status(StatusCode::OK);
+                assert_eq!(answer.json, body, "{path}");
+            }
+            None => {
+                answer.assert_matrix_error(StatusCode::NOT_FOUND, "M_NOT_FOUND");
+            }
+        }
+    }
+    let delete = scenario
+        .send(
+            Some("dave"),
+            Method::DELETE,
+            "/room_keys/version/bogusversion",
+            None,
+        )
+        .await;
+    delete.assert_matrix_error(StatusCode::NOT_FOUND, "M_NOT_FOUND");
 }
 
 #[tokio::test]

@@ -113,6 +113,18 @@ fn app_with(
     )
 }
 
+/// [`receive_device_list_update`], then waits for any fetch it started in the background, so
+/// a test sees what the fetch did.
+async fn receive_settled(
+    state: &E2eState<MemoryBackend>,
+    origin: &str,
+    content: &Value,
+) -> Result<InboundDeviceList, hs_e2e::error::E2eError> {
+    let outcome = receive_device_list_update(state, origin, content).await;
+    state.resyncs_settled().await;
+    outcome
+}
+
 fn bobs_list(stream_id: u64, devices: Vec<Value>) -> Value {
     json!({"user_id": BOB, "stream_id": stream_id, "devices": devices})
 }
@@ -148,9 +160,10 @@ async fn register_alice(scenario: &mut Scenario) {
 
 /// Sytest's "Server correctly resyncs when client query keys and there is no remote cache" and
 /// "Device list doesn't change if remote server is down": the first query of a user who shares
-/// a room fetches their whole list (`GET /user/devices`, not `/user/keys/query`) and keeps it;
-/// the next is answered from the copy with no request at all, so it still answers, with no
-/// `failures`, when their server cannot be reached.
+/// a room fetches their whole list (`GET /user/devices`, not `/user/keys/query`) and keeps it,
+/// and that is a device-list change for them (Sytest waits for them in `device_lists.changed`
+/// after it); the next is answered from the copy with no request at all and no change, so it
+/// still answers, with no `failures`, when their server cannot be reached.
 #[tokio::test]
 async fn a_shared_users_list_is_fetched_once_and_then_served_from_the_copy_even_when_their_server_is_down()
  {
@@ -162,11 +175,23 @@ async fn a_shared_users_list_is_fetched_once_and_then_served_from_the_copy_even_
             device("LANDER", "k2", None),
         ],
     ));
-    let (router, _) = app(remote.clone(), true);
+    let (router, state) = app(remote.clone(), true);
     let mut scenario = Scenario::new(router);
     register_alice(&mut scenario).await;
+    let bob = UserId::parse(BOB).unwrap();
+    let before = state.store.current_stream_pos().await.unwrap();
 
     let first = query_bob(&mut scenario).await;
+    let after_first = state.store.current_stream_pos().await.unwrap();
+    assert!(
+        state
+            .store
+            .changed_users_since(before, None)
+            .await
+            .unwrap()
+            .contains(&bob),
+        "the first fetch is a change local users are told of"
+    );
     assert_eq!(
         first["device_keys"][BOB]["ROVER"]["keys"]["ed25519:ROVER"],
         "k1"
@@ -191,6 +216,61 @@ async fn a_shared_users_list_is_fetched_once_and_then_served_from_the_copy_even_
         1,
         "nothing was asked: {:?}",
         remote.asked()
+    );
+    assert_eq!(
+        state.store.current_stream_pos().await.unwrap(),
+        after_first,
+        "serving the copy changes nothing"
+    );
+}
+
+/// A fetch that finds the copy current is no change: an update that skipped one, whose fetch
+/// answers what is held already, tells local clients nothing (Synapse's "our cache matches
+/// already"), while one whose fetch says something new does.
+#[tokio::test]
+async fn a_fetch_that_finds_the_copy_current_records_no_change() {
+    let remote = Arc::new(FakeRemote::default());
+    remote.set_devices(bobs_list(1, vec![device("ROVER", "k1", Some("Rover"))]));
+    let (_router, state) = app(remote.clone(), true);
+    let bob = UserId::parse(BOB).unwrap();
+    let first = receive_settled(
+        &state,
+        "there.example",
+        &json!({"user_id": BOB, "device_id": "ROVER", "stream_id": 1}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first, InboundDeviceList::ResyncScheduled);
+    let held = state.store.current_stream_pos().await.unwrap();
+    assert!(held > 0, "the first copy is a change");
+
+    remote.set_devices(bobs_list(3, vec![device("ROVER", "k1", Some("Rover"))]));
+    let same = receive_settled(
+        &state,
+        "there.example",
+        &json!({"user_id": BOB, "device_id": "ROVER", "stream_id": 3, "prev_id": [2]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(same, InboundDeviceList::ResyncScheduled);
+    assert_eq!(state.store.current_stream_pos().await.unwrap(), held);
+
+    remote.set_devices(bobs_list(5, vec![device("ROVER", "k2", Some("Rover"))]));
+    let new = receive_settled(
+        &state,
+        "there.example",
+        &json!({"user_id": BOB, "device_id": "ROVER", "stream_id": 5, "prev_id": [4]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(new, InboundDeviceList::ResyncScheduled);
+    assert!(
+        state
+            .store
+            .changed_users_since(held, None)
+            .await
+            .unwrap()
+            .contains(&bob)
     );
 }
 
@@ -290,18 +370,18 @@ async fn an_update_for_an_unknown_user_fetches_the_list_and_one_in_sequence_is_a
     register_alice(&mut scenario).await;
     let before = state.store.current_stream_pos().await.unwrap();
 
-    let first = receive_device_list_update(
+    let first = receive_settled(
         &state,
         "there.example",
         &json!({"user_id": BOB, "device_id": "ROVER", "stream_id": 1, "keys": {"keys": {"ed25519:ROVER": "k1"}}}),
     )
     .await
     .unwrap();
-    assert_eq!(first, InboundDeviceList::Resynced);
+    assert_eq!(first, InboundDeviceList::ResyncScheduled);
     assert_eq!(remote.asked(), [format!("devices there.example {BOB}")]);
     assert!(state.store.current_stream_pos().await.unwrap() > before);
 
-    let second = receive_device_list_update(
+    let second = receive_settled(
         &state,
         "there.example",
         &json!({
@@ -344,7 +424,7 @@ async fn a_device_added_without_keys_is_keyed_by_the_next_update_and_nothing_is_
     assert_eq!(remote.asked().len(), 1, "fetched once");
 
     // The sign-in: a device with no keys, announced on its own.
-    let login = receive_device_list_update(
+    let login = receive_settled(
         &state,
         "there.example",
         &json!({"user_id": BOB, "device_id": "LAPTOP", "stream_id": 2, "prev_id": [1]}),
@@ -370,7 +450,7 @@ async fn a_device_added_without_keys_is_keyed_by_the_next_update_and_nothing_is_
     );
 
     // The key upload, in sequence.
-    let keyed = receive_device_list_update(
+    let keyed = receive_settled(
         &state,
         "there.example",
         &json!({
@@ -406,7 +486,7 @@ async fn an_update_that_skipped_one_fetches_the_whole_list_again() {
     let (router, state) = app(remote.clone(), true);
     let mut scenario = Scenario::new(router);
     register_alice(&mut scenario).await;
-    receive_device_list_update(
+    receive_settled(
         &state,
         "there.example",
         &json!({"user_id": BOB, "device_id": "ROVER", "stream_id": 1}),
@@ -419,14 +499,14 @@ async fn an_update_that_skipped_one_fetches_the_whole_list_again() {
         3,
         vec![device("ROVER", "LOu9tc6Sg7", Some("New device name"))],
     ));
-    let third = receive_device_list_update(
+    let third = receive_settled(
         &state,
         "there.example",
         &json!({"user_id": BOB, "device_id": "ROVER", "stream_id": 3, "prev_id": [2], "device_display_name": "New device name"}),
     )
     .await
     .unwrap();
-    assert_eq!(third, InboundDeviceList::Resynced);
+    assert_eq!(third, InboundDeviceList::ResyncScheduled);
     assert_eq!(remote.asked().len(), 2);
 
     let answer = query_bob(&mut scenario).await;
@@ -453,14 +533,14 @@ async fn a_copy_that_could_not_be_fetched_again_is_stale_until_it_is() {
     query_bob(&mut scenario).await;
 
     remote.go_down();
-    let outcome = receive_device_list_update(
+    let outcome = receive_settled(
         &state,
         "there.example",
         &json!({"user_id": BOB, "device_id": "ROVER", "stream_id": 5, "prev_id": [4]}),
     )
     .await
     .unwrap();
-    assert_eq!(outcome, InboundDeviceList::ResyncFailed);
+    assert_eq!(outcome, InboundDeviceList::ResyncScheduled);
     let while_down = query_bob(&mut scenario).await;
     assert!(
         while_down["failures"].get("there.example").is_some(),
@@ -491,7 +571,7 @@ async fn a_deletion_in_sequence_removes_the_device_and_an_old_update_is_ignored(
     register_alice(&mut scenario).await;
     query_bob(&mut scenario).await;
 
-    let old = receive_device_list_update(
+    let old = receive_settled(
         &state,
         "there.example",
         &json!({"user_id": BOB, "device_id": "ROVER", "stream_id": 2, "prev_id": [1], "deleted": true}),
@@ -500,7 +580,7 @@ async fn a_deletion_in_sequence_removes_the_device_and_an_old_update_is_ignored(
     .unwrap();
     assert_eq!(old, InboundDeviceList::AlreadyKnown);
 
-    let deletion = receive_device_list_update(
+    let deletion = receive_settled(
         &state,
         "there.example",
         &json!({"user_id": BOB, "device_id": "LANDER", "stream_id": 3, "prev_id": [2], "deleted": true}),
@@ -548,7 +628,7 @@ async fn a_signing_key_update_changes_the_copied_master_key_and_a_forged_one_is_
     assert_eq!(second["self_signing_keys"][BOB]["keys"]["ed25519:s2"], "s2");
     assert_eq!(remote.asked().len(), 1);
 
-    let forged = receive_device_list_update(
+    let forged = receive_settled(
         &state,
         "elsewhere.example",
         &json!({"user_id": BOB, "device_id": "EVIL", "stream_id": 9}),
@@ -649,4 +729,81 @@ async fn a_local_users_list_for_other_servers_has_every_device_named_and_keyed()
             .is_none(),
         "not this server's user"
     );
+}
+
+/// A remote server whose `/user/devices` answers only when the test lets it, counting the
+/// requests.
+struct GatedRemote {
+    gate: tokio::sync::Semaphore,
+    asked: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl RemoteKeys for GatedRemote {
+    async fn query(&self, _server: &str, _device_keys: Value) -> Result<Value, String> {
+        Err("not asked in this test".to_owned())
+    }
+
+    async fn claim(&self, _server: &str, _one_time_keys: Value) -> Result<Value, String> {
+        Err("not asked in this test".to_owned())
+    }
+
+    async fn devices(&self, _server: &str, _user_id: &str) -> Result<Value, String> {
+        self.asked.fetch_add(1, Ordering::SeqCst);
+        let permit = self.gate.acquire().await.map_err(|e| e.to_string())?;
+        permit.forget();
+        Ok(bobs_list(3, vec![device("ROVER", "k3", None)]))
+    }
+}
+
+/// An update that calls for a fetch is answered before the fetch is done (the fetch is in the
+/// background: a transaction must not wait on a request to its own sender, which this
+/// server's one-request-at-a-time client would queue behind its own transaction to them), and
+/// updates arriving meanwhile ask for one more fetch after it, not one each at once.
+#[tokio::test]
+async fn an_update_calling_for_a_fetch_is_answered_at_once_and_later_ones_wait_for_one_more() {
+    let remote = Arc::new(GatedRemote {
+        gate: tokio::sync::Semaphore::new(0),
+        asked: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let auth_state = AuthState::in_memory();
+    let store = TablesE2eStore::open(MemoryBackend::new()).expect("open e2e store");
+    let state: E2eState<MemoryBackend> = E2eState::new(auth_state, Arc::new(store));
+    state.install_remote_keys(remote.clone());
+    state.install_room_sharing(Arc::new(Sharing(AtomicBool::new(true))));
+    let bob = UserId::parse(BOB).unwrap();
+
+    let update = |stream_id: u64| json!({"user_id": BOB, "device_id": "ROVER", "stream_id": stream_id, "prev_id": [stream_id - 1]});
+    let first = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        receive_device_list_update(&state, "there.example", &update(2)),
+    )
+    .await
+    .expect("answered without waiting for the fetch")
+    .unwrap();
+    assert_eq!(first, InboundDeviceList::ResyncScheduled);
+    for stream_id in [3, 4] {
+        receive_device_list_update(&state, "there.example", &update(stream_id))
+            .await
+            .unwrap();
+    }
+    while remote.asked.load(Ordering::SeqCst) == 0 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        remote.asked.load(Ordering::SeqCst),
+        1,
+        "one fetch at a time"
+    );
+
+    remote.gate.add_permits(2);
+    state.resyncs_settled().await;
+    assert_eq!(
+        remote.asked.load(Ordering::SeqCst),
+        2,
+        "the two updates that came meanwhile asked for one more fetch between them"
+    );
+    let held = state.store.get_remote_user(&bob).await.unwrap().unwrap();
+    assert_eq!(held.stream_id, 3);
+    assert!(!held.stale);
 }

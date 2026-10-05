@@ -30,7 +30,7 @@
 //!   self-signing keys), then each EDU whose `prev_id`s are all at or before the copy's
 //!   `stream_id` is applied to it directly, and one that is not (a gap: an update was missed, or
 //!   there is no copy yet) makes this server fetch the whole list again
-//!   ([`receive_device_list_update`]). When the fetch fails the copy is marked stale and is not
+//!   ([`receive_device_list_update`]), in the background ([`ResyncQueue`] says why). When the fetch fails the copy is marked stale and is not
 //!   served until a fetch succeeds. A copy that is complete is served without asking anybody,
 //!   which is what lets a client query keys while the other server is down.
 //! - **Not sharing a room** -- no EDUs would come, so no copy is kept: the query goes to
@@ -449,6 +449,13 @@ fn parse_user_devices(
 /// Fetches `user_id`'s whole device list from their server and replaces the copy held. Returns
 /// whether that succeeded; on failure the copy, if any, is marked stale (logged either way).
 ///
+/// When what was fetched differs from the copy held (or there was none), a device-list change
+/// is recorded for the user, so local users sharing a room with them are told in `/sync` to
+/// query again -- as Synapse does after a resync. A first fetch made to answer a `/keys/query`
+/// is such a change: Sytest's "Device list doesn't change if remote server is down" waits for
+/// the remote user in `device_lists.changed` after its first query. A fetch that found the
+/// copy current records nothing.
+///
 /// # Errors
 /// A storage error.
 pub async fn resync_remote_user<B: hs_kv::KvBackend + 'static>(
@@ -473,10 +480,16 @@ pub async fn resync_remote_user<B: hs_kv::KvBackend + 'static>(
                 stream_id = user.stream_id,
                 "fetched a remote user's device list"
             );
+            let changed = differs_from_copy(state, user_id, &user, &devices).await?;
             state
                 .store
                 .replace_remote_device_list(user_id, user, devices)
                 .await?;
+            if changed {
+                state.store.record_device_list_change(user_id).await?;
+            } else {
+                tracing::debug!(%user_id, "a fetched device list matches the copy held");
+            }
             Ok(true)
         }
         None => {
@@ -486,17 +499,42 @@ pub async fn resync_remote_user<B: hs_kv::KvBackend + 'static>(
     }
 }
 
+/// Whether a fetched list (`user`, `devices`) says anything a local client would see that the
+/// copy held does not: a device, its keys or name, or a cross-signing key. No copy held
+/// differs; a stale one is compared like any other (stale says it may be behind, not that it
+/// is: Synapse's "our cache matches already").
+async fn differs_from_copy<B: hs_kv::KvBackend + 'static>(
+    state: &crate::state::E2eState<B>,
+    user_id: &UserId,
+    user: &RemoteUserRow,
+    devices: &[(OwnedDeviceId, RemoteDeviceRow)],
+) -> Result<bool, E2eError> {
+    let Some(held) = state.store.get_remote_user(user_id).await? else {
+        return Ok(true);
+    };
+    if held.master != user.master || held.self_signing != user.self_signing {
+        return Ok(true);
+    }
+    let held_devices: BTreeMap<OwnedDeviceId, RemoteDeviceRow> = state
+        .store
+        .list_remote_devices(user_id)
+        .await?
+        .into_iter()
+        .collect();
+    let fetched: BTreeMap<OwnedDeviceId, RemoteDeviceRow> = devices.iter().cloned().collect();
+    Ok(held_devices != fetched)
+}
+
 /// What [`receive_device_list_update`] or [`receive_signing_key_update`] did with one EDU.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InboundDeviceList {
     /// The update followed the copy held and was applied to it.
     Applied,
-    /// The update did not follow the copy held (or there was none), so the whole list was
-    /// fetched again from the user's server.
-    Resynced,
-    /// As [`InboundDeviceList::Resynced`], but the fetch failed: the copy is marked stale and
-    /// will be fetched again when next needed.
-    ResyncFailed,
+    /// The update did not follow the copy held (or there was none), so the whole list is being
+    /// fetched again from the user's server, in the background ([`ResyncQueue`]); the copy is
+    /// stale until that is done. A fetch that fails leaves it stale, to be fetched again when
+    /// next needed.
+    ResyncScheduled,
     /// The user's list is not kept (no local user shares a room with them); the change was
     /// recorded so a client that does ask is told to query again, and nothing else was done.
     Noted,
@@ -521,8 +559,10 @@ fn edu_user(origin: &str, content: &Value) -> Result<ruma::OwnedUserId, &'static
 
 /// Applies one `m.device_list_update` EDU from `origin` (the transaction's authenticated
 /// sender). See the module docs for the rules; every outcome but
-/// [`InboundDeviceList::Dropped`] and [`InboundDeviceList::AlreadyKnown`] records a device-list
-/// change for the user, so local clients that share a room with them are told to query again.
+/// [`InboundDeviceList::Dropped`], [`InboundDeviceList::AlreadyKnown`] and a
+/// [`InboundDeviceList::ResyncScheduled`] whose fetch found the copy current records a
+/// device-list change for the user (the last when its fetch is done), so local clients that
+/// share a room with them are told to query again.
 ///
 /// # Errors
 /// A storage error.
@@ -592,13 +632,119 @@ pub async fn receive_device_list_update<B: hs_kv::KvBackend + 'static>(
         state.store.record_device_list_change(&user_id).await?;
         return Ok(InboundDeviceList::Noted);
     };
-    let fetched = resync_remote_user(state, remote, &user_id).await?;
-    state.store.record_device_list_change(&user_id).await?;
-    Ok(if fetched {
-        InboundDeviceList::Resynced
-    } else {
-        InboundDeviceList::ResyncFailed
-    })
+    // A fetch that changed the copy recorded the change itself; one that failed did not, and
+    // local clients are told anyway, so that their next query fetches again.
+    // The copy, if any, is not served while the fetch is under way: a query in between asks
+    // the user's server itself.
+    if state.store.get_remote_user(&user_id).await?.is_some() {
+        state.store.mark_remote_user_stale(&user_id).await?;
+    }
+    schedule_resync(state, remote, user_id);
+    Ok(InboundDeviceList::ResyncScheduled)
+}
+
+/// The remote users whose device list [`receive_device_list_update`] is fetching again in the
+/// background, held by [`crate::state::E2eState`].
+///
+/// In the background, not in the transaction that brought the update: this server's federation
+/// client sends to each destination one request at a time (Synapse's default too), so a
+/// transaction from server B whose update made this server ask B for the user's devices waited
+/// behind this server's own transaction to B -- and when B was doing the same, each server's
+/// `/send` waited on the other's until both timed out, 30 s later, and B was then backed off
+/// (Complement's `TestDeviceListUpdates`: every subtest after the first failed on the backoff).
+/// Synapse resyncs in the background for the same reason. A user's fetch runs once at a time:
+/// an update that arrives while one is under way asks for one more after it, not a second at
+/// once.
+#[derive(Debug)]
+pub struct ResyncQueue {
+    /// User -> whether another fetch was asked for while one is under way.
+    users: std::sync::Mutex<BTreeMap<ruma::OwnedUserId, bool>>,
+    /// How many users have a fetch under way, for [`crate::state::E2eState::resyncs_settled`].
+    pub(crate) in_flight: tokio::sync::watch::Sender<usize>,
+}
+
+impl Default for ResyncQueue {
+    fn default() -> Self {
+        Self {
+            users: std::sync::Mutex::new(BTreeMap::new()),
+            in_flight: tokio::sync::watch::Sender::new(0),
+        }
+    }
+}
+
+impl ResyncQueue {
+    /// Claims `user_id`'s fetch: `true` if the caller is to run it, `false` if one is under way
+    /// (which is then asked to run once more).
+    fn claim(&self, user_id: &UserId) -> bool {
+        let mut users = self
+            .users
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(again) = users.get_mut(user_id) {
+            *again = true;
+            return false;
+        }
+        users.insert(user_id.to_owned(), false);
+        let count = users.len();
+        drop(users);
+        self.in_flight.send_replace(count);
+        true
+    }
+
+    /// After a fetch of `user_id`'s: `true` if another was asked for meanwhile (and is now the
+    /// caller's to run), `false` if the user is done with.
+    fn finish(&self, user_id: &UserId) -> bool {
+        let mut users = self
+            .users
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(again) = users.get_mut(user_id)
+            && *again
+        {
+            *again = false;
+            return true;
+        }
+        users.remove(user_id);
+        let count = users.len();
+        drop(users);
+        self.in_flight.send_replace(count);
+        false
+    }
+}
+
+/// Fetches `user_id`'s list again on a task of its own (see [`ResyncQueue`]). A fetch that
+/// fails records a device-list change, so local clients query again and that query fetches;
+/// one that changes the copy has recorded it ([`resync_remote_user`]).
+fn schedule_resync<B: hs_kv::KvBackend + 'static>(
+    state: &crate::state::E2eState<B>,
+    remote: &Arc<dyn RemoteKeys>,
+    user_id: ruma::OwnedUserId,
+) {
+    if !state.resyncs.claim(&user_id) {
+        tracing::debug!(%user_id, "a device-list fetch is under way; one more is asked for after it");
+        return;
+    }
+    tracing::debug!(%user_id, "fetching a remote user's device list again in the background");
+    let state = state.clone();
+    let remote = remote.clone();
+    tokio::spawn(async move {
+        loop {
+            match resync_remote_user(&state, &remote, &user_id).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    if let Err(error) = state.store.record_device_list_change(&user_id).await {
+                        tracing::warn!(%user_id, %error, "could not record a device-list change after a failed fetch");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%user_id, %error, "could not store a remote user's fetched device list");
+                }
+            }
+            if !state.resyncs.finish(&user_id) {
+                break;
+            }
+        }
+    });
 }
 
 /// Applies one `m.signing_key_update` EDU from `origin`: the user's master and self-signing keys

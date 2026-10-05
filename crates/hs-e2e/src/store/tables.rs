@@ -134,6 +134,10 @@ pub struct TablesE2eStore<B: KvBackend> {
     remote_users: TypedKeyspace<B::Keyspace, RemoteUserKey>,
     remote_devices: TypedKeyspace<B::Keyspace, RemoteDeviceKey>,
     counters: B::Keyspace,
+    /// The latest device-list stream position this process has committed, for
+    /// [`DeviceKeyStore::subscribe_device_list_stream`]: written after each commit that moved
+    /// the stream, so a follower wakes at once instead of at its next poll.
+    stream_head: tokio::sync::watch::Sender<u64>,
 }
 
 impl<B: KvBackend> TablesE2eStore<B> {
@@ -163,8 +167,23 @@ impl<B: KvBackend> TablesE2eStore<B> {
             remote_users: TypedKeyspace::new(open("hs_e2e.remote_users")?),
             remote_devices: TypedKeyspace::new(open("hs_e2e.remote_devices")?),
             counters: open("hs_e2e.counters")?,
+            stream_head: tokio::sync::watch::Sender::new(0),
             backend,
         })
+    }
+
+    /// Tells [`DeviceKeyStore::subscribe_device_list_stream`]'s receivers the stream reached
+    /// `pos` (committed). Positions committed concurrently may arrive out of order, so the head
+    /// only moves forwards.
+    fn stream_moved(&self, pos: u64) {
+        self.stream_head.send_if_modified(|head| {
+            if pos > *head {
+                *head = pos;
+                true
+            } else {
+                false
+            }
+        });
     }
 
     /// The underlying backend, for callers that need their own transactions spanning this store
@@ -238,6 +257,7 @@ impl<B: KvBackend> DeviceKeyStore for TablesE2eStore<B> {
             Ok(pos)
         })
         .map_err(store_err)
+        .inspect(|pos| self.stream_moved(*pos))
     }
 
     async fn replace_device_keys(
@@ -308,6 +328,7 @@ impl<B: KvBackend> DeviceKeyStore for TablesE2eStore<B> {
             self.bump_device_list(txn, user_id)
         })
         .map_err(store_err)
+        .inspect(|pos| self.stream_moved(*pos))
     }
 
     async fn record_device_list_change(&self, user_id: &UserId) -> Result<u64, StoreError> {
@@ -315,6 +336,7 @@ impl<B: KvBackend> DeviceKeyStore for TablesE2eStore<B> {
             self.bump_device_list(txn, user_id)
         })
         .map_err(store_err)
+        .inspect(|pos| self.stream_moved(*pos))
     }
 
     async fn record_own_device_list_change(&self, user_id: &UserId) -> Result<u64, StoreError> {
@@ -328,6 +350,7 @@ impl<B: KvBackend> DeviceKeyStore for TablesE2eStore<B> {
             Ok(pos)
         })
         .map_err(store_err)
+        .inspect(|pos| self.stream_moved(*pos))
     }
 
     async fn own_changes_since(
@@ -380,6 +403,10 @@ impl<B: KvBackend> DeviceKeyStore for TablesE2eStore<B> {
         upto: Option<u64>,
     ) -> Result<BTreeSet<OwnedUserId>, StoreError> {
         Ok(self.stream_entries(since, upto)?.0)
+    }
+
+    fn subscribe_device_list_stream(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        Some(self.stream_head.subscribe())
     }
 }
 
@@ -1451,6 +1478,37 @@ mod tests {
             alice_pos,
             "the position other servers are told of does not move"
         );
+    }
+
+    #[tokio::test]
+    async fn every_write_to_the_device_list_stream_wakes_a_subscriber_with_its_position() {
+        let s = store();
+        let alice = uid("@alice:example.org");
+        let mut rx = s
+            .subscribe_device_list_stream()
+            .expect("the tables store can say");
+        assert!(!rx.has_changed().unwrap());
+        let seen = |pos: u64, rx: &mut tokio::sync::watch::Receiver<u64>| {
+            assert!(rx.has_changed().unwrap(), "the write at {pos} woke it");
+            assert_eq!(*rx.borrow_and_update(), pos);
+        };
+        let pos = s
+            .upload_device_keys(&alice, &did("A1"), serde_json::json!({}))
+            .await
+            .unwrap();
+        seen(pos, &mut rx);
+        let pos = s.record_device_list_change(&alice).await.unwrap();
+        seen(pos, &mut rx);
+        let pos = s.record_own_device_list_change(&alice).await.unwrap();
+        seen(pos, &mut rx);
+        let pos = s.delete_device_keys(&alice, &did("A1")).await.unwrap();
+        seen(pos, &mut rx);
+        // A write that does not touch the stream does not wake it.
+        s.replace_device_keys(&alice, &did("A2"), serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(!rx.has_changed().unwrap());
+        assert_eq!(*rx.borrow(), s.current_stream_pos().await.unwrap());
     }
 
     #[tokio::test]

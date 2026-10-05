@@ -224,6 +224,20 @@ pub trait DeviceKeyStore: Send + Sync {
     /// ever changed.
     async fn current_stream_pos(&self) -> Result<u64, StoreError>;
 
+    /// A receiver marked changed each time this process commits a write to the device-list
+    /// stream, holding the highest position committed so far (`None`: this store cannot say,
+    /// and a follower polls [`DeviceKeyStore::current_stream_pos`] only). What lets
+    /// `hs serve`'s federation announcer tell other servers of a change as it happens, rather
+    /// than at its next poll: the servers to tell are those sharing a room with the user *at
+    /// the change*, and a poll that runs later also tells a server that joined since (Sytest's
+    /// "Local device key changes get to remote servers" saw the previous test's user's new
+    /// device announced to a server that joined its room 50 ms after the device was made).
+    /// A write committed by another replica on a shared backend does not mark it; that
+    /// replica's own receiver does.
+    fn subscribe_device_list_stream(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        None
+    }
+
     /// The stream position of `user_id`'s most recent device-list change, or `0` if they have
     /// never had one. What this server reports as `stream_id` in its `/user/devices/{userId}`
     /// answer and stamps on the `m.device_list_update` EDUs it sends for the user, so the two

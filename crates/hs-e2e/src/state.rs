@@ -128,6 +128,10 @@ pub struct E2eState<B: KvBackend> {
     /// once installed: the condition for keeping a copy of their device list. Shared across
     /// clones like `remote_keys`; unset means no copy is ever kept.
     room_sharing: Arc<OnceLock<Arc<dyn crate::federation::RoomSharing>>>,
+    /// The remote users whose device list is being fetched again in the background
+    /// ([`crate::federation::receive_device_list_update`] on a gap), shared across clones. See
+    /// [`crate::federation::ResyncQueue`].
+    pub(crate) resyncs: Arc<crate::federation::ResyncQueue>,
     /// Marker so `B` (the backend `E2eState` was constructed over) is nameable in code that
     /// otherwise only touches `store` through the trait object — kept even though `store` itself
     /// erases `B`, so `E2eState<B>: FromRequestParts` bounds line up the same way `RoomState<B>`'s
@@ -213,8 +217,19 @@ impl<B: KvBackend> E2eState<B> {
             remote_keys: Arc::new(OnceLock::new()),
             to_device_outbox: Arc::new(OnceLock::new()),
             room_sharing: Arc::new(OnceLock::new()),
+            resyncs: Arc::new(crate::federation::ResyncQueue::default()),
             _backend: std::marker::PhantomData,
         }
+    }
+
+    /// Waits until no remote user's device list is being fetched again in the background (see
+    /// [`crate::federation::receive_device_list_update`]). For tests and an orderly shutdown;
+    /// a fetch that is started while this waits is waited for too.
+    pub async fn resyncs_settled(&self) {
+        let mut in_flight = self.resyncs.in_flight.subscribe();
+        // `wait_for` returns at once when it is already zero; the sender lives in `self`, so
+        // the channel cannot close while this borrows it.
+        let _ = in_flight.wait_for(|n| *n == 0).await;
     }
 
     /// Installs how this crate learns whether a remote user shares a room with a local one

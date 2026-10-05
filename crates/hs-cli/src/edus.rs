@@ -34,7 +34,9 @@
 //! # What is not sent
 //!
 //! Device-list changes made while the server was down are not announced (the announcer starts at
-//! the stream's position at start). In a cluster, an EDU for a destination whose federation shard
+//! the stream's position at start), and the sender keeps EDUs in memory, so a to-device message
+//! or device-list update queued for a server that is down is lost if this one restarts first
+//! (Complement's `stopped_server` cases; `docs/rfcs/0023-durable-to-device-and-device-list-edus.md`). In a cluster, an EDU for a destination whose federation shard
 //! another replica owns is forwarded to that replica over the mesh (`crate::edu_forward`), except
 //! the device-list announcer's: every replica follows the stream and produces those for itself,
 //! and each queues them only for the destinations it sends for.
@@ -221,17 +223,26 @@ impl<B: KvBackend + 'static> InboundEduSink for EduDispatcher<B> {
     }
 }
 
-/// How often [`DeviceListAnnouncer`] looks at the device-list stream. A client that uploads keys
-/// and a remote server that is told about it are this far apart at most, plus the transaction.
+/// How often [`DeviceListAnnouncer`] looks at the device-list stream without being woken: for
+/// a change another replica committed (one committed in this process wakes it at once). A
+/// client of another replica that uploads keys and a remote server that is told about it are
+/// this far apart at most, plus the transaction.
 pub const DEVICE_LIST_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Follows the local device-list stream and announces each local user's changes to the servers
 /// that share a room with them. See the module docs.
 ///
-/// Polling, not a hook: every device-list change -- a key upload, a device added, renamed or
-/// deleted through `hs-auth`, a cross-signing key or signature -- already goes through
-/// `hs-e2e`'s stream, and reading the stream catches all of them without either crate learning
-/// about federation. The stream names the user, not what changed, so the announcer remembers
+/// Following the stream, not a hook: every device-list change -- a key upload, a device added,
+/// renamed or deleted through `hs-auth`, a cross-signing key or signature -- already goes
+/// through `hs-e2e`'s stream, and reading the stream catches all of them without either crate
+/// learning about federation. It looks as soon as a write in this process commits
+/// (`hs_e2e::store::DeviceKeyStore::subscribe_device_list_stream`), because who is told is
+/// worked out when it looks: the servers sharing a room with the user then. A look a poll
+/// interval late also told a server that joined in between, of a change made before it did
+/// (Sytest's "Local device key changes get to remote servers", which saw the previous test's
+/// user's new device first), and a remote user's sync that returned before the EDU arrived
+/// missed it (Sytest's "If remote user leaves room we no longer receive device updates"). It
+/// still polls every [`DEVICE_LIST_POLL_INTERVAL`] for the writes another replica commits. The stream names the user, not what changed, so the announcer remembers
 /// what it last announced for each user (`hs_e2e::federation::Announced`) and sends only the
 /// difference (`hs_e2e::federation::device_list_update_edus`). The first change it sees for a
 /// user announces every device and any cross-signing keys, since it cannot tell what changed. It
@@ -267,8 +278,11 @@ impl DeviceListAnnouncer {
             let mut announced: HashMap<OwnedUserId, Announced> = HashMap::new();
             let mut interval = tokio::time::interval(DEVICE_LIST_POLL_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Woken by this process's own writes as they commit; the poll stays for the writes
+            // of other replicas on a shared backend, and for a store that cannot say.
+            let mut woken = e2e.store.subscribe_device_list_stream();
             loop {
-                interval.tick().await;
+                next_look(&mut interval, &mut woken).await;
                 let now = match e2e.store.current_stream_pos().await {
                     Ok(pos) if pos > last => pos,
                     Ok(_) => continue,
@@ -308,6 +322,28 @@ impl DeviceListAnnouncer {
 impl Drop for DeviceListAnnouncer {
     fn drop(&mut self) {
         self.task.abort();
+    }
+}
+
+/// Waits for the announcer's next look at the stream: a write committed in this process
+/// (`woken`), or the poll interval for anything else. A closed `woken` falls back to the poll.
+async fn next_look(
+    interval: &mut tokio::time::Interval,
+    woken: &mut Option<tokio::sync::watch::Receiver<u64>>,
+) {
+    let Some(rx) = woken.as_mut() else {
+        interval.tick().await;
+        return;
+    };
+    tokio::select! {
+        _ = interval.tick() => {}
+        changed = rx.changed() => {
+            if changed.is_err() {
+                *woken = None;
+            } else {
+                rx.borrow_and_update();
+            }
+        }
     }
 }
 
@@ -514,5 +550,30 @@ mod tests {
         assert_eq!(types(&edus), ["m.device_list_update"]);
         assert_eq!(edus[0].1["prev_id"], json!([7]));
         assert_eq!(edus[0].1["stream_id"], 9);
+    }
+
+    /// The announcer looks as soon as a write commits, not at its next poll: who is told is
+    /// worked out when it looks, and a late look tells a server that joined in between (see
+    /// [`DeviceListAnnouncer`]). Time is paused, so a look that waited for the interval would
+    /// show it.
+    #[tokio::test(start_paused = true)]
+    async fn a_committed_write_wakes_the_announcer_before_its_poll_and_a_closed_watch_falls_back() {
+        let mut interval = tokio::time::interval(DEVICE_LIST_POLL_INTERVAL);
+        interval.tick().await;
+        let (tx, rx) = tokio::sync::watch::channel(0_u64);
+        let mut woken = Some(rx);
+        let started = tokio::time::Instant::now();
+        tx.send_replace(5);
+        next_look(&mut interval, &mut woken).await;
+        assert_eq!(started.elapsed(), Duration::ZERO, "woken at once");
+
+        drop(tx);
+        next_look(&mut interval, &mut woken).await;
+        assert!(woken.is_none(), "a closed watch is let go");
+        next_look(&mut interval, &mut woken).await;
+        assert!(
+            started.elapsed() >= DEVICE_LIST_POLL_INTERVAL,
+            "then the poll paces it"
+        );
     }
 }

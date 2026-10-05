@@ -66,9 +66,13 @@ fn session_from_json(value: &Value) -> Result<BackupSessionRow, E2eError> {
     })
 }
 
+/// A backup version named in a path or `?version=`. Every version this server makes is a
+/// number, so one that is not names no backup: `404 M_NOT_FOUND`, as for a number that names
+/// none (the spec's only error for a version that does not exist; Synapse answers the same, and
+/// Sytest's "Responds correctly when backup is empty" asks for `bogusversion`).
 fn parse_version_param(raw: &str) -> Result<u64, E2eError> {
     raw.parse::<u64>()
-        .map_err(|_| E2eError::BadRequest(format!("not a valid backup version: {raw:?}")))
+        .map_err(|_| E2eError::NotFound(format!("no such key backup version: {raw:?}")))
 }
 
 /// Resolves `?version=` for a **write** endpoint: absent means "the current version", present
@@ -87,17 +91,14 @@ async fn resolve_write_version<B: KvBackend + 'static>(
         .ok_or_else(|| E2eError::NotFound("no current key backup version".to_string()))?;
     match requested {
         None => Ok(current),
-        Some(raw) => {
-            let requested = parse_version_param(raw)?;
-            if requested == current {
-                Ok(current)
-            } else {
-                Err(E2eError::wrong_backup_version(
-                    requested.to_string(),
-                    current.to_string(),
-                ))
-            }
-        }
+        // A version that is not a number is not the current one either.
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(requested) if requested == current => Ok(current),
+            _ => Err(E2eError::wrong_backup_version(
+                raw.to_owned(),
+                current.to_string(),
+            )),
+        },
     }
 }
 
