@@ -22,3 +22,7 @@ crates/hs-cli/data/
 web/playwright-report*/
 web/test-results/
 .playwright-mcp/
+
+# Python bytecode (tools/*.py)
+__pycache__/
+*.pyc
