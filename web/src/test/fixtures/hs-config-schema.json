@@ -228,7 +228,15 @@
             "require_lowercase": false
           }
         },
+        "recaptcha": {
+          "required": false,
+          "public_key": null,
+          "private_key": null,
+          "private_key_file": null,
+          "siteverify_api": "https://www.recaptcha.net/recaptcha/api/siteverify"
+        },
         "oidc_providers": [],
+        "cas": null,
         "mas_delegation": null
       }
     },
@@ -1606,7 +1614,7 @@
           "x-applies": "hot"
         },
         "third_party_id_validation": {
-          "description": "How fast email and phone verification codes may be requested\n(`POST /account/3pid/*/requestToken`). Not used yet: this server sends no verification\ncodes. Corresponds to Synapse's `rc_3pid_validation`.",
+          "description": "How fast validation emails may be requested (`POST /register/email/requestToken`,\n`/account/3pid/email/requestToken`, `/account/password/email/requestToken`), counted per\nclient address and per email address, so nobody can use this server to flood a mailbox.\nCorresponds to Synapse's `rc_3pid_validation`.",
           "$ref": "#/$defs/RateLimitBucket",
           "default": {
             "per_second": 0.003,
@@ -1741,6 +1749,18 @@
             }
           }
         },
+        "recaptcha": {
+          "description": "A CAPTCHA people solve when they sign up. Unset keys (the default) mean no CAPTCHA.",
+          "$ref": "#/$defs/RecaptchaConfig",
+          "default": {
+            "required": false,
+            "public_key": null,
+            "private_key": null,
+            "private_key_file": null,
+            "siteverify_api": "https://www.recaptcha.net/recaptcha/api/siteverify"
+          },
+          "x-applies": "hot"
+        },
         "oidc_providers": {
           "description": "Other sign-in services people may use instead of a password here (\"Sign in with Google\",\na company Keycloak or Okta), each registered with the provider first. Empty by default.\nCorresponds to Synapse's `oidc_providers`.",
           "type": "array",
@@ -1749,6 +1769,19 @@
           },
           "default": [],
           "x-applies": "restart"
+        },
+        "cas": {
+          "description": "Sign-in through a CAS server instead of, or as well as, a password here. Unset by default.\nPeople who sign in through CAS for the first time get an account named after their CAS\nuser name; somebody whose CAS name matches an existing account signs in to that account.\nNeeds `server.public_baseurl` (or `service_url`), since CAS sends people back there.\nCorresponds to Synapse's `cas_config`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CasConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "x-applies": "hot"
         },
         "mas_delegation": {
           "description": "Hand sign-in to a separate Matrix Authentication Service (MAS) instead of this server's\nown OAuth issuer. Unset by default, which is right unless MAS is already deployed.\nCorresponds to Synapse's `experimental_features.msc3861`.",
@@ -1840,6 +1873,44 @@
       },
       "additionalProperties": false
     },
+    "RecaptchaConfig": {
+      "description": "A CAPTCHA (Google reCAPTCHA, or a service that answers its verification API) that people\nsolve when they sign up, to keep scripts from creating accounts in bulk. Corresponds to\nSynapse's `recaptcha_*` settings and `enable_registration_captcha`.",
+      "type": "object",
+      "properties": {
+        "required": {
+          "description": "Whether every new account must solve the CAPTCHA. Needs `public_key` and `private_key`.\nOff by default. With the keys set and this off, a client may still offer the CAPTCHA and\nthe server checks it, but sign-up does not require it. Corresponds to Synapse's\n`enable_registration_captcha`.",
+          "type": "boolean",
+          "default": false
+        },
+        "public_key": {
+          "description": "The site key the CAPTCHA service gave this server, which clients show the puzzle with.\nNot a secret. Corresponds to Synapse's `recaptcha_public_key`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "private_key": {
+          "description": "The secret key the CAPTCHA service gave this server, which this server checks answers\nwith. Prefer `private_key_file`. Corresponds to Synapse's `recaptcha_private_key`.",
+          "$ref": "#/$defs/SecretString",
+          "default": null
+        },
+        "private_key_file": {
+          "description": "Path to a file holding the secret key, read in place of `private_key`. Corresponds to\nSynapse's `recaptcha_private_key_path`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "siteverify_api": {
+          "description": "Where this server checks an answer. The default is Google's; change it only for a\ncompatible service. Corresponds to Synapse's `recaptcha_siteverify_api`.",
+          "type": "string",
+          "default": "https://www.recaptcha.net/recaptcha/api/siteverify"
+        }
+      },
+      "additionalProperties": false
+    },
     "OidcProviderConfig": {
       "description": "One upstream OIDC identity provider. Corresponds to one entry in\nSynapse's `oidc_providers`.",
       "type": "object",
@@ -1894,6 +1965,52 @@
         "idp_id",
         "issuer",
         "client_id"
+      ]
+    },
+    "CasConfig": {
+      "description": "Sign-in through a CAS server (Apereo CAS, the single sign-on many universities run).\nCorresponds to Synapse's `cas_config`.",
+      "type": "object",
+      "properties": {
+        "server_url": {
+          "description": "The CAS server's address, the part before `/login` (`https://cas.example.edu/cas`).\nPeople are sent to `<server_url>/login` to sign in, and this server checks the ticket\nthey come back with at `<server_url>/proxyValidate`. Corresponds to Synapse's\n`cas_config.server_url`.",
+          "type": "string"
+        },
+        "service_url": {
+          "description": "The address CAS sends people back to, when it is not `server.public_baseurl` (a server\nbehind a proxy that CAS reaches by another name). Unset, `server.public_baseurl` is used.\nMany CAS servers only send people back to addresses registered with them, so this must\nmatch what the CAS administrator registered. Corresponds to Synapse's\n`cas_config.service_url`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "displayname_attribute": {
+          "description": "The CAS attribute holding the person's name, used as the display name of an account\ncreated at their first sign-in (`displayName`, `cn`). Unset, a new account has no\ndisplay name. Corresponds to Synapse's `cas_config.displayname_attribute`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "required_attributes": {
+          "description": "Attributes a person must have to sign in, as `attribute: value` (`affiliation: staff`),\nor `attribute: null` to require only that the attribute is present. Somebody whose CAS\naccount lacks one is refused. Empty by default: anyone CAS signs in may. Corresponds to\nSynapse's `cas_config.required_attributes`.",
+          "type": "object",
+          "additionalProperties": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "default": {}
+        },
+        "idp_name": {
+          "description": "The name shown on the sign-in button (\"Sign in with ...\"). Corresponds to Synapse's\n`cas_config.idp_name`.",
+          "type": "string",
+          "default": "CAS"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "server_url"
       ]
     },
     "MasDelegationConfig": {

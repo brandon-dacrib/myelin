@@ -16,10 +16,13 @@
 //! | `hs_auth.access_tokens` | `(hash_hex,)` | `hs_auth.access_tokens_by_user` (non-unique, `(user_id,)`) | `TokenStore`'s access-token methods, including the "for device"/"except one" families, which filter the user-scoped index result in memory rather than adding a second index (see `delete_access_tokens_for_device` below) |
 //! | `hs_auth.refresh_tokens` | `(hash_hex,)` | `hs_auth.refresh_tokens_by_user` (non-unique, `(user_id,)`) | `TokenStore`'s refresh-token methods |
 //! | `hs_auth.login_tokens` | `(hash_hex,)` | none — only ever looked up by its own hash | `TokenStore`'s login-token methods |
+//! | `hs_auth.openid_tokens` | `(hash_hex,)` | none — looked up by its own hash; expired rows are swept on each insert | `TokenStore`'s OpenID-token methods |
 //! | `hs_auth.uia_sessions` | `(session_id,)` | none | `UiaStore` |
 //! | `hs_auth.threepids` | `(medium, address_lower)` | `hs_auth.threepids_by_user` (`(user_id, medium, address_lower)`, the whole record, written in the same transaction) | `UserStore::get_user_by_threepid`, `IdentityStore`'s 3PID methods |
 //! | `hs_auth.external_ids` | `(provider, external_id)` | `hs_auth.external_ids_by_user` (`(user_id, provider, external_id)`, likewise) | `IdentityStore`'s external-id methods |
 //! | `hs_auth.experimental_features` | `(user_id,)` | none | `IdentityStore`'s experimental-feature methods |
+//! | `hs_auth.threepid_validations` | `(sid,)` | `hs_auth.threepid_validations_by_secret` (`(medium, address, client_secret, sid)`, empty values, written in the same transaction) | `ThreepidStore`'s validation-session methods |
+//! | `hs_auth.threepid_bindings` | `(user_id, medium, address_lower, id_server)` | none — listing is a prefix scan on `(user_id,)` | `ThreepidStore`'s identity-server binding methods |
 //!
 //! Every index is maintained by [`hs_tables::index::maintain_index`] inside the same write
 //! transaction as the row it indexes (never a separate write that could diverge). The property
@@ -39,8 +42,9 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     AccessTokenRecord, DeviceRecord, DeviceStore, ExternalIdRecord, IdentityStore,
-    LoginTokenRecord, RecoveryTokenRecord, RefreshTokenRecord, SetupStore, StoreError,
-    ThreepidRecord, TokenStore, UiaStore, UserRecord, UserStore, tokens_match,
+    LoginTokenRecord, OpenIdTokenRecord, RecoveryTokenRecord, RefreshTokenRecord, SetupStore,
+    StoreError, ThreepidBindingRecord, ThreepidRecord, ThreepidStore, ThreepidValidationRecord,
+    TokenStore, UiaStore, UserRecord, UserStore, tokens_match,
 };
 use crate::token::TokenHash;
 
@@ -127,6 +131,7 @@ pub struct TablesAuthStore<B: KvBackend> {
     refresh_tokens: TypedKeyspace<B::Keyspace, (String,)>,
     refresh_tokens_by_user: IndexDef<B::Keyspace, (String,), (String,)>,
     login_tokens: TypedKeyspace<B::Keyspace, (String,)>,
+    openid_tokens: TypedKeyspace<B::Keyspace, (String,)>,
     uia_sessions: TypedKeyspace<B::Keyspace, (String,)>,
     threepids: TypedKeyspace<B::Keyspace, (String, String)>,
     threepids_by_user: TypedKeyspace<B::Keyspace, (String, String, String)>,
@@ -135,6 +140,9 @@ pub struct TablesAuthStore<B: KvBackend> {
     experimental_features: TypedKeyspace<B::Keyspace, (String,)>,
     /// One row at most, under [`SETUP_TOKEN_KEY`].
     setup: TypedKeyspace<B::Keyspace, (String,)>,
+    threepid_validations: TypedKeyspace<B::Keyspace, (String,)>,
+    threepid_validations_by_secret: TypedKeyspace<B::Keyspace, (String, String, String, String)>,
+    threepid_bindings: TypedKeyspace<B::Keyspace, (String, String, String, String)>,
 }
 
 impl<B: KvBackend> TablesAuthStore<B> {
@@ -168,6 +176,7 @@ impl<B: KvBackend> TablesAuthStore<B> {
             row_owner_user_id_refresh,
         );
         let login_tokens = TypedKeyspace::new(open("hs_auth.login_tokens")?);
+        let openid_tokens = TypedKeyspace::new(open("hs_auth.openid_tokens")?);
         let uia_sessions = TypedKeyspace::new(open("hs_auth.uia_sessions")?);
         let threepids = TypedKeyspace::new(open("hs_auth.threepids")?);
         let threepids_by_user = TypedKeyspace::new(open("hs_auth.threepids_by_user")?);
@@ -175,6 +184,10 @@ impl<B: KvBackend> TablesAuthStore<B> {
         let external_ids_by_user = TypedKeyspace::new(open("hs_auth.external_ids_by_user")?);
         let experimental_features = TypedKeyspace::new(open("hs_auth.experimental_features")?);
         let setup = TypedKeyspace::new(open("hs_auth.setup")?);
+        let threepid_validations = TypedKeyspace::new(open("hs_auth.threepid_validations")?);
+        let threepid_validations_by_secret =
+            TypedKeyspace::new(open("hs_auth.threepid_validations_by_secret")?);
+        let threepid_bindings = TypedKeyspace::new(open("hs_auth.threepid_bindings")?);
         Ok(Self {
             backend,
             users,
@@ -185,6 +198,7 @@ impl<B: KvBackend> TablesAuthStore<B> {
             refresh_tokens,
             refresh_tokens_by_user,
             login_tokens,
+            openid_tokens,
             uia_sessions,
             threepids,
             threepids_by_user,
@@ -192,6 +206,9 @@ impl<B: KvBackend> TablesAuthStore<B> {
             external_ids_by_user,
             experimental_features,
             setup,
+            threepid_validations,
+            threepid_validations_by_secret,
+            threepid_bindings,
         })
     }
 
@@ -438,6 +455,138 @@ fn identity_err(e: KvError) -> StoreError {
         return StoreError::Conflict(detail.clone());
     }
     store_err(e)
+}
+
+/// A validation session's primary row (by `sid`) and its by-secret row are written in one
+/// transaction, so a repeated `requestToken` always finds the session it continues.
+#[async_trait::async_trait]
+impl<B: KvBackend> ThreepidStore for TablesAuthStore<B> {
+    async fn put_validation_session(
+        &self,
+        record: ThreepidValidationRecord,
+    ) -> Result<(), StoreError> {
+        let key = (record.sid.clone(),);
+        let by_secret = (
+            record.medium.clone(),
+            record.address.clone(),
+            record.client_secret.clone(),
+            record.sid.clone(),
+        );
+        let value = encode(&record)?;
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            self.threepid_validations
+                .put(txn, &key, &value)
+                .map_err(to_kv)?;
+            self.threepid_validations_by_secret
+                .put(txn, &by_secret, &[])
+                .map_err(to_kv)
+        })
+        .map_err(store_err)
+    }
+
+    async fn get_validation_session(
+        &self,
+        sid: &str,
+    ) -> Result<Option<ThreepidValidationRecord>, StoreError> {
+        let snap = self.backend.snapshot();
+        self.threepid_validations
+            .get(&snap, &(sid.to_owned(),))
+            .map_err(|e| StoreError::Backend(e.to_string()))?
+            .map(|bytes| decode(&bytes))
+            .transpose()
+    }
+
+    async fn find_unvalidated_session(
+        &self,
+        medium: &str,
+        address: &str,
+        client_secret: &str,
+    ) -> Result<Option<ThreepidValidationRecord>, StoreError> {
+        let snap = self.backend.snapshot();
+        let prefix = TypedKeyspace::<B::Keyspace, (String, String, String, String)>::prefix(&(
+            medium.to_owned(),
+            address.to_owned(),
+            client_secret.to_owned(),
+        ));
+        let mut best: Option<ThreepidValidationRecord> = None;
+        for item in self.threepid_validations_by_secret.range(&snap, prefix) {
+            let ((_, _, _, sid), _) = item.map_err(|e| StoreError::Backend(e.to_string()))?;
+            let Some(bytes) = self
+                .threepid_validations
+                .get(&snap, &(sid,))
+                .map_err(|e| StoreError::Backend(e.to_string()))?
+            else {
+                continue;
+            };
+            let record: ThreepidValidationRecord = decode(&bytes)?;
+            if record.validated_at_ms.is_none()
+                && best
+                    .as_ref()
+                    .is_none_or(|b| b.created_at_ms < record.created_at_ms)
+            {
+                best = Some(record);
+            }
+        }
+        Ok(best)
+    }
+
+    async fn add_threepid_binding(&self, record: ThreepidBindingRecord) -> Result<(), StoreError> {
+        let key = (
+            record.user_id.to_string(),
+            record.medium.clone(),
+            record.address.to_ascii_lowercase(),
+            record.id_server.clone(),
+        );
+        let value = encode(&record)?;
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            if self
+                .threepid_bindings
+                .get(txn, &key)
+                .map_err(to_kv)?
+                .is_some()
+            {
+                return Ok(());
+            }
+            self.threepid_bindings.put(txn, &key, &value).map_err(to_kv)
+        })
+        .map_err(store_err)
+    }
+
+    async fn remove_threepid_binding(
+        &self,
+        user_id: &UserId,
+        medium: &str,
+        address: &str,
+        id_server: &str,
+    ) -> Result<(), StoreError> {
+        let key = (
+            user_id.to_string(),
+            medium.to_owned(),
+            address.to_ascii_lowercase(),
+            id_server.to_owned(),
+        );
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            self.threepid_bindings.delete(txn, &key).map_err(to_kv)
+        })
+        .map_err(store_err)
+    }
+
+    async fn list_threepid_bindings(
+        &self,
+        user_id: &UserId,
+    ) -> Result<Vec<ThreepidBindingRecord>, StoreError> {
+        let snap = self.backend.snapshot();
+        let prefix = TypedKeyspace::<B::Keyspace, (String, String, String, String)>::prefix(&(
+            user_id.to_string(),
+        ));
+        self.threepid_bindings
+            .range(&snap, prefix)
+            .map(|item| {
+                let (_k, v) = item.map_err(|e| StoreError::Backend(e.to_string()))?;
+                decode(&v)
+            })
+            .collect()
+    }
 }
 
 /// Every write keeps a primary row (by the identifier, which is what makes it unique to one
@@ -1014,7 +1163,60 @@ impl<B: KvBackend> TokenStore for TablesAuthStore<B> {
         })
         .map_err(store_err)
     }
+
+    async fn put_openid_token(
+        &self,
+        record: OpenIdTokenRecord,
+        now_ms: u64,
+    ) -> Result<(), StoreError> {
+        let key = (record.hash.to_hex(),);
+        let value = encode(&record)?;
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            // Sweep some of the expired ones: a token lives an hour and is never listed, so
+            // this keeps the keyspace at about an hour's worth of tokens. At most
+            // `OPENID_SWEEP_LIMIT` rows are read per insert, so one insert stays small.
+            let mut stale = Vec::new();
+            for item in self
+                .openid_tokens
+                .range(&*txn, RangeSpec::full())
+                .take(OPENID_SWEEP_LIMIT)
+            {
+                let (stale_key, bytes) = item.map_err(to_kv)?;
+                let expired = serde_json::from_slice::<OpenIdTokenRecord>(&bytes)
+                    .map(|r| r.expires_at_ms < now_ms)
+                    .unwrap_or(true);
+                if expired {
+                    stale.push(stale_key);
+                }
+            }
+            for stale_key in &stale {
+                self.openid_tokens.delete(txn, stale_key).map_err(to_kv)?;
+            }
+            self.openid_tokens.put(txn, &key, &value).map_err(to_kv)
+        })
+        .map_err(store_err)
+    }
+
+    async fn get_openid_token(
+        &self,
+        hash: &TokenHash,
+        now_ms: u64,
+    ) -> Result<Option<OpenIdTokenRecord>, StoreError> {
+        let key = (hash.to_hex(),);
+        let bytes = transact(&self.backend, TransactConfig::default(), |txn| {
+            self.openid_tokens.get(txn, &key).map_err(to_kv)
+        })
+        .map_err(store_err)?;
+        let Some(bytes) = bytes else {
+            return Ok(None);
+        };
+        let record: OpenIdTokenRecord = decode(&bytes)?;
+        Ok((record.expires_at_ms >= now_ms).then_some(record))
+    }
 }
+
+/// How many `hs_auth.openid_tokens` rows one insert reads looking for expired ones to delete.
+const OPENID_SWEEP_LIMIT: usize = 256;
 
 /// The only key in the `hs_auth.setup` keyspace.
 const SETUP_TOKEN_KEY: &str = "token";

@@ -14,11 +14,9 @@
 //! # What these adapters will and will not answer
 //!
 //! Every method applies [`RegistryRoomSource::visible_to`] before returning any room content, as
-//! [`RoomDataSource`]'s contract requires. Beyond that, one endpoint answers *less* than the spec
-//! allows, deliberately:
+//! [`RoomDataSource`]'s contract requires. Two endpoints are worth a note:
 //!
-//! - **`/openid/userinfo` answers nothing** (below) is now the only such case here. `/state` and
-//!   `/state_ids` used to refuse every event but the newest, because `hs-room` exposed no
+//! - `/state` and `/state_ids` used to refuse every event but the newest, because `hs-room` exposed no
 //!   historical state query and answering about the past with the present would have handed a
 //!   remote state it could not detect was wrong. `hs_room::actor::RoomActor::state_before_event`
 //!   lifted that: both endpoints now answer for any event this server holds in its timeline,
@@ -27,9 +25,8 @@
 //!   (`crate::backfill`). They answered with the state *after* it until 2026-09-30, which
 //!   differs whenever the event is itself a state event. An outlier this server has not placed
 //!   in its timeline has no known state and is `404`, as in Synapse.
-//! - **`/openid/userinfo` answers nothing**, because no OpenID token is ever issued: the
-//!   client-side `POST /user/{userId}/openid/request_token` endpoint does not exist yet, so there
-//!   is no token this could resolve and every call is an invalid token.
+//! - **`/openid/userinfo`** resolves the tokens `POST /user/{userId}/openid/request_token`
+//!   issues (`hs_auth::openid::userinfo`); any other token is `401`.
 //!
 //! Auth chains are computed by walking `auth_events` transitively from the stored events
 //! themselves (bounded by [`MAX_AUTH_CHAIN`]), not from `hs-state`'s chain-cover index: the room
@@ -1379,10 +1376,18 @@ impl<B: KvBackend + 'static> FederationQuerySource for ServerQuerySource<B> {
         }))
     }
 
-    async fn openid_userinfo(&self, _access_token: &str) -> Option<String> {
-        // No OpenID token is ever issued (see the module doc), so every token presented here is
-        // one this server did not mint.
-        None
+    async fn openid_userinfo(&self, access_token: &str) -> Option<String> {
+        // Tokens from `POST /user/{userId}/openid/request_token` (`hs_auth::openid`).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        match hs_auth::openid::userinfo(self.auth.as_ref(), access_token, now).await {
+            Ok(user) => user.map(|u| u.to_string()),
+            Err(error) => {
+                tracing::warn!(%error, "could not look up an OpenID token");
+                None
+            }
+        }
     }
 
     async fn keys_query(&self, origin: &str, device_keys: &Value) -> Option<Value> {

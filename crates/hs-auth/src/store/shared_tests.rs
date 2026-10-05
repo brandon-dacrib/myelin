@@ -550,6 +550,48 @@ pub(crate) async fn login_token_expiry_is_enforced<S: AuthStore>(s: &S) {
     assert!(result.is_none());
 }
 
+pub(crate) async fn openid_tokens_live_until_they_expire<S: AuthStore>(s: &S) {
+    let alice = user_id!("@alice:example.org").to_owned();
+    let live = crate::token::TokenHash::of("openid-live");
+    let stale = crate::token::TokenHash::of("openid-stale");
+    s.put_openid_token(
+        crate::store::OpenIdTokenRecord {
+            hash: stale,
+            user_id: alice.clone(),
+            expires_at_ms: 1_000,
+        },
+        0,
+    )
+    .await
+    .unwrap();
+    s.put_openid_token(
+        crate::store::OpenIdTokenRecord {
+            hash: live,
+            user_id: alice.clone(),
+            expires_at_ms: 10_000,
+        },
+        2_000,
+    )
+    .await
+    .unwrap();
+    // Read twice: an OpenID token is not single-use.
+    for _ in 0..2 {
+        let found = s.get_openid_token(&live, 5_000).await.unwrap().unwrap();
+        assert_eq!(found.user_id, alice);
+    }
+    assert!(s.get_openid_token(&live, 10_001).await.unwrap().is_none());
+    assert!(
+        s.get_openid_token(&stale, 500).await.unwrap().is_none(),
+        "swept"
+    );
+    assert!(
+        s.get_openid_token(&crate::token::TokenHash::of("never"), 0)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
 pub(crate) async fn consume_login_token_missing_returns_none<S: AuthStore>(s: &S) {
     let hash = TokenHash::of("syl_never_existed");
     let result = s.consume_login_token(&hash, 1_000).await.unwrap();
@@ -858,6 +900,7 @@ pub(crate) async fn run_all<S: AuthStore>(make_store: impl Fn() -> S) {
     login_token_is_single_use(&make_store()).await;
     login_token_expiry_is_enforced(&make_store()).await;
     consume_login_token_missing_returns_none(&make_store()).await;
+    openid_tokens_live_until_they_expire(&make_store()).await;
     threepid_lookup_is_case_insensitive_on_address(&make_store()).await;
     threepids_are_listed_unique_and_removable(&make_store()).await;
     external_ids_are_listed_unique_and_removable(&make_store()).await;
@@ -868,4 +911,117 @@ pub(crate) async fn run_all<S: AuthStore>(make_store: impl Fn() -> S) {
     setup_token_is_absent_until_inserted_and_the_first_insert_wins(&make_store()).await;
     setup_token_is_consumed_once_and_only_by_the_right_token(&make_store()).await;
     clear_setup_token_withdraws_it_and_is_idempotent(&make_store()).await;
+    threepid_validation_sessions_round_trip_and_are_found_by_secret(&make_store()).await;
+    threepid_bindings_are_recorded_listed_and_forgotten(&make_store()).await;
+}
+
+fn validation(sid: &str, secret: &str, created_at_ms: u64) -> super::ThreepidValidationRecord {
+    super::ThreepidValidationRecord {
+        sid: sid.to_owned(),
+        medium: "email".to_owned(),
+        address: "bob@example.com".to_owned(),
+        client_secret: secret.to_owned(),
+        purpose: "registration".to_owned(),
+        token_hash: "00".to_owned(),
+        send_attempt: 1,
+        created_at_ms,
+        token_expires_at_ms: created_at_ms + 1000,
+        validated_at_ms: None,
+    }
+}
+
+pub(crate) async fn threepid_validation_sessions_round_trip_and_are_found_by_secret<
+    S: AuthStore,
+>(
+    s: &S,
+) {
+    assert!(s.get_validation_session("nope").await.unwrap().is_none());
+    s.put_validation_session(validation("s1", "secret", 1))
+        .await
+        .unwrap();
+    s.put_validation_session(validation("s2", "secret", 2))
+        .await
+        .unwrap();
+    s.put_validation_session(validation("s3", "other", 3))
+        .await
+        .unwrap();
+    assert_eq!(
+        s.get_validation_session("s1").await.unwrap().unwrap(),
+        validation("s1", "secret", 1)
+    );
+    // The newest unvalidated session for this secret.
+    let found = s
+        .find_unvalidated_session("email", "bob@example.com", "secret")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.sid, "s2");
+    // A validated session is no longer continued.
+    let mut validated = validation("s2", "secret", 2);
+    validated.validated_at_ms = Some(5);
+    s.put_validation_session(validated.clone()).await.unwrap();
+    assert_eq!(
+        s.find_unvalidated_session("email", "bob@example.com", "secret")
+            .await
+            .unwrap()
+            .unwrap()
+            .sid,
+        "s1"
+    );
+    assert_eq!(
+        s.get_validation_session("s2").await.unwrap().unwrap(),
+        validated
+    );
+    assert!(
+        s.find_unvalidated_session("email", "carol@example.com", "secret")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+pub(crate) async fn threepid_bindings_are_recorded_listed_and_forgotten<S: AuthStore>(s: &S) {
+    let alice = user_id!("@alice:example.org");
+    let binding = |address: &str, id_server: &str| super::ThreepidBindingRecord {
+        user_id: alice.to_owned(),
+        medium: "email".to_owned(),
+        address: address.to_owned(),
+        id_server: id_server.to_owned(),
+        bound_at_ms: 7,
+    };
+    s.add_threepid_binding(binding("b@example.com", "id.two"))
+        .await
+        .unwrap();
+    s.add_threepid_binding(binding("a@example.com", "id.one"))
+        .await
+        .unwrap();
+    // Recording it twice is not an error and keeps one.
+    s.add_threepid_binding(binding("a@example.com", "id.one"))
+        .await
+        .unwrap();
+    s.add_threepid_binding(super::ThreepidBindingRecord {
+        user_id: user_id!("@bob:example.org").to_owned(),
+        ..binding("c@example.com", "id.one")
+    })
+    .await
+    .unwrap();
+    let listed = s.list_threepid_bindings(alice).await.unwrap();
+    assert_eq!(
+        listed,
+        vec![
+            binding("a@example.com", "id.one"),
+            binding("b@example.com", "id.two")
+        ]
+    );
+    s.remove_threepid_binding(alice, "email", "A@example.com", "id.one")
+        .await
+        .unwrap();
+    // Forgetting one never recorded is not an error.
+    s.remove_threepid_binding(alice, "email", "z@example.com", "id.one")
+        .await
+        .unwrap();
+    assert_eq!(
+        s.list_threepid_bindings(alice).await.unwrap(),
+        vec![binding("b@example.com", "id.two")]
+    );
 }

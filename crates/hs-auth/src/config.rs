@@ -82,12 +82,10 @@ pub struct AuthConfig {
     /// stops new guest sessions at once; guests already signed in keep theirs.
     pub guest_registration_enabled: bool,
 
-    /// Whether `m.login.recaptcha` is included in the registration UIA flows at all. When
-    /// `false` (the default), the stage is never offered, so clients never hit it; when `true`,
-    /// [`crate::routes::register`] fails the stage cleanly with `M_UNRECOGNIZED` because this
-    /// server does not integrate with Google's verification service yet — see
-    /// `docs/rfcs/0002-auth-tokens-and-requester.md` section 7 for the follow-up.
-    pub recaptcha_enabled: bool,
+    /// The CAPTCHA at registration (`auth.recaptcha`), when its secret key is configured.
+    /// `None` (the default): `m.login.recaptcha` is never offered and a client submitting it
+    /// gets `M_UNRECOGNIZED`. See [`crate::recaptcha`].
+    pub recaptcha: Option<RecaptchaSettings>,
 
     /// Whether `m.login.terms` is included in the registration flow. Synapse's
     /// `user_consent.require_at_registration`.
@@ -122,6 +120,33 @@ pub struct AuthConfig {
     /// silently change who can register admin accounts through this route. See
     /// `docs/status/07-auth-and-identity.md` "Decisions made".
     pub registration_shared_secret: Option<String>,
+
+    /// The address clients reach this server at, without a trailing slash
+    /// (`https://matrix.example.org`): `server.public_baseurl`. The links this server hands out
+    /// that must come back to it -- a single-sign-on provider's return address, an email
+    /// validation link -- are built on it. `None` when it is not configured.
+    pub public_baseurl: Option<String>,
+
+    /// Sign-in through a CAS server (`auth.cas`, Synapse's `cas_config`), if configured. See
+    /// [`crate::cas`].
+    pub cas: Option<CasSettings>,
+}
+
+/// A configured CAS server ([`AuthConfig::cas`]): `hs_config::auth::CasConfig`, with its URLs
+/// stripped of any trailing slash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CasSettings {
+    /// The CAS server's base address: people sign in at `<server_url>/login`, tickets are
+    /// checked at `<server_url>/proxyValidate`.
+    pub server_url: String,
+    /// The base CAS sends people back to, in place of [`AuthConfig::public_baseurl`].
+    pub service_base: Option<String>,
+    /// The CAS attribute a new account's display name is taken from.
+    pub displayname_attribute: Option<String>,
+    /// Attributes a person must have to sign in: a value, or `None` for "present at all".
+    pub required_attributes: std::collections::BTreeMap<String, Option<String>>,
+    /// The provider's name, shown on the sign-in button.
+    pub idp_name: String,
 }
 
 impl Default for AuthConfig {
@@ -143,13 +168,40 @@ impl Default for AuthConfig {
             registration_requires_token: false,
             valid_registration_tokens: HashSet::new(),
             guest_registration_enabled: false,
-            recaptcha_enabled: false,
+            recaptcha: None,
             terms_enabled: false,
             password_policy: PasswordPolicy::default(),
             shared_secret_auth_secret: None,
             registration_shared_secret: None,
+            public_baseurl: None,
+            cas: None,
         }
     }
+}
+
+impl AuthConfig {
+    /// Whether a single-sign-on provider is configured, so `m.login.sso` can be offered (at
+    /// `GET /login`, and as a user-interactive auth flow by [`crate::reauth`]).
+    #[must_use]
+    pub fn sso_available(&self) -> bool {
+        self.cas.is_some()
+    }
+}
+
+/// The CAPTCHA settings registration reads: `hs_config::auth::RecaptchaConfig` with the secret
+/// resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecaptchaSettings {
+    /// Whether every registration flow includes `m.login.recaptcha`
+    /// (`auth.recaptcha.required`, Synapse's `enable_registration_captcha`). Off, a client may
+    /// still complete the stage, which Synapse allows too.
+    pub required: bool,
+    /// The site key, offered to clients in the challenge's `params`.
+    pub public_key: Option<String>,
+    /// The secret key the answer is checked with.
+    pub private_key: String,
+    /// The verification endpoint.
+    pub siteverify_api: String,
 }
 
 /// An error converting a native [`hs_config::Config`] into this crate's [`AuthConfig`].
@@ -177,8 +229,7 @@ impl TryFrom<&hs_config::Config> for AuthConfig {
     /// - `registration_requires_token`, `valid_registration_tokens`: `hs-config` has no
     ///   registration-token config surface yet (this crate's own `valid_registration_tokens` is
     ///   day-one, in-process-only storage besides — see that field's own doc comment).
-    /// - `recaptcha_enabled`, `terms_enabled`, `accept_legacy_query_param_token`: same — no
-    ///   native config field yet.
+    /// - `terms_enabled`, `accept_legacy_query_param_token`: same — no native config field yet.
     ///
     /// `shared_secret_auth_secret` (the `com.devture.shared_secret_auth` login provider) has no
     /// dedicated `hs_config` field either, but is deliberately **not** left at its default:
@@ -224,6 +275,34 @@ impl TryFrom<&hs_config::Config> for AuthConfig {
                 .registration_shared_secret
                 .as_str()
                 .map(str::to_owned),
+            recaptcha: config
+                .auth
+                .recaptcha
+                .private_key
+                .as_str()
+                .map(|private_key| RecaptchaSettings {
+                    required: config.auth.recaptcha.required,
+                    public_key: config.auth.recaptcha.public_key.clone(),
+                    private_key: private_key.to_owned(),
+                    siteverify_api: config.auth.recaptcha.siteverify_api.clone(),
+                }),
+            public_baseurl: config
+                .server
+                .public_baseurl
+                .as_deref()
+                .map(|url| url.trim_end_matches('/').to_owned())
+                .filter(|url| !url.is_empty()),
+            cas: config.auth.cas.as_ref().map(|cas| CasSettings {
+                server_url: cas.server_url.trim().trim_end_matches('/').to_owned(),
+                service_base: cas
+                    .service_url
+                    .as_deref()
+                    .map(|url| url.trim().trim_end_matches('/').to_owned())
+                    .filter(|url| !url.is_empty()),
+                displayname_attribute: cas.displayname_attribute.clone(),
+                required_attributes: cas.required_attributes.clone(),
+                idp_name: cas.idp_name.clone(),
+            }),
             ..Self::default()
         };
 
@@ -480,7 +559,7 @@ mod tests {
             auth.guest_registration_enabled,
             default.guest_registration_enabled
         );
-        assert_eq!(auth.recaptcha_enabled, default.recaptcha_enabled);
+        assert_eq!(auth.recaptcha, default.recaptcha);
         assert_eq!(auth.terms_enabled, default.terms_enabled);
         assert_eq!(
             auth.accept_legacy_query_param_token,

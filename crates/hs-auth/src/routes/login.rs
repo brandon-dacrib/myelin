@@ -51,6 +51,15 @@ pub async fn get_login_types(State(state): State<AuthState>) -> Json<Value> {
     if state.config.get().shared_secret_auth_secret.is_some() {
         flows.push(json!({"type": SHARED_SECRET_AUTH_LOGIN_TYPE}));
     }
+    // Single sign-on (`crate::cas`): the spec's `m.login.sso` with its one provider, and the
+    // older `m.login.cas` that clients from before `m.login.sso` (and Sytest) look for.
+    if let Some(cas) = &state.config.get().cas {
+        flows.push(json!({
+            "type": "m.login.sso",
+            "identity_providers": [{"id": crate::cas::PROVIDER, "name": cas.idp_name}],
+        }));
+        flows.push(json!({"type": "m.login.cas"}));
+    }
     Json(json!({ "flows": flows }))
 }
 
@@ -75,6 +84,16 @@ pub async fn post_login(
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
+    // The pre-identifier way of naming an account by its email address or phone number:
+    // top-level `medium` and `address`, which Synapse still reads (Sytest's "Can login with 3pid
+    // and password using m.login.password" sends it).
+    let legacy_threepid = match (
+        body.get("medium").and_then(Value::as_str),
+        body.get("address").and_then(Value::as_str),
+    ) {
+        (Some(medium), Some(address)) => Some((medium.to_owned(), address.to_owned())),
+        _ => None,
+    };
     let login_info: LoginInfo = serde_json::from_value(body).map_err(|_| {
         MatrixError::new(
             StatusCode::BAD_REQUEST,
@@ -99,7 +118,9 @@ pub async fn post_login(
         resolve_shared_secret_auth_login(&state, &login_info.data()).await?
     } else {
         match login_info {
-            LoginInfo::Password(p) => resolve_password_login(&state, &p).await?,
+            LoginInfo::Password(p) => {
+                resolve_password_login(&state, &p, legacy_threepid.as_ref()).await?
+            }
             LoginInfo::Token(t) => resolve_token_login(&state, &t.token).await?,
             LoginInfo::ApplicationService(as_info) => {
                 resolve_appservice_login(&state, &headers, &query, as_info.identifier.as_ref())
@@ -171,10 +192,18 @@ fn lowercase_localpart_for_login(raw: &str) -> String {
 async fn resolve_password_login(
     state: &AuthState,
     p: &ruma::api::client::session::login::v3::Password,
+    legacy_threepid: Option<&(String, String)>,
 ) -> Result<OwnedUserId, MatrixError> {
     #[allow(deprecated)]
     let user_id = if let Some(identifier) = &p.identifier {
         identifier_to_user_id(state, identifier).await?
+    } else if let Some((medium, address)) = legacy_threepid {
+        let address = if medium == "email" {
+            address.trim().to_lowercase()
+        } else {
+            address.clone()
+        };
+        threepid_user_id(state, medium, &address).await?
     } else if let Some(user) = &p.user {
         UserId::parse_with_server_name(
             lowercase_localpart_for_login(user.as_str()),
@@ -207,7 +236,7 @@ async fn resolve_password_login(
 /// country-calling-code table — a day-one simplification noted in
 /// `docs/rfcs/0002-auth-tokens-and-requester.md` section 8; clients that already send a bare
 /// MSISDN as `phone` with `country` empty are unaffected.
-async fn identifier_to_user_id(
+pub(crate) async fn identifier_to_user_id(
     state: &AuthState,
     identifier: &UserIdentifier,
 ) -> Result<OwnedUserId, MatrixError> {

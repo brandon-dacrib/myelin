@@ -20,8 +20,7 @@
 //!
 //! A few settings are declared but nothing in the server reads them at all. Those that are
 //! plain data a future reader would look up per operation are classified hot
-//! (`server.admin_contact`, `server.report_stats`, `media.remote_media_retention`, and
-//! `rate_limits.third_party_id_validation`, whose route is not served); those whose
+//! (`server.admin_contact`, `server.report_stats` and `media.remote_media_retention`); those whose
 //! reader would be built at startup are classified restart (`auth.enable_legacy_login`,
 //! `auth.password.enabled`, `auth.session_secret`, `appservices.enabled`). Either way a change
 //! has no effect today; `docs/status/13-config-compat-and-migration.md` lists them.
@@ -296,7 +295,7 @@ pub const SETTINGS: &[Setting] = &[
     ),
     hot(
         "/rate_limits/third_party_id_validation",
-        "nothing yet: no 3PID requestToken route is served, so there is nothing to limit",
+        "validation emails requested, per client address and per email address",
     ),
     // auth
     hot(
@@ -350,10 +349,12 @@ pub const SETTINGS: &[Setting] = &[
         "read when a password is checked",
     ),
     hot("/auth/password/policy", "read when a password is set"),
+    hot("/auth/recaptcha", "POST /register reads it per request"),
     restart(
         "/auth/oidc_providers",
         "upstream OIDC clients are built at startup",
     ),
+    hot("/auth/cas", "CAS sign-in reads it per request"),
     restart(
         "/auth/mas_delegation",
         "delegation replaces the native issuer at startup",

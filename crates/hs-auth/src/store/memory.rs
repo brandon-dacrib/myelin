@@ -11,8 +11,9 @@ use ruma::{DeviceId, OwnedDeviceId, OwnedUserId, UserId};
 
 use super::{
     AccessTokenRecord, DeviceRecord, DeviceStore, ExternalIdRecord, IdentityStore,
-    LoginTokenRecord, RecoveryTokenRecord, RefreshTokenRecord, SetupStore, StoreError,
-    ThreepidRecord, TokenStore, UiaStore, UserRecord, UserStore, tokens_match,
+    LoginTokenRecord, OpenIdTokenRecord, RecoveryTokenRecord, RefreshTokenRecord, SetupStore,
+    StoreError, ThreepidBindingRecord, ThreepidRecord, ThreepidStore, ThreepidValidationRecord,
+    TokenStore, UiaStore, UserRecord, UserStore, tokens_match,
 };
 use crate::token::TokenHash;
 
@@ -30,6 +31,7 @@ struct Inner {
     access_tokens: HashMap<TokenHash, AccessTokenRecord>,
     refresh_tokens: HashMap<TokenHash, RefreshTokenRecord>,
     login_tokens: HashMap<TokenHash, LoginTokenRecord>,
+    openid_tokens: HashMap<TokenHash, OpenIdTokenRecord>,
     uia_sessions: HashMap<String, UiaSession>,
     /// Keyed `(medium, address lower-cased)`.
     threepids: HashMap<(String, String), ThreepidRecord>,
@@ -38,6 +40,10 @@ struct Inner {
     experimental_features: HashMap<OwnedUserId, BTreeMap<String, bool>>,
     setup_token: Option<String>,
     recovery_token: Option<RecoveryTokenRecord>,
+    /// Keyed by `sid`.
+    threepid_validations: HashMap<String, ThreepidValidationRecord>,
+    /// Keyed `(user_id, medium, address lower-cased, id_server)`.
+    threepid_bindings: BTreeMap<(String, String, String, String), ThreepidBindingRecord>,
 }
 
 /// The in-memory `AuthStore`. Cheap to construct; clone the `Arc` you wrap it in, not this type.
@@ -260,6 +266,87 @@ impl UserStore for InMemoryAuthStore {
         let mut users: Vec<UserRecord> = self.lock().users.values().cloned().collect();
         users.sort_by(|a, b| a.user_id.cmp(&b.user_id));
         Ok(users)
+    }
+}
+
+#[async_trait]
+impl ThreepidStore for InMemoryAuthStore {
+    async fn put_validation_session(
+        &self,
+        record: ThreepidValidationRecord,
+    ) -> Result<(), StoreError> {
+        self.lock()
+            .threepid_validations
+            .insert(record.sid.clone(), record);
+        Ok(())
+    }
+
+    async fn get_validation_session(
+        &self,
+        sid: &str,
+    ) -> Result<Option<ThreepidValidationRecord>, StoreError> {
+        Ok(self.lock().threepid_validations.get(sid).cloned())
+    }
+
+    async fn find_unvalidated_session(
+        &self,
+        medium: &str,
+        address: &str,
+        client_secret: &str,
+    ) -> Result<Option<ThreepidValidationRecord>, StoreError> {
+        Ok(self
+            .lock()
+            .threepid_validations
+            .values()
+            .filter(|r| {
+                r.medium == medium
+                    && r.address == address
+                    && r.client_secret == client_secret
+                    && r.validated_at_ms.is_none()
+            })
+            .max_by_key(|r| r.created_at_ms)
+            .cloned())
+    }
+
+    async fn add_threepid_binding(&self, record: ThreepidBindingRecord) -> Result<(), StoreError> {
+        let key = (
+            record.user_id.to_string(),
+            record.medium.clone(),
+            record.address.to_ascii_lowercase(),
+            record.id_server.clone(),
+        );
+        self.lock().threepid_bindings.entry(key).or_insert(record);
+        Ok(())
+    }
+
+    async fn remove_threepid_binding(
+        &self,
+        user_id: &UserId,
+        medium: &str,
+        address: &str,
+        id_server: &str,
+    ) -> Result<(), StoreError> {
+        let key = (
+            user_id.to_string(),
+            medium.to_owned(),
+            address.to_ascii_lowercase(),
+            id_server.to_owned(),
+        );
+        self.lock().threepid_bindings.remove(&key);
+        Ok(())
+    }
+
+    async fn list_threepid_bindings(
+        &self,
+        user_id: &UserId,
+    ) -> Result<Vec<ThreepidBindingRecord>, StoreError> {
+        Ok(self
+            .lock()
+            .threepid_bindings
+            .iter()
+            .filter(|(k, _)| k.0 == user_id.as_str())
+            .map(|(_, v)| v.clone())
+            .collect())
     }
 }
 
@@ -599,6 +686,30 @@ impl TokenStore for InMemoryAuthStore {
         }
         rec.used = true;
         Ok(Some(rec.clone()))
+    }
+
+    async fn put_openid_token(
+        &self,
+        record: OpenIdTokenRecord,
+        now_ms: u64,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.lock();
+        inner.openid_tokens.retain(|_, r| r.expires_at_ms >= now_ms);
+        inner.openid_tokens.insert(record.hash, record);
+        Ok(())
+    }
+
+    async fn get_openid_token(
+        &self,
+        hash: &TokenHash,
+        now_ms: u64,
+    ) -> Result<Option<OpenIdTokenRecord>, StoreError> {
+        Ok(self
+            .lock()
+            .openid_tokens
+            .get(hash)
+            .filter(|r| r.expires_at_ms >= now_ms)
+            .cloned())
     }
 }
 

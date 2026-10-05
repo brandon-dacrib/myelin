@@ -214,12 +214,12 @@ Native field paths are dotted `hs-config` `Config` paths, e.g. `federation.domai
 
 | Option | Status | Native | Notes |
 |---|---|---|---|
-| `recaptcha_public_key` | Unsupported | — | R-PHASE1 (hs-auth). CAPTCHA-gated registration is not in the Phase 0 schema; tracked alongside registration tokens as a registration-hardening addition. |
-| `recaptcha_public_key_path` | Unsupported | — | R-PHASE1 (hs-auth), paired with above. |
-| `recaptcha_private_key` | Unsupported | — | R-PHASE1 (hs-auth). |
-| `recaptcha_private_key_path` | Unsupported | — | R-PHASE1 (hs-auth). |
-| `enable_registration_captcha` | Unsupported | — | R-PHASE1 (hs-auth). |
-| `recaptcha_siteverify_api` | Unsupported | — | R-PHASE1 (hs-auth). |
+| `recaptcha_public_key` | Mapped | `auth.recaptcha.public_key` | The site key clients show the CAPTCHA with. |
+| `recaptcha_public_key_path` | Unsupported | — | The site key is not a secret; set `auth.recaptcha.public_key` to the file's contents. |
+| `recaptcha_private_key` | Mapped | `auth.recaptcha.private_key` | Checked against the siteverify API when a registration submits `m.login.recaptcha`. |
+| `recaptcha_private_key_path` | Mapped | `auth.recaptcha.private_key_file` | |
+| `enable_registration_captcha` | Mapped | `auth.recaptcha.required` | Adds `m.login.recaptcha` to every registration flow. Off, a configured key still lets a client complete the stage, as Synapse allows. |
+| `recaptcha_siteverify_api` | Mapped | `auth.recaptcha.siteverify_api` | Same default (`https://www.recaptcha.net/recaptcha/api/siteverify`). |
 
 ## TURN
 
@@ -315,7 +315,7 @@ Native field paths are dotted `hs-config` `Config` paths, e.g. `federation.domai
 |---|---|---|---|
 | `saml2_config` | Unsupported | — | R-PHASE1 (hs-auth). SAML 2.0 SP support is not implemented in the Phase 0 auth schema, which covers OIDC upstream IdPs only (`PLAN.md` D5); tracked for Phase 1. |
 | `oidc_providers` | Mapped (diff) | `auth.oidc_providers` | Fewer sub-options than Synapse's (no per-provider claim-mapping template, no `user_mapping_provider` Python module hook — see `modules`/R-MODULE); `idp_id`, `issuer`, `client_id`, `client_secret`/`client_secret_path` and `scopes` map directly. |
-| `cas_config` | Unsupported | — | R-SSO-LEGACY. |
+| `cas_config` | Mapped (diff) | `auth.cas` | `server_url`, `service_url`, `displayname_attribute`, `required_attributes` and `idp_name` map directly; `enabled: false` leaves CAS off. CAS 2/3 `/proxyValidate` is always used (no `protocol_version`), a first sign-in always creates the account (no `enable_registration`), and `allow_numeric_ids`, `numeric_ids_prefix`, `idp_icon` and `idp_brand` are not carried over. |
 | `sso` | Unsupported | — | R-PHASE1 (hs-auth). SSO landing-page customization (`client_whitelist`, template overrides, `update_profile_information`) is not yet in the schema; tracked with `templates`. |
 | `jwt_config` | Unsupported | — | R-PHASE1 (hs-auth). `m.login.jwt` is not implemented in the Phase 0 auth schema. |
 | `password_config` | Mapped (diff) | `auth.password` | Synapse's `localdb_enabled` (disable the local password DB while keeping password login via a custom Python provider) has no equivalent — see `modules`/R-MODULE. `enabled`, `pepper`/`pepper_path` and `policy` map directly. |

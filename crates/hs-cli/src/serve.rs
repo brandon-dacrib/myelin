@@ -238,10 +238,26 @@ fn build_router<B: KvBackend>(
 ) -> (Router, RouteManifest) {
     let auth_router = hs_auth::routes::router().with_state(auth.clone());
     let auth_routes = crate::auth_manifest::routes();
+    // `GET /capabilities` takes an access token (the `Requester` extractor), so it is built on
+    // the auth state rather than in the stateless block below.
+    let (capabilities_router, capabilities_manifest) = Builder::<AuthState>::new()
+        .get(
+            "/capabilities",
+            crate::capabilities::get_capabilities,
+            RouteMeta::new(Surface::MatrixClient, AuthKind::Matrix)
+                .with_operation_id("getCapabilities"),
+        )
+        .build();
+    let capabilities_router = capabilities_router.with_state(auth.clone());
+    let capabilities_routes = capabilities_manifest.routes;
     // The registration-token validity check, which the spec puts under `v1` only: what an
     // invite link's sign-up page asks before showing its form.
     let auth_v1_router = hs_auth::routes::v1_router().with_state(auth.clone());
     let auth_v1_routes = crate::auth_manifest::v1_routes();
+    // The links in validation emails and the `/account/3pid/*` routes, which Synapse also
+    // answers under `unstable` and Sytest calls there.
+    let auth_unstable_router = hs_auth::routes::unstable_router().with_state(auth.clone());
+    let auth_unstable_routes = crate::auth_manifest::unstable_routes();
 
     // `hs-auth`'s shared-secret registration fragment spells its own absolute path
     // (`/_synapse/admin/v1/register`), so unlike the fragment above it is merged at the root
@@ -321,6 +337,7 @@ fn build_router<B: KvBackend>(
         hs_appservice::client_routes::client_router::<B>(mounts.appservice_queries);
     let appservice_client_router = appservice_client_router.with_state(auth.clone());
     let appservice_client_routes = appservice_client_manifest.routes;
+    let openid_auth = auth.clone();
     let ping_router =
         hs_appservice::routes::ping_router::<B>(mounts.appservice_ping).with_state(auth);
     let ping_routes = crate::appservice_manifest::routes();
@@ -332,22 +349,6 @@ fn build_router<B: KvBackend>(
             "/_matrix/client/versions",
             versions::get_versions,
             RouteMeta::new(Surface::MatrixClient, AuthKind::None).with_operation_id("getVersions"),
-        )
-        .get(
-            "/_matrix/client/v3/capabilities",
-            crate::capabilities::get_capabilities,
-            // `AuthKind::None` reflects actual current behavior, not the spec's requirement:
-            // this handler does not check for a token yet (see crate::capabilities's doc
-            // comment). Marking it `Matrix` here would be exactly the kind of overclaiming this
-            // track was told not to do for `/versions`.
-            RouteMeta::new(Surface::MatrixClient, AuthKind::None)
-                .with_operation_id("getCapabilities"),
-        )
-        .get(
-            "/_matrix/client/r0/capabilities",
-            crate::capabilities::get_capabilities,
-            RouteMeta::new(Surface::MatrixClient, AuthKind::None)
-                .with_operation_id("getCapabilities"),
         )
         .get(
             "/.well-known/matrix/server",
@@ -375,6 +376,16 @@ fn build_router<B: KvBackend>(
             "/metrics",
             metrics_handler,
             RouteMeta::new(Surface::Admin, AuthKind::None).with_operation_id("metrics"),
+        )
+        .merge_router(
+            "/_matrix/client/v3",
+            capabilities_router.clone(),
+            capabilities_routes.clone(),
+        )
+        .merge_router(
+            "/_matrix/client/r0",
+            capabilities_router,
+            capabilities_routes,
         )
         .merge_router(
             "/_matrix/client/v3",
@@ -430,7 +441,12 @@ fn build_router<B: KvBackend>(
             appservice_client_routes,
         )
         .merge_router("/_matrix/client/v1", ping_router, ping_routes)
-        .merge_router("/_matrix/client/v1", auth_v1_router, auth_v1_routes);
+        .merge_router("/_matrix/client/v1", auth_v1_router, auth_v1_routes)
+        .merge_router(
+            "/_matrix/client/unstable",
+            auth_unstable_router,
+            auth_unstable_routes,
+        );
 
     if let Some((state, x_matrix, own_keys, server_name)) = federation {
         let (federation_router, federation_manifest) =
@@ -543,6 +559,12 @@ fn build_router<B: KvBackend>(
     // called with the wrong method into `405 M_UNRECOGNIZED`, in whichever error shape the path's
     // API speaks -- see `hs_http::fallback`.
     let router = hs_http::fallback::apply(router);
+    // OpenID userinfo is unauthenticated, but its route sits behind the federation router's
+    // `X-Matrix` layer; answered here, before routing (see `crate::openid_userinfo`).
+    let router = router.layer(middleware::from_fn_with_state(
+        openid_auth,
+        crate::openid_userinfo::ahead_of_x_matrix,
+    ));
 
     let router = router
         // Without this a browser client cannot talk to this server at all: it fails every
@@ -1551,6 +1573,11 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     // Admin API requests refused for lacking their operation's scope, by scope.
     metrics.with_registry(hs_admin::metrics::register_metrics);
     metrics.with_registry(hs_auth::guest::register_metrics);
+    metrics.with_registry(hs_auth::recaptcha::register_metrics);
+    metrics.with_registry(hs_auth::openid::register_metrics);
+    // `hs_auth_sso_logins_total{provider,outcome}`: CAS sign-ins and confirmations.
+    metrics.with_registry(hs_auth::cas::register_metrics);
+    metrics.with_registry(hs_auth::threepid::register_metrics);
     metrics.with_registry(hs_room::third_party_invite::register_metrics);
     // Third-party invites reach only the identity servers `auth.identity_servers` names; the
     // client is installed whatever the list says, so adding one applies at once.
@@ -1559,6 +1586,11 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             .map_err(|e| ServeError::Sessions(Box::new(e)))?,
     );
     rooms.install_identity_service(identity_service.clone());
+    // The same client binds and unbinds users' own third-party identifiers
+    // (`/account/3pid/bind`, `/unbind`, `/delete`, deactivation); an unbind is signed with this
+    // server's key, as Synapse signs it.
+    identity_service.set_signer(server_name.to_string(), signing_key.clone());
+    auth_state.install_identity_server_client(identity_service.clone());
     if let Some(live) = &options.live_config {
         // `network.outbound.ipv4_only`: every outbound client reads it per new connection.
         live.on_change("network", |config| {
@@ -1616,6 +1648,13 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     crate::push_delivery::describe_email(&config.email);
     if let Some(email) = email_wiring {
         tokio::spawn(email.worker.run());
+        // Validation emails (`hs_auth::threepid`) go through the same mailer, from the same
+        // sender, so an `email` change re-points both.
+        let threepid_email = Arc::new(crate::threepid_email::ThreepidEmailSender::new(
+            email.mailer.clone(),
+            &config.email,
+        ));
+        auth_state.install_email_sender(threepid_email.clone());
         if let Some(live) = &options.live_config {
             // Every `email` setting is read per email sent: the mailer takes the server, the
             // worker the rest, and the next email uses them.
@@ -1624,6 +1663,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             live.on_change("email", move |config| {
                 mailer.set(crate::push_delivery::smtp_settings(&config.email));
                 handle.set_settings(crate::push_delivery::email_settings(&config.email));
+                threepid_email.set(&config.email);
                 crate::push_delivery::describe_email(&config.email);
                 Ok(())
             });
@@ -2742,9 +2782,10 @@ mod tests {
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(res.status(), reqwest::StatusCode::OK, "{prefix}");
+            // Mounted, and not public: a token is required (`tests/e2e.rs` reads it with one).
+            assert_eq!(res.status(), reqwest::StatusCode::UNAUTHORIZED, "{prefix}");
             let body: serde_json::Value = res.json().await.unwrap();
-            assert_eq!(body["capabilities"]["m.change_password"]["enabled"], true);
+            assert_eq!(body["errcode"], "M_MISSING_TOKEN");
         }
         handle.shutdown().await;
     }

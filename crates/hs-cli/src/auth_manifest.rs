@@ -42,6 +42,21 @@ pub fn routes() -> Vec<Route> {
     vec![
         route("GET", "/login", NoAuth, "getLoginFlows"),
         route("POST", "/login", NoAuth, "login"),
+        route("GET", "/login/sso/redirect", NoAuth, "redirectToSSO"),
+        route(
+            "GET",
+            "/login/sso/redirect/{idpId}",
+            NoAuth,
+            "redirectToIdP",
+        ),
+        route("GET", "/login/cas/redirect", NoAuth, "redirectToCAS"),
+        route("GET", "/login/cas/ticket", NoAuth, "casTicket"),
+        route(
+            "GET",
+            "/auth/m.login.sso/fallback/web",
+            NoAuth,
+            "ssoFallback",
+        ),
         route("POST", "/logout", Matrix, "logout"),
         route("POST", "/logout/all", Matrix, "logoutAll"),
         route("POST", "/refresh", NoAuth, "refresh"),
@@ -51,6 +66,57 @@ pub fn routes() -> Vec<Route> {
         route("POST", "/account/password", Matrix, "changePassword"),
         route("POST", "/account/deactivate", Matrix, "deactivateAccount"),
         route("GET", "/account/3pid", Matrix, "getAccount3PIDs"),
+        route("POST", "/account/3pid", Matrix, "post3PIDs"),
+        route("POST", "/account/3pid/add", Matrix, "add3PID"),
+        route(
+            "POST",
+            "/account/3pid/delete",
+            Matrix,
+            "delete3pidFromAccount",
+        ),
+        route("POST", "/account/3pid/bind", Matrix, "bind3PID"),
+        route(
+            "POST",
+            "/account/3pid/unbind",
+            Matrix,
+            "unbind3pidFromAccount",
+        ),
+        route(
+            "POST",
+            "/register/email/requestToken",
+            NoAuth,
+            "requestTokenToRegisterEmail",
+        ),
+        route(
+            "POST",
+            "/account/3pid/email/requestToken",
+            NoAuth,
+            "requestTokenTo3PIDEmail",
+        ),
+        route(
+            "POST",
+            "/account/password/email/requestToken",
+            NoAuth,
+            "requestTokenToResetPasswordEmail",
+        ),
+        route(
+            "POST",
+            "/register/msisdn/requestToken",
+            NoAuth,
+            "requestTokenToRegisterMSISDN",
+        ),
+        route(
+            "POST",
+            "/account/3pid/msisdn/requestToken",
+            NoAuth,
+            "requestTokenTo3PIDMSISDN",
+        ),
+        route(
+            "POST",
+            "/account/password/msisdn/requestToken",
+            NoAuth,
+            "requestTokenToResetPasswordMSISDN",
+        ),
         route(
             "POST",
             "/user_directory/search",
@@ -91,6 +157,13 @@ pub fn routes() -> Vec<Route> {
             Matrix,
             "setAvatarUrl",
         ),
+        route(
+            "POST",
+            "/user/{userId}/openid/request_token",
+            Matrix,
+            "requestOpenIdToken",
+        ),
+        route("GET", "/admin/whois/{userId}", Matrix, "getWhoIs"),
     ]
 }
 
@@ -104,6 +177,48 @@ pub fn v1_routes() -> Vec<Route> {
         AuthKind::None,
         "registrationTokenValidity",
     )]
+}
+
+/// The entries for `hs_auth::routes::unstable_router()`: the links in validation emails and the
+/// `/account/3pid/*` routes Synapse also answers under `/_matrix/client/unstable`; spec-relative
+/// like [`routes`], and mounted under that one prefix.
+#[must_use]
+pub fn unstable_routes() -> Vec<Route> {
+    use AuthKind::{Matrix, None as NoAuth};
+    vec![
+        route(
+            "GET",
+            "/registration/email/submit_token",
+            NoAuth,
+            "submitRegistrationEmailToken",
+        ),
+        route(
+            "GET",
+            "/add_threepid/email/submit_token",
+            NoAuth,
+            "submitAddThreepidEmailToken",
+        ),
+        route(
+            "GET",
+            "/password_reset/email/submit_token",
+            NoAuth,
+            "submitPasswordResetEmailToken",
+        ),
+        route("POST", "/account/3pid/add", Matrix, "add3PID"),
+        route(
+            "POST",
+            "/account/3pid/delete",
+            Matrix,
+            "delete3pidFromAccount",
+        ),
+        route("POST", "/account/3pid/bind", Matrix, "bind3PID"),
+        route(
+            "POST",
+            "/account/3pid/unbind",
+            Matrix,
+            "unbind3pidFromAccount",
+        ),
+    ]
 }
 
 /// The two `/_synapse/admin/v1/register` entries for `hs_auth::synapse_admin_router()`
@@ -144,8 +259,11 @@ mod tests {
     #[test]
     fn mirrors_the_expected_route_count() {
         // One entry per `(method, path)` pair `hs_auth::routes::router()` registers: 18 for the
-        // auth and device surface, plus 5 for profiles.
-        assert_eq!(routes().len(), 23);
+        // auth and device surface, 5 for single sign-on through CAS, 11 for third-party
+        // identifiers, 5 for profiles, the OpenID token and the admin whois.
+        assert_eq!(routes().len(), 41);
+        // `hs_auth::routes::unstable_router()`: 3 validation links and 4 `/account/3pid/*`.
+        assert_eq!(unstable_routes().len(), 7);
     }
 
     #[test]

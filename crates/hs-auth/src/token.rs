@@ -107,6 +107,17 @@ pub fn generate_login_token() -> String {
     format!("{base}_{crc}")
 }
 
+/// How many letters an OpenID token has: about 182 bits, like Synapse's 24-character tokens and
+/// then some.
+const OPENID_TOKEN_LEN: usize = 32;
+
+/// Generates an OpenID token (`crate::openid`). Letters only: a third party passes it back in a
+/// query string.
+#[must_use]
+pub fn generate_openid_token() -> String {
+    random_ascii_letters(OPENID_TOKEN_LEN)
+}
+
 /// How many letters a setup token has. Each is one of 52, so 40 of them is about 228 bits:
 /// guessing it is not a way in.
 const SETUP_TOKEN_LEN: usize = 40;

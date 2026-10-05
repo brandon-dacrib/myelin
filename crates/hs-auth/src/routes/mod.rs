@@ -19,9 +19,12 @@ pub mod logout;
 pub mod profile;
 pub mod refresh;
 pub mod register;
+pub mod sso;
 pub mod synapse_admin;
+pub mod threepid;
 pub mod user_directory;
 pub mod whoami;
+pub mod whois;
 
 use axum::Router;
 use axum::routing::{get, post};
@@ -36,6 +39,14 @@ pub fn router() -> Router<AuthState> {
             "/login",
             get(login::get_login_types).post(login::post_login),
         )
+        .route("/login/sso/redirect", get(sso::get_sso_redirect))
+        .route(
+            "/login/sso/redirect/{idpId}",
+            get(sso::get_sso_redirect_idp),
+        )
+        .route("/login/cas/redirect", get(sso::get_sso_redirect))
+        .route("/login/cas/ticket", get(sso::get_cas_ticket))
+        .route("/auth/m.login.sso/fallback/web", get(sso::get_sso_fallback))
         .route("/logout", post(logout::post_logout))
         .route("/logout/all", post(logout::post_logout_all))
         .route("/refresh", post(refresh::post_refresh))
@@ -47,12 +58,46 @@ pub fn router() -> Router<AuthState> {
             "/account/deactivate",
             post(account::post_account_deactivate),
         )
-        // `GET` only: a user cannot add, bind or delete a 3PID themself (only an administrator
-        // can, through `users.threepids.*`), and the server says so through
-        // `m.3pid_changes: {"enabled": false}` in `GET /capabilities`. Registering the `POST
-        // /account/3pid/*` half would claim a surface that cannot work -- see
-        // `account::get_account_3pid`'s doc comment for what each of them would need first.
-        .route("/account/3pid", get(account::get_account_3pid))
+        // A user's own third-party identifiers (`crate::threepid`): listed, added once this
+        // server has validated them, deleted, and bound or unbound at an identity server.
+        .route(
+            "/account/3pid",
+            get(account::get_account_3pid).post(threepid::post_account_3pid),
+        )
+        .route("/account/3pid/add", post(threepid::post_account_3pid_add))
+        .route(
+            "/account/3pid/delete",
+            post(threepid::post_account_3pid_delete),
+        )
+        .route("/account/3pid/bind", post(threepid::post_account_3pid_bind))
+        .route(
+            "/account/3pid/unbind",
+            post(threepid::post_account_3pid_unbind),
+        )
+        .route(
+            "/register/email/requestToken",
+            post(threepid::post_register_email_request_token),
+        )
+        .route(
+            "/account/3pid/email/requestToken",
+            post(threepid::post_account_3pid_email_request_token),
+        )
+        .route(
+            "/account/password/email/requestToken",
+            post(threepid::post_password_email_request_token),
+        )
+        .route(
+            "/register/msisdn/requestToken",
+            post(threepid::post_msisdn_request_token),
+        )
+        .route(
+            "/account/3pid/msisdn/requestToken",
+            post(threepid::post_msisdn_request_token),
+        )
+        .route(
+            "/account/password/msisdn/requestToken",
+            post(threepid::post_msisdn_request_token),
+        )
         .route("/password_policy", get(account::get_password_policy))
         .route("/devices", get(devices::get_devices))
         .route(
@@ -78,6 +123,41 @@ pub fn router() -> Router<AuthState> {
             get(profile::get_displayname),
         )
         .route("/profile/{userId}/avatar_url", get(profile::get_avatar_url))
+        .route(
+            "/user/{userId}/openid/request_token",
+            post(crate::openid::post_request_token),
+        )
+        .route("/admin/whois/{userId}", get(whois::get_whois))
+}
+
+/// The auth endpoints served under `/_matrix/client/unstable`: the links in validation emails
+/// (`/<purpose>/email/submit_token`, where Synapse serves them) and the `/account/3pid/*`
+/// routes, which Synapse also answers under `unstable` and Sytest calls there
+/// (`/unstable/account/3pid/bind`). Mount under `/_matrix/client/unstable` only.
+pub fn unstable_router() -> Router<AuthState> {
+    Router::new()
+        .route(
+            "/registration/email/submit_token",
+            get(threepid::get_registration_submit_token),
+        )
+        .route(
+            "/add_threepid/email/submit_token",
+            get(threepid::get_add_threepid_submit_token),
+        )
+        .route(
+            "/password_reset/email/submit_token",
+            get(threepid::get_password_reset_submit_token),
+        )
+        .route("/account/3pid/add", post(threepid::post_account_3pid_add))
+        .route(
+            "/account/3pid/delete",
+            post(threepid::post_account_3pid_delete),
+        )
+        .route("/account/3pid/bind", post(threepid::post_account_3pid_bind))
+        .route(
+            "/account/3pid/unbind",
+            post(threepid::post_account_3pid_unbind),
+        )
 }
 
 /// The auth endpoints the spec defines under `/_matrix/client/v1` rather than `v3`: today, the

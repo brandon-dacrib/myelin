@@ -118,6 +118,10 @@ pub struct ServerLimits {
     /// `rate_limits.admin_redaction`: redactions by a server administrator, per user, in place of
     /// the message limit (as Synapse's `rc_admin_redaction`).
     pub admin_redaction: hs_http::buckets::TokenBuckets,
+    /// `rate_limits.third_party_id_validation`: validation emails requested
+    /// (`POST /register/email/requestToken` and its siblings), per client address and per
+    /// address emailed, as Synapse's `rc_3pid_validation`.
+    pub third_party_id_validation: hs_http::buckets::TokenBuckets,
 }
 
 impl Default for ServerLimits {
@@ -128,6 +132,9 @@ impl Default for ServerLimits {
             joins_local: hs_http::buckets::TokenBuckets::new("joins_local"),
             joins_remote: hs_http::buckets::TokenBuckets::new("joins_remote"),
             admin_redaction: hs_http::buckets::TokenBuckets::new("admin_redaction"),
+            third_party_id_validation: hs_http::buckets::TokenBuckets::new(
+                "third_party_id_validation",
+            ),
         }
     }
 }
@@ -148,6 +155,8 @@ impl ServerLimits {
         self.joins_remote.set_limit(limit(&config.joins_remote));
         self.admin_redaction
             .set_limit(limit(&config.admin_redaction));
+        self.third_party_id_validation
+            .set_limit(limit(&config.third_party_id_validation));
     }
 }
 

@@ -58,6 +58,13 @@ pub enum ErrCode {
     ThreepidNotFound,
     /// `M_THREEPID_DENIED`: the homeserver refuses this 3PID (policy).
     ThreepidDenied,
+    /// `M_THREEPID_AUTH_FAILED`: no validated session matches the credentials presented.
+    ThreepidAuthFailed,
+    /// `M_THREEPID_MEDIUM_NOT_SUPPORTED`: this server cannot validate that kind of identifier
+    /// (no email set up, or a phone number, which it never sends to).
+    ThreepidMediumNotSupported,
+    /// `M_SERVER_NOT_TRUSTED`: the identity server named is not one this server will contact.
+    ServerNotTrusted,
     /// `M_LIMIT_EXCEEDED`: rate limited. Carries `retry_after_ms`.
     LimitExceeded,
     /// `M_WEAK_PASSWORD`: the password fails the configured password policy.
@@ -99,6 +106,9 @@ impl ErrCode {
             Self::ThreepidInUse => "M_THREEPID_IN_USE",
             Self::ThreepidNotFound => "M_THREEPID_NOT_FOUND",
             Self::ThreepidDenied => "M_THREEPID_DENIED",
+            Self::ThreepidAuthFailed => "M_THREEPID_AUTH_FAILED",
+            Self::ThreepidMediumNotSupported => "M_THREEPID_MEDIUM_NOT_SUPPORTED",
+            Self::ServerNotTrusted => "M_SERVER_NOT_TRUSTED",
             Self::LimitExceeded => "M_LIMIT_EXCEEDED",
             Self::WeakPassword => "M_WEAK_PASSWORD",
             Self::GuestAccessForbidden => "M_GUEST_ACCESS_FORBIDDEN",

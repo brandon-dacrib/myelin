@@ -17,7 +17,9 @@
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use hs_config::auth::{MasDelegationConfig, OidcProviderConfig, PasswordConfig, PasswordPolicy};
+use hs_config::auth::{
+    CasConfig, MasDelegationConfig, OidcProviderConfig, PasswordConfig, PasswordPolicy,
+};
 use hs_config::listeners::{Listener, ListenerResource, TlsConfig};
 use hs_config::media::{MediaStorageBackend, ThumbnailMethod, ThumbnailSize};
 use hs_config::ratelimit::RateLimitBucket;
@@ -750,6 +752,31 @@ fn translate_key(key: &str, v: &Value, config: &mut Config) {
                 config.auth.registration_shared_secret = SecretString::from(s);
             }
         }
+        "enable_registration_captcha" => {
+            if let Some(b) = v.as_bool() {
+                config.auth.recaptcha.required = b;
+            }
+        }
+        "recaptcha_public_key" => {
+            if let Some(s) = v.as_str() {
+                config.auth.recaptcha.public_key = Some(s.to_owned());
+            }
+        }
+        "recaptcha_private_key" => {
+            if let Some(s) = v.as_str() {
+                config.auth.recaptcha.private_key = SecretString::from(s);
+            }
+        }
+        "recaptcha_private_key_path" => {
+            if let Some(s) = v.as_str() {
+                config.auth.recaptcha.private_key_file = Some(PathBuf::from(s));
+            }
+        }
+        "recaptcha_siteverify_api" => {
+            if let Some(s) = v.as_str() {
+                config.auth.recaptcha.siteverify_api = s.to_owned();
+            }
+        }
         "registration_shared_secret_path" => {
             if let Some(s) = v.as_str() {
                 config.auth.registration_shared_secret_file = Some(PathBuf::from(s));
@@ -819,6 +846,7 @@ fn translate_key(key: &str, v: &Value, config: &mut Config) {
             }
         }
         "matrix_authentication_service" => apply_mas(v, config),
+        "cas_config" => apply_cas(v, config),
 
         "app_service_config_files" => {
             if let Some(list) = get_str_list_value(v) {
@@ -949,6 +977,37 @@ fn apply_database(v: &Value, config: &mut Config) {
         schema: "public".to_owned(),
         ssl_mode,
         ssl_root_cert,
+    });
+}
+
+/// Synapse's `cas_config` onto `auth.cas`. `enabled: false` (or no `server_url`) leaves CAS
+/// off. Synapse's `protocol_version`, `enable_registration`, `allow_numeric_ids`,
+/// `numeric_ids_prefix`, `idp_icon` and `idp_brand` have no native counterpart (the classification
+/// row says so): CAS 2/3 `/proxyValidate` is always used and a first sign-in always creates the
+/// account.
+fn apply_cas(v: &Value, config: &mut Config) {
+    if get_bool(v, "enabled") == Some(false) {
+        return;
+    }
+    let Some(server_url) = get_str(v, "server_url") else {
+        return;
+    };
+    let required_attributes = get(v, "required_attributes")
+        .and_then(Value::as_mapping)
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, val)| {
+                    Some((k.as_str()?.to_owned(), val.as_str().map(str::to_owned)))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    config.auth.cas = Some(CasConfig {
+        server_url,
+        service_url: get_str(v, "service_url"),
+        displayname_attribute: get_str(v, "displayname_attribute"),
+        required_attributes,
+        idp_name: get_str(v, "idp_name").unwrap_or_else(|| "CAS".to_owned()),
     });
 }
 
@@ -1270,6 +1329,40 @@ database:
             config.auth.registration_shared_secret.as_str(),
             Some("inline-secret")
         );
+    }
+
+    #[test]
+    fn translates_the_recaptcha_settings() {
+        let yaml = "server_name: example.org\nenable_registration_captcha: true\n\
+                    recaptcha_public_key: site-key\nrecaptcha_private_key: secret-key\n\
+                    recaptcha_siteverify_api: https://captcha.example/siteverify\n";
+        let (config, report) = translate(yaml, TranslateOptions::default()).unwrap();
+        assert!(!report.has_blocking());
+        let captcha = &config.auth.recaptcha;
+        assert!(captcha.required);
+        assert_eq!(captcha.public_key.as_deref(), Some("site-key"));
+        assert_eq!(captcha.private_key.as_str(), Some("secret-key"));
+        assert_eq!(captcha.siteverify_api, "https://captcha.example/siteverify");
+    }
+
+    #[test]
+    fn translates_cas_config() {
+        let yaml = "server_name: example.org\npublic_baseurl: https://example.org/\ncas_config:\n  enabled: true\n  server_url: https://cas.example.edu/cas\n  displayname_attribute: name\n  required_attributes:\n    userGroup: staff\n    department: ~\n";
+        let (config, report) = translate(yaml, TranslateOptions::default()).unwrap();
+        let cas = config.auth.cas.expect("cas_config maps to auth.cas");
+        assert_eq!(cas.server_url, "https://cas.example.edu/cas");
+        assert_eq!(cas.displayname_attribute.as_deref(), Some("name"));
+        assert_eq!(cas.idp_name, "CAS");
+        assert_eq!(
+            cas.required_attributes.get("userGroup"),
+            Some(&Some("staff".to_owned()))
+        );
+        assert_eq!(cas.required_attributes.get("department"), Some(&None));
+        let _ = report;
+
+        let disabled = "server_name: example.org\ncas_config:\n  enabled: false\n  server_url: https://cas.example.edu/cas\n";
+        let (config, _) = translate(disabled, TranslateOptions::default()).unwrap();
+        assert!(config.auth.cas.is_none());
     }
 
     #[test]

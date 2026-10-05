@@ -144,17 +144,16 @@ async fn boots_registers_logs_in_and_reports_ready() {
     );
     assert!(versions_json["unstable_features"].is_object());
 
-    // 0b. GET /_matrix/client/v3/capabilities, also called by every client right after login.
+    // 0b. GET /_matrix/client/v3/capabilities is not public (Sytest's and Complement's "GET
+    //     /v3/capabilities is not public"); step 5 reads it with a token.
     let capabilities_response = client
         .get(format!("{base}/_matrix/client/v3/capabilities"))
         .send()
         .await
         .unwrap();
-    assert_eq!(capabilities_response.status(), reqwest::StatusCode::OK);
-    let capabilities_json: serde_json::Value = capabilities_response.json().await.unwrap();
     assert_eq!(
-        capabilities_json["capabilities"]["m.change_password"]["enabled"],
-        true
+        capabilities_response.status(),
+        reqwest::StatusCode::UNAUTHORIZED
     );
 
     // 1. /health/ready is already OK right after boot.
@@ -235,6 +234,23 @@ async fn boots_registers_logs_in_and_reports_ready() {
     assert_eq!(whoami_response.status(), reqwest::StatusCode::OK);
     let whoami_json: serde_json::Value = whoami_response.json().await.unwrap();
     assert_eq!(whoami_json["user_id"], "@e2euser:example.org");
+
+    // 5b. GET /capabilities with the token, under both prefixes; every client calls it right
+    //     after login.
+    for prefix in ["v3", "r0"] {
+        let capabilities_response = client
+            .get(format!("{base}/_matrix/client/{prefix}/capabilities"))
+            .bearer_auth(&access_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(capabilities_response.status(), reqwest::StatusCode::OK);
+        let capabilities_json: serde_json::Value = capabilities_response.json().await.unwrap();
+        assert_eq!(
+            capabilities_json["capabilities"]["m.change_password"]["enabled"],
+            true
+        );
+    }
 
     // 6. /metrics is reachable, and after the traffic above actually has data in it (this was
     //    the second gap the integration review found: the registry existed and was served, but

@@ -169,7 +169,11 @@ async fn authenticate_appservice(
     }))
 }
 
-async fn authenticate_user_token(token: &str, state: &AuthState) -> Result<Requester, MatrixError> {
+async fn authenticate_user_token(
+    token: &str,
+    state: &AuthState,
+    client_ip: Option<String>,
+) -> Result<Requester, MatrixError> {
     let hash = TokenHash::of(token);
     let Some(record) = state.store.get_access_token(&hash).await? else {
         return Err(MatrixError::unknown_token(false));
@@ -197,7 +201,7 @@ async fn authenticate_user_token(token: &str, state: &AuthState) -> Result<Reque
     if let Some(device_id) = &record.device_id {
         state
             .store
-            .record_seen(&user.user_id, device_id, now, None)
+            .record_seen(&user.user_id, device_id, now, client_ip)
             .await?;
     }
 
@@ -221,7 +225,19 @@ async fn authenticate(parts: &mut Parts, state: &AuthState) -> Result<Requester,
         return Ok(requester);
     }
 
-    authenticate_user_token(&token, state).await
+    // The address a device was last seen at, for the admin `whois` and the devices list: the
+    // forwarded client behind a trusted proxy, as the rate limiter's buckets read it, or else the
+    // peer itself -- loopback included, which the buckets leave out (a request from this host is
+    // still somebody's device here).
+    let client_ip = hs_http::buckets::ClientIp::from_parts(parts)
+        .key()
+        .or_else(|| {
+            parts
+                .extensions
+                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                .map(|axum::extract::ConnectInfo(addr)| addr.ip().to_string())
+        });
+    authenticate_user_token(&token, state, client_ip).await
 }
 
 impl FromRequestParts<AuthState> for Requester {

@@ -149,7 +149,11 @@ pub async fn delete_device(
         .appservice
         .as_ref()
         .is_some_and(|a| a.msc4190_enabled);
-    if !msc4190 && let Some(response) = reauth::run(&state, &requester, &body).await? {
+    let operation = format!("DELETE /devices/{device_id}");
+    if !msc4190
+        && let Some(response) =
+            reauth::run_for_operation(&state, &requester, &body, &operation).await?
+    {
         return Ok(response);
     }
     let device_id: ruma::OwnedDeviceId = device_id.into();
@@ -180,7 +184,9 @@ pub async fn post_delete_devices(
     raw_body: Bytes,
 ) -> Result<Response, MatrixError> {
     let body = parse_optional_json_body(&raw_body)?;
-    if let Some(response) = reauth::run(&state, &requester, &body).await? {
+    if let Some(response) =
+        reauth::run_for_operation(&state, &requester, &body, "POST /delete_devices").await?
+    {
         return Ok(response);
     }
     let device_ids: Vec<String> = body
@@ -378,6 +384,126 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// Two accounts with the same password, as every Sytest account has, and a device of the
+    /// first with a second device to delete.
+    async fn alice_and_eve_with_the_same_password() -> (AuthState, Requester) {
+        let state = AuthState::in_memory();
+        for name in ["@alice:example.org", "@eve:example.org"] {
+            let mut record = UserRecord::new(ruma::UserId::parse(name).unwrap(), 0);
+            record.password_hash = Some(crate::password::hash_password("sekrit").unwrap());
+            state.store.create_user(record).await.unwrap();
+        }
+        let alice = user_id!("@alice:example.org").to_owned();
+        for device in ["DEV1", "DEV2"] {
+            state
+                .store
+                .upsert_device(DeviceRecord {
+                    user_id: alice.clone(),
+                    device_id: device.into(),
+                    display_name: None,
+                    last_seen_ms: None,
+                    last_seen_ip: None,
+                })
+                .await
+                .unwrap();
+        }
+        (state, Requester::for_user(alice))
+    }
+
+    fn password_auth(user: &str, session: Option<&str>) -> Value {
+        let mut auth = json!({
+            "type": "m.login.password",
+            "identifier": {"type": "m.id.user", "user": user},
+            "password": "sekrit",
+        });
+        if let Some(session) = session {
+            auth["session"] = json!(session);
+        }
+        json!({ "auth": auth })
+    }
+
+    /// Sytest's and Complement's "DELETE /device/{deviceId} requires UI auth user to match device
+    /// owner": alice's token with eve's (correct) password is `403`, and the device stays.
+    #[tokio::test]
+    async fn deleting_a_device_with_another_accounts_password_is_forbidden() {
+        let (state, alice) = alice_and_eve_with_the_same_password().await;
+        let err = delete_device(
+            State(state.clone()),
+            alice.clone(),
+            Path("DEV1".to_owned()),
+            body_bytes(password_auth("@eve:example.org", None)),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+        assert!(
+            state
+                .store
+                .get_device(&alice.user_id, device_id!("DEV1"))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        // Alice's own password works, named by localpart or in full.
+        let response = delete_device(
+            State(state.clone()),
+            alice.clone(),
+            Path("DEV1".to_owned()),
+            body_bytes(password_auth("alice", None)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Sytest's "The operation must be consistent through an interactive authentication session":
+    /// a session started deleting one device cannot be finished deleting another.
+    #[tokio::test]
+    async fn a_session_started_for_one_device_cannot_delete_another() {
+        let (state, alice) = alice_and_eve_with_the_same_password().await;
+        let challenge = delete_device(
+            State(state.clone()),
+            alice.clone(),
+            Path("DEV1".to_owned()),
+            body_bytes(json!({})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(challenge.status(), StatusCode::UNAUTHORIZED);
+        let bytes = axum::body::to_bytes(challenge.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let challenge: Value = serde_json::from_slice(&bytes).unwrap();
+        let session = challenge["session"].as_str().unwrap();
+        let err = delete_device(
+            State(state.clone()),
+            alice.clone(),
+            Path("DEV2".to_owned()),
+            body_bytes(password_auth("@alice:example.org", Some(session))),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+        assert!(
+            state
+                .store
+                .get_device(&alice.user_id, device_id!("DEV2"))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        // The same session finishes the operation it was started for.
+        let response = delete_device(
+            State(state),
+            alice,
+            Path("DEV1".to_owned()),
+            body_bytes(password_auth("@alice:example.org", Some(session))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     fn msc4190_appservice_requester(user_id: ruma::OwnedUserId) -> Requester {

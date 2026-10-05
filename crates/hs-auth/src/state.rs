@@ -9,6 +9,7 @@ use crate::appservice::{AppserviceRegistry, InMemoryAppserviceRegistry};
 use crate::clock::{Clock, SystemClock};
 use crate::config::AuthConfig;
 use crate::ratelimit::{InMemoryRateLimiter, RateLimiter, ServerLimits};
+use crate::recaptcha::{HttpRecaptchaVerifier, RecaptchaVerifier};
 use crate::registration_tokens::{InMemoryRegistrationTokens, RegistrationTokenStore};
 use crate::store::AuthStore;
 use crate::store::memory::InMemoryAuthStore;
@@ -154,6 +155,20 @@ pub struct AuthState {
     pub(crate) remote_profiles: Arc<OnceLock<Arc<dyn RemoteProfileSource>>>,
     /// See [`ProfileRefresh`] and [`AuthState::install_profile_refresh`].
     pub(crate) profile_refresh: Arc<OnceLock<Arc<dyn ProfileRefresh>>>,
+    /// What checks a CAPTCHA answer; see [`AuthState::recaptcha_verifier`].
+    pub(crate) recaptcha_verifier: Arc<OnceLock<Arc<dyn RecaptchaVerifier>>>,
+    /// Registrations waiting on a user-interactive auth session, by the username they asked
+    /// for; see [`crate::routes::register`]'s "a session, once issued, is required".
+    pub(crate) pending_registrations: Arc<crate::routes::register::PendingRegistrations>,
+    /// Checks CAS tickets ([`crate::cas`]): [`crate::cas::HttpCasValidator`] unless replaced
+    /// with [`AuthState::with_cas_validator`].
+    pub(crate) cas_validator: Arc<dyn crate::cas::CasValidator>,
+    /// See [`crate::threepid::EmailSender`] and [`AuthState::install_email_sender`].
+    pub(crate) email_sender: Arc<OnceLock<Arc<dyn crate::threepid::EmailSender>>>,
+    /// See [`crate::threepid::IdentityServerClient`] and
+    /// [`AuthState::install_identity_server_client`].
+    pub(crate) identity_server_client:
+        Arc<OnceLock<Arc<dyn crate::threepid::IdentityServerClient>>>,
 }
 
 impl AuthState {
@@ -177,6 +192,11 @@ impl AuthState {
             session_revocation_observer: Arc::new(OnceLock::new()),
             remote_profiles: Arc::new(OnceLock::new()),
             profile_refresh: Arc::new(OnceLock::new()),
+            recaptcha_verifier: Arc::new(OnceLock::new()),
+            pending_registrations: Arc::default(),
+            cas_validator: Arc::new(crate::cas::HttpCasValidator::default()),
+            email_sender: Arc::new(OnceLock::new()),
+            identity_server_client: Arc::new(OnceLock::new()),
         }
     }
 
@@ -231,6 +251,14 @@ impl AuthState {
     #[must_use]
     pub fn with_registration_tokens(mut self, tokens: Arc<dyn RegistrationTokenStore>) -> Self {
         self.registration_tokens = tokens;
+        self
+    }
+
+    /// Replaces what checks CAS tickets (a test's fake CAS server), returning the state so this
+    /// reads as a builder. For the same reason as [`AuthState::with_appservices`].
+    #[must_use]
+    pub fn with_cas_validator(mut self, validator: Arc<dyn crate::cas::CasValidator>) -> Self {
+        self.cas_validator = validator;
         self
     }
 
@@ -346,6 +374,73 @@ impl AuthState {
     #[must_use]
     pub fn profile_refresh(&self) -> Option<&Arc<dyn ProfileRefresh>> {
         self.profile_refresh.get()
+    }
+
+    /// Installs what checks a CAPTCHA answer at registration, in place of the HTTP
+    /// [`HttpRecaptchaVerifier`] used otherwise: a test's stand-in for the CAPTCHA service. Same
+    /// one-installer convention as [`AuthState::install_device_list_notifier`].
+    pub fn install_recaptcha_verifier(&self, verifier: Arc<dyn RecaptchaVerifier>) {
+        if self.recaptcha_verifier.set(verifier).is_err() {
+            tracing::warn!(
+                "a CAPTCHA verifier was already installed on this auth state; ignoring the \
+                 second install"
+            );
+        }
+    }
+
+    /// Installs where validation emails are sent from (`hs serve`'s SMTP mailer). Same
+    /// one-installer convention as [`AuthState::install_device_list_notifier`].
+    pub fn install_email_sender(&self, sender: Arc<dyn crate::threepid::EmailSender>) {
+        if self.email_sender.set(sender).is_err() {
+            tracing::warn!(
+                "an email sender was already installed on this auth state; ignoring the second \
+                 install"
+            );
+        }
+    }
+
+    /// What checks a CAPTCHA answer: the installed [`RecaptchaVerifier`], or the HTTP one,
+    /// built on first use.
+    ///
+    /// # Errors
+    /// If the HTTP client cannot be built.
+    pub fn recaptcha_verifier(&self) -> Result<Arc<dyn RecaptchaVerifier>, String> {
+        if let Some(verifier) = self.recaptcha_verifier.get() {
+            return Ok(verifier.clone());
+        }
+        let verifier: Arc<dyn RecaptchaVerifier> =
+            Arc::new(HttpRecaptchaVerifier::new().map_err(|e| e.to_string())?);
+        Ok(self.recaptcha_verifier.get_or_init(|| verifier).clone())
+    }
+
+    /// The installed [`crate::threepid::EmailSender`], if any. `None`: this process cannot
+    /// send email, so email addresses cannot be validated.
+    #[must_use]
+    pub fn email_sender(&self) -> Option<&Arc<dyn crate::threepid::EmailSender>> {
+        self.email_sender.get()
+    }
+
+    /// Installs the identity-server client binding and unbinding use (`hs serve`'s, which
+    /// contacts only `auth.identity_servers`). Same one-installer convention as
+    /// [`AuthState::install_device_list_notifier`].
+    pub fn install_identity_server_client(
+        &self,
+        client: Arc<dyn crate::threepid::IdentityServerClient>,
+    ) {
+        if self.identity_server_client.set(client).is_err() {
+            tracing::warn!(
+                "an identity server client was already installed on this auth state; ignoring \
+                 the second install"
+            );
+        }
+    }
+
+    /// The installed [`crate::threepid::IdentityServerClient`], if any.
+    #[must_use]
+    pub fn identity_server_client(
+        &self,
+    ) -> Option<&Arc<dyn crate::threepid::IdentityServerClient>> {
+        self.identity_server_client.get()
     }
 
     /// The installed [`DeviceListChangeNotifier`], if any.

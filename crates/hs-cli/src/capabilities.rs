@@ -10,9 +10,9 @@
 //! mounted, persist, and propagate into membership events. They kept reporting `false` for a
 //! while after those routes landed, which a real client reads as "this server will not let me
 //! change my name": a capability claim is only worth anything if it tracks the routes, so change
-//! both together. `m.3pid_changes` is still `false` — only an administrator binds a 3PID
-//! (`users.threepids.*` in the admin API); a user cannot add or remove one themself. Update this
-//! alongside `crate::versions`'s `unstable_features` as more routers get mounted here.
+//! both together. `m.3pid_changes` is `true` since a user can add, delete, bind and unbind their
+//! own 3PIDs (`hs_auth::threepid`, 2026-10-04). Update this alongside `crate::versions`'s
+//! `unstable_features` as more routers get mounted here.
 //!
 //! # `m.room_versions`
 //!
@@ -34,6 +34,7 @@
 //! asked" means here; none of the versions in the table are experimental drafts.
 
 use axum::Json;
+use axum::extract::State;
 use serde_json::{Map, Value, json};
 
 /// The room version `hs-room` creates a room with when the request names none. Mirrors
@@ -49,20 +50,40 @@ fn available_room_versions() -> Map<String, Value> {
         .collect()
 }
 
-/// `GET /_matrix/client/v3/capabilities` handler.
-pub async fn get_capabilities() -> Json<Value> {
-    Json(json!({
+/// Whether a user may add and remove their own 3PIDs (`m.3pid_changes`): yes. Deleting,
+/// binding and unbinding always work (`hs_auth::threepid`); adding an email address needs the
+/// server to send email, and the request-token routes say so when it cannot -- Synapse reports
+/// `true` by default the same way (`enable_3pid_changes`).
+fn three_pid_changes(_auth: &hs_auth::state::AuthState) -> bool {
+    true
+}
+
+/// The capabilities document, given whether a user may change their own 3PIDs.
+#[must_use]
+pub fn capabilities_body(three_pid_changes: bool) -> Value {
+    json!({
         "capabilities": {
             "m.change_password": {"enabled": true},
             "m.set_displayname": {"enabled": true},
             "m.set_avatar_url": {"enabled": true},
-            "m.3pid_changes": {"enabled": false},
+            "m.3pid_changes": {"enabled": three_pid_changes},
             "m.room_versions": {
                 "default": DEFAULT_ROOM_VERSION,
                 "available": available_room_versions()
             }
         }
-    }))
+    })
+}
+
+/// `GET /_matrix/client/v3/capabilities` handler. It needs an access token, as the spec has it
+/// ("Requires authentication: Yes"), Synapse does and Sytest's and Complement's "GET
+/// /v3/capabilities is not public" check: without one it is `401 M_MISSING_TOKEN`, from the
+/// [`hs_auth::requester::Requester`] extractor. A guest may call it.
+pub async fn get_capabilities(
+    State(auth): State<hs_auth::state::AuthState>,
+    _requester: hs_auth::requester::Requester,
+) -> Json<Value> {
+    Json(capabilities_body(three_pid_changes(&auth)))
 }
 
 #[cfg(test)]
@@ -71,19 +92,22 @@ mod tests {
 
     #[tokio::test]
     async fn reports_what_is_actually_mounted() {
-        let Json(body) = get_capabilities().await;
+        let body = capabilities_body(false);
         assert_eq!(body["capabilities"]["m.change_password"]["enabled"], true);
         // Both profile routes are mounted and work; claiming otherwise tells a client it cannot
         // change its display name when it can.
         assert_eq!(body["capabilities"]["m.set_displayname"]["enabled"], true);
         assert_eq!(body["capabilities"]["m.set_avatar_url"]["enabled"], true);
-        // No 3PID management is exposed over HTTP.
         assert_eq!(body["capabilities"]["m.3pid_changes"]["enabled"], false);
+        assert_eq!(
+            capabilities_body(true)["capabilities"]["m.3pid_changes"]["enabled"],
+            true
+        );
     }
 
     #[tokio::test]
     async fn advertises_every_room_version_the_rules_table_knows() {
-        let Json(body) = get_capabilities().await;
+        let body = capabilities_body(false);
         let available = body["capabilities"]["m.room_versions"]["available"]
             .as_object()
             .expect("available is an object");
@@ -112,7 +136,7 @@ mod tests {
 
     #[tokio::test]
     async fn default_is_advertised_among_the_available_versions() {
-        let Json(body) = get_capabilities().await;
+        let body = capabilities_body(false);
         let versions = &body["capabilities"]["m.room_versions"];
         let default = versions["default"].as_str().unwrap();
         assert!(

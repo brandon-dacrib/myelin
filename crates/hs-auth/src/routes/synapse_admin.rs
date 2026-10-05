@@ -112,6 +112,11 @@ async fn post_register(
     // case-insensitive per `routes::login`) would silently create two different accounts instead
     // of the one the operator meant.
     let lowercased_username = req.username.to_ascii_lowercase();
+    // The strict grammar a new user ID must follow, as `POST /register` checks it
+    // (`register::validate_localpart`): Synapse's `check_username` refuses `us,er` here too, and
+    // Complement's "POST /_synapse/admin/v1/register with shared secret disallows symbols"
+    // expects `400 M_INVALID_USERNAME`. Parsing alone accepts anything but `:` and NUL.
+    super::register::validate_localpart(&state, &lowercased_username)?;
     let user_id = UserId::parse_with_server_name(lowercased_username.as_str(), state.server_name())
         .map_err(|_| {
             MatrixError::invalid_username(format!(
@@ -465,5 +470,31 @@ mod tests {
         let (status, response) = post(&app, body).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(response["errcode"], "M_USER_IN_USE");
+    }
+
+    /// Complement's "POST /_synapse/admin/v1/register with shared secret disallows symbols".
+    #[tokio::test]
+    async fn a_username_outside_the_grammar_is_invalid() {
+        let app: Router<()> = router().with_state(state_with_secret());
+        let (_, nonce_body) = get_nonce(&app).await;
+        let nonce = nonce_body["nonce"].as_str().unwrap().to_string();
+        let mac = compute_mac(
+            SECRET.as_bytes(),
+            &nonce,
+            "us,er",
+            "sUp3rs3kr1t",
+            false,
+            None,
+        );
+        let body = json!({
+            "nonce": nonce,
+            "username": "us,er",
+            "password": "sUp3rs3kr1t",
+            "admin": false,
+            "mac": mac,
+        });
+        let (status, response) = post(&app, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(response["errcode"], "M_INVALID_USERNAME");
     }
 }

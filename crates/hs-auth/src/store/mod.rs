@@ -233,6 +233,19 @@ pub struct LoginTokenRecord {
     pub used: bool,
 }
 
+/// An OpenID access token (`POST /user/{userId}/openid/request_token`): proof of a Matrix
+/// identity a third party (an integration manager, a widget) checks with this server's
+/// `GET /_matrix/federation/v1/openid/userinfo`. It grants nothing else.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OpenIdTokenRecord {
+    /// Hash of the token string.
+    pub hash: TokenHash,
+    /// Whose identity it proves.
+    pub user_id: OwnedUserId,
+    /// Absolute expiry, milliseconds since epoch.
+    pub expires_at_ms: u64,
+}
+
 /// User account storage.
 #[async_trait]
 pub trait UserStore: Send + Sync {
@@ -495,6 +508,22 @@ pub trait TokenStore: Send + Sync {
         hash: &TokenHash,
         now_ms: u64,
     ) -> Result<Option<LoginTokenRecord>, StoreError>;
+
+    /// Stores a freshly minted OpenID token, dropping any that expired before `now_ms` while it
+    /// is at it (they are only ever looked up, never listed, so nothing else would).
+    async fn put_openid_token(
+        &self,
+        record: OpenIdTokenRecord,
+        now_ms: u64,
+    ) -> Result<(), StoreError>;
+
+    /// The OpenID token with this hash, if it exists and has not expired by `now_ms`. Not
+    /// consumed: a third party may check it more than once while it lives.
+    async fn get_openid_token(
+        &self,
+        hash: &TokenHash,
+        now_ms: u64,
+    ) -> Result<Option<OpenIdTokenRecord>, StoreError>;
 }
 
 /// User-interactive-auth session storage. See [`crate::uia`] for the state machine built on top
@@ -698,14 +727,106 @@ pub trait IdentityStore: Send + Sync {
     ) -> Result<(), StoreError>;
 }
 
+/// One attempt to prove that a person controls a third-party identifier: the email this server
+/// sent with a one-time link (`POST /register/email/requestToken` and its siblings), and whether
+/// the link was followed. See [`crate::threepid`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ThreepidValidationRecord {
+    /// The session id handed to the client (`sid`).
+    pub sid: String,
+    /// `"email"`.
+    pub medium: String,
+    /// The address being validated, canonicalised (an email address lower-cased).
+    pub address: String,
+    /// The client's secret: only a request that presents it may use the session.
+    pub client_secret: String,
+    /// What the validation is for: `registration`, `add_threepid` or `password_reset`.
+    pub purpose: String,
+    /// SHA-256 of the one-time token in the emailed link, hex. The token itself is never stored.
+    pub token_hash: String,
+    /// The highest `send_attempt` an email went out for. A request repeating it (or a lower one)
+    /// gets the same session back and no second email.
+    pub send_attempt: u64,
+    /// When the session was started, milliseconds since the Unix epoch.
+    pub created_at_ms: u64,
+    /// When the emailed link stops working, milliseconds since the Unix epoch.
+    pub token_expires_at_ms: u64,
+    /// When the link was followed, if it has been.
+    pub validated_at_ms: Option<u64>,
+}
+
+/// A third-party identifier this server bound at an identity server for one of its users
+/// (`POST /account/3pid/bind`), remembered so that removing the identifier, or deactivating the
+/// account, can unbind it there again.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ThreepidBindingRecord {
+    /// The account the identifier was bound to.
+    pub user_id: OwnedUserId,
+    /// `"email"` or `"msisdn"`.
+    pub medium: String,
+    /// The address, as the identity server reported it.
+    pub address: String,
+    /// The identity server, `host[:port]`.
+    pub id_server: String,
+    /// When it was bound, milliseconds since the Unix epoch.
+    pub bound_at_ms: u64,
+}
+
+/// Validation sessions and identity-server bindings for self-service third-party identifiers
+/// ([`crate::threepid`]).
+#[async_trait]
+pub trait ThreepidStore: Send + Sync {
+    /// Stores a validation session, replacing any with the same `sid`.
+    async fn put_validation_session(
+        &self,
+        record: ThreepidValidationRecord,
+    ) -> Result<(), StoreError>;
+
+    /// The validation session `sid`, if there is one.
+    async fn get_validation_session(
+        &self,
+        sid: &str,
+    ) -> Result<Option<ThreepidValidationRecord>, StoreError>;
+
+    /// The newest session for `(medium, address, client_secret)` that has not been validated
+    /// yet, which a repeated `requestToken` continues instead of starting another.
+    async fn find_unvalidated_session(
+        &self,
+        medium: &str,
+        address: &str,
+        client_secret: &str,
+    ) -> Result<Option<ThreepidValidationRecord>, StoreError>;
+
+    /// Remembers an identity-server binding. Recording one already recorded is not an error.
+    async fn add_threepid_binding(&self, record: ThreepidBindingRecord) -> Result<(), StoreError>;
+
+    /// Forgets an identity-server binding (the address matched case-insensitively). Forgetting
+    /// one never recorded is not an error.
+    async fn remove_threepid_binding(
+        &self,
+        user_id: &ruma::UserId,
+        medium: &str,
+        address: &str,
+        id_server: &str,
+    ) -> Result<(), StoreError>;
+
+    /// Every identity-server binding recorded for `user_id`, sorted by
+    /// `(medium, address, id_server)`.
+    async fn list_threepid_bindings(
+        &self,
+        user_id: &ruma::UserId,
+    ) -> Result<Vec<ThreepidBindingRecord>, StoreError>;
+}
+
 /// The union of every storage trait this crate needs, for callers that just want "the auth
-/// store" without naming each capability. [`memory::InMemoryAuthStore`] implements all six.
+/// store" without naming each capability. [`memory::InMemoryAuthStore`] implements all seven.
 pub trait AuthStore:
-    UserStore + DeviceStore + TokenStore + UiaStore + SetupStore + IdentityStore
+    UserStore + DeviceStore + TokenStore + UiaStore + SetupStore + IdentityStore + ThreepidStore
 {
 }
-impl<T: UserStore + DeviceStore + TokenStore + UiaStore + SetupStore + IdentityStore> AuthStore
-    for T
+impl<
+    T: UserStore + DeviceStore + TokenStore + UiaStore + SetupStore + IdentityStore + ThreepidStore,
+> AuthStore for T
 {
 }
 

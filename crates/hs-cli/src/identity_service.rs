@@ -31,10 +31,14 @@ pub const INSECURE_TLS_ENV: &str = "HS_TEST_INSECURE_IDENTITY_SERVER_TLS";
 /// How long one identity-server request may take.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// The `hs serve` [`IdentityService`]. See the module docs.
+/// The `hs serve` [`IdentityService`], and [`hs_auth::threepid::IdentityServerClient`] for
+/// binding and unbinding a user's third-party identifiers. See the module docs.
 pub struct HttpIdentityService {
     client: reqwest::Client,
     allowed: RwLock<Vec<String>>,
+    /// This server's name and signing key, which unbinding signs its request with
+    /// ([`Self::set_signer`]). Unset, an unbind goes unsigned.
+    signer: RwLock<Option<(String, std::sync::Arc<hs_model::signing::SigningKeyPair>)>>,
 }
 
 impl HttpIdentityService {
@@ -59,7 +63,22 @@ impl HttpIdentityService {
         Ok(Self {
             client,
             allowed: RwLock::new(normalise(allowed)),
+            signer: RwLock::new(None),
         })
+    }
+
+    /// Sets the name and key an unbind request is signed with (`Authorization: X-Matrix`), as
+    /// Synapse signs `POST /_matrix/identity/v2/3pid/unbind` so the identity server can tell
+    /// the request comes from the user's own homeserver.
+    pub fn set_signer(
+        &self,
+        server_name: String,
+        key: std::sync::Arc<hs_model::signing::SigningKeyPair>,
+    ) {
+        *self
+            .signer
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((server_name, key));
     }
 
     /// Replaces the allowed identity servers (a change to `auth.identity_servers`).
@@ -239,6 +258,90 @@ impl IdentityService for HttpIdentityService {
             )
             .await?;
         Ok(body["valid"].as_bool().unwrap_or(false))
+    }
+}
+
+/// What a call to an identity server came back with, for [`hs_auth::threepid`]'s calls.
+async fn identity_server_answer(
+    request: reqwest::RequestBuilder,
+) -> Result<(u16, Value), hs_auth::threepid::IdentityServerError> {
+    let response = request
+        .send()
+        .await
+        .map_err(|e| hs_auth::threepid::IdentityServerError::Unreachable(e.to_string()))?;
+    let status = response.status().as_u16();
+    let body: Value = response.json().await.unwrap_or(Value::Null);
+    Ok((status, body))
+}
+
+#[async_trait]
+impl hs_auth::threepid::IdentityServerClient for HttpIdentityService {
+    fn allows(&self, id_server: &str) -> bool {
+        IdentityService::allows(self, id_server)
+    }
+
+    async fn bind(
+        &self,
+        id_server: &str,
+        id_access_token: &str,
+        sid: &str,
+        client_secret: &str,
+        mxid: &ruma::UserId,
+    ) -> Result<Value, hs_auth::threepid::IdentityServerError> {
+        let url = format!("{}/_matrix/identity/v2/3pid/bind", Self::base(id_server));
+        let (status, body) = identity_server_answer(
+            self.client
+                .post(url)
+                .bearer_auth(id_access_token)
+                .json(&json!({"sid": sid, "client_secret": client_secret, "mxid": mxid})),
+        )
+        .await?;
+        if (200..300).contains(&status) {
+            Ok(body)
+        } else {
+            Err(hs_auth::threepid::IdentityServerError::Refused { status, body })
+        }
+    }
+
+    async fn unbind(
+        &self,
+        id_server: &str,
+        mxid: &ruma::UserId,
+        medium: &str,
+        address: &str,
+    ) -> Result<hs_auth::threepid::UnbindOutcome, hs_auth::threepid::IdentityServerError> {
+        const PATH: &str = "/_matrix/identity/v2/3pid/unbind";
+        let content = json!({"mxid": mxid, "threepid": {"medium": medium, "address": address}});
+        let mut request = self
+            .client
+            .post(format!("{}{PATH}", Self::base(id_server)))
+            .json(&content);
+        let signer = self
+            .signer
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some((origin, key)) = signer {
+            match hs_federation::xmatrix::sign_request(
+                "POST",
+                PATH,
+                &origin,
+                id_server,
+                Some(&content),
+                &key,
+            ) {
+                Ok(header) => request = request.header(reqwest::header::AUTHORIZATION, header),
+                Err(error) => tracing::warn!(%error, "could not sign an identity server unbind"),
+            }
+        }
+        let (status, body) = identity_server_answer(request).await?;
+        match status {
+            200..=299 => Ok(hs_auth::threepid::UnbindOutcome::Unbound),
+            // An identity server that does not support unbinding, or does not have the binding,
+            // as Synapse's `_try_unbind_threepid_with_id_server` reads these.
+            400 | 404 | 501 => Ok(hs_auth::threepid::UnbindOutcome::NotSupported),
+            _ => Err(hs_auth::threepid::IdentityServerError::Refused { status, body }),
+        }
     }
 }
 

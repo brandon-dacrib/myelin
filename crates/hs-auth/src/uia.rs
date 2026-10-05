@@ -12,7 +12,8 @@
 //! user's password, which registration-token store), so handlers call [`advance`] with the
 //! already-computed `stage_ok` for whatever stage was just submitted.
 
-use ruma::api::client::uiaa::{AuthFlow, AuthType, UiaaInfo};
+use ruma::api::client::uiaa::{AuthFlow, AuthType};
+use serde_json::{Value, json};
 
 use crate::error::MatrixError;
 use crate::store::UiaStore;
@@ -138,9 +139,7 @@ pub async fn advance(
                 .into_iter()
                 .map(AuthType::from)
                 .collect();
-            let challenge =
-                serde_json::to_value(incomplete_body(flows.to_vec(), completed, session_id))
-                    .unwrap_or_default();
+            let challenge = incomplete_body(flows.to_vec(), completed, session_id);
             let mut error = MatrixError::new(
                 axum::http::StatusCode::UNAUTHORIZED,
                 crate::error::ErrCode::Forbidden,
@@ -165,29 +164,130 @@ pub async fn advance(
     })
 }
 
-/// Builds the `401` response body for an incomplete session.
-///
-/// `params` is always populated (as `{}` when no offered stage needs one), never left `None`.
-/// `UiaaInfo`'s own `#[serde(skip_serializing_if = "Option::is_none")]` on that field means
-/// leaving it `None` (`UiaaInfo::new`'s default) drops the key entirely, but the spec's UIA
-/// example responses always show a `params` object and Synapse's `_auth_dict_for_flows`
-/// (`refs/synapse/synapse/handlers/auth.py`) always initializes `params: dict = {}` before adding
-/// per-stage entries -- it is never entirely absent. Confirmed against Complement's
-/// `refs/complement/tests/csapi/apidoc_device_management_test.go`: "DELETE /device/{deviceId}
-/// with no body gives a 401" asserts `match.JSONKeyPresent("params")` on the challenge body.
-/// This crate offers no stage that has its own params (`m.login.dummy`, `m.login.password`,
-/// `m.login.registration_token`, `m.login.terms` all take none), so the object is always empty.
+/// Builds the `401` response body for an incomplete session, with an empty `params` object.
+/// See [`incomplete_body_with_params`].
 #[must_use]
 pub fn incomplete_body(
     flows: Vec<AuthFlow>,
     completed: Vec<AuthType>,
     session_id: String,
-) -> UiaaInfo {
-    let mut info = UiaaInfo::new(flows);
-    info.completed = completed;
-    info.session = Some(session_id);
-    info.params = serde_json::value::to_raw_value(&serde_json::json!({})).ok();
-    info
+) -> Value {
+    incomplete_body_with_params(flows, completed, session_id, json!({}))
+}
+
+/// Builds the `401` response body for an incomplete session: `flows`, `params`, `session` and
+/// `completed`, every one of them always present.
+///
+/// `params` is always an object, never absent: the spec's UIA example responses always show one
+/// and Synapse's `_auth_dict_for_flows` (`refs/synapse/synapse/handlers/auth.py`) always
+/// initializes `params: dict = {}` before adding per-stage entries. Confirmed against
+/// Complement's `refs/complement/tests/csapi/apidoc_device_management_test.go`: "DELETE
+/// /device/{deviceId} with no body gives a 401" asserts `match.JSONKeyPresent("params")`. A stage
+/// with parameters of its own (`m.login.recaptcha`'s `public_key`) puts them here.
+///
+/// `completed` is always present too, as an empty list before any stage has passed. `ruma`'s
+/// `UiaaInfo` skips an empty `completed`, which is why this body is built by hand: Synapse sets
+/// `ret["completed"] = list(creds)` unconditionally, and Sytest's "Can't deactivate account with
+/// wrong password" (`tests/14account/02deactivate.pl`) asserts the keys `error errcode params
+/// completed flows` on a failed first attempt, when nothing has completed yet.
+#[must_use]
+pub fn incomplete_body_with_params(
+    flows: Vec<AuthFlow>,
+    completed: Vec<AuthType>,
+    session_id: String,
+    params: Value,
+) -> Value {
+    let flows: Vec<Value> = flows
+        .iter()
+        .map(|flow| {
+            json!({
+                "stages": flow.stages.iter().map(AsRef::as_ref).collect::<Vec<&str>>()
+            })
+        })
+        .collect();
+    let completed: Vec<&str> = completed.iter().map(AsRef::as_ref).collect();
+    json!({
+        "flows": flows,
+        "params": params,
+        "session": session_id,
+        "completed": completed,
+    })
+}
+
+/// Where a UIA session remembers the operation (`METHOD path`) it was started for, so a
+/// session cannot be started for one request and finished on another. See [`bind_operation`].
+pub const OPERATION_KEY: &str = "operation";
+
+/// Where a UIA session remembers which account a completed stage proved the caller to be
+/// (the user whose password was entered, the user the single-sign-on provider vouched for).
+/// An endpoint acting on an account checks it against the requester once the flow completes
+/// ([`crate::reauth`]). Any stage that authenticates somebody records it here.
+pub const AUTHENTICATED_USER_KEY: &str = "authenticated_user";
+
+/// Ties `session_id` to `operation` (`"DELETE /devices/ABC"`): the first call records it, and
+/// a later call naming a different one is refused with `403 M_FORBIDDEN`, as Synapse's
+/// `check_ui_auth` refuses "Requested operation has changed during the UI authentication
+/// session". Without this, a session started for deleting one device -- whose challenge a
+/// client might show its user as "confirm deleting your phone" -- could be finished on a request
+/// deleting another (Sytest's "The operation must be consistent through an interactive
+/// authentication session", `tests/10apidoc/13ui-auth.pl`).
+///
+/// # Errors
+/// `403 M_FORBIDDEN` on a different operation; a storage failure as `500`.
+pub async fn bind_operation(
+    store: &dyn UiaStore,
+    session_id: &str,
+    operation: &str,
+) -> Result<(), MatrixError> {
+    match store.get_session_data(session_id, OPERATION_KEY).await? {
+        None => {
+            store
+                .set_session_data(session_id, OPERATION_KEY, json!(operation))
+                .await?;
+            Ok(())
+        }
+        Some(Value::String(bound)) if bound == operation => Ok(()),
+        Some(bound) => {
+            tracing::info!(
+                session = session_id,
+                bound = %bound,
+                requested = operation,
+                "refused a user-interactive auth session finished on another operation"
+            );
+            Err(MatrixError::forbidden(
+                "Requested operation has changed during the UI authentication session.",
+            ))
+        }
+    }
+}
+
+/// Records that a stage of `session_id` proved the caller to be `user_id`
+/// ([`AUTHENTICATED_USER_KEY`]).
+///
+/// # Errors
+/// A storage failure as `500`.
+pub async fn record_authenticated_user(
+    store: &dyn UiaStore,
+    session_id: &str,
+    user_id: &ruma::UserId,
+) -> Result<(), MatrixError> {
+    Ok(store
+        .set_session_data(session_id, AUTHENTICATED_USER_KEY, json!(user_id))
+        .await?)
+}
+
+/// The account a stage of `session_id` proved the caller to be, if any stage recorded one.
+///
+/// # Errors
+/// A storage failure as `500`.
+pub async fn authenticated_user(
+    store: &dyn UiaStore,
+    session_id: &str,
+) -> Result<Option<String>, MatrixError> {
+    Ok(store
+        .get_session_data(session_id, AUTHENTICATED_USER_KEY)
+        .await?
+        .and_then(|v| v.as_str().map(str::to_owned)))
 }
 
 #[cfg(test)]
@@ -390,8 +490,53 @@ mod tests {
     /// `None` (see this function's doc comment), so it must be set to `Some` even when empty.
     #[test]
     fn incomplete_body_always_includes_a_params_object() {
-        let info = incomplete_body(dummy_flow(), Vec::new(), "sess1".to_string());
-        let value = serde_json::to_value(&info).unwrap();
+        let value = incomplete_body(dummy_flow(), Vec::new(), "sess1".to_string());
         assert_eq!(value["params"], serde_json::json!({}));
+    }
+
+    /// Sytest's "Can't deactivate account with wrong password" wants `completed` on the very
+    /// first failed attempt, when it is empty; `ruma`'s `UiaaInfo` would have left it out.
+    #[test]
+    fn incomplete_body_always_includes_completed_even_when_empty() {
+        let value = incomplete_body(dummy_flow(), Vec::new(), "sess1".to_string());
+        assert_eq!(value["completed"], serde_json::json!([]));
+        assert_eq!(
+            value["flows"],
+            serde_json::json!([{"stages": ["m.login.dummy"]}])
+        );
+        assert_eq!(value["session"], "sess1");
+        let value = incomplete_body(dummy_flow(), vec![AuthType::Dummy], "sess1".to_string());
+        assert_eq!(value["completed"], serde_json::json!(["m.login.dummy"]));
+    }
+
+    #[tokio::test]
+    async fn a_session_is_bound_to_the_operation_it_was_started_for() {
+        let store = InMemoryAuthStore::new();
+        let id = session_id_for(&store, None, 0, 10_000).await.unwrap();
+        bind_operation(&store, &id, "DELETE /devices/A")
+            .await
+            .unwrap();
+        bind_operation(&store, &id, "DELETE /devices/A")
+            .await
+            .unwrap();
+        let err = bind_operation(&store, &id, "DELETE /devices/B")
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), axum::http::StatusCode::FORBIDDEN);
+        assert_eq!(err.errcode(), crate::error::ErrCode::Forbidden);
+    }
+
+    #[tokio::test]
+    async fn the_authenticated_user_round_trips() {
+        let store = InMemoryAuthStore::new();
+        let id = session_id_for(&store, None, 0, 10_000).await.unwrap();
+        assert_eq!(authenticated_user(&store, &id).await.unwrap(), None);
+        record_authenticated_user(&store, &id, ruma::user_id!("@a:example.org"))
+            .await
+            .unwrap();
+        assert_eq!(
+            authenticated_user(&store, &id).await.unwrap().as_deref(),
+            Some("@a:example.org")
+        );
     }
 }

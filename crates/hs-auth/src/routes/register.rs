@@ -1,19 +1,34 @@
 //! `POST /register` and `GET /register/available`.
 //!
 //! Registration drives the same [`crate::uia`] state machine as password change and device
-//! deletion. Per the current spec, the client resends the *entire* request body (not just
-//! `auth`/`session`) on every round of a multi-stage flow, so this handler does not need to
-//! remember `username`/`password` across rounds in UIA session data — it just re-validates them
-//! every time and only creates the account once the flow completes.
+//! deletion, and remembers what a dance needs across its rounds in the UIA session, as Synapse's
+//! `RegisterRestServlet` does:
 //!
-//! Supported UIA stages: `m.login.dummy` (always available as the fallback flow when nothing else
-//! is configured), `m.login.registration_token` (checked against
-//! [`crate::config::AuthConfig::valid_registration_tokens`]), `m.login.terms` (acknowledgement
-//! only — there is no server-side wording to validate against). `m.login.recaptcha`,
-//! `m.login.email.identity` and `m.login.msisdn` are never included in the offered flows (no
-//! verification backend exists yet) and fail cleanly with a clear `M_UNRECOGNIZED` if a client
-//! submits one anyway, rather than the generic "invalid auth" a genuinely-wrong stage result
-//! would get.
+//! - **The parameters.** The request body (less `auth` and `password`) is stored on the session;
+//!   a later round that sends only `auth` gets the stored parameters back (Sytest's "registration
+//!   remembers parameters": `device_id` and `initial_device_display_name` from the first call,
+//!   `inhibit_login` likewise). A round that sends parameters replaces them.
+//! - **The password**, as its hash only, never in plain text, so a later round need not send it.
+//! - **The account made.** Once a session has registered an account, the same session finishing
+//!   again logs that account in again rather than making a second one or answering
+//!   `M_USER_IN_USE` (Sytest's "registration is idempotent, with/without username specified").
+//! - **A session, once issued, is required** for an `m.login.dummy` stage for that username:
+//!   one submitted without `session` while a session handed out for the same username is still
+//!   open gets the challenge again (`401`) instead of registering around it (Complement's
+//!   "Registration without a session fails"). A one-shot registration that never asked for a
+//!   session is unaffected, as are a guest upgrading itself (Sytest's "Guest user can upgrade to
+//!   fully featured user" sends its stage without the session it was given) and a stage carrying
+//!   its own proof, such as an invite link's registration token.
+//!
+//! Supported UIA stages: `m.login.dummy` (the flow when nothing else is required),
+//! `m.login.registration_token` (checked against
+//! [`crate::config::AuthConfig::valid_registration_tokens`] and the token store),
+//! `m.login.terms` (acknowledgement only), and `m.login.recaptcha` when `auth.recaptcha` has a
+//! secret key ([`crate::recaptcha`]; required in every flow only with `auth.recaptcha.required`,
+//! but a client may complete it either way, as Synapse allows), and `m.login.email.identity` (an
+//! address this server validated, [`crate::threepid`]) as a flow of its own while email can be
+//! sent. `m.login.msisdn` fails cleanly with `M_UNRECOGNIZED`, as does a stage this server
+//! cannot check.
 
 use std::collections::HashMap;
 
@@ -43,24 +58,95 @@ fn registration_flows(state: &AuthState, token_only: bool) -> Vec<AuthFlow> {
     if state.config.get().registration_requires_token || token_only {
         required.push(AuthType::RegistrationToken);
     }
+    if state
+        .config
+        .get()
+        .recaptcha
+        .as_ref()
+        .is_some_and(|r| r.required)
+    {
+        required.push(AuthType::ReCaptcha);
+    }
     if state.config.get().terms_enabled {
         required.push(AuthType::Terms);
     }
-    if required.is_empty() {
+    let mut flows = if required.is_empty() {
         vec![AuthFlow::new(vec![AuthType::Dummy])]
     } else {
-        vec![AuthFlow::new(required)]
+        vec![AuthFlow::new(required.clone())]
+    };
+    // Registering with an email address this server validates (`crate::threepid`), offered as
+    // its own flow while the server can send email, as Synapse offers `[m.login.email.identity]`.
+    if crate::threepid::email_available(state) {
+        required.push(AuthType::EmailIdentity);
+        flows.push(AuthFlow::new(required));
+    }
+    flows
+}
+
+/// Whether `auth_type` is a stage this server can satisfy now: the CAPTCHA once its key is
+/// configured, an email address once this server can send email. Anything else (`m.login.msisdn`,
+/// an unknown stage) gets the clean `M_UNRECOGNIZED` failure rather than "invalid auth".
+fn stage_is_supported(state: &AuthState, auth_type: &AuthType) -> bool {
+    match auth_type {
+        AuthType::Dummy | AuthType::RegistrationToken | AuthType::Terms => true,
+        AuthType::ReCaptcha => state.config.get().recaptcha.is_some(),
+        AuthType::EmailIdentity => crate::threepid::email_available(state),
+        _ => false,
     }
 }
 
-/// Whether `auth_type` is a stage this server can ever satisfy. Recaptcha/email/msisdn stages are
-/// never in [`registration_flows`], so a client only submits one deliberately (an old client
-/// hardcoding a flow, or a probe); this is the clean failure path for that.
-fn stage_is_supported(auth_type: &AuthType) -> bool {
-    matches!(
-        auth_type,
-        AuthType::Dummy | AuthType::RegistrationToken | AuthType::Terms
-    )
+/// The challenge's `params`: the site key a client shows the CAPTCHA with, when the CAPTCHA is
+/// configured.
+fn challenge_params(state: &AuthState) -> Value {
+    match state
+        .config
+        .get()
+        .recaptcha
+        .as_ref()
+        .and_then(|r| r.public_key.clone())
+    {
+        Some(public_key) => json!({"m.login.recaptcha": {"public_key": public_key}}),
+        None => json!({}),
+    }
+}
+
+/// Checks a CAPTCHA answer with the CAPTCHA service. A service that cannot be asked fails the
+/// stage (logged), and the client may try again.
+async fn verify_recaptcha(
+    state: &AuthState,
+    response: &str,
+    remote_ip: Option<&str>,
+) -> Result<bool, MatrixError> {
+    let Some(settings) = state.config.get().recaptcha.clone() else {
+        return Ok(false);
+    };
+    let verifier = state.recaptcha_verifier().map_err(|error| {
+        tracing::warn!(%error, "could not build the CAPTCHA verifier");
+        MatrixError::internal()
+    })?;
+    let check = crate::recaptcha::RecaptchaCheck {
+        siteverify_api: &settings.siteverify_api,
+        private_key: &settings.private_key,
+        response,
+        remote_ip,
+    };
+    match verifier.verify(&check).await {
+        Ok(true) => {
+            crate::recaptcha::count("passed");
+            Ok(true)
+        }
+        Ok(false) => {
+            crate::recaptcha::count("failed");
+            tracing::info!("a registration's CAPTCHA answer was refused by the CAPTCHA service");
+            Ok(false)
+        }
+        Err(error) => {
+            crate::recaptcha::count("error");
+            tracing::warn!(%error, api = %settings.siteverify_api, "could not check a CAPTCHA answer");
+            Ok(false)
+        }
+    }
 }
 
 /// Whether a submitted stage succeeded. A registration token is checked against the tokens in
@@ -71,9 +157,11 @@ async fn verify_stage(
     state: &AuthState,
     data: &AuthData,
     session_id: Option<&str>,
+    remote_ip: Option<&str>,
 ) -> Result<bool, MatrixError> {
     Ok(match data {
         AuthData::Dummy(_) => true,
+        AuthData::ReCaptcha(r) => verify_recaptcha(state, &r.response, remote_ip).await?,
         AuthData::Terms(_) => true,
         AuthData::RegistrationToken(t) => {
             if state
@@ -104,6 +192,41 @@ async fn verify_stage(
                 false
             }
         }
+        AuthData::EmailIdentity(e) => {
+            // An address this server validated (`crate::threepid`), named by the session the
+            // validation email started; remembered on the UIA session so that creating the
+            // account can add it.
+            let creds = &e.thirdparty_id_creds;
+            match crate::threepid::validated_session(
+                state,
+                creds.sid.as_str(),
+                creds.client_secret.as_str(),
+            )
+            .await?
+            {
+                Some(record)
+                    if record.medium == "email"
+                        && state
+                            .store
+                            .get_user_by_threepid("email", &record.address)
+                            .await?
+                            .is_none() =>
+                {
+                    if let Some(session_id) = session_id {
+                        state
+                            .store
+                            .set_session_data(
+                                session_id,
+                                REGISTRATION_EMAIL_KEY,
+                                serde_json::to_value(&record).unwrap_or_default(),
+                            )
+                            .await?;
+                    }
+                    true
+                }
+                _ => false,
+            }
+        }
         _ => false,
     })
 }
@@ -111,6 +234,71 @@ async fn verify_stage(
 /// Where a registration's UIA session remembers the token it presented, so that creating the
 /// account can count the use.
 const REGISTRATION_TOKEN_KEY: &str = "registration_token";
+
+/// Where a registration's UIA session keeps the request's parameters (less `auth` and
+/// `password`), for a later round that sends only `auth`. See the module docs.
+const PARAMS_KEY: &str = "registration_params";
+
+/// Where a registration's UIA session keeps the password's hash, for a later round that does
+/// not send the password again.
+const PASSWORD_HASH_KEY: &str = "registration_password_hash";
+
+/// Where a registration's UIA session records the account it made, so finishing the same
+/// session again logs that account in instead of making another.
+const REGISTERED_USER_KEY: &str = "registered_user_id";
+
+/// The registrations that were handed a UIA session, by the username they asked for, so that a
+/// stage submitted for that username without the session can be sent back to it (see the module
+/// docs). Kept in this process's memory and bounded: it is a strictness check, not state a
+/// registration depends on -- behind a load balancer, a request that reaches another replica
+/// simply is not checked.
+#[derive(Debug, Default)]
+pub struct PendingRegistrations {
+    by_username: std::sync::Mutex<HashMap<String, (String, u64)>>,
+}
+
+impl PendingRegistrations {
+    /// The most usernames remembered at once; the oldest is forgotten first.
+    const CAPACITY: usize = 10_000;
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, (String, u64)>> {
+        self.by_username
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn remember(&self, username: &str, session_id: &str, now_ms: u64, timeout_ms: u64) {
+        let mut map = self.lock();
+        map.retain(|_, (_, at)| at.saturating_add(timeout_ms) >= now_ms);
+        if map.len() >= Self::CAPACITY
+            && !map.contains_key(username)
+            && let Some(oldest) = map
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(name, _)| name.clone())
+        {
+            map.remove(&oldest);
+        }
+        map.entry(username.to_owned())
+            .or_insert_with(|| (session_id.to_owned(), now_ms));
+    }
+
+    fn session_for(&self, username: &str, now_ms: u64, timeout_ms: u64) -> Option<String> {
+        self.lock()
+            .get(username)
+            .filter(|(_, at)| at.saturating_add(timeout_ms) >= now_ms)
+            .map(|(session, _)| session.clone())
+    }
+
+    fn forget(&self, username: &str) {
+        self.lock().remove(username);
+    }
+}
+
+/// Where a registration's UIA session remembers the email address its `m.login.email.identity`
+/// stage validated (the [`crate::store::ThreepidValidationRecord`]), so that creating the
+/// account can add it.
+const REGISTRATION_EMAIL_KEY: &str = "registration_email";
 
 /// Whether any stored token would admit a registration now. On a server with open registration
 /// off, a registration that presents nothing is refused outright unless this holds, so a closed
@@ -283,7 +471,7 @@ pub async fn post_register(
     let response = if kind == "guest" {
         register_guest(&state, &body).await?
     } else {
-        register_user(&state, &body).await?
+        register_user(&state, &body, address.as_deref()).await?
     };
     if response.status() == StatusCode::OK
         && let Some(address) = &address
@@ -430,7 +618,11 @@ async fn guest_to_upgrade(
     Ok(user.user_id)
 }
 
-async fn register_user(state: &AuthState, body: &Value) -> Result<Response, MatrixError> {
+async fn register_user(
+    state: &AuthState,
+    body: &Value,
+    remote_ip: Option<&str>,
+) -> Result<Response, MatrixError> {
     let auth: Option<AuthData> = match body.get("auth") {
         Some(v) if !v.is_null() => Some(
             serde_json::from_value(v.clone())
@@ -440,6 +632,50 @@ async fn register_user(state: &AuthState, body: &Value) -> Result<Response, Matr
     };
     let session_id_param = auth.as_ref().and_then(AuthData::session);
     let submitted_type = auth.as_ref().and_then(AuthData::auth_type);
+    let now = state.now_ms();
+    let timeout = state.config.get().uia_session_timeout_ms;
+
+    // What this session remembers from earlier rounds (see the module docs). An unknown or
+    // expired session remembers nothing; `uia::advance` refuses it below.
+    let live_session = match session_id_param {
+        Some(id) if state.store.session_exists(id, now, timeout).await? => Some(id),
+        _ => None,
+    };
+    let remembered = |key: &'static str| async move {
+        match live_session {
+            Some(id) => state.store.get_session_data(id, key).await,
+            None => Ok(None),
+        }
+    };
+    let stored_params = remembered(PARAMS_KEY).await?;
+    let stored_password_hash = remembered(PASSWORD_HASH_KEY)
+        .await?
+        .and_then(|v| v.as_str().map(str::to_owned));
+    let registered_user: Option<OwnedUserId> = remembered(REGISTERED_USER_KEY)
+        .await?
+        .and_then(|v| v.as_str().and_then(|s| UserId::parse(s).ok()));
+
+    // The parameters in force: this request's, or -- for a round that sends only `auth` -- the
+    // ones the session remembers.
+    let mut params = body.as_object().cloned().unwrap_or_default();
+    params.remove("auth");
+    let params_from_request = !params.is_empty();
+    if !params_from_request && let Some(Value::Object(stored)) = stored_params {
+        params = stored;
+    }
+    let password_raw = params
+        .remove("password")
+        .and_then(|v| v.as_str().map(str::to_owned));
+    if params_from_request
+        && password_raw.is_none()
+        && params.remove("initial_device_display_name").is_some()
+    {
+        // Synapse's workaround for a client that sent `initial_device_display_name` alone on a
+        // later round, which would otherwise replace the remembered parameters with nothing but
+        // a display name.
+        tracing::debug!("ignored initial_device_display_name sent without a password");
+    }
+    let params_value = Value::Object(params.clone());
 
     // With open registration off, a registration token is the only way in. A request that
     // presents one, or continues a session that may already hold one, goes on to the token
@@ -454,8 +690,7 @@ async fn register_user(state: &AuthState, body: &Value) -> Result<Response, Matr
         }
     }
 
-    let password_raw = body.get("password").and_then(Value::as_str);
-    if let Some(pw) = password_raw {
+    if let Some(pw) = &password_raw {
         state.config.get().password_policy.validate(pw)?;
     }
 
@@ -471,7 +706,7 @@ async fn register_user(state: &AuthState, body: &Value) -> Result<Response, Matr
     // (registers `user-UPPER`, expects `user_id: "@user-upper:hs1"`). ASCII-only: the grammar
     // itself is ASCII (`validate_localpart` rejects anything else), so a locale-aware
     // `str::to_lowercase` would only risk surprising non-ASCII casing rules for no benefit.
-    let username = body
+    let username = params
         .get("username")
         .and_then(Value::as_str)
         .map(str::to_ascii_lowercase);
@@ -480,12 +715,19 @@ async fn register_user(state: &AuthState, body: &Value) -> Result<Response, Matr
         refuse_exclusive(state, username, None).await?;
     }
     // A guest becoming a full account keeps its user ID, which is taken -- by the guest.
-    let upgrading = match body.get("guest_access_token").and_then(Value::as_str) {
+    let upgrading = match params.get("guest_access_token").and_then(Value::as_str) {
         Some(token) => Some(guest_to_upgrade(state, token, username.as_deref()).await?),
         None => None,
     };
+    // The account this session already made has the name, which is not "in use" to it.
+    let already_ours = |name: &str| {
+        registered_user
+            .as_ref()
+            .is_some_and(|u| u.localpart() == name)
+    };
     if let Some(username) = &username
         && upgrading.is_none()
+        && !already_ours(username)
         && !state.store.is_localpart_available(username).await?
     {
         return Err(MatrixError::user_in_use());
@@ -494,7 +736,7 @@ async fn register_user(state: &AuthState, body: &Value) -> Result<Response, Matr
     let flows = registration_flows(state, token_only);
 
     if let Some(auth_type) = &submitted_type
-        && !stage_is_supported(auth_type)
+        && !stage_is_supported(state, auth_type)
     {
         return Err(MatrixError::new(
             StatusCode::BAD_REQUEST,
@@ -506,26 +748,54 @@ async fn register_user(state: &AuthState, body: &Value) -> Result<Response, Matr
         ));
     }
 
+    // A dummy stage submitted without its session while one handed out for this username is
+    // still open goes back to that session (see the module docs). Only the dummy stage: it
+    // proves nothing, so it can only be acknowledging a challenge, and has to name it. A stage
+    // that carries its own proof (a registration token, a CAPTCHA answer, a validated email)
+    // may still start a session of its own, as Synapse allows -- an invite link's sign-up page
+    // asks for the flows and then sends the token without the session.
+    if session_id_param.is_none()
+        && submitted_type == Some(AuthType::Dummy)
+        && upgrading.is_none()
+        && let Some(username) = &username
+        && let Some(pending) = state
+            .pending_registrations
+            .session_for(username, now, timeout)
+        && state.store.session_exists(&pending, now, timeout).await?
+    {
+        tracing::info!(
+            username = %username,
+            "refused a registration stage sent without the session its username was given"
+        );
+        let completed = state
+            .store
+            .completed_stages(&pending)
+            .await?
+            .into_iter()
+            .map(AuthType::from)
+            .collect();
+        let body =
+            uia::incomplete_body_with_params(flows, completed, pending, challenge_params(state));
+        return Ok((StatusCode::UNAUTHORIZED, Json(body)).into_response());
+    }
+
     // A registration token takes a place on the token for this session, so the session has to
     // exist before the stage is checked: resolve (or create) it first, exactly as `advance`
     // would, and hand `advance` the id.
-    let session_id: Option<String> = if submitted_type == Some(AuthType::RegistrationToken) {
-        Some(
-            uia::session_id_for(
-                state.store.as_ref(),
-                session_id_param,
-                state.now_ms(),
-                state.config.get().uia_session_timeout_ms,
-            )
-            .await?,
-        )
+    let session_id: Option<String> = if matches!(
+        submitted_type,
+        Some(AuthType::RegistrationToken | AuthType::EmailIdentity)
+    ) {
+        Some(uia::session_id_for(state.store.as_ref(), session_id_param, now, timeout).await?)
     } else {
         session_id_param.map(str::to_owned)
     };
 
     let stage_ok = match &auth {
-        Some(data) => verify_stage(state, data, session_id.as_deref()).await?,
-        None => true,
+        Some(data) if submitted_type.is_some() => {
+            verify_stage(state, data, session_id.as_deref(), remote_ip).await?
+        }
+        _ => true,
     };
 
     let outcome = uia::advance(
@@ -534,19 +804,65 @@ async fn register_user(state: &AuthState, body: &Value) -> Result<Response, Matr
         session_id.as_deref(),
         submitted_type,
         stage_ok,
-        state.now_ms(),
-        state.config.get().uia_session_timeout_ms,
+        now,
+        timeout,
     )
     .await?;
-
-    if !outcome.complete {
-        let body = uia::incomplete_body(flows, outcome.completed, outcome.session_id);
-        return Ok((StatusCode::UNAUTHORIZED, Json(body)).into_response());
+    let session_id = outcome.session_id.clone();
+    uia::bind_operation(state.store.as_ref(), &session_id, "POST /register").await?;
+    if params_from_request {
+        state
+            .store
+            .set_session_data(&session_id, PARAMS_KEY, params_value.clone())
+            .await?;
     }
 
-    let password_hash = match password_raw {
-        Some(pw) => Some(password::hash_password(pw).map_err(|_| MatrixError::internal())?),
-        None => None,
+    if !outcome.complete {
+        // The password is hashed once and kept with the session, so a later round need not send
+        // it again (and the plain text is never stored).
+        if let Some(pw) = &password_raw
+            && stored_password_hash.is_none()
+        {
+            let hash = password::hash_password(pw).map_err(|_| MatrixError::internal())?;
+            state
+                .store
+                .set_session_data(&session_id, PASSWORD_HASH_KEY, json!(hash))
+                .await?;
+        }
+        if let Some(username) = &username
+            && upgrading.is_none()
+        {
+            state
+                .pending_registrations
+                .remember(username, &session_id, now, timeout);
+        }
+        let body = uia::incomplete_body_with_params(
+            flows,
+            outcome.completed,
+            session_id,
+            challenge_params(state),
+        );
+        return Ok((StatusCode::UNAUTHORIZED, Json(body)).into_response());
+    }
+    if let Some(username) = &username {
+        state.pending_registrations.forget(username);
+    }
+
+    let inhibit_login = params
+        .get("inhibit_login")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    if let Some(user_id) = registered_user {
+        // This session already made its account: log it in again (Synapse: "Already registered
+        // user ID for this session").
+        tracing::info!(%user_id, "a registration session finished again; logging its account in");
+        return finish_registration(state, &user_id, &params_value, inhibit_login).await;
+    }
+
+    let password_hash = match (&password_raw, stored_password_hash) {
+        (Some(pw), _) => Some(password::hash_password(pw).map_err(|_| MatrixError::internal())?),
+        (None, stored) => stored,
     };
 
     let user_id = if let Some(user_id) = upgrading {
@@ -580,26 +896,39 @@ async fn register_user(state: &AuthState, body: &Value) -> Result<Response, Matr
             .await?;
         user_id
     };
+    state
+        .store
+        .set_session_data(&session_id, REGISTERED_USER_KEY, json!(user_id))
+        .await?;
 
     // The account exists: the token this registration presented has been used. A failure to
     // count it is logged rather than failing a registration that has already succeeded.
     if let Ok(Some(Value::String(token))) = state
         .store
-        .get_session_data(&outcome.session_id, REGISTRATION_TOKEN_KEY)
+        .get_session_data(&session_id, REGISTRATION_TOKEN_KEY)
         .await
         && let Err(error) = state
             .registration_tokens
-            .complete(&token, &outcome.session_id)
+            .complete(&token, &session_id)
             .await
     {
         tracing::warn!(%error, %user_id, "could not count a registration token's use");
     }
 
-    let inhibit_login = body
-        .get("inhibit_login")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    finish_registration(state, &user_id, body, inhibit_login).await
+    // The email address the `m.login.email.identity` stage validated is the account's now. The
+    // account exists already, so a failure here (somebody bound the address in between) is
+    // logged rather than failing the registration.
+    if let Ok(Some(record)) = state
+        .store
+        .get_session_data(&session_id, REGISTRATION_EMAIL_KEY)
+        .await
+        && let Ok(record) = serde_json::from_value::<crate::store::ThreepidValidationRecord>(record)
+        && let Err(error) = crate::threepid::add_validated(state, &user_id, &record).await
+    {
+        tracing::warn!(%error, %user_id, "could not add the email address a registration validated");
+    }
+
+    finish_registration(state, &user_id, &params_value, inhibit_login).await
 }
 
 async fn fresh_user_id(state: &AuthState) -> Result<OwnedUserId, MatrixError> {
@@ -835,6 +1164,249 @@ mod tests {
         .unwrap()
     }
 
+    async fn challenge(state: &AuthState, body: Value) -> (String, Value) {
+        let response = register(state, body).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = json_body(response).await;
+        (body["session"].as_str().unwrap().to_owned(), body)
+    }
+
+    /// Sytest's "registration remembers parameters" and "registration with inhibit_login
+    /// inhibits login": a round that sends only `auth` gets the first round's parameters.
+    #[tokio::test]
+    async fn a_round_with_only_auth_uses_the_remembered_parameters() {
+        let state = AuthState::in_memory();
+        let (session, first) = challenge(
+            &state,
+            json!({
+                "username": "remembered",
+                "password": "sUp3rs3kr1t",
+                "device_id": "xyzzy",
+                "initial_device_display_name": "display_name",
+            }),
+        )
+        .await;
+        assert_eq!(first["completed"], json!([]));
+        let response = register(
+            &state,
+            json!({"auth": {"type": "m.login.dummy", "session": session}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["user_id"], "@remembered:example.org");
+        assert_eq!(body["device_id"], "xyzzy");
+        let user_id = ruma::user_id!("@remembered:example.org");
+        let device = state
+            .store
+            .get_device(user_id, ruma::device_id!("xyzzy"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(device.display_name.as_deref(), Some("display_name"));
+        // The password came from the first round, as a hash.
+        let record = state.store.get_user(user_id).await.unwrap().unwrap();
+        assert!(
+            crate::password::verify_password(
+                "sUp3rs3kr1t",
+                record.password_hash.as_ref().unwrap(),
+                ""
+            )
+            .unwrap()
+        );
+
+        let (session, _) = challenge(
+            &state,
+            json!({"username": "inhibited", "password": "sUp3rs3kr1t", "inhibit_login": true}),
+        )
+        .await;
+        let body = json_body(
+            register(
+                &state,
+                json!({"auth": {"type": "m.login.dummy", "session": session}}),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(body["user_id"], "@inhibited:example.org");
+        assert!(body.get("access_token").is_none(), "{body}");
+        assert!(body.get("device_id").is_none(), "{body}");
+    }
+
+    /// Sytest's "registration is idempotent, with/without username specified": the same
+    /// session finishing twice logs the one account in twice.
+    #[tokio::test]
+    async fn finishing_a_session_again_logs_its_account_in_again() {
+        let state = AuthState::in_memory();
+        for username in [None, Some("idempotent")] {
+            let mut first = json!({"password": "sUp3rs3kr1t"});
+            if let Some(name) = username {
+                first["username"] = json!(name);
+            }
+            let (session, _) = challenge(&state, first.clone()).await;
+            let mut finish = first.clone();
+            finish["auth"] = json!({"type": "m.login.dummy", "session": session});
+            let one = json_body(register(&state, finish.clone()).await.unwrap()).await;
+            let two = json_body(register(&state, finish).await.unwrap()).await;
+            assert_eq!(one["user_id"], two["user_id"], "{one} {two}");
+            assert!(two["access_token"].is_string());
+            assert_ne!(one["access_token"], two["access_token"]);
+        }
+    }
+
+    /// Complement's "Registration without a session fails": once a username was handed a
+    /// session, a stage sent for it without that session is challenged again. A one-shot
+    /// registration (no session ever handed out) still completes.
+    #[tokio::test]
+    async fn a_stage_without_the_session_its_username_was_given_is_challenged() {
+        let state = AuthState::in_memory();
+        let (session, _) = challenge(
+            &state,
+            json!({"username": "needs-session", "password": "sUp3rs3kr1t"}),
+        )
+        .await;
+        let response = register(
+            &state,
+            json!({
+                "username": "needs-session",
+                "password": "sUp3rs3kr1t",
+                "auth": {"type": "m.login.dummy"}
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(json_body(response).await["session"], session.as_str());
+        assert!(
+            state
+                .store
+                .is_localpart_available("needs-session")
+                .await
+                .unwrap()
+        );
+        // With the session it goes through.
+        let response = register(
+            &state,
+            json!({
+                "username": "needs-session",
+                "password": "sUp3rs3kr1t",
+                "auth": {"type": "m.login.dummy", "session": session}
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// An invite link's sign-up page asks for the flows, then sends the token without the
+    /// session it was handed: the token proves itself, so that registers
+    /// (`crates/hs-cli/tests/invites_and_notices.rs`).
+    #[tokio::test]
+    async fn a_token_stage_without_the_session_still_registers() {
+        let state = closed_server();
+        add_token(&state, "invite", Some(1), None).await;
+        let _ = challenge(
+            &state,
+            json!({"username": "dana", "password": "hunter2-dana"}),
+        )
+        .await;
+        let response = register(
+            &state,
+            json!({
+                "username": "dana",
+                "password": "hunter2-dana",
+                "auth": {"type": "m.login.registration_token", "token": "invite"}
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Stands in for the CAPTCHA service: right when the answer is "right".
+    struct FakeCaptcha;
+
+    #[async_trait::async_trait]
+    impl crate::recaptcha::RecaptchaVerifier for FakeCaptcha {
+        async fn verify(
+            &self,
+            check: &crate::recaptcha::RecaptchaCheck<'_>,
+        ) -> Result<bool, String> {
+            assert_eq!(check.private_key, "captcha-secret");
+            Ok(check.response == "right")
+        }
+    }
+
+    fn captcha_server(required: bool) -> AuthState {
+        let state = AuthState::in_memory_with_config(AuthConfig {
+            recaptcha: Some(crate::config::RecaptchaSettings {
+                required,
+                public_key: Some("captcha-site".into()),
+                private_key: "captcha-secret".into(),
+                siteverify_api: "https://captcha.invalid/siteverify".into(),
+            }),
+            ..AuthConfig::default()
+        });
+        state.install_recaptcha_verifier(std::sync::Arc::new(FakeCaptcha));
+        state
+    }
+
+    /// Sytest's "Register with a recaptcha": with keys configured and the CAPTCHA not
+    /// required, a client may still complete the stage, and the challenge says so.
+    #[tokio::test]
+    async fn a_configured_captcha_can_be_completed_even_when_not_required() {
+        let state = captcha_server(false);
+        let response = register(
+            &state,
+            json!({
+                "username": "captcha",
+                "password": "sUp3rs3kr1t",
+                "auth": {"type": "m.login.recaptcha", "response": "right"}
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = json_body(response).await;
+        assert_eq!(body["completed"], json!(["m.login.recaptcha"]));
+        assert_eq!(body["flows"], json!([{"stages": ["m.login.dummy"]}]));
+        assert_eq!(
+            body["params"]["m.login.recaptcha"]["public_key"],
+            "captcha-site"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_required_captcha_is_in_the_flow_and_a_wrong_answer_fails_it() {
+        let state = captcha_server(true);
+        let (session, body) = challenge(
+            &state,
+            json!({"username": "captcha2", "password": "sUp3rs3kr1t"}),
+        )
+        .await;
+        assert_eq!(body["flows"], json!([{"stages": ["m.login.recaptcha"]}]));
+        let err = register(
+            &state,
+            json!({"auth": {"type": "m.login.recaptcha", "response": "wrong", "session": session}}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
+        let response = register(
+            &state,
+            json!({"auth": {"type": "m.login.recaptcha", "response": "right", "session": session}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            json_body(response).await["user_id"],
+            "@captcha2:example.org"
+        );
+    }
+
     #[tokio::test]
     async fn a_closed_server_with_no_tokens_stays_closed() {
         let state = closed_server();
@@ -861,22 +1433,27 @@ mod tests {
             body["flows"][0]["stages"],
             json!(["m.login.registration_token"])
         );
+        let session = body["session"].as_str().unwrap().to_owned();
         // A dummy stage does not satisfy it.
-        let response = register(
-            &state,
-            json!({"username": "first", "password": "hunter22", "auth": {"type": "m.login.dummy"}}),
-        )
-        .await
-        .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-
-        // The token does, in one request.
         let response = register(
             &state,
             json!({
                 "username": "first",
                 "password": "hunter22",
-                "auth": {"type": "m.login.registration_token", "token": "invite"}
+                "auth": {"type": "m.login.dummy", "session": session}
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // The token does.
+        let response = register(
+            &state,
+            json!({
+                "username": "first",
+                "password": "hunter22",
+                "auth": {"type": "m.login.registration_token", "token": "invite", "session": session}
             }),
         )
         .await

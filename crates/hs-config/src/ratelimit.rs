@@ -181,9 +181,10 @@ pub struct RateLimitConfig {
         deserialize_with = "partial_federation"
     )]
     pub federation: RateLimitBucket,
-    /// How fast email and phone verification codes may be requested
-    /// (`POST /account/3pid/*/requestToken`). Not used yet: this server sends no verification
-    /// codes. Corresponds to Synapse's `rc_3pid_validation`.
+    /// How fast validation emails may be requested (`POST /register/email/requestToken`,
+    /// `/account/3pid/email/requestToken`, `/account/password/email/requestToken`), counted per
+    /// client address and per email address, so nobody can use this server to flood a mailbox.
+    /// Corresponds to Synapse's `rc_3pid_validation`.
     #[serde(
         default = "default_third_party_id_validation",
         deserialize_with = "partial_third_party_id_validation"

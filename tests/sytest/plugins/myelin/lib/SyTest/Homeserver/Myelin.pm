@@ -99,11 +99,16 @@ sub start
 # The native configuration (crates/hs-config) for one Sytest homeserver. The settings that
 # differ from the defaults are the ones Sytest's Synapse configuration (Synapse.pm) also changes:
 # open registration, guest access, Sytest's identity server, the shared secret `reg_secret`, no rate limits, no IP-range blocklists (every
-# server is on localhost), public rooms over federation, and the appservice registrations Sytest
-# writes for server 0.
+# server is on localhost), public rooms over federation, the appservice registrations Sytest
+# writes for server 0, and Sytest's mock reCAPTCHA, CAS and mail servers (`recaptcha_config`,
+# `cas_config` and `smtp_server_config`, which tests/05homeserver.pl configures on every server).
 sub _get_config
 {
    my $self = shift;
+
+   my $recaptcha = $self->{recaptcha_config};
+   my $smtp      = $self->{smtp_server_config};
+   my $cas       = $self->{cas_config};
 
    return {
       server => {
@@ -129,7 +134,26 @@ sub _get_config
          identity_servers           => [ "localhost", "127.0.0.1" ],
          enable_legacy_login        => JSON::true,
          registration_shared_secret => "reg_secret",
+         # Not required, as in Sytest's Synapse configuration: the keys alone let a client
+         # complete `m.login.recaptcha` (tests/11register.pl "Register with a recaptcha").
+         $recaptcha ? ( recaptcha => {
+            public_key     => $recaptcha->{public_key},
+            private_key    => $recaptcha->{private_key},
+            siteverify_api => $recaptcha->{siteverify_api},
+         } ) : (),
+         # Sytest's mock CAS server (tests/12login/02cas.pl, the SSO tests of
+         # tests/10apidoc/13ui-auth.pl); CAS sends people back to `public_baseurl`.
+         $cas ? ( cas => { server_url => $cas->{server_url} } ) : (),
       },
+      # Sytest's mail server, for 3PID validation emails (plain SMTP on localhost).
+      $smtp ? ( email => {
+         smtp => {
+            host     => $smtp->{host},
+            port     => $smtp->{port},
+            security => "none",
+         },
+         from => 'synapse@localhost',
+      } ) : (),
       network => {
          # Sytest's own federation server and identity server listen on `localhost`, which
          # the image's Perl binds on `::1`; the server's default (IPv4 only, decision of

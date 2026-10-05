@@ -15,7 +15,7 @@ Decision 0010: this server is administered through the admin API and the web int
 Every setting is one of three kinds (decision 0016; `hs_config::reload::SETTINGS` is the table, and the schema the admin API serves carries it as `x-applies` on each setting):
 
 - **bootstrap** (7): set at install, per process, never stored in the database;
-- **hot** (51): applies to the running server at once -- a save reports it as reloaded;
+- **hot** (53): applies to the running server at once -- a save reports it as reloaded;
 - **restart** (25): stored at once, read at the next start -- a save reports it as waiting for a restart.
 
 The **Applies** column below gives each setting's kind and what reads it. Sections in which every administered setting is hot: `server`, `rate_limits`, `migration`, `network`, `email`.
@@ -160,7 +160,7 @@ How fast one user, address or server may do each costly thing before it is told 
 | `joins_remote` | object | `{"per_second":0.01,"burst_count":10}` | hot (joins through another server, per user) | How fast one user may join rooms on other servers. Each such join fetches the room's state over federation, which can take this server minutes and a lot of memory for a large room, so this limit is the strictest. Corresponds to Synapse's `rc_joins.remote`. |
 | `admin_redaction` | object | `{"per_second":1.0,"burst_count":50}` | hot (redactions by server administrators, per user) | How fast a server administrator's redactions may go, in place of the message limit, so that removing a spammer's messages is not throttled like ordinary sending. Corresponds to Synapse's `rc_admin_redaction`. |
 | `federation` | object | `{"per_second":10.0,"burst_count":100}` | hot (inbound federation transactions, per origin server) | How fast one other server may send transactions to this one (`PUT /send`), counted per origin server. A server catching up after an outage sends in bursts; too low a limit slows how soon its users' messages arrive here. Corresponds to Synapse's `rc_federation`. |
-| `third_party_id_validation` | object | `{"per_second":0.003,"burst_count":5}` | hot (nothing yet: no 3PID requestToken route is served, so there is nothing to limit) | How fast email and phone verification codes may be requested (`POST /account/3pid/*/requestToken`). Not used yet: this server sends no verification codes. Corresponds to Synapse's `rc_3pid_validation`. |
+| `third_party_id_validation` | object | `{"per_second":0.003,"burst_count":5}` | hot (validation emails requested, per client address and per email address) | How fast validation emails may be requested (`POST /register/email/requestToken`, `/account/3pid/email/requestToken`, `/account/password/email/requestToken`), counted per client address and per email address, so nobody can use this server to flood a mailbox. Corresponds to Synapse's `rc_3pid_validation`. |
 
 
 ## `auth`
@@ -184,7 +184,9 @@ sign-in services.
 | `access_token_lifetime` | string \| integer | `"1h"` | hot (read when a token is issued) | How long an access token from the OAuth issuer works before the client must refresh it. Shorter limits the damage of a leaked token; clients refresh on their own, so people do not notice. Tokens from the classic sign-in that cannot be refreshed are not affected, as in Synapse. Corresponds to Synapse's `access_token_lifetime`. |
 | `refresh_token_lifetime` | object | `"1y"` | hot (read when a token is issued) | How long a refresh token works: after it, a device that has not been used must sign in again. Unset, refresh tokens never expire. Corresponds to Synapse's `refreshable_access_token_lifetime` family. |
 | `password` | object | `{"enabled":true,"pepper":null,"pepper_file":null,"policy":{"minimum_length":8,"require_digit":false,"require_symbol":false,"require_uppercase":false,"require_lowercase":false}}` | `enabled`: restart; `pepper`: hot; `pepper_file`: hot; `policy`: hot | Password sign-in: whether it is offered, the pepper mixed into hashes, and what a new password must contain. |
+| `recaptcha` | object | `{"required":false,"public_key":null,"private_key":null,"private_key_file":null,"siteverify_api":"https://www.recaptcha.net/recaptcha/api/siteverify"}` | hot (POST /register reads it per request) | A CAPTCHA people solve when they sign up. Unset keys (the default) mean no CAPTCHA. |
 | `oidc_providers` | array<object> | `[]` | restart (upstream OIDC clients are built at startup) | Other sign-in services people may use instead of a password here ("Sign in with Google", a company Keycloak or Okta), each registered with the provider first. Empty by default. Corresponds to Synapse's `oidc_providers`. |
+| `cas` | object | — | hot (CAS sign-in reads it per request) | Sign-in through a CAS server instead of, or as well as, a password here. Unset by default. People who sign in through CAS for the first time get an account named after their CAS user name; somebody whose CAS name matches an existing account signs in to that account. Needs `server.public_baseurl` (or `service_url`), since CAS sends people back there. Corresponds to Synapse's `cas_config`. |
 | `mas_delegation` | object | — | restart (delegation replaces the native issuer at startup) | Hand sign-in to a separate Matrix Authentication Service (MAS) instead of this server's own OAuth issuer. Unset by default, which is right unless MAS is already deployed. Corresponds to Synapse's `experimental_features.msc3861`. |
 
 

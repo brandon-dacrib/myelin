@@ -34,7 +34,9 @@ pub async fn post_account_password(
         .ok_or_else(|| MatrixError::missing_param("Missing new_password"))?;
     state.config.get().password_policy.validate(new_password)?;
 
-    if let Some(response) = reauth::run(&state, &requester, &body).await? {
+    if let Some(response) =
+        reauth::run_for_operation(&state, &requester, &body, "POST /account/password").await?
+    {
         return Ok(response);
     }
 
@@ -91,7 +93,9 @@ pub async fn post_account_deactivate(
     // namespace before this `Requester` existed.
     if let Some(appservice) = &requester.appservice {
         tracing::info!(user = %requester.user_id, appservice = %appservice.appservice_id, "an appservice deactivated one of its users");
-    } else if let Some(response) = reauth::run(&state, &requester, &body).await? {
+    } else if let Some(response) =
+        reauth::run_for_operation(&state, &requester, &body, "POST /account/deactivate").await?
+    {
         return Ok(response);
     }
 
@@ -130,21 +134,26 @@ pub async fn post_account_deactivate(
         );
     }
 
-    // We do not implement identity-server unbinding (no identity-server client in this crate
-    // yet); "no-support" is the spec's documented value for "the server did not attempt it".
-    Ok(Json(json!({"id_server_unbind_result": "no-support"})).into_response())
+    // The account's third-party identifiers, as Synapse's deactivation handles them: each one
+    // this server bound at an identity server is unbound there, and every one bound to the
+    // account here is removed (`crate::threepid::on_deactivation`). `success` when every
+    // unbind succeeded -- and so when there was nothing to unbind; `no-support` when an
+    // identity server does not support unbinding or none could be asked. The erasure above
+    // already removed the local ones.
+    let unbound = crate::threepid::on_deactivation(&state, &requester.user_id).await?;
+    Ok(Json(json!({
+        "id_server_unbind_result": if unbound { "success" } else { "no-support" }
+    }))
+    .into_response())
 }
 
 /// `GET /account/3pid`: the third-party identifiers (email addresses, phone numbers) this
 /// homeserver has associated with the caller's account.
 ///
-/// Since 2026-09-28 these are real: an administrator binds them (`users.threepids.add` in the
-/// admin API, [`crate::store::IdentityStore::add_threepid`]), and each is listed here with the
-/// `added_at`/`validated_at` timestamps the spec makes required (an administrator's binding is
-/// validated when it is made). A user still cannot add, bind or remove one themself -- that
-/// needs a mailer or SMS gateway and a validation-session store, or an identity-server client,
-/// none of which exist -- so `GET /_matrix/client/v3/capabilities` goes on reporting
-/// `m.3pid_changes: {"enabled": false}`.
+/// An administrator binds them (`users.threepids.add` in the admin API,
+/// [`crate::store::IdentityStore::add_threepid`]), and since 2026-10-04 so can the user, once
+/// this server has validated the address (`POST /account/3pid/add`, [`crate::threepid`]). Each
+/// is listed with the `added_at`/`validated_at` timestamps the spec makes required.
 ///
 /// An account with none gets an empty list, which is the spec-complete answer, not a stub:
 /// Element's Settings page calls this on open and shows a visible error when it fails.

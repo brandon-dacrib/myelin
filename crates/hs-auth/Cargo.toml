@@ -39,6 +39,8 @@ bcrypt = { workspace = true }
 crc32fast = { workspace = true }
 regex = { workspace = true }
 rand_core = { workspace = true, features = ["getrandom"] }
+quick-xml = { workspace = true }
+reqwest = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }

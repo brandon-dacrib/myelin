@@ -2,7 +2,8 @@
 
 Track brief: `docs/workstreams/07-auth-and-identity.md`. Owner crate: `hs-auth`.
 
-Last updated: 2026-10-02 (session 12: account erasure, below; session 11: guest access and
+Last updated: 2026-10-04 (UIA binding, registration sessions, CAPTCHA, CAS, self-service 3PIDs,
+OpenID and whois, below; session 12: account erasure; session 11: guest access and
 third-party invites; session 10: the
 setup link without `public_baseurl`; session 9:
 devices, 3PIDs, external ids). Session 7 (2026-09-19)
@@ -12,6 +13,129 @@ found and fixed a real case-sensitivity bug in `POST /login`, re-confirmed `/cap
 unfixed (held by another track this session), checked for Element-Web findings in
 `docs/status/16-management-web-interface.md` (none landed as of this write-up), and designed
 (without implementing) a UIA session-correlation scheme left open at the end of session 5).
+
+## 2026-10-04: UIA binding, registration sessions, CAPTCHA, CAS, self-service 3PIDs, OpenID, whois (branch `agent/auth-gaps`)
+
+The auth rows of Sytest's wave-1 run (`target/sytest/20261004-wave1/`, main `c2d74174`) and
+Complement's `TestDeviceManagement`, `TestRegistration` and `TestServerCapabilities`.
+
+**UIA is bound to its user and its operation** (`uia.rs`, `reauth.rs`). A password stage is
+checked against the account its `identifier` names (`auth.user` is rewritten to an identifier
+first), and the account is recorded on the session (`uia::AUTHENTICATED_USER_KEY`; the SSO stage
+records it too). A completed flow whose account is not the requester's is `403 M_FORBIDDEN`:
+before, the requester's own hash was tried whatever the identifier said, and every Sytest
+account has the same password, so another account's credentials deleted the victim's device.
+`reauth::run_for_operation` binds a session to `METHOD path` on its first round
+(`uia::bind_operation`; a different operation later is `403`); every caller in this crate uses
+it, and `reauth::run` (unbound) stays for `hs-e2e`'s cross-signing upload. Every challenge is
+built by `uia::incomplete_body[_with_params]` and always carries `completed` (`ruma`'s
+`UiaaInfo` dropped it when empty) and `params`.
+
+**Registration remembers per session** (`routes/register.rs`, as Synapse's
+`RegisterRestServlet`): the request's parameters less `auth`/`password` (a round sending only
+`auth` gets them back: `device_id`, `initial_device_display_name`, `inhibit_login`), the
+password's hash (never the text), and the account made (the same session finishing again logs
+that account in instead of `M_USER_IN_USE`). An `m.login.dummy` stage sent *without* the session
+its username was handed while that session is open is challenged again (a stage carrying its own
+proof -- an invite link's registration token, a CAPTCHA answer -- still starts its own session, as
+`hs-cli/tests/invites_and_notices.rs` and Synapse need) (`PendingRegistrations`, in memory,
+bounded at 10 000 names, not shared across replicas); a one-shot registration and a guest
+upgrading itself are not affected (Sytest's guest upgrade relies on that).
+
+**CAPTCHA**: `auth.recaptcha` (`required`, `public_key`, `private_key`/`private_key_file`,
+`siteverify_api`, default Google's), hot; Synapse's `enable_registration_captcha` and
+`recaptcha_*` map onto it in `hs-compat`. With a key configured `m.login.recaptcha` can be
+completed (checked by `crate::recaptcha`'s siteverify call, a `RecaptchaVerifier` seam for
+tests) and the challenge's `params` carries the site key; `required` puts it in every flow.
+Counter `hs_auth_recaptcha_checks_total{outcome=passed|failed|error}`.
+
+**CAS single sign-on** (`cas.rs`, `routes/sso.rs`): `auth.cas` (`server_url`, `service_url`,
+`displayname_attribute`, `required_attributes`, `idp_name`), hot, from Synapse's `cas_config`.
+`GET /login` lists `m.login.sso` (provider `cas`) and `m.login.cas`; `/login/sso/redirect[/cas]`
+and `/login/cas/redirect` send people to CAS with the service
+`{public_baseurl}/_matrix/client/r0/login/cas/ticket?redirectUrl=...`; the ticket is checked at
+`/proxyValidate` (CAS 2/3 XML, `quick-xml`), the user mapped (an external id `cas`, else the
+account with the mapped localpart -- `cas_user!` is `cas_user=21` -- else a new account) and a
+200 page links back with `loginToken`. With `?session=` the ticket completes `m.login.sso` for
+that UIA session, which `reauth` offers whenever CAS is configured; `/auth/m.login.sso/fallback/web`
+starts it. Counter `hs_auth_sso_logins_total{provider,outcome}`.
+
+**Self-service 3PIDs** (`threepid.rs`, `routes/threepid.rs`, new `ThreepidStore` in both stores):
+this server validates email addresses itself when `email.smtp.host`, `email.from` and
+`server.public_baseurl` are set (no new key): `/register/email/requestToken`,
+`/account/3pid/email/requestToken`, `/account/password/email/requestToken` mail a link to
+`/_matrix/client/unstable/<registration|add_threepid|password_reset>/email/submit_token`;
+registration offers `[m.login.email.identity]` and adds the address; `POST /account/3pid`
+(deprecated, `three_pid_creds`), `/account/3pid/add` (UIA), `/delete`, `/bind` and `/unbind`
+(through the identity server, unbind X-Matrix signed, bindings recorded so deactivation and
+delete know where to unbind); msisdn answers `M_THREEPID_MEDIUM_NOT_SUPPORTED`. Login accepts the
+legacy top-level `medium`/`address`. `rate_limits.third_party_id_validation` is now read. Mounted
+at v3, r0 and (`/account/3pid/*`, the submit links) `unstable`. `m.3pid_changes` is `true`. The
+mail goes through `hs serve`'s SMTP mailer (`hs_cli::threepid_email`), the IS calls through
+`HttpIdentityService`. Counters `hs_auth_threepid_validations_total{medium,outcome}`,
+`hs_auth_threepid_changes_total{action}`.
+
+**Also**: `GET /capabilities` needs a token (`hs-cli` mounts it on the auth state; `401
+M_MISSING_TOKEN` without). OpenID tokens (`openid.rs`, `POST /user/{userId}/openid/request_token`,
+an hour, hashed, `hs_auth.openid_tokens`): `/_matrix/federation/v1/openid/userinfo` answers them
+-- from `hs_cli::openid_userinfo`, a middleware ahead of routing, because `hs-federation`
+registers that route behind its `X-Matrix` layer and every real call was refused "signature
+verification failed". Counters `hs_auth_openid_tokens_{issued,checked}_total`.
+`GET /admin/whois/{userId}` (self, or an administrator about anyone): one session per device with
+its last connection; the address is now recorded on every authenticated request (the forwarded
+client behind a trusted proxy, else the peer, loopback included); the user agent is not
+recorded (`null`). The shared-secret registration (`/_synapse/admin/v1/register`) checks the
+strict localpart grammar (`us,er` is `400 M_INVALID_USERNAME`).
+
+**Verified.** `cargo test -p hs-auth` (306), `-p hs-config`, `-p hs-compat`, `-p hs-cli --lib`;
+clippy `-D warnings` on the four crates; the real binary in `crates/hs-cli/tests/auth_sessions.rs`
+(capabilities, remembered parameters, idempotent sessions, the strict session, CAPTCHA against a
+fake service, the device-deletion user and operation checks, deactivation's `completed`, OpenID
+over the federation path, whois, the shared-secret grammar, the counters), `cas_sso.rs` (a fake CAS
+server: login types, redirect, ticket, `m.login.token`, a password account through CAS, UIA SSO 403
+then 200), `threepid_email.rs` (an in-test SMTP server: register with an email, log in by
+`medium`/`address`, add and delete, msisdn refused, deactivation) and `e2e.rs`; `npm run check`
+in `web/` (the new settings render through the generic configuration page).
+
+**Sytest** (`tests/sytest/run.sh` with this branch's bookworm `hs`, the graded files:
+`10apidoc/{01register,12device_management,13ui-auth,45server-capabilities}`, `11register`,
+`12login/*`, `14account/02deactivate`, `30rooms/13guestaccess`, `45openid`, `48admin`,
+`54identity`): **75 of 76**, every graded test passing -- "DELETE /device/{deviceId} requires UI
+auth user to match device owner", "The operation must be consistent through an interactive
+authentication session", "GET /v3/capabilities is not public", "Register with a recaptcha",
+"registration is idempotent" (both), "registration remembers parameters", "registration with
+inhibit_login inhibits login", "Can register using an email address", "Can login with 3pid and
+password using m.login.password", "login types include SSO", "Can login with new user via CAS",
+"Can't deactivate account with wrong password", the six 3PID bind/unbind tests, "Can generate a
+openid access_token ...", "/whois", and the four that had been skipped for want of `m.login.cas`
+("/login/cas/redirect ...", "Interactive authentication types include SSO", "Can perform
+interactive authentication with SSO", "The user must be consistent ... with SSO"). The one
+failure, "Guest users are kicked from guest_access rooms on revocation of guest_access over
+federation", is a timing flake on `main` too (main's image and plugin: failed 2 of 3 runs alone;
+this branch: 2 of 5). A wider run of `10apidoc/*`, `12login/*`, `13logout`, `14account/*`,
+`90jira/*`: 116 of 118, the two failures (`/messages` pagination tokens) as on `main`. Validation
+emails to Sytest's mail server needed `hs_cli::smtp_helo`: it answers only `HELO`, and `lettre`
+gives up when `EHLO` is refused, so on a relay without TLS the sender falls back to `HELO` as RFC
+5321 4.1.4 says (email pushers do not, yet: `hs-push`'s mailer is that track's).
+
+**Complement** (`complement-hs-auth-gaps:dev`, under the shared lock): `TestDeviceManagement`,
+`TestRegistration` and `TestServerCapabilities` pass (all three failed on `c2d74174`); `TestLogin`,
+`TestLogout`, `TestChangePassword`, `TestDeactivateAccount`, `TestPasswordPolicy`, `TestGuest*`,
+`TestWhoami`, `TestRefresh*`, `TestDeviceListUpdates` pass.
+
+**Left.** Binding and unbinding at an identity server are tested with a fake seam only (the
+client speaks only https). Email password reset (`/account/password` with
+`m.login.email.identity`) is not built; `next_link` is ignored; the admin API's deactivation
+does not unbind. CAS: no `sso.client_whitelist` (the confirmation page always shows),
+`protocol_version`, `enable_registration`, numeric ids and icons are not carried over. A change
+to `server.public_baseurl` reaches `hs-auth` only with the next `auth` change. The pending-session
+check is per replica. `hs-federation` should register `/openid/userinfo` outside its `X-Matrix`
+layer, after which `hs_cli::openid_userinfo` goes. The `/3pid/onbind` failures of Sytest's "Can
+invite unbound 3pid over federation" family are `hs-room`'s: the invitee's server does not know
+the room and does not exchange the invite over federation.
+
+**Shared dependencies added**: `quick-xml = "0.41"` in `[workspace.dependencies]` (already in the
+lock through another crate); `hs-auth` now depends on `reqwest` and `quick-xml`.
 
 ## 2026-10-04: an administrator changes a user's profile and kind (branch `agent/users-update-sources`)
 
@@ -1765,3 +1889,10 @@ All additions are path dependencies on sibling crates already in the workspace, 
   (`hs-compat` depends only on `hs-config`, confirmed by reading `crates/hs-compat/Cargo.toml`
   before adding this). `hs-admin` was **not** newly added this session — it was already a dependency
   of `crates/hs-auth/Cargo.toml` from whichever earlier session/salvage added `admin_verifier.rs`.
+
+### 2026-10-04 (`agent/auth-gaps`)
+
+- `quick-xml = "0.41"` added to `[workspace.dependencies]` (already in `Cargo.lock` through
+  another crate) for the CAS ticket response (`crate::cas`).
+- `hs-auth` now depends on `reqwest` (workspace) for the CAPTCHA siteverify call and CAS ticket
+  validation, through `hs_http::client::builder()`, and on `quick-xml`.

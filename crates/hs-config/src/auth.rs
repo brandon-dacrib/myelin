@@ -102,6 +102,52 @@ impl Default for PasswordPolicy {
     }
 }
 
+fn default_recaptcha_siteverify_api() -> String {
+    "https://www.recaptcha.net/recaptcha/api/siteverify".to_owned()
+}
+
+/// A CAPTCHA (Google reCAPTCHA, or a service that answers its verification API) that people
+/// solve when they sign up, to keep scripts from creating accounts in bulk. Corresponds to
+/// Synapse's `recaptcha_*` settings and `enable_registration_captcha`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RecaptchaConfig {
+    /// Whether every new account must solve the CAPTCHA. Needs `public_key` and `private_key`.
+    /// Off by default. With the keys set and this off, a client may still offer the CAPTCHA and
+    /// the server checks it, but sign-up does not require it. Corresponds to Synapse's
+    /// `enable_registration_captcha`.
+    #[serde(default)]
+    pub required: bool,
+    /// The site key the CAPTCHA service gave this server, which clients show the puzzle with.
+    /// Not a secret. Corresponds to Synapse's `recaptcha_public_key`.
+    #[serde(default)]
+    pub public_key: Option<String>,
+    /// The secret key the CAPTCHA service gave this server, which this server checks answers
+    /// with. Prefer `private_key_file`. Corresponds to Synapse's `recaptcha_private_key`.
+    #[serde(default)]
+    pub private_key: SecretString,
+    /// Path to a file holding the secret key, read in place of `private_key`. Corresponds to
+    /// Synapse's `recaptcha_private_key_path`.
+    #[serde(default)]
+    pub private_key_file: Option<PathBuf>,
+    /// Where this server checks an answer. The default is Google's; change it only for a
+    /// compatible service. Corresponds to Synapse's `recaptcha_siteverify_api`.
+    #[serde(default = "default_recaptcha_siteverify_api")]
+    pub siteverify_api: String,
+}
+
+impl Default for RecaptchaConfig {
+    fn default() -> Self {
+        Self {
+            required: false,
+            public_key: None,
+            private_key: SecretString::default(),
+            private_key_file: None,
+            siteverify_api: default_recaptcha_siteverify_api(),
+        }
+    }
+}
+
 /// One upstream OIDC identity provider. Corresponds to one entry in
 /// Synapse's `oidc_providers`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -133,6 +179,44 @@ pub struct OidcProviderConfig {
 
 fn default_oidc_scopes() -> Vec<String> {
     vec!["openid".into(), "profile".into()]
+}
+
+fn default_cas_idp_name() -> String {
+    "CAS".to_owned()
+}
+
+/// Sign-in through a CAS server (Apereo CAS, the single sign-on many universities run).
+/// Corresponds to Synapse's `cas_config`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CasConfig {
+    /// The CAS server's address, the part before `/login` (`https://cas.example.edu/cas`).
+    /// People are sent to `<server_url>/login` to sign in, and this server checks the ticket
+    /// they come back with at `<server_url>/proxyValidate`. Corresponds to Synapse's
+    /// `cas_config.server_url`.
+    pub server_url: String,
+    /// The address CAS sends people back to, when it is not `server.public_baseurl` (a server
+    /// behind a proxy that CAS reaches by another name). Unset, `server.public_baseurl` is used.
+    /// Many CAS servers only send people back to addresses registered with them, so this must
+    /// match what the CAS administrator registered. Corresponds to Synapse's
+    /// `cas_config.service_url`.
+    #[serde(default)]
+    pub service_url: Option<String>,
+    /// The CAS attribute holding the person's name, used as the display name of an account
+    /// created at their first sign-in (`displayName`, `cn`). Unset, a new account has no
+    /// display name. Corresponds to Synapse's `cas_config.displayname_attribute`.
+    #[serde(default)]
+    pub displayname_attribute: Option<String>,
+    /// Attributes a person must have to sign in, as `attribute: value` (`affiliation: staff`),
+    /// or `attribute: null` to require only that the attribute is present. Somebody whose CAS
+    /// account lacks one is refused. Empty by default: anyone CAS signs in may. Corresponds to
+    /// Synapse's `cas_config.required_attributes`.
+    #[serde(default)]
+    pub required_attributes: std::collections::BTreeMap<String, Option<String>>,
+    /// The name shown on the sign-in button ("Sign in with ..."). Corresponds to Synapse's
+    /// `cas_config.idp_name`.
+    #[serde(default = "default_cas_idp_name")]
+    pub idp_name: String,
 }
 
 /// Matrix Authentication Service delegation mode: this server introspects
@@ -233,11 +317,21 @@ pub struct AuthConfig {
     /// password must contain.
     #[serde(default)]
     pub password: PasswordConfig,
+    /// A CAPTCHA people solve when they sign up. Unset keys (the default) mean no CAPTCHA.
+    #[serde(default)]
+    pub recaptcha: RecaptchaConfig,
     /// Other sign-in services people may use instead of a password here ("Sign in with Google",
     /// a company Keycloak or Okta), each registered with the provider first. Empty by default.
     /// Corresponds to Synapse's `oidc_providers`.
     #[serde(default)]
     pub oidc_providers: Vec<OidcProviderConfig>,
+    /// Sign-in through a CAS server instead of, or as well as, a password here. Unset by default.
+    /// People who sign in through CAS for the first time get an account named after their CAS
+    /// user name; somebody whose CAS name matches an existing account signs in to that account.
+    /// Needs `server.public_baseurl` (or `service_url`), since CAS sends people back there.
+    /// Corresponds to Synapse's `cas_config`.
+    #[serde(default)]
+    pub cas: Option<CasConfig>,
     /// Hand sign-in to a separate Matrix Authentication Service (MAS) instead of this server's
     /// own OAuth issuer. Unset by default, which is right unless MAS is already deployed.
     /// Corresponds to Synapse's `experimental_features.msc3861`.
@@ -260,7 +354,9 @@ impl Default for AuthConfig {
             access_token_lifetime: default_access_token_lifetime(),
             refresh_token_lifetime: default_refresh_token_lifetime(),
             password: PasswordConfig::default(),
+            recaptcha: RecaptchaConfig::default(),
             oidc_providers: Vec::new(),
+            cas: None,
             mas_delegation: None,
         }
     }
@@ -278,6 +374,27 @@ impl Validate for AuthConfig {
             errors.push(
                 format!("{prefix}.password.policy.minimum_length"),
                 "must be at least 1",
+            );
+        }
+        let captcha = &self.recaptcha;
+        if captcha.required
+            && (captcha
+                .public_key
+                .as_deref()
+                .is_none_or(|k| k.trim().is_empty())
+                || (!captcha.private_key.is_some() && captcha.private_key_file.is_none()))
+        {
+            errors.push(
+                format!("{prefix}.recaptcha.required"),
+                "needs public_key and private_key (or private_key_file)",
+            );
+        }
+        if !(captcha.siteverify_api.starts_with("https://")
+            || captcha.siteverify_api.starts_with("http://"))
+        {
+            errors.push(
+                format!("{prefix}.recaptcha.siteverify_api"),
+                "must be an http:// or https:// URL",
             );
         }
         let mut seen_idp_ids = std::collections::HashSet::new();
@@ -305,6 +422,28 @@ impl Validate for AuthConfig {
                     format!("{prefix}.identity_servers[{i}]"),
                     "must be a host name, optionally with :port, such as vector.im",
                 );
+            }
+        }
+        if let Some(cas) = &self.cas {
+            let url = cas.server_url.trim();
+            if url.is_empty() {
+                errors.push(format!("{prefix}.cas.server_url"), "must not be empty");
+            } else if !(url.starts_with("https://") || url.starts_with("http://")) {
+                errors.push(
+                    format!("{prefix}.cas.server_url"),
+                    "must be an http:// or https:// address",
+                );
+            }
+            if let Some(service) = &cas.service_url
+                && !(service.starts_with("https://") || service.starts_with("http://"))
+            {
+                errors.push(
+                    format!("{prefix}.cas.service_url"),
+                    "must be an http:// or https:// address",
+                );
+            }
+            if cas.idp_name.trim().is_empty() {
+                errors.push(format!("{prefix}.cas.idp_name"), "must not be empty");
             }
         }
         if let Some(mas) = &self.mas_delegation
@@ -342,6 +481,11 @@ impl AuthConfig {
             &mut self.password.pepper,
             &self.password.pepper_file,
         )?;
+        resolve_secret_pair(
+            &format!("{prefix}.recaptcha.private_key"),
+            &mut self.recaptcha.private_key,
+            &self.recaptcha.private_key_file,
+        )?;
         for (i, p) in self.oidc_providers.iter_mut().enumerate() {
             resolve_secret_pair(
                 &format!("{prefix}.oidc_providers[{i}].client_secret"),
@@ -373,6 +517,31 @@ mod tests {
     }
 
     #[test]
+    fn a_required_captcha_needs_its_keys() {
+        let mut cfg = AuthConfig::default();
+        cfg.recaptcha.required = true;
+        let mut errors = ValidationErrors::new();
+        cfg.validate("auth", &mut errors);
+        assert!(errors.0.iter().any(|e| e.path == "auth.recaptcha.required"));
+
+        cfg.recaptcha.public_key = Some("site".into());
+        cfg.recaptcha.private_key = SecretString::from("secret");
+        let mut errors = ValidationErrors::new();
+        cfg.validate("auth", &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+
+        cfg.recaptcha.siteverify_api = "ftp://nope".into();
+        let mut errors = ValidationErrors::new();
+        cfg.validate("auth", &mut errors);
+        assert!(
+            errors
+                .0
+                .iter()
+                .any(|e| e.path == "auth.recaptcha.siteverify_api")
+        );
+    }
+
+    #[test]
     fn rejects_duplicate_idp_ids() {
         let mut cfg = AuthConfig::default();
         let make = |id: &str| OidcProviderConfig {
@@ -393,6 +562,30 @@ mod tests {
                 .iter()
                 .any(|e| e.message.contains("more than one provider"))
         );
+    }
+
+    #[test]
+    fn cas_needs_a_server_url_that_is_an_http_address() {
+        let mut cfg = AuthConfig::default();
+        cfg.cas = Some(CasConfig {
+            server_url: "cas.example.edu".into(),
+            service_url: None,
+            displayname_attribute: None,
+            required_attributes: Default::default(),
+            idp_name: default_cas_idp_name(),
+        });
+        let mut errors = ValidationErrors::new();
+        cfg.validate("auth", &mut errors);
+        assert!(errors.0.iter().any(|e| e.path == "auth.cas.server_url"));
+
+        let cfg: AuthConfig = serde_json::from_value(
+            serde_json::json!({"cas": {"server_url": "https://cas.example.edu/cas"}}),
+        )
+        .unwrap();
+        let mut errors = ValidationErrors::new();
+        cfg.validate("auth", &mut errors);
+        assert!(errors.is_empty());
+        assert_eq!(cfg.cas.unwrap().idp_name, "CAS");
     }
 
     #[test]
