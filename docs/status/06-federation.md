@@ -1,5 +1,163 @@
 # 06 Federation: status
 
+## 2026-10-04 (branch `agent/federation-gaps`): the /send deadlock, cross-room ancestors, third-party invites over federation, and room version 12
+
+Wave 2's federation brief: the two Sytest regressions of `c2d74174`, Sytest's cross-room,
+erasure, ban and third-party-invite federation tests, and Complement's federation and
+version-12 failures. Crates: `hs-federation`, `hs-room` (actor and remote-event paths,
+`third_party_invite.rs`, `remote_join.rs`), `hs-state`, `hs-cli` (wiring and tests); `hs-model`
+needed no change.
+
+**1. The regressions were a distributed deadlock** (`hs-federation`, `client`). The outbound
+client allowed one request in flight per destination (`DEFAULT_PER_DESTINATION_CONCURRENCY = 1`,
+on the belief that Synapse does; Synapse limits *transactions* per destination, which the
+sender already does alone). When both Sytest servers were sending each other a transaction and
+each `/send` handler made a request back (a device-list resync for a joiner, `GET
+/user/devices`, since `5fc19dc5` more often), each request queued behind its own server's
+outbound transaction, which waited for the other's handler: 30 s frozen until the request
+timeout broke it (wave-1 logs: both `/send`s time out at the same millisecond, the device
+fetches complete 6 ms later). "Message history can be paginated over federation" and "Remote
+room alias queries can handle Unicode" ran in that window; alone they pass on `main` too.
+Now 8 per destination, and a wait over a second for a slot is logged at `info` ("a federation
+request waited for a free slot to its destination", with `waited_ms` and `limit`). Pinned by
+`client::tests::a_request_is_not_held_up_behind_a_slow_one_to_the_same_destination`.
+
+**2. Cross-room ancestors** (`hs-room`, `actor::rejected`, `actor::redactions`, `actor::gaps`).
+An event citing an event of *another* room this server holds, in `auth_events` or
+`prev_events`, is rejected (stored as such, `{}` to `/send`) instead of answered "missing
+ancestors" and fetched for (`RoomActor::held_in_another_room`). A redaction naming an event of
+another room is withheld from clients (held soft-failed, logged "withheld a redaction ..."), as
+Synapse withholds it; the other room's event is untouched. A timeline gap does not wait for an
+event of another room.
+
+**3. A backward page backfills past a fetched prev event** (`hs-room`, `persist_with`). An event
+placed after a prev event held with a fetched state (`fetched_state`) now opens a timeline gap
+below it, as a rejoin does, so `/messages` stops there and asks `/backfill` for the outlier
+(before, the page walked straight from it to the join and asked nothing).
+
+**4. A local membership another server made is not sent again** (`hs-room`
+`RoomActor::is_proactively_sent`, `hs-cli` `federation_sender`). The join a `send_join` made (and
+a leave or knock a resident took, a restricted join through a resident) was queued for the
+room's servers as if made here; the resident had it already and got it again ahead of the
+next message (Complement's `TestOutboundFederationSend`, `TestFederationRedactSendsWithoutEvent`
+read the first PDU). Synapse's `proactively_send = False`. A co-signed invite is still sent.
+
+**5. Erased accounts** (`hs-cli` `RegistryRoomSource::with_erasure`). `/event`, `/backfill` and
+`/get_missing_events` serve an erased local account's events redacted, as Synapse's
+`filter_events_for_server`.
+
+**6. A banned user may not read the room's state** (`hs-room` `reader_view`): `403`, as Synapse's
+`check_user_in_room_or_world_readable`; a member who left still reads the state at their leave.
+
+**7. Third-party invites over federation** (`hs-room` `third_party_invite`, `remote_join`;
+`hs-cli` `identity_service::on_exchange`, `remote_join`, `serve`; `hs-federation` seam removed).
+`/3pid/onbind` for a room this server is not in -- or one whose invitation a user of another
+server made -- hands the invitation to the inviter's server (`PUT
+/exchange_third_party_invite/{roomId}`, new `RemoteJoin::exchange_third_party_invite`); the
+inbound route (behind `X-Matrix`) makes the invite (`third_party_invite::on_exchange`, the keys
+re-checked with the identity server) and sends it to the invitee's server by `/invite`. An
+exchange for a remote invitee now goes through `/invite` too. Counted
+`hs_room_third_party_invites_total{outcome="forwarded"}`.
+
+**8. Missing auth events are fetched by ID** (`hs-federation` `inbound`,
+`state_fallback::fetch_missing_auth_events`; `hs-room` `accept_auth_outliers`). A received event
+whose prev events are all held but whose auth events are not gets them by `GET /event` (and
+theirs, ten rounds at most), each judged by its own auth events -- a rejected one rejects the
+event citing it -- instead of `/get_missing_events` and `/backfill`. New
+`RoomWriteSink::accept_auth_outliers` (default refuses).
+
+**9. `/get_missing_events` answered means `/backfill` is not asked** (`hs-federation` `backfill`),
+as Synapse asks nothing more for a pushed event; `/backfill` is still the fallback when
+`/get_missing_events` fails. What is left goes to the `/state_ids` fallback or is refused.
+
+**10. Outliers with a broken auth chain are left out** (`hs-room` `authorize_outlier`): one whose
+auth events are not all held is `MissingAncestors`, not judged by the ones that are (which let
+Complement's `TestCorruptedAuthChain`'s C, D, E become the state without B).
+
+**11. Room version 12** (`hs-room`, `hs-state`, `hs-federation`). A trusted private chat's
+invitees are additional creators (and not in the power levels); naming a creator in the power
+levels or sending a second `m.room.create` is `400 M_BAD_JSON` before the auth rules (which
+answered `403`); state resolution v2.1 includes the conflicted state subgraph (MSC4297,
+`state_res::v2::conflicted_subgraph`; it passed the conflicted events alone); MSC4311: an
+invite's and a knock's room state go as whole PDUs, and a version-12 invite without the create
+event is `400 M_MISSING_PARAM`.
+
+**12. Also:** a `public_chat` room has no `m.room.guest_access` (Synapse's preset;
+`TestInboundCanReturnMissingEvents` reads the room's first events by position);
+`/query/profile` with a user ID whose server name does not parse is `400`.
+
+**Verified.**
+
+- Unit tests: `hs-federation` (221; new `client::tests::a_request_is_not_held_up_behind_a_slow_one_to_the_same_destination`,
+  `invite::tests::a_version_12_invite_without_the_create_event_in_its_room_state_is_refused`,
+  `transport::read_routes::tests::a_user_id_with_a_non_numeric_port_is_not_valid`,
+  `backfill::tests::a_partial_get_missing_events_answer_is_not_continued_by_backfill`);
+  `hs-room` (lib 187 and every integration file; new
+  `actor::rejected::tests::{an_event_citing_an_event_of_another_room_is_rejected_not_fetched_for, a_redaction_of_an_event_of_another_room_is_withheld}`,
+  `actor::fetched_state::tests::fetched_events_whose_auth_chain_is_broken_are_left_out`,
+  `actor::tests::{a_banned_member_may_not_read_the_rooms_state_but_one_who_left_may, version_12_creators_are_the_invitees_of_a_trusted_chat_and_never_named_in_power_levels}`);
+  `hs-state` (new `state_res::v2::tests::an_event_between_two_conflicted_events_is_in_the_subgraph`;
+  the oracle cross-check property tests, which include room version 12, still agree).
+- Real `hs serve` (`hs-cli`), new: `federation_state_fallback::{back_pagination_backfills_past_a_fetched_prev_event_and_never_crosses_rooms,
+  an_erased_accounts_events_are_served_to_other_servers_redacted,
+  a_missing_auth_event_is_fetched_by_id_and_its_rejection_carries_over}` (the first fails
+  without the gap change, checked), `federation_sender::a_local_users_join_another_server_made_is_not_sent_again`,
+  and `third_party_invites_federation` (two servers and a fake identity server: B hands A the
+  invitation, A invites over `/invite`, the invitee joins; with a member of B in the room too,
+  who sees the invitation in `/sync`). `federation_writes`'s two backfill tests now answer
+  `/get_missing_events` (or refuse it) as rule 9 needs. The whole `cargo test -p hs-cli`: 58
+  result lines, none failed.
+- `cargo fmt --all --check`; `cargo clippy -p hs-federation -p hs-room -p hs-state -p hs-model
+  -p hs-cli --all-targets -- -D warnings`: clean. Not run: the workspace gate.
+- **Sytest** (release `hs` on bookworm from this branch through `SYTEST_HS_BINARY`, the eight
+  files: `30rooms/{04messages,05aliases,07ban,12thirdpartyinvite}.pl`,
+  `50federation/{31room-send,32room-getevent,34room-backfill,39redactions}.pl`; 49 of 53, 41 on
+  `main`'s image): newly passing "Remote banned user is kicked and may not rejoin until
+  unbanned", "Can invite unbound 3pid over federation", "... with no ops into a private room",
+  "Events whose auth_events are in the wrong room do not mess up the room state", "Inbound
+  federation redacts events from erased users", "Backfilled events whose prev_events are in a
+  different room do not allow cross-room back-pagination", "An event which redacts an event in a
+  different room should be ignored"; "Message history can be paginated over federation" and
+  "Remote room alias queries can handle Unicode" pass (they also pass alone on `main`: they
+  failed only in the deadlock window of a full run, item 1). Still failing: the two
+  "Ephemeral messages ... are correctly expired" (MSC2228: `room-client-gaps` expires them at
+  render time, on its branch; nothing federation-side is needed for "from servers", whose
+  message is a local user's), "Can delete canonical alias" (route side), and "Can invite unbound
+  3pid over federation with users from both servers": the joiner on the second server waits for
+  `m.room.third_party_invite` on the legacy `GET /events` stream and never sees it, though it
+  reaches that server (its `/sync` has it, pinned in `third_party_invites_federation`) -- an
+  `hs-user` question.
+
+- **Complement** (image `complement-hs-federation-gaps:dev` of this branch, run under the shared
+  lock, `refs/complement` with `apply_patches.sh` applied; `-run` the brief's tests): all pass but
+  two. Newly passing: `TestInboundFederationProfile` (both), `TestFederationRedactSendsWithoutEvent`,
+  `TestInboundFederationRejectsEventsWithRejectedAuthEvents` (three),
+  `TestOutboundFederationIgnoresMissingEventWithBadJSONForRoomVersion6`, `TestOutboundFederationSend`,
+  `TestInboundCanReturnMissingEvents` (four), `TestMSC4289PrivilegedRoomCreators` (eleven),
+  `_Additional`, `_InvitedAreCreators`, `_AdditionalCreatorsAndInvited`,
+  `TestMSC4291RoomIDAsHashOfCreateEvent_CannotSendCreateEvent`,
+  `TestMSC4297StateResolutionV2_1_includes_conflicted_subgraph`, `TestMSC4311StrippedStateClientAPI`
+  (four; the remote invite and knock had timed out at 30 s, the item 1 deadlock),
+  `TestMSC4311FullEventsOnStrippedStateFederation` (two), `TestMSC4311RejectInvalidStrippedStateFederation`.
+  Still failing:
+  - `TestCorruptedAuthChain`: C, D and E are now left out (item 10, the test's point), but the
+    event for `/state_ids` cites E among its auth events, so it cannot be held either, the
+    fallback fails, and `/send` answers the received event with an error, which
+    `MustSendTransaction` refuses. Synapse uses the fetched state for the pulled event without
+    holding the prev event; doing that here is the next step (`hs-federation` `state_fallback`,
+    `hs-room` `fetched_state`).
+  - `TestMSC4291RoomIDAsHashOfCreateEvent_RoomIDIsOnCreateEvent`: the client-facing create event
+    of a version-12 room needs `room_id` added when rendered (`hs-room` `routes/render.rs`,
+    `room-client-gaps`'s).
+
+**Left.** `TestCorruptedAuthChain`'s `/send` answer (above). The legacy `/events` stream not
+showing a remotely received `m.room.third_party_invite` (`hs-user`). State deduplication of a
+`PUT /state` with the same sender and content (Synapse's `deduplicate_state_event`) is route
+side; `TestInboundCanReturnMissingEvents`'s `shared` case passes without it today because the
+actor's `send_event` already reuses identical content. MSC2228 expiry is `room-client-gaps`'s
+(render time); if it lands as a stored redaction instead, federation serves it redacted with no
+further change here.
+
 ## 2026-10-04 (branch `agent/fed-state-ids`): the `/state_ids` fallback's federation side, soft failure, and float bodies
 
 Closes session 18 item 6 (the half left open), the soft-failure half of `docs/next-steps.md`

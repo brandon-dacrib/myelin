@@ -445,6 +445,11 @@ pub struct RoomActor<B: KvBackend> {
     /// Events held soft failed (`soft_fail`): in the timeline and the state store, out of every
     /// client read, never a forward extremity.
     soft_failed: HashSet<EventSn>,
+    /// Memberships of this server's own users that another server made the handshake for, which
+    /// this server must therefore not send to the room itself ([`RoomActor::is_proactively_sent`]):
+    /// the join a `send_join` made, a leave or knock a resident took. In-memory only: it matters
+    /// for the moment the event is published, which is when the federation sender reads it.
+    not_proactively_sent: HashSet<EventSn>,
     /// Set once an administrator has deleted this room (`crate::actor::admin_ops`). A handle
     /// somebody still holds refuses every write from then on, so nothing can be written into a
     /// room whose records are being removed.
@@ -768,6 +773,7 @@ impl<B: KvBackend> RoomActor<B> {
             purged: HashSet::new(),
             rejected: HashSet::new(),
             soft_failed: HashSet::new(),
+            not_proactively_sent: HashSet::new(),
             deleted: false,
             publish,
             global: None,
@@ -1469,10 +1475,50 @@ impl<B: KvBackend> RoomActor<B> {
         {
             return Ok(existing);
         }
+        self.refuse_malformed_local_state(&event_type, state_key.as_deref(), &content)?;
         let prev_sns = self.forward_extremities_vec();
         self.send_event_citing(
             sender, event_type, state_key, content, redacts, now_ms, &prev_sns,
         )
+    }
+
+    /// What a client may not send at all, whatever its power, refused `400 M_BAD_JSON` before
+    /// the auth rules are asked (which would answer `403`), as Synapse validates a new event:
+    ///
+    /// - a second `m.room.create` (Complement's
+    ///   `TestMSC4291RoomIDAsHashOfCreateEvent_CannotSendCreateEvent`);
+    /// - from room version 12 (MSC4289), `m.room.power_levels` naming a creator in `users`
+    ///   (`TestMSC4289PrivilegedRoomCreators` and `_Additional`): creators' power is implicit
+    ///   and may not be written down. `createRoom`'s `power_level_content_override` goes through
+    ///   here too.
+    ///
+    /// # Errors
+    /// [`RoomError::BadRequest`] (`400 M_BAD_JSON`) for either; [`RoomError::State`] reading the state.
+    fn refuse_malformed_local_state(
+        &self,
+        event_type: &str,
+        state_key: Option<&str>,
+        content: &serde_json::Value,
+    ) -> Result<(), RoomError> {
+        if state_key != Some("") {
+            return Ok(());
+        }
+        if event_type == "m.room.create" && self.state_event("m.room.create", "")?.is_some() {
+            return Err(RoomError::BadRequest(
+                "a room's m.room.create event cannot be sent again".to_owned(),
+            ));
+        }
+        if event_type == "m.room.power_levels" && self.rules.explicitly_privilege_room_creators {
+            let creators = self.creators()?;
+            if let Some(users) = content.get("users").and_then(serde_json::Value::as_object)
+                && let Some(creator) = creators.iter().find(|c| users.contains_key(c.as_str()))
+            {
+                return Err(RoomError::BadRequest(format!(
+                    "{creator} is a creator of this room and may not be named in the power levels' users"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// The idempotency check [`RoomActor::send_event`]'s doc comment describes. Returns the
@@ -1798,6 +1844,14 @@ impl<B: KvBackend> RoomActor<B> {
             }
         }
         if !missing.is_empty() {
+            // An ancestor of another room is not missing, it is wrong (`rejected`).
+            if let Some((cited, other_room)) = self.held_in_another_room(&missing)? {
+                let reason = format!("it cites {cited}, an event of another room ({other_room})");
+                if let Err(error) = self.store_rejected(event, &reason) {
+                    tracing::warn!(room_id = %self.room_id, %error, "could not store a rejected event");
+                }
+                return Err(RoomError::Forbidden(reason));
+            }
             return Err(RoomError::MissingAncestors(missing));
         }
 
@@ -1820,7 +1874,14 @@ impl<B: KvBackend> RoomActor<B> {
         } else {
             self.soft_fail_reason(&event, &prev_sns)?
         };
-        if soft_failed.is_some() {
+        // A redaction of an event of another room is held as a soft-failed event is: in the
+        // graph, out of every client read (`redactions`).
+        let withheld = if self.quiet || soft_failed.is_some() {
+            None
+        } else {
+            self.cross_room_redaction(&event)?
+        };
+        if soft_failed.is_some() || withheld.is_some() {
             event.flags_mut().set_soft_failed(true);
         }
 
@@ -1832,7 +1893,36 @@ impl<B: KvBackend> RoomActor<B> {
             Some(snapshot) => PersistKind::AfterFetchedState { snapshot },
             None => PersistKind::Ordinary,
         };
+        // A local user's join, leave or knock another server made the handshake for (a
+        // restricted join this server could not authorise itself, `hs_cli::remote_join`): that
+        // server has it and sends it on (`not_proactively_sent`). Not an invite: one co-signed
+        // by the invitee's server is this server's to send to the room's other servers.
+        let handshake_membership = event.header().sender.server_name() == self.identity.server_name
+            && event.header().event_type == "m.room.member"
+            && matches!(
+                event
+                    .json()
+                    .get("content")
+                    .and_then(CanonicalJsonValue::as_object)
+                    .and_then(|c| c.get("membership"))
+                    .and_then(CanonicalJsonValue::as_str),
+                Some("join" | "leave" | "knock")
+            );
         let event_sn = self.persist_with(event, kind)?;
+        // The federation sender reads this after this call returns.
+        if handshake_membership {
+            self.not_proactively_sent.insert(event_sn);
+        }
+        if let Some(other_room) = withheld {
+            crate::metrics::record_soft_failed_event();
+            tracing::info!(
+                room_id = %self.room_id,
+                %event_id,
+                %other_room,
+                "withheld a redaction received over federation: the event it names is of another room"
+            );
+            return Ok(RemoteEventOutcome::SoftFailed(event_sn));
+        }
         if let Some(reason) = soft_failed {
             crate::metrics::record_soft_failed_event();
             tracing::info!(
@@ -2117,11 +2207,18 @@ impl<B: KvBackend> RoomActor<B> {
         // its timeline -- a rejoin through another server, an invite while out -- follows a
         // stretch of the room's history this server was not there for. Positions are reserved
         // below it for that history (`crate::actor::gaps`), and the gap is recorded with it.
+        // The same for an event placed after a prev event held with the state another server
+        // answered for it (`fetched_state`): that prev event is an outlier, so what came
+        // before it is history this server does not hold either, and a backward page must
+        // stop there and fetch it (Sytest's "Backfilled events whose prev_events are in a
+        // different room do not allow cross-room back-pagination" waits for that `/backfill`).
+        // Until 2026-10-04 such an event opened no gap, and a page walked from it straight to
+        // whatever the timeline held before, as if nothing were missing.
         let gap_below = match &kind {
-            PersistKind::Ordinary
-            | PersistKind::NewRoom
-            | PersistKind::AfterFetchedState { .. } => None,
-            PersistKind::RemoteJoin { .. } => self.gap_below_for(&event),
+            PersistKind::Ordinary | PersistKind::NewRoom => None,
+            PersistKind::RemoteJoin { .. } | PersistKind::AfterFetchedState { .. } => {
+                self.gap_below_for(&event)
+            }
         };
         let room_pos = match gap_below {
             Some(_) => self.next_room_pos + crate::timeline::TIMELINE_GAP_SPAN,
@@ -2176,6 +2273,12 @@ impl<B: KvBackend> RoomActor<B> {
             }
         };
         let must_be_new = matches!(kind, PersistKind::NewRoom);
+        // A membership another server made the handshake for (`send_join`, `send_leave`,
+        // `send_knock`) is that server's to send on, as Synapse's `proactively_send = False`
+        // has it for a remote join: this server sending it too reached the resident as a
+        // second copy, ahead of anything this server's users sent next (Complement's
+        // `TestOutboundFederationSend` reads the first PDU it is sent).
+        let received_from_elsewhere = matches!(kind, PersistKind::RemoteJoin { .. });
 
         // Set from inside the `transact` closure below when the cluster-fencing check fails, so
         // the failure can be reported as `RoomError::Fenced` with its real message rather than
@@ -2331,6 +2434,9 @@ impl<B: KvBackend> RoomActor<B> {
             self.soft_failed.insert(event_sn);
         } else {
             self.forward_extremities.insert(event_sn);
+        }
+        if received_from_elsewhere {
+            self.not_proactively_sent.insert(event_sn);
         }
         self.timeline.insert(room_pos, event_sn);
         self.next_room_pos = room_pos + 1;
@@ -3490,27 +3596,9 @@ impl<B: KvBackend> RoomActor<B> {
     /// # Errors
     /// [`RoomError::State`] if the current state cannot be read.
     pub fn stripped_state(&self, members: &[&str]) -> Result<Vec<serde_json::Value>, RoomError> {
-        const TYPES: &[&str] = &[
-            "m.room.create",
-            "m.room.join_rules",
-            "m.room.canonical_alias",
-            "m.room.name",
-            "m.room.avatar",
-            "m.room.topic",
-            "m.room.encryption",
-        ];
         let mut out = Vec::new();
-        for event in self.full_state()? {
+        for event in self.stripped_state_events(members)? {
             let header = event.header();
-            let wanted = TYPES.contains(&header.event_type.as_str())
-                || (header.event_type == "m.room.member"
-                    && header
-                        .state_key
-                        .as_deref()
-                        .is_some_and(|key| members.contains(&key)));
-            if !wanted {
-                continue;
-            }
             let content = event
                 .json()
                 .get("content")
@@ -3527,6 +3615,62 @@ impl<B: KvBackend> RoomActor<B> {
             }));
         }
         Ok(out)
+    }
+
+    /// The events [`RoomActor::stripped_state`] describes the room with, whole: what an invite
+    /// sent to another server carries as `invite_room_state` (MSC4311: full PDUs, the create
+    /// event among them, so the invitee's server can check them; Complement's
+    /// `TestMSC4311FullEventsOnStrippedStateFederation`). A redacted event goes in its redacted
+    /// form, as every PDU this server hands another.
+    ///
+    /// # Errors
+    /// [`RoomError::State`] if the state store fails.
+    pub fn stripped_state_pdus(
+        &self,
+        members: &[&str],
+    ) -> Result<Vec<serde_json::Value>, RoomError> {
+        Ok(self
+            .stripped_state_events(members)?
+            .into_iter()
+            .map(|event| {
+                let json = if event.header().flags.is_redacted() {
+                    event
+                        .redacted_json()
+                        .unwrap_or_else(|_| event.json().clone())
+                } else {
+                    event.json().clone()
+                };
+                serde_json::from_slice(&CanonicalJsonValue::Object(json).to_canonical_bytes())
+                    .unwrap_or(serde_json::Value::Null)
+            })
+            .collect())
+    }
+
+    /// The current state events stripped state is made of: those of the spec's stripped-state
+    /// types, and the memberships of `members`.
+    fn stripped_state_events(&self, members: &[&str]) -> Result<Vec<&Event>, RoomError> {
+        const TYPES: &[&str] = &[
+            "m.room.create",
+            "m.room.join_rules",
+            "m.room.canonical_alias",
+            "m.room.name",
+            "m.room.avatar",
+            "m.room.topic",
+            "m.room.encryption",
+        ];
+        Ok(self
+            .full_state()?
+            .into_iter()
+            .filter(|event| {
+                let header = event.header();
+                TYPES.contains(&header.event_type.as_str())
+                    || (header.event_type == "m.room.member"
+                        && header
+                            .state_key
+                            .as_deref()
+                            .is_some_and(|key| members.contains(&key)))
+            })
+            .collect())
     }
 
     /// Creates the local actor for `room_id` from a **verified** federation `send_join` response:
@@ -3613,6 +3757,33 @@ impl<B: KvBackend> RoomActor<B> {
                     serde_json::Value::String(creator.to_string()),
                 );
             }
+            // MSC4289 (room version 12): a trusted private chat's invitees are its creators too,
+            // added to any `additional_creators` the request named, as Synapse's `createRoom`
+            // does (Complement's `TestMSC4289PrivilegedRoomCreators_InvitedAreCreators`).
+            if rules.explicitly_privilege_room_creators
+                && request.preset.as_deref() == Some("trusted_private_chat")
+                && !request.invite.is_empty()
+            {
+                let mut creators: Vec<String> = map
+                    .get("additional_creators")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|list| {
+                        list.iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for invitee in &request.invite {
+                    if !creators.iter().any(|c| c == invitee.as_str()) {
+                        creators.push(invitee.to_string());
+                    }
+                }
+                map.insert(
+                    "additional_creators".to_owned(),
+                    serde_json::Value::from(creators),
+                );
+            }
         }
 
         let mut actor = Self::create_placed(
@@ -3643,10 +3814,15 @@ impl<B: KvBackend> RoomActor<B> {
         )?;
 
         let preset = request.preset.as_deref().unwrap_or("private_chat");
+        // `public_chat` sends no `m.room.guest_access` at all, as Synapse's preset (its
+        // `guest_can_join: False`) does not: an absent one already means guests are forbidden.
+        // Sending one put an event Synapse does not have between the history visibility and
+        // what came next, and Complement's `TestInboundCanReturnMissingEvents` reads the room's
+        // first events from `/get_missing_events` by position.
         let (join_rule, history_visibility, guest_access) = match preset {
-            "public_chat" => ("public", "shared", "forbidden"),
-            "trusted_private_chat" => ("invite", "shared", "can_join"),
-            _ => ("invite", "shared", "can_join"),
+            "public_chat" => ("public", "shared", None),
+            "trusted_private_chat" => ("invite", "shared", Some("can_join")),
+            _ => ("invite", "shared", Some("can_join")),
         };
         // "`initial_state` ... takes precedence over events set by `preset`" (`POST /createRoom`):
         // a preset event the request carries its own copy of is not sent first, as Synapse does
@@ -3672,10 +3848,10 @@ impl<B: KvBackend> RoomActor<B> {
             if !rules.explicitly_privilege_room_creators {
                 users.insert(creator.to_string(), serde_json::Value::from(100));
             }
-            if preset == "trusted_private_chat" {
-                // Invitees are not creators (creators are the sender plus any
-                // `additional_creators` on the create event), so they take an ordinary explicit
-                // entry in every room version.
+            if preset == "trusted_private_chat" && !rules.explicitly_privilege_room_creators {
+                // Below room version 12 invitees are not creators, so they take an ordinary
+                // explicit entry; from 12 they are additional creators (above), whom the power
+                // levels may not name.
                 for user in &request.invite {
                     users.insert(user.to_string(), serde_json::Value::from(100));
                 }
@@ -3769,7 +3945,9 @@ impl<B: KvBackend> RoomActor<B> {
                 now_ms,
             )?;
         }
-        if !in_initial_state("m.room.guest_access") {
+        if let Some(guest_access) = guest_access
+            && !in_initial_state("m.room.guest_access")
+        {
             actor.send_event(
                 creator.clone(),
                 "m.room.guest_access".to_owned(),
@@ -4497,7 +4675,8 @@ impl<B: KvBackend> RoomActor<B> {
     /// `Ok(None)` means "deny outright": `requester` has no `m.room.member` event in this room's
     /// current state at all (never joined, invited, knocked, or been banned/kicked) and the room
     /// is not `world_readable` -- the same "never a member" case
-    /// [`RoomActor::can_read_room`] denies for `.../messages`.
+    /// [`RoomActor::can_read_room`] denies for `.../messages`. A banned `requester` of a room
+    /// that is not `world_readable` is [`RoomError::Forbidden`] (`403`), as Synapse answers.
     ///
     /// # Errors
     /// Returns [`RoomError::State`] if the state store fails, or [`RoomError::Internal`] if
@@ -4528,6 +4707,16 @@ impl<B: KvBackend> RoomActor<B> {
         let Some(membership_event) = membership_event else {
             return Ok(None);
         };
+        // A banned user may not read the room at all, as Synapse's
+        // `check_user_in_room_or_world_readable` lets only a joined or a departed (`leave`)
+        // member through: Sytest's "Remote banned user is kicked and may not rejoin until
+        // unbanned" waits for the banned user's own read of their membership to be `403`.
+        if membership == PriorState::Ban {
+            return Err(RoomError::Forbidden(format!(
+                "{requester} is banned from {}",
+                self.room_id
+            )));
+        }
         let sn = *self
             .event_id_index
             .get(membership_event.event_id())
@@ -4705,6 +4894,18 @@ impl<B: KvBackend> RoomActor<B> {
     #[must_use]
     pub fn event_sn_of(&self, event_id: &EventId) -> Option<EventSn> {
         self.event_id_index.get(event_id).copied()
+    }
+
+    /// Whether this server sends `event_id` to the room's other servers itself: every event of
+    /// its own users, except a membership another server made the handshake for
+    /// (`not_proactively_sent`: a `send_join`'s join, a leave or knock a resident took), which
+    /// that server distributes. The federation sender (`hs_cli::federation_sender`) asks this
+    /// before queueing a local user's event.
+    #[must_use]
+    pub fn is_proactively_sent(&self, event_id: &EventId) -> bool {
+        self.event_id_index
+            .get(event_id)
+            .is_none_or(|sn| !self.not_proactively_sent.contains(sn))
     }
 
     /// One event by ID, if this actor holds it (its own room's events only) in a form a
@@ -6463,6 +6664,18 @@ impl<B: KvBackend> RoomActorHandle<B> {
         .await
     }
 
+    /// [`RoomActor::accept_auth_outliers`] on the actor's thread.
+    ///
+    /// # Errors
+    /// As [`RoomActor::accept_auth_outliers`].
+    pub async fn accept_auth_outliers(&self, events: Vec<Event>) -> Result<usize, RoomError>
+    where
+        B: 'static,
+    {
+        self.with_actor(move |actor| actor.accept_auth_outliers(events))
+            .await
+    }
+
     /// [`RoomActor::import_event`] through the handle: the Synapse importer's way in.
     pub async fn import_event(&self, event: Event) -> Result<RemoteEventOutcome, RoomError>
     where
@@ -6679,6 +6892,113 @@ mod tests {
             1,
         )
         .unwrap()
+    }
+
+    /// A member who left may still read the room's state as of their leave; a banned one may
+    /// not read it at all (`403`), as Synapse answers -- Sytest's "Remote banned user is kicked
+    /// and may not rejoin until unbanned" polls the banned user's own membership for a `403`.
+    #[test]
+    fn a_banned_member_may_not_read_the_rooms_state_but_one_who_left_may() {
+        let mut actor = room("public_chat");
+        let alice = user_id!("@alice:hs1").to_owned();
+        let bob = user_id!("@bob:hs1").to_owned();
+        let carol = user_id!("@carol:hs1").to_owned();
+        for user in [&bob, &carol] {
+            actor
+                .membership_action(
+                    user.clone(),
+                    crate::membership::Action::Join,
+                    user.clone(),
+                    serde_json::json!({}),
+                    2,
+                )
+                .unwrap();
+        }
+        actor
+            .membership_action(
+                carol.clone(),
+                crate::membership::Action::Leave,
+                carol.clone(),
+                serde_json::json!({}),
+                3,
+            )
+            .unwrap();
+        actor
+            .membership_action(
+                alice,
+                crate::membership::Action::Ban,
+                bob.clone(),
+                serde_json::json!({"reason": "testing"}),
+                4,
+            )
+            .unwrap();
+        assert!(matches!(
+            actor.state_event_for_reader(&bob, "m.room.member", bob.as_str()),
+            Err(RoomError::Forbidden(_))
+        ));
+        assert!(matches!(
+            actor.full_state_for_reader(&bob),
+            Err(RoomError::Forbidden(_))
+        ));
+        let carols = actor
+            .state_event_for_reader(&carol, "m.room.member", carol.as_str())
+            .unwrap()
+            .expect("a member who left reads the state as of their leave");
+        assert_eq!(content_str(carols, "membership"), Some("leave"));
+    }
+
+    /// Room version 12 (MSC4289, MSC4291): a trusted private chat's invitees are additional
+    /// creators, kept out of the power levels; naming a creator in the power levels, or sending
+    /// a second create event, is a bad request (`400`), not an auth failure.
+    #[test]
+    fn version_12_creators_are_the_invitees_of_a_trusted_chat_and_never_named_in_power_levels() {
+        let backend = MemoryBackend::new();
+        let bob = user_id!("@bob:hs1").to_owned();
+        let mut actor = RoomActor::create_room(
+            backend.clone(),
+            Tables::open(&backend).unwrap(),
+            HomeserverIdentity::for_tests("hs1"),
+            user_id!("@alice:hs1").to_owned(),
+            CreateRoomRequest {
+                preset: Some("trusted_private_chat".to_owned()),
+                room_version: Some(RoomVersionId::V12),
+                invite: vec![bob.clone()],
+                ..Default::default()
+            },
+            1,
+        )
+        .unwrap();
+        let creators = actor.creators().unwrap();
+        assert!(creators.contains(&bob), "{creators:?}");
+        let levels = power_levels_of(&actor);
+        assert!(levels["users"].get(bob.as_str()).is_none(), "{levels}");
+
+        let mut named = levels.clone();
+        named["users"][bob.as_str()] = serde_json::json!(100);
+        let refused = actor.send_event(
+            user_id!("@alice:hs1").to_owned(),
+            "m.room.power_levels".to_owned(),
+            Some(String::new()),
+            named,
+            None,
+            2,
+        );
+        assert!(
+            matches!(refused, Err(RoomError::BadRequest(_))),
+            "{refused:?}"
+        );
+        let refused = actor.send_event(
+            user_id!("@alice:hs1").to_owned(),
+            "m.room.create".to_owned(),
+            Some(String::new()),
+            serde_json::json!({"room_version": "12"}),
+            None,
+            3,
+        );
+        assert!(
+            matches!(refused, Err(RoomError::BadRequest(_))),
+            "{refused:?}"
+        );
     }
 
     /// The current `m.room.power_levels` content, as plain JSON to assert against.

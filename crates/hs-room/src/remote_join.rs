@@ -126,6 +126,30 @@ pub trait RemoteJoin: Send + Sync {
         )))
     }
 
+    /// Hands a bound third-party invitation for `room_id`, a room this server is not in, to
+    /// `destination` -- the server of whoever made the invitation, which is in the room --
+    /// (`PUT /_matrix/federation/v1/exchange_third_party_invite/{roomId}`), which turns it into
+    /// the invite and sends it here. `event` is the spec's body: the `m.room.member` invite's
+    /// `type`, `room_id`, `sender`, `state_key` and `content` (`membership` and
+    /// `third_party_invite.signed`).
+    ///
+    /// The default refuses.
+    ///
+    /// # Errors
+    /// [`RoomError::Forbidden`] if `destination` refused the invitation,
+    /// [`RoomError::RemoteJoinFailed`] if it could not be asked.
+    async fn exchange_third_party_invite(
+        &self,
+        destination: &str,
+        room_id: &RoomId,
+        event: Value,
+    ) -> Result<(), RoomError> {
+        let _ = (destination, event);
+        Err(RoomError::RemoteJoinFailed(format!(
+            "cannot hand a third-party invitation for {room_id} to another server"
+        )))
+    }
+
     /// `server`'s public room directory (`GET`/`POST /_matrix/federation/v1/publicRooms`), the
     /// page as that server answered it (`chunk`, `next_batch`, `prev_batch`,
     /// `total_room_count_estimate`): what `GET /publicRooms?server=` passes through. `limit`

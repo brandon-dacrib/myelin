@@ -495,6 +495,65 @@ async fn fetch_whole_state(
     Some(state)
 }
 
+/// How many rounds [`fetch_missing_auth_events`] walks back through auth events of auth events.
+const MAX_AUTH_ROUNDS: usize = 10;
+
+/// Fetches the auth events a received event cites and this server lacks -- `missing`, from
+/// `origin`, one `GET /event` each -- and theirs in turn that it lacks too (at most
+/// [`MAX_AUTH_ROUNDS`] rounds, [`MAX_EVENT_FETCHES`] events a round), verified and of the room,
+/// and hands them all to `sink` as outliers ([`RoomWriteSink::accept_auth_outliers`]), which
+/// judges each by its own auth events. Called by `crate::inbound::process_transaction` for an
+/// event whose prev events are all held; its caller then offers the event again.
+///
+/// # Errors
+/// A description, when nothing could be fetched or the sink would not hold what was.
+pub async fn fetch_missing_auth_events(
+    origin: &str,
+    room_id: &str,
+    room_version: &RoomVersionId,
+    missing: Vec<String>,
+    fetcher: &dyn AncestorFetcher,
+    key_cache: &DynRemoteKeyCache,
+    sink: &dyn RoomWriteSink,
+) -> Result<(), String> {
+    let mut wanted = dedup(missing);
+    let mut asked: HashSet<String> = HashSet::new();
+    let mut fetched: Vec<Event> = Vec::new();
+    for _ in 0..MAX_AUTH_ROUNDS {
+        wanted.retain(|id| asked.insert(id.clone()));
+        if wanted.is_empty() {
+            break;
+        }
+        let batch = fetch_events(origin, room_id, room_version, wanted, fetcher, key_cache).await;
+        let cited: Vec<String> = dedup(
+            batch
+                .iter()
+                .flat_map(|event| ids_named(event, "auth_events"))
+                .filter(|id| !asked.contains(id))
+                .collect(),
+        );
+        fetched.extend(batch);
+        wanted = sink.unknown_events(room_id, &cited).await;
+    }
+    if fetched.is_empty() {
+        return Err("none of the missing auth events could be fetched".to_owned());
+    }
+    let events: Vec<Value> = fetched.iter().map(event_json).collect();
+    match sink.accept_auth_outliers(room_id, &events).await {
+        Ok(held) => {
+            tracing::info!(
+                origin,
+                room_id,
+                fetched = fetched.len(),
+                held,
+                "fetched the auth events a received event cites and this server lacked"
+            );
+            Ok(())
+        }
+        Err(rejected) => Err(rejected.error),
+    }
+}
+
 /// `GET /event` for one ID: verified, of the room, and the event asked for.
 async fn fetch_verified_event(
     origin: &str,
@@ -893,7 +952,7 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(outcome, Err(BackfillGiveUpReason::RemoteUnavailable(_))),
+            matches!(outcome, Err(BackfillGiveUpReason::StillMissing(_))),
             "{outcome:?}"
         );
         assert!(fetcher.state_ids_asked.lock().unwrap().is_empty());

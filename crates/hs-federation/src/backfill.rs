@@ -589,7 +589,13 @@ async fn resolve_rounds(
             )
             .await
         {
-            Ok(fetched) if !fetched.is_empty() => {
+            // Answered: that is the sending server's account of the gap, and `/backfill` is not
+            // asked as well. Synapse asks nothing else for an event pushed to it (what is still
+            // missing is the `/state_ids` fallback's, for events fetched here, or a refusal),
+            // and a server that answers `/get_missing_events` need not serve `/backfill`
+            // (Complement's `TestOutboundFederationIgnoresMissingEventWithBadJSONForRoomVersion6`
+            // fails on the request).
+            Ok(fetched) => {
                 let new = attempt
                     .absorb(&fetched, room_version, key_cache, limits)
                     .await;
@@ -602,13 +608,14 @@ async fn resolve_rounds(
                         }
                     }
                 }
-            }
-            Ok(_) => {
                 tracing::debug!(
                     origin,
                     room_id,
-                    "/get_missing_events answered with nothing; asking /backfill"
+                    fetched = fetched.len(),
+                    new,
+                    "/get_missing_events did not close the gap; not asking /backfill"
                 );
+                return Err(BackfillGiveUpReason::StillMissing(frontier));
             }
             Err(error) => {
                 tracing::debug!(origin, room_id, %error, "/get_missing_events could not be used; asking /backfill");
@@ -1133,10 +1140,12 @@ pub(crate) mod tests {
         assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
     }
 
-    /// A partial `/get_missing_events` answer (the gap is deeper than one response) is kept, and
-    /// `/backfill` walks the rest from where it left off.
+    /// A partial `/get_missing_events` answer (the gap is deeper than one response) is kept,
+    /// and `/backfill` is not asked for the rest: the sending server answered for the gap, as
+    /// Synapse takes it. What is still missing is the `/state_ids` fallback's (which this
+    /// fetcher does not serve) or a refusal.
     #[tokio::test]
-    async fn a_partial_get_missing_events_answer_is_continued_by_backfill() {
+    async fn a_partial_get_missing_events_answer_is_not_continued_by_backfill() {
         let dir = tempfile::tempdir().unwrap();
         let keys = OwnSigningKeys::load_or_generate(dir.path()).unwrap();
         let cache = key_cache(&keys, "origin.example.org");
@@ -1149,7 +1158,6 @@ pub(crate) mod tests {
         let e2 = signed_message(&keys, room_id, sender, vec![e1_id.clone()], 2);
         let e2_id = event_id_of(&e2);
 
-        // `/get_missing_events` hands back only the newer half; `/backfill` supplies e1.
         let fetcher = QueuedFetcher::new(vec![vec![e1]]).answering_missing_events(vec![e2]);
         let sink = DagSink::new(vec![root_id.clone()]);
         let context = GapContext {
@@ -1169,11 +1177,14 @@ pub(crate) mod tests {
             &BackfillLimits::default(),
         )
         .await;
-        assert!(result.is_ok(), "{result:?}");
-        assert!(sink.known.lock().unwrap().contains(&e1_id));
-        assert!(sink.known.lock().unwrap().contains(&e2_id));
+        assert!(result.is_err(), "{result:?}");
+        assert!(!sink.known.lock().unwrap().contains(&e1_id));
         assert_eq!(fetcher.missing_events_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fetcher.calls.load(Ordering::SeqCst),
+            0,
+            "/backfill was asked"
+        );
     }
 
     fn event_id_of(raw: &Value) -> String {

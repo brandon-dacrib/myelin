@@ -81,20 +81,14 @@ pub fn resolve(
         converted.iter(),
         auth_chains,
         |id: &EventId| adapters.get(id).cloned(),
-        // Conflicted-state-subgraph inclusion (MSC4297, v2.1 only) is a Phase 1/2 concern per
-        // `docs/workstreams/02-state-and-model.md` ("MSC4242 state DAGs are supported
-        // experimentally from the first federation milestone", not Phase 0); until it lands, the
-        // conflicted candidates themselves are returned unexpanded, which is conservative (it
-        // under-includes rather than over-includes) and correct whenever the subgraph is empty,
-        // which it is for every room that is not deliberately exercising MSC4297/MSC4242.
+        // The conflicted state subgraph (MSC4297, state resolution v2.1): the conflicted events
+        // and every event on an `auth_events` path from one to another. `ruma-state-res` asks
+        // for it only under v2.1. Until 2026-10-04 the conflicted events alone were answered,
+        // which loses an event between two conflicted ones that the full conflicted set needs
+        // (Complement's `TestMSC4297StateResolutionV2_1_includes_conflicted_subgraph`).
         |conflicted: &ruma::state_res::StateMap<Vec<OwnedEventId>>| {
-            let mut set = EventIdSet::new();
-            for ids in conflicted.values() {
-                for id in ids {
-                    set.insert(id.clone());
-                }
-            }
-            Some(set)
+            let ids: Vec<OwnedEventId> = conflicted.values().flatten().cloned().collect();
+            Some(conflicted_subgraph(&ids, store))
         },
     )
     .map_err(|e| StateResError::UnsupportedInput(e.to_string()))?;
@@ -103,6 +97,58 @@ pub fn resolve(
         .into_iter()
         .map(|((event_type, state_key), id)| ((event_type.to_string(), state_key), id))
         .collect())
+}
+
+/// The conflicted state subgraph of `conflicted` (MSC4297): those events, and every event that
+/// is an `auth_events` ancestor of one of them and has another of them among its own
+/// ancestors -- that is, lies on a path between two. Walked within `store`, each event once.
+fn conflicted_subgraph(
+    conflicted: &[OwnedEventId],
+    store: &EventStore,
+) -> EventIdSet<OwnedEventId> {
+    let targets: std::collections::HashSet<&OwnedEventId> = conflicted.iter().collect();
+    // Every strict ancestor of a conflicted event.
+    let ancestors = auth_chain_of(conflicted.iter(), store).unwrap_or_default();
+    // Whether an event is conflicted or reaches one through `auth_events`, memoised; the
+    // walk is iterative so a long auth chain does not exhaust the stack.
+    let mut reaches: HashMap<OwnedEventId, bool> = HashMap::new();
+    let mut set = EventIdSet::new();
+    for id in conflicted {
+        set.insert(id.clone());
+    }
+    for start in ancestors.iter() {
+        let mut stack: Vec<(OwnedEventId, bool)> = vec![(start.clone(), false)];
+        while let Some((id, expanded)) = stack.pop() {
+            if reaches.contains_key(&id) {
+                continue;
+            }
+            if targets.contains(&id) {
+                reaches.insert(id, true);
+                continue;
+            }
+            let auth: Vec<OwnedEventId> = store
+                .get(&id)
+                .map(|event| event.auth_events.clone())
+                .unwrap_or_default();
+            if expanded {
+                let any = auth
+                    .iter()
+                    .any(|a| reaches.get(a).copied().unwrap_or(false));
+                reaches.insert(id, any);
+            } else {
+                stack.push((id, true));
+                for a in auth {
+                    if !reaches.contains_key(&a) {
+                        stack.push((a, false));
+                    }
+                }
+            }
+        }
+        if reaches.get(start).copied().unwrap_or(false) {
+            set.insert(start.clone());
+        }
+    }
+    set
 }
 
 /// Walks `auth_events` transitively from every event in `ids`, within `store`.
@@ -223,5 +269,61 @@ impl RumaEvent for Adapter {
 
     fn rejected(&self) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hs_model::room_version;
+    use ruma::RoomVersionId;
+    use serde_json::json;
+
+    use super::super::test_support::RoomBuilder;
+
+    /// MSC4297: with conflicted power levels A and C, where C's auth chain runs through B to A,
+    /// B lies between them and is in the conflicted subgraph; the create event, below A, is not.
+    #[test]
+    fn an_event_between_two_conflicted_events_is_in_the_subgraph() {
+        let rules = room_version::rules_for(&RoomVersionId::V12).unwrap();
+        let mut builder = RoomBuilder::new(rules);
+        let (mut state, tip, [creator, _, _]) = builder.genesis();
+        let create = state
+            .get(&("m.room.create".to_owned(), String::new()))
+            .unwrap()
+            .clone();
+        let a = builder.push(
+            &mut state,
+            Some(tip),
+            10,
+            "m.room.power_levels",
+            "",
+            &creator,
+            json!({"users": {}, "state_default": 51}),
+        );
+        let b = builder.push(
+            &mut state,
+            Some(a.clone()),
+            11,
+            "m.room.power_levels",
+            "",
+            &creator,
+            json!({"users": {}, "state_default": 52}),
+        );
+        let c = builder.push(
+            &mut state,
+            Some(b.clone()),
+            12,
+            "m.room.power_levels",
+            "",
+            &creator,
+            json!({"users": {}, "state_default": 53}),
+        );
+        let subgraph = super::conflicted_subgraph(&[a.clone(), c.clone()], &builder.store);
+        assert!(subgraph.contains(&a) && subgraph.contains(&c));
+        assert!(subgraph.contains(&b), "the event between them is left out");
+        assert!(
+            !subgraph.contains(&create),
+            "the create event is not between them"
+        );
     }
 }

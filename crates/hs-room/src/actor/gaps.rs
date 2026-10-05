@@ -318,6 +318,26 @@ impl<B: KvBackend> RoomActor<B> {
                     .is_some_and(|sn| in_timeline.contains(sn))
             })
             .collect();
+        // An event of another room is never part of this room's history, however its events
+        // cite it (`RoomActor::held_in_another_room`): the gap does not wait for it.
+        let mut missing = missing;
+        if !missing.is_empty() {
+            let cited: Vec<OwnedEventId> = missing.iter().cloned().collect();
+            for id in cited {
+                if self
+                    .held_in_another_room(std::slice::from_ref(&id))?
+                    .is_some()
+                {
+                    tracing::info!(
+                        room_id = %self.room_id,
+                        top,
+                        event_id = %id,
+                        "an event placed in a timeline gap cites an event of another room; the gap does not wait for it"
+                    );
+                    missing.remove(&id);
+                }
+            }
+        }
         let closed = exhausted || missing.is_empty();
         let filled_to = gap.filled_to - i64::try_from(placed).unwrap_or(i64::MAX);
         self.gaps.insert(

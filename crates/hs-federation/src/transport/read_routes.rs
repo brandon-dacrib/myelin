@@ -149,6 +149,17 @@ async fn query(
             let Some(user_id) = params.user_id else {
                 return MatrixError::missing_param("user_id").into_response();
             };
+            // A user ID whose server name does not parse -- Sytest's and Complement's "Non-numeric
+            // ports in server names are rejected", `@user1:localhost:http` -- is a bad request,
+            // as Synapse answers, not an unknown user.
+            if !is_valid_user_id(&user_id) {
+                return MatrixError::custom(
+                    axum::http::StatusCode::BAD_REQUEST,
+                    MatrixErrorCode::InvalidParam,
+                    "user_id is not a valid user ID",
+                )
+                .into_response();
+            }
             match state
                 .queries
                 .profile(&user_id, params.field.as_deref())
@@ -177,6 +188,18 @@ async fn query(
         )
         .into_response(),
     }
+}
+
+/// Whether `user_id` is `@localpart:server_name` with a server name the spec allows: a host and,
+/// if any, a numeric port.
+fn is_valid_user_id(user_id: &str) -> bool {
+    let Some((_, server)) = user_id
+        .strip_prefix('@')
+        .and_then(|rest| rest.split_once(':'))
+    else {
+        return false;
+    };
+    ruma::UserId::parse(user_id).is_ok() && ruma::ServerName::parse(server).is_ok()
 }
 
 async fn query_profile(state: State<FederationState>, params: Query<QueryParams>) -> Response {
@@ -725,5 +748,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn a_user_id_with_a_non_numeric_port_is_not_valid() {
+        assert!(super::is_valid_user_id("@user1:localhost"));
+        assert!(super::is_valid_user_id("@user1:localhost:8448"));
+        assert!(!super::is_valid_user_id("@user1:localhost:http"));
+        assert!(!super::is_valid_user_id("user1:localhost"));
+        assert!(!super::is_valid_user_id("@user1"));
     }
 }

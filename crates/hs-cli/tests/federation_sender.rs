@@ -586,3 +586,115 @@ async fn catch_up_sends_the_latest_local_event_and_nothing_after_the_destination
     );
     assert!(source.latest_pdu("not a room", &h.remote).await.is_err());
 }
+
+/// A local user's join another server made the handshake for -- a `send_join`'s join, or a
+/// restricted join through a resident, which reaches this room as a remote event -- is not sent
+/// on by this server: the resident distributes it, as Synapse's `proactively_send = False`
+/// (Complement's `TestOutboundFederationSend` and `TestFederationRedactSendsWithoutEvent` read
+/// the first PDU they are sent, and got the join again ahead of the message). Carol's next
+/// event, made here, is sent.
+#[tokio::test]
+async fn a_local_users_join_another_server_made_is_not_sent_again() {
+    use hs_model::canonical::{CanonicalJsonValue, to_canonical_object};
+
+    let h = Harness::new().await;
+    let mut updates = h.rooms.subscribe_global();
+    let bob = h.bob();
+    let carol = ruma::UserId::parse(format!("@carol:{US}")).unwrap();
+    let own = h.identity.server_name.clone();
+    let room = h.public_room().await;
+    room.membership(
+        bob.clone(),
+        Action::Join,
+        bob.clone(),
+        serde_json::json!({}),
+        2_000,
+    )
+    .await
+    .expect("bob joins");
+
+    let (room_id, version, head, depth, auth) = room
+        .query(|actor| {
+            let id = |kind: &str, key: &str| {
+                actor
+                    .state_event(kind, key)
+                    .unwrap()
+                    .unwrap()
+                    .event_id()
+                    .to_string()
+            };
+            let (head, depth) = actor.forward_extremity_ids().remove(0);
+            (
+                actor.room_id().to_string(),
+                actor.room_version().clone(),
+                head.to_string(),
+                depth,
+                vec![
+                    id("m.room.create", ""),
+                    id("m.room.power_levels", ""),
+                    id("m.room.join_rules", ""),
+                ],
+            )
+        })
+        .await;
+    let mut object = to_canonical_object(
+        &serde_json::json!({
+            "type": "m.room.member", "state_key": carol.as_str(), "sender": carol.as_str(),
+            "room_id": room_id, "origin_server_ts": 3_000, "depth": depth + 1,
+            "content": {"membership": "join"},
+            "prev_events": [head], "auth_events": auth,
+        }),
+        true,
+    )
+    .unwrap();
+    let hash = hs_model::hash::content_hash_base64(&object);
+    object.insert(
+        "hashes".to_owned(),
+        CanonicalJsonValue::Object(
+            [("sha256".to_owned(), CanonicalJsonValue::String(hash))]
+                .into_iter()
+                .collect(),
+        ),
+    );
+    let rules = hs_model::room_version::rules_for(&version).unwrap();
+    let mut redacted = hs_model::redaction::redact(&object, &rules.redaction).unwrap();
+    hs_model::signing::sign_object(&mut redacted, &own, &h.identity.signing_key).unwrap();
+    object.insert(
+        "signatures".to_owned(),
+        redacted.remove("signatures").unwrap(),
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&CanonicalJsonValue::Object(object).to_canonical_bytes()).unwrap();
+    let join = hs_model::Event::parse(&value, version).unwrap();
+    let join_id = join.event_id().to_owned();
+    room.accept_remote_event(join)
+        .await
+        .expect("the join is taken");
+    let update = update_for(&mut updates, &join_id).await;
+    assert_eq!(
+        forward_update(&h.rooms, &h.sender, &own, &update)
+            .await
+            .unwrap(),
+        Vec::<String>::new(),
+        "a join another server made was queued for the room's servers"
+    );
+
+    let next = room
+        .send_event(
+            carol.clone(),
+            "m.room.message".to_owned(),
+            None,
+            serde_json::json!({ "msgtype": "m.text", "body": "made here" }),
+            None,
+            4_000,
+        )
+        .await
+        .expect("message");
+    let update = update_for(&mut updates, next.event_id()).await;
+    assert_eq!(
+        forward_update(&h.rooms, &h.sender, &own, &update)
+            .await
+            .unwrap(),
+        vec![h.remote.clone()]
+    );
+}

@@ -86,6 +86,7 @@ impl<B: KvBackend> RoomActor<B> {
         pending.sort_by(topological_order);
         let mut seen: HashSet<OwnedEventId> = HashSet::new();
         let mut rejected = 0usize;
+        let mut unjudged = 0usize;
         let mut accepted: Vec<Event> = Vec::with_capacity(pending.len());
         for event in pending {
             if !seen.insert(event.event_id().to_owned()) {
@@ -100,6 +101,16 @@ impl<B: KvBackend> RoomActor<B> {
                 Err(RoomError::Forbidden(reason)) => {
                     rejected += 1;
                     self.store_rejected(event, &reason)?;
+                }
+                // Its auth chain is broken here: left out, and so is whatever stands on it.
+                Err(RoomError::MissingAncestors(missing)) => {
+                    unjudged += 1;
+                    tracing::info!(
+                        room_id = %self.room_id,
+                        event_id = %event.event_id(),
+                        missing = missing.len(),
+                        "left out a fetched event whose auth events are not all held"
+                    );
                 }
                 Err(other) => return Err(other),
             }
@@ -153,9 +164,57 @@ impl<B: KvBackend> RoomActor<B> {
             state_events = state_sns.len(),
             fetched = accepted.len(),
             rejected,
+            unjudged,
             "held a missing prev event with the state another server answered for it"
         );
         Ok(RemoteEventOutcome::Stored(sn))
+    }
+
+    /// Holds `events` -- auth events of a received event this server lacked, fetched by `/event`
+    /// and verified by the caller -- as outliers, oldest first, each judged by its own
+    /// `auth_events` ([`RoomActor::authorize_outlier`]): one that passes is held, one that fails
+    /// is stored rejected (`rejected`), so the received event citing it is rejected in turn, as
+    /// Complement's `TestInboundFederationRejectsEventsWithRejectedAuthEvents` has it. One whose
+    /// own auth events are still not held is left out (it cannot be judged). Returns how many were
+    /// held or rejected.
+    ///
+    /// # Errors
+    /// [`RoomError::Store`], [`RoomError::Fenced`] or [`RoomError::State`] from persistence.
+    pub fn accept_auth_outliers(&mut self, events: Vec<Event>) -> Result<usize, RoomError> {
+        let mut pending: Vec<Event> = events
+            .into_iter()
+            .filter(|event| !self.event_id_index.contains_key(event.event_id()))
+            .collect();
+        pending.sort_by(topological_order);
+        let mut seen: HashSet<OwnedEventId> = HashSet::new();
+        let (mut held, mut rejected, mut unjudged) = (0usize, 0usize, 0usize);
+        for event in pending {
+            if !seen.insert(event.event_id().to_owned())
+                || self.event_id_index.contains_key(event.event_id())
+            {
+                continue;
+            }
+            match self.authorize_outlier(&event) {
+                Ok(()) => {
+                    self.persist_outliers(vec![event])?;
+                    held += 1;
+                }
+                Err(RoomError::Forbidden(reason)) => {
+                    self.store_rejected(event, &reason)?;
+                    rejected += 1;
+                }
+                Err(RoomError::MissingAncestors(_)) => unjudged += 1,
+                Err(other) => return Err(other),
+            }
+        }
+        tracing::info!(
+            room_id = %self.room_id,
+            held,
+            rejected,
+            unjudged,
+            "held fetched auth events as outliers"
+        );
+        Ok(held + rejected)
     }
 
     /// Whether `sn` has a timeline position.
@@ -165,11 +224,26 @@ impl<B: KvBackend> RoomActor<B> {
 
     /// An outlier fetched for a state is judged by its own `auth_events` only (as the events of
     /// a `send_join` snapshot are), with no state before it: its prev events are not held.
+    ///
+    /// One whose auth events are not all held cannot be judged, and is
+    /// [`RoomError::MissingAncestors`]: the caller leaves it out. Judging it by the auth events
+    /// that are held instead let a chain of a user's memberships whose first link nobody would
+    /// serve in, each judged without the membership before it -- Complement's
+    /// `TestCorruptedAuthChain`, where C, D and E followed a B that `/event` answers `404` for,
+    /// and E became the room's state.
     fn authorize_outlier(&self, event: &Event) -> Result<(), RoomError> {
-        let auth_sns: Vec<EventSn> = pipeline::decode_event_ids(event.json().get("auth_events"))
-            .iter()
-            .filter_map(|id| self.event_id_index.get(id).copied())
-            .collect();
+        let ids = pipeline::decode_event_ids(event.json().get("auth_events"));
+        let mut auth_sns: Vec<EventSn> = Vec::with_capacity(ids.len());
+        let mut missing = Vec::new();
+        for id in ids {
+            match self.event_id_index.get(&id) {
+                Some(sn) => auth_sns.push(*sn),
+                None => missing.push(id),
+            }
+        }
+        if !missing.is_empty() {
+            return Err(RoomError::MissingAncestors(missing));
+        }
         self.authorize_remote_at(event, &[], &auth_sns, StateBefore::None)
     }
 
@@ -208,6 +282,7 @@ mod tests {
 
     use super::super::tests::room;
     use super::super::{RemoteEventOutcome, RoomActor};
+    use crate::error::RoomError;
     use crate::membership::Action;
     use crate::timeline::Direction;
 
@@ -395,6 +470,90 @@ mod tests {
     /// a state fetched for a missing prev event is not taken on trust. An event in it that its
     /// own auth events do not authorise (a power-levels event by a user with no power, citing no
     /// power levels) is stored rejected and left out of the state.
+    /// Complement's `TestCorruptedAuthChain`: the state answered for a prev event names bob's
+    /// membership E, whose auth chain runs E -> D -> C -> B -> A; B is never served. C, D and E
+    /// cannot be judged without B and are left out -- not judged by the auth events that are
+    /// held, which let them through -- and bob's membership in the room stays his join.
+    #[test]
+    fn fetched_events_whose_auth_chain_is_broken_are_left_out() {
+        let mut actor = room("public_chat");
+        let bob: &UserId = user_id!("@bob:remote.example");
+        actor
+            .membership_action(
+                bob.to_owned(),
+                Action::Join,
+                bob.to_owned(),
+                serde_json::json!({}),
+                2,
+            )
+            .unwrap();
+        let key = signing::SigningKeyPair::generate("1");
+        let (create, power, state) = ids(&actor);
+        let room_id = actor.room_id().to_string();
+        let join_rules = actor
+            .state_event("m.room.join_rules", "")
+            .unwrap()
+            .unwrap()
+            .event_id()
+            .to_string();
+        let bob_join = actor
+            .state_event("m.room.member", bob.as_str())
+            .unwrap()
+            .unwrap()
+            .event_id()
+            .to_string();
+        let member = |name: &str, prev: &str, auth: &str, depth: i64| {
+            remote_pdu(
+                &key,
+                serde_json::json!({
+                    "type": "m.room.member", "state_key": bob.as_str(), "sender": bob.as_str(),
+                    "room_id": room_id, "origin_server_ts": 10 + depth, "depth": depth,
+                    "content": {"membership": "join", "displayname": name},
+                    "prev_events": [prev],
+                    "auth_events": [create, power, join_rules, auth],
+                }),
+            )
+        };
+        let a = member("A", &bob_join, &bob_join, 10);
+        let b = member("B", a.event_id().as_str(), a.event_id().as_str(), 11);
+        let c = member("C", b.event_id().as_str(), b.event_id().as_str(), 12);
+        let d = member("D", c.event_id().as_str(), c.event_id().as_str(), 13);
+        let e = member("E", d.event_id().as_str(), d.event_id().as_str(), 14);
+        let prev = remote_pdu(
+            &key,
+            serde_json::json!({
+                "type": "m.room.message", "sender": bob.as_str(), "room_id": room_id,
+                "origin_server_ts": 30, "depth": 15, "content": {"body": "for /state_ids"},
+                "prev_events": [e.event_id().as_str()],
+                "auth_events": [create, power, e.event_id().as_str()],
+            }),
+        );
+        let mut state_ids: Vec<ruma::OwnedEventId> = state
+            .iter()
+            .filter(|id| id.as_str() != bob_join)
+            .map(|id| ruma::EventId::parse(id).unwrap().to_owned())
+            .collect();
+        state_ids.push(e.event_id().to_owned());
+        let outcome = actor.accept_prev_event_with_state(
+            prev,
+            &state_ids,
+            vec![a.clone(), c.clone(), d.clone(), e.clone()],
+        );
+        assert!(
+            matches!(outcome, Err(RoomError::MissingAncestors(_))),
+            "{outcome:?}"
+        );
+        for left_out in [&c, &d, &e] {
+            assert!(actor.held_event(left_out.event_id()).is_none());
+            assert!(!actor.is_rejected_event(left_out.event_id()));
+        }
+        let membership = actor
+            .state_event("m.room.member", bob.as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(membership.event_id().as_str(), bob_join);
+    }
+
     #[test]
     fn a_fetched_state_event_its_auth_events_do_not_authorise_is_rejected_and_left_out() {
         let mut actor = room("public_chat");

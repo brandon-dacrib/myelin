@@ -267,6 +267,37 @@ pub async fn on_bind<B: hs_kv::KvBackend + 'static>(
     }
 }
 
+/// `PUT /_matrix/federation/v1/exchange_third_party_invite/{roomId}`: another server -- the
+/// invitee's, which is not in the room -- hands over a bound third-party invitation one of this
+/// server's users made (`hs_room::third_party_invite::on_exchange`). Behind the `X-Matrix`
+/// layer (`crate::serve`); the origin is read from the verified header. `{}` once the invite is
+/// made and sent to the invitee's server; the refusal otherwise (`403` from the auth rules or a
+/// key the identity server no longer vouches for, `400` for a body that is not such an invite).
+pub async fn on_exchange<B: hs_kv::KvBackend + 'static>(
+    axum::extract::State(state): axum::extract::State<hs_room::state::RoomState<B>>,
+    axum::extract::Path(room_id): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+    axum::Json(event): axum::Json<Value>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let origin = hs_federation::xmatrix::parse_x_matrix_header(&headers)
+        .map(|auth| auth.origin)
+        .unwrap_or_default();
+    let Ok(room_id) = ruma::RoomId::parse(room_id.as_str()) else {
+        return hs_room::RoomError::BadRequest("not a room ID".into()).into_response();
+    };
+    match hs_room::third_party_invite::on_exchange(&state, &origin, &room_id, &event).await {
+        Ok(invitee) => {
+            tracing::info!(%room_id, origin, %invitee, "made the invite of a third-party invitation another server handed over");
+            axum::Json(json!({})).into_response()
+        }
+        Err(error) => {
+            tracing::info!(%room_id, origin, %error, "refused a third-party invitation another server handed over");
+            error.into_response()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

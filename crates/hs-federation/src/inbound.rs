@@ -378,6 +378,27 @@ pub trait RoomWriteSink: Send + Sync {
             "this sink cannot hold a prev event with a fetched state",
         ))
     }
+
+    /// Holds `events` -- auth events of a received event that this server lacked, fetched by
+    /// `/event` and already hash- and signature-verified -- as outliers, each judged by its own
+    /// `auth_events` (one that fails is stored rejected, so an event citing it is rejected in
+    /// turn). See `crate::state_fallback::fetch_missing_auth_events`. Returns how many were
+    /// held, rejected ones included.
+    ///
+    /// The default refuses.
+    ///
+    /// # Errors
+    /// [`WriteRejected::other`] when they cannot be held at all.
+    async fn accept_auth_outliers(
+        &self,
+        room_id: &str,
+        events: &[Value],
+    ) -> Result<usize, WriteRejected> {
+        let _ = (room_id, events);
+        Err(WriteRejected::other(
+            "this sink cannot hold fetched auth events",
+        ))
+    }
 }
 
 /// A [`RoomWriteSink`] that already knows every event it will ever be asked about (for this
@@ -582,6 +603,46 @@ pub async fn process_transaction(
             Ok(_) => {
                 results.insert(event_id, serde_json::json!({}));
             }
+            // Only auth events are missing: they are fetched one by one (`/event`), as Synapse
+            // and Dendrite do, not walked for -- `/get_missing_events` and `/backfill` are for
+            // prev events, and a server answering this one need not serve them (Complement's
+            // `TestInboundFederationRejectsEventsWithRejectedAuthEvents` fails on either).
+            Err(rejected)
+                if !rejected.missing_ancestors.is_empty()
+                    && ancestor_fetcher.is_some()
+                    && only_auth_events_missing(&value, &rejected.missing_ancestors) =>
+            {
+                let fetcher = ancestor_fetcher.expect("checked Some above");
+                match crate::state_fallback::fetch_missing_auth_events(
+                    origin,
+                    room_id,
+                    &room_version,
+                    rejected.missing_ancestors.clone(),
+                    fetcher,
+                    key_cache,
+                    sink,
+                )
+                .await
+                {
+                    Ok(()) => match sink.accept_verified_event(room_id, &event_id, &value).await {
+                        Ok(_) => {
+                            results.insert(event_id, serde_json::json!({}));
+                        }
+                        Err(still_rejected) => {
+                            let result = rejection_result(origin, &event_id, &still_rejected);
+                            results.insert(event_id, result);
+                        }
+                    },
+                    Err(reason) => {
+                        results.insert(
+                            event_id,
+                            serde_json::json!({
+                                "error": format!("{}; fetching them: {reason}", rejected.error)
+                            }),
+                        );
+                    }
+                }
+            }
             Err(rejected)
                 if !rejected.missing_ancestors.is_empty() && ancestor_fetcher.is_some() =>
             {
@@ -658,6 +719,33 @@ pub async fn process_transaction(
     let response = serde_json::json!({ "pdus": Value::Object(results) });
     transactions.put(origin, txn_id, response.clone()).await;
     Ok(response)
+}
+
+/// Whether every one of `missing` is an `auth_events` entry of `event` and none a `prev_events`
+/// one.
+fn only_auth_events_missing(event: &Value, missing: &[String]) -> bool {
+    let ids = |field: &str| -> Vec<String> {
+        event
+            .get(field)
+            .and_then(Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|entry| {
+                        entry
+                            .as_str()
+                            .or_else(|| entry.as_array()?.first()?.as_str())
+                            .map(str::to_owned)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let prevs = ids("prev_events");
+    let auths = ids("auth_events");
+    missing
+        .iter()
+        .all(|id| auths.contains(id) && !prevs.contains(id))
 }
 
 /// What `/send` answers for a PDU the sink did not take: `{}` for one event authorization

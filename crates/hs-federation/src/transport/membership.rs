@@ -247,7 +247,8 @@ async fn send_knock(
     .await
     {
         Ok(result) => {
-            let knock_room_state = crate::stripped::stripped_state(&result.state, &[]);
+            // MSC4311: whole events, not their stripped form.
+            let knock_room_state = crate::stripped::stripped_state_events(&result.state, &[]);
             axum::Json(json!({ "knock_room_state": knock_room_state })).into_response()
         }
         Err(response) => *response,
@@ -300,6 +301,12 @@ fn invite_error_response(e: &InviteError) -> Response {
         )
         .into_response(),
         InviteError::Malformed(msg) => MatrixError::bad_json(msg.clone()).into_response(),
+        InviteError::MissingState(msg) => MatrixError::custom(
+            StatusCode::BAD_REQUEST,
+            MatrixErrorCode::MissingParam,
+            msg.clone(),
+        )
+        .into_response(),
         InviteError::Forbidden(msg) => MatrixError::forbidden(msg.clone()).into_response(),
         InviteError::Store(msg) => MatrixError::custom(
             StatusCode::INTERNAL_SERVER_ERROR,

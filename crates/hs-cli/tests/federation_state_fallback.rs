@@ -174,6 +174,8 @@ struct Peer {
     state_ids: Mutex<Option<(String, Value)>>,
     /// What `/event` serves, by ID.
     events: Mutex<HashMap<String, Value>>,
+    /// What `/backfill` serves; `404` while empty.
+    backfill: Mutex<Vec<Value>>,
     /// Every request: `"{method} {path}?{query}"`.
     requests: Mutex<Vec<String>>,
 }
@@ -204,6 +206,7 @@ async fn spawn_peer_for(version: ruma::RoomVersionId) -> Arc<Peer> {
         missing_events: Mutex::new(Vec::new()),
         state_ids: Mutex::new(None),
         events: Mutex::new(HashMap::new()),
+        backfill: Mutex::new(Vec::new()),
         requests: Mutex::new(Vec::new()),
     });
 
@@ -240,6 +243,14 @@ async fn spawn_peer_for(version: ruma::RoomVersionId) -> Arc<Peer> {
             None => not_found(),
         }
     }
+    async fn backfill(State(peer): State<Arc<Peer>>) -> axum::response::Response {
+        let pdus = peer.backfill.lock().unwrap().clone();
+        if pdus.is_empty() {
+            return not_found();
+        }
+        axum::Json(json!({"origin": peer.name, "origin_server_ts": 1, "pdus": pdus}))
+            .into_response()
+    }
     fn not_found() -> axum::response::Response {
         (
             StatusCode::NOT_FOUND,
@@ -265,7 +276,7 @@ async fn spawn_peer_for(version: ruma::RoomVersionId) -> Arc<Peer> {
         )
         .route(
             "/_matrix/federation/v1/backfill/{room_id}",
-            axum::routing::get(|| async { not_found() }),
+            axum::routing::get(backfill),
         )
         .route(
             "/_matrix/federation/v1/state/{room_id}",
@@ -402,6 +413,17 @@ async fn room_with_bob(
     power: impl FnOnce(&mut Value, &str),
 ) -> JoinedRoom {
     let (_alice_id, token) = register(client, &server.base, alice).await;
+    room_of_alices_with_bob(client, server, peer, token, power).await
+}
+
+/// [`room_with_bob`] for an alice already registered, by her access token.
+async fn room_of_alices_with_bob(
+    client: &reqwest::Client,
+    server: &Server,
+    peer: &Peer,
+    token: String,
+    power: impl FnOnce(&mut Value, &str),
+) -> JoinedRoom {
     let created: Value = client
         .post(format!("{}/_matrix/client/v3/createRoom", server.base))
         .bearer_auth(&token)
@@ -863,5 +885,299 @@ async fn an_event_the_current_state_refuses_is_soft_failed_and_kept_from_clients
         after > before,
         "the soft failure is counted: {before} -> {after}"
     );
+    server.handle.shutdown().await;
+}
+
+/// Sytest's "Backfilled events whose prev_events are in a different room do not allow
+/// cross-room back-pagination" (`34room-backfill.pl`), on the real server. Bob's P is in room
+/// one; in room two, Q cites P as its prev event, R cites Q and S cites R. S is sent; R comes
+/// from `/get_missing_events`, Q through the state fallback (its own prev event is nobody's
+/// to give). A backward `/messages` page from S stops at the outlier Q and asks `/backfill`
+/// for it -- before 2026-10-04 it walked straight from R to the join, asking nothing -- and
+/// the page holds Q and never P, which this server holds in room one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn back_pagination_backfills_past_a_fetched_prev_event_and_never_crosses_rooms() {
+    let server = start().await;
+    let peer = spawn_peer().await;
+    let client = reqwest::Client::new();
+    let (_alice, token) = register(&client, &server.base, "alice").await;
+    let one = room_of_alices_with_bob(&client, &server, &peer, token.clone(), |_, _| {}).await;
+    let two = room_of_alices_with_bob(&client, &server, &peer, token.clone(), |_, _| {}).await;
+    let message = |room: &JoinedRoom, prev: Vec<&str>, depth: i64, body: &str| {
+        pdu(
+            &peer,
+            json!({
+                "type": "m.room.message", "sender": room.bob, "room_id": room.room_id,
+                "origin_server_ts": 1_000 + depth, "depth": depth,
+                "content": {"body": body},
+                "prev_events": prev,
+                "auth_events": room.auth(&room.power_id),
+            }),
+        )
+    };
+    let (p, p_id) = message(&one, vec![&one.join_id], one.join_depth + 1, "event P");
+    let depth = one.join_depth.max(two.join_depth);
+    let (q, q_id) = message(&two, vec![&p_id], depth + 2, "event Q");
+    let (r, r_id) = message(&two, vec![&q_id], depth + 3, "event R");
+    let (s, s_id) = message(&two, vec![&r_id], depth + 4, "event S");
+
+    let mut state_at_q = two.state_before_join.clone();
+    state_at_q.push(two.join_id.clone());
+    *peer.missing_events.lock().unwrap() = vec![r.clone()];
+    *peer.state_ids.lock().unwrap() = Some((
+        q_id.clone(),
+        json!({"pdu_ids": state_at_q, "auth_chain_ids": []}),
+    ));
+    peer.events
+        .lock()
+        .unwrap()
+        .extend([(q_id.clone(), q.clone()), (r_id.clone(), r)]);
+    *peer.backfill.lock().unwrap() = vec![q];
+
+    for (txn, event, id) in [("txn-s", s, &s_id), ("txn-p", p, &p_id)] {
+        let (status, answer) = signed(
+            &client,
+            &peer,
+            &server,
+            "PUT",
+            &format!("/_matrix/federation/v1/send/{txn}"),
+            Some(&json!({"origin": peer.name, "origin_server_ts": 1, "pdus": [event], "edus": []})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        assert_eq!(answer["pdus"][id], json!({}), "{answer}");
+    }
+    assert!(peer.requested(&format!("/state_ids/{}?event_id=", two.room_id)));
+
+    let room_id = two.room_id.clone();
+    let filter = r#"{"room":{"timeline":{"limit":2}}}"#;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let prev_batch = loop {
+        let sync: Value = client
+            .get(format!("{}/_matrix/client/v3/sync", server.base))
+            .query(&[("filter", filter)])
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let bodies = timeline_bodies(&sync, &room_id);
+        if bodies.iter().any(|b| b == "event S") {
+            break sync["rooms"]["join"][&room_id]["timeline"]["prev_batch"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+        }
+        assert!(Instant::now() < deadline, "S never reached alice's sync");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    let page: Value = client
+        .get(format!(
+            "{}/_matrix/client/v3/rooms/{room_id}/messages",
+            server.base
+        ))
+        .query(&[("dir", "b"), ("from", prev_batch.as_str())])
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        peer.requested(&format!("/backfill/{room_id}")),
+        "the page did not ask for the history before Q: {:?}",
+        peer.requests.lock().unwrap()
+    );
+    let chunk = page["chunk"].as_array().unwrap();
+    assert!(chunk.len() >= 2, "{page}");
+    let bodies: Vec<&str> = chunk
+        .iter()
+        .filter_map(|e| e["content"]["body"].as_str())
+        .collect();
+    assert!(bodies.contains(&"event Q"), "{page}");
+    assert!(!bodies.contains(&"event P"), "{page}");
+    assert!(
+        chunk.iter().all(|e| e["room_id"] == room_id.as_str()),
+        "{page}"
+    );
+    server.handle.shutdown().await;
+}
+
+/// Sytest's "Inbound federation redacts events from erased users" (`32room-getevent.pl`), on
+/// the real server: another server fetching alice's message over `/event` gets it whole, and
+/// once alice has deactivated her account with `erase`, gets it redacted -- still the same
+/// event, with no `body`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_erased_accounts_events_are_served_to_other_servers_redacted() {
+    let server = start().await;
+    let peer = spawn_peer().await;
+    let client = reqwest::Client::new();
+    let r = room_with_bob(&client, &server, &peer, "alice", |_, _| {}).await;
+    let sent: Value = client
+        .put(format!(
+            "{}/_matrix/client/v3/rooms/{}/send/m.room.message/erase-1",
+            server.base, r.room_id
+        ))
+        .bearer_auth(&r.token)
+        .json(&json!({"msgtype": "m.text", "body": "body1"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let event_id = sent["event_id"].as_str().unwrap().to_owned();
+    let path = format!("/_matrix/federation/v1/event/{event_id}");
+    let (status, before) = signed(&client, &peer, &server, "GET", &path, None).await;
+    assert_eq!(status, StatusCode::OK, "{before}");
+    assert_eq!(before["pdus"][0]["content"]["body"], "body1", "{before}");
+
+    let status = client
+        .post(format!("{}/_matrix/client/v3/account/deactivate", server.base))
+        .bearer_auth(&r.token)
+        .json(&json!({
+            "erase": true,
+            "auth": {"type": "m.login.password", "identifier": {"type": "m.id.user", "user": "alice"}, "password": "correct horse"},
+        }))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert!(status.is_success(), "{status}");
+
+    let (status, after) = signed(&client, &peer, &server, "GET", &path, None).await;
+    assert_eq!(status, StatusCode::OK, "{after}");
+    let pdu = &after["pdus"][0];
+    assert_eq!(pdu["type"], "m.room.message", "{after}");
+    assert!(
+        pdu["content"].get("body").is_none(),
+        "not redacted: {after}"
+    );
+    let parsed = hs_model::Event::parse(pdu, peer.version.clone()).unwrap();
+    assert_eq!(parsed.event_id(), event_id.as_str(), "the same event");
+    server.handle.shutdown().await;
+}
+
+/// Complement's `TestInboundFederationRejectsEventsWithRejectedAuthEvents`, on the real server:
+/// bob's power levels are rejected (he has no power); an outlier O (his membership, citing the
+/// rejected power levels among its auth events) is never sent, only served by `/event`; E1
+/// cites O among its auth events. The server fetches O by `/event` -- not by
+/// `/get_missing_events` or `/backfill`, which are for prev events -- holds it rejected, and
+/// rejects E1 (`{}` to `/send`, `404` to alice); the sentinel after it reaches alice's sync.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_missing_auth_event_is_fetched_by_id_and_its_rejection_carries_over() {
+    let server = start().await;
+    let peer = spawn_peer().await;
+    let client = reqwest::Client::new();
+    let r = room_with_bob(&client, &server, &peer, "alice", |_, _| {}).await;
+    let join_rules = {
+        let state: Vec<Value> = client
+            .get(format!(
+                "{}/_matrix/client/v3/rooms/{}/state",
+                server.base, r.room_id
+            ))
+            .bearer_auth(&r.token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        state
+            .iter()
+            .find(|e| e["type"] == "m.room.join_rules")
+            .and_then(|e| e["event_id"].as_str())
+            .unwrap()
+            .to_owned()
+    };
+    let d = r.join_depth;
+    let (pl, pl_id) = pdu(
+        &peer,
+        json!({
+            "type": "m.room.power_levels", "state_key": "", "sender": r.bob,
+            "room_id": r.room_id, "origin_server_ts": 1_001, "depth": d + 1,
+            "content": {"users": {}},
+            "prev_events": [r.join_id], "auth_events": r.auth(&r.power_id),
+        }),
+    );
+    let (outlier, outlier_id) = pdu(
+        &peer,
+        json!({
+            "type": "m.room.member", "state_key": r.bob, "sender": r.bob,
+            "room_id": r.room_id, "origin_server_ts": 1_002, "depth": d + 1,
+            "content": {"membership": "join", "test": 1},
+            "prev_events": [r.join_id],
+            "auth_events": [r.create_id, join_rules, pl_id, r.join_id],
+        }),
+    );
+    let mut e1_auth = r.auth(&r.power_id);
+    e1_auth.push(outlier_id.clone());
+    let (e1, e1_id) = pdu(
+        &peer,
+        json!({
+            "type": "m.room.message", "sender": r.bob, "room_id": r.room_id,
+            "origin_server_ts": 1_003, "depth": d + 1, "content": {"body": "sent 1"},
+            "prev_events": [r.join_id], "auth_events": e1_auth,
+        }),
+    );
+    let (sentinel, sentinel_id) = pdu(
+        &peer,
+        json!({
+            "type": "m.room.message", "sender": r.bob, "room_id": r.room_id,
+            "origin_server_ts": 1_004, "depth": d + 2, "content": {"body": "sentinel"},
+            "prev_events": [e1_id], "auth_events": r.auth(&r.power_id),
+        }),
+    );
+    peer.events
+        .lock()
+        .unwrap()
+        .insert(outlier_id.clone(), outlier);
+
+    for (txn, pdus) in [("txn-pl", vec![pl]), ("txn-e", vec![e1, sentinel])] {
+        let (status, answer) = signed(
+            &client,
+            &peer,
+            &server,
+            "PUT",
+            &format!("/_matrix/federation/v1/send/{txn}"),
+            Some(&json!({"origin": peer.name, "origin_server_ts": 1, "pdus": pdus, "edus": []})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        for (_, result) in answer["pdus"].as_object().unwrap() {
+            assert_eq!(result, &json!({}), "{answer}");
+        }
+    }
+    assert!(peer.requested(&format!("/event/{outlier_id}")));
+    assert!(
+        !peer.requested("/get_missing_events/") && !peer.requested("/backfill/"),
+        "a missing auth event was walked for: {:?}",
+        peer.requests.lock().unwrap()
+    );
+    let room_id = r.room_id.clone();
+    sync_until(&client, &server.base, &r.token, move |sync| {
+        timeline_bodies(sync, &room_id)
+            .iter()
+            .any(|b| b == "sentinel")
+    })
+    .await;
+    for id in [&pl_id, &outlier_id, &e1_id] {
+        let status = client
+            .get(format!(
+                "{}/_matrix/client/v3/rooms/{}/event/{id}",
+                server.base, r.room_id
+            ))
+            .bearer_auth(&r.token)
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status.as_u16(), 404, "{id} is visible");
+    }
+    let _ = sentinel_id;
     server.handle.shutdown().await;
 }

@@ -83,6 +83,10 @@ pub enum InviteError {
     /// The invite could not be recorded.
     #[error("{0}")]
     Store(String),
+    /// `invite_room_state` lacks what it must carry (`400 M_MISSING_PARAM`): from room version
+    /// 12, the room's `m.room.create` event (MSC4311).
+    #[error("{0}")]
+    MissingState(String),
 }
 
 /// Checks, co-signs and records an invite sent by `origin` (see the module docs). Returns the
@@ -110,6 +114,19 @@ pub async fn receive_invite(
         ));
     }
 
+    // MSC4311: the invite's room state must carry the room's create event -- a SHOULD from
+    // room version 12 (whose room ID is the create event's hash, so it is what tells the
+    // invitee what room this is), a MAY before, where older servers do not send it.
+    if hs_model::room_version::rules_for(&version)
+        .is_some_and(|rules| rules.room_create_event_id_as_room_id)
+        && !invite_room_state
+            .iter()
+            .any(|e| e.get("type").and_then(Value::as_str) == Some("m.room.create"))
+    {
+        return Err(InviteError::MissingState(
+            "invite_room_state does not carry the room's m.room.create event".to_owned(),
+        ));
+    }
     // Canonical JSON first (a float in a version-6 room is `400 M_BAD_JSON`, Sytest's "Inbound
     // federation rejects invites which include invalid JSON for room version 6"); then the
     // signature, whose absence is the room refusing the invite (`403`, "... invites which are
@@ -396,6 +413,46 @@ mod tests {
                 json!({"type": "m.room.name", "state_key": "", "sender": "@alice:inviter.example.org", "content": {"name": "n"}})
             ]
         );
+    }
+
+    /// Complement's `TestMSC4311RejectInvalidStrippedStateFederation`: an invite to a room of
+    /// version 12 whose `invite_room_state` lacks the create event is `400 M_MISSING_PARAM`
+    /// (`InviteError::MissingState`), before anything else is looked at; before version 12 it
+    /// is not required.
+    #[tokio::test]
+    async fn a_version_12_invite_without_the_create_event_in_its_room_state_is_refused() {
+        let f = fixture();
+        let raw = signed_invite(&f.inviter_keys, "@bob:invitee.example.org", "invite");
+        let event_id = event_id_of(&raw);
+        let refused = receive_invite(
+            &f.handling,
+            &f.cache,
+            "invitee.example.org",
+            "inviter.example.org",
+            "!r:inviter.example.org",
+            &event_id,
+            "12",
+            &raw,
+            &[],
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(InviteError::MissingState(_))),
+            "{refused:?}"
+        );
+        let taken = receive_invite(
+            &f.handling,
+            &f.cache,
+            "invitee.example.org",
+            "inviter.example.org",
+            "!r:inviter.example.org",
+            &event_id,
+            "11",
+            &raw,
+            &[],
+        )
+        .await;
+        assert!(taken.is_ok(), "{taken:?}");
     }
 
     #[tokio::test]

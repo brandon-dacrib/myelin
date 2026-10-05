@@ -722,7 +722,7 @@ async fn spawn_configurable_backfill_peer() -> (u16, Arc<Mutex<Value>>, tokio::t
 /// **The backfill loop, end to end** (`docs/next-steps.md` item 4): a remote sends an event (`m2`)
 /// whose `prev_events` cites an event (`m1`) this server has never seen. `RoomActor::persist`
 /// reports `RoomError::MissingAncestors`, and this server fetches exactly the missing event from
-/// the "remote" over a real, signed HTTP `/backfill` request, verifies it the same way any inbound
+/// the "remote" over a real, signed HTTP request (`/get_missing_events`), verifies it the same way any inbound
 /// PDU is verified, persists it, then retries `m2` -- which now succeeds because its one missing
 /// ancestor is no longer missing.
 #[tokio::test]
@@ -762,8 +762,9 @@ async fn send_backfills_a_missing_ancestor_then_accepts_the_original_event() {
 
     // The peer's canned response: exactly the one event that closes the gap, nothing more --
     // proves this server asks for, and is satisfied by, the minimum necessary, not a bulk history
-    // dump.
-    *peer_body.lock().unwrap() = serde_json::json!({ "pdus": [m1] });
+    // dump. Under both keys: the gap-shaped `/get_missing_events` (`events`) is asked first, and
+    // once it has answered `/backfill` (`pdus`) is not asked as well.
+    *peer_body.lock().unwrap() = serde_json::json!({ "pdus": [m1], "events": [m1] });
 
     let body = serde_json::json!({ "pdus": [m2], "edus": [] });
     let (status, response) = harness.signed_put(false, "/send/txn-backfill", &body).await;
@@ -814,38 +815,49 @@ async fn send_gives_up_when_the_remote_serves_an_endless_backfill_chain() {
     let power_id_for_app = power_id.clone();
     let member_id_for_app = member_id.clone();
     let alice_for_app = alice.clone();
-    let app = axum::Router::new().route(
-        "/{*rest}",
-        axum::routing::any(move || {
-            let calls = calls_for_app.clone();
-            let signing_key = signing_key_for_app.clone();
-            let room_id = room_id_for_app.clone();
-            let create_id = create_id_for_app.clone();
-            let power_id = power_id_for_app.clone();
-            let member_id = member_id_for_app.clone();
-            let alice = alice_for_app.clone();
-            async move {
-                let n = calls.fetch_add(1, Ordering::SeqCst);
-                // Every response points to a brand-new, still-missing ancestor: this "remote"
-                // never converges, no matter how many times it is asked. It never gets far enough
-                // for authorization to even run (ancestor presence is checked first), so the
-                // auth_events here do not need to be exhaustively correct -- only shaped like a
-                // real event.
-                let never_ends = format!("$never-ends-{n}");
-                let event = build_signed_message(
-                    &signing_key,
-                    &room_id,
-                    &alice,
-                    vec![never_ends],
-                    vec![create_id, power_id, member_id],
-                    -(n as i64),
-                    20_000 + n as i64,
-                    "endless",
-                );
-                axum::Json(serde_json::json!({ "pdus": [event] }))
-            }
-        }),
-    );
+    // `/get_missing_events` is not served, so the `/backfill` rounds are what is bounded here.
+    let app = axum::Router::new()
+        .route(
+            "/_matrix/federation/v1/get_missing_events/{room_id}",
+            axum::routing::post(|| async {
+                (
+                    StatusCode::NOT_FOUND,
+                    axum::Json(serde_json::json!({"errcode": "M_UNRECOGNIZED"})),
+                )
+            }),
+        )
+        .route(
+            "/{*rest}",
+            axum::routing::any(move || {
+                let calls = calls_for_app.clone();
+                let signing_key = signing_key_for_app.clone();
+                let room_id = room_id_for_app.clone();
+                let create_id = create_id_for_app.clone();
+                let power_id = power_id_for_app.clone();
+                let member_id = member_id_for_app.clone();
+                let alice = alice_for_app.clone();
+                async move {
+                    let n = calls.fetch_add(1, Ordering::SeqCst);
+                    // Every response points to a brand-new, still-missing ancestor: this "remote"
+                    // never converges, no matter how many times it is asked. It never gets far enough
+                    // for authorization to even run (ancestor presence is checked first), so the
+                    // auth_events here do not need to be exhaustively correct -- only shaped like a
+                    // real event.
+                    let never_ends = format!("$never-ends-{n}");
+                    let event = build_signed_message(
+                        &signing_key,
+                        &room_id,
+                        &alice,
+                        vec![never_ends],
+                        vec![create_id, power_id, member_id],
+                        -(n as i64),
+                        20_000 + n as i64,
+                        "endless",
+                    );
+                    axum::Json(serde_json::json!({ "pdus": [event] }))
+                }
+            }),
+        );
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
@@ -873,8 +885,8 @@ async fn send_gives_up_when_the_remote_serves_an_endless_backfill_chain() {
         "expected the transaction to report a clean backfill give-up, got: {response}"
     );
 
-    // Bounded: one gap-shaped `/get_missing_events` request (this peer answers it with no
-    // `events`, so it closes nothing), then exactly `max_rounds` `/backfill` rounds -- not one
+    // Bounded: the gap-shaped `/get_missing_events` (not served here, and not counted), then
+    // exactly `max_rounds` `/backfill` rounds -- not one
     // per hop of the (literally endless) chain it kept offering -- then the `/state_ids`
     // fallback for at most `MAX_PENDING_EVENTS` of the events it fetched and could not place:
     // `/state_ids` and `/state` each, both answered with something that is not a state, so no
@@ -882,9 +894,9 @@ async fn send_gives_up_when_the_remote_serves_an_endless_backfill_chain() {
     let limits = hs_federation::backfill::BackfillLimits::default();
     assert_eq!(
         calls.load(Ordering::SeqCst),
-        limits.max_rounds + 1 + 2 * hs_federation::state_fallback::MAX_PENDING_EVENTS,
-        "expected the gap-shaped request, exactly max_rounds backfill requests and the bounded \
-         state fallback to the hostile peer"
+        limits.max_rounds + 2 * hs_federation::state_fallback::MAX_PENDING_EVENTS,
+        "expected exactly max_rounds backfill requests and the bounded state fallback to the \
+         hostile peer"
     );
 }
 

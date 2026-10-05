@@ -36,7 +36,7 @@
 //! actor does not maintain that index yet, and a direct walk over a room's own auth DAG is both
 //! correct and cheap at the room sizes this server has been run at.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -69,6 +69,9 @@ const MAX_TIMESTAMP_SCAN: usize = 10_000;
 /// [`RoomDataSource`] over `hs-room`'s [`RoomRegistry`], its published-room directory included.
 pub struct RegistryRoomSource<B: KvBackend> {
     rooms: Arc<RoomRegistry<B>>,
+    /// The account store, to tell an erased account's events
+    /// ([`RegistryRoomSource::with_erasure`]). `None` serves every event as held.
+    accounts: Option<Arc<dyn hs_auth::store::AuthStore>>,
 }
 
 impl<B: KvBackend + 'static> RegistryRoomSource<B> {
@@ -76,7 +79,82 @@ impl<B: KvBackend + 'static> RegistryRoomSource<B> {
     /// nothing of its own and sees exactly the data the client-server API sees.
     #[must_use]
     pub fn new(rooms: Arc<RoomRegistry<B>>) -> Self {
-        Self { rooms }
+        Self {
+            rooms,
+            accounts: None,
+        }
+    }
+
+    /// Serves the events of this server's erased accounts (`hs_auth::erasure`) to other servers
+    /// in their redacted form, through `/event`, `/backfill` and `/get_missing_events`: an
+    /// erased account's messages are not handed out again, as Synapse's
+    /// `filter_events_for_server` prunes an erased sender's events (Sytest's "Inbound federation
+    /// redacts events from erased users"). The events stay whole in the room, and to its
+    /// members here; what clients see of them is the room layer's.
+    #[must_use]
+    pub fn with_erasure(mut self, accounts: Arc<dyn hs_auth::store::AuthStore>) -> Self {
+        self.accounts = Some(accounts);
+        self
+    }
+
+    /// `pdus` of `room_id`, each of an erased account of this server's replaced by its redacted
+    /// form. See [`RegistryRoomSource::with_erasure`].
+    async fn without_erased_content(&self, room_id: &str, pdus: Vec<Value>) -> Vec<Value> {
+        let Some(accounts) = &self.accounts else {
+            return pdus;
+        };
+        let Ok(handle) = self.handle(room_id).await else {
+            return pdus;
+        };
+        let version = handle.query(|actor| actor.room_version().clone()).await;
+        let own = self.rooms.server_name().to_owned();
+        let Some(rules) = hs_model::room_version::rules_for(&version) else {
+            return pdus;
+        };
+        let mut erased: HashMap<String, bool> = HashMap::new();
+        let mut out = Vec::with_capacity(pdus.len());
+        for pdu in pdus {
+            let Some(sender) = pdu
+                .get("sender")
+                .and_then(Value::as_str)
+                .and_then(|s| ruma::UserId::parse(s).ok())
+            else {
+                out.push(pdu);
+                continue;
+            };
+            if sender.server_name() != own {
+                out.push(pdu);
+                continue;
+            }
+            let is_erased = match erased.get(sender.as_str()) {
+                Some(known) => *known,
+                None => {
+                    let known = matches!(
+                        accounts.get_user(&sender).await,
+                        Ok(Some(record)) if record.erased
+                    );
+                    erased.insert(sender.to_string(), known);
+                    known
+                }
+            };
+            if !is_erased {
+                out.push(pdu);
+                continue;
+            }
+            let redacted = hs_model::canonical::to_canonical_object(&pdu, false)
+                .ok()
+                .and_then(|object| hs_model::redaction::redact(&object, &rules.redaction).ok());
+            match redacted {
+                Some(redacted) => {
+                    tracing::debug!(room_id, %sender, "serving an erased account's event redacted");
+                    out.push(canonical_to_json(&redacted));
+                }
+                None => {
+                    tracing::warn!(room_id, %sender, "could not redact an erased account's event; leaving it out");
+                }
+            }
+        }
+        out
     }
 
     /// Loads a room's actor handle. A room ID that does not parse is reported as
@@ -390,12 +468,17 @@ impl<B: KvBackend + 'static> RoomDataSource for RegistryRoomSource<B> {
         requesting_server: &str,
     ) -> Result<EventJson, RoomSourceError> {
         let wanted = event_id.to_owned();
-        self.with_visible_room(room_id, requesting_server, move |actor| {
-            event_by_str(actor, &wanted)
-                .map(full_pdu)
-                .ok_or(RoomSourceError::NotFound)
-        })
-        .await
+        let pdu = self
+            .with_visible_room(room_id, requesting_server, move |actor| {
+                event_by_str(actor, &wanted)
+                    .map(full_pdu)
+                    .ok_or(RoomSourceError::NotFound)
+            })
+            .await?;
+        self.without_erased_content(room_id, vec![pdu])
+            .await
+            .pop()
+            .ok_or(RoomSourceError::NotFound)
     }
 
     async fn get_event_by_id(
@@ -501,14 +584,16 @@ impl<B: KvBackend + 'static> RoomDataSource for RegistryRoomSource<B> {
             return Ok(Vec::new());
         }
         let server = requesting_server.to_owned();
-        self.with_visible_room(room_id, requesting_server, move |actor| {
-            let (events, _) = actor.paginate(token, Direction::Backward, limit);
-            Ok(events
-                .into_iter()
-                .filter_map(|event| pdu_for_server(actor, event, &server))
-                .collect())
-        })
-        .await
+        let pdus = self
+            .with_visible_room(room_id, requesting_server, move |actor| {
+                let (events, _) = actor.paginate(token, Direction::Backward, limit);
+                Ok(events
+                    .into_iter()
+                    .filter_map(|event| pdu_for_server(actor, event, &server))
+                    .collect())
+            })
+            .await?;
+        Ok(self.without_erased_content(room_id, pdus).await)
     }
 
     async fn missing_events(
@@ -523,59 +608,61 @@ impl<B: KvBackend + 'static> RoomDataSource for RegistryRoomSource<B> {
         let earliest: HashSet<String> = earliest_events.iter().cloned().collect();
         let latest = latest_events.to_vec();
         let server = requesting_server.to_owned();
-        self.with_visible_room(room_id, requesting_server, move |actor| {
-            // Walk back over `prev_events` from what the caller has, stopping at the events it
-            // says it already knows. This is the gap-filling request a remote makes when an
-            // event it received cites parents it has never seen.
-            let mut seen: HashSet<String> = earliest.clone();
-            let mut queue: VecDeque<String> = latest.iter().cloned().collect();
-            let mut found: Vec<&hs_model::Event> = Vec::new();
-            while let Some(id) = queue.pop_front() {
-                if found.len() >= limit {
-                    break;
-                }
-                if !seen.insert(id.clone()) {
-                    continue;
-                }
-                let Some(event) = event_by_str(actor, &id) else {
-                    continue;
-                };
-                // Below the caller's floor: not returned, and not walked past either, since
-                // everything behind it is shallower still.
-                if event.header().depth < min_depth {
-                    continue;
-                }
-                if !latest.contains(&id) {
-                    found.push(event);
-                }
-                for prev in prev_event_ids(event) {
-                    if !seen.contains(&prev) {
-                        queue.push_back(prev);
+        let pdus = self
+            .with_visible_room(room_id, requesting_server, move |actor| {
+                // Walk back over `prev_events` from what the caller has, stopping at the events it
+                // says it already knows. This is the gap-filling request a remote makes when an
+                // event it received cites parents it has never seen.
+                let mut seen: HashSet<String> = earliest.clone();
+                let mut queue: VecDeque<String> = latest.iter().cloned().collect();
+                let mut found: Vec<&hs_model::Event> = Vec::new();
+                while let Some(id) = queue.pop_front() {
+                    if found.len() >= limit {
+                        break;
+                    }
+                    if !seen.insert(id.clone()) {
+                        continue;
+                    }
+                    let Some(event) = event_by_str(actor, &id) else {
+                        continue;
+                    };
+                    // Below the caller's floor: not returned, and not walked past either, since
+                    // everything behind it is shallower still.
+                    if event.header().depth < min_depth {
+                        continue;
+                    }
+                    if !latest.contains(&id) {
+                        found.push(event);
+                    }
+                    for prev in prev_event_ids(event) {
+                        if !seen.contains(&prev) {
+                            queue.push_back(prev);
+                        }
                     }
                 }
-            }
-            // The walk above runs backwards, so `found` is newest-first -- but the response has
-            // to be oldest-first, the order the events happened in. A requesting server replays
-            // them into its own DAG, and one that reads the first entry as the earliest of the
-            // batch gets the wrong event: Complement reads `*ev.StateKey()` off it and
-            // dereferences a nil pointer when it is a message rather than a state event, which
-            // kills the whole Go test binary and silently discards every test after it.
-            //
-            // Depth, then event ID, because depth alone is not a total order: two events on
-            // forked branches share one, and the response must still be stable for a caller
-            // comparing two servers' answers.
-            found.sort_by(|a, b| {
-                a.header()
-                    .depth
-                    .cmp(&b.header().depth)
-                    .then_with(|| a.event_id().as_str().cmp(b.event_id().as_str()))
-            });
-            Ok(found
-                .into_iter()
-                .filter_map(|event| pdu_for_server(actor, event, &server))
-                .collect())
-        })
-        .await
+                // The walk above runs backwards, so `found` is newest-first -- but the response has
+                // to be oldest-first, the order the events happened in. A requesting server replays
+                // them into its own DAG, and one that reads the first entry as the earliest of the
+                // batch gets the wrong event: Complement reads `*ev.StateKey()` off it and
+                // dereferences a nil pointer when it is a message rather than a state event, which
+                // kills the whole Go test binary and silently discards every test after it.
+                //
+                // Depth, then event ID, because depth alone is not a total order: two events on
+                // forked branches share one, and the response must still be stable for a caller
+                // comparing two servers' answers.
+                found.sort_by(|a, b| {
+                    a.header()
+                        .depth
+                        .cmp(&b.header().depth)
+                        .then_with(|| a.event_id().as_str().cmp(b.event_id().as_str()))
+                });
+                Ok(found
+                    .into_iter()
+                    .filter_map(|event| pdu_for_server(actor, event, &server))
+                    .collect())
+            })
+            .await?;
+        Ok(self.without_erased_content(room_id, pdus).await)
     }
 
     async fn event_near_timestamp(
@@ -993,6 +1080,27 @@ impl<B: KvBackend + 'static> hs_federation::inbound::RoomWriteSink for RegistryW
             .into_iter()
             .map(|id| id.to_string())
             .collect()
+    }
+
+    async fn accept_auth_outliers(
+        &self,
+        room_id: &str,
+        events: &[Value],
+    ) -> Result<usize, hs_federation::inbound::WriteRejected> {
+        use hs_federation::inbound::WriteRejected;
+
+        let Some(handle) = self.handle(room_id).await else {
+            return Err(WriteRejected::other("unknown room"));
+        };
+        let room_version = handle.query(|actor| actor.room_version().clone()).await;
+        let parsed: Vec<hs_model::Event> = events
+            .iter()
+            .filter_map(|raw| hs_model::Event::parse(raw, room_version.clone()).ok())
+            .collect();
+        handle
+            .accept_auth_outliers(parsed)
+            .await
+            .map_err(|e| WriteRejected::other(e.to_string()))
     }
 
     async fn accept_prev_event_with_state(
@@ -1474,7 +1582,7 @@ pub fn build_mount<B: KvBackend + 'static>(
 
     let state = hs_federation::transport::FederationState {
         own_server_name: Arc::from(server_name.as_str()),
-        rooms: Arc::new(RegistryRoomSource::new(rooms.clone())),
+        rooms: Arc::new(RegistryRoomSource::new(rooms.clone()).with_erasure(auth.clone())),
         queries: Arc::new(
             ServerQuerySource::new(auth, e2e.store.clone(), rooms.clone(), server_name.clone())
                 .with_keys(e2e),

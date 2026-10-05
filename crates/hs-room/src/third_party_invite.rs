@@ -24,8 +24,15 @@
 //! servers its operator chose. Without an installed service (this crate's tests) every 3PID
 //! invite is refused the same way. Counted in `hs_room_third_party_invites_total{outcome}`.
 //!
-//! Not done: an exchange for a room this server does not hold (the invitee's server forwarding
-//! to the room's, `PUT /_matrix/federation/v1/exchange_third_party_invite/{roomId}`) is refused.
+//! # Over federation
+//! The identity server tells the *invitee's* server, which need not be in the room. When it is
+//! not ([`on_bind`] finds no local member there), the invitation is handed to the server of
+//! whoever made it (the `sender` the identity server names), which is: `PUT
+//! /_matrix/federation/v1/exchange_third_party_invite/{roomId}` (the room's side is
+//! [`on_exchange`]), as Synapse does. That server makes the invite as above and sends it here
+//! through the ordinary `/invite` handshake, and the invitee joins as for any invite. An
+//! invite this server makes for a user of another server -- for itself, or for a server that
+//! handed it an invitation -- goes through that handshake too, not just into the room.
 
 use std::sync::LazyLock;
 
@@ -102,13 +109,14 @@ fn count(outcome: &'static str) {
 
 /// Registers `hs_room_third_party_invites_total{outcome}`: `invited` (the address was bound, so
 /// an ordinary invite), `stored` (an `m.room.third_party_invite` was sent), `exchanged` (a bound
-/// address turned into an invite), `refused` (no identity server allowed, or the identity server
-/// or the auth rules said no).
+/// address turned into an invite), `forwarded` (a bound invitation for a room this server is
+/// not in, handed to the inviter's server), `refused` (no identity server allowed, or the
+/// identity server or the auth rules said no).
 pub fn register_metrics(registry: &mut prometheus_client::registry::Registry) {
     registry.register(
         "hs_room_third_party_invites",
         "Invitations by email or other third-party identifier, by outcome: invited, stored, \
-         exchanged, refused",
+         exchanged, forwarded, refused",
         OUTCOMES.clone(),
     );
 }
@@ -342,17 +350,33 @@ pub async fn exchange<B: KvBackend + 'static>(
         "third_party_invite": {"display_name": display_name, "signed": signed},
     });
     crate::routes::membership::fill_in_profile(state, &mxid, &mut extra).await;
-    match handle
-        .membership(
-            sender.clone(),
-            Action::Invite,
-            mxid.clone(),
-            extra,
-            now_ms(),
-        )
-        .await
-    {
-        Ok(_) => {
+    let remote = mxid.server_name() != &*state.identity.server_name;
+    let invited = match (&state.remote_join, remote) {
+        // The invitee's server learns of it through `/invite`, as for any invite of one of its
+        // users; it is not in the room, so the room's own distribution would never reach it.
+        (Some(hook), true) => {
+            crate::routes::membership::invite_remote(
+                hook.as_ref(),
+                &handle,
+                sender.clone(),
+                mxid.clone(),
+                extra,
+            )
+            .await
+        }
+        _ => handle
+            .membership(
+                sender.clone(),
+                Action::Invite,
+                mxid.clone(),
+                extra,
+                now_ms(),
+            )
+            .await
+            .map(|_| ()),
+    };
+    match invited {
+        Ok(()) => {
             count("exchanged");
             tracing::info!(%room_id, invitee = %mxid, inviter = %sender, "a bound third-party invitation became an invite");
             Ok(mxid)
@@ -396,7 +420,11 @@ pub async fn on_bind<B: KvBackend + 'static>(
             ));
             continue;
         };
-        match exchange(state, &room_id, signed).await {
+        let inviter = invite
+            .get("sender")
+            .and_then(Value::as_str)
+            .and_then(|u| UserId::parse(u).ok());
+        match exchange_here_or_there(state, &room_id, inviter.as_deref(), signed).await {
             Ok(_) => exchanged += 1,
             Err(error) => {
                 tracing::info!(%room_id, %error, "could not turn a bound third-party invitation into an invite");
@@ -408,6 +436,106 @@ pub async fn on_bind<B: KvBackend + 'static>(
         Some(error) => Err(error),
         None => Ok(exchanged),
     }
+}
+
+/// [`exchange`] when a user of this server is in `room_id`; otherwise, the invitation handed to
+/// the server of `inviter` (who made it, and so is in the room) to exchange there (see the
+/// module docs' "Over federation").
+///
+/// # Errors
+/// [`exchange`]'s; [`RoomError::RoomNotFound`] for a room this server is not in when there is
+/// no inviter of another server to hand it to; whatever handing it over fails with.
+async fn exchange_here_or_there<B: KvBackend + 'static>(
+    state: &RoomState<B>,
+    room_id: &RoomId,
+    inviter: Option<&UserId>,
+    signed: &Value,
+) -> Result<OwnedUserId, RoomError> {
+    let here = match state.rooms.get_or_load(room_id).await {
+        Ok(handle) => handle.query(|actor| actor.local_user_joined()).await,
+        Err(RoomError::RoomNotFound(_)) => false,
+        Err(error) => return Err(error),
+    };
+    let inviter_is_local = inviter.is_none_or(|u| u.server_name() == &*state.identity.server_name);
+    // An invite is its sender's event, signed by their server: this server makes it only for an
+    // invitation one of its own users made, and hands the rest to the inviter's server even
+    // when a user of this one is in the room too (Sytest's "... with users from both servers").
+    if here && inviter_is_local {
+        return exchange(state, room_id, signed).await;
+    }
+    let (Some(inviter), Some(hook)) = (inviter, state.remote_join.as_ref()) else {
+        return Err(RoomError::RoomNotFound(room_id.to_string()));
+    };
+    if inviter_is_local {
+        return Err(RoomError::RoomNotFound(room_id.to_string()));
+    }
+    let mxid = UserId::parse(field(signed, "mxid")?)
+        .map_err(|e| RoomError::BadRequest(format!("signed.mxid: {e}")))?;
+    let event = json!({
+        "type": "m.room.member",
+        "room_id": room_id,
+        "sender": inviter,
+        "state_key": mxid,
+        "content": {
+            "membership": "invite",
+            "third_party_invite": {"signed": signed},
+        },
+    });
+    let destination = inviter.server_name().to_string();
+    match hook
+        .exchange_third_party_invite(&destination, room_id, event)
+        .await
+    {
+        Ok(()) => {
+            count("forwarded");
+            tracing::info!(%room_id, invitee = %mxid, inviter = %inviter, destination, "handed a bound third-party invitation to the room's server");
+            Ok(mxid)
+        }
+        Err(error) => {
+            count("refused");
+            Err(error)
+        }
+    }
+}
+
+/// `PUT /_matrix/federation/v1/exchange_third_party_invite/{roomId}`'s work: another server --
+/// the invitee's, which is not in the room -- hands over a bound third-party invitation
+/// (`event`: an `m.room.member` invite carrying `third_party_invite.signed`), and this server,
+/// which is in `room_id`, makes the invite ([`exchange`]: the room's stored keys checked with
+/// their identity server, the invite sent by whoever made the invitation) and sends it to the
+/// invitee's server. `origin` is the authenticated sending server, for the log.
+///
+/// # Errors
+/// [`RoomError::BadRequest`] for a body that is not such an invite of `room_id`, whose
+/// `state_key` is not `signed.mxid`; [`exchange`]'s otherwise.
+pub async fn on_exchange<B: KvBackend + 'static>(
+    state: &RoomState<B>,
+    origin: &str,
+    room_id: &RoomId,
+    event: &Value,
+) -> Result<OwnedUserId, RoomError> {
+    let bad = |what: &str| RoomError::BadRequest(format!("exchange_third_party_invite: {what}"));
+    if event.get("type").and_then(Value::as_str) != Some("m.room.member") {
+        return Err(bad("the event is not an m.room.member"));
+    }
+    if event.get("room_id").and_then(Value::as_str) != Some(room_id.as_str()) {
+        return Err(bad("the event is of another room"));
+    }
+    let content = event.get("content").cloned().unwrap_or(Value::Null);
+    if content.get("membership").and_then(Value::as_str) != Some("invite") {
+        return Err(bad("the event is not an invite"));
+    }
+    let Some(signed) = content
+        .get("third_party_invite")
+        .and_then(|t| t.get("signed"))
+    else {
+        return Err(bad("the invite carries no third_party_invite.signed"));
+    };
+    if event.get("state_key").and_then(Value::as_str) != Some(field(signed, "mxid")?) {
+        return Err(bad("the invite's state_key is not the signed mxid"));
+    }
+    tracing::info!(%room_id, origin, "another server handed over a bound third-party invitation");
+    exchange(state, room_id, signed).await
 }
 
 fn now_ms() -> i64 {

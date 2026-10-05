@@ -20,9 +20,24 @@ use hs_model::signing::SigningKeyPair;
 /// section 3: 50 MiB), enforced independent of any `Content-Length` the peer claims.
 pub const MAX_RESPONSE_BODY_BYTES: usize = 50 * 1024 * 1024;
 
-/// Per-destination outbound concurrency (threat model section 3 / Synapse's own default: 1
-/// in-flight request per destination).
-pub const DEFAULT_PER_DESTINATION_CONCURRENCY: usize = 1;
+/// Per-destination outbound concurrency: how many requests to one server may be in flight at
+/// once (threat model section 3 bounds it; it does not need to be one).
+///
+/// It was 1 until 2026-10-04, on the belief that Synapse allows one request per destination.
+/// Synapse allows one *transaction* per destination (its sender's own rule, which
+/// `crate::sender` keeps by itself); its other requests are not limited per destination. With one
+/// slot, two servers deadlocked whenever each was sending the other a transaction while the
+/// other's `/send` handler made a request back -- a device-list resync (`GET /user/devices`), a
+/// `/get_missing_events` -- that queued behind its own outbound transaction: each `/send` waited
+/// for the other's, until the 30 s request timeout broke the cycle. Sytest's "Message history can
+/// be paginated over federation" and "Remote room alias queries can handle Unicode" timed out in
+/// that window. With several slots, a request made while a transaction is in flight goes out at
+/// once.
+pub const DEFAULT_PER_DESTINATION_CONCURRENCY: usize = 8;
+
+/// A wait for a per-destination slot longer than this is logged: the destination's requests are
+/// queueing behind each other.
+const SLOW_PERMIT_WAIT: Duration = Duration::from_secs(1);
 
 /// Parsed CIDR allow/deny policy for outbound connection targets, built once from
 /// `hs-config::FederationConfig`'s string lists (this crate does not depend on `hs-config`'s
@@ -444,11 +459,22 @@ impl FederationClient {
             });
         }
 
+        let waited_from = std::time::Instant::now();
         let permit = self
             .semaphore_for(destination)
             .acquire_owned()
             .await
             .expect("semaphore is never closed");
+        let waited = waited_from.elapsed();
+        if waited >= SLOW_PERMIT_WAIT {
+            tracing::info!(
+                destination,
+                path,
+                waited_ms = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+                limit = self.config.per_destination_concurrency,
+                "a federation request waited for a free slot to its destination"
+            );
+        }
 
         let result = self.send_inner(destination, method, path, body).await;
         drop(permit);
@@ -1249,6 +1275,59 @@ mod tests {
         );
         assert_eq!(r1.unwrap().status, 200);
         assert_eq!(r2.unwrap().status, 200);
+    }
+
+    #[tokio::test]
+    async fn a_request_is_not_held_up_behind_a_slow_one_to_the_same_destination() {
+        // The deadlock of 2026-10-04: a transaction to a server whose `/send` handler is waiting
+        // on a request back to us must not keep our other requests to it waiting too. A peer
+        // whose `/send` never answers, and one `/version` behind it.
+        use axum::routing::{get, put};
+        let app = axum::Router::new()
+            .route(
+                "/_matrix/federation/v1/send/{txn}",
+                put(|| async {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    "{}"
+                }),
+            )
+            .route(
+                "/_matrix/federation/v1/version",
+                get(|| async { axum::Json(serde_json::json!({"server": {"name": "peer"}})) }),
+            );
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = Arc::new(client_for_port(
+            port,
+            ClientConfig {
+                scheme: "http",
+                ..ClientConfig::default()
+            },
+        ));
+        let dest = format!("localhost:{port}");
+        let (slow_client, slow_dest) = (client.clone(), dest.clone());
+        let slow = tokio::spawn(async move {
+            slow_client
+                .send(
+                    &slow_dest,
+                    "PUT",
+                    "/_matrix/federation/v1/send/1",
+                    Some(&serde_json::json!({"pdus": []})),
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let quick = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.send(&dest, "GET", "/_matrix/federation/v1/version", None),
+        )
+        .await
+        .expect("the second request waited behind the first");
+        assert_eq!(quick.unwrap().status, 200);
+        slow.abort();
     }
 
     #[tokio::test]

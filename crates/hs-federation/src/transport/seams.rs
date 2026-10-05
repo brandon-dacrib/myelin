@@ -34,14 +34,11 @@ pub(super) fn add_routes(builder: Builder<FederationState>) -> Builder<Federatio
     let mut builder = builder;
     // `/send`, the join, leave and knock handshakes and `/invite` are real now -- see
     // `crate::transport::{send, join, membership}`.
-    builder = seam!(
-        builder,
-        Method::PUT,
-        "/exchange_third_party_invite/{roomId}",
-        "federationExchangeThirdPartyInvite"
-    );
-    // `/3pid/onbind` is real, and not here: an identity server calls it unauthenticated, so it is
-    // mounted outside this router's `X-Matrix` layer (`hs-cli`'s `identity_service::on_bind`).
+    // `/exchange_third_party_invite/{roomId}` is real, and not here: it is `hs-room`'s work
+    // (`hs_room::third_party_invite::on_exchange`), mounted by `hs-cli` behind the same
+    // `X-Matrix` layer (`crate::transport::behind_x_matrix`). `/3pid/onbind` is real too: an
+    // identity server calls it unauthenticated, so it is mounted outside this router's
+    // `X-Matrix` layer (`hs-cli`'s `identity_service::on_bind`).
     builder = seam!(
         builder,
         Method::GET,
@@ -165,5 +162,6 @@ mod tests {
         assert!(!paths.contains(&"/make_knock/{roomId}/{userId}"));
         assert!(!paths.contains(&"/send_knock/{roomId}/{eventId}"));
         assert!(!paths.contains(&"/invite/{roomId}/{eventId}"));
+        assert!(!paths.contains(&"/exchange_third_party_invite/{roomId}"));
     }
 }

@@ -409,6 +409,26 @@ impl<B: KvBackend + 'static> hs_room::remote_join::RemoteJoin for FederationRemo
             .and_then(|key| UserId::parse(key).ok())
             .map(|user| user.server_name().to_string())
             .ok_or_else(|| RoomError::BadRequest("the invite is not about a user".to_owned()))?;
+        // MSC4311: the room's stripped state goes as whole events, which the invitee's server
+        // can verify; the stripped form the caller built is kept for a room this server does
+        // not hold, which cannot happen for an invite made here.
+        let inviter = event.header().sender.to_string();
+        let room_id = event
+            .json()
+            .get("room_id")
+            .and_then(hs_model::canonical::CanonicalJsonValue::as_str)
+            .and_then(|r| RoomId::parse(r).ok());
+        let handle = match room_id {
+            Some(room_id) => self.rooms.get_or_load(&room_id).await,
+            None => Err(RoomError::BadRequest("the invite names no room".to_owned())),
+        };
+        let invite_room_state = match handle {
+            Ok(handle) => handle
+                .query(move |actor| actor.stripped_state_pdus(&[inviter.as_str()]))
+                .await
+                .unwrap_or(invite_room_state),
+            Err(_) => invite_room_state,
+        };
         hs_federation::outbound_membership::send_invite(
             &self.client,
             &self.key_cache,
@@ -479,6 +499,41 @@ impl<B: KvBackend + 'static> hs_room::remote_join::RemoteJoin for FederationRemo
             })
             .unwrap_or_default();
         Ok((room_id.to_owned(), servers))
+    }
+
+    async fn exchange_third_party_invite(
+        &self,
+        destination: &str,
+        room_id: &RoomId,
+        event: Value,
+    ) -> Result<(), RoomError> {
+        let path = format!(
+            "/_matrix/federation/v1/exchange_third_party_invite/{}",
+            hs_federation::client::encode_path_segment(room_id.as_str())
+        );
+        let response = self
+            .client
+            .send(destination, "PUT", &path, Some(&event))
+            .await
+            .map_err(|e| {
+                RoomError::RemoteJoinFailed(format!(
+                    "could not hand the third-party invitation for {room_id} to {destination}: {e}"
+                ))
+            })?;
+        match response.status {
+            200..=299 => {
+                tracing::info!(%room_id, destination, "handed a bound third-party invitation to the inviter's server");
+                Ok(())
+            }
+            403 => Err(RoomError::Forbidden(format!(
+                "{destination} refused the third-party invitation: {}",
+                response.body
+            ))),
+            status => Err(RoomError::RemoteJoinFailed(format!(
+                "{destination} answered the third-party invitation for {room_id} with HTTP {status}: {}",
+                response.body
+            ))),
+        }
     }
 
     async fn public_rooms(

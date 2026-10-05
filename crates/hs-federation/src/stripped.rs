@@ -66,6 +66,28 @@ pub fn stripped_state<'a>(
         .collect()
 }
 
+/// [`stripped_state`]'s events of `state`, whole: what a resident answers `send_knock` with as
+/// `knock_room_state` (MSC4311: full PDUs, which the knocking server can verify).
+#[must_use]
+pub fn stripped_state_events<'a>(
+    state: impl IntoIterator<Item = &'a Value>,
+    members: &[&str],
+) -> Vec<Value> {
+    state
+        .into_iter()
+        .filter(|event| {
+            let event_type = event.get("type").and_then(Value::as_str).unwrap_or("");
+            STRIPPED_STATE_TYPES.contains(&event_type)
+                || (event_type == "m.room.member"
+                    && event
+                        .get("state_key")
+                        .and_then(Value::as_str)
+                        .is_some_and(|key| members.contains(&key)))
+        })
+        .cloned()
+        .collect()
+}
+
 /// Keeps only the entries of a stripped-state list received from another server that are
 /// shaped like stripped state events (an object with a string `type`, a string `state_key` and
 /// an object `content`), reduced to the four allowed properties. What a remote server hands over

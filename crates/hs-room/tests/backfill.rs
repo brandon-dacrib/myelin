@@ -246,16 +246,17 @@ fn history_before_the_join_is_placed_below_it_in_the_residents_order() {
     let batch = resident_backfill(&resident, &resident.join, 100);
     assert_eq!(
         batch.len(),
-        12,
-        "the resident's whole timeline: six creation events, five of alice's, the join"
+        11,
+        "the resident's whole timeline: five creation events (a public room has no \
+         m.room.guest_access), five of alice's, the join"
     );
     let added = joiner
         .actor
         .accept_backfilled_events(batch.clone())
         .expect("the batch is stored");
-    // Everything but the join, which was already in the timeline: five new events and the six
+    // Everything but the join, which was already in the timeline: five new events and the five
     // creation events the snapshot already held as outliers, now placed.
-    assert_eq!(added, 11);
+    assert_eq!(added, 10);
 
     // --- the timeline is now the resident's, in the resident's order, and it begins at the
     // create event ---
@@ -285,7 +286,7 @@ fn history_before_the_join_is_placed_below_it_in_the_residents_order() {
         .iter()
         .find(|e| e.header().event_type == "m.room.create")
         .expect("the snapshot has the create event");
-    assert_eq!(joiner.actor.timeline_position(create.event_id()), Some(-11));
+    assert_eq!(joiner.actor.timeline_position(create.event_id()), Some(-10));
 
     // --- a placed outlier is still an outlier ---
     let held_create = joiner
@@ -401,7 +402,7 @@ fn history_before_the_join_is_placed_below_it_in_the_residents_order() {
             .flags
             .is_outlier()
     );
-    assert_eq!(reloaded.timeline_position(create.event_id()), Some(-11));
+    assert_eq!(reloaded.timeline_position(create.event_id()), Some(-10));
 }
 
 #[test]
@@ -440,7 +441,7 @@ fn a_second_batch_continues_from_where_the_first_stopped() {
             .actor
             .accept_backfilled_events(second)
             .expect("second batch"),
-        8
+        7
     );
     assert!(!joiner.actor.history_before_oldest());
     assert_eq!(

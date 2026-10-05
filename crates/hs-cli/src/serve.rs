@@ -276,6 +276,18 @@ fn build_router<B: KvBackend>(
         )
         .build();
     let onbind_router = onbind_router.with_state(mounts.room.clone());
+    // Another server handing over a bound third-party invitation for a room of this server's
+    // (`crate::identity_service::on_exchange`): federation, so behind the `X-Matrix` layer
+    // below; `hs-room`'s work, so mounted here rather than in `hs-federation`'s router.
+    let (exchange_router, exchange_manifest) = Builder::<RoomState<B>>::new()
+        .put(
+            "/{roomId}",
+            crate::identity_service::on_exchange::<B>,
+            RouteMeta::new(Surface::MatrixFederation, AuthKind::Matrix)
+                .with_operation_id("federationExchangeThirdPartyInvite"),
+        )
+        .build();
+    let exchange_router = exchange_router.with_state(mounts.room.clone());
     let room_router = room_router.with_state(mounts.room);
     let room_routes = room_manifest.routes;
 
@@ -420,6 +432,8 @@ fn build_router<B: KvBackend>(
             media_federation_router.with_state(mounts.media.clone()),
             x_matrix.clone(),
         );
+        let exchange_router =
+            hs_federation::transport::behind_x_matrix(exchange_router, x_matrix.clone());
         // The key server (`/_matrix/key/v2/server`, its deprecated `/server/{keyId}` spelling and
         // the notary `/query`) is deliberately *outside* the `X-Matrix` layer: it must answer an
         // unsigned request, since it is what a remote server fetches in order to be able to
@@ -446,6 +460,11 @@ fn build_router<B: KvBackend>(
                 "/_matrix/federation/v1/media",
                 media_federation_router,
                 media_federation_manifest.routes,
+            )
+            .merge_router(
+                "/_matrix/federation/v1/exchange_third_party_invite",
+                exchange_router,
+                exchange_manifest.routes,
             );
     }
     // Mounted with federation off too: a third-party invite in a room of this server's own

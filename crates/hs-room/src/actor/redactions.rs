@@ -108,6 +108,32 @@ impl<B: KvBackend> RoomActor<B> {
         }
     }
 
+    /// The room `event` -- a redaction received from another server -- names its target in, when
+    /// that is a room other than this one: such a redaction is withheld from clients, as Synapse
+    /// withholds one ("Withholding redaction ... of event ... from a different room"), rather
+    /// than shown in this room's timeline as if it redacted something here (Sytest's "An event
+    /// which redacts an event in a different room should be ignored"). It never redacts the
+    /// other room's event: this room's actor only ever applies a redaction to its own events.
+    /// `None` for every other event, and for a redaction whose target is this room's or not
+    /// held anywhere yet (that one waits for it, `apply_waiting_redactions`).
+    ///
+    /// # Errors
+    /// [`RoomError::Store`] or [`RoomError::Internal`] reading the event store.
+    pub(super) fn cross_room_redaction(&self, event: &Event) -> Result<Option<String>, RoomError> {
+        if event.header().event_type != "m.room.redaction" {
+            return Ok(None);
+        }
+        let Some(target) = extract_redacts(event) else {
+            return Ok(None);
+        };
+        if self.event_id_index.contains_key(&target) {
+            return Ok(None);
+        }
+        Ok(self
+            .held_in_another_room(std::slice::from_ref(&target))?
+            .map(|(_, room)| room))
+    }
+
     /// Whether a redaction by `sender` of `target` (held) may take effect: the sender is on the
     /// original sender's server (the spec's rule from room version 3, under which the auth rules
     /// admit any member's redaction and leave this check to whoever applies it), or

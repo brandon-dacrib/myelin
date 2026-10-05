@@ -11,6 +11,9 @@
 //! signed and queues it for the servers that should receive it. Events whose sender is a remote
 //! user are never re-sent: each server distributes its own events, and a resident server that
 //! accepted a remote join forwards that one event itself (`hs_federation::join::send_join`).
+//! Nor is a local user's membership another server made the handshake for
+//! (`RoomActor::is_proactively_sent`): the join this server's `send_join` made, a leave or knock
+//! a resident took. The server that has it sends it on, as Synapse's `proactively_send = False`.
 //!
 //! # Who receives an event
 //!
@@ -249,6 +252,11 @@ pub async fn forward_update<B: KvBackend + 'static>(
             let event = actor
                 .event_by_id(&event_id)
                 .ok_or_else(|| RoomError::EventNotFound(event_id.to_string()))?;
+            // A join `send_join` made, or a leave or knock a resident took: the server that has
+            // it sends it on (`RoomActor::is_proactively_sent`).
+            if !actor.is_proactively_sent(&event_id) {
+                return Ok((Value::Null, Vec::new()));
+            }
             let destinations = remote_servers_for(actor, event, &own)?;
             let pdu = serde_json::from_slice(event.canonical_bytes())
                 .map_err(|e| RoomError::Internal(format!("stored event is not JSON: {e}")))?;
