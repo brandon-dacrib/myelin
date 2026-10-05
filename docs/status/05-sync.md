@@ -5,6 +5,19 @@ Session 13: `/joined_rooms` read-your-writes. Session 12: RFC 0018, a non-owner'
 catches up instead of reloading. Session 11, session 10, session 9, session 8, session 7 and
 the integration note follow; sessions 1-6 are preserved unchanged further down.)
 
+
+## 2026-10-05 (the coordinator): a ban no longer fails the banned member's whole `/sync`
+
+Found by the wave-2 measurement (Complement `TestUnbanViaInvite`, PASS on `c2d74174`, FAIL on
+`731d2433`): `build_state_section` read a room's state through `full_state_for_reader`, the
+`/state` reader, which since `federation-gaps` (`bde7a789`) refuses a banned member with `403`
+as Synapse does for `/state`, and `?` carried that refusal out of the whole `/sync`. `/sync` now
+reads through `RoomActor::full_state_for_sync`, which gives a banned member the state as of
+their ban, as a departed member gets it as of their leave; the room is in `rooms.leave` with the
+ban in its timeline. `/state` still answers `403`. Pinned by
+`sync_scenario::a_banned_members_sync_lists_the_room_as_left_with_the_ban` (fails without the
+fix) and the `hs-room` unit test `a_banned_member_may_not_read_the_rooms_state_but_one_who_left_may`.
+
 ## Session 16 (2026-10-04, branch `agent/sync-gaps`): Sytest's `/sync` leftovers, room peeking, presence on federated joins
 
 Graded by the wave-1 Sytest run (`target/sytest/20261004-wave1/`, main `c2d74174`) and the

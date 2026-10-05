@@ -445,7 +445,7 @@ fn build_state_section(
     // the state as of their leaving. The live state told them who had joined since, what the
     // room had been renamed to, and anything else that changed after they were gone.
     Ok(actor
-        .full_state_for_reader(self_user)?
+        .full_state_for_sync(self_user)?
         .unwrap_or_default()
         .into_iter()
         .filter(|e| !timeline_event_ids.contains(e.event_id().as_str()))

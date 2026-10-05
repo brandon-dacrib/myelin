@@ -34,6 +34,15 @@ pub mod catch_up;
 mod fetched_state;
 pub mod gaps;
 mod history;
+/// What [`RoomActor`]'s reader view gives a requester who is banned from the room.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BannedReader {
+    /// `403`, as Synapse answers a client's state read.
+    Refuse,
+    /// The state as of their ban, as a departed member's is as of their leave (`/sync`).
+    AsOfBan,
+}
+
 #[cfg(test)]
 mod new_room_ids;
 pub mod redactions;
@@ -4699,6 +4708,18 @@ impl<B: KvBackend> RoomActor<B> {
         &self,
         requester: &UserId,
     ) -> Result<Option<RoomStateView<'_, ProductionStateStore<B>>>, RoomError> {
+        self.reader_view_with(requester, BannedReader::Refuse)
+    }
+
+    /// [`RoomActor::reader_view`], saying what a banned reader gets: refused (`403`, a client's
+    /// `/state` read, as Synapse answers) or the state as of their ban, as a departed member gets
+    /// it (`/sync`, which shows a banned user the room among the rooms they left, ban included,
+    /// and must never fail as a whole because of one room).
+    fn reader_view_with(
+        &self,
+        requester: &UserId,
+        banned: BannedReader,
+    ) -> Result<Option<RoomStateView<'_, ProductionStateStore<B>>>, RoomError> {
         let current = self.current_view()?;
         let membership_event = current
             .event_for("m.room.member", requester.as_str())
@@ -4724,7 +4745,7 @@ impl<B: KvBackend> RoomActor<B> {
         // `check_user_in_room_or_world_readable` lets only a joined or a departed (`leave`)
         // member through: Sytest's "Remote banned user is kicked and may not rejoin until
         // unbanned" waits for the banned user's own read of their membership to be `403`.
-        if membership == PriorState::Ban {
+        if membership == PriorState::Ban && banned == BannedReader::Refuse {
             return Err(RoomError::Forbidden(format!(
                 "{requester} is banned from {}",
                 self.room_id
@@ -4750,6 +4771,23 @@ impl<B: KvBackend> RoomActor<B> {
         requester: &UserId,
     ) -> Result<Option<Vec<&Event>>, RoomError> {
         let Some(view) = self.reader_view(requester)? else {
+            return Ok(None);
+        };
+        self.state_at_root(view.root).map(Some)
+    }
+
+    /// [`RoomActor::full_state_for_reader`] for `/sync`: a banned `requester` gets the state as of
+    /// their ban, as one who left gets it as of their leave, instead of [`RoomError::Forbidden`].
+    /// `/sync` lists the room among the ones they left (with the ban in it), and one room's
+    /// refusal must not fail the whole response (Complement's `TestUnbanViaInvite`).
+    ///
+    /// # Errors
+    /// Returns [`RoomError::State`] if the state store fails.
+    pub fn full_state_for_sync(
+        &self,
+        requester: &UserId,
+    ) -> Result<Option<Vec<&Event>>, RoomError> {
+        let Some(view) = self.reader_view_with(requester, BannedReader::AsOfBan)? else {
             return Ok(None);
         };
         self.state_at_root(view.root).map(Some)
@@ -6998,6 +7036,20 @@ mod tests {
             .unwrap()
             .expect("a member who left reads the state as of their leave");
         assert_eq!(content_str(carols, "membership"), Some("leave"));
+        // `/sync` is not refused: it gets the state as of the ban, the ban included, as a
+        // departed member gets it as of their leave (Complement's `TestUnbanViaInvite`).
+        let for_sync = actor
+            .full_state_for_sync(&bob)
+            .expect("a ban does not fail /sync")
+            .expect("a banned member's /sync sees the room as of the ban");
+        let bobs = for_sync
+            .iter()
+            .find(|e| {
+                e.header().event_type == "m.room.member"
+                    && e.header().state_key.as_deref() == Some(bob.as_str())
+            })
+            .expect("the ban is in the state /sync reads");
+        assert_eq!(content_str(bobs, "membership"), Some("ban"));
     }
 
     /// Room version 12 (MSC4289, MSC4291): a trusted private chat's invitees are additional

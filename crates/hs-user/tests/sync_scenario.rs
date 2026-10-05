@@ -825,3 +825,72 @@ async fn a_sync_poll_sets_the_callers_presence_and_the_other_member_sees_it() {
     assert_eq!(alice_presence["type"], "m.presence");
     assert_eq!(alice_presence["content"]["presence"], "unavailable");
 }
+
+/// A ban never fails the banned member's `/sync`: the room is among the rooms they left, the ban
+/// in its timeline, as Synapse sends it. Before, the sync read the room's state through the
+/// `/state` reader, which refuses a banned member (`403`), and the whole response was that `403`
+/// (Complement's `TestUnbanViaInvite`, 2026-10-05).
+#[tokio::test]
+async fn a_banned_members_sync_lists_the_room_as_left_with_the_ban() {
+    let (mut s, rooms, hub) = setup();
+    s.register("alice", "alice", "hunter2-alice")
+        .await
+        .assert_ok();
+    s.register("bob", "bob", "hunter2-bob").await.assert_ok();
+
+    let create = s
+        .send(
+            Some("alice"),
+            Method::POST,
+            "/createRoom",
+            Some(json!({"preset": "public_chat"})),
+        )
+        .await;
+    create.assert_ok();
+    let room_id = create.str_field("room_id").to_owned();
+    let handle = rooms
+        .get_or_load(&ruma::RoomId::parse(&room_id).unwrap())
+        .await
+        .unwrap();
+    hub.watch_room(handle).await;
+    s.send(Some("bob"), Method::POST, &format!("/join/{room_id}"), None)
+        .await
+        .assert_ok();
+    settle().await;
+
+    let before = s.sync("bob").await;
+    before.assert_ok();
+    let since = before.str_field("next_batch").to_owned();
+
+    s.send(
+        Some("alice"),
+        Method::POST,
+        &format!("/rooms/{room_id}/ban"),
+        Some(json!({"user_id": "@bob:sync-e2e.test", "reason": "testing"})),
+    )
+    .await
+    .assert_ok();
+    settle().await;
+
+    let after = s
+        .send(
+            Some("bob"),
+            Method::GET,
+            &format!("/sync?since={since}&timeout=0"),
+            None,
+        )
+        .await;
+    after.assert_ok();
+    let left = &after.json["rooms"]["leave"][&room_id];
+    assert!(
+        left["timeline"]["events"]
+            .as_array()
+            .is_some_and(|events| events.iter().any(|e| e["type"] == "m.room.member"
+                && e["state_key"] == "@bob:sync-e2e.test"
+                && e["content"]["membership"] == "ban")),
+        "the ban is in the left room's timeline: {}",
+        after.json
+    );
+    let initial = s.sync("bob").await;
+    initial.assert_ok();
+}
