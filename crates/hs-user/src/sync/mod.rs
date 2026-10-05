@@ -999,7 +999,7 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
         let newly_joined = !is_initial && fresh_room && membership.membership == "join";
         let current_state_counts = membership.membership == "join";
         let federation = params.filter.federation_format();
-        let (timeline, mut state_events, summary) = handle
+        let (mut timeline, mut state_events, summary) = handle
             .query(move |actor| {
                 let scope = TimelineScope {
                     limit: timeline_limit,
@@ -1108,6 +1108,8 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
                 Ok::<_, hs_room::RoomError>((timeline, state, summary))
             })
             .await?;
+
+        timeline::apply_erasure(hub.account_store(), &mut timeline).await;
 
         if !remembered.is_empty() {
             state_events.retain(|event| {

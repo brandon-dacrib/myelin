@@ -29,6 +29,7 @@ use hs_kv::KvBackend;
 use hs_model::Event;
 use hs_model::canonical::CanonicalJsonValue;
 use hs_room::actor::RoomActor;
+use hs_room::routes::client_events::attach_membership;
 use hs_room::routes::render::{attach_replaced_state, client_event_json};
 use hs_room::timeline::{Direction, PaginationToken};
 use ruma::UserId;
@@ -50,6 +51,10 @@ pub(crate) struct Timeline {
     pub(crate) limited: bool,
     /// Where `GET /messages` continues backwards from: just before the first event.
     pub(crate) prev_batch: Option<String>,
+    /// The events that are shown pruned if their sender's account was erased: `(event_id,
+    /// sender, pruned content)`, for a sender of this server and a reader who was not joined
+    /// when the event was sent ([`apply_erasure`]).
+    pub(crate) erasable: Vec<(String, ruma::OwnedUserId, Value)>,
 }
 
 impl Timeline {
@@ -58,6 +63,7 @@ impl Timeline {
             events: Vec::new(),
             limited: false,
             prev_batch: None,
+            erasable: Vec::new(),
         }
     }
 }
@@ -224,15 +230,91 @@ fn render(
         .events
         .last()
         .map(|(pos, _)| PaginationToken::new(*pos, Direction::Backward).to_string());
+    let mut erasable = Vec::new();
+    let events = collected
+        .events
+        .into_iter()
+        .rev()
+        .map(|(_, event)| {
+            // MSC4115: the reader's own membership at the event (Complement's
+            // `TestMembershipOnEvents`), as `/messages` and `/context` give it.
+            let membership = actor.membership_at_event(event, requester).ok();
+            let sender = &event.header().sender;
+            if sender.server_name() == requester.server_name()
+                && membership.as_deref() != Some("join")
+                && !event.header().flags.is_redacted()
+                && let Some(pruned) = pruned_content(event)
+            {
+                erasable.push((event.event_id().to_string(), sender.clone(), pruned));
+            }
+            attach_membership(
+                rendered_with_replaced_state(actor, event, requester),
+                membership.as_deref(),
+            )
+        })
+        .collect();
     Timeline {
-        events: collected
-            .events
-            .into_iter()
-            .rev()
-            .map(|(_, event)| rendered_with_replaced_state(actor, event, requester))
-            .collect(),
+        events,
         limited: collected.more,
         prev_batch,
+        erasable,
+    }
+}
+
+/// The content `event` has once redacted, as JSON.
+fn pruned_content(event: &Event) -> Option<Value> {
+    let redacted = event.redacted_json().ok()?;
+    let content = redacted
+        .get("content")
+        .and_then(CanonicalJsonValue::as_object)
+        .cloned()
+        .unwrap_or_default();
+    Some(hs_room::routes::render::canonical_to_json(&content))
+}
+
+/// Shows an erased sender's events pruned (`hs_room::routes::client_events::finish`'s rule):
+/// each of `timeline.erasable` whose sender's account `accounts` says was erased has its
+/// content replaced by the pruned one. Sytest's "Only original members of the room can see
+/// messages from erased users". The account store is asked once per sender; a sender it cannot
+/// answer for is taken as not erased. No store, nothing pruned.
+pub(crate) async fn apply_erasure(
+    accounts: Option<&std::sync::Arc<dyn hs_auth::store::AuthStore>>,
+    timeline: &mut Timeline,
+) {
+    let Some(accounts) = accounts else {
+        return;
+    };
+    if timeline.erasable.is_empty() {
+        return;
+    }
+    let mut erased: std::collections::HashMap<ruma::OwnedUserId, bool> =
+        std::collections::HashMap::new();
+    for (event_id, sender, pruned) in std::mem::take(&mut timeline.erasable) {
+        let is_erased = match erased.get(&sender) {
+            Some(known) => *known,
+            None => {
+                let known = match accounts.get_user(&sender).await {
+                    Ok(record) => record.is_some_and(|r| r.erased),
+                    Err(error) => {
+                        tracing::warn!(%sender, %error, "could not tell whether a sender was erased; showing their events");
+                        false
+                    }
+                };
+                erased.insert(sender.clone(), known);
+                known
+            }
+        };
+        if !is_erased {
+            continue;
+        }
+        if let Some(event) = timeline
+            .events
+            .iter_mut()
+            .find(|e| e.get("event_id").and_then(Value::as_str) == Some(event_id.as_str()))
+            && let Some(object) = event.as_object_mut()
+        {
+            object.insert("content".to_owned(), pruned);
+        }
     }
 }
 

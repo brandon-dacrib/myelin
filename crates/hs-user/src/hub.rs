@@ -361,6 +361,9 @@ pub struct SessionHub<B: KvBackend, R: RoomSource<B>> {
     /// `unread_notifications`/`unread_thread_notifications` as the hard-zero placeholder it
     /// always has, rather than failing.
     counts: OnceLock<Arc<dyn CountsStore>>,
+    /// The account store, if installed ([`SessionHub::install_account_store`]): whom `/sync`
+    /// asks whether a sender's account was erased. `None` until installed -- nothing is pruned.
+    accounts: OnceLock<Arc<dyn hs_auth::store::AuthStore>>,
     /// How many rooms a user-directory search has had to read whole, because the directory
     /// index had nothing for them yet ([`SessionHub::directory_rooms_walked`]).
     directory_walks: std::sync::atomic::AtomicU64,
@@ -421,6 +424,7 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
             receipts,
             push_rules: OnceLock::new(),
             counts: OnceLock::new(),
+            accounts: OnceLock::new(),
             directory_walks: std::sync::atomic::AtomicU64::new(0),
             feed_retention: std::sync::atomic::AtomicU64::new(DEFAULT_FEED_RETENTION_ENTRIES),
             hot_stream_retention: std::sync::atomic::AtomicU64::new(
@@ -506,6 +510,22 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         if self.counts.set(store).is_err() {
             tracing::warn!("a counts store was already installed on this hub; ignoring");
         }
+    }
+
+    /// Installs the account store `/sync` asks whether a sender was erased (an erased local
+    /// user's events are shown pruned to whoever was not in the room when they were sent, as
+    /// the room's own read paths show them: `hs_room::routes::client_events::finish`). Same
+    /// idempotent-install convention as [`SessionHub::install_counts_store`].
+    pub fn install_account_store(&self, store: Arc<dyn hs_auth::store::AuthStore>) {
+        if self.accounts.set(store).is_err() {
+            tracing::warn!("an account store was already installed on this hub; ignoring");
+        }
+    }
+
+    /// The installed account store, if any -- see [`SessionHub::install_account_store`].
+    #[must_use]
+    pub fn account_store(&self) -> Option<&Arc<dyn hs_auth::store::AuthStore>> {
+        self.accounts.get()
     }
 
     /// The installed counts store, if any -- see [`SessionHub::install_counts_store`].

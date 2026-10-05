@@ -755,6 +755,8 @@ fn build_session_mounts<B: KvBackend>(
     // previous behaviour rather than a panic.
     user.hub.install_push_rules_store(push.rulesets.clone());
     user.hub.install_counts_store(push.counts.clone());
+    // Whether a sender was erased, for `/sync` to prune their events as the room reads do.
+    user.hub.install_account_store(user.auth.store.clone());
     user.hub.install_read_receipt_sink(Arc::new(pipeline));
     // A password change that ends the other sessions ends their pushers too.
     auth.install_session_revocation_observer(Arc::new(

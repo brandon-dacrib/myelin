@@ -93,6 +93,19 @@ Verified:
   on the peeking device only, joining moves it to `join`); `legacy_events`, `federation_edus`,
   `invites_and_notices`, `federation_two_servers` still pass.
 
+**On top of `room-client-gaps`' room helpers** (`7ca60aa6`): every timeline event carries the reader's membership at
+it in `unsigned.membership` (MSC4115, `RoomActor::membership_at_event`; Complement's
+`TestMembershipOnEvents` passes), and an erased local sender's events are shown pruned to a
+reader who was not joined when they were sent (`timeline::apply_erasure`, the rule of
+`hs_room::routes::client_events::finish`; Sytest's "Only original members of the room can see
+messages from erased users" passes). The account store reaches the hub through the new
+`SessionHub::install_account_store`, installed in `hs-cli`'s `serve.rs` next to the counts
+store. Peeked rooms are not pruned yet. With it, `30rooms/32erasure.pl` and the sync files run
+alone: 50 of 51 (only the gapped lazy-loading test Synapse blacklists). Complement
+`TestGetRoomMembersAtPoint` still fails: a fresh timeline's `prev_batch` is at the room's first
+event, and `/members?at=` finds no event before it and answers the current members (bob too):
+the room side of `at`.
+
 Left (not this crate's):
 - "A next_batch token can be used in the v1 messages API": the page is right, but `/messages`
   leaves `end` out of a forward page that reaches the live end (`hs-room`'s

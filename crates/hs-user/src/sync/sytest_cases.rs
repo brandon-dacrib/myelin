@@ -648,3 +648,83 @@ async fn the_joiner_is_in_their_own_device_lists_changed() {
         "{response}"
     );
 }
+
+/// Complement's `TestMembershipOnEvents` (MSC4115): each timeline event carries the reader's
+/// membership at it in `unsigned.membership`.
+#[tokio::test]
+async fn timeline_events_carry_the_readers_membership_at_them() {
+    let hub = hub();
+    let (alice, bob) = (
+        user_id!("@alice:sync.test").to_owned(),
+        user_id!("@bob:sync.test").to_owned(),
+    );
+    let (handle, room_id) = create(&hub, &alice).await;
+    say(&handle, &alice, "before bob").await;
+    member(&handle, &bob, Action::Join, &bob).await;
+    say(&handle, &alice, "with bob").await;
+    let (response, _) = sync(&hub, &bob, None, json!({})).await;
+    let timeline = events(&room(&response, "join", &room_id)["timeline"]);
+    let membership_of = |body: &str| {
+        timeline
+            .iter()
+            .find(|e| e["content"]["body"] == body)
+            .map(|e| e["unsigned"]["membership"].clone())
+    };
+    assert_eq!(
+        membership_of("before bob"),
+        Some(json!("leave")),
+        "{response}"
+    );
+    assert_eq!(membership_of("with bob"), Some(json!("join")), "{response}");
+}
+
+/// Sytest's "Only original members of the room can see messages from erased users": an erased
+/// local sender's message is pruned for somebody who joined after it, and kept for somebody who
+/// was there.
+#[tokio::test]
+async fn an_erased_senders_messages_are_pruned_for_later_members_only() {
+    let hub = hub();
+    let accounts: Arc<dyn hs_auth::store::AuthStore> =
+        Arc::new(hs_auth::store::memory::InMemoryAuthStore::new());
+    hub.install_account_store(accounts.clone());
+    let (alice, bob, carol) = (
+        user_id!("@alice:sync.test").to_owned(),
+        user_id!("@bob:sync.test").to_owned(),
+        user_id!("@carol:sync.test").to_owned(),
+    );
+    let (handle, room_id) = create(&hub, &alice).await;
+    member(&handle, &bob, Action::Join, &bob).await;
+    say(&handle, &alice, "said before carol").await;
+    member(&handle, &carol, Action::Join, &carol).await;
+    let mut record = hs_auth::store::UserRecord::new(alice.clone(), 0);
+    record.erased = true;
+    accounts.create_user(record).await.unwrap();
+
+    let body_seen_by = |response: &Value| -> Option<Value> {
+        events(&room(response, "join", &room_id)["timeline"])
+            .iter()
+            .find(|e| e["type"] == "m.room.message")
+            .map(|e| e["content"].clone())
+    };
+    let (response, _) = sync(&hub, &carol, None, json!({})).await;
+    assert_eq!(body_seen_by(&response), Some(json!({})), "{response}");
+    let (response, _) = sync(&hub, &bob, None, json!({})).await;
+    assert_eq!(
+        body_seen_by(&response).map(|c| c["body"].clone()),
+        Some(json!("said before carol")),
+        "{response}"
+    );
+}
+
+/// Complement's `TestGetRoomMembersAtPoint`: a fresh timeline that reaches the room's first
+/// event still hands out a `prev_batch`, at that event.
+#[tokio::test]
+async fn a_timeline_reaching_the_first_event_still_has_a_prev_batch() {
+    let hub = hub();
+    let alice = user_id!("@alice:sync.test").to_owned();
+    let (_handle, room_id) = create(&hub, &alice).await;
+    let (response, _) = sync(&hub, &alice, None, json!({})).await;
+    let timeline = &room(&response, "join", &room_id)["timeline"];
+    assert_eq!(events(timeline)[0]["type"], "m.room.create", "{response}");
+    assert!(timeline["prev_batch"].is_string(), "{response}");
+}
