@@ -81,6 +81,36 @@ baseline (the coordinator's next measurement); the "unknown" group drift in
 `are-we-synapse-yet.py`'s name list (session 8); bridge conformance and the performance table
 still commit no result file for the dashboard to read.
 
+## Session 10 (2026-10-05, the coordinator): wave 2, measured
+
+`main` at `731d2433` (all eight wave-2 branches), image `myelin-sytest:dev` rebuilt from it, run
+`target/sytest/20261005-wave2`, quiet machine: **Sytest 742 / 772** (13 failed, 17 skipped),
+**98.3%** of tests run, from 663 (session 9). Client-server **514 / 534**, federation **101 / 105**,
+application services **22 / 22**, non-spec 102 / 107. Files:
+`docs/status/sytest/2026-10-05-wave2-{results,summary,are-we-synapse-yet}.txt`.
+
+**Complement**, same tree, `tests/complement/apply_patches.sh` applied (the NoCreators wait):
+federation (run 12) **300 / 317 assertions, 82 / 90 top-level** (from 241 / 314, 58 / 90): 25
+FAIL -> PASS, among them all four NoCreators tests, every version-12 MSC test but one, the
+thumbnail and media tests, `TestInboundCanReturnMissingEvents` and
+`TestJoinFederatedRoomFromApplicationServiceBridgeUser`; **one PASS -> FAIL, `TestUnbanViaInvite`**.
+csapi (run 17) **377 / 386, 102 / 106** (from 345 / 386, 87 / 106): 15 FAIL -> PASS, none back.
+
+**The regression, found and fixed the same evening** (`agent/sync-ban`, status 05): after a ban,
+the banned member's whole `/sync` answered `403`. `federation-gaps` made the `/state` reader
+refuse a banned member, as Synapse does, and `/sync` read room state through that reader and
+passed the refusal out. Sytest's "Banned rooms appear in the leave section of sync" and both
+"Newly banned rooms appear in the leave section of incremental sync" are the same bug.
+
+**Other Sytest PASS -> FAIL since session 9**, to grade after that fix: "Sync can be polled for
+updates" and "Sync is woken up for leaves" (`31sync/08polling.pl`, "Expected an event timeline"),
+"Banned servers cannot /invite" (server ACLs), "outliers whose auth_events are in a different
+room are correctly rejected", "Guest users are kicked from guest_access rooms on revocation of
+guest_access over federation" (flaky on main before, per `auth-gaps`). Still failing from before:
+the two `/messages` tests in `10apidoc` (fixed on `room-client-gaps`' branch, failing on the merged
+tree), the third 3PID-invite-over-federation test, "The only membership state included in a
+gapped incremental sync ...", "If a device list update goes missing ..." (a race in the test).
+
 ## Session 9 (2026-10-04 afternoon, the coordinator): the wave of 2026-10-04, measured
 
 `main` at `c2d74174` (ten branches of the wave plus the thumbnail fix), image `myelin-sytest:dev`

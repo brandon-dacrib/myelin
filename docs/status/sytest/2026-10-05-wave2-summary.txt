@@ -1,0 +1,27 @@
+process exits during the run (the last few are the shutdown):
+1008:WARN: haproxy-0 process failed - code=2
+1009:WARN: haproxy-1 process failed - code=2
+
+tests: 772
+pass: 742
+fail: 13
+expected fail (Sytest's own marking): 0
+skip: 17
+pass rate (of tests run, skips excluded): 98.3%
+
+most common failure reasons (first line of the message, normalised):
+     3  Timed out waiting for test at run-tests.pl line N.
+     2  Expected a 'end' key at tests/10apidoc/34room-messages.pl line N.
+     2  Expected an event timeline at tests/31sync/08polling.pl line N.
+     1  HTTP Request failed ( 403 Forbidden https://localhost:PORT/_matrix/client/v3/sync?filter=CqRwNUpiNOkoiFjk&access_token=TOKEN ) from GET https://localhost:PORT/_matrix/client/v3/sync?...
+     1  HTTP Request failed ( 403 Forbidden https://localhost:PORT/_matrix/client/v3/sync?filter=HTNiorNmxmTEkzJy&access_token=TOKEN&since=TOKEN ) from GET https://localhost:PORT/_matrix/client/v3/sync?...
+     1  HTTP Request failed ( 403 Forbidden https://localhost:PORT/_matrix/client/v3/sync?access_token=TOKEN&filter=AdGeRNLUFYNhNMsP&since=TOKEN ) from GET https://localhost:PORT/_matrix/client/v3/sync?...
+     1  Expected only N membership events (got N) at tests/10apidoc/09synced.pl line N.
+     1  Unexpected response from /send: {
+     1  HTTP Request failed ( 400 Bad Request https://localhost:PORT/_matrix/federation/v2/invite/!ROOM/$EVENT ) from PUT https://localhost:PORT/_matrix/federation/v2/invite/!ROOM/$EVENT?...
+
+skip reasons:
+    13  lack of can_change_power_levels
+     2  lack of can_get_messages
+     1  lack of can_upload_media
+     1  failing fixture: server does not support org.matrix.msc2625.mark_unread action at tests/61push/03_unread_count.pl line 27.
