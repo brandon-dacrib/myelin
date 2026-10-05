@@ -479,14 +479,31 @@ async fn messages_accepts_a_token_minted_by_sync_in_both_directions() {
     );
 
     // A token minted by `/messages` itself (this endpoint's own `end`) must still work exactly as
-    // before -- the "don't break what worked" half of this session's brief. Taken from a page of
-    // one, which cannot have reached the start of the room: a page that does carries no `end`
-    // at all (the spec's "no further events"), and the page above, with the default limit over
-    // a room this small, is exactly that page.
+    // before -- the "don't break what worked" half of this session's brief. Decision 0031: a page
+    // with events always carries an `end`, even the one that reached the room's first event, and
+    // only the empty page after it has none (the spec's "no further events"). The page above,
+    // with the default limit over a room this small, reached the start, so following its `end`
+    // gives that empty page.
+    let past_start = backward.json["end"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a page with events carries an `end`: {}", backward.json))
+        .to_owned();
+    let after_last = s
+        .send(
+            Some("alice"),
+            Method::GET,
+            &format!("/rooms/{room_id}/messages?dir=b&from={past_start}"),
+            None,
+        )
+        .await;
+    after_last.assert_ok();
     assert!(
-        backward.json.get("end").is_none(),
-        "a page that reached the room's first event must not offer a continuation: {}",
-        backward.json
+        after_last.json["chunk"]
+            .as_array()
+            .is_some_and(|c| c.is_empty())
+            && after_last.json.get("end").is_none(),
+        "the page after the room's first event is empty and offers no continuation: {}",
+        after_last.json
     );
     let one = s
         .send(

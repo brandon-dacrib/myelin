@@ -2921,6 +2921,10 @@ export interface components {
             mode?: string;
             /** @description How many replicas are registered and heartbeating, whatever their status (joining, active, draining or drained; a replica that has stopped heartbeating is not counted). A drained replica is counted, because it is still serving by forwarding. Without the replica registry, the number of replicas owning a shard. 1 for a single node. */
             replica_count?: number;
+            /** @description Events the answering replica's room-event search index holds, as of its last write to it (`hs_room_search_index_documents`). Set for a single node too. Absent until the indexer has read the count once since the replica started. */
+            search_index_documents?: number;
+            /** @description Rooms the answering replica owns whose newest events are not yet searchable there, which its search indexer's catch-up still has to read (`hs_room_search_rooms_behind`). The indexer runs on every replica over the rooms that replica owns, so this is the answering replica's number. 0 when search is up to date; a number that stays high means the indexer is stuck, and its log lines start with "search index". Set for a single node too. Absent until the indexer has counted once since the replica started. */
+            search_rooms_behind?: number;
             shard_count?: number;
         };
         ConfigChange: {

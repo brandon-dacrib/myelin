@@ -273,6 +273,9 @@ export function clusterSummary(): ClusterStatus {
     heartbeat_seq: me ? heartbeatSeq(me, Date.now()) : undefined,
     // The mock hands shards off one at a time; it never releases them at once.
     drain_released_at_once_count: 0,
+    // The answering replica's search indexer, caught up.
+    search_rooms_behind: 0,
+    search_index_documents: 18204,
   };
 }
 

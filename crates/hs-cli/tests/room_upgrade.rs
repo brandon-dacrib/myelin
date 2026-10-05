@@ -503,3 +503,88 @@ async fn an_upgrade_carries_bans_the_directory_entry_and_federation_closure() {
         "the upgrade's log line counts the ban and the directory move: {line}"
     );
 }
+
+/// Sytest's "/upgrade preserves direct room state": the upgrader's own `m.direct` names the
+/// replacement once the upgrade is done. The replacement's create burst reached no stream, so
+/// the session hub never saw the upgrader join it and never carried the account data over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_upgraded_direct_chat_is_still_a_direct_chat_for_the_upgrader() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = reserve_port();
+    let config = dir.path().join("hs.yaml");
+    std::fs::write(&config, config_yaml(port, &dir.path().join("data"))).unwrap();
+    let client = Client {
+        http: reqwest::Client::new(),
+        base: format!("http://127.0.0.1:{port}"),
+    };
+    let mut hs = HsProcess::serve(&config);
+    hs.wait_for("listening");
+
+    let alice = client.register("alice").await;
+    let user_id = format!("@alice:{SERVER}");
+    let old = client
+        .call(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/createRoom",
+            &alice,
+            json!({}),
+        )
+        .await["room_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    client
+        .call(
+            reqwest::Method::PUT,
+            &format!(
+                "/_matrix/client/v3/user/{}/account_data/m.direct",
+                segment(&user_id)
+            ),
+            &alice,
+            json!({ user_id.clone(): [old.clone()] }),
+        )
+        .await;
+    let new = client
+        .call(
+            reqwest::Method::POST,
+            &format!("/_matrix/client/v3/rooms/{}/upgrade", segment(&old)),
+            &alice,
+            json!({"new_version": "11"}),
+        )
+        .await["replacement_room"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // What Sytest does: wait for the new room in /sync, then read the account data once.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let sync = client
+            .get("/_matrix/client/v3/sync?timeout=0", &alice)
+            .await;
+        if sync["rooms"]["join"].get(new.as_str()).is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the replacement never reached /sync"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let direct = client
+        .get(
+            &format!(
+                "/_matrix/client/v3/user/{}/account_data/m.direct",
+                segment(&user_id)
+            ),
+            &alice,
+        )
+        .await;
+    let rooms: Vec<&str> = direct[user_id.as_str()]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(rooms.contains(&new.as_str()), "{direct}");
+    assert!(rooms.contains(&old.as_str()), "{direct}");
+}

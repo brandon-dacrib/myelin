@@ -1746,16 +1746,30 @@ async fn the_overview_counts_real_accounts_rooms_and_an_empty_media_repository()
     let second = overview(client.clone(), base.clone(), admin_token.clone()).await;
     assert_eq!(second, first);
 
-    let cluster: serde_json::Value = client
-        .get(format!("{base}/api/v1/cluster"))
-        .bearer_auth(&admin_token)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(cluster, json!({"mode": "single-node", "replica_count": 1}));
+    // A single node indexes its rooms for search too, so `GET /cluster` carries the search
+    // index's lag once the indexer, started at boot, has counted. The numbers are process-wide
+    // and other servers in this test binary share them, so only their presence is asserted.
+    let mut cluster = serde_json::Value::Null;
+    for _ in 0..120 {
+        cluster = client
+            .get(format!("{base}/api/v1/cluster"))
+            .bearer_auth(&admin_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if cluster["search_rooms_behind"].is_u64() && cluster["search_index_documents"].is_u64() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    assert_eq!(cluster["mode"], "single-node", "{cluster}");
+    assert_eq!(cluster["replica_count"], 1, "{cluster}");
+    assert!(cluster["search_rooms_behind"].is_u64(), "{cluster}");
+    assert!(cluster["search_index_documents"].is_u64(), "{cluster}");
+    assert!(cluster.get("heartbeat_seq").is_none(), "{cluster}");
 
     // Not for just anybody: an ordinary account's token is not an administrator's.
     let response = client

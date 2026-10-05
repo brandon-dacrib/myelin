@@ -405,6 +405,15 @@ pub fn server_has_member<B: KvBackend>(actor: &RoomActor<B>, server: &str) -> bo
     })
 }
 
+/// Whether somebody who has not said who they are may see the room: the part of
+/// [`local_access`] that depends on the room alone (an open join rule, world-readable history,
+/// or a restricted room, which nobody unnamed can be shown to). For the room summary, which the
+/// spec lets anyone ask for.
+#[must_use]
+pub fn anonymous_access<B: KvBackend>(actor: &RoomActor<B>) -> Access {
+    state_access(actor)
+}
+
 /// The part of the answer that depends on the room alone.
 fn state_access<B: KvBackend>(actor: &RoomActor<B>) -> Access {
     let join_rule = content_str(actor, "m.room.join_rules", "join_rule");

@@ -9566,6 +9566,8 @@ mod tests {
                 shard_count: None,
                 heartbeat_seq: None,
                 drain_released_at_once_count: None,
+                search_rooms_behind: None,
+                search_index_documents: None,
             },
         }));
         let (router, _manifest) = build_router(state);
@@ -9579,6 +9581,33 @@ mod tests {
         let (status, body) = get_json(&router, "/api/v1/cluster", Some("admin-token")).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, json!({"mode": "single-node", "replica_count": 1}));
+    }
+
+    #[tokio::test]
+    async fn cluster_get_carries_the_search_index_lag_and_a_caught_up_zero() {
+        use crate::model::{ClusterStatus, StatisticsOverview};
+        use crate::sources::StaticOverviewSource;
+
+        let state = test_state().with_overview(Arc::new(StaticOverviewSource {
+            statistics: StatisticsOverview::default(),
+            cluster: ClusterStatus {
+                mode: "single-node".into(),
+                epoch: None,
+                replica_count: Some(1),
+                shard_count: None,
+                heartbeat_seq: None,
+                drain_released_at_once_count: None,
+                search_rooms_behind: Some(0),
+                search_index_documents: Some(42),
+            },
+        }));
+        let (router, _manifest) = build_router(state);
+
+        let (status, body) = get_json(&router, "/api/v1/cluster", Some("admin-token")).await;
+        assert_eq!(status, StatusCode::OK);
+        // Caught up is a real 0, not a missing number.
+        assert_eq!(body["search_rooms_behind"], json!(0));
+        assert_eq!(body["search_index_documents"], json!(42));
     }
 
     #[tokio::test]

@@ -288,6 +288,16 @@ pub struct ClusterStatus {
     /// absent for a single node.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drain_released_at_once_count: Option<u64>,
+    /// Rooms the answering replica owns whose newest events its room-event search index does
+    /// not hold yet: what the indexer's catch-up still has to read (`hs_room_search_rooms_behind`).
+    /// 0 when search is up to date. Absent until the indexer has counted once since the replica
+    /// started. Set for a single node too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_rooms_behind: Option<u64>,
+    /// Events the answering replica's search index holds, as of its last write to it
+    /// (`hs_room_search_index_documents`). Absent until the indexer has read the count once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_index_documents: Option<u64>,
 }
 
 /// The OpenAPI `SetupStatus` schema: the body of `GET /setup`.

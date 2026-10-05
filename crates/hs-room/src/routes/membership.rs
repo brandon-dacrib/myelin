@@ -1187,6 +1187,8 @@ mod tests {
             State(state.clone()),
             Path(room_id.to_string()),
             axum::extract::Query(crate::routes::query::MessagesQuery {
+                filter: None,
+                to: None,
                 from: None,
                 dir: None,
                 limit: Some(1),

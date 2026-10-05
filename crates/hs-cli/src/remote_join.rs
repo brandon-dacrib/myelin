@@ -19,7 +19,7 @@ use hs_kv::KvBackend;
 use hs_room::RoomError;
 use hs_room::identity::HomeserverIdentity;
 use hs_room::registry::RoomRegistry;
-use ruma::{OwnedRoomId, RoomAliasId, RoomId, UserId};
+use ruma::{OwnedEventId, OwnedRoomId, RoomAliasId, RoomId, UserId};
 use serde_json::Value;
 
 /// The `hs serve` implementation of [`hs_room::remote_join::RemoteJoin`]. See the module docs.
@@ -567,6 +567,57 @@ impl<B: KvBackend + 'static> hs_room::remote_join::RemoteJoin for FederationRemo
         }
         tracing::debug!(server, "fetched another server's public room list");
         Ok(response.body)
+    }
+
+    async fn timestamp_to_event(
+        &self,
+        server: &str,
+        room_id: &RoomId,
+        ts: i64,
+        direction: hs_room::timeline::Direction,
+    ) -> Result<Option<(OwnedEventId, i64)>, RoomError> {
+        let dir = match direction {
+            hs_room::timeline::Direction::Forward => "f",
+            hs_room::timeline::Direction::Backward => "b",
+        };
+        let path = format!(
+            "/_matrix/federation/v1/timestamp_to_event/{}?ts={ts}&dir={dir}",
+            query_encode(room_id.as_str())
+        );
+        let response = self
+            .client
+            .send(server, "GET", &path, None)
+            .await
+            .map_err(|e| {
+                RoomError::RemoteJoinFailed(format!(
+                    "could not ask {server} for an event by time: {e}"
+                ))
+            })?;
+        if response.status == 404 {
+            return Ok(None);
+        }
+        if response.status / 100 != 2 {
+            return Err(RoomError::RemoteJoinFailed(format!(
+                "{server} answered timestamp_to_event with HTTP {}: {}",
+                response.status, response.body
+            )));
+        }
+        let event_id = response
+            .body
+            .get("event_id")
+            .and_then(Value::as_str)
+            .and_then(|id| ruma::EventId::parse(id).ok());
+        let at = response
+            .body
+            .get("origin_server_ts")
+            .and_then(Value::as_i64);
+        match (event_id, at) {
+            (Some(event_id), Some(at)) => Ok(Some((event_id, at))),
+            _ => Err(RoomError::RemoteJoinFailed(format!(
+                "{server} answered timestamp_to_event with something else: {}",
+                response.body
+            ))),
+        }
     }
 }
 

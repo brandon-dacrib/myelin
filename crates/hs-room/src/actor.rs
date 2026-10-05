@@ -4640,7 +4640,20 @@ impl<B: KvBackend> RoomActor<B> {
     /// whose whole create burst was published before any registry held it, and for a room
     /// loaded from disk, which a consumer of the stream may never have heard of.
     pub(crate) fn join_global_stream(&mut self, global: Arc<crate::registry::GlobalStream>) {
-        if let Some(head) = self.head_update() {
+        self.join_global_stream_announcing(global, Vec::new());
+    }
+
+    /// [`RoomActor::join_global_stream`], with `membership_deltas` on the head update it
+    /// announces: for a room just created, whose create burst was persisted before the actor
+    /// had a stream to publish to, so that a consumer still learns who joined
+    /// (`crate::registry::RoomRegistry::create_room`).
+    pub(crate) fn join_global_stream_announcing(
+        &mut self,
+        global: Arc<crate::registry::GlobalStream>,
+        membership_deltas: Vec<crate::protocol::MembershipDelta>,
+    ) {
+        if let Some(mut head) = self.head_update() {
+            head.membership_deltas = membership_deltas;
             global.publish(head);
         }
         self.global = Some(global);
@@ -5113,6 +5126,46 @@ impl<B: KvBackend> RoomActor<B> {
             .map_err(|e| RoomError::State(e.to_string()))?
             .and_then(|e| content_str(e, "membership"))
             == Some("join"))
+    }
+
+    /// `user`'s `m.room.member` event in the room's state as of immediately after `event`, if
+    /// they have one there. An outlier, which has no state of its own, is answered from the
+    /// room's current state. What a lazy-loading `/messages` or `/context` sends for each sender
+    /// of its page (`crate::routes::client_events`).
+    ///
+    /// # Errors
+    /// Returns [`RoomError::EventNotFound`] if this actor does not hold `event`, or
+    /// [`RoomError::State`] if the state store fails.
+    pub fn member_event_at(
+        &self,
+        event: &Event,
+        user: &UserId,
+    ) -> Result<Option<&Event>, RoomError> {
+        if event.header().flags.is_outlier() {
+            return self.state_event("m.room.member", user.as_str());
+        }
+        let sn = *self
+            .event_id_index
+            .get(event.event_id())
+            .ok_or_else(|| RoomError::EventNotFound(event.event_id().to_string()))?;
+        self.state_view_at_sn(sn)?
+            .event_for("m.room.member", user.as_str())
+            .map_err(|e| RoomError::State(e.to_string()))
+    }
+
+    /// `user`'s membership in this room as of immediately after `event` (MSC4115's
+    /// `unsigned.membership`): the `membership` of [`RoomActor::member_event_at`], `"leave"`
+    /// when they have none there. Their own join reads `"join"`, the message before it
+    /// `"leave"` -- what Complement's `TestMembershipOnEvents` checks a client is told.
+    ///
+    /// # Errors
+    /// See [`RoomActor::member_event_at`].
+    pub fn membership_at_event(&self, event: &Event, user: &UserId) -> Result<String, RoomError> {
+        Ok(self
+            .member_event_at(event, user)?
+            .and_then(|e| content_str(e, "membership"))
+            .unwrap_or("leave")
+            .to_owned())
     }
 
     /// Up to `limit` events after room-local position `after`, oldest first, each with its own

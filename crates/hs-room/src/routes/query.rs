@@ -145,7 +145,8 @@ pub async fn get_event<B: KvBackend + 'static>(
     let room_id = parse_room_id(&room_id)?;
     let event_id = parse_event_id(&event_id)?;
     let handle = state.rooms.get_or_load(&room_id).await?;
-    let found: Result<serde_json::Value, RoomError> = handle
+    let local_server = state.identity.server_name.clone();
+    let viewed = handle
         .query(move |actor| {
             let event = actor
                 .event_by_id(&event_id)
@@ -157,28 +158,32 @@ pub async fn get_event<B: KvBackend + 'static>(
             if !actor.event_visible_to(event, &requester.user_id)? {
                 return Err(RoomError::EventNotFound("event not found".into()));
             }
-            let bundle = actor.relation_bundle(event.event_id(), &requester.user_id);
-            let txn_id = actor.transaction_id_for(
-                event.event_id(),
-                &requester.user_id,
-                requester.device_id.as_deref(),
-            );
-            Ok(attach_replaced_state(
-                crate::routes::render::attach_transaction_id(
-                    crate::routes::render::client_event_json_bundled(event, &bundle),
-                    txn_id,
-                ),
-                actor.replaced_state_for(event, &requester.user_id).as_ref(),
+            Ok::<_, RoomError>(crate::routes::client_events::view_event(
+                actor,
+                event,
+                &requester,
+                &local_server,
             ))
         })
-        .await;
-    found.map(|v| Json(v).into_response())
+        .await?;
+    let mut shown = crate::routes::client_events::finish(&state, vec![viewed]).await;
+    Ok(Json(shown.pop().unwrap_or(serde_json::Value::Null)).into_response())
 }
 
 /// `GET /rooms/{roomId}/context/{eventId}`.
 ///
 /// `event`, `events_before` and `events_after` each carry `unsigned.m.relations` if they have
-/// children (`crate::relations::bundle`).
+/// children (`crate::relations::bundle`) and the reader's membership at them in
+/// `unsigned.membership` (MSC4115); an erased sender's events are pruned for a reader who was not
+/// there ([`crate::routes::client_events::finish`]).
+///
+/// A reader who may not read the room at all (never a member of a room that is not
+/// `world_readable`) is refused with `403`, as Synapse refuses them -- Sytest's "/context/ on non
+/// world readable room does not work"; one who may read the room but not that event gets `404`,
+/// the same as for an event that does not exist. `filter` is a `RoomEventFilter`: its content
+/// conditions apply to `events_before` and `events_after`, and with `lazy_load_members` the
+/// `state` is only the member events of the senders of the events returned (Sytest's
+/// "/context/ with lazy_load_members filter works"), not the room's whole state.
 pub async fn get_context<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
     Path((room_id, event_id)): Path<(String, String)>,
@@ -191,11 +196,21 @@ pub async fn get_context<B: KvBackend + 'static>(
         .get("limit")
         .and_then(|s| s.parse().ok())
         .unwrap_or(10);
+    let filter = crate::routes::client_events::RoomEventFilter::from_param(
+        params.get("filter").map(String::as_str),
+    )?;
     let handle = state.rooms.get_or_load(&room_id).await?;
+    let local_server = state.identity.server_name.clone();
 
-    let result = handle
-        .query(move |actor| {
-            let target = actor.event_by_id(&event_id)?;
+    let (target, before, after, state_json, (start, end)) = handle
+        .query(move |actor| -> Result<_, RoomError> {
+            if !actor.can_read_room(&requester.user_id)? {
+                return Err(RoomError::Forbidden(
+                    "you aren't a member of the room".into(),
+                ));
+            }
+            let not_found = || RoomError::EventNotFound("event not found".into());
+            let target = actor.event_by_id(&event_id).ok_or_else(not_found)?;
             // Same "not found, not forbidden" shape as `get_event`: a target the requester may
             // not see per `m.room.history_visibility` is reported identically to one that does
             // not exist at all.
@@ -203,29 +218,17 @@ pub async fn get_context<B: KvBackend + 'static>(
                 .event_visible_to(target, &requester.user_id)
                 .unwrap_or(false)
             {
-                return None;
+                return Err(not_found());
             }
-            let visible = |e: &&&hs_model::Event| {
-                actor
-                    .event_visible_to(e, &requester.user_id)
-                    .unwrap_or(false)
+            let shown = |e: &&&hs_model::Event| {
+                filter.matches(e)
+                    && actor
+                        .event_visible_to(e, &requester.user_id)
+                        .unwrap_or(false)
             };
-            let render = |e: &hs_model::Event| {
-                let bundle = actor.relation_bundle(e.event_id(), &requester.user_id);
-                let txn_id = actor.transaction_id_for(
-                    e.event_id(),
-                    &requester.user_id,
-                    requester.device_id.as_deref(),
-                );
-                attach_replaced_state(
-                    crate::routes::render::attach_transaction_id(
-                        crate::routes::render::client_event_json_bundled(e, &bundle),
-                        txn_id,
-                    ),
-                    actor.replaced_state_for(e, &requester.user_id).as_ref(),
-                )
+            let view = |e: &hs_model::Event| {
+                crate::routes::client_events::view_event(actor, e, &requester, &local_server)
             };
-            let target_json = render(target);
             // Find the target's position in the timeline via a full scan. Acceptable for Phase
             // 0's in-memory timeline (no store round trip either way, and the whole room's
             // history is already resident -- see `RoomActor`'s doc comment on its `events`
@@ -234,27 +237,25 @@ pub async fn get_context<B: KvBackend + 'static>(
             // `all` is newest-first (descending `room_pos`): index `pos - 1` is the event
             // immediately *newer* than the target, index `pos + 1` immediately *older*.
             let (all, _) = actor.paginate(None, Direction::Backward, usize::MAX);
-            let pos = all.iter().position(|e| e.event_id() == target.event_id())?;
+            let pos = all
+                .iter()
+                .position(|e| e.event_id() == target.event_id())
+                .ok_or_else(not_found)?;
             // "events_before" (older than target) in reverse-chronological order (nearest to the
             // target first): that is exactly ascending-index order over `all[pos+1..end]`, since
             // `all` is already newest-first.
             let end = (pos + 1 + limit).min(all.len());
-            let events_before: Vec<_> = all[pos + 1..end]
-                .iter()
-                .filter(visible)
-                .copied()
-                .map(render)
-                .collect();
+            let before: Vec<&hs_model::Event> =
+                all[pos + 1..end].iter().filter(shown).copied().collect();
             // "events_after" (newer than target) in chronological order (nearest to the target
             // first, i.e. oldest of the "after" set first): `all[start..pos]` is newest-first, so
             // reverse it.
             let start = pos.saturating_sub(limit);
-            let events_after: Vec<_> = all[start..pos]
+            let after: Vec<&hs_model::Event> = all[start..pos]
                 .iter()
                 .rev()
-                .filter(visible)
+                .filter(shown)
                 .copied()
-                .map(render)
                 .collect();
             // Pinned to the target event, not this room's *live* current state -- the same bug
             // class already fixed for `/messages`/`/event`/`/state`/`/members` (reading a live
@@ -265,39 +266,82 @@ pub async fn get_context<B: KvBackend + 'static>(
             // list of state events relevant to displaying `id`"). `RoomActor::state_at_event`
             // already exists for exactly this ("the room's state as of immediately after the
             // queried event").
-            let state_json = actor
-                .state_at_event(target.event_id())
-                .ok()??
-                .state
-                .iter()
-                .map(|e| {
-                    attach_replaced_state(
-                        client_event_json(e),
-                        actor.replaced_state_for(e, &requester.user_id).as_ref(),
-                    )
-                })
-                .collect::<Vec<_>>();
-            Some(json!({
-                "event": target_json,
-                "events_before": events_before,
-                "events_after": events_after,
-                "state": state_json,
-                "start": "",
-                "end": "",
-            }))
+            let state_json = if filter.lazy_loads_members() {
+                let senders: Vec<&ruma::UserId> = std::iter::once(target)
+                    .chain(before.iter().copied())
+                    .chain(after.iter().copied())
+                    .map(|e| e.header().sender.as_ref())
+                    .collect();
+                crate::routes::client_events::lazy_member_state(
+                    actor,
+                    target,
+                    &senders,
+                    &requester.user_id,
+                )
+            } else {
+                actor
+                    .state_at_event(target.event_id())?
+                    .map(|snapshot| {
+                        snapshot
+                            .state
+                            .iter()
+                            .map(|e| {
+                                attach_replaced_state(
+                                    client_event_json(e),
+                                    actor.replaced_state_for(e, &requester.user_id).as_ref(),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .ok_or_else(not_found)?
+            };
+            // `start` is the boundary before the oldest event returned, `end` the one after the
+            // newest (the target itself when either side is empty): a backward `/messages` from
+            // `start` continues with what is older, a forward one from `end` with what is
+            // newer, and a backward one from `end` begins with the target or what follows it.
+            let position = |e: &hs_model::Event| actor.timeline_position(e.event_id());
+            let start = before
+                .last()
+                .copied()
+                .and_then(position)
+                .or_else(|| position(target))
+                .map(|p| PaginationToken::new(p, Direction::Backward).to_string());
+            let end = after
+                .last()
+                .copied()
+                .and_then(position)
+                .or_else(|| position(target))
+                .map(|p| PaginationToken::new(p, Direction::Forward).to_string());
+            Ok((
+                view(target),
+                before.into_iter().map(view).collect::<Vec<_>>(),
+                after.into_iter().map(view).collect::<Vec<_>>(),
+                state_json,
+                (start, end),
+            ))
         })
-        .await;
-
-    result
-        .map(|v| Json(v).into_response())
-        .ok_or_else(|| RoomError::EventNotFound("event not found".into()))
+        .await?;
+    let mut target = crate::routes::client_events::finish(&state, vec![target]).await;
+    let events_before = crate::routes::client_events::finish(&state, before).await;
+    let events_after = crate::routes::client_events::finish(&state, after).await;
+    Ok(Json(json!({
+        "event": target.pop().unwrap_or(serde_json::Value::Null),
+        "events_before": events_before,
+        "events_after": events_after,
+        "state": state_json,
+        "start": start.unwrap_or_default(),
+        "end": end.unwrap_or_default(),
+    }))
+    .into_response())
 }
 
-/// Query parameters for `GET /rooms/{roomId}/members`. `at` is accepted and not honoured: the
-/// member list is always the current one (or, for a departed member, the one as of their
-/// leaving -- see [`get_members`]).
+/// Query parameters for `GET /rooms/{roomId}/members`.
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct MembersQuery {
+    /// A pagination token (a sync's `prev_batch` or `next_batch`, or a `/messages` token): the
+    /// members as of the newest event before it, rather than now.
+    #[serde(default)]
+    pub at: Option<String>,
     /// Only members whose `membership` is this.
     #[serde(default)]
     pub membership: Option<String>,
@@ -314,12 +358,44 @@ pub async fn get_members<B: KvBackend + 'static>(
     RoomRequester(requester): RoomRequester,
 ) -> Result<Response, RoomError> {
     let room_id = parse_room_id(&room_id)?;
+    let at = resolve_token(
+        &state,
+        &requester.user_id,
+        &room_id,
+        filter.at.as_deref(),
+        Direction::Backward,
+    )
+    .await?;
     let handle = state.rooms.get_or_load(&room_id).await?;
     // `members_for_reader`, not `members`: a departed member must not see a member who joined
     // after they left (`room_leave_test.go`'s `TestLeftRoomFixture`).
     let chunk = handle
         .query(move |actor| {
             actor.members_for_reader(&requester.user_id).map(|found| {
+                // `at`: the members in the state after the newest event before the token
+                // (Complement's `TestGetRoomMembersAtPoint`, Synapse's reading), when the reader
+                // may see that event; otherwise what they may see now.
+                let found = found.map(|now| {
+                    at.and_then(|at| {
+                        let (newest, _) = actor.paginate(Some(at), Direction::Backward, 1);
+                        let point = newest.first().copied()?;
+                        if !actor
+                            .event_visible_to(point, &requester.user_id)
+                            .unwrap_or(false)
+                        {
+                            return None;
+                        }
+                        let snapshot = actor.state_at_event(point.event_id()).ok()??;
+                        let members: Vec<&hs_model::Event> = snapshot
+                            .state
+                            .iter()
+                            .filter(|e| e.header().event_type == "m.room.member")
+                            .filter_map(|e| actor.event_by_id(e.event_id()))
+                            .collect();
+                        Some(members)
+                    })
+                    .unwrap_or(now)
+                });
                 found
                     .unwrap_or_default()
                     .into_iter()
@@ -403,27 +479,125 @@ pub async fn get_joined_members<B: KvBackend + 'static>(
 }
 
 /// Query parameters for `GET /rooms/{roomId}/messages`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct MessagesQuery {
-    /// The pagination token to start from. Absent means "the live end of the timeline".
+    /// The pagination token to start from. Absent, or empty (Synapse's reading of `from=`, which
+    /// a client sends when a sync gave it no `prev_batch`), means "the live end of the timeline"
+    /// backwards and "the room's start" forwards.
     pub from: Option<String>,
+    /// The token to stop at: nothing at or beyond it is returned (a sync token works here, as
+    /// it does for `from`).
+    pub to: Option<String>,
     /// `"f"` or `"b"`; defaults to `"b"`.
     pub dir: Option<String>,
     /// Maximum number of events to return; defaults to 10, capped at 1000.
     pub limit: Option<usize>,
+    /// A `RoomEventFilter`, JSON-encoded ([`crate::routes::client_events::RoomEventFilter`]).
+    pub filter: Option<String>,
+}
+
+/// Resolves a `from`/`to` pagination token for `room_id`: `None` for an absent or empty one;
+/// this crate's own [`PaginationToken`] as it is; otherwise, if a
+/// [`crate::registry::GlobalTokenResolver`] is installed (in production `hs-user`'s, for the
+/// tokens `/sync` hands out), the position it names, as a token a page in `direction` starts
+/// from. A sync token covers its room *through* the position it names (the newest event the
+/// sync had handed out), while a page excludes its `from` position: so a backward page starts
+/// just above it -- the events the sync showed are the first a client paging back from it sees
+/// -- and a forward page starts after it.
+///
+/// # Errors
+/// [`RoomError::InvalidPaginationToken`] when neither format matches.
+pub(crate) async fn resolve_token<B: KvBackend + 'static>(
+    state: &RoomState<B>,
+    user_id: &ruma::UserId,
+    room_id: &RoomId,
+    raw: Option<&str>,
+    direction: Direction,
+) -> Result<Option<PaginationToken>, RoomError> {
+    let Some(raw) = raw.filter(|raw| !raw.is_empty()) else {
+        return Ok(None);
+    };
+    if let Ok(token) = raw.parse::<PaginationToken>() {
+        return Ok(Some(towards(token, direction)));
+    }
+    let Some(resolver) = state.rooms.global_token_resolver() else {
+        return Err(RoomError::InvalidPaginationToken);
+    };
+    match resolver.resolve(user_id, room_id, raw).await? {
+        // Not shaped like the resolver's own tokens either: neither format matched, so this
+        // really is an invalid token.
+        None => Err(RoomError::InvalidPaginationToken),
+        // One of the resolver's own tokens, but no position for this room -- treat exactly like
+        // an absent token (see the trait doc comment).
+        Some(None) => Ok(None),
+        Some(Some(pos)) => Ok(Some(match direction {
+            Direction::Backward => PaginationToken::new(pos.saturating_add(1), direction),
+            Direction::Forward => PaginationToken::new(pos, direction),
+        })),
+    }
+}
+
+/// `token` as the start of a page in `direction`. A token is a boundary between two events: a
+/// backward token at `p` lies just before position `p` (a backward page from it begins below
+/// `p`), a forward token at `p` just after it (a forward page begins above `p`). Read the other
+/// way it is the same boundary, so a forward token at `p` starts a backward page at `p`
+/// included, and a backward token at `p` a forward page at `p` included -- what `/context`'s
+/// `end` and `start` need to be (Complement's `TestJumpToDateEndpoint` pages backwards from a
+/// `/context` `end` and expects the event itself).
+fn towards(token: PaginationToken, direction: Direction) -> PaginationToken {
+    match (token.direction, direction) {
+        (Direction::Forward, Direction::Backward) => {
+            PaginationToken::new(token.room_pos.saturating_add(1), direction)
+        }
+        (Direction::Backward, Direction::Forward) => {
+            PaginationToken::new(token.room_pos.saturating_sub(1), direction)
+        }
+        _ => token,
+    }
+}
+
+/// The opposite direction: how a `to` token is resolved (see [`MessagesBound`]).
+fn opposite(direction: Direction) -> Direction {
+    match direction {
+        Direction::Backward => Direction::Forward,
+        Direction::Forward => Direction::Backward,
+    }
+}
+
+/// Where a `/messages` page must stop, from its `to` token: the token resolved for the opposite
+/// direction marks the region a page *towards* this one would read, and a page keeps only what
+/// lies on its own side of it -- forwards, positions below it; backwards, positions above it.
+#[derive(Debug, Clone, Copy)]
+struct MessagesBound {
+    direction: Direction,
+    at: i64,
+}
+
+impl MessagesBound {
+    fn keeps(self, pos: i64) -> bool {
+        match self.direction {
+            Direction::Forward => pos < self.at,
+            Direction::Backward => pos > self.at,
+        }
+    }
 }
 
 /// `GET /rooms/{roomId}/messages`.
 ///
 /// Each event in `chunk` carries `unsigned.m.relations` if it has children
-/// (`crate::relations::bundle`).
+/// (`crate::relations::bundle`) and the reader's own membership at it in `unsigned.membership`
+/// (MSC4115); an erased sender's events are pruned for a reader who was not there when they
+/// were sent ([`crate::routes::client_events::finish`]).
 ///
-/// `from`, if present, is tried first as this crate's own
-/// [`PaginationToken`]; if that fails to parse, [`crate::registry::RoomRegistry::global_token_resolver`]
-/// (if one is installed) gets a chance to recognize a different token format instead of an
-/// outright `400` -- see [`crate::registry::GlobalTokenResolver`]'s doc comment for why this
-/// indirection exists (in production, `hs-user` installs one so this endpoint accepts a token
-/// minted by `/sync`, matching every real Matrix client's ordinary sync-then-paginate flow).
+/// `from` and `to`, if present, are tried first as this crate's own [`PaginationToken`] and then
+/// through [`crate::registry::RoomRegistry::global_token_resolver`] ([`resolve_token`]). `filter`
+/// is a `RoomEventFilter`: its content conditions drop events from the page (the page's tokens
+/// stay where the unfiltered page would put them, so nothing is skipped), and with
+/// `lazy_load_members` the page's senders' member events come back in `state`.
+///
+/// `end` is given whenever the page has events, and left out once a page comes back empty at
+/// the end of the room, as Synapse does: Sytest's `/messages` tests page once more from the
+/// last page's `end` and expect that page to say it is the end.
 pub async fn get_messages<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
     Path(room_id): Path<String>,
@@ -436,37 +610,29 @@ pub async fn get_messages<B: KvBackend + 'static>(
         .as_deref()
         .and_then(Direction::from_query)
         .unwrap_or(Direction::Backward);
-    let from = match query.from.as_deref() {
-        None => None,
-        Some(raw) => match raw.parse::<PaginationToken>() {
-            Ok(token) => Some(token),
-            Err(_) => match state.rooms.global_token_resolver() {
-                Some(resolver) => {
-                    match resolver.resolve(&requester.user_id, &room_id, raw).await? {
-                        // Not shaped like the resolver's own tokens either: neither format
-                        // matched, so this really is an invalid token.
-                        None => return Err(RoomError::InvalidPaginationToken),
-                        // One of the resolver's own tokens, but no position for this room --
-                        // treat exactly like an absent `from` (see the trait doc comment).
-                        Some(None) => None,
-                        // A sync token covers its room *through* `pos` (the newest event the
-                        // sync had handed out), while a page excludes its `from` position. So a
-                        // backward page starts just above it -- the events the sync showed are
-                        // the first a client paging back from it sees, as the spec and every
-                        // client expect -- and a forward page starts after it.
-                        Some(Some(pos)) => Some(match direction {
-                            Direction::Backward => {
-                                PaginationToken::new(pos.saturating_add(1), direction)
-                            }
-                            Direction::Forward => PaginationToken::new(pos, direction),
-                        }),
-                    }
-                }
-                None => return Err(RoomError::InvalidPaginationToken),
-            },
-        },
-    };
-    let limit = query.limit.unwrap_or(10).min(1000);
+    let filter =
+        crate::routes::client_events::RoomEventFilter::from_param(query.filter.as_deref())?;
+    let from = resolve_token(
+        &state,
+        &requester.user_id,
+        &room_id,
+        query.from.as_deref(),
+        direction,
+    )
+    .await?;
+    let to = resolve_token(
+        &state,
+        &requester.user_id,
+        &room_id,
+        query.to.as_deref(),
+        opposite(direction),
+    )
+    .await?
+    .map(|token| MessagesBound {
+        direction,
+        at: token.room_pos,
+    });
+    let limit = query.limit.or(filter.limit).unwrap_or(10).min(1000);
 
     // A non-existent room reports the same `403 M_FORBIDDEN` as "you aren't a member of the
     // room" (`room_messages_test.go`'s `TestFetchMessagesFromNonExistentRoom`), rather than
@@ -492,6 +658,12 @@ pub async fn get_messages<B: KvBackend + 'static>(
     // at the room tries again, rather than being handed the same token forever while a peer is
     // down. At a gap, a fetch that adds nothing reads on across the gap instead, so the client
     // still reaches what was held before the leave.
+    let options = PageOptions {
+        requester: requester.clone(),
+        filter,
+        to,
+        local_server: state.identity.server_name.clone(),
+    };
     let hook = state.rooms.backfill_hook().cloned();
     let mut stop_at_gaps = hook.is_some();
     let mut older_fetched = false;
@@ -503,7 +675,7 @@ pub async fn get_messages<B: KvBackend + 'static>(
             from,
             direction,
             limit,
-            requester.clone(),
+            options.clone(),
             older_fetched,
             stop_at_gaps,
         )
@@ -549,13 +721,21 @@ pub async fn get_messages<B: KvBackend + 'static>(
         }
     };
     let MessagesPage {
-        start, chunk, end, ..
+        start,
+        chunk,
+        state: members,
+        end,
+        ..
     } = page;
+    let chunk = crate::routes::client_events::finish(&state, chunk).await;
     // `end` is left out, not `null`, when there is nothing further: the spec's signal for "you
     // have reached the start of the room", and the one a paginating client stops on.
     let mut body = json!({"start": start, "chunk": chunk});
     if let Some(end) = end {
         body["end"] = serde_json::Value::String(end);
+    }
+    if !members.is_empty() {
+        body["state"] = serde_json::Value::Array(members);
     }
     Ok(Json(body).into_response())
 }
@@ -599,7 +779,12 @@ pub async fn get_room_initial_sync<B: KvBackend + 'static>(
         None,
         Direction::Backward,
         limit,
-        requester.clone(),
+        PageOptions {
+            requester: requester.clone(),
+            filter: crate::routes::client_events::RoomEventFilter::default(),
+            to: None,
+            local_server: state.identity.server_name.clone(),
+        },
         false,
         false,
     )
@@ -637,11 +822,9 @@ pub async fn get_room_initial_sync<B: KvBackend + 'static>(
         "private"
     };
     let MessagesPage {
-        start,
-        mut chunk,
-        end,
-        ..
+        start, chunk, end, ..
     } = page;
+    let mut chunk = crate::routes::client_events::finish(&state, chunk).await;
     // A backward page is newest first; a client reads `messages` oldest first.
     chunk.reverse();
     let mut messages = json!({"chunk": chunk, "end": start});
@@ -677,12 +860,24 @@ enum Wants {
     Gap(i64),
 }
 
-/// One page of `GET /messages`, rendered for a requester.
+/// One page of `GET /messages`, rendered for a requester, before erasure is applied
+/// ([`crate::routes::client_events::finish`]).
 struct MessagesPage {
     start: String,
-    chunk: Vec<serde_json::Value>,
+    chunk: Vec<crate::routes::client_events::ViewedEvent>,
+    /// The lazy-loaded member events, when the filter asked for them.
+    state: Vec<serde_json::Value>,
     end: Option<String>,
     wants: Wants,
+}
+
+/// What a `/messages` page is read with beyond its position, direction and size.
+#[derive(Clone)]
+struct PageOptions {
+    requester: hs_auth::requester::Requester,
+    filter: crate::routes::client_events::RoomEventFilter,
+    to: Option<MessagesBound>,
+    local_server: ruma::OwnedServerName,
 }
 
 /// One page of `GET /messages`, rendered for `requester`, with what it [`Wants`] fetched. A
@@ -693,17 +888,27 @@ struct MessagesPage {
 /// server. With `stop_at_gaps`, a backward page stops at an open gap in the middle of the
 /// timeline (`RoomActor::paginate_page`) and wants [`Wants::Gap`], with an `end` naming the
 /// boundary; without it, it reads across gaps.
+///
+/// Otherwise a page with events always has an `end` (its last event's position, when the actor
+/// says there is nothing beyond it): the empty page after it is the one without, as Synapse
+/// answers. A `to` bound cuts the page where it lies.
 async fn messages_page<B: KvBackend + 'static>(
     handle: &crate::actor::RoomActorHandle<B>,
     from: Option<PaginationToken>,
     direction: Direction,
     limit: usize,
-    requester: hs_auth::requester::Requester,
+    options: PageOptions,
     after_backfill: bool,
     stop_at_gaps: bool,
 ) -> Result<MessagesPage, RoomError> {
     handle
         .query(move |actor| -> Result<_, RoomError> {
+            let PageOptions {
+                requester,
+                filter,
+                to,
+                local_server,
+            } = options;
             // The entry gate: forgetting, or never having had a membership record in a
             // non-world-readable room, refuses the whole call outright -- see
             // `RoomActor::can_read_room`'s doc comment for exactly what this distinguishes from
@@ -728,39 +933,64 @@ async fn messages_page<B: KvBackend + 'static>(
                 }
                 None => Wants::Nothing,
             };
+            let mut events = page.events;
+            let mut next = page.next;
+            if let Some(to) = to
+                && let Some(cut) = events.iter().position(|e| {
+                    actor
+                        .timeline_position(e.event_id())
+                        .is_some_and(|pos| !to.keeps(pos))
+                })
+            {
+                events.truncate(cut);
+                next = None;
+            }
+            // A page with events always says where the next one starts; the empty page after
+            // the last one is the one that says it is the end.
+            if next.is_none()
+                && let Some(last) = events.last()
+                && let Some(pos) = actor.timeline_position(last.event_id())
+            {
+                next = Some(PaginationToken::new(pos, direction));
+            }
             let end = if wants == Wants::Older && !after_backfill {
                 None
             } else {
-                page.next
+                next
             };
             let start_token = from.unwrap_or_else(|| PaginationToken::new(0, direction));
-            let chunk = page
-                .events
+            let shown: Vec<&hs_model::Event> = events
                 .into_iter()
+                .filter(|e| filter.matches(e))
                 .filter(|e| {
                     actor
                         .event_visible_to(e, &requester.user_id)
                         .unwrap_or(false)
                 })
-                .map(|e| {
-                    let bundle = actor.relation_bundle(e.event_id(), &requester.user_id);
-                    let txn_id = actor.transaction_id_for(
-                        e.event_id(),
+                .collect();
+            let state = match shown.first() {
+                Some(first) if filter.lazy_loads_members() => {
+                    let senders: Vec<&ruma::UserId> =
+                        shown.iter().map(|e| e.header().sender.as_ref()).collect();
+                    crate::routes::client_events::lazy_member_state(
+                        actor,
+                        first,
+                        &senders,
                         &requester.user_id,
-                        requester.device_id.as_deref(),
-                    );
-                    attach_replaced_state(
-                        crate::routes::render::attach_transaction_id(
-                            crate::routes::render::client_event_json_bundled(e, &bundle),
-                            txn_id,
-                        ),
-                        actor.replaced_state_for(e, &requester.user_id).as_ref(),
                     )
+                }
+                _ => Vec::new(),
+            };
+            let chunk = shown
+                .into_iter()
+                .map(|e| {
+                    crate::routes::client_events::view_event(actor, e, &requester, &local_server)
                 })
                 .collect::<Vec<_>>();
             Ok(MessagesPage {
                 start: start_token.to_string(),
                 chunk,
+                state,
                 end: end.map(|t| t.to_string()),
                 wants,
             })
@@ -782,6 +1012,7 @@ mod tests {
     use crate::identity::HomeserverIdentity;
     use crate::registry::RoomRegistry;
     use crate::state::RoomState;
+    use serde_json::json;
 
     fn requester(user: &ruma::UserId) -> RoomRequester {
         RoomRequester(Requester {
@@ -949,6 +1180,8 @@ mod tests {
             State(state),
             Path(room_id.to_string()),
             Query(MessagesQuery {
+                filter: None,
+                to: None,
                 from: None,
                 dir: Some("b".to_owned()),
                 limit: Some(50),
@@ -1016,7 +1249,9 @@ mod tests {
     }
 
     /// A client paginating backwards stops when `end` is absent; it used to be `null` after one
-    /// extra empty page, and a reader that takes "present" literally never stopped.
+    /// extra empty page, and a reader that takes "present" literally never stopped. The last
+    /// page with events has an `end` (Sytest's `/messages` tests ask for it), and the empty page
+    /// after it has none.
     #[tokio::test]
     async fn paginating_backwards_reaches_the_start_of_the_room_and_says_so() {
         let state = app();
@@ -1056,6 +1291,8 @@ mod tests {
                 State(state.clone()),
                 Path(room_id.to_string()),
                 Query(MessagesQuery {
+                    filter: None,
+                    to: None,
                     from: from.clone(),
                     dir: Some("b".to_owned()),
                     limit: Some(2),
@@ -1078,10 +1315,11 @@ mod tests {
                 "the pagination never reached the start of the room"
             );
         }
-        // Every event the room has, in as many pages as a limit of 2 needs, and then a stop.
+        // Every event the room has, in as many pages as a limit of 2 needs, then one empty page
+        // without `end` -- Synapse's shape: a page with events always has an `end`.
         let total = handle.query(|actor| actor.events_after(0, 100).len()).await;
         assert_eq!(seen, total);
-        assert_eq!(pages, total.div_ceil(2));
+        assert_eq!(pages, total.div_ceil(2) + 1);
     }
 
     /// A resolver that knows one token, `synctok`, standing for a sync that covered the room
@@ -1148,6 +1386,8 @@ mod tests {
                 State(state.clone()),
                 Path(room_id.to_string()),
                 Query(MessagesQuery {
+                    filter: None,
+                    to: None,
                     from: Some("synctok".to_owned()),
                     dir: Some(dir.to_owned()),
                     limit: Some(1),
@@ -1245,5 +1485,414 @@ mod tests {
         let body = json_body(initial_sync(stranger, 10).await.unwrap()).await;
         assert!(body.get("membership").is_none(), "{body}");
         assert!(!body["state"].as_array().unwrap().is_empty());
+    }
+
+    /// A public room alice made, with `n` messages from her, and its handle.
+    async fn public_room(
+        state: &RoomState<MemoryBackend>,
+        alice: &ruma::UserId,
+    ) -> (
+        crate::actor::RoomActorHandle<MemoryBackend>,
+        ruma::OwnedRoomId,
+    ) {
+        let handle = state
+            .rooms
+            .create_room(
+                alice.to_owned(),
+                crate::actor::CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .expect("create should succeed");
+        let room_id = handle.query(|actor| actor.room_id().to_owned()).await;
+        (handle, room_id)
+    }
+
+    async fn say(
+        handle: &crate::actor::RoomActorHandle<MemoryBackend>,
+        who: &ruma::UserId,
+        content: serde_json::Value,
+    ) -> ruma::OwnedEventId {
+        handle
+            .send_event(
+                who.to_owned(),
+                "m.room.message".to_owned(),
+                None,
+                content,
+                None,
+                100,
+            )
+            .await
+            .expect("send should succeed")
+            .event_id()
+            .to_owned()
+    }
+
+    async fn join(handle: &crate::actor::RoomActorHandle<MemoryBackend>, who: &ruma::UserId) {
+        handle
+            .membership(
+                who.to_owned(),
+                crate::membership::Action::Join,
+                who.to_owned(),
+                serde_json::json!({}),
+                100,
+            )
+            .await
+            .expect("join should succeed");
+    }
+
+    async fn messages(
+        state: &RoomState<MemoryBackend>,
+        room_id: &ruma::RoomId,
+        who: &ruma::UserId,
+        query: MessagesQuery,
+    ) -> serde_json::Value {
+        let response = get_messages::<MemoryBackend>(
+            State(state.clone()),
+            Path(room_id.to_string()),
+            Query(query),
+            requester(who),
+        )
+        .await
+        .expect("messages should succeed")
+        .into_response();
+        json_body(response).await
+    }
+
+    /// Sytest's "GET /rooms/:room_id/messages returns a message" and "... lazy loads members
+    /// correctly": `from=` (a sync that gave no `prev_batch`) is the live end; the page has an
+    /// `end` and, lazy-loading, only the sender's member event in `state`; the page after it is
+    /// empty and has no `end`.
+    #[tokio::test]
+    async fn an_empty_from_pages_back_from_the_live_end_with_lazy_members() {
+        let state = app();
+        let alice = user_id!("@alice:hs1");
+        let (handle, room_id) = public_room(&state, alice).await;
+        say(&handle, alice, json!({"msgtype": "m.text", "body": "hi"})).await;
+
+        let body = messages(
+            &state,
+            &room_id,
+            alice,
+            MessagesQuery {
+                from: Some(String::new()),
+                dir: Some("b".to_owned()),
+                filter: Some(r#"{ "lazy_load_members" : true }"#.to_owned()),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(body["chunk"][0]["content"]["body"], "hi");
+        let state_events = body["state"].as_array().expect("state");
+        assert_eq!(state_events.len(), 1, "{body}");
+        assert_eq!(state_events[0]["type"], "m.room.member");
+        assert_eq!(state_events[0]["state_key"], alice.as_str());
+        let end = body["end"]
+            .as_str()
+            .expect("a page with events has an end")
+            .to_owned();
+
+        let body = messages(
+            &state,
+            &room_id,
+            alice,
+            MessagesQuery {
+                from: Some(end),
+                dir: Some("b".to_owned()),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(body["chunk"], json!([]));
+        assert!(body.get("end").is_none(), "{body}");
+        assert!(body.get("state").is_none(), "{body}");
+    }
+
+    /// Sytest's "Ephemeral messages received from clients are correctly expired": with a
+    /// `types` filter only the messages come back, and one whose
+    /// `org.matrix.self_destruct_after` has passed has empty content; one still in its time is
+    /// whole.
+    #[tokio::test]
+    async fn a_types_filter_and_an_expired_ephemeral_message() {
+        let state = app();
+        let alice = user_id!("@alice:hs1");
+        let (handle, room_id) = public_room(&state, alice).await;
+        let now = crate::metrics::now_ms();
+        say(
+            &handle,
+            alice,
+            json!({"msgtype": "m.text", "body": "gone", crate::routes::render::SELF_DESTRUCT_AFTER: now - 1000}),
+        )
+        .await;
+        say(
+            &handle,
+            alice,
+            json!({"msgtype": "m.text", "body": "here", crate::routes::render::SELF_DESTRUCT_AFTER: now + 3_600_000}),
+        )
+        .await;
+        let body = messages(
+            &state,
+            &room_id,
+            alice,
+            MessagesQuery {
+                filter: Some(r#"{"types":["m.room.message"]}"#.to_owned()),
+                ..Default::default()
+            },
+        )
+        .await;
+        let chunk = body["chunk"].as_array().expect("chunk");
+        assert_eq!(chunk.len(), 2, "{body}");
+        assert_eq!(chunk[0]["content"]["body"], "here");
+        assert_eq!(chunk[1]["content"], json!({}));
+    }
+
+    /// Complement's `TestRoomMessagesLazyLoading`: a forward page with a `to` stops there.
+    #[tokio::test]
+    async fn to_stops_a_forward_page() {
+        let state = app();
+        let alice = user_id!("@alice:hs1");
+        let (handle, room_id) = public_room(&state, alice).await;
+        let first = say(&handle, alice, json!({"msgtype": "m.text", "body": "1"})).await;
+        say(&handle, alice, json!({"msgtype": "m.text", "body": "2"})).await;
+        let third = say(&handle, alice, json!({"msgtype": "m.text", "body": "3"})).await;
+        let (p1, p3) = handle
+            .query(move |actor| {
+                (
+                    actor.timeline_position(&first).unwrap(),
+                    actor.timeline_position(&third).unwrap(),
+                )
+            })
+            .await;
+        let body = messages(
+            &state,
+            &room_id,
+            alice,
+            MessagesQuery {
+                from: Some(PaginationToken::new(p1, Direction::Forward).to_string()),
+                to: Some(PaginationToken::new(p3, Direction::Backward).to_string()),
+                dir: Some("f".to_owned()),
+                ..Default::default()
+            },
+        )
+        .await;
+        let bodies: Vec<_> = body["chunk"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["content"]["body"].clone())
+            .collect();
+        assert_eq!(bodies, vec![json!("2")], "{body}");
+    }
+
+    /// MSC4115 (Complement's `TestMembershipOnEvents`): each event says what the reader's
+    /// membership was at it -- `leave` before bob joined, `join` from his join on.
+    #[tokio::test]
+    async fn every_event_carries_the_readers_membership_at_it() {
+        let state = app();
+        let alice = user_id!("@alice:hs1");
+        let bob = user_id!("@bob:hs1");
+        let (handle, room_id) = public_room(&state, alice).await;
+        say(
+            &handle,
+            alice,
+            json!({"msgtype": "m.text", "body": "before"}),
+        )
+        .await;
+        join(&handle, bob).await;
+        say(
+            &handle,
+            alice,
+            json!({"msgtype": "m.text", "body": "after"}),
+        )
+        .await;
+        let body = messages(
+            &state,
+            &room_id,
+            bob,
+            MessagesQuery {
+                dir: Some("f".to_owned()),
+                limit: Some(100),
+                ..Default::default()
+            },
+        )
+        .await;
+        let mut joined = false;
+        for event in body["chunk"].as_array().unwrap() {
+            if event["type"] == "m.room.member" && event["state_key"] == bob.as_str() {
+                joined = true;
+            }
+            let want = if joined { "join" } else { "leave" };
+            assert_eq!(event["unsigned"]["membership"], want, "{event}");
+        }
+        assert!(joined);
+    }
+
+    /// Sytest's "Only original members of the room can see messages from erased users": once
+    /// alice's account is erased, bob, who was there, still reads her message; carol, who
+    /// joined after it, reads it pruned.
+    #[tokio::test]
+    async fn an_erased_senders_message_is_pruned_for_who_was_not_there() {
+        let state = app();
+        let alice = user_id!("@alice:hs1");
+        let bob = user_id!("@bob:hs1");
+        let carol = user_id!("@carol:hs1");
+        let (handle, room_id) = public_room(&state, alice).await;
+        join(&handle, bob).await;
+        let said = say(
+            &handle,
+            alice,
+            json!({"msgtype": "m.text", "body": "body1"}),
+        )
+        .await;
+        join(&handle, carol).await;
+        state
+            .auth
+            .store
+            .create_user(hs_auth::store::UserRecord::new(alice.to_owned(), 1))
+            .await
+            .unwrap();
+        state.auth.store.erase_user(alice, 2).await.unwrap();
+        let content_for = |who: &'static ruma::UserId| {
+            let state = state.clone();
+            let room_id = room_id.clone();
+            let said = said.clone();
+            async move {
+                let body = messages(
+                    &state,
+                    &room_id,
+                    who,
+                    MessagesQuery {
+                        limit: Some(100),
+                        ..Default::default()
+                    },
+                )
+                .await;
+                body["chunk"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|e| e["event_id"] == said.as_str())
+                    .map(|e| e["content"].clone())
+            }
+        };
+        assert_eq!(content_for(bob).await.unwrap()["body"], "body1");
+        assert_eq!(content_for(carol).await, Some(json!({})));
+    }
+
+    /// Sytest's "/context/ on non world readable room does not work" (a stranger is refused
+    /// with 403, not told the event does not exist) and "/context/ with lazy_load_members
+    /// filter works" (only the senders of what is returned are in `state`).
+    #[tokio::test]
+    async fn context_refuses_a_stranger_and_lazy_loads_senders() {
+        let state = app();
+        let alice = user_id!("@alice:hs1");
+        let bob = user_id!("@bob:hs1");
+        let handle = state
+            .rooms
+            .create_room(
+                alice.to_owned(),
+                crate::actor::CreateRoomRequest::default(),
+                1,
+            )
+            .await
+            .unwrap();
+        let room_id = handle.query(|actor| actor.room_id().to_owned()).await;
+        let said = say(
+            &handle,
+            alice,
+            json!({"msgtype": "m.text", "body": "hello"}),
+        )
+        .await;
+        let err = get_context::<MemoryBackend>(
+            State(state.clone()),
+            Path((room_id.to_string(), said.to_string())),
+            Query(HashMap::new()),
+            requester(bob),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, RoomError::Forbidden(_)), "{err:?}");
+
+        let (handle, room_id) = public_room(&state, alice).await;
+        join(&handle, bob).await;
+        say(&handle, alice, json!({"msgtype": "m.text", "body": "1"})).await;
+        let last = say(&handle, alice, json!({"msgtype": "m.text", "body": "2"})).await;
+        let response = get_context::<MemoryBackend>(
+            State(state.clone()),
+            Path((room_id.to_string(), last.to_string())),
+            Query(HashMap::from([
+                ("limit".to_owned(), "1".to_owned()),
+                (
+                    "filter".to_owned(),
+                    r#"{"lazy_load_members": true}"#.to_owned(),
+                ),
+            ])),
+            requester(alice),
+        )
+        .await
+        .unwrap();
+        let body = json_body(response).await;
+        let members: Vec<_> = body["state"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["state_key"].clone())
+            .collect();
+        assert_eq!(members, vec![json!(alice.as_str())], "{body}");
+        assert_eq!(body["event"]["unsigned"]["membership"], "join");
+    }
+
+    /// Complement's `TestGetRoomMembersAtPoint`: `at` gives the members as of the token, not
+    /// now.
+    #[tokio::test]
+    async fn members_at_a_token_are_the_members_then() {
+        let state = app();
+        let alice = user_id!("@alice:hs1");
+        let bob = user_id!("@bob:hs1");
+        let (handle, room_id) = public_room(&state, alice).await;
+        let said = say(&handle, alice, json!({"msgtype": "m.text", "body": "hi"})).await;
+        let pos = handle
+            .query(move |actor| actor.timeline_position(&said).unwrap())
+            .await;
+        join(&handle, bob).await;
+        let members = |at: Option<String>| {
+            let state = state.clone();
+            let room_id = room_id.clone();
+            async move {
+                let response = get_members::<MemoryBackend>(
+                    State(state),
+                    Path(room_id.to_string()),
+                    Query(MembersQuery {
+                        at,
+                        ..Default::default()
+                    }),
+                    requester(alice),
+                )
+                .await
+                .unwrap();
+                let mut keys: Vec<String> = json_body(response).await["chunk"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|e| e["state_key"].as_str().unwrap().to_owned())
+                    .collect();
+                keys.sort();
+                keys
+            }
+        };
+        assert_eq!(
+            members(Some(
+                PaginationToken::new(pos + 1, Direction::Backward).to_string()
+            ))
+            .await,
+            vec![alice.to_string()]
+        );
+        assert_eq!(
+            members(None).await,
+            vec![alice.to_string(), bob.to_string()]
+        );
     }
 }

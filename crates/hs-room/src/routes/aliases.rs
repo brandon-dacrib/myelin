@@ -172,10 +172,88 @@ pub async fn delete_alias<B: KvBackend + 'static>(
             alias.as_str()
         )));
     }
+    let removed = alias.clone();
     handle
-        .query(move |actor| actor.remove_alias(&alias))
+        .query(move |actor| actor.remove_alias(&removed))
         .await?;
+    drop_from_canonical_alias(&handle, &requester.user_id, &alias).await;
     Ok(Json(json!({})).into_response())
+}
+
+/// `content` of an `m.room.canonical_alias` event with `alias` taken out of `alias` and
+/// `alt_aliases` (an emptied `alt_aliases` goes too), or `None` when it names `alias` nowhere.
+fn without_alias(content: &Value, alias: &str) -> Option<Value> {
+    let mut content = content.as_object()?.clone();
+    let mut changed = false;
+    if content.get("alias").and_then(Value::as_str) == Some(alias) {
+        content.remove("alias");
+        changed = true;
+    }
+    if let Some(Value::Array(alt)) = content.get_mut("alt_aliases") {
+        let before = alt.len();
+        alt.retain(|a| a.as_str() != Some(alias));
+        changed |= alt.len() != before;
+        if alt.is_empty() {
+            content.remove("alt_aliases");
+        }
+    }
+    changed.then_some(Value::Object(content))
+}
+
+/// After `alias` is deleted from the directory, sends the room a new `m.room.canonical_alias`
+/// without it, as `user_id`, when the current one names it -- so the room stops advertising an
+/// address that leads nowhere (Synapse's `_update_canonical_alias`; Sytest's and Complement's
+/// "Can delete canonical alias", which wait for an `m.room.canonical_alias` with empty
+/// content). Best effort, as Synapse's is: a deleter who may delete the alias but not send the
+/// state event (an alias creator without power) leaves the event as it was, logged.
+async fn drop_from_canonical_alias<B: KvBackend + 'static>(
+    handle: &crate::actor::RoomActorHandle<B>,
+    user_id: &ruma::UserId,
+    alias: &ruma::RoomAliasId,
+) {
+    let current = handle
+        .query(|actor| {
+            actor
+                .state_event("m.room.canonical_alias", "")
+                .ok()
+                .flatten()
+                .and_then(|event| event.json().get("content"))
+                .and_then(hs_model::canonical::CanonicalJsonValue::as_object)
+                .map(crate::routes::render::canonical_to_json)
+        })
+        .await;
+    let Some(content) = current.and_then(|c| without_alias(&c, alias.as_str())) else {
+        return;
+    };
+    let now_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(i64::MAX);
+    match handle
+        .send_event(
+            user_id.to_owned(),
+            "m.room.canonical_alias".to_owned(),
+            Some(String::new()),
+            content,
+            None,
+            now_ms,
+        )
+        .await
+    {
+        Ok(event) => tracing::info!(
+            alias = %alias,
+            event_id = %event.event_id(),
+            "a deleted alias was taken out of the room's canonical alias"
+        ),
+        Err(error) => tracing::info!(
+            alias = %alias,
+            %error,
+            "a deleted alias is still in the room's canonical alias: its deleter may not change it"
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -414,5 +492,90 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, RoomError::RoomNotFound(_)), "{err:?}");
+    }
+
+    #[test]
+    fn without_alias_takes_it_out_of_alias_and_alt_aliases() {
+        assert_eq!(
+            without_alias(&json!({"alias": "#a:hs1"}), "#a:hs1"),
+            Some(json!({}))
+        );
+        assert_eq!(
+            without_alias(
+                &json!({"alias": "#a:hs1", "alt_aliases": ["#b:hs1", "#a:hs1"]}),
+                "#a:hs1"
+            ),
+            Some(json!({"alt_aliases": ["#b:hs1"]}))
+        );
+        assert_eq!(
+            without_alias(
+                &json!({"alias": "#b:hs1", "alt_aliases": ["#a:hs1"]}),
+                "#a:hs1"
+            ),
+            Some(json!({"alias": "#b:hs1"}))
+        );
+        assert_eq!(without_alias(&json!({"alias": "#b:hs1"}), "#a:hs1"), None);
+    }
+
+    /// Sytest's and Complement's "Can delete canonical alias": deleting the alias the room's
+    /// `m.room.canonical_alias` names sends a new one without it.
+    #[tokio::test]
+    async fn deleting_the_canonical_alias_takes_it_out_of_the_room_state() {
+        let state = state(None);
+        let alice = ruma::user_id!("@alice:hs1");
+        let handle = state
+            .rooms
+            .create_room(
+                alice.to_owned(),
+                crate::actor::CreateRoomRequest::default(),
+                1,
+            )
+            .await
+            .unwrap();
+        let room_id = handle.query(|actor| actor.room_id().to_owned()).await;
+        put_alias(
+            State(state.clone()),
+            Path("#gone:hs1".to_owned()),
+            requester(alice.as_str(), None),
+            PermissiveJson(json!({"room_id": room_id.to_string()})),
+        )
+        .await
+        .unwrap();
+        handle
+            .send_event(
+                alice.to_owned(),
+                "m.room.canonical_alias".to_owned(),
+                Some(String::new()),
+                json!({"alias": "#gone:hs1"}),
+                None,
+                2,
+            )
+            .await
+            .unwrap();
+        delete_alias(
+            State(state.clone()),
+            Path("#gone:hs1".to_owned()),
+            requester(alice.as_str(), None),
+        )
+        .await
+        .unwrap();
+        let content = handle
+            .query(|actor| {
+                actor
+                    .state_event("m.room.canonical_alias", "")
+                    .unwrap()
+                    .and_then(|e| e.json().get("content"))
+                    .and_then(hs_model::canonical::CanonicalJsonValue::as_object)
+                    .map(crate::routes::render::canonical_to_json)
+            })
+            .await;
+        assert_eq!(content, Some(json!({})));
+        assert!(
+            state
+                .rooms
+                .resolve_alias(&RoomAliasId::parse("#gone:hs1").unwrap())
+                .unwrap()
+                .is_none()
+        );
     }
 }

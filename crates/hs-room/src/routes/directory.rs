@@ -160,10 +160,8 @@ pub async fn get_directory_visibility<B: KvBackend + 'static>(
 pub struct PublicRoomsQuery {
     /// Maximum number of rooms to return.
     pub limit: Option<usize>,
-    /// Pagination token. Not implemented (this crate's directory is small enough in Phase 0 scope
-    /// to return everything up to `limit` in one page); accepted and ignored rather than rejected,
-    /// so a client that always sends one back from an earlier response does not break.
-    #[allow(dead_code)]
+    /// Pagination token: a `next_batch` or `prev_batch` from an earlier page
+    /// ([`DirectoryToken`]). An unrecognised one starts from the beginning.
     pub since: Option<String>,
     /// Another server, whose directory is asked over federation
     /// ([`crate::remote_join::RemoteJoin::public_rooms`]) and answered as it came. Absent, or
@@ -234,7 +232,6 @@ pub struct PublicRoomsBody {
     /// Maximum number of rooms to return.
     pub limit: Option<usize>,
     /// See [`PublicRoomsQuery::since`].
-    #[allow(dead_code)]
     pub since: Option<String>,
     /// See [`PublicRoomsQuery::server`].
     pub server: Option<String>,
@@ -275,9 +272,72 @@ async fn remote_public_rooms<B: KvBackend + 'static>(
     Ok(Some(Json(body).into_response()))
 }
 
+/// A position in this server's directory listing, which is ordered by joined members (most
+/// first) and then room ID, so that the same rooms come back in the same order on every page:
+/// `n<offset>` is a forward page starting at the `offset`-th room, `p<offset>` a backward page
+/// of the rooms before it. Offsets shift if rooms are published, unpublished or change size
+/// between pages, which a directory listing tolerates (Synapse's tokens are positional too).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectoryToken {
+    /// The page starting at this offset.
+    Next(usize),
+    /// The page ending just before this offset.
+    Prev(usize),
+}
+
+impl DirectoryToken {
+    /// Parses a token this module handed out; `None` for anything else.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        let (kind, offset) = raw.split_at_checked(1)?;
+        let offset = offset.parse().ok()?;
+        match kind {
+            "n" => Some(Self::Next(offset)),
+            "p" => Some(Self::Prev(offset)),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for DirectoryToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Next(offset) => write!(f, "n{offset}"),
+            Self::Prev(offset) => write!(f, "p{offset}"),
+        }
+    }
+}
+
+/// The rooms of one page of `total`, as a range, with the tokens on either side of it: what
+/// `since` and `limit` select. Without a `limit` the page is everything from `since` on.
+fn directory_page(
+    total: usize,
+    limit: Option<usize>,
+    since: Option<DirectoryToken>,
+) -> (std::ops::Range<usize>, Option<String>, Option<String>) {
+    let (start, end) = match since {
+        Some(DirectoryToken::Prev(before)) => {
+            let before = before.min(total);
+            (limit.map_or(0, |l| before.saturating_sub(l)), before)
+        }
+        Some(DirectoryToken::Next(from)) => {
+            let from = from.min(total);
+            (
+                from,
+                limit.map_or(total, |l| from.saturating_add(l).min(total)),
+            )
+        }
+        None => (0, limit.map_or(total, |l| l.min(total))),
+    };
+    let next = (end < total).then(|| DirectoryToken::Next(end).to_string());
+    let prev = (start > 0).then(|| DirectoryToken::Prev(start).to_string());
+    (start..end, next, prev)
+}
+
 async fn render_public_rooms<B: KvBackend + 'static>(
     state: &RoomState<B>,
     limit: Option<usize>,
+    since: Option<&str>,
     search_term: Option<String>,
     networks: PublicRoomsNetworks,
 ) -> Result<Response, RoomError> {
@@ -306,16 +366,31 @@ async fn render_public_rooms<B: KvBackend + 'static>(
             })
         });
     }
+    // Most joined members first, then by room ID: Synapse's order, and a stable one, which
+    // paging needs (Sytest's "Can paginate public room list" sees every room exactly once).
+    chunk.sort_by(|a, b| {
+        let members = |v: &Value| v.get("num_joined_members").and_then(Value::as_u64);
+        let room_id = |v: &Value| v.get("room_id").and_then(Value::as_str).map(str::to_owned);
+        members(b)
+            .cmp(&members(a))
+            .then_with(|| room_id(a).cmp(&room_id(b)))
+    });
 
     let total = chunk.len();
-    if let Some(limit) = limit {
-        chunk.truncate(limit);
-    }
-    Ok(Json(json!({
+    let (range, next_batch, prev_batch) =
+        directory_page(total, limit, since.and_then(DirectoryToken::parse));
+    let chunk: Vec<Value> = chunk.drain(range).collect();
+    let mut body = json!({
         "chunk": chunk,
         "total_room_count_estimate": total,
-    }))
-    .into_response())
+    });
+    if let Some(next) = next_batch {
+        body["next_batch"] = Value::String(next);
+    }
+    if let Some(prev) = prev_batch {
+        body["prev_batch"] = Value::String(prev);
+    }
+    Ok(Json(body).into_response())
 }
 
 /// `GET /publicRooms`.
@@ -338,7 +413,7 @@ pub async fn get_public_rooms<B: KvBackend + 'static>(
         third_party_instance_id: query.third_party_instance_id,
         include_all_networks: query.include_all_networks.unwrap_or(false),
     };
-    render_public_rooms(&state, query.limit, None, networks).await
+    render_public_rooms(&state, query.limit, query.since.as_deref(), None, networks).await
 }
 
 /// `POST /publicRooms`.
@@ -362,7 +437,7 @@ pub async fn post_public_rooms<B: KvBackend + 'static>(
         third_party_instance_id: body.third_party_instance_id,
         include_all_networks: body.include_all_networks.unwrap_or(false),
     };
-    render_public_rooms(&state, body.limit, term, networks).await
+    render_public_rooms(&state, body.limit, body.since.as_deref(), term, networks).await
 }
 
 #[cfg(test)]
@@ -375,6 +450,43 @@ mod tests {
     use ruma::{OwnedRoomId, UserId};
 
     use super::*;
+
+    /// Sytest's "Can paginate public room list": forwards from the start sees every room once,
+    /// and backwards from the last page's `prev_batch` every room before that page once.
+    #[test]
+    fn directory_pages_cover_every_room_once_both_ways() {
+        let total = 23;
+        let mut seen = vec![0; total];
+        let mut since = None;
+        let mut last_prev = None;
+        loop {
+            let (range, next, prev) = directory_page(total, Some(3), since);
+            assert!(range.len() <= 3);
+            for i in range {
+                seen[i] += 1;
+            }
+            last_prev = prev.or(last_prev);
+            match next {
+                Some(next) => since = DirectoryToken::parse(&next),
+                None => break,
+            }
+        }
+        assert!(seen.iter().all(|n| *n == 1), "{seen:?}");
+        let mut back = vec![0; total];
+        let mut since = last_prev.as_deref().and_then(DirectoryToken::parse);
+        while since.is_some() {
+            let (range, _, prev) = directory_page(total, Some(3), since);
+            for i in range {
+                back[i] += 1;
+            }
+            since = prev.as_deref().and_then(DirectoryToken::parse);
+        }
+        assert!(back.iter().all(|n| *n <= 1));
+        assert!(back.iter().sum::<usize>() >= total - 3);
+        // No limit is everything, with no tokens.
+        assert_eq!(directory_page(5, None, None), (0..5, None, None));
+        assert_eq!(DirectoryToken::parse("x3"), None);
+    }
     use crate::identity::HomeserverIdentity;
     use crate::registry::RoomRegistry;
 

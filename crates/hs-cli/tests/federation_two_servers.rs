@@ -358,9 +358,11 @@ async fn a_user_joins_a_room_on_another_server_and_messages_flow_both_ways() {
             None => break,
         }
     }
+    // Three pages with events, then the empty page that says the room starts there (decision
+    // 0031: a page with events always has an `end`, as Synapse's do).
     assert_eq!(
-        requests, 3,
-        "one backfill batch per page that reaches the edge"
+        requests, 4,
+        "one backfill batch per page that reaches the edge, then the empty last page"
     );
     let bodies: Vec<String> = chunk
         .iter()

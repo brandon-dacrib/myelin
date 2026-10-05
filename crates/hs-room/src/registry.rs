@@ -456,13 +456,30 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
         let tables = self.tables.clone();
         let identity = self.identity.clone();
         let fencing = self.fencing.get().cloned();
-        let actor = tokio::task::spawn_blocking(move || {
+        let joined = creator.clone();
+        let mut actor = tokio::task::spawn_blocking(move || {
             RoomActor::create_room_placed(
                 backend, tables, identity, creator, request, now_ms, fencing,
             )
         })
         .await
         .expect("room creation task panicked")?;
+        // An upgraded room's replacement says its creator joined: the create burst reached
+        // no stream, and what follows a join into a replacement -- the joiner's `m.direct`
+        // and tags about the old room carried onto the new one (`hs-user`'s
+        // `carry_account_data_on_upgrade`) -- runs off that delta. Without it the upgrader's
+        // own direct chat stopped being one (Sytest's "/upgrade preserves direct room state").
+        if actor.predecessor_room_id().is_some() {
+            actor.set_fencing(self.fencing.get().cloned());
+            actor.join_global_stream_announcing(
+                self.global.clone(),
+                vec![crate::protocol::MembershipDelta {
+                    user_id: joined,
+                    membership: "join".to_owned(),
+                }],
+            );
+            return Ok(self.register(actor).await);
+        }
         Ok(self.insert(actor).await)
     }
 
@@ -474,6 +491,12 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
     pub async fn insert(&self, mut actor: RoomActor<B>) -> RoomActorHandle<B> {
         actor.set_fencing(self.fencing.get().cloned());
         actor.join_global_stream(self.global.clone());
+        self.register(actor).await
+    }
+
+    /// The map half of [`RoomRegistry::insert`], for an actor already fenced and on the global
+    /// stream.
+    async fn register(&self, actor: RoomActor<B>) -> RoomActorHandle<B> {
         let room_id = actor.room_id().to_owned();
         let handle = RoomActorHandle::new(actor);
         let mut rooms = self.rooms.lock().await;

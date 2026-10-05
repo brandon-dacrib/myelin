@@ -19,13 +19,44 @@ pub fn canonical_to_json(obj: &CanonicalJsonObject) -> serde_json::Value {
 /// a state event that was redacted after it was superseded must not leak its pre-redaction
 /// content back to a client through the `prev_content` of whatever replaced it.
 fn readable_json(event: &Event) -> CanonicalJsonObject {
-    if event.header().flags.is_redacted() {
+    if event.header().flags.is_redacted() || self_destructed(event, now_ms()) {
         event
             .redacted_json()
             .unwrap_or_else(|_| event.json().clone())
     } else {
         event.json().clone()
     }
+}
+
+/// MSC2228's content key: the time (milliseconds since the Unix epoch) after which the sender
+/// wants the event's content gone.
+pub const SELF_DESTRUCT_AFTER: &str = "org.matrix.self_destruct_after";
+
+/// Milliseconds since the Unix epoch, now.
+fn now_ms() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(i64::MAX)
+}
+
+/// Whether `event` is an ephemeral message (MSC2228) whose time is up at `now_ms`: its content
+/// carries an integer [`SELF_DESTRUCT_AFTER`] at or before `now_ms`. Such an event is shown
+/// redacted from then on, by every read that renders it here -- `/messages`, `/context`,
+/// `/event`, `/sync`, the admin API -- as Synapse expires it (Sytest's "Ephemeral messages
+/// received from clients are correctly expired"). Applied on read, so it holds across restarts
+/// with no job to run late; the stored event keeps its content, as a redacted one does.
+#[must_use]
+pub fn self_destructed(event: &Event, now_ms: i64) -> bool {
+    event
+        .json()
+        .get("content")
+        .and_then(CanonicalJsonValue::as_object)
+        .and_then(|c| c.get(SELF_DESTRUCT_AFTER))
+        .is_some_and(|v| matches!(v, CanonicalJsonValue::Integer(at) if *at <= now_ms))
 }
 
 /// The state event that one state event replaced, in the form [`attach_replaced_state`] needs to

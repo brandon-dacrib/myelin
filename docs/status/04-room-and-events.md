@@ -2,7 +2,8 @@
 
 Track brief: `docs/workstreams/04-room-and-events.md`. Owner crate: `hs-room`.
 
-Last updated: 2026-10-01 (session 16: upgrading a room to version 12; session 15: `POST
+Last updated: 2026-10-04 (session 19: the room read endpoints a client pages and previews with, below).
+Before that, 2026-10-01 (session 16: upgrading a room to version 12; session 15: `POST
 /search`, below). Before that, 2026-09-30 (session
 Last updated: 2026-10-02 (session 18: an erased user leaves every room; session 17: a new
 room's id is new; session 15: `POST /search`, below). Before that, 2026-09-30 (session
@@ -14,6 +15,112 @@ version 12; session 15: `POST /search`, below) and 2026-09-30 (session
 session 13: the state at backfilled history is asked for; session 12: the history between a
 leave and a rejoin; session 11: the client space hierarchy) and 2026-09-28 (session 10: the
 admin API's room long tail).
+
+> **2026-10-04, session 19: the room read endpoints a client pages and previews with**
+> (branch `agent/room-client-gaps`; decision 0031; OpenAPI 0.1.10). The Sytest and Complement
+> tests of wave 1 that failed in `hs-room`'s routes, each fixed in the server, pinned in a unit
+> test and run against the real binary in `crates/hs-cli/tests/room_client_reads.rs` (one
+> server, every endpoint below) and `room_upgrade.rs`'s
+> `an_upgraded_direct_chat_is_still_a_direct_chat_for_the_upgrader` (which fails without the
+> fix).
+>
+> - **`GET /messages`** (`routes/query.rs`): an empty `from` is no token (Synapse's reading;
+>   what a client sends when `/sync` gave no `prev_batch`); `to` is honoured; `filter` is parsed
+>   (`routes/client_events.rs`'s `RoomEventFilter`: `types`, `not_types`, `senders`,
+>   `not_senders`, `contains_url`, `limit`, `lazy_load_members`), its content conditions drop
+>   events from the page without moving its tokens, and `lazy_load_members` puts the page's
+>   senders' member events in `state`; a page with events always has an `end`, the empty page
+>   after the last has none (decision 0031). Sytest "GET /rooms/:room_id/messages returns a
+>   message", "... lazy loads members correctly"; Complement `TestRoomMessagesLazyLoading`,
+>   `TestRoomMessagesLazyLoadingLocalUser`.
+> - **Tokens are boundaries** (decision 0031): a forward token read backwards starts at its
+>   event, a backward token read forwards likewise (`query::towards`). `/context` returns real
+>   `start`/`end` tokens (it returned `""`).
+> - **`/context`**: a reader who may not read the room gets `403` (it was `404`); `filter` with
+>   `lazy_load_members` sends only the senders' member events. Sytest "/context/ on non world
+>   readable room does not work", "/context/ with lazy_load_members filter works".
+> - **MSC4115 `unsigned.membership`** on every event of `/messages`, `/context`, `/event` and
+>   `/relations`: the reader's membership after the event (`RoomActor::member_event_at`,
+>   `membership_at_event`, new and small). Complement's `TestMembershipOnEvents` reads it from
+>   `/sync`, which is `hs-user`'s (below).
+> - **Erased senders**: `/messages`, `/context`, `/event` and `/relations` show an erased local
+>   user's events pruned to a reader who was not joined when they were sent
+>   (`client_events::view_event` keeps the pruned content beside the event; `finish` /
+>   `finish_with_accounts` asks the account store once per sender). Sytest's "Only original
+>   members of the room can see messages from erased users" reads it from `/sync` (below).
+> - **MSC2228 ephemeral messages**: an event whose `org.matrix.self_destruct_after` has passed is
+>   rendered redacted by every read (`render::self_destructed`, inside `readable_json`, so
+>   `/sync` and the admin API too). Applied on read, so no job and nothing to miss across a
+>   restart; the stored row keeps its content, as a redacted one does. Sytest "Ephemeral
+>   messages received from clients are correctly expired". The federation side (an ephemeral
+>   event received from another server) is `federation-gaps`'s and needs nothing more from the
+>   render path.
+> - **`PUT /redact`** of an event this server holds in another room: `400 M_INVALID_PARAM`
+>   (`registry.find_event_globally`). Sytest "PUT /redact disallows redaction of event in
+>   different room".
+> - **`DELETE /directory/room/{alias}`** of the room's canonical alias sends a new
+>   `m.room.canonical_alias` without it (as the deleter, best effort, logged; `alias` and
+>   `alt_aliases`). Sytest "Can delete canonical alias", Complement `TestRoomDeleteAlias`.
+> - **`/publicRooms` paging**: ordered by joined members then room ID, `since` honoured,
+>   `next_batch`/`prev_batch` positional tokens (`n<offset>`/`p<offset>`). Sytest "Can paginate
+>   public room list".
+> - **`GET /members?at=`**: the members after the newest event before the token. Complement's
+>   `TestGetRoomMembersAtPoint` passes `at` from a sync `prev_batch`, which `hs-user` leaves out
+>   for a timeline that reaches the room's start (below).
+> - **`GET /relations`** paginates (`from`, `to`, `limit` default 5, `dir`, `recurse`,
+>   `next_batch`, `prev_batch`, `recursion_depth`), takes sync tokens, hides what the reader may
+>   not see and the edits of a redacted parent, and refuses a reader who may not read the room.
+>   Complement `TestRelationsPagination`, `TestRelationsPaginationSync`.
+> - **`GET /_matrix/client/v1/room_summary/{roomIdOrAlias}`** (MSC3266, new, `routes/summary.rs`):
+>   `hierarchy::summarize` plus `membership`; visible as in the hierarchy, `404` otherwise;
+>   optional authentication (`MaybeRequester`). Complement `TestRoomSummaryAllowedRoomIDs`.
+> - **`GET /_matrix/client/v1/rooms/{roomId}/timestamp_to_event`** (MSC3030, new): over what is
+>   held (`RoomActor::event_nearest`), `403` for who may not read the room; when this server's
+>   history of the room begins later than the room, the other servers are asked
+>   (`RemoteJoin::timestamp_to_event`, new, implemented in `hs-cli`'s `remote_join.rs`) and the
+>   history down to their answer fetched. Complement `TestJumpToDateEndpoint`.
+> - **An upgrade's replacement announces its creator's join** on the global stream
+>   (`RoomRegistry::create_room`, `RoomActor::join_global_stream_announcing`): the create burst
+>   reached no stream, so `hs-user` never carried the upgrader's `m.direct` and tags over.
+>   Sytest "/upgrade preserves direct room state".
+> - **Search index lag in the admin API**: `GET /api/v1/cluster` carries
+>   `search_rooms_behind` and `search_index_documents` for the answering replica
+>   (`hs_room::metrics::search_index_lag`, wired in `hs-cli`'s `overview.rs`), shown on the web
+>   Statistics page's new "Search index" section with what the numbers mean (status 15).
+>
+> **Verified.** Sytest (`SYTEST_HS_BINARY`, a bookworm release `hs` of this branch, the eight
+> files these tests live in; `target/sytest/rcg-1`): 57 pass, 1 fail, 3 skip (power-level
+> prerequisites from files not run). Now passing: "GET /rooms/:room_id/messages returns a
+> message", "... lazy loads members correctly", "Ephemeral messages received from clients are
+> correctly expired", "Can delete canonical alias", "PUT /redact disallows redaction of event in
+> different room", "/context/ on non world readable room does not work", "/context/ with
+> lazy_load_members filter works", "/upgrade preserves direct room state", "Can paginate public
+> room list". Still failing: "Only original members of the room can see messages from erased
+> users" (it reads `/sync`, below). Complement (that binary in `complement-hs-main:c2d74174`'s
+> image, under the shared lock): now passing `TestRoomDeleteAlias`, `TestRoomMessagesLazyLoading`,
+> `TestRoomMessagesLazyLoadingLocalUser`, `TestRelationsPagination`,
+> `TestRelationsPaginationSync`, `TestRoomSummaryAllowedRoomIDs`, `TestRoomImageRoundtrip` (`contains_url`, `end`), and 11 of
+> `TestJumpToDateEndpoint`'s 14 subtests (all five federation ones but the import); still
+> passing `TestRelations`, `TestMessagesOverFederation`, `TestSendAndFetchMessage`,
+> `TestFetchMessagesFromNonExistentRoom`, `TestRoomCanonicalAlias`. Still failing:
+> `TestMembershipOnEvents`, `TestGetRoomMembersAtPoint`, `TestPushRuleRoomUpgrade` (below) and
+> the three `TestJumpToDateEndpoint` subtests that send as Complement's application service
+> (`401 M_UNKNOWN_TOKEN` for `@the-bridge-user:hs1`). `cargo test -p hs-room`, `-p hs-admin`,
+> `-p hs-user` (one flaky timing test in `cluster::two_replica_tests` passed alone three times),
+> and nineteen `hs-cli` real-binary test files touching these endpoints pass;
+> `federation_two_servers`' backfill pagination now counts the empty last page (decision 0031).
+>
+> **Left, and whose:** `hs-user`'s `/sync` (no wave-2 owner named here): (1) render timeline
+> events through `hs_room::routes::client_events::attach_membership(json,
+> actor.membership_at_event(event, user).ok().as_deref())` for MSC4115 (`TestMembershipOnEvents`);
+> (2) prune erased senders the same way, `view_event` + `finish_with_accounts` (Sytest's erasure
+> test reads `/sync`); (3) hand out a `prev_batch` for a fresh timeline that reaches the room's
+> first event, `PaginationToken::new(oldest_pos, Backward)` (`TestGetRoomMembersAtPoint`).
+> `push-media-gaps`: copy room push rules from the old room to the new one for each local user
+> who joins the replacement, from the same place `SessionHub::carry_account_data_on_upgrade`
+> runs (it now runs for the upgrader too); `TestPushRuleRoomUpgrade`. Timestamp-to-event's
+> application-service cases need Complement's appservice registration to work
+> (`401 M_UNKNOWN_TOKEN` for the bridge user), which is not this track's.
 
 > **2026-10-02, session 18: an erased user leaves every room** (branch `agent/user-erase`).
 > `hs_room::admin_users::RoomRegistryUserActivity` implements the new

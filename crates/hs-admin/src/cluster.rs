@@ -1123,6 +1123,8 @@ mod tests {
                 shard_count: Some(4),
                 heartbeat_seq: None,
                 drain_released_at_once_count: None,
+                search_rooms_behind: None,
+                search_index_documents: None,
             },
         }));
         let (status, body) = request(

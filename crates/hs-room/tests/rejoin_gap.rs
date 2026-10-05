@@ -615,6 +615,8 @@ async fn read_messages(
             State(state.clone()),
             Path(room_id.to_string()),
             Query(MessagesQuery {
+                filter: None,
+                to: None,
                 from: from.clone(),
                 dir: Some("b".to_owned()),
                 limit: Some(limit),

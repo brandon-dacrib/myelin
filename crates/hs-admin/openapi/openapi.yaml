@@ -10,7 +10,7 @@ openapi: 3.1.0
 info:
   title: hs-admin API
   summary: The native administration and moderation API for the homeserver.
-  version: 0.1.9
+  version: 0.1.10
   description: 'The only API the management interface (track 16) talks to. See docs/rfcs/0004-admin-api.md for the full design rationale: resource modeling, naming, pagination, filtering, errors, idempotency, scopes, versioning and the event stream. This document is the contract; the hs-admin router''s contract tests assert the router and this document agree on paths and methods (RFC 0004 section 1, decision D15.16).'
   contact:
     name: 'Track 15: Admin API and modules'
@@ -79,6 +79,13 @@ info:
       did; user_type is bot, support or null, on users.create too. users.availability answers
       for real, and refuses a localpart that could never be a username with 400 naming
       param:localpart and the reason.'
+  - version: 0.1.10
+    date: '2026-10-04'
+    notes: 'Additive: ClusterStatus.search_rooms_behind (rooms the answering replica owns whose
+      newest events its room-event search index does not hold yet, hs_room_search_rooms_behind;
+      0 when search is up to date) and ClusterStatus.search_index_documents (events that index
+      holds, hs_room_search_index_documents). Both are set for a single node too, and absent
+      until the indexer has counted once since the replica started.'
 servers:
 - url: /api/v1
   description: Same origin as /_matrix on the client listener.
@@ -8693,6 +8700,22 @@ components:
           description: How many times since the answering replica started a drain released
             every shard it owned at once rather than one lease at a time
             (`hs_cluster_drain_released_at_once_total`). Absent for a single node.
+        search_rooms_behind:
+          type: integer
+          minimum: 0
+          description: Rooms the answering replica owns whose newest events are not yet
+            searchable there, which its search indexer's catch-up still has to read
+            (`hs_room_search_rooms_behind`). The indexer runs on every replica over the rooms
+            that replica owns, so this is the answering replica's number. 0 when search is up to
+            date; a number that stays high means the indexer is stuck, and its log lines start
+            with "search index". Set for a single node too. Absent until the indexer has counted
+            once since the replica started.
+        search_index_documents:
+          type: integer
+          minimum: 0
+          description: Events the answering replica's room-event search index holds, as of its
+            last write to it (`hs_room_search_index_documents`). Set for a single node too.
+            Absent until the indexer has read the count once since the replica started.
     Replica:
       type: object
       description: One replica of the cluster, as the replica answering the request sees it. A server not running as a cluster is a cluster of one (`role` is `single-node`).

@@ -125,6 +125,7 @@ export function StatisticsPage() {
       </div>
 
       <ClusterNow />
+      <SearchIndexNow />
     </div>
   );
 }
@@ -240,6 +241,74 @@ function ClusterNow() {
               Cluster page
             </Link>{" "}
             follows every replica&apos;s heartbeat while it is open.
+          </p>
+        </>
+      )}
+    </section>
+  );
+}
+
+/**
+ * The search index's lag now, from `GET /cluster`'s `search_rooms_behind` and
+ * `search_index_documents`. Every replica, a single node included, indexes the rooms it owns, so
+ * these are the answering replica's numbers and are shown whatever the mode.
+ */
+function SearchIndexNow() {
+  const cluster = useClusterStatus();
+  const behind = cluster.data?.search_rooms_behind;
+  const tiles: { label: string; value: string; description: string }[] = [
+    {
+      label: "Rooms behind",
+      value: formatCount(behind),
+      description:
+        "Rooms whose newest messages search does not find yet on this replica. 0 means search is up to date.",
+    },
+    {
+      label: "Events indexed",
+      value: formatCount(cluster.data?.search_index_documents),
+      description: "Messages and other events that search can find on this replica.",
+    },
+  ];
+  return (
+    <section aria-labelledby="search-index-heading" className="space-y-3">
+      <h2 id="search-index-heading" className="text-md font-medium text-text">
+        Search index
+      </h2>
+      {cluster.isError ? (
+        <QueryProblemState
+          error={cluster.error}
+          resource="the search index's numbers"
+          scope="admin:read"
+          compact
+          onRetry={() => cluster.refetch()}
+        />
+      ) : cluster.isLoading ? (
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          {tiles.map((tile) => (
+            <Skeleton key={tile.label} className="h-24 rounded-md" />
+          ))}
+        </div>
+      ) : (
+        <>
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            {tiles.map((tile) => (
+              <div key={tile.label} className="rounded-md border border-border bg-surface p-4">
+                <p className="text-xs text-text-muted">{tile.label}</p>
+                <p className="mt-1 text-2xl text-text tabular-nums">{tile.value}</p>
+                <p className="mt-1 text-xs text-text-faint">{tile.description}</p>
+              </div>
+            ))}
+          </div>
+          <p className="text-xs text-text-faint">
+            {behind === undefined
+              ? "The search indexer has not counted yet since this replica started; the numbers appear once it has. "
+              : behind === 0
+                ? "Search is up to date: every message this replica holds can be found. "
+                : "The indexer is catching up; new messages in these rooms show up in search once it reaches them. "}
+            Each replica indexes the rooms it owns, so these are the numbers of the replica
+            answering this page. A number of rooms behind that stays high means the indexer is
+            stuck: look in the server&apos;s logs for lines starting with &ldquo;search
+            index&rdquo;.
           </p>
         </>
       )}

@@ -170,4 +170,26 @@ pub trait RemoteJoin: Send + Sync {
             "cannot fetch the public room list of {server}"
         )))
     }
+
+    /// Asks `server` which event of `room_id` is closest to `ts` in `direction`
+    /// (`GET /_matrix/federation/v1/timestamp_to_event/{roomId}`): `Some((event_id,
+    /// origin_server_ts))`, or `None` when it has none (its `404`). What
+    /// `GET /rooms/{roomId}/timestamp_to_event` falls back on when this server's copy of the
+    /// room begins later than the room does.
+    ///
+    /// # Errors
+    /// [`RoomError::RemoteJoinFailed`] if the server could not be asked or answered with
+    /// something else.
+    async fn timestamp_to_event(
+        &self,
+        server: &str,
+        room_id: &RoomId,
+        ts: i64,
+        direction: crate::timeline::Direction,
+    ) -> Result<Option<(ruma::OwnedEventId, i64)>, RoomError> {
+        let _ = (room_id, ts, direction);
+        Err(RoomError::RemoteJoinFailed(format!(
+            "cannot ask {server} for an event by time"
+        )))
+    }
 }

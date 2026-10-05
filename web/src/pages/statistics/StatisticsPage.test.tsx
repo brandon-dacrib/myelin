@@ -181,6 +181,48 @@ describe("Statistics", () => {
     expect(screen.queryByText("Heartbeat sequence")).not.toBeInTheDocument();
   });
 
+  it("shows how far the search index is behind, and what a caught-up 0 means", async () => {
+    open();
+    const section = within(
+      (await screen.findByRole("heading", { name: "Search index" })).closest("section")!,
+    );
+    expect(await section.findByText("Rooms behind")).toBeInTheDocument();
+    expect(section.getByText("0")).toBeInTheDocument();
+    expect(section.getByText("Events indexed")).toBeInTheDocument();
+    expect(section.getByText("18,204")).toBeInTheDocument();
+    expect(section.getByText(/Search is up to date/)).toBeInTheDocument();
+    expect(section.getByText(/search index/)).toBeInTheDocument();
+  });
+
+  it("says the indexer is catching up, on a single node too", async () => {
+    server.use(
+      http.get("/api/v1/cluster", () =>
+        HttpResponse.json({
+          mode: "single-node",
+          replica_count: 1,
+          search_rooms_behind: 4,
+          search_index_documents: 120,
+        }),
+      ),
+    );
+    open();
+    const section = within(
+      (await screen.findByRole("heading", { name: "Search index" })).closest("section")!,
+    );
+    expect(await section.findByText("4")).toBeInTheDocument();
+    expect(section.getByText(/indexer is catching up/)).toBeInTheDocument();
+  });
+
+  it("says when the search indexer has not counted yet", async () => {
+    server.use(
+      http.get("/api/v1/cluster", () =>
+        HttpResponse.json({ mode: "single-node", replica_count: 1 }),
+      ),
+    );
+    open();
+    expect(await screen.findByText(/has not counted yet/)).toBeInTheDocument();
+  });
+
   it("is not shown without admin:read", async () => {
     await signIn(["moderation:read"]);
     open();

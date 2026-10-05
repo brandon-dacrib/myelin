@@ -2,6 +2,37 @@
 
 Track brief: `docs/workstreams/15-admin-api-and-modules.md`. Owner crates: `hs-admin`, `hs-modules`, `hs-identity`, `hs-http` (shared with 07 and 14).
 
+## 2026-10-04: `GET /cluster` says how far the search index is behind
+
+Branch `agent/room-client-gaps` (tracks 15, 04, 16). The search indexer's lag was a Prometheus
+metric only (`hs_room_search_rooms_behind`, `hs_room_search_index_documents`). It is now in the
+admin API and on the web Statistics page.
+
+**Contract** (`openapi.yaml` **0.1.10**): `ClusterStatus.search_rooms_behind` (rooms the answering
+replica owns whose newest events its search index does not hold yet; 0 when search is up to date)
+and `ClusterStatus.search_index_documents` (events that index holds). Both are set for a single
+node too, and absent, not 0, until the indexer has counted once since the replica started.
+`ClusterStatus` is the place because the indexer runs per replica over the rooms that replica
+owns, and `GET /cluster` already carries the answering replica's own counters (`heartbeat_seq`,
+`drain_released_at_once_count`). Other replicas' lag is not in `Replica` (it would need the
+heartbeat to carry it); each replica's `/metrics` has its own.
+
+**Wiring**: `hs_room::metrics::search_index_lag()` returns a `SearchIndexLag { rooms_behind,
+documents }` read from the gauges, with `None` until each gauge is first set. `hs-cli`'s
+`ServerOverview::cluster` (`overview.rs`) fills both fields in both modes. hs-admin still does
+not depend on hs-room. The `hs-admin-mock` fixture and the web mock carry both fields.
+
+**Web**: a "Search index" section on Statistics, below Cluster and shown in both modes: "Rooms
+behind" and "Events indexed", what 0 means, and that a number that stays high means a stuck
+indexer whose log lines start with "search index".
+
+**Tests**: hs-room `metrics::tests` (unset vs. set gauge); hs-admin router
+`cluster_get_carries_the_search_index_lag_and_a_caught_up_zero`; hs-cli real-binary
+`the_overview_counts_real_accounts_rooms_and_an_empty_media_repository` now asserts both fields
+are there on a single node; three `StatisticsPage.test.tsx` cases (caught up, catching up on a
+single node, not counted yet). `cargo test -p hs-admin`, clippy on hs-admin, hs-cli and hs-room,
+`npm run check` and `npm run test:e2e` (68/68) pass.
+
 ## 2026-10-04: `users.update` changes the name, avatar and kind; `users.availability` is real
 
 Branch `agent/users-update-sources` (tracks 15, 07, 16). `PATCH /users/{user_id}` used to refuse

@@ -8,7 +8,7 @@
 //! at startup.
 
 use std::sync::LazyLock;
-use std::sync::atomic::AtomicI64;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
@@ -57,6 +57,14 @@ static SEARCH_INDEX_DOCUMENTS: LazyLock<Gauge<i64, AtomicI64>> = LazyLock::new(G
 
 /// `hs_room_search_rooms_behind`: rooms the indexer's current catch-up still has to read.
 static SEARCH_ROOMS_BEHIND: LazyLock<Gauge<i64, AtomicI64>> = LazyLock::new(Gauge::default);
+
+/// Whether `SEARCH_INDEX_DOCUMENTS` has been set since this process started; until then it reads
+/// 0 without meaning it.
+static SEARCH_INDEX_DOCUMENTS_SET: AtomicBool = AtomicBool::new(false);
+
+/// Whether the indexer has counted the rooms it is behind on since this process started; until
+/// its first catch-up does, `SEARCH_ROOMS_BEHIND` reads 0 without meaning it.
+static SEARCH_ROOMS_BEHIND_SET: AtomicBool = AtomicBool::new(false);
 
 /// `hs_room_search_index_delay_seconds`: from an event's `origin_server_ts` to its words being
 /// in the index -- the indexing lag.
@@ -124,11 +132,49 @@ pub(crate) fn create_room_id_taken() -> u64 {
 pub(crate) fn search_indexed(added: u64, documents: i64) {
     SEARCH_INDEXED_EVENTS.inc_by(added);
     SEARCH_INDEX_DOCUMENTS.set(documents);
+    SEARCH_INDEX_DOCUMENTS_SET.store(true, Ordering::Release);
 }
 
 /// Records how many rooms the indexer's catch-up has left.
 pub(crate) fn set_search_rooms_behind(rooms: usize) {
     SEARCH_ROOMS_BEHIND.set(i64::try_from(rooms).unwrap_or(i64::MAX));
+    SEARCH_ROOMS_BEHIND_SET.store(true, Ordering::Release);
+}
+
+/// How far this replica's room-event search index is behind, as `/metrics` serves it in
+/// `hs_room_search_rooms_behind` and `hs_room_search_index_documents`: what `hs-cli` puts in the
+/// admin API's `GET /cluster` (`ClusterStatus.search_rooms_behind` and
+/// `.search_index_documents`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SearchIndexLag {
+    /// Rooms this replica owns whose newest events are not yet in its search index: what the
+    /// indexer's current catch-up still has to read. 0 when search is up to date. `None` until
+    /// the indexer has counted once since the process started.
+    pub rooms_behind: Option<u64>,
+    /// Events the index holds, as of this replica's last write to it. `None` until the indexer
+    /// has read or written the count once since the process started.
+    pub documents: Option<u64>,
+}
+
+/// A gauge's value, or `None` when it has not been `set` (it reads 0 then without meaning it).
+/// A negative value, which the indexer never sets, reads as 0.
+fn gauge_value(value: i64, set: bool) -> Option<u64> {
+    set.then(|| u64::try_from(value).unwrap_or(0))
+}
+
+/// This replica's search-index lag now (see [`SearchIndexLag`]).
+#[must_use]
+pub fn search_index_lag() -> SearchIndexLag {
+    SearchIndexLag {
+        rooms_behind: gauge_value(
+            SEARCH_ROOMS_BEHIND.get(),
+            SEARCH_ROOMS_BEHIND_SET.load(Ordering::Acquire),
+        ),
+        documents: gauge_value(
+            SEARCH_INDEX_DOCUMENTS.get(),
+            SEARCH_INDEX_DOCUMENTS_SET.load(Ordering::Acquire),
+        ),
+    }
 }
 
 /// Observes one event's indexing lag, `delay_ms` milliseconds (negative, for a sender's clock
@@ -206,4 +252,29 @@ pub fn register_metrics(registry: &mut prometheus_client::registry::Registry) {
         "Time taken to answer POST /search",
         SEARCH_DURATION.clone(),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unset_gauge_is_unknown_and_a_set_one_is_its_value() {
+        assert_eq!(gauge_value(0, false), None);
+        assert_eq!(gauge_value(7, false), None);
+        assert_eq!(gauge_value(0, true), Some(0));
+        assert_eq!(gauge_value(7, true), Some(7));
+        assert_eq!(gauge_value(-1, true), Some(0));
+    }
+
+    #[test]
+    fn the_lag_is_known_once_the_indexer_has_recorded_it() {
+        // Process-wide statics that other tests' indexers also set: only that the values become
+        // known can be asserted here, not which numbers they hold.
+        set_search_rooms_behind(3);
+        search_indexed(0, 12);
+        let lag = search_index_lag();
+        assert!(lag.rooms_behind.is_some());
+        assert!(lag.documents.is_some());
+    }
 }

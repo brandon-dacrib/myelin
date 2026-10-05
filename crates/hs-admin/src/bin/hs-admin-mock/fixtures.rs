@@ -224,5 +224,12 @@ pub fn statistics_overview() -> Value {
 }
 
 pub fn cluster_status() -> Value {
-    json!({"mode": "clustered", "epoch": 42, "replica_count": 3, "shard_count": 256})
+    json!({
+        "mode": "clustered",
+        "epoch": 42,
+        "replica_count": 3,
+        "shard_count": 256,
+        "search_rooms_behind": 0,
+        "search_index_documents": 18_204,
+    })
 }

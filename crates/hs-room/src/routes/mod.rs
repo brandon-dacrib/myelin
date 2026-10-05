@@ -5,6 +5,7 @@
 //! prefixed ones.
 
 pub mod aliases;
+pub mod client_events;
 pub mod create_room;
 pub mod directory;
 pub mod hierarchy;
@@ -17,6 +18,7 @@ pub mod render;
 pub mod report;
 pub mod search;
 pub mod send_state;
+pub mod summary;
 pub mod threads;
 pub mod upgrade;
 
@@ -240,6 +242,19 @@ pub fn router<B: KvBackend + 'static>() -> (axum::Router<RoomState<B>>, RouteMan
             "/rooms/{roomId}/hierarchy",
             hierarchy::get_hierarchy::<B>,
             matrix_client("getSpaceHierarchy"),
+        )
+        // MSC3266's room summary, `v1` like the hierarchy. The spec lets anyone ask, so the
+        // handler takes a token when there is one (`summary::MaybeRequester`).
+        .get(
+            "/room_summary/{roomIdOrAlias}",
+            summary::get_room_summary::<B>,
+            RouteMeta::new(Surface::MatrixClient, AuthKind::None)
+                .with_operation_id("getRoomSummary"),
+        )
+        .get(
+            "/rooms/{roomId}/timestamp_to_event",
+            summary::get_timestamp_to_event::<B>,
+            matrix_client("getEventByTimestamp"),
         )
         .post("/search", search::post_search::<B>, matrix_client("search"))
         .post(

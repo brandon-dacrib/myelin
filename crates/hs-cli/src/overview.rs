@@ -221,6 +221,10 @@ impl<B: KvBackend + 'static> OverviewSource for ServerOverview<B> {
     }
 
     async fn cluster(&self) -> Result<ClusterStatus, SourceError> {
+        // This replica's search indexer, as `/metrics` serves it in
+        // `hs_room_search_rooms_behind` and `hs_room_search_index_documents`: the indexer runs
+        // on every replica over the rooms it owns, so the numbers are the answering replica's.
+        let search = hs_room::metrics::search_index_lag();
         if self.single_node {
             return Ok(ClusterStatus {
                 mode: "single-node".to_owned(),
@@ -229,6 +233,8 @@ impl<B: KvBackend + 'static> OverviewSource for ServerOverview<B> {
                 shard_count: None,
                 heartbeat_seq: None,
                 drain_released_at_once_count: None,
+                search_rooms_behind: search.rooms_behind,
+                search_index_documents: search.documents,
             });
         }
         // The shard map is what this replica currently believes; the counts are of that belief.
@@ -243,6 +249,8 @@ impl<B: KvBackend + 'static> OverviewSource for ServerOverview<B> {
             shard_count: map.as_ref().map(|m| m.owned_shard_count() as u64),
             heartbeat_seq: counters.as_ref().map(|c| c.heartbeat_seq),
             drain_released_at_once_count: counters.as_ref().map(|c| c.drain_released_at_once),
+            search_rooms_behind: search.rooms_behind,
+            search_index_documents: search.documents,
         })
     }
 }
