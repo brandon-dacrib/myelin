@@ -4,7 +4,88 @@ Written 2026-09-20 by the integration lead, last revised 2026-10-04, afternoon E
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
-## Resume here: 2026-10-04, afternoon EDT -- the wave is merged; roll to the first green image of `8ec77d0f` or later
+## Resume here: 2026-10-05 -- wave 2 is merged; roll to the first green image of `731d2433` or later
+
+**Where `main` is.** `731d2433`. All eight wave-2 branches are merged through the queue, plus three
+fixes found on the way, each gate green: `ops-web` `385a748d`, `pycache` `7dd22356`, `e2ee-gaps`
+`5afac15c`, `push-media-gaps` `2c563a4d`, `federation-gaps` `bde7a789`, `appservice-gaps`
+`5cdb4989`, `email-held-flake` `3b54fb48`, `room-client-gaps` `7ca60aa6`, `auth-gaps` `c281412a`,
+`sync-gaps` `731d2433`. **Nothing is unmerged, no lock, no agent worktree, no agent process.**
+OpenAPI is **0.1.10** (the search index's lag on `GET /api/v1/cluster`); decisions **0030**
+(appservice namespaces reach registration, aliases and the directory) and **0031** (a page with
+events has an `end`; a token is a boundary between events); RFC **0023** (durable to-device and
+device-list EDUs, proposed). **Not yet measured as a whole**: the last numbers are Sytest 663/772
+and Complement federation 241/314 on `c2d74174` (status 14 session 9).
+
+**Three things went wrong in the session and are fixed** (memory notes say how to avoid them):
+the disk filled at 21:00 EDT (the merge queue's reused `target/` was 237 GB; a gate failed at
+link time); the full disk restarted OrbStack, which removed the gate's PostgreSQL on 5462, and
+the TLS test had been skipping in every gate because its variables were never exported. Both
+servers now run with `--restart unless-stopped`, and **`source .claude/gate-pg/env.sh` before
+every gate** exports all four connection strings (the TLS certificate there expires 2026-11-03).
+Two Complement runs of one package on one Docker daemon break each other (shared container
+names): agents serialise them through a lock (`complement-lock.sh` in the session scratchpad;
+make it a script in `tests/complement/` next wave).
+
+**What the wave holds** (each track's status file has a dated section):
+
+- **Sync** (05): timelines, gaps, newly joined rooms and `full_state` as Sytest expects; peeking
+  (`POST /peek`, `/unpeek`, MSC2753, per device); presence for new members and over federation on
+  a join; filters on presence, account data and ephemeral events; remote users in the user
+  directory; the joiner in their own `device_lists.changed` (as Synapse); MSC4115 membership and
+  erasure pruning on timeline events. Sytest's ten sync files 64/67 on the branch (41 before).
+- **Federation** (06): the two "regressions" were two servers deadlocking on each other's `/send`
+  (one request per destination); now 8, and a slow slot is logged. Events citing another room are
+  rejected; erased accounts are served redacted; third-party invites cross servers
+  (`exchange_third_party_invite`); room version 12's creators, v2.1 conflicted subgraph and full
+  stripped state. 49/53 of its Sytest files (41 before).
+- **Room client** (04, decision 0031): `/messages` filters, `to`, lazy members, `contains_url` and
+  `end`; `/context` tokens; `/relations` paging; `/publicRooms` `since`; canonical alias on delete;
+  `GET /room_summary` and `/timestamp_to_event`; ephemeral messages expire on read; the search
+  index's lag on the Statistics page.
+- **Auth** (07): UIA bound to the account and operation; registration remembers its session;
+  `auth.recaptcha` and `auth.cas` (hot, Synapse's keys translated); self-service 3PIDs with an
+  identity server; OpenID userinfo; admin whois; `/capabilities` needs a token. 26/26 graded.
+- **E2EE** (08): device-list updates go out as the change commits; a fetched remote list that
+  differs is a change; a gap is fetched in the background (two servers no longer wait on each
+  other); a non-numeric backup version is 404.
+- **Appservices** (11, decision 0030): exclusive namespaces in registration, aliases and the
+  directory; alias and user queries to the bridge; `/thirdparty/*`; appservice room lists; an
+  appservice can no longer act as a user with no account (403, as Synapse); LinkedIn's port.
+  `tests/60app-services/` 25/25.
+- **Push and media** (10, 09, 13): invites over federation pushed with the room's name; held
+  notification emails survive a restart (and the flake in its test, a log line before the write,
+  is fixed); thumbnails at any size from the nearest configured; URL previews with every `og:`
+  tag and the image size; legacy downloads ask the origin's legacy path; Synapse's `email` block
+  translates.
+- **Ops and web** (14, 16): `tools/dashboard.py` reads the committed results and runs without
+  cargo; the NoCreators race is patched (`tests/complement/apply_patches.sh`; run it once on a
+  fresh `refs/complement`); the Cluster page's Epoch is a time and the table fits 1280 px; e2e-real
+  screenshots go to `test-results/`; one warning when IPv4-only meets an IPv6-only peer.
+
+**What is next, in order:**
+
+1. **Roll the demo** to the first green image of `731d2433` or later, then the bridge migration in
+   `docs/bridges/mautrix.md` ("2026-10-04"). *Desk item.*
+2. **Measure wave 2**: Sytest whole suite and Complement federation and csapi on a quiet machine
+   (run `tests/complement/apply_patches.sh refs/complement` first), into status 14 session 10.
+3. **What wave 2 left**, by track: 06 `TestCorruptedAuthChain` (use fetched state without holding
+   the prev event), `TestMSC4291..._RoomIDIsOnCreateEvent` (`room_id` on the rendered v12 create
+   event, `hs-room` `routes/render.rs`), alias queries over federation asking the bridge, RFC 0023
+   (durable EDUs) and the `stopped_server` device-list and to-device cases it covers; 05
+   `TestGetRoomMembersAtPoint` (`/members?at=` before the first event), a peeked room does not
+   wake a long-poll, `TestSyncOmitsStateChangeOnFilteredEvents`; 10 MSC4306 `postcontent`
+   push-rule kind (`TestThreadedReceipts`, `TestThreadReceiptsInSyncMSC4102`), push rules copied
+   on a room upgrade (`TestPushRuleRoomUpgrade`), a HELO fallback for the pusher's mailer; 07 email
+   password reset and `next_link`, CAS sign-in does not check appservice namespaces, admin
+   deactivation does not unbind 3PIDs, `public_baseurl` reaches `hs-auth` only with the next auth
+   change, `hs-federation` registers `/openid/userinfo` behind X-Matrix (`hs_cli::openid_userinfo`
+   works around it); 08 two device-list tests that are races in Sytest; 11 one event pump for all
+   rooms (a silent bridge holds delivery for up to 10 s per unknown user per minute); 14 a shared
+   BuildKit target cache can link another branch's crate into a Complement image.
+4. **The federation milestone** against a real Synapse, and **operations on the cluster**. *Desk.*
+
+## Earlier: 2026-10-04, afternoon EDT -- the wave is merged; roll to the first green image of `8ec77d0f` or later
 
 **Where `main` is.** `8ec77d0f` (the wave, then the fuzz fix below). Every branch of the wave named in the next section is merged
 through the queue, each gate green with both PostgreSQL servers (plain on 5462, TLS on 5463):
