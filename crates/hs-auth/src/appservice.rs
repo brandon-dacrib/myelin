@@ -98,6 +98,38 @@ pub trait AppserviceRegistry: Send + Sync {
     /// Returns the appservice this token belongs to, or `None` if it is not an appservice token
     /// at all (the caller then falls through to ordinary user-token authentication).
     async fn lookup_by_token(&self, token: &str) -> Option<AppserviceRecord>;
+
+    /// The appservice whose **exclusive** user namespace covers `user_id`, if any. Nobody else
+    /// may register that user ID (`M_EXCLUSIVE`): not a person, not another appservice.
+    ///
+    /// The default (this stub registry's) knows of no exclusive namespaces. Track 11's
+    /// `hs_appservice::auth_registry::RegistryAppserviceAdapter` answers from its registry.
+    async fn exclusive_user_owner(&self, _user_id: &UserId) -> Option<String> {
+        None
+    }
+
+    /// The appservice whose **exclusive** alias namespace covers the room alias `alias`, if any.
+    /// Nobody else may create that alias (`M_EXCLUSIVE`).
+    async fn exclusive_alias_owner(&self, _alias: &str) -> Option<String> {
+        None
+    }
+
+    /// For a local alias the directory does not hold: asks each appservice whose alias namespace
+    /// covers `alias` (`GET /_matrix/app/v1/rooms/{roomAlias}`) whether it can provide it. `true`
+    /// once one said yes, by which time it has created the alias, so the caller looks it up
+    /// again. The default asks nobody.
+    async fn query_room_alias(&self, _alias: &str) -> bool {
+        false
+    }
+
+    /// The rooms appservices published in their own room directories (`PUT
+    /// /directory/list/appservice/{networkId}/{roomId}`): one network's, named by its
+    /// `third_party_instance_id` (`{appservice id}|{network id}`), or every network's with
+    /// `None`. Kept apart from the server's own directory: `/publicRooms` shows them only when
+    /// asked to. The default has none.
+    async fn network_room_ids(&self, _instance_id: Option<&str>) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// An in-memory registry for tests and for running this crate standalone before track 11's real
@@ -131,6 +163,20 @@ impl AppserviceRegistry for InMemoryAppserviceRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(token)
             .cloned()
+    }
+
+    async fn exclusive_user_owner(&self, user_id: &UserId) -> Option<String> {
+        self.by_token
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .find(|record| {
+                record
+                    .user_namespaces
+                    .iter()
+                    .any(|ns| ns.exclusive && ns.regex.is_match(user_id.as_str()))
+            })
+            .map(|record| record.appservice_id.clone())
     }
 }
 

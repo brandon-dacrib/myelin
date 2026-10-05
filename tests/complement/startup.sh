@@ -84,6 +84,19 @@ else
   FEDERATION_CA_CONFIG='  custom_ca_certificates: ["/complement/ca/ca.crt"]'
 fi
 
+# ---- 2c. Appservice registrations ------------------------------------------------------------
+# Complement copies each blueprint appservice's registration to /complement/appservice/<id>.yaml
+# before the container starts (refs/complement/internal/docker/deployer.go, MountAppServicePath).
+# Without these listed, the bridge's as_token is unknown (TestJoinFederatedRoomFromApplication
+# ServiceBridgeUser: 401 M_UNKNOWN_TOKEN). Each file is imported once, as `hs serve` does for any
+# listed registration (docs/config.md, appservices.registration_files).
+APPSERVICE_FILES=""
+for f in /complement/appservice/*.yaml; do
+  [ -f "$f" ] || continue
+  APPSERVICE_FILES="$APPSERVICE_FILES\"$f\", "
+done
+APPSERVICE_FILES="[${APPSERVICE_FILES%, }]"
+
 # ---- 3. Native hs-config, written fresh each start (cheap, and SERVER_NAME can differ across
 #         containers reusing the same image even though /data itself is not reused across runs).
 DB_DIR=/data/db
@@ -122,6 +135,8 @@ media:
 # rc_message limit the same way. Decision 0015: the server-wide send limit is enforced.
 rate_limits:
   enabled: false
+appservices:
+  registration_files: $APPSERVICE_FILES
 EOF
 
 # ---- 4. TLS termination in front of the plaintext hs listener ---------------------------------

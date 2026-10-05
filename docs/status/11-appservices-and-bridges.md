@@ -1,6 +1,8 @@
 # Status: track 11, appservices and bridges
 
-Last updated: 2026-10-04 (the demo's shared WhatsApp registration becomes a declared offering,
+Last updated: 2026-10-04, late (a bridge's namespaces, protocols and room directory mean what
+Sytest's `tests/60app-services/` says, and a ghost acts once it is registered; below); before
+that 2026-10-04 (the demo's shared WhatsApp registration becomes a declared offering,
 and the server names a bridge registered by hand beside an offering; a changed double puppeting
 reaches each instance's registration; Signal, Slack, X and LinkedIn have their command prefix;
 `hs-bridges` and the operator connect under the outbound policy; mautrix-signal is the second
@@ -16,6 +18,116 @@ manager) and an instance's Kubernetes objects say whose bridge they are; before 
 (who has signed in to a bridge; the `cluster` runtime run on kind); before that 2026-09-30
 (ephemeral, to-device and device-list delivery); before that 2026-09-27 (RFC 0017 run against
 the real binary), 2026-09-27 (the bridge manager) and 2026-09-25.
+
+## Session 2026-10-04, late (branch `agent/appservice-gaps`): what a bridge's namespaces, protocols and room directory mean outside delivery
+
+Graded by Sytest `target/sytest/20261004-wave1/` (10 of `tests/60app-services/` failing, 2
+skipped behind them) and Complement's `TestJoinFederatedRoomFromApplicationServiceBridgeUser`.
+Decision `docs/decisions/0030-an-appservices-namespaces-reach-registration-aliases-and-the-room-directory-through-hs-auths-registry.md`
+(the seam and the call sites, and why a ghost must be registered).
+
+**The seam.** `hs_auth::appservice::AppserviceRegistry` gained four methods with default
+bodies (`exclusive_user_owner`, `exclusive_alias_owner`, `query_room_alias`,
+`network_room_ids`); `hs_appservice::auth_registry::RegistryAppserviceAdapter` answers them from
+the registry and, `with_queries`, asks the bridges. The stub `InMemoryAppserviceRegistry`
+answers `exclusive_user_owner` from its records' exclusive rules.
+
+**What changed, by Sytest test.**
+
+- "Regular users cannot register within the AS namespace": `/register` and `/register/available`
+  refuse an exclusive user ID with `400 M_EXCLUSIVE` (also an appservice registering in another's;
+  `hs-auth` `routes/register.rs`, `refuse_exclusive`). Log: `refused a registration in an
+  appservice's exclusive namespace`.
+- "Regular users cannot create room aliases within the AS namespace": `PUT /directory/room`
+  refuses an exclusive alias to anyone but its appservice (`hs-room` `routes/aliases.rs`,
+  `RoomError::Exclusive` → `400 M_EXCLUSIVE`). Log: `refused an alias in an appservice's
+  exclusive namespace`.
+- "Accesing an AS-hosted room alias asks the AS server": a local alias the directory does not
+  hold is asked of each appservice whose alias namespace covers it (`GET
+  /_matrix/app/v1/rooms/{alias}`, `QueryService::room_alias_exists`) and read again
+  (`hs_room::routes::aliases::resolve_local_alias`, used by `GET /directory/room` and `POST
+  /join/{alias}`).
+- "Inviting an AS-hosted user asks the AS server": before the pump queues an event naming a local
+  user with no account (sender, or a membership's target) whom a bridge covers, it asks the bridge
+  (`GET /_matrix/app/v1/users/{userId}`) and waits, as Synapse's `_check_user_exists` does
+  (`Pump::with_user_queries`, `LocalUsers`, `hs-cli`'s `appservice_delivery::Accounts`). A user
+  nobody provides is not asked about again for a minute.
+- "Events in rooms with AS-hosted room aliases are sent to AS server": alias interest was already
+  in the pump; it failed only because the alias above was never made.
+- "HS provides query metadata", "HS can provide query metadata on a single protocol" (and the two
+  it unskips, "HS will proxy request for 3PU/3PL mapping"): new routes
+  `hs_appservice::client_routes` (`GET /thirdparty/protocols`, `/thirdparty/protocol/{p}`,
+  `/thirdparty/user[/{p}]`, `/thirdparty/location[/{p}]`), mounted under `v3` and `r0`. Each
+  protocol is asked of every appservice declaring it and merged as Synapse merges (first answer's
+  fields, every answer's instances); an instance with a `network_id` gets
+  `instance_id: "{appservice}|{network}"`; answers are kept five minutes (`PROTOCOL_CACHE_MS`),
+  which the single-protocol test relies on. Lookups pass the client's query (minus
+  `access_token`) and keep only well-formed results.
+- "AS can publish rooms in their own list", "AS and main public room lists are separate": `PUT`/
+  `DELETE /directory/list/appservice/{networkId}/{roomId}` (appservice tokens only, `403`
+  otherwise) keep rooms in keyspace `hs_appservice.network_rooms` (purged with the appservice);
+  `/publicRooms` (`hs-room` `routes/directory.rs`) reads `third_party_instance_id` (that network)
+  and `include_all_networks` (the server's and every network's); the server's own list is
+  unchanged. Log: `an appservice changed its room directory`.
+- "AS can deactivate a user": `/account/deactivate` skips UIA for an appservice requester
+  (`hs-auth` `routes/account.rs`). Log: `an appservice deactivated one of its users`.
+
+**Found on the way: an unregistered ghost could act.** "Ghost user must register before joining
+room" passed only by Sytest's leniency (its check passed before the test did anything): the
+appservice could masquerade as `@astest-02ghost-1` without registering it. With the user query
+on, that unregistered sender made the pump ask a bridge that never answered, holding every
+room's delivery for the ten-second timeout, and two `03passive` tests failed behind it.
+`hs-auth`'s appservice authentication now refuses a masquerade as a user with no account here
+(`403`, "Application service has not registered this user"), as Synapse does; the bot is exempt.
+The real mautrix-whatsapp and mautrix-signal stories pass with it.
+
+**Observable.** `hs_appservice_queries_total{appservice,kind,outcome}` (kinds `user`,
+`room_alias`, `protocol`, `thirdparty_user`, `thirdparty_location`; outcomes `yes`, `no`,
+`error`, `cached`), registered by `hs serve`; `WARN` when a bridge does not answer; `INFO` when it
+provides a user or alias.
+
+**Complement.** `TestJoinFederatedRoomFromApplicationServiceBridgeUser` failed with `401
+M_UNKNOWN_TOKEN`: the image never listed the registrations Complement copies to
+`/complement/appservice/*.yaml`. `tests/complement/startup.sh` (track 14's file; one block, 2c)
+now lists them in `appservices.registration_files`.
+
+**The catalogue's LinkedIn port** is 29341, mautrix-linkedin's `DefaultPort`
+(`pkg/connector/connector.go` at commit af73c518, read 2026-10-04); it said 29325
+(`hs_admin::bridge_types`, test `linkedin_listens_on_its_sources_default_port`, which also checks
+no two entries share a port; the web mock's table).
+
+**Verified.** Unit: `cargo test -p hs-appservice` (114; new `registry::tests::
+exclusive_owners_and_interested_appservices`, `network_rooms_are_kept_per_appservice_and_network`,
+`query::tests::protocol_metadata_is_merged_across_appservices_and_kept_a_while`,
+`thirdparty_lookups_go_to_the_protocols_appservices`,
+`existence_questions_go_to_the_appservices_that_cover_the_id`,
+`pump::tests::the_bridge_is_asked_about_an_unknown_user_before_it_hears_of_them`,
+`client_routes::tests` ×3), `-p hs-auth` (265; new
+`a_person_cannot_register_in_an_appservices_exclusive_namespace`,
+`an_appservice_deactivates_its_user_without_uia`, and
+`appservice_can_masquerade_as_namespaced_user` now registers its ghost first), `-p hs-room --lib`
+(184; new `an_appservices_aliases_are_its_own_and_it_is_asked_for_ones_nobody_has_made`,
+`an_appservice_networks_rooms_are_listed_apart_from_the_servers`), `-p hs-admin`, `-p
+hs-bridges`, `-p hs-cli --lib`, `-p hs-bridge-conformance` (with the real mautrix bridges, 4 of
+4). **Real binary:** `cargo test -p hs-cli --test appservice_queries` (new; the whole Sytest story
+in one server, metrics and log lines included), and `appservice_ephemeral`, `bridge_offerings`,
+`bridge_logins` again. **Sytest** (`tests/60app-services/*.pl`, `SYTEST_HS_BINARY` of this
+branch, bookworm release build): **25 of 25 pass**, the 10 graded failures and the 2 skips
+behind them included (before: 13 pass, 10 fail, 2 skip; `target/sytest/base-60as/` against
+`as-2/`), and "Ghost user must register before joining room" no longer passes before it does
+anything. **Complement** (`refs/complement`, under the shared lock, image
+`complement-hs-appservice-gaps:dev`: this branch's `hs` and `startup.sh` over
+`complement-hs-main:c2d74174`): `TestJoinFederatedRoomFromApplicationServiceBridgeUser` passes;
+`TestJumpToDateEndpoint`, the other test on the appservice blueprint, is unchanged (2 of 14
+subtests, as on main: `/timestamp_to_event` is not a route, `hs-room`'s). Clippy `-D warnings` on hs-appservice, hs-auth, hs-room, hs-admin,
+hs-cli, hs-bridge-conformance; `cargo fmt --all --check`. `web/` (the LinkedIn port in the
+mock): `npm run check` (605 tests; four lint warnings in files this branch does not touch),
+`npm run test:e2e` 68 of 68.
+
+**Not done / left.** The pump is one task for all rooms, so a bridge that never answers
+`/users/{userId}` holds delivery for the query's ten-second timeout once per unknown user per
+minute (decision 0030, consequences). Inbound federation alias queries
+(`/_matrix/federation/v1/query/directory`, `hs-federation`) do not ask the bridge yet.
 
 ## Session 2026-10-04 (branch `agent/bridge-offering-demo`): the demo's shared WhatsApp registration becomes an offering
 
@@ -1229,6 +1341,12 @@ to anything broken.
 
 ## Interfaces provided
 
+- 2026-10-04: `hs_appservice::query::QueryService::{user_exists, room_alias_exists, protocols,
+  thirdparty_lookup, set_metrics}`; `hs_appservice::client_routes::client_router` (mount under
+  `/_matrix/client/v3` and `r0`); `hs_appservice::pump::{LocalUsers, Pump::with_user_queries}`;
+  `Registry::{interested, exclusive_owner, set_network_room, network_room_ids}`,
+  `registry::instance_id`; `RegistryAppserviceAdapter::with_queries`, which answers the four new
+  `hs_auth::appservice::AppserviceRegistry` methods (decision 0030).
 - `hs_appservice::provisioning::BridgeLogins` (2026-10-01): asks a mautrix bridge's
   provisioning API who has signed in, with a 30 s cache and the
   `hs_admin_bridge_login_queries_total` counter; `RegistryAppserviceDirectory::
@@ -1276,6 +1394,9 @@ to anything broken.
 
 ## Decisions made
 
+- **2026-10-04: decision 0030.** The appservice seam into registration, aliases and
+  `/publicRooms` is `hs-auth`'s `AppserviceRegistry` trait (default methods, no new crate edge);
+  a ghost acts once registered; protocol metadata is kept five minutes.
 - **The owner's chat with their bridge's bot is started as the owner, not by the bot**
   (2026-10-02). mautrix marks a room as a person's management room only when the person invites
   its bot; a chat the bot starts never takes bare commands, so the invitation the manager used to

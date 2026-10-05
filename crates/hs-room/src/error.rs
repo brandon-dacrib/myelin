@@ -48,6 +48,11 @@ pub enum RoomError {
     #[error("{0}")]
     BadAlias(String),
 
+    /// An alias an appservice holds in an exclusive namespace, created by someone else.
+    /// `400 M_EXCLUSIVE`.
+    #[error("{0}")]
+    Exclusive(String),
+
     /// A signing or hashing operation failed.
     #[error(transparent)]
     Signing(#[from] hs_model::SigningError),
@@ -209,6 +214,11 @@ impl RoomError {
             Self::BadAlias(msg) => MatrixError::custom(
                 axum::http::StatusCode::BAD_REQUEST,
                 MatrixErrorCode::BadAlias,
+                msg.clone(),
+            ),
+            Self::Exclusive(msg) => MatrixError::custom(
+                axum::http::StatusCode::BAD_REQUEST,
+                MatrixErrorCode::Exclusive,
                 msg.clone(),
             ),
             Self::Forbidden(msg) => MatrixError::forbidden(msg.clone()),

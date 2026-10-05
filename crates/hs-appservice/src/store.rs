@@ -210,6 +210,11 @@ pub struct AppserviceStore<B: KvBackend> {
     /// streams (receipts, presence, to-device, device lists) each appservice has been sent.
     /// See [`AppserviceStore::enqueue_ephemeral`] and [`crate::ephemeral`].
     ephemeral_pos: TypedKeyspace<B::Keyspace, (String, String)>,
+    /// `(appservice id, network id, room id) -> ()`: the rooms an appservice published in its
+    /// own room directory for one of its networks (`PUT
+    /// /_matrix/client/v3/directory/list/appservice/{networkId}/{roomId}`). See
+    /// [`AppserviceStore::set_network_room`].
+    network_rooms: TypedKeyspace<B::Keyspace, (String, String, String)>,
 }
 
 /// What [`AppserviceStore::enqueue_ephemeral`] queues for one appservice: a transaction body,
@@ -264,6 +269,7 @@ impl<B: KvBackend> AppserviceStore<B> {
         let room_cursor = TypedKeyspace::new(backend.keyspace("hs_appservice.room_cursor")?);
         let pump_meta = TypedKeyspace::new(backend.keyspace("hs_appservice.pump_meta")?);
         let ephemeral_pos = TypedKeyspace::new(backend.keyspace("hs_appservice.ephemeral_pos")?);
+        let network_rooms = TypedKeyspace::new(backend.keyspace("hs_appservice.network_rooms")?);
         Ok(Self {
             backend,
             registry,
@@ -275,6 +281,7 @@ impl<B: KvBackend> AppserviceStore<B> {
             room_cursor,
             pump_meta,
             ephemeral_pos,
+            network_rooms,
         })
     }
 
@@ -736,6 +743,80 @@ impl<B: KvBackend> AppserviceStore<B> {
             self.delete_queue_entry(id, entry.seq)?;
         }
         Ok(())
+    }
+
+    // ---- appservice room directories ----
+
+    /// Publishes (`published`) or unpublishes `room_id` in appservice `id`'s room directory for
+    /// `network_id`. Idempotent both ways.
+    ///
+    /// # Errors
+    /// Returns [`AppserviceError::Store`] on failure.
+    pub fn set_network_room(
+        &self,
+        id: &str,
+        network_id: &str,
+        room_id: &str,
+        published: bool,
+    ) -> Result<(), AppserviceError> {
+        let key = (id.to_string(), network_id.to_string(), room_id.to_string());
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            if published {
+                self.network_rooms.put(txn, &key, b"").map_err(to_kv)
+            } else {
+                self.network_rooms.delete(txn, &key).map_err(to_kv)
+            }
+        })
+        .map_err(|e| AppserviceError::Store(e.to_string()))
+    }
+
+    /// `(appservice id, network id, room id)` for every room published in an appservice's room
+    /// directory: only `(id, network_id)`'s with `Some`, every network's with `None`.
+    ///
+    /// # Errors
+    /// Returns [`AppserviceError::Store`] on failure.
+    pub fn network_rooms(
+        &self,
+        network: Option<(&str, &str)>,
+    ) -> Result<Vec<(String, String, String)>, AppserviceError> {
+        let snap = self.backend.snapshot();
+        let spec = match network {
+            Some((id, network_id)) => {
+                TypedKeyspace::<B::Keyspace, (String, String, String)>::prefix(&(
+                    id.to_string(),
+                    network_id.to_string(),
+                ))
+            }
+            None => RangeSpec::full(),
+        };
+        self.network_rooms
+            .range(&snap, spec)
+            .map(|item| Ok(item?.0))
+            .collect()
+    }
+
+    /// Removes everything appservice `id` published in its room directories (when it is
+    /// removed).
+    ///
+    /// # Errors
+    /// Returns [`AppserviceError::Store`] on failure.
+    pub fn purge_network_rooms(&self, id: &str) -> Result<(), AppserviceError> {
+        let snap = self.backend.snapshot();
+        let prefix =
+            TypedKeyspace::<B::Keyspace, (String, String, String)>::prefix(&(id.to_string(),));
+        let keys: Vec<(String, String, String)> = self
+            .network_rooms
+            .range(&snap, prefix)
+            .map(|item| item.map(|(k, _)| k))
+            .collect::<Result<_, _>>()?;
+        drop(snap);
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            for key in &keys {
+                self.network_rooms.delete(txn, key).map_err(to_kv)?;
+            }
+            Ok(())
+        })
+        .map_err(|e| AppserviceError::Store(e.to_string()))
     }
 }
 

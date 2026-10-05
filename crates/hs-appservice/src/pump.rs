@@ -60,6 +60,7 @@ use serde_json::Value;
 use crate::ephemeral::{Interest, KeyCountSource, key_counts_for};
 use crate::error::AppserviceError;
 use crate::namespace::{NamespaceKind, Namespaces};
+use crate::query::QueryService;
 use crate::registry::Registry;
 use crate::scheduler::wire_body;
 use crate::store::AppserviceRow;
@@ -110,6 +111,27 @@ pub trait RoomSource: Send + Sync {
     /// Every room this server holds, with the position of its newest event. Must not need each
     /// room loaded into memory: it is called at every start.
     async fn room_heads(&self) -> Result<Vec<(String, i64)>, String>;
+}
+
+/// Whether a local user ID is a registered account: what the pump asks before it asks an
+/// appservice about a user it does not know ([`Pump::with_user_queries`]). A trait for the same
+/// reason [`RoomSource`] is: the accounts are `hs-auth`'s, and `hs-cli` implements it over them.
+#[async_trait]
+pub trait LocalUsers: Send + Sync {
+    /// True if `user_id` (a full user ID on this server) has an account.
+    async fn is_registered(&self, user_id: &str) -> bool;
+}
+
+/// How long the pump waits before asking the appservices again about a user they did not
+/// provide.
+pub const UNKNOWN_USER_RETRY_MS: u64 = 60_000;
+
+/// What [`Pump::with_user_queries`] keeps: who to ask, and whom it asked about lately.
+struct UserQueries<B: KvBackend> {
+    users: Arc<dyn LocalUsers>,
+    queries: Arc<QueryService<B>>,
+    /// `user ID -> when the appservices last said no`.
+    unknown: std::sync::Mutex<BTreeMap<String, u64>>,
 }
 
 /// Whether `appservice` should be sent `event`, which is one of `page`'s. See the module docs.
@@ -195,6 +217,9 @@ pub struct Pump<B: KvBackend> {
     /// MSC3202's key counts, for the transactions of an appservice that asked for them. `None`
     /// sends none (tests, and a server without an E2EE store).
     keys: Option<Arc<dyn KeyCountSource>>,
+    /// Asks appservices about unknown users before delivering events naming them. `None` asks
+    /// nobody (tests that do not need it).
+    user_queries: Option<UserQueries<B>>,
 }
 
 impl<B: KvBackend> Pump<B> {
@@ -205,6 +230,82 @@ impl<B: KvBackend> Pump<B> {
             registry,
             source,
             keys: None,
+            user_queries: None,
+        }
+    }
+
+    /// Before queuing an event for the appservices, asks them about each local user it names
+    /// (its sender, and a membership event's target) who has no account and is not an
+    /// appservice's bot: `GET /_matrix/app/v1/users/{userId}` of every appservice whose user
+    /// namespace covers them ([`QueryService::user_exists`]), waiting for the answers, as
+    /// Synapse does (`ApplicationServicesHandler._check_user_exists`, before it enqueues). This
+    /// is how a bridge creates the ghost someone just invited, before it hears of the invite
+    /// (Sytest's "Inviting an AS-hosted user asks the AS server"). A user nobody provided is not
+    /// asked about again for [`UNKNOWN_USER_RETRY_MS`].
+    #[must_use]
+    pub fn with_user_queries(
+        mut self,
+        users: Arc<dyn LocalUsers>,
+        queries: Arc<QueryService<B>>,
+    ) -> Self {
+        self.user_queries = Some(UserQueries {
+            users,
+            queries,
+            unknown: std::sync::Mutex::new(BTreeMap::new()),
+        });
+        self
+    }
+
+    /// See [`Pump::with_user_queries`]: asks about the unknown local users `page` names that
+    /// one of `listeners` covers.
+    async fn ask_about_unknown_users(&self, listeners: &[Listener], page: &RoomPage) {
+        let Some(asking) = &self.user_queries else {
+            return;
+        };
+        let server_name = self.registry.server_name();
+        let mut seen = BTreeSet::new();
+        for event in &page.events {
+            let field = |name: &str| event.json.get(name).and_then(Value::as_str);
+            let mut named = vec![field("sender")];
+            if field("type") == Some("m.room.member") {
+                named.push(field("state_key"));
+            }
+            for user_id in named.into_iter().flatten() {
+                if !seen.insert(user_id.to_owned()) {
+                    continue;
+                }
+                let local = ruma::UserId::parse(user_id)
+                    .is_ok_and(|parsed| parsed.server_name() == server_name);
+                if !local
+                    || listeners.iter().any(|l| l.bot_user_id == user_id)
+                    || !listeners
+                        .iter()
+                        .any(|l| l.namespaces.is_interested(NamespaceKind::Users, user_id))
+                {
+                    continue;
+                }
+                let now = self.registry.now_ms();
+                let recently = asking
+                    .unknown
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(user_id)
+                    .is_some_and(|at| now.saturating_sub(*at) < UNKNOWN_USER_RETRY_MS);
+                if recently || asking.users.is_registered(user_id).await {
+                    continue;
+                }
+                let provided = asking.queries.user_exists(user_id).await;
+                let mut unknown = asking
+                    .unknown
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if provided {
+                    unknown.remove(user_id);
+                } else {
+                    tracing::debug!(user_id, "no appservice provided a user an event names");
+                    unknown.insert(user_id.to_owned(), now);
+                }
+            }
         }
     }
 
@@ -293,6 +394,8 @@ impl<B: KvBackend> Pump<B> {
                 break;
             };
             let new_cursor = last.pos;
+
+            self.ask_about_unknown_users(&listeners, &page).await;
 
             let mut deliveries = Vec::new();
             for listener in &listeners {
@@ -525,6 +628,119 @@ mod tests {
             queued(&registry, "irc"),
             vec!["@ircbot:example.org", "hello irc"]
         );
+    }
+
+    /// The accounts, as a set the transport below adds to when the bridge is asked.
+    #[derive(Default)]
+    struct Accounts(Mutex<BTreeSet<String>>);
+
+    #[async_trait]
+    impl LocalUsers for Accounts {
+        async fn is_registered(&self, user_id: &str) -> bool {
+            self.0.lock().unwrap().contains(user_id)
+        }
+    }
+
+    /// A bridge that provides `@irc_bob` when asked (registering him, as a real bridge does
+    /// before it answers) and nobody else, recording what it was asked.
+    struct ProvidesBob {
+        accounts: Arc<Accounts>,
+        asked: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl crate::query::AppserviceQueryTransport for ProvidesBob {
+        async fn get(
+            &self,
+            _url: &str,
+            _hs_token: &str,
+            path_and_query: &str,
+        ) -> Result<Option<Value>, String> {
+            self.asked.lock().unwrap().push(path_and_query.to_owned());
+            if path_and_query == "/users/%40irc_bob%3Aexample.org" {
+                self.accounts
+                    .0
+                    .lock()
+                    .unwrap()
+                    .insert("@irc_bob:example.org".to_owned());
+                return Ok(Some(json!({})));
+            }
+            Ok(None)
+        }
+    }
+
+    /// Sytest's "Inviting an AS-hosted user asks the AS server": before an event naming a local
+    /// user with no account is queued, the bridge whose namespace covers them is asked about
+    /// them, once; nobody is asked about a person with an account, the bot, a user of another
+    /// server or a user no bridge covers.
+    #[tokio::test]
+    async fn the_bridge_is_asked_about_an_unknown_user_before_it_hears_of_them() {
+        let (registry, rooms, _) = setup(&[BRIDGE]);
+        let accounts = Arc::new(Accounts::default());
+        accounts
+            .0
+            .lock()
+            .unwrap()
+            .insert("@alice:example.org".to_owned());
+        let transport = Arc::new(ProvidesBob {
+            accounts: accounts.clone(),
+            asked: Mutex::new(Vec::new()),
+        });
+        let queries = Arc::new(QueryService::new(registry.clone(), transport.clone()));
+        let pump =
+            Pump::new(registry.clone(), rooms.clone()).with_user_queries(accounts.clone(), queries);
+        pump.start().await.unwrap();
+
+        let room = "!r:example.org";
+        rooms.join(room, "@alice:example.org");
+        let invite = |target: &str| {
+            let mut all = rooms.rooms.lock().unwrap();
+            let page = all.entry(room.to_owned()).or_default();
+            let pos = page.events.last().map_or(1, |e| e.pos + 1);
+            let joined_members = FakeRooms::members_now(page);
+            page.events.push(RoomEvent {
+                pos,
+                json: json!({
+                    "type": "m.room.member",
+                    "room_id": room,
+                    "event_id": format!("$invite-{pos}"),
+                    "sender": "@alice:example.org",
+                    "state_key": target,
+                    "content": {"membership": "invite"},
+                }),
+                joined_members,
+            });
+        };
+        invite("@irc_bob:example.org");
+        invite("@irc_carol:example.org");
+        invite("@irc_carol:example.org");
+        invite("@ircbot:example.org");
+        invite("@irc_dave:elsewhere.org");
+        invite("@dave:example.org");
+        pump.pump_room(room).await.unwrap();
+
+        assert_eq!(
+            *transport.asked.lock().unwrap(),
+            vec![
+                "/users/%40irc_bob%3Aexample.org",
+                "/users/%40irc_carol%3Aexample.org"
+            ]
+        );
+        assert!(accounts.is_registered("@irc_bob:example.org").await);
+        assert_eq!(
+            queued(&registry, "irc"),
+            vec![
+                "@irc_bob:example.org",
+                "@irc_carol:example.org",
+                "@irc_carol:example.org",
+                "@ircbot:example.org",
+            ]
+        );
+
+        // Carol was not provided: she is not asked about again for a while.
+        invite("@irc_carol:example.org");
+        pump.pump_room(room).await.unwrap();
+        assert_eq!(transport.asked.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]

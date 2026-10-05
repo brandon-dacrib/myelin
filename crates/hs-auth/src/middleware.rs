@@ -114,6 +114,16 @@ async fn authenticate_appservice(
                     "Application service cannot masquerade as this user",
                 ));
             }
+            // A ghost acts once it is registered, as in Synapse (`Auth.get_appservice_user`:
+            // "Application service has not registered this user"); the bot needs no account.
+            // Sytest's "Ghost user must register before joining room". Without this an
+            // unregistered ghost could fill rooms with a sender no account stands behind, and
+            // the appservice would then be asked about a user it never provided.
+            if uid != record.sender && state.store.get_user(&uid).await?.is_none() {
+                return Err(MatrixError::forbidden(format!(
+                    "Application service has not registered this user ({uid})"
+                )));
+            }
             uid
         }
         None => record.sender.clone(),
@@ -640,15 +650,31 @@ mod tests {
             appservices: std::sync::Arc::new(registry),
             ..state
         };
-
-        let mut parts = parts_for(
+        let request = || {
             Request::builder()
                 .uri("/x?user_id=@bridge_alice:example.org")
                 .header(AUTHORIZATION, "Bearer as_token")
                 .body(Body::empty())
-                .unwrap(),
-        )
-        .await;
+                .unwrap()
+        };
+
+        // Not until the ghost is registered (Sytest's "Ghost user must register before joining
+        // room").
+        let mut parts = parts_for(request()).await;
+        let err = Requester::from_request_parts(&mut parts, &state)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), axum::http::StatusCode::FORBIDDEN);
+
+        state
+            .store
+            .create_user(UserRecord::new(
+                user_id!("@bridge_alice:example.org").to_owned(),
+                0,
+            ))
+            .await
+            .unwrap();
+        let mut parts = parts_for(request()).await;
         let requester = Requester::from_request_parts(&mut parts, &state)
             .await
             .unwrap();

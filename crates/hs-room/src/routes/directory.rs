@@ -169,6 +169,54 @@ pub struct PublicRoomsQuery {
     /// ([`crate::remote_join::RemoteJoin::public_rooms`]) and answered as it came. Absent, or
     /// this server's own name: this server's directory.
     pub server: Option<String>,
+    /// [`PublicRoomsNetworks::third_party_instance_id`].
+    pub third_party_instance_id: Option<String>,
+    /// [`PublicRoomsNetworks::include_all_networks`].
+    pub include_all_networks: Option<bool>,
+}
+
+/// Which room directories `/publicRooms` lists: the server's own (neither field), one
+/// appservice network's (`third_party_instance_id`, `{appservice id}|{network id}` as
+/// `/thirdparty/protocols` gives it), or the server's and every network's
+/// (`include_all_networks`). Appservices publish to their networks' directories with `PUT
+/// /directory/list/appservice/{networkId}/{roomId}`; `hs-appservice` keeps those and answers
+/// through `hs-auth`'s `AppserviceRegistry::network_room_ids`.
+#[derive(Debug, Default)]
+struct PublicRoomsNetworks {
+    third_party_instance_id: Option<String>,
+    include_all_networks: bool,
+}
+
+impl PublicRoomsNetworks {
+    async fn room_ids<B: KvBackend + 'static>(
+        &self,
+        state: &RoomState<B>,
+    ) -> Result<Vec<ruma::OwnedRoomId>, RoomError> {
+        let network = |ids: Vec<String>| -> Vec<ruma::OwnedRoomId> {
+            ids.iter()
+                .filter_map(|id| RoomId::parse(id.as_str()).ok().map(|r| r.to_owned()))
+                .collect()
+        };
+        if self.include_all_networks {
+            let mut rooms = state.rooms.list_published_room_ids()?;
+            for room_id in network(state.auth.appservices.network_room_ids(None).await) {
+                if !rooms.contains(&room_id) {
+                    rooms.push(room_id);
+                }
+            }
+            return Ok(rooms);
+        }
+        match &self.third_party_instance_id {
+            Some(instance) => Ok(network(
+                state
+                    .auth
+                    .appservices
+                    .network_room_ids(Some(instance))
+                    .await,
+            )),
+            None => state.rooms.list_published_room_ids(),
+        }
+    }
 }
 
 /// `filter.generic_search_term`, the one filter field `POST /publicRooms` defines.
@@ -192,6 +240,10 @@ pub struct PublicRoomsBody {
     pub server: Option<String>,
     /// Search/filter criteria.
     pub filter: Option<PublicRoomsFilter>,
+    /// [`PublicRoomsNetworks::third_party_instance_id`].
+    pub third_party_instance_id: Option<String>,
+    /// [`PublicRoomsNetworks::include_all_networks`].
+    pub include_all_networks: Option<bool>,
 }
 
 /// Another server's directory, when `server` names one (Sytest's "Can get remote public room
@@ -227,8 +279,9 @@ async fn render_public_rooms<B: KvBackend + 'static>(
     state: &RoomState<B>,
     limit: Option<usize>,
     search_term: Option<String>,
+    networks: PublicRoomsNetworks,
 ) -> Result<Response, RoomError> {
-    let room_ids = state.rooms.list_published_room_ids()?;
+    let room_ids = networks.room_ids(state).await?;
     let mut chunk = Vec::with_capacity(room_ids.len());
     for room_id in room_ids {
         // A room can be unpublished and evicted between the directory scan and this load in a
@@ -281,7 +334,11 @@ pub async fn get_public_rooms<B: KvBackend + 'static>(
     {
         return Ok(remote);
     }
-    render_public_rooms(&state, query.limit, None).await
+    let networks = PublicRoomsNetworks {
+        third_party_instance_id: query.third_party_instance_id,
+        include_all_networks: query.include_all_networks.unwrap_or(false),
+    };
+    render_public_rooms(&state, query.limit, None, networks).await
 }
 
 /// `POST /publicRooms`.
@@ -301,7 +358,11 @@ pub async fn post_public_rooms<B: KvBackend + 'static>(
     {
         return Ok(remote);
     }
-    render_public_rooms(&state, body.limit, term).await
+    let networks = PublicRoomsNetworks {
+        third_party_instance_id: body.third_party_instance_id,
+        include_all_networks: body.include_all_networks.unwrap_or(false),
+    };
+    render_public_rooms(&state, body.limit, term, networks).await
 }
 
 #[cfg(test)]
@@ -398,6 +459,7 @@ mod tests {
                 limit: Some(5),
                 since: Some("10".to_owned()),
                 server: Some("remote.example".to_owned()),
+                ..Default::default()
             }),
         )
         .await
@@ -414,6 +476,7 @@ mod tests {
                 filter: Some(PublicRoomsFilter {
                     generic_search_term: Some("tea".to_owned()),
                 }),
+                ..Default::default()
             }),
         )
         .await
@@ -427,6 +490,7 @@ mod tests {
                 limit: None,
                 since: None,
                 server: Some("hs1".to_owned()),
+                ..Default::default()
             }),
         )
         .await
@@ -452,6 +516,110 @@ mod tests {
         );
     }
 
+    /// An appservice with one network, `irc|libera`, whose directory holds the rooms in it.
+    struct IrcNetworks(Mutex<Vec<String>>);
+
+    #[async_trait]
+    impl hs_auth::appservice::AppserviceRegistry for IrcNetworks {
+        async fn lookup_by_token(
+            &self,
+            _token: &str,
+        ) -> Option<hs_auth::appservice::AppserviceRecord> {
+            None
+        }
+
+        async fn network_room_ids(&self, instance_id: Option<&str>) -> Vec<String> {
+            match instance_id {
+                None | Some("irc|libera") => self.0.lock().unwrap().clone(),
+                Some(_) => Vec::new(),
+            }
+        }
+    }
+
+    fn room_ids(body: &Value) -> Vec<String> {
+        let mut ids: Vec<String> = body["chunk"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|room| room["room_id"].as_str().unwrap().to_owned())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// Sytest's "AS can publish rooms in their own list" and "AS and main public room lists are
+    /// separate": a room in an appservice network's directory is listed for that network's
+    /// `third_party_instance_id` and with `include_all_networks`, never in the server's own
+    /// list, which stays as it was.
+    #[tokio::test]
+    async fn an_appservice_networks_rooms_are_listed_apart_from_the_servers() {
+        let mut state = state(None);
+        let alice = UserId::parse("@alice:hs1").unwrap().to_owned();
+        let mut created = Vec::new();
+        for _ in 0..2 {
+            let handle = state
+                .rooms
+                .create_room(alice.clone(), crate::actor::CreateRoomRequest::default(), 1)
+                .await
+                .unwrap();
+            created.push(handle.query(|actor| actor.room_id().to_string()).await);
+        }
+        let (bridged, main) = (created[0].clone(), created[1].clone());
+        state.auth.appservices = Arc::new(IrcNetworks(Mutex::new(vec![bridged.clone()])));
+        state
+            .rooms
+            .set_directory_visibility(&RoomId::parse(&main).unwrap(), true)
+            .unwrap();
+
+        let list = |body: PublicRoomsBody| {
+            let state = state.clone();
+            async move {
+                body_json(
+                    post_public_rooms(State(state), PermissiveJson(body))
+                        .await
+                        .unwrap(),
+                )
+                .await
+            }
+        };
+        assert_eq!(
+            room_ids(&list(PublicRoomsBody::default()).await),
+            vec![main.clone()]
+        );
+        let network = list(PublicRoomsBody {
+            third_party_instance_id: Some("irc|libera".to_owned()),
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(room_ids(&network), vec![bridged.clone()]);
+        let other = list(PublicRoomsBody {
+            third_party_instance_id: Some("irc|oftc".to_owned()),
+            ..Default::default()
+        })
+        .await;
+        assert!(room_ids(&other).is_empty());
+        let mut everything = vec![bridged.clone(), main.clone()];
+        everything.sort();
+        let all = list(PublicRoomsBody {
+            include_all_networks: Some(true),
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(room_ids(&all), everything);
+
+        // The same through `GET`'s query.
+        let response = get_public_rooms(
+            State(state.clone()),
+            Query(PublicRoomsQuery {
+                third_party_instance_id: Some("irc|libera".to_owned()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(room_ids(&body_json(response).await), vec![bridged]);
+    }
+
     #[tokio::test]
     async fn another_servers_directory_without_federation_is_not_found() {
         let err = get_public_rooms(
@@ -460,6 +628,7 @@ mod tests {
                 limit: None,
                 since: None,
                 server: Some("remote.example".to_owned()),
+                ..Default::default()
             }),
         )
         .await

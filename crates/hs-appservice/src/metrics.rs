@@ -20,6 +20,12 @@
 //!   `unreachable`, `timeout`, `refused` (the bridge answered with an error) or
 //!   `invalid_answer`. Named for the admin API it serves; counted here, where the asking is.
 //!
+//! - `hs_appservice_queries_total{appservice,kind,outcome}`: the homeserver's questions to an
+//!   appservice ([`crate::query`]), by kind (`user`, `room_alias`, `protocol`,
+//!   `thirdparty_user`, `thirdparty_location`) and outcome: `yes` (it answered 2xx), `no` (404, or
+//!   an answer that was not what the spec asks for), `error` (unreachable, or another status), or
+//!   `cached` (protocol metadata answered from the last five minutes).
+//!
 //! `appservice` is the registration id: bounded by how many bridges an operator runs, and what
 //! the operator looks at the numbers by.
 
@@ -65,6 +71,17 @@ pub struct KeyWithheldLabels {
     pub code: String,
 }
 
+/// Labels of `hs_appservice_queries_total`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, prometheus_client::encoding::EncodeLabelSet)]
+pub struct QueryLabels {
+    /// The registration id.
+    pub appservice: String,
+    /// `user`, `room_alias`, `protocol`, `thirdparty_user` or `thirdparty_location`.
+    pub kind: String,
+    /// `yes`, `no`, `error` or `cached`.
+    pub outcome: String,
+}
+
 /// The delivery metric families. Cheap to clone; every clone counts into the same families.
 #[derive(Clone, Default)]
 pub struct AppserviceMetrics {
@@ -76,6 +93,8 @@ pub struct AppserviceMetrics {
     pub bridge_login_queries_total: Family<BridgeLoginLabels, Counter>,
     /// `hs_appservice_key_withheld_total{appservice,code}`.
     pub key_withheld_total: Family<KeyWithheldLabels, Counter>,
+    /// `hs_appservice_queries_total{appservice,kind,outcome}`.
+    pub queries_total: Family<QueryLabels, Counter>,
 }
 
 impl AppserviceMetrics {
@@ -110,7 +129,25 @@ impl AppserviceMetrics {
              to share a room's keys with the bridge), by appservice and the event's code",
             metrics.key_withheld_total.clone(),
         );
+        registry.register(
+            "hs_appservice_queries",
+            "The homeserver's questions to appservices (does this user or alias exist, \
+             third-party protocols and lookups), by appservice, kind and outcome (yes, no, \
+             error, cached)",
+            metrics.queries_total.clone(),
+        );
         metrics
+    }
+
+    /// Counts one question to `appservice`.
+    pub fn record_query(&self, appservice: &str, kind: &str, outcome: &str) {
+        self.queries_total
+            .get_or_create(&QueryLabels {
+                appservice: appservice.to_owned(),
+                kind: kind.to_owned(),
+                outcome: outcome.to_owned(),
+            })
+            .inc();
     }
 
     /// Counts one `m.room_key.withheld` delivered to `appservice`.
@@ -189,6 +226,7 @@ mod tests {
         );
         metrics.record_failed("irc");
         metrics.record_login_query("mautrix-whatsapp", "answered");
+        metrics.record_query("irc", "user", "yes");
         let mut text = String::new();
         prometheus_client::encoding::text::encode(&mut text, &registry).unwrap();
         assert!(
@@ -218,6 +256,12 @@ mod tests {
         assert!(
             text.contains(
                 "hs_admin_bridge_login_queries_total{type=\"mautrix-whatsapp\",outcome=\"answered\"} 1"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "hs_appservice_queries_total{appservice=\"irc\",kind=\"user\",outcome=\"yes\"} 1"
             ),
             "{text}"
         );

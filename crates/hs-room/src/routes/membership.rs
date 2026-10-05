@@ -612,7 +612,7 @@ pub async fn post_join_by_id_or_alias<B: KvBackend + 'static>(
     } else {
         let alias = ruma::RoomAliasId::parse(&room_id_or_alias)
             .map_err(|e| RoomError::BadRequest(e.to_string()))?;
-        match state.rooms.resolve_alias(&alias)? {
+        match crate::routes::aliases::resolve_local_alias(&state, &alias).await? {
             Some(room_id) => room_id,
             None => match &state.remote_join {
                 Some(remote) if alias.server_name() != &*state.identity.server_name => {

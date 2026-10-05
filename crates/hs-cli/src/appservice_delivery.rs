@@ -37,7 +37,7 @@ use hs_appservice::ephemeral::{
     PresenceChange, ReceiptChange, RoomFacts, ToDeviceChange, ToDeviceMessage,
 };
 use hs_appservice::metrics::AppserviceMetrics;
-use hs_appservice::pump::{Pump, RoomEvent, RoomPage, RoomSource};
+use hs_appservice::pump::{LocalUsers, Pump, RoomEvent, RoomPage, RoomSource};
 use hs_appservice::registry::Registry;
 use hs_appservice::scheduler::{HttpTransactionSender, Scheduler};
 use hs_cluster::ownership::{Ownership, OwnershipEvent};
@@ -500,6 +500,36 @@ pub struct DeliveryDeps<B: KvBackend + 'static> {
     pub layout: ShardLayout,
     /// The `hs_appservice_*` counters, if registered.
     pub metrics: Option<AppserviceMetrics>,
+    /// The accounts, and who to ask: the pump asks appservices about an unknown local user an
+    /// event names before delivering it (`Pump::with_user_queries`). `None` asks nobody.
+    pub user_queries: Option<UserQueries<B>>,
+}
+
+/// The accounts to look users up in, and the service that asks appservices about them.
+pub type UserQueries<B> = (
+    Arc<dyn LocalUsers>,
+    Arc<hs_appservice::query::QueryService<B>>,
+);
+
+/// [`LocalUsers`] over `hs-auth`'s accounts: what the pump asks before it asks an appservice
+/// about a user.
+pub struct Accounts(pub Arc<dyn hs_auth::store::AuthStore>);
+
+#[async_trait]
+impl LocalUsers for Accounts {
+    async fn is_registered(&self, user_id: &str) -> bool {
+        let Ok(user_id) = ruma::UserId::parse(user_id) else {
+            return false;
+        };
+        match self.0.get_user(&user_id).await {
+            Ok(user) => user.is_some(),
+            Err(error) => {
+                // Not asking is the quieter mistake: the event is delivered as before.
+                tracing::warn!(%user_id, %error, "could not read an account before asking appservices about it");
+                true
+            }
+        }
+    }
 }
 
 /// The running delivery machinery: stopped by [`AppserviceDelivery::stop`], which `hs serve`'s
@@ -533,6 +563,7 @@ impl<B: KvBackend + 'static> AppserviceDelivery<B> {
             ownership,
             layout,
             metrics,
+            user_queries,
         } = deps;
         let clock: Arc<dyn hs_auth::clock::Clock> = Arc::new(hs_auth::clock::SystemClock);
         let mut scheduler = Scheduler::new(
@@ -571,15 +602,17 @@ impl<B: KvBackend + 'static> AppserviceDelivery<B> {
             rooms: rooms.clone(),
             e2e,
         });
-        let pump = Arc::new(
-            Pump::new(
-                appservices.clone(),
-                Arc::new(Rooms {
-                    registry: rooms.clone(),
-                }),
-            )
-            .with_key_counts(sources.clone()),
-        );
+        let mut pump = Pump::new(
+            appservices.clone(),
+            Arc::new(Rooms {
+                registry: rooms.clone(),
+            }),
+        )
+        .with_key_counts(sources.clone());
+        if let Some((users, queries)) = user_queries {
+            pump = pump.with_user_queries(users, queries);
+        }
+        let pump = Arc::new(pump);
         let ephemeral = Arc::new(EphemeralPump::new(appservices, sources.clone(), sources));
         // Installed before the first tick, so that a change in between rings a bell the tick
         // answers, rather than waiting for the timer.
@@ -869,6 +902,7 @@ mod tests {
             ownership: ownership.clone(),
             layout,
             metrics: None,
+            user_queries: None,
         })
         .await
         .unwrap();

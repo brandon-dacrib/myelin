@@ -18,6 +18,15 @@ use crate::namespace::NamespaceKind;
 use crate::registration::Registration;
 use crate::store::{AppserviceRow, AppserviceStore, HealthRow, QueueStatus, QueuedTransaction};
 
+/// The third-party instance ID of appservice `appservice_id`'s network `network_id`:
+/// `{appservice id}|{network id}`, as Synapse spells it (`ThirdPartyInstanceID.to_string`), which
+/// is what `/thirdparty/protocols` puts in each instance's `instance_id` and what a client passes
+/// back as `/publicRooms`' `third_party_instance_id`.
+#[must_use]
+pub fn instance_id(appservice_id: &str, network_id: &str) -> String {
+    format!("{appservice_id}|{network_id}")
+}
+
 /// A hook for checking whether a literal ID is already claimed by something outside the
 /// appservice registry — principally, an already-registered human user. `PLAN.md` Appendix B and
 /// section 8.2 both call for "namespace conflict detection against existing registrations and
@@ -264,6 +273,104 @@ impl<B: KvBackend> Registry<B> {
         self.store.list()
     }
 
+    /// Every registered appservice whose `kind` namespace covers `text` (any rule, exclusive or
+    /// not: Synapse's `is_interested_in_user`/`is_room_alias_in_namespace`), with its namespaces
+    /// compiled. For a user ID an appservice's own bot counts too. A row whose namespaces no
+    /// longer compile is skipped (it is logged where it is delivered to, `crate::pump`).
+    ///
+    /// # Errors
+    /// Returns [`AppserviceError::Store`] on backend failure.
+    pub fn interested(
+        &self,
+        kind: NamespaceKind,
+        text: &str,
+    ) -> Result<Vec<AppserviceRow>, AppserviceError> {
+        let mut out = Vec::new();
+        for row in self.store.list()? {
+            let Ok(namespaces) = row.namespaces.compile() else {
+                continue;
+            };
+            let is_bot =
+                kind == NamespaceKind::Users && self.sender_user_id(&row.sender_localpart) == text;
+            if is_bot || namespaces.is_interested(kind, text) {
+                out.push(row);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The appservice that holds `text` in an **exclusive** `kind` namespace, if one does
+    /// (Synapse's `is_exclusive_user`/`is_exclusive_alias`): what a person registering a user
+    /// ID or creating an alias is refused for (`M_EXCLUSIVE`). An appservice's bot is exclusive
+    /// to it.
+    ///
+    /// # Errors
+    /// Returns [`AppserviceError::Store`] on backend failure.
+    pub fn exclusive_owner(
+        &self,
+        kind: NamespaceKind,
+        text: &str,
+    ) -> Result<Option<String>, AppserviceError> {
+        for row in self.store.list()? {
+            let Ok(namespaces) = row.namespaces.compile() else {
+                continue;
+            };
+            let is_bot =
+                kind == NamespaceKind::Users && self.sender_user_id(&row.sender_localpart) == text;
+            if is_bot || namespaces.exclusive_match(kind, text) {
+                return Ok(Some(row.id));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Publishes or unpublishes `room_id` in appservice `id`'s room directory for `network_id`
+    /// (`PUT`/`DELETE /directory/list/appservice/{networkId}/{roomId}`). Its rooms are listed
+    /// by `/publicRooms` under the third-party instance ID [`instance_id`]`(id, network_id)`,
+    /// and with `include_all_networks`, never in the server's own list.
+    ///
+    /// # Errors
+    /// Returns [`AppserviceError::NotFound`] if `id` is not registered, or
+    /// [`AppserviceError::Store`] on backend failure.
+    pub fn set_network_room(
+        &self,
+        id: &str,
+        network_id: &str,
+        room_id: &str,
+        published: bool,
+    ) -> Result<(), AppserviceError> {
+        if self.store.get(id)?.is_none() {
+            return Err(AppserviceError::NotFound(id.to_string()));
+        }
+        self.store
+            .set_network_room(id, network_id, room_id, published)
+    }
+
+    /// The rooms published in appservice room directories: the one network a third-party
+    /// instance ID names (`{appservice id}|{network id}`, [`instance_id`]), or every network's
+    /// with `None`. An instance ID that names no network has none.
+    ///
+    /// # Errors
+    /// Returns [`AppserviceError::Store`] on backend failure.
+    pub fn network_room_ids(&self, instance: Option<&str>) -> Result<Vec<String>, AppserviceError> {
+        let network = match instance {
+            Some(instance) => match instance.split_once('|') {
+                Some(pair) => Some(pair),
+                None => return Ok(Vec::new()),
+            },
+            None => None,
+        };
+        let mut rooms: Vec<String> = self
+            .store
+            .network_rooms(network)?
+            .into_iter()
+            .map(|(_, _, room_id)| room_id)
+            .collect();
+        rooms.sort();
+        rooms.dedup();
+        Ok(rooms)
+    }
+
     /// Applies an RFC 7396 JSON Merge Patch to an appservice's registration fields (everything
     /// but `id`), matching the admin API's `PATCH /appservices/{id}` semantics
     /// (`AppServiceUpdate` in `crates/hs-admin/openapi/openapi.yaml`). `sender_localpart` is
@@ -353,6 +460,7 @@ impl<B: KvBackend> Registry<B> {
         self.store.remove(id)?;
         self.store.purge_queue(id)?;
         self.store.delete_health(id)?;
+        self.store.purge_network_rooms(id)?;
         Ok(())
     }
 
@@ -689,6 +797,106 @@ mod tests {
             msc4190: false,
             extra: Default::default(),
         }
+    }
+
+    /// The registry answers who holds an ID exclusively (what `/register` and `PUT
+    /// /directory/room` refuse a person for) and who is interested in it at all (who is asked
+    /// about it): a non-exclusive rule makes an appservice interested without holding the ID,
+    /// and its bot is its own.
+    #[test]
+    fn exclusive_owners_and_interested_appservices() {
+        let registry = registry();
+        let mut irc = reg("irc", "ircbot", r"@irc_.*:example\.org", true);
+        irc.namespaces.aliases =
+            vec![crate::namespace::NamespaceRule::compile(r"#irc_.*", true).unwrap()];
+        registry.add(&irc).unwrap();
+        registry
+            .add(&reg("puppet", "puppetbot", r"@.*:example\.org", false))
+            .unwrap();
+
+        let owner = |kind, text| registry.exclusive_owner(kind, text).unwrap();
+        assert_eq!(
+            owner(NamespaceKind::Users, "@irc_alice:example.org").as_deref(),
+            Some("irc")
+        );
+        assert_eq!(
+            owner(NamespaceKind::Users, "@puppetbot:example.org").as_deref(),
+            Some("puppet")
+        );
+        assert_eq!(owner(NamespaceKind::Users, "@alice:example.org"), None);
+        assert_eq!(
+            owner(NamespaceKind::Aliases, "#irc_libera:example.org").as_deref(),
+            Some("irc")
+        );
+        assert_eq!(owner(NamespaceKind::Aliases, "#tea:example.org"), None);
+
+        let interested = |kind, text| -> Vec<String> {
+            registry
+                .interested(kind, text)
+                .unwrap()
+                .into_iter()
+                .map(|row| row.id)
+                .collect()
+        };
+        assert_eq!(
+            interested(NamespaceKind::Users, "@irc_alice:example.org"),
+            vec!["irc", "puppet"]
+        );
+        assert_eq!(
+            interested(NamespaceKind::Users, "@alice:example.org"),
+            vec!["puppet"]
+        );
+        assert_eq!(
+            interested(NamespaceKind::Aliases, "#irc_libera:example.org"),
+            vec!["irc"]
+        );
+    }
+
+    /// An appservice's room directories: per network, listed by instance ID or all together,
+    /// idempotent, and gone with the appservice.
+    #[test]
+    fn network_rooms_are_kept_per_appservice_and_network() {
+        let registry = registry();
+        registry
+            .add(&reg("irc", "ircbot", r"@irc_.*", true))
+            .unwrap();
+        registry
+            .add(&reg("slack", "slackbot", r"@slack_.*", true))
+            .unwrap();
+        registry
+            .set_network_room("irc", "libera", "!a:example.org", true)
+            .unwrap();
+        registry
+            .set_network_room("irc", "libera", "!a:example.org", true)
+            .unwrap();
+        registry
+            .set_network_room("irc", "oftc", "!b:example.org", true)
+            .unwrap();
+        registry
+            .set_network_room("slack", "work", "!c:example.org", true)
+            .unwrap();
+        assert!(matches!(
+            registry.set_network_room("nobody", "x", "!d:example.org", true),
+            Err(AppserviceError::NotFound(_))
+        ));
+
+        let ids = |instance| registry.network_room_ids(instance).unwrap();
+        let libera = instance_id("irc", "libera");
+        assert_eq!(ids(Some(&libera)), vec!["!a:example.org"]);
+        assert_eq!(ids(Some("irc|oftc")), vec!["!b:example.org"]);
+        assert!(ids(Some("irc|efnet")).is_empty());
+        assert!(ids(Some("no-bar-in-it")).is_empty());
+        assert_eq!(
+            ids(None),
+            vec!["!a:example.org", "!b:example.org", "!c:example.org"]
+        );
+
+        registry
+            .set_network_room("irc", "libera", "!a:example.org", false)
+            .unwrap();
+        assert!(ids(Some("irc|libera")).is_empty());
+        registry.remove("irc").unwrap();
+        assert_eq!(ids(None), vec!["!c:example.org"]);
     }
 
     #[test]

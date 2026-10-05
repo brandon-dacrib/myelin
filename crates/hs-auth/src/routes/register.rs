@@ -171,6 +171,7 @@ pub async fn get_register_available(
         .get("username")
         .ok_or_else(|| MatrixError::missing_param("Missing username"))?;
     validate_localpart(&state, username)?;
+    refuse_exclusive(&state, username, None).await?;
     if !state.store.is_localpart_available(username).await? {
         return Err(MatrixError::user_in_use());
     }
@@ -210,6 +211,31 @@ pub(crate) fn validate_localpart(state: &AuthState, username: &str) -> Result<()
     user_id.validate_strict().map_err(|_| {
         MatrixError::invalid_username(format!("'{username}' is not a valid user ID localpart"))
     })
+}
+
+/// Refuses `username` when an appservice holds it in an exclusive user namespace (`400
+/// M_EXCLUSIVE`, the spec's `/register` error for "the desired user ID is in the exclusive
+/// namespace claimed by an application service"), unless `appservice_id` is that appservice.
+/// Logged at `INFO`: an operator who wonders why a name cannot be had sees which bridge has it.
+async fn refuse_exclusive(
+    state: &AuthState,
+    username: &str,
+    appservice_id: Option<&str>,
+) -> Result<(), MatrixError> {
+    let Ok(user_id) = UserId::parse_with_server_name(username, state.server_name()) else {
+        return Ok(());
+    };
+    match state.appservices.exclusive_user_owner(&user_id).await {
+        Some(owner) if Some(owner.as_str()) != appservice_id => {
+            tracing::info!(%user_id, appservice = %owner, "refused a registration in an appservice's exclusive namespace");
+            Err(MatrixError::new(
+                StatusCode::BAD_REQUEST,
+                ErrCode::Exclusive,
+                format!("{user_id} is reserved by an application service"),
+            ))
+        }
+        _ => Ok(()),
+    }
 }
 
 fn random_localpart() -> String {
@@ -309,6 +335,9 @@ async fn register_appservice_user(
                 appservice.appservice_id
             ),
         ));
+    }
+    if user_id != appservice.sender {
+        refuse_exclusive(state, &username, Some(&appservice.appservice_id)).await?;
     }
     if !state.store.is_localpart_available(&username).await? {
         return Err(MatrixError::user_in_use());
@@ -448,6 +477,7 @@ async fn register_user(state: &AuthState, body: &Value) -> Result<Response, Matr
         .map(str::to_ascii_lowercase);
     if let Some(username) = &username {
         validate_localpart(state, username)?;
+        refuse_exclusive(state, username, None).await?;
     }
     // A guest becoming a full account keeps its user ID, which is taken -- by the guest.
     let upgrading = match body.get("guest_access_token").and_then(Value::as_str) {
@@ -1343,6 +1373,54 @@ mod tests {
             format!("Bearer {token}").parse().unwrap(),
         );
         headers
+    }
+
+    /// Sytest's "Regular users cannot register within the AS namespace": a person may not take
+    /// a user ID a bridge holds exclusively, from `/register` or `/register/available`
+    /// (`400 M_EXCLUSIVE`); the bridge itself still may.
+    #[tokio::test]
+    async fn a_person_cannot_register_in_an_appservices_exclusive_namespace() {
+        let state = closed_server_with_a_bridge();
+        let state = AuthState {
+            config: hs_config::Live::new(AuthConfig::default()),
+            ..state
+        };
+        let err = register(
+            &state,
+            json!({"username": "irc_carol", "password": "a-long-enough-password", "auth": {"type": "m.login.dummy"}}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.errcode(), ErrCode::Exclusive, "{err:?}");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+
+        let mut query = HashMap::new();
+        query.insert("username".to_owned(), "irc_carol".to_owned());
+        let err = get_register_available(State(state.clone()), Query(query))
+            .await
+            .unwrap_err();
+        assert_eq!(err.errcode(), ErrCode::Exclusive, "{err:?}");
+
+        // Outside the namespace nothing changes.
+        register(
+            &state,
+            json!({"username": "carol", "password": "a-long-enough-password", "auth": {"type": "m.login.dummy"}}),
+        )
+        .await
+        .unwrap();
+
+        // The bridge registers its own ghost there.
+        let body = json!({"type": "m.login.application_service", "username": "irc_carol"});
+        let response = post_register(
+            State(state),
+            Query(HashMap::new()),
+            bearer("as_secret"),
+            hs_http::buckets::ClientIp(None),
+            PermissiveJson(body),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     /// What heisenbridge sends first, byte for byte, and got "Registration is disabled" for:

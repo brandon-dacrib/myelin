@@ -31,7 +31,7 @@ const PORTS: Record<string, number> = {
   "mautrix-discord": 29334,
   "mautrix-slack": 29335,
   "mautrix-twitter": 29327,
-  "mautrix-linkedin": 29325,
+  "mautrix-linkedin": 29341,
   "mautrix-bluesky": 29340,
   heisenbridge: 9898,
   "matrix-appservice-irc": 9999,

@@ -26,6 +26,9 @@
 //!   ([`provisioning::BridgeLogins`]), for the admin API's `appservices.logins`.
 //! - [`query`]: the outbound user/room-alias query protocol and third-party lookups
 //!   ([`query::QueryService`]).
+//! - [`client_routes`]: the client-server routes about appservices this crate answers:
+//!   `/thirdparty/*` and an appservice's own room directory
+//!   (`/directory/list/appservice/{networkId}/{roomId}`).
 //! - [`auth_registry`]: the [`hs_auth::appservice::AppserviceRegistry`] implementation over
 //!   [`registry::Registry`], replacing track 07's stub.
 //! - [`error`]: [`error::AppserviceError`], the crate's error type.
@@ -35,6 +38,7 @@
 
 pub mod admin_directory;
 pub mod auth_registry;
+pub mod client_routes;
 pub mod delivery;
 pub mod ephemeral;
 pub mod error;

@@ -104,6 +104,10 @@ pub struct LoadedAppservices<B: KvBackend> {
     pub registry: Arc<Registry<B>>,
     /// The ping service, ready to mount via `hs_appservice::routes::ping_router`.
     pub ping_service: Arc<PingService<B>>,
+    /// The homeserver's questions to appservices (unknown users and aliases, third-party
+    /// protocols and lookups), for `hs_appservice::client_routes::client_router`, the auth
+    /// adapter and the event pump.
+    pub query_service: Arc<hs_appservice::query::QueryService<B>>,
     /// Every listed registration file and what this start did with it, for [`audit_imports`].
     pub imports: Vec<ImportedRegistration>,
 }
@@ -133,9 +137,14 @@ pub fn load<B: KvBackend>(
         registry.clone(),
         Arc::new(HttpPingTransport::new()),
     ));
+    let query_service = Arc::new(hs_appservice::query::QueryService::new(
+        registry.clone(),
+        Arc::new(hs_appservice::query::HttpQueryTransport::new()),
+    ));
     Ok(LoadedAppservices {
         registry,
         ping_service,
+        query_service,
         imports,
     })
 }

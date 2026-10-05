@@ -23,6 +23,30 @@ fn parse_alias(raw: &str) -> Result<ruma::OwnedRoomAliasId, RoomError> {
         .map_err(|e| RoomError::BadRequest(e.to_string()))
 }
 
+/// A local alias from the directory, or, when the directory does not hold it, from the
+/// appservice whose alias namespace covers it: asked (`GET /_matrix/app/v1/rooms/{roomAlias}`,
+/// through `hs-auth`'s `AppserviceRegistry::query_room_alias`, which `hs-appservice` answers),
+/// it creates the room and the alias, and the directory is read again (Sytest's "Accesing an
+/// AS-hosted room alias asks the AS server").
+pub(crate) async fn resolve_local_alias<B: KvBackend + 'static>(
+    state: &RoomState<B>,
+    alias: &RoomAliasId,
+) -> Result<Option<ruma::OwnedRoomId>, RoomError> {
+    if let Some(room_id) = state.rooms.resolve_alias(alias)? {
+        return Ok(Some(room_id));
+    }
+    if alias.server_name() != &*state.identity.server_name
+        || !state
+            .auth
+            .appservices
+            .query_room_alias(alias.as_str())
+            .await
+    {
+        return Ok(None);
+    }
+    state.rooms.resolve_alias(alias)
+}
+
 /// `GET /rooms/{roomId}/aliases`.
 pub async fn get_room_aliases<B: KvBackend + 'static>(
     State(state): State<RoomState<B>>,
@@ -53,6 +77,23 @@ pub async fn put_alias<B: KvBackend + 'static>(
 ) -> Result<Response, RoomError> {
     crate::moderation::refuse_if_suspended(&requester)?;
     let alias = parse_alias(&room_alias)?;
+    // An alias an appservice holds exclusively is its own to create (`400 M_EXCLUSIVE`).
+    if let Some(owner) = state
+        .auth
+        .appservices
+        .exclusive_alias_owner(alias.as_str())
+        .await
+        && requester
+            .appservice
+            .as_ref()
+            .map(|a| a.appservice_id.as_str())
+            != Some(owner.as_str())
+    {
+        tracing::info!(%alias, appservice = %owner, "refused an alias in an appservice's exclusive namespace");
+        return Err(RoomError::Exclusive(format!(
+            "{alias} is reserved by an application service"
+        )));
+    }
     let room_id_str = body
         .get("room_id")
         .and_then(Value::as_str)
@@ -88,9 +129,8 @@ pub async fn get_alias<B: KvBackend + 'static>(
             Json(json!({"room_id": room_id.to_string(), "servers": servers})).into_response(),
         );
     }
-    let room_id = state
-        .rooms
-        .resolve_alias(&alias)?
+    let room_id = resolve_local_alias(&state, &alias)
+        .await?
         .ok_or_else(|| RoomError::RoomNotFound(room_alias.clone()))?;
     Ok(Json(json!({"room_id": room_id.to_string(), "servers": [state.identity.server_name.to_string()]})).into_response())
 }
@@ -253,6 +293,118 @@ mod tests {
                 "#☕:remote.example:8448",
                 "#nowhere:remote.example:8448"
             ]
+        );
+    }
+
+    /// An appservice that holds `#irc_*:hs1` exclusively, and provides `#irc_new:hs1` (on
+    /// `room`) when it is asked about it.
+    struct IrcBridge {
+        rooms: Arc<RoomRegistry<MemoryBackend>>,
+        room: Mutex<Option<OwnedRoomId>>,
+        asked: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl hs_auth::appservice::AppserviceRegistry for IrcBridge {
+        async fn lookup_by_token(
+            &self,
+            _token: &str,
+        ) -> Option<hs_auth::appservice::AppserviceRecord> {
+            None
+        }
+
+        async fn exclusive_alias_owner(&self, alias: &str) -> Option<String> {
+            alias.starts_with("#irc_").then(|| "irc".to_owned())
+        }
+
+        async fn query_room_alias(&self, alias: &str) -> bool {
+            self.asked.lock().unwrap().push(alias.to_owned());
+            if alias != "#irc_new:hs1" {
+                return false;
+            }
+            let room = self.room.lock().unwrap().clone().unwrap();
+            let handle = self.rooms.get_or_load(&room).await.unwrap();
+            let alias = RoomAliasId::parse(alias).unwrap().to_owned();
+            let bot = UserId::parse("@ircbot:hs1").unwrap().to_owned();
+            handle
+                .query(move |actor| actor.create_alias(&alias, &bot))
+                .await
+                .unwrap();
+            true
+        }
+    }
+
+    fn requester(user: &str, appservice: Option<&str>) -> RoomRequester {
+        let mut requester =
+            hs_auth::requester::Requester::for_user(UserId::parse(user).unwrap().to_owned());
+        requester.appservice = appservice.map(|id| hs_auth::requester::AppserviceIdentity {
+            appservice_id: id.to_owned(),
+            sender: UserId::parse("@ircbot:hs1").unwrap().to_owned(),
+            masqueraded_user: false,
+            masqueraded_device_id: None,
+            rate_limited: true,
+            msc4190_enabled: false,
+        });
+        RoomRequester(requester)
+    }
+
+    /// Sytest's "Regular users cannot create room aliases within the AS namespace" (`400
+    /// M_EXCLUSIVE`, while the appservice itself may), and "Accesing an AS-hosted room alias asks
+    /// the AS server": a local alias the directory does not hold is asked of the appservice,
+    /// which creates it, and it then resolves.
+    #[tokio::test]
+    async fn an_appservices_aliases_are_its_own_and_it_is_asked_for_ones_nobody_has_made() {
+        let mut state = state(None);
+        let bridge = Arc::new(IrcBridge {
+            rooms: state.rooms.clone(),
+            room: Mutex::new(None),
+            asked: Mutex::new(Vec::new()),
+        });
+        state.auth.appservices = bridge.clone();
+        let alice = UserId::parse("@alice:hs1").unwrap().to_owned();
+        let handle = state
+            .rooms
+            .create_room(alice, crate::actor::CreateRoomRequest::default(), 1)
+            .await
+            .unwrap();
+        let room_id = handle.query(|actor| actor.room_id().to_owned()).await;
+        *bridge.room.lock().unwrap() = Some(room_id.clone());
+        let put = |alias: &str, who: RoomRequester| {
+            put_alias::<MemoryBackend>(
+                State(state.clone()),
+                Path(alias.to_owned()),
+                who,
+                PermissiveJson(json!({"room_id": room_id.to_string()})),
+            )
+        };
+
+        let err = put("#irc_mine:hs1", requester("@alice:hs1", None))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RoomError::Exclusive(_)), "{err:?}");
+        assert_eq!(err.to_matrix_error().errcode.as_str(), "M_EXCLUSIVE");
+        put("#irc_mine:hs1", requester("@ircbot:hs1", Some("irc")))
+            .await
+            .unwrap();
+        put("#plain:hs1", requester("@alice:hs1", None))
+            .await
+            .unwrap();
+
+        let response = get_alias(State(state.clone()), Path("#irc_new:hs1".to_owned()))
+            .await
+            .unwrap();
+        assert_eq!(body_json(response).await["room_id"], room_id.to_string());
+        let err = get_alias(State(state.clone()), Path("#irc_gone:hs1".to_owned()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RoomError::RoomNotFound(_)), "{err:?}");
+        // A held alias is not asked about; an unknown one is.
+        get_alias(State(state.clone()), Path("#plain:hs1".to_owned()))
+            .await
+            .unwrap();
+        assert_eq!(
+            *bridge.asked.lock().unwrap(),
+            vec!["#irc_new:hs1", "#irc_gone:hs1"]
         );
     }
 

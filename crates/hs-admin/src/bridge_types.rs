@@ -243,8 +243,10 @@ const CATALOGUE: &[Entry] = &[
         ],
         notes: None,
     ),
+    // The port is mautrix-linkedin's `DefaultPort`, 29341 (`pkg/connector/connector.go`,
+    // `GetName`, at commit af73c518, read 2026-10-04); the catalogue said 29325 until then.
     mautrix!(
-        "mautrix-linkedin", "LinkedIn", "linkedin", 29325, "linkedin_", "linkedinbot",
+        "mautrix-linkedin", "LinkedIn", "linkedin", 29341, "linkedin_", "linkedinbot",
         category: Category::Social,
         description: "LinkedIn messaging.",
         needs: [("account", "A LinkedIn account to sign in with from the bridge", true)],
@@ -1456,6 +1458,19 @@ mod tests {
     /// Every mautrix `bridgev2` bridge in the catalogue has a command prefix, the connector's
     /// own or mautrix-go's fallback of `!` and the network id (see [`command_prefix`]); the
     /// other runtimes have none claimed.
+    /// Each mautrix bridge's port is its connector's `DefaultPort`, the one the bridge's own
+    /// example config writes. LinkedIn's is 29341 (`pkg/connector/connector.go`, commit
+    /// af73c518); the catalogue had 29325.
+    #[test]
+    fn linkedin_listens_on_its_sources_default_port() {
+        assert_eq!(get("mautrix-linkedin", "x.org").unwrap().port, 29341);
+        let mut ports: Vec<u16> = CATALOGUE.iter().map(|e| e.port).collect();
+        ports.sort_unstable();
+        let before = ports.len();
+        ports.dedup();
+        assert_eq!(ports.len(), before, "two catalogue entries share a port");
+    }
+
     #[test]
     fn every_mautrix_bridge_has_its_command_prefix() {
         let prefixes: Vec<(String, Option<String>)> = list("chat.example.net")

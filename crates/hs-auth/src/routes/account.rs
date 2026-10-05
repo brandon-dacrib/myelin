@@ -85,7 +85,13 @@ pub async fn post_account_deactivate(
 ) -> Result<Response, MatrixError> {
     requester.require_not_suspended()?;
 
-    if let Some(response) = reauth::run(&state, &requester, &body).await? {
+    // An appservice deactivating one of its users has no password to re-enter and nobody to
+    // ask: its token is the authority, as in Synapse (`DeactivateAccountRestServlet`) and
+    // Sytest's "AS can deactivate a user". The masquerade was already checked against its
+    // namespace before this `Requester` existed.
+    if let Some(appservice) = &requester.appservice {
+        tracing::info!(user = %requester.user_id, appservice = %appservice.appservice_id, "an appservice deactivated one of its users");
+    } else if let Some(response) = reauth::run(&state, &requester, &body).await? {
         return Ok(response);
     }
 
@@ -356,6 +362,67 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// Sytest's "AS can deactivate a user": an appservice deactivating its ghost is not asked to
+    /// re-authenticate (it has no password to give), and the account is deactivated.
+    #[tokio::test]
+    async fn an_appservice_deactivates_its_user_without_uia() {
+        let state = AuthState::in_memory();
+        let ghost = user_id!("@irc_bob:example.org").to_owned();
+        state
+            .store
+            .create_user(UserRecord::new(ghost.clone(), 0))
+            .await
+            .unwrap();
+        let mut requester = Requester::for_user(ghost.clone());
+        requester.appservice = Some(crate::requester::AppserviceIdentity {
+            appservice_id: "irc".to_owned(),
+            sender: user_id!("@ircbot:example.org").to_owned(),
+            masqueraded_user: true,
+            masqueraded_device_id: None,
+            rate_limited: true,
+            msc4190_enabled: false,
+        });
+        let response =
+            post_account_deactivate(State(state.clone()), requester, PermissiveJson(json!({})))
+                .await
+                .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            state
+                .store
+                .get_user(&ghost)
+                .await
+                .unwrap()
+                .unwrap()
+                .deactivated
+        );
+
+        // A person still gets the UIA challenge.
+        let person = user_id!("@carol:example.org").to_owned();
+        state
+            .store
+            .create_user(UserRecord::new(person.clone(), 0))
+            .await
+            .unwrap();
+        let response = post_account_deactivate(
+            State(state.clone()),
+            Requester::for_user(person.clone()),
+            PermissiveJson(json!({})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            !state
+                .store
+                .get_user(&person)
+                .await
+                .unwrap()
+                .unwrap()
+                .deactivated
         );
     }
 

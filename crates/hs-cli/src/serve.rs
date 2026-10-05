@@ -315,6 +315,12 @@ fn build_router<B: KvBackend>(
     let push_router = push_router.with_state(mounts.push);
     let push_routes = push_manifest.routes;
 
+    // `/thirdparty/*` and an appservice's own room directory, under `v3` and `r0` like the
+    // other client routes.
+    let (appservice_client_router, appservice_client_manifest) =
+        hs_appservice::client_routes::client_router::<B>(mounts.appservice_queries);
+    let appservice_client_router = appservice_client_router.with_state(auth.clone());
+    let appservice_client_routes = appservice_client_manifest.routes;
     let ping_router =
         hs_appservice::routes::ping_router::<B>(mounts.appservice_ping).with_state(auth);
     let ping_routes = crate::appservice_manifest::routes();
@@ -413,6 +419,16 @@ fn build_router<B: KvBackend>(
         )
         .merge_router("/_matrix/client/r0", push_router, push_routes)
         .merge_router("/_matrix/client/v1/media", media_router, media_routes)
+        .merge_router(
+            "/_matrix/client/v3",
+            appservice_client_router.clone(),
+            appservice_client_routes.clone(),
+        )
+        .merge_router(
+            "/_matrix/client/r0",
+            appservice_client_router,
+            appservice_client_routes,
+        )
         .merge_router("/_matrix/client/v1", ping_router, ping_routes)
         .merge_router("/_matrix/client/v1", auth_v1_router, auth_v1_routes);
 
@@ -576,6 +592,7 @@ struct Mounts<B: KvBackend> {
     push: hs_push::state::PushState<B>,
     media: MediaState<B>,
     appservice_ping: Arc<PingService<B>>,
+    appservice_queries: Arc<hs_appservice::query::QueryService<B>>,
     admin: hs_admin::router::AdminState,
 }
 
@@ -950,8 +967,12 @@ fn throwaway_mounts() -> Mounts<hs_kv::memory::MemoryBackend> {
         .expect("opening an in-memory appservice registry cannot fail"),
     );
     let appservice_ping = Arc::new(hs_appservice::ping::PingService::new(
-        registry,
+        registry.clone(),
         Arc::new(hs_appservice::ping::HttpPingTransport::new()),
+    ));
+    let appservice_queries = Arc::new(hs_appservice::query::QueryService::new(
+        registry,
+        Arc::new(hs_appservice::query::HttpQueryTransport::new()),
     ));
 
     Mounts {
@@ -962,6 +983,7 @@ fn throwaway_mounts() -> Mounts<hs_kv::memory::MemoryBackend> {
         push,
         media,
         appservice_ping,
+        appservice_queries,
         admin: manifest_only_admin_state(),
     }
 }
@@ -1501,8 +1523,11 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     // declares actually authenticates through `Requester` — see
     // `hs_appservice::auth_registry::RegistryAppserviceAdapter`'s own doc comment. Set before
     // `room_state`/`media_state` are built below, since both embed a clone of `auth_state`.
+    // With the query service, a local alias the directory does not hold is asked of the
+    // appservice whose namespace covers it (`hs_room::routes::aliases`).
     auth_state.appservices = Arc::new(
-        hs_appservice::auth_registry::RegistryAppserviceAdapter::new(appservices.registry.clone()),
+        hs_appservice::auth_registry::RegistryAppserviceAdapter::new(appservices.registry.clone())
+            .with_queries(appservices.query_service.clone()),
     );
 
     let rooms = Arc::new(hs_room::registry::RoomRegistry::open(
@@ -1961,6 +1986,9 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     // Delivery to bridges is counted (`hs_appservice_*`, `hs_appservice::metrics`).
     let appservice_metrics =
         metrics.with_registry(hs_appservice::metrics::AppserviceMetrics::register);
+    appservices
+        .query_service
+        .set_metrics(appservice_metrics.clone());
     let appservice_delivery = crate::appservice_delivery::AppserviceDelivery::start(
         crate::appservice_delivery::DeliveryDeps {
             appservices: appservices.registry.clone(),
@@ -1970,7 +1998,13 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             e2e: e2e_state.store.clone(),
             ownership: cluster_handles.cluster.ownership().clone(),
             layout: cluster_handles.layout,
-            metrics: Some(appservice_metrics),
+            metrics: Some(appservice_metrics.clone()),
+            user_queries: Some((
+                Arc::new(crate::appservice_delivery::Accounts(
+                    auth_state.store.clone(),
+                )),
+                appservices.query_service.clone(),
+            )),
         },
     )
     .await
@@ -2195,6 +2229,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         push: push_state,
         media: media_state,
         appservice_ping: appservices.ping_service,
+        appservice_queries: appservices.query_service,
         admin,
     };
 

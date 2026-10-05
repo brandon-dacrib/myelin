@@ -25,19 +25,33 @@ use hs_auth::appservice::{AppserviceRecord, AppserviceRegistry, NamespaceRule};
 use hs_kv::KvBackend;
 use ruma::UserId;
 
+use crate::namespace::NamespaceKind;
+use crate::query::QueryService;
 use crate::registry::Registry;
 
 /// Adapts [`Registry`] to `hs-auth`'s [`AppserviceRegistry`] trait, so `hs-auth`'s middleware can
 /// authenticate appservice requests against this crate's store-backed registry.
 pub struct RegistryAppserviceAdapter<B: KvBackend> {
     registry: Arc<Registry<B>>,
+    queries: Option<Arc<QueryService<B>>>,
 }
 
 impl<B: KvBackend> RegistryAppserviceAdapter<B> {
     /// Wraps `registry` for use as `hs-auth`'s `AuthState::appservices`.
     #[must_use]
     pub fn new(registry: Arc<Registry<B>>) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            queries: None,
+        }
+    }
+
+    /// Asks the appservices about local aliases the directory does not hold
+    /// ([`AppserviceRegistry::query_room_alias`]) through `queries`. Without it, nobody is asked.
+    #[must_use]
+    pub fn with_queries(mut self, queries: Arc<QueryService<B>>) -> Self {
+        self.queries = Some(queries);
+        self
     }
 }
 
@@ -87,6 +101,40 @@ impl<B: KvBackend> AppserviceRegistry for RegistryAppserviceAdapter<B> {
             rate_limited: row.rate_limited,
             msc4190_enabled: row.msc4190,
         })
+    }
+
+    async fn exclusive_user_owner(&self, user_id: &UserId) -> Option<String> {
+        self.registry
+            .exclusive_owner(NamespaceKind::Users, user_id.as_str())
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, %user_id, "could not read the appservice registry for an exclusive-namespace check");
+                None
+            })
+    }
+
+    async fn exclusive_alias_owner(&self, alias: &str) -> Option<String> {
+        self.registry
+            .exclusive_owner(NamespaceKind::Aliases, alias)
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, alias, "could not read the appservice registry for an exclusive-namespace check");
+                None
+            })
+    }
+
+    async fn query_room_alias(&self, alias: &str) -> bool {
+        match &self.queries {
+            Some(queries) => queries.room_alias_exists(alias).await,
+            None => false,
+        }
+    }
+
+    async fn network_room_ids(&self, instance_id: Option<&str>) -> Vec<String> {
+        self.registry
+            .network_room_ids(instance_id)
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "could not read the appservices' room directories");
+                Vec::new()
+            })
     }
 }
 
