@@ -1,5 +1,32 @@
 # 14 Test and conformance (integration lead): status
 
+## Session 9 (2026-10-04 afternoon, the coordinator): the wave of 2026-10-04, measured
+
+`main` at `c2d74174` (ten branches of the wave plus the thumbnail fix), image `myelin-sytest:dev`
+rebuilt from that tree, Sytest `7473158`, run `target/sytest/20261004-wave1`, nothing else on
+the machine: **663 / 772** (86 failed, 23 skipped), **88.5%** of tests run, from 643 in the
+morning (session 8). Client-server **465 / 537**, federation **95 / 105**, application services
+11 / 23, non-spec 88 / 103. Files: `docs/status/sytest/2026-10-04-wave1-{results,summary,are-we-synapse-yet}.txt`.
+
+**Four PASS -> FAIL against session 8:** "Local device key changes get to remote servers" and
+"... with correct prev_id" (`50federation/40devicelists.pl`, "Got @USER, expected @USER": an
+update for another user arrives first; `fed-state-ids` saw the first flaky in 2 of 3 runs, and
+`device-list-invites` `5fc19dc5` changed who is told), "Message history can be paginated over
+federation" (`30rooms/04messages.pl`) and "Remote room alias queries can handle Unicode". Each
+is in a wave-2 brief (`e2ee-gaps`, `federation-gaps`).
+
+**Complement** from the same tree (`complement-hs-main:c2d74174`, Complement `61af675`): the
+federation package (run 11) **241 / 314 assertions, 58 / 90 top-level** (from 235, 56): FAIL ->
+PASS `TestMSC4289PrivilegedRoomCreators_AdditionalValidation` and
+`TestMSC4297StateResolutionV2_1_starts_from_empty_set`, no PASS -> FAIL; the four NoCreators tests
+all lost their race. csapi (run 16) **345 / 386 assertions, 87 / 106 top-level** (from 346 / 384,
+86): FAIL -> PASS `TestMessagesOverFederation`, no PASS -> FAIL (the assertion count moved because
+a subtest set grew). Baselines rewritten.
+
+The 86 Sytest and 51 Complement failures are divided by owning crate into the eight wave-2
+briefs (`sync-gaps`, `federation-gaps`, `room-client-gaps`, `auth-gaps`, `e2ee-gaps`,
+`appservice-gaps`, `push-media-gaps`, `ops-web`), which name every test.
+
 ## Session 8 (2026-10-04, on `main`): the measurement, on a quiet machine
 
 The whole suite on merged `main` at `1372c71f` (code tip `a9f62fc7`; image `myelin-sytest:dev`

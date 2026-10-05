@@ -1,7 +1,7 @@
 # Complement tests, top-level results. One line per test so that two runs can be compared
 # by name: a change is worth something when it moves a *named* test and that survives a re-run.
 # Written and read by tools/complement_triage.py (--write-baseline, --diff).
-# Run 10, 2026-10-04, a9f62fc7 (run 8 of 2026-10-01 was 225 of 314, 50 of 90; the four NoCreators tests lost their race this run): 235 of 314 assertions, 56 of 90 top-level (1 skipped).
+# Run 11, 2026-10-04, c2d74174 (the wave of 2026-10-04; run 10 on a9f62fc7 was 235 of 314, 56 of 90): 241 of 314 assertions, 58 of 90 top-level (1 skipped).
 PASS TestACLs
 PASS TestACLsForEDUs
 PASS TestBannedUserCannotSendJoin
@@ -47,7 +47,7 @@ FAIL TestLocalPngThumbnail
 FAIL TestMSC4289PrivilegedRoomCreators
 FAIL TestMSC4289PrivilegedRoomCreators_Additional
 FAIL TestMSC4289PrivilegedRoomCreators_AdditionalCreatorsAndInvited
-FAIL TestMSC4289PrivilegedRoomCreators_AdditionalValidation
+PASS TestMSC4289PrivilegedRoomCreators_AdditionalValidation
 FAIL TestMSC4289PrivilegedRoomCreators_InvitedAreCreators
 PASS TestMSC4289PrivilegedRoomCreators_Upgrades
 PASS TestMSC4291RoomIDAsHashOfCreateEvent
@@ -56,7 +56,7 @@ FAIL TestMSC4291RoomIDAsHashOfCreateEvent_CannotSendCreateEvent
 FAIL TestMSC4291RoomIDAsHashOfCreateEvent_RoomIDIsOnCreateEvent
 PASS TestMSC4291RoomIDAsHashOfCreateEvent_UpgradedRooms
 FAIL TestMSC4297StateResolutionV2_1_includes_conflicted_subgraph
-FAIL TestMSC4297StateResolutionV2_1_starts_from_empty_set
+PASS TestMSC4297StateResolutionV2_1_starts_from_empty_set
 FAIL TestMSC4311FullEventsOnStrippedStateFederation
 FAIL TestMSC4311RejectInvalidStrippedStateFederation
 FAIL TestMSC4311StrippedStateClientAPI

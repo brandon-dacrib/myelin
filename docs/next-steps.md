@@ -70,6 +70,15 @@ thumbnailing runs on blocking threads, at most one per CPU; a refusal is `400` "
 generate thumbnail" and `hs_media_thumbnail_refused_total{reason}`. **Roll to the first green
 image of `8ec77d0f` or later**, not `1e262118`.
 
+**Measured after the wave** (status 14 session 9, `c2d74174`, quiet machine): **Sytest 663 / 772**
+(from 643; four PASS -> FAIL, named there), **Complement federation 241 / 314, 58 / 90**, **csapi
+87 / 106 top-level**, no Complement regression. Item 2 below is done. **Wave 2** (launched
+2026-10-04 afternoon): `sync-gaps` (05), `federation-gaps` (06), `room-client-gaps` (04 with the
+search-lag admin field), `auth-gaps` (07), `e2ee-gaps` (08, the two device-list regressions),
+`appservice-gaps` (11), `push-media-gaps` (10, 09, 13), `ops-web` (14, 16: the dashboard, the
+NoCreators race, the Cluster page). If `git branch -r --no-merged origin/main` lists one, it is
+unmerged work.
+
 **What is next, in order:**
 
 1. **Roll the demo** to the first green image of `8ec77d0f` or later, then the owner's bridge

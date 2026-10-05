@@ -1,7 +1,7 @@
 # Complement tests/csapi, top-level results. One line per test so that two runs can be compared
 # by name: a change is worth something when it moves a *named* test and that survives a re-run.
 # Written and read by tools/complement_triage.py (--write-baseline, --diff).
-# Run 15, 2026-10-04, a9f62fc7 (run 13 of 2026-10-01 was 343 of 384, 82 of 106): 346 of 384 assertions, 86 of 106 top-level (0 skipped).
+# Run 16, 2026-10-04, c2d74174 (the wave of 2026-10-04; run 15 on a9f62fc7 was 346 of 384, 86 of 106): 345 of 386 assertions, 87 of 106 top-level.
 PASS TestAddAccountData
 PASS TestArchivedRoomsHistory
 PASS TestAsyncUpload
@@ -48,7 +48,7 @@ PASS TestLogout
 PASS TestMediaConfig
 PASS TestMembersLocal
 FAIL TestMembershipOnEvents
-FAIL TestMessagesOverFederation
+PASS TestMessagesOverFederation
 PASS TestNotPresentUserCannotBanOthers
 PASS TestOlderLeftRoomsNotInLeaveSection
 PASS TestPowerLevels

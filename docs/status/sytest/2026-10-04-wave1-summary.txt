@@ -1,0 +1,30 @@
+process exits during the run (the last few are the shutdown):
+1082:WARN: haproxy-0 process failed - code=2
+1083:WARN: haproxy-1 process failed - code=2
+
+tests: 772
+pass: 663
+fail: 86
+expected fail (Sytest's own marking): 0
+skip: 23
+pass rate (of tests run, skips excluded): 88.5%
+
+most common failure reasons (first line of the message, normalised):
+     9  Timed out waiting for test at run-tests.pl line N.
+     5  HTTP Request failed ( 404 Not Found https://localhost:PORT/_matrix/client/v3/peek/!ROOM?access_token=TOKEN ) from POST https://localhost:PORT/_matrix/client/v3/peek/!ROOM?...
+     5  HTTP Request failed ( 404 Not Found https://localhost:PORT/_matrix/client/unstable/account/Npid/bind?access_token=TOKEN ) from POST https://localhost:PORT/_matrix/client/unstable/account/Npid/bind?...
+     4  Expected to receive an HTTP N failure but it succeeded at run-tests.pl line N.
+     3  No join for joined user at tests/31sync/06state.pl line N.
+     2  HTTP Request failed ( 404 Not Found https://localhost:PORT/_matrix/federation/v1/Npid/onbind ) from POST https://localhost:PORT/_matrix/federation/v1/Npid/onbind?...
+     2  Expected only N membership events (got N) at tests/10apidoc/09synced.pl line N.
+     2  Got N, expected N for number of presence events at tests/31sync/03joined.pl line N.
+     2  Got "\@USER", expected "\@USER" for at tests/50federation/40devicelists.pl line N.
+     2  Expected to receive an HTTP Nxx failure but it succeeded at run-tests.pl line N.
+
+skip reasons:
+    13  lack of can_change_power_levels
+     4  failing fixture: no m.login.cas at tests/10apidoc/13ui-auth.pl line 25.
+     2  lack of can_get_messages
+     2  lack of can_get_3pe_metadata
+     1  lack of can_upload_media
+     1  failing fixture: server does not support org.matrix.msc2625.mark_unread action at tests/61push/03_unread_count.pl line 27.
