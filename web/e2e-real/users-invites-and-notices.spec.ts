@@ -1,4 +1,5 @@
 import { test, expect, type APIRequestContext, type Page } from "@playwright/test";
+import { SHOTS } from "./screenshots";
 import { settle } from "./settle";
 
 /**
@@ -17,10 +18,9 @@ import { settle } from "./settle";
  * and fitted to main's dialogs. Needs `HS_REAL_SERVER_URL` and `HS_REAL_ADMIN_TOKEN`
  * (playwright.real.config.ts). Registration may be closed: the recipient is made through the
  * admin API. Names carry a per-run suffix so that a rerun does not collide. Screenshots go to
- * `docs/design/screenshots/users-*-real.png` as the record of the run.
+ * `users-*-real.png` in `SHOTS` (`./screenshots.ts`) as the record of the run.
  */
 const adminToken = process.env.HS_REAL_ADMIN_TOKEN;
-const SHOTS = "../docs/design/screenshots";
 const run = Date.now().toString(36);
 
 /** The whole page, or just the viewport for a dialog (a full-page capture scrolls it away). */

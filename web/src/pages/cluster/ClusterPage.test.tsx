@@ -455,3 +455,64 @@ describe("Cluster", () => {
     expect(await screen.findByText(/This needs the/)).toHaveTextContent("admin:read");
   });
 });
+
+describe("Cluster replica generation", () => {
+  it("shows a millisecond generation as the time the replica started, with the number in the tooltip", async () => {
+    const started = Date.UTC(2026, 9, 4, 18, 30);
+    server.use(
+      http.get("/api/v1/cluster/replicas", () =>
+        HttpResponse.json({
+          items: [{ ...SINGLE_NODE_REPLICA, epoch: started }],
+          next_cursor: null,
+          prev_cursor: null,
+        }),
+      ),
+    );
+    open();
+    const row = await replicaRow("hs-single");
+    const cell = row.getByTitle(`Generation ${started}: started 2026-10-04T18:30:00.000Z`);
+    expect(cell.tagName).toBe("TIME");
+    expect(cell).toHaveAttribute("dateTime", "2026-10-04T18:30:00.000Z");
+    // Short, never the thirteen-digit number that overflowed the column at 1280 px.
+    expect(cell.textContent).not.toMatch(/\d{4,}/);
+    expect(row.queryByText(started.toLocaleString())).toBeNull();
+  });
+
+  it("says a mesh address the replica is named after is its ID, rather than repeat it", async () => {
+    server.use(
+      http.get("/api/v1/cluster/replicas", () =>
+        HttpResponse.json({
+          items: [
+            {
+              ...SINGLE_NODE_REPLICA,
+              id: "127.0.0.1:18456",
+              role: "replica",
+              mesh_addr: "127.0.0.1:18456",
+            },
+            {
+              ...SINGLE_NODE_REPLICA,
+              id: "hs-1",
+              role: "replica",
+              this_replica: false,
+              mesh_addr: "10.0.1.11:7600",
+            },
+          ],
+          next_cursor: null,
+          prev_cursor: null,
+        }),
+      ),
+    );
+    open();
+    const same = await replicaRow("127.0.0.1:18456");
+    expect(same.getByTitle("127.0.0.1:18456")).toHaveTextContent("Same as its ID");
+    const other = await replicaRow("hs-1");
+    expect(other.getByText("10.0.1.11:7600")).toBeInTheDocument();
+  });
+
+  it("shows a small generation as a number", async () => {
+    singleNode();
+    open();
+    const row = await replicaRow("hs-single");
+    expect(row.getByTitle("Generation 1")).toHaveTextContent("1");
+  });
+});

@@ -1,4 +1,5 @@
 import { test, expect, type APIRequestContext, type Page } from "@playwright/test";
+import { SHOTS } from "./screenshots";
 import { settle } from "./settle";
 
 /**
@@ -16,10 +17,9 @@ import { settle } from "./settle";
  *
  * Needs `HS_REAL_SERVER_URL` and `HS_REAL_ADMIN_TOKEN` (playwright.real.config.ts). Names carry
  * a per-run suffix so a rerun does not collide. Screenshots go to
- * `docs/design/screenshots/user-erase-*-real.png`.
+ * `user-erase-*-real.png` in `SHOTS` (`./screenshots.ts`).
  */
 const adminToken = process.env.HS_REAL_ADMIN_TOKEN;
-const SHOTS = "../docs/design/screenshots";
 const run = Date.now().toString(36);
 
 async function shot(page: Page, name: string, fullPage = true) {

@@ -1,6 +1,44 @@
 # 16. Management web interface: status
 
-Last updated: 2026-10-04 (Federation and Overview at scale, cluster series; branch `agent/web-scale-items`).
+Last updated: 2026-10-04 (the Cluster page's Epoch and the e2e-real harness; branch `agent/ops-web`).
+
+## 2026-10-04: the Cluster page's Epoch, fitted at 1280 px; e2e-real for one node or many; screenshots stay out of the tree (branch `agent/ops-web`)
+
+- **Epoch is a start time.** A replica's generation is the wall clock in milliseconds when it
+  started (`hs_cluster::Generation::fresh`), and the Replicas table printed it raw
+  ("1,791,160,993,246"), which pushed the table past a 1280 px screen. `describeGeneration`
+  (`src/lib/cluster.ts`) reads a thirteen-digit value as the start time ("Oct 4, 20:43",
+  24-hour, the year only when it is not this one) in a `<time>` whose tooltip has the raw number
+  and the ISO time ("Generation 1791160993246: started 2026-10-05T00:43:13.246Z"); anything
+  smaller stays a number with "Generation N" in the tooltip. "What the columns mean" says so.
+- **The Replicas table fits 1280 px** in every state the real server was put in (single node, two
+  active replicas, one drained): the status column is narrower (`min-w-28 max-w-44`, the drain
+  bar `w-36`), the drain-blocked reason wraps at `max-w-32`, the "asked by" Matrix ID may break
+  anywhere, and the mesh address, which in cluster mode is always the replica's ID
+  (`hs_cli::cluster` names a replica after its advertised mesh address), reads "Same as its ID"
+  with the address in the tooltip (a different one is shown and may break anywhere).
+- **The mock's replicas have real generations** (start times three hours, a day and two days
+  ago), so `npm run dev:mock` shows what the server shows.
+- **`e2e-real/cluster.spec.ts` passes against a single node and a cluster.** It reads the
+  replicas and shards from the admin API and checks the page against them whichever mode the
+  server runs in: the mode's sentence, "N of N" owned, every replica's row (this replica, status,
+  shard count, the Epoch as a short time with the raw number in its tooltip), the table not
+  scrolling sideways and the page not wider than the viewport, drain disabled with the reason on
+  a single node and enabled for an active replica while another active one exists (nothing is
+  drained), every owner on the map, and each room shard owned by a listed replica.
+- **e2e-real screenshots go to `test-results/real-screenshots/`** (`e2e-real/screenshots.ts`),
+  so running `reports-tasks-statistics.spec.ts` (or any of the nine specs that wrote into
+  `docs/design/screenshots/`) no longer rewrites committed images;
+  `HS_REAL_UPDATE_SCREENSHOTS=1` writes the `*-real.png` record there on purpose.
+
+**Verified:** against the real `hs` binary of this branch: a single node (embedded storage) and
+two replicas on one PostgreSQL 17 (`public.ecr.aws/docker/library/postgres:17`), `cluster.spec.ts`
+green on each, and again on the cluster with one replica drained through the admin API;
+`reports-tasks-statistics.spec.ts` green on the single node with `docs/design/screenshots/`
+untouched (`git status`). Unit tests: `ClusterPage.test.tsx` (a millisecond generation is a
+`<time>` with the number in its tooltip and never the number in the cell; a small one is a
+number; a mesh address equal to the ID reads "Same as its ID"), `cluster.test.ts`
+(`describeGeneration`). `npm run check` (lint, types, 610 unit tests, build) and `npm run test:e2e` (68) green.
 
 ## 2026-10-04: Federation and Overview at scale, and the cluster series (branch `agent/web-scale-items`)
 

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { Replica, Shard } from "@/api/cluster";
 import {
   countByOwner,
+  describeGeneration,
   describeOwnership,
   drainBlockedReason,
   groupByKind,
@@ -64,5 +65,21 @@ describe("cluster wording", () => {
     expect(joinWithAnd(["a"])).toBe("a");
     expect(joinWithAnd(["a", "b"])).toBe("a and b");
     expect(joinWithAnd(["a", "b", "c"])).toBe("a, b and c");
+  });
+});
+
+describe("describeGeneration", () => {
+  it("reads a millisecond clock value as the start time, keeping the raw value for the tooltip", () => {
+    const at = Date.UTC(2026, 9, 4, 18, 30, 5, 123);
+    const g = describeGeneration(at);
+    expect(g.startedAt?.toISOString()).toBe("2026-10-04T18:30:05.123Z");
+    expect(g.title).toBe(`Generation ${at}: started 2026-10-04T18:30:05.123Z`);
+    expect(g.label.length).toBeLessThan(20);
+    expect(g.label).not.toContain(String(at));
+  });
+
+  it("keeps anything outside a timestamp's range a number", () => {
+    expect(describeGeneration(7)).toEqual({ label: "7", title: "Generation 7", startedAt: null });
+    expect(describeGeneration(123_456).startedAt).toBeNull();
   });
 });

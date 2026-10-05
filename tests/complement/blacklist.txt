@@ -15,5 +15,9 @@
 # failures populate this list (with a one-line reason each), the same way Synapse's own blacklist
 # is grown incrementally rather than guessed at up front.
 #
+# A test that fails only because it races two servers (it asserts on one what was only
+# guaranteed on the other) gets a patch in patches/ that waits for the precondition instead of a
+# line here, so it keeps measuring the behaviour: see README.md, "Patches to upstream tests".
+#
 # Example entry once real failures are known:
 # TestOutboundFederationProfile  # not yet implemented: federation profile queries (track 06)

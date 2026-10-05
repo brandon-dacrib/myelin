@@ -1,0 +1,54 @@
+Wait for hs2 to have the power-levels change before charlie's local join (NoCreators race).
+
+Tests: TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11, ...V12,
+TestKnockRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11, ...V12 (all four share
+doTestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevels).
+
+Alice (hs1) gives bob (hs2) invite power with SendEventSynced, which waits for the event on
+hs1 only. The test then has charlie join through hs2 straight away, and hs2 can only
+authorise that join through bob once the power-levels event has arrived over federation.
+On a loaded host it had not: charlie's join was refused 15 ms after hs1 accepted the
+change (docs/status/14-test-and-conformance.md, session 6), and all four failed in four
+runs of 2026-09-30 and on c2d74174. The patch makes bob sync until he sees the event,
+which is the precondition the assertion depends on; the assertion itself is unchanged.
+Applied by tests/complement/apply_patches.sh. Upstream: matrix-org/complement
+tests/restricted_rooms_test.go (Apache-2.0).
+
+diff --git a/tests/restricted_rooms_test.go b/tests/restricted_rooms_test.go
+index b72b630..6a42f83 100644
+--- a/tests/restricted_rooms_test.go
++++ b/tests/restricted_rooms_test.go
+@@ -508,9 +508,10 @@ func doTestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevels(t *testing.T, roomV
+ 	// Alice restricts the invite power level to moderators and promotes Bob to
+ 	// moderator.
+ 	state_key := ""
++	var powerLevelsEventID string
+ 	if roomVersion == "12" {
+ 		// Alice is a creator and cannot appear in the power levels
+-		alice.SendEventSynced(t, room, b.Event{
++		powerLevelsEventID = alice.SendEventSynced(t, room, b.Event{
+ 			Type:     "m.room.power_levels",
+ 			StateKey: &state_key,
+ 			Content: map[string]interface{}{
+@@ -522,7 +523,7 @@ func doTestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevels(t *testing.T, roomV
+ 		})
+ 	} else {
+ 		// rooms <v12 need alice to be in the power levels to retain power
+-		alice.SendEventSynced(t, room, b.Event{
++		powerLevelsEventID = alice.SendEventSynced(t, room, b.Event{
+ 			Type:     "m.room.power_levels",
+ 			StateKey: &state_key,
+ 			Content: map[string]interface{}{
+@@ -535,6 +536,12 @@ func doTestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevels(t *testing.T, roomV
+ 		})
+ 	}
+ 
++	// Myelin harness patch (tests/complement/patches/): wait until hs2 has the
++	// power-levels change. SendEventSynced only waits for alice's own server; until
++	// the event reaches hs2 over federation, bob has no invite power there and hs2
++	// is right to refuse charlie's local join.
++	bob.MustSyncUntil(t, client.SyncReq{}, client.SyncTimelineHasEventID(room, powerLevelsEventID))
++
+ 	// Charlie joins the allowed room.
+ 	charlie.JoinRoom(t, allowed_room, []spec.ServerName{
+ 		deployment.GetFullyQualifiedHomeserverName(t, "hs1"),

@@ -12,5 +12,6 @@ clone https://gitlab.com/famedly/conduit.git conduit               # Apache-2.0 
 clone https://github.com/mautrix/go.git mautrix-go                 # MPL-2.0
 clone https://github.com/mautrix/python.git mautrix-python         # MPL-2.0
 clone https://github.com/matrix-org/complement.git complement      # Apache-2.0
+tests/complement/apply_patches.sh refs/complement                  # harness fixes to upstream races
 clone https://github.com/matrix-org/matrix-spec.git matrix-spec    # Apache-2.0 (OpenAPI under data/api)
 clone https://github.com/matrix-org/sytest.git sytest              # Apache-2.0

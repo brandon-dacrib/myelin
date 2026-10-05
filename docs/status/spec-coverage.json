@@ -1,0 +1,52 @@
+{
+  "generated_at": "2026-10-05T00:53:34Z",
+  "routes_manifest": "docs/status/routes.json",
+  "routes_manifest_generated_at": "2026-10-05T00:41:36.986Z",
+  "summary": {
+    "overall_percent": 68.08510638297872,
+    "total_spec_routes": 235,
+    "total_registered": 160,
+    "apis": [
+      {
+        "family": "client-server",
+        "spec_total": 166,
+        "registered": 126,
+        "missing": 40,
+        "extra": 200,
+        "percent": 75.90361445783132
+      },
+      {
+        "family": "server-server",
+        "spec_total": 36,
+        "registered": 34,
+        "missing": 2,
+        "extra": 8,
+        "percent": 94.44444444444444
+      },
+      {
+        "family": "application-service",
+        "spec_total": 9,
+        "registered": 0,
+        "missing": 9,
+        "extra": 2,
+        "percent": 0.0
+      },
+      {
+        "family": "identity",
+        "spec_total": 23,
+        "registered": 0,
+        "missing": 23,
+        "extra": 0,
+        "percent": 0.0
+      },
+      {
+        "family": "push-gateway",
+        "spec_total": 1,
+        "registered": 0,
+        "missing": 1,
+        "extra": 0,
+        "percent": 0.0
+      }
+    ]
+  }
+}

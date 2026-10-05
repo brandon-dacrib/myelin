@@ -28,6 +28,7 @@ import { DataTable, type Column } from "@/components/ui/table/DataTable";
 import { hasScope } from "@/lib/auth";
 import { cn } from "@/lib/cn";
 import {
+  describeGeneration,
   drainBlockedReason,
   isDrainRequested,
   isSingleNode,
@@ -135,10 +136,16 @@ export function ClusterPage() {
             </dd>
             <dt className="text-text">Mesh address</dt>
             <dd>
-              Where the other replicas reach it to forward requests to the shard&apos;s owner.
+              Where the other replicas reach it to forward requests to the shard&apos;s owner. A
+              replica is named after the mesh address it advertises, so this usually says
+              &ldquo;Same as its ID&rdquo; (the address is in the tooltip).
             </dd>
             <dt className="text-text">Epoch</dt>
-            <dd>Its generation: a new number each time it starts, so a restart shows here.</dd>
+            <dd>
+              Its generation: a new one each time it starts, so a restart shows here. The server
+              makes it from the clock when the replica starts, so it is shown as that time; the
+              number itself is in the tooltip.
+            </dd>
           </dl>
         </details>
         {singleNode && replicas.data && (
@@ -375,12 +382,20 @@ function ReplicasTable({
       key: "mesh",
       header: "Mesh address",
       priority: 3,
+      // A replica is named after the mesh address it advertises (`hs_cli::cluster`), so the
+      // same string twice would only push the table past a 1280 px screen. A different address
+      // (a server that names its replicas otherwise) may break anywhere.
       render: (r) =>
-        r.mesh_addr ? (
-          <span className="whitespace-nowrap font-identifier">{r.mesh_addr}</span>
-        ) : (
+        !r.mesh_addr ? (
           <Dash />
+        ) : r.mesh_addr === r.id ? (
+          <span className="text-text-muted" title={r.mesh_addr}>
+            Same as its ID
+          </span>
+        ) : (
+          <span className="font-identifier wrap-anywhere">{r.mesh_addr}</span>
         ),
+      renderCompact: (r) => r.mesh_addr ?? "—",
     },
     {
       key: "epoch",
@@ -388,7 +403,8 @@ function ReplicasTable({
       priority: 3,
       align: "end",
       // A stopped replica has no generation (the server answers 0).
-      render: (r) => (isStopped(r) || !r.epoch ? <Dash /> : r.epoch.toLocaleString()),
+      render: (r) => (isStopped(r) || !r.epoch ? <Dash /> : <GenerationCell epoch={r.epoch} />),
+      renderCompact: (r) => (isStopped(r) || !r.epoch ? "—" : describeGeneration(r.epoch).title),
     },
     {
       key: "actions",
@@ -469,6 +485,24 @@ function HeartbeatCell({ replica }: { replica: Replica }) {
   );
 }
 
+/** A replica's generation as its start time (or a number), with the raw value in the tooltip. */
+function GenerationCell({ epoch }: { epoch: number }) {
+  const generation = describeGeneration(epoch);
+  return generation.startedAt ? (
+    <time
+      dateTime={generation.startedAt.toISOString()}
+      title={generation.title}
+      className="whitespace-nowrap tabular-nums"
+    >
+      {generation.label}
+    </time>
+  ) : (
+    <span title={generation.title} className="whitespace-nowrap tabular-nums">
+      {generation.label}
+    </span>
+  );
+}
+
 /**
  * A drained replica that has been stopped: the server keeps listing it (drained, with no
  * heartbeat and no mesh address) so its drain request is not lost, until it is undrained.
@@ -485,7 +519,7 @@ function Dash() {
 function ReplicaStatusCell({ replica }: { replica: Replica }) {
   const meta = replicaStatusMeta(replica.status);
   return (
-    <div className="flex min-w-40 max-w-52 flex-col items-start gap-1 text-left">
+    <div className="flex min-w-28 max-w-44 flex-col items-start gap-1 text-left">
       <Badge status={meta.status}>{meta.label}</Badge>
       {replica.status === "draining" && replica.drain_task_id && (
         <DrainProgress replica={replica} taskId={replica.drain_task_id} />
@@ -506,7 +540,8 @@ function ReplicaStatusCell({ replica }: { replica: Replica }) {
           {replica.drain_requested_by && (
             <>
               {" by "}
-              <span className="font-identifier">{replica.drain_requested_by}</span>
+              {/* A Matrix ID has no spaces to wrap at; let it break so the column stays narrow. */}
+              <span className="font-identifier wrap-anywhere">{replica.drain_requested_by}</span>
             </>
           )}
           {replica.drain_requested_at && (
@@ -538,7 +573,7 @@ function DrainProgress({ replica, taskId }: { replica: Replica; taskId: string }
   const left = replica.shard_count ?? 0;
   const words = task.data ? describeProgress(task.data) : null;
   return (
-    <div className="w-40">
+    <div className="w-36">
       <TaskProgressBar
         fraction={task.data ? progressFraction(task.data) : null}
         label={
@@ -599,7 +634,7 @@ function ReplicaActions({
         Drain
       </Button>
       {blocked && (
-        <span id={reasonId} className="max-w-48 text-right text-xs text-text-muted">
+        <span id={reasonId} className="max-w-32 text-right text-xs text-text-muted">
           {blocked}
         </span>
       )}

@@ -1,4 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
+import { SHOTS } from "./screenshots";
 import { settle } from "./settle";
 
 /**
@@ -7,10 +8,9 @@ import { settle } from "./settle";
  * `GET /api/v1/users` with `403 insufficient-scope` naming `admin:read`, the page lists it with
  * its scope, and revoking it from the page makes its next request `401`. Needs
  * `HS_REAL_SERVER_URL` and `HS_REAL_ADMIN_TOKEN` (playwright.real.config.ts). Screenshots go to
- * `docs/design/screenshots/admin-tokens-*-real.png` as the record of the run.
+ * `admin-tokens-*-real.png` in `SHOTS` (`./screenshots.ts`) as the record of the run.
  */
 const adminToken = process.env.HS_REAL_ADMIN_TOKEN;
-const SHOTS = "../docs/design/screenshots";
 const run = Date.now().toString(36);
 
 async function shot(page: Page, name: string, fullPage = true) {

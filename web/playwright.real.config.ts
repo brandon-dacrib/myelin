@@ -17,6 +17,10 @@ import { defineConfig, devices } from "@playwright/test";
  * `HS_REAL_ADMIN_TOKEN` is optional; without it, only the always-available "sign-in rejects an
  * unrecognized token" case runs (which needs no admin account — see the spec for why that's the
  * one case guaranteed to be exercisable against the server as of this writing).
+ *
+ * Screenshots go to `test-results/` (`e2e-real/screenshots.ts`), so a run leaves the committed
+ * record in `docs/design/screenshots/` alone; `HS_REAL_UPDATE_SCREENSHOTS=1` writes the
+ * `*-real.png` record there instead, on purpose.
  */
 const target = process.env.HS_REAL_SERVER_URL;
 // `HS_REAL_UI_PORT` moves the dev server off 4180, so that two checkouts can each run the suite

@@ -30,6 +30,9 @@ fi
 
 ./build.sh "$IMAGE_TAG"
 
+# Harness fixes to upstream tests' races (patches/, README.md "Patches to upstream tests").
+./apply_patches.sh "$COMPLEMENT_DIR"
+
 SKIP_REGEX="$(./skip_regex.sh)"
 
 cd "$COMPLEMENT_DIR"

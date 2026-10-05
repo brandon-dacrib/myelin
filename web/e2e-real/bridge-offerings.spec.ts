@@ -1,4 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
+import { SHOTS } from "./screenshots";
 import { settle } from "./settle";
 
 /**
@@ -10,11 +11,10 @@ import { settle } from "./settle";
  * Needs `HS_REAL_SERVER_URL` and `HS_REAL_ADMIN_TOKEN` (playwright.real.config.ts), a server
  * with no WhatsApp offering yet, and a local user `@alice:<server>` (register one through the
  * client API; `HS_REAL_USER` overrides the Matrix ID). Screenshots go to
- * `docs/design/screenshots/bridge-offerings-*-real.png`: the record of the run.
+ * `bridge-offerings-*-real.png` in `SHOTS` (`./screenshots.ts`): the record of the run.
  */
 const adminToken = process.env.HS_REAL_ADMIN_TOKEN;
 const user = process.env.HS_REAL_USER ?? "@alice:example.org";
-const SHOTS = "../docs/design/screenshots";
 
 /** The whole page, or just the viewport for a dialog (a full-page capture scrolls it away). */
 async function shot(page: Page, name: string, fullPage = true) {

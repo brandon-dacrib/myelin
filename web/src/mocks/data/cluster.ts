@@ -53,6 +53,16 @@ interface State {
   taskCounter: number;
 }
 
+/**
+ * When each mock replica started, as the server makes a generation (`epoch`): the wall clock in
+ * milliseconds at start. hs-0 restarted most recently; hs-1 has run longest.
+ */
+const STARTED_AT = [
+  Date.now() - 3 * 3_600_000,
+  Date.now() - 2 * 86_400_000,
+  Date.now() - 26 * 3_600_000,
+] as const;
+
 function seed(): State {
   const replicas: Replica[] = [
     {
@@ -60,7 +70,7 @@ function seed(): State {
       role: "replica",
       status: "active",
       shard_count: 0,
-      epoch: 4,
+      epoch: STARTED_AT[0],
       this_replica: true,
       mesh_addr: "10.0.1.10:7600",
       version: "0.1.0-dev",
@@ -75,7 +85,7 @@ function seed(): State {
       role: "replica",
       status: "active",
       shard_count: 0,
-      epoch: 2,
+      epoch: STARTED_AT[1],
       this_replica: false,
       mesh_addr: "10.0.1.11:7600",
       version: "0.1.0-dev",
@@ -90,7 +100,7 @@ function seed(): State {
       role: "replica",
       status: "active",
       shard_count: 0,
-      epoch: 3,
+      epoch: STARTED_AT[2],
       this_replica: false,
       mesh_addr: "10.0.1.12:7600",
       version: "0.1.0-dev",
@@ -216,7 +226,7 @@ const HEARTBEAT_MS = 2_000;
  * One that is unreachable stopped a minute and a half ago and its number stands still.
  */
 function heartbeatSeq(replica: Replica, now: number): number {
-  const before = 10_000 * (replica.epoch ?? 1);
+  const before = Math.floor((BOOT - (replica.epoch ?? BOOT)) / HEARTBEAT_MS);
   const until = replica.status === "unreachable" ? BOOT : now;
   return before + Math.floor((until - BOOT) / HEARTBEAT_MS);
 }
@@ -224,7 +234,8 @@ function heartbeatSeq(replica: Replica, now: number): number {
 /** A replica as the wire has it: a heartbeat a moment ago for a replica that is up. */
 function wire(replica: Replica): Replica {
   const now = Date.now();
-  const offset = replica.this_replica ? 800 : 1_600 + (replica.epoch ?? 0) * 300;
+  const index = state.replicas.findIndex((r) => r.id === replica.id);
+  const offset = replica.this_replica ? 800 : 1_600 + Math.max(index, 0) * 300;
   return {
     ...replica,
     last_heartbeat_at:

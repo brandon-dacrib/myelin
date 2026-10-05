@@ -1,5 +1,86 @@
 # 14 Test and conformance (integration lead): status
 
+## Session 10 (2026-10-04 evening, branch `agent/ops-web`): the dashboard reads the results, the NoCreators race, the IPv4-only warning
+
+Four wave-1 leftovers from `docs/next-steps.md`'s gaps table (tracks 14, 16 and 12).
+
+**1. `tools/dashboard.py` reports what was measured, and runs without cargo.** The Sytest and
+Complement rows were hard-coded "scaffold, untested"; they are now read from the committed
+results: every `docs/status/sytest/<run>-results.txt` (newest first, by the date the name
+starts with and then by commit time; the headline is the newest run of at least 90% of the
+suite, so a run of a few files is never it), with that run's summary note and "are we Synapse
+yet" groups, and each `docs/status/complement-<suite>-results.txt` baseline (top-level counts,
+the run/date/commit and assertion count from its `# Run` header, and the failing names). The
+test-layer table detects L3/L4 as "measured" from those files and L6-L12 from what is on disk
+(they all said "not started"). The tracks table takes each file's title and its newest dated
+`##` section, which is how every status file is written now (the Done/In progress/Blockers
+counts read 0 for most files and track 03's title was a session heading). Spec coverage: a run
+through cargo saves `docs/status/spec-coverage.json`; with no cargo on the host, or no
+`refs/matrix-spec` (it also looks in the main checkout when run from a worktree), the dashboard
+reports that committed snapshot and says so; `--coverage-from <json>` reads a saved summary and
+runs no cargo; `--refresh-routes` rewrites `docs/status/routes.json` with `hs routes-manifest`
+first. The committed manifest dated from 2026-09-19 and is refreshed here: **160 / 235 spec
+routes (68.1%)**, from 138 (client-server 126 / 166, server-server 34 / 36). Regenerated
+`docs/status/dashboard.md`. Tests: `python3 -m unittest tools/test_dashboard.py` (5: run
+ordering and the headline, a Complement header, status titles and dates, the no-cargo snapshot
+path through `main`, a bare `--json-out` file).
+
+**2. The NoCreators race is patched, not blacklisted.** The four tests
+(`TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11`/`V12`,
+`TestKnockRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11`/`V12`) share one helper, where
+alice's power-levels change is sent with `SendEventSynced` (waits on hs1 only) and charlie's
+local join through hs2 follows at once. `tests/complement/patches/0001-nocreators-wait-for-hs2-power-levels.patch`
+makes bob (hs2) sync until he has that event first; the assertion is unchanged.
+`tests/complement/apply_patches.sh [<dir>]` applies `patches/*.patch` idempotently (an applied
+patch is left alone, a stale one is an error naming it; it stops git from discovering an
+enclosing repository, which made a check against a copy under `target/` pass having looked at
+nothing). `tools/fetch-refs.sh` runs it after cloning `refs/complement` and `run_single_node.sh`
+before every run; by hand: `tests/complement/apply_patches.sh refs/complement`. README section
+"Patches to upstream tests". **Verified** with `complement-hs-main:c2d74174` (the hs code of
+`main`; this branch changes no code the image runs except the outbound warning) from a patched
+copy of `refs/complement` (`refs/` itself left alone while other agents run from it):
+`go test -count=1` then `-count=3` of the four, **16 of 16 PASS**; the same four unpatched,
+`TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11` and `V12` **FAIL** at
+`restricted_rooms_test.go:554` (the knock pair won its race that time). Then with this
+branch's own image (`tests/complement/build.sh complement-hs-ops-web:dev`), `-count=2`, at load
+55 to 80: **8 of 8 PASS**. A first try of that run lost three to `Conflict. The container name
+"/complement_fed.2_servers.hs1" is already in use`: another agent was running Complement's
+`tests` package at the same moment, and Complement names its containers by package and
+blueprint only, so two runs of the same package on one Docker daemon cannot overlap (the
+coordinator should serialize Complement runs; there is no environment variable to change the
+names).
+
+**3. Web (track 16): the Cluster page's Epoch, the e2e-real cluster spec, the screenshots.** See
+`docs/status/16-management-web-interface.md`, 2026-10-04 (`agent/ops-web`).
+
+**4. A peer on IPv6 alone under the IPv4-only policy is one clear warning (`hs-http`).** The
+outbound module logged a policy-dropped IPv6 address nowhere (and a failed connection only at
+`debug`), so the Sytest failure of 2026-10-04 (haproxy on `::1` only, `localhost` resolving to
+both, every federation request "connection refused" on `127.0.0.1`) showed nothing that named
+the cause. `hs_http::outbound` now records the IPv6 addresses the policy dropped with each
+connection's candidates, and when every IPv4 address fails it logs one `warn` naming the host,
+the IPv4 addresses tried, the IPv6 addresses not tried and `network.outbound.ipv4_only`; also
+when a name has only IPv6 addresses. At most once per host per ten minutes
+(`DROPPED_IPV6_WARNING_INTERVAL`; repeats are `debug`). README paragraph on the policy updated.
+Tests: `crates/hs-cli/tests/outbound_ipv6_only_peer.rs` (two `hs serve` instances: the peer
+listens on `[::1]` only and its name resolves to `::1` and `127.0.0.1`; the asker under the
+default policy fails, logs exactly one such warning across two requests, and it names the host,
+both addresses and the setting; a third server with `ipv4_only: false` reaches the peer; prints
+`SKIP` on a host with no IPv6 loopback), and in `hs-http`
+`the_ipv6_warning_is_given_once_per_host_per_interval` and
+`an_offer_names_the_ipv6_addresses_the_policy_dropped`. `outbound_address_policy.rs` still
+passes.
+
+**Verified:** `cargo test -p hs-http --lib outbound` (8), `cargo test -p hs-cli --test
+outbound_ipv6_only_peer --test outbound_address_policy`, `cargo clippy -p hs-http -p hs-cli
+--all-targets -- -D warnings`, `cargo fmt --all --check`; the Complement runs above; the web
+checks in status 16.
+
+**Left:** a Complement run of the whole federation package with the patch, to move the
+baseline (the coordinator's next measurement); the "unknown" group drift in
+`are-we-synapse-yet.py`'s name list (session 8); bridge conformance and the performance table
+still commit no result file for the dashboard to read.
+
 ## Session 9 (2026-10-04 afternoon, the coordinator): the wave of 2026-10-04, measured
 
 `main` at `c2d74174` (ten branches of the wave plus the thumbnail fix), image `myelin-sytest:dev`

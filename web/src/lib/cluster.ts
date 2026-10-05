@@ -134,3 +134,39 @@ export function joinWithAnd(names: readonly string[]): string {
   if (names.length <= 1) return names.join("");
   return `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
 }
+
+/**
+ * A replica's generation (`epoch`) read as what it is. The server makes a replica's generation
+ * from the wall clock when the process starts, in milliseconds since the Unix epoch (one more
+ * than the last one instead if the clock went backwards: `hs_cluster::Generation::fresh`), so a
+ * value in a timestamp's range is the start time; anything smaller is shown as a number.
+ */
+export function describeGeneration(epoch: number): {
+  /** What the cell shows: the start time, short, or the number. */
+  label: string;
+  /** The tooltip: the raw value, and the start time in full when it is one. */
+  title: string;
+  /** The start time, when the generation is a timestamp. */
+  startedAt: Date | null;
+} {
+  // 10^12 ms is September 2001, 10^13 is the year 2286: thirteen digits is a millisecond clock.
+  if (Number.isSafeInteger(epoch) && epoch >= 1e12 && epoch < 1e13) {
+    const startedAt = new Date(epoch);
+    const sameYear = startedAt.getFullYear() === new Date().getFullYear();
+    const label = startedAt.toLocaleString(undefined, {
+      ...(sameYear ? {} : { year: "numeric" }),
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+      // 24-hour: shorter, and the column has room for little at 1280 px.
+      hourCycle: "h23",
+    });
+    return {
+      label,
+      title: `Generation ${epoch}: started ${startedAt.toISOString()}`,
+      startedAt,
+    };
+  }
+  return { label: epoch.toLocaleString(), title: `Generation ${epoch}`, startedAt: null };
+}

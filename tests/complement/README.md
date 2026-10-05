@@ -30,6 +30,7 @@ file's "What a next session should do first").
 | `run_cluster.sh` | The seam for track 03/12's cluster deployment topology (sharded rooms, lease handover, multi-container blueprints) — see that script's header for why this is further from working than single-node mode. |
 | `skip_regex.sh` | Turns `blacklist.txt` into the `|`-joined regex `run_single_node.sh` passes to `go test -skip`. |
 | `blacklist.txt` | This server's Complement blacklist — see below. |
+| `patches/`, `apply_patches.sh` | Harness fixes to races in upstream tests, applied idempotently to a Complement checkout — see "Patches to upstream tests" below. |
 
 ## Image contract (from `refs/complement/README.md`, "Image requirements")
 
@@ -83,6 +84,25 @@ RFC explaining why, a Complement bug), with a `#` comment naming that reason. Pa
 "672 pass, 0 fail, 14 skip" (`refs/palpo/tests/complement/` and its results file) is the bar this
 track's brief sets for a new Rust server; an empty or ever-growing blacklist without comments
 explaining each entry does not meet it.
+
+## Patches to upstream tests
+
+A few upstream tests assert on one homeserver what has only been guaranteed on another, and
+lose that race on a loaded host whatever the server does. Rather than blacklist them (and stop
+measuring the behaviour they test), `patches/` holds a fix per race that waits for the
+precondition the assertion depends on; no patch relaxes an assertion. `apply_patches.sh
+[<complement dir>]` applies them idempotently (an applied patch is left alone, a stale one is an
+error naming it). `tools/fetch-refs.sh` runs it after cloning `refs/complement`, and
+`run_single_node.sh` before every run; when running `go test` by hand in a checkout made some
+other way, run it once first:
+
+```bash
+tests/complement/apply_patches.sh refs/complement
+```
+
+| Patch | Tests | What it waits for |
+|---|---|---|
+| `0001-nocreators-wait-for-hs2-power-levels.patch` | `TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11`/`V12`, `TestKnockRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11`/`V12` | bob, on hs2, syncs until alice's power-levels change (sent on hs1 with `SendEventSynced`, which waits on hs1 only) has reached hs2, before charlie's local join through hs2. Without it, charlie's join was refused 15 ms after hs1 accepted the change; all four failed on `c2d74174`, and pass with the patch (status 14, 2026-10-04 session). |
 
 ## Single-node vs cluster mode
 

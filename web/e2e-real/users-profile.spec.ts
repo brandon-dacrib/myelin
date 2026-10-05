@@ -1,4 +1,5 @@
 import { test, expect, type APIRequestContext } from "@playwright/test";
+import { SHOTS } from "./screenshots";
 import { settle } from "./settle";
 
 /**
@@ -14,10 +15,9 @@ import { settle } from "./settle";
  *
  * Needs `HS_REAL_SERVER_URL` and `HS_REAL_ADMIN_TOKEN` (playwright.real.config.ts), and a
  * server with open registration or the admin token's `users.create`. Names carry a per-run
- * suffix. Screenshots go to `docs/design/screenshots/users-profile-*-real.png`.
+ * suffix. Screenshots go to `users-profile-*-real.png` in `SHOTS` (`./screenshots.ts`).
  */
 const adminToken = process.env.HS_REAL_ADMIN_TOKEN;
-const SHOTS = "../docs/design/screenshots";
 const run = Date.now().toString(36);
 const admin = () => ({ authorization: `Bearer ${adminToken}` });
 const bearer = (token: string) => ({ authorization: `Bearer ${token}` });
