@@ -55,6 +55,24 @@ pub trait RoomSource<B: KvBackend + 'static>: Send + Sync {
     async fn resident_handles(&self) -> Vec<RoomActorHandle<B>> {
         Vec::new()
     }
+
+    /// This server's own name, when the source knows it: who among a room's members is local.
+    /// `None`, the default, for a source with no notion of one; what needs it is then skipped.
+    fn server_name(&self) -> Option<ruma::OwnedServerName> {
+        None
+    }
+
+    /// The room a local alias names (`#alias:this.server`), if any. `None`, the default, for a
+    /// source with no alias directory.
+    ///
+    /// # Errors
+    /// Returns [`RoomSourceError`] on a storage failure.
+    fn resolve_alias(
+        &self,
+        _alias: &ruma::RoomAliasId,
+    ) -> Result<Option<ruma::OwnedRoomId>, RoomSourceError> {
+        Ok(None)
+    }
 }
 
 #[async_trait::async_trait]
@@ -73,6 +91,17 @@ impl<B: KvBackend + 'static> RoomSource<B> for Arc<RoomRegistry<B>> {
 
     async fn resident_handles(&self) -> Vec<RoomActorHandle<B>> {
         RoomRegistry::resident_handles(self).await
+    }
+
+    fn server_name(&self) -> Option<ruma::OwnedServerName> {
+        Some(RoomRegistry::server_name(self).to_owned())
+    }
+
+    fn resolve_alias(
+        &self,
+        alias: &ruma::RoomAliasId,
+    ) -> Result<Option<ruma::OwnedRoomId>, RoomSourceError> {
+        RoomRegistry::resolve_alias(self, alias)
     }
 }
 

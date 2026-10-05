@@ -1,9 +1,118 @@
 # 05 Sync: status
 
-Last updated: 2026-10-04 (session 15: `device_lists` counts invites and rejoins, `/keys/changes` walks memberships between two tokens, a remote copy goes stale with the last shared room. Session 14: the owner's fan-out in batches, and feed retention.
+Last updated: 2026-10-04 (session 16: Sytest's sync leftovers -- timelines from the newest end with holes, gap state, peeking, presence on joins, filters for presence/account data/ephemeral, remote users in the directory. Session 15: `device_lists` counts invites and rejoins, `/keys/changes` walks memberships between two tokens, a remote copy goes stale with the last shared room. Session 14: the owner's fan-out in batches, and feed retention.
 Session 13: `/joined_rooms` read-your-writes. Session 12: RFC 0018, a non-owner's room copy
 catches up instead of reloading. Session 11, session 10, session 9, session 8, session 7 and
 the integration note follow; sessions 1-6 are preserved unchanged further down.)
+
+## Session 16 (2026-10-04, branch `agent/sync-gaps`): Sytest's `/sync` leftovers, room peeking, presence on federated joins
+
+Graded by the wave-1 Sytest run (`target/sytest/20261004-wave1/`, main `c2d74174`) and the
+Complement runs of the same commit.
+
+**Timelines** (`crate::sync::timeline`, new): one walk backwards from where the batch ends
+(`collect_backward`) builds both kinds of batch. An incremental batch is the newest `limit`
+events after the token's position, `limited` when there are more; a fresh one the newest `limit`
+of the room. What counts: an event the requester may see by history visibility, **or one that
+is the room's current state while they are joined** (Synapse's `always_include_ids`), and that
+the timeline filter passes; up to 500 hidden events are walked past before a batch gives up and
+says `limited`. An incremental batch stops at a **hole in the history** (an event whose
+`prev_events` are not held: remote history that could not all be fetched) and is `limited` from
+there (Complement's `TestSyncTimelineGap`). `prev_batch` is now just before the batch's first
+event (it was the token's position, which skipped the event at it). A room joined since the
+token is `limited` (Synapse's `newly_joined_room`). `types: []` returns an empty, unlimited
+timeline without walking.
+
+**State after a gap** is what changed inside the gap (state events placed after the token's
+position), not the whole state again; lazy-loaded members keep their own rules.
+**A user who joined and left within the batch** (invited at the token) gets the left room
+whole (`resume_mode`). **`full_state=true` with a token** chooses rooms as an initial sync does.
+**A forgotten room** is left out of an initial sync even with `include_leave` (`can_read_room`;
+its leave still reaches an incremental sync).
+
+**Rooms with only account-data news** (`m.fully_read`, tags) are in the batch:
+`UserStore::rooms_with_account_data_since`, read only when the account-data counter moved.
+
+**Filters applied** (`crate::filter`'s docs list them): `event_format: "federation"`
+(`timeline::federation_format`: the PDU with `event_id`, `room_id` and `unsigned`), the top-level
+`presence` and `account_data` filters (`m.push_rules` included), `room.account_data` and
+`room.ephemeral` (by type and room). Still parsed only: `event_fields`, `limit` outside
+`room.timeline`.
+
+**Presence**: whoever comes into view in a batch (members of a room just joined, whoever joined
+or was invited to one of the user's rooms) is sent, as `offline` when this server has nothing
+for them (Synapse's `get_states`). `GET /events` marks its caller online, as `/sync` does. And
+**across servers on a join** (`SessionHub::share_presence_on_join`): a local joiner's presence
+goes to every other server in the room, and a remote joiner's server gets this server's members'
+presence (debug lines "a local user joined a room with other servers in it..." and "a remote
+user joined a room; sending their server our members' presence"). Needs
+`RoomSource::server_name` (new, default `None`; the registry answers).
+
+**Room peeking (MSC2753)**: `POST /_matrix/client/v3/peek/{roomIdOrAlias}` and `POST
+/rooms/{roomId}/unpeek` (`crate::routes::peek`). World-readable rooms only (`403 M_FORBIDDEN`
+otherwise, `404` for a room this server does not hold; no federation peeking). Per device:
+`hs_user.peeks` `(user, device, room) -> feed_seq` and `hs_user.room_peekers`; the peek writes
+the room into the user's feed, the hub writes later updates into peekers' feeds
+(`fan_out_to_peekers`, one range read per update) and ends a user's peeks when they join; the
+peeking device's `/sync` has `rooms.peek`, whole for a new peek and incrementally after
+(`build_peeks`); a room no longer world-readable ends the peek. Info lines on peek, unpeek and
+each ending. Left: a peeked *hot* room does not wake a long-poll (it is found on the next one).
+
+**`device_lists.changed` counts the joiner too** (from `e2ee-gaps`' finding): the "themself
+excepted" filter session 15 put on `newly_shared` is gone. Synapse counts every member of a newly
+joined room, the joiner included, and Complement's `TestDeviceListsUpdateOverFederation` waits for
+it. The syncer is still never in `left`. `08-cross-signing.pl` ("Changing user-signing key
+notifies local users" included) and `06-device-lists.pl` pass as before.
+
+**User directory**: other servers' users the room layer offers are searched by the display name
+and avatar of their member events. `hs-auth` (track 07's, owned by `auth-gaps` this wave) gained
+the seam: `UserDirectoryVisibility::remote_profiles` (default empty) and `RemoteProfile` in
+`crates/hs-auth/src/state.rs`, and the merge in `post_user_directory_search`
+(`crates/hs-auth/src/routes/user_directory.rs`, the block after `let mut accounts`), with a test.
+`SessionHub` implements it from the remote user's membership records, one room read per user.
+
+Verified:
+- Sytest, release bookworm `hs` of this branch, the ten files alone (`31sync/03joined`,
+  `04timeline`, `06state`, `13filtered_sync`, `14read-markers`, `15lazy-members`, `17peeking`,
+  `44account_data`, `50federation/44presence`, `52user-directory/01public`): **64 of 67**, against
+  41 of 67 on `c2d74174`; 23 FAIL to PASS, none the other way.
+- unit: `sync::sytest_cases` (16, one per Sytest case above, plus the presence filter, the
+  forgotten room, presence across servers on a join and the directory's remote profiles),
+  `routes::peek::tests` (4), hs-auth's `another_servers_user_the_room_layer_offers_is_found_by_their_room_name`;
+  `cargo test -p hs-user` all pass.
+- Sytest again after the device-list change, those ten files with `41end-to-end-keys/06-device-lists.pl`
+  and `08-cross-signing.pl`: **86 of 90**; the four failures are the three below and "If remote
+  user leaves room we no longer receive device updates" (session 15's race, failing before).
+- Complement (image of this branch rebased on `bde7a789`, under the shared lock): csapi
+  `TestSync`, `TestSyncTimelineGap`, `TestRoomForget`, `TestMessagesOverFederation` pass;
+  `TestDeviceListsUpdateOverFederation`'s `good_connectivity` and `interrupted_connectivity`
+  pass, `stopped_server` does not, nor `TestDeviceListsUpdateOverFederationOnRoomJoin` (skipped
+  on Synapse and Dendrite; the joiner's server is never sent a device-list EDU): track 08's.
+- unit: `sync::sytest_cases::the_joiner_is_in_their_own_device_lists_changed`.
+- real binary: `crates/hs-cli/tests/peeking.rs` (403 for a shared room, peek by alias, `rooms.peek`
+  on the peeking device only, joining moves it to `join`); `legacy_events`, `federation_edus`,
+  `invites_and_notices`, `federation_two_servers` still pass.
+
+Left (not this crate's):
+- "A next_batch token can be used in the v1 messages API": the page is right, but `/messages`
+  leaves `end` out of a forward page that reaches the live end (`hs-room`'s
+  `routes/query.rs::messages_page`, `end = page.next`); Synapse always gives a forward page an
+  `end`. `room-client-gaps`' crate.
+- "The only membership state included in an incremental sync is for senders in the timeline":
+  the room has an `m.room.guest_access` the test does not expect. `createRoom`'s `public_chat`
+  preset sends `guest_access: forbidden`; Synapse's sends none (`guest_can_join: False`). A
+  three-line change in `hs-room/src/actor.rs` (the preset match), but `hs-room/tests/backfill.rs`
+  counts six creation events in two tests and would need five: `federation-gaps`' files, so not
+  made here.
+- "The only membership state included in a gapped incremental sync is for senders in the
+  timeline": on Synapse's own Sytest blacklist, and its own comment says it should fail (it
+  expects Charlie's membership absent though Charlie sent every timeline event).
+- Complement `TestThreadedReceipts`/`TestThreadReceiptsInSyncMSC4102`: fail at setup, `PUT
+  /pushrules/global/postcontent/...` answers 400 "unknown push rule kind" (MSC4306's
+  `postcontent` kind): `hs-push`, `push-media-gaps`' crate.
+- Complement `TestSyncOmitsStateChangeOnFilteredEvents`: Synapse passes because an initial sync
+  orders by depth (the newest unfiltered event is E4 and S2 lands in `state`); this server orders
+  by arrival, so S2 is the newest event and is in the timeline. Not changed.
 
 ## Session 15 (2026-10-04, branch `agent/device-list-invites`): who is in `device_lists`, and `/keys/changes` between two sync tokens
 

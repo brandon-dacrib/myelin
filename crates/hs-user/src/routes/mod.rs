@@ -7,6 +7,7 @@
 pub mod account_data;
 pub mod events;
 pub mod filter;
+pub mod peek;
 pub mod presence;
 pub mod receipts;
 pub mod rooms;
@@ -27,7 +28,7 @@ fn matrix_client(operation_id: &str) -> RouteMeta {
 /// This crate's endpoints and their `routes.json` manifest: `/sync`, the deprecated `/events`
 /// and `/initialSync` (`events`), `/joined_rooms`, account
 /// data (global and room-scoped), room tags (`tags`), filters, typing, presence and read
-/// receipts (`m.receipt` and `m.fully_read`).
+/// receipts (`m.receipt` and `m.fully_read`), and room peeking (`peek`, MSC2753).
 ///
 /// `/publicRooms` (`crate::routes::rooms::get_public_rooms`/`post_public_rooms`) is deliberately
 /// **not** mounted here as of this session: `docs/workstreams/04-room-and-events.md` lists
@@ -118,6 +119,16 @@ pub fn router<B: KvBackend + 'static, R: RoomSource<B> + 'static>()
             "/rooms/{roomId}/read_markers",
             receipts::post_read_markers::<B, R>,
             matrix_client("setReadMarker"),
+        )
+        .post(
+            "/peek/{roomIdOrAlias}",
+            peek::post_peek::<B, R>,
+            matrix_client("peek"),
+        )
+        .post(
+            "/rooms/{roomId}/unpeek",
+            peek::post_unpeek::<B, R>,
+            matrix_client("unpeek"),
         )
         .get(
             "/presence/{userId}/status",

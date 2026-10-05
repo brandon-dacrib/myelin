@@ -34,19 +34,19 @@
 //!   incremental sync always includes a room the user just left, regardless of this flag, since
 //!   the client needs to see the leave event itself).
 //!
+//! - `event_format: "federation"`: events are rendered as servers exchange them
+//!   (`prev_events`, `auth_events`, `depth`, `hashes`, `signatures`), with `event_id`, `room_id`
+//!   and `unsigned` added (`crate::sync`'s `federation_format`).
+//! - `presence` (top-level): `types`/`not_types`/`senders`/`not_senders` on the `m.presence`
+//!   events, within the shared-room scope `crate::sync` already applies.
+//! - `account_data` (top-level) and `room.account_data`: by event type (and, for the room one,
+//!   `rooms`/`not_rooms`); account data has no sender, and the user's own id stands for one.
+//! - `room.ephemeral`: by event type (`m.typing`, `m.receipt`) and `rooms`/`not_rooms`.
+//!
 //! **Parsed but ignored** (present in [`SyncFilter`]'s fields so a client's filter round-trips
 //! and is never rejected, but `crate::sync` does not act on it):
-//! - `event_fields`, `event_format`: no field-pruning or federation-format rendering is
-//!   implemented; every event is always rendered in full client format
-//!   (`hs_room::routes::render::client_event_json`).
-//! - `presence`, `account_data` (top-level, i.e. the *global* account-data filter): global account
-//!   data is always returned in full, unfiltered; the top-level `presence` filter is unused since
-//!   `presence.events` is always built from shared-room scope, not filtered further.
-//! - `room.account_data`, `room.ephemeral`: room-scoped account data and ephemeral events
-//!   (`m.typing`, `m.receipt`) are always returned in full, not content-filtered -- both are
-//!   already small, bounded sets (one typing/receipt snapshot per room, not a history), so this
-//!   crate does not apply `EventFilter`/`RoomEventFilter`'s `types`/`senders` restrictions to
-//!   them.
+//! - `event_fields`: no field pruning; every event is rendered whole.
+//! - `limit` anywhere but `room.timeline`.
 //!
 //! This asymmetry (timeline vs. state cannot independently restrict which rooms they cover) is a
 //! known simplification: the spec allows `room.timeline.rooms` and `room.state.rooms` to differ,
@@ -114,6 +114,47 @@ fn type_pattern_matches(pattern: &str, event_type: &str) -> bool {
         })
 }
 
+impl EventFilter {
+    /// Whether an event of `event_type` from `sender` passes this filter's `types`/`not_types`/
+    /// `senders`/`not_senders`, with the same precedence as [`RoomEventFilter::matches`].
+    #[must_use]
+    pub fn matches(&self, event_type: &str, sender: &str) -> bool {
+        type_and_sender_match(
+            self.types.as_deref(),
+            self.not_types.as_deref(),
+            self.senders.as_deref(),
+            self.not_senders.as_deref(),
+            event_type,
+            sender,
+        )
+    }
+}
+
+/// The `types`/`not_types`/`senders`/`not_senders` rule both filter shapes share: a denylist
+/// excludes outright, then an allowlist must name the event.
+fn type_and_sender_match(
+    types: Option<&[String]>,
+    not_types: Option<&[String]>,
+    senders: Option<&[String]>,
+    not_senders: Option<&[String]>,
+    event_type: &str,
+    sender: &str,
+) -> bool {
+    if not_types.is_some_and(|list| list.iter().any(|t| type_pattern_matches(t, event_type))) {
+        return false;
+    }
+    if not_senders.is_some_and(|list| list.iter().any(|s| s == sender)) {
+        return false;
+    }
+    if types.is_some_and(|list| !list.iter().any(|t| type_pattern_matches(t, event_type))) {
+        return false;
+    }
+    if senders.is_some_and(|list| !list.iter().any(|s| s == sender)) {
+        return false;
+    }
+    true
+}
+
 impl RoomEventFilter {
     /// Whether this filter has no content restriction at all (`types`/`not_types`/`senders`/
     /// `not_senders` all absent) -- used by `crate::sync` to take its unfiltered, single-`paginate`-call
@@ -134,29 +175,14 @@ impl RoomEventFilter {
     /// [`SyncFilter::room_allowed`] already uses for `not_rooms`).
     #[must_use]
     pub fn matches(&self, event_type: &str, sender: &str) -> bool {
-        if let Some(not_types) = &self.not_types
-            && not_types
-                .iter()
-                .any(|t| type_pattern_matches(t, event_type))
-        {
-            return false;
-        }
-        if let Some(not_senders) = &self.not_senders
-            && not_senders.iter().any(|s| s == sender)
-        {
-            return false;
-        }
-        if let Some(types) = &self.types
-            && !types.iter().any(|t| type_pattern_matches(t, event_type))
-        {
-            return false;
-        }
-        if let Some(senders) = &self.senders
-            && !senders.iter().any(|s| s == sender)
-        {
-            return false;
-        }
-        true
+        type_and_sender_match(
+            self.types.as_deref(),
+            self.not_types.as_deref(),
+            self.senders.as_deref(),
+            self.not_senders.as_deref(),
+            event_type,
+            sender,
+        )
     }
 }
 
@@ -345,6 +371,49 @@ impl SyncFilter {
             .unwrap_or(false)
     }
 
+    /// Whether events are to be rendered in the federation format (`event_format:
+    /// "federation"`) rather than the client one.
+    #[must_use]
+    pub fn federation_format(&self) -> bool {
+        self.event_format.as_deref() == Some("federation")
+    }
+
+    /// Whether the top-level `presence` filter passes an `m.presence` event from `sender`.
+    #[must_use]
+    pub fn presence_allows(&self, sender: &str) -> bool {
+        self.presence
+            .as_ref()
+            .is_none_or(|f| f.matches("m.presence", sender))
+    }
+
+    /// Whether the top-level `account_data` filter passes global account data of `event_type`.
+    /// Account data has no sender; the user's own id stands for it, as Synapse does.
+    #[must_use]
+    pub fn account_data_allows(&self, event_type: &str, user_id: &str) -> bool {
+        self.account_data
+            .as_ref()
+            .is_none_or(|f| f.matches(event_type, user_id))
+    }
+
+    /// Whether `room.account_data` passes room account data of `event_type` in `room_id`.
+    #[must_use]
+    pub fn room_account_data_allows(&self, room_id: &str, event_type: &str, user_id: &str) -> bool {
+        self.room
+            .as_ref()
+            .and_then(|r| r.account_data.as_ref())
+            .is_none_or(|f| room_section_allows(f, room_id, event_type, user_id))
+    }
+
+    /// Whether `room.ephemeral` passes an ephemeral event of `event_type` in `room_id`.
+    /// Ephemeral events carry no sender of their own; the room-level rule is by type.
+    #[must_use]
+    pub fn ephemeral_allows(&self, room_id: &str, event_type: &str) -> bool {
+        self.room
+            .as_ref()
+            .and_then(|r| r.ephemeral.as_ref())
+            .is_none_or(|f| room_section_allows(f, room_id, event_type, ""))
+    }
+
     /// `room.timeline`'s content filter (`types`/`not_types`/`senders`/`not_senders`), if this
     /// filter sets one. `None` (not merely a no-op [`RoomEventFilter`]) whenever `room.timeline`
     /// itself is absent, so a caller can cheaply skip the filtered code path entirely when there
@@ -413,26 +482,51 @@ fn log_ignored_fields(filter: &SyncFilter) {
     if filter.event_fields.is_some() {
         ignored.push("event_fields");
     }
-    if filter.event_format.is_some() {
-        ignored.push("event_format");
-    }
-    if filter.presence.is_some() {
-        ignored.push("presence");
-    }
-    if filter.account_data.is_some() {
-        ignored.push("account_data (global)");
-    }
-    if let Some(room) = &filter.room {
-        if room.ephemeral.is_some() {
-            ignored.push("room.ephemeral");
-        }
-        if room.account_data.is_some() {
-            ignored.push("room.account_data");
-        }
+    if filter
+        .event_format
+        .as_deref()
+        .is_some_and(|format| format != "client" && format != "federation")
+    {
+        ignored.push("event_format (neither client nor federation)");
     }
     if !ignored.is_empty() {
         tracing::debug!(?ignored, "filter fields present but not applied by hs-user");
     }
+}
+
+/// Whether a room section's filter passes an event of `event_type` from `sender` in `room_id`:
+/// its own `rooms`/`not_rooms`, then its content rule.
+fn room_section_allows(
+    filter: &RoomEventFilter,
+    room_id: &str,
+    event_type: &str,
+    sender: &str,
+) -> bool {
+    if filter
+        .not_rooms
+        .as_ref()
+        .is_some_and(|rooms| rooms.iter().any(|r| r == room_id))
+    {
+        return false;
+    }
+    if filter
+        .rooms
+        .as_ref()
+        .is_some_and(|rooms| !rooms.iter().any(|r| r == room_id))
+    {
+        return false;
+    }
+    if sender.is_empty() {
+        return type_and_sender_match(
+            filter.types.as_deref(),
+            filter.not_types.as_deref(),
+            None,
+            None,
+            event_type,
+            sender,
+        );
+    }
+    filter.matches(event_type, sender)
 }
 
 #[cfg(test)]

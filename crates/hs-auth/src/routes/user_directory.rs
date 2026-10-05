@@ -19,8 +19,11 @@
 //! depends on it, not the other way round), so the scope arrives through
 //! [`crate::state::UserDirectoryVisibility`], installed by `hs serve`.
 //!
-//! Remote users are not searched. The spec says a server "SHOULD query remote users as part of
-//! the search"; doing so means federated user-directory queries, which this server does not make.
+//! Other servers' users are searched as this server knows them: those the room layer offers
+//! (sharing a room with the requester, or in a public room here), by the display name and avatar
+//! their `m.room.member` events carry ([`crate::state::UserDirectoryVisibility::remote_profiles`]).
+//! The spec also says a server "SHOULD query remote users as part of the search"; that means
+//! federated user-directory queries, which this server does not make.
 
 use axum::Json;
 use axum::extract::State;
@@ -86,10 +89,32 @@ pub async fn post_user_directory_search(
     };
 
     let needle = search_term.to_lowercase();
-    let mut matches: Vec<(Rank, UserRecord)> = state
-        .store
-        .list_users()
-        .await?
+    let mut accounts = state.store.list_users().await?;
+    // The visible users with no account here: other servers' users, offered with the profile
+    // their member events carry.
+    if let (Some(visible), Some(visibility)) = (visible.as_ref(), state.user_directory_visibility())
+    {
+        let local: std::collections::BTreeSet<&ruma::OwnedUserId> =
+            accounts.iter().map(|u| &u.user_id).collect();
+        let remote: std::collections::BTreeSet<ruma::OwnedUserId> = visible
+            .iter()
+            .filter(|u| !local.contains(u))
+            .cloned()
+            .collect();
+        if !remote.is_empty() {
+            let profiles = visibility.remote_profiles(&remote).await.map_err(|e| {
+                tracing::error!(error = %e, "could not read other servers' users for the user directory");
+                MatrixError::internal()
+            })?;
+            accounts.extend(profiles.into_iter().map(|profile| {
+                let mut record = UserRecord::new(profile.user_id, 0);
+                record.display_name = profile.display_name;
+                record.avatar_url = profile.avatar_url;
+                record
+            }));
+        }
+    }
+    let mut matches: Vec<(Rank, UserRecord)> = accounts
         .into_iter()
         .filter(|user| {
             // A deactivated account cannot be invited anywhere or log in again, so offering it as
@@ -321,6 +346,50 @@ mod tests {
                 Err(e) => Err((*e).to_owned()),
             }
         }
+    }
+
+    /// A room layer that also knows other servers' users, by the profiles their member events
+    /// carry.
+    struct WithRemote;
+
+    #[async_trait::async_trait]
+    impl crate::state::UserDirectoryVisibility for WithRemote {
+        async fn visible_to(
+            &self,
+            _requester: &ruma::UserId,
+        ) -> Result<std::collections::BTreeSet<ruma::OwnedUserId>, String> {
+            Ok(["@alice:example.org", "@zed:remote.example"]
+                .into_iter()
+                .map(|id| ruma::UserId::parse(id).unwrap())
+                .collect())
+        }
+
+        async fn remote_profiles(
+            &self,
+            users: &std::collections::BTreeSet<ruma::OwnedUserId>,
+        ) -> Result<Vec<crate::state::RemoteProfile>, String> {
+            assert_eq!(
+                users.iter().map(|u| u.as_str()).collect::<Vec<_>>(),
+                vec!["@zed:remote.example"],
+                "only the visible users with no account here are asked about"
+            );
+            Ok(vec![crate::state::RemoteProfile {
+                user_id: ruma::UserId::parse("@zed:remote.example").unwrap(),
+                display_name: Some("Zed Faraway".to_owned()),
+                avatar_url: None,
+            }])
+        }
+    }
+
+    /// Sytest's "User in remote room doesn't appear in user directory after server left room"
+    /// (its first half): another server's user who shares a room is found by their name there.
+    #[tokio::test]
+    async fn another_servers_user_the_room_layer_offers_is_found_by_their_room_name() {
+        let state = state_with_users().await;
+        state.install_user_directory_visibility(std::sync::Arc::new(WithRemote));
+        let found = search(&state, "@bob:example.org", "faraway").await;
+        assert_eq!(ids(&found), vec!["@zed:remote.example"], "{found}");
+        assert_eq!(found["results"][0]["display_name"], "Zed Faraway");
     }
 
     /// With a room layer installed, a match the requester is not allowed to see is not a match.

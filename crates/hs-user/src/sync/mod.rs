@@ -99,12 +99,19 @@ use hs_e2e::store::{DeviceKeyStore, E2eStore, FallbackKeyStore, OneTimeKeyStore,
 use hs_kv::KvBackend;
 use hs_model::Event;
 use hs_push::rulesets::RulesetStore;
-use hs_room::routes::render::{attach_replaced_state, attach_transaction_id, client_event_json};
-use hs_room::timeline::{Direction, PaginationToken};
+use hs_room::routes::render::{attach_transaction_id, client_event_json};
 use ruma::{OwnedDeviceId, OwnedRoomId, OwnedUserId, RoomId, UserId};
 use serde_json::{Value, json};
 
 pub mod device_lists;
+#[cfg(test)]
+mod sytest_cases;
+mod timeline;
+
+use timeline::{
+    TimelineScope, build_fresh_timeline, build_incremental_timeline, federation_format,
+    rendered_with_replaced_state,
+};
 
 use crate::error::UserError;
 use crate::filter::SyncFilter;
@@ -221,12 +228,37 @@ async fn resume_mode<B: KvBackend + 'static, R: RoomSource<B>>(
         // the room when their membership has changed since that position at all. The same
         // question settles somebody who joined a hot room after the token: the position the
         // hot-room stream gives is the room's, from before they were in it.
-        if membership.membership == "join" && membership.room_pos > pos {
+        //
+        // Somebody who has left again within the batch -- invited at the token, then joined and
+        // left -- is new to the room in the same way: they get it whole, as it was when they
+        // left, in `leave` (Sytest's "When user joins and leaves a room in the same batch, the
+        // full state is still included in the next sync"). Only if they were joined in between:
+        // an invitation declined, or a kick from an invitation, is not a room they ever saw.
+        let departed = matches!(membership.membership.as_str(), "leave" | "ban");
+        if (membership.membership == "join" || departed) && membership.room_pos > pos {
             let user = user_id.to_owned();
-            let was_joined = handle
-                .query(move |actor| actor.was_joined_at(&user, pos))
+            let fresh = handle
+                .query(move |actor| {
+                    if actor.was_joined_at(&user, pos)? {
+                        return Ok::<_, hs_room::RoomError>(false);
+                    }
+                    if !departed {
+                        return Ok(true);
+                    }
+                    // Their departure replaced a join: they were in the room since the token.
+                    let joined_since = actor
+                        .state_event("m.room.member", user.as_str())?
+                        .map(|own| rendered_with_replaced_state(actor, own, &user))
+                        .and_then(|own| {
+                            own.pointer("/unsigned/prev_content/membership")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                        })
+                        .is_some_and(|prev| prev == "join");
+                    Ok(joined_since)
+                })
                 .await?;
-            if !was_joined {
+            if fresh {
                 return Ok(ResumeMode::FreshRoom);
             }
         }
@@ -258,243 +290,9 @@ async fn resume_mode<B: KvBackend + 'static, R: RoomSource<B>>(
     Ok(ResumeMode::FreshRoom)
 }
 
-/// One room's rendered timeline, plus whether it was capped and, if so, a token to page further
-/// back with (reusing `hs_room`'s own `/messages`-shaped pagination tokens -- see the module
-/// docs).
-struct Timeline {
-    events: Vec<Value>,
-    limited: bool,
-    prev_batch: Option<String>,
-}
-
 /// How many of a newly joined room's members have their presence sent to the joiner along with
 /// the room. See `build`'s `newly_visible`.
 const NEWLY_JOINED_PRESENCE_LIMIT: usize = 500;
-
-/// How many raw timeline events a single `/sync` response will fetch in one `paginate` call once
-/// `room.timeline` carries a content filter (`types`/`not_types`/`senders`/`not_senders`), rather
-/// than the plain `limit` an unfiltered request uses. A filter that excludes nearly everything
-/// (e.g. `types: ["m.room.message"]` in a room dominated by reactions and edits) could otherwise
-/// need to scan arbitrarily far back to fill `limit` post-filter events; this crate does not loop
-/// indefinitely to do so (see [`build_incremental_timeline`]/[`build_fresh_timeline`]'s doc
-/// comments for exactly what "conservative" means for `limited` in that case). Matches this
-/// crate's existing "bounded response" philosophy (`TO_DEVICE_LIMIT`).
-const FILTERED_TIMELINE_SCAN: usize = 500;
-
-/// Renders one event for a client, carrying `unsigned.prev_content`/`replaces_state`/`prev_sender`
-/// when it is a state event that replaced another one.
-///
-/// Without this a client cannot tell a display-name change from a join and renders both as "Alice
-/// joined the room" -- and `/sync` is the endpoint whose output a client's timeline is actually
-/// built from, so fixing only `/messages` and `/state` fixes only what scrollback shows.
-/// `replaced_state_for` decides the history-visibility question about the *replaced* event, which
-/// is why the requesting user has to reach this far down.
-fn rendered_with_replaced_state(
-    actor: &hs_room::actor::RoomActor<impl KvBackend>,
-    event: &Event,
-    requester: &UserId,
-) -> Value {
-    attach_replaced_state(
-        client_event_json(event),
-        actor.replaced_state_for(event, requester).as_ref(),
-    )
-}
-
-/// A room's timeline for an incremental sync: what happened after `resume_pos`.
-///
-/// Usually that is a handful of events and they are all returned, oldest first. When it is more
-/// than `limit` there is a *gap*, and the spec is specific about which side of it the client
-/// gets: the most recent `limit` events, with `limited: true` and a `prev_batch` from which
-/// paginating backwards recovers the rest. So a gap is answered by [`build_fresh_timeline`], the
-/// same newest-first page an initial sync uses.
-///
-/// It used to be answered with the *oldest* `limit` events. The token handed back alongside them
-/// is positioned at the end of the room, so everything after that first page was never delivered
-/// by any later sync either, and `prev_batch` pointed back past `resume_pos` into history the
-/// client already had. Whatever did not fit in one page was simply lost to that client -- which
-/// is what happens to a phone that has been offline for an hour in a busy room.
-///
-/// With a content filter the forward scan is bounded by [`FILTERED_TIMELINE_SCAN`], and running
-/// into that bound is treated as a gap as well: there may be matching events beyond it, the token
-/// is going to skip past them regardless, and the newest matching events are the ones to send.
-///
-/// `upto` is where this batch ends: the room's position as of the token being handed out with
-/// it ([`crate::store::UserStore::room_pos_at_token`]), or the requester's own departure,
-/// whichever is first. Nothing after it is sent, however much the room has moved on since the
-/// token was fixed -- an event that lands while the response is being assembled has a feed entry
-/// past the token and belongs to the next batch. It used to be sent in both.
-fn build_incremental_timeline(
-    actor: &hs_room::actor::RoomActor<impl KvBackend>,
-    resume_pos: i64,
-    limit: usize,
-    content_filter: Option<&crate::filter::RoomEventFilter>,
-    requester: &UserId,
-    upto: Option<i64>,
-) -> Timeline {
-    let empty = Timeline {
-        events: Vec::new(),
-        limited: false,
-        prev_batch: None,
-    };
-    if upto.is_some_and(|upto| upto <= resume_pos) {
-        return empty;
-    }
-    let from = Some(PaginationToken::new(resume_pos, Direction::Forward));
-    // One more than could be returned, so that "exactly `limit` new events" (no gap) can be told
-    // from "more than `limit`" (a gap) without a second query.
-    let request = content_filter.map_or(limit, |_| limit.max(FILTERED_TIMELINE_SCAN)) + 1;
-    let (mut raw, _) = actor.paginate(from, Direction::Forward, request);
-    let mut scan_cut_short = raw.len() == request;
-
-    if let Some(upto) = upto {
-        // The page is cut at the newest event at or before `upto`. `paginate` hands back events
-        // without their positions, so that event is looked up on its own (one keyed read, the
-        // same page a backward `/messages` from `upto` would start with) and found in the page.
-        // Not in the page and the page full: the bound lies beyond the scan, a gap either way.
-        // Not in the page and the page not full: it lies at or before `resume_pos`, so nothing
-        // between the two is new.
-        let (boundary, _) = actor.paginate(
-            Some(PaginationToken::new(
-                upto.saturating_add(1),
-                Direction::Backward,
-            )),
-            Direction::Backward,
-            1,
-        );
-        let Some(boundary) = boundary.first() else {
-            return empty;
-        };
-        match raw.iter().position(|e| e.event_id() == boundary.event_id()) {
-            Some(end) => {
-                raw.truncate(end + 1);
-                scan_cut_short = false;
-            }
-            None if scan_cut_short => {}
-            None => return empty,
-        }
-    }
-
-    let events: Vec<&Event> = raw
-        .into_iter()
-        .filter(|e| visible_in_sync(actor, e, requester))
-        .filter(|e| {
-            content_filter
-                .is_none_or(|f| f.matches(&e.header().event_type, e.header().sender.as_str()))
-        })
-        .collect();
-
-    if events.len() > limit || scan_cut_short {
-        let mut newest = build_fresh_timeline(actor, limit, content_filter, requester, upto);
-        newest.limited = true;
-        return newest;
-    }
-
-    let prev_batch = if events.is_empty() {
-        None
-    } else {
-        Some(PaginationToken::new(resume_pos, Direction::Backward).to_string())
-    };
-    Timeline {
-        events: events
-            .into_iter()
-            .map(|event| rendered_with_replaced_state(actor, event, requester))
-            .collect(),
-        limited: false,
-        prev_batch,
-    }
-}
-
-/// Whether `event` belongs in `requester`'s sync timeline: the history-visibility module's
-/// per-event rule, which `/messages` and `/event` already applied and `/sync` did not.
-///
-/// Without it a timeline was whatever the room held. Somebody who had left, or been kicked or
-/// banned, and then did an initial sync with `include_leave` was sent the room's *latest*
-/// messages -- everything said since they were gone -- and somebody who joined a room whose
-/// history is visible only to members from the point they joined was sent what came before. An
-/// event whose visibility cannot be worked out is left out.
-fn visible_in_sync(
-    actor: &hs_room::actor::RoomActor<impl KvBackend>,
-    event: &Event,
-    requester: &UserId,
-) -> bool {
-    actor.event_visible_to(event, requester).unwrap_or(false)
-}
-
-/// The most recent `limit` events `requester` may see, oldest first.
-///
-/// `upto` is the room position of the requester's own departure, for a room they have left or
-/// been removed from: the page then ends there rather than at the room's live end, which for
-/// them is a stretch of events they may not read and so would come back empty however much
-/// they are entitled to from before.
-fn build_fresh_timeline(
-    actor: &hs_room::actor::RoomActor<impl KvBackend>,
-    limit: usize,
-    content_filter: Option<&crate::filter::RoomEventFilter>,
-    requester: &UserId,
-    upto: Option<i64>,
-) -> Timeline {
-    let request = content_filter.map_or(limit, |_| limit.max(FILTERED_TIMELINE_SCAN));
-    let from = upto.map(|pos| PaginationToken::new(pos.saturating_add(1), Direction::Backward));
-    let (raw, next) = actor.paginate(from, Direction::Backward, request);
-    let raw_exhausted = raw.len() < request;
-    let raw: Vec<&Event> = raw
-        .into_iter()
-        .filter(|e| visible_in_sync(actor, e, requester))
-        .collect();
-
-    let (mut events, limited): (Vec<&Event>, bool) = match content_filter {
-        None => {
-            // `raw_exhausted` is about the page as fetched, before visibility was applied: a
-            // full page means there may be more behind it, whatever survived the filter.
-            // No continuation token means the page ended at the room's first event: nothing
-            // is behind it, and asking from `None` would mean "from the newest", not "from
-            // here".
-            let limited = match next {
-                Some(next) if !raw_exhausted => {
-                    let (more, _) = actor.paginate(Some(next), Direction::Backward, 1);
-                    !more.is_empty()
-                }
-                _ => false,
-            };
-            (raw, limited)
-        }
-        Some(f) => {
-            // `raw` is newest-first; filter first (order-preserving), then take the newest
-            // `limit` of what survives -- taking from the *front* here, unlike the incremental
-            // case's `take(limit)` from a forward-ordered list, is what keeps this the most
-            // recent `limit` matching events rather than the oldest ones in the scanned window.
-            let filtered: Vec<&Event> = raw
-                .into_iter()
-                .filter(|e| f.matches(&e.header().event_type, e.header().sender.as_str()))
-                .collect();
-            let truncated = filtered.len() > limit;
-            let events = if truncated {
-                filtered.into_iter().take(limit).collect()
-            } else {
-                filtered
-            };
-            // Same conservative reasoning as `build_incremental_timeline` above.
-            let limited = truncated || !raw_exhausted;
-            (events, limited)
-        }
-    };
-    // The exact continuation token for "everything older than the scanned window" is not
-    // knowable here, when a content filter is present, without threading the filtered-out tail's
-    // own position through (this crate does not track that) -- `next` (from the raw, unfiltered
-    // scan) is still a safe, conservative choice either way: paging from it can only ever
-    // *repeat or skip past* already-scanned raw events, never lose events this response already
-    // returned.
-    let prev_batch = next.map(|t| t.to_string());
-    events.reverse(); // paginate(Backward) is newest-first; /sync wants chronological order.
-    Timeline {
-        events: events
-            .into_iter()
-            .map(|event| rendered_with_replaced_state(actor, event, requester))
-            .collect(),
-        limited,
-        prev_batch,
-    }
-}
 
 /// The state event types stripped state carries, from the client-server API's own list
 /// ("Stripped state should contain some or all of the following"). `m.room.create` is
@@ -636,7 +434,13 @@ fn build_state_section(
     timeline_senders: &HashSet<String>,
     self_user: &UserId,
     content_filter: Option<&crate::filter::RoomEventFilter>,
+    changed_after: Option<i64>,
 ) -> Result<Vec<Value>, hs_room::RoomError> {
+    let changed_since = |e: &Event, since: i64| {
+        actor
+            .timeline_position(e.event_id())
+            .is_some_and(|pos| pos > since)
+    };
     // Through the reader's view, not the room's live state: for somebody who has left, that is
     // the state as of their leaving. The live state told them who had joined since, what the
     // room had been renamed to, and anything else that changed after they were gone.
@@ -645,23 +449,22 @@ fn build_state_section(
         .unwrap_or_default()
         .into_iter()
         .filter(|e| !timeline_event_ids.contains(e.event_id().as_str()))
-        .filter(|e| {
-            let Some(scope) = lazy else {
-                return true;
-            };
-            if e.header().event_type != "m.room.member" {
-                return true;
+        .filter(|e| match lazy {
+            Some(scope) if e.header().event_type == "m.room.member" => {
+                // The *member* (its `state_key`), not the event's sender: an invite or a kick is
+                // sent by somebody else, and it is the member's event the client needs.
+                let member = e.header().state_key.as_deref().unwrap_or_default();
+                (scope.include_self && member == self_user.as_str())
+                    || timeline_senders.contains(member)
+                    || scope
+                        .changed_after
+                        .is_some_and(|since| changed_since(e, since))
             }
-            // The *member* (its `state_key`), not the event's sender: an invite or a kick is
-            // sent by somebody else, and it is the member's event the client needs.
-            let member = e.header().state_key.as_deref().unwrap_or_default();
-            (scope.include_self && member == self_user.as_str())
-                || timeline_senders.contains(member)
-                || scope.changed_after.is_some_and(|since| {
-                    actor
-                        .timeline_position(e.event_id())
-                        .is_some_and(|pos| pos > since)
-                })
+            // After a gap, what changed inside it, not the whole state again: the spec's
+            // "state between `since` and the start of the timeline". The client already has
+            // the rest (Sytest's "Changes to state are included in an gapped incremental
+            // sync" counts).
+            _ => changed_after.is_none_or(|since| changed_since(e, since)),
         })
         .filter(|e| {
             content_filter
@@ -890,13 +693,12 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
         )
         .await?;
 
-    let mut candidate_rooms: BTreeSet<OwnedRoomId> = if is_initial {
-        store
-            .list_memberships(user_id)
-            .await?
-            .into_iter()
-            .map(|m| m.room_id)
-            .collect()
+    // `full_state=true` with a token chooses its rooms as an initial sync does: every room the
+    // user is in, whether or not anything happened in it (Synapse's
+    // `_get_room_changes_for_initial_sync`; Sytest's "Full state sync includes joined rooms").
+    let whole = is_initial || params.full_state;
+    let changed_rooms: BTreeSet<OwnedRoomId> = if is_initial {
+        BTreeSet::new()
     } else {
         let mut set: BTreeSet<OwnedRoomId> = store
             .feed_since(user_id, baseline.feed_seq)
@@ -918,8 +720,28 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
                 set.insert(m.room_id);
             }
         }
+        // Room account data (`m.fully_read`, tags) changes no room's feed: a room whose only
+        // news is that is found here (Sytest's "Read markers appear in incremental v2 /sync").
+        // Only read when the account-data counter has moved at all.
+        if new_account_data_seq > baseline.account_data_seq {
+            set.extend(
+                store
+                    .rooms_with_account_data_since(user_id, baseline.account_data_seq)
+                    .await?,
+            );
+        }
         set
     };
+    let mut candidate_rooms = changed_rooms.clone();
+    if whole {
+        candidate_rooms.extend(
+            store
+                .list_memberships(user_id)
+                .await?
+                .into_iter()
+                .map(|m| m.room_id),
+        );
+    }
 
     // `m.typing`: gathered up front, against *every* joined room (not just the feed-derived
     // candidate set above), since a typing-only change never touches the feed at all
@@ -980,6 +802,9 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
     // key upload. Not restricted to encrypted rooms, because a room can become one later and
     // nothing would announce its members then.
     let mut newly_shared: BTreeSet<OwnedUserId> = BTreeSet::new();
+    // Whoever joined, or was invited to, a room this user is in, within this batch: their
+    // presence is news (Synapse's `newly_joined_or_invited_users`).
+    let mut newly_arrived: BTreeSet<OwnedUserId> = BTreeSet::new();
     // For the batch's debug line below.
     let mut timeline_events = 0usize;
 
@@ -990,10 +815,8 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
         let Some(membership) = store.get_membership(user_id, room_id).await? else {
             continue;
         };
-        if (membership.membership == "leave" || membership.membership == "ban")
-            && is_initial
-            && !params.filter.include_leave()
-        {
+        let departed = membership.membership == "leave" || membership.membership == "ban";
+        if departed && whole && !changed_rooms.contains(room_id) && !params.filter.include_leave() {
             // Historical leaves/bans are omitted from an initial sync unless the filter asks
             // for them. A room reached via the *incremental* candidate set (the feed) always
             // means something just happened -- e.g. the user was just kicked -- so it is always
@@ -1058,6 +881,18 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
             }
             Err(error) => return Err(error),
         };
+        if departed && whole && !changed_rooms.contains(room_id) {
+            // A room the user has forgotten (`POST /rooms/{roomId}/forget`) is not offered
+            // again, `include_leave` or not; its leave still reaches an incremental sync that
+            // spans it, so that their other devices learn of it (Complement's `TestRoomForget`).
+            let user = user_id.to_owned();
+            if !handle
+                .query(move |actor| actor.can_read_room(&user))
+                .await?
+            {
+                continue;
+            }
+        }
         let room_id_owned = room_id.clone();
         let membership_value = membership.membership.clone();
         let full_state_requested = params.full_state;
@@ -1138,6 +973,13 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
         };
         let account_data_json: Vec<Value> = account_data
             .iter()
+            .filter(|a| {
+                params.filter.room_account_data_allows(
+                    room_id.as_str(),
+                    &a.event_type,
+                    user_id.as_str(),
+                )
+            })
             .map(|a| json!({"type": a.event_type, "content": a.content}))
             .collect();
 
@@ -1150,25 +992,30 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
                 HashMap::new()
             };
 
+        // A room this user has joined since their token comes as a whole new room, and is
+        // `limited` as Synapse's `newly_joined_room` is: the client has none of its history,
+        // whatever fits in the batch (Sytest's and Complement's "Newly joined room has correct
+        // timeline in incremental sync").
+        let newly_joined = !is_initial && fresh_room && membership.membership == "join";
+        let current_state_counts = membership.membership == "join";
+        let federation = params.filter.federation_format();
         let (timeline, mut state_events, summary) = handle
             .query(move |actor| {
-                let mut timeline = match &resume {
-                    ResumeMode::Incremental(pos) => build_incremental_timeline(
-                        actor,
-                        *pos,
-                        timeline_limit,
-                        timeline_content_filter.as_ref(),
-                        &user_id_owned,
-                        upto,
-                    ),
-                    ResumeMode::FreshRoom => build_fresh_timeline(
-                        actor,
-                        timeline_limit,
-                        timeline_content_filter.as_ref(),
-                        &user_id_owned,
-                        upto,
-                    ),
+                let scope = TimelineScope {
+                    limit: timeline_limit,
+                    filter: timeline_content_filter.as_ref(),
+                    requester: &user_id_owned,
+                    current_state_counts,
                 };
+                let mut timeline = match &resume {
+                    ResumeMode::Incremental(pos) => {
+                        build_incremental_timeline(actor, *pos, &scope, upto)
+                    }
+                    ResumeMode::FreshRoom => build_fresh_timeline(actor, &scope, upto),
+                };
+                if newly_joined {
+                    timeline.limited = true;
+                }
                 // What an ignored user says is not delivered; what they do to the room's state
                 // (joining, leaving, renaming it) still is, or the client's picture of the room
                 // drifts. The window keeps its edges (`limited`, `prev_batch`): a batch with
@@ -1217,44 +1064,46 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
                         _ => None,
                     },
                 });
-                let state = if force_full_state || timeline.limited {
-                    // A room the client has no baseline for (an initial sync, `full_state`, a
-                    // room new to it) or a gap: the client's idea of the room's state cannot be
-                    // brought up to date by the timeline alone, so it gets the current state --
-                    // less whatever the timeline already carries, which would otherwise reach it
-                    // twice. A room sent whole used to skip that subtraction, and Complement's
-                    // `TestArchivedRoomsHistory` is a client that counts. For a gap this is more
-                    // than the strict minimum -- the spec asks for the state changes *between*
-                    // `since` and the start of the timeline -- and it errs in the safe direction:
-                    // a repeated state event is harmless, a missed one is a stale room.
-                    build_state_section(
-                        actor,
-                        &timeline_ids,
-                        lazy_scope,
-                        &timeline_senders,
-                        &user_id_owned,
-                        state_content_filter.as_ref(),
-                    )?
-                } else {
-                    // An ordinary incremental sync: every state change since `since` is *in* the
-                    // timeline, so there is nothing for `state` to add -- except, under lazy
-                    // loading, the membership of whoever sent those events, which the client may
-                    // never have been given. This used to send the room's entire state on every
-                    // sync that had so much as one new message in it.
-                    build_state_section(
-                        actor,
-                        &timeline_ids,
-                        lazy_scope,
-                        &timeline_senders,
-                        &user_id_owned,
-                        state_content_filter.as_ref(),
-                    )?
-                    .into_iter()
-                    .filter(|e| {
-                        lazy && e.get("type").and_then(Value::as_str) == Some("m.room.member")
-                    })
-                    .collect()
+                // What `state` carries depends on what the client already has:
+                // - nothing (an initial sync, `full_state`, a room new to it): the current state,
+                //   less whatever the timeline carries, which would otherwise reach it twice (a
+                //   room sent whole used to skip that subtraction, and Complement's
+                //   `TestArchivedRoomsHistory` is a client that counts);
+                // - everything up to a gap: what changed inside the gap, which the timeline does
+                //   not carry;
+                // - everything up to the timeline: nothing -- every state change since `since`
+                //   is *in* the timeline -- except, under lazy loading, the membership of
+                //   whoever sent those events, which the client may never have been given. This
+                //   used to send the room's entire state on every sync that had so much as one
+                //   new message in it.
+                let gap_since = match (&resume, timeline.limited) {
+                    (ResumeMode::Incremental(pos), true) if !force_full_state => Some(*pos),
+                    _ => None,
                 };
+                let state = build_state_section(
+                    actor,
+                    &timeline_ids,
+                    lazy_scope,
+                    &timeline_senders,
+                    &user_id_owned,
+                    state_content_filter.as_ref(),
+                    gap_since,
+                )?;
+                let mut state: Vec<Value> = if force_full_state || timeline.limited {
+                    state
+                } else {
+                    state
+                        .into_iter()
+                        .filter(|e| {
+                            lazy && e.get("type").and_then(Value::as_str) == Some("m.room.member")
+                        })
+                        .collect()
+                };
+                if federation {
+                    for event in timeline.events.iter_mut().chain(state.iter_mut()) {
+                        *event = federation_format(actor, std::mem::take(event));
+                    }
+                }
                 let summary = build_room_summary(actor, &user_id_owned)?;
                 Ok::<_, hs_room::RoomError>((timeline, state, summary))
             })
@@ -1353,6 +1202,9 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
             {
                 // And somebody who left and came back within the batch is newly shared.
                 left_candidates.remove(&other);
+                if matches!(membership, Some("join") | Some("invite")) {
+                    newly_arrived.insert(other.clone());
+                }
                 newly_shared.insert(other);
             }
         }
@@ -1366,8 +1218,16 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
         // Only a joined room can have typing or receipt activity (both maps above are only ever
         // populated for `membership == "join"` rows), so a leave/ban room correctly never has an
         // entry here.
-        let mut ephemeral_events = typing_by_room.get(room_id).cloned().unwrap_or_default();
-        if let Some(content) = receipts_by_room.get(room_id) {
+        let mut ephemeral_events = typing_by_room
+            .get(room_id)
+            .filter(|_| params.filter.ephemeral_allows(room_id.as_str(), "m.typing"))
+            .cloned()
+            .unwrap_or_default();
+        if let Some(content) = receipts_by_room.get(room_id).filter(|_| {
+            params
+                .filter
+                .ephemeral_allows(room_id.as_str(), "m.receipt")
+        }) {
             ephemeral_events.push(json!({
                 "type": "m.receipt",
                 "content": content,
@@ -1452,6 +1312,22 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
         }
     }
 
+    let peek = build_peeks(
+        hub,
+        user_id,
+        device_id.as_deref(),
+        &params,
+        &PeekBounds {
+            baseline: &baseline,
+            whole,
+            changed_rooms: &changed_rooms,
+            new_feed_seq,
+            new_hot_seq,
+            timeline_limit,
+        },
+    )
+    .await?;
+
     // One line per batch: which stretch of the feed it stands for, and how much it carries.
     // Two consecutive lines from one device whose `since` and `next` do not chain, or whose
     // event count is out of step with what the client shows, are where to start reading.
@@ -1460,12 +1336,12 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
         since = baseline.feed_seq,
         next = new_feed_seq,
         initial = is_initial,
-        rooms = join.len() + invite.len() + knock.len() + leave.len(),
+        rooms = join.len() + invite.len() + knock.len() + leave.len() + peek.len(),
         timeline_events,
         "assembled a /sync batch"
     );
 
-    let global_account_data = if is_initial {
+    let global_account_data = if whole {
         store.list_global_account_data(user_id).await?
     } else {
         store
@@ -1477,6 +1353,11 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
     };
     let mut global_account_data_json: Vec<Value> = global_account_data
         .iter()
+        .filter(|a| {
+            params
+                .filter
+                .account_data_allows(&a.event_type, user_id.as_str())
+        })
         .map(|a| json!({"type": a.event_type, "content": a.content}))
         .collect();
 
@@ -1488,7 +1369,11 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
     let new_push_rules_seq = match hub.push_rules_store() {
         Some(rulesets) => {
             let push_rules = rulesets.account_data_for_sync(user_id).await?;
-            if is_initial || push_rules.changed_seq > baseline.push_rules_seq {
+            if (whole || push_rules.changed_seq > baseline.push_rules_seq)
+                && params
+                    .filter
+                    .account_data_allows("m.push_rules", user_id.as_str())
+            {
                 global_account_data_json.push(json!({
                     "type": "m.push_rules",
                     "content": push_rules.content,
@@ -1564,12 +1449,10 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
         let changed: BTreeSet<&OwnedUserId> = changed_all
             .iter()
             .filter(|u| shared.contains(*u) || u.as_str() == user_id.as_str())
-            // Themself excepted: a room they have just joined counts them among its members.
-            .chain(
-                newly_shared
-                    .iter()
-                    .filter(|u| u.as_str() != user_id.as_str()),
-            )
+            // Themself included: a room they have just joined counts them among its members, as
+            // Synapse counts every member of a newly joined room (Complement's
+            // `TestDeviceListsUpdateOverFederation` waits for the joiner in their own `changed`).
+            .chain(newly_shared.iter())
             .collect();
         let mut changed = changed;
         let own_id = user_id.to_owned();
@@ -1597,8 +1480,29 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
     // who has a record at all -- the client has seen nothing yet). See the module docs.
     let mut presence_events: Vec<Value> = Vec::new();
     let mut new_presence_seq = baseline.presence_seq;
-    for other in &presence_audience(&shared, user_id) {
+    // Whoever has come into this user's view in this batch (the members of a room they have
+    // just joined, and whoever has just joined or been invited to one of their rooms) has their
+    // presence sent whatever its stamp says -- and somebody this server has no presence for is
+    // sent as `offline`, as Synapse's `get_states` does, so that the client knows the server
+    // has nothing better (Sytest's "Newly joined room includes presence in incremental sync"
+    // and "Get presence for newly joined members in incremental sync").
+    let mut presence_extras: BTreeSet<OwnedUserId> = newly_visible;
+    presence_extras.extend(newly_arrived);
+    presence_extras.remove(user_id);
+    let mut audience = presence_audience(&shared, user_id);
+    audience.extend(presence_extras.iter().cloned());
+    for other in &audience {
+        if !params.filter.presence_allows(other.as_str()) {
+            continue;
+        }
         let Some(record) = hub.presence_of(other).await else {
+            if !whole && presence_extras.contains(other) {
+                presence_events.push(json!({
+                    "type": "m.presence",
+                    "sender": other.as_str(),
+                    "content": {"presence": "offline"},
+                }));
+            }
             continue;
         };
         new_presence_seq = new_presence_seq.max(record.seq);
@@ -1608,7 +1512,7 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
         // the newcomer would see an empty room until each of them happened to do something.
         // (The other direction, the room learning about the newcomer, is
         // `PresenceRegistry::restamp`.)
-        if is_initial || record.seq > baseline.presence_seq || newly_visible.contains(other) {
+        if whole || record.seq > baseline.presence_seq || presence_extras.contains(other) {
             let mut content = json!({
                 "presence": record.presence,
                 "last_active_ago": record.last_active_ago_ms(),
@@ -1650,6 +1554,9 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
     if !leave.is_empty() {
         rooms.insert("leave".into(), Value::Object(leave));
     }
+    if !peek.is_empty() {
+        rooms.insert("peek".into(), Value::Object(peek));
+    }
 
     let mut response = json!({
         "next_batch": next_token.encode(),
@@ -1668,6 +1575,164 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
     }
 
     Ok((response, next_token))
+}
+
+/// Where a batch's peek section starts and ends: the parts of [`build`]'s own bounds it needs.
+struct PeekBounds<'a> {
+    baseline: &'a SyncToken,
+    whole: bool,
+    changed_rooms: &'a BTreeSet<OwnedRoomId>,
+    new_feed_seq: u64,
+    new_hot_seq: u64,
+    timeline_limit: usize,
+}
+
+/// `rooms.peek` (MSC2753, `crate::routes::peek`): each room this device peeks into, shaped as
+/// a joined room's entry (`timeline`, `state`), and only on the device that peeked. A peek that
+/// began after the token -- or any peek, in an initial or `full_state` sync -- brings the room
+/// whole; after that, what changed since the token. A room that is no longer world-readable,
+/// or no longer exists, ends the peek here. A room the user has since joined is in `join`.
+async fn build_peeks<B: KvBackend + 'static, R: RoomSource<B>>(
+    hub: &SessionHub<B, R>,
+    user_id: &UserId,
+    device_id: Option<&ruma::DeviceId>,
+    params: &SyncParams,
+    bounds: &PeekBounds<'_>,
+) -> Result<serde_json::Map<String, Value>, UserError> {
+    let store = hub.store();
+    let device = cursor_device_id(device_id).to_owned();
+    let mut peek = serde_json::Map::new();
+    for (room_id, peek_seq) in store.list_peeks(user_id, &device).await? {
+        // A peek begun while this batch was being assembled is the next batch's.
+        if peek_seq > bounds.new_feed_seq || !params.filter.room_allowed(room_id.as_str()) {
+            continue;
+        }
+        let new_peek = bounds.whole || peek_seq > bounds.baseline.feed_seq;
+        let hot_moved = store
+            .latest_hot_seq_of_room(&room_id)
+            .await?
+            .is_some_and(|seq| seq > bounds.baseline.hot_seq);
+        if !new_peek && !bounds.changed_rooms.contains(&room_id) && !hot_moved {
+            continue;
+        }
+        if store
+            .get_membership(user_id, &room_id)
+            .await?
+            .is_some_and(|m| m.membership == "join")
+        {
+            continue;
+        }
+        let handle = match hub.room(&room_id).await {
+            Ok(handle) => handle,
+            Err(error) if error.is_room_not_found() => {
+                store.remove_peeks(user_id, Some(&device), &room_id).await?;
+                tracing::info!(%user_id, device_id = %device, %room_id, "a peeked room no longer exists; the peek ends");
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let resume = if new_peek {
+            None
+        } else {
+            store
+                .room_pos_as_of(user_id, &room_id, bounds.baseline.feed_seq)
+                .await?
+                .max(
+                    store
+                        .hot_room_pos_as_of(&room_id, bounds.baseline.hot_seq)
+                        .await?,
+                )
+        };
+        let upto = store
+            .room_pos_at_token(user_id, &room_id, bounds.new_feed_seq)
+            .await?
+            .max(
+                store
+                    .hot_room_pos_as_of(&room_id, bounds.new_hot_seq)
+                    .await?,
+            );
+        let user = user_id.to_owned();
+        let filter = params.filter.timeline_content_filter().cloned();
+        let state_filter = params.filter.state_content_filter().cloned();
+        let lazy = params.filter.lazy_load_members();
+        let federation = params.filter.federation_format();
+        let limit = bounds.timeline_limit;
+        let entry = handle
+            .query(move |actor| {
+                if !crate::routes::peek::is_world_readable(actor) {
+                    return Ok::<_, hs_room::RoomError>(Err(()));
+                }
+                // The room is world-readable now, so its current state is anybody's to read;
+                // its earlier events are visible as their own history visibility says.
+                let scope = TimelineScope {
+                    limit,
+                    filter: filter.as_ref(),
+                    requester: &user,
+                    current_state_counts: true,
+                };
+                let mut timeline = match resume {
+                    Some(pos) => build_incremental_timeline(actor, pos, &scope, upto),
+                    None => build_fresh_timeline(actor, &scope, upto),
+                };
+                if resume.is_some() && timeline.events.is_empty() {
+                    return Ok(Ok(None));
+                }
+                let ids: HashSet<String> = timeline
+                    .events
+                    .iter()
+                    .filter_map(|e| e.get("event_id").and_then(Value::as_str).map(str::to_owned))
+                    .collect();
+                let senders: HashSet<String> = timeline
+                    .events
+                    .iter()
+                    .filter_map(|e| e.get("sender").and_then(Value::as_str).map(str::to_owned))
+                    .collect();
+                let gap_since = resume.filter(|_| timeline.limited);
+                let mut state = if resume.is_none() || timeline.limited {
+                    build_state_section(
+                        actor,
+                        &ids,
+                        lazy.then_some(LazyScope {
+                            include_self: false,
+                            changed_after: gap_since,
+                        }),
+                        &senders,
+                        &user,
+                        state_filter.as_ref(),
+                        gap_since,
+                    )?
+                } else {
+                    Vec::new()
+                };
+                if federation {
+                    for event in timeline.events.iter_mut().chain(state.iter_mut()) {
+                        *event = federation_format(actor, std::mem::take(event));
+                    }
+                }
+                Ok(Ok(Some(json!({
+                    "timeline": {
+                        "events": timeline.events,
+                        "limited": timeline.limited,
+                        "prev_batch": timeline.prev_batch,
+                    },
+                    "state": {"events": state},
+                    "account_data": {"events": []},
+                    "ephemeral": {"events": []},
+                }))))
+            })
+            .await?;
+        match entry {
+            Ok(Some(entry)) => {
+                peek.insert(room_id.to_string(), entry);
+            }
+            Ok(None) => {}
+            Err(()) => {
+                store.remove_peeks(user_id, Some(&device), &room_id).await?;
+                tracing::info!(%user_id, device_id = %device, %room_id, "a peeked room is no longer world-readable; the peek ends");
+            }
+        }
+    }
+    Ok(peek)
 }
 
 /// Every user (other than `user_id`) currently sharing at least one *joined* room with
@@ -1850,6 +1915,7 @@ mod tests {
     use hs_kv::memory::MemoryBackend;
     use hs_room::actor::CreateRoomRequest;
     use hs_room::membership::Action;
+    use hs_room::timeline::{Direction, PaginationToken};
     use ruma::user_id;
     use std::sync::Arc;
 
@@ -4593,7 +4659,17 @@ mod tests {
             async move {
                 let timeline = handle
                     .query(move |actor| {
-                        build_incremental_timeline(actor, resume, limit, None, &alice, upto)
+                        build_incremental_timeline(
+                            actor,
+                            resume,
+                            &TimelineScope {
+                                limit,
+                                filter: None,
+                                requester: &alice,
+                                current_state_counts: true,
+                            },
+                            upto,
+                        )
                     })
                     .await;
                 let bodies: Vec<String> = timeline

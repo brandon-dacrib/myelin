@@ -63,6 +63,32 @@ pub trait UserDirectoryVisibility: Send + Sync {
         &self,
         requester: &UserId,
     ) -> Result<std::collections::BTreeSet<ruma::OwnedUserId>, String>;
+
+    /// The profiles of `users` -- people [`UserDirectoryVisibility::visible_to`] offered who
+    /// have no account here, other servers' users -- as the rooms this server shares with them
+    /// say (their `m.room.member` events' `displayname` and `avatar_url`). A user the room layer
+    /// has nothing for is left out. Empty by default: a room layer that does not answer offers
+    /// no remote users, as before this existed.
+    ///
+    /// # Errors
+    /// A description of why the room layer could not answer.
+    async fn remote_profiles(
+        &self,
+        _users: &std::collections::BTreeSet<ruma::OwnedUserId>,
+    ) -> Result<Vec<RemoteProfile>, String> {
+        Ok(Vec::new())
+    }
+}
+
+/// One other server's user, as [`UserDirectoryVisibility::remote_profiles`] found them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteProfile {
+    /// Their user id.
+    pub user_id: ruma::OwnedUserId,
+    /// Their display name in a room shared with them, if they set one.
+    pub display_name: Option<String>,
+    /// Their avatar in a room shared with them, if they set one.
+    pub avatar_url: Option<String>,
 }
 
 /// Where a profile change an administrator makes (`hs-admin`'s `users.update`, through

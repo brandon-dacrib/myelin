@@ -1988,6 +1988,11 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
             .await?;
 
         let hot = member_count > self.fan_out_threshold;
+        let joined_members: Vec<OwnedUserId> = active_members
+            .iter()
+            .filter(|(_, membership)| membership == "join")
+            .map(|(user, _)| user.clone())
+            .collect();
 
         let mut targets: HashMap<OwnedUserId, String> = active_members
             .into_iter()
@@ -2035,6 +2040,8 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
             }
         }
 
+        self.share_presence_on_join(&update, &joined_members).await;
+
         let started = std::time::Instant::now();
         let fan_out = self.fan_out(&update, hot, &targets).await?;
         if fan_out.flipped > 0 {
@@ -2070,15 +2077,133 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         // before anyone is woken to ask for it.
         self.mark_unshared_remote_lists_stale(&update, &targets)
             .await;
+        let peekers = self.fan_out_to_peekers(&update, hot, &targets).await?;
         // And everyone is woken last, once everything a woken `/sync` will read is written.
-        for user_id in targets.keys() {
+        for user_id in targets.keys().chain(peekers.iter()) {
             self.wake(user_id).await;
         }
         // The feeds that outgrew their retention are compacted after the wake: a compaction
         // is a scan the woken syncs need not wait for, and it deletes nothing they read.
         self.compact_feeds(&fan_out.report.feeds_to_compact).await;
 
-        Ok(targets.into_keys().collect())
+        let mut woken: Vec<OwnedUserId> = targets.into_keys().collect();
+        woken.extend(peekers);
+        Ok(woken)
+    }
+
+    /// Peeking (MSC2753, `crate::routes::peek`): a local user who joins a room stops peeking
+    /// into it -- the room moves to `join` -- and everyone else with a device peeking into it
+    /// gets the update in their feed as a member does (no membership record: a peeker is not in
+    /// the room). Returns the peekers to wake. One range read of the room's peekers per update,
+    /// nearly always empty.
+    async fn fan_out_to_peekers(
+        &self,
+        update: &RoomUpdate,
+        hot: bool,
+        targets: &HashMap<OwnedUserId, String>,
+    ) -> Result<Vec<OwnedUserId>, UserError> {
+        for delta in &update.membership_deltas {
+            if delta.membership == "join" {
+                let ended = self
+                    .store
+                    .remove_peeks(&delta.user_id, None, &update.room_id)
+                    .await?;
+                if ended > 0 {
+                    tracing::debug!(
+                        user_id = %delta.user_id,
+                        room_id = %update.room_id,
+                        ended,
+                        "a peeker joined the room; their peeks into it end"
+                    );
+                }
+            }
+        }
+        let mut peekers = Vec::new();
+        for peeker in self.store.room_peekers(&update.room_id).await? {
+            if targets.contains_key(&peeker) {
+                continue;
+            }
+            // A hot room writes no feed entries; its peekers, like its members, follow the
+            // hot-room stream.
+            if !hot {
+                self.store
+                    .append_feed_entry(&peeker, &update.room_id, update.room_pos)
+                    .await?;
+            }
+            peekers.push(peeker);
+        }
+        Ok(peekers)
+    }
+
+    /// Presence across servers when a room gains a member, as Synapse's presence handler does
+    /// on a join: a local joiner's presence goes to every other server in the room, and a
+    /// remote joiner's server -- which may be new to the room, and so have nothing of this
+    /// server's users -- is sent the presence of this server's members. Without it two people
+    /// on two servers who have just started a chat see each other as offline until one of them
+    /// changes state (Sytest's "New federated private chats get full presence information
+    /// (SYN-115)"). Needs an outbox and this server's name; nothing is sent without them.
+    async fn share_presence_on_join(&self, update: &RoomUpdate, joined: &[OwnedUserId]) {
+        let Some(outbox) = self.edu_outbox.get() else {
+            return;
+        };
+        let Some(own) = self.rooms.server_name() else {
+            return;
+        };
+        for delta in &update.membership_deltas {
+            if delta.membership != "join" {
+                continue;
+            }
+            if delta.user_id.server_name() == own {
+                let servers: BTreeSet<String> = crate::edu::servers_of(joined)
+                    .into_iter()
+                    .filter(|server| server.as_str() != own.as_str())
+                    .collect();
+                if servers.is_empty() {
+                    continue;
+                }
+                if let Some(record) = self.presence.get(&delta.user_id).await {
+                    tracing::debug!(
+                        user_id = %delta.user_id,
+                        room_id = %update.room_id,
+                        servers = servers.len(),
+                        "a local user joined a room with other servers in it; sending them their presence"
+                    );
+                    outbox.send_edu(
+                        servers,
+                        "m.presence",
+                        crate::edu::presence_content(&delta.user_id, &record),
+                        Some(format!("presence {}", delta.user_id)),
+                    );
+                }
+            } else {
+                let mut push = Vec::new();
+                for member in joined.iter().filter(|m| m.server_name() == own) {
+                    if let Some(record) = self.presence.get(member).await
+                        && let Some(entry) = crate::edu::presence_content(member, &record)
+                            .get_mut("push")
+                            .and_then(|p| p.as_array_mut())
+                            .and_then(|p| p.pop())
+                    {
+                        push.push(entry);
+                    }
+                }
+                if push.is_empty() {
+                    continue;
+                }
+                tracing::debug!(
+                    joiner = %delta.user_id,
+                    room_id = %update.room_id,
+                    users = push.len(),
+                    "a remote user joined a room; sending their server our members' presence"
+                );
+                outbox.send_edu(
+                    BTreeSet::from([delta.user_id.server_name().to_string()]),
+                    "m.presence",
+                    serde_json::json!({"push": push}),
+                    None,
+                );
+            }
+        }
     }
 
     /// Writes one update's membership records and feed entries for `targets` (each active
@@ -2325,6 +2450,66 @@ impl<B: KvBackend + 'static, R: RoomSource<B> + 'static> hs_auth::state::UserDir
         self.users_visible_in_directory_to(requester)
             .await
             .map_err(|e| e.to_string())
+    }
+
+    /// Each remote user's display name and avatar from their member event in one room they are
+    /// joined to here (their membership records name the rooms: this hub keeps one for every
+    /// member of a room it follows, whichever server they are on). One room read per user,
+    /// for the users a search offers who have no account here.
+    async fn remote_profiles(
+        &self,
+        users: &std::collections::BTreeSet<OwnedUserId>,
+    ) -> Result<Vec<hs_auth::state::RemoteProfile>, String> {
+        let mut profiles = Vec::new();
+        for user in users {
+            let memberships = self
+                .store
+                .list_memberships(user)
+                .await
+                .map_err(|e| e.to_string())?;
+            for record in memberships.into_iter().filter(|m| m.membership == "join") {
+                let handle = match self.room(&record.room_id).await {
+                    Ok(handle) => handle,
+                    Err(error) if error.is_room_not_found() => continue,
+                    Err(error) => return Err(error.to_string()),
+                };
+                let who = user.clone();
+                let event = handle
+                    .query(move |actor| {
+                        actor
+                            .state_event("m.room.member", who.as_str())
+                            .ok()
+                            .flatten()
+                            .map(hs_room::routes::render::client_event_json)
+                    })
+                    .await;
+                let Some(event) = event.filter(|e| {
+                    e.pointer("/content/membership")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("join")
+                }) else {
+                    continue;
+                };
+                let field = |name: &str| {
+                    event
+                        .pointer(&format!("/content/{name}"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                };
+                profiles.push(hs_auth::state::RemoteProfile {
+                    user_id: user.clone(),
+                    display_name: field("displayname"),
+                    avatar_url: field("avatar_url"),
+                });
+                break;
+            }
+        }
+        tracing::debug!(
+            asked = users.len(),
+            found = profiles.len(),
+            "read other servers' users' profiles for a user-directory search"
+        );
+        Ok(profiles)
     }
 }
 

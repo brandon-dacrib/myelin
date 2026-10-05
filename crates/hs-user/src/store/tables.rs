@@ -24,6 +24,8 @@
 //! | `hs_user.presence_stream` | `(pos: u64,)` | the server-wide presence stream: one entry per presence change (a new stamp), for appservice delivery |
 //! | `hs_user.hot_positions` | `(room_id, hot_seq)` | the server-wide hot-room stream: one entry per update to a room above the fan-out threshold, its `room_pos` -- `crate::token`'s `hot_seq` indexes here |
 //! | `hs_user.room_members` | `(room_id, user_id)` | each indexed room's joined members, for the user directory; the row with an empty `user_id` is the marker that says the room is indexed (`UserStore::index_room_members_if_absent`) |
+//! | `hs_user.peeks` | `(user_id, device_id, room_id)` | each device's peeks into world-readable rooms (MSC2753), with the feed position each began at |
+//! | `hs_user.room_peekers` | `(room_id, user_id, device_id)` | the same peeks by room, for a room update's fan-out |
 //! | `hs_user.ephemeral_counters` | `receipt_stream` / `presence_stream` / `hot_positions` (raw `atomic_add` keys) | the three streams' position counters; `hot_positions_floor` (a plain 8-byte key) is the hot-room stream's floor |
 //!
 //! # The coalescing invariant, precisely
@@ -183,6 +185,8 @@ pub struct TablesUserStore<B: KvBackend> {
     presence_stream: TypedKeyspace<B::Keyspace, (u64,)>,
     hot_positions: TypedKeyspace<B::Keyspace, (String, u64)>,
     room_members: TypedKeyspace<B::Keyspace, (String, String)>,
+    peeks: TypedKeyspace<B::Keyspace, (String, String, String)>,
+    room_peekers: TypedKeyspace<B::Keyspace, (String, String, String)>,
     ephemeral_counters: B::Keyspace,
 }
 
@@ -249,6 +253,8 @@ impl<B: KvBackend> TablesUserStore<B> {
             presence_stream: TypedKeyspace::new(open("hs_user.presence_stream")?),
             hot_positions: TypedKeyspace::new(open("hs_user.hot_positions")?),
             room_members: TypedKeyspace::new(open("hs_user.room_members")?),
+            peeks: TypedKeyspace::new(open("hs_user.peeks")?),
+            room_peekers: TypedKeyspace::new(open("hs_user.room_peekers")?),
             ephemeral_counters: open("hs_user.ephemeral_counters")?,
             backend,
         })
@@ -1266,6 +1272,130 @@ impl<B: KvBackend> UserStore for TablesUserStore<B> {
                 content: decoded.content,
                 changed_seq: decoded.changed_seq,
             });
+        }
+        Ok(out)
+    }
+
+    async fn rooms_with_account_data_since(
+        &self,
+        user_id: &UserId,
+        since: u64,
+    ) -> Result<std::collections::BTreeSet<ruma::OwnedRoomId>, StoreError> {
+        let snap = self.backend.snapshot();
+        let spec =
+            TypedKeyspace::<B::Keyspace, (String, String, String)>::prefix(&(user_id.to_string(),));
+        let mut rooms = std::collections::BTreeSet::new();
+        for item in self.account_data_room.range(&snap, spec) {
+            let ((_, room_id, _), value) = item.map_err(StoreError::Table)?;
+            let decoded: AccountDataValue = json_decode(&value)?;
+            if decoded.changed_seq > since
+                && let Ok(room_id) = ruma::RoomId::parse(room_id.as_str())
+            {
+                rooms.insert(room_id);
+            }
+        }
+        Ok(rooms)
+    }
+
+    async fn put_peek(
+        &self,
+        user_id: &UserId,
+        device_id: &DeviceId,
+        room_id: &RoomId,
+        feed_seq: u64,
+    ) -> Result<(), StoreError> {
+        let (uid, did, rid) = (
+            user_id.to_string(),
+            device_id.to_string(),
+            room_id.to_string(),
+        );
+        let value = json_encode(&feed_seq)?;
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            self.peeks
+                .put(txn, &(uid.clone(), did.clone(), rid.clone()), &value)
+                .map_err(to_kv)?;
+            self.room_peekers
+                .put(txn, &(rid.clone(), uid.clone(), did.clone()), &[])
+                .map_err(to_kv)?;
+            Ok(())
+        })
+        .map_err(StoreError::Kv)
+    }
+
+    async fn remove_peeks(
+        &self,
+        user_id: &UserId,
+        device_id: Option<&DeviceId>,
+        room_id: &RoomId,
+    ) -> Result<usize, StoreError> {
+        let (uid, rid) = (user_id.to_string(), room_id.to_string());
+        let did = device_id.map(ToString::to_string);
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            let devices: Vec<String> = match &did {
+                Some(did) => vec![did.clone()],
+                None => {
+                    let spec = TypedKeyspace::<B::Keyspace, (String, String, String)>::prefix(&(
+                        rid.clone(),
+                        uid.clone(),
+                    ));
+                    let mut devices = Vec::new();
+                    for item in self.room_peekers.range(&*txn, spec) {
+                        let ((_, _, device), _) = item.map_err(to_kv)?;
+                        devices.push(device);
+                    }
+                    devices
+                }
+            };
+            let mut removed = 0;
+            for device in devices {
+                let key = (uid.clone(), device.clone(), rid.clone());
+                if self.peeks.get(&*txn, &key).map_err(to_kv)?.is_some() {
+                    removed += 1;
+                }
+                self.peeks.delete(txn, &key).map_err(to_kv)?;
+                self.room_peekers
+                    .delete(txn, &(rid.clone(), uid.clone(), device))
+                    .map_err(to_kv)?;
+            }
+            Ok(removed)
+        })
+        .map_err(StoreError::Kv)
+    }
+
+    async fn list_peeks(
+        &self,
+        user_id: &UserId,
+        device_id: &DeviceId,
+    ) -> Result<Vec<(ruma::OwnedRoomId, u64)>, StoreError> {
+        let snap = self.backend.snapshot();
+        let spec = TypedKeyspace::<B::Keyspace, (String, String, String)>::prefix(&(
+            user_id.to_string(),
+            device_id.to_string(),
+        ));
+        let mut out = Vec::new();
+        for item in self.peeks.range(&snap, spec) {
+            let ((_, _, room_id), value) = item.map_err(StoreError::Table)?;
+            let feed_seq: u64 = json_decode(&value)?;
+            if let Ok(room_id) = ruma::RoomId::parse(room_id.as_str()) {
+                out.push((room_id, feed_seq));
+            }
+        }
+        Ok(out)
+    }
+
+    async fn room_peekers(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<std::collections::BTreeSet<OwnedUserId>, StoreError> {
+        let snap = self.backend.snapshot();
+        let spec =
+            TypedKeyspace::<B::Keyspace, (String, String, String)>::prefix(&(room_id.to_string(),));
+        let mut out = std::collections::BTreeSet::new();
+        for item in self.room_peekers.range(&snap, spec) {
+            let ((_, user, _), _) = item.map_err(StoreError::Table)?;
+            if let Ok(user) = UserId::parse(user.as_str()) {
+                out.insert(user);
+            }
         }
         Ok(out)
     }

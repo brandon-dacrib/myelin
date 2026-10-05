@@ -2968,11 +2968,21 @@ async fn accepting_an_invitation_to_an_encrypted_direct_chat_tells_the_client_ev
             "{needed:?} never reached bob: {synced}"
         );
     }
-    assert_eq!(
-        synced["device_lists"]["changed"],
-        json!([alice_id]),
-        "{synced}"
-    );
+    // Everyone in the room bob has just joined, bob included: Synapse's
+    // `generate_sync_entry_for_device_list` adds every member of a newly joined room
+    // (`get_users_in_room`, the syncer among them) and never takes the syncer out
+    // (`synapse/handlers/device.py`), and Complement's `TestDeviceListsUpdateOverFederation`
+    // waits for the joiner in their own `changed`.
+    let mut changed: Vec<&str> = synced["device_lists"]["changed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    changed.sort_unstable();
+    let mut expected = vec![alice_id, bob_id];
+    expected.sort_unstable();
+    assert_eq!(changed, expected, "{synced}");
 
     // And then it is an ordinary room: the next thing said in it arrives on its own.
     call(

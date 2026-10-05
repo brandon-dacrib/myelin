@@ -605,6 +605,66 @@ pub trait UserStore: Send + Sync {
         room_id: &ruma::RoomId,
     ) -> Result<Vec<AccountDataRecord>, StoreError>;
 
+    /// The rooms in which `user_id` has room-scoped account data changed after `since` (an
+    /// account-data counter value, [`UserStore::latest_account_data_seq`]): what `/sync` adds to
+    /// its rooms, since a change of room account data (`m.fully_read`, `m.tag`) is in no room's
+    /// feed. One scan of the user's room account data.
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] on a storage failure.
+    async fn rooms_with_account_data_since(
+        &self,
+        user_id: &ruma::UserId,
+        since: u64,
+    ) -> Result<std::collections::BTreeSet<ruma::OwnedRoomId>, StoreError>;
+
+    /// Records that `device_id` of `user_id` peeks into `room_id` (MSC2753, `POST /peek`), from
+    /// feed position `feed_seq` on: the feed entry the peek wrote. A second peek of the same room
+    /// replaces the first.
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] on a storage failure.
+    async fn put_peek(
+        &self,
+        user_id: &ruma::UserId,
+        device_id: &ruma::DeviceId,
+        room_id: &ruma::RoomId,
+        feed_seq: u64,
+    ) -> Result<(), StoreError>;
+
+    /// Ends `device_id`'s peek into `room_id`, or every device's of `user_id` when `device_id`
+    /// is `None` (they joined the room). Returns how many peeks ended.
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] on a storage failure.
+    async fn remove_peeks(
+        &self,
+        user_id: &ruma::UserId,
+        device_id: Option<&ruma::DeviceId>,
+        room_id: &ruma::RoomId,
+    ) -> Result<usize, StoreError>;
+
+    /// The rooms `device_id` of `user_id` peeks into, each with the feed position its peek
+    /// began at.
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] on a storage failure.
+    async fn list_peeks(
+        &self,
+        user_id: &ruma::UserId,
+        device_id: &ruma::DeviceId,
+    ) -> Result<Vec<(ruma::OwnedRoomId, u64)>, StoreError>;
+
+    /// Every user with a device peeking into `room_id`: whose feeds a room update reaches
+    /// besides its members'.
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] on a storage failure.
+    async fn room_peekers(
+        &self,
+        room_id: &ruma::RoomId,
+    ) -> Result<std::collections::BTreeSet<ruma::OwnedUserId>, StoreError>;
+
     /// Stores a named filter (`POST /user/{userId}/filter`), returning the id it was assigned.
     ///
     /// # Errors

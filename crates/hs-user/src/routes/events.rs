@@ -191,6 +191,13 @@ pub async fn get_events<B: KvBackend + 'static, R: RoomSource<B> + 'static>(
         .map(Duration::from_millis)
         .unwrap_or_default()
         .min(MAX_TIMEOUT);
+    // Polling the event stream is a client being there, as polling `/sync` is: the caller is
+    // marked online (Synapse's `user_syncing`). Sytest's federation presence tests
+    // (`flush_events_for`) mark their users online this way.
+    state
+        .hub
+        .touch_presence(&requester.user_id, "online")
+        .await?;
     let since = match query.from.as_deref().map(SyncToken::decode) {
         Some(Ok(token)) => token,
         // Not one of this server's stream tokens (an `/initialSync` room's `messages.end`, which
