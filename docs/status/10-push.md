@@ -1,5 +1,13 @@
 # 10 Push: status
 
+## 2026-10-05 (branch `agent/email-held-flake`): the held email is stored before "holding" is logged
+
+`email_held_restart` failed in two merge gates: the worker logged "holding a notification for an
+email" before writing the row, and the test kills the server on that line, so under load the kill
+landed first and nothing was restored. The worker now stores the row, then logs (Fjall's default
+journal mode flushes each commit to the OS, so a committed row survives `SIGKILL`). Reproduced
+with 10 runs beside a looping `cargo test -p hs-room`: 1/10 passed before, 10/10 after.
+
 ## Session 4 (2026-10-04, branch `agent/push-media-gaps`): invites pushed with their room's name, held emails survive a restart
 
 ### Done

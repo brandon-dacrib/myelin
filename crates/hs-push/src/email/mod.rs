@@ -541,13 +541,16 @@ impl EmailPushersWorker {
         if room.lines.len() > LINES_PER_ROOM {
             room.lines.remove(0);
         }
+        let due_in_ms = pending.due.saturating_duration_since(now).as_millis();
+        // Stored first, then said: whoever reads "holding" (an operator, the restart test) can
+        // rely on the held email surviving a stop from then on.
+        self.persist(&key).await;
         tracing::debug!(
             user = %notification.user_id,
             room = %notification.room_id,
-            due_in_ms = pending.due.saturating_duration_since(now).as_millis(),
+            due_in_ms,
             "holding a notification for an email"
         );
-        self.persist(&key).await;
     }
 
     /// Takes the room out of everything held for the user and forgets its throttle.
