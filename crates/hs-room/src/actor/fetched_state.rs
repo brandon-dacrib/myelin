@@ -61,7 +61,8 @@ impl<B: KvBackend> RoomActor<B> {
     ///
     /// # Errors
     /// [`RoomError::Forbidden`] if `prev` fails authorization (it is then stored rejected, as a
-    /// received event is); [`RoomError::Store`], [`RoomError::Fenced`] or [`RoomError::State`]
+    /// received event is, and held with the state before it, which is the state after it);
+    /// [`RoomError::Store`], [`RoomError::Fenced`] or [`RoomError::State`]
     /// from persistence.
     pub fn accept_prev_event_with_state(
         &mut self,
@@ -128,14 +129,22 @@ impl<B: KvBackend> RoomActor<B> {
         //    fetched state: a state event of it that does not verify (Sytest's made-up power
         //    levels in "... asks for /state_ids and resolves the state") leaves the state
         //    without that key, and an honest prev event would then be refused for it.
-        if let Err(error) = self.authorize_outlier(&prev) {
-            if let RoomError::Forbidden(reason) = &error {
-                self.store_rejected(prev, reason)?;
-            }
-            return Err(error);
-        }
+        //    One that is refused is stored rejected and still held with the state: the state
+        //    after a rejected event is the state before it, and an event citing it (Sytest's R
+        //    and S, after a Q whose auth events are of another room) is judged at that state,
+        //    where the prev events of the rejected one are not held to walk back to.
         let prev_id = prev.event_id().to_owned();
-        self.persist_outliers(vec![prev])?;
+        let refused = match self.authorize_outlier(&prev) {
+            Ok(()) => {
+                self.persist_outliers(vec![prev])?;
+                None
+            }
+            Err(RoomError::Forbidden(reason)) => {
+                self.store_rejected(prev, &reason)?;
+                Some(reason)
+            }
+            Err(error) => return Err(error),
+        };
         let sn = *self.event_id_index.get(&prev_id).ok_or_else(|| {
             RoomError::Internal(format!("{prev_id} was not indexed after persisting"))
         })?;
@@ -156,6 +165,18 @@ impl<B: KvBackend> RoomActor<B> {
             Some(msg) => RoomError::Fenced(msg),
             None => RoomError::from(e),
         })?;
+        if let Some(reason) = refused {
+            self.record_rejected_outlier_state(sn, &state_sns)?;
+            self.fetched_state_outliers.insert(sn);
+            tracing::info!(
+                room_id = %self.room_id,
+                event_id = %prev_id,
+                state_events = state_sns.len(),
+                %reason,
+                "held a missing prev event, rejected, with the state another server answered for it"
+            );
+            return Err(RoomError::Forbidden(reason));
+        }
         self.record_placed_outlier_state(sn, &state_sns)?;
         self.fetched_state_outliers.insert(sn);
         tracing::info!(
@@ -242,6 +263,14 @@ impl<B: KvBackend> RoomActor<B> {
             }
         }
         if !missing.is_empty() {
+            // An auth event of another room is not missing, it is wrong: the outlier is
+            // rejected (Sytest's "outliers whose auth_events are in a different room are
+            // correctly rejected"), as a received event citing one is.
+            if let Some((cited, other_room)) = self.held_in_another_room(&missing)? {
+                return Err(RoomError::Forbidden(format!(
+                    "it cites {cited}, an event of another room ({other_room})"
+                )));
+            }
             return Err(RoomError::MissingAncestors(missing));
         }
         self.authorize_remote_at(event, &[], &auth_sns, StateBefore::None)

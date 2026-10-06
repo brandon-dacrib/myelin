@@ -879,11 +879,9 @@ async fn send_gives_up_when_the_remote_serves_an_endless_backfill_chain() {
     let pdus = response["pdus"].as_object().unwrap();
     assert_eq!(pdus.len(), 1, "{response}");
     let (_, result) = pdus.iter().next().unwrap();
-    let error = result.get("error").and_then(Value::as_str).unwrap_or("");
-    assert!(
-        error.contains("backfill") || error.contains("round"),
-        "expected the transaction to report a clean backfill give-up, got: {response}"
-    );
+    // A clean give-up: the PDU is dropped and answered `{}`, as Synapse answers every pushed
+    // PDU (`hs_federation::inbound`).
+    assert_eq!(result, &serde_json::json!({}), "{response}");
 
     // Bounded: the gap-shaped `/get_missing_events` (not served here, and not counted), then
     // exactly `max_rounds` `/backfill` rounds -- not one

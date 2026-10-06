@@ -1002,10 +1002,15 @@ impl<B: KvBackend> RoomActor<B> {
         // An outlier held with a fetched state and no timeline position (`fetched_state`): the
         // state after it is the one it was held with, as at the time it was.
         for (sn, state) in explicit_states {
-            if actor.events.contains_key(&sn) && !actor.rejected.contains(&sn) {
-                actor.record_placed_outlier_state(sn, &state)?;
-                actor.fetched_state_outliers.insert(sn);
+            if !actor.events.contains_key(&sn) {
+                continue;
             }
+            if actor.rejected.contains(&sn) {
+                actor.record_rejected_outlier_state(sn, &state)?;
+            } else {
+                actor.record_placed_outlier_state(sn, &state)?;
+            }
+            actor.fetched_state_outliers.insert(sn);
         }
 
         // The authoritative forward-extremity set is whatever `RoomActor::persist` last wrote to
@@ -1418,6 +1423,21 @@ impl<B: KvBackend> RoomActor<B> {
         state_before: &[EventSn],
     ) -> Result<(), RoomError> {
         let root = self.root_from_sns(state_before, Some(sn))?;
+        self.placed_outlier_roots.insert(sn, root);
+        Ok(())
+    }
+
+    /// Records the state after a rejected outlier held with a fetched state
+    /// (`fetched_state`): `state_before` alone, a rejected event changing nothing.
+    ///
+    /// # Errors
+    /// [`RoomError::State`] if the store fails.
+    fn record_rejected_outlier_state(
+        &mut self,
+        sn: EventSn,
+        state_before: &[EventSn],
+    ) -> Result<(), RoomError> {
+        let root = self.root_from_sns(state_before, None)?;
         self.placed_outlier_roots.insert(sn, root);
         Ok(())
     }

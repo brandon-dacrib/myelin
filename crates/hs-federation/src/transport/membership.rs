@@ -277,6 +277,9 @@ async fn invite(
             .into_response(),
         ));
     };
+    // ACL first is the route layer's (`crate::acl::enforce_on_room_routes`); whether the room
+    // is held here decides whether `invite_room_state` must describe it.
+    let room_is_held = state.rooms.room_version(room_id).await.is_some();
     invite::receive_invite(
         handling,
         &ctx.key_cache,
@@ -287,6 +290,7 @@ async fn invite(
         room_version,
         event,
         invite_room_state,
+        room_is_held,
     )
     .await
     .map_err(|e| Box::new(invite_error_response(&e)))

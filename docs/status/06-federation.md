@@ -1,5 +1,119 @@
 # 06 Federation: status
 
+## 2026-10-05 (branch `agent/fed-wave3`): two regressions, durable EDUs (RFC 0023), dropped PDUs, two Sytest races, bridge aliases over federation
+
+Wave 3's federation brief. Crates: `hs-federation`, `hs-room` (actor: `fetched_state`,
+`rejected`, `load`), `hs-cli` (wiring and tests). `hs-state` and `hs-model` needed no change.
+Decision **0032** (pushed PDUs answered as Synapse answers them; remote joins carry their
+profile keys). RFC **0023** accepted and implemented.
+
+**1. "Banned servers cannot /invite"** (`hs-federation` `invite`, `transport::membership`). The
+ACL check was already first (the route layer, `acl::enforce_on_room_routes`); what failed was
+Sytest's *control* invite, before the ban: into a version-12 room this server made, with an empty
+`invite_room_state`, which wave 2's MSC4311 check refused `400 M_MISSING_PARAM`. The create event
+is required only of an invite into a room this server does not hold (new `room_is_held`
+argument of `receive_invite`, from `RoomDataSource::room_version`), which is what the room state
+is for; Complement's `TestMSC4311RejectInvalidStrippedStateFederation` (a room only the inviter
+holds) is still refused. A refusal is now logged at `info`.
+
+**2. "outliers whose auth_events are in a different room are correctly rejected"** (`hs-room`
+`actor::fetched_state`, `actor::rejected`, `RoomActor::load`). A missing prev event fetched with
+its state (`accept_prev_event_with_state`) whose auth events cite an event of another room was
+"missing ancestors" (the other room's event is not this room's), so the fallback failed and
+`/send` answered the PDU with an error. Now `authorize_outlier` rejects it, as a received event
+citing another room's event is rejected; and a rejected prev event is still held with the state
+it was fetched with (the state after a rejected event is the state before it:
+`record_rejected_outlier_state`, kept across a reload, and `effective_prev_sns` stops at it), so
+the events after it are judged there -- Sytest's R rejected for citing Q, S accepted.
+
+**3. Durable to-device and device-list EDUs (RFC 0023)** (`hs-federation` `sender`,
+`outbound_store`; `hs-cli` `edus`). `m.direct_to_device`, `m.device_list_update` and
+`m.signing_key_update` (`sender::DURABLE_EDU_TYPES`) are kept in the outbound store
+(`hs_federation.outbound_edus`, coalescing index `outbound_edu_keys`, counters
+`outbound_edu_lengths`) until a transaction carrying them is accepted, whichever enqueue method
+names them; each transaction carries the oldest durable EDUs first. `resume` starts a worker for
+every destination with durable EDUs waiting ("resuming durable EDUs left by a previous run",
+`info`). Bound `SenderConfig::max_queued_durable_edus_per_destination` (10 000; past it the oldest
+goes, `warn`). The device-list announcer stores its stream position in the sender's store
+(`edus::ANNOUNCER_POSITION`) and resumes from it, so a change committed while the server was
+stopped is announced at the next start. Not an `hs-config` key yet.
+
+**4. A pushed PDU that cannot be placed is answered `{}`** (`hs-federation` `inbound`, decision
+0032). When its missing prev events or auth events cannot be obtained, the PDU is dropped,
+logged at `info`, counted in `hs_federation_pdus_dropped_total{reason}`, and answered `{}` --
+as Synapse, which answers every pushed PDU before processing it. Complement's
+`TestCorruptedAuthChain` needed exactly this (its received event cites E, whose chain lacks B;
+Synapse drops it too). Every processed PDU is also logged at `debug` with its result.
+
+**5. "Guest users are kicked ... over federation": the race** (`hs-cli` `remote_join`, decision
+0032). The test joins the remote user a second time (`matrix_join_room_synced`) and waits for
+the room in an incremental `/sync` from a position taken just before. The second join was
+idempotent here (identical content: no event), so the sync only showed the room if the power
+levels and guest access, sent a moment earlier on the other server, arrived after Sytest took the
+position -- they usually did not, by a millisecond (Sytest logs: the remote user's sync position
+`next=2` at 16,361 ms, the two events processed at 16,358 and 16,360, then ten seconds of empty
+syncs). On Synapse the second join is a new event because Synapse's remote join content carries
+`displayname` and `avatar_url` even when unset (`null`) and its local join does not. A join
+through another server now carries them as `null` too. Pinned, deterministically (B is made to
+hold the guest access before the position is taken), by `guest_access_federation`; it fails
+without the change.
+
+**6. "Can invite unbound 3pid over federation with users from both servers": a race in the test,
+not fixed.** The joiner on the second server is a `remote_user_fixture` with no event-stream
+token, so its first `GET /events` has no `from` and starts from now -- as Synapse's does
+(`Notifier.get_events_for`). `hs-user`'s route does the same: `crates/hs-user/src/routes/events.rs`
+lines 201-206 (`Some(Err(_)) | None => current_token(...)`), and nothing is wrong there. The
+`m.room.third_party_invite` reaches the second server before that first request: server A stored
+it at 04,453 ms, server B processed it at 04,454 (new debug log), and B's first `/events`
+answered at 04,960 after its 500 ms wait, so it began at about 04,460. Synapse passes because its
+staged `/send` processing takes longer than Sytest's next request. Nothing a server should do
+differently; it passes when the event is slower (as on `c2d74174`).
+
+**7. Alias queries over federation ask the bridge** (`hs-cli` `federation::ServerQuerySource`).
+`GET /query/directory` for a local alias the directory does not hold asks the appservices whose
+alias namespace covers it (`AppserviceRegistry::query_room_alias`, the same call the client
+directory makes), as Synapse's `get_association` does; the answer lists every server with a
+joined member after this one (it listed this server only). `build_mount` takes the registry.
+
+**Verified.**
+
+- Unit tests: `hs-federation` 224 after the rebase (new `sender::tests::{durable_edus_survive_a_restart_and_wait_for_a_destination_that_is_down,
+  the_durable_edu_queue_is_bounded_dropping_the_oldest}`, the version-12 invite test extended to
+  a held room); `hs-room` (new `actor::rejected::tests::a_fetched_prev_event_citing_another_rooms_event_is_rejected_and_what_follows_judged`,
+  across a reload); `hs-state` unchanged and passing.
+- Real `hs serve` (`hs-cli`, the whole `cargo test -p hs-cli`: 70 result lines, none failed),
+  new: `guest_access_federation` (two servers; fails without item 5), `appservice_alias_federation`
+  (two servers and a bridge: bob of B joins `#bridged-room:A`, which A's bridge makes when asked),
+  `third_party_invites_federation` extended (the watcher on B reads the legacy `/events`
+  stream, from-less first, as Sytest does, in a private room it was invited to);
+  `federation_state_fallback` and `federation_writes` expect `{}` for a dropped PDU and the
+  counter.
+- `cargo fmt --all --check`; `cargo clippy -p hs-federation -p hs-room -p hs-cli --all-targets --
+  -D warnings`: clean.
+- **Complement** (image `complement-hs-fedwave3:dev`: `complement-hs-main:w2` with this branch's
+  bookworm `hs`; under the shared lock, patches applied): `TestCorruptedAuthChain`,
+  `TestDeviceListsUpdateOverFederation` (all three, `stopped_server` included),
+  `TestToDeviceMessagesOverFederation` (all three) newly pass; `TestMSC4311RejectInvalidStrippedStateFederation`,
+  `TestMSC4311FullEventsOnStrippedStateFederation`, `TestInboundFederationRejectsEventsWithRejectedAuthEvents`,
+  `TestInboundCanReturnMissingEvents`, `TestOutboundFederationIgnoresMissingEventWithBadJSONForRoomVersion6`
+  still pass. The whole `./tests/` package: 86 of 90 top-level pass (run 12's baseline 82):
+  newly passing the three above and `TestUnbanViaInvite`; failing, as in the baseline and outside
+  this brief, `TestDeviceListsUpdateOverFederationOnRoomJoin`, `TestSyncOmitsStateChangeOnFilteredEvents`,
+  `TestJumpToDateEndpoint`, `TestMSC4291RoomIDAsHashOfCreateEvent_RoomIDIsOnCreateEvent`. No
+  regression.
+- **Sytest** (`SYTEST_HS_BINARY` of this branch): `50federation/{33room-get-missing-events,50server-acl-endpoints}.pl`
+  all pass ("outliers ... correctly rejected" and "Banned servers cannot /invite" newly);
+  `30rooms/13guestaccess.pl` all pass; `30rooms/12thirdpartyinvite.pl` all but item 6. The whole
+  suite: **748 of 772** pass, 17 skipped as in wave 2's run, 7 fail (wave 2's measure 742): the
+  two `/messages` tests of `10apidoc/34room-messages.pl` (route side), item 6, `31sync/08polling.pl`'s
+  two and "The only membership state included in a gapped incremental sync ..." (`hs-user`), and
+  "If a device list update goes missing, the server resyncs on the next one" (failing in wave 2
+  too; E2EE).
+
+**Left.** Item 6 is the test's race. `federation.max_queued_durable_edus_per_destination` is not
+a config key (the sender's default applies). The announcer's stored position is one for a whole
+cluster. `TestDeviceListsUpdateOverFederationOnRoomJoin` was not in this brief.
+
 ## 2026-10-04 (branch `agent/federation-gaps`): the /send deadlock, cross-room ancestors, third-party invites over federation, and room version 12
 
 Wave 2's federation brief: the two Sytest regressions of `c2d74174`, Sytest's cross-room,

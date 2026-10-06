@@ -157,6 +157,8 @@ async fn unbound_invite_is_claimed(
 ) {
     let (invitee_id, invitee_token) = invitee;
     let id_server = ids.base.trim_start_matches("https://").to_owned();
+    // Where the watcher's legacy event stream stands before the invitation, as Sytest's
+    // `await_event_for` reads it.
     let status = client
         .post(format!("{}/_matrix/client/v3/rooms/{room_id}/invite", a.base))
         .bearer_auth(alice)
@@ -166,8 +168,41 @@ async fn unbound_invite_is_claimed(
         .unwrap()
         .status();
     assert!(status.is_success(), "{status}");
-    // A member on B sees the invitation arrive, as Sytest's joiner waits for it.
+    // A member on B sees the invitation arrive, as Sytest's joiner waits for it: on the legacy
+    // event stream, and in `/sync`.
     if let Some(watcher) = watcher {
+        let mut from: Option<String> = None;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let from_param = from
+                .as_deref()
+                .map(|from| format!("&from={from}"))
+                .unwrap_or_default();
+            let page: Value = client
+                .get(format!(
+                    "{}/_matrix/client/v3/events?timeout=500{from_param}",
+                    b.base
+                ))
+                .bearer_auth(watcher)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if page["chunk"].as_array().is_some_and(|chunk| {
+                chunk
+                    .iter()
+                    .any(|e| e["type"] == "m.room.third_party_invite" && e["room_id"] == room_id)
+            }) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the invitation never reached the event stream; the last page: {page}"
+            );
+            from = page["end"].as_str().map(str::to_owned);
+        }
         let wanted = room_id.to_owned();
         sync_until(client, &b.base, watcher, move |sync| {
             sync["rooms"]["join"][&wanted]["timeline"]["events"]
@@ -306,12 +341,13 @@ async fn scenario() {
     )
     .await;
 
-    // "... with users from both servers": carol of B is in the room already, and the
-    // invitation is still alice's, made on A.
+    // "... with users from both servers": carol of B is in the room already -- a private one,
+    // invited and then joined, as Sytest's `matrix_create_and_join_room(with_invite => 1)` --
+    // and the invitation is still alice's, made on A.
     let created: Value = client
         .post(format!("{}/_matrix/client/v3/createRoom", a.base))
         .bearer_auth(&alice)
-        .json(&json!({"preset": "public_chat"}))
+        .json(&json!({"preset": "private_chat"}))
         .send()
         .await
         .unwrap()
@@ -319,6 +355,17 @@ async fn scenario() {
         .await
         .unwrap();
     let shared = created["room_id"].as_str().unwrap().to_owned();
+    let invited = client
+        .post(format!(
+            "{}/_matrix/client/v3/rooms/{shared}/invite",
+            a.base
+        ))
+        .bearer_auth(&alice)
+        .json(&json!({"user_id": carol_id}))
+        .send()
+        .await
+        .unwrap();
+    assert!(invited.status().is_success(), "{:?}", invited.text().await);
     let joined = client
         .post(format!(
             "{}/_matrix/client/v3/join/{shared}?server_name={}",
@@ -330,7 +377,6 @@ async fn scenario() {
         .await
         .unwrap();
     assert!(joined.status().is_success(), "{:?}", joined.text().await);
-    let _ = carol_id;
     unbound_invite_is_claimed(
         &client,
         &ids,

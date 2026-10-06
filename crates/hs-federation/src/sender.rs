@@ -91,9 +91,17 @@
 //! [`FederationSender::enqueue_edu`] queues an EDU (typing, receipts, presence, device-list
 //! updates) for each destination alongside its PDUs: every transaction carries up to
 //! [`MAX_EDUS_PER_TRANSACTION`] of them (the spec's limit, and Synapse's), with whatever PDUs are
-//! waiting, and a destination with only EDUs waiting gets a transaction of only EDUs. Unlike PDUs
-//! they are **in memory only** -- an EDU describes a moment, and one delivered after a restart
-//! would mostly describe a moment that has passed -- and each destination keeps at most
+//! waiting, and a destination with only EDUs waiting gets a transaction of only EDUs. Most are
+//! **in memory only** -- typing, receipts and presence describe a moment, and one delivered after
+//! a restart would mostly describe a moment that has passed. The exceptions are
+//! [`DURABLE_EDU_TYPES`] (RFC 0023): a to-device message is a message, often a room key, and a
+//! lost device-list or signing-key update leaves the other server with a stale device list. Those
+//! are written to the store ([`FederationSender::enqueue_durable_edu`], which `enqueue_edu` and
+//! `enqueue_edu_local` route them to), go first in each transaction, are deleted once a
+//! transaction carrying them is accepted, and survive a restart ([`FederationSender::resume`]
+//! starts a worker for each destination they wait for), at most
+//! [`SenderConfig::max_queued_durable_edus_per_destination`] per destination. Of the in-memory
+//! ones, each destination keeps at most
 //! [`MAX_QUEUED_EDUS_PER_DESTINATION`], dropping the oldest, so a destination that is down for a
 //! day does not hold a day of typing notices. An EDU queued with a coalescing key replaces the
 //! unsent one with the same key (a typing or presence update supersedes the previous one). An
@@ -152,6 +160,26 @@ pub trait OutboundPduSink: Send + Sync {
 /// docs' "EDUs".
 pub const MAX_QUEUED_EDUS_PER_DESTINATION: usize = 5_000;
 
+/// The EDU types kept in the store until the destination accepts them (RFC 0023), whichever
+/// method queues them: a to-device message is a message (often a room key), and a lost
+/// device-list or signing-key update leaves the other server with a stale device list. See the
+/// module docs' "EDUs".
+pub const DURABLE_EDU_TYPES: &[&str] = &[
+    "m.direct_to_device",
+    "m.device_list_update",
+    "m.signing_key_update",
+];
+
+/// Whether an EDU of `edu_type` is kept in the store until delivered ([`DURABLE_EDU_TYPES`]).
+#[must_use]
+pub fn is_durable_edu_type(edu_type: &str) -> bool {
+    DURABLE_EDU_TYPES.contains(&edu_type)
+}
+
+/// The default [`SenderConfig::max_queued_durable_edus_per_destination`]: past it a
+/// destination's oldest durable EDU is dropped (and logged at `warn`).
+pub const DEFAULT_MAX_QUEUED_DURABLE_EDUS_PER_DESTINATION: usize = 10_000;
+
 /// The default [`SenderConfig::max_queued_pdus_per_destination`] (and of
 /// `federation.max_queued_pdus_per_destination`): a destination's queue holds this many PDUs
 /// before it is dropped and the destination is caught up from the rooms instead (the module
@@ -202,6 +230,9 @@ pub struct SenderConfig {
     /// [`DEFAULT_MAX_QUEUED_PDUS_PER_DESTINATION`] by default; `hs serve` takes it from
     /// `federation.max_queued_pdus_per_destination`.
     pub max_queued_pdus_per_destination: usize,
+    /// How many durable EDUs ([`DURABLE_EDU_TYPES`]) a destination keeps waiting before its
+    /// oldest is dropped. [`DEFAULT_MAX_QUEUED_DURABLE_EDUS_PER_DESTINATION`] by default.
+    pub max_queued_durable_edus_per_destination: usize,
 }
 
 impl Default for SenderConfig {
@@ -212,6 +243,8 @@ impl Default for SenderConfig {
             reset_poll_interval: BACKOFF_POLL_INTERVAL,
             store_rescan_interval: None,
             max_queued_pdus_per_destination: DEFAULT_MAX_QUEUED_PDUS_PER_DESTINATION,
+            max_queued_durable_edus_per_destination:
+                DEFAULT_MAX_QUEUED_DURABLE_EDUS_PER_DESTINATION,
         }
     }
 }
@@ -350,10 +383,10 @@ impl EduQueue {
         dropped
     }
 
-    /// Takes up to [`MAX_EDUS_PER_TRANSACTION`] of the oldest.
-    fn take(&self) -> Vec<Arc<Value>> {
+    /// Takes up to `limit` of the oldest.
+    fn take(&self, limit: usize) -> Vec<Arc<Value>> {
         let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
-        let n = queue.len().min(MAX_EDUS_PER_TRANSACTION);
+        let n = queue.len().min(limit);
         queue.drain(..n).map(|(_, edu)| edu).collect()
     }
 
@@ -363,6 +396,14 @@ impl EduQueue {
             .unwrap_or_else(PoisonError::into_inner)
             .len()
     }
+}
+
+/// The EDUs of one transaction: the durable ones first (their sequence numbers, to delete them
+/// from the store once delivered), then the in-memory ones.
+#[derive(Default)]
+struct EduBatch {
+    edus: Vec<Arc<Value>>,
+    durable: Vec<u64>,
 }
 
 /// What a failed attempt asks the worker to do before the next one.
@@ -608,6 +649,15 @@ impl FederationSender {
         for (destination, _) in self.shared.store.catch_up_marks()? {
             backlog.entry(destination).or_insert(0);
         }
+        // So does one with durable EDUs waiting (to-device messages, device-list updates).
+        for (destination, edus) in self.shared.store.durable_edus_queued()? {
+            tracing::info!(
+                destination,
+                edus,
+                "resuming durable EDUs left by a previous run"
+            );
+            backlog.entry(destination).or_insert(0);
+        }
         let mut resumed = 0usize;
         for (destination, count) in backlog {
             if destination == self.shared.own_server_name
@@ -750,8 +800,9 @@ impl FederationSender {
     /// Queues an EDU (`{"edu_type": edu_type, "content": content}`) for each server in
     /// `destinations` (deduplicated; this server's own name is always skipped), to go out with
     /// the next transaction to each. With a `coalesce_key`, it replaces an unsent EDU with the same
-    /// key for the same destination. In memory only; see the module docs' "EDUs" for what is kept,
-    /// what is dropped, and why. Like [`FederationSender::enqueue_pdu`] it must be called from
+    /// key for the same destination. In memory only, except for [`DURABLE_EDU_TYPES`], which are
+    /// kept in the store until delivered ([`FederationSender::enqueue_durable_edu`]); see the
+    /// module docs' "EDUs" for what is kept, what is dropped, and why. Like [`FederationSender::enqueue_pdu`] it must be called from
     /// within a Tokio runtime and is a no-op after [`FederationSender::shutdown`].
     ///
     /// A destination another replica sends for is handed to the installed [`EduForwarder`]
@@ -782,6 +833,25 @@ impl FederationSender {
         self.enqueue_edu_inner(destinations, edu_type, content, coalesce_key, false);
     }
 
+    /// Queues an EDU durably (RFC 0023): written to the store for each destination sent from
+    /// here, delivered with that destination's next transactions, ahead of the in-memory EDUs,
+    /// and deleted only once a transaction carrying it is accepted -- so it survives a restart
+    /// of this server and waits for a destination that is down. A `coalesce_key` replaces the
+    /// destination's unsent durable EDU with the same key; past
+    /// [`SenderConfig::max_queued_durable_edus_per_destination`] the oldest is dropped. A
+    /// destination another replica sends for goes to the [`EduForwarder`], as with
+    /// [`FederationSender::enqueue_edu`] (the receiving replica queues it durably in turn).
+    /// [`DURABLE_EDU_TYPES`] take this path from `enqueue_edu` and `enqueue_edu_local` too.
+    pub fn enqueue_durable_edu(
+        &self,
+        destinations: impl IntoIterator<Item = String>,
+        edu_type: &str,
+        content: Value,
+        coalesce_key: Option<String>,
+    ) {
+        self.enqueue_edu_with(destinations, edu_type, content, coalesce_key, true, true);
+    }
+
     fn enqueue_edu_inner(
         &self,
         destinations: impl IntoIterator<Item = String>,
@@ -789,6 +859,26 @@ impl FederationSender {
         content: Value,
         coalesce_key: Option<String>,
         forward: bool,
+    ) {
+        let durable = is_durable_edu_type(edu_type);
+        self.enqueue_edu_with(
+            destinations,
+            edu_type,
+            content,
+            coalesce_key,
+            forward,
+            durable,
+        );
+    }
+
+    fn enqueue_edu_with(
+        &self,
+        destinations: impl IntoIterator<Item = String>,
+        edu_type: &str,
+        content: Value,
+        coalesce_key: Option<String>,
+        forward: bool,
+        durable: bool,
     ) {
         if self.shared.shut_down.load(Ordering::Acquire) {
             tracing::debug!(
@@ -799,6 +889,7 @@ impl FederationSender {
         }
         let edu = Arc::new(serde_json::json!({"edu_type": edu_type, "content": content}));
         let mut seen = HashSet::new();
+        let mut durable_targets: Vec<String> = Vec::new();
         let mut queues = self.queues.lock().unwrap_or_else(PoisonError::into_inner);
         for destination in destinations {
             if destination.is_empty()
@@ -864,6 +955,10 @@ impl FederationSender {
             let Some(queue) = queues.get(&destination) else {
                 continue;
             };
+            if durable {
+                durable_targets.push(destination);
+                continue;
+            }
             let dropped = queue.edus.push(coalesce_key.clone(), edu.clone());
             if dropped > 0 {
                 tracing::warn!(
@@ -879,17 +974,60 @@ impl FederationSender {
                 );
             }
         }
+        if durable_targets.is_empty() {
+            return;
+        }
+        let max = self.shared.config.max_queued_durable_edus_per_destination;
+        match self.shared.store.enqueue_durable_edu(
+            &durable_targets,
+            &edu,
+            coalesce_key.as_deref(),
+            max,
+        ) {
+            Ok(dropped) => {
+                if dropped > 0 {
+                    tracing::warn!(
+                        destinations = ?durable_targets,
+                        edu_type,
+                        dropped,
+                        bound = max,
+                        "a destination's durable EDU queue is full; dropped the oldest"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::error!(
+                    destinations = ?durable_targets,
+                    edu_type,
+                    %error,
+                    "could not persist an outbound EDU; it will not be sent"
+                );
+                return;
+            }
+        }
+        for destination in &durable_targets {
+            if let Some(queue) = queues.get(destination)
+                && queue.tx.send(Queued::Edus).is_err()
+            {
+                tracing::debug!(
+                    destination,
+                    "outbound federation worker is gone; the EDU waits in the store"
+                );
+            }
+        }
     }
 
-    /// EDUs queued for `destination` and not yet in a transaction it accepted. Zero for a
-    /// destination nothing has been queued for.
+    /// EDUs queued for `destination` and not yet in a transaction it accepted, in memory and in
+    /// the store. Zero for a destination nothing has been queued for.
     #[must_use]
     pub fn pending_edus_for(&self, destination: &str) -> usize {
-        self.queues
+        let in_memory = self
+            .queues
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(destination)
-            .map_or(0, |queue| queue.edus.len())
+            .map_or(0, |queue| queue.edus.len());
+        in_memory + self.shared.durable_edus_waiting(destination)
     }
 
     /// PDUs queued and not yet accepted by (or dropped for) their destination, summed over every
@@ -944,6 +1082,26 @@ impl FederationSender {
         destination: &str,
     ) -> Result<Option<OutboundDestinationState>, OutboundStoreError> {
         self.shared.store.state(destination)
+    }
+
+    /// The position a follower of another stream stored under `name` with
+    /// [`FederationSender::store_position`]: how far it had handed that stream's changes to this
+    /// sender when it last said. `hs-cli`'s device-list announcer resumes from it at start, so a
+    /// change committed while the process stopped is still announced (RFC 0023). `None` with a
+    /// store that never had one, or an in-memory store after a restart.
+    ///
+    /// # Errors
+    /// Returns the store's error.
+    pub fn stored_position(&self, name: &str) -> Result<Option<u64>, OutboundStoreError> {
+        self.shared.store.cursor(name)
+    }
+
+    /// Stores `position` under `name` (see [`FederationSender::stored_position`]).
+    ///
+    /// # Errors
+    /// Returns the store's error.
+    pub fn store_position(&self, name: &str, position: u64) -> Result<(), OutboundStoreError> {
+        self.shared.store.set_cursor(name, position)
     }
 
     /// Forgets `destination`'s persisted backoff, so its worker -- which re-reads the store
@@ -1098,14 +1256,16 @@ async fn run_worker(
                 .map(|row| (row.seq, Arc::new(row.pdu)))
                 .collect();
             let pdus: Vec<Arc<Value>> = rows.iter().map(|(_, pdu)| pdu.clone()).collect();
+            let edu_batch = shared.gather_edus(&destination, &edus);
             match shared
-                .send_batch(&destination, &pdus, &edus.take(), Mode::Queue)
+                .send_batch(&destination, &pdus, &edu_batch.edus, Mode::Queue)
                 .await
             {
                 Delivery::ShutDown => return,
                 Delivery::Superseded => continue 'outer,
                 Delivery::Delivered | Delivery::Dropped | Delivery::Failed => {}
             }
+            shared.settle_edus(&destination, &edu_batch.durable).await;
             shared.settle(&destination, through, &rows, &pending);
             acked_through = through;
         }
@@ -1113,16 +1273,22 @@ async fn run_worker(
         loop {
             // EDUs left over from a full transaction, or queued while one was being sent (their
             // doorbells may already have been consumed), go out before waiting for anything.
-            if edus.len() > 0 {
-                match shared
-                    .send_batch(&destination, &[], &edus.take(), Mode::Queue)
-                    .await
-                {
-                    Delivery::ShutDown => return,
-                    Delivery::Superseded => continue 'outer,
-                    Delivery::Delivered | Delivery::Dropped | Delivery::Failed => {}
+            if edus.len() > 0 || shared.durable_edus_waiting(&destination) > 0 {
+                let edu_batch = shared.gather_edus(&destination, &edus);
+                if edu_batch.edus.is_empty() {
+                    // Waiting, but none could be read (logged): wait for the next doorbell.
+                } else {
+                    match shared
+                        .send_batch(&destination, &[], &edu_batch.edus, Mode::Queue)
+                        .await
+                    {
+                        Delivery::ShutDown => return,
+                        Delivery::Superseded => continue 'outer,
+                        Delivery::Delivered | Delivery::Dropped | Delivery::Failed => {}
+                    }
+                    shared.settle_edus(&destination, &edu_batch.durable).await;
+                    continue;
                 }
-                continue;
             }
             let first = match shared.config.store_rescan_interval {
                 None => rx.recv().await,
@@ -1150,18 +1316,19 @@ async fn run_worker(
                 }
                 next = rx.try_recv().ok();
             }
-            let edu_batch = edus.take();
-            if !batch.is_empty() || !edu_batch.is_empty() {
+            let edu_batch = shared.gather_edus(&destination, &edus);
+            if !batch.is_empty() || !edu_batch.edus.is_empty() {
                 let through = batch.last().map_or(acked_through, |(seq, _)| *seq);
                 let pdus: Vec<Arc<Value>> = batch.iter().map(|(_, pdu)| pdu.clone()).collect();
                 match shared
-                    .send_batch(&destination, &pdus, &edu_batch, Mode::Queue)
+                    .send_batch(&destination, &pdus, &edu_batch.edus, Mode::Queue)
                     .await
                 {
                     Delivery::ShutDown => return,
                     Delivery::Superseded => continue 'outer,
                     Delivery::Delivered | Delivery::Dropped | Delivery::Failed => {}
                 }
+                shared.settle_edus(&destination, &edu_batch.durable).await;
                 if !pdus.is_empty() {
                     shared.settle(&destination, through, &batch, &pending);
                     acked_through = through;
@@ -1220,6 +1387,60 @@ impl Shared {
     ) -> Delivery {
         let txn_id = self.next_txn_id();
         self.deliver(destination, &txn_id, pdus, edus, mode).await
+    }
+
+    /// A transaction's EDUs: the destination's oldest durable ones from the store, then
+    /// in-memory ones up to [`MAX_EDUS_PER_TRANSACTION`] in all. A store that cannot be read is
+    /// logged and its EDUs wait.
+    fn gather_edus(&self, destination: &str, memory: &EduQueue) -> EduBatch {
+        let mut batch = EduBatch::default();
+        match self
+            .store
+            .peek_durable_edus(destination, MAX_EDUS_PER_TRANSACTION)
+        {
+            Ok(rows) => {
+                for row in rows {
+                    batch.durable.push(row.seq);
+                    batch.edus.push(Arc::new(row.edu));
+                }
+            }
+            Err(error) => {
+                tracing::error!(destination, %error, "cannot read the durable EDU queue");
+            }
+        }
+        let room = MAX_EDUS_PER_TRANSACTION.saturating_sub(batch.edus.len());
+        if room > 0 {
+            batch.edus.extend(memory.take(room));
+        }
+        batch
+    }
+
+    /// How many durable EDUs wait in the store for `destination` (0 when it cannot be read).
+    fn durable_edus_waiting(&self, destination: &str) -> usize {
+        self.store
+            .durable_edu_len(destination)
+            .unwrap_or_else(|error| {
+                tracing::error!(destination, %error, "cannot read the durable EDU queue");
+                0
+            })
+    }
+
+    /// Deletes the durable EDUs a delivered (or policy-dropped) transaction carried. A store
+    /// that refuses is logged, and the worker pauses for a moment rather than resending them in
+    /// a tight loop; they go again with the next transaction (a receiver deduplicates a
+    /// to-device message by its `message_id`, and a repeated device-list update is harmless).
+    async fn settle_edus(&self, destination: &str, durable: &[u64]) {
+        if durable.is_empty() {
+            return;
+        }
+        if let Err(error) = self.store.ack_durable_edus(destination, durable) {
+            tracing::error!(
+                destination,
+                %error,
+                "could not remove delivered durable EDUs from the store; they will be sent again"
+            );
+            tokio::time::sleep(self.config.initial_backoff).await;
+        }
     }
 
     /// Takes a delivered (or dropped) batch out of the store and the pending counts, and moves
@@ -1783,6 +2004,8 @@ mod tests {
             reset_poll_interval: Duration::from_millis(50),
             store_rescan_interval: None,
             max_queued_pdus_per_destination: DEFAULT_MAX_QUEUED_PDUS_PER_DESTINATION,
+            max_queued_durable_edus_per_destination:
+                DEFAULT_MAX_QUEUED_DURABLE_EDUS_PER_DESTINATION,
         }
     }
 
@@ -2148,6 +2371,7 @@ mod tests {
                 reset_poll_interval: BACKOFF_POLL_INTERVAL,
                 store_rescan_interval: None,
                 max_queued_pdus_per_destination: 1,
+                max_queued_durable_edus_per_destination: 1,
             },
             store: Arc::new(InMemoryOutboundStore::new()),
             gate: RwLock::new(Arc::new(SendsEverywhere)),
@@ -2761,6 +2985,158 @@ mod tests {
             .await
         );
         assert_eq!(peer.request_count(), 1);
+    }
+
+    // ---- Durable EDUs (RFC 0023) ----
+
+    fn to_device(i: usize) -> Value {
+        serde_json::json!({
+            "sender": "@alice:us.example.org",
+            "type": "my.test.type",
+            "message_id": format!("m{i}"),
+            "messages": {"@bob:peer.example.org": {"DEVICE": {"i": i}}},
+        })
+    }
+
+    /// Complement's `stopped_server` cases: a to-device message and a device-list update queued
+    /// for a destination that is down are in the store, not only in memory; the sender is shut
+    /// down (the restart), and the next sender over the same backend delivers them -- ahead of
+    /// an in-memory EDU queued after it -- once the destination is up, and deletes them. A newer
+    /// device-list update for the same key replaced the older one while it waited; a typing
+    /// notice queued before the restart is gone with the process, as it should be.
+    #[tokio::test]
+    async fn durable_edus_survive_a_restart_and_wait_for_a_destination_that_is_down() {
+        let reserved = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = reserved.local_addr().unwrap().port();
+        drop(reserved);
+        let destination = format!("localhost:{port}");
+        let backend = MemoryBackend::new();
+        let store: Arc<dyn OutboundStore> =
+            Arc::new(KvOutboundStore::open(backend.clone()).unwrap());
+
+        let first = FederationSender::with_store(client(), US, fast(), store.clone());
+        first.enqueue_edu([destination.clone()], "m.typing", typing(0), None);
+        first.enqueue_edu(
+            [destination.clone()],
+            "m.direct_to_device",
+            to_device(0),
+            None,
+        );
+        for stream_id in [1, 2] {
+            first.enqueue_edu_local(
+                [destination.clone()],
+                "m.device_list_update",
+                serde_json::json!({"user_id": "@alice:us.example.org", "device_id": "D", "stream_id": stream_id}),
+                Some("device @alice:us.example.org D".to_owned()),
+            );
+        }
+        assert_eq!(store.durable_edu_len(&destination).unwrap(), 2);
+        assert_eq!(first.pending_edus_for(&destination), 2 + 1);
+        assert!(
+            wait_for(Duration::from_secs(10), || {
+                first
+                    .destination_state(&destination)
+                    .unwrap()
+                    .is_some_and(|state| state.failures >= 1)
+            })
+            .await
+        );
+        first.shutdown();
+        drop(first);
+        assert_eq!(
+            store.durable_edus_queued().unwrap(),
+            vec![(destination.clone(), 2)]
+        );
+
+        let peer = FakeFederationPeer::new("peer.example.org");
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap();
+        spawn_peer_on(&peer, listener);
+        let second = FederationSender::with_store(
+            client(),
+            US,
+            fast(),
+            Arc::new(KvOutboundStore::open(backend).unwrap()),
+        );
+        let metrics = crate::metrics::EduMetrics::default();
+        second.install_edu_metrics(metrics.clone());
+        assert_eq!(second.resume().unwrap(), 0, "no PDUs were waiting");
+        second.enqueue_edu([destination.clone()], "m.typing", typing(1), None);
+        assert!(
+            wait_for(Duration::from_secs(10), || store
+                .durable_edu_len(&destination)
+                .unwrap()
+                == 0)
+            .await,
+            "the durable EDUs were delivered and deleted"
+        );
+        let edus: Vec<Value> = peer
+            .requests()
+            .iter()
+            .flat_map(|request| request.body["edus"].as_array().cloned().unwrap_or_default())
+            .collect();
+        let types: Vec<&str> = edus
+            .iter()
+            .map(|edu| edu["edu_type"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            types,
+            vec!["m.direct_to_device", "m.device_list_update", "m.typing"],
+            "{edus:?}"
+        );
+        assert_eq!(edus[0]["content"], to_device(0));
+        assert_eq!(
+            edus[1]["content"]["stream_id"], 2,
+            "the newer update replaced the older"
+        );
+        assert_eq!(edus[2]["content"], typing(1));
+        assert!(
+            wait_for(Duration::from_secs(10), || metrics
+                .sent("m.direct_to_device")
+                == 1)
+            .await
+        );
+        assert_eq!(second.pending_edus_for(&destination), 0);
+    }
+
+    /// A destination's durable EDU queue is bounded: past
+    /// [`SenderConfig::max_queued_durable_edus_per_destination`] the oldest goes.
+    #[tokio::test]
+    async fn the_durable_edu_queue_is_bounded_dropping_the_oldest() {
+        let unused = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let destination = format!("localhost:{}", unused.local_addr().unwrap().port());
+        drop(unused);
+        for store in [
+            Arc::new(InMemoryOutboundStore::new()) as Arc<dyn OutboundStore>,
+            Arc::new(KvOutboundStore::open(MemoryBackend::new()).unwrap()),
+        ] {
+            let sender = FederationSender::with_store(
+                client(),
+                US,
+                SenderConfig {
+                    max_queued_durable_edus_per_destination: 2,
+                    ..fast()
+                },
+                store.clone(),
+            );
+            for i in 0..3 {
+                sender.enqueue_durable_edu(
+                    [destination.clone()],
+                    "m.direct_to_device",
+                    to_device(i),
+                    None,
+                );
+            }
+            let kept: Vec<Value> = store
+                .peek_durable_edus(&destination, 10)
+                .unwrap()
+                .into_iter()
+                .map(|row| row.edu["content"]["message_id"].clone())
+                .collect();
+            assert_eq!(kept, vec![serde_json::json!("m1"), serde_json::json!("m2")]);
+            sender.shutdown();
+        }
     }
 
     // ---- EDUs ----

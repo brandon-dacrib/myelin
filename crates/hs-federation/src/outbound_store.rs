@@ -44,6 +44,21 @@
 //! - `hs_federation.outbound_catch_up`: `(destination,) -> CatchUpMark` JSON, present while the
 //!   destination is in catch-up mode (see [`CatchUpMark`] and `crate::sender`'s module docs).
 //!
+//! - `hs_federation.outbound_edus`: `(destination, seq) -> {"edu": EDU JSON, "key": coalescing
+//!   key or null}`: the **durable EDUs** ([`OutboundStore::enqueue_durable_edu`], RFC 0023):
+//!   to-device messages and device-list updates, which unlike typing or presence must survive a
+//!   restart. Numbered from the same `seq` counter as the PDUs; deleted when the transaction
+//!   carrying them is accepted ([`OutboundStore::ack_durable_edus`]).
+//! - `hs_federation.outbound_edu_keys`: `(destination, key) -> seq`: the unsent durable EDU of
+//!   each coalescing key, so a newer one replaces it with one read.
+//! - `hs_federation.outbound_edu_lengths`: `(destination,) -> i64` (an `atomic_add` counter): how
+//!   many durable EDUs are waiting for the destination, for the bound and for the worker's "is
+//!   anything waiting" check.
+//! - `hs_federation.outbound_meta`'s `cursor:{name}` keys: positions a follower of another
+//!   stream has handed over to the sender ([`OutboundStore::cursor`]), so what it had not yet
+//!   handed over when the process stopped is handed over at the next start (`hs-cli`'s
+//!   device-list announcer).
+//!
 //! Sequence numbers are `u64` big-endian in the key, so a range over one destination's prefix
 //! is its queue oldest-first, and a `u64` never wraps in practice.
 
@@ -78,6 +93,16 @@ pub struct QueuedPdu {
     /// The event exactly as it will be sent (federation format: `hashes`, `signatures`, no
     /// `event_id`).
     pub pdu: Value,
+}
+
+/// A durable EDU queued for a destination ([`OutboundStore::enqueue_durable_edu`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedEdu {
+    /// Store-wide, monotonic (the PDUs' counter): a destination's durable EDUs in `seq` order
+    /// are the order they were queued in.
+    pub seq: u64,
+    /// The EDU as it goes in a transaction: `{"edu_type": ..., "content": ...}`.
+    pub edu: Value,
 }
 
 /// How the sender's retrying of one destination's head transaction is going. Persisted, so a
@@ -401,6 +426,68 @@ pub trait OutboundStore: Send + Sync {
     /// # Errors
     /// Returns the backend's error.
     fn reset(&self, destination: &str) -> Result<(), OutboundStoreError>;
+
+    /// Queues `edu` durably for every destination, in one transaction: with a `coalesce_key`,
+    /// it replaces the destination's unsent durable EDU with the same key; past
+    /// `max_per_destination` the destination's oldest is dropped. Returns how many were dropped
+    /// that way, over every destination.
+    ///
+    /// # Errors
+    /// Returns the backend's error; nothing was queued anywhere then.
+    fn enqueue_durable_edu(
+        &self,
+        destinations: &[String],
+        edu: &Value,
+        coalesce_key: Option<&str>,
+        max_per_destination: usize,
+    ) -> Result<usize, OutboundStoreError>;
+
+    /// The oldest `limit` durable EDUs queued for `destination`, oldest first. A row that no
+    /// longer decodes is logged and skipped.
+    ///
+    /// # Errors
+    /// Returns the backend's error.
+    fn peek_durable_edus(
+        &self,
+        destination: &str,
+        limit: usize,
+    ) -> Result<Vec<QueuedEdu>, OutboundStoreError>;
+
+    /// Removes the durable EDUs `seqs` of `destination` (those a transaction it accepted
+    /// carried, or that this server's policy refused). One already gone -- replaced by a newer
+    /// one with its key meanwhile -- is skipped. Returns how many were removed.
+    ///
+    /// # Errors
+    /// Returns the backend's error.
+    fn ack_durable_edus(
+        &self,
+        destination: &str,
+        seqs: &[u64],
+    ) -> Result<usize, OutboundStoreError>;
+
+    /// How many durable EDUs are queued for `destination`.
+    ///
+    /// # Errors
+    /// Returns the backend's error.
+    fn durable_edu_len(&self, destination: &str) -> Result<usize, OutboundStoreError>;
+
+    /// Every destination with durable EDUs queued, with how many, sorted by name.
+    ///
+    /// # Errors
+    /// Returns the backend's error.
+    fn durable_edus_queued(&self) -> Result<Vec<(String, usize)>, OutboundStoreError>;
+
+    /// The position stored under `name` by [`OutboundStore::set_cursor`], if any.
+    ///
+    /// # Errors
+    /// Returns the backend's error.
+    fn cursor(&self, name: &str) -> Result<Option<u64>, OutboundStoreError>;
+
+    /// Stores `position` under `name`.
+    ///
+    /// # Errors
+    /// Returns the backend's error.
+    fn set_cursor(&self, name: &str, position: u64) -> Result<(), OutboundStoreError>;
 }
 
 /// An [`OutboundStore`] that lives and dies with the process. What a sender built without a
@@ -419,6 +506,9 @@ struct InMemoryInner {
     room_queued: BTreeMap<(String, String), u64>,
     room_sent: BTreeMap<(String, String), u64>,
     marks: HashMap<String, CatchUpMark>,
+    /// Durable EDUs: `destination -> seq -> (key, edu)`.
+    edus: HashMap<String, BTreeMap<u64, (Option<String>, Value)>>,
+    cursors: HashMap<String, u64>,
 }
 
 impl InMemoryInner {
@@ -692,6 +782,97 @@ impl OutboundStore for InMemoryOutboundStore {
         }
         Ok(())
     }
+
+    fn enqueue_durable_edu(
+        &self,
+        destinations: &[String],
+        edu: &Value,
+        coalesce_key: Option<&str>,
+        max_per_destination: usize,
+    ) -> Result<usize, OutboundStoreError> {
+        let mut inner = self.lock();
+        inner.next_seq += 1;
+        let seq = inner.next_seq;
+        let mut dropped = 0usize;
+        for destination in destinations {
+            let queue = inner.edus.entry(destination.clone()).or_default();
+            if let Some(key) = coalesce_key {
+                queue.retain(|_, (existing, _)| existing.as_deref() != Some(key));
+            }
+            queue.insert(seq, (coalesce_key.map(str::to_owned), edu.clone()));
+            while queue.len() > max_per_destination.max(1) {
+                queue.pop_first();
+                dropped += 1;
+            }
+        }
+        Ok(dropped)
+    }
+
+    fn peek_durable_edus(
+        &self,
+        destination: &str,
+        limit: usize,
+    ) -> Result<Vec<QueuedEdu>, OutboundStoreError> {
+        Ok(self
+            .lock()
+            .edus
+            .get(destination)
+            .map(|queue| {
+                queue
+                    .iter()
+                    .take(limit)
+                    .map(|(seq, (_, edu))| QueuedEdu {
+                        seq: *seq,
+                        edu: edu.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    fn ack_durable_edus(
+        &self,
+        destination: &str,
+        seqs: &[u64],
+    ) -> Result<usize, OutboundStoreError> {
+        let mut inner = self.lock();
+        let Some(queue) = inner.edus.get_mut(destination) else {
+            return Ok(0);
+        };
+        let removed = seqs
+            .iter()
+            .filter(|seq| queue.remove(seq).is_some())
+            .count();
+        if queue.is_empty() {
+            inner.edus.remove(destination);
+        }
+        Ok(removed)
+    }
+
+    fn durable_edu_len(&self, destination: &str) -> Result<usize, OutboundStoreError> {
+        Ok(self.lock().edus.get(destination).map_or(0, BTreeMap::len))
+    }
+
+    fn durable_edus_queued(&self) -> Result<Vec<(String, usize)>, OutboundStoreError> {
+        let inner = self.lock();
+        let mut all: Vec<(String, usize)> = inner
+            .edus
+            .iter()
+            .filter(|(_, queue)| !queue.is_empty())
+            .map(|(name, queue)| (name.clone(), queue.len()))
+            .collect();
+        all.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(all)
+    }
+
+    fn cursor(&self, name: &str) -> Result<Option<u64>, OutboundStoreError> {
+        Ok(self.lock().cursors.get(name).copied())
+    }
+
+    fn set_cursor(&self, name: &str, position: u64) -> Result<(), OutboundStoreError> {
+        self.lock().cursors.insert(name.to_owned(), position);
+        Ok(())
+    }
 }
 
 /// The `hs-kv`-backed [`OutboundStore`]: see the module docs for the layout. What `hs serve`
@@ -706,6 +887,21 @@ pub struct KvOutboundStore<B: KvBackend> {
     room_queued: TypedKeyspace<B::Keyspace, (String, String)>,
     room_sent: TypedKeyspace<B::Keyspace, (String, String)>,
     marks: TypedKeyspace<B::Keyspace, (String,)>,
+    edus: TypedKeyspace<B::Keyspace, (String, u64)>,
+    edu_keys: TypedKeyspace<B::Keyspace, (String, String)>,
+    edu_lengths: B::Keyspace,
+}
+
+/// A durable EDU row of `hs_federation.outbound_edus`.
+#[derive(Serialize, Deserialize)]
+struct EduRow {
+    edu: Value,
+    #[serde(default)]
+    key: Option<String>,
+}
+
+fn cursor_key(name: &str) -> Vec<u8> {
+    format!("cursor:{name}").into_bytes()
 }
 
 const SEQ_KEY: &[u8] = b"seq";
@@ -737,6 +933,9 @@ impl<B: KvBackend> KvOutboundStore<B> {
             TypedKeyspace::new(backend.keyspace("hs_federation.outbound_room_queued")?);
         let room_sent = TypedKeyspace::new(backend.keyspace("hs_federation.outbound_room_sent")?);
         let marks = TypedKeyspace::new(backend.keyspace("hs_federation.outbound_catch_up")?);
+        let edus = TypedKeyspace::new(backend.keyspace("hs_federation.outbound_edus")?);
+        let edu_keys = TypedKeyspace::new(backend.keyspace("hs_federation.outbound_edu_keys")?);
+        let edu_lengths = backend.keyspace("hs_federation.outbound_edu_lengths")?;
         let store = Self {
             backend,
             queue,
@@ -746,6 +945,9 @@ impl<B: KvBackend> KvOutboundStore<B> {
             room_queued,
             room_sent,
             marks,
+            edus,
+            edu_keys,
+            edu_lengths,
         };
         store.count_lengths_once()?;
         Ok(store)
@@ -794,6 +996,55 @@ impl<B: KvBackend> KvOutboundStore<B> {
             .map_or(0, |bytes| {
                 u64::try_from(i64::from_be_bytes(bytes)).unwrap_or(0)
             }))
+    }
+
+    fn edu_length<R: KvRead<Keyspace = B::Keyspace>>(
+        &self,
+        reader: &R,
+        destination: &str,
+    ) -> Result<u64, hs_kv::KvError> {
+        Ok(reader
+            .get(&self.edu_lengths, &length_key(destination))?
+            .and_then(|bytes| <[u8; 8]>::try_from(bytes.as_ref()).ok())
+            .map_or(0, |bytes| {
+                u64::try_from(i64::from_be_bytes(bytes)).unwrap_or(0)
+            }))
+    }
+
+    /// Deletes `destination`'s durable EDU `seq`, and its key's index entry when that still
+    /// names it. Returns whether the row was there.
+    fn delete_edu<W: KvWrite<Keyspace = B::Keyspace> + KvRead<Keyspace = B::Keyspace>>(
+        &self,
+        txn: &mut W,
+        destination: &str,
+        seq: u64,
+    ) -> Result<bool, hs_kv::KvError> {
+        let row_key = (destination.to_owned(), seq);
+        let Some(bytes) = self
+            .edus
+            .get(txn, &row_key)
+            .map_err(|e| into_kv(e.into()))?
+        else {
+            return Ok(false);
+        };
+        if let Ok(EduRow { key: Some(key), .. }) = serde_json::from_slice::<EduRow>(&bytes) {
+            let index_key = (destination.to_owned(), key);
+            let indexed = self
+                .edu_keys
+                .get(txn, &index_key)
+                .map_err(|e| into_kv(e.into()))?
+                .and_then(|bytes| decode_u64(&bytes));
+            if indexed == Some(seq) {
+                self.edu_keys
+                    .delete(txn, &index_key)
+                    .map_err(|e| into_kv(e.into()))?;
+            }
+        }
+        self.edus
+            .delete(txn, &row_key)
+            .map_err(|e| into_kv(e.into()))?;
+        txn.atomic_add(&self.edu_lengths, &length_key(destination), -1)?;
+        Ok(true)
     }
 
     fn read_mark<R: KvRead<Keyspace = B::Keyspace>>(
@@ -1227,6 +1478,142 @@ impl<B: KvBackend> OutboundStore for KvOutboundStore<B> {
         self.update_state(destination, |current| {
             current.map(OutboundDestinationState::reset)
         })
+    }
+
+    fn enqueue_durable_edu(
+        &self,
+        destinations: &[String],
+        edu: &Value,
+        coalesce_key: Option<&str>,
+        max_per_destination: usize,
+    ) -> Result<usize, OutboundStoreError> {
+        let bytes = serde_json::to_vec(&EduRow {
+            edu: edu.clone(),
+            key: coalesce_key.map(str::to_owned),
+        })?;
+        let max = u64::try_from(max_per_destination.max(1)).unwrap_or(u64::MAX);
+        let dropped = transact(&self.backend, TransactConfig::default(), |txn| {
+            let seq = txn.atomic_add(&self.meta, SEQ_KEY, 1)?;
+            let seq = u64::try_from(seq).unwrap_or(0);
+            let mut dropped = 0usize;
+            for destination in destinations {
+                if let Some(key) = coalesce_key {
+                    let index_key = (destination.clone(), key.to_owned());
+                    if let Some(previous) = self
+                        .edu_keys
+                        .get(txn, &index_key)
+                        .map_err(|e| into_kv(e.into()))?
+                        .and_then(|bytes| decode_u64(&bytes))
+                    {
+                        self.delete_edu(txn, destination, previous)?;
+                    }
+                    self.edu_keys
+                        .put(txn, &index_key, &seq.to_be_bytes())
+                        .map_err(|e| into_kv(e.into()))?;
+                }
+                self.edus
+                    .put(txn, &(destination.clone(), seq), &bytes)
+                    .map_err(|e| into_kv(e.into()))?;
+                txn.atomic_add(&self.edu_lengths, &length_key(destination), 1)?;
+                // Past the bound, the oldest go.
+                let mut len = self.edu_length(txn, destination)?;
+                while len > max {
+                    let spec = TypedKeyspace::<B::Keyspace, (String, u64)>::prefix(&(
+                        destination.clone(),
+                    ))
+                    .limit(1);
+                    let oldest = self
+                        .edus
+                        .range(txn, spec)
+                        .next()
+                        .transpose()
+                        .map_err(|e| into_kv(e.into()))?
+                        .map(|((_, oldest), _)| oldest);
+                    let Some(oldest) = oldest else {
+                        break;
+                    };
+                    self.delete_edu(txn, destination, oldest)?;
+                    dropped += 1;
+                    len -= 1;
+                }
+            }
+            Ok(dropped)
+        })?;
+        Ok(dropped)
+    }
+
+    fn peek_durable_edus(
+        &self,
+        destination: &str,
+        limit: usize,
+    ) -> Result<Vec<QueuedEdu>, OutboundStoreError> {
+        let snapshot = self.backend.snapshot();
+        let spec = TypedKeyspace::<B::Keyspace, (String, u64)>::prefix(&(destination.to_owned(),))
+            .limit(limit);
+        let mut out = Vec::new();
+        for item in self.edus.range(&snapshot, spec) {
+            let ((_, seq), bytes) = item?;
+            match serde_json::from_slice::<EduRow>(&bytes) {
+                Ok(row) => out.push(QueuedEdu { seq, edu: row.edu }),
+                Err(error) => tracing::error!(
+                    destination,
+                    seq,
+                    %error,
+                    "a queued durable EDU no longer decodes; skipping it"
+                ),
+            }
+        }
+        Ok(out)
+    }
+
+    fn ack_durable_edus(
+        &self,
+        destination: &str,
+        seqs: &[u64],
+    ) -> Result<usize, OutboundStoreError> {
+        if seqs.is_empty() {
+            return Ok(0);
+        }
+        let removed = transact(&self.backend, TransactConfig::default(), |txn| {
+            let mut removed = 0usize;
+            for seq in seqs {
+                if self.delete_edu(txn, destination, *seq)? {
+                    removed += 1;
+                }
+            }
+            Ok(removed)
+        })?;
+        Ok(removed)
+    }
+
+    fn durable_edu_len(&self, destination: &str) -> Result<usize, OutboundStoreError> {
+        let len = self.edu_length(&self.backend.snapshot(), destination)?;
+        Ok(usize::try_from(len).unwrap_or(usize::MAX))
+    }
+
+    fn durable_edus_queued(&self) -> Result<Vec<(String, usize)>, OutboundStoreError> {
+        let snapshot = self.backend.snapshot();
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        for item in self.edus.range(&snapshot, RangeSpec::full()) {
+            let ((destination, _), _) = item?;
+            *counts.entry(destination).or_default() += 1;
+        }
+        Ok(counts.into_iter().collect())
+    }
+
+    fn cursor(&self, name: &str) -> Result<Option<u64>, OutboundStoreError> {
+        Ok(self
+            .backend
+            .snapshot()
+            .get(&self.meta, &cursor_key(name))?
+            .and_then(|bytes| decode_u64(&bytes)))
+    }
+
+    fn set_cursor(&self, name: &str, position: u64) -> Result<(), OutboundStoreError> {
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            txn.put(&self.meta, &cursor_key(name), &position.to_be_bytes())
+        })?;
+        Ok(())
     }
 }
 

@@ -31,15 +31,22 @@
 //! by the sender once the destination accepts its transaction, and counted in
 //! `hs_federation_edus_sent_total{edu_type}` (`hs_federation::metrics`).
 //!
-//! # What is not sent
+//! # Across a restart
 //!
-//! Device-list changes made while the server was down are not announced (the announcer starts at
-//! the stream's position at start), and the sender keeps EDUs in memory, so a to-device message
-//! or device-list update queued for a server that is down is lost if this one restarts first
-//! (Complement's `stopped_server` cases; `docs/rfcs/0023-durable-to-device-and-device-list-edus.md`). In a cluster, an EDU for a destination whose federation shard
-//! another replica owns is forwarded to that replica over the mesh (`crate::edu_forward`), except
-//! the device-list announcer's: every replica follows the stream and produces those for itself,
-//! and each queues them only for the destinations it sends for.
+//! To-device messages and device-list and signing-key updates are durable EDUs
+//! (`hs_federation::sender::DURABLE_EDU_TYPES`, RFC 0023): the sender keeps them in its store
+//! until the destination accepts them, so one queued for a server that is down survives a restart
+//! of this one (Complement's `stopped_server` cases). The announcer stores how far it has read
+//! the device-list stream ([`ANNOUNCER_POSITION`], in the sender's store) and resumes from there,
+//! so a change committed while the process stopped is announced at the next start; what it had
+//! announced before is not remembered, so the first change of each user after a start is
+//! announced as their whole device list. Typing, receipts and presence stay in memory: they
+//! describe a moment. In a cluster, an EDU for a destination whose federation shard another
+//! replica owns is forwarded to that replica over the mesh (`crate::edu_forward`), except the
+//! device-list announcer's: every replica follows the stream and produces those for itself, and
+//! each queues them only for the destinations it sends for. The stored position is one for the
+//! whole cluster (the furthest any replica read), so a replica down while others read on does
+//! not catch up on its own destinations' share.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -100,8 +107,9 @@ impl hs_e2e::federation::ToDeviceOutbox for SenderEduOutbox {
             message_id,
             "queueing a to-device message for another server"
         );
-        // Never coalesced: every to-device message is delivered, in order.
-        self.sender.enqueue_edu(
+        // Never coalesced: every to-device message is delivered, in order; durable, kept in the
+        // sender's store until the destination accepts it (RFC 0023).
+        self.sender.enqueue_durable_edu(
             [destination.to_owned()],
             DIRECT_TO_DEVICE_EDU,
             content,
@@ -257,6 +265,10 @@ pub struct DeviceListAnnouncer {
     task: tokio::task::JoinHandle<()>,
 }
 
+/// The name the device-list announcer stores its stream position under in the federation
+/// sender's store (`FederationSender::store_position`).
+pub const ANNOUNCER_POSITION: &str = "device_list_announcer";
+
 impl DeviceListAnnouncer {
     /// Starts following `e2e`'s stream from its current position, announcing through `sender`
     /// to the servers `hub` says share a room with each changed user of `own_server`.
@@ -268,11 +280,30 @@ impl DeviceListAnnouncer {
         own_server: OwnedServerName,
     ) -> Self {
         let task = tokio::spawn(async move {
-            let mut last = match e2e.store.current_stream_pos().await {
+            let current = match e2e.store.current_stream_pos().await {
                 Ok(pos) => pos,
                 Err(error) => {
                     tracing::error!(%error, "cannot read the device-list stream; device-list updates will not be sent");
                     return;
+                }
+            };
+            // Where the previous run got to, if it said: what was committed since is announced
+            // now. A stored position past the stream (a store reset under it) starts from now.
+            let mut last = match sender.stored_position(ANNOUNCER_POSITION) {
+                Ok(Some(stored)) if stored <= current => {
+                    if stored < current {
+                        tracing::info!(
+                            from = stored,
+                            to = current,
+                            "announcing device-list changes committed while this server was stopped"
+                        );
+                    }
+                    stored
+                }
+                Ok(_) => current,
+                Err(error) => {
+                    tracing::warn!(%error, "cannot read where the device-list announcer got to; starting from now");
+                    current
                 }
             };
             let mut announced: HashMap<OwnedUserId, Announced> = HashMap::new();
@@ -307,6 +338,11 @@ impl DeviceListAnnouncer {
                     if let Some(after) = announce(&hub, &e2e, &sender, &user_id, before).await {
                         announced.insert(user_id, after);
                     }
+                }
+                // Handed over (the EDUs are durable in the sender's store): the next start
+                // begins here.
+                if let Err(error) = sender.store_position(ANNOUNCER_POSITION, last) {
+                    tracing::warn!(%error, "cannot store where the device-list announcer got to");
                 }
             }
         });
@@ -405,7 +441,8 @@ async fn announce<B: KvBackend + 'static>(
             "announcing a key change to other servers"
         );
         // Local only: every replica follows this stream, so the owner of each destination
-        // announces to it already (`crate::edu_forward`).
+        // announces to it already (`crate::edu_forward`). Durable, as a device-list or
+        // signing-key update is (`hs_federation::sender::DURABLE_EDU_TYPES`).
         sender.enqueue_edu_local(
             destinations.iter().cloned(),
             edu_type,

@@ -297,6 +297,24 @@ pub(crate) fn query_encode(value: &str) -> String {
     out
 }
 
+/// A join made through another server carries `avatar_url` (and `displayname`) even when the
+/// user has none, as `null`: what Synapse's remote join puts in the content
+/// (`RoomMemberHandler.update_membership_locked` sets both from the profile for a remote join,
+/// and only the ones that are set for a local one). So a later join made here once the room is
+/// resident -- whose content leaves an unset avatar out -- is a new event, not the idempotent
+/// no-op an identical content is, as on Synapse. Sytest's "Guest users are kicked from
+/// guest_access rooms on revocation of guest_access over federation" joins a remote user twice
+/// and waits for the second join in `/sync`; with no new event it waited forever whenever the
+/// room's latest events reached the user's server before Sytest took its sync position (the
+/// test's flakiness on `main`).
+fn with_synapse_profile_keys(mut content: Value) -> Value {
+    if let Some(object) = content.as_object_mut() {
+        object.entry("displayname").or_insert(Value::Null);
+        object.entry("avatar_url").or_insert(Value::Null);
+    }
+    content
+}
+
 #[async_trait]
 impl<B: KvBackend + 'static> hs_room::remote_join::RemoteJoin for FederationRemoteJoin<B> {
     async fn join(
@@ -311,6 +329,7 @@ impl<B: KvBackend + 'static> hs_room::remote_join::RemoteJoin for FederationRemo
                 "{user_id} is not a user of this server"
             )));
         }
+        let content = with_synapse_profile_keys(content);
         let own_name = self.identity.server_name.as_str();
         let mut last_error: Option<RoomError> = None;
         for destination in via.iter().filter(|d| d.as_str() != own_name) {

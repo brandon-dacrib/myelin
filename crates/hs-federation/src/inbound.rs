@@ -492,8 +492,9 @@ impl TransactionStore for InMemoryTransactionStore {
 /// A PDU rejected for missing ancestors (`WriteRejected::missing_ancestors` non-empty) is not
 /// immediately reported as an error: if `ancestor_fetcher` is supplied, the gap is closed via
 /// [`crate::backfill::resolve_missing_ancestors`] against `origin` (the server that sent us this
-/// transaction) and the PDU is retried exactly once before falling back to reporting an error.
-/// This is the loop described in `docs/status/06-federation.md`: it turns "an event arrived before
+/// transaction) and the PDU is retried exactly once; if the gap does not close, the PDU is
+/// dropped and answered `{}`, as Synapse answers it (`dropped_result`, decision 0032). This is
+/// the loop described in `docs/status/06-federation.md`: it turns "an event arrived before
 /// its history" into "an event arrived, and now so did its history" whenever the gap is small
 /// enough and the peer cooperative enough to close within `backfill_limits`.
 ///
@@ -504,8 +505,8 @@ impl TransactionStore for InMemoryTransactionStore {
 ///
 /// # Errors
 /// Returns [`TransactionError::TooManyPdus`]/[`TransactionError::TooManyEdus`] if the transaction
-/// exceeds the resource-limits table; never fails for a problem with an individual PDU (including
-/// a backfill attempt that gives up), which is reported per-event in the returned map instead.
+/// exceeds the resource-limits table; never fails for a problem with an individual PDU, which is
+/// answered per event in the returned map instead (`{}` for a backfill attempt that gives up).
 #[allow(clippy::too_many_arguments)]
 pub async fn process_transaction(
     origin: &str,
@@ -598,6 +599,7 @@ pub async fn process_transaction(
             }
         };
         let event_id = event.event_id().to_string();
+        let logged_id = event_id.clone();
         let value = event_json(&event);
         match sink.accept_verified_event(room_id, &event_id, &value).await {
             Ok(_) => {
@@ -634,12 +636,13 @@ pub async fn process_transaction(
                         }
                     },
                     Err(reason) => {
-                        results.insert(
-                            event_id,
-                            serde_json::json!({
-                                "error": format!("{}; fetching them: {reason}", rejected.error)
-                            }),
+                        let result = dropped_result(
+                            origin,
+                            &event_id,
+                            "missing_auth_events",
+                            &format!("{}; fetching them: {reason}", rejected.error),
                         );
+                        results.insert(event_id, result);
                     }
                 }
             }
@@ -681,15 +684,13 @@ pub async fn process_transaction(
                         }
                     },
                     Err(gave_up) => {
-                        results.insert(
-                            event_id,
-                            serde_json::json!({
-                                "error": format!(
-                                    "{}; backfill attempt to close it {gave_up}",
-                                    rejected.error
-                                )
-                            }),
+                        let result = dropped_result(
+                            origin,
+                            &event_id,
+                            "missing_ancestors",
+                            &format!("{}; backfill attempt to close it {gave_up}", rejected.error),
                         );
+                        results.insert(event_id, result);
                     }
                 }
             }
@@ -697,6 +698,15 @@ pub async fn process_transaction(
                 let result = rejection_result(origin, &event_id, &rejected);
                 results.insert(event_id, result);
             }
+        }
+        if let Some(result) = results.get(&logged_id) {
+            tracing::debug!(
+                origin,
+                room_id,
+                event_id = %logged_id,
+                %result,
+                "processed a PDU received over federation"
+            );
         }
     }
 
@@ -764,6 +774,27 @@ fn rejection_result(origin: &str, event_id: &str, rejected: &WriteRejected) -> V
     } else {
         serde_json::json!({ "error": rejected.error })
     }
+}
+
+/// What `/send` answers for a PDU this server received and verified but could not place because
+/// what it stands on -- prev events the sender did not supply, or auth events that could not be
+/// fetched or judged -- could not be obtained: `{}`, as Synapse answers every pushed PDU it has
+/// checked the signatures of (it stages them and processes them after answering; one that then
+/// fails is dropped, and the sender is never told). An error here made Sytest's `send_event` and
+/// Complement's `MustSendTransaction` fail where Synapse passes (`TestCorruptedAuthChain`, whose
+/// event cites an auth chain the sender withholds a link of). Dropped, logged at `info` with
+/// why, and counted in `hs_federation_pdus_dropped_total{reason}`; a later event citing it
+/// fetches it again.
+fn dropped_result(origin: &str, event_id: &str, reason: &'static str, detail: &str) -> Value {
+    crate::metrics::record_pdu_dropped(reason);
+    tracing::info!(
+        origin,
+        event_id,
+        reason,
+        detail,
+        "dropped a PDU received over federation: what it stands on could not be obtained"
+    );
+    serde_json::json!({})
 }
 
 /// Why [`process_transaction`] refused a whole transaction outright (as opposed to one PDU within

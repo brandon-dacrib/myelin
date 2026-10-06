@@ -325,6 +325,32 @@ static NOTARY_QUERIES: std::sync::LazyLock<Family<NotaryLabels, Counter>> =
     std::sync::LazyLock::new(Family::default);
 static STATE_FALLBACKS: std::sync::LazyLock<Family<StateFallbackLabels, Counter>> =
     std::sync::LazyLock::new(Family::default);
+static PDUS_DROPPED: std::sync::LazyLock<Family<PduDroppedLabels, Counter>> =
+    std::sync::LazyLock::new(Family::default);
+
+/// Labels of `hs_federation_pdus_dropped_total`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, prometheus_client::encoding::EncodeLabelSet)]
+pub struct PduDroppedLabels {
+    /// `missing_ancestors` (prev events the sending server would not, or could not, supply) or
+    /// `missing_auth_events` (auth events that could not be fetched or judged).
+    pub reason: &'static str,
+}
+
+/// Counts one PDU received over `/send` and dropped because what it stands on could not be
+/// obtained (answered `{}`, as Synapse answers every pushed PDU; see `crate::inbound`).
+pub fn record_pdu_dropped(reason: &'static str) {
+    PDUS_DROPPED
+        .get_or_create(&PduDroppedLabels { reason })
+        .inc();
+}
+
+/// How many pushed PDUs were dropped for `reason`, in this process.
+#[must_use]
+pub fn pdus_dropped(reason: &'static str) -> u64 {
+    PDUS_DROPPED
+        .get_or_create(&PduDroppedLabels { reason })
+        .get()
+}
 
 /// Labels of `hs_federation_state_fallbacks_total`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, prometheus_client::encoding::EncodeLabelSet)]
@@ -398,6 +424,9 @@ pub fn record_notary_answer(answered: bool) {
 /// - `hs_federation_state_fallbacks_total{outcome}`: missing prev events the `/state_ids`
 ///   fallback tried to take with the state another server answered for them, by outcome
 ///   ([`STATE_FALLBACK_OUTCOMES`]).
+/// - `hs_federation_pdus_dropped_total{reason}`: PDUs received over `/send` and dropped because
+///   their missing prev events (`missing_ancestors`) or auth events (`missing_auth_events`) could
+///   not be obtained.
 pub fn register_transport_metrics(registry: &mut Registry) {
     // Registered without `_total`: the text encoder appends it.
     registry.register(
@@ -417,6 +446,12 @@ pub fn register_transport_metrics(registry: &mut Registry) {
          server answered for them, by outcome (resolved, rejected, no_state, no_event, refused, \
          timed_out)",
         STATE_FALLBACKS.clone(),
+    );
+    registry.register(
+        "hs_federation_pdus_dropped",
+        "PDUs received over /send and dropped because their missing prev events \
+         (missing_ancestors) or auth events (missing_auth_events) could not be obtained",
+        PDUS_DROPPED.clone(),
     );
 }
 

@@ -726,7 +726,8 @@ async fn missing_prev_event_taken_with_state(version: ruma::RoomVersionId) {
 
 /// Sytest's "Federation rejects inbound events where the prev_events cannot be found": an
 /// event sent directly whose missing prev event `/get_missing_events` will not divulge is
-/// refused, and the state at that prev event is never asked for.
+/// dropped -- answered `{}`, as Synapse answers every pushed PDU, and counted in
+/// `hs_federation_pdus_dropped_total` -- and the state at that prev event is never asked for.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_event_whose_prev_event_nobody_divulges_is_refused_without_asking_the_state() {
     let server = start().await;
@@ -754,7 +755,13 @@ async fn an_event_whose_prev_event_nobody_divulges_is_refused_without_asking_the
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{answer}");
-    assert!(answer["pdus"][&sent_id]["error"].is_string(), "{answer}");
+    assert_eq!(answer["pdus"][&sent_id], json!({}), "{answer}");
+    assert!(
+        counter(
+            &metrics(&client, &server.base).await,
+            "hs_federation_pdus_dropped_total{reason=\"missing_ancestors\"}",
+        ) >= 1
+    );
     assert!(peer.requested("/get_missing_events/"));
     assert!(
         !peer.requested("/state_ids/"),

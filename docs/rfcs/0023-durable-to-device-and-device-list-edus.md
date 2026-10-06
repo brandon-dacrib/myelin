@@ -1,6 +1,7 @@
 # 0023. To-device and device-list EDUs should survive a restart of the sending server
 
-Status: **proposed**, 2026-10-04 (branch `agent/e2ee-gaps`). Author: track 08 (E2EE). Owner of
+Status: **accepted and implemented**, 2026-10-05 (branch `agent/fed-wave3`; proposed 2026-10-04
+on `agent/e2ee-gaps`). See "As implemented" at the end. Author: track 08 (E2EE). Owner of
 the change: track 06 (federation), which owns `hs_federation::sender`. Affects:
 `hs_federation::sender::FederationSender`, `hs_federation::outbound_store`,
 `crates/hs-cli/src/edus.rs` (`SenderEduOutbox`, `DeviceListAnnouncer`).
@@ -73,3 +74,30 @@ Callers (track 08, once it exists):
 
 None: new rows in the existing outbound keyspace. A server that has never written one reads an
 empty queue.
+
+## As implemented (2026-10-05, track 06)
+
+- `FederationSender::enqueue_durable_edu` exists as proposed, and the three EDU types
+  (`hs_federation::sender::DURABLE_EDU_TYPES`: `m.direct_to_device`, `m.device_list_update`,
+  `m.signing_key_update`) take the durable path from `enqueue_edu` and `enqueue_edu_local` too, so
+  every caller -- `SenderEduOutbox`, the `DeviceListAnnouncer`, and the mesh forwarding of
+  `crate::edu_forward` on the owning replica -- gets it without a second code path.
+- Store layout (`hs_federation::outbound_store`'s module docs): `hs_federation.outbound_edus`
+  `(destination, seq) -> {edu, key}` numbered from the PDUs' counter;
+  `hs_federation.outbound_edu_keys` `(destination, key) -> seq` for coalescing in one read;
+  `hs_federation.outbound_edu_lengths` per-destination counters for the bound and the worker's
+  "anything waiting" check. New `OutboundStore` methods: `enqueue_durable_edu`,
+  `peek_durable_edus`, `ack_durable_edus`, `durable_edu_len`, `durable_edus_queued`, and
+  `cursor`/`set_cursor` for the announcer's position.
+- The bound is `SenderConfig::max_queued_durable_edus_per_destination` (default 10 000), not yet
+  an `hs-config` key: past it the oldest goes, logged at `warn`.
+- Each transaction carries the destination's oldest durable EDUs first, then in-memory ones, up
+  to 100; the durable ones are deleted once the transaction is accepted (or this server's policy
+  forbids the destination). `resume` starts a worker for every destination with durable EDUs
+  waiting.
+- In a cluster, a durable EDU for a destination another replica sends for is still forwarded
+  over the mesh (as before), and the owning replica stores it durably; it is not written to the
+  shared store by the replica that produced it, so no rescan is needed to find it.
+- The announcer stores its stream position under `device_list_announcer` in the sender's store
+  (`hs-cli` `edus::ANNOUNCER_POSITION`) after each batch it hands over, and resumes from it at
+  start. One position for the whole cluster.

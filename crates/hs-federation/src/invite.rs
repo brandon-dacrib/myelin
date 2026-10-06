@@ -92,6 +92,12 @@ pub enum InviteError {
 /// Checks, co-signs and records an invite sent by `origin` (see the module docs). Returns the
 /// co-signed event, which is what the inviting server gets back.
 ///
+/// `room_is_held` says this server already holds the room (it is, or was, in it): then the
+/// invite's `invite_room_state` is not what tells the invitee what the room is, and MSC4311's
+/// create-event requirement is not applied (Sytest's server-ACL tests invite into a room the
+/// receiving server made, with an empty `invite_room_state`, and expect it taken, as Synapse
+/// takes it).
+///
 /// # Errors
 /// See [`InviteError`].
 #[allow(clippy::too_many_arguments)]
@@ -105,6 +111,7 @@ pub async fn receive_invite(
     room_version: &str,
     raw_event: &Value,
     invite_room_state: &[Value],
+    room_is_held: bool,
 ) -> Result<Value, InviteError> {
     let version = RoomVersionId::try_from(room_version)
         .map_err(|_| InviteError::IncompatibleRoomVersion(room_version.to_owned()))?;
@@ -116,13 +123,21 @@ pub async fn receive_invite(
 
     // MSC4311: the invite's room state must carry the room's create event -- a SHOULD from
     // room version 12 (whose room ID is the create event's hash, so it is what tells the
-    // invitee what room this is), a MAY before, where older servers do not send it.
-    if hs_model::room_version::rules_for(&version)
-        .is_some_and(|rules| rules.room_create_event_id_as_room_id)
+    // invitee what room this is), a MAY before, where older servers do not send it. A room
+    // this server holds needs no description from the inviter.
+    if !room_is_held
+        && hs_model::room_version::rules_for(&version)
+            .is_some_and(|rules| rules.room_create_event_id_as_room_id)
         && !invite_room_state
             .iter()
             .any(|e| e.get("type").and_then(Value::as_str) == Some("m.room.create"))
     {
+        tracing::info!(
+            room_id,
+            event_id,
+            origin,
+            "refused an invite: its invite_room_state does not carry the room's create event"
+        );
         return Err(InviteError::MissingState(
             "invite_room_state does not carry the room's m.room.create event".to_owned(),
         ));
@@ -392,6 +407,7 @@ mod tests {
             "11",
             &raw,
             &stripped,
+            false,
         )
         .await
         .unwrap();
@@ -418,7 +434,7 @@ mod tests {
     /// Complement's `TestMSC4311RejectInvalidStrippedStateFederation`: an invite to a room of
     /// version 12 whose `invite_room_state` lacks the create event is `400 M_MISSING_PARAM`
     /// (`InviteError::MissingState`), before anything else is looked at; before version 12 it
-    /// is not required.
+    /// is not required, nor for a room this server holds.
     #[tokio::test]
     async fn a_version_12_invite_without_the_create_event_in_its_room_state_is_refused() {
         let f = fixture();
@@ -434,12 +450,29 @@ mod tests {
             "12",
             &raw,
             &[],
+            false,
         )
         .await;
         assert!(
             matches!(refused, Err(InviteError::MissingState(_))),
             "{refused:?}"
         );
+        // A room this server holds (Sytest's "Banned servers cannot /invite", whose control
+        // invite carries no room state) is taken without one.
+        let held = receive_invite(
+            &f.handling,
+            &f.cache,
+            "invitee.example.org",
+            "inviter.example.org",
+            "!r:inviter.example.org",
+            &event_id,
+            "12",
+            &raw,
+            &[],
+            true,
+        )
+        .await;
+        assert!(held.is_ok(), "{held:?}");
         let taken = receive_invite(
             &f.handling,
             &f.cache,
@@ -450,6 +483,7 @@ mod tests {
             "11",
             &raw,
             &[],
+            false,
         )
         .await;
         assert!(taken.is_ok(), "{taken:?}");
@@ -469,6 +503,7 @@ mod tests {
             "11",
             &raw,
             &[],
+            false,
         )
         .await
         .unwrap_err();
@@ -485,6 +520,7 @@ mod tests {
             "11",
             &raw,
             &[],
+            false,
         )
         .await
         .unwrap_err();
@@ -506,6 +542,7 @@ mod tests {
             "11",
             &raw,
             &[],
+            false,
         )
         .await
         .unwrap_err();
@@ -522,6 +559,7 @@ mod tests {
             "11",
             &raw,
             &[],
+            false,
         )
         .await
         .unwrap_err();
@@ -537,6 +575,7 @@ mod tests {
             "999",
             &raw,
             &[],
+            false,
         )
         .await
         .unwrap_err();
@@ -571,6 +610,7 @@ mod tests {
             "11",
             &raw,
             &[],
+            false,
         )
         .await
         .unwrap_err();
@@ -590,6 +630,7 @@ mod tests {
             "11",
             &raw,
             &[],
+            false,
         )
         .await
         .unwrap_err();
@@ -608,6 +649,7 @@ mod tests {
             "11",
             &raw,
             &[],
+            false,
         )
         .await
         .unwrap_err();
@@ -625,6 +667,7 @@ mod tests {
             "11",
             &raw,
             &[],
+            false,
         )
         .await
         .expect("an invite whose content changed is taken redacted");

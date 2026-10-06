@@ -1281,6 +1281,9 @@ pub struct ServerQuerySource<B: KvBackend> {
     /// What answers `/user/keys/query` and `/user/keys/claim`
     /// ([`ServerQuerySource::with_keys`]); `None` answers neither.
     keys: Option<hs_e2e::state::E2eState<B>>,
+    /// Who is asked about a local alias the directory does not hold
+    /// ([`ServerQuerySource::with_appservices`]); `None` asks nobody.
+    appservices: Option<Arc<dyn hs_auth::appservice::AppserviceRegistry>>,
 }
 
 impl<B: KvBackend + 'static> ServerQuerySource<B> {
@@ -1298,7 +1301,22 @@ impl<B: KvBackend + 'static> ServerQuerySource<B> {
             rooms,
             own_server_name: own_server_name.into(),
             keys: None,
+            appservices: None,
         }
+    }
+
+    /// Asks the appservices whose alias namespace covers a local alias the directory does not
+    /// hold, when another server queries it (`GET /query/directory`), as the client-server
+    /// directory does (`hs_room::routes::aliases`) and as Synapse's
+    /// `DirectoryHandler.get_association` does for both: a bridge that answers yes has created
+    /// the room and the alias, and the answer is looked up again.
+    #[must_use]
+    pub fn with_appservices(
+        mut self,
+        appservices: Arc<dyn hs_auth::appservice::AppserviceRegistry>,
+    ) -> Self {
+        self.appservices = Some(appservices);
+        self
     }
 
     /// Answers other servers' key queries and claims from `e2e`'s store
@@ -1337,11 +1355,35 @@ impl<B: KvBackend + 'static> FederationQuerySource for ServerQuerySource<B> {
 
     async fn resolve_alias(&self, alias: &str) -> Option<(String, Vec<String>)> {
         let parsed = ruma::RoomAliasId::parse(alias).ok()?;
-        let room_id = self.rooms.resolve_alias(&parsed).ok().flatten()?;
-        // The only server known to be in the room from here is this one; a fuller answer would
-        // list every server with a joined member, which `/query/directory`'s callers treat as a
-        // hint rather than a guarantee.
-        Some((room_id.to_string(), vec![self.own_server_name.clone()]))
+        let room_id = match self.rooms.resolve_alias(&parsed).ok().flatten() {
+            Some(room_id) => room_id,
+            // Not held: a bridge whose namespace covers a local alias may provide it.
+            None if parsed.server_name().as_str() == self.own_server_name => {
+                let appservices = self.appservices.as_ref()?;
+                if !appservices.query_room_alias(alias).await {
+                    return None;
+                }
+                let provided = self.rooms.resolve_alias(&parsed).ok().flatten();
+                tracing::info!(
+                    alias,
+                    provided = provided.is_some(),
+                    "another server asked for a local alias an appservice provided"
+                );
+                provided?
+            }
+            None => return None,
+        };
+        // This server first, then every other server with a joined member, as Synapse answers:
+        // what the asking server tries to join through.
+        let mut servers = vec![self.own_server_name.clone()];
+        if let Ok(handle) = self.rooms.get_or_load(&room_id).await {
+            for server in handle.query(|actor| joined_servers(actor)).await {
+                if !servers.contains(&server) {
+                    servers.push(server);
+                }
+            }
+        }
+        Some((room_id.to_string(), servers))
     }
 
     async fn devices(&self, user_id: &str) -> Option<Value> {
@@ -1507,7 +1549,7 @@ const KEY_VALIDITY_SECS: u64 = 24 * 60 * 60;
 /// # Errors
 /// Returns the backend's error if the destination-backoff or outbound-queue keyspaces cannot be
 /// opened.
-// Seven parameters: the stores this mount reads, plus the one test seam (`scheme`). A struct
+// The stores this mount reads, plus the test seams (`scheme`, the resolvers). A struct
 // of them would be built at exactly one call site and read at exactly one, which is the same
 // list twice.
 #[allow(clippy::too_many_arguments)]
@@ -1517,6 +1559,7 @@ pub fn build_mount<B: KvBackend + 'static>(
     backend: B,
     rooms: Arc<RoomRegistry<B>>,
     auth: Arc<dyn hs_auth::store::AuthStore>,
+    appservices: Arc<dyn hs_auth::appservice::AppserviceRegistry>,
     e2e: hs_e2e::state::E2eState<B>,
     scheme: Option<&'static str>,
     resolver_override: Option<crate::serve::FederationResolvers>,
@@ -1590,7 +1633,8 @@ pub fn build_mount<B: KvBackend + 'static>(
         rooms: Arc::new(RegistryRoomSource::new(rooms.clone()).with_erasure(auth.clone())),
         queries: Arc::new(
             ServerQuerySource::new(auth, e2e.store.clone(), rooms.clone(), server_name.clone())
-                .with_keys(e2e),
+                .with_keys(e2e)
+                .with_appservices(appservices),
         ),
         policy: hs_federation::transport::InboundPolicy::new(
             config.federation.allow_public_rooms_over_federation,

@@ -1830,6 +1830,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             backend.clone(),
             rooms.clone(),
             auth_state.store.clone(),
+            auth_state.appservices.clone(),
             e2e_state.clone(),
             options.federation_scheme,
             options.federation_resolvers.clone(),

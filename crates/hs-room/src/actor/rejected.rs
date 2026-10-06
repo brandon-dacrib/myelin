@@ -137,7 +137,9 @@ impl<B: KvBackend> RoomActor<B> {
     /// `prev_sns` with every rejected event replaced by its own `prev_events` (recursively, up
     /// to [`MAX_REJECTED_WALK`] rejected events): what the state before an event that cites a
     /// rejected one is computed from, since the state after a rejected event is the state before
-    /// it. The input unchanged when it names no rejected event, as it almost always does.
+    /// it. A rejected outlier held with a fetched state is kept: the state after it is the one
+    /// it was held with. The input unchanged when it names no rejected event, as it almost
+    /// always does.
     pub(super) fn effective_prev_sns(&self, prev_sns: &[EventSn]) -> Vec<EventSn> {
         if !prev_sns.iter().any(|sn| self.rejected.contains(sn)) {
             return prev_sns.to_vec();
@@ -150,7 +152,9 @@ impl<B: KvBackend> RoomActor<B> {
             if !seen.insert(sn) {
                 continue;
             }
-            if !self.rejected.contains(&sn) {
+            // A rejected outlier held with a fetched state has a state after it of its own
+            // (the state before it); its prev events are not held to walk back to.
+            if !self.rejected.contains(&sn) || self.placed_outlier_roots.contains_key(&sn) {
                 out.push(sn);
                 continue;
             }
@@ -341,6 +345,98 @@ mod tests {
         assert!(matches!(
             two.accept_remote_event(unknown),
             Err(RoomError::MissingAncestors(_))
+        ));
+    }
+
+    /// Sytest's "outliers whose auth_events are in a different room are correctly rejected": a
+    /// missing prev event Q fetched with the state before it, whose auth events cite an event of
+    /// another room, is rejected (the fetched-state path answered "missing ancestors" for it,
+    /// and `/send` refused the PDU that started it) and still held with that state, so R and S
+    /// after it are judged at it -- R rejected for citing Q, S accepted -- across a reload too.
+    #[test]
+    fn a_fetched_prev_event_citing_another_rooms_event_is_rejected_and_what_follows_judged() {
+        let key = signing::SigningKeyPair::generate("1");
+        let (_one, mut two, one_join, two_join) = two_rooms_with_bob(&key);
+        let bob = "@bob:remote.example";
+        let room = two.room_id().as_str().to_owned();
+        let (create, power) = (
+            state_id(&two, "m.room.create", ""),
+            state_id(&two, "m.room.power_levels", ""),
+        );
+        let state_before_q: Vec<ruma::OwnedEventId> = two
+            .full_state()
+            .unwrap()
+            .iter()
+            .map(|e| e.event_id().to_owned())
+            .collect();
+        let q = remote_pdu(
+            &key,
+            serde_json::json!({
+                "type": "m.room.message", "sender": bob, "room_id": room,
+                "origin_server_ts": 30, "depth": 10, "content": {"body": "Q"},
+                "prev_events": ["$never-held"],
+                "auth_events": [create, power, one_join],
+            }),
+        );
+        let r = remote_pdu(
+            &key,
+            serde_json::json!({
+                "type": "m.room.message", "sender": bob, "room_id": room,
+                "origin_server_ts": 31, "depth": 11, "content": {"body": "R"},
+                "prev_events": [q.event_id().as_str()],
+                "auth_events": [create, power, q.event_id().as_str()],
+            }),
+        );
+        let s = remote_pdu(
+            &key,
+            serde_json::json!({
+                "type": "m.room.message", "sender": bob, "room_id": room,
+                "origin_server_ts": 32, "depth": 12, "content": {"body": "S"},
+                "prev_events": [r.event_id().as_str()],
+                "auth_events": [create, power, two_join],
+            }),
+        );
+        match two.accept_prev_event_with_state(q.clone(), &state_before_q, Vec::new()) {
+            Err(RoomError::Forbidden(reason)) => {
+                assert!(reason.contains("another room"), "{reason}")
+            }
+            other => panic!("expected Q rejected, got {other:?}"),
+        }
+        assert!(two.is_rejected_event(q.event_id()));
+        assert!(matches!(
+            two.accept_remote_event(r.clone()),
+            Err(RoomError::Forbidden(_))
+        ));
+        assert!(matches!(
+            two.accept_remote_event(s.clone()).unwrap(),
+            RemoteEventOutcome::Stored(_)
+        ));
+
+        // Reloaded, the state after Q is still the state before it.
+        let backend = two.backend.clone();
+        let tables = two.tables.clone();
+        let identity = two.identity.clone();
+        drop(two);
+        let mut two = RoomActor::load(
+            backend,
+            tables,
+            identity,
+            &ruma::RoomId::parse(&room).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let t = remote_pdu(
+            &key,
+            serde_json::json!({
+                "type": "m.room.message", "sender": bob, "room_id": room,
+                "origin_server_ts": 33, "depth": 11, "content": {"body": "T"},
+                "prev_events": [q.event_id().as_str()],
+                "auth_events": [create, power, two_join],
+            }),
+        );
+        assert!(matches!(
+            two.accept_remote_event(t).unwrap(),
+            RemoteEventOutcome::Stored(_)
         ));
     }
 
