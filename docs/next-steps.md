@@ -79,9 +79,11 @@ shows in `git branch -r --no-merged origin/main`.
 accepted, decision 0032), `push-gaps` `dcd02f4c`, and the presence-test wait `9f56e070`. **Sytest
 754 / 772** (99.6% of tests run; the three left are two races in the tests and one Synapse
 blacklists), **Complement federation 88 / 90**, **csapi 105 / 106**. Two Complement tests that
-passed on their branches fail on the merged tree (a remote long-poll never woken: `TestUnbanViaInvite`,
-`TestPushRuleRoomUpgrade`'s remote subtest); `agent/sync-wakes` is on them. **Roll to the first
-green image of `dcd02f4c` or later.** OpenAPI 0.1.10, last decision 0032, last RFC 0023.
+passed on their branches failed on the merged tree; **both fixed in `a1fa71a6`** (`sync-wakes`,
+status 05 session 18): concurrent `/pushrules` writes lost each other's rules (read-modify-write
+without a lock, and a stale cache refill; `hs-push` `update_ruleset`, track 10 to review), and a late
+unban that lost state resolution overwrote a re-invite in the hub (`drop_memberships_that_lost`).
+**Roll to the first green image of `a1fa71a6` or later.** Nothing is unmerged. OpenAPI 0.1.10, last decision 0032, last RFC 0023.
 
 **What is next, in order:**
 
