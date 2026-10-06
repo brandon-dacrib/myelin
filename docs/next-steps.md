@@ -74,6 +74,15 @@ threaded receipts, the mailer's HELO fallback), `auth-leftovers` (07: email pass
 appservice namespaces, deactivation unbinds, `/openid/userinfo` outside X-Matrix). Unmerged work
 shows in `git branch -r --no-merged origin/main`.
 
+**Wave 3 merged and measured** (2026-10-05 night, status 14 session 11, `dcd02f4c`): `room-render`
+`2fd513e5`, `auth-leftovers` `786f975a`, `sync-polling` `5ae81cd6`, `fed-wave3` `cfa1f389` (RFC 0023
+accepted, decision 0032), `push-gaps` `dcd02f4c`, and the presence-test wait `9f56e070`. **Sytest
+754 / 772** (99.6% of tests run; the three left are two races in the tests and one Synapse
+blacklists), **Complement federation 88 / 90**, **csapi 105 / 106**. Two Complement tests that
+passed on their branches fail on the merged tree (a remote long-poll never woken: `TestUnbanViaInvite`,
+`TestPushRuleRoomUpgrade`'s remote subtest); `agent/sync-wakes` is on them. **Roll to the first
+green image of `dcd02f4c` or later.** OpenAPI 0.1.10, last decision 0032, last RFC 0023.
+
 **What is next, in order:**
 
 1. **Roll the demo** to the first green image of `a70a5975` or later, then the bridge migration in

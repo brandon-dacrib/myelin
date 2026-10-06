@@ -1,7 +1,7 @@
 # Complement tests/csapi, top-level results. One line per test so that two runs can be compared
 # by name: a change is worth something when it moves a *named* test and that survives a re-run.
 # Written and read by tools/complement_triage.py (--write-baseline, --diff).
-# Run 17, 2026-10-05, 731d2433 (wave 2; run 16 on c2d74174 was 345 of 386, 87 of 106): 377 of 386 assertions, 102 of 106 top-level.
+# Run 18, 2026-10-05, dcd02f4c (wave 3; run 17 on 731d2433 was 377 of 386, 102 of 106): 383 of 386 assertions, 105 of 106 top-level (0 skipped).
 PASS TestAddAccountData
 PASS TestArchivedRoomsHistory
 PASS TestAsyncUpload
@@ -33,7 +33,7 @@ PASS TestFilter
 PASS TestGappedSyncLeaveSection
 PASS TestGetFilteredRoomMembers
 PASS TestGetRoomMembers
-FAIL TestGetRoomMembersAtPoint
+PASS TestGetRoomMembersAtPoint
 PASS TestInviteFromIgnoredUsersDoesNotAppearInSync
 PASS TestJson
 PASS TestKeyChangesLocal
@@ -93,8 +93,8 @@ PASS TestSyncFilter
 PASS TestSyncLeaveSection
 PASS TestSyncTimelineGap
 PASS TestTentativeEventualJoiningAfterRejecting
-FAIL TestThreadReceiptsInSyncMSC4102
-FAIL TestThreadedReceipts
+PASS TestThreadReceiptsInSyncMSC4102
+PASS TestThreadedReceipts
 PASS TestThreadsEndpoint
 PASS TestToDeviceMessages
 PASS TestTxnIdWithRefreshToken

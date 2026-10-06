@@ -1,7 +1,7 @@
 # Complement tests, top-level results. One line per test so that two runs can be compared
 # by name: a change is worth something when it moves a *named* test and that survives a re-run.
 # Written and read by tools/complement_triage.py (--write-baseline, --diff).
-# Run 12, 2026-10-05, 731d2433 (wave 2; run 11 on c2d74174 was 241 of 314, 58 of 90; NoCreators patched): 300 of 317 assertions, 82 of 90 top-level (1 skipped).
+# Run 13, 2026-10-05, dcd02f4c (wave 3; run 12 on 731d2433 was 300 of 317, 82 of 90): 315 of 317 assertions, 88 of 90 top-level (1 skipped).
 PASS TestACLs
 PASS TestACLsForEDUs
 PASS TestBannedUserCannotSendJoin
@@ -15,8 +15,8 @@ PASS TestClientSpacesSummary
 PASS TestClientSpacesSummaryJoinRules
 PASS TestComplementCanCreateValidV12Rooms
 PASS TestContentMediaV1
-FAIL TestCorruptedAuthChain
-FAIL TestDeviceListsUpdateOverFederation
+PASS TestCorruptedAuthChain
+PASS TestDeviceListsUpdateOverFederation
 FAIL TestDeviceListsUpdateOverFederationOnRoomJoin
 PASS TestEventAuth
 PASS TestFederatedClientSpaces
@@ -36,7 +36,7 @@ PASS TestJoinFederatedRoomFailOver
 PASS TestJoinFederatedRoomFromApplicationServiceBridgeUser
 PASS TestJoinFederatedRoomWithUnverifiableEvents
 PASS TestJoinViaRoomIDAndServerName
-FAIL TestJumpToDateEndpoint
+PASS TestJumpToDateEndpoint
 PASS TestKnockRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11
 PASS TestKnockRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV12
 PASS TestKnockRoomsInPublicRoomsDirectory
@@ -53,7 +53,7 @@ PASS TestMSC4289PrivilegedRoomCreators_Upgrades
 PASS TestMSC4291RoomIDAsHashOfCreateEvent
 PASS TestMSC4291RoomIDAsHashOfCreateEvent_AuthEventsOmitsCreateEvent
 PASS TestMSC4291RoomIDAsHashOfCreateEvent_CannotSendCreateEvent
-FAIL TestMSC4291RoomIDAsHashOfCreateEvent_RoomIDIsOnCreateEvent
+PASS TestMSC4291RoomIDAsHashOfCreateEvent_RoomIDIsOnCreateEvent
 PASS TestMSC4291RoomIDAsHashOfCreateEvent_UpgradedRooms
 PASS TestMSC4297StateResolutionV2_1_includes_conflicted_subgraph
 PASS TestMSC4297StateResolutionV2_1_starts_from_empty_set
@@ -86,8 +86,8 @@ PASS TestRestrictedRoomsSpacesSummaryFederation
 PASS TestRestrictedRoomsSpacesSummaryLocal
 PASS TestRoomSummaryAllowedRoomIDs
 SKIP TestSendJoinPartialStateResponse
-FAIL TestSyncOmitsStateChangeOnFilteredEvents
-FAIL TestToDeviceMessagesOverFederation
+PASS TestSyncOmitsStateChangeOnFilteredEvents
+PASS TestToDeviceMessagesOverFederation
 FAIL TestUnbanViaInvite
 PASS TestUnknownEndpoints
 PASS TestUnrejectRejectedEvents

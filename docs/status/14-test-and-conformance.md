@@ -1,5 +1,31 @@
 # 14 Test and conformance (integration lead): status
 
+## Session 11 (2026-10-05 night, the coordinator): wave 3, measured
+
+`main` at `dcd02f4c` (the five wave-3 branches and the presence-test fix), quiet machine, run
+`target/sytest/20261005-wave3`: **Sytest 754 / 772** (3 failed, 15 skipped), **99.6%** of tests
+run, from 742 (session 10). Client-server **523 / 534**, federation **103 / 105**, application
+services 22 / 22, non-spec 102 / 107. The three left: "Can invite unbound 3pid over federation with
+users from both servers" (a race in the test: the joiner's first `GET /events` starts after the
+event arrived; `fed-wave3`, status 06), "The only membership state included in a gapped
+incremental sync is for senders in the timeline" (on Synapse's own blacklist; the test says it
+should fail), "If a device list update goes missing, the server resyncs on the next one" (a race
+in the test; `e2ee-gaps`, status 08).
+
+**Complement**, same tree, patches applied: federation (run 13) **315 / 317 assertions, 88 / 90
+top-level** (from 300 / 317, 82 / 90): FAIL -> PASS `TestCorruptedAuthChain`,
+`TestDeviceListsUpdateOverFederation`, `TestToDeviceMessagesOverFederation`, `TestJumpToDateEndpoint`,
+`TestMSC4291RoomIDAsHashOfCreateEvent_RoomIDIsOnCreateEvent`, `TestSyncOmitsStateChangeOnFilteredEvents`.
+csapi (run 18) **383 / 386, 105 / 106** (from 377 / 386, 102 / 106): FAIL -> PASS
+`TestGetRoomMembersAtPoint`, `TestThreadedReceipts`, `TestThreadReceiptsInSyncMSC4102`. No PASS -> FAIL.
+
+Left: `TestDeviceListsUpdateOverFederationOnRoomJoin` (Synapse and Dendrite skip it; sending
+device-list updates on join would make two Sytest tests flaky), and two that passed on their
+branches but not on the merged tree, both a remote user's long-poll never seeing a change within
+5 s: `TestUnbanViaInvite` (the re-invite) and `TestPushRuleRoomUpgrade`'s remote manual-upgrade
+subtest (the push-rule account data, before the upgrade). `agent/sync-wakes` is on both.
+`tools/dashboard.py` regenerated `docs/status/dashboard.md` from these files.
+
 ## Session 10 (2026-10-04 evening, branch `agent/ops-web`): the dashboard reads the results, the NoCreators race, the IPv4-only warning
 
 Four wave-1 leftovers from `docs/next-steps.md`'s gaps table (tracks 14, 16 and 12).
