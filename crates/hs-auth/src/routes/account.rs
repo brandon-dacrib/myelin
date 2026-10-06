@@ -13,18 +13,172 @@ use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 
+use axum::http::StatusCode;
+use ruma::api::client::uiaa::{AuthData, AuthFlow, AuthType};
+
 use crate::error::MatrixError;
+use crate::middleware::MaybeRequester;
 use crate::password;
 use crate::reauth;
 use crate::requester::Requester;
 use crate::state::AuthState;
+use crate::uia;
 use hs_http::body::PermissiveJson;
 
-/// `POST /account/password`.
+/// `POST /account/password`: with an access token, the caller changes their own password after
+/// re-authenticating ([`reauth`]); without one, somebody resets the password of the account
+/// whose email address they prove they control (`m.login.email.identity`, see
+/// [`reset_password_by_email`]) -- the two cases of Synapse's `PasswordRestServlet`.
 pub async fn post_account_password(
     State(state): State<AuthState>,
-    requester: Requester,
+    MaybeRequester(requester): MaybeRequester,
     PermissiveJson(body): PermissiveJson<Value>,
+) -> Result<Response, MatrixError> {
+    match requester {
+        Some(requester) => change_password(state, requester, body).await,
+        None => reset_password_by_email(state, body).await,
+    }
+}
+
+/// Where a password reset's UIA session remembers the email address its
+/// `m.login.email.identity` stage proved.
+const RESET_ADDRESS_KEY: &str = "password_reset_address";
+
+/// Where a password reset's UIA session remembers the new password's hash, for a later round
+/// that does not send the password again (as Synapse's `PASSWORD_HASH` session data).
+const RESET_PASSWORD_HASH_KEY: &str = "password_reset_hash";
+
+/// The signed-out half of `POST /account/password`: one user-interactive auth flow,
+/// `[m.login.email.identity]`, whose `threepid_creds` name a validated password-reset session
+/// (`POST /account/password/email/requestToken`, its emailed link followed and confirmed:
+/// [`crate::threepid`]). Once it completes, the account that address belongs to gets the new
+/// password and, unless `logout_devices` is `false`, loses every session. A server that cannot
+/// send email has no way to reset a password, so it answers as before, `401
+/// M_MISSING_TOKEN`.
+async fn reset_password_by_email(state: AuthState, body: Value) -> Result<Response, MatrixError> {
+    if !crate::threepid::email_available(&state) {
+        return Err(MatrixError::missing_token());
+    }
+    let new_password = body.get("new_password").and_then(Value::as_str);
+    if let Some(new_password) = new_password {
+        state.config.get().password_policy.validate(new_password)?;
+    }
+    let flows = vec![AuthFlow::new(vec![AuthType::EmailIdentity])];
+    let auth: Option<AuthData> = match body.get("auth") {
+        Some(v) if !v.is_null() => Some(
+            serde_json::from_value(v.clone())
+                .map_err(|_| MatrixError::invalid_param("invalid auth data"))?,
+        ),
+        _ => None,
+    };
+    let store = state.store.as_ref();
+    let timeout = state.config.get().uia_session_timeout_ms;
+    let session_id = uia::session_id_for(
+        store,
+        auth.as_ref().and_then(AuthData::session),
+        state.now_ms(),
+        timeout,
+    )
+    .await?;
+    uia::bind_operation(store, &session_id, "POST /account/password").await?;
+    let submitted_type = auth.as_ref().and_then(AuthData::auth_type);
+    let stage_ok = match &auth {
+        Some(AuthData::EmailIdentity(e)) => {
+            let creds = &e.thirdparty_id_creds;
+            match crate::threepid::password_reset_address(
+                &state,
+                creds.sid.as_str(),
+                creds.client_secret.as_str(),
+            )
+            .await?
+            {
+                Some(address) => {
+                    store
+                        .set_session_data(&session_id, RESET_ADDRESS_KEY, json!(address))
+                        .await?;
+                    true
+                }
+                None => false,
+            }
+        }
+        _ => submitted_type.is_none(),
+    };
+    let outcome = uia::advance(
+        store,
+        &flows,
+        Some(&session_id),
+        submitted_type,
+        stage_ok,
+        state.now_ms(),
+        timeout,
+    )
+    .await?;
+    let remembered_hash = store
+        .get_session_data(&session_id, RESET_PASSWORD_HASH_KEY)
+        .await?
+        .and_then(|v| v.as_str().map(str::to_owned));
+
+    if !outcome.complete {
+        if let Some(new_password) = new_password
+            && remembered_hash.is_none()
+        {
+            let hash =
+                password::hash_password(new_password).map_err(|_| MatrixError::internal())?;
+            store
+                .set_session_data(&session_id, RESET_PASSWORD_HASH_KEY, json!(hash))
+                .await?;
+        }
+        let body = uia::incomplete_body(flows, outcome.completed, outcome.session_id);
+        return Ok((StatusCode::UNAUTHORIZED, Json(body)).into_response());
+    }
+
+    let address = store
+        .get_session_data(&session_id, RESET_ADDRESS_KEY)
+        .await?
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .ok_or_else(MatrixError::internal)?;
+    let user_id = crate::threepid::password_reset_owner(&state, &address).await?;
+    let user = state
+        .store
+        .get_user(&user_id)
+        .await?
+        .ok_or_else(MatrixError::internal)?;
+    if user.deactivated {
+        return Err(MatrixError::forbidden("This account has been deactivated"));
+    }
+    let hash = match (new_password, remembered_hash) {
+        (Some(new_password), _) => {
+            password::hash_password(new_password).map_err(|_| MatrixError::internal())?
+        }
+        (None, Some(hash)) => hash,
+        (None, None) => return Err(MatrixError::missing_param("Missing params: password")),
+    };
+    state.store.set_password_hash(&user_id, Some(hash)).await?;
+    let logout_devices = body
+        .get("logout_devices")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    if logout_devices {
+        state
+            .store
+            .delete_all_access_tokens_for_user(&user_id)
+            .await?;
+        state
+            .store
+            .delete_all_refresh_tokens_for_user(&user_id)
+            .await?;
+        state.notify_other_sessions_revoked(&user_id, None).await;
+    }
+    crate::threepid::count_password_reset("reset");
+    tracing::info!(user = %user_id, logout_devices, "a password was reset by email");
+    Ok(Json(json!({})).into_response())
+}
+
+/// The signed-in half of `POST /account/password`.
+async fn change_password(
+    state: AuthState,
+    requester: Requester,
+    body: Value,
 ) -> Result<Response, MatrixError> {
     requester.require_not_suspended()?;
 
@@ -194,8 +348,16 @@ mod tests {
     use crate::config::AuthConfig;
     use crate::store::UserRecord;
     use crate::token::TokenHash;
-    use axum::http::StatusCode;
     use ruma::user_id;
+
+    /// The signed-in call, as every test below but the email reset makes it.
+    async fn post_account_password(
+        state: State<AuthState>,
+        requester: Requester,
+        body: PermissiveJson<Value>,
+    ) -> Result<Response, MatrixError> {
+        super::post_account_password(state, MaybeRequester(Some(requester)), body).await
+    }
 
     async fn state_with_user(password: &str) -> (AuthState, Requester) {
         let state = AuthState::in_memory();

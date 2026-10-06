@@ -355,6 +355,11 @@ pub const SETTINGS: &[Setting] = &[
         "upstream OIDC clients are built at startup",
     ),
     hot("/auth/cas", "CAS sign-in reads it per request"),
+    hot("/auth/sso", "single sign-on reads it per sign-in"),
+    hot(
+        "/auth/next_link_domain_whitelist",
+        "a validation email request reads it",
+    ),
     restart(
         "/auth/mas_delegation",
         "delegation replaces the native issuer at startup",

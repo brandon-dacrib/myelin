@@ -411,9 +411,9 @@ pub const OPTIONS: &[KeyInfo] = &[
     },
     KeyInfo {
         key: "next_link_domain_whitelist",
-        classification: Classification::Unsupported,
-        native: "",
-        note: "R-PHASE1 (hs-auth, password-reset redirect allowlist).",
+        classification: Classification::Mapped,
+        native: "`auth.next_link_domain_whitelist`",
+        note: "The hosts a validation email's `next_link` may send people to; unset allows any `http(s)` address, as in Synapse.",
     },
     KeyInfo {
         key: "templates",
@@ -1179,9 +1179,9 @@ pub const OPTIONS: &[KeyInfo] = &[
     },
     KeyInfo {
         key: "sso",
-        classification: Classification::Unsupported,
-        native: "",
-        note: "R-PHASE1 (hs-auth). SSO landing-page customization (`client_whitelist`, template overrides, `update_profile_information`) is not yet in the schema; tracked with `templates`.",
+        classification: Classification::MappedDiff,
+        native: "`auth.sso.client_whitelist`",
+        note: "`client_whitelist` maps directly (a prefix match; this server's login fallback is always trusted, as in Synapse). `update_profile_information` and the template overrides (`templates`) are not carried over.",
     },
     KeyInfo {
         key: "jwt_config",

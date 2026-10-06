@@ -927,6 +927,7 @@ fn validation(sid: &str, secret: &str, created_at_ms: u64) -> super::ThreepidVal
         created_at_ms,
         token_expires_at_ms: created_at_ms + 1000,
         validated_at_ms: None,
+        next_link: None,
     }
 }
 

@@ -337,7 +337,6 @@ fn build_router<B: KvBackend>(
         hs_appservice::client_routes::client_router::<B>(mounts.appservice_queries);
     let appservice_client_router = appservice_client_router.with_state(auth.clone());
     let appservice_client_routes = appservice_client_manifest.routes;
-    let openid_auth = auth.clone();
     let ping_router =
         hs_appservice::routes::ping_router::<B>(mounts.appservice_ping).with_state(auth);
     let ping_routes = crate::appservice_manifest::routes();
@@ -559,12 +558,6 @@ fn build_router<B: KvBackend>(
     // called with the wrong method into `405 M_UNRECOGNIZED`, in whichever error shape the path's
     // API speaks -- see `hs_http::fallback`.
     let router = hs_http::fallback::apply(router);
-    // OpenID userinfo is unauthenticated, but its route sits behind the federation router's
-    // `X-Matrix` layer; answered here, before routing (see `crate::openid_userinfo`).
-    let router = router.layer(middleware::from_fn_with_state(
-        openid_auth,
-        crate::openid_userinfo::ahead_of_x_matrix,
-    ));
 
     let router = router
         // Without this a browser client cannot talk to this server at all: it fails every
@@ -1628,6 +1621,19 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             );
             auth.set_config(new);
             identity_service.set_allowed(config.auth.identity_servers.clone());
+            Ok(())
+        });
+        // `server.public_baseurl` is part of the auth settings too: the address CAS sends people
+        // back to and validation emails link to are built on it, per request. Before
+        // 2026-10-05 a change to it reached them only with the next `auth` change.
+        let auth = auth_state.clone();
+        live.on_change("server", move |config| {
+            let new = hs_auth::config::AuthConfig::try_from(config).map_err(|e| e.to_string())?;
+            tracing::info!(
+                public_baseurl = ?new.public_baseurl,
+                "sign-in and validation links now use the new public address"
+            );
+            auth.set_config(new);
             Ok(())
         });
         let registry = appservices.registry.clone();

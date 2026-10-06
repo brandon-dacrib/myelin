@@ -418,3 +418,205 @@ async fn an_email_address_is_validated_registered_with_signed_in_by_added_and_re
         "added counter"
     );
 }
+
+/// Element's "Forgot password?" against the real binary: signed out, `POST /account/password`
+/// asks for `m.login.email.identity`; the reset email's link first shows a confirmation page
+/// (a mail scanner fetching it validates nothing), its button sends the browser on to the
+/// client's `next_link`; the reset then sets the new password and signs every session out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forgotten_password_is_reset_by_email() {
+    let inbox = Inbox::default();
+    let smtp_port = smtp_server(inbox.clone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let base = format!("http://127.0.0.1:{port}");
+    let config_path = dir.path().join("homeserver.yaml");
+    let data = dir.path().join("data");
+    std::fs::write(
+        &config_path,
+        format!(
+            "server:\n  server_name: example.org\n  public_baseurl: {base}/\n\
+             listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, health, metrics]\n\
+             storage:\n  backend: embedded\n  data_dir: {data:?}\n\
+             media:\n  storage:\n    backend: local\n    path: {:?}\n\
+             auth:\n  enable_registration: true\n  next_link_domain_whitelist: [app.example]\n\
+             email:\n  smtp:\n    host: 127.0.0.1\n    port: {smtp_port}\n    security: none\n\
+             \x20 from: \"Myelin <noreply@example.org>\"\n  app_name: Myelin\n",
+            data.join("media"),
+        ),
+    )
+    .unwrap();
+    let mut server = HsProcess::serve(&config_path);
+    server.wait_for("setup_link=");
+    let nobody = Caller {
+        base: base.clone(),
+        token: None,
+    };
+
+    // Carol registers with her address.
+    let (_, challenge) = nobody
+        .call(
+            Method::POST,
+            "/_matrix/client/v3/register",
+            Some(json!({"username": "carol", "password": "old-password-1"})),
+        )
+        .await;
+    let session = challenge["session"].as_str().unwrap().to_owned();
+    let sid = validate(
+        &nobody,
+        &inbox,
+        "/_matrix/client/v3/register/email/requestToken",
+        "carol@example.com",
+        "registration",
+    )
+    .await;
+    let registered = nobody
+        .expect(
+            Method::POST,
+            "/_matrix/client/v3/register",
+            Some(json!({
+                "username": "carol", "password": "old-password-1",
+                "auth": {"type": "m.login.email.identity", "session": session,
+                         "threepid_creds": {"sid": sid, "client_secret": "clientSECRET.=_-"}},
+            })),
+        )
+        .await;
+    let carol = Caller {
+        base: base.clone(),
+        token: Some(registered["access_token"].as_str().unwrap().to_owned()),
+    };
+
+    // Signed out, the challenge is the email flow.
+    let (status, challenge) = nobody
+        .call(
+            Method::POST,
+            "/_matrix/client/v3/account/password",
+            Some(json!({"new_password": "new-password-2"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{challenge}");
+    assert_eq!(
+        challenge["flows"],
+        json!([{"stages": ["m.login.email.identity"]}])
+    );
+    let session = challenge["session"].as_str().unwrap().to_owned();
+
+    // A next_link on a host the operator did not list is refused before any email goes.
+    let ask = |next_link: &str| {
+        json!({"client_secret": "resetSECRET", "email": "carol@example.com",
+               "send_attempt": 1, "next_link": next_link})
+    };
+    let (status, refused) = nobody
+        .call(
+            Method::POST,
+            "/_matrix/client/v3/account/password/email/requestToken",
+            Some(ask("https://elsewhere.example/")),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(refused["errcode"], "M_INVALID_PARAM");
+    let before = inbox.messages().len();
+    let sid = nobody
+        .expect(
+            Method::POST,
+            "/_matrix/client/v3/account/password/email/requestToken",
+            Some(ask("https://app.example/reset-done")),
+        )
+        .await["sid"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let message = loop {
+        if let Some(m) = inbox.messages().get(before) {
+            break m.clone();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no reset email arrived"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
+    let link = link_in(&message);
+    assert!(
+        link.starts_with(&format!(
+            "{base}/_matrix/client/unstable/password_reset/email/submit_token?"
+        )),
+        "{link}"
+    );
+    let reset = json!({
+        "auth": {"type": "m.login.email.identity", "session": session,
+                 "threepid_creds": {"sid": sid, "client_secret": "resetSECRET"}},
+    });
+
+    // Fetching the link only shows the confirmation page.
+    let page = reqwest::get(&link).await.unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+    assert!(page.text().await.unwrap().contains("method=\"post\""));
+    let (status, _) = nobody
+        .call(
+            Method::POST,
+            "/_matrix/client/v3/account/password",
+            Some(reset.clone()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "not validated yet");
+
+    // Confirmed: the browser goes on to the client's page.
+    let confirmed = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap()
+        .post(&link)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(confirmed.status(), StatusCode::FOUND);
+    assert_eq!(
+        confirmed.headers()["location"],
+        "https://app.example/reset-done"
+    );
+
+    // The reset completes with the password the first round sent, and signs Carol out.
+    nobody
+        .expect(
+            Method::POST,
+            "/_matrix/client/v3/account/password",
+            Some(reset),
+        )
+        .await;
+    let (status, _) = carol
+        .call(Method::GET, "/_matrix/client/v3/account/whoami", None)
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "the old session is gone");
+    let (status, _) = nobody
+        .call(
+            Method::POST,
+            "/_matrix/client/v3/login",
+            Some(json!({"type": "m.login.password", "identifier": {"type": "m.id.user", "user": "carol"},
+                        "password": "old-password-1"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "the old password is refused");
+    let login = nobody
+        .expect(
+            Method::POST,
+            "/_matrix/client/v3/login",
+            Some(json!({"type": "m.login.password", "identifier": {"type": "m.id.user", "user": "carol"},
+                        "password": "new-password-2"})),
+        )
+        .await;
+    assert_eq!(login["user_id"], "@carol:example.org");
+
+    let metrics = reqwest::get(format!("{base}/metrics"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        metrics.contains(r#"hs_auth_password_resets_total{outcome="reset"} 1"#),
+        "{metrics}"
+    );
+    server.wait_for("a password was reset by email");
+}

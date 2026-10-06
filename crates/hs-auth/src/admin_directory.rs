@@ -479,12 +479,32 @@ impl UserDirectory for AuthStoreUserDirectory {
             .map_err(map_set_error)
     }
 
+    /// `users.deactivate` (and the deactivated toggle): the flag, then, when an account is
+    /// deactivated, its third-party identifiers as the client's own deactivation treats them --
+    /// unbound at every identity server this server bound them at, and removed from the
+    /// account ([`crate::threepid::on_admin_deactivation`]; an identity server that cannot be
+    /// reached is logged, not fatal). Without the auth state (a directory over a bare store)
+    /// only the flag changes.
     async fn set_deactivated(&self, user_id: &str, deactivated: bool) -> Result<(), SourceError> {
         let uid = parse_user_id(user_id)?;
         self.store
             .set_deactivated(&uid, deactivated)
             .await
-            .map_err(map_set_error)
+            .map_err(map_set_error)?;
+        if deactivated && let Some(state) = &self.accounts {
+            match crate::threepid::on_admin_deactivation(state, &uid).await {
+                Ok(failed) => tracing::info!(
+                    user = %uid,
+                    unbind_failures = failed,
+                    "a deactivated account's third-party identifiers were unbound and removed"
+                ),
+                Err(error) => {
+                    tracing::warn!(user = %uid, %error, "could not remove a deactivated account's third-party identifiers");
+                    return Err(SourceError::Unavailable(error.to_string()));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// `users.update`'s display name and avatar: the record first, then the rooms through the
@@ -1352,6 +1372,124 @@ mod tests {
             directory.get_device("@nobody:example.org", "A").await,
             Err(SourceError::NotFound)
         ));
+    }
+
+    /// An identity server that records unbinds, or cannot be reached at all.
+    struct RecordingIdentityServer {
+        reachable: bool,
+        unbinds: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::threepid::IdentityServerClient for RecordingIdentityServer {
+        fn allows(&self, _: &str) -> bool {
+            true
+        }
+        async fn bind(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &ruma::UserId,
+        ) -> Result<serde_json::Value, crate::threepid::IdentityServerError> {
+            unreachable!("deactivation never binds")
+        }
+        async fn unbind(
+            &self,
+            id_server: &str,
+            _: &ruma::UserId,
+            _: &str,
+            address: &str,
+        ) -> Result<crate::threepid::UnbindOutcome, crate::threepid::IdentityServerError> {
+            if !self.reachable {
+                return Err(crate::threepid::IdentityServerError::Unreachable(
+                    "connection refused".to_owned(),
+                ));
+            }
+            self.unbinds
+                .lock()
+                .unwrap()
+                .push(format!("{id_server} {address}"));
+            Ok(crate::threepid::UnbindOutcome::Unbound)
+        }
+    }
+
+    async fn bound_account(state: &AuthState, uid: &ruma::UserId) {
+        state
+            .store
+            .create_user(UserRecord::new(uid.to_owned(), 0))
+            .await
+            .unwrap();
+        state
+            .store
+            .add_threepid(ThreepidRecord {
+                user_id: uid.to_owned(),
+                medium: "email".to_owned(),
+                address: "carol@example.com".to_owned(),
+                added_at_ms: 0,
+                validated_at_ms: 0,
+            })
+            .await
+            .unwrap();
+        state
+            .store
+            .add_threepid_binding(crate::store::ThreepidBindingRecord {
+                user_id: uid.to_owned(),
+                medium: "email".to_owned(),
+                address: "carol@example.com".to_owned(),
+                id_server: "id.example".to_owned(),
+                bound_at_ms: 0,
+            })
+            .await
+            .unwrap();
+    }
+
+    /// `users.deactivate` unbinds the account's identifiers at the identity server and removes
+    /// them, as `POST /account/deactivate` does; an identity server that cannot be reached is
+    /// logged and the deactivation goes ahead, keeping the binding.
+    #[tokio::test]
+    async fn deactivation_unbinds_and_removes_third_party_identifiers() {
+        let uid = ruma::user_id!("@carol:example.org");
+        for reachable in [true, false] {
+            let state = AuthState::in_memory();
+            let server = Arc::new(RecordingIdentityServer {
+                reachable,
+                unbinds: std::sync::Mutex::new(Vec::new()),
+            });
+            state.install_identity_server_client(server.clone());
+            bound_account(&state, uid).await;
+            let directory = AuthStoreUserDirectory::from_auth_state(&state);
+            directory.set_deactivated(uid.as_str(), true).await.unwrap();
+            assert!(
+                state
+                    .store
+                    .get_user(uid)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .deactivated
+            );
+            assert!(state.store.list_threepids(uid).await.unwrap().is_empty());
+            let bindings = state.store.list_threepid_bindings(uid).await.unwrap();
+            if reachable {
+                assert_eq!(
+                    *server.unbinds.lock().unwrap(),
+                    ["id.example carol@example.com"]
+                );
+                assert!(bindings.is_empty());
+            } else {
+                assert_eq!(bindings.len(), 1, "kept for a later attempt");
+            }
+            assert_eq!(
+                state
+                    .store
+                    .get_user_by_threepid("email", "carol@example.com")
+                    .await
+                    .unwrap(),
+                None
+            );
+        }
     }
 
     #[tokio::test]

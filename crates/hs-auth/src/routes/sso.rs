@@ -258,32 +258,69 @@ async fn validate(
     Ok(response)
 }
 
-/// The local account `response` names, if there is one: the account linked to this CAS user
-/// before, or else the account whose localpart the CAS user name maps onto (an account that
-/// existed before CAS was turned on, as Synapse's grandfathering of existing users does).
+/// Which local account a CAS sign-in is for.
+enum CasAccount {
+    /// The account linked to this CAS user at an earlier sign-in.
+    Linked(OwnedUserId),
+    /// An account that existed before CAS was turned on, whose localpart the CAS user name maps
+    /// onto (Synapse's grandfathering of existing users).
+    Existing(OwnedUserId),
+    /// Nobody yet: a first sign-in makes this account.
+    New(OwnedUserId),
+    /// The CAS user name maps onto no valid user ID.
+    Unusable,
+}
+
+/// The local account `response` names: see [`CasAccount`].
 async fn existing_account(
     state: &AuthState,
     response: &CasResponse,
-) -> Result<(Option<OwnedUserId>, Option<OwnedUserId>), StoreError> {
+) -> Result<CasAccount, StoreError> {
     if let Some(user_id) = state
         .store
         .get_user_by_external_id(cas::PROVIDER, &response.user)
         .await?
     {
-        return Ok((Some(user_id), None));
+        return Ok(CasAccount::Linked(user_id));
     }
     let localpart = cas::map_username_to_localpart(&response.user);
     let Ok(user_id) = UserId::parse_with_server_name(localpart.as_str(), state.server_name())
     else {
-        return Ok((None, None));
+        return Ok(CasAccount::Unusable);
     };
     if user_id.validate_strict().is_err() {
-        return Ok((None, None));
+        return Ok(CasAccount::Unusable);
     }
     if state.store.get_user(&user_id).await?.is_some() {
-        Ok((Some(user_id), None))
+        Ok(CasAccount::Existing(user_id))
     } else {
-        Ok((None, Some(user_id)))
+        Ok(CasAccount::New(user_id))
+    }
+}
+
+/// Refuses a CAS sign-in that would make, or take over, an account in an application service's
+/// exclusive user namespace (a bridge's `@irc_.*`): the same `M_EXCLUSIVE` rule `/register`
+/// applies ([`crate::routes::register::refuse_exclusive`], which logs which appservice holds the
+/// name), as Synapse's SSO registration checks it through `check_username`.
+async fn refuse_exclusive(state: &AuthState, user_id: &UserId) -> Result<(), Box<Response>> {
+    match crate::routes::register::refuse_exclusive(state, user_id.localpart(), None).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.status() == StatusCode::BAD_REQUEST => {
+            cas::count("failed");
+            Err(Box::new(error_page(
+                StatusCode::FORBIDDEN,
+                "Your user name at the sign-in service is reserved here for a bridge or another \
+                 application service, so it cannot be used to sign in. Ask this server's \
+                 administrator.",
+            )))
+        }
+        Err(error) => {
+            tracing::warn!(%error, %user_id, "could not check a CAS sign-in against the appservice namespaces");
+            Err(Box::new(error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Something went wrong.",
+            )))
+        }
     }
 }
 
@@ -310,15 +347,20 @@ async fn login_ticket(
         Err(page) => return *page,
     };
     let internal = || error_page(StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong.");
-    let (existing, new) = match existing_account(state, &response).await {
+    let account = match existing_account(state, &response).await {
         Ok(found) => found,
         Err(error) => {
             tracing::warn!(%error, "could not look up a CAS sign-in's account");
             return internal();
         }
     };
-    let (user_id, created) = match (existing, new) {
-        (Some(user_id), _) => {
+    if let CasAccount::Existing(user_id) | CasAccount::New(user_id) = &account
+        && let Err(page) = refuse_exclusive(state, user_id).await
+    {
+        return *page;
+    }
+    let (user_id, created) = match account {
+        CasAccount::Linked(user_id) | CasAccount::Existing(user_id) => {
             match state.store.get_user(&user_id).await {
                 Ok(Some(user)) if user.deactivated => {
                     cas::count("failed");
@@ -333,7 +375,7 @@ async fn login_ticket(
             link(state, &user_id, &response).await;
             (user_id, false)
         }
-        (None, Some(user_id)) => {
+        CasAccount::New(user_id) => {
             match state
                 .store
                 .is_localpart_available(user_id.localpart())
@@ -366,7 +408,7 @@ async fn login_ticket(
             link(state, &user_id, &response).await;
             (user_id, true)
         }
-        (None, None) => {
+        CasAccount::Unusable => {
             cas::count("failed");
             tracing::info!(cas_user = %response.user, "refused a CAS sign-in: the user name makes no valid user ID");
             return error_page(
@@ -391,6 +433,12 @@ async fn login_ticket(
     tracing::info!(%user_id, cas_user = %response.user, new_account = created, "signed in through CAS");
 
     let continue_to = with_login_token(client, &token);
+    // An application the operator trusts (`auth.sso.client_whitelist`) gets the person back at
+    // once, without the confirmation page, as Synapse's `complete_sso_login` does.
+    if state.config.get().sso_client_is_trusted(client) {
+        tracing::debug!(%user_id, "sent a CAS sign-in straight back to a trusted application");
+        return redirect(&continue_to);
+    }
     page(
         StatusCode::OK,
         "Continue to your account",
@@ -429,7 +477,8 @@ async fn ui_auth_ticket(
     };
     let internal = || error_page(StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong.");
     let user_id = match existing_account(state, &response).await {
-        Ok((existing, _)) => existing,
+        Ok(CasAccount::Linked(user_id) | CasAccount::Existing(user_id)) => Some(user_id),
+        Ok(CasAccount::New(_) | CasAccount::Unusable) => None,
         Err(error) => {
             tracing::warn!(%error, "could not look up a CAS confirmation's account");
             return internal();
@@ -618,6 +667,80 @@ mod tests {
         assert_eq!(sso["identity_providers"][0]["id"], "cas");
         assert_eq!(sso["identity_providers"][0]["name"], "Campus CAS");
         assert!(flows.iter().any(|f| f["type"] == "m.login.cas"));
+    }
+
+    /// `auth.sso.client_whitelist`: a trusted application gets the person back with a `302`,
+    /// any other still gets the confirmation page.
+    #[tokio::test]
+    async fn a_trusted_client_is_sent_straight_back_without_the_confirmation_page() {
+        let (state, _) = state_with_cas(success("trusted"));
+        let mut config = (*state.config.get()).clone();
+        config.sso_client_whitelist = vec!["https://client/".to_owned()];
+        state.set_config(config);
+        let uri = format!(
+            "/login/cas/ticket?redirectUrl={}&ticket=t",
+            cas::encode_component("https://client/app#/home")
+        );
+        let (status, location, _) = get(&state, &uri).await;
+        assert_eq!(status, StatusCode::FOUND);
+        let location = location.unwrap();
+        assert!(
+            location.starts_with("https://client/app?loginToken="),
+            "{location}"
+        );
+        assert!(location.ends_with("#/home"), "{location}");
+
+        // Not on the list: the page, as before.
+        let uri = format!(
+            "/login/cas/ticket?redirectUrl={}&ticket=t",
+            cas::encode_component("https://client.evil.example/")
+        );
+        let (status, location, body) = get(&state, &uri).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(location, None);
+        assert!(body.contains("Continue"), "{body}");
+    }
+
+    /// A CAS user name inside a bridge's exclusive namespace neither makes an account nor signs
+    /// in to the bridge's existing one, as `/register` refuses it with `M_EXCLUSIVE`.
+    #[tokio::test]
+    async fn a_cas_user_cannot_take_a_name_in_an_appservices_exclusive_namespace() {
+        let (state, _) = state_with_cas(success("irc_bob"));
+        let registry = crate::appservice::InMemoryAppserviceRegistry::new();
+        registry.insert(
+            "as_secret",
+            crate::appservice::AppserviceRecord::new(
+                "irc",
+                ruma::user_id!("@ircbot:example.org").to_owned(),
+                vec![crate::appservice::NamespaceRule {
+                    regex: regex::Regex::new(r"^@irc_.*:example\.org$").unwrap(),
+                    exclusive: true,
+                }],
+            ),
+        );
+        let state = AuthState {
+            appservices: Arc::new(registry),
+            ..state
+        };
+        let uri = format!(
+            "/login/cas/ticket?redirectUrl={}&ticket=t",
+            cas::encode_component(CLIENT)
+        );
+        let (status, _, body) = get(&state, &uri).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(!body.contains("loginToken"));
+        let ghost = ruma::user_id!("@irc_bob:example.org");
+        assert!(state.store.get_user(ghost).await.unwrap().is_none());
+
+        // The bridge's own ghost, already registered, is not signed in to either.
+        state
+            .store
+            .create_user(UserRecord::new(ghost.to_owned(), 0))
+            .await
+            .unwrap();
+        let (status, _, body) = get(&state, &uri).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(!body.contains("loginToken"));
     }
 
     #[tokio::test]

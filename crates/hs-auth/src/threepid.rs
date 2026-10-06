@@ -10,7 +10,16 @@
 //! (`GET /_matrix/client/unstable/<purpose>/email/submit_token`) marks the session
 //! (`sid`, kept by [`crate::store::ThreepidStore`]) validated. The client then presents
 //! `{sid, client_secret}` where it wants the address used: the `m.login.email.identity`
-//! registration stage, or `POST /account/3pid/add`. This is Synapse's "local" email behaviour
+//! registration stage, `POST /account/3pid/add`, or (signed out) `POST /account/password`,
+//! which resets the password of the account the address belongs to ([`password_reset_owner`]).
+//!
+//! A client may name a `next_link`, where the person's browser goes once the link is followed
+//! (its own "you can go back now" page); [`check_next_link`] allows `http(s)` addresses only, and
+//! only on the hosts `auth.next_link_domain_whitelist` lists when it is set, as Synapse's
+//! `assert_valid_next_link`. A password reset link first shows a page asking the person to
+//! confirm (a `POST` back to the same address), so that a mail scanner fetching every link in
+//! an email cannot validate the session on its own, as Synapse's `password_reset_confirmation`
+//! page does. This is Synapse's "local" email behaviour
 //! (`threepid_behaviour_email = LOCAL`); this server never delegates email validation to an
 //! identity server. Validation is available while the server can send email and knows the
 //! address its links point back to: `email.smtp.host`, `email.from` and
@@ -202,8 +211,22 @@ struct ChangeLabels {
     action: &'static str,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, EncodeLabelSet)]
+struct ResetLabels {
+    outcome: &'static str,
+}
+
 static VALIDATIONS: LazyLock<Family<ValidationLabels, Counter>> = LazyLock::new(Family::default);
 static CHANGES: LazyLock<Family<ChangeLabels, Counter>> = LazyLock::new(Family::default);
+static PASSWORD_RESETS: LazyLock<Family<ResetLabels, Counter>> = LazyLock::new(Family::default);
+
+/// Counts one signed-out password reset by email: `reset`, or `unknown_address` (the validated
+/// address belongs to no account any more).
+pub(crate) fn count_password_reset(outcome: &'static str) {
+    PASSWORD_RESETS
+        .get_or_create(&ResetLabels { outcome })
+        .inc();
+}
 
 fn count_validation(outcome: &'static str) {
     VALIDATIONS
@@ -222,8 +245,9 @@ pub(crate) fn count_change(action: &'static str) {
 
 /// Registers this module's counters into `registry`:
 /// `hs_auth_threepid_validations_total{medium,outcome}` (`sent`, `send_failed`, `validated`,
-/// `rejected`: a link with a wrong or expired token) and
-/// `hs_auth_threepid_changes_total{action}` (`added`, `deleted`, `bound`, `unbound`).
+/// `rejected`: a link with a wrong or expired token),
+/// `hs_auth_threepid_changes_total{action}` (`added`, `deleted`, `bound`, `unbound`) and
+/// `hs_auth_password_resets_total{outcome}` (`reset`, `unknown_address`).
 pub fn register_metrics(registry: &mut prometheus_client::registry::Registry) {
     registry.register(
         "hs_auth_threepid_validations",
@@ -236,6 +260,12 @@ pub fn register_metrics(registry: &mut prometheus_client::registry::Registry) {
         "Changes to users' third-party identifiers, by action: added to or deleted from an \
          account, bound or unbound at an identity server",
         CHANGES.clone(),
+    );
+    registry.register(
+        "hs_auth_password_resets",
+        "Passwords reset by somebody signed out who proved they control the account's email \
+         address, by outcome",
+        PASSWORD_RESETS.clone(),
     );
 }
 
@@ -300,7 +330,8 @@ fn token_hash(token: &str) -> String {
 
 /// Percent-encodes a query value (the token, secret and session id are already from a safe
 /// alphabet, but a `client_secret` may contain `=`).
-fn query_escape(value: &str) -> String {
+#[must_use]
+pub fn query_escape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for b in value.bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
@@ -318,6 +349,33 @@ fn medium_not_supported(message: &str) -> MatrixError {
         ErrCode::ThreepidMediumNotSupported,
         message,
     )
+}
+
+/// Checks a client's `next_link`, as Synapse's `assert_valid_next_link`: an `http` or `https`
+/// address (never `file:`, which would point at the person's own disk), on a host
+/// `auth.next_link_domain_whitelist` lists when that is set. Returns the address to store.
+///
+/// # Errors
+/// `400 M_INVALID_PARAM` otherwise.
+pub fn check_next_link(state: &AuthState, next_link: &str) -> Result<String, MatrixError> {
+    let refused = || {
+        tracing::info!(next_link, "refused a validation email's next_link");
+        MatrixError::invalid_param("'next_link' domain not included in whitelist, or not http(s)")
+    };
+    let parsed = reqwest::Url::parse(next_link).map_err(|_| refused())?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(refused());
+    }
+    if let Some(allowed) = &state.config.get().next_link_domain_whitelist {
+        let host = parsed.host_str().unwrap_or_default();
+        if !allowed
+            .iter()
+            .any(|domain| domain.eq_ignore_ascii_case(host))
+        {
+            return Err(refused());
+        }
+    }
+    Ok(next_link.to_owned())
 }
 
 /// `POST .../email/requestToken` for `purpose`: checks the request, and sends a validation
@@ -363,6 +421,11 @@ pub async fn request_email_token(
                 .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
         })
         .ok_or_else(|| MatrixError::missing_param("Missing send_attempt"))?;
+    let next_link = match body.get("next_link") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(link)) => Some(check_next_link(state, link)?),
+        Some(_) => return Err(MatrixError::invalid_param("next_link must be a string")),
+    };
 
     let owner = state.store.get_user_by_threepid("email", &address).await?;
     match purpose {
@@ -463,6 +526,7 @@ pub async fn request_email_token(
             created_at_ms,
             token_expires_at_ms: now + TOKEN_LIFETIME_MS,
             validated_at_ms: None,
+            next_link,
         })
         .await?;
     count_validation("sent");
@@ -558,6 +622,45 @@ pub async fn validated_session(
         && record.validated_at_ms.is_some()
         && state.now_ms() <= record.created_at_ms + VALIDATED_SESSION_LIFETIME_MS;
     Ok(usable.then_some(record))
+}
+
+/// What a signed-out `POST /account/password`'s `m.login.email.identity` stage proves: the
+/// address of the validated password-reset session `{sid, client_secret}` names (a session
+/// started by `/account/password/email/requestToken`, whose link was followed and confirmed).
+/// `None` for an unknown, unvalidated, expired or other-purpose session.
+///
+/// # Errors
+/// A storage failure.
+pub async fn password_reset_address(
+    state: &AuthState,
+    sid: &str,
+    client_secret: &str,
+) -> Result<Option<String>, MatrixError> {
+    Ok(validated_session(state, sid, client_secret)
+        .await?
+        .filter(|r| r.medium == "email" && r.purpose == Purpose::PasswordReset.as_str())
+        .map(|r| r.address))
+}
+
+/// The account whose password a reset by `address` changes: the one the address is bound to.
+///
+/// # Errors
+/// `404 M_NOT_FOUND` when no account has it (any more), as Synapse answers.
+pub async fn password_reset_owner(
+    state: &AuthState,
+    address: &str,
+) -> Result<ruma::OwnedUserId, MatrixError> {
+    match state.store.get_user_by_threepid("email", address).await? {
+        Some(user_id) => Ok(user_id),
+        None => {
+            count_password_reset("unknown_address");
+            Err(MatrixError::new(
+                StatusCode::NOT_FOUND,
+                ErrCode::NotFound,
+                "Email address not found",
+            ))
+        }
+    }
 }
 
 /// Adds a validated address to `user_id`'s account.
@@ -770,6 +873,51 @@ pub async fn on_deactivation(state: &AuthState, user_id: &UserId) -> Result<bool
         }
     }
     Ok(all_unbound)
+}
+
+/// What an administrator deactivating `user_id` does to its third-party identifiers
+/// (`users.deactivate`, Synapse's admin deactivation): the same as [`on_deactivation`] --
+/// every binding this server made is unbound at its identity server, then every identifier is
+/// removed from the account -- except that an identity server which cannot be asked does not
+/// undo the administrator's decision. Its failure is logged at `WARN` and its binding kept (so
+/// the account's owner, or a later attempt, still knows where it was), and the rest go on.
+/// Returns how many bindings could not be unbound.
+///
+/// # Errors
+/// Storage failures.
+pub async fn on_admin_deactivation(
+    state: &AuthState,
+    user_id: &UserId,
+) -> Result<usize, MatrixError> {
+    let mut failed = 0;
+    let bindings = state.store.list_threepid_bindings(user_id).await?;
+    let mut seen = std::collections::BTreeSet::new();
+    for binding in bindings {
+        if !seen.insert((binding.medium.clone(), binding.address.to_ascii_lowercase())) {
+            continue;
+        }
+        if let Err(error) = unbind(state, user_id, &binding.medium, &binding.address, None).await {
+            failed += 1;
+            tracing::warn!(
+                user = %user_id,
+                medium = binding.medium,
+                id_server = binding.id_server,
+                %error,
+                "could not unbind a deactivated account's third-party identifier"
+            );
+        }
+    }
+    for threepid in state.store.list_threepids(user_id).await? {
+        match state
+            .store
+            .remove_threepid(user_id, &threepid.medium, &threepid.address)
+            .await
+        {
+            Ok(()) | Err(crate::store::StoreError::NotFound(_)) => count_change("deleted"),
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(failed)
 }
 
 #[cfg(test)]

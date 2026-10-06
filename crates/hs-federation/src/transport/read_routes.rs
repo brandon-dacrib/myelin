@@ -52,11 +52,6 @@ pub(super) fn add_routes(builder: Builder<FederationState>) -> Builder<Federatio
             timestamp_to_event,
             meta("federationTimestampToEvent"),
         )
-        .get(
-            "/openid/userinfo",
-            openid_userinfo,
-            meta("federationOpenIdUserinfo"),
-        )
         .get("/event/{eventId}", get_event, meta("federationGetEvent"))
         .get("/state/{roomId}", get_state, meta("federationGetState"))
         .get(
@@ -76,6 +71,23 @@ pub(super) fn add_routes(builder: Builder<FederationState>) -> Builder<Federatio
             get_missing_events,
             meta("federationGetMissingEvents"),
         )
+}
+
+/// The one federation route that is not called by a homeserver and so carries no `X-Matrix`
+/// signature: `GET /openid/userinfo`, which an integration manager or a widget's backend calls
+/// with the OpenID token a user handed it. [`super::router`] mounts it beside, not inside, the
+/// `X-Matrix` layer (before 2026-10-05 it sat inside, and every real call was refused
+/// "signature verification failed"; `hs serve` answered it ahead of routing instead).
+pub(super) fn add_unsigned_routes(builder: Builder<FederationState>) -> Builder<FederationState> {
+    builder.get(
+        "/openid/userinfo",
+        openid_userinfo,
+        hs_http::router::RouteMeta::new(
+            hs_http::router::Surface::MatrixFederation,
+            hs_http::router::AuthKind::None,
+        )
+        .with_operation_id("federationOpenIdUserinfo"),
+    )
 }
 
 /// Extracts the requesting server's name from the (already-verified, by the layer above) request.
@@ -326,16 +338,19 @@ async fn timestamp_to_event(
     }
 }
 
+/// `GET /openid/userinfo?access_token=`: `{"sub": user_id}` for a live OpenID token. A missing
+/// token is `401 M_MISSING_TOKEN` and an unknown or expired one `401 M_UNKNOWN_TOKEN`, as
+/// Synapse's `OpenIdUserInfo` answers.
 async fn openid_userinfo(
     State(state): State<FederationState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let Some(token) = params.get("access_token") else {
-        return MatrixError::missing_param("access_token").into_response();
+        return MatrixError::missing_token().into_response();
     };
     match state.queries.openid_userinfo(token).await {
         Some(user_id) => axum::Json(serde_json::json!({ "sub": user_id })).into_response(),
-        None => MatrixError::unknown_token("invalid or expired OpenID token").into_response(),
+        None => MatrixError::unknown_token("Access Token unknown or expired").into_response(),
     }
 }
 

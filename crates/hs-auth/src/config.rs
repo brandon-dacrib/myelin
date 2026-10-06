@@ -130,6 +130,16 @@ pub struct AuthConfig {
     /// Sign-in through a CAS server (`auth.cas`, Synapse's `cas_config`), if configured. See
     /// [`crate::cas`].
     pub cas: Option<CasSettings>,
+
+    /// Address prefixes of the applications single sign-on sends people straight back to,
+    /// without the confirmation page (`auth.sso.client_whitelist`, Synapse's
+    /// `sso.client_whitelist`). See [`AuthConfig::sso_client_is_trusted`].
+    pub sso_client_whitelist: Vec<String>,
+
+    /// The hosts a validation email's `next_link` may name (`auth.next_link_domain_whitelist`,
+    /// Synapse's `next_link_domain_whitelist`): `None` allows any `http(s)` address. See
+    /// [`crate::threepid::check_next_link`].
+    pub next_link_domain_whitelist: Option<Vec<String>>,
 }
 
 /// A configured CAS server ([`AuthConfig::cas`]): `hs_config::auth::CasConfig`, with its URLs
@@ -175,6 +185,8 @@ impl Default for AuthConfig {
             registration_shared_secret: None,
             public_baseurl: None,
             cas: None,
+            sso_client_whitelist: Vec::new(),
+            next_link_domain_whitelist: None,
         }
     }
 }
@@ -185,6 +197,24 @@ impl AuthConfig {
     #[must_use]
     pub fn sso_available(&self) -> bool {
         self.cas.is_some()
+    }
+
+    /// Whether single sign-on may send a person straight back to `client_redirect_url`, without
+    /// the page asking them to confirm: its address begins with an entry of
+    /// [`AuthConfig::sso_client_whitelist`] (a plain prefix match, as Synapse's), or it is this
+    /// server's own login fallback (`{public_baseurl}/_matrix/static/client/login`), which
+    /// Synapse trusts too since the page it would show names this server, not an application.
+    #[must_use]
+    pub fn sso_client_is_trusted(&self, client_redirect_url: &str) -> bool {
+        let fallback = self
+            .public_baseurl
+            .as_deref()
+            .map(|base| format!("{base}/_matrix/static/client/login"));
+        self.sso_client_whitelist
+            .iter()
+            .map(String::as_str)
+            .chain(fallback.as_deref())
+            .any(|prefix| !prefix.is_empty() && client_redirect_url.starts_with(prefix))
     }
 }
 
@@ -303,6 +333,8 @@ impl TryFrom<&hs_config::Config> for AuthConfig {
                 required_attributes: cas.required_attributes.clone(),
                 idp_name: cas.idp_name.clone(),
             }),
+            sso_client_whitelist: config.auth.sso.client_whitelist.clone(),
+            next_link_domain_whitelist: config.auth.next_link_domain_whitelist.clone(),
             ..Self::default()
         };
 
@@ -396,6 +428,36 @@ impl PasswordPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sso_clients_are_trusted_by_prefix_and_the_login_fallback_always() {
+        let mut config = AuthConfig {
+            sso_client_whitelist: vec!["https://app.example/".to_owned()],
+            public_baseurl: Some("https://hs.example".to_owned()),
+            ..AuthConfig::default()
+        };
+        assert!(config.sso_client_is_trusted("https://app.example/#/home"));
+        assert!(!config.sso_client_is_trusted("https://app.example.evil/"));
+        assert!(!config.sso_client_is_trusted("https://other.example/"));
+        assert!(config.sso_client_is_trusted("https://hs.example/_matrix/static/client/login/"));
+        config.public_baseurl = None;
+        config.sso_client_whitelist = vec![String::new()];
+        assert!(!config.sso_client_is_trusted("https://anything/"));
+    }
+
+    #[test]
+    fn the_sso_and_next_link_settings_come_from_the_native_configuration() {
+        let mut native = hs_config::Config::default();
+        native.server.server_name = "example.org".to_owned();
+        native.auth.sso.client_whitelist = vec!["https://app.example/".to_owned()];
+        native.auth.next_link_domain_whitelist = Some(vec!["app.example".to_owned()]);
+        let config = AuthConfig::try_from(&native).unwrap();
+        assert_eq!(config.sso_client_whitelist, ["https://app.example/"]);
+        assert_eq!(
+            config.next_link_domain_whitelist,
+            Some(vec!["app.example".to_owned()])
+        );
+    }
 
     #[test]
     fn default_policy_accepts_anything() {

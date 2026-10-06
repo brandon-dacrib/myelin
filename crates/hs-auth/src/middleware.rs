@@ -282,6 +282,34 @@ impl FromRequestParts<AuthState> for AllowGuest {
     }
 }
 
+/// [`Requester`] when the request carries an access token at all (an `Authorization` header or
+/// an `access_token` query parameter), else `None` -- Synapse's `has_access_token` test. A
+/// token that is there but wrong is still refused, as for [`Requester`]. For the one endpoint
+/// that serves both the signed in and the signed out: `POST /account/password`, which changes
+/// the caller's password or resets one by email.
+pub struct MaybeRequester(pub Option<Requester>);
+
+impl FromRequestParts<AuthState> for MaybeRequester {
+    type Rejection = MatrixError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AuthState,
+    ) -> Result<Self, Self::Rejection> {
+        let has_token = parts.headers.contains_key(AUTHORIZATION)
+            || query_params(parts, state)
+                .await
+                .contains_key("access_token");
+        if has_token {
+            Ok(Self(Some(
+                Requester::from_request_parts(parts, state).await?,
+            )))
+        } else {
+            Ok(Self(None))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

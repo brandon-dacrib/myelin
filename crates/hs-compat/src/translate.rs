@@ -847,6 +847,14 @@ fn translate_key(key: &str, v: &Value, config: &mut Config) {
         }
         "matrix_authentication_service" => apply_mas(v, config),
         "cas_config" => apply_cas(v, config),
+        "sso" => {
+            if let Some(clients) = get_str_list(v, "client_whitelist") {
+                config.auth.sso.client_whitelist = clients;
+            }
+        }
+        "next_link_domain_whitelist" => {
+            config.auth.next_link_domain_whitelist = get_str_list_value(v);
+        }
 
         "app_service_config_files" => {
             if let Some(list) = get_str_list_value(v) {
@@ -1329,6 +1337,27 @@ database:
             config.auth.registration_shared_secret.as_str(),
             Some("inline-secret")
         );
+    }
+
+    #[test]
+    fn translates_the_sso_client_whitelist_and_next_link_domains() {
+        let yaml = "server_name: example.org\n\
+                    sso:\n  client_whitelist: [\"https://app.example/\"]\n  \
+                    update_profile_information: true\n\
+                    next_link_domain_whitelist: [app.example]\n";
+        let (config, report) = translate(yaml, TranslateOptions::default()).unwrap();
+        assert!(!report.has_blocking());
+        assert_eq!(config.auth.sso.client_whitelist, ["https://app.example/"]);
+        assert_eq!(
+            config.auth.next_link_domain_whitelist,
+            Some(vec!["app.example".to_owned()])
+        );
+        let (unset, _) = translate(
+            "server_name: example.org\nnext_link_domain_whitelist: null\n",
+            TranslateOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(unset.auth.next_link_domain_whitelist, None);
     }
 
     #[test]

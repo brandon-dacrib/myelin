@@ -753,6 +753,11 @@ pub struct ThreepidValidationRecord {
     pub token_expires_at_ms: u64,
     /// When the link was followed, if it has been.
     pub validated_at_ms: Option<u64>,
+    /// Where the person is sent once they follow the link (`next_link`, an address the client
+    /// asked for and [`crate::threepid::check_next_link`] allowed), if anywhere. Absent from
+    /// sessions stored before 2026-10-05.
+    #[serde(default)]
+    pub next_link: Option<String>,
 }
 
 /// A third-party identifier this server bound at an identity server for one of its users

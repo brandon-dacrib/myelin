@@ -146,7 +146,8 @@ pub fn unstable_router() -> Router<AuthState> {
         )
         .route(
             "/password_reset/email/submit_token",
-            get(threepid::get_password_reset_submit_token),
+            get(threepid::get_password_reset_submit_token)
+                .post(threepid::post_password_reset_submit_token),
         )
         .route("/account/3pid/add", post(threepid::post_account_3pid_add))
         .route(

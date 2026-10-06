@@ -2,7 +2,9 @@
 
 Track brief: `docs/workstreams/07-auth-and-identity.md`. Owner crate: `hs-auth`.
 
-Last updated: 2026-10-04 (UIA binding, registration sessions, CAPTCHA, CAS, self-service 3PIDs,
+Last updated: 2026-10-05 (email password reset, `next_link`, CAS whitelist and bridge
+namespaces, admin deactivation unbinds, the public address reload, OpenID outside `X-Matrix`;
+2026-10-04: UIA binding, registration sessions, CAPTCHA, CAS, self-service 3PIDs,
 OpenID and whois, below; session 12: account erasure; session 11: guest access and
 third-party invites; session 10: the
 setup link without `public_baseurl`; session 9:
@@ -13,6 +15,96 @@ found and fixed a real case-sensitivity bug in `POST /login`, re-confirmed `/cap
 unfixed (held by another track this session), checked for Element-Web findings in
 `docs/status/16-management-web-interface.md` (none landed as of this write-up), and designed
 (without implementing) a UIA session-correlation scheme left open at the end of session 5).
+
+## 2026-10-05: email password reset, `next_link`, CAS client whitelist and bridge namespaces, admin deactivation unbinds, the public address reload, OpenID outside `X-Matrix` (branch `agent/auth-leftovers`)
+
+What `agent/auth-gaps` left.
+
+**Email password reset** (`routes/account.rs`, `threepid.rs`, `middleware::MaybeRequester`).
+`POST /account/password` without an access token is now Synapse's signed-out case: one flow,
+`[m.login.email.identity]`, whose `threepid_creds` name a validated *password-reset* session
+(`/account/password/email/requestToken`; a registration or add-address session does not count).
+Once complete, the account the address belongs to gets the new password (sent in this round or
+remembered, hashed, from an earlier round of the same session, as Synapse's `PASSWORD_HASH`) and,
+unless `logout_devices: false`, loses every access and refresh token (and its pushers, through
+the sessions-revoked hook). An address nobody has any more is `404 M_NOT_FOUND`; a deactivated
+account `403`. A server that cannot send email answers a signed-out call `401 M_MISSING_TOKEN`
+as before. With a token, nothing changed. The reset link
+(`/_matrix/client/unstable/password_reset/email/submit_token`) now shows a confirmation page on
+`GET` and validates on the page's `POST` (Synapse's `password_reset_confirmation.html`: a mail
+scanner fetching every link validates nothing). Counter `hs_auth_password_resets_total{outcome=reset|unknown_address}`,
+log "a password was reset by email".
+
+**`next_link`** (`threepid::check_next_link`): every `requestToken` takes it, refused `400
+M_INVALID_PARAM` unless `http(s)` and, when the new `auth.next_link_domain_whitelist` is set, on a
+listed host (Synapse's `assert_valid_next_link`, stricter in refusing every non-http scheme, not
+only `file:`). It is stored on the session (`ThreepidValidationRecord.next_link`, `serde(default)`);
+following the link (registration, add-address) or confirming it (reset) answers `302` there
+instead of this server's page.
+
+**CAS** (`routes/sso.rs`, `config::AuthConfig::sso_client_is_trusted`): the new
+`auth.sso.client_whitelist` (Synapse's `sso.client_whitelist`, a prefix match; this server's own
+`{public_baseurl}/_matrix/static/client/login` is always trusted, as Synapse appends it) sends a
+listed application the person straight back with a `302` and no confirmation page. A CAS user name
+that maps into an appservice's exclusive user namespace is refused with a `403` page, both when it
+would create the account and when it would sign in to an existing account by localpart (the
+bridge's own ghost); an account already linked to that CAS user still signs in. The check is
+`/register`'s (`routes::register::refuse_exclusive`, now `pub(crate)`), which logs which
+appservice holds the name; counted as `hs_auth_sso_logins_total{outcome="failed"}`.
+
+**Admin deactivation** (`admin_directory.rs`, `threepid::on_admin_deactivation`):
+`UserDirectory::set_deactivated(true)` -- `users.deactivate`, the deactivated toggle and
+`/_synapse/admin/v1/deactivate` through `hs-compat` -- now unbinds every identifier this server
+bound at an identity server and removes every identifier from the account, as the client's
+`/account/deactivate` does. Unlike the client's, an identity server that cannot be reached does
+not fail the administrator's deactivation: it is logged at `WARN` and its binding kept.
+
+**`server.public_baseurl` reaches `hs-auth` at once**: `hs serve` registers a second `server`
+applier that rebuilds the auth settings (`hs_cli::serve`), logging "sign-in and validation links
+now use the new public address". **`/openid/userinfo`** is registered by `hs-federation` outside its
+`X-Matrix` layer (`read_routes::add_unsigned_routes`, merged after the layer in
+`transport::router`, `AuthKind::None` in the manifest); missing and unknown tokens are `401
+M_MISSING_TOKEN`/`M_UNKNOWN_TOKEN` as Synapse answers; `hs_cli::openid_userinfo` is gone. With
+`federation.enabled: false` the route is not served at all (the workaround answered it anyway;
+Synapse needs its `openid` listener resource for that).
+
+**Config** (`hs-config`): `auth.sso.client_whitelist` (http(s) addresses) and
+`auth.next_link_domain_whitelist` (host names; unset allows any), both hot (`reload.rs`);
+`docs/config.md` and `web/src/test/fixtures/hs-config-schema.json` regenerated; the web renders both
+through the generic Configuration page with their doc comments (`npm run check` passes). `hs-compat`:
+`sso` is now Mapped (diff) (`client_whitelist`; `update_profile_information` and templates not carried
+over) and `next_link_domain_whitelist` Mapped, in `classification.rs`, `translate.rs` and
+`docs/compat/synapse-config-table.md`.
+
+**Verified.** `cargo test -p hs-auth` (318: `routes::threepid::tests::{a_password_is_reset_by_email_while_signed_out,
+a_password_reset_needs_a_reset_session_for_an_address_somebody_has,
+next_link_is_checked_and_the_followed_link_goes_there}`,
+`routes::sso::tests::{a_trusted_client_is_sent_straight_back_without_the_confirmation_page,
+a_cas_user_cannot_take_a_name_in_an_appservices_exclusive_namespace}`,
+`admin_directory::tests::deactivation_unbinds_and_removes_third_party_identifiers`, the config
+tests), `-p hs-config`, `-p hs-compat`, `-p hs-federation`
+(`transport::tests::openid_userinfo_answers_an_unsigned_request`), `-p hs-cli --lib`; clippy `-D
+warnings` on the five crates. Real binary: `crates/hs-cli/tests/threepid_email.rs`
+(`a_forgotten_password_is_reset_by_email`: the challenge, a refused `next_link`, the confirmation
+page, the `302`, the reset, the old session and password refused, the new one signs in, the counter
+and log line), `cas_sso.rs` (`cas_follows_the_public_address_trusts_listed_clients_and_respects_bridges`:
+`server.public_baseurl` patched through the admin API changes the CAS service at once, a listed
+client gets a `302` and its token signs in, another gets the page, `irc_bob` gets a `403` and no
+account), `auth_sessions.rs` (OpenID over the federation path, now without the workaround).
+
+**Sytest** (`tests/sytest/run.sh` with this branch's bookworm `hs`, `target/sytest/auth-leftovers/`):
+`12login/01threepid-and-password`, `12login/02cas`, `14account/01change-password`,
+`14account/02deactivate`, `54identity`, `11register`: **28 of 28**, nothing moved back (the password
+change tests, which now go through `MaybeRequester`; CAS; registration with an email address; the
+six 3PID bind/unbind tests; "3PIDs are unbound after account deactivation"). Complement has no
+`TestPasswordReset*` in our checkout, so none was run.
+
+**Left.** Binding and unbinding at an identity server are still tested with a fake seam only.
+The pending-registration check is per replica. Self-service erasure still does not leave rooms.
+CAS `protocol_version`, `enable_registration`, numeric ids and icons are not carried over;
+`sso.update_profile_information` and template overrides neither. No Complement
+`TestPasswordReset*` exists in our checkout (`refs/complement`), so the reset is covered by this
+crate's and the real-binary tests only.
 
 ## 2026-10-04: UIA binding, registration sessions, CAPTCHA, CAS, self-service 3PIDs, OpenID, whois (branch `agent/auth-gaps`)
 

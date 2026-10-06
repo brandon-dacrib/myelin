@@ -348,3 +348,205 @@ async fn cas_signs_people_in_creates_accounts_and_confirms_user_interactive_auth
         assert!(metrics.contains(&line), "{line} not in /metrics");
     }
 }
+
+/// The CAS settings of 2026-10-05, against the real binary: a change to `server.public_baseurl`
+/// through the admin API reaches the CAS return address at once (it used to wait for the next
+/// `auth` change); an application on `auth.sso.client_whitelist` gets the person back with a
+/// `302` and no confirmation page; and a CAS user name inside a bridge's exclusive namespace
+/// makes no account, as `/register` refuses it.
+#[tokio::test]
+async fn cas_follows_the_public_address_trusts_listed_clients_and_respects_bridges() {
+    use std::io::BufRead;
+    let fake = Arc::new(FakeCas::default());
+    let cas_port = start_fake_cas(fake.clone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let base = format!("http://127.0.0.1:{port}");
+    let registration = dir.path().join("irc.yaml");
+    std::fs::write(
+        &registration,
+        "id: irc\nurl: null\nas_token: as_token_for_the_cas_namespace_test_000000000000\n\
+         hs_token: hs_token_for_the_cas_namespace_test_000000000000\nsender_localpart: ircbot\n\
+         namespaces:\n  users:\n    - regex: '@irc_.*:example\\.org'\n      exclusive: true\n",
+    )
+    .unwrap();
+    let config_path = dir.path().join("hs.yaml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "server:\n  server_name: example.org\n  public_baseurl: https://before.example/\n\
+             listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, health, metrics]\n\
+             storage:\n  backend: embedded\n  data_dir: {:?}\n\
+             media:\n  storage:\n    backend: local\n    path: {:?}\n\
+             federation:\n  enabled: false\n\
+             rate_limits:\n  enabled: false\n\
+             appservices:\n  registration_files: [{registration:?}]\n\
+             auth:\n  cas:\n    server_url: http://127.0.0.1:{cas_port}/cas\n  sso:\n    client_whitelist: [\"https://trusted.example/\"]\n",
+            dir.path().join("db"),
+            dir.path().join("media"),
+        ),
+    )
+    .unwrap();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_hs"))
+        .args(["serve", "-c"])
+        .arg(&config_path)
+        .env_remove("RUST_LOG")
+        .env_remove("HS_DATA_DIR")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .expect("the hs binary should start");
+    let stdout = child.stdout.take().unwrap();
+    let _hs = HsProcess(child);
+    let (tx, lines) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let wait_for = |needle: &str| -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let line = lines
+                .recv_timeout(left)
+                .unwrap_or_else(|_| panic!("the log never said {needle:?}"));
+            if line.contains(needle) {
+                return line;
+            }
+        }
+    };
+    let setup_token = wait_for("setup_link=")
+        .rsplit_once("#token=")
+        .unwrap()
+        .1
+        .trim()
+        .to_owned();
+    let client = Client {
+        base: base.clone(),
+        http: reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap(),
+    };
+    let (status, ops) = client
+        .json(
+            Method::POST,
+            "/api/v1/setup",
+            None,
+            Some(json!({"setup_token": setup_token, "username": "ops", "password": "hunter2-first-admin"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{ops}");
+    let ops_token = ops["access_token"].as_str().unwrap().to_owned();
+
+    let service_for = |client_url: &str| {
+        let client = &client;
+        let client_url = client_url.to_owned();
+        async move {
+            let redirect = client
+                .raw(&format!(
+                    "{}/_matrix/client/v3/login/sso/redirect?redirectUrl={}",
+                    client.base,
+                    urlencode(&client_url)
+                ))
+                .await;
+            assert_eq!(redirect.status(), StatusCode::FOUND);
+            let location =
+                reqwest::Url::parse(redirect.headers()["location"].to_str().unwrap()).unwrap();
+            location
+                .query_pairs()
+                .find(|(k, _)| k == "service")
+                .unwrap()
+                .1
+                .into_owned()
+        }
+    };
+
+    // The booted public address, then the new one the moment it is saved.
+    assert!(
+        service_for("https://trusted.example/app")
+            .await
+            .starts_with("https://before.example/_matrix/client/r0/login/cas/ticket?"),
+    );
+    let (status, updated) = client
+        .json(
+            Method::PATCH,
+            "/api/v1/config/server",
+            Some(&ops_token),
+            Some(json!({"public_baseurl": format!("{base}/")})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{updated}");
+    assert_eq!(updated["applied"]["reloaded_sections"], json!(["server"]));
+    let service = service_for("https://trusted.example/app").await;
+    assert!(
+        service.starts_with(&format!("{base}/_matrix/client/r0/login/cas/ticket?")),
+        "{service}"
+    );
+    wait_for("sign-in and validation links now use the new public address");
+
+    // A trusted application gets the person straight back.
+    *fake.user.lock().unwrap() = "trusted".to_owned();
+    let back = client.raw(&format!("{service}&ticket=t1")).await;
+    assert_eq!(back.status(), StatusCode::FOUND);
+    let location = back.headers()["location"].to_str().unwrap().to_owned();
+    assert!(
+        location.starts_with("https://trusted.example/app?loginToken="),
+        "{location}"
+    );
+    let token = location.split("loginToken=").nth(1).unwrap();
+    let (status, login) = client
+        .json(
+            Method::POST,
+            "/_matrix/client/v3/login",
+            None,
+            Some(json!({"type": "m.login.token", "token": token})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{login}");
+    assert_eq!(login["user_id"], "@trusted:example.org");
+
+    // Anybody else still sees the confirmation page.
+    *fake.user.lock().unwrap() = "other".to_owned();
+    let service = service_for("https://untrusted.example/").await;
+    let page = client.raw(&format!("{service}&ticket=t2")).await;
+    assert_eq!(page.status(), StatusCode::OK);
+    assert!(page.text().await.unwrap().contains("Continue"));
+
+    // A CAS user name the bridge holds makes no account.
+    *fake.user.lock().unwrap() = "irc_bob".to_owned();
+    let page = client.raw(&format!("{service}&ticket=t3")).await;
+    assert_eq!(page.status(), StatusCode::FORBIDDEN);
+    assert!(!page.text().await.unwrap().contains("loginToken"));
+    let (status, _) = client
+        .json(
+            Method::GET,
+            "/_matrix/client/v3/profile/@irc_bob:example.org",
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "no account was made");
+    wait_for("refused a registration in an appservice's exclusive namespace");
+
+    let metrics = client
+        .http
+        .get(format!("{base}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    for (outcome, count) in [("registered", "2"), ("failed", "1")] {
+        let line =
+            format!("hs_auth_sso_logins_total{{provider=\"cas\",outcome=\"{outcome}\"}} {count}");
+        assert!(metrics.contains(&line), "{line} not in /metrics");
+    }
+}

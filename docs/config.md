@@ -15,7 +15,7 @@ Decision 0010: this server is administered through the admin API and the web int
 Every setting is one of three kinds (decision 0016; `hs_config::reload::SETTINGS` is the table, and the schema the admin API serves carries it as `x-applies` on each setting):
 
 - **bootstrap** (7): set at install, per process, never stored in the database;
-- **hot** (53): applies to the running server at once -- a save reports it as reloaded;
+- **hot** (55): applies to the running server at once -- a save reports it as reloaded;
 - **restart** (25): stored at once, read at the next start -- a save reports it as waiting for a restart.
 
 The **Applies** column below gives each setting's kind and what reads it. Sections in which every administered setting is hot: `server`, `rate_limits`, `migration`, `network`, `email`.
@@ -187,6 +187,8 @@ sign-in services.
 | `recaptcha` | object | `{"required":false,"public_key":null,"private_key":null,"private_key_file":null,"siteverify_api":"https://www.recaptcha.net/recaptcha/api/siteverify"}` | hot (POST /register reads it per request) | A CAPTCHA people solve when they sign up. Unset keys (the default) mean no CAPTCHA. |
 | `oidc_providers` | array<object> | `[]` | restart (upstream OIDC clients are built at startup) | Other sign-in services people may use instead of a password here ("Sign in with Google", a company Keycloak or Okta), each registered with the provider first. Empty by default. Corresponds to Synapse's `oidc_providers`. |
 | `cas` | object | — | hot (CAS sign-in reads it per request) | Sign-in through a CAS server instead of, or as well as, a password here. Unset by default. People who sign in through CAS for the first time get an account named after their CAS user name; somebody whose CAS name matches an existing account signs in to that account. Needs `server.public_baseurl` (or `service_url`), since CAS sends people back there. Corresponds to Synapse's `cas_config`. |
+| `sso` | object | `{"client_whitelist":[]}` | hot (single sign-on reads it per sign-in) | What happens after single sign-on, for every provider: `client_whitelist` lists the address prefixes of applications people are sent straight back to, without the page asking them to confirm (end each with a `/` after the host name). Empty by default. Corresponds to Synapse's `sso`. |
+| `next_link_domain_whitelist` | array \| null | — | hot (a validation email request reads it) | The domains a validation email's link may send people on to once they follow it (the `next_link` an application asks for, such as its own "you can go back now" page). Unset (the default), any `http` or `https` address is allowed; set, only addresses whose host is listed are (`[app.element.io]`), and an empty list allows none. An address on the person's own disk (`file:`) is never allowed. Corresponds to Synapse's `next_link_domain_whitelist`. |
 | `mas_delegation` | object | — | restart (delegation replaces the native issuer at startup) | Hand sign-in to a separate Matrix Authentication Service (MAS) instead of this server's own OAuth issuer. Unset by default, which is right unless MAS is already deployed. Corresponds to Synapse's `experimental_features.msc3861`. |
 
 

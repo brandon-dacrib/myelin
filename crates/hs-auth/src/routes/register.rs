@@ -405,7 +405,7 @@ pub(crate) fn validate_localpart(state: &AuthState, username: &str) -> Result<()
 /// M_EXCLUSIVE`, the spec's `/register` error for "the desired user ID is in the exclusive
 /// namespace claimed by an application service"), unless `appservice_id` is that appservice.
 /// Logged at `INFO`: an operator who wonders why a name cannot be had sees which bridge has it.
-async fn refuse_exclusive(
+pub(crate) async fn refuse_exclusive(
     state: &AuthState,
     username: &str,
     appservice_id: Option<&str>,

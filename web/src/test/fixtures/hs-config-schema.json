@@ -237,6 +237,10 @@
         },
         "oidc_providers": [],
         "cas": null,
+        "sso": {
+          "client_whitelist": []
+        },
+        "next_link_domain_whitelist": null,
         "mas_delegation": null
       }
     },
@@ -1783,6 +1787,26 @@
           "default": null,
           "x-applies": "hot"
         },
+        "sso": {
+          "description": "What happens after single sign-on, for every provider: `client_whitelist` lists the\naddress prefixes of applications people are sent straight back to, without the page\nasking them to confirm (end each with a `/` after the host name). Empty by default.\nCorresponds to Synapse's `sso`.",
+          "$ref": "#/$defs/SsoConfig",
+          "default": {
+            "client_whitelist": []
+          },
+          "x-applies": "hot"
+        },
+        "next_link_domain_whitelist": {
+          "description": "The domains a validation email's link may send people on to once they follow it (the\n`next_link` an application asks for, such as its own \"you can go back now\" page). Unset\n(the default), any `http` or `https` address is allowed; set, only addresses whose host\nis listed are (`[app.element.io]`), and an empty list allows none. An address on the\nperson's own disk (`file:`) is never allowed. Corresponds to Synapse's\n`next_link_domain_whitelist`.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "default": null,
+          "x-applies": "hot"
+        },
         "mas_delegation": {
           "description": "Hand sign-in to a separate Matrix Authentication Service (MAS) instead of this server's\nown OAuth issuer. Unset by default, which is right unless MAS is already deployed.\nCorresponds to Synapse's `experimental_features.msc3861`.",
           "anyOf": [
@@ -2012,6 +2036,21 @@
       "required": [
         "server_url"
       ]
+    },
+    "SsoConfig": {
+      "description": "Settings shared by every single-sign-on provider (CAS today). Corresponds to Synapse's\n`sso` section.",
+      "type": "object",
+      "properties": {
+        "client_whitelist": {
+          "description": "Applications people are sent straight back to after signing in through single sign-on,\nwithout the page that asks them to confirm where they are going. Each entry is the start\nof an address (`https://app.element.io/`): an application whose return address begins\nwith one is trusted. End each entry with a `/` after the host name, or\n`https://my.client` also trusts `https://my.client.evil.example`. Empty by default:\neverybody sees the confirmation page, which is what stops a link somebody else crafted\nfrom signing a person in to an application they never meant to use. Corresponds to\nSynapse's `sso.client_whitelist`.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        }
+      },
+      "additionalProperties": false
     },
     "MasDelegationConfig": {
       "description": "Matrix Authentication Service delegation mode: this server introspects\ntokens against MAS instead of running its own OAuth issuer. Corresponds\nto Synapse's `experimental_features.msc3861` block.",

@@ -219,6 +219,23 @@ pub struct CasConfig {
     pub idp_name: String,
 }
 
+/// Settings shared by every single-sign-on provider (CAS today). Corresponds to Synapse's
+/// `sso` section.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SsoConfig {
+    /// Applications people are sent straight back to after signing in through single sign-on,
+    /// without the page that asks them to confirm where they are going. Each entry is the start
+    /// of an address (`https://app.element.io/`): an application whose return address begins
+    /// with one is trusted. End each entry with a `/` after the host name, or
+    /// `https://my.client` also trusts `https://my.client.evil.example`. Empty by default:
+    /// everybody sees the confirmation page, which is what stops a link somebody else crafted
+    /// from signing a person in to an application they never meant to use. Corresponds to
+    /// Synapse's `sso.client_whitelist`.
+    #[serde(default)]
+    pub client_whitelist: Vec<String>,
+}
+
 /// Matrix Authentication Service delegation mode: this server introspects
 /// tokens against MAS instead of running its own OAuth issuer. Corresponds
 /// to Synapse's `experimental_features.msc3861` block.
@@ -332,6 +349,20 @@ pub struct AuthConfig {
     /// Corresponds to Synapse's `cas_config`.
     #[serde(default)]
     pub cas: Option<CasConfig>,
+    /// What happens after single sign-on, for every provider: `client_whitelist` lists the
+    /// address prefixes of applications people are sent straight back to, without the page
+    /// asking them to confirm (end each with a `/` after the host name). Empty by default.
+    /// Corresponds to Synapse's `sso`.
+    #[serde(default)]
+    pub sso: SsoConfig,
+    /// The domains a validation email's link may send people on to once they follow it (the
+    /// `next_link` an application asks for, such as its own "you can go back now" page). Unset
+    /// (the default), any `http` or `https` address is allowed; set, only addresses whose host
+    /// is listed are (`[app.element.io]`), and an empty list allows none. An address on the
+    /// person's own disk (`file:`) is never allowed. Corresponds to Synapse's
+    /// `next_link_domain_whitelist`.
+    #[serde(default)]
+    pub next_link_domain_whitelist: Option<Vec<String>>,
     /// Hand sign-in to a separate Matrix Authentication Service (MAS) instead of this server's
     /// own OAuth issuer. Unset by default, which is right unless MAS is already deployed.
     /// Corresponds to Synapse's `experimental_features.msc3861`.
@@ -357,6 +388,8 @@ impl Default for AuthConfig {
             recaptcha: RecaptchaConfig::default(),
             oidc_providers: Vec::new(),
             cas: None,
+            sso: SsoConfig::default(),
+            next_link_domain_whitelist: None,
             mas_delegation: None,
         }
     }
@@ -444,6 +477,23 @@ impl Validate for AuthConfig {
             }
             if cas.idp_name.trim().is_empty() {
                 errors.push(format!("{prefix}.cas.idp_name"), "must not be empty");
+            }
+        }
+        for (i, client) in self.sso.client_whitelist.iter().enumerate() {
+            if !(client.starts_with("https://") || client.starts_with("http://")) {
+                errors.push(
+                    format!("{prefix}.sso.client_whitelist[{i}]"),
+                    "must be an http:// or https:// address",
+                );
+            }
+        }
+        for (i, domain) in self.next_link_domain_whitelist.iter().flatten().enumerate() {
+            let domain = domain.trim();
+            if domain.is_empty() || domain.contains('/') || domain.contains(':') {
+                errors.push(
+                    format!("{prefix}.next_link_domain_whitelist[{i}]"),
+                    "must be a host name, such as app.element.io",
+                );
             }
         }
         if let Some(mas) = &self.mas_delegation
@@ -586,6 +636,29 @@ mod tests {
         cfg.validate("auth", &mut errors);
         assert!(errors.is_empty());
         assert_eq!(cfg.cas.unwrap().idp_name, "CAS");
+    }
+
+    #[test]
+    fn sso_client_whitelist_and_next_link_domains_are_checked() {
+        let cfg: AuthConfig = serde_json::from_value(serde_json::json!({
+            "sso": {"client_whitelist": ["https://app.example/", "app.example"]},
+            "next_link_domain_whitelist": ["app.example", "https://app.example", ""],
+        }))
+        .unwrap();
+        let mut errors = ValidationErrors::new();
+        cfg.validate("auth", &mut errors);
+        let paths: Vec<&str> = errors.0.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "auth.sso.client_whitelist[1]",
+                "auth.next_link_domain_whitelist[1]",
+                "auth.next_link_domain_whitelist[2]",
+            ]
+        );
+        let defaults = AuthConfig::default();
+        assert!(defaults.sso.client_whitelist.is_empty());
+        assert_eq!(defaults.next_link_domain_whitelist, None);
     }
 
     #[test]

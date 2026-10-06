@@ -12,7 +12,7 @@ Native field paths are dotted `hs-config` `Config` paths, e.g. `federation.domai
 
 | List | Mapped | Mapped (diff) | Unsupported | Total |
 |---|---|---|---|---|
-| Top-level options | 27 | 26 | 176 | 229 |
+| Top-level options | 28 | 27 | 174 | 229 |
 | `experimental_features` flags | 0 | 1 | 50 | 51 |
 
 (Counts are exact against the tables below; regenerate this summary whenever a row changes. See "Keeping this current".)
@@ -112,7 +112,7 @@ Native field paths are dotted `hs-config` `Config` paths, e.g. `federation.domai
 | `forgotten_room_retention_period` | Unsupported | — | R-PHASE1 (hs-room retention/purge). |
 | `user_ips_max_age` | Unsupported | — | R-PHASE1 (hs-auth, login-IP retention). |
 | `request_token_inhibit_3pid_errors` | Unsupported | — | R-PHASE1 (hs-auth, 3PID enumeration hardening). |
-| `next_link_domain_whitelist` | Unsupported | — | R-PHASE1 (hs-auth, password-reset redirect allowlist). |
+| `next_link_domain_whitelist` | Mapped | `auth.next_link_domain_whitelist` | The hosts a validation email's `next_link` may send people to; unset allows any `http(s)` address, as in Synapse. |
 | `templates` | Unsupported | — | R-PHASE1 (hs-compat/hs-auth). Custom Jinja template overrides for email/SSO pages; the native templating mechanism is not yet designed. |
 | `retention` | Unsupported | — | R-PHASE1 (hs-room retention/purge scheduler). |
 
@@ -316,7 +316,7 @@ Native field paths are dotted `hs-config` `Config` paths, e.g. `federation.domai
 | `saml2_config` | Unsupported | — | R-PHASE1 (hs-auth). SAML 2.0 SP support is not implemented in the Phase 0 auth schema, which covers OIDC upstream IdPs only (`PLAN.md` D5); tracked for Phase 1. |
 | `oidc_providers` | Mapped (diff) | `auth.oidc_providers` | Fewer sub-options than Synapse's (no per-provider claim-mapping template, no `user_mapping_provider` Python module hook — see `modules`/R-MODULE); `idp_id`, `issuer`, `client_id`, `client_secret`/`client_secret_path` and `scopes` map directly. |
 | `cas_config` | Mapped (diff) | `auth.cas` | `server_url`, `service_url`, `displayname_attribute`, `required_attributes` and `idp_name` map directly; `enabled: false` leaves CAS off. CAS 2/3 `/proxyValidate` is always used (no `protocol_version`), a first sign-in always creates the account (no `enable_registration`), and `allow_numeric_ids`, `numeric_ids_prefix`, `idp_icon` and `idp_brand` are not carried over. |
-| `sso` | Unsupported | — | R-PHASE1 (hs-auth). SSO landing-page customization (`client_whitelist`, template overrides, `update_profile_information`) is not yet in the schema; tracked with `templates`. |
+| `sso` | Mapped (diff) | `auth.sso.client_whitelist` | `client_whitelist` maps directly (a prefix match; this server's login fallback is always trusted, as in Synapse). `update_profile_information` and the template overrides (`templates`) are not carried over. |
 | `jwt_config` | Unsupported | — | R-PHASE1 (hs-auth). `m.login.jwt` is not implemented in the Phase 0 auth schema. |
 | `password_config` | Mapped (diff) | `auth.password` | Synapse's `localdb_enabled` (disable the local password DB while keeping password login via a custom Python provider) has no equivalent — see `modules`/R-MODULE. `enabled`, `pepper`/`pepper_path` and `policy` map directly. |
 

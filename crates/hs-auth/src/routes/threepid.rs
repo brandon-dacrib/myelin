@@ -81,6 +81,23 @@ fn page(status: StatusCode, title: &str, message: &str) -> Response {
         .into_response()
 }
 
+fn validated_page(purpose: Purpose) -> Response {
+    if purpose == Purpose::PasswordReset {
+        page(
+            StatusCode::OK,
+            "Email address validated",
+            "Your email address has been validated. Go back to your app to choose your new \
+             password.",
+        )
+    } else {
+        page(
+            StatusCode::OK,
+            "Email address validated",
+            "Your email address has been validated. Go back to your app to continue.",
+        )
+    }
+}
+
 async fn submit(state: &AuthState, purpose: Purpose, query: &HashMap<String, String>) -> Response {
     let (Some(sid), Some(client_secret), Some(token)) = (
         query.get("sid"),
@@ -95,11 +112,16 @@ async fn submit(state: &AuthState, purpose: Purpose, query: &HashMap<String, Str
         );
     };
     match threepid::submit_token(state, purpose, sid, client_secret, token).await {
-        Ok(_) => page(
-            StatusCode::OK,
-            "Email address validated",
-            "Your email address has been validated. Go back to your app to continue.",
-        ),
+        // Where the client asked for the person to be sent next, as Synapse's submit_token
+        // servlets do: a `302` there instead of this server's own page.
+        Ok(record) if record.next_link.is_some() => {
+            let next_link = record.next_link.unwrap_or_default();
+            match header::HeaderValue::from_str(&next_link) {
+                Ok(location) => (StatusCode::FOUND, [(header::LOCATION, location)]).into_response(),
+                Err(_) => validated_page(purpose),
+            }
+        }
+        Ok(_) => validated_page(purpose),
         Err(error) if error.status() == StatusCode::BAD_REQUEST => page(
             StatusCode::BAD_REQUEST,
             "Link not valid",
@@ -129,8 +151,53 @@ pub async fn get_add_threepid_submit_token(
 }
 
 /// `GET /_matrix/client/unstable/password_reset/email/submit_token`: the link in a password
-/// reset email.
+/// reset email. It validates nothing yet: it shows a page asking the person to confirm, whose
+/// button `POST`s back to the same address (see [`post_password_reset_submit_token`]), so that a
+/// mail scanner that fetches every link it sees cannot validate the session -- Synapse's
+/// `password_reset_confirmation.html`.
 pub async fn get_password_reset_submit_token(
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let (Some(sid), Some(client_secret), Some(token)) = (
+        query.get("sid"),
+        query.get("client_secret"),
+        query.get("token"),
+    ) else {
+        return page(
+            StatusCode::BAD_REQUEST,
+            "Link incomplete",
+            "This link is missing part of its address. Copy the whole link from the email.",
+        );
+    };
+    let action = format!(
+        "submit_token?sid={}&client_secret={}&token={}",
+        threepid::query_escape(sid),
+        threepid::query_escape(client_secret),
+        threepid::query_escape(token),
+    );
+    let body = format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" \
+         content=\"width=device-width, initial-scale=1\"><title>Reset your password</title>\
+         </head><body style=\"font-family: sans-serif; max-width: 32em; margin: 3em auto; \
+         padding: 0 1em\"><h1>Reset your password</h1><p>Somebody, hopefully you, asked to \
+         reset the password of the account this email address belongs to. Confirm to continue, \
+         then choose your new password in your app. If it was not you, close this page and \
+         nothing changes.</p><form method=\"post\" action=\"{action}\"><button \
+         type=\"submit\">Confirm</button></form></body></html>",
+        action = threepid::html_escape(&action),
+    );
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        body,
+    )
+        .into_response()
+}
+
+/// `POST /_matrix/client/unstable/password_reset/email/submit_token`: the confirmation page's
+/// button. Validates the session, then sends the person to the client's `next_link` or shows
+/// that it worked.
+pub async fn post_password_reset_submit_token(
     State(state): State<AuthState>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
@@ -898,5 +965,255 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    async fn call(
+        app: &axum::Router,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Option<String>, String) {
+        use tower::ServiceExt;
+        let mut request = axum::http::Request::builder().method(method).uri(uri);
+        if body.is_some() {
+            request = request.header("content-type", "application/json");
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                request
+                    .body(axum::body::Body::from(
+                        body.map(|b| b.to_string()).unwrap_or_default(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .map(|v| v.to_str().unwrap().to_owned());
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, location, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    /// `next_link`, as Synapse's `assert_valid_next_link`: only `http(s)`, only the listed
+    /// hosts when `auth.next_link_domain_whitelist` is set, and the followed link sends the
+    /// browser there.
+    #[tokio::test]
+    async fn next_link_is_checked_and_the_followed_link_goes_there() {
+        let (state, sender) = email_state();
+        let ask = |next_link: &str| {
+            let state = state.clone();
+            let body = json!({"client_secret": "SECRET.=_-", "email": "n@example.com",
+                              "send_attempt": 1, "next_link": next_link});
+            async move { threepid::request_email_token(&state, Purpose::AddThreepid, &body, None).await }
+        };
+        for refused in ["file:///etc/passwd", "javascript:alert(1)", "not a url"] {
+            let err = ask(refused).await.unwrap_err();
+            assert_eq!(err.errcode(), ErrCode::InvalidParam, "{refused}");
+        }
+        let mut config = (*state.config.get()).clone();
+        config.next_link_domain_whitelist = Some(vec!["app.example".to_owned()]);
+        state.set_config(config);
+        let err = ask("https://other.example/done").await.unwrap_err();
+        assert_eq!(err.errcode(), ErrCode::InvalidParam);
+        assert!(sender.0.lock().unwrap().is_empty(), "nothing was sent");
+
+        ask("https://App.example/done?x=1").await.unwrap();
+        let email = sender.0.lock().unwrap()[0].clone();
+        let response = follow(&state, Purpose::AddThreepid, &email).await;
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(
+            response.headers()[header::LOCATION],
+            "https://App.example/done?x=1"
+        );
+    }
+
+    /// Element's "Forgot password?": signed out, the client asks for a reset email, the person
+    /// confirms the link (a `GET` only shows the confirmation page), and `POST /account/password`
+    /// with `m.login.email.identity` sets the new password on the account the address belongs to
+    /// and signs every session out.
+    #[tokio::test]
+    async fn a_password_is_reset_by_email_while_signed_out() {
+        let (state, sender) = email_state();
+        let alice = user_with_password(&state, user_id!("@alice:example.org")).await;
+        state
+            .store
+            .add_threepid(crate::store::ThreepidRecord {
+                user_id: alice.user_id.clone(),
+                medium: "email".to_owned(),
+                address: "alice@example.com".to_owned(),
+                added_at_ms: 0,
+                validated_at_ms: 0,
+            })
+            .await
+            .unwrap();
+        let token_hash = crate::token::TokenHash::of("syt_alice");
+        state
+            .store
+            .put_access_token(crate::store::AccessTokenRecord {
+                hash: token_hash,
+                user_id: alice.user_id.clone(),
+                device_id: None,
+                expires_at_ms: None,
+                refresh_token_hash: None,
+                last_used_ms: None,
+            })
+            .await
+            .unwrap();
+        let app = crate::routes::router().with_state(state.clone());
+        let unstable = crate::routes::unstable_router().with_state(state.clone());
+
+        // Signed out, the challenge is the email flow.
+        let (status, _, challenge) = call(
+            &app,
+            "POST",
+            "/account/password",
+            Some(json!({"new_password": "brand-new-1"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let challenge: Value = serde_json::from_str(&challenge).unwrap();
+        assert_eq!(
+            challenge["flows"],
+            json!([{"stages": ["m.login.email.identity"]}])
+        );
+        let session = challenge["session"].as_str().unwrap().to_owned();
+
+        let (status, _, sid) = call(
+            &app,
+            "POST",
+            "/account/password/email/requestToken",
+            Some(
+                json!({"client_secret": "SECRET.=_-", "email": "Alice@example.com",
+                        "send_attempt": 1, "next_link": "https://app.example/reset"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{sid}");
+        let sid = serde_json::from_str::<Value>(&sid).unwrap()["sid"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let link = link_in(&sender.0.lock().unwrap()[0]);
+        let path = link.split_once("/_matrix/client/unstable").unwrap().1;
+        let reset = json!({
+            "auth": {"type": "m.login.email.identity", "session": session,
+                     "threepid_creds": {"sid": sid, "client_secret": "SECRET.=_-"}},
+        });
+
+        // Following the link only asks for confirmation; the stage does not pass yet.
+        let (status, _, page) = call(&unstable, "GET", path, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(page.contains("<form method=\"post\""), "{page}");
+        let (status, _, refused) =
+            call(&app, "POST", "/account/password", Some(reset.clone())).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{refused}");
+        assert!(refused.contains("M_FORBIDDEN"), "{refused}");
+
+        // Confirmed, the browser goes on to the client's page, and the reset completes with the
+        // password remembered from the first round.
+        let (status, location, _) = call(&unstable, "POST", path, None).await;
+        assert_eq!(status, StatusCode::FOUND);
+        assert_eq!(location.as_deref(), Some("https://app.example/reset"));
+        let (status, _, done) = call(&app, "POST", "/account/password", Some(reset)).await;
+        assert_eq!(status, StatusCode::OK, "{done}");
+
+        let user = state.store.get_user(&alice.user_id).await.unwrap().unwrap();
+        assert!(
+            crate::password::verify_password("brand-new-1", &user.password_hash.unwrap(), "")
+                .unwrap()
+        );
+        assert!(
+            state
+                .store
+                .get_access_token(&token_hash)
+                .await
+                .unwrap()
+                .is_none(),
+            "every session was signed out"
+        );
+    }
+
+    /// A reset session for an address that no account has any more is `404 M_NOT_FOUND`; a
+    /// server that cannot send email still answers a signed-out call `401 M_MISSING_TOKEN`; an
+    /// add-address session does not reset anybody's password.
+    #[tokio::test]
+    async fn a_password_reset_needs_a_reset_session_for_an_address_somebody_has() {
+        let plain = crate::routes::router().with_state(AuthState::in_memory());
+        let (status, _, body) = call(
+            &plain,
+            "POST",
+            "/account/password",
+            Some(json!({"new_password": "x"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(body.contains("M_MISSING_TOKEN"), "{body}");
+
+        let (state, sender) = email_state();
+        let bob = user_with_password(&state, user_id!("@bob:example.org")).await;
+        state
+            .store
+            .add_threepid(crate::store::ThreepidRecord {
+                user_id: bob.user_id.clone(),
+                medium: "email".to_owned(),
+                address: "bob@example.com".to_owned(),
+                added_at_ms: 0,
+                validated_at_ms: 0,
+            })
+            .await
+            .unwrap();
+        let app = crate::routes::router().with_state(state.clone());
+        let sid = request(&state, Purpose::PasswordReset, "bob@example.com", 1).await["sid"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let email = sender.0.lock().unwrap()[0].clone();
+        let query = query_of(&link_in(&email));
+        assert_eq!(
+            submit(&state, Purpose::PasswordReset, &query)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        state
+            .store
+            .remove_threepid(&bob.user_id, "email", "bob@example.com")
+            .await
+            .unwrap();
+        let (status, _, body) = call(
+            &app,
+            "POST",
+            "/account/password",
+            Some(json!({"new_password": "brand-new-1",
+                        "auth": {"type": "m.login.email.identity",
+                                 "threepid_creds": {"sid": sid, "client_secret": "SECRET.=_-"}}})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(body.contains("M_NOT_FOUND"), "{body}");
+
+        // A validated session started to add an address is not a reset session.
+        let sid = request(&state, Purpose::AddThreepid, "new@example.com", 1).await["sid"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let email = sender.0.lock().unwrap()[1].clone();
+        follow(&state, Purpose::AddThreepid, &email).await;
+        let (status, _, body) = call(
+            &app,
+            "POST",
+            "/account/password",
+            Some(json!({"new_password": "brand-new-1",
+                        "auth": {"type": "m.login.email.identity",
+                                 "threepid_creds": {"sid": sid, "client_secret": "SECRET.=_-"}}})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
     }
 }
