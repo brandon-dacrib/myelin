@@ -557,6 +557,19 @@ async fn a_join_shares_presence_across_the_servers_in_the_room() {
     outbox.0.lock().unwrap().clear();
 
     member(&handle, &bob, Action::Join, &bob).await;
+    // Until the presence for remote.test is out, not a fixed pause: a 30 ms sleep lost the race
+    // under a loaded merge gate (2026-10-05) while the test passed alone every time.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline
+        && !outbox
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(to, kind, _)| kind == "m.presence" && to.contains("remote.test"))
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     tokio::time::sleep(Duration::from_millis(30)).await;
     let sent = std::mem::take(&mut *outbox.0.lock().unwrap());
     let to_remote: Vec<&Value> = sent
