@@ -1312,14 +1312,48 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         event_id: ruma::OwnedEventId,
         ts: u64,
     ) -> Result<(), UserError> {
+        self.set_threaded_receipt(
+            room_id,
+            user_id,
+            kind,
+            &hs_push::counts::ReceiptThread::Unthreaded,
+            event_id,
+            ts,
+        )
+        .await
+    }
+
+    /// [`SessionHub::set_receipt`] for a receipt in `thread` (MSC3771's `thread_id`): kept
+    /// beside the user's receipts in other threads, shown with its `thread_id`, sent to other
+    /// servers with it, and read by the push counts for that thread only
+    /// (`hs_push::counts`). Returns once the push counts reflect it (bounded by
+    /// `hs_push::pipeline::RECEIPT_SETTLE`), so the client's next `/sync` has them.
+    ///
+    /// # Errors
+    /// Returns [`UserError`] if the room could not be loaded.
+    pub async fn set_threaded_receipt(
+        &self,
+        room_id: &RoomId,
+        user_id: &UserId,
+        kind: ReceiptKind,
+        thread: &hs_push::counts::ReceiptThread,
+        event_id: ruma::OwnedEventId,
+        ts: u64,
+    ) -> Result<(), UserError> {
         let seq = self
             .receipts
-            .set(room_id, user_id, kind, event_id.clone(), ts)
+            .set_in_thread(room_id, user_id, kind, thread, event_id.clone(), ts)
             .await;
         // Push counts follow receipts of either kind: a private receipt is just as much "read".
         // The sink ignores other servers' users (an inbound EDU's receipt).
         if let Some(sink) = self.read_receipt_sink.get() {
-            sink.read_receipt(user_id, room_id);
+            sink.read_receipt(hs_push::pipeline::ReadReceipt {
+                user_id: user_id.to_owned(),
+                room_id: room_id.to_owned(),
+                event_id: event_id.clone(),
+                thread: thread.clone(),
+            })
+            .await;
         }
         let members = self.joined_member_ids(room_id).await?;
         for member in &members {
@@ -1336,8 +1370,13 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
             outbox.send_edu(
                 crate::edu::servers_of(&members),
                 "m.receipt",
-                crate::edu::receipt_content(room_id, user_id, &event_id, ts),
-                Some(format!("receipt {room_id} {user_id}")),
+                crate::edu::receipt_content(room_id, user_id, &event_id, thread, ts),
+                // One receipt per thread: a threaded receipt must not replace an unsent
+                // unthreaded one (MSC4102), nor the other way round.
+                Some(format!(
+                    "receipt {room_id} {user_id} {}",
+                    thread.as_wire().unwrap_or_default()
+                )),
             );
         }
         Ok(())
@@ -1423,13 +1462,14 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
                     user_id,
                     event_id,
                     ts,
+                    thread,
                 } => {
                     let Some(members) = self.members_if_joined(&room_id, &user_id).await else {
                         continue;
                     };
                     let seq = self
                         .receipts
-                        .set(&room_id, &user_id, ReceiptKind::Read, event_id, ts)
+                        .set_in_thread(&room_id, &user_id, ReceiptKind::Read, &thread, event_id, ts)
                         .await;
                     for member in &members {
                         self.wake(member).await;

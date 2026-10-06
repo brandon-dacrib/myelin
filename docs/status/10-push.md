@@ -1,5 +1,93 @@
 # 10 Push: status
 
+## 2026-10-05 (branch `agent/push-gaps`): threaded receipts and per-thread counts, `postcontent`, one HELO fallback
+
+### Done
+
+- **Unread counts are "after the read receipt", per thread** (MSC3771, MSC3773;
+  `crates/hs-push/src/counts.rs`, `counts/{memory,tables}.rs`). Each notification is kept with
+  its event's room position (`hs_push.unread`, key `(user, room, thread_key, pos)`) until a
+  receipt reads it; a receipt is a position and a `ReceiptThread` (`Unthreaded`, `Main`,
+  `Thread(root)`). An unthreaded receipt reads every scope up to its event, `main` the main
+  timeline, a thread receipt that thread; what came after stays unread. Read positions are kept
+  (`hs_push.read_marks`) so a notification the pipeline learns of after the receipt that read it
+  is not counted. `CountsStore::record_notification` takes the position; `mark_read` is new.
+  Counters from older builds (`hs_push.counts`) are still counted until a receipt covering their
+  scope deletes them.
+- **The pipeline reads receipts per thread** (`pipeline.rs`): `Job::Receipt(ReadReceipt)` carries
+  the event and thread; `EventSource::event_position` (new; `hs-cli`'s `RegistrySource` asks
+  `RoomActor::timeline_position`) gives its position, and an event not known here reads its
+  whole scope. `ReadReceiptSink::read_receipt` is async and returns once the pipeline has
+  handled the receipt (at most `RECEIPT_SETTLE`, 2 s), so the `/sync` after `POST .../receipt`
+  has its counts. `SettledCounts` (installed for `/sync` in `hs-cli`'s `serve.rs`) waits up to
+  `READ_SETTLE` (250 ms) for queued jobs before a read, and stops waiting for a second after a
+  wait runs out. `PipelineHandle::{wait_for, settle}` are the job tickets behind both.
+- **Threaded receipts in `hs-user`** (the receipt store only, plus the sync lines below):
+  `ReceiptRegistry::set_in_thread`, one receipt per user, kind and thread; the content shows a
+  threaded receipt's `thread_id`, and on one event the unthreaded receipt wins (MSC4102, else the
+  newest). `StoredReceipt.thread_id` (serde default; a threaded row's key is
+  `"{kind} {thread_id}"`, an unthreaded row keeps its old key). `POST .../receipt` takes
+  `thread_id` (`main` or an event ID, else `400 M_INVALID_PARAM`); `SessionHub::set_threaded_receipt`
+  (`set_receipt` is it, unthreaded). The `m.receipt` EDU carries `data.thread_id` both ways, and
+  its coalescing key names the thread, so a threaded receipt never replaces an unsent
+  unthreaded one. Files: `crates/hs-user/src/{receipts.rs, edu.rs, hub.rs, filter.rs,
+  routes/receipts.rs, store/mod.rs, store/tables.rs}`.
+- **`/sync` splits counts by thread only when asked** (`crates/hs-user/src/sync/mod.rs`, the
+  joined-room entry, about lines 1270-1320; `SyncFilter::unread_thread_notifications` reads
+  `room.timeline.unread_thread_notifications`): asked, `unread_notifications` is the main
+  timeline and `unread_thread_notifications` each thread with something unread (left out when
+  none); not asked, one count for the room and no `unread_thread_notifications` key at all.
+  `sync-polling` owns this file: the change is that block only.
+- **MSC4306's `postcontent` push-rule kind** (`ruleset.rs`, `engine.rs`): accepted on every
+  `/pushrules` path, evaluated between `content` and `room` as Synapse does, with no rules here
+  (thread subscriptions are not implemented, as Synapse with `msc4306_enabled` off), so its rules
+  are `404` and a client `PUT` is `400 M_INVALID_PARAM`. Left out of `GET /pushrules/` when empty.
+- **One HELO fallback** (`crates/hs-push/src/email/helo.rs`, moved from `hs-cli`'s
+  `smtp_helo.rs`, which is gone): `SmtpMailer::send` retries over plain `HELO` when a relay
+  without TLS and without credentials refuses `EHLO` (`500`/`502`), so notification emails reach
+  such a relay too; `hs-cli`'s validation-email sender no longer has its own copy.
+- Not done here, by the coordinator's change: `copy_room_rules` for `TestPushRuleRoomUpgrade`
+  (`room-render` copies the rules in `hs-user`'s upgrade hook with `get_ruleset`/`set_ruleset`).
+- Observability: `debug` when a receipt's event is unknown (whole scope read), when the
+  pipeline is behind a receipt or a read; `info` when the mailer falls back to `HELO`.
+
+### Verified
+
+- `cargo test -p hs-push` (86; new: `receipts_read_per_thread_up_to_their_position` on both
+  stores, `legacy_counters_count_until_a_receipt_reads_their_scope`,
+  `receipts_read_their_thread_up_to_their_event`,
+  `a_receipt_and_a_settled_read_see_what_was_queued_before_them`,
+  `postcontent_is_a_kind_with_no_rules_and_none_a_client_may_add`,
+  `a_relay_that_refuses_ehlo_gets_the_email_over_helo`); `cargo test -p hs-user` (new:
+  threaded-receipt registry and EDU tests, `a_receipt_takes_a_thread_id`, the sync counts test
+  with and without the thread filter); clippy clean on `hs-push`, `hs-user`, `hs-cli`.
+- Real binary, `cargo test -p hs-cli --test thread_receipts` (5 runs, all green):
+  `threaded_receipts_read_their_thread_and_counts_split_by_thread` is Complement's
+  `TestThreadedReceipts` step for step, stricter (each `/sync` right at once);
+  `an_unthreaded_receipt_wins_a_clash_here_and_over_federation` is
+  `TestThreadReceiptsInSyncMSC4102` across two servers. Also green: `--lib`, `push_federated_invite`,
+  `email_held_restart`, `email_pushers` (Mailpit), `threepid_email`, `federation_edus`,
+  `appservice_ephemeral`, `e2e` receipts and push tests.
+- Complement csapi, image of this branch (`complement-hs-push-gaps:dev`): `TestThreadedReceipts`
+  and `TestThreadReceiptsInSyncMSC4102` PASS (both FAIL on `main`: `disableMsc4306PushRules`
+  got a `400` for `postcontent`), with `TestPushSync`, `TestPushRuleCacheHealth`,
+  `TestRoomReceipts`, `TestChangePasswordPushers`, `TestThreadsEndpoint` still passing.
+  `TestPushRuleRoomUpgrade` still fails, all four subtests: its copy is `room-render`'s.
+- Sytest with this branch's bookworm `hs` (`SYTEST_HS_BINARY`): `61push/01message-pushed.pl`,
+  `03_unread_count.pl`, `08_rejected_pushers.pl`, `09_notifications_api.pl`,
+  `10apidoc/37room-receipts.pl`, `30rooms/21receipts.pl`, `31sync/12receipts.pl`,
+  `50federation/38receipts.pl`, `90jira/SYN-516.pl`: 20 PASS, 1 SKIP (the unstable
+  `org.matrix.msc2625.mark_unread` action, skipped on `main` too).
+
+### Left
+
+- The `/notifications` log and the email worker still treat any receipt as reading the whole
+  room (a thread receipt marks the room's log entries read and cancels its held email).
+- Thread subscriptions (MSC4306) themselves, and with them its two `postcontent` rules.
+- Synapse-imported threaded receipts are still taken as room receipts (`hs-compat`'s rule).
+- In a cluster, a receipt on a replica that does not own the room reads the room's stored
+  state to find the event's position (`RoomRegistry::read_room`), which is a full load.
+
 ## 2026-10-05 (branch `agent/email-held-flake`): the held email is stored before "holding" is logged
 
 `email_held_restart` failed in two merge gates: the worker logged "holding a notification for an

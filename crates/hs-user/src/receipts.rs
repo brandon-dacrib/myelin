@@ -23,6 +23,15 @@
 //! [`ReceiptRegistry::set`] exactly as a local one does; the registry does not care whose
 //! receipt it is.
 //!
+//! # Threads (MSC3771, MSC4102)
+//!
+//! A receipt may name a thread (`thread_id`: `main` or a thread root's event ID), and a user
+//! has one receipt per kind per thread, unthreaded included ([`hs_push::counts::ReceiptThread`]).
+//! The content shows a threaded receipt with its `thread_id` in the receipt's data. When one
+//! user has receipts of one kind for one event in more than one thread, the content (a map from
+//! event to kind to user) has room for one: the unthreaded receipt wins (MSC4102, Complement's
+//! `TestThreadReceiptsInSyncMSC4102`), else the newest.
+//!
 //! # `m.fully_read` is not handled here
 //!
 //! The fully-read marker is private room account data (`m.fully_read`, content
@@ -42,6 +51,7 @@
 
 use std::collections::HashMap;
 
+use hs_push::counts::ReceiptThread;
 use ruma::{EventId, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UserId};
 use serde_json::{Map, Value, json};
 use tokio::sync::Mutex;
@@ -86,15 +96,17 @@ impl ReceiptKind {
 struct ReceiptEntry {
     event_id: OwnedEventId,
     ts: u64,
+    /// The stamp it was set with, to tell the newer of two clashing receipts.
+    seq: u64,
 }
 
 struct RoomReceipts {
-    /// `(user, kind) -> latest receipt`. A later call for the same `(user, kind)` overwrites the
+    /// `(user, kind, thread) -> latest receipt`. A later call for the same key overwrites the
     /// earlier one -- this registry does not verify the new event is actually "later" than the
     /// old one (it has no timeline position to compare against without a round trip to the room
     /// actor); a real client only ever advances its own read receipt, so this is not a practical
     /// gap.
-    by_user: HashMap<(OwnedUserId, ReceiptKind), ReceiptEntry>,
+    by_user: HashMap<(OwnedUserId, ReceiptKind, ReceiptThread), ReceiptEntry>,
     seq: u64,
 }
 
@@ -146,20 +158,22 @@ impl ReceiptRegistry {
                 match store.list_room_receipts(room_id).await {
                     Ok(rows) => {
                         for row in rows {
-                            let (Some(kind), Ok(user), Ok(event_id)) = (
+                            let (Some(kind), Ok(user), Ok(event_id), Ok(thread)) = (
                                 ReceiptKind::parse(&row.kind),
                                 UserId::parse(row.user_id.as_str()),
                                 EventId::parse(row.event_id.as_str()),
+                                ReceiptThread::from_wire(row.thread_id.as_deref()),
                             ) else {
                                 continue;
                             };
                             self.counter.observe(row.seq);
                             loaded.seq = loaded.seq.max(row.seq);
                             loaded.by_user.insert(
-                                (user, kind),
+                                (user, kind, thread),
                                 ReceiptEntry {
                                     event_id,
                                     ts: row.ts,
+                                    seq: row.seq,
                                 },
                             );
                         }
@@ -195,14 +209,37 @@ impl ReceiptRegistry {
         event_id: OwnedEventId,
         ts: u64,
     ) -> u64 {
+        self.set_in_thread(
+            room_id,
+            user_id,
+            kind,
+            &ReceiptThread::Unthreaded,
+            event_id,
+            ts,
+        )
+        .await
+    }
+
+    /// [`ReceiptRegistry::set`] for a receipt in `thread` (see the module docs): it replaces
+    /// only the user's receipt of that kind in that thread.
+    pub async fn set_in_thread(
+        &self,
+        room_id: &RoomId,
+        user_id: &UserId,
+        kind: ReceiptKind,
+        thread: &ReceiptThread,
+        event_id: OwnedEventId,
+        ts: u64,
+    ) -> u64 {
         let mut rooms = self.rooms.lock().await;
         let entry = self.load(&mut rooms, room_id).await;
         let seq = self.counter.next();
         entry.by_user.insert(
-            (user_id.to_owned(), kind),
+            (user_id.to_owned(), kind, thread.clone()),
             ReceiptEntry {
                 event_id: event_id.clone(),
                 ts,
+                seq,
             },
         );
         entry.seq = seq;
@@ -214,6 +251,7 @@ impl ReceiptRegistry {
                 event_id: event_id.to_string(),
                 ts,
                 seq,
+                thread_id: thread.as_wire().map(str::to_owned),
             };
             if let Err(error) = store.put_receipt(room_id, &row).await {
                 tracing::warn!(
@@ -247,24 +285,47 @@ impl ReceiptRegistry {
 
     /// Builds the `m.receipt` event content for `room_id` as `viewer` would see it: every
     /// `m.read` receipt in the room, plus `viewer`'s own `m.read.private` receipts and nobody
-    /// else's. Shape is the spec's own: `{event_id: {receipt_type: {user_id: {ts: ...}}}}`.
-    /// Returns the empty object (not `null`) and the room's current cursor when there is nothing
-    /// to report or the room has never had a receipt.
+    /// else's. Shape is the spec's own: `{event_id: {receipt_type: {user_id: {ts: ...}}}}`,
+    /// with `thread_id` beside `ts` for a threaded receipt (see the module docs for the clash
+    /// of two receipts on one event). Returns the empty object (not `null`) and the room's
+    /// current cursor when there is nothing to report or the room has never had a receipt.
     pub async fn content_for(&self, room_id: &RoomId, viewer: &UserId) -> (Value, u64) {
         let mut rooms = self.rooms.lock().await;
         let entry = self.load(&mut rooms, room_id).await;
-        let mut by_event: HashMap<String, HashMap<&'static str, Map<String, Value>>> =
+        // `(event, kind, user) -> (thread, receipt)`, the clash rule applied.
+        let mut chosen: HashMap<(&EventId, ReceiptKind, &UserId), (&ReceiptThread, &ReceiptEntry)> =
             HashMap::new();
-        for ((user, kind), receipt) in &entry.by_user {
+        for ((user, kind, thread), receipt) in &entry.by_user {
             if matches!(kind, ReceiptKind::ReadPrivate) && user.as_str() != viewer.as_str() {
                 continue;
             }
+            let slot = chosen
+                .entry((&receipt.event_id, *kind, user))
+                .or_insert((thread, receipt));
+            let (held_thread, held) = *slot;
+            let wins = match (thread, held_thread) {
+                (ReceiptThread::Unthreaded, ReceiptThread::Unthreaded) => false,
+                (ReceiptThread::Unthreaded, _) => true,
+                (_, ReceiptThread::Unthreaded) => false,
+                _ => receipt.seq > held.seq,
+            };
+            if wins {
+                *slot = (thread, receipt);
+            }
+        }
+        let mut by_event: HashMap<String, HashMap<&'static str, Map<String, Value>>> =
+            HashMap::new();
+        for ((event_id, kind, user), (thread, receipt)) in chosen {
+            let mut data = json!({"ts": receipt.ts});
+            if let Some(thread_id) = thread.as_wire() {
+                data["thread_id"] = Value::String(thread_id.to_owned());
+            }
             by_event
-                .entry(receipt.event_id.to_string())
+                .entry(event_id.to_string())
                 .or_default()
                 .entry(kind.as_str())
                 .or_default()
-                .insert(user.to_string(), json!({"ts": receipt.ts}));
+                .insert(user.to_string(), data);
         }
         let content: Map<String, Value> = by_event
             .into_iter()
@@ -379,6 +440,110 @@ mod tests {
         assert_eq!(
             content,
             json!({"$two": {"m.read": {"@alice:example.org": {"ts": 2}}}})
+        );
+    }
+
+    /// MSC3771: one receipt per thread, shown with its `thread_id`; MSC4102: on one event, the
+    /// unthreaded receipt wins over a threaded one, whichever came last.
+    #[tokio::test]
+    async fn threaded_receipts_are_kept_per_thread_and_the_unthreaded_one_wins_a_clash() {
+        let reg = ReceiptRegistry::new();
+        let room = room_id!("!r:example.org");
+        let alice = user_id!("@alice:example.org");
+        let root = event_id!("$a");
+        reg.set_in_thread(
+            room,
+            alice,
+            ReceiptKind::Read,
+            &ReceiptThread::Main,
+            event_id!("$a").to_owned(),
+            1,
+        )
+        .await;
+        reg.set_in_thread(
+            room,
+            alice,
+            ReceiptKind::Read,
+            &ReceiptThread::Thread(root.to_owned()),
+            event_id!("$b").to_owned(),
+            2,
+        )
+        .await;
+        let (content, _) = reg.content_for(room, alice).await;
+        assert_eq!(
+            content,
+            json!({
+                "$a": {"m.read": {"@alice:example.org": {"ts": 1, "thread_id": "main"}}},
+                "$b": {"m.read": {"@alice:example.org": {"ts": 2, "thread_id": "$a"}}},
+            })
+        );
+
+        reg.set(
+            room,
+            alice,
+            ReceiptKind::Read,
+            event_id!("$c").to_owned(),
+            3,
+        )
+        .await;
+        reg.set_in_thread(
+            room,
+            alice,
+            ReceiptKind::Read,
+            &ReceiptThread::Thread(root.to_owned()),
+            event_id!("$c").to_owned(),
+            4,
+        )
+        .await;
+        let (content, _) = reg.content_for(room, alice).await;
+        assert_eq!(
+            content["$c"],
+            json!({"m.read": {"@alice:example.org": {"ts": 3}}}),
+            "the unthreaded receipt wins the clash on $c"
+        );
+        assert!(
+            content.get("$b").is_none(),
+            "the thread's receipt moved to $c"
+        );
+        assert_eq!(
+            content["$a"]["m.read"]["@alice:example.org"]["thread_id"],
+            "main"
+        );
+    }
+
+    #[tokio::test]
+    async fn threaded_receipts_outlive_the_registry_that_recorded_them() {
+        let backend = hs_kv::memory::MemoryBackend::new();
+        let room = room_id!("!r:example.org");
+        let alice = user_id!("@alice:example.org");
+        let before = ReceiptRegistry::with_store(store_over(&backend));
+        before
+            .set(
+                room,
+                alice,
+                ReceiptKind::Read,
+                event_id!("$one").to_owned(),
+                1,
+            )
+            .await;
+        before
+            .set_in_thread(
+                room,
+                alice,
+                ReceiptKind::Read,
+                &ReceiptThread::Thread(event_id!("$root").to_owned()),
+                event_id!("$two").to_owned(),
+                2,
+            )
+            .await;
+        let (expected, _) = before.content_for(room, alice).await;
+        drop(before);
+        let after = ReceiptRegistry::with_store(store_over(&backend));
+        let (content, _) = after.content_for(room, alice).await;
+        assert_eq!(content, expected);
+        assert_eq!(
+            content["$two"]["m.read"]["@alice:example.org"]["thread_id"],
+            "$root"
         );
     }
 

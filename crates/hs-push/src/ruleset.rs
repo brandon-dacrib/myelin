@@ -1,5 +1,18 @@
-//! A user's push ruleset: the five rule kinds in the spec's priority order, with the CRUD the
-//! `/pushrules` surface needs.
+//! A user's push ruleset: the spec's five rule kinds and MSC4306's `postcontent`, in evaluation
+//! order, with the CRUD the `/pushrules` surface needs.
+//!
+//! # `postcontent` (MSC4306)
+//!
+//! MSC4306 (thread subscriptions) adds a sixth kind, `postcontent`, evaluated after `content`
+//! and before `room`, as Synapse does (`rust/src/push/mod.rs`'s `PushRules::iter`). Its only
+//! rules are server defaults (`.io.element.msc4306.rule.subscribed_thread` and
+//! `.unsubscribed_thread`) whose condition is the user's subscription to the event's thread;
+//! clients may not add their own (`PUT` answers `400 M_INVALID_PARAM`, as Synapse's does). This
+//! server does not implement thread subscriptions, so it ships no `postcontent` rules, exactly
+//! what Synapse does with `msc4306_enabled` off (its default): the kind is accepted on every
+//! `/pushrules` path, its list is empty, and asking for one of those rules is `404`. A
+//! `postcontent` rule that reaches a ruleset some other way (an imported one) is evaluated in
+//! its place like any other conditional rule.
 //!
 //! This is this crate's own container rather than `ruma::push::Ruleset`, for one reason: Ruma
 //! types a room rule's `rule_id` as `OwnedRoomId` and a sender rule's as `OwnedUserId`, and
@@ -22,13 +35,16 @@ use ruma::push::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// The five kinds of push rule, in the spec's evaluation order.
+/// The kinds of push rule, in evaluation order: the spec's five, with MSC4306's `postcontent`
+/// between `content` and `room` (see the module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RuleKind {
     /// Highest priority: user-set and server-default override rules.
     Override,
     /// Glob matches on `content.body`.
     Content,
+    /// MSC4306's conditional rules after `content`: server defaults only.
+    PostContent,
     /// One room, by its `rule_id`.
     Room,
     /// One sender, by its `rule_id`.
@@ -39,9 +55,10 @@ pub enum RuleKind {
 
 impl RuleKind {
     /// Every kind, in evaluation order.
-    pub const ALL: [RuleKind; 5] = [
+    pub const ALL: [RuleKind; 6] = [
         RuleKind::Override,
         RuleKind::Content,
+        RuleKind::PostContent,
         RuleKind::Room,
         RuleKind::Sender,
         RuleKind::Underride,
@@ -53,6 +70,7 @@ impl RuleKind {
         Some(match raw {
             "override" => Self::Override,
             "content" => Self::Content,
+            "postcontent" => Self::PostContent,
             "room" => Self::Room,
             "sender" => Self::Sender,
             "underride" => Self::Underride,
@@ -60,12 +78,13 @@ impl RuleKind {
         })
     }
 
-    /// The wire name (`override`, `content`, `room`, `sender`, `underride`).
+    /// The wire name (`override`, `content`, `postcontent`, `room`, `sender`, `underride`).
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Override => "override",
             Self::Content => "content",
+            Self::PostContent => "postcontent",
             Self::Room => "room",
             Self::Sender => "sender",
             Self::Underride => "underride",
@@ -247,6 +266,9 @@ pub enum RuleError {
     /// Server-default rules cannot be removed (only disabled or re-actioned).
     #[error("server-default rules cannot be removed")]
     ServerDefault,
+    /// `postcontent` rules are server defaults only (MSC4306).
+    #[error("user-defined rules using `postcontent` are not accepted")]
+    UserPostContent,
 }
 
 /// A user's complete global ruleset. See the module docs for why this is not
@@ -259,6 +281,10 @@ pub struct Ruleset {
     /// Content rules.
     #[serde(default)]
     pub content: Vec<PatternedPushRule>,
+    /// MSC4306's `postcontent` rules (see the module docs). Left out of the JSON when empty,
+    /// which it always is here, so a client that predates the kind sees the spec's shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub postcontent: Vec<ConditionalPushRule>,
     /// Room rules.
     #[serde(default)]
     pub room: Vec<SimpleRule>,
@@ -366,8 +392,8 @@ impl Ruleset {
         Self::from(ruma::push::Ruleset::server_default(user_id))
     }
 
-    /// Every rule, in the spec's evaluation order: override, content, room, sender, underride,
-    /// each list in its own priority order.
+    /// Every rule, in evaluation order: override, content, postcontent, room, sender,
+    /// underride, each list in its own priority order.
     pub fn iter(&self) -> impl Iterator<Item = (RuleKind, RuleRef<'_>)> {
         let o = self
             .override_
@@ -377,6 +403,10 @@ impl Ruleset {
             .content
             .iter()
             .map(|r| (RuleKind::Content, RuleRef::Patterned(r)));
+        let p = self
+            .postcontent
+            .iter()
+            .map(|r| (RuleKind::PostContent, RuleRef::Conditional(r)));
         let r = self
             .room
             .iter()
@@ -389,7 +419,7 @@ impl Ruleset {
             .underride
             .iter()
             .map(|r| (RuleKind::Underride, RuleRef::Conditional(r)));
-        o.chain(c).chain(r).chain(s).chain(u)
+        o.chain(c).chain(p).chain(r).chain(s).chain(u)
     }
 
     /// The rules of one kind, in priority order.
@@ -398,6 +428,7 @@ impl Ruleset {
         match kind {
             RuleKind::Override => self.override_.iter().map(RuleRef::Conditional).collect(),
             RuleKind::Content => self.content.iter().map(RuleRef::Patterned).collect(),
+            RuleKind::PostContent => self.postcontent.iter().map(RuleRef::Conditional).collect(),
             RuleKind::Room => self.room.iter().map(RuleRef::Simple).collect(),
             RuleKind::Sender => self.sender.iter().map(RuleRef::Simple).collect(),
             RuleKind::Underride => self.underride.iter().map(RuleRef::Conditional).collect(),
@@ -418,14 +449,17 @@ impl Ruleset {
     /// existing user rule instead.
     ///
     /// # Errors
-    /// See [`RuleError`]: a reserved or malformed ID, a content rule without a pattern, or a bad
-    /// `after`/`before`.
+    /// See [`RuleError`]: a reserved or malformed ID, a content rule without a pattern, a
+    /// `postcontent` rule, or a bad `after`/`before`.
     pub fn insert(
         &mut self,
         rule: NewRule,
         after: Option<&str>,
         before: Option<&str>,
     ) -> Result<(), RuleError> {
+        if rule.kind == RuleKind::PostContent {
+            return Err(RuleError::UserPostContent);
+        }
         validate_new_rule_id(&rule.rule_id)?;
         if after.is_some_and(|s| s.starts_with('.')) || before.is_some_and(|s| s.starts_with('.')) {
             return Err(RuleError::RelativeToServerDefaultRule);
@@ -458,6 +492,7 @@ impl Ruleset {
                     insert_rule(&mut self.underride, new, 0, after, before)
                 }
             }
+            RuleKind::PostContent => Err(RuleError::UserPostContent),
             RuleKind::Content => {
                 let pattern = pattern.ok_or(RuleError::MissingPattern)?;
                 let new = PatternedPushRule::from(PatternedPushRuleInit {
@@ -495,6 +530,7 @@ impl Ruleset {
         match kind {
             RuleKind::Override => remove_rule(&mut self.override_, rule_id),
             RuleKind::Content => remove_rule(&mut self.content, rule_id),
+            RuleKind::PostContent => remove_rule(&mut self.postcontent, rule_id),
             RuleKind::Room => remove_rule(&mut self.room, rule_id),
             RuleKind::Sender => remove_rule(&mut self.sender, rule_id),
             RuleKind::Underride => remove_rule(&mut self.underride, rule_id),
@@ -514,6 +550,7 @@ impl Ruleset {
         match kind {
             RuleKind::Override => set_actions_on(&mut self.override_, rule_id, actions),
             RuleKind::Content => set_actions_on(&mut self.content, rule_id, actions),
+            RuleKind::PostContent => set_actions_on(&mut self.postcontent, rule_id, actions),
             RuleKind::Room => set_actions_on(&mut self.room, rule_id, actions),
             RuleKind::Sender => set_actions_on(&mut self.sender, rule_id, actions),
             RuleKind::Underride => set_actions_on(&mut self.underride, rule_id, actions),
@@ -533,6 +570,7 @@ impl Ruleset {
         match kind {
             RuleKind::Override => set_enabled_on(&mut self.override_, rule_id, enabled),
             RuleKind::Content => set_enabled_on(&mut self.content, rule_id, enabled),
+            RuleKind::PostContent => set_enabled_on(&mut self.postcontent, rule_id, enabled),
             RuleKind::Room => set_enabled_on(&mut self.room, rule_id, enabled),
             RuleKind::Sender => set_enabled_on(&mut self.sender, rule_id, enabled),
             RuleKind::Underride => set_enabled_on(&mut self.underride, rule_id, enabled),
@@ -558,6 +596,7 @@ impl From<ruma::push::Ruleset> for Ruleset {
         Self {
             override_: r.override_.into_iter().collect(),
             content: r.content.into_iter().collect(),
+            postcontent: Vec::new(),
             room: r
                 .room
                 .into_iter()
@@ -733,14 +772,52 @@ mod tests {
     }
 
     #[test]
+    fn postcontent_rules_are_evaluated_in_their_place_and_never_added_by_a_client() {
+        let mut rules = Ruleset::default();
+        let mut rule = room_rule("mine");
+        rule.kind = RuleKind::PostContent;
+        assert_eq!(
+            rules.insert(rule, None, None),
+            Err(RuleError::UserPostContent)
+        );
+        assert_eq!(RuleKind::parse("postcontent"), Some(RuleKind::PostContent));
+        let order: Vec<&str> = RuleKind::ALL.iter().map(|k| k.as_str()).collect();
+        assert_eq!(
+            order,
+            [
+                "override",
+                "content",
+                "postcontent",
+                "room",
+                "sender",
+                "underride"
+            ]
+        );
+        let with_one: Ruleset = serde_json::from_value(serde_json::json!({
+            "postcontent": [{"rule_id": ".x", "default": true, "enabled": true,
+                             "conditions": [], "actions": ["notify"]}],
+            "room": [{"rule_id": "!r:x", "default": false, "enabled": true, "actions": []}],
+        }))
+        .unwrap();
+        let kinds: Vec<RuleKind> = with_one.iter().map(|(k, _)| k).collect();
+        assert_eq!(kinds, [RuleKind::PostContent, RuleKind::Room]);
+        assert_eq!(
+            serde_json::to_value(&with_one).unwrap()["postcontent"][0]["rule_id"],
+            ".x"
+        );
+    }
+
+    #[test]
     fn json_round_trips_through_rumas_shape() {
         let alice = user_id!("@alice:example.org");
         let theirs = serde_json::to_value(ruma::push::Ruleset::server_default(alice)).unwrap();
         let ours: Ruleset = serde_json::from_value(theirs.clone()).unwrap();
         let mut ours_json = serde_json::to_value(&ours).unwrap();
         // Ruma omits empty lists; the spec's example shows every kind. Both read back the same.
+        // `postcontent` (MSC4306) is not the spec's: left out when empty, as it is here.
+        assert!(ours_json.get("postcontent").is_none());
         for kind in RuleKind::ALL {
-            if theirs.get(kind.as_str()).is_none() {
+            if kind != RuleKind::PostContent && theirs.get(kind.as_str()).is_none() {
                 assert_eq!(ours_json[kind.as_str()], serde_json::json!([]));
                 ours_json.as_object_mut().unwrap().remove(kind.as_str());
             }

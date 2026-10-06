@@ -302,6 +302,47 @@ async fn malformed_gets_are_400_and_unknown_rules_404() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+/// MSC4306's `postcontent` kind is a kind like the others on every path (Complement's
+/// `disableMsc4306PushRules` asks for its rules and expects a `404` when a server has none),
+/// with no rules here and none a client may add (Synapse's `test_no_user_defined_postcontent_rules`).
+#[tokio::test]
+async fn postcontent_is_a_kind_with_no_rules_and_none_a_client_may_add() {
+    let state = state().await;
+    let (status, body) = call(&state, "GET", "/pushrules/global/postcontent/", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!([]));
+    for path in [
+        "/pushrules/global/postcontent/.io.element.msc4306.rule.subscribed_thread",
+        "/pushrules/global/postcontent/.io.element.msc4306.rule.unsubscribed_thread",
+        "/pushrules/global/postcontent/.io.element.msc4306.rule.subscribed_thread/enabled",
+    ] {
+        let (status, _) = call(&state, "GET", path, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "GET {path}");
+    }
+    let (status, _) = call(
+        &state,
+        "PUT",
+        "/pushrules/global/postcontent/.io.element.msc4306.rule.subscribed_thread/enabled",
+        Some(json!({"enabled": false})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, body) = call(
+        &state,
+        "PUT",
+        "/pushrules/global/postcontent/some.user.rule",
+        Some(json!({"actions": ["notify"], "conditions": []})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["errcode"], "M_INVALID_PARAM");
+    let (_, all) = call(&state, "GET", "/pushrules/", None).await;
+    assert!(
+        all["global"].get("postcontent").is_none(),
+        "an empty postcontent list stays out of the spec's shape"
+    );
+}
+
 #[tokio::test]
 async fn an_unstable_action_is_refused_so_clients_can_tell() {
     let state = state().await;

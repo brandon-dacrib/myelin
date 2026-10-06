@@ -18,7 +18,7 @@
 //! | `hs_user.account_data_room` | `(user_id, room_id, event_type)` | room-scoped account data (`m.tag` and friends) |
 //! | `hs_user.account_data_counter` | `user_id` (raw `atomic_add` key, not a [`hs_tables::keyspace::TypedKeyspace`]) | the shared global/room account-data change counter |
 //! | `hs_user.filters` | `(user_id, filter_id)` | uploaded named filters (`POST /user/{userId}/filter`) |
-//! | `hs_user.receipts` | `(room_id, user_id, kind)` | the latest read receipt of each kind per user per room |
+//! | `hs_user.receipts` | `(room_id, user_id, kind)`, or `(room_id, user_id, "{kind} {thread_id}")` for a threaded receipt | the latest read receipt of each kind per user per thread per room |
 //! | `hs_user.presence` | `user_id` | each user's latest presence |
 //! | `hs_user.receipt_stream` | `(pos: u64,)` | the server-wide receipt stream: one entry per receipt written, for appservice delivery |
 //! | `hs_user.presence_stream` | `(pos: u64,)` | the server-wide presence stream: one entry per presence change (a new stamp), for appservice delivery |
@@ -1483,11 +1483,13 @@ impl<B: KvBackend> UserStore for TablesUserStore<B> {
         room_id: &RoomId,
         receipt: &StoredReceipt,
     ) -> Result<(), StoreError> {
-        let key = (
-            room_id.to_string(),
-            receipt.user_id.clone(),
-            receipt.kind.clone(),
-        );
+        // The third key part is the kind, with the thread after a space for a threaded
+        // receipt: an unthreaded receipt keeps the key rows had before threads were kept.
+        let slot = match &receipt.thread_id {
+            Some(thread) => format!("{} {thread}", receipt.kind),
+            None => receipt.kind.clone(),
+        };
+        let key = (room_id.to_string(), receipt.user_id.clone(), slot);
         let value = json_encode(receipt)?;
         let stream_value = json_encode(&ReceiptStreamValue {
             room_id: room_id.to_string(),
@@ -1674,6 +1676,7 @@ mod tests {
             event_id: event.to_owned(),
             ts: 1000,
             seq,
+            thread_id: None,
         };
         s.put_receipt(room, &receipt("$one", 10)).await.unwrap();
         s.put_receipt(room, &receipt("$two", 11)).await.unwrap();

@@ -63,9 +63,10 @@ async fn rule_applies(
     ctx: &PushConditionRoomCtx,
 ) -> bool {
     match (kind, rule) {
-        (RuleKind::Override | RuleKind::Underride, RuleRef::Conditional(r)) => {
-            r.applies(event, ctx).await
-        }
+        (
+            RuleKind::Override | RuleKind::PostContent | RuleKind::Underride,
+            RuleRef::Conditional(r),
+        ) => r.applies(event, ctx).await,
         (RuleKind::Content, RuleRef::Patterned(r)) => r.applies_to("content.body", event, ctx),
         (RuleKind::Room, RuleRef::Simple(r)) => {
             r.enabled && event.get_str("room_id") == Some(r.rule_id.as_str())

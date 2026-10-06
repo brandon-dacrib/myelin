@@ -30,6 +30,7 @@
 //! `hs_push_email_sent_total{outcome=sent|failed|skipped}`.
 
 pub mod held;
+pub mod helo;
 pub mod smtp;
 pub mod template;
 pub mod throttle;
@@ -913,10 +914,22 @@ mod tests {
         }
     }
 
+    /// A distinct room position for each notification a test records.
+    fn next_pos() -> i64 {
+        static NEXT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// A notification the pipeline would have counted: counts first, then the hold.
     async fn notify(h: &mut Harness, room: &RoomId, body: &str) {
         h.counts
-            .record_notification(user_id!("@alice:example.org"), room, Scope::Main, false)
+            .record_notification(
+                user_id!("@alice:example.org"),
+                room,
+                Scope::Main,
+                false,
+                next_pos(),
+            )
             .await
             .unwrap();
         h.worker.hold(message(room, body)).await;
@@ -1033,7 +1046,13 @@ mod tests {
         dm.room_name = None;
         dm.event["type"] = json!("m.room.encrypted");
         h.counts
-            .record_notification(user_id!("@alice:example.org"), other, Scope::Main, false)
+            .record_notification(
+                user_id!("@alice:example.org"),
+                other,
+                Scope::Main,
+                false,
+                next_pos(),
+            )
             .await
             .unwrap();
         h.worker.hold(dm).await;
@@ -1126,7 +1145,7 @@ mod tests {
         // Another replica's email is not this one's to send.
         h.held.put("hs-1", alice, ADDRESS, &stale).await.unwrap();
         h.counts
-            .record_notification(alice, room, Scope::Main, false)
+            .record_notification(alice, room, Scope::Main, false, next_pos())
             .await
             .unwrap();
         let mut worker = restarted(&h);
@@ -1221,7 +1240,7 @@ mod tests {
             .await
             .unwrap();
         counts
-            .record_notification(alice, room, Scope::Main, false)
+            .record_notification(alice, room, Scope::Main, false, next_pos())
             .await
             .unwrap();
         let handle = spawn(

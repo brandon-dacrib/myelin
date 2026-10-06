@@ -1334,39 +1334,47 @@ async fn build_batch<B: KvBackend + 'static, R: RoomSource<B>>(
                     Some(counts) => counts.get_room_counts(user_id, room_id).await?,
                     None => hs_push::counts::RoomNotificationCounts::default(),
                 };
-                let totals = room_counts.totals();
-                let thread_counts: serde_json::Map<String, Value> = room_counts
-                    .threads
-                    .iter()
-                    .map(|(thread_root, c)| {
-                        (
-                            thread_root.to_string(),
-                            json!({
-                                "highlight_count": c.highlight_count,
-                                "notification_count": c.notification_count,
-                            }),
-                        )
-                    })
-                    .collect();
-                join.insert(
-                    bucket_key,
-                    json!({
-                        "state": {"events": state_events},
-                        "timeline": {
-                            "events": timeline.events,
-                            "limited": timeline.limited,
-                            "prev_batch": timeline.prev_batch,
-                        },
-                        "account_data": {"events": account_data_json},
-                        "ephemeral": {"events": ephemeral_events},
-                        "unread_notifications": {
-                            "highlight_count": totals.highlight_count,
-                            "notification_count": totals.notification_count,
-                        },
-                        "unread_thread_notifications": thread_counts,
-                        "summary": summary,
-                    }),
-                );
+                // Split by thread only for a client that asked (MSC3773): the main timeline in
+                // `unread_notifications` and each thread with unread notifications in
+                // `unread_thread_notifications`, which is left out when there are none.
+                // Otherwise one count for the whole room, and no thread breakdown at all.
+                let (unread, thread_counts) = if params.filter.unread_thread_notifications() {
+                    let threads: serde_json::Map<String, Value> = room_counts
+                        .threads
+                        .iter()
+                        .map(|(thread_root, c)| {
+                            (
+                                thread_root.to_string(),
+                                json!({
+                                    "highlight_count": c.highlight_count,
+                                    "notification_count": c.notification_count,
+                                }),
+                            )
+                        })
+                        .collect();
+                    (room_counts.main, (!threads.is_empty()).then_some(threads))
+                } else {
+                    (room_counts.totals(), None)
+                };
+                let mut entry = json!({
+                    "state": {"events": state_events},
+                    "timeline": {
+                        "events": timeline.events,
+                        "limited": timeline.limited,
+                        "prev_batch": timeline.prev_batch,
+                    },
+                    "account_data": {"events": account_data_json},
+                    "ephemeral": {"events": ephemeral_events},
+                    "unread_notifications": {
+                        "highlight_count": unread.highlight_count,
+                        "notification_count": unread.notification_count,
+                    },
+                    "summary": summary,
+                });
+                if let Some(threads) = thread_counts {
+                    entry["unread_thread_notifications"] = Value::Object(threads);
+                }
+                join.insert(bucket_key, entry);
             }
         }
     }
@@ -3644,15 +3652,43 @@ mod tests {
             hs_push::counts::tables::TablesCountsStore::open(MemoryBackend::new()).unwrap(),
         );
         counts
-            .record_notification(&alice, &room_id, hs_push::counts::Scope::Main, true)
+            .record_notification(&alice, &room_id, hs_push::counts::Scope::Main, true, 1)
+            .await
+            .unwrap();
+        let root = ruma::event_id!("$root:sync.test");
+        counts
+            .record_notification(
+                &alice,
+                &room_id,
+                hs_push::counts::Scope::Thread(root),
+                false,
+                2,
+            )
             .await
             .unwrap();
         hub.install_counts_store(counts);
 
+        // Not asked for by thread: one count for the room, and no breakdown at all.
         let (response, _) = build(&hub, &e2e, &alice, params(None)).await.unwrap();
+        let room = &response["rooms"]["join"][room_id.as_str()];
+        assert_eq!(room["unread_notifications"]["notification_count"], 2);
+        assert_eq!(room["unread_notifications"]["highlight_count"], 1);
+        assert!(room.get("unread_thread_notifications").is_none(), "{room}");
+
+        // Asked for (MSC3773): the main timeline, and the thread on its own.
+        let mut by_thread = params(None);
+        by_thread.filter = serde_json::from_value(json!({
+            "room": {"timeline": {"unread_thread_notifications": true}}
+        }))
+        .unwrap();
+        let (response, _) = build(&hub, &e2e, &alice, by_thread).await.unwrap();
         let room = &response["rooms"]["join"][room_id.as_str()];
         assert_eq!(room["unread_notifications"]["notification_count"], 1);
         assert_eq!(room["unread_notifications"]["highlight_count"], 1);
+        assert_eq!(
+            room["unread_thread_notifications"][root.as_str()],
+            json!({"notification_count": 1, "highlight_count": 0})
+        );
     }
 
     /// The motivating case named in this track's status file: a room with no `m.room.name`

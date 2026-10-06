@@ -59,12 +59,15 @@ async fn require_joined<B: KvBackend + 'static, R: RoomSource<B> + 'static>(
     Ok(())
 }
 
-/// `POST /rooms/{roomId}/receipt/{receiptType}/{eventId}`'s body. Every field is optional and
-/// ignored beyond validating the request parses as an object -- this crate does not implement
-/// MSC2285's `hidden` flag or thread-scoped receipts (MSC3771's `thread_id`), and the spec allows
-/// an empty `{}` body.
+/// `POST /rooms/{roomId}/receipt/{receiptType}/{eventId}`'s body. Every field is optional, and
+/// the spec allows an empty `{}` body.
 #[derive(Debug, Deserialize, Default)]
-pub struct ReceiptBody {}
+pub struct ReceiptBody {
+    /// The thread the receipt is for (MSC3771, spec v1.4): `main` for the room's main timeline,
+    /// or a thread root's event ID; absent for an unthreaded receipt, which reads every thread.
+    #[serde(default)]
+    pub thread_id: Option<String>,
+}
 
 /// `POST /rooms/{roomId}/receipt/{receiptType}/{eventId}`. `receiptType` is `m.read` or
 /// `m.read.private` (an ephemeral `m.receipt` event, via [`crate::receipts::ReceiptRegistry`]) --
@@ -84,7 +87,7 @@ pub async fn post_receipt<B: KvBackend + 'static, R: RoomSource<B> + 'static>(
     UserRequester(requester): UserRequester,
     body: Option<PermissiveJson<ReceiptBody>>,
 ) -> Result<Response, UserError> {
-    let _ = body;
+    let thread_id = body.and_then(|PermissiveJson(body)| body.thread_id);
     let room_id = parse_room_id(&room_id)?;
     let event_id = parse_event_id(&event_id)?;
     require_joined(&state, &requester.user_id, &room_id).await?;
@@ -103,6 +106,8 @@ pub async fn post_receipt<B: KvBackend + 'static, R: RoomSource<B> + 'static>(
         state.hub.account_data_changed(&requester.user_id).await;
         return Ok(Json(json!({})).into_response());
     }
+    let thread = hs_push::counts::ReceiptThread::from_wire(thread_id.as_deref())
+        .map_err(UserError::InvalidParam)?;
     let kind = ReceiptKind::parse(&receipt_type).ok_or_else(|| {
         UserError::InvalidParam(format!(
             "unsupported receipt type {receipt_type:?} (expected m.read, m.read.private or \
@@ -112,7 +117,14 @@ pub async fn post_receipt<B: KvBackend + 'static, R: RoomSource<B> + 'static>(
 
     state
         .hub
-        .set_receipt(&room_id, &requester.user_id, kind, event_id, now_ms())
+        .set_threaded_receipt(
+            &room_id,
+            &requester.user_id,
+            kind,
+            &thread,
+            event_id,
+            now_ms(),
+        )
         .await?;
     Ok(Json(json!({})).into_response())
 }
@@ -340,6 +352,42 @@ mod tests {
             content["$one"]["m.read"]["@alice:receipts.test"]["ts"]
                 .as_u64()
                 .is_some()
+        );
+    }
+
+    /// MSC3771: a `thread_id` of `main` or an event ID is kept with the receipt; anything else
+    /// is `400 M_INVALID_PARAM`.
+    #[tokio::test]
+    async fn a_receipt_takes_a_thread_id() {
+        let (state, room_id) = test_state().await;
+        let alice = user_id!("@alice:receipts.test");
+        let post = |thread_id: &str| {
+            post_receipt(
+                State(state.clone()),
+                Path((
+                    room_id.to_string(),
+                    "m.read".to_owned(),
+                    event_id!("$one").to_string(),
+                )),
+                UserRequester(Requester::for_user(alice.to_owned())),
+                Some(PermissiveJson(ReceiptBody {
+                    thread_id: Some(thread_id.to_owned()),
+                })),
+            )
+        };
+        assert_eq!(
+            post("main").await.unwrap().status(),
+            axum::http::StatusCode::OK
+        );
+        let (content, _) = state.hub.receipt_content_for(&room_id, alice).await;
+        assert_eq!(
+            content["$one"]["m.read"]["@alice:receipts.test"]["thread_id"],
+            "main"
+        );
+        let err = post("not a thread").await.unwrap_err();
+        assert_eq!(
+            err.into_response().status(),
+            axum::http::StatusCode::BAD_REQUEST
         );
     }
 

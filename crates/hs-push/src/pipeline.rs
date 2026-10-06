@@ -1,7 +1,17 @@
 //! The push pipeline: every accepted room event is evaluated against each local member's rules;
 //! a match that notifies counts toward the room's unread numbers, lands in the user's
-//! notification log, and goes out to each of their HTTP pushers. A read receipt zeroes the
-//! room's counts, marks the log read, and sends each pusher the new badge.
+//! notification log, and goes out to each of their HTTP pushers. A read receipt reads what it
+//! covers up to its event (its thread, the main timeline, or the whole room:
+//! [`crate::counts`]), marks the log read, and sends each pusher the new badge.
+//!
+//! # Read your own receipt
+//!
+//! Jobs run in order on one task, behind the room stream. A receipt's sender waits for its
+//! receipt to be handled ([`ReadReceiptSink::read_receipt`], up to [`RECEIPT_SETTLE`]), so the
+//! `/sync` a client sends after `POST .../receipt` returns has the counts the receipt left.
+//! [`SettledCounts`] does the same for `/sync`'s reads of the counts: it waits (up to
+//! [`READ_SETTLE`]) for the jobs already queued, so an event a client saw sent is counted in the
+//! `/sync` that brings it.
 //!
 //! # Where the events come from
 //!
@@ -29,9 +39,9 @@
 //! deleted, per the Push Gateway API. An email pusher's notifications go to
 //! [`crate::email`], which holds and batches them into notification emails.
 
-use std::sync::Arc;
-use std::sync::LazyLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
@@ -40,10 +50,10 @@ use ruma::api::client::push::{Pusher, PusherKind};
 use ruma::push::{Action, PushFormat};
 use ruma::{EventId, OwnedEventId, OwnedRoomId, OwnedServerName, OwnedUserId, RoomId, UserId};
 use serde_json::{Map, Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::context::{PushEvaluationInput, PushEvaluationMember, build_room_ctx};
-use crate::counts::{CountsStore, Scope};
+use crate::counts::{CountsStore, ReceiptThread, RoomNotificationCounts, Scope};
 use crate::cursors::CursorStore;
 use crate::email::EmailPushersHandle;
 use crate::engine::{EvaluationOutcome, evaluate, flatten_event};
@@ -57,6 +67,12 @@ use crate::rulesets::{CachedRulesetStore, RulesetStore};
 /// How much older than the pipeline's start an event may be, in a room the pipeline has never
 /// seen, before it is taken for a re-announced head rather than news. See the module docs.
 pub const STALE_HEAD_GRACE_MS: u64 = 60_000;
+
+/// How long a receipt's sender waits for the pipeline to handle it. See the module docs.
+pub const RECEIPT_SETTLE: Duration = Duration::from_secs(2);
+
+/// How long a read of the counts waits for the jobs already queued. See the module docs.
+pub const READ_SETTLE: Duration = Duration::from_millis(250);
 
 /// Everything the pipeline needs to know about one event, from the room layer.
 #[derive(Debug, Clone)]
@@ -83,6 +99,15 @@ pub trait EventSource: Send + Sync {
         room_id: &RoomId,
         event_id: &EventId,
     ) -> Result<Option<DescribedEvent>, String>;
+
+    /// `event_id`'s room-local position in `room_id`'s timeline (the `room_pos` its
+    /// [`Job::Event`] carries), or `None` if the event is not known here: what a read receipt
+    /// pointing at it reads up to.
+    async fn event_position(
+        &self,
+        room_id: &RoomId,
+        event_id: &EventId,
+    ) -> Result<Option<i64>, String>;
 }
 
 /// A user's effective ruleset, as the pipeline reads it: the cached store behind a trait object,
@@ -113,18 +138,30 @@ pub enum Job {
         room_pos: i64,
     },
     /// A local user sent a read receipt for a room.
-    Receipt {
-        /// The reader.
-        user_id: OwnedUserId,
-        /// The room.
-        room_id: OwnedRoomId,
-    },
+    Receipt(ReadReceipt),
+}
+
+/// One read receipt (`m.read` or `m.read.private`), as the pipeline acts on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadReceipt {
+    /// The reader.
+    pub user_id: OwnedUserId,
+    /// The room.
+    pub room_id: OwnedRoomId,
+    /// The event read up to.
+    pub event_id: OwnedEventId,
+    /// Which timeline it reads (MSC3771's `thread_id`).
+    pub thread: ReceiptThread,
 }
 
 /// The sending side of the pipeline, for the room stream forwarder and the receipt hook.
 #[derive(Debug, Clone)]
 pub struct PipelineHandle {
     tx: mpsc::UnboundedSender<Job>,
+    /// Jobs sent so far; the `n`th job sent is ticket `n`.
+    sent: Arc<AtomicU64>,
+    /// Jobs handled so far, in order, by the worker.
+    done: watch::Receiver<u64>,
 }
 
 impl PipelineHandle {
@@ -137,28 +174,152 @@ impl PipelineHandle {
         });
     }
 
-    /// Tells the pipeline a user read a room (any `m.read` or `m.read.private` receipt).
-    pub fn receipt(&self, user_id: OwnedUserId, room_id: OwnedRoomId) {
-        self.send(Job::Receipt { user_id, room_id });
+    /// Tells the pipeline a user read a room (any `m.read` or `m.read.private` receipt), and
+    /// returns the job's ticket for [`PipelineHandle::wait_for`].
+    pub fn receipt(&self, receipt: ReadReceipt) -> u64 {
+        self.send(Job::Receipt(receipt))
     }
 
-    fn send(&self, job: Job) {
+    /// Waits until the job with `ticket` (and so every job before it) has been handled, for at
+    /// most `timeout`. Returns whether it was.
+    pub async fn wait_for(&self, ticket: u64, timeout: Duration) -> bool {
+        if *self.done.borrow() >= ticket {
+            return true;
+        }
+        let mut done = self.done.clone();
+        matches!(
+            tokio::time::timeout(timeout, done.wait_for(|d| *d >= ticket)).await,
+            Ok(Ok(_))
+        )
+    }
+
+    /// Waits until every job sent before this call has been handled, for at most `timeout`.
+    /// Returns whether they were.
+    pub async fn settle(&self, timeout: Duration) -> bool {
+        let ticket = self.sent.load(Ordering::SeqCst);
+        self.wait_for(ticket, timeout).await
+    }
+
+    fn send(&self, job: Job) -> u64 {
+        let ticket = self.sent.fetch_add(1, Ordering::SeqCst) + 1;
         if self.tx.send(job).is_err() {
             tracing::warn!("the push pipeline has stopped; dropping a job");
+        }
+        ticket
+    }
+}
+
+/// What a session layer calls when a read receipt lands; implemented by [`PipelineHandle`]. A
+/// trait so `hs-user` can hold one without naming the pipeline.
+#[async_trait::async_trait]
+pub trait ReadReceiptSink: Send + Sync {
+    /// A receipt landed. Returns once the counts reflect it, or after [`RECEIPT_SETTLE`] if the
+    /// pipeline is that far behind (it then still applies the receipt, later). Receipts of
+    /// other servers' users are ignored by the pipeline.
+    async fn read_receipt(&self, receipt: ReadReceipt);
+}
+
+#[async_trait::async_trait]
+impl ReadReceiptSink for PipelineHandle {
+    async fn read_receipt(&self, receipt: ReadReceipt) {
+        let ticket = self.receipt(receipt);
+        if !self.wait_for(ticket, RECEIPT_SETTLE).await {
+            tracing::debug!(
+                "the push pipeline is behind; a receipt's counts are applied after it returns"
+            );
         }
     }
 }
 
-/// What a session layer calls when a local user's read receipt lands; implemented by
-/// [`PipelineHandle`]. A trait so `hs-user` can hold one without naming the pipeline.
-pub trait ReadReceiptSink: Send + Sync {
-    /// `user_id` read `room_id` (up to some event; the pipeline treats the whole room as read).
-    fn read_receipt(&self, user_id: &UserId, room_id: &RoomId);
+/// A [`CountsStore`] whose room reads first wait, briefly, for the pipeline's queued jobs: what
+/// `/sync` is given (see the module docs). Writes go straight through. When a wait runs out the
+/// pipeline is taken to be behind, and reads in the next second do not wait at all, so a long
+/// backlog slows no `/sync` by more than one [`READ_SETTLE`].
+pub struct SettledCounts {
+    inner: Arc<dyn CountsStore>,
+    pipeline: PipelineHandle,
+    behind_until: Mutex<Option<Instant>>,
 }
 
-impl ReadReceiptSink for PipelineHandle {
-    fn read_receipt(&self, user_id: &UserId, room_id: &RoomId) {
-        self.receipt(user_id.to_owned(), room_id.to_owned());
+impl SettledCounts {
+    /// `inner`, read after `pipeline` settles.
+    #[must_use]
+    pub fn new(inner: Arc<dyn CountsStore>, pipeline: PipelineHandle) -> Self {
+        Self {
+            inner,
+            pipeline,
+            behind_until: Mutex::new(None),
+        }
+    }
+
+    async fn settle(&self) {
+        let now = Instant::now();
+        let behind = self
+            .behind_until
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some_and(|until| now < until);
+        if behind || self.pipeline.settle(READ_SETTLE).await {
+            return;
+        }
+        *self
+            .behind_until
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) =
+            Some(Instant::now() + Duration::from_secs(1));
+        tracing::debug!("the push pipeline is behind; serving counts without waiting for it");
+    }
+}
+
+#[async_trait::async_trait]
+impl CountsStore for SettledCounts {
+    async fn get_room_counts(
+        &self,
+        user_id: &UserId,
+        room_id: &RoomId,
+    ) -> Result<RoomNotificationCounts, StoreError> {
+        self.settle().await;
+        self.inner.get_room_counts(user_id, room_id).await
+    }
+
+    async fn record_notification(
+        &self,
+        user_id: &UserId,
+        room_id: &RoomId,
+        scope: Scope<'_>,
+        highlight: bool,
+        pos: i64,
+    ) -> Result<(), StoreError> {
+        self.inner
+            .record_notification(user_id, room_id, scope, highlight, pos)
+            .await
+    }
+
+    async fn mark_read(
+        &self,
+        user_id: &UserId,
+        room_id: &RoomId,
+        thread: &ReceiptThread,
+        pos: i64,
+    ) -> Result<(), StoreError> {
+        self.inner.mark_read(user_id, room_id, thread, pos).await
+    }
+
+    async fn reset(
+        &self,
+        user_id: &UserId,
+        room_id: &RoomId,
+        scope: Scope<'_>,
+    ) -> Result<(), StoreError> {
+        self.inner.reset(user_id, room_id, scope).await
+    }
+
+    async fn reset_room(&self, user_id: &UserId, room_id: &RoomId) -> Result<(), StoreError> {
+        self.inner.reset_room(user_id, room_id).await
+    }
+
+    async fn total_unread(&self, user_id: &UserId) -> Result<u64, StoreError> {
+        self.inner.total_unread(user_id).await
     }
 }
 
@@ -243,6 +404,7 @@ fn now_ms() -> u64 {
 pub struct PipelineWorker {
     pipeline: Pipeline,
     rx: mpsc::UnboundedReceiver<Job>,
+    done: watch::Sender<u64>,
 }
 
 impl PipelineWorker {
@@ -250,6 +412,7 @@ impl PipelineWorker {
     pub async fn run(mut self) {
         while let Some(job) = self.rx.recv().await {
             self.pipeline.handle(job).await;
+            self.done.send_modify(|done| *done += 1);
         }
         tracing::info!("the push pipeline stopped: every handle was dropped");
     }
@@ -260,11 +423,18 @@ impl PipelineWorker {
 #[must_use]
 pub fn channel(deps: PipelineDeps) -> (PipelineHandle, PipelineWorker) {
     let (tx, rx) = mpsc::unbounded_channel();
+    let (done_tx, done_rx) = watch::channel(0);
     let worker = PipelineWorker {
         pipeline: Pipeline::new(deps),
         rx,
+        done: done_tx,
     };
-    (PipelineHandle { tx }, worker)
+    let handle = PipelineHandle {
+        tx,
+        sent: Arc::new(AtomicU64::new(0)),
+        done: done_rx,
+    };
+    (handle, worker)
 }
 
 /// Starts the pipeline on a new task and returns the handle the room and session layers feed.
@@ -298,9 +468,14 @@ impl Pipeline {
                     tracing::warn!(room = %room_id, event = %event_id, error = %e, "push evaluation failed");
                 }
             }
-            Job::Receipt { user_id, room_id } => {
-                if let Err(e) = self.handle_receipt(&user_id, &room_id).await {
-                    tracing::warn!(room = %room_id, user = %user_id, error = %e, "push receipt handling failed");
+            Job::Receipt(receipt) => {
+                if let Err(e) = self.handle_receipt(&receipt).await {
+                    tracing::warn!(
+                        room = %receipt.room_id,
+                        user = %receipt.user_id,
+                        error = %e,
+                        "push receipt handling failed"
+                    );
                 }
             }
         }
@@ -346,7 +521,9 @@ impl Pipeline {
             return Ok(None);
         }
 
-        let notified = self.evaluate_for_members(room_id, &described).await?;
+        let notified = self
+            .evaluate_for_members(room_id, &described, room_pos)
+            .await?;
         advance().await?;
         Ok(Some(notified))
     }
@@ -355,6 +532,7 @@ impl Pipeline {
         &self,
         room_id: &RoomId,
         described: &DescribedEvent,
+        room_pos: i64,
     ) -> Result<usize, String> {
         let event = &described.event;
         let flattened = flatten_event(&event.to_string()).map_err(|e| e.to_string())?;
@@ -397,7 +575,7 @@ impl Pipeline {
                 "push rule matched"
             );
             notified += 1;
-            self.notify_member(room_id, described, member, &outcome)
+            self.notify_member(room_id, described, member, &outcome, room_pos)
                 .await?;
         }
         Ok(notified)
@@ -409,6 +587,7 @@ impl Pipeline {
         described: &DescribedEvent,
         member: &PushEvaluationMember,
         outcome: &EvaluationOutcome,
+        room_pos: i64,
     ) -> Result<(), String> {
         let event = &described.event;
         let event_id: OwnedEventId = event["event_id"]
@@ -422,7 +601,7 @@ impl Pipeline {
         };
         self.deps
             .counts
-            .record_notification(&member.user_id, room_id, scope, outcome.highlight)
+            .record_notification(&member.user_id, room_id, scope, outcome.highlight, room_pos)
             .await
             .map_err(|e| e.to_string())?;
         self.deps
@@ -492,17 +671,39 @@ impl Pipeline {
         Ok(())
     }
 
-    /// Zeroes the room's counts, marks its log entries read, and tells each pusher the new
-    /// badge. Receipts from other servers' users are not this pipeline's.
-    pub async fn handle_receipt(&self, user_id: &UserId, room_id: &RoomId) -> Result<(), String> {
+    /// Reads what the receipt covers up to its event ([`CountsStore::mark_read`]; the whole
+    /// scope when the event's position is not known here), marks the room's log entries read,
+    /// and tells each pusher the new badge. Receipts from other servers' users are not this
+    /// pipeline's.
+    pub async fn handle_receipt(&self, receipt: &ReadReceipt) -> Result<(), String> {
+        let ReadReceipt {
+            user_id,
+            room_id,
+            event_id,
+            thread,
+        } = receipt;
         if user_id.server_name() != self.deps.server_name {
             return Ok(());
         }
-        self.deps
-            .counts
-            .reset_room(user_id, room_id)
-            .await
-            .map_err(|e| e.to_string())?;
+        let counts = &self.deps.counts;
+        match self.deps.source.event_position(room_id, event_id).await? {
+            Some(pos) => counts.mark_read(user_id, room_id, thread, pos).await,
+            None => {
+                tracing::debug!(
+                    room = %room_id,
+                    event = %event_id,
+                    "a receipt for an event not known here reads its whole scope"
+                );
+                match thread {
+                    ReceiptThread::Unthreaded => counts.reset_room(user_id, room_id).await,
+                    ReceiptThread::Main => counts.reset(user_id, room_id, Scope::Main).await,
+                    ReceiptThread::Thread(root) => {
+                        counts.reset(user_id, room_id, Scope::Thread(root)).await
+                    }
+                }
+            }
+        }
+        .map_err(|e| e.to_string())?;
         self.deps
             .log
             .mark_room_read(user_id, room_id)
@@ -757,6 +958,7 @@ mod tests {
     /// A fixed room: Alice and Bob joined (both local), Carol invited, Dave remote.
     struct FakeSource {
         events: Mutex<HashMap<OwnedEventId, DescribedEvent>>,
+        positions: Mutex<HashMap<OwnedEventId, i64>>,
     }
 
     fn member(id: &str, membership: &str, local: bool) -> PushEvaluationMember {
@@ -796,6 +998,14 @@ mod tests {
         ) -> Result<Option<DescribedEvent>, String> {
             Ok(self.events.lock().unwrap().get(event_id).cloned())
         }
+
+        async fn event_position(
+            &self,
+            _room_id: &RoomId,
+            event_id: &EventId,
+        ) -> Result<Option<i64>, String> {
+            Ok(self.positions.lock().unwrap().get(event_id).copied())
+        }
     }
 
     struct Harness {
@@ -807,8 +1017,19 @@ mod tests {
     }
 
     fn harness() -> Harness {
+        let (deps, h) = harness_parts();
+        Harness {
+            pipeline: Pipeline::new(deps),
+            ..h
+        }
+    }
+
+    /// The harness's dependencies, and a harness whose own pipeline runs on nothing (for a test
+    /// that runs the deps on a [`channel`] instead).
+    fn harness_parts() -> (PipelineDeps, Harness) {
         let source = Arc::new(FakeSource {
             events: Mutex::new(HashMap::new()),
+            positions: Mutex::new(HashMap::new()),
         });
         let counts = Arc::new(InMemoryCountsStore::new());
         let log = Arc::new(InMemoryNotificationLogStore::new());
@@ -828,13 +1049,57 @@ mod tests {
             })),
             email: None,
         };
-        Harness {
-            pipeline: Pipeline::new(deps),
-            source,
-            counts,
-            log,
-            pushers,
+        let idle = PipelineDeps {
+            server_name: deps.server_name.clone(),
+            source: deps.source.clone(),
+            rulesets: deps.rulesets.clone(),
+            pushers: deps.pushers.clone(),
+            counts: deps.counts.clone(),
+            log: deps.log.clone(),
+            cursors: Arc::new(InMemoryCursorStore::new()),
+            http: deps.http.clone(),
+            email: None,
+        };
+        (
+            deps,
+            Harness {
+                pipeline: Pipeline::new(idle),
+                source,
+                counts,
+                log,
+                pushers,
+            },
+        )
+    }
+
+    fn receipt(user: &str, event: &str, thread: ReceiptThread) -> ReadReceipt {
+        ReadReceipt {
+            user_id: UserId::parse(user).unwrap(),
+            room_id: room_id!("!room:example.org").to_owned(),
+            event_id: EventId::parse(event).unwrap(),
+            thread,
         }
+    }
+
+    /// Records `event` at `pos` in the fake room and runs it through `pipeline`.
+    async fn send(h: &Harness, pipeline: &Pipeline, event: Value, pos: i64) {
+        let id = EventId::parse(event["event_id"].as_str().unwrap()).unwrap();
+        h.source.positions.lock().unwrap().insert(id.clone(), pos);
+        h.source
+            .events
+            .lock()
+            .unwrap()
+            .insert(id.clone(), describe(event));
+        pipeline
+            .handle_event(room_id!("!room:example.org"), &id, pos)
+            .await
+            .unwrap();
+    }
+
+    fn in_thread(id: &str, root: &str) -> Value {
+        let mut event = message(id, "in a thread");
+        event["content"]["m.relates_to"] = json!({"rel_type": "m.thread", "event_id": root});
+        event
     }
 
     fn message(id: &str, body: &str) -> Value {
@@ -976,16 +1241,111 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(h.counts.total_unread(alice).await.unwrap(), 2);
-        h.pipeline.handle_receipt(alice, room).await.unwrap();
+        // An event not known here: the whole room is read.
+        h.pipeline
+            .handle_receipt(&receipt(
+                alice.as_str(),
+                "$unknown:example.org",
+                ReceiptThread::Unthreaded,
+            ))
+            .await
+            .unwrap();
         assert_eq!(h.counts.total_unread(alice).await.unwrap(), 0);
         let log = h.log.page(alice, None, 10, false).await.unwrap();
         assert!(log.iter().all(|e| e.read));
 
         // A remote user's receipt is not ours to act on.
         h.pipeline
-            .handle_receipt(user_id!("@dave:remote.org"), room)
+            .handle_receipt(&receipt(
+                "@dave:remote.org",
+                "$a:example.org",
+                ReceiptThread::Unthreaded,
+            ))
             .await
             .unwrap();
+    }
+
+    /// A threaded receipt reads its thread up to its event and nothing else; an unthreaded one
+    /// reads every scope up to its event and leaves what came after it unread.
+    #[tokio::test]
+    async fn receipts_read_their_thread_up_to_their_event() {
+        let h = harness();
+        let p = &h.pipeline;
+        let room = room_id!("!room:example.org");
+        let alice = user_id!("@alice:example.org");
+        let root = "$root:example.org";
+        send(&h, p, message(root, "root"), 1).await;
+        send(&h, p, in_thread("$t1:example.org", root), 2).await;
+        send(&h, p, message("$m2:example.org", "main"), 3).await;
+        send(&h, p, in_thread("$t2:example.org", root), 4).await;
+        let counts = h.counts.get_room_counts(alice, room).await.unwrap();
+        assert_eq!(counts.main.notification_count, 2);
+        let root_id = EventId::parse(root).unwrap();
+        assert_eq!(counts.threads[&root_id].notification_count, 2);
+
+        p.handle_receipt(&receipt(
+            alice.as_str(),
+            "$t1:example.org",
+            ReceiptThread::Thread(root_id.clone()),
+        ))
+        .await
+        .unwrap();
+        let counts = h.counts.get_room_counts(alice, room).await.unwrap();
+        assert_eq!(
+            counts.main.notification_count, 2,
+            "the main timeline is untouched"
+        );
+        assert_eq!(counts.threads[&root_id].notification_count, 1);
+
+        p.handle_receipt(&receipt(
+            alice.as_str(),
+            "$m2:example.org",
+            ReceiptThread::Unthreaded,
+        ))
+        .await
+        .unwrap();
+        let counts = h.counts.get_room_counts(alice, room).await.unwrap();
+        assert_eq!(counts.main.notification_count, 0);
+        assert_eq!(
+            counts.threads[&root_id].notification_count, 1,
+            "$t2 came after the receipt"
+        );
+    }
+
+    /// Through the channel: the receipt's sender returns once the counts reflect it, and a
+    /// settled read sees an event queued just before it.
+    #[tokio::test]
+    async fn a_receipt_and_a_settled_read_see_what_was_queued_before_them() {
+        let (deps, h) = harness_parts();
+        let (handle, worker) = channel(deps);
+        let room = room_id!("!room:example.org");
+        let alice = user_id!("@alice:example.org");
+        let ev = ruma::event_id!("$q:example.org");
+        h.source.positions.lock().unwrap().insert(ev.to_owned(), 1);
+        h.source
+            .events
+            .lock()
+            .unwrap()
+            .insert(ev.to_owned(), describe(message(ev.as_str(), "queued")));
+        // Queued before the worker runs at all.
+        handle.event_persisted(room.to_owned(), ev.to_owned(), 1);
+        tokio::spawn(worker.run());
+
+        let settled = SettledCounts::new(h.counts.clone(), handle.clone());
+        assert_eq!(
+            settled
+                .get_room_counts(alice, room)
+                .await
+                .unwrap()
+                .main
+                .notification_count,
+            1
+        );
+        let sink: Arc<dyn ReadReceiptSink> = Arc::new(handle.clone());
+        sink.read_receipt(receipt(alice.as_str(), ev.as_str(), ReceiptThread::Main))
+            .await;
+        assert_eq!(h.counts.total_unread(alice).await.unwrap(), 0);
+        assert!(handle.settle(Duration::from_millis(10)).await);
     }
 
     #[tokio::test]
@@ -1055,7 +1415,15 @@ mod tests {
         assert_eq!(left[0].ids.pushkey, "fresh");
 
         // A receipt sends the zero badge.
-        h.pipeline.handle_receipt(alice, room).await.unwrap();
+        h.source.positions.lock().unwrap().insert(ev.to_owned(), 1);
+        h.pipeline
+            .handle_receipt(&receipt(
+                alice.as_str(),
+                ev.as_str(),
+                ReceiptThread::Unthreaded,
+            ))
+            .await
+            .unwrap();
         while gateway.notifications().len() < 3 && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }

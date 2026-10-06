@@ -193,6 +193,26 @@ impl<B: KvBackend + 'static> EventSource for RegistrySource<B> {
             Ok(Err(e)) | Err(e) => Err(e.to_string()),
         }
     }
+
+    /// The event's timeline position, on any replica: a receipt is taken wherever its sender
+    /// is served, and on a replica that does not own the room this is a read of the stored
+    /// room (`RoomRegistry::read_room`).
+    async fn event_position(
+        &self,
+        room_id: &RoomId,
+        event_id: &EventId,
+    ) -> Result<Option<i64>, String> {
+        let event_id = event_id.to_owned();
+        match self
+            .rooms
+            .read_room(room_id, move |actor| actor.timeline_position(&event_id))
+            .await
+        {
+            Ok(position) => Ok(position),
+            Err(RoomError::RoomNotFound(_)) => Ok(None),
+            Err(e) => Err(e.to_string()),
+        }
+    }
 }
 
 /// Forwards every update on the registry's global stream to the pipeline, until the stream

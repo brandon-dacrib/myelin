@@ -47,7 +47,6 @@ pub mod room_admin;
 pub mod serve;
 pub mod server_notices;
 pub mod signing_key;
-pub mod smtp_helo;
 pub mod statistics;
 pub mod storage;
 pub mod synapse_serve;

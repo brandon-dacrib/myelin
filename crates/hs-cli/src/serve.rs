@@ -747,7 +747,13 @@ fn build_session_mounts<B: KvBackend>(
     // install is idempotent and absent-by-default, so a caller that never wires them gets the
     // previous behaviour rather than a panic.
     user.hub.install_push_rules_store(push.rulesets.clone());
-    user.hub.install_counts_store(push.counts.clone());
+    // `/sync` reads the counts after the push pipeline's queued jobs (briefly), so an event a
+    // client saw sent is counted in the response that brings it (`hs_push::pipeline`).
+    user.hub
+        .install_counts_store(Arc::new(hs_push::pipeline::SettledCounts::new(
+            push.counts.clone(),
+            pipeline.clone(),
+        )));
     // Whether a sender was erased, for `/sync` to prune their events as the room reads do.
     user.hub.install_account_store(user.auth.store.clone());
     user.hub.install_read_receipt_sink(Arc::new(pipeline));

@@ -1,22 +1,34 @@
 //! An in-memory [`super::CountsStore`], for tests.
 
-use std::collections::HashMap;
-use std::sync::RwLock;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{PoisonError, RwLock};
 
-use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UserId};
+use ruma::{OwnedRoomId, OwnedUserId, RoomId, UserId};
 
-use super::{Counts, CountsStore, RoomNotificationCounts, Scope};
+use super::{Counts, CountsStore, ReceiptThread, RoomNotificationCounts, Scope};
 use crate::error::StoreError;
 
-type Key = (OwnedUserId, OwnedRoomId, String);
+/// `(user_id, room_id, thread_key, pos)`: one unread notification. `thread_key` is empty for the
+/// main timeline, else the thread root's event ID (the same key shape as
+/// `crate::counts::tables::TablesCountsStore`, so the two behave identically, per
+/// [`super::contract_tests`]).
+type UnreadKey = (OwnedUserId, OwnedRoomId, String, i64);
 
-/// An in-memory `(user_id, room_id, thread_key) -> Counts` map. `thread_key` is empty for the
-/// main timeline, else the thread root event ID as a string (matches
-/// `crate::counts::tables::TablesCountsStore`'s on-disk key shape, so the two implementations
-/// stay behaviorally identical, per [`super::contract_tests`]).
+/// `(user_id, room_id, mark_key)`: the position a receipt read up to.
+type MarkKey = (OwnedUserId, OwnedRoomId, String);
+
+#[derive(Debug, Default)]
+struct Rows {
+    /// Unread notifications, the value whether it was highlighted.
+    unread: BTreeMap<UnreadKey, bool>,
+    /// Read positions.
+    marks: HashMap<MarkKey, i64>,
+}
+
+/// The in-memory store. See the module docs.
 #[derive(Debug, Default)]
 pub struct InMemoryCountsStore {
-    rows: RwLock<HashMap<Key, Counts>>,
+    rows: RwLock<Rows>,
 }
 
 impl InMemoryCountsStore {
@@ -25,10 +37,18 @@ impl InMemoryCountsStore {
     pub fn new() -> Self {
         Self::default()
     }
+
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, Rows> {
+        self.rows.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, Rows> {
+        self.rows.write().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
-fn key(user_id: &UserId, room_id: &RoomId, scope: Scope<'_>) -> Key {
-    (user_id.to_owned(), room_id.to_owned(), scope.key_part())
+fn mark_key(user_id: &UserId, room_id: &RoomId, thread: &ReceiptThread) -> MarkKey {
+    (user_id.to_owned(), room_id.to_owned(), thread.mark_key())
 }
 
 #[async_trait::async_trait]
@@ -38,19 +58,19 @@ impl CountsStore for InMemoryCountsStore {
         user_id: &UserId,
         room_id: &RoomId,
     ) -> Result<RoomNotificationCounts, StoreError> {
-        let rows = self.rows.read().unwrap();
+        let rows = self.read();
         let mut out = RoomNotificationCounts::default();
-        for ((u, r, thread), counts) in rows.iter() {
+        for ((u, r, thread, _), highlight) in &rows.unread {
             if u != user_id || r != room_id {
                 continue;
             }
-            if thread.is_empty() {
-                out.main = *counts;
-            } else {
-                let root: OwnedEventId = thread.as_str().try_into().map_err(|e| {
-                    StoreError::Backend(format!("stored thread key is not an event id: {e}"))
-                })?;
-                out.threads.insert(root, *counts);
+            let one = Counts {
+                notification_count: 1,
+                highlight_count: u64::from(*highlight),
+            };
+            match Scope::parse_key_part(thread)? {
+                None => out.main.add(one),
+                Some(root) => out.threads.entry(root).or_default().add(one),
             }
         }
         Ok(out)
@@ -62,14 +82,59 @@ impl CountsStore for InMemoryCountsStore {
         room_id: &RoomId,
         scope: Scope<'_>,
         highlight: bool,
+        pos: i64,
     ) -> Result<(), StoreError> {
-        let mut rows = self.rows.write().unwrap();
-        let entry = rows.entry(key(user_id, room_id, scope)).or_default();
-        entry.notification_count += 1;
-        if highlight {
-            entry.highlight_count += 1;
+        let mut rows = self.write();
+        let root = match scope {
+            Scope::Main => None,
+            Scope::Thread(root) => Some(root),
+        };
+        let read_to = [ReceiptThread::Unthreaded, ReceiptThread::of_scope(root)]
+            .iter()
+            .filter_map(|t| rows.marks.get(&mark_key(user_id, room_id, t)).copied())
+            .max();
+        if read_to.is_some_and(|read| pos <= read) {
+            return Ok(());
         }
+        rows.unread.insert(
+            (
+                user_id.to_owned(),
+                room_id.to_owned(),
+                scope.key_part(),
+                pos,
+            ),
+            highlight,
+        );
         Ok(())
+    }
+
+    async fn mark_read(
+        &self,
+        user_id: &UserId,
+        room_id: &RoomId,
+        thread: &ReceiptThread,
+        pos: i64,
+    ) -> Result<(), StoreError> {
+        let mut rows = self.write();
+        let mark = rows
+            .marks
+            .entry(mark_key(user_id, room_id, thread))
+            .or_insert(pos);
+        *mark = (*mark).max(pos);
+        let mut keep = Ok(());
+        rows.unread.retain(|(u, r, scope, at), _| {
+            if u != user_id || r != room_id || *at > pos {
+                return true;
+            }
+            match Scope::parse_key_part(scope) {
+                Ok(root) => !thread.reads(root.as_deref()),
+                Err(e) => {
+                    keep = Err(e);
+                    true
+                }
+            }
+        });
+        keep
     }
 
     async fn reset(
@@ -78,30 +143,27 @@ impl CountsStore for InMemoryCountsStore {
         room_id: &RoomId,
         scope: Scope<'_>,
     ) -> Result<(), StoreError> {
-        self.rows
-            .write()
-            .unwrap()
-            .remove(&key(user_id, room_id, scope));
+        let key = scope.key_part();
+        self.write()
+            .unread
+            .retain(|(u, r, s, _), _| !(u == user_id && r == room_id && *s == key));
         Ok(())
     }
 
     async fn reset_room(&self, user_id: &UserId, room_id: &RoomId) -> Result<(), StoreError> {
-        self.rows
-            .write()
-            .unwrap()
-            .retain(|(u, r, _), _| !(u == user_id && r == room_id));
+        self.write()
+            .unread
+            .retain(|(u, r, _, _), _| !(u == user_id && r == room_id));
         Ok(())
     }
 
     async fn total_unread(&self, user_id: &UserId) -> Result<u64, StoreError> {
         Ok(self
-            .rows
             .read()
-            .unwrap()
-            .iter()
-            .filter(|((u, _, _), _)| u == user_id)
-            .map(|(_, c)| c.notification_count)
-            .sum())
+            .unread
+            .keys()
+            .filter(|(u, _, _, _)| u == user_id)
+            .count() as u64)
     }
 }
 
@@ -113,5 +175,11 @@ mod tests {
     async fn satisfies_the_shared_counts_store_contract() {
         let store = InMemoryCountsStore::new();
         crate::counts::contract_tests::behaves_correctly(&store).await;
+    }
+
+    #[tokio::test]
+    async fn reads_per_thread_up_to_each_receipt() {
+        let store = InMemoryCountsStore::new();
+        crate::counts::contract_tests::receipts_read_per_thread_up_to_their_position(&store).await;
     }
 }

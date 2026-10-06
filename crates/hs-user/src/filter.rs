@@ -99,8 +99,9 @@ pub struct RoomEventFilter {
     /// Whether a lazy-loaded incremental sync should send a member's event again although this
     /// device was sent it before. Applied -- see the module docs.
     pub include_redundant_members: Option<bool>,
-    /// Whether to include events with a relation to another event that the filter would
-    /// otherwise exclude. Parsed, not applied.
+    /// Whether `/sync` splits a room's notification counts by thread (MSC3773, spec v1.4):
+    /// `unread_notifications` for the main timeline and `unread_thread_notifications` per thread.
+    /// Applied from the room timeline filter ([`SyncFilter::unread_thread_notifications`]).
     pub unread_thread_notifications: Option<bool>,
 }
 
@@ -338,6 +339,17 @@ impl SyncFilter {
             .and_then(|r| r.timeline.as_ref())
             .and_then(|t| t.limit)
             .unwrap_or(default_limit)
+    }
+
+    /// Whether the client asked for notification counts per thread
+    /// (`room.timeline.unread_thread_notifications`, as Synapse reads it).
+    #[must_use]
+    pub fn unread_thread_notifications(&self) -> bool {
+        self.room
+            .as_ref()
+            .and_then(|r| r.timeline.as_ref())
+            .and_then(|t| t.unread_thread_notifications)
+            .unwrap_or(false)
     }
 
     /// Whether lazy-loading room members is requested.

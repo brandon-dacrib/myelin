@@ -1,13 +1,14 @@
 //! A last-resort plain-SMTP sender for a relay that does not speak ESMTP.
 //!
-//! The SMTP client email pushers and validation emails use (`lettre`, under
-//! `hs_push::email::smtp`) opens with `EHLO` and gives up when the server answers it with
-//! `500`/`502`. RFC 5321 section 4.1.4 says a client SHOULD then fall back to `HELO`, which is
-//! all an old relay or a minimal test mail catcher understands: Sytest's mail server is one
-//! (`lib/SyTest/MailServer/Protocol.pm` answers `HELO`, `MAIL`, `RCPT`, `DATA` and nothing else),
-//! and every validation email to it failed "500 Syntax error: unrecognized command". This module
-//! is that fallback, for connections without TLS only (`email.smtp.security: none`): `HELO`,
-//! `MAIL FROM`, `RCPT TO`, `DATA` with dot-stuffing, `QUIT`. No authentication, no extensions.
+//! [`super::smtp::SmtpMailer`] (`lettre`) opens with `EHLO` and gives up when the server answers
+//! it with `500`/`502`. RFC 5321 section 4.1.4 says a client SHOULD then fall back to `HELO`,
+//! which is all an old relay or a minimal test mail catcher understands: Sytest's mail server is
+//! one (`lib/SyTest/MailServer/Protocol.pm` answers `HELO`, `MAIL`, `RCPT`, `DATA` and nothing
+//! else), and every email to it failed "500 Syntax error: unrecognized command". This module is
+//! that fallback, for connections without TLS and without credentials only
+//! (`email.smtp.security: none`, no `username`): `HELO`, `MAIL FROM`, `RCPT TO`, `DATA` with
+//! dot-stuffing, `QUIT`. No authentication, no extensions. The mailer uses it for every email it
+//! sends, notification emails and `hs-cli`'s validation emails alike.
 
 use std::time::Duration;
 

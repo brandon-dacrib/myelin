@@ -2,7 +2,8 @@
 //! emails `POST /register/email/requestToken` and its siblings send go through the same
 //! `email.smtp` server, from the same `email.from` sender, and a change to the `email` section
 //! re-points both at once ([`ThreepidEmailSender::set`], called from `hs serve`'s live
-//! configuration hook beside the push mailer's).
+//! configuration hook beside the push mailer's). A relay that only speaks `HELO` is the
+//! mailer's to handle (`hs_push::email::helo`), for these emails and notification emails alike.
 
 use std::sync::{Arc, PoisonError, RwLock};
 
@@ -14,9 +15,6 @@ use hs_push::email::Mailer;
 struct Settings {
     from: Option<String>,
     app_name: String,
-    /// The relay, when it is reached without TLS: the one case [`crate::smtp_helo`] can fall
-    /// back to plain `HELO` for.
-    plain_relay: Option<(String, u16)>,
 }
 
 /// Sends validation emails through `hs serve`'s SMTP mailer. See the module docs.
@@ -46,12 +44,6 @@ impl ThreepidEmailSender {
             .unwrap_or_else(PoisonError::into_inner) = Settings {
             from: config.from.clone().filter(|f| !f.trim().is_empty()),
             app_name: config.app_name.clone(),
-            plain_relay: match (&config.smtp.host, config.smtp.security) {
-                (Some(host), hs_config::email::SmtpSecurity::None) => {
-                    Some((host.clone(), config.smtp.port))
-                }
-                _ => None,
-            },
         };
     }
 
@@ -85,25 +77,7 @@ impl hs_auth::threepid::EmailSender for ThreepidEmailSender {
             text: email.text,
             html: email.html,
         };
-        match self.mailer.send(&mail).await {
-            Ok(()) => Ok(()),
-            // A relay without TLS that refused the opening `EHLO` (`500`/`502`): RFC 5321's
-            // fall-back to `HELO` (`crate::smtp_helo`).
-            Err(error)
-                if settings.plain_relay.is_some()
-                    && ["(500)", "(502)"]
-                        .iter()
-                        .any(|c| error.to_string().contains(c)) =>
-            {
-                let (host, port) = settings.plain_relay.unwrap_or_default();
-                tracing::info!(%error, host, port, "the SMTP server refused EHLO; sending with HELO");
-                let message = hs_push::email::smtp::build_message(&mail)
-                    .map_err(|e| e.to_string())?
-                    .formatted();
-                crate::smtp_helo::send(&host, port, &mail.from, &mail.to, &message).await
-            }
-            Err(error) => Err(error.to_string()),
-        }
+        self.mailer.send(&mail).await.map_err(|e| e.to_string())
     }
 }
 

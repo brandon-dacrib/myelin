@@ -30,6 +30,7 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
+use hs_push::counts::ReceiptThread;
 use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId, UserId};
 use serde_json::{Value, json};
 
@@ -70,20 +71,26 @@ pub fn typing_content(room_id: &ruma::RoomId, user_id: &UserId, typing: bool) ->
     json!({"room_id": room_id, "user_id": user_id, "typing": typing})
 }
 
-/// `m.receipt`'s content for one `m.read` receipt.
+/// `m.receipt`'s content for one `m.read` receipt, with its `thread_id` in `data` when it is
+/// threaded (the spec's `ReceiptData`, as Synapse sends it).
 #[must_use]
 pub fn receipt_content(
     room_id: &ruma::RoomId,
     user_id: &UserId,
     event_id: &ruma::EventId,
+    thread: &ReceiptThread,
     ts: u64,
 ) -> Value {
+    let mut data = json!({"ts": ts});
+    if let Some(thread_id) = thread.as_wire() {
+        data["thread_id"] = Value::String(thread_id.to_owned());
+    }
     json!({
         room_id.as_str(): {
             "m.read": {
                 user_id.as_str(): {
                     "event_ids": [event_id],
-                    "data": {"ts": ts},
+                    "data": data,
                 }
             }
         }
@@ -128,6 +135,8 @@ pub enum InboundEdu {
         event_id: OwnedEventId,
         /// When, in milliseconds since the Unix epoch (`0` when the sender gave none).
         ts: u64,
+        /// The thread it is for (`data.thread_id`); unthreaded when absent.
+        thread: ReceiptThread,
     },
     /// One user's update from an `m.presence` EDU's `push` list.
     Presence {
@@ -203,16 +212,25 @@ impl InboundEdu {
                         else {
                             continue;
                         };
-                        let ts = receipt
-                            .get("data")
+                        let data = receipt.get("data");
+                        let ts = data
                             .and_then(|d| d.get("ts"))
                             .and_then(Value::as_u64)
                             .unwrap_or(0);
+                        // A `thread_id` that is neither `main` nor an event ID: the receipt is
+                        // malformed, and skipped.
+                        let Ok(thread) = ReceiptThread::from_wire(
+                            data.and_then(|d| d.get("thread_id"))
+                                .and_then(Value::as_str),
+                        ) else {
+                            continue;
+                        };
                         out.push(Self::Receipt {
                             room_id: room_id.clone(),
                             user_id,
                             event_id,
                             ts,
+                            thread,
                         });
                     }
                 }
@@ -283,7 +301,12 @@ mod tests {
             room_id!("!r:a.example"),
             user_id!("@alice:a.example"),
             event_id!("$e"),
+            &ReceiptThread::Unthreaded,
             7,
+        );
+        assert_eq!(
+            content["!r:a.example"]["m.read"]["@alice:a.example"]["data"],
+            json!({"ts": 7})
         );
         assert_eq!(
             InboundEdu::parse("a.example", "m.receipt", &content),
@@ -292,9 +315,31 @@ mod tests {
                 user_id: user_id!("@alice:a.example").to_owned(),
                 event_id: event_id!("$e").to_owned(),
                 ts: 7,
+                thread: ReceiptThread::Unthreaded,
             }]
         );
         assert!(InboundEdu::parse("b.example", "m.receipt", &content).is_empty());
+
+        // A threaded receipt carries its thread both ways; a bad `thread_id` is dropped.
+        let thread = ReceiptThread::Thread(event_id!("$root").to_owned());
+        let content = receipt_content(
+            room_id!("!r:a.example"),
+            user_id!("@alice:a.example"),
+            event_id!("$e"),
+            &thread,
+            8,
+        );
+        assert_eq!(
+            content["!r:a.example"]["m.read"]["@alice:a.example"]["data"]["thread_id"],
+            "$root"
+        );
+        assert!(matches!(
+            &InboundEdu::parse("a.example", "m.receipt", &content)[..],
+            [InboundEdu::Receipt { thread: t, .. }] if *t == thread
+        ));
+        let mut bad = content.clone();
+        bad["!r:a.example"]["m.read"]["@alice:a.example"]["data"]["thread_id"] = json!("nope");
+        assert!(InboundEdu::parse("a.example", "m.receipt", &bad).is_empty());
     }
 
     #[test]

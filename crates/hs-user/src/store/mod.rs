@@ -137,7 +137,7 @@ fn default_true() -> bool {
     true
 }
 
-/// One user's latest read receipt of one kind in one room, as [`UserStore::put_receipt`] keeps
+/// One user's latest read receipt of one kind in one thread of one room, as [`UserStore::put_receipt`] keeps
 /// it. Written through by `crate::receipts::ReceiptRegistry` so read state survives a restart;
 /// the registry is the only reader.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,6 +153,10 @@ pub struct StoredReceipt {
     /// The stamp the registry gave this receipt (`crate::stamp`), kept so that a restarted
     /// process does not report an old receipt as news to a client that already saw it.
     pub seq: u64,
+    /// The thread the receipt is for (MSC3771): `main` or a thread root's event ID, absent for
+    /// an unthreaded receipt (and in every row written before threads were kept).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
 }
 
 /// One user's presence, as [`UserStore::put_presence`] keeps it. Written through by
@@ -736,8 +740,8 @@ pub trait UserStore: Send + Sync {
     /// Returns [`StoreError`] on a storage failure.
     async fn list_directory_public_rooms(&self) -> Result<Vec<PublicRoomEntry>, StoreError>;
 
-    /// Records `receipt` as the latest of its user and kind in `room_id`, replacing any earlier
-    /// one.
+    /// Records `receipt` as the latest of its user, kind and thread in `room_id`, replacing any
+    /// earlier one.
     ///
     /// # Errors
     /// Returns [`StoreError`] on a storage failure.

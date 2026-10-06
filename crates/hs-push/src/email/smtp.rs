@@ -2,6 +2,12 @@
 //! connection pool: notification email is rare enough that a connection per mail is simpler
 //! than a pool to keep healthy, and a configuration change (`SmtpMailer::set`) needs nothing
 //! drained.
+//!
+//! A relay reached without TLS and without credentials that refuses `EHLO` (`500`/`502`) gets
+//! the email again over plain `HELO` ([`super::helo`]), as RFC 5321 section 4.1.4 says a client
+//! should: an old relay or a minimal mail catcher (Sytest's) speaks nothing else. TLS needs
+//! `EHLO` (STARTTLS is an extension) and so do credentials (`AUTH` is one), so those settings
+//! never fall back.
 
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
@@ -144,12 +150,38 @@ impl Mailer for SmtpMailer {
         let settings = self.current().ok_or(MailError::NotConfigured)?;
         let message = build_message(mail)?;
         let transport = Self::transport(&settings)?;
-        transport
-            .send(message)
-            .await
-            .map(|_| ())
-            .map_err(|e| MailError::Transport(e.to_string()))
+        let error = match transport.send(message.clone()).await {
+            Ok(_) => return Ok(()),
+            Err(error) => error.to_string(),
+        };
+        if !may_fall_back_to_helo(&settings, &error) {
+            return Err(MailError::Transport(error));
+        }
+        tracing::info!(
+            %error,
+            host = %settings.host,
+            port = settings.port,
+            "the SMTP server refused EHLO; sending with HELO"
+        );
+        super::helo::send(
+            &settings.host,
+            settings.port,
+            &mail.from,
+            &mail.to,
+            &message.formatted(),
+        )
+        .await
+        .map_err(MailError::Transport)
     }
+}
+
+/// Whether a send that failed with `error` should be retried over plain `HELO`: the server
+/// refused `EHLO` itself (`500` or `502`, which `lettre` reports as `(500)`/`(502)`), on a
+/// connection without TLS and without credentials. See the module docs.
+fn may_fall_back_to_helo(settings: &SmtpSettings, error: &str) -> bool {
+    settings.security == Security::None
+        && settings.credentials.is_none()
+        && ["(500)", "(502)"].iter().any(|code| error.contains(code))
 }
 
 #[cfg(test)]
@@ -200,6 +232,80 @@ mod tests {
             mailer.send(&mail()).await,
             Err(MailError::NotConfigured)
         ));
+    }
+
+    /// A server that knows only `HELO` (Sytest's mail server) refuses `EHLO` with `500`; the
+    /// mailer sends the email again with `HELO`, and it arrives.
+    #[tokio::test]
+    async fn a_relay_that_refuses_ehlo_gets_the_email_over_helo() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let mut data = String::new();
+            // `lettre`'s attempt, then the `HELO` one.
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read, mut write) = stream.into_split();
+                let mut read = BufReader::new(read);
+                write.write_all(b"220 hi\r\n").await.unwrap();
+                let mut in_data = false;
+                loop {
+                    let mut line = String::new();
+                    if read.read_line(&mut line).await.unwrap_or(0) == 0 {
+                        break;
+                    }
+                    if in_data {
+                        if line == ".\r\n" {
+                            in_data = false;
+                            write.write_all(b"250 ok\r\n").await.unwrap();
+                        } else {
+                            data.push_str(&line);
+                        }
+                        continue;
+                    }
+                    let reply: &[u8] = match line.split_whitespace().next().unwrap_or("") {
+                        "HELO" | "MAIL" | "RCPT" => b"250 ok\r\n",
+                        "DATA" => {
+                            in_data = true;
+                            b"354 go\r\n"
+                        }
+                        "QUIT" => break,
+                        _ => b"500 Syntax error: unrecognized command\r\n",
+                    };
+                    if write.write_all(reply).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            data
+        });
+        let mut settings = SmtpSettings {
+            host: "127.0.0.1".to_owned(),
+            port,
+            security: Security::None,
+            credentials: None,
+            tls_name: None,
+            timeout: Duration::from_secs(10),
+        };
+        let mailer = SmtpMailer::new(Some(settings.clone()));
+        mailer.send(&mail()).await.unwrap();
+        let data = server.await.unwrap();
+        assert!(data.contains("Subject: [Myelin] hi"), "{data}");
+        assert!(data.contains("hello"), "{data}");
+
+        // Only without TLS and without credentials.
+        let refused = "permanent error (500): Syntax error";
+        assert!(may_fall_back_to_helo(&settings, refused));
+        assert!(!may_fall_back_to_helo(
+            &settings,
+            "permanent error (550): no"
+        ));
+        settings.credentials = Some(("u".to_owned(), "p".to_owned()));
+        assert!(!may_fall_back_to_helo(&settings, refused));
+        settings.credentials = None;
+        settings.security = Security::Starttls;
+        assert!(!may_fall_back_to_helo(&settings, refused));
     }
 
     #[tokio::test]
