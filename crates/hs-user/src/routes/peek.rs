@@ -190,11 +190,16 @@ mod tests {
     type TestState = UserState<MemoryBackend, Arc<hs_room::registry::RoomRegistry<MemoryBackend>>>;
 
     fn state() -> TestState {
+        state_with_threshold(500)
+    }
+
+    /// A state whose rooms are hot above `threshold` members.
+    fn state_with_threshold(threshold: usize) -> TestState {
         let store: crate::store::DynUserStore =
             Arc::new(TablesUserStore::open(MemoryBackend::new()).unwrap());
         let e2e: Arc<dyn hs_e2e::store::E2eStore> =
             Arc::new(hs_e2e::store::tables::TablesE2eStore::open(MemoryBackend::new()).unwrap());
-        let hub = Arc::new(SessionHub::new(store, registry("peek.test"), 500));
+        let hub = Arc::new(SessionHub::new(store, registry("peek.test"), threshold));
         std::mem::forget(hub.watch_all(hub.rooms().subscribe_global()));
         UserState {
             auth: AuthState::in_memory(),
@@ -365,6 +370,87 @@ mod tests {
         assert!(response["rooms"]["peek"].is_null(), "{response}");
         let (response, _) = sync(&state, &bob, "LAPTOP", None).await;
         assert!(response["rooms"]["peek"].is_null(), "{response}");
+    }
+
+    /// A new event in a peeked room wakes the peeking device's long-poll, for a room above
+    /// the fan-out threshold (which writes no feed entries) as for one below it. A hot room's
+    /// used to be found only by the next poll, after this one's timeout.
+    #[tokio::test]
+    async fn a_new_event_in_a_peeked_room_wakes_a_long_poll() {
+        for threshold in [500, 0] {
+            let state = state_with_threshold(threshold);
+            let alice = user_id!("@alice:peek.test").to_owned();
+            let bob = user_id!("@bob:peek.test").to_owned();
+            let (handle, room_id) = room(&state, &alice, "world_readable", None).await;
+            peek(&state, on_device(&bob, "PHONE"), room_id.as_str())
+                .await
+                .unwrap();
+            let (_, token) = sync(&state, &bob, "PHONE", None).await;
+
+            let speaker = {
+                let handle = handle.clone();
+                let alice = alice.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    say(&handle, &alice, "news").await;
+                })
+            };
+            let started = std::time::Instant::now();
+            let (response, _) = build(
+                &state.hub,
+                &state.e2e,
+                &bob,
+                SyncParams {
+                    since: Some(token),
+                    full_state: false,
+                    timeout: Duration::from_secs(10),
+                    filter: crate::filter::SyncFilter::none(),
+                    device_id: Some("PHONE".into()),
+                },
+            )
+            .await
+            .unwrap();
+            speaker.await.unwrap();
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "threshold {threshold}: woken, not timed out"
+            );
+            assert_eq!(
+                bodies(peeked(&response, &room_id)),
+                vec!["news"],
+                "threshold {threshold}: {response}"
+            );
+        }
+    }
+
+    /// A peeker is shown an erased local sender's events pruned, as a member who joined after
+    /// them is (`crate::sync::timeline::apply_erasure`).
+    #[tokio::test]
+    async fn a_peeker_sees_an_erased_senders_messages_pruned() {
+        let state = state();
+        let accounts: Arc<dyn hs_auth::store::AuthStore> =
+            Arc::new(hs_auth::store::memory::InMemoryAuthStore::new());
+        state.hub.install_account_store(accounts.clone());
+        let alice = user_id!("@alice:peek.test").to_owned();
+        let bob = user_id!("@bob:peek.test").to_owned();
+        let (handle, room_id) = room(&state, &alice, "world_readable", None).await;
+        say(&handle, &alice, "erase me").await;
+        let mut record = hs_auth::store::UserRecord::new(alice.clone(), 0);
+        record.erased = true;
+        accounts.create_user(record).await.unwrap();
+
+        peek(&state, on_device(&bob, "PHONE"), room_id.as_str())
+            .await
+            .unwrap();
+        let (response, _) = sync(&state, &bob, "PHONE", None).await;
+        let message = peeked(&response, &room_id)["timeline"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["type"] == "m.room.message")
+            .cloned()
+            .unwrap();
+        assert_eq!(message["content"], json!({}), "{response}");
     }
 
     /// Sytest's "We can't peek into rooms with {shared,invited,joined} history_visibility".

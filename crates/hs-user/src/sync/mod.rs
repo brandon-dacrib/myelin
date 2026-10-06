@@ -105,6 +105,8 @@ use serde_json::{Value, json};
 
 pub mod device_lists;
 #[cfg(test)]
+mod polling_cases;
+#[cfg(test)]
 mod sytest_cases;
 mod timeline;
 
@@ -619,11 +621,9 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
     hub: &SessionHub<B, R>,
     e2e: &Arc<dyn E2eStore>,
     user_id: &UserId,
-    params: SyncParams,
+    mut params: SyncParams,
 ) -> Result<(Value, SyncToken), UserError> {
-    let baseline = params.since.unwrap_or_else(SyncToken::initial);
-    let is_initial = params.since.is_none();
-    let device_id = params.device_id.clone();
+    let deadline = Instant::now() + params.timeout;
 
     // Everything published before this request arrived is in the feeds before they are read:
     // see `SessionHub::wait_for_consumed`, and `SessionHub::settle_before_read` for the same
@@ -631,17 +631,74 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
     // news is not also holding a stale idea of what has already happened.
     hub.settle_before_read(READ_YOUR_WRITES_WAIT).await;
 
-    if !is_initial {
+    // An initial sync, or `full_state`, answers at once with everything.
+    if params.since.is_none() || params.full_state {
+        return build_batch(hub, e2e, user_id, &params).await;
+    }
+
+    // An incremental sync waits for news, builds a batch, and if the batch has nothing in it
+    // for this client after all (the news was filtered out: presence a `presence` filter
+    // drops, typing a `room.ephemeral` filter drops, an event the user may not see), waits on
+    // from the batch's own token rather than answering early with nothing. Synapse's notifier
+    // does the same (`wait_for_events` with `SyncResult.__bool__`). Answering early cost a
+    // client the very event it was waiting for: Sytest's "Sync can be polled for updates".
+    loop {
+        let baseline = params.since.unwrap_or_else(SyncToken::initial);
         long_poll(
             hub,
             e2e,
             user_id,
-            device_id.as_deref(),
+            params.device_id.as_deref(),
             &baseline,
-            params.timeout,
+            &params.filter,
+            deadline,
         )
         .await?;
+        let (response, token) = build_batch(hub, e2e, user_id, &params).await?;
+        if !response_is_empty(&response) || Instant::now() >= deadline || hub.is_shutting_down() {
+            return Ok((response, token));
+        }
+        tracing::debug!(
+            %user_id,
+            "a long-poll woke for news this client's filter or view leaves out; waiting on"
+        );
+        if token == baseline {
+            // Nothing moved, so whatever woke the poll would wake it again at once: wait for
+            // the next wake (or the next periodic check) before looking again.
+            let waker = hub.waker(user_id).await;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let _ = tokio::time::timeout(remaining.min(E2E_POLL_INTERVAL), waker.notified()).await;
+        }
+        params.since = Some(token);
     }
+}
+
+/// Whether a built `/sync` response carries nothing for the client: no room, presence,
+/// account data, to-device message or device-list change. The one-time-key counts and
+/// fallback key types are always present and are not news by themselves (Synapse's
+/// `SyncResult.__bool__` leaves them out the same way).
+fn response_is_empty(response: &Value) -> bool {
+    let empty_object = |v: &Value| v.as_object().is_none_or(serde_json::Map::is_empty);
+    let empty_array = |v: &Value| v.as_array().is_none_or(Vec::is_empty);
+    empty_object(&response["rooms"])
+        && empty_array(&response["presence"]["events"])
+        && empty_array(&response["account_data"]["events"])
+        && empty_array(&response["to_device"]["events"])
+        && empty_array(&response["device_lists"]["changed"])
+        && empty_array(&response["device_lists"]["left"])
+}
+
+/// One `/sync` batch from `params.since` (or from nothing) to now, without waiting: the body
+/// of [`build`].
+async fn build_batch<B: KvBackend + 'static, R: RoomSource<B>>(
+    hub: &SessionHub<B, R>,
+    e2e: &Arc<dyn E2eStore>,
+    user_id: &UserId,
+    params: &SyncParams,
+) -> Result<(Value, SyncToken), UserError> {
+    let baseline = params.since.unwrap_or_else(SyncToken::initial);
+    let is_initial = params.since.is_none();
+    let device_id = params.device_id.clone();
 
     let store = hub.store();
     let timeline_limit = params.filter.timeline_limit(DEFAULT_TIMELINE_LIMIT);
@@ -1318,7 +1375,7 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
         hub,
         user_id,
         device_id.as_deref(),
-        &params,
+        params,
         &PeekBounds {
             baseline: &baseline,
             whole,
@@ -1494,10 +1551,17 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
     let mut audience = presence_audience(&shared, user_id);
     audience.extend(presence_extras.iter().cloned());
     for other in &audience {
+        let record = hub.presence_of(other).await;
+        // The token moves past an update the filter drops, as past one it sends: otherwise
+        // the update stays "new" to every later long-poll, which wakes at once for it and
+        // answers with nothing (Sytest's `08polling.pl`, whose filter drops `m.presence`).
+        if let Some(record) = &record {
+            new_presence_seq = new_presence_seq.max(record.seq);
+        }
         if !params.filter.presence_allows(other.as_str()) {
             continue;
         }
-        let Some(record) = hub.presence_of(other).await else {
+        let Some(record) = record else {
             if !whole && presence_extras.contains(other) {
                 presence_events.push(json!({
                     "type": "m.presence",
@@ -1507,7 +1571,6 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
             }
             continue;
         };
-        new_presence_seq = new_presence_seq.max(record.seq);
         // Newer than the token -- or belonging to somebody in a room this user has only just
         // joined. Presence has one sequence for the whole server, so the people already in that
         // room may well have last changed state long before this user's token; by stamp alone
@@ -1711,21 +1774,27 @@ async fn build_peeks<B: KvBackend + 'static, R: RoomSource<B>>(
                         *event = federation_format(actor, std::mem::take(event));
                     }
                 }
-                Ok(Ok(Some(json!({
-                    "timeline": {
-                        "events": timeline.events,
-                        "limited": timeline.limited,
-                        "prev_batch": timeline.prev_batch,
-                    },
-                    "state": {"events": state},
-                    "account_data": {"events": []},
-                    "ephemeral": {"events": []},
-                }))))
+                Ok(Ok(Some((timeline, state))))
             })
             .await?;
         match entry {
-            Ok(Some(entry)) => {
-                peek.insert(room_id.to_string(), entry);
+            Ok(Some((mut timeline, state))) => {
+                // A peeker was never joined, so an erased local sender's events are shown to
+                // them pruned, as to any later member (`timeline::apply_erasure`).
+                timeline::apply_erasure(hub.account_store(), &mut timeline).await;
+                peek.insert(
+                    room_id.to_string(),
+                    json!({
+                        "timeline": {
+                            "events": timeline.events,
+                            "limited": timeline.limited,
+                            "prev_batch": timeline.prev_batch,
+                        },
+                        "state": {"events": state},
+                        "account_data": {"events": []},
+                        "ephemeral": {"events": []},
+                    }),
+                );
             }
             Ok(None) => {}
             Err(()) => {
@@ -1775,6 +1844,7 @@ async fn has_new_data<B: KvBackend + 'static, R: RoomSource<B>>(
     user_id: &UserId,
     device_id: Option<&ruma::DeviceId>,
     baseline: &SyncToken,
+    filter: &SyncFilter,
 ) -> Result<bool, UserError> {
     let store = hub.store();
     if store.latest_feed_seq(user_id).await? > baseline.feed_seq {
@@ -1827,7 +1897,26 @@ async fn has_new_data<B: KvBackend + 'static, R: RoomSource<B>>(
     // presence update since `baseline`? Scoped the same way `device_lists` is (see the module
     // docs) -- an over-broad wake here would just cost an extra response-building pass, same
     // reasoning as the to-device peek below.
+    // A peeked hot room (MSC2753) is news for the peeking device as a joined one is for a
+    // member: it writes no feed entries, and only the hot-room stream says it moved. (A peeked
+    // room below the threshold writes the peeker's feed, which the first check sees.)
+    for (room_id, _) in store
+        .list_peeks(user_id, cursor_device_id(device_id))
+        .await?
+    {
+        if store
+            .latest_hot_seq_of_room(&room_id)
+            .await?
+            .is_some_and(|seq| seq > baseline.hot_seq)
+        {
+            return Ok(true);
+        }
+    }
+    // Presence the filter drops is no news (`build_batch`'s token moves past it anyway).
     for other in &presence_audience(&shared_users(hub, user_id).await?, user_id) {
+        if !filter.presence_allows(other.as_str()) {
+            continue;
+        }
         if let Some(record) = hub.presence_of(other).await
             && record.seq > baseline.presence_seq
         {
@@ -1863,7 +1952,7 @@ async fn has_new_data<B: KvBackend + 'static, R: RoomSource<B>>(
 /// long-poll into a busy loop.
 const E2E_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-/// The long-poll loop: waits until [`has_new_data`] is true or `timeout` elapses. Registers
+/// The long-poll loop: waits until [`has_new_data`] is true or `deadline` passes. Registers
 /// interest on the hub's waker with [`tokio::sync::futures::Notified::enable`] *before* checking,
 /// which is what makes this race-free against `hub::SessionHub::process_room_update`'s
 /// `notify_waiters` call -- `tokio::sync::Notify::notify_waiters` only wakes futures that have
@@ -1877,9 +1966,9 @@ async fn long_poll<B: KvBackend + 'static, R: RoomSource<B>>(
     user_id: &UserId,
     device_id: Option<&ruma::DeviceId>,
     baseline: &SyncToken,
-    timeout: Duration,
+    filter: &SyncFilter,
+    deadline: Instant,
 ) -> Result<(), UserError> {
-    let deadline = Instant::now() + timeout;
     loop {
         let waker = hub.waker(user_id).await;
         let notified = waker.notified();
@@ -1891,7 +1980,7 @@ async fn long_poll<B: KvBackend + 'static, R: RoomSource<B>>(
         if hub.is_shutting_down() {
             return Ok(());
         }
-        if has_new_data(hub, e2e, user_id, device_id, baseline).await? {
+        if has_new_data(hub, e2e, user_id, device_id, baseline, filter).await? {
             return Ok(());
         }
 
@@ -3762,12 +3851,16 @@ mod tests {
     async fn assert_settled(hub: &TestHub, e2e: &Arc<dyn E2eStore>, user: &UserId) -> SyncToken {
         let (_, token) = build(hub, e2e, user, params(None)).await.unwrap();
         assert!(
-            !has_new_data(hub, e2e, user, None, &token).await.unwrap(),
+            !has_new_data(hub, e2e, user, None, &token, &SyncFilter::none())
+                .await
+                .unwrap(),
             "the token an initial sync returned already counts as new data"
         );
         let (response, again) = build(hub, e2e, user, params(Some(token))).await.unwrap();
         assert!(
-            !has_new_data(hub, e2e, user, None, &again).await.unwrap(),
+            !has_new_data(hub, e2e, user, None, &again, &SyncFilter::none())
+                .await
+                .unwrap(),
             "the token an incremental sync returned already counts as new data: {response}"
         );
         again
@@ -3890,7 +3983,7 @@ mod tests {
             "{response}"
         );
         assert!(
-            !has_new_data(&hub, &e2e, &alice, None, &token)
+            !has_new_data(&hub, &e2e, &alice, None, &token, &SyncFilter::none())
                 .await
                 .unwrap()
         );

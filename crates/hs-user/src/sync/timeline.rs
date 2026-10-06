@@ -49,7 +49,8 @@ pub(crate) struct Timeline {
     pub(crate) events: Vec<Value>,
     /// Whether there is more the requester may see before the first event.
     pub(crate) limited: bool,
-    /// Where `GET /messages` continues backwards from: just before the first event.
+    /// Where `GET /messages` continues backwards from: just before the first event, or, for a
+    /// fresh batch that holds the whole room, the batch's end (`build_fresh_timeline`).
     pub(crate) prev_batch: Option<String>,
     /// The events that are shown pruned if their sender's account was erased: `(event_id,
     /// sender, pruned content)`, for a sender of this server and a reader who was not joined
@@ -226,10 +227,14 @@ fn render(
     collected: Collected<'_>,
     requester: &UserId,
 ) -> Timeline {
+    // Before the earliest of the batch's events in the room's order (a fresh batch's are in
+    // depth order, whose last need not be the earliest to arrive).
     let prev_batch = collected
         .events
-        .last()
-        .map(|(pos, _)| PaginationToken::new(*pos, Direction::Backward).to_string());
+        .iter()
+        .map(|(pos, _)| *pos)
+        .min()
+        .map(|pos| PaginationToken::new(pos, Direction::Backward).to_string());
     let mut erasable = Vec::new();
     let events = collected
         .events
@@ -365,8 +370,47 @@ pub(crate) fn build_fresh_timeline(
     if blocks_everything(scope.filter) {
         return Timeline::empty();
     }
-    let collected = collect_backward(actor, scope, upto, None, false);
-    render(actor, collected, scope.requester)
+    // Synapse's `load_limit`: a wider window than the batch, so that the batch can be the
+    // newest `limit` events by depth rather than by arrival (below).
+    let window = TimelineScope {
+        limit: scope.limit.saturating_mul(2).max(10),
+        ..*scope
+    };
+    let mut collected = collect_backward(actor, &window, upto, None, false);
+    // A fresh batch is a historical section of the room, ordered as the room's DAG has it --
+    // by depth, then arrival -- as Synapse's initial sync (`paginate_room_events_by_topological_
+    // ordering`) and `/messages` order it. By arrival alone, an event of a fork that reached
+    // this server late is "newest" though it sits deep in the DAG, and takes the batch's place
+    // from the events that follow it in the room (Complement's
+    // `TestSyncOmitsStateChangeOnFilteredEvents`: a state event of an old fork belongs in
+    // `state`, not as the timeline's only event). In a linear history the two orders agree.
+    collected
+        .events
+        .sort_by_key(|(pos, event)| std::cmp::Reverse((event.header().depth, *pos)));
+    if collected.events.len() > scope.limit {
+        collected.events.truncate(scope.limit);
+        collected.more = true;
+    }
+    let whole_room = !collected.more;
+    let mut timeline = render(actor, collected, scope.requester);
+    // A fresh batch that holds all the room has for the requester gives the batch's own end
+    // as `prev_batch`, not the point before its first event: Synapse's `_load_filtered_recents`
+    // moves the token back only when it truncated the timeline, and clients rely on it. Sytest
+    // pages `/messages?dir=b` from it and expects the room's events ("GET /rooms/:room_id/messages
+    // returns a message"), and Complement's `TestGetRoomMembersAtPoint` asks `/members?at=` it
+    // for the members as of this sync; before the first event there are none, and no events.
+    if whole_room && let Some(end) = upto.or_else(|| newest_position(actor)) {
+        timeline.prev_batch =
+            Some(PaginationToken::new(end.saturating_add(1), Direction::Backward).to_string());
+    }
+    timeline
+}
+
+/// The timeline position of the room's newest event, if it has any.
+fn newest_position(actor: &RoomActor<impl KvBackend>) -> Option<i64> {
+    let (page, _) = actor.paginate(None, Direction::Backward, 1);
+    page.first()
+        .and_then(|event| actor.timeline_position(event.event_id()))
 }
 
 /// One event in the federation format a filter's `event_format: "federation"` asks for: the

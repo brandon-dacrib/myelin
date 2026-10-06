@@ -1,10 +1,93 @@
 # 05 Sync: status
 
-Last updated: 2026-10-04 (session 16: Sytest's sync leftovers -- timelines from the newest end with holes, gap state, peeking, presence on joins, filters for presence/account data/ephemeral, remote users in the directory. Session 15: `device_lists` counts invites and rejoins, `/keys/changes` walks memberships between two tokens, a remote copy goes stale with the last shared room. Session 14: the owner's fan-out in batches, and feed retention.
+Last updated: 2026-10-05 (session 17: a filtered long-poll waits for real news, a fresh
+batch's `prev_batch` and order follow Synapse's initial sync, peeked hot rooms wake a long-poll and
+are pruned for erased senders. Session 16: Sytest's sync leftovers -- timelines from the newest end with holes, gap state, peeking, presence on joins, filters for presence/account data/ephemeral, remote users in the directory. Session 15: `device_lists` counts invites and rejoins, `/keys/changes` walks memberships between two tokens, a remote copy goes stale with the last shared room. Session 14: the owner's fan-out in batches, and feed retention.
 Session 13: `/joined_rooms` read-your-writes. Session 12: RFC 0018, a non-owner's room copy
 catches up instead of reloading. Session 11, session 10, session 9, session 8, session 7 and
 the integration note follow; sessions 1-6 are preserved unchanged further down.)
 
+
+## Session 17 (2026-10-05, branch `agent/sync-polling`): wave 2's sync regressions
+
+Graded by the wave-2 measurement (`731d2433`, rechecked on `a70a5975`: Sytest
+`target/sytest/20261005-recheck/`, Complement runs 12 and 17).
+
+**A long-poll whose filter drops presence answered at once with nothing** (Sytest's
+`31sync/08polling.pl`, "Sync can be polled for updates" and "Sync is woken up for leaves", PASS on
+`c2d74174`, FAIL since session 16 applied the top-level `presence` filter). Every `/sync` marks
+its caller online; the batch skipped the filtered-out presence records *before* moving the
+token's `presence_seq` past them, so the caller's own presence stayed "new" to `has_new_data`
+for ever, and every long-poll returned at once with the same token. Three changes in
+`crate::sync`:
+- the token moves past presence the filter drops, as past presence it sends;
+- `has_new_data` ignores presence the filter drops;
+- **an incremental batch with nothing in it for the client is not an answer**: `build` now
+  long-polls, builds the batch (`build_batch`, the old body), and if it is empty
+  (`response_is_empty`: no rooms, presence, account data, to-device or device-list change; the
+  one-time-key counts are not news) and time is left, waits on from the batch's own token.
+  Synapse's notifier does the same (`wait_for_events` with `SyncResult.__bool__`). Whatever wakes
+  a poll and is then filtered out (typing under a `room.ephemeral` filter, an event the user may
+  not see) no longer ends it. A batch that did not move the token waits for the next wake before
+  looking again, so a stuck wake condition cannot spin. Debug line "a long-poll woke for news this
+  client's filter or view leaves out; waiting on". `full_state=true` with a token now answers at
+  once, as Synapse does (it used to long-poll first).
+
+**A fresh batch's `prev_batch`** (Sytest `10apidoc/34room-messages.pl` "GET /rooms/:room_id/
+messages returns a message" and "... lazy loads members correctly", Complement
+`TestGetRoomMembersAtPoint`): session 16 made it the point before the batch's first event, which
+for a fresh timeline holding the whole room is before `m.room.create`: `/messages?dir=b` from it
+was empty, and `/members?at=` found no event before it. Synapse's `_load_filtered_recents` moves
+the token back only when it truncated the timeline; otherwise it is the sync position. Now so
+(`timeline::build_fresh_timeline`); a truncated fresh batch and every incremental one keep "just
+before the first event". The `hs-room` side (`/members?at=` answering the current members when no
+event precedes the token) is not what the test exercises any more; Synapse answers 404 there. Not
+changed (`room-render`'s crate).
+
+**A fresh batch is ordered by depth, then arrival** (Complement federation
+`TestSyncOmitsStateChangeOnFilteredEvents`, failing since it was first run): an initial sync is a
+historical section of the room, which Synapse pages by topological ordering. By arrival, S2 (a
+state event of an old fork that arrived after E3 and E4) was the newest event, so with E5 filtered
+out and `limit: 1` it was the timeline and not in `state`. `build_fresh_timeline` now reads a
+window of `max(2 * limit, 10)` events from the newest end (Synapse's `load_limit`), orders it by
+`(depth, position)` and keeps the newest `limit`; `prev_batch` of a truncated batch is before the
+earliest of them by position. In a linear history the order is unchanged.
+
+**Peeking**: a peeked room above the fan-out threshold (no feed entries) now wakes the peeking
+device's long-poll (`has_new_data` reads the device's peeks against the hot-room stream; it used
+to be found only by the next poll); and a peeked room's timeline is pruned for erased local
+senders, as a later member's is (`timeline::apply_erasure`; a peeker was never joined).
+
+**Not changed, and why**: "The only membership state included in a gapped incremental sync is for
+senders in the timeline" (`31sync/15lazy-members.pl`, reported at `10apidoc/09synced.pl` line
+402) is **not a regression**: it fails in every run in `target/sytest/` including wave 1's
+(`20261004-wave1`, `c2d74174`). It is on Synapse's own Sytest blacklist, its own comment says
+"THIS SHOULD FAIL", and Synapse answers it as this server does (Charlie's membership as a timeline
+sender, Dave's as a gap change: two members). It contradicts "Gapped incremental syncs include all
+state changes" in the same file, which has the same shape and expects both, and passes.
+
+Verified:
+- unit: `sync::polling_cases` (new, 6: the filtered long-poll woken by a message and by a leave,
+  the token past dropped presence and a poll that then waits out its timeout, a poll woken by
+  filtered typing that waits on for the message, a fresh whole-room `prev_batch`, the late fork in
+  `state`), `routes::peek::tests::{a_new_event_in_a_peeked_room_wakes_a_long_poll,
+  a_peeker_sees_an_erased_senders_messages_pruned}`; each fails without its change.
+  `cargo test -p hs-user` all pass.
+- real binary: `crates/hs-cli/tests/sync_polling.rs` (new: the filtered long-poll woken by a
+  message and by a leave within 5 s of a 10 s timeout, `/members?at=` a fresh `prev_batch` is
+  alice alone after bob joined, `/messages?dir=b` from it returns the message); `peeking`,
+  `legacy_events`, `user_erasure` still pass.
+- Sytest, release bookworm `hs` of this branch: `10apidoc/34room-messages.pl`, all seventeen
+  `31sync/*.pl` and `30rooms/32erasure.pl`: **87 of 88** (`target/sytest/sp1/` in the worktree);
+  the one failure is the blacklisted gapped test above. "Sync can be polled for updates", "Sync is
+  woken up for leaves" and both `34room-messages.pl` tests FAIL to PASS.
+- Complement (image `complement-hs-sync-polling:dev`: main's `complement-hs-main:w2` with this
+  branch's bookworm `hs`; under the shared lock): csapi `TestGetRoomMembersAtPoint`, `TestSync`,
+  `TestSyncTimelineGap`, `TestMembershipOnEvents`, `TestArchivedRoomsHistory`, `TestRoomForget`,
+  `TestGetFilteredRoomMembers` pass; federation `TestSyncOmitsStateChangeOnFilteredEvents` passes
+  (FAIL in run 12 and before).
+
+Left: `event_fields` and `limit` outside `room.timeline` are still parsed only.
 
 ## 2026-10-05 (the coordinator): a ban no longer fails the banned member's whole `/sync`
 

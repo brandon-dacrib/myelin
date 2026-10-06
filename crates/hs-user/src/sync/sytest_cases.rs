@@ -729,8 +729,9 @@ async fn an_erased_senders_messages_are_pruned_for_later_members_only() {
     );
 }
 
-/// Complement's `TestGetRoomMembersAtPoint`: a fresh timeline that reaches the room's first
-/// event still hands out a `prev_batch`, at that event.
+/// A fresh timeline that reaches the room's first event still hands out a `prev_batch` (at the
+/// batch's end since session 17: `polling_cases`' test of Complement's
+/// `TestGetRoomMembersAtPoint`).
 #[tokio::test]
 async fn a_timeline_reaching_the_first_event_still_has_a_prev_batch() {
     let hub = hub();
