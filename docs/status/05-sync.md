@@ -1,12 +1,99 @@
 # 05 Sync: status
 
-Last updated: 2026-10-05 (session 17: a filtered long-poll waits for real news, a fresh
+Last updated: 2026-10-06 (session 18: two long-polls that never saw their change were a lost
+push-rule write and a membership event that lost to the room's state, not the long-poll. Session 17: a filtered long-poll waits for real news, a fresh
 batch's `prev_batch` and order follow Synapse's initial sync, peeked hot rooms wake a long-poll and
 are pruned for erased senders. Session 16: Sytest's sync leftovers -- timelines from the newest end with holes, gap state, peeking, presence on joins, filters for presence/account data/ephemeral, remote users in the directory. Session 15: `device_lists` counts invites and rejoins, `/keys/changes` walks memberships between two tokens, a remote copy goes stale with the last shared room. Session 14: the owner's fan-out in batches, and feed retention.
 Session 13: `/joined_rooms` read-your-writes. Session 12: RFC 0018, a non-owner's room copy
 catches up instead of reloading. Session 11, session 10, session 9, session 8, session 7 and
 the integration note follow; sessions 1-6 are preserved unchanged further down.)
 
+
+## Session 18 (2026-10-06, branch `agent/sync-wakes`): two `/sync`s that never showed their change
+
+Measured on `dcd02f4c`: two Complement tests that passed on their own branches failed on merged
+main, each with a `/sync` that never showed the change it waited for. The suspect was session 17's
+"an empty batch waits on" (`build_batch`, `response_is_empty`, `has_new_data`). It was not that:
+reproduced against main's image (`complement-hs-main:w3`), neither poll missed a wake. In both,
+the change the client waited for was gone from the server's own records, and nothing was left to
+wake for. Both races are timing-dependent: on a quiet machine `TestUnbanViaInvite` failed 3 of 15
+runs on main, and `TestPushRuleRoomUpgrade` passed 4 of 4.
+
+**Push-rule changes one user makes at once lost all but the last** (csapi
+`TestPushRuleRoomUpgrade/parallel/joining_a_remote_manually_upgraded_room_carries_over_existing_push_rules`).
+Its parallel subtests share bob, and each adds bob's room rule for its own room. Every
+`PUT /pushrules/...` read the ruleset (through the rule cache), changed it and wrote all of it
+back. Two at once both read the same ruleset, and the second write dropped the first one's rule.
+Bob's `m.push_rules` then came down `/sync` (responses #1 and #5 in the failure) without the rule
+for one room, so the test synced until it timed out. A second race made a stale copy stick: a
+reader that missed the cache and read the store just before a write cached the old ruleset after
+the write had invalidated it. The fix is in `hs-push`, track 10's crate, and is kept small:
+- `CachedRulesetStore::update_ruleset(user, edit)` makes each change under one lock (writes are
+  rare, so one lock covers every user), reading the store rather than the cache.
+  `set_ruleset` takes the same lock. `PUT`, `DELETE` and `PUT .../{attr}` on `/pushrules` use
+  it (`routes::pushrules::change`).
+- `RuleCache` has a generation that every invalidation moves on.
+  `effective_ruleset` caches what it read only if no invalidation happened during the read
+  (`RuleCache::insert_if_unchanged`), and logs at debug when one did.
+- `SessionHub::copy_room_push_rules` (the rules that follow a user into an upgraded room's
+  replacement) also goes through `update_ruleset`. It used to write the store directly, which
+  raced a client's own edit and never invalidated the cache.
+
+**A membership event that lost to the room's state still moved the user's membership**
+(federation `TestUnbanViaInvite`). Bob (hs2) bans alice (hs1), unbans her and invites her back.
+hs2 sends the unban over `/send`, because its target's server is sent membership changes about
+its own users, and the invite over `PUT /invite`. The `/send` transaction is queued first but
+often lands second. With nobody of hs1 left in the room, the invite was recorded out of band
+(`RoomActor::accept_out_of_room_membership`). The unban, applied after it, lost state resolution
+("cannot invite user that is joined or banned" at WARN in hs1's log), and the room's state still
+said `invite`. But `hs-room` takes a `RoomUpdate`'s `membership_deltas` from the event itself, so
+the unban's update said `leave`, and the hub wrote that into alice's membership record. Her
+`/sync` then had `"rooms": {}`: no invite, and a leave is left out of a fresh sync.
+`SessionHub::apply_room_update` now drops a delta when the room's state gives that user a
+different membership, set by an event stored before this one (`drop_memberships_that_lost`, in
+`crate::hub`). That event won, and the user's membership stays as it says. A membership set by a
+later event only supersedes this one, and that event's update follows. A state event with the same
+membership is not a loss either: a new room's creation burst comes as one update carrying every
+delta. The log line, at info: "a membership event lost to an earlier one in the room's state; the
+user's membership stays as that one says". This also covers a soft-failed membership event and a
+membership change lost to resolution between two servers' concurrent events.
+
+Not changed: `hs-room` still puts the unban in the room's graph although no user of this server
+is in the room. Synapse ignores a PDU for a room it has no member in ("Ignoring PDU ... as we're
+not in the room"). The out-of-room path (`hs_cli::federation::RegistryWriteSink`) could do the
+same. That decision belongs to tracks 04 and 06; the hub fix holds either way.
+
+**Verified.**
+- `hs-push`: `rulesets::tests::two_changes_made_at_once_both_land` and
+  `a_read_racing_a_change_does_not_cache_the_old_rules`, and
+  `compiled::tests::a_read_from_before_an_invalidation_is_not_cached`. Both `rulesets` tests fail
+  with the lock and the generation check taken out.
+- Real binary: `crates/hs-cli/tests/push_rules_concurrent.rs` sends five rounds of eight
+  concurrent `PUT`s for one user, then checks `GET /pushrules/` and an incremental `/sync`'s
+  `m.push_rules`. Without the lock it loses about a third of the rules.
+- `hs-user`: `sync::membership_cases::an_invite_survives_the_unban_before_it_arriving_after_it`
+  plays two servers, one of them a bare `RoomActor`, with the invite out of band and then the
+  unban through `accept_remote_event`. Without the fix the fresh sync is `"rooms": {}`, exactly
+  Complement's failure. Its counterpart in the usual order also passes.
+- Unchanged and passing: `hs-cli`'s `room_upgrade`, `federation_membership`,
+  `federation_two_servers`, `sync_polling`, `peeking`, `user_moderation`,
+  `third_party_invites_federation`, `guest_access_federation`, `thread_receipts`,
+  `push_federated_invite` and `invites_and_notices`; all of `hs-user` and `hs-push`.
+- Complement against main's image with this branch's binary layered over it
+  (`complement-hs-sync-wakes:dev`):
+  - `TestUnbanViaInvite`: 15/15 passed. On main the same 15 runs had 3 failures. The race came
+    up in 5 of the branch's runs, and the new info line was logged each time.
+  - `TestPushRuleRoomUpgrade`: 5/5 runs, all four subtests each time.
+  - csapi `TestSync`, `TestSyncTimelineGap` and `TestThreadedReceipts`: pass.
+- Sytest `tests/31sync/08polling.pl` on this branch's bookworm binary: 2/2 PASS
+  (`target/sytest/sync-wakes-08polling/`).
+
+**Left.**
+- Track 10 should review the `hs-push` change (`update_ruleset`, the cache generation) and note
+  it in `docs/status/10-push.md`.
+- Whether to ignore `/send` PDUs for rooms with no local member (above) is for tracks 04 and 06.
+- The rule cache is still per process. A cluster needs the cross-replica invalidation that
+  `docs/status/10-push.md` already records as owed.
 
 ## Session 17 (2026-10-05, branch `agent/sync-polling`): wave 2's sync regressions
 

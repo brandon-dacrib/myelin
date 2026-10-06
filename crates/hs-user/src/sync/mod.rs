@@ -105,6 +105,8 @@ use serde_json::{Value, json};
 
 pub mod device_lists;
 #[cfg(test)]
+mod membership_cases;
+#[cfg(test)]
 mod polling_cases;
 #[cfg(test)]
 mod sytest_cases;

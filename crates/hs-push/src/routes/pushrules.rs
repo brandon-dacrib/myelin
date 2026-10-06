@@ -352,11 +352,12 @@ pub async fn put_pushrule<B: KvBackend + 'static>(
         pattern: body.pattern,
     };
 
-    let mut ruleset = (*effective(&state, &requester.user_id).await?).clone();
-    ruleset
-        .insert(new_rule, ba.after.as_deref(), ba.before.as_deref())
-        .map_err(rule_edit_error)?;
-    save(&state, &requester.user_id, &ruleset).await?;
+    change(&state, &requester.user_id, |ruleset| {
+        ruleset
+            .insert(new_rule, ba.after.as_deref(), ba.before.as_deref())
+            .map_err(rule_edit_error)
+    })
+    .await?;
     Ok(Json(json!({})))
 }
 
@@ -368,11 +369,12 @@ pub async fn delete_pushrule<B: KvBackend + 'static>(
 ) -> Result<Json<Value>, MatrixError> {
     scope(&raw_scope)?;
     let kind = kind(&raw_kind)?;
-    let mut ruleset = (*effective(&state, &requester.user_id).await?).clone();
-    ruleset
-        .remove(kind, rule_id.as_str())
-        .map_err(|_| not_found(&rule_id))?;
-    save(&state, &requester.user_id, &ruleset).await?;
+    change(&state, &requester.user_id, |ruleset| {
+        ruleset
+            .remove(kind, rule_id.as_str())
+            .map_err(|_| not_found(&rule_id))
+    })
+    .await?;
     Ok(Json(json!({})))
 }
 
@@ -386,36 +388,43 @@ pub async fn put_pushrule_attr<B: KvBackend + 'static>(
 ) -> Result<Json<Value>, MatrixError> {
     scope(&raw_scope)?;
     let kind = kind(&raw_kind)?;
-    let mut ruleset = (*effective(&state, &requester.user_id).await?).clone();
-    match attr.as_str() {
+    // The request is read in full first; the ruleset is then changed under the store's lock.
+    let edit: AttrEdit = match attr.as_str() {
         "actions" => {
             let raw = body
                 .get("actions")
                 .and_then(Value::as_array)
                 .cloned()
                 .ok_or_else(|| MatrixError::missing_param("actions"))?;
-            let actions = parse_actions(raw)?;
-            ruleset
-                .set_actions(kind, rule_id.as_str(), actions)
-                .map_err(rule_edit_error)?;
+            AttrEdit::Actions(parse_actions(raw)?)
         }
-        "enabled" => {
-            let enabled = body
-                .get("enabled")
+        "enabled" => AttrEdit::Enabled(
+            body.get("enabled")
                 .and_then(Value::as_bool)
-                .ok_or_else(|| invalid("enabled must be a boolean"))?;
-            ruleset
-                .set_enabled(kind, rule_id.as_str(), enabled)
-                .map_err(rule_edit_error)?;
-        }
+                .ok_or_else(|| invalid("enabled must be a boolean"))?,
+        ),
         other => {
             return Err(unrecognized(format!(
                 "push rule attribute {other:?} cannot be set"
             )));
         }
-    }
-    save(&state, &requester.user_id, &ruleset).await?;
+    };
+    change(&state, &requester.user_id, |ruleset| match edit {
+        AttrEdit::Actions(actions) => ruleset
+            .set_actions(kind, rule_id.as_str(), actions)
+            .map_err(rule_edit_error),
+        AttrEdit::Enabled(enabled) => ruleset
+            .set_enabled(kind, rule_id.as_str(), enabled)
+            .map_err(rule_edit_error),
+    })
+    .await?;
     Ok(Json(json!({})))
+}
+
+/// The one attribute `PUT /pushrules/{scope}/{kind}/{ruleId}/{attr}` sets.
+enum AttrEdit {
+    Actions(Vec<Action>),
+    Enabled(bool),
 }
 
 async fn effective<B: KvBackend + 'static>(
@@ -429,18 +438,35 @@ async fn effective<B: KvBackend + 'static>(
         .map_err(store_err)
 }
 
-async fn save<B: KvBackend + 'static>(
+/// Changes the user's ruleset with `edit`, one change at a time
+/// (`CachedRulesetStore::update_ruleset`): two requests from one user at once each keep the
+/// other's change, which a read here and a write after it did not.
+async fn change<B: KvBackend + 'static>(
     state: &PushState<B>,
     user_id: &UserId,
-    ruleset: &Ruleset,
+    edit: impl FnOnce(&mut Ruleset) -> Result<(), MatrixError>,
 ) -> Result<(), MatrixError> {
-    state
+    let changed = state
         .rulesets
-        .set_ruleset(user_id, ruleset)
+        .update_ruleset(user_id, |ruleset| {
+            edit(ruleset).map(Some).map_err(StoreOrMatrix)
+        })
         .await
-        .map_err(store_err)?;
-    tracing::debug!(user = %user_id, "push rules changed");
+        .map_err(|e: StoreOrMatrix| e.0)?;
+    if let Some(((), seq)) = changed {
+        tracing::debug!(user = %user_id, seq, "push rules changed");
+    }
     Ok(())
+}
+
+/// [`MatrixError`] with a conversion from the store's error, for
+/// `CachedRulesetStore::update_ruleset`.
+struct StoreOrMatrix(MatrixError);
+
+impl From<crate::error::StoreError> for StoreOrMatrix {
+    fn from(e: crate::error::StoreError) -> Self {
+        Self(store_err(e))
+    }
 }
 
 fn store_err(e: crate::error::StoreError) -> MatrixError {

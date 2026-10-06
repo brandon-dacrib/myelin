@@ -89,6 +89,66 @@ pub const DEFAULT_HOT_STREAM_RETENTION_ENTRIES: u64 = 100_000;
 /// `docs/status/05-sync.md` (session 14), and an escape hatch.
 pub const FAN_OUT_UNBATCHED_ENV: &str = "HS_SYNC_FAN_OUT_UNBATCHED";
 
+/// Takes out of `update` each membership change the room did not take up: one whose user's
+/// membership in the room's state is something else, set by an event stored before this one.
+/// This event lost to that one -- state resolution kept the other, or it was soft-failed -- and
+/// the user's membership is still the other one's. (A membership set by an event stored after
+/// this one has merely superseded it, and that event's update follows this one. And an update
+/// can carry the membership changes of the events before it -- a new room's creation burst is
+/// published as one -- so a state event other than this one with the same membership is no
+/// sign of anything.)
+///
+/// What it fixes: a user banned from a room on another server, unbanned and invited back. The
+/// invite comes over `PUT /invite` and the unban over `/send`, and the unban often lands second;
+/// with nobody of this server left in the room, the invite was recorded out of band, and the
+/// unban, applied after it, resolved away. The room still said "invite", but the unban's update
+/// said "leave", and the user's `/sync` never showed the invite (Complement's
+/// `TestUnbanViaInvite`).
+async fn drop_memberships_that_lost<B: KvBackend + 'static>(
+    handle: &hs_room::actor::RoomActorHandle<B>,
+    update: &mut RoomUpdate,
+) {
+    if update.membership_deltas.is_empty() {
+        return;
+    }
+    let deltas: Vec<(OwnedUserId, String)> = update
+        .membership_deltas
+        .iter()
+        .map(|d| (d.user_id.clone(), d.membership.clone()))
+        .collect();
+    let (event_id, event_sn) = (update.event_id.clone(), update.event_sn);
+    let lost: Vec<(OwnedUserId, String, ruma::OwnedEventId)> = handle
+        .query(move |actor| {
+            deltas
+                .into_iter()
+                .filter_map(|(user, delta)| {
+                    let current = actor.state_event("m.room.member", user.as_str()).ok()??;
+                    let membership = membership_of(current)?;
+                    if *current.event_id() == *event_id || membership == delta {
+                        return None;
+                    }
+                    let current_sn = actor.event_sn_of(current.event_id())?;
+                    (current_sn < event_sn)
+                        .then(|| (user, membership, current.event_id().to_owned()))
+                })
+                .collect()
+        })
+        .await;
+    for (user_id, membership, kept) in &lost {
+        tracing::info!(
+            room_id = %update.room_id,
+            %user_id,
+            event_id = %update.event_id,
+            %membership,
+            kept_event_id = %kept,
+            "a membership event lost to an earlier one in the room's state; the user's membership stays as that one says"
+        );
+    }
+    update
+        .membership_deltas
+        .retain(|d| !lost.iter().any(|(user_id, _, _)| *user_id == d.user_id));
+}
+
 pub(crate) fn membership_of(event: &Event) -> Option<String> {
     event
         .json()
@@ -2028,86 +2088,86 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         new_room_id: &RoomId,
     ) -> Result<(), UserError> {
         use hs_push::ruleset::{NewRule, RuleKind};
-        use hs_push::rulesets::RulesetStore as _;
         use ruma::push::PushCondition;
 
         let Some(store) = self.push_rules.get() else {
             return Ok(());
         };
-        let Some(mut ruleset) = store.store().get_ruleset(user_id).await? else {
-            return Ok(());
-        };
         let (old, new) = (old_room_id.as_str(), new_room_id.as_str());
-        // (kind, new rule, enabled), collected first: the ruleset is edited after the reads.
-        let mut copies: Vec<(NewRule, bool)> = Vec::new();
-        if let Some(rule) = ruleset.room.iter().find(|r| r.rule_id == old)
-            && !ruleset.room.iter().any(|r| r.rule_id == new)
-        {
-            copies.push((
-                NewRule {
-                    kind: RuleKind::Room,
-                    rule_id: new.to_owned(),
-                    actions: rule.actions.clone(),
-                    conditions: Vec::new(),
-                    pattern: None,
-                },
-                rule.enabled,
-            ));
-        }
-        for (kind, list) in [
-            (RuleKind::Override, &ruleset.override_),
-            (RuleKind::Underride, &ruleset.underride),
-        ] {
-            for rule in list.iter().filter(|r| !r.default) {
-                let names_old_room = rule.conditions.iter().any(|c| {
-                    matches!(c, PushCondition::EventMatch(data)
-                        if data.key == "room_id" && data.pattern == old)
-                });
-                if !names_old_room {
-                    continue;
+        // Read and written under the store's lock (`CachedRulesetStore::update_ruleset`): a
+        // rule the user adds at the same moment is kept, and the cached copy is dropped.
+        let copied = store
+            .update_ruleset(user_id, |ruleset| {
+                // (kind, new rule, enabled), collected first: the ruleset is edited after the
+                // reads.
+                let mut copies: Vec<(NewRule, bool)> = Vec::new();
+                if let Some(rule) = ruleset.room.iter().find(|r| r.rule_id == old)
+                    && !ruleset.room.iter().any(|r| r.rule_id == new)
+                {
+                    copies.push((
+                        NewRule {
+                            kind: RuleKind::Room,
+                            rule_id: new.to_owned(),
+                            actions: rule.actions.clone(),
+                            conditions: Vec::new(),
+                            pattern: None,
+                        },
+                        rule.enabled,
+                    ));
                 }
-                let rule_id = rule.rule_id.replace(old, new);
-                if rule_id == rule.rule_id || list.iter().any(|r| r.rule_id == rule_id) {
-                    continue;
-                }
-                let mut conditions = rule.conditions.clone();
-                for condition in &mut conditions {
-                    if let PushCondition::EventMatch(data) = condition
-                        && data.key == "room_id"
-                        && data.pattern == old
-                    {
-                        new.clone_into(&mut data.pattern);
+                for (kind, list) in [
+                    (RuleKind::Override, &ruleset.override_),
+                    (RuleKind::Underride, &ruleset.underride),
+                ] {
+                    for rule in list.iter().filter(|r| !r.default) {
+                        let names_old_room = rule.conditions.iter().any(|c| {
+                            matches!(c, PushCondition::EventMatch(data)
+                                if data.key == "room_id" && data.pattern == old)
+                        });
+                        if !names_old_room {
+                            continue;
+                        }
+                        let rule_id = rule.rule_id.replace(old, new);
+                        if rule_id == rule.rule_id || list.iter().any(|r| r.rule_id == rule_id) {
+                            continue;
+                        }
+                        let mut conditions = rule.conditions.clone();
+                        for condition in &mut conditions {
+                            if let PushCondition::EventMatch(data) = condition
+                                && data.key == "room_id"
+                                && data.pattern == old
+                            {
+                                new.clone_into(&mut data.pattern);
+                            }
+                        }
+                        copies.push((
+                            NewRule {
+                                kind,
+                                rule_id,
+                                actions: rule.actions.clone(),
+                                conditions,
+                                pattern: None,
+                            },
+                            rule.enabled,
+                        ));
                     }
                 }
-                copies.push((
-                    NewRule {
-                        kind,
-                        rule_id,
-                        actions: rule.actions.clone(),
-                        conditions,
-                        pattern: None,
-                    },
-                    rule.enabled,
-                ));
-            }
-        }
-        if copies.is_empty() {
-            return Ok(());
-        }
-        let mut copied = 0usize;
-        for (rule, enabled) in copies {
-            let (kind, rule_id) = (rule.kind, rule.rule_id.clone());
-            if let Err(error) = ruleset.insert(rule, None, None) {
-                tracing::warn!(user = %user_id, %rule_id, %error, "a push rule could not be copied onto an upgraded room's replacement");
-                continue;
-            }
-            if !enabled {
-                let _ = ruleset.set_enabled(kind, &rule_id, false);
-            }
-            copied += 1;
-        }
-        if copied > 0 {
-            store.set_ruleset(user_id, &ruleset).await?;
+                let mut copied = 0usize;
+                for (rule, enabled) in copies {
+                    let (kind, rule_id) = (rule.kind, rule.rule_id.clone());
+                    if let Err(error) = ruleset.insert(rule, None, None) {
+                        tracing::warn!(user = %user_id, %rule_id, %error, "a push rule could not be copied onto an upgraded room's replacement");
+                        continue;
+                    }
+                    if !enabled {
+                        let _ = ruleset.set_enabled(kind, &rule_id, false);
+                    }
+                    copied += 1;
+                }
+                Ok::<_, UserError>((copied > 0).then_some(copied))
+            })
+            .await?;
+        if let Some((copied, _)) = copied {
             tracing::info!(
                 user = %user_id,
                 %old_room_id,
@@ -2123,7 +2183,10 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
     /// replicas are told (`crate::cluster::RoomWake::users`). Empty, and nothing written, for a
     /// room this replica does not own: its owner feeds it, and two hubs writing the same
     /// user's feed from two views of one room would race each other.
-    async fn apply_room_update(&self, update: RoomUpdate) -> Result<Vec<OwnedUserId>, UserError> {
+    async fn apply_room_update(
+        &self,
+        mut update: RoomUpdate,
+    ) -> Result<Vec<OwnedUserId>, UserError> {
         if !self.owns_room(&update.room_id) {
             return Ok(Vec::new());
         }
@@ -2134,6 +2197,7 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
             }
             Err(error) => return Err(error.into()),
         };
+        drop_memberships_that_lost(&handle, &mut update).await;
         let (active_members, member_count, directory) = handle
             .query(|actor| {
                 let members = actor.members()?;

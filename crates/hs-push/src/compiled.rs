@@ -33,15 +33,24 @@
 //! one).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::ruleset::Ruleset;
 use ruma::OwnedUserId;
 
 /// An in-memory cache of compiled (i.e. already-deserialized) per-user rulesets.
+///
+/// A reader that missed the cache, read the store and then inserts what it read must not put
+/// back a ruleset a write replaced in the meantime: the stale entry would then be served until
+/// the user's next write. [`RuleCache::generation`] and [`RuleCache::insert_if_unchanged`] are
+/// how it avoids that: every [`RuleCache::invalidate`] moves the generation on, and an insert
+/// taken at an older generation is dropped.
 #[derive(Debug, Default)]
 pub struct RuleCache {
     entries: RwLock<HashMap<OwnedUserId, Arc<Ruleset>>>,
+    /// Moved on by every [`RuleCache::invalidate`], under the `entries` write lock.
+    generation: AtomicU64,
 }
 
 impl RuleCache {
@@ -63,10 +72,37 @@ impl RuleCache {
         self.entries.write().unwrap().insert(user_id, ruleset);
     }
 
-    /// Drops the cached entry for `user_id`, if any. Called by `crate::rulesets::CachedRulesetStore`
-    /// after every write to that user's ruleset.
+    /// The cache's generation: read it before reading a ruleset from the store, and pass it to
+    /// [`RuleCache::insert_if_unchanged`] with what was read.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Caches `ruleset` for `user_id` only if nothing has been invalidated since `generation`
+    /// was read ([`RuleCache::generation`]); returns whether it was cached. A ruleset read from
+    /// the store before a concurrent write landed is then not cached over that write. (Any
+    /// user's invalidation counts: writes are rare, and the next read caches it.)
+    pub fn insert_if_unchanged(
+        &self,
+        user_id: OwnedUserId,
+        ruleset: Arc<Ruleset>,
+        generation: u64,
+    ) -> bool {
+        let mut entries = self.entries.write().unwrap();
+        if self.generation.load(Ordering::Acquire) != generation {
+            return false;
+        }
+        entries.insert(user_id, ruleset);
+        true
+    }
+
+    /// Drops the cached entry for `user_id`, if any, and moves the generation on. Called by
+    /// `crate::rulesets::CachedRulesetStore` after every write to that user's ruleset.
     pub fn invalidate(&self, user_id: &ruma::UserId) {
-        self.entries.write().unwrap().remove(user_id);
+        let mut entries = self.entries.write().unwrap();
+        entries.remove(user_id);
+        self.generation.fetch_add(1, Ordering::AcqRel);
     }
 
     /// The number of users currently cached, for tests and metrics.
@@ -114,5 +150,21 @@ mod tests {
         assert!(cache.peek(alice).is_none());
         assert!(cache.peek(bob).is_some());
         assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn a_read_from_before_an_invalidation_is_not_cached() {
+        let cache = RuleCache::new();
+        let alice = user_id!("@alice:example.org");
+        let generation = cache.generation();
+        // A write lands between the reader's store read and its insert.
+        cache.invalidate(alice);
+        let stale = Arc::new(Ruleset::server_default(alice));
+        assert!(!cache.insert_if_unchanged(alice.to_owned(), stale.clone(), generation));
+        assert!(cache.peek(alice).is_none(), "the stale read was cached");
+        // Read again after the write: cached.
+        let generation = cache.generation();
+        assert!(cache.insert_if_unchanged(alice.to_owned(), stale, generation));
+        assert!(cache.peek(alice).is_some());
     }
 }

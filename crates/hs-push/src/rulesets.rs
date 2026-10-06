@@ -78,9 +78,18 @@ pub fn default_ruleset(user_id: &UserId) -> Ruleset {
 /// A [`RulesetStore`] fronted by a [`RuleCache`]: the seam `crate::compiled`'s module docs
 /// describe. Every read goes through the cache first; every write invalidates the cache entry it
 /// just changed.
+///
+/// Every change to a ruleset is a read, an edit and a write of the whole thing, so two changes
+/// made at once (a client adding rules for two rooms in parallel, or a rule copied onto an
+/// upgraded room while the user edits another) must not both start from the same read: the
+/// second write would drop the first one's rule. [`CachedRulesetStore::update_ruleset`] makes
+/// each change under one lock, reading the store rather than the cache, and
+/// [`CachedRulesetStore::set_ruleset`] takes the same lock. Writes are rare (a person editing
+/// their notification settings), so one lock for every user is plenty.
 pub struct CachedRulesetStore<S: RulesetStore> {
     inner: S,
     cache: Arc<RuleCache>,
+    writes: tokio::sync::Mutex<()>,
 }
 
 impl<S: RulesetStore> CachedRulesetStore<S> {
@@ -89,6 +98,7 @@ impl<S: RulesetStore> CachedRulesetStore<S> {
         Self {
             inner,
             cache: Arc::new(RuleCache::new()),
+            writes: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -116,12 +126,20 @@ impl<S: RulesetStore> CachedRulesetStore<S> {
         if let Some(cached) = self.cache.peek(user_id) {
             return Ok(cached);
         }
+        // Taken before the read: a write that lands between the read and the insert below
+        // keeps what was read out of the cache (`RuleCache::insert_if_unchanged`).
+        let generation = self.cache.generation();
         let ruleset = match self.inner.get_ruleset(user_id).await? {
             Some(r) => r,
             None => default_ruleset(user_id),
         };
         let ruleset = Arc::new(ruleset);
-        self.cache.insert(user_id.to_owned(), ruleset.clone());
+        if !self
+            .cache
+            .insert_if_unchanged(user_id.to_owned(), ruleset.clone(), generation)
+        {
+            tracing::debug!(user = %user_id, "push rules changed while being read; not cached");
+        }
         Ok(ruleset)
     }
 
@@ -137,9 +155,39 @@ impl<S: RulesetStore> CachedRulesetStore<S> {
         user_id: &UserId,
         ruleset: &Ruleset,
     ) -> Result<u64, StoreError> {
+        let _write = self.writes.lock().await;
         let seq = self.inner.set_ruleset(user_id, ruleset).await?;
         self.cache.invalidate(user_id);
         Ok(seq)
+    }
+
+    /// Changes `user_id`'s ruleset with `edit`, one change at a time: `edit` is given the
+    /// stored ruleset (or [`default_ruleset`]) as of now, read under the lock every write takes,
+    /// so a change made at the same time cannot be lost under this one. `Ok(Some(value))` from
+    /// `edit` writes the edited ruleset and returns `value` with the new change-seq;
+    /// `Ok(None)` writes nothing; an error writes nothing and is returned.
+    ///
+    /// # Errors
+    /// `edit`'s error, or the underlying store's (converted with `From`).
+    pub async fn update_ruleset<T, E>(
+        &self,
+        user_id: &UserId,
+        edit: impl FnOnce(&mut Ruleset) -> Result<Option<T>, E>,
+    ) -> Result<Option<(T, u64)>, E>
+    where
+        E: From<StoreError>,
+    {
+        let _write = self.writes.lock().await;
+        let mut ruleset = match self.inner.get_ruleset(user_id).await? {
+            Some(r) => r,
+            None => default_ruleset(user_id),
+        };
+        let Some(value) = edit(&mut ruleset)? else {
+            return Ok(None);
+        };
+        let seq = self.inner.set_ruleset(user_id, &ruleset).await?;
+        self.cache.invalidate(user_id);
+        Ok(Some((value, seq)))
     }
 
     /// Everything `/sync` (track 05) needs to decide whether, and what, to include for
@@ -239,6 +287,117 @@ mod tests {
             .get(crate::ruleset::RuleKind::Underride, ".m.rule.message")
             .unwrap();
         assert!(!rule.enabled());
+    }
+
+    /// A store whose reads take a while, so two changes made at once both read before either
+    /// writes unless something keeps them apart.
+    struct SlowReads(InMemoryRulesetStore);
+
+    #[async_trait::async_trait]
+    impl RulesetStore for SlowReads {
+        async fn get_ruleset(&self, user_id: &UserId) -> Result<Option<Ruleset>, StoreError> {
+            let read = self.0.get_ruleset(user_id).await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            read
+        }
+        async fn set_ruleset(
+            &self,
+            user_id: &UserId,
+            ruleset: &Ruleset,
+        ) -> Result<u64, StoreError> {
+            self.0.set_ruleset(user_id, ruleset).await
+        }
+        async fn changed_seq(&self, user_id: &UserId) -> Result<u64, StoreError> {
+            self.0.changed_seq(user_id).await
+        }
+    }
+
+    fn room_rule(room: &str) -> crate::ruleset::NewRule {
+        crate::ruleset::NewRule {
+            kind: crate::ruleset::RuleKind::Room,
+            rule_id: room.to_owned(),
+            actions: Vec::new(),
+            conditions: Vec::new(),
+            pattern: None,
+        }
+    }
+
+    /// Complement's `TestPushRuleRoomUpgrade` adds one user's room rules for two rooms from two
+    /// parallel subtests; each change read the ruleset, added its rule and wrote it back, and
+    /// the later write dropped the earlier rule, which that user's `/sync` then waited for in
+    /// vain.
+    #[tokio::test]
+    async fn two_changes_made_at_once_both_land() {
+        let store = Arc::new(CachedRulesetStore::new(SlowReads(
+            InMemoryRulesetStore::new(),
+        )));
+        let alice = user_id!("@alice:example.org");
+        let add = |room: &'static str| {
+            let store = store.clone();
+            async move {
+                store
+                    .update_ruleset(alice, |ruleset| {
+                        ruleset
+                            .insert(room_rule(room), None, None)
+                            .map(Some)
+                            .map_err(|e| StoreError::Backend(e.to_string()))
+                    })
+                    .await
+            }
+        };
+        let (first, second) = tokio::join!(add("!one:example.org"), add("!two:example.org"));
+        first.unwrap().expect("the first change was written");
+        second.unwrap().expect("the second change was written");
+        let ruleset = store.effective_ruleset(alice).await.unwrap();
+        for room in ["!one:example.org", "!two:example.org"] {
+            assert!(
+                ruleset.get(crate::ruleset::RuleKind::Room, room).is_some(),
+                "the rule for {room} was lost to the other change"
+            );
+        }
+        assert_eq!(store.store().changed_seq(alice).await.unwrap(), 2);
+    }
+
+    /// A reader that misses the cache while a change is being written must not cache what it
+    /// read before the write: every later read would be served the ruleset without the change.
+    #[tokio::test]
+    async fn a_read_racing_a_change_does_not_cache_the_old_rules() {
+        let store = Arc::new(CachedRulesetStore::new(SlowReads(
+            InMemoryRulesetStore::new(),
+        )));
+        let alice = user_id!("@alice:example.org");
+        let reader = {
+            let store = store.clone();
+            tokio::spawn(async move { store.effective_ruleset(alice).await })
+        };
+        // The reader is inside its slow read; the change lands while it waits.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let mut edited = default_ruleset(alice);
+        edited
+            .insert(room_rule("!one:example.org"), None, None)
+            .unwrap();
+        store.store().set_ruleset(alice, &edited).await.unwrap();
+        store.cache().invalidate(alice);
+        reader.await.unwrap().unwrap();
+        let after = store.effective_ruleset(alice).await.unwrap();
+        assert!(
+            after
+                .get(crate::ruleset::RuleKind::Room, "!one:example.org")
+                .is_some(),
+            "the read from before the change was cached over it"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_edit_that_changes_nothing_writes_nothing() {
+        let store = CachedRulesetStore::new(InMemoryRulesetStore::new());
+        let alice = user_id!("@alice:example.org");
+        let outcome = store
+            .update_ruleset::<(), StoreError>(alice, |_| Ok(None))
+            .await
+            .unwrap();
+        assert!(outcome.is_none());
+        assert_eq!(store.store().changed_seq(alice).await.unwrap(), 0);
     }
 
     /// Pins [`default_ruleset`]'s shape against the spec's own "Predefined Rules" list
