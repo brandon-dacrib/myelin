@@ -8,8 +8,12 @@
 # A default -timeout is set below because go test's own default (10m for the whole binary) is
 # too short for the full suite against a real homeserver; pass your own -timeout after `--` to
 # override it.
+#
+# The `go test` runs under ./lock.sh, so a second run on this desktop (another worktree, another
+# agent) waits for this one instead of sharing its container names; see README.md.
 set -euo pipefail
 cd "$(dirname "$0")"
+HERE="$(pwd)"
 
 IMAGE_TAG="${COMPLEMENT_BASE_IMAGE:-complement-hs-reimplement:dev}"
 COMPLEMENT_DIR="${COMPLEMENT_DIR:-$(cd ../../refs/complement && pwd)}"
@@ -47,4 +51,4 @@ if [ "${1:-}" = "--" ]; then
 fi
 
 echo "run_single_node.sh: go test ${GO_ARGS[*]}" >&2
-go test "${GO_ARGS[@]}"
+"$HERE/lock.sh" go test "${GO_ARGS[@]}"

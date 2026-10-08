@@ -1,5 +1,66 @@
 # 14 Test and conformance (integration lead): status
 
+## Session 12 (2026-10-08, branch `agent/ops-harness`): the harness lessons of 2026-10-04/05
+
+**1. The Complement lock is in the repository.** `tests/complement/lock.sh <command...>` holds
+`.git/myelin-complement.lock` (the common git directory, so every worktree shares it) while the
+command runs; `owner` inside names the PID, start time, working directory and command, and a
+waiting run prints it once. Released however the command ends (a trap; INT, TERM and HUP are
+passed on). A lock whose owner PID is gone is taken over and logged; a lock with no `owner` file
+yet is never taken. `run_single_node.sh` runs `go test` under it; the README's new section "One
+image, one cache, one run at a time" gives the hand-run form. Replaces the session scratchpad's
+`complement-lock.sh` (briefs should now name `tests/complement/lock.sh`).
+
+**2. One BuildKit `target/` cache per image tag.** `tests/complement/build.sh` and
+`tests/sytest/build.sh` pass `TARGET_CACHE_ID=myelin-{complement,sytest}-target-<tag>` to the
+Dockerfiles, whose `target/` mount id is now that argument (the old shared id is the
+Dockerfile's default, and `--shared-cache` selects it). `TARGET_CACHE_ID=<id>` overrides;
+`--dry-run` prints the tag, id and command. Checked against this Docker daemon that an `ARG` in
+a cache mount's `id` expands and that two ids are two caches. Complement's `build.sh` also leaves
+`.claude/` (agent worktrees, hundreds of GB) and fuzz output out of its tar, as Sytest's did. The
+first build of a new tag is cold (the default `:dev` tags get new ids too).
+
+**3. `tools/merge-queue.sh`.** Refuses to start, and refuses each gate (return 10), when
+`HS_CLUSTER_TEST_POSTGRES_DSN`, `HS_KV_TEST_POSTGRES_DSN`, `HS_KV_TEST_POSTGRES_TLS_DSN` or
+`HS_KV_TEST_POSTGRES_TLS_CERT` is unset, a DSN's host and port take no TCP connection (`nc -z`),
+or the certificate is not a readable file; it names each. `--allow-skips` warns and gates. It
+sources `.claude/gate-pg/env.sh` (`$MERGE_QUEUE_ENV`) first if present, without overriding set
+variables. **Found:** hs-cli's `postgres_tls.rs` reads `HS_CLUSTER_TEST_POSTGRES_TLS_{DSN,CERT}`,
+which `.claude/gate-pg/env.sh` does not set, so unless they were set by hand it printed SKIP and
+passed (cargo hides a passing test's output, so the gate logs cannot say which); the queue now
+sets them from the KV TLS pair when unset (the same kind of server), logged. Before each
+gate, if the queue's `target/` is over `MERGE_QUEUE_TARGET_MAX_GB` (80), it removes
+`target/debug/incremental`, then `target/debug` if still over, logging sizes; a dry run says what
+it would remove. New `--no-push`: lock and real gate, no push, no branch deleted. Header and
+AGENTS.md ("Working in Parallel") document all of it.
+
+**4.** `docs/next-steps.md`'s gaps table: the dashboard row and the NoCreators row struck,
+closed by `385a748d`.
+
+**Verified:** `tools/test_ops_scripts.sh` (new; 32 checks, no Docker, PostgreSQL or cargo: the
+lock's exit status, serialisation of three concurrent runs, stale and owner-less locks, TERM
+passed on and release; both `build.sh --dry-run` cache ids; the queue's DSN parser, `check_pg`
+against a live and a closed port and a missing certificate, `prune_target` on a 3 GB fake
+`target/` dry and real, the env file sourced, exported and never over a set variable, and the whole script refusing to
+start without PostgreSQL).
+`tools/merge-queue.sh --dry-run` with the coordinator's env file, without it, and with a zero
+size limit. `cargo test -p hs-cli --test postgres_tls` with the cluster TLS variables equal to
+the KV pair, against a plain and a TLS PostgreSQL of my own: passed in 6.7 s (ran, not SKIP). A
+real gate through the queue, under the lock, of a throwaway docs-only branch off `ac061e20` with
+`--no-push` (14:02-14:20): env file sourced, TLS pair set, `target/ is 0 GB (limit 80 GB): kept`,
+`cluster_admin`'s two-replica test and both `postgres_tls` tests ran; 3,113 passed and **one
+failed on `main`'s own tree**: `hs-room`'s `scenario.rs`
+`profile_propagates_into_join_invite_and_knock_membership_content` (line 532, "a profile change
+must not retroactively edit an already-sent membership event": got "Bobby"). It passes 6/6
+alone. The test asserts the opposite of what `PUT /profile` now does (re-stamps the member event
+in every joined room, `hs_room::routes::profile`) and passes only while its GET beats that
+fan-out; under the gate's load it lost. Track 04's to fix (the assertion, not the server). The
+throwaway branch is deleted.
+
+**Left:** a real Complement or Sytest image build with a per-tag cache (the mechanism was tested
+on a small image; a full image build is a 20-minute cold release build and was not run here).
+Old shared caches (`myelin-complement-target`, `myelin-sytest-target`) stay until pruned.
+
 ## Session 11 (2026-10-05 night, the coordinator): wave 3, measured
 
 `main` at `dcd02f4c` (the five wave-3 branches and the presence-test fix), quiet machine, run

@@ -26,8 +26,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libs
     && rm -rf /var/lib/apt/lists/*
 COPY . .
 # Four jobs, not every core: the desktop is shared with other agents' builds.
+#
+# The `target/` mount's id is TARGET_CACHE_ID, which build.sh sets per image tag (one cache shared
+# by every branch's image once linked another branch's crate into an image, 2026-10-04/05); a
+# plain `docker build` without the argument gets the old shared id.
+ARG TARGET_CACHE_ID=myelin-sytest-target
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=myelin-cargo-registry \
-    --mount=type=cache,target=/workspace/target,id=myelin-sytest-target \
+    --mount=type=cache,target=/workspace/target,id=${TARGET_CACHE_ID} \
     CARGO_PROFILE_RELEASE_DEBUG=0 cargo build --release --jobs 4 -p hs-cli --bin hs \
     && cp target/release/hs /hs
 

@@ -25,8 +25,9 @@ file's "What a next session should do first").
 | `Dockerfile.template` | The Complement image: build stage (`cargo build --release --jobs 4 -p hs-cli`, the real `hs` binary), runtime stage (the binary, `stunnel4` terminating TLS on 8448 in front of `hs`'s plaintext 8008, `openssl`/`curl`, a `HEALTHCHECK`, `EXPOSE 8008 8448`). |
 | `stunnel.conf.template` | The `stunnel` config `startup.sh` fills in with the per-container-signed cert path. |
 | `startup.sh` | Container entrypoint: signs a federation TLS cert against Complement's mounted CA (`/complement/ca/{ca.crt,ca.key}`), trusts that CA itself, writes a native `hs-config` YAML to `/data/config.yaml`, starts `stunnel`, then `exec`s `hs serve -c /data/config.yaml`. |
-| `build.sh` | Streams a `tar` of the repo (excluding `target/`, `.git/`, `web/node_modules/`, `refs/` and other build-irrelevant, multi-gigabyte directories) to `docker build`'s stdin, rather than using `.` as the build context directly — see the status file for why. Skips cleanly (exit 0) if Docker is unavailable, fails loudly if Docker is available but the build itself fails. |
-| `run_single_node.sh` | The common case: one server process per Complement blueprint. Builds the image, applies `blacklist.txt` as a `go test -skip` regex, runs `go test ./tests/...` from `refs/matrix-spec`'s sibling checkout `refs/complement`. |
+| `build.sh` | Streams a `tar` of the repo (excluding `target/`, `.git/`, `.claude/`, `web/node_modules/`, `refs/` and other build-irrelevant, multi-gigabyte directories) to `docker build`'s stdin, rather than using `.` as the build context directly — see the status file for why. Gives each image tag its own BuildKit `target/` cache (see "One image, one cache, one run at a time" below). Skips cleanly (exit 0) if Docker is unavailable, fails loudly if Docker is available but the build itself fails. |
+| `run_single_node.sh` | The common case: one server process per Complement blueprint. Builds the image, applies `blacklist.txt` as a `go test -skip` regex, runs `go test ./tests/...` from `refs/matrix-spec`'s sibling checkout `refs/complement`, under `lock.sh`. |
+| `lock.sh` | Runs a command while holding the repository's Complement lock, so runs from different worktrees or agents on one Docker daemon take turns. |
 | `run_cluster.sh` | The seam for track 03/12's cluster deployment topology (sharded rooms, lease handover, multi-container blueprints) — see that script's header for why this is further from working than single-node mode. |
 | `skip_regex.sh` | Turns `blacklist.txt` into the `|`-joined regex `run_single_node.sh` passes to `go test -skip`. |
 | `blacklist.txt` | This server's Complement blacklist — see below. |
@@ -68,6 +69,35 @@ explanation rather than failing if one is missing, per this track's brief ("desi
 Docker-dependent ones are skipped cleanly when it is absent").
 
 `COMPLEMENT_BASE_IMAGE` and `COMPLEMENT_DIR` can be overridden; see `run_single_node.sh`.
+
+## One image, one cache, one run at a time
+
+Several agents share the desktop's one Docker daemon. Two lessons of 2026-10-04/05:
+
+- **Two `go test` runs of one Complement package at once break each other**: they share
+  container and network names. `run_single_node.sh` runs `go test` under `lock.sh`; a run by hand
+  should too:
+
+  ```bash
+  tests/complement/lock.sh go test -v -run 'TestRestrictedRooms' ./tests/...   # in the checkout
+  ```
+
+  The lock is the directory `.git/myelin-complement.lock` in the repository's common git
+  directory, so every worktree shares it; `owner` in it says who holds it (PID, start time,
+  working directory, command), and a waiting run prints that once. The lock is released however
+  the command ends; INT, TERM and HUP are passed on to it. A lock whose owner PID is gone (a
+  `kill -9`, a reboot) is taken over, and that is logged. `COMPLEMENT_LOCK_DIR` and
+  `COMPLEMENT_LOCK_POLL` (seconds, default 20) override the defaults.
+- **A BuildKit `target/` cache shared by every branch's image once linked another branch's crate
+  into an image.** `build.sh` now gives each image tag its own cache,
+  `myelin-complement-target-<tag>`, so build one tag per branch
+  (`./tests/complement/build.sh complement-hs-reimplement:<agent name>`, and run with
+  `COMPLEMENT_BASE_IMAGE` set to it). The first build into a new cache is a cold release build
+  (about 20 minutes here). `--shared-cache` uses the old shared cache (`myelin-complement-target`),
+  right only when one branch builds at a time; `TARGET_CACHE_ID=<id>` names any other;
+  `--dry-run` prints the tag, cache id and command. Each cache holds a few GB: list them with
+  `docker buildx du --verbose | grep -B6 myelin-complement-target` and remove a finished
+  branch's with `docker buildx prune -f --filter id=<ID>`.
 
 ## Blacklist management
 

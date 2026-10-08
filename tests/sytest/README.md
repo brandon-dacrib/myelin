@@ -43,8 +43,19 @@ Environment for `run.sh`:
 
 `build.sh` itself is incremental (the registry and `target/` are BuildKit cache mounts, so a
 rebuild after a server change compiles only what changed), which is the simplest way to test a
-change. A bookworm `hs` for `SYTEST_HS_BINARY`, reusing a cargo cache between builds, is the
-other way, and does not need the Sytest image rebuilt at all:
+change. Each image tag has its own `target/` cache, `myelin-sytest-target-<tag>`, because one
+cache shared by every branch's image once linked another branch's crate into an image
+(2026-10-04/05: cargo trusts file times, and a branch's sources can be older than another
+branch's build in the same cache). So build one tag per branch (`tests/sytest/build.sh
+myelin-sytest:<agent name>`, then `SYTEST_IMAGE_TAG=myelin-sytest:<agent name>`). The first build
+into a new cache is a cold release build. `--shared-cache` uses the one shared cache
+(`myelin-sytest-target`) as before, `TARGET_CACHE_ID=<id>` any other, and `--dry-run` prints the
+tag, cache id and command; `docker buildx du --verbose | grep -B6 myelin-sytest-target` lists the
+caches and `docker buildx prune -f --filter id=<ID>` removes one.
+
+A bookworm `hs` for `SYTEST_HS_BINARY`, reusing a cargo cache between builds, is the other way,
+and does not need the Sytest image rebuilt at all. For the same reason, give each branch its own
+target volume (`myelin-sytest-cargo-target-<agent name>` rather than the name below):
 
 ```bash
 docker run --rm -v "$PWD:/src:ro" -v myelin-sytest-cargo-target:/target \
