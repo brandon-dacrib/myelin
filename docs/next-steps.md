@@ -85,6 +85,24 @@ without a lock, and a stale cache refill; `hs-push` `update_ruleset`, track 10 t
 unban that lost state resolution overwrote a re-invite in the hub (`drop_memberships_that_lost`).
 **Roll to the first green image of `a1fa71a6` or later.** Nothing is unmerged. OpenAPI 0.1.10, last decision 0032, last RFC 0023.
 
+**Wave 4 merged** (2026-10-08 afternoon), each gate green with real PostgreSQL (every PostgreSQL
+and cluster test was also rerun on `2be4f1fa` after one gate ran without it, all passing):
+`appservice-pump` `2ef00ef7` (decision 0033, OpenAPI 0.1.11: a silent bridge stalls only itself; a
+"Waiting to send" column), `push-receipts` `ef6931ae` (thread-scoped `/notifications` and held mail,
+threaded receipts imported, push rules right across replicas with a conditional write), `ops-harness`
+`6a76980a` (`tests/complement/lock.sh`, per-image BuildKit caches, the queue sources
+`.claude/gate-pg/env.sh`, refuses to gate without PostgreSQL unless `--allow-skips`, prunes its
+`target/` over 80 GB), `web-items` `6869a00c` (decision 0034, OpenAPI 0.1.12: server-wide limits
+beside overrides, what offering changes do to existing bridges, five settings with no reader retired
+or given one), `fed-cluster` `2be4f1fa` (`/send` ignores rooms with no member here, the durable-EDU cap
+as a hot setting, the announcer per federation shard, `/members?at=` 404, `/openid/userinfo` with
+federation off), and **`fed-forward` `e7506946`** (decision 0035): a cluster bug `fed-cluster`
+found, **another server's join, leave, knock, invite and `/send` reaching a replica that does not own
+the room were refused (`501`); they are forwarded to the owner now**, mid-handoff included. Nothing is
+unmerged. Left: an offering's runtime change does not move existing bridges cleanly (track 11); the
+media retention sweeper runs on every replica; the real `hs` binary fetches signing keys over HTTPS
+only, so a two-replica test cannot forward a join to a binary replica from a plain-HTTP peer.
+
 **Wave 4** (launched 2026-10-08, after clearing the merge queue's 38 GB `target/` and 32 GB of
 stale test images): five agents on the leftovers that need neither the cluster nor a real Synapse.
 `push-receipts` (10, 13: thread-scoped `/notifications` and held mail, threaded receipts imported,
