@@ -67,6 +67,12 @@ async fn send(
             "transaction exceeds the resource limits for pdus/edus",
         )
         .into_response(),
+        Err(e @ TransactionError::NotOwner(_)) => MatrixError::custom(
+            StatusCode::SERVICE_UNAVAILABLE,
+            MatrixErrorCode::Other("M_HS_NOT_SHARD_OWNER".to_owned()),
+            e.to_string(),
+        )
+        .into_response(),
     }
 }
 

@@ -67,6 +67,14 @@ use hs_kv::KvBackend;
 /// misbehaving peer.
 const MAX_PROXIED_BODY_BYTES: usize = 10 * 1024 * 1024;
 
+/// The `kind` label a forwarded client request is counted under in
+/// `hs_cluster_forward_latency_seconds`.
+const FORWARD_KIND_CLIENT: &str = "client";
+
+/// The `kind` label a forwarded federation request (another server's) is counted under in
+/// `hs_cluster_forward_latency_seconds`.
+const FORWARD_KIND_FEDERATION: &str = "federation";
+
 /// How many times [`RoomShardGate::run_create_room`] makes a `/createRoom` that `hs-room`'s fence
 /// refused here (ownership moved while it ran) before refusing it to the client. Each attempt
 /// chooses afresh, so the second normally forwards to the new owner; all of them together stay
@@ -123,6 +131,46 @@ pub struct ClusterHandles {
     /// `user.`, `crate::edu_forward::install` for `federation.`) and served by
     /// [`ClusterHandles::spawn_mesh`]: the mesh takes one handler, and this is it.
     peer_routes: Arc<PeerRoutes>,
+    /// The handlers for forwarded shard requests that are not an HTTP request to replay, one
+    /// per route prefix (`crate::federation_forward::install` for `federation.sink`). A forward
+    /// whose route no prefix matches is replayed against the router, as every client request is.
+    shard_routes: Arc<ShardRoutes>,
+}
+
+/// The [`ShardHandler`]s added for routes other than the HTTP proxy, by route prefix. Consulted
+/// by [`ProxyShardHandler`] before it replays a forward against the router.
+#[derive(Default)]
+pub struct ShardRoutes {
+    routes: std::sync::RwLock<Vec<(&'static str, Arc<dyn ShardHandler>)>>,
+}
+
+impl ShardRoutes {
+    /// Adds `handler` for every forwarded route starting with `prefix`. A second handler for the
+    /// same prefix is ignored with a warning.
+    pub fn add(&self, prefix: &'static str, handler: Arc<dyn ShardHandler>) {
+        let mut routes = self
+            .routes
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if routes.iter().any(|(known, _)| *known == prefix) {
+            tracing::warn!(
+                prefix,
+                "a mesh shard handler was already added for this prefix; ignoring the second"
+            );
+            return;
+        }
+        routes.push((prefix, handler));
+        routes.sort_by_key(|(known, _)| std::cmp::Reverse(known.len()));
+    }
+
+    fn handler_for(&self, route: &str) -> Option<Arc<dyn ShardHandler>> {
+        self.routes
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .find(|(prefix, _)| route.starts_with(prefix))
+            .map(|(_, handler)| handler.clone())
+    }
 }
 
 /// The one [`hs_cluster::mesh::PeerHandler`] the mesh serves, handing each message to the
@@ -360,6 +408,7 @@ pub async fn start<B: KvBackend + 'static>(
             ownership,
         }),
         peer_routes: Arc::new(PeerRoutes::default()),
+        shard_routes: Arc::new(ShardRoutes::default()),
     })
 }
 
@@ -382,6 +431,7 @@ impl ClusterHandles {
             server_name: None,
             mesh: None,
             peer_routes: Arc::new(PeerRoutes::default()),
+            shard_routes: Arc::new(ShardRoutes::default()),
         }
     }
 
@@ -395,6 +445,20 @@ impl ClusterHandles {
     #[must_use]
     pub fn origin_generation(&self) -> Generation {
         self.origin_generation
+    }
+
+    /// How long a forward from this replica may take, retries included
+    /// (`cluster.mesh.default_deadline`).
+    #[must_use]
+    pub fn default_deadline(&self) -> Duration {
+        self.default_deadline
+    }
+
+    /// Adds a handler for forwarded shard requests whose route starts with `prefix`, served on
+    /// this replica when it owns the shard (see [`ShardRoutes`]). Must be called before
+    /// [`ClusterHandles::spawn_mesh`].
+    pub fn add_shard_handler(&self, prefix: &'static str, handler: Arc<dyn ShardHandler>) {
+        self.shard_routes.add(prefix, handler);
     }
 
     /// Adds a handler for the `POST /mesh/v1/peer` messages whose route starts with `prefix`
@@ -429,7 +493,10 @@ impl ClusterHandles {
                     Some(material),
                 ),
             };
-        let handler: Arc<dyn ShardHandler> = Arc::new(ProxyShardHandler { app });
+        let handler: Arc<dyn ShardHandler> = Arc::new(ProxyShardHandler {
+            app,
+            routes: self.shard_routes.clone(),
+        });
         let deps = Arc::new(MeshDeps {
             authenticator,
             ownership: mesh.ownership.clone(),
@@ -707,6 +774,51 @@ fn extract_room_id(path: &str) -> Option<String> {
     None
 }
 
+/// The federation endpoints whose first path parameter is a room this server answers for, so
+/// only the room's owner may answer them: the membership handshakes (`make_join`, `send_join`,
+/// `make_leave`, `send_leave`, `make_knock`, `send_knock`), `invite` and
+/// `exchange_third_party_invite`, which write to the room; and the room reads another server
+/// walks the room's history with (`state`, `state_ids`, `backfill`, `get_missing_events`,
+/// `event_auth`, `timestamp_to_event`, `hierarchy`, `extremities`), which a non-owner's copy of
+/// the room could answer stale -- a server fetching an event the owner has just sent it would be
+/// told it does not exist. `/rooms/{roomId}/...` (the room complexity) is matched like any other
+/// `/rooms/` path by [`extract_room_id`]. `/send` carries PDUs of any number of rooms and is
+/// handled per PDU instead (`crate::federation_forward`).
+const FEDERATION_ROOM_ENDPOINTS: &[&str] = &[
+    "make_join",
+    "send_join",
+    "make_leave",
+    "send_leave",
+    "make_knock",
+    "send_knock",
+    "invite",
+    "exchange_third_party_invite",
+    "state",
+    "state_ids",
+    "backfill",
+    "get_missing_events",
+    "event_auth",
+    "timestamp_to_event",
+    "hierarchy",
+    "extremities",
+];
+
+/// The percent-decoded room id of a federation request for one room
+/// (`/_matrix/federation/{version}/{endpoint}/{roomId}/...`, the endpoint one of
+/// [`FEDERATION_ROOM_ENDPOINTS`]), or `None` for every other path.
+fn extract_federation_room_id(path: &str) -> Option<String> {
+    let path = path.split_once('?').map_or(path, |(path, _query)| path);
+    let rest = path.strip_prefix("/_matrix/federation/")?;
+    let mut segments = rest.split('/');
+    let _version = segments.next()?;
+    let endpoint = segments.next()?;
+    if !FEDERATION_ROOM_ENDPOINTS.contains(&endpoint) {
+        return None;
+    }
+    let room_id = percent_decode(segments.next()?);
+    room_id.starts_with('!').then_some(room_id)
+}
+
 /// The alias in `.../join/{alias}` or `.../knock/{alias}`, percent-decoded, when the segment is an
 /// alias (`#...`) rather than a room id. `None` for every other path.
 fn extract_alias(path: &str) -> Option<String> {
@@ -958,19 +1070,29 @@ impl RoomShardGate {
             return self.run_create_room(req, next).await;
         }
         let mut req = req;
-        let room_id = match extract_room_id(req.uri().path()) {
-            Some(room_id) => room_id,
-            None => match self.resolve_alias_ahead(&mut req).await {
+        let (room_id, kind) = if let Some(room_id) = extract_federation_room_id(req.uri().path()) {
+            (room_id, FORWARD_KIND_FEDERATION)
+        } else {
+            let room_id = match extract_room_id(req.uri().path()) {
                 Some(room_id) => room_id,
-                None => return next.run(req).await,
-            },
+                None => match self.resolve_alias_ahead(&mut req).await {
+                    Some(room_id) => room_id,
+                    None => return next.run(req).await,
+                },
+            };
+            let kind = if req.uri().path().starts_with("/_matrix/federation/") {
+                FORWARD_KIND_FEDERATION
+            } else {
+                FORWARD_KIND_CLIENT
+            };
+            (room_id, kind)
         };
         let shard = self.layout.room_shard(&room_id);
         if self.ownership.is_mine(shard) {
-            return self.run_owned(shard, req, next).await;
+            return self.run_owned(shard, req, next, kind).await;
         }
         match &self.forwarder {
-            Some(forwarder) => match self.forward(forwarder, shard, req).await {
+            Some(forwarder) => match self.forward(forwarder, shard, req, kind).await {
                 Ok(response) => response,
                 Err(reason) => self.refuse(shard, &reason),
             },
@@ -1026,7 +1148,13 @@ impl RoomShardGate {
     /// Only at the edge: a request that came in over the mesh returns its `503` to the replica
     /// that forwarded it, whose forwarder retries against the current owner. In single-node mode
     /// the request passes straight through (no forwarder, and no buffering).
-    async fn run_owned(&self, shard: ShardId, req: Request, next: Next) -> Response {
+    async fn run_owned(
+        &self,
+        shard: ShardId,
+        req: Request,
+        next: Next,
+        kind: &'static str,
+    ) -> Response {
         let Some(forwarder) = &self.forwarder else {
             return next.run(req).await;
         };
@@ -1053,6 +1181,7 @@ impl RoomShardGate {
         }
         tracing::info!(
             %shard,
+            kind,
             "the room's shard moved while a request for it ran here; sending it on to the new owner"
         );
         match self
@@ -1060,6 +1189,7 @@ impl RoomShardGate {
                 forwarder,
                 shard,
                 Request::from_parts(parts, Body::from(body)),
+                kind,
             )
             .await
         {
@@ -1191,7 +1321,10 @@ impl RoomShardGate {
         };
         req.headers_mut().insert(PREASSIGNED_ROOM_ID_HEADER, value);
         tracing::debug!(%room_id, %shard, "forwarding /createRoom to the shard's owner");
-        let response = match self.forward(forwarder, shard, req).await {
+        let response = match self
+            .forward(forwarder, shard, req, FORWARD_KIND_CLIENT)
+            .await
+        {
             Ok(response) => response,
             Err(reason) => self.refuse(shard, &reason),
         };
@@ -1269,12 +1402,16 @@ impl RoomShardGate {
         .into_response()
     }
 
+    /// Sends `req` to `shard`'s owner over the mesh and returns the owner's response, counted
+    /// under `kind` (`client` or `federation`) in `hs_cluster_forward_latency_seconds`.
     async fn forward(
         &self,
         forwarder: &Forwarder,
         shard: ShardId,
         req: Request,
+        kind: &'static str,
     ) -> Result<Response, String> {
+        let started = std::time::Instant::now();
         let (parts, body) = req.into_parts();
         let body_bytes = to_bytes(body, MAX_PROXIED_BODY_BYTES)
             .await
@@ -1324,10 +1461,19 @@ impl RoomShardGate {
             payload: Bytes::from(payload),
         };
 
-        let reply = forwarder
-            .forward(env)
-            .await
-            .map_err(|e| format!("forwarding to the shard owner: {e}"))?;
+        let reply = forwarder.forward_as(kind, env).await.map_err(|e| {
+            tracing::debug!(kind, %shard, method = %parts.method, path = parts.uri.path(), error = %e, "could not forward a request to the shard's owner");
+            format!("forwarding to the shard owner: {e}")
+        })?;
+        tracing::debug!(
+            kind,
+            %shard,
+            method = %parts.method,
+            path = parts.uri.path(),
+            status = reply.status,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "forwarded a request to the shard's owner"
+        );
 
         // `reply.status` here is the *proxied* application's status (a `200` from a successful
         // `PUT /send/...`, a `403` from a rejected event, ...) except in the one case
@@ -1366,16 +1512,19 @@ impl RoomShardGate {
 /// arrived over the mesh rather than a client socket.
 struct ProxyShardHandler {
     app: axum::Router,
+    /// Routes that are not an HTTP request to replay (see [`ShardRoutes`]).
+    routes: Arc<ShardRoutes>,
 }
 
 #[async_trait::async_trait]
 impl ShardHandler for ProxyShardHandler {
-    async fn handle(&self, env: Envelope, _fence: Fence) -> Reply {
-        // `_fence` is not consulted: `hs-room`'s `RoomActor::persist` does not call
-        // `Fence::check` yet (out of this crate's reach — see this module's docs and
-        // docs/status/03-cluster.md item 4). Routing every write through the single owner
-        // (this handler existing at all) is the primary defense; the fence is the documented
-        // belt-and-braces gap left for track 04.
+    async fn handle(&self, env: Envelope, fence: Fence) -> Reply {
+        if let Some(handler) = self.routes.handler_for(&env.route) {
+            return handler.handle(env, fence).await;
+        }
+        // `fence` is not consulted here: `hs-room`'s `RoomActor::persist` checks the room's
+        // own fence inside every write it commits (`hs_room::fencing`), which is the
+        // belt-and-braces behind routing every write through the single owner.
         let proxied: ProxiedRequest = match serde_json::from_slice(&env.payload) {
             Ok(p) => p,
             Err(e) => {
@@ -1500,6 +1649,41 @@ mod tests {
     }
 
     #[test]
+    fn extracts_room_id_from_federation_room_endpoints() {
+        for path in [
+            "/_matrix/federation/v1/make_join/!abc%3Aexample.org/%40bob%3Aremote?ver=11",
+            "/_matrix/federation/v2/send_join/!abc:example.org/$event",
+            "/_matrix/federation/v1/send_leave/!abc%3Aexample.org/$event",
+            "/_matrix/federation/v1/make_knock/!abc%3Aexample.org/%40bob%3Aremote",
+            "/_matrix/federation/v1/send_knock/!abc%3Aexample.org/$event",
+            "/_matrix/federation/v2/invite/!abc%3Aexample.org/$event",
+            "/_matrix/federation/v1/exchange_third_party_invite/!abc%3Aexample.org",
+            "/_matrix/federation/v1/get_missing_events/!abc%3Aexample.org",
+            "/_matrix/federation/v1/state_ids/!abc%3Aexample.org?event_id=$e",
+            "/_matrix/federation/v1/backfill/!abc%3Aexample.org?v=$e&limit=10",
+        ] {
+            assert_eq!(
+                extract_federation_room_id(path),
+                Some("!abc:example.org".to_owned()),
+                "{path}"
+            );
+        }
+        for path in [
+            // `/send` is handled per PDU (`crate::federation_forward`), not by the gate.
+            "/_matrix/federation/v1/send/txn1",
+            "/_matrix/federation/v1/event/$event",
+            "/_matrix/federation/v1/query/directory",
+            "/_matrix/federation/v1/user/devices/%40bob%3Aexample.org",
+            "/_matrix/federation/v1/publicRooms",
+            // A client path with the same word is not a federation request.
+            "/_matrix/client/v3/rooms/!abc%3Aexample.org/state",
+            "/_matrix/federation/v1/make_join/",
+        ] {
+            assert_eq!(extract_federation_room_id(path), None, "{path}");
+        }
+    }
+
+    #[test]
     fn percent_decoding_round_trips_common_room_ids() {
         assert_eq!(percent_decode("!abc%3Aexample.org"), "!abc:example.org");
         assert_eq!(percent_decode("!nopercent"), "!nopercent");
@@ -1521,6 +1705,7 @@ mod tests {
             server_name: None,
             mesh: None,
             peer_routes: Arc::new(PeerRoutes::default()),
+            shard_routes: Arc::new(ShardRoutes::default()),
         };
         let gate = RoomShardGate::new(&handles);
         assert!(
@@ -1898,7 +2083,10 @@ mod tests {
         let deps = Arc::new(MeshDeps {
             authenticator: Arc::new(SharedSecretAuthenticator::new(TEST_SECRET)),
             ownership: ownership_b,
-            handler: Arc::new(ProxyShardHandler { app: app_b }),
+            handler: Arc::new(ProxyShardHandler {
+                app: app_b,
+                routes: Arc::default(),
+            }),
             idempotency: Arc::new(IdempotencyCache::new(Duration::from_secs(5), 16)),
             in_flight: Arc::new(tokio::sync::Semaphore::new(8)),
             nudge: None,
@@ -2074,7 +2262,10 @@ mod tests {
         let deps = Arc::new(MeshDeps {
             authenticator: Arc::new(SharedSecretAuthenticator::new(TEST_SECRET)),
             ownership: ownership_b,
-            handler: Arc::new(ProxyShardHandler { app: app_b }),
+            handler: Arc::new(ProxyShardHandler {
+                app: app_b,
+                routes: Arc::default(),
+            }),
             idempotency: Arc::new(IdempotencyCache::new(Duration::from_secs(5), 16)),
             in_flight: Arc::new(tokio::sync::Semaphore::new(8)),
             nudge: None,
@@ -2129,6 +2320,185 @@ mod tests {
             "the owner was handed the room id and the servers, over the mesh"
         );
         assert_eq!(resolver.asked.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// A federation router standing in for the real one: `send_join` and `make_join` record
+    /// the path, the `Authorization` header and the body they were given; `/send` records that
+    /// it ran.
+    fn federation_router(
+        seen: Arc<std::sync::Mutex<Vec<(String, String, String)>>>,
+    ) -> axum::Router {
+        let record = move |req: Request| {
+            let seen = seen.clone();
+            async move {
+                let (parts, body) = req.into_parts();
+                let body = to_bytes(body, 1 << 20).await.unwrap();
+                seen.lock().unwrap().push((
+                    parts
+                        .uri
+                        .path_and_query()
+                        .map(|pq| pq.as_str().to_owned())
+                        .unwrap_or_default(),
+                    parts
+                        .headers
+                        .get(http::header::AUTHORIZATION)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default()
+                        .to_owned(),
+                    String::from_utf8_lossy(&body).into_owned(),
+                ));
+                axum::Json(serde_json::json!({ "ok": true }))
+            }
+        };
+        axum::Router::new()
+            .route(
+                "/_matrix/federation/v2/send_join/{roomId}/{eventId}",
+                axum::routing::put(record.clone()),
+            )
+            .route(
+                "/_matrix/federation/v1/make_join/{roomId}/{userId}",
+                axum::routing::get(record.clone()),
+            )
+            .route(
+                "/_matrix/federation/v1/send/{txnId}",
+                axum::routing::put(record),
+            )
+    }
+
+    /// A federation request for a room another replica owns is sent to it whole -- path, query,
+    /// signature and body unchanged, so the owner's `X-Matrix` layer verifies it again -- and
+    /// never runs on the replica it reached. Before, `send_join` ran there and its write was
+    /// refused by the room's fence (`501 M_HS_INBOUND_INGESTION_UNSUPPORTED`, "fenced: ...").
+    /// `/send` names no room and still runs where it lands.
+    #[tokio::test]
+    async fn on_a_non_owner_a_federation_request_for_a_room_is_forwarded_to_the_owner() {
+        let b_addr = format!("127.0.0.1:{}", free_port());
+        let seen_b = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ownership_b: Arc<dyn Ownership> = scripted(&b_addr, true, None);
+        let app_b = gate(ownership_b.clone(), true).layer(federation_router(seen_b.clone()));
+        let deps = Arc::new(MeshDeps {
+            authenticator: Arc::new(SharedSecretAuthenticator::new(TEST_SECRET)),
+            ownership: ownership_b,
+            handler: Arc::new(ProxyShardHandler {
+                app: app_b,
+                routes: Arc::default(),
+            }),
+            idempotency: Arc::new(IdempotencyCache::new(Duration::from_secs(5), 16)),
+            in_flight: Arc::new(tokio::sync::Semaphore::new(8)),
+            nudge: None,
+            peers: None,
+        });
+        let server = MeshServer::new(b_addr.clone(), None).unwrap();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        tokio::spawn(async move {
+            server.serve(deps, shutdown_rx).await.unwrap();
+        });
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(&b_addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let seen_a = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app_a = gate(scripted("127.0.0.1:1", false, Some(&b_addr)), true)
+            .layer(federation_router(seen_a.clone()));
+        let signature = "X-Matrix origin=\"remote.example\",destination=\"example.org\",key=\"ed25519:k\",sig=\"abc\"";
+        let send_join = Request::builder()
+            .method("PUT")
+            .uri("/_matrix/federation/v2/send_join/%21abc%3Aexample.org/%24join?omit_members=true")
+            .header(http::header::AUTHORIZATION, signature)
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"type":"m.room.member"}"#))
+            .unwrap();
+        let response = app_a.clone().oneshot(send_join).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let make_join = Request::builder()
+            .method("GET")
+            .uri("/_matrix/federation/v1/make_join/%21abc%3Aexample.org/%40bob%3Aremote.example?ver=11")
+            .header(http::header::AUTHORIZATION, signature)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app_a.clone().oneshot(make_join).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let send = Request::builder()
+            .method("PUT")
+            .uri("/_matrix/federation/v1/send/txn1")
+            .header(http::header::AUTHORIZATION, signature)
+            .body(Body::from("{}"))
+            .unwrap();
+        assert_eq!(app_a.oneshot(send).await.unwrap().status(), StatusCode::OK);
+
+        assert_eq!(
+            seen_b.lock().unwrap().clone(),
+            vec![
+                (
+                    "/_matrix/federation/v2/send_join/%21abc%3Aexample.org/%24join?omit_members=true"
+                        .to_owned(),
+                    signature.to_owned(),
+                    r#"{"type":"m.room.member"}"#.to_owned()
+                ),
+                (
+                    "/_matrix/federation/v1/make_join/%21abc%3Aexample.org/%40bob%3Aremote.example?ver=11"
+                        .to_owned(),
+                    signature.to_owned(),
+                    String::new()
+                ),
+            ],
+            "the owner got both requests exactly as they were signed"
+        );
+        assert_eq!(
+            seen_a
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(path, ..)| path.clone())
+                .collect::<Vec<_>>(),
+            vec!["/_matrix/federation/v1/send/txn1".to_owned()],
+            "only `/send` ran on the replica it reached"
+        );
+    }
+
+    /// A forward on a route a shard handler was added for goes to that handler, not to the
+    /// router.
+    #[tokio::test]
+    async fn a_forward_on_an_added_route_goes_to_its_handler() {
+        struct Answer;
+        #[async_trait::async_trait]
+        impl ShardHandler for Answer {
+            async fn handle(&self, env: Envelope, _fence: Fence) -> Reply {
+                Reply::ok(Bytes::from(format!("handled {}", env.route)))
+            }
+        }
+        let routes = Arc::new(ShardRoutes::default());
+        routes.add("federation.sink", Arc::new(Answer));
+        let handler = ProxyShardHandler {
+            app: axum::Router::new(),
+            routes,
+        };
+        let shard = ShardId::new(hs_cluster::ShardKind::Room, 0);
+        let env = |route: &str| Envelope {
+            shard,
+            route: route.to_owned(),
+            idempotency_key: IdempotencyKey::generate(),
+            requester: serde_json::Value::Null,
+            deadline: Duration::from_secs(1),
+            origin: ReplicaId::new("a"),
+            origin_generation: Generation::fresh(None),
+            hops: 1,
+            traceparent: None,
+            payload: Bytes::from_static(b"not a proxied request"),
+        };
+        let reply = handler
+            .handle(env("federation.sink"), Fence::inert(shard))
+            .await;
+        assert_eq!(reply.status, 200);
+        assert_eq!(&reply.payload[..], b"handled federation.sink");
+        // Anything else is a proxied HTTP request, and this one is not one.
+        let reply = handler.handle(env("http.proxy"), Fence::inert(shard)).await;
+        assert_eq!(reply.status, 400);
     }
 
     #[tokio::test]
@@ -2254,7 +2624,10 @@ mod tests {
         let deps = Arc::new(MeshDeps {
             authenticator: Arc::new(SharedSecretAuthenticator::new(TEST_SECRET)),
             ownership: ownership_b,
-            handler: Arc::new(ProxyShardHandler { app: app_b }),
+            handler: Arc::new(ProxyShardHandler {
+                app: app_b,
+                routes: Arc::default(),
+            }),
             idempotency: Arc::new(IdempotencyCache::new(Duration::from_secs(5), 16)),
             in_flight: Arc::new(tokio::sync::Semaphore::new(8)),
             nudge: None,
@@ -2385,7 +2758,10 @@ mod tests {
         let deps = Arc::new(MeshDeps {
             authenticator: Arc::new(SharedSecretAuthenticator::new(TEST_SECRET)),
             ownership: ownership_b,
-            handler: Arc::new(ProxyShardHandler { app: app_b }),
+            handler: Arc::new(ProxyShardHandler {
+                app: app_b,
+                routes: Arc::default(),
+            }),
             idempotency: Arc::new(IdempotencyCache::new(Duration::from_secs(5), 16)),
             in_flight: Arc::new(tokio::sync::Semaphore::new(8)),
             nudge: None,

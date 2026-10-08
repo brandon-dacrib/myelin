@@ -312,6 +312,12 @@ fn invite_error_response(e: &InviteError) -> Response {
         )
         .into_response(),
         InviteError::Forbidden(msg) => MatrixError::forbidden(msg.clone()).into_response(),
+        InviteError::NotOwner(_) => MatrixError::custom(
+            StatusCode::SERVICE_UNAVAILABLE,
+            MatrixErrorCode::Other("M_HS_NOT_SHARD_OWNER".to_owned()),
+            e.to_string(),
+        )
+        .into_response(),
         InviteError::Store(msg) => MatrixError::custom(
             StatusCode::INTERNAL_SERVER_ERROR,
             MatrixErrorCode::Unknown,

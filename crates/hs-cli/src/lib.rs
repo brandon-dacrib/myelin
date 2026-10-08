@@ -26,6 +26,7 @@ pub mod config_source;
 pub mod edu_forward;
 pub mod edus;
 pub mod federation;
+pub mod federation_forward;
 pub mod federation_sender;
 pub mod generate_config;
 pub mod hash_password;

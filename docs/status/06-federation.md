@@ -118,6 +118,35 @@ join is held. `/members?at=` for a point the reader may not see still answers wh
 now (Synapse: `403`). A shard's place can be moved on by a replica that lost the shard during
 the look (the place is stored only for shards still owned after it, which narrows but does not
 close the window).
+## 2026-10-08 (branch `agent/fed-forward`): federation in a cluster reaches the room's owner (decision 0035)
+
+Tracks 03 and 06; the cluster side is in `docs/status/03-cluster.md`'s section of the same date.
+A remote server's `send_join` that reached a replica not owning the room was refused
+`501 M_HS_INBOUND_INGESTION_UNSUPPORTED` ("fenced: ..."), and `/send`'s PDUs for such a room were
+refused one by one. Now `hs-cli`'s shard gate forwards every federation request for one room
+(the membership handshakes, `invite`, `exchange_third_party_invite`, the room reads) to the
+owner, and `/send` hands each write to its room's owner over the mesh
+(`hs-cli` `federation_forward`).
+
+`hs-federation` changes, for a write the room's fence refused because the shard moved (nothing
+stored; the owner should be asked):
+
+- `WriteRejected` has `not_owner` (`WriteRejected::not_owner`); `hs-cli`'s `RegistryWriteSink`
+  maps `RoomError::Fenced` to it.
+- `JoinError::NotOwner` (`send_join`/`send_leave`/`send_knock`) and `InviteError::NotOwner`
+  answer `503 M_HS_NOT_SHARD_OWNER`, which the gate sends on to the new owner; every other store
+  failure keeps its old status. `InviteRejected` is now a struct (`message`, `not_owner`) with
+  `InviteRejected::new` and `InviteRejected::not_owner`.
+- `TransactionError::NotOwner`: a `/send` PDU no owner could take within the forward deadline
+  answers the transaction `503` and leaves it unremembered, so the sender retries it.
+
+Tests: `transport::join::tests::a_write_another_replica_owns_is_a_503_and_a_store_failure_is_not`,
+`inbound::tests::a_pdu_no_owner_could_take_fails_the_transaction_unremembered`; end to end,
+`crates/hs-cli/tests/cluster_federation.rs` (join, `/send`, leave, knock, knock withdrawn,
+inbound invite, each reaching the non-owner; see status 03). `cargo test -p hs-federation`
+(226 unit) and clippy pass.
+
+Left: Complement and Sytest run single-node and are unaffected; no cluster-mode conformance run.
 
 ## 2026-10-05 (branch `agent/fed-wave3`): two regressions, durable EDUs (RFC 0023), dropped PDUs, two Sytest races, bridge aliases over federation
 

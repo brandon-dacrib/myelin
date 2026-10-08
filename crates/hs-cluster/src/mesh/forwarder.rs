@@ -95,10 +95,27 @@ impl Forwarder {
     /// drain left a 0.4 s window and a replica rejoining a 1.6 s one in which the believed
     /// owner answered `421`; four attempts 10 ms apart turned both into client-visible `503`s.
     ///
+    /// Counted under `kind="client"` in `hs_cluster_forward_latency_seconds`; a caller
+    /// forwarding something else says what with [`Forwarder::forward_as`].
+    ///
     /// # Errors
     /// Returns [`ForwardError`] if no owner is known, the hop limit or deadline is exceeded, or
     /// every retry attempt fails.
-    pub async fn forward(&self, mut env: Envelope) -> Result<Reply, ForwardError> {
+    pub async fn forward(&self, env: Envelope) -> Result<Reply, ForwardError> {
+        self.forward_as("client", env).await
+    }
+
+    /// [`Forwarder::forward`], counted under `kind` in `hs_cluster_forward_latency_seconds`
+    /// (`federation` for a request from another server, `federation_pdu` for one PDU of a
+    /// `/send`): what the caller forwarded, which the mesh itself never interprets.
+    ///
+    /// # Errors
+    /// As [`Forwarder::forward`].
+    pub async fn forward_as(
+        &self,
+        kind: &'static str,
+        mut env: Envelope,
+    ) -> Result<Reply, ForwardError> {
         let start = Instant::now();
         let deadline_at = start + env.deadline;
         env.hops += 1;
@@ -142,6 +159,7 @@ impl Forwarder {
                     if self.out_of_retries(attempts, wait, deadline_at) {
                         self.metrics.record_forward(
                             "forward",
+                            kind,
                             "misdirected",
                             attempt_start.elapsed(),
                         );
@@ -164,6 +182,7 @@ impl Forwarder {
                     if self.out_of_retries(attempts, wait, deadline_at) {
                         self.metrics.record_forward(
                             "forward",
+                            kind,
                             "unavailable",
                             attempt_start.elapsed(),
                         );
@@ -177,7 +196,7 @@ impl Forwarder {
                 }
                 Ok((status, _hdrs, body)) => {
                     self.metrics
-                        .record_forward("forward", "ok", attempt_start.elapsed());
+                        .record_forward("forward", kind, "ok", attempt_start.elapsed());
                     return Ok(Reply {
                         status: status.as_u16(),
                         payload: body,
@@ -188,8 +207,12 @@ impl Forwarder {
                     tracing::debug!(shard = %env.shard, attempt = attempts, error = %e, "mesh forward attempt failed");
                     let wait = self.backoff(attempts);
                     if self.out_of_retries(attempts, wait, deadline_at) {
-                        self.metrics
-                            .record_forward("forward", "error", attempt_start.elapsed());
+                        self.metrics.record_forward(
+                            "forward",
+                            kind,
+                            "error",
+                            attempt_start.elapsed(),
+                        );
                         return Err(ForwardError::RetriesExhausted {
                             shard: env.shard,
                             attempts,
@@ -262,6 +285,7 @@ impl Forwarder {
             ))),
         };
         self.metrics.record_forward(
+            "peer",
             "peer",
             if result.is_ok() { "ok" } else { "error" },
             start.elapsed(),

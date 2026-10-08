@@ -36,8 +36,36 @@ use crate::keys::DynRemoteKeyCache;
 
 /// Why an [`InviteSink`] could not record an invite.
 #[derive(Debug, Clone, thiserror::Error)]
-#[error("{0}")]
-pub struct InviteRejected(pub String);
+#[error("{message}")]
+pub struct InviteRejected {
+    /// What went wrong, for the inviting server.
+    pub message: String,
+    /// In a cluster, the room's shard moved to another replica while the invite was being
+    /// recorded here, and nothing was stored: `503`, which the replica that took the request
+    /// sends on to the new owner (`hs-cli`'s shard gate).
+    pub not_owner: bool,
+}
+
+impl InviteRejected {
+    /// An invite that cannot be recorded.
+    #[must_use]
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            not_owner: false,
+        }
+    }
+
+    /// An invite this replica could not record because the room's shard is another replica's
+    /// ([`InviteRejected::not_owner`]).
+    #[must_use]
+    pub fn not_owner(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            not_owner: true,
+        }
+    }
+}
 
 /// Records an invite this server has accepted and co-signed, so the invitee sees it.
 #[async_trait]
@@ -87,6 +115,10 @@ pub enum InviteError {
     /// 12, the room's `m.room.create` event (MSC4311).
     #[error("{0}")]
     MissingState(String),
+    /// The room's shard is another replica's ([`InviteRejected::not_owner`]): `503
+    /// M_HS_NOT_SHARD_OWNER`.
+    #[error("this replica no longer owns the room: {0}")]
+    NotOwner(String),
 }
 
 /// Checks, co-signs and records an invite sent by `origin` (see the module docs). Returns the
@@ -177,7 +209,13 @@ pub async fn receive_invite(
         .sink
         .accept_invite(&version, &cosigned_event, &stripped)
         .await
-        .map_err(|e| InviteError::Forbidden(e.0))?;
+        .map_err(|e| {
+            if e.not_owner {
+                InviteError::NotOwner(e.message)
+            } else {
+                InviteError::Forbidden(e.message)
+            }
+        })?;
     tracing::info!(
         room_id,
         event_id,

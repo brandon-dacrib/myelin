@@ -294,6 +294,12 @@ pub struct WriteRejected {
     /// it, as the spec's "a rejected event is still processed" and Synapse do, rather than an
     /// error the sending server would read as a delivery failure.
     pub auth_rejected: bool,
+    /// Whether the room belongs to another replica of this server: in a cluster, this replica's
+    /// fence for the room's shard refused the write because the shard moved (or is moving)
+    /// elsewhere, and nothing was stored. Not a verdict on the event: the same write made on
+    /// the room's owner may well succeed, so a caller retries it there or answers `503` so the
+    /// sender retries (`docs/decisions/0035-federation-requests-go-to-the-rooms-owner.md`).
+    pub not_owner: bool,
 }
 
 impl WriteRejected {
@@ -304,6 +310,19 @@ impl WriteRejected {
             error: message.into(),
             missing_ancestors: Vec::new(),
             auth_rejected: false,
+            not_owner: false,
+        }
+    }
+
+    /// A rejection because this replica does not own the room's shard any more
+    /// ([`WriteRejected::not_owner`]): nothing was stored, and the room's owner should be asked.
+    #[must_use]
+    pub fn not_owner(message: impl Into<String>) -> Self {
+        Self {
+            error: message.into(),
+            missing_ancestors: Vec::new(),
+            auth_rejected: false,
+            not_owner: true,
         }
     }
 
@@ -315,6 +334,7 @@ impl WriteRejected {
             error: message.into(),
             missing_ancestors: Vec::new(),
             auth_rejected: true,
+            not_owner: false,
         }
     }
 
@@ -326,6 +346,7 @@ impl WriteRejected {
             error: message.into(),
             missing_ancestors: missing,
             auth_rejected: false,
+            not_owner: false,
         }
     }
 }
@@ -648,6 +669,22 @@ pub async fn process_transaction(
             Ok(_) => {
                 results.insert(event_id, serde_json::json!({}));
             }
+            // In a cluster, the room's shard moved away from this replica and its new owner
+            // could not be reached in time either: nothing was stored. The whole transaction is
+            // answered `503` and not remembered, so the sender sends it again once ownership
+            // has settled; what this one did store is already known then.
+            Err(rejected) if rejected.not_owner => {
+                tracing::warn!(
+                    origin,
+                    txn_id,
+                    room_id,
+                    event_id = %event_id,
+                    reason = %rejected.error,
+                    "a PDU's room is owned by another replica that could not be reached; \
+                     answering the transaction 503 so that the sender retries it"
+                );
+                return Err(TransactionError::NotOwner(rejected.error));
+            }
             // Only auth events are missing: they are fetched one by one (`/event`), as Synapse
             // and Dendrite do, not walked for -- `/get_missing_events` and `/backfill` are for
             // prev events, and a server answering this one need not serve them (Complement's
@@ -842,10 +879,14 @@ fn dropped_result(origin: &str, event_id: &str, reason: &'static str, detail: &s
 
 /// Why [`process_transaction`] refused a whole transaction outright (as opposed to one PDU within
 /// it, which is reported per-event instead).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransactionError {
     TooManyPdus,
     TooManyEdus,
+    /// A PDU's room belongs to another replica of this server, which could not take it in time
+    /// ([`WriteRejected::not_owner`]). Answered `503`, and the transaction is not remembered,
+    /// so the sender's retry is processed afresh.
+    NotOwner(String),
 }
 
 impl std::fmt::Display for TransactionError {
@@ -858,6 +899,11 @@ impl std::fmt::Display for TransactionError {
             Self::TooManyEdus => write!(
                 f,
                 "too many edus in one transaction (max {MAX_EDUS_PER_TRANSACTION})"
+            ),
+            Self::NotOwner(reason) => write!(
+                f,
+                "a room in the transaction is owned by another replica of this server, which \
+                 could not take it: {reason}"
             ),
         }
     }
@@ -1275,6 +1321,54 @@ mod tests {
             "{response}"
         );
         assert!(crate::metrics::pdus_dropped("unknown_room") > before);
+    }
+
+    /// A PDU whose room another replica owns, and which no owner took in time, fails the whole
+    /// transaction with [`TransactionError::NotOwner`] (`503`), and the transaction is not
+    /// remembered: the sender's retry is processed afresh, once ownership has settled.
+    #[tokio::test]
+    async fn a_pdu_no_owner_could_take_fails_the_transaction_unremembered() {
+        struct Moving;
+        #[async_trait]
+        impl RoomWriteSink for Moving {
+            async fn accept_verified_event(
+                &self,
+                _room_id: &str,
+                _event_id: &str,
+                _event_json: &Value,
+            ) -> Result<WriteOutcome, WriteRejected> {
+                Err(WriteRejected::not_owner("fenced: the shard moved"))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let keys = OwnSigningKeys::load_or_generate(dir.path()).unwrap();
+        let cache = key_cache(&keys, "origin.example.org");
+        let raw = signed_event(&keys, "!r:origin.example.org", "@alice:origin.example.org");
+        let rooms = room_source("!r:origin.example.org");
+        let transactions = InMemoryTransactionStore::new();
+        let result = process_transaction(
+            "origin.example.org",
+            "txn-moving",
+            &serde_json::json!({"pdus": [raw], "edus": []}),
+            &rooms,
+            &Moving,
+            &cache,
+            &transactions,
+            None,
+            &crate::backfill::BackfillLimits::default(),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(TransactionError::NotOwner(ref reason)) if reason.contains("moved")),
+            "{result:?}"
+        );
+        assert!(
+            transactions
+                .get("origin.example.org", "txn-moving")
+                .await
+                .is_none()
+        );
     }
 
     /// A PDU in a room whose server ACL denies the transaction's origin is refused with an

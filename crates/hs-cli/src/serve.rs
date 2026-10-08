@@ -1852,7 +1852,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     // How `POST /join` reaches a room hosted elsewhere (`crate::remote_join`): over the
     // federation mount's own client, so only when federation is on.
     let remote_join: Option<Arc<dyn hs_room::remote_join::RemoteJoin>>;
-    let federation = if config.federation.enabled {
+    let mut federation = if config.federation.enabled {
         let mount = crate::federation::build_mount(
             &config,
             &identity,
@@ -2073,6 +2073,13 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         &metrics,
     )
     .map_err(|e| ServeError::Sessions(Box::new(e)))?;
+    // Federation writes across replicas (`crate::federation_forward`): a `/send` PDU for a room
+    // another replica owns is handed to that replica over the mesh, as the shard gate forwards
+    // every other federation request for a room. Nothing in single-node mode; before
+    // `spawn_mesh`, which serves the handler this adds.
+    if let Some((state, ..)) = federation.as_mut() {
+        crate::federation_forward::install(&cluster_handles, state);
+    }
     // Push rules across replicas (`crate::push_cluster`): a change on one replica drops the
     // others' cached copy over the mesh. Nothing in single-node mode; before `spawn_mesh`.
     if let Some(rulesets) = user_state.hub.push_rules_store() {

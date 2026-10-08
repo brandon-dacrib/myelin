@@ -1038,7 +1038,7 @@ impl<B: KvBackend + 'static> hs_federation::inbound::RoomWriteSink for RegistryW
                     Ok(hs_room::actor::RemoteEventOutcome::AlreadyKnown) => {
                         Ok(WriteOutcome::AlreadyKnown)
                     }
-                    Err(e) => Err(WriteRejected::other(e.to_string())),
+                    Err(e) => Err(write_rejected(e)),
                 }
             }
             // A missing ancestor is not a rejection of this event: it means this server has a hole
@@ -1060,7 +1060,7 @@ impl<B: KvBackend + 'static> hs_federation::inbound::RoomWriteSink for RegistryW
             // Event authorization refused it: processed and rejected, which `/send` answers
             // `{}` for (`WriteRejected::auth_rejected`).
             Err(e @ hs_room::RoomError::Forbidden(_)) => Err(WriteRejected::auth(e.to_string())),
-            Err(e) => Err(WriteRejected::other(e.to_string())),
+            Err(e) => Err(write_rejected(e)),
         }
     }
 
@@ -1109,7 +1109,7 @@ impl<B: KvBackend + 'static> hs_federation::inbound::RoomWriteSink for RegistryW
             ) => Ok(WriteOutcome::Stored),
             Ok(hs_room::actor::RemoteEventOutcome::AlreadyKnown) => Ok(WriteOutcome::AlreadyKnown),
             Err(e @ hs_room::RoomError::Forbidden(_)) => Err(WriteRejected::auth(e.to_string())),
-            Err(e) => Err(WriteRejected::other(e.to_string())),
+            Err(e) => Err(write_rejected(e)),
         }
     }
 
@@ -1147,7 +1147,7 @@ impl<B: KvBackend + 'static> hs_federation::inbound::RoomWriteSink for RegistryW
         handle
             .accept_auth_outliers(parsed)
             .await
-            .map_err(|e| WriteRejected::other(e.to_string()))
+            .map_err(write_rejected)
     }
 
     async fn accept_prev_event_with_state(
@@ -1196,8 +1196,21 @@ impl<B: KvBackend + 'static> hs_federation::inbound::RoomWriteSink for RegistryW
             Ok(hs_room::actor::RemoteEventOutcome::SoftFailed(_)) => Ok(WriteOutcome::Stored),
             Ok(hs_room::actor::RemoteEventOutcome::AlreadyKnown) => Ok(WriteOutcome::AlreadyKnown),
             Err(e @ hs_room::RoomError::Forbidden(_)) => Err(WriteRejected::auth(e.to_string())),
-            Err(e) => Err(WriteRejected::other(e.to_string())),
+            Err(e) => Err(write_rejected(e)),
         }
+    }
+}
+
+/// A room error as a [`hs_federation::inbound::WriteRejected`]: a fenced write (the room's shard
+/// moved to another replica while it ran, and nothing was stored) is
+/// [`hs_federation::inbound::WriteRejected::not_owner`], so the caller asks the room's owner
+/// instead (`crate::federation_forward`); everything else is an ordinary rejection.
+fn write_rejected(e: hs_room::RoomError) -> hs_federation::inbound::WriteRejected {
+    match e {
+        hs_room::RoomError::Fenced(_) => {
+            hs_federation::inbound::WriteRejected::not_owner(e.to_string())
+        }
+        e => hs_federation::inbound::WriteRejected::other(e.to_string()),
     }
 }
 
@@ -1299,7 +1312,7 @@ impl<B: KvBackend + 'static> hs_federation::invite::InviteSink for RegistryInvit
             .get("room_id")
             .and_then(hs_model::canonical::CanonicalJsonValue::as_str)
             .and_then(|id| ruma::RoomId::parse(id).ok())
-            .ok_or_else(|| InviteRejected("the invite names no room".to_owned()))?;
+            .ok_or_else(|| InviteRejected::new("the invite names no room"))?;
         if let Ok(handle) = self.rooms.get_or_load(&room_id).await
             && handle.query(|actor| actor.local_user_joined()).await
         {
@@ -1308,12 +1321,17 @@ impl<B: KvBackend + 'static> hs_federation::invite::InviteSink for RegistryInvit
         let mut json = hs_federation::inbound::event_json(event);
         json["unsigned"]["invite_room_state"] = Value::Array(invite_room_state.to_vec());
         let event = hs_model::Event::parse(&json, room_version.clone())
-            .map_err(|e| InviteRejected(format!("the invite does not parse: {e}")))?;
+            .map_err(|e| InviteRejected::new(format!("the invite does not parse: {e}")))?;
         self.rooms
             .accept_out_of_room_membership(&room_id, room_version.clone(), event)
             .await
             .map(|_| ())
-            .map_err(|e| InviteRejected(e.to_string()))
+            .map_err(|e| match e {
+                // The room's shard moved to another replica while this ran: `503`, which the
+                // shard gate sends on to the new owner.
+                hs_room::RoomError::Fenced(_) => InviteRejected::not_owner(e.to_string()),
+                e => InviteRejected::new(e.to_string()),
+            })
     }
 }
 

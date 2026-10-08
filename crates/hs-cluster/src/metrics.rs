@@ -97,7 +97,7 @@ pub struct HistogramSnapshot {
 pub struct ClusterMetrics {
     ownership_changes: Mutex<HashMap<(&'static str, ChurnReason), u64>>,
     owned_shards: Mutex<HashMap<&'static str, i64>>,
-    forward_latency: Mutex<HashMap<(String, &'static str), Histogram>>,
+    forward_latency: Mutex<HashMap<(String, &'static str, &'static str), Histogram>>,
     forward_retries: Mutex<HashMap<&'static str, u64>>,
     fenced_total: Mutex<HashMap<&'static str, u64>>,
     live_replicas: AtomicU64,
@@ -133,13 +133,23 @@ impl ClusterMetrics {
         }
     }
 
-    /// Records the outcome and latency of one forward.
-    pub fn record_forward(&self, route: &str, outcome: &'static str, latency: Duration) {
+    /// Records the outcome and latency of one forward. `route` is how it travelled (`forward`
+    /// for a request sent to a shard's owner, `peer` for a replica-to-replica message); `kind`
+    /// is what the caller forwarded (`client` for a client request, `federation` for a request
+    /// from another server, `federation_pdu` for one PDU of a `/send`, `peer` for a peer
+    /// message), as [`crate::mesh::Forwarder::forward_as`] was told.
+    pub fn record_forward(
+        &self,
+        route: &str,
+        kind: &'static str,
+        outcome: &'static str,
+        latency: Duration,
+    ) {
         let mut m = self
             .forward_latency
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        m.entry((route.to_owned(), outcome))
+        m.entry((route.to_owned(), kind, outcome))
             .or_default()
             .observe(latency);
     }
@@ -243,8 +253,8 @@ pub struct MetricsSnapshot {
     pub ownership_changes: HashMap<(&'static str, ChurnReason), u64>,
     /// `hs_cluster_owned_shards{kind}`.
     pub owned_shards: HashMap<&'static str, i64>,
-    /// `hs_cluster_forward_latency_seconds{route, outcome}`.
-    pub forward_latency: HashMap<(String, &'static str), HistogramSnapshot>,
+    /// `hs_cluster_forward_latency_seconds{route, kind, outcome}`.
+    pub forward_latency: HashMap<(String, &'static str, &'static str), HistogramSnapshot>,
     /// `hs_cluster_forward_retries_total{reason}`.
     pub forward_retries: HashMap<&'static str, u64>,
     /// `hs_cluster_fenced_total{kind}`.
@@ -264,7 +274,7 @@ pub struct MetricsSnapshot {
 ///
 /// Series (RFC 0001 section 15): `hs_cluster_owned_shards{kind}`,
 /// `hs_cluster_ownership_changes_total{kind,reason}`, `hs_cluster_forward_latency_seconds{route,
-/// outcome}` (histogram), `hs_cluster_forward_retries_total{reason}`,
+/// kind, outcome}` (histogram), `hs_cluster_forward_retries_total{reason}`,
 /// `hs_cluster_fenced_total{kind}`, `hs_cluster_live_replicas` and
 /// `hs_cluster_lease_age_seconds`; and, beyond the RFC, `hs_cluster_heartbeat_seq` and
 /// `hs_cluster_drain_released_at_once_total`.
@@ -348,7 +358,8 @@ impl prometheus_client::collector::Collector for ClusterCollector {
 
         let mut family = encoder.encode_descriptor(
             "hs_cluster_forward_latency_seconds",
-            "Latency of requests forwarded over the mesh, retries included, by route and outcome",
+            "Latency of requests forwarded over the mesh, retries included, by route, kind \
+             (client, federation, federation_pdu, peer) and outcome",
             None,
             MetricType::Histogram,
         )?;
@@ -357,7 +368,7 @@ impl prometheus_client::collector::Collector for ClusterCollector {
                 .forward_latency
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut keys: Vec<&(String, &'static str)> = latency.keys().collect();
+            let mut keys: Vec<&(String, &'static str, &'static str)> = latency.keys().collect();
             keys.sort();
             for key in keys {
                 let Some(histogram) = latency.get(key) else {
@@ -365,7 +376,11 @@ impl prometheus_client::collector::Collector for ClusterCollector {
                 };
                 let snap = histogram.snapshot();
                 family
-                    .encode_family(&[("route", key.0.as_str()), ("outcome", key.1)])?
+                    .encode_family(&[
+                        ("route", key.0.as_str()),
+                        ("kind", key.1),
+                        ("outcome", key.2),
+                    ])?
                     .encode_histogram::<prometheus_client::encoding::NoLabelSet>(
                         snap.sum_ms as f64 / 1000.0,
                         snap.count,
@@ -456,8 +471,9 @@ mod tests {
         m.record_ownership_change("room", ChurnReason::Acquire);
         m.record_ownership_change("room", ChurnReason::Acquire);
         m.record_ownership_change("room", ChurnReason::Release);
-        m.record_forward("forward", "ok", Duration::from_millis(3));
-        m.record_forward("forward", "ok", Duration::from_millis(1_800));
+        m.record_forward("forward", "client", "ok", Duration::from_millis(3));
+        m.record_forward("forward", "client", "ok", Duration::from_millis(1_800));
+        m.record_forward("forward", "federation", "ok", Duration::from_millis(4));
         m.record_forward_retry("421");
         m.record_fenced("room");
         m.set_live_replicas(2);
@@ -474,8 +490,9 @@ mod tests {
             "hs_cluster_owned_shards{kind=\"room\"} 1",
             "hs_cluster_ownership_changes_total{kind=\"room\",reason=\"acquire\"} 2",
             "hs_cluster_ownership_changes_total{kind=\"room\",reason=\"release\"} 1",
-            "hs_cluster_forward_latency_seconds_count{route=\"forward\",outcome=\"ok\"} 2",
-            "hs_cluster_forward_latency_seconds_sum{route=\"forward\",outcome=\"ok\"} 1.803",
+            "hs_cluster_forward_latency_seconds_count{route=\"forward\",kind=\"client\",outcome=\"ok\"} 2",
+            "hs_cluster_forward_latency_seconds_sum{route=\"forward\",kind=\"client\",outcome=\"ok\"} 1.803",
+            "hs_cluster_forward_latency_seconds_count{route=\"forward\",kind=\"federation\",outcome=\"ok\"} 1",
             "hs_cluster_forward_retries_total{reason=\"421\"} 1",
             "hs_cluster_fenced_total{kind=\"room\"} 1",
             "hs_cluster_live_replicas 2",
@@ -490,6 +507,7 @@ mod tests {
             text.lines()
                 .find(|l| {
                     l.starts_with("hs_cluster_forward_latency_seconds_bucket")
+                        && l.contains("kind=\"client\"")
                         && l.contains(&format!("le=\"{le}\""))
                 })
                 .map(|l| l.rsplit(' ').next().unwrap_or_default().to_owned())
@@ -514,9 +532,9 @@ mod tests {
     #[test]
     fn forward_latency_is_observed() {
         let m = ClusterMetrics::new();
-        m.record_forward("room.send", "ok", Duration::from_millis(3));
+        m.record_forward("room.send", "client", "ok", Duration::from_millis(3));
         let snap = m.snapshot();
-        let h = snap.forward_latency[&("room.send".to_string(), "ok")];
+        let h = snap.forward_latency[&("room.send".to_string(), "client", "ok")];
         assert_eq!(h.count, 1);
     }
 }

@@ -1,3 +1,66 @@
+## 2026-10-08: another server's requests for a room reach the room's owner (branch `agent/fed-forward`, decision 0035)
+
+Found by `fed-cluster`: a federation `send_join` that reached a replica not owning the room's
+shard was refused `501 M_HS_INBOUND_INGESTION_UNSUPPORTED` ("fenced: ...") instead of being
+forwarded, so a remote join into a clustered server's room failed whenever the Service picked
+the wrong replica; `/send`'s PDUs were refused the same way, one by one. Now
+(`docs/decisions/0035-federation-requests-go-to-the-rooms-owner.md`):
+
+- **The shard gate forwards federation requests for a room** (`hs-cli` `cluster.rs`,
+  `extract_federation_room_id`, `FEDERATION_ROOM_ENDPOINTS`): `make_join`, `send_join` v1/v2,
+  `make_leave`, `send_leave` v1/v2, `make_knock`, `send_knock`, `invite` v1/v2,
+  `exchange_third_party_invite`, and the room reads (`state`, `state_ids`, `backfill`,
+  `get_missing_events`, `event_auth`, `timestamp_to_event`, `hierarchy`, `extremities`). Whole,
+  before the `X-Matrix` layer, so the owner verifies the signature again. The client path's
+  mid-handoff handling (`run_owned`: a `503` from a handler whose shard moved meanwhile is sent
+  on to the new owner) covers them too.
+- **`/send` writes go to each room's owner** (`hs-cli` `federation_forward.rs`, new):
+  `ClusterWriteSink` is the transport's `RoomWriteSink` on a clustered replica; a write for a
+  room another replica owns is an envelope on mesh route `federation.sink`, applied there by
+  `SinkShardHandler` through the owner's own sink. A write fenced here because the shard moved
+  is made again at the new owner; one fenced on the owner is answered `503`, which the forwarder
+  retries; if none takes it within the deadline the transaction is `503` and not remembered.
+  Installed in `serve.rs` after the cluster starts and before `spawn_mesh`; a no-op in
+  single-node mode.
+- **`ClusterHandles::add_shard_handler`/`ShardRoutes`**: a forwarded shard request on a route
+  with an added handler goes to it; everything else is replayed against the router, as before.
+  `ClusterHandles::default_deadline()` is public.
+- **`hs_cluster_forward_latency_seconds` has a `kind` label** (`client`, `federation`,
+  `federation_pdu`, `peer`): `Forwarder::forward_as(kind, env)`; `forward(env)` counts as
+  `client`. `ClusterMetrics::record_forward` takes the kind. Each forward is logged at debug
+  (`kind`, shard, method, path, status, elapsed) by the gate, and by `ClusterWriteSink` /
+  `SinkShardHandler`.
+
+Tests: `cluster::tests::extracts_room_id_from_federation_room_endpoints`,
+`on_a_non_owner_a_federation_request_for_a_room_is_forwarded_to_the_owner` (path, query,
+signature and body arrive unchanged; `/send` stays local), `a_forward_on_an_added_route_goes_to_its_handler`;
+`federation_forward::tests` (five: local when owned, owner when not, fenced-then-moved goes to
+the new owner, no owner in time is `not_owner`, the owner refuses a room of another shard; plus
+the wire round trip); `metrics::tests` for the label. Real servers:
+`crates/hs-cli/tests/cluster_federation.rs` -- A is two replicas on PostgreSQL (in process: the
+binary federates over HTTPS only, and B listens on HTTP), B one embedded server; every room is
+on replica 2's shard and every request of B's reaches replica 1. bob of B joins, talks, leaves,
+knocks and takes the knock back, and invites alice of A into a room of B's (on replica 2's shard
+by A's layout); replica 1 counts at least seven `kind="federation"` and two
+`kind="federation_pdu"` forwards. Passes in 8 s. With the gate and the sink both off it fails at
+the join (`send_join` refused `503 ... fenced`), and with either one off it fails later.
+
+Verified: `cargo test -p hs-cluster`, `-p hs-federation`, `-p hs-cli --lib`, and
+`--test cluster_federation --test cluster_alias_join --test cluster_edus --test cluster_create_room`
+with `HS_CLUSTER_TEST_POSTGRES_DSN` against a private `postgres:17`; per-crate clippy with
+`-D warnings`; `cargo fmt --all --check`.
+
+Left: no real-cluster run (the verification cluster is unreachable from a session); a forward
+landing mid-handoff is covered by unit tests, not by a real two-replica drain during a join.
+`cluster_device_lists.rs` (from `agent/fed-cluster`) keeps its room on replica 1's shard, for a
+different reason now (its comment says so): B's join would be forwarded to replica 2, the real
+binary, which federates over HTTPS only and could not fetch B's key to verify the forwarded
+`send_join` (tried: `401 signature verification failed`). `/send`'s pushed PDUs travel as
+their own `SinkCall::Pushed`, so the owner applies fed-cluster's `NotInRoom` check
+(`federation_forward::tests::a_pushed_pdu_is_judged_by_the_owner`); `RegistryWriteSink::
+accept_pushed_event` maps a fenced write to `not_owner` too. Also run after the rebase:
+`cluster_device_lists`, `federation_state_fallback`, `cluster_edus`, `cluster_admin` pass.
+
 ## 2026-10-04: a replica keeps its shards until its lease lapses (branch `agent/cluster-heartbeat`, decision 0028)
 
 Closes the `hs-cluster` row of the known gaps: "a replica gives up every shard when one tick

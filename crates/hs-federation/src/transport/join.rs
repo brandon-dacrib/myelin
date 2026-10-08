@@ -229,6 +229,12 @@ pub(super) fn join_error_response(e: &JoinError) -> Response {
             msg.clone(),
         )
         .into_response(),
+        JoinError::NotOwner(_) => MatrixError::custom(
+            StatusCode::SERVICE_UNAVAILABLE,
+            MatrixErrorCode::Other("M_HS_NOT_SHARD_OWNER".to_owned()),
+            e.to_string(),
+        )
+        .into_response(),
         JoinError::Store(msg) => MatrixError::custom(
             StatusCode::NOT_IMPLEMENTED,
             MatrixErrorCode::Other("M_HS_INBOUND_INGESTION_UNSUPPORTED".to_owned()),
@@ -249,6 +255,22 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
+
+    /// A membership write fenced because the room moved to another replica is a `503
+    /// M_HS_NOT_SHARD_OWNER` -- which the shard gate sends on to the new owner -- not the `501`
+    /// every other store failure still is.
+    #[tokio::test]
+    async fn a_write_another_replica_owns_is_a_503_and_a_store_failure_is_not() {
+        let response = join_error_response(&JoinError::NotOwner("fenced: moved".to_owned()));
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["errcode"], "M_HS_NOT_SHARD_OWNER");
+        let response = join_error_response(&JoinError::Store("disk".to_owned()));
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    }
 
     struct EmptyFetcher;
     #[async_trait]

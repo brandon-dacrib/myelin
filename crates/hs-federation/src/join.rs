@@ -83,6 +83,11 @@ pub enum JoinError {
     /// left ("Not an active room on this server").
     NotInRoom,
     Store(String),
+    /// In a cluster, the room's shard moved to another replica while the request ran here, and
+    /// nothing was stored ([`crate::inbound::WriteRejected::not_owner`]). `503
+    /// M_HS_NOT_SHARD_OWNER`: the replica that took the request sends it on to the new owner
+    /// (`hs-cli`'s shard gate), and a sender that does get it retries.
+    NotOwner(String),
 }
 
 impl std::fmt::Display for JoinError {
@@ -108,6 +113,7 @@ impl std::fmt::Display for JoinError {
             Self::UnableToAuthorise(e) => write!(f, "cannot authorise the join: {e}"),
             Self::NotInRoom => write!(f, "not an active room on this server"),
             Self::Store(e) => write!(f, "{e}"),
+            Self::NotOwner(e) => write!(f, "this replica no longer owns the room: {e}"),
         }
     }
 }
@@ -823,7 +829,13 @@ pub async fn send_membership(
     let outcome = sink
         .accept_verified_event(room_id, event.event_id().as_str(), &value)
         .await
-        .map_err(|e| JoinError::Store(e.error))?;
+        .map_err(|e| {
+            if e.not_owner {
+                JoinError::NotOwner(e.error)
+            } else {
+                JoinError::Store(e.error)
+            }
+        })?;
     tracing::info!(
         room_id,
         event_id,

@@ -441,8 +441,9 @@ async fn a_device_list_change_made_while_its_destinations_shard_had_no_live_owne
         .unwrap();
     let alice = register(&client, &base_1, &alice_name).await;
     let bob = register(&client, &b.base_url(), "bob").await;
-    // A room whose shard is replica 1's: `send_join` is not forwarded to the room's owner, so
-    // B's join must reach the replica that holds the room (and the room must outlive the kill).
+    // A room whose shard is replica 1's. B's join reaches replica 1 either way, and would be
+    // forwarded to replica 2 if the room were its (decision 0035); but replica 2 is the binary,
+    // which fetches B's key over HTTPS only and so could not verify B's signature on it.
     let mut room_id = String::new();
     for _ in 0..60 {
         let created: Value = client
