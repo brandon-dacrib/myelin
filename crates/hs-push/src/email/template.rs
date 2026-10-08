@@ -27,6 +27,13 @@ pub struct NotificationLine {
     pub ts_ms: u64,
     /// What the line says after the sender's name.
     pub text: LineText,
+    /// The event's room position, for the receipts that read it (absent on lines held by an
+    /// older build, which any receipt for their scope reads).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pos: Option<i64>,
+    /// The root of the thread the event is in (`None`: the room's main timeline).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<ruma::OwnedEventId>,
 }
 
 /// What a notification line says.
@@ -121,6 +128,8 @@ pub fn line_for(event: &Value, sender_display_name: Option<&str>) -> Option<Noti
         sender,
         ts_ms,
         text,
+        pos: None,
+        thread: None,
     })
 }
 
@@ -302,6 +311,8 @@ pub fn render_html(input: &MailInput<'_>) -> String {
                         sender: String::new(),
                         ts_ms: 0,
                         text: other.clone(),
+                        pos: None,
+                        thread: None,
                     }))
                 ),
             };
@@ -356,6 +367,8 @@ mod tests {
             sender: sender.to_owned(),
             ts_ms: 1_700_000_000_000,
             text,
+            pos: None,
+            thread: None,
         }
     }
 

@@ -1443,10 +1443,10 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
     }
 
     /// Records a receipt copied from another implementation's database for this same server
-    /// (the Synapse importer, `hs_compat::migration`): as [`SessionHub::set_receipt`] -- kept
-    /// durably, the room's joined members woken, the other replicas told -- except that nothing
-    /// is sent to other servers. The receipt is not news to them: Synapse sent it when it was
-    /// made. Returns the receipt's stamp.
+    /// (the Synapse importer, `hs_compat::migration`): as [`SessionHub::set_threaded_receipt`]
+    /// -- kept durably, in its thread, the room's joined members woken, the other replicas
+    /// told -- except that nothing is sent to other servers. The receipt is not news to them:
+    /// Synapse sent it when it was made. Returns the receipt's stamp.
     ///
     /// # Errors
     /// Returns [`UserError`] if the room could not be loaded.
@@ -1455,13 +1455,14 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         room_id: &RoomId,
         user_id: &UserId,
         kind: ReceiptKind,
+        thread: &hs_push::counts::ReceiptThread,
         event_id: ruma::OwnedEventId,
         ts: u64,
     ) -> Result<u64, UserError> {
         let members = self.joined_member_ids(room_id).await?;
         let seq = self
             .receipts
-            .set(room_id, user_id, kind, event_id, ts)
+            .set_in_thread(room_id, user_id, kind, thread, event_id, ts)
             .await;
         for member in &members {
             self.wake(member).await;
@@ -1586,6 +1587,19 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
     /// `room_id`'s current receipt cursor. See [`crate::receipts`].
     pub async fn receipts_seq(&self, room_id: &RoomId) -> u64 {
         self.receipts.seq(room_id).await
+    }
+
+    /// `user_id`'s `kind` receipt in `thread` of `room_id`: the event it is at and its `ts`
+    /// (`crate::receipts::ReceiptRegistry::get`). What the Synapse importer checks its copy
+    /// against.
+    pub async fn receipt_of(
+        &self,
+        room_id: &RoomId,
+        user_id: &UserId,
+        kind: ReceiptKind,
+        thread: &hs_push::counts::ReceiptThread,
+    ) -> Option<(ruma::OwnedEventId, u64)> {
+        self.receipts.get(room_id, user_id, kind, thread).await
     }
 
     /// The `m.receipt` event content for `room_id` as `viewer` (privacy-scoped -- see

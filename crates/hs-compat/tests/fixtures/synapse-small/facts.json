@@ -7,6 +7,8 @@
   "picture": "mxc://fixture.test/SKiaEVOECXKelEXuYONTEKlH",
   "first_message": "$b1bnN03Z4RrABXHOUyrLjPJ3twSCNIUb2XEFpNOaS7g",
   "private_receipt": "$nix7kIRvmrAFghalvbZ-8o7hzhTuExPbIyEMsm9Nee8",
+  "thread_receipt": "$yfA_SDWz3P2LifTv547c9syFfHgGTBGeZq9YRLt5rss",
+  "main_receipt": "$SRG6vJVQKNWP3QD7T87GsON-sYeIou8Uuap0BGF4cKw",
   "alice_filter": "0",
   "bob_filter": "0",
   "backup_version": "2",

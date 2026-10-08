@@ -1,5 +1,123 @@
 # 10 Push: status
 
+## 2026-10-08 (branch `agent/push-receipts`): everything a receipt reads follows its thread; push rules across replicas
+
+### Done
+
+- **`/notifications` follows the receipt's thread** (`crates/hs-push/src/notification_log.rs`,
+  `notification_log/{memory,tables}.rs`). An entry is read when the unthreaded receipt or its
+  own scope's (`main`, or its thread's root) is at or past its event's room position, as the
+  unread counts are. Entries carry their position and thread (`NewNotification.pos`/`thread`);
+  marks are per room and scope (`ReadMark`: a position, plus a `seq` for a receipt whose event
+  is not known here and one for entries logged before positions were kept), in the new
+  keyspace `hs_push.notification_read_scopes`. The old whole-room `hs_push.notification_read_marks`
+  rows are still read, as the unthreaded mark. `NotificationLogStore::mark_room_read` is now
+  `mark_read(user, room, thread, pos)`.
+- **Held notification emails follow it too** (`crates/hs-push/src/email/mod.rs`). Each held line
+  carries its position and thread (`NotificationLine.pos`/`thread`, serde-defaulted so emails held
+  by an older build restore); a receipt takes out only the lines it covers, a room with no line
+  left leaves the email, an email with no room left is not sent. `EmailPushersHandle::room_read`
+  is now `read(user, room, thread, pos)`; the throttle still resets on any receipt for the room.
+  Logged at debug: "a receipt took what it read out of a waiting notification email" with
+  `lines_read`.
+- **Push rules across replicas** (`compiled.rs`'s "Across replicas", `rulesets.rs`,
+  `crates/hs-cli/src/push_cluster.rs`):
+  - Every write is announced to the other live replicas on the mesh, route
+    `push.rules_changed` (`{user_id, seq}`), and a replica told drops its cached copy
+    (`CachedRulesetStore::changed_elsewhere`; `RulesetChangeFeed` is the seam, installed by
+    `hs_cli::push_cluster::install` in cluster mode only).
+  - Cache entries carry the change-seq they were read at. What a client is shown (`GET
+    /pushrules`, `/sync`'s `m.push_rules`) is checked against the store's seq on every read
+    (`CachedRulesetStore::current_ruleset`, one point read), so it is never stale even if a
+    message is lost; a client read also refreshes that replica's copy.
+  - The evaluation path re-checks an entry older than 30 s (`REVALIDATE_AFTER`, cluster only):
+    the bound on a lost message.
+  - **Concurrent edits on two replicas no longer lose one** (found reviewing `sync-wakes`, see
+    below): `RulesetStore::set_ruleset_if(user, ruleset, expected_seq)` writes only at the seq
+    the edit started from (serializable transaction on the KV backends), and
+    `update_ruleset` runs the edit again on the newer ruleset when it lost (up to 8 times;
+    `edit` is `FnMut` now).
+  - Metric `hs_push_rule_cache_invalidations_total{source="local"|"peer"|"stale"}`; info logs
+    when a peer refuses or misses a change, and at startup ("push rules are cluster-aware").
+- **A receipt's position without a room load on a non-owner** (`crates/hs-cli/src/push_delivery.rs`):
+  `RegistrySource::event_position` reads the event's stored row
+  (`event_id -> EventSn -> PersistedEvent.room_pos`, written with the timeline row in one
+  transaction; `RoomRegistry::find_event_globally`) on a replica that does not own the room,
+  where it loaded the whole room. The owner still asks its resident actor. Measured (debug
+  build, Fjall, `measure_the_receipt_position_lookup`, 20 rounds each): a room of 100 messages
+  9.3 ms load vs 23 µs index; 1,000: 129 ms vs 25 µs; 5,000: 470 ms vs 28 µs. In practice
+  `POST .../receipt` is forwarded to the room's owner, so the non-owner case is the edge
+  (ownership moving under a request), not the common path.
+- **Synapse's threaded receipts are imported in their threads** (`hs-compat`, `hs-cli`'s
+  migration target, `hs-user`'s `SessionHub::import_receipt`/`receipt_of`,
+  `ReceiptRegistry::get`): status 13's 2026-10-08 section has the details.
+
+### Review of `sync-wakes`' `hs-push` change (`a1fa71a6`)
+
+- `CachedRulesetStore::update_ruleset` (one lock, reading the store, not the cache): correct
+  within one process. The lock is a `tokio::sync::Mutex` held across store I/O for every
+  user's writes; acceptable since writes are rare, but a slow store stalls all rule writes on
+  that replica, noted. It did not cover replicas: two edits for one user on two replicas could
+  still lose one. Fixed here with the conditional write (above), and the two-replica test shows
+  it (without it, wave 0 lost two of eight rules).
+- `RuleCache`'s generation: correct. The generation is read before the store read, an insert is
+  refused under the write lock if any invalidation happened since, and `invalidate` bumps it
+  under the same lock; a write between the read and the insert keeps the stale copy out, and a
+  write before the generation read is already in the store. Any user's invalidation refuses
+  every concurrent insert, which only costs a re-read. `RuleCache::insert` (unguarded) is used
+  by tests only.
+- `edit` was `FnOnce`; it is `FnMut` now so a lost conditional write can run it again.
+  `SessionHub::copy_room_push_rules`' closure needed no change.
+- The race test (`a_read_racing_a_change_does_not_cache_the_old_rules`) relies on a 5 ms vs
+  20 ms sleep: under load it can pass without exercising the race, never fail spuriously.
+
+### Verified
+
+- `cargo test -p hs-push` (99; new: `receipts_mark_entries_read_per_thread` on both stores,
+  `a_whole_room_mark_from_an_older_build_still_reads`, `a_mark_never_moves_back_and_reads_legacy_entries_by_seq`,
+  `a_thread_receipt_marks_only_its_threads_entries_read`, the log check in
+  `receipts_read_their_thread_up_to_their_event`, `a_receipt_takes_out_only_what_it_reads`,
+  `a_change_made_on_another_replica_meanwhile_is_kept`, `a_change_on_one_replica_reaches_the_others_cache`,
+  `a_lost_message_is_bounded_by_the_revalidation_interval`, `a_conditional_write_lands_only_at_the_seq_it_expects`);
+  `cargo test -p hs-user` (new `get_finds_a_receipt_by_its_thread`), `-p hs-compat`, `-p hs-cli --lib`
+  (`push_cluster`, `push_delivery`); clippy clean on `hs-push`, `hs-user`, `hs-compat`, `hs-cli`.
+- Real server, `cargo test -p hs-cli --test thread_receipts`: `/notifications`' read flags of
+  A-F checked after each receipt of Complement's `TestThreadedReceipts` (with whole-room reads,
+  as on `main`, the first check fails: all six read after a `main` receipt on A).
+- Real binary, `--test email_held_restart`: new
+  `a_thread_receipt_leaves_the_main_timeline_in_the_waiting_email` (a thread receipt takes one
+  line out, the email about the main timeline still goes); the restart test still passes.
+- Real binaries, two replicas on PostgreSQL, `--test cluster_push_rules` (new; green on each of its last 4 runs,
+  `HS_CLUSTER_TEST_POSTGRES_DSN`): alice's content rule changed on A, then on B, each while the
+  room's owner had her rules cached; the owner's next push carries the new sound each time,
+  then `GET /pushrules` and `/sync` on the other replica show it; then three waves of eight
+  concurrent `PUT`s split across A and B all land. Without `push_cluster::install` round 1 fails
+  (the owner pushed with the old sound); without the conditional write wave 0 loses rules.
+- Also green: `--test migration` (real binary, 4 receipts), `cluster_ephemeral`,
+  `push_rules_concurrent`, `push_federated_invite`, `room_upgrade`, `federation_edus`.
+
+### Left
+
+- Thread subscriptions (MSC4306) and their `postcontent` rules (unchanged).
+- A held email trims each room to its last 10 lines; if a receipt reads every kept line, the
+  room leaves the email even when an older, trimmed line on another scope is still unread.
+- The rule-write lock is per process and global; fine for human-rate edits.
+- `synapse-small`'s `populate.py` does not make the threaded receipts (status 13).
+
+### Interfaces changed
+
+- `hs_push::notification_log::NotificationLogStore::mark_read` (was `mark_room_read`);
+  `NewNotification` has `pos` and `thread`.
+- `hs_push::email::EmailPushersHandle::read` (was `room_read`); `Notification` has `pos` and
+  `thread`; `EmailPushersWorker::read` (and `room_read`, unthreaded, kept for tests).
+- `hs_push::rulesets::RulesetStore::set_ruleset_if` (new, required);
+  `CachedRulesetStore::{current_ruleset, install_change_feed, changed_elsewhere}`,
+  `RulesetChangeFeed`; `update_ruleset` takes `FnMut`. `hs_push::compiled::{CachedRules,
+  register_metrics}`; `RuleCache::insert_if_unchanged` takes the seq; `RuleCache::{entry, confirm}`.
+- `hs_user::hub::SessionHub::import_receipt` takes a `thread`; `SessionHub::receipt_of` and
+  `ReceiptRegistry::get` are new.
+- Mesh peer route prefix `push.` (`push.rules_changed`), `hs_cli::push_cluster`.
+
 ## 2026-10-05 (branch `agent/push-gaps`): threaded receipts and per-thread counts, `postcontent`, one HELO fallback
 
 ### Done

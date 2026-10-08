@@ -2,7 +2,8 @@
 //! a match that notifies counts toward the room's unread numbers, lands in the user's
 //! notification log, and goes out to each of their HTTP pushers. A read receipt reads what it
 //! covers up to its event (its thread, the main timeline, or the whole room:
-//! [`crate::counts`]), marks the log read, and sends each pusher the new badge.
+//! [`crate::counts`]), in the counts, the notification log and the emails waiting to be sent
+//! alike, and sends each pusher the new badge.
 //!
 //! # Read your own receipt
 //!
@@ -337,8 +338,10 @@ static EVALUATIONS: LazyLock<Family<ResultLabels, Counter>> = LazyLock::new(Fami
 static HTTP_PUSHES: LazyLock<Family<OutcomeLabels, Counter>> = LazyLock::new(Family::default);
 
 /// Registers this module's metrics: `hs_push_evaluations_total` (by result: `notify`, `silent`,
-/// `none`) and `hs_push_http_pushes_total` (by outcome: `sent`, `rejected`, `failed`).
+/// `none`) and `hs_push_http_pushes_total` (by outcome: `sent`, `rejected`, `failed`), and the
+/// rule cache's `hs_push_rule_cache_invalidations_total` ([`crate::compiled::register_metrics`]).
 pub fn register_metrics(registry: &mut prometheus_client::registry::Registry) {
+    crate::compiled::register_metrics(registry);
     registry.register(
         "hs_push_evaluations",
         "Push rule evaluations of one event for one local member, by result: notify (a rule \
@@ -615,6 +618,8 @@ impl Pipeline {
                     actions: outcome.actions.clone(),
                     profile_tag: None,
                     ts_ms: now_ms(),
+                    pos: Some(room_pos),
+                    thread: thread_root.clone(),
                 },
             )
             .await
@@ -662,6 +667,8 @@ impl Pipeline {
                             room_name: room_name_for(described),
                             sender_display_name: sender_display_name_for(described),
                             event: event.clone(),
+                            pos: room_pos,
+                            thread: thread_root.clone(),
                         });
                     }
                 }
@@ -672,8 +679,9 @@ impl Pipeline {
     }
 
     /// Reads what the receipt covers up to its event ([`CountsStore::mark_read`]; the whole
-    /// scope when the event's position is not known here), marks the room's log entries read,
-    /// and tells each pusher the new badge. Receipts from other servers' users are not this
+    /// scope when the event's position is not known here), marks the log entries it covers
+    /// read and takes them out of any email waiting to be sent, and tells each pusher the new
+    /// badge. Receipts from other servers' users are not this
     /// pipeline's.
     pub async fn handle_receipt(&self, receipt: &ReadReceipt) -> Result<(), String> {
         let ReadReceipt {
@@ -686,7 +694,8 @@ impl Pipeline {
             return Ok(());
         }
         let counts = &self.deps.counts;
-        match self.deps.source.event_position(room_id, event_id).await? {
+        let pos = self.deps.source.event_position(room_id, event_id).await?;
+        match pos {
             Some(pos) => counts.mark_read(user_id, room_id, thread, pos).await,
             None => {
                 tracing::debug!(
@@ -706,11 +715,11 @@ impl Pipeline {
         .map_err(|e| e.to_string())?;
         self.deps
             .log
-            .mark_room_read(user_id, room_id)
+            .mark_read(user_id, room_id, thread, pos)
             .await
             .map_err(|e| e.to_string())?;
         if let Some(email) = &self.deps.email {
-            email.room_read(user_id, room_id);
+            email.read(user_id, room_id, thread, pos);
         }
         let pushers = self
             .deps
@@ -787,11 +796,7 @@ async fn deliver(
 
 /// The root of the thread `event` is in, if it carries an `m.thread` relation.
 fn thread_root(event: &Value) -> Option<OwnedEventId> {
-    let relation = event.get("content")?.get("m.relates_to")?;
-    if relation.get("rel_type")?.as_str()? != "m.thread" {
-        return None;
-    }
-    EventId::parse(relation.get("event_id")?.as_str()?).ok()
+    crate::notification_log::thread_of_event(event)
 }
 
 /// The pusher's `data` as the gateway sees it: everything given at registration but `url`.
@@ -1309,6 +1314,61 @@ mod tests {
         assert_eq!(
             counts.threads[&root_id].notification_count, 1,
             "$t2 came after the receipt"
+        );
+        // `/notifications` agrees with the counts entry by entry.
+        let read: HashMap<String, bool> = h
+            .log
+            .page(alice, None, 10, false)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.event_id.to_string(), e.read))
+            .collect();
+        assert_eq!(
+            read,
+            HashMap::from([
+                (root.to_owned(), true),
+                ("$t1:example.org".to_owned(), true),
+                ("$m2:example.org".to_owned(), true),
+                ("$t2:example.org".to_owned(), false),
+            ])
+        );
+    }
+
+    /// The log follows a thread receipt as the counts do: the thread's entries up to it are
+    /// read, and nothing on the main timeline.
+    #[tokio::test]
+    async fn a_thread_receipt_marks_only_its_threads_entries_read() {
+        let h = harness();
+        let p = &h.pipeline;
+        let alice = user_id!("@alice:example.org");
+        let root = "$root:example.org";
+        send(&h, p, message(root, "root"), 1).await;
+        send(&h, p, in_thread("$t1:example.org", root), 2).await;
+        send(&h, p, message("$m2:example.org", "main"), 3).await;
+        p.handle_receipt(&receipt(
+            alice.as_str(),
+            "$t1:example.org",
+            ReceiptThread::Thread(EventId::parse(root).unwrap()),
+        ))
+        .await
+        .unwrap();
+        let read: Vec<(String, bool)> = h
+            .log
+            .page(alice, None, 10, false)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.event_id.to_string(), e.read))
+            .collect();
+        assert_eq!(
+            read,
+            [
+                ("$m2:example.org".to_owned(), false),
+                ("$t1:example.org".to_owned(), true),
+                (root.to_owned(), false),
+            ],
+            "only the thread's entry is read"
         );
     }
 

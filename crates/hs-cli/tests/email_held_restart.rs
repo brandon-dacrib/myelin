@@ -3,6 +3,9 @@
 //! graceful shutdown) while it waits, and the next `hs` on the same data directory restores it
 //! from the push store (`hs_push::email::held`) and sends it, once.
 //!
+//! Also: a receipt in a thread takes only that thread's messages out of the waiting email, so
+//! the email about the room's main timeline still goes (`hs_push::email`'s module docs).
+//!
 //! The SMTP server is a few lines of this test rather than Mailpit, so the test needs nothing
 //! but the binary: it accepts plain SMTP and keeps each message's text.
 
@@ -91,6 +94,16 @@ fn free_port() -> u16 {
 }
 
 fn config_yaml(port: u16, data_dir: &std::path::Path, smtp_port: u16) -> String {
+    config_yaml_holding(port, data_dir, smtp_port, "20s")
+}
+
+/// [`config_yaml`] with notification emails held for `delay`.
+fn config_yaml_holding(
+    port: u16,
+    data_dir: &std::path::Path,
+    smtp_port: u16,
+    delay: &str,
+) -> String {
     format!(
         "server:\n  server_name: example.org\n\
          listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, health]\n\
@@ -100,7 +113,7 @@ fn config_yaml(port: u16, data_dir: &std::path::Path, smtp_port: u16) -> String 
          rate_limits:\n  enabled: false\n\
          email:\n  smtp:\n    host: 127.0.0.1\n    port: {smtp_port}\n    security: none\n\
          \x20 from: \"Myelin <noreply@example.org>\"\n  app_name: Myelin\n\
-         \x20 notifications:\n    delay_before_mail: 20s\n",
+         \x20 notifications:\n    delay_before_mail: {delay}\n",
         data_dir,
         data_dir.join("media"),
     )
@@ -340,4 +353,124 @@ async fn a_waiting_notification_email_is_sent_after_the_server_is_killed_and_res
         "nothing left to restore:\n{log}"
     );
     assert_eq!(smtp.messages().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_thread_receipt_leaves_the_main_timeline_in_the_waiting_email() {
+    let (smtp, smtp_port) = SmtpSink::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let config_path = dir.path().join("homeserver.yaml");
+    std::fs::write(
+        &config_path,
+        config_yaml_holding(port, &dir.path().join("data"), smtp_port, "15s"),
+    )
+    .unwrap();
+
+    let mut server = HsProcess::serve(&config_path);
+    let line = server.wait_for("setup_link=");
+    let setup_token: String = line
+        .split_once("/admin/setup#token=")
+        .unwrap()
+        .1
+        .chars()
+        .take_while(char::is_ascii_alphabetic)
+        .collect();
+    let nobody = Caller {
+        base: format!("http://127.0.0.1:{port}"),
+        token: None,
+    };
+    let admin = nobody
+        .expect(
+            Method::POST,
+            "/api/v1/setup",
+            Some(json!({"setup_token": setup_token, "username": "ops", "password": "hunter2-first-admin"})),
+        )
+        .await;
+    let admin = nobody.with_token(&admin["access_token"]);
+    let mut sessions = Vec::new();
+    for name in ["alice", "bob"] {
+        let registered = nobody
+            .expect(
+                Method::POST,
+                "/_matrix/client/v3/register",
+                Some(json!({"username": name, "password": format!("hunter2-{name}"), "auth": {"type": "m.login.dummy"}})),
+            )
+            .await;
+        sessions.push(nobody.with_token(&registered["access_token"]));
+    }
+    let (alice, bob) = (&sessions[0], &sessions[1]);
+    admin
+        .expect(
+            Method::POST,
+            "/api/v1/users/%40alice%3Aexample.org/threepids",
+            Some(json!({"medium": "email", "address": "alice@example.org"})),
+        )
+        .await;
+    alice
+        .expect(
+            Method::POST,
+            "/_matrix/client/v3/pushers/set",
+            Some(json!({
+                "pushkey": "alice@example.org",
+                "app_id": "m.email",
+                "kind": "email",
+                "app_display_name": "Email Notifications",
+                "device_display_name": "alice@example.org",
+                "lang": "en",
+                "data": {},
+            })),
+        )
+        .await;
+    let room = alice
+        .expect(
+            Method::POST,
+            "/_matrix/client/v3/createRoom",
+            Some(json!({"name": "Lunch", "invite": ["@bob:example.org"]})),
+        )
+        .await;
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+    bob.expect(
+        Method::POST,
+        &format!("/_matrix/client/v3/join/{room_id}"),
+        Some(json!({})),
+    )
+    .await;
+
+    // A message on the main timeline, and a thread under it.
+    let send = |txn: &'static str, content: Value| {
+        let path = format!("/_matrix/client/v3/rooms/{room_id}/send/m.room.message/{txn}");
+        async move { bob.expect(Method::PUT, &path, Some(content)).await }
+    };
+    let root = send(
+        "txn1",
+        json!({"msgtype": "m.text", "body": "Soup at noon?"}),
+    )
+    .await;
+    let root = root["event_id"].as_str().unwrap().to_owned();
+    let reply = send(
+        "txn2",
+        json!({"msgtype": "m.text", "body": "Or salad",
+               "m.relates_to": {"rel_type": "m.thread", "event_id": root}}),
+    )
+    .await;
+    let reply = reply["event_id"].as_str().unwrap().to_owned();
+    server.wait_for("holding a notification for an email");
+    server.wait_for("holding a notification for an email");
+
+    // Alice reads the thread, not the room: the thread's message leaves the email, the root
+    // (on the main timeline) stays, and the email goes when due.
+    alice
+        .expect(
+            Method::POST,
+            &format!("/_matrix/client/v3/rooms/{room_id}/receipt/m.read/{reply}"),
+            Some(json!({"thread_id": root})),
+        )
+        .await;
+    let read = server.wait_for("a receipt took what it read out of a waiting notification email");
+    assert!(read.contains("lines_read=1"), "{read}");
+    server.wait_for("notification email sent");
+    let messages = smtp.messages();
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    assert!(messages[0].contains("Lunch"), "{}", messages[0]);
 }

@@ -309,7 +309,7 @@ async fn threaded_receipts_read_their_thread_and_counts_split_by_thread() {
         threaded("Start thread!".into(), None),
     )
     .await;
-    send_synced(
+    let c = send_synced(
         &client,
         &alice,
         &room_id,
@@ -320,7 +320,7 @@ async fn threaded_receipts_read_their_thread_and_counts_split_by_thread() {
     let mut mention = message(format!("Hello {}!", bob.id));
     mention["m.mentions"] = json!({"user_ids": [bob.id]});
     let d = send_synced(&client, &alice, &room_id, "m.room.message", mention).await;
-    send_synced(
+    let e = send_synced(
         &client,
         &alice,
         &room_id,
@@ -378,6 +378,35 @@ async fn threaded_receipts_read_their_thread_and_counts_split_by_thread() {
     let (_, _, t) = check("before any receipt", (2, 6), (1, 3)).await;
     assert_eq!(t, Some((1, 3)));
 
+    // `/notifications` follows the receipts as the counts do, entry by entry: which of A-F
+    // (G, a reaction, notifies nobody) read as read.
+    let notifications_read = |label: &'static str, expected: [bool; 6]| {
+        let (client, bob, ids) = (
+            client.clone(),
+            &bob,
+            [&a, &b, &c, &d, &e, &f].map(|id| id.clone()),
+        );
+        async move {
+            let page = ok(&client, bob, Method::GET, "notifications", Value::Null).await;
+            let read: Vec<bool> = ids
+                .iter()
+                .map(|id| {
+                    page["notifications"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .find(|n| n["event"]["event_id"] == id.as_str())
+                        .unwrap_or_else(|| panic!("{label}: {id} is not in /notifications: {page}"))
+                        ["read"]
+                        .as_bool()
+                        .unwrap()
+                })
+                .collect();
+            assert_eq!(read, expected, "{label}: read flags of A-F in {page}");
+        }
+    };
+    notifications_read("before any receipt", [false; 6]).await;
+
     let post_receipt = |event: String, body: Value| {
         let (client, bob, room_id) = (client.clone(), &bob, room_id.clone());
         async move {
@@ -395,6 +424,11 @@ async fn threaded_receipts_read_their_thread_and_counts_split_by_thread() {
     post_receipt(a.clone(), json!({"thread_id": "main"})).await;
     let (plain, _, t) = check("a main receipt on A", (2, 5), (1, 2)).await;
     assert_eq!(t, Some((1, 3)));
+    notifications_read(
+        "a main receipt on A",
+        [true, false, false, false, false, false],
+    )
+    .await;
     assert_eq!(
         receipt(&plain, &room_id, &a, &bob.id).unwrap()["thread_id"],
         "main"
@@ -403,6 +437,11 @@ async fn threaded_receipts_read_their_thread_and_counts_split_by_thread() {
     post_receipt(b.clone(), json!({"thread_id": a})).await;
     let (plain, _, t) = check("a thread receipt on B", (2, 4), (1, 2)).await;
     assert_eq!(t, Some((1, 2)));
+    notifications_read(
+        "a thread receipt on B",
+        [true, true, false, false, false, false],
+    )
+    .await;
     assert_eq!(
         receipt(&plain, &room_id, &b, &bob.id).unwrap()["thread_id"],
         a.as_str()
@@ -411,6 +450,11 @@ async fn threaded_receipts_read_their_thread_and_counts_split_by_thread() {
     post_receipt(d.clone(), json!({})).await;
     let (plain, _, t) = check("an unthreaded receipt on D", (0, 2), (0, 1)).await;
     assert_eq!(t, Some((0, 1)));
+    notifications_read(
+        "an unthreaded receipt on D",
+        [true, true, true, true, false, false],
+    )
+    .await;
     assert!(
         receipt(&plain, &room_id, &d, &bob.id)
             .unwrap()
@@ -421,6 +465,11 @@ async fn threaded_receipts_read_their_thread_and_counts_split_by_thread() {
     post_receipt(g.clone(), json!({"thread_id": a})).await;
     let (_, split, t) = check("the thread read through G", (0, 1), (0, 1)).await;
     assert_eq!(t, None, "a thread with nothing unread is left out: {split}");
+    notifications_read(
+        "the thread read through G",
+        [true, true, true, true, true, false],
+    )
+    .await;
 
     // A `thread_id` that is neither `main` nor an event ID is refused.
     let (status, body) = call(

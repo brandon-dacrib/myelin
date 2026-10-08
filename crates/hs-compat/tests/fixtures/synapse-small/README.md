@@ -20,7 +20,8 @@ with changed actions) and a pusher; a sync filter each for alice and bob.
 - `signing.key`: the fixture server's signing key (a test key, used nowhere else). A migrated
   server keeps signing with it, so the events Synapse signed stay verifiable.
 - `facts.json`: ids the tests need (the two rooms, alice's and bob's access tokens, the media,
-  the receipted events, the filter ids, the backup version, the cross-signing keys).
+  the receipted events (threaded ones too), the filter ids, the backup version, the
+  cross-signing keys).
 
 Regenerated on 2026-10-01 with the end-to-end keys, push rules, pushers, receipts and filters
 (the earlier one lacked them); the counts the tests assert are unchanged.
@@ -33,6 +34,15 @@ a thumbnail row) and `RemoteMissingFileTwo`, whose file is gone, as Synapse's ca
 leaves the row. `facts.json` names both (`remote_picture`, `remote_missing`). `export.py` keeps
 both tables on a regeneration; a Synapse that had fetched another server's media writes the
 same rows.
+
+Added by hand on 2026-10-08 (no Synapse was run): two more of alice's `m.read` receipts in the
+lobby, as Synapse 1.161 writes threaded receipts (MSC3771) into `receipts_linearized`:
+stream 4 at "Message number 12" with `thread_id` the first message's event id (a thread
+receipt), and stream 5 at "Message number 11" with `thread_id` `main`. `facts.json` names their
+events (`thread_receipt`, `main_receipt`). The lobby has no thread events, so a real Synapse
+would have refused the first (it checks that a thread receipt's event is in the thread); the
+importer does not check, and the row's shape is Synapse's. `populate.py` does not make them:
+a regeneration drops them unless it gains a thread and the two receipts.
 
 Used by `crates/hs-compat/tests/migration.rs` (the engine, against an in-memory target) and
 `crates/hs-cli/tests/migration.rs` (the real `hs` binary, through the admin API), which load

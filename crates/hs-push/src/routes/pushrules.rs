@@ -354,7 +354,7 @@ pub async fn put_pushrule<B: KvBackend + 'static>(
 
     change(&state, &requester.user_id, |ruleset| {
         ruleset
-            .insert(new_rule, ba.after.as_deref(), ba.before.as_deref())
+            .insert(new_rule.clone(), ba.after.as_deref(), ba.before.as_deref())
             .map_err(rule_edit_error)
     })
     .await?;
@@ -409,12 +409,12 @@ pub async fn put_pushrule_attr<B: KvBackend + 'static>(
             )));
         }
     };
-    change(&state, &requester.user_id, |ruleset| match edit {
+    change(&state, &requester.user_id, |ruleset| match &edit {
         AttrEdit::Actions(actions) => ruleset
-            .set_actions(kind, rule_id.as_str(), actions)
+            .set_actions(kind, rule_id.as_str(), actions.clone())
             .map_err(rule_edit_error),
         AttrEdit::Enabled(enabled) => ruleset
-            .set_enabled(kind, rule_id.as_str(), enabled)
+            .set_enabled(kind, rule_id.as_str(), *enabled)
             .map_err(rule_edit_error),
     })
     .await?;
@@ -431,20 +431,23 @@ async fn effective<B: KvBackend + 'static>(
     state: &PushState<B>,
     user_id: &UserId,
 ) -> Result<std::sync::Arc<Ruleset>, MatrixError> {
+    // What the client is shown: the store's rules as of now, whichever replica wrote them.
     state
         .rulesets
-        .effective_ruleset(user_id)
+        .current_ruleset(user_id)
         .await
+        .map(|(ruleset, _)| ruleset)
         .map_err(store_err)
 }
 
 /// Changes the user's ruleset with `edit`, one change at a time
 /// (`CachedRulesetStore::update_ruleset`): two requests from one user at once each keep the
-/// other's change, which a read here and a write after it did not.
+/// other's change, which a read here and a write after it did not. `edit` may run more than
+/// once: again on the newer ruleset when another replica changed it meanwhile.
 async fn change<B: KvBackend + 'static>(
     state: &PushState<B>,
     user_id: &UserId,
-    edit: impl FnOnce(&mut Ruleset) -> Result<(), MatrixError>,
+    mut edit: impl FnMut(&mut Ruleset) -> Result<(), MatrixError>,
 ) -> Result<(), MatrixError> {
     let changed = state
         .rulesets

@@ -265,6 +265,24 @@ impl ReceiptRegistry {
         seq
     }
 
+    /// `user_id`'s `kind` receipt in `thread` of `room_id`, if there is one: the event it is
+    /// at and its `ts`. Exact, where [`ReceiptRegistry::content_for`] shows one receipt per
+    /// event (the clash rule): what an importer checks its copy against.
+    pub async fn get(
+        &self,
+        room_id: &RoomId,
+        user_id: &UserId,
+        kind: ReceiptKind,
+        thread: &ReceiptThread,
+    ) -> Option<(OwnedEventId, u64)> {
+        let mut rooms = self.rooms.lock().await;
+        self.load(&mut rooms, room_id)
+            .await
+            .by_user
+            .get(&(user_id.to_owned(), kind, thread.clone()))
+            .map(|r| (r.event_id.clone(), r.ts))
+    }
+
     /// Forgets what is cached for `room_id`, so that the next call about the room reads the
     /// store again, and raises the counter past `seq`, the stamp of the receipt that made the
     /// cache stale. How another replica's receipt reaches this one
@@ -351,6 +369,48 @@ impl Default for ReceiptRegistry {
 mod tests {
     use super::*;
     use ruma::{event_id, room_id, user_id};
+
+    /// `get` answers per thread, where `content_for` shows one receipt per event.
+    #[tokio::test]
+    async fn get_finds_a_receipt_by_its_thread() {
+        let reg = ReceiptRegistry::new();
+        let room = room_id!("!r:example.org");
+        let alice = user_id!("@alice:example.org");
+        let root = event_id!("$root:example.org").to_owned();
+        reg.set_in_thread(
+            room,
+            alice,
+            ReceiptKind::Read,
+            &ReceiptThread::Thread(root.clone()),
+            event_id!("$t:example.org").to_owned(),
+            5,
+        )
+        .await;
+        reg.set_in_thread(
+            room,
+            alice,
+            ReceiptKind::Read,
+            &ReceiptThread::Main,
+            event_id!("$m:example.org").to_owned(),
+            6,
+        )
+        .await;
+        assert_eq!(
+            reg.get(room, alice, ReceiptKind::Read, &ReceiptThread::Thread(root))
+                .await,
+            Some((event_id!("$t:example.org").to_owned(), 5))
+        );
+        assert_eq!(
+            reg.get(room, alice, ReceiptKind::Read, &ReceiptThread::Main)
+                .await,
+            Some((event_id!("$m:example.org").to_owned(), 6))
+        );
+        assert_eq!(
+            reg.get(room, alice, ReceiptKind::Read, &ReceiptThread::Unthreaded)
+                .await,
+            None
+        );
+    }
 
     #[tokio::test]
     async fn unknown_room_reports_empty_content_and_seq_zero() {

@@ -3,17 +3,28 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-use ruma::{OwnedRoomId, RoomId, UserId};
+use ruma::{OwnedEventId, OwnedRoomId, RoomId, UserId};
 
-use super::{NewNotification, NotificationEntry, NotificationLogStore, is_highlight};
+use super::{
+    NewNotification, NotificationEntry, NotificationLogStore, ReadMark, entry_is_read,
+    is_highlight, thread_of_event,
+};
+use crate::counts::ReceiptThread;
 use crate::error::StoreError;
+
+/// One logged entry, with what deciding whether it is read needs.
+struct Logged {
+    entry: NotificationEntry,
+    pos: Option<i64>,
+    thread: Option<OwnedEventId>,
+}
 
 #[derive(Default)]
 struct UserLog {
     next_seq: u64,
-    entries: Vec<NotificationEntry>,
-    /// Per room, the newest `seq` a receipt has covered.
-    read_marks: HashMap<OwnedRoomId, u64>,
+    entries: Vec<Logged>,
+    /// Per room, per receipt scope (`ReceiptThread`'s stored form), what the receipts read.
+    read_marks: HashMap<OwnedRoomId, HashMap<String, ReadMark>>,
 }
 
 /// An in-memory per-user notification log.
@@ -41,15 +52,22 @@ impl NotificationLogStore for InMemoryNotificationLogStore {
         let log = users.entry(user_id.to_owned()).or_default();
         log.next_seq += 1;
         let seq = log.next_seq;
-        log.entries.push(NotificationEntry {
-            seq,
-            room_id: notification.room_id,
-            event_id: notification.event_id,
-            event: notification.event,
-            actions: notification.actions,
-            profile_tag: notification.profile_tag,
-            ts_ms: notification.ts_ms,
-            read: false,
+        let thread = notification
+            .thread
+            .or_else(|| thread_of_event(&notification.event));
+        log.entries.push(Logged {
+            entry: NotificationEntry {
+                seq,
+                room_id: notification.room_id,
+                event_id: notification.event_id,
+                event: notification.event,
+                actions: notification.actions,
+                profile_tag: notification.profile_tag,
+                ts_ms: notification.ts_ms,
+                read: false,
+            },
+            pos: notification.pos,
+            thread,
         });
         Ok(seq)
     }
@@ -66,29 +84,39 @@ impl NotificationLogStore for InMemoryNotificationLogStore {
             return Ok(Vec::new());
         };
         let ceiling = before.unwrap_or(u64::MAX);
+        let no_marks = HashMap::new();
         Ok(log
             .entries
             .iter()
             .rev()
-            .filter(|e| e.seq < ceiling)
-            .filter(|e| !only_highlight || is_highlight(&e.actions))
+            .filter(|l| l.entry.seq < ceiling)
+            .filter(|l| !only_highlight || is_highlight(&l.entry.actions))
             .take(limit)
-            .map(|e| {
-                let mut entry = e.clone();
-                entry.read = log
-                    .read_marks
-                    .get(&e.room_id)
-                    .is_some_and(|mark| e.seq <= *mark);
+            .map(|l| {
+                let mut entry = l.entry.clone();
+                let marks = log.read_marks.get(&entry.room_id).unwrap_or(&no_marks);
+                entry.read = entry_is_read(marks, entry.seq, l.pos, l.thread.as_deref());
                 entry
             })
             .collect())
     }
 
-    async fn mark_room_read(&self, user_id: &UserId, room_id: &RoomId) -> Result<(), StoreError> {
+    async fn mark_read(
+        &self,
+        user_id: &UserId,
+        room_id: &RoomId,
+        thread: &ReceiptThread,
+        pos: Option<i64>,
+    ) -> Result<(), StoreError> {
         let mut users = self.users.write().unwrap();
         let log = users.entry(user_id.to_owned()).or_default();
-        let mark = log.next_seq;
-        log.read_marks.insert(room_id.to_owned(), mark);
+        let newest = log.next_seq;
+        log.read_marks
+            .entry(room_id.to_owned())
+            .or_default()
+            .entry(thread.mark_key())
+            .or_default()
+            .apply(newest, pos);
         Ok(())
     }
 }
@@ -101,5 +129,8 @@ mod tests {
     async fn satisfies_the_shared_notification_log_contract() {
         let store = InMemoryNotificationLogStore::new();
         crate::notification_log::contract_tests::behaves_correctly(&store).await;
+        let store = InMemoryNotificationLogStore::new();
+        crate::notification_log::contract_tests::receipts_mark_entries_read_per_thread(&store)
+            .await;
     }
 }

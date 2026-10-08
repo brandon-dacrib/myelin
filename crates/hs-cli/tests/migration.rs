@@ -444,7 +444,7 @@ async fn a_synapse_database_is_migrated_verified_and_cut_over_through_the_admin_
         ("push_rules", 1),
         ("pushers", 1),
         ("filters", 2),
-        ("receipts", 2),
+        ("receipts", 4),
     ] {
         assert_eq!(stream(name)["copied_count"], count, "{name}: {ready}");
         assert_eq!(stream(name)["failed_count"], 0, "{name}: {ready}");
@@ -811,6 +811,16 @@ async fn a_synapse_database_is_migrated_verified_and_cut_over_through_the_admin_
         lobby_receipts[first]["m.read"].get(bob_id).is_some(),
         "{lobby_receipts}"
     );
+    // Alice's threaded receipts in the lobby, each in its thread (MSC3771).
+    for (event, thread) in [
+        (facts["thread_receipt"].as_str().unwrap(), first),
+        (facts["main_receipt"].as_str().unwrap(), "main"),
+    ] {
+        assert_eq!(
+            lobby_receipts[event]["m.read"][alice_id]["thread_id"], thread,
+            "{lobby_receipts}"
+        );
+    }
     let dm_receipts = receipt_in(&sync, dm);
     let private = facts["private_receipt"].as_str().unwrap();
     assert!(

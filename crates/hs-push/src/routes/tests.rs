@@ -375,6 +375,8 @@ async fn notifications_page_newest_first_with_a_token() {
                     actions: vec![ruma::push::Action::Notify],
                     profile_tag: None,
                     ts_ms: 1000 * i,
+                    pos: i64::try_from(i).ok(),
+                    thread: None,
                 },
             )
             .await

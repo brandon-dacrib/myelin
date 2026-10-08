@@ -154,12 +154,12 @@ impl ReceiptThread {
     }
 
     /// The stored form of a read position's key: `""` unthreaded, else [`Self::as_wire`].
-    fn mark_key(&self) -> String {
+    pub(crate) fn mark_key(&self) -> String {
         self.as_wire().unwrap_or_default().to_owned()
     }
 
     /// Whether this receipt reads `scope`.
-    fn reads(&self, scope: Option<&EventId>) -> bool {
+    pub(crate) fn reads(&self, scope: Option<&EventId>) -> bool {
         match (self, scope) {
             (Self::Unthreaded, _) | (Self::Main, None) => true,
             (Self::Thread(root), Some(scope)) => root == scope,
@@ -168,7 +168,7 @@ impl ReceiptThread {
     }
 
     /// The receipt that reads the scope `scope` names (`None`: main).
-    fn of_scope(scope: Option<&EventId>) -> Self {
+    pub(crate) fn of_scope(scope: Option<&EventId>) -> Self {
         scope.map_or(Self::Main, |root| Self::Thread(root.to_owned()))
     }
 }

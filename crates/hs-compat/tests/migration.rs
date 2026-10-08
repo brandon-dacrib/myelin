@@ -172,8 +172,8 @@ type AccountDataKey = (String, Option<String>, String);
 /// A backup version and its room keys by session, under `(user, version)`.
 type Backups = HashMap<(String, u64), (SynapseBackupVersion, HashMap<String, SynapseRoomKey>)>;
 
-/// `(room, user, receipt type) -> (event, ts)`.
-type Receipts = HashMap<(String, String, String), (String, u64)>;
+/// `(room, user, receipt type, thread) -> (event, ts)`.
+type Receipts = HashMap<(String, String, String, Option<String>), (String, u64)>;
 
 /// A room as the in-memory target holds it.
 #[derive(Default, Clone)]
@@ -479,6 +479,7 @@ impl MigrationTarget for MemoryTarget {
                 receipt.room_id.clone(),
                 receipt.user_id.clone(),
                 receipt.receipt_type.clone(),
+                receipt.thread_id.clone(),
             ),
             (receipt.event_id.clone(), receipt.ts),
         ))
@@ -667,6 +668,7 @@ impl MigrationTarget for MemoryTarget {
                 receipt.room_id.clone(),
                 receipt.user_id.clone(),
                 receipt.receipt_type.clone(),
+                receipt.thread_id.clone(),
             )),
             &(receipt.event_id.clone(), receipt.ts),
         ))
@@ -922,14 +924,33 @@ async fn the_reader_sees_what_synapse_holds() {
     assert_eq!(pushers.len(), 1);
     assert_eq!(pushers[0].pushkey, "alice-pushkey");
     let receipts = source.receipts(None, 10).await.unwrap();
+    let first_message = facts["first_message"].as_str().unwrap();
     assert_eq!(
         receipts
             .iter()
-            .map(|r| (r.receipt_type.as_str(), r.event_id.as_str()))
+            .map(|r| (
+                r.receipt_type.as_str(),
+                r.event_id.as_str(),
+                r.thread_id.as_deref()
+            ))
             .collect::<Vec<_>>(),
         [
-            ("m.read", facts["first_message"].as_str().unwrap()),
-            ("m.read.private", facts["private_receipt"].as_str().unwrap())
+            ("m.read", first_message, None),
+            (
+                "m.read.private",
+                facts["private_receipt"].as_str().unwrap(),
+                None
+            ),
+            (
+                "m.read",
+                facts["thread_receipt"].as_str().unwrap(),
+                Some(first_message)
+            ),
+            (
+                "m.read",
+                facts["main_receipt"].as_str().unwrap(),
+                Some("main")
+            ),
         ]
     );
     let filters = source.filters(None, 10, "fixture.test").await.unwrap();
@@ -1008,7 +1029,7 @@ async fn a_copy_is_verified_and_cut_over_and_nothing_can_follow_it() {
     assert_eq!(copied(&record, Stream::Pushers), 1);
     assert_eq!(copied(&record, Stream::Filters), 2);
     assert_eq!(copied(&record, Stream::Rooms), 2);
-    assert_eq!(copied(&record, Stream::Receipts), 2);
+    assert_eq!(copied(&record, Stream::Receipts), 4);
     assert_eq!(copied(&record, Stream::Media), 2);
     let remote = record.stream(Stream::RemoteMedia).unwrap();
     assert_eq!((remote.copied, remote.skipped), (1, 1), "{remote:?}");
@@ -1048,11 +1069,28 @@ async fn a_copy_is_verified_and_cut_over_and_nothing_can_follow_it() {
         target.receipts.lock().unwrap()[&(
             lobby.to_owned(),
             "@bob:fixture.test".to_owned(),
-            "m.read".to_owned()
+            "m.read".to_owned(),
+            None
         )]
             .0,
         facts["first_message"].as_str().unwrap()
     );
+    // Alice's threaded receipts are copied in their threads, not as room receipts.
+    for (thread, event) in [
+        (facts["first_message"].as_str().unwrap(), "thread_receipt"),
+        ("main", "main_receipt"),
+    ] {
+        assert_eq!(
+            target.receipts.lock().unwrap()[&(
+                lobby.to_owned(),
+                "@alice:fixture.test".to_owned(),
+                "m.read".to_owned(),
+                Some(thread.to_owned())
+            )]
+                .0,
+            facts[event].as_str().unwrap()
+        );
+    }
     // The rooms were written a page (`batch_size`, 2) at a time.
     let largest = target.largest_page.load(Ordering::Relaxed);
     assert!(largest > 0 && largest <= 2, "{largest}");
@@ -1095,7 +1133,7 @@ async fn a_copy_is_verified_and_cut_over_and_nothing_can_follow_it() {
         ("push_rules", 1),
         ("pushers", 1),
         ("filters", 2),
-        ("receipts", 2),
+        ("receipts", 4),
     ] {
         let stream = report.streams.iter().find(|s| s.name == name).unwrap();
         assert_eq!(

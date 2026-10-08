@@ -8,8 +8,12 @@
 //! is held for the user's address, and the email goes when the hold is due, carrying every
 //! room with unread notifications held by then (one email, several rooms), each room's unread
 //! count from the notification counts, and the messages themselves as sender, time and
-//! snippet (no snippet in an encrypted room). Reading a room in a client takes it out of the
-//! held email, so someone at their keyboard is not emailed about what they just read.
+//! snippet (no snippet in an encrypted room). Reading a room in a client takes what the read
+//! receipt covers out of the held email, so someone at their keyboard is not emailed about
+//! what they just read: a receipt in a thread takes out that thread's messages up to it, a
+//! `main` receipt the main timeline's, an unthreaded one both (MSC3771, as the unread counts
+//! do). A room with nothing left in it leaves the email, and an email with no room left is not
+//! sent.
 //!
 //! # When the email goes
 //!
@@ -43,12 +47,12 @@ use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use ruma::api::client::push::PusherKind;
-use ruma::{OwnedRoomId, OwnedUserId, RoomId, UserId};
+use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UserId};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-use crate::counts::CountsStore;
+use crate::counts::{CountsStore, ReceiptThread};
 use crate::pushers::PusherStore;
 use held::{HeldMail, HeldMailStore, HeldRoom};
 use template::{LineText, MailInput, RoomSection};
@@ -198,15 +202,21 @@ pub struct Notification {
     pub sender_display_name: Option<String>,
     /// The event, in the client-server API's shape.
     pub event: Value,
+    /// The event's room position, for the receipts that read it.
+    pub pos: i64,
+    /// The root of the thread the event is in (`None`: the room's main timeline).
+    pub thread: Option<OwnedEventId>,
 }
 
 /// What the pipeline tells the worker.
 #[derive(Debug, Clone)]
 enum Job {
     Notified(Box<Notification>),
-    RoomRead {
+    Read {
         user_id: OwnedUserId,
         room_id: OwnedRoomId,
+        thread: ReceiptThread,
+        pos: Option<i64>,
     },
 }
 
@@ -239,11 +249,21 @@ impl EmailPushersHandle {
         self.send(Job::Notified(Box::new(notification)));
     }
 
-    /// A user read a room: nothing held about it is emailed, and its throttle starts over.
-    pub fn room_read(&self, user_id: &UserId, room_id: &RoomId) {
-        self.send(Job::RoomRead {
+    /// A user sent a read receipt: what it covers of the room (`thread`, up to room position
+    /// `pos`, or the whole scope when `pos` is not known) is not emailed, and the room's
+    /// throttle starts over.
+    pub fn read(
+        &self,
+        user_id: &UserId,
+        room_id: &RoomId,
+        thread: &ReceiptThread,
+        pos: Option<i64>,
+    ) {
+        self.send(Job::Read {
             user_id: user_id.to_owned(),
             room_id: room_id.to_owned(),
+            thread: thread.clone(),
+            pos,
         });
     }
 
@@ -467,7 +487,12 @@ impl EmailPushersWorker {
     async fn handle_job(&mut self, job: Job) {
         match job {
             Job::Notified(notification) => self.hold(*notification).await,
-            Job::RoomRead { user_id, room_id } => self.room_read(&user_id, &room_id).await,
+            Job::Read {
+                user_id,
+                room_id,
+                thread,
+                pos,
+            } => self.read(&user_id, &room_id, &thread, pos).await,
         }
     }
 
@@ -483,12 +508,14 @@ impl EmailPushersWorker {
             count("skipped");
             return;
         }
-        let Some(line) = template::line_for(
+        let Some(mut line) = template::line_for(
             &notification.event,
             notification.sender_display_name.as_deref(),
         ) else {
             return;
         };
+        line.pos = Some(notification.pos);
+        line.thread = notification.thread.clone();
         let now = Instant::now();
         let mut due = now + settings.delay_before_mail;
         match self
@@ -554,24 +581,66 @@ impl EmailPushersWorker {
         );
     }
 
-    /// Takes the room out of everything held for the user and forgets its throttle.
+    /// Takes the room out of everything held for the user and forgets its throttle: an
+    /// unthreaded receipt whose event's position is not known here. [`Self::read`] for any
+    /// other receipt.
     pub async fn room_read(&mut self, user_id: &UserId, room_id: &RoomId) {
-        let touched: Vec<(OwnedUserId, String)> = self
-            .pending
-            .iter()
-            .filter(|((user, _), pending)| {
-                user == user_id && pending.held.rooms.contains_key(room_id)
-            })
-            .map(|(k, _)| k.clone())
-            .collect();
-        self.pending.retain(|(user, _), pending| {
-            if user == user_id {
+        self.read(user_id, room_id, &ReceiptThread::Unthreaded, None)
+            .await;
+    }
+
+    /// A read receipt: takes the lines it covers out of everything held for the user (those
+    /// in `thread`'s scope up to room position `pos`, or all of the scope's when `pos` is not
+    /// known; a line held by an older build has no position and goes with any receipt for its
+    /// scope), drops a room with no line left and an email with no room left, and forgets the
+    /// room's throttle: the user is reading it.
+    pub async fn read(
+        &mut self,
+        user_id: &UserId,
+        room_id: &RoomId,
+        thread: &ReceiptThread,
+        pos: Option<i64>,
+    ) {
+        let covers = |line: &template::NotificationLine| {
+            thread.reads(line.thread.as_deref())
+                && match (pos, line.pos) {
+                    (Some(read), Some(at)) => at <= read,
+                    _ => true,
+                }
+        };
+        let mut touched: Vec<(OwnedUserId, String)> = Vec::new();
+        let mut lines_read = 0usize;
+        for (key, pending) in &mut self.pending {
+            if key.0 != user_id {
+                continue;
+            }
+            let Some(room) = pending.held.rooms.get_mut(room_id) else {
+                continue;
+            };
+            let before = room.lines.len();
+            room.lines.retain(|line| !covers(line));
+            if room.lines.len() == before {
+                continue;
+            }
+            lines_read += before - room.lines.len();
+            if room.lines.is_empty() {
                 pending.held.rooms.remove(room_id);
             }
-            !pending.held.rooms.is_empty()
-        });
+            touched.push(key.clone());
+        }
+        self.pending
+            .retain(|(user, _), pending| user != user_id || !pending.held.rooms.is_empty());
         for key in &touched {
             self.persist(key).await;
+        }
+        if lines_read > 0 {
+            tracing::debug!(
+                user = %user_id,
+                room = %room_id,
+                thread = thread.as_wire().unwrap_or("(unthreaded)"),
+                lines_read,
+                "a receipt took what it read out of a waiting notification email"
+            );
         }
         if let Err(e) = self.deps.throttle.reset_room(user_id, room_id).await {
             tracing::warn!(user = %user_id, room = %room_id, error = %e, "could not reset the email throttle");
@@ -911,6 +980,8 @@ mod tests {
                 "origin_server_ts": 1_700_000_000_000u64,
                 "content": {"msgtype": "m.text", "body": body},
             }),
+            pos: 0,
+            thread: None,
         }
     }
 
@@ -922,17 +993,106 @@ mod tests {
 
     /// A notification the pipeline would have counted: counts first, then the hold.
     async fn notify(h: &mut Harness, room: &RoomId, body: &str) {
+        notify_in(h, room, body, None).await;
+    }
+
+    /// [`notify`] in `thread` (`None`: the main timeline); returns the event's position.
+    async fn notify_in(
+        h: &mut Harness,
+        room: &RoomId,
+        body: &str,
+        thread: Option<&ruma::EventId>,
+    ) -> i64 {
+        let pos = next_pos();
         h.counts
             .record_notification(
                 user_id!("@alice:example.org"),
                 room,
-                Scope::Main,
+                thread.map_or(Scope::Main, Scope::Thread),
                 false,
-                next_pos(),
+                pos,
             )
             .await
             .unwrap();
-        h.worker.hold(message(room, body)).await;
+        let mut notification = message(room, body);
+        notification.pos = pos;
+        notification.thread = thread.map(ToOwned::to_owned);
+        h.worker.hold(notification).await;
+        pos
+    }
+
+    /// The bodies held for alice's address in `room`, oldest first.
+    fn held_lines(h: &Harness, room: &RoomId) -> Vec<String> {
+        h.worker
+            .pending
+            .get(&(
+                user_id!("@alice:example.org").to_owned(),
+                ADDRESS.to_owned(),
+            ))
+            .and_then(|p| p.held.rooms.get(room))
+            .map(|r| {
+                r.lines
+                    .iter()
+                    .map(|l| match &l.text {
+                        LineText::Snippet(body) => body.clone(),
+                        other => format!("{other:?}"),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// A receipt takes out of the waiting email only what it reads: a thread receipt that
+    /// thread's messages up to it, a `main` receipt the main timeline's, an unthreaded one
+    /// both; and the stored copy follows.
+    #[tokio::test(start_paused = true)]
+    async fn a_receipt_takes_out_only_what_it_reads() {
+        let mut h = harness(Settings {
+            delay_before_mail: Duration::from_secs(600),
+            ..settings()
+        })
+        .await;
+        let alice = user_id!("@alice:example.org");
+        let room = room_id!("!threads:example.org");
+        let root = ruma::event_id!("$root:example.org");
+        let a = notify_in(&mut h, room, "main one", None).await;
+        let t1 = notify_in(&mut h, room, "thread one", Some(root)).await;
+        let t2 = notify_in(&mut h, room, "thread two", Some(root)).await;
+        let b = notify_in(&mut h, room, "main two", None).await;
+        assert_eq!(held_lines(&h, room).len(), 4);
+
+        h.worker
+            .read(
+                alice,
+                room,
+                &ReceiptThread::Thread(root.to_owned()),
+                Some(t1),
+            )
+            .await;
+        assert_eq!(
+            held_lines(&h, room),
+            ["main one", "thread two", "main two"],
+            "the thread up to its first message"
+        );
+        h.worker
+            .read(alice, room, &ReceiptThread::Main, Some(a))
+            .await;
+        assert_eq!(held_lines(&h, room), ["thread two", "main two"]);
+        // What is stored follows, so a restart holds the same.
+        let stored = h.held.held_by("hs-0").await.unwrap();
+        assert_eq!(stored[0].2.rooms[room].lines.len(), 2);
+
+        // A thread receipt whose event is not known here reads the whole thread.
+        h.worker
+            .read(alice, room, &ReceiptThread::Thread(root.to_owned()), None)
+            .await;
+        assert_eq!(held_lines(&h, room), ["main two"]);
+        assert!(t2 < b);
+        h.worker
+            .read(alice, room, &ReceiptThread::Unthreaded, Some(b))
+            .await;
+        assert_eq!(h.worker.pending_count(), 0, "everything was read");
+        assert!(h.held.held_by("hs-0").await.unwrap().is_empty());
     }
 
     #[tokio::test(start_paused = true)]
@@ -1127,6 +1287,8 @@ mod tests {
             sender: "Bob".to_owned(),
             ts_ms: 1,
             text: LineText::Snippet("missed you".to_owned()),
+            pos: None,
+            thread: None,
         };
         let mut rooms = BTreeMap::new();
         rooms.insert(

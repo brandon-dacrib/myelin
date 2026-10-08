@@ -195,24 +195,58 @@ impl<B: KvBackend + 'static> EventSource for RegistrySource<B> {
     }
 
     /// The event's timeline position, on any replica: a receipt is taken wherever its sender
-    /// is served, and on a replica that does not own the room this is a read of the stored
-    /// room (`RoomRegistry::read_room`).
+    /// is served. On the replica that owns the room it is the resident actor's answer (the
+    /// room is resident there whenever anyone is reading it). On another replica it is read
+    /// from the event's stored row ([`event_position_by_index`]: two point reads), where until
+    /// 2026-10-08 it was a load of the whole room from the store (`RoomRegistry::read_room`).
+    /// An event of another room, an outlier, or one not stored here has no position.
     async fn event_position(
         &self,
         room_id: &RoomId,
         event_id: &EventId,
     ) -> Result<Option<i64>, String> {
-        let event_id = event_id.to_owned();
-        match self
-            .rooms
-            .read_room(room_id, move |actor| actor.timeline_position(&event_id))
-            .await
-        {
-            Ok(position) => Ok(position),
-            Err(RoomError::RoomNotFound(_)) => Ok(None),
-            Err(e) => Err(e.to_string()),
+        if self.rooms.owns_room(room_id) {
+            let event_id = event_id.to_owned();
+            return match self
+                .rooms
+                .read_room(room_id, move |actor| actor.timeline_position(&event_id))
+                .await
+            {
+                Ok(position) => Ok(position),
+                Err(RoomError::RoomNotFound(_)) => Ok(None),
+                Err(e) => Err(e.to_string()),
+            };
         }
+        let (rooms, room_id, event_id) =
+            (self.rooms.clone(), room_id.to_owned(), event_id.to_owned());
+        tokio::task::spawn_blocking(move || event_position_by_index(&rooms, &room_id, &event_id))
+            .await
+            .map_err(|e| format!("event position lookup failed: {e}"))?
     }
+}
+
+/// `event_id`'s room-local position in `room_id`, from the store's event index without
+/// loading the room (`event_id -> EventSn -> PersistedEvent.room_pos`, written with the
+/// timeline row in one transaction): what [`RegistrySource::event_position`] answers with on a
+/// replica that does not own the room. Blocking (a store read).
+///
+/// # Errors
+/// The store could not be read, or the event's row could not be decoded.
+pub fn event_position_by_index<B: KvBackend>(
+    rooms: &RoomRegistry<B>,
+    room_id: &RoomId,
+    event_id: &EventId,
+) -> Result<Option<i64>, String> {
+    let Some(row) = rooms
+        .find_event_globally(event_id)
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(None);
+    };
+    if row.room_id != room_id.as_str() {
+        return Ok(None);
+    }
+    Ok(row.room_pos)
 }
 
 /// Forwards every update on the registry's global stream to the pipeline, until the stream
@@ -353,5 +387,134 @@ mod tests {
         assert_eq!(smtp.security, hs_push::email::smtp::Security::Tls);
         assert_eq!(smtp.credentials, Some(("u".to_owned(), "p".to_owned())));
         assert!(smtp_settings(&hs_config::EmailConfig::default()).is_none());
+    }
+
+    /// A room of `messages` messages after its creation, and its events' IDs in order.
+    async fn room_with<B: KvBackend + 'static>(
+        rooms: &RoomRegistry<B>,
+        messages: usize,
+    ) -> (ruma::OwnedRoomId, Vec<ruma::OwnedEventId>) {
+        let alice = ruma::user_id!("@alice:example.org").to_owned();
+        let handle = rooms
+            .create_room(
+                alice.clone(),
+                hs_room::actor::CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let mut ids = Vec::new();
+        for i in 0..messages {
+            let event = handle
+                .send_event(
+                    alice.clone(),
+                    "m.room.message".to_owned(),
+                    None,
+                    serde_json::json!({"msgtype": "m.text", "body": format!("message {i}")}),
+                    None,
+                    2 + i64::try_from(i).unwrap(),
+                )
+                .await
+                .unwrap();
+            ids.push(event.event_id().to_owned());
+        }
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+        (room_id, ids)
+    }
+
+    /// A receipt's position read from the event index (another replica's way) is the one the
+    /// room itself has for the event (the owner's way); another room's event, or one not
+    /// stored, has none.
+    #[tokio::test]
+    async fn a_receipts_position_is_the_rooms_own_read_from_the_index() {
+        let rooms = Arc::new(
+            RoomRegistry::open(
+                hs_kv::memory::MemoryBackend::new(),
+                hs_room::identity::HomeserverIdentity::for_tests("example.org"),
+            )
+            .unwrap(),
+        );
+        let (room, ids) = room_with(&rooms, 20).await;
+        let (other, other_ids) = room_with(&rooms, 1).await;
+        let source = RegistrySource::new(rooms.clone());
+        let handle = rooms.get_or_load(&room).await.unwrap();
+        let mut last = 0;
+        for id in &ids {
+            let lookup = id.clone();
+            let from_room = handle.query(move |a| a.timeline_position(&lookup)).await;
+            let indexed = event_position_by_index(&rooms, &room, id).unwrap();
+            assert_eq!(indexed, from_room, "{id}");
+            assert_eq!(source.event_position(&room, id).await.unwrap(), from_room);
+            let pos = indexed.unwrap();
+            assert!(pos > last, "positions go up");
+            last = pos;
+        }
+        assert_eq!(
+            source.event_position(&room, &other_ids[0]).await.unwrap(),
+            None
+        );
+        assert!(
+            source
+                .event_position(&other, &other_ids[0])
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            source
+                .event_position(&room, ruma::event_id!("$nowhere:example.org"))
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    /// What a receipt on a replica that does not own the room cost before (a load of the room
+    /// from the store) and costs now (the index), on Fjall. A measurement, not a check:
+    ///
+    /// ```sh
+    /// cargo test -p hs-cli --lib -- --ignored --nocapture measure_the_receipt_position_lookup
+    /// ```
+    #[tokio::test]
+    #[ignore = "a measurement; run by hand"]
+    async fn measure_the_receipt_position_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = hs_kv::fjall_backend::FjallBackend::open(dir.path()).unwrap();
+        let identity = hs_room::identity::HomeserverIdentity::for_tests("example.org");
+        let rooms = Arc::new(RoomRegistry::open(backend.clone(), identity.clone()).unwrap());
+        for messages in [100usize, 1_000, 5_000] {
+            let (room, ids) = room_with(&rooms, messages).await;
+            let target = ids[messages / 2].clone();
+            let tables = hs_room::persist::Tables::open(&backend).unwrap();
+            let rounds: u32 = 20;
+            let started = std::time::Instant::now();
+            let mut by_load = None;
+            for _ in 0..rounds {
+                let actor = hs_room::actor::RoomActor::load(
+                    backend.clone(),
+                    tables.clone(),
+                    identity.clone(),
+                    &room,
+                )
+                .unwrap()
+                .unwrap();
+                by_load = actor.timeline_position(&target);
+            }
+            let load = started.elapsed() / rounds;
+            let started = std::time::Instant::now();
+            let mut by_index = None;
+            for _ in 0..rounds {
+                by_index = event_position_by_index(&rooms, &room, &target).unwrap();
+            }
+            let index = started.elapsed() / rounds;
+            assert_eq!(by_load, by_index);
+            println!(
+                "room of {messages} messages: load {load:?}, index {index:?} ({:.0}x)",
+                load.as_secs_f64() / index.as_secs_f64().max(1e-9)
+            );
+        }
     }
 }

@@ -18,7 +18,8 @@
 pub mod memory;
 pub mod tables;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use crate::ruleset::Ruleset;
 use ruma::UserId;
@@ -40,6 +41,17 @@ pub trait RulesetStore: Send + Sync {
     /// greater than whatever [`RulesetStore::changed_seq`] returned before this call.
     async fn set_ruleset(&self, user_id: &UserId, ruleset: &Ruleset) -> Result<u64, StoreError>;
 
+    /// [`RulesetStore::set_ruleset`], only if the user's change-seq is still `expected`: the
+    /// write of an edit that started from the ruleset at `expected`. `Ok(None)` when another
+    /// write landed since, and nothing was written. Atomic with that check, across every
+    /// process sharing the store.
+    async fn set_ruleset_if(
+        &self,
+        user_id: &UserId,
+        ruleset: &Ruleset,
+        expected: u64,
+    ) -> Result<Option<u64>, StoreError>;
+
     /// This user's current push-rules change-seq: `0` if they have never had a ruleset written
     /// (the server-default ruleset, which never changes on its own), otherwise whatever the most
     /// recent [`RulesetStore::set_ruleset`] call returned. This is the seam `/sync` (track 05)
@@ -47,6 +59,30 @@ pub trait RulesetStore: Send + Sync {
     /// [`CachedRulesetStore::account_data_for_sync`] and `docs/status/10-push.md`'s "Interfaces
     /// provided".
     async fn changed_seq(&self, user_id: &UserId) -> Result<u64, StoreError>;
+}
+
+#[async_trait::async_trait]
+impl<T: RulesetStore + ?Sized> RulesetStore for Arc<T> {
+    async fn get_ruleset(&self, user_id: &UserId) -> Result<Option<Ruleset>, StoreError> {
+        (**self).get_ruleset(user_id).await
+    }
+
+    async fn set_ruleset(&self, user_id: &UserId, ruleset: &Ruleset) -> Result<u64, StoreError> {
+        (**self).set_ruleset(user_id, ruleset).await
+    }
+
+    async fn set_ruleset_if(
+        &self,
+        user_id: &UserId,
+        ruleset: &Ruleset,
+        expected: u64,
+    ) -> Result<Option<u64>, StoreError> {
+        (**self).set_ruleset_if(user_id, ruleset, expected).await
+    }
+
+    async fn changed_seq(&self, user_id: &UserId) -> Result<u64, StoreError> {
+        (**self).changed_seq(user_id).await
+    }
 }
 
 /// The ruleset a user with no stored rules is evaluated against: the spec's predefined rules,
@@ -75,9 +111,22 @@ pub fn default_ruleset(user_id: &UserId) -> Ruleset {
     Ruleset::server_default(user_id)
 }
 
+/// How many times [`CachedRulesetStore::update_ruleset`] starts a change over because the
+/// ruleset was changed elsewhere (another replica) while it was being edited.
+const UPDATE_ATTEMPTS: usize = 8;
+
+/// Tells the other processes sharing the store that a user's push rules changed, so they drop
+/// their cached copy (`crate::compiled`'s "Across replicas"). `hs-cli` sends it over the
+/// cluster mesh; a single node installs none.
+pub trait RulesetChangeFeed: Send + Sync {
+    /// `user_id`'s rules were written here, at change-seq `seq`. Must not block: delivery is
+    /// best effort and happens in the background.
+    fn changed(&self, user_id: &UserId, seq: u64);
+}
+
 /// A [`RulesetStore`] fronted by a [`RuleCache`]: the seam `crate::compiled`'s module docs
 /// describe. Every read goes through the cache first; every write invalidates the cache entry it
-/// just changed.
+/// just changed, and tells the other replicas when there are any ([`RulesetChangeFeed`]).
 ///
 /// Every change to a ruleset is a read, an edit and a write of the whole thing, so two changes
 /// made at once (a client adding rules for two rooms in parallel, or a rule copied onto an
@@ -85,21 +134,59 @@ pub fn default_ruleset(user_id: &UserId) -> Ruleset {
 /// second write would drop the first one's rule. [`CachedRulesetStore::update_ruleset`] makes
 /// each change under one lock, reading the store rather than the cache, and
 /// [`CachedRulesetStore::set_ruleset`] takes the same lock. Writes are rare (a person editing
-/// their notification settings), so one lock for every user is plenty.
+/// their notification settings), so one lock for every user is plenty. The lock covers one
+/// process; between replicas the write itself is conditional on the change-seq the edit
+/// started from ([`RulesetStore::set_ruleset_if`]), and an edit that lost starts over.
 pub struct CachedRulesetStore<S: RulesetStore> {
     inner: S,
     cache: Arc<RuleCache>,
     writes: tokio::sync::Mutex<()>,
+    /// Told of every write, in a cluster.
+    feed: OnceLock<Arc<dyn RulesetChangeFeed>>,
+    /// How long an entry is used on the evaluation path before its seq is checked against
+    /// the store again; unset (never) on a single node.
+    revalidate_after: OnceLock<Duration>,
 }
 
 impl<S: RulesetStore> CachedRulesetStore<S> {
-    /// Wraps `inner` with a fresh cache.
+    /// Wraps `inner` with a fresh, empty cache.
     pub fn new(inner: S) -> Self {
         Self {
             inner,
             cache: Arc::new(RuleCache::new()),
             writes: tokio::sync::Mutex::new(()),
+            feed: OnceLock::new(),
+            revalidate_after: OnceLock::new(),
         }
+    }
+
+    /// Makes this store cluster-aware: every write is told to `feed`, and a cached entry used
+    /// for evaluation is checked against the store once it is `revalidate_after` old (the
+    /// bound on staleness should a change's message be lost). Set once; a second call is
+    /// ignored and logged.
+    pub fn install_change_feed(
+        &self,
+        feed: Arc<dyn RulesetChangeFeed>,
+        revalidate_after: Duration,
+    ) {
+        if self.feed.set(feed).is_err() || self.revalidate_after.set(revalidate_after).is_err() {
+            tracing::warn!("a push-rule change feed was already installed; keeping the first");
+        }
+    }
+
+    /// Another replica wrote `user_id`'s rules (at `seq`): drops the cached copy, unless it is
+    /// already that one or newer.
+    pub fn changed_elsewhere(&self, user_id: &UserId, seq: u64) {
+        if self
+            .cache
+            .entry(user_id)
+            .is_some_and(|e| e.seq.is_some_and(|held| held >= seq))
+        {
+            return;
+        }
+        self.cache.invalidate(user_id);
+        crate::compiled::count_invalidation("peer");
+        tracing::debug!(user = %user_id, seq, "push rules changed on another replica; cached copy dropped");
     }
 
     /// The underlying store, for callers (the `/pushrules` handlers) that need direct CRUD
@@ -118,38 +205,84 @@ impl<S: RulesetStore> CachedRulesetStore<S> {
     /// The ruleset to evaluate `user_id` against: the cache if warm, otherwise the store's value
     /// (or [`default_ruleset`] if the store has none), caching the result either way. This is the
     /// hot-path call `crate::pushers` and the room-update consumer make once per recipient per
-    /// event.
+    /// event. In a cluster, an entry older than the revalidation interval has its seq checked
+    /// against the store first.
     ///
     /// # Errors
-    /// Propagates the underlying store's error on a cache miss.
+    /// Propagates the underlying store's error on a cache miss or a check.
     pub async fn effective_ruleset(&self, user_id: &UserId) -> Result<Arc<Ruleset>, StoreError> {
-        if let Some(cached) = self.cache.peek(user_id) {
-            return Ok(cached);
+        if let Some(entry) = self.cache.entry(user_id) {
+            let Some(after) = self.revalidate_after.get() else {
+                return Ok(entry.ruleset);
+            };
+            if entry.checked.elapsed() < *after {
+                return Ok(entry.ruleset);
+            }
+            let seq = self.inner.changed_seq(user_id).await?;
+            if entry.seq == Some(seq) {
+                self.cache.confirm(user_id, seq);
+                return Ok(entry.ruleset);
+            }
+            crate::compiled::count_invalidation("stale");
+            tracing::debug!(user = %user_id, seq, "cached push rules were behind the store; read again");
         }
+        Ok(self.load(user_id).await?.0)
+    }
+
+    /// The ruleset as the store has it now, from the cache when the cached copy is current
+    /// (one change-seq read to know), with that change-seq. What a client is shown (`/sync`'s
+    /// `m.push_rules`, `GET /pushrules`), so never a stale copy, cluster or not.
+    ///
+    /// # Errors
+    /// Propagates the underlying store's error.
+    pub async fn current_ruleset(
+        &self,
+        user_id: &UserId,
+    ) -> Result<(Arc<Ruleset>, u64), StoreError> {
+        let seq = self.inner.changed_seq(user_id).await?;
+        if let Some(entry) = self.cache.entry(user_id)
+            && entry.seq == Some(seq)
+        {
+            self.cache.confirm(user_id, seq);
+            return Ok((entry.ruleset, seq));
+        }
+        if self.cache.entry(user_id).is_some() {
+            crate::compiled::count_invalidation("stale");
+            tracing::debug!(user = %user_id, seq, "cached push rules were behind the store; read again");
+        }
+        self.load(user_id).await
+    }
+
+    /// Reads `user_id`'s ruleset and change-seq from the store and caches them, unless a write
+    /// landed meanwhile. The seq is read first: a write between the two reads leaves an entry
+    /// whose seq is behind its ruleset, which the next check reads again (never the reverse).
+    async fn load(&self, user_id: &UserId) -> Result<(Arc<Ruleset>, u64), StoreError> {
         // Taken before the read: a write that lands between the read and the insert below
         // keeps what was read out of the cache (`RuleCache::insert_if_unchanged`).
         let generation = self.cache.generation();
+        let seq = self.inner.changed_seq(user_id).await?;
         let ruleset = match self.inner.get_ruleset(user_id).await? {
             Some(r) => r,
             None => default_ruleset(user_id),
         };
         let ruleset = Arc::new(ruleset);
-        if !self
-            .cache
-            .insert_if_unchanged(user_id.to_owned(), ruleset.clone(), generation)
-        {
+        if !self.cache.insert_if_unchanged(
+            user_id.to_owned(),
+            ruleset.clone(),
+            Some(seq),
+            generation,
+        ) {
             tracing::debug!(user = %user_id, "push rules changed while being read; not cached");
         }
-        Ok(ruleset)
+        Ok((ruleset, seq))
     }
 
-    /// Writes `ruleset` for `user_id` and invalidates the cache so the next
-    /// [`CachedRulesetStore::effective_ruleset`] call re-reads it. Returns the new change-seq (see
-    /// [`RulesetStore::changed_seq`]).
+    /// Writes `user_id`'s ruleset through to the store and invalidates the cache entry, so the
+    /// next [`CachedRulesetStore::effective_ruleset`] call sees the new rules. Returns the new
+    /// change-seq.
     ///
     /// # Errors
-    /// Propagates the underlying store's error; the cache is left untouched on failure (the old
-    /// cached value, if any, is still correct since nothing was written).
+    /// Propagates the underlying store's error.
     pub async fn set_ruleset(
         &self,
         user_id: &UserId,
@@ -157,37 +290,68 @@ impl<S: RulesetStore> CachedRulesetStore<S> {
     ) -> Result<u64, StoreError> {
         let _write = self.writes.lock().await;
         let seq = self.inner.set_ruleset(user_id, ruleset).await?;
-        self.cache.invalidate(user_id);
+        self.written(user_id, seq);
         Ok(seq)
     }
 
+    /// What every write is followed by: the cached copy goes, and the other replicas are told.
+    fn written(&self, user_id: &UserId, seq: u64) {
+        self.cache.invalidate(user_id);
+        crate::compiled::count_invalidation("local");
+        if let Some(feed) = self.feed.get() {
+            feed.changed(user_id, seq);
+        }
+    }
+
     /// Changes `user_id`'s ruleset with `edit`, one change at a time: `edit` is given the
-    /// stored ruleset (or [`default_ruleset`]) as of now, read under the lock every write takes,
-    /// so a change made at the same time cannot be lost under this one. `Ok(Some(value))` from
-    /// `edit` writes the edited ruleset and returns `value` with the new change-seq;
-    /// `Ok(None)` writes nothing; an error writes nothing and is returned.
+    /// stored ruleset (or [`default_ruleset`]) as of now, read under the lock every write here
+    /// takes, so a change made at the same time cannot be lost under this one; and the write
+    /// lands only if nothing (another replica) wrote since that read, else `edit` is given the
+    /// newer ruleset and runs again. `Ok(Some(value))` from `edit` writes the edited ruleset
+    /// and returns `value` with the new change-seq; `Ok(None)` writes nothing; an error writes
+    /// nothing and is returned.
     ///
     /// # Errors
-    /// `edit`'s error, or the underlying store's (converted with `From`).
+    /// `edit`'s error, or the underlying store's (converted with `From`), or a store error
+    /// when the ruleset kept changing elsewhere through every attempt.
     pub async fn update_ruleset<T, E>(
         &self,
         user_id: &UserId,
-        edit: impl FnOnce(&mut Ruleset) -> Result<Option<T>, E>,
+        mut edit: impl FnMut(&mut Ruleset) -> Result<Option<T>, E>,
     ) -> Result<Option<(T, u64)>, E>
     where
         E: From<StoreError>,
     {
         let _write = self.writes.lock().await;
-        let mut ruleset = match self.inner.get_ruleset(user_id).await? {
-            Some(r) => r,
-            None => default_ruleset(user_id),
-        };
-        let Some(value) = edit(&mut ruleset)? else {
-            return Ok(None);
-        };
-        let seq = self.inner.set_ruleset(user_id, &ruleset).await?;
-        self.cache.invalidate(user_id);
-        Ok(Some((value, seq)))
+        for attempt in 1..=UPDATE_ATTEMPTS {
+            // The seq first: a write between the two reads makes the conditional write below
+            // fail, and the edit runs again on what that write left.
+            let expected = self.inner.changed_seq(user_id).await?;
+            let mut ruleset = match self.inner.get_ruleset(user_id).await? {
+                Some(r) => r,
+                None => default_ruleset(user_id),
+            };
+            let Some(value) = edit(&mut ruleset)? else {
+                return Ok(None);
+            };
+            if let Some(seq) = self
+                .inner
+                .set_ruleset_if(user_id, &ruleset, expected)
+                .await?
+            {
+                self.written(user_id, seq);
+                return Ok(Some((value, seq)));
+            }
+            tracing::debug!(
+                user = %user_id,
+                attempt,
+                "push rules changed elsewhere while being edited; editing them again"
+            );
+        }
+        Err(StoreError::Backend(format!(
+            "{user_id}'s push rules kept changing elsewhere through {UPDATE_ATTEMPTS} attempts"
+        ))
+        .into())
     }
 
     /// Everything `/sync` (track 05) needs to decide whether, and what, to include for
@@ -201,7 +365,8 @@ impl<S: RulesetStore> CachedRulesetStore<S> {
     /// token on an incremental one -- exactly the comparison `crate::rulesets`'s module docs and
     /// `docs/status/10-push.md` describe, and the same shape `crate::store::UserStore`'s own
     /// `account_data_seq`/`changed_seq` convention in `hs-user` already uses for every other
-    /// piece of account data.
+    /// piece of account data. The content is the store's as of `changed_seq`
+    /// ([`CachedRulesetStore::current_ruleset`]), whichever replica wrote it.
     ///
     /// # Errors
     /// Propagates the underlying store's error.
@@ -209,8 +374,7 @@ impl<S: RulesetStore> CachedRulesetStore<S> {
         &self,
         user_id: &UserId,
     ) -> Result<PushRulesForSync, StoreError> {
-        let ruleset = self.effective_ruleset(user_id).await?;
-        let changed_seq = self.inner.changed_seq(user_id).await?;
+        let (ruleset, changed_seq) = self.current_ruleset(user_id).await?;
         Ok(PushRulesForSync {
             content: account_data_content(&ruleset),
             changed_seq,
@@ -307,9 +471,178 @@ mod tests {
         ) -> Result<u64, StoreError> {
             self.0.set_ruleset(user_id, ruleset).await
         }
+        async fn set_ruleset_if(
+            &self,
+            user_id: &UserId,
+            ruleset: &Ruleset,
+            expected: u64,
+        ) -> Result<Option<u64>, StoreError> {
+            self.0.set_ruleset_if(user_id, ruleset, expected).await
+        }
         async fn changed_seq(&self, user_id: &UserId) -> Result<u64, StoreError> {
             self.0.changed_seq(user_id).await
         }
+    }
+
+    /// A store that another replica writes to, once, right after this one's first read of the
+    /// ruleset: what a change made on two replicas at once looks like from one of them.
+    struct WrittenElsewhere {
+        inner: InMemoryRulesetStore,
+        pending: std::sync::Mutex<Option<Ruleset>>,
+    }
+
+    #[async_trait::async_trait]
+    impl RulesetStore for WrittenElsewhere {
+        async fn get_ruleset(&self, user_id: &UserId) -> Result<Option<Ruleset>, StoreError> {
+            let read = self.inner.get_ruleset(user_id).await;
+            let elsewhere = self.pending.lock().unwrap().take();
+            if let Some(ruleset) = elsewhere {
+                self.inner.set_ruleset(user_id, &ruleset).await?;
+            }
+            read
+        }
+        async fn set_ruleset(
+            &self,
+            user_id: &UserId,
+            ruleset: &Ruleset,
+        ) -> Result<u64, StoreError> {
+            self.inner.set_ruleset(user_id, ruleset).await
+        }
+        async fn set_ruleset_if(
+            &self,
+            user_id: &UserId,
+            ruleset: &Ruleset,
+            expected: u64,
+        ) -> Result<Option<u64>, StoreError> {
+            self.inner.set_ruleset_if(user_id, ruleset, expected).await
+        }
+        async fn changed_seq(&self, user_id: &UserId) -> Result<u64, StoreError> {
+            self.inner.changed_seq(user_id).await
+        }
+    }
+
+    /// A change another replica made while this one was editing is kept: this replica's
+    /// write is refused, and its edit runs again on the ruleset that change left.
+    #[tokio::test]
+    async fn a_change_made_on_another_replica_meanwhile_is_kept() {
+        let alice = user_id!("@alice:example.org");
+        let mut theirs = default_ruleset(alice);
+        theirs
+            .insert(room_rule("!theirs:example.org"), None, None)
+            .unwrap();
+        let store = CachedRulesetStore::new(WrittenElsewhere {
+            inner: InMemoryRulesetStore::new(),
+            pending: std::sync::Mutex::new(Some(theirs)),
+        });
+        let mut runs = 0;
+        let (_, seq) = store
+            .update_ruleset(alice, |ruleset| {
+                runs += 1;
+                ruleset
+                    .insert(room_rule("!mine:example.org"), None, None)
+                    .map(Some)
+                    .map_err(|e| StoreError::Backend(e.to_string()))
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(runs, 2, "the edit ran again on the newer ruleset");
+        assert_eq!(seq, 2);
+        let (ruleset, _) = store.current_ruleset(alice).await.unwrap();
+        for room in ["!theirs:example.org", "!mine:example.org"] {
+            assert!(
+                ruleset.get(crate::ruleset::RuleKind::Room, room).is_some(),
+                "{room}'s rule was lost"
+            );
+        }
+    }
+
+    /// Records what a [`CachedRulesetStore`] tells the other replicas.
+    #[derive(Default)]
+    struct RecordingFeed(std::sync::Mutex<Vec<(ruma::OwnedUserId, u64)>>);
+
+    impl RulesetChangeFeed for RecordingFeed {
+        fn changed(&self, user_id: &UserId, seq: u64) {
+            self.0.lock().unwrap().push((user_id.to_owned(), seq));
+        }
+    }
+
+    /// Two replicas over one store: a change on one is told to the other, which drops its
+    /// copy; what clients are shown is never stale even without that message; and the
+    /// evaluation path reads the store again once its copy is past the revalidation interval.
+    #[tokio::test]
+    async fn a_change_on_one_replica_reaches_the_others_cache() {
+        let alice = user_id!("@alice:example.org");
+        let shared = Arc::new(InMemoryRulesetStore::new());
+        let a = CachedRulesetStore::new(shared.clone());
+        let b = CachedRulesetStore::new(shared.clone());
+        let feed = Arc::new(RecordingFeed::default());
+        a.install_change_feed(feed.clone(), Duration::from_secs(3600));
+        b.install_change_feed(
+            Arc::new(RecordingFeed::default()),
+            Duration::from_secs(3600),
+        );
+
+        // B has alice's rules cached.
+        assert!(b.effective_ruleset(alice).await.unwrap().room.is_empty());
+        let add = |ruleset: &mut Ruleset| {
+            ruleset
+                .insert(room_rule("!one:example.org"), None, None)
+                .map(Some)
+                .map_err(|e| StoreError::Backend(e.to_string()))
+        };
+        let (_, seq) = a.update_ruleset(alice, add).await.unwrap().unwrap();
+        assert_eq!(*feed.0.lock().unwrap(), [(alice.to_owned(), seq)]);
+
+        // Before the message reaches B: B's evaluation copy is stale (an hour's interval),
+        // but what a client is shown is read through to the store.
+        assert!(b.effective_ruleset(alice).await.unwrap().room.is_empty());
+        let (shown, shown_seq) = b.current_ruleset(alice).await.unwrap();
+        assert_eq!(shown.room.len(), 1);
+        assert_eq!(shown_seq, seq);
+        let sync = b.account_data_for_sync(alice).await.unwrap();
+        assert_eq!(sync.changed_seq, seq);
+
+        // The message: B's next evaluation reads the new rules.
+        b.cache().invalidate(alice);
+        b.effective_ruleset(alice).await.unwrap();
+        a.update_ruleset(alice, |ruleset| {
+            ruleset
+                .remove(crate::ruleset::RuleKind::Room, "!one:example.org")
+                .map(|()| Some(()))
+                .map_err(|e| StoreError::Backend(e.to_string()))
+        })
+        .await
+        .unwrap();
+        let (told, seq) = feed.0.lock().unwrap().last().cloned().unwrap();
+        b.changed_elsewhere(&told, seq);
+        assert!(b.cache().peek(alice).is_none());
+        assert!(b.effective_ruleset(alice).await.unwrap().room.is_empty());
+        // A message about a change B already has is ignored.
+        b.changed_elsewhere(alice, seq);
+        assert!(b.cache().peek(alice).is_some());
+    }
+
+    /// With no message at all, the evaluation path notices a change made elsewhere once its
+    /// copy is past the revalidation interval.
+    #[tokio::test]
+    async fn a_lost_message_is_bounded_by_the_revalidation_interval() {
+        let alice = user_id!("@alice:example.org");
+        let shared = Arc::new(InMemoryRulesetStore::new());
+        let b = CachedRulesetStore::new(shared.clone());
+        b.install_change_feed(Arc::new(RecordingFeed::default()), Duration::ZERO);
+        assert!(b.effective_ruleset(alice).await.unwrap().room.is_empty());
+        let mut edited = default_ruleset(alice);
+        edited
+            .insert(room_rule("!one:example.org"), None, None)
+            .unwrap();
+        shared.set_ruleset(alice, &edited).await.unwrap();
+        assert_eq!(b.effective_ruleset(alice).await.unwrap().room.len(), 1);
+        // And an unchanged copy is kept, its check renewed.
+        let before = b.cache().entry(alice).unwrap().checked;
+        b.effective_ruleset(alice).await.unwrap();
+        assert!(b.cache().entry(alice).unwrap().checked >= before);
+        assert_eq!(b.cache().entry(alice).unwrap().seq, Some(1));
     }
 
     fn room_rule(room: &str) -> crate::ruleset::NewRule {

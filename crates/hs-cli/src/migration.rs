@@ -1040,6 +1040,9 @@ impl<B: KvBackend + 'static> MigrationTarget for StoreTarget<B> {
             .map_err(|e| row(format!("{:?} is not a room id: {e}", receipt.room_id)))?;
         let event_id = ruma::OwnedEventId::try_from(receipt.event_id.as_str())
             .map_err(|e| row(format!("{:?} is not an event id: {e}", receipt.event_id)))?;
+        // Kept in its thread, as Synapse kept it (`receipts_linearized.thread_id`).
+        let thread =
+            hs_push::counts::ReceiptThread::from_wire(receipt.thread_id.as_deref()).map_err(row)?;
         match self.rooms.get_or_load(&room_id).await {
             Ok(_) => {}
             Err(RoomError::RoomNotFound(_)) => {
@@ -1052,7 +1055,7 @@ impl<B: KvBackend + 'static> MigrationTarget for StoreTarget<B> {
             return Ok(Imported::AlreadyThere);
         }
         self.hub
-            .import_receipt(&room_id, &user, kind, event_id, receipt.ts)
+            .import_receipt(&room_id, &user, kind, &thread, event_id, receipt.ts)
             .await
             .map_err(row)?;
         Ok(if check == Check::Missing {
@@ -1537,27 +1540,24 @@ impl<B: KvBackend + 'static> MigrationTarget for StoreTarget<B> {
 
     async fn verify_receipt(&self, receipt: &SynapseReceipt) -> Result<Check, TargetError> {
         let user = user_id(&receipt.user_id)?;
-        let Ok(room_id) = ruma::OwnedRoomId::try_from(receipt.room_id.as_str()) else {
+        let (Ok(room_id), Some(kind), Ok(thread)) = (
+            ruma::OwnedRoomId::try_from(receipt.room_id.as_str()),
+            ReceiptKind::parse(&receipt.receipt_type),
+            hs_push::counts::ReceiptThread::from_wire(receipt.thread_id.as_deref()),
+        ) else {
             return Ok(Check::Missing);
         };
-        let (content, _) = self.hub.receipt_content_for(&room_id, &user).await;
-        let mine = content
-            .as_object()
-            .into_iter()
-            .flatten()
-            .find_map(|(event_id, by_type)| {
-                by_type
-                    .get(&receipt.receipt_type)
-                    .and_then(|users| users.get(user.as_str()))
-                    .map(|r| (event_id.clone(), r.get("ts").and_then(Value::as_u64)))
-            });
-        Ok(match mine {
-            None => Check::Missing,
-            Some((event_id, ts)) if event_id == receipt.event_id && ts == Some(receipt.ts) => {
-                Check::Same
-            }
-            Some((event_id, _)) => Check::Differs(format!("here it is at {event_id}")),
-        })
+        // The user's receipt of that type in that thread, exactly: the room's `m.receipt`
+        // content shows one receipt per event, and a threaded one can hide behind another.
+        Ok(
+            match self.hub.receipt_of(&room_id, &user, kind, &thread).await {
+                None => Check::Missing,
+                Some((event_id, ts)) if event_id == receipt.event_id && ts == receipt.ts => {
+                    Check::Same
+                }
+                Some((event_id, _)) => Check::Differs(format!("here it is at {event_id}")),
+            },
+        )
     }
 }
 // -------------------------------------------------------------------------------------------

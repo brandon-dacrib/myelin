@@ -1941,10 +1941,11 @@ impl Migrator {
     }
 }
 
-/// Why a receipt is not copied, or `None` when it is: this server keeps one `m.read` and one
-/// `m.read.private` receipt per person in a room, for the room as a whole. A receipt for the
-/// room's main timeline (`thread_id` `main`) is taken as one for the room; one in a thread is
-/// left out.
+/// Why a receipt is not copied, or `None` when it is: this server keeps `m.read` and
+/// `m.read.private` receipts, one per person, type and thread in a room (MSC3771), as Synapse
+/// does: an unthreaded one (`thread_id` null), one for the room's main timeline (`main`), and
+/// one per thread (the thread root's event id, which starts with `$`; the target parses it).
+/// Any other type is left out, and so is a `thread_id` that is neither `main` nor an event id.
 #[must_use]
 pub fn receipt_not_copied(receipt: &super::model::SynapseReceipt) -> Option<String> {
     if !matches!(receipt.receipt_type.as_str(), "m.read" | "m.read.private") {
@@ -1955,9 +1956,9 @@ pub fn receipt_not_copied(receipt: &super::model::SynapseReceipt) -> Option<Stri
     }
     match receipt.thread_id.as_deref() {
         None | Some("main") => None,
+        Some(thread) if thread.starts_with('$') => None,
         Some(thread) => Some(format!(
-            "a receipt in thread {thread}: this server keeps one receipt per person and type in \
-             a room, for the room as a whole"
+            "a receipt in thread {thread:?}, which is neither \"main\" nor an event id"
         )),
     }
 }
@@ -2312,5 +2313,33 @@ impl MigrationSource for Migrator {
                 .to_owned(),
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod receipt_rule_tests {
+    use super::receipt_not_copied;
+    use crate::migration::model::SynapseReceipt;
+
+    fn receipt(receipt_type: &str, thread_id: Option<&str>) -> SynapseReceipt {
+        SynapseReceipt {
+            stream_id: 1,
+            room_id: "!room:fixture.test".to_owned(),
+            receipt_type: receipt_type.to_owned(),
+            user_id: "@alice:fixture.test".to_owned(),
+            event_id: "$event".to_owned(),
+            thread_id: thread_id.map(str::to_owned),
+            ts: 1,
+        }
+    }
+
+    #[test]
+    fn read_receipts_are_copied_in_every_thread_and_others_are_not() {
+        for thread in [None, Some("main"), Some("$root")] {
+            assert_eq!(receipt_not_copied(&receipt("m.read", thread)), None);
+            assert_eq!(receipt_not_copied(&receipt("m.read.private", thread)), None);
+        }
+        assert!(receipt_not_copied(&receipt("m.fully_read", None)).is_some());
+        assert!(receipt_not_copied(&receipt("m.read", Some("nonsense"))).is_some());
     }
 }

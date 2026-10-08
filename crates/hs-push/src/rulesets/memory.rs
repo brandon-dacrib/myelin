@@ -55,6 +55,27 @@ impl RulesetStore for InMemoryRulesetStore {
         Ok(next_seq)
     }
 
+    async fn set_ruleset_if(
+        &self,
+        user_id: &UserId,
+        ruleset: &Ruleset,
+        expected: u64,
+    ) -> Result<Option<u64>, StoreError> {
+        let mut rows = self.rows.write().unwrap();
+        let current = rows.get(user_id).map_or(0, |row| row.changed_seq);
+        if current != expected {
+            return Ok(None);
+        }
+        rows.insert(
+            user_id.to_owned(),
+            Row {
+                ruleset: ruleset.clone(),
+                changed_seq: current + 1,
+            },
+        );
+        Ok(Some(current + 1))
+    }
+
     async fn changed_seq(&self, user_id: &UserId) -> Result<u64, StoreError> {
         Ok(self
             .rows

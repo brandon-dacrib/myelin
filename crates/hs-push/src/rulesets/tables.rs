@@ -72,22 +72,54 @@ impl<B: KvBackend> RulesetStore for TablesRulesetStore<B> {
         .map_err(StoreError::from)
     }
 
+    async fn set_ruleset_if(
+        &self,
+        user_id: &UserId,
+        ruleset: &Ruleset,
+        expected: u64,
+    ) -> Result<Option<u64>, StoreError> {
+        let key = (user_id.to_string(),);
+        let uid_bytes = user_id.as_bytes().to_vec();
+        let value = serde_json::to_vec(ruleset)
+            .map_err(|e| StoreError::Backend(format!("encode ruleset: {e}")))?;
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            // Read inside the transaction, so a write that lands after it makes this one
+            // conflict (serializable) rather than overwrite it.
+            let current = txn.get(&self.ruleset_seq, &uid_bytes)?;
+            let current = decode_seq(current.as_deref()).map_err(hs_kv::KvError::backend)?;
+            if current != expected {
+                return Ok(None);
+            }
+            self.rulesets
+                .put(txn, &key, &value)
+                .map_err(hs_kv::KvError::backend)?;
+            let seq = txn.atomic_add(&self.ruleset_seq, &uid_bytes, 1)?;
+            #[allow(clippy::cast_sign_loss, reason = "atomic_add never goes negative here")]
+            Ok(Some(seq as u64))
+        })
+        .map_err(StoreError::from)
+    }
+
     async fn changed_seq(&self, user_id: &UserId) -> Result<u64, StoreError> {
         let snap = self.backend.snapshot();
-        match snap
+        let bytes = snap
             .get(&self.ruleset_seq, user_id.as_bytes())
-            .map_err(StoreError::from)?
-        {
-            Some(bytes) => {
-                let arr: [u8; 8] = bytes
-                    .as_ref()
-                    .try_into()
-                    .map_err(|_| StoreError::Backend("expected an 8-byte counter".to_owned()))?;
-                #[allow(clippy::cast_sign_loss, reason = "atomic_add never goes negative here")]
-                Ok(i64::from_be_bytes(arr) as u64)
-            }
-            None => Ok(0),
+            .map_err(StoreError::from)?;
+        decode_seq(bytes.as_deref())
+    }
+}
+
+/// A change-seq counter's value (`0` when absent).
+fn decode_seq(bytes: Option<&[u8]>) -> Result<u64, StoreError> {
+    match bytes {
+        Some(bytes) => {
+            let arr: [u8; 8] = bytes
+                .try_into()
+                .map_err(|_| StoreError::Backend("expected an 8-byte counter".to_owned()))?;
+            #[allow(clippy::cast_sign_loss, reason = "atomic_add never goes negative here")]
+            Ok(i64::from_be_bytes(arr) as u64)
         }
+        None => Ok(0),
     }
 }
 
@@ -112,5 +144,42 @@ mod tests {
                 .get(crate::ruleset::RuleKind::Underride, ".m.rule.message")
                 .is_some()
         );
+    }
+
+    /// The conditional write lands only at the change-seq it was given.
+    #[tokio::test]
+    async fn a_conditional_write_lands_only_at_the_seq_it_expects() {
+        let store = TablesRulesetStore::open(MemoryBackend::new()).unwrap();
+        let alice = user_id!("@alice:example.org");
+        let mut ruleset = super::super::default_ruleset(alice);
+        assert_eq!(
+            store.set_ruleset_if(alice, &ruleset, 0).await.unwrap(),
+            Some(1)
+        );
+        ruleset
+            .set_enabled(
+                crate::ruleset::RuleKind::Underride,
+                ".m.rule.message",
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            store.set_ruleset_if(alice, &ruleset, 0).await.unwrap(),
+            None,
+            "another write landed since 0"
+        );
+        let stored = store.get_ruleset(alice).await.unwrap().unwrap();
+        assert!(
+            stored
+                .get(crate::ruleset::RuleKind::Underride, ".m.rule.message")
+                .unwrap()
+                .enabled(),
+            "the refused write changed nothing"
+        );
+        assert_eq!(
+            store.set_ruleset_if(alice, &ruleset, 1).await.unwrap(),
+            Some(2)
+        );
+        assert_eq!(store.changed_seq(alice).await.unwrap(), 2);
     }
 }

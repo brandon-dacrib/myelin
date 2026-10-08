@@ -2038,6 +2038,11 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         &metrics,
     )
     .map_err(|e| ServeError::Sessions(Box::new(e)))?;
+    // Push rules across replicas (`crate::push_cluster`): a change on one replica drops the
+    // others' cached copy over the mesh. Nothing in single-node mode; before `spawn_mesh`.
+    if let Some(rulesets) = user_state.hub.push_rules_store() {
+        crate::push_cluster::install(&cluster_handles, rulesets);
+    }
     // Delivery to bridges is counted (`hs_appservice_*`, `hs_appservice::metrics`).
     let appservice_metrics =
         metrics.with_registry(hs_appservice::metrics::AppserviceMetrics::register);

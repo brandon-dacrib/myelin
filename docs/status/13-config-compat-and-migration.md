@@ -4,6 +4,34 @@ Track brief: `docs/workstreams/13-config-compat-and-migration.md`. Owner
 crates/files: `crates/hs-config`, `crates/hs-compat`,
 `tools/synapse_inventory.py`, `docs/synapse-inventory.md`.
 
+## 2026-10-08 (branch `agent/push-receipts`): Synapse's threaded receipts are imported in their threads
+
+The importer took a receipt in a thread other than `main` as "not copied" and a `main` one as
+the room's, because `hs-user`'s receipt store had no thread dimension. It has one now (track
+10's `agent/push-gaps`), so each `receipts_linearized` row is copied in its thread:
+`thread_id` null unthreaded, `main` the main timeline's, an event id that thread's.
+
+- `hs_compat::migration::receipt_not_copied` leaves out only types other than `m.read`/
+  `m.read.private`, and a `thread_id` that is neither `main` nor an event id (`$...`).
+- `hs-cli`'s target (`crates/hs-cli/src/migration.rs`): `import_receipt` parses the thread
+  (`ReceiptThread::from_wire`) and hands it to `SessionHub::import_receipt` (new `thread`
+  argument); `verify_receipt` reads the user's receipt of that type in that thread exactly
+  (`SessionHub::receipt_of`, new), where it read the room's `m.receipt` content, in which one
+  receipt per event is shown and a threaded one can hide behind another.
+- Fixture `synapse-small`: two of alice's lobby receipts added by hand (stream 4, a thread
+  receipt rooted at the first message; stream 5, `main`), `facts.json` `thread_receipt` and
+  `main_receipt`; the README says how they were made and that `populate.py` does not make them.
+- `docs/compat/synapse-importer-mapping.md`'s `receipts_linearized` row says so.
+
+**Verified.** `cargo test -p hs-compat` (the engine against the fixture on PostgreSQL: 4
+receipts copied, alice's two in their threads; `receipt_rule_tests`); real binary,
+`cargo test -p hs-cli --test migration` (4 receipts copied, and `/sync` shows alice's two
+lobby receipts with their `thread_id`s).
+
+**Left.** `populate.py` does not make a thread and the two receipts, so a regeneration of the
+fixture drops them until it does (a real Synapse refuses a thread receipt for an event outside
+the thread). Imported receipts do not move the unread counts (nothing imported does).
+
 ## 2026-10-04 (branch `agent/push-media-gaps`): Synapse's `email` block is translated
 
 The `email` row of `docs/compat/synapse-config-table.md` was Unsupported although the native
