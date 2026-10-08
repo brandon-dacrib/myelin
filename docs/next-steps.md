@@ -85,6 +85,18 @@ without a lock, and a stale cache refill; `hs-push` `update_ruleset`, track 10 t
 unban that lost state resolution overwrote a re-invite in the hub (`drop_memberships_that_lost`).
 **Roll to the first green image of `a1fa71a6` or later.** Nothing is unmerged. OpenAPI 0.1.10, last decision 0032, last RFC 0023.
 
+**Wave 4** (launched 2026-10-08, after clearing the merge queue's 38 GB `target/` and 32 GB of
+stale test images): five agents on the leftovers that need neither the cluster nor a real Synapse.
+`push-receipts` (10, 13: thread-scoped `/notifications` and held mail, threaded receipts imported,
+a cheaper cluster receipt lookup, the push-rule cache across replicas), `appservice-pump` (11: one
+delivery task per appservice, so a silent bridge stalls only itself), `fed-cluster` (06, 04, 07:
+`/send` into a room with no member ignored, the durable-EDU cap as a setting, the announcer
+position per replica, `/members?at=` 404, `/openid/userinfo` with federation off), `ops-harness`
+(14: the Complement lock and per-image BuildKit caches in the repository, the merge queue prunes its
+`target/` and refuses to gate without its PostgreSQL), `web-items` (16, 15: effective server-wide
+values beside overrides, bridge defaults, settings with no reader). Unmerged work shows in
+`git branch -r --no-merged origin/main`.
+
 **What is next, in order:**
 
 1. **Roll the demo** to the first green image of `a70a5975` or later, then the bridge migration in
