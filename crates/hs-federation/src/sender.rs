@@ -176,8 +176,9 @@ pub fn is_durable_edu_type(edu_type: &str) -> bool {
     DURABLE_EDU_TYPES.contains(&edu_type)
 }
 
-/// The default [`SenderConfig::max_queued_durable_edus_per_destination`]: past it a
-/// destination's oldest durable EDU is dropped (and logged at `warn`).
+/// The default [`SenderConfig::max_queued_durable_edus_per_destination`] (and of
+/// `federation.max_queued_durable_edus_per_destination`): past it a destination's oldest durable
+/// EDU is dropped (and logged at `warn`).
 pub const DEFAULT_MAX_QUEUED_DURABLE_EDUS_PER_DESTINATION: usize = 10_000;
 
 /// The default [`SenderConfig::max_queued_pdus_per_destination`] (and of
@@ -231,7 +232,9 @@ pub struct SenderConfig {
     /// `federation.max_queued_pdus_per_destination`.
     pub max_queued_pdus_per_destination: usize,
     /// How many durable EDUs ([`DURABLE_EDU_TYPES`]) a destination keeps waiting before its
-    /// oldest is dropped. [`DEFAULT_MAX_QUEUED_DURABLE_EDUS_PER_DESTINATION`] by default.
+    /// oldest is dropped. [`DEFAULT_MAX_QUEUED_DURABLE_EDUS_PER_DESTINATION`] by default; `hs
+    /// serve` takes it from `federation.max_queued_durable_edus_per_destination`, and replaces
+    /// it live ([`FederationSender::set_max_queued_durable_edus_per_destination`]).
     pub max_queued_durable_edus_per_destination: usize,
 }
 
@@ -335,6 +338,9 @@ struct Shared {
     catch_up_source: std::sync::OnceLock<Arc<dyn CatchUpSource>>,
     /// Where catch-up is counted, once installed ([`FederationSender::install_catch_up_metrics`]).
     catch_up_metrics: std::sync::OnceLock<crate::metrics::CatchUpMetrics>,
+    /// The bound in force on each destination's durable EDUs: `config`'s at first, replaced
+    /// live by [`FederationSender::set_max_queued_durable_edus_per_destination`].
+    max_durable_edus: AtomicUsize,
 }
 
 struct DestinationQueue {
@@ -495,9 +501,29 @@ impl FederationSender {
                 edu_forwarder: std::sync::OnceLock::new(),
                 catch_up_source: std::sync::OnceLock::new(),
                 catch_up_metrics: std::sync::OnceLock::new(),
+                max_durable_edus: AtomicUsize::new(
+                    config.max_queued_durable_edus_per_destination.max(1),
+                ),
             }),
             queues: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Replaces [`SenderConfig::max_queued_durable_edus_per_destination`] for every durable EDU
+    /// queued from now on (`federation.max_queued_durable_edus_per_destination`, hot). A queue
+    /// already longer than the new bound keeps what it holds until its next durable EDU, which
+    /// drops the oldest down to the bound. Zero is taken as one.
+    pub fn set_max_queued_durable_edus_per_destination(&self, max: usize) {
+        self.shared
+            .max_durable_edus
+            .store(max.max(1), Ordering::Release);
+    }
+
+    /// The bound on each destination's durable EDUs in force now
+    /// ([`FederationSender::set_max_queued_durable_edus_per_destination`]).
+    #[must_use]
+    pub fn max_queued_durable_edus_per_destination(&self) -> usize {
+        self.shared.max_durable_edus.load(Ordering::Acquire)
     }
 
     /// Counts every EDU in a transaction a destination accepts into `metrics`
@@ -977,7 +1003,7 @@ impl FederationSender {
         if durable_targets.is_empty() {
             return;
         }
-        let max = self.shared.config.max_queued_durable_edus_per_destination;
+        let max = self.shared.max_durable_edus.load(Ordering::Acquire);
         match self.shared.store.enqueue_durable_edu(
             &durable_targets,
             &edu,
@@ -1102,6 +1128,15 @@ impl FederationSender {
     /// Returns the store's error.
     pub fn store_position(&self, name: &str, position: u64) -> Result<(), OutboundStoreError> {
         self.shared.store.set_cursor(name, position)
+    }
+
+    /// Stores each `(name, position)` of `positions` (see
+    /// [`FederationSender::stored_position`]), in one write where the store can.
+    ///
+    /// # Errors
+    /// Returns the store's error.
+    pub fn store_positions(&self, positions: &[(String, u64)]) -> Result<(), OutboundStoreError> {
+        self.shared.store.set_cursors(positions)
     }
 
     /// Forgets `destination`'s persisted backoff, so its worker -- which re-reads the store
@@ -2383,6 +2418,7 @@ mod tests {
             edu_forwarder: std::sync::OnceLock::new(),
             catch_up_source: std::sync::OnceLock::new(),
             catch_up_metrics: std::sync::OnceLock::new(),
+            max_durable_edus: AtomicUsize::new(1),
         };
         assert_eq!(shared.backoff(1), Duration::from_millis(100));
         assert_eq!(shared.backoff(2), Duration::from_millis(200));
@@ -3135,6 +3171,44 @@ mod tests {
                 .map(|row| row.edu["content"]["message_id"].clone())
                 .collect();
             assert_eq!(kept, vec![serde_json::json!("m1"), serde_json::json!("m2")]);
+
+            // The bound is live (`federation.max_queued_durable_edus_per_destination` is hot):
+            // raised, the queue grows to it; lowered, the next EDU trims the queue down to it.
+            sender.set_max_queued_durable_edus_per_destination(3);
+            assert_eq!(sender.max_queued_durable_edus_per_destination(), 3);
+            for i in 3..5 {
+                sender.enqueue_durable_edu(
+                    [destination.clone()],
+                    "m.direct_to_device",
+                    to_device(i),
+                    None,
+                );
+            }
+            let ids = || -> Vec<Value> {
+                store
+                    .peek_durable_edus(&destination, 10)
+                    .unwrap()
+                    .into_iter()
+                    .map(|row| row.edu["content"]["message_id"].clone())
+                    .collect()
+            };
+            assert_eq!(
+                ids(),
+                vec![
+                    serde_json::json!("m2"),
+                    serde_json::json!("m3"),
+                    serde_json::json!("m4")
+                ]
+            );
+            sender.set_max_queued_durable_edus_per_destination(0);
+            assert_eq!(sender.max_queued_durable_edus_per_destination(), 1);
+            sender.enqueue_durable_edu(
+                [destination.clone()],
+                "m.direct_to_device",
+                to_device(5),
+                None,
+            );
+            assert_eq!(ids(), vec![serde_json::json!("m5")]);
             sender.shutdown();
         }
     }

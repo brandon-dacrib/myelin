@@ -671,3 +671,83 @@ async fn settings_that_had_no_reader_are_read_or_gone() {
     assert_eq!(applies("/auth/password/enabled"), "hot");
     assert_eq!(applies("/server/admin_contact"), "hot");
 }
+
+/// `federation.max_queued_durable_edus_per_destination` (RFC 0023's bound on each server's
+/// waiting to-device and device-list updates) is hot: the sender reads it for each update it
+/// queues, and a save through the admin API reports `federation` reloaded with nothing waiting
+/// for a restart, logs the bound now in force, and counts the setting applied.
+#[tokio::test]
+async fn the_durable_edu_bound_applies_without_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let config_path = dir.path().join("hs.yaml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "server:\n  server_name: \"127.0.0.1:{port}\"\n\
+             listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, federation, health, metrics]\n\
+             storage:\n  backend: embedded\n  data_dir: {:?}\n\
+             media:\n  storage:\n    backend: local\n    path: {:?}\n\
+             federation:\n  ip_range_blocklist: []\n",
+            dir.path().join("db"),
+            dir.path().join("media"),
+        ),
+    )
+    .unwrap();
+
+    let mut hs = HsProcess::serve(&config_path);
+    let setup_line = hs.wait_for(&["setup_link="]);
+    let setup_token = setup_line
+        .rsplit_once("#token=")
+        .unwrap()
+        .1
+        .trim()
+        .to_owned();
+    let nobody = Caller {
+        base: format!("http://127.0.0.1:{port}"),
+        token: None,
+        from: None,
+    };
+    let session = nobody
+        .expect(
+            Method::POST,
+            "/api/v1/setup",
+            Some(json!({"setup_token": setup_token, "username": "ops", "password": "hunter2-first-admin"})),
+            StatusCode::CREATED,
+        )
+        .await;
+    let ops = nobody.with(session["access_token"].as_str().unwrap());
+
+    let schema = ops
+        .expect(Method::GET, "/api/v1/config/schema", None, StatusCode::OK)
+        .await;
+    let applies = schema["settings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["pointer"] == "/federation/max_queued_durable_edus_per_destination")
+        .map(|s| s["applies"].clone());
+    assert_eq!(applies, Some(json!("hot")), "{}", schema["settings"]);
+
+    ops.apply(
+        "federation",
+        json!({"max_queued_durable_edus_per_destination": 25}),
+    )
+    .await;
+    hs.wait_for(&[
+        "max_queued_durable_edus_per_destination=25",
+        "is now in force",
+    ]);
+    let text = metrics(&nobody.base).await;
+    let line = r#"hs_config_settings_applied_total{setting="/federation/max_queued_durable_edus_per_destination",outcome="applied"} 1"#;
+    assert!(text.contains(line), "{line} not in:\n{text}");
+
+    // Zero is refused, as the bound is at least one.
+    ops.expect(
+        Method::PATCH,
+        "/api/v1/config/federation",
+        Some(json!({"max_queued_durable_edus_per_destination": 0})),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+}

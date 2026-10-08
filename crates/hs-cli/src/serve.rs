@@ -238,6 +238,7 @@ fn build_router<B: KvBackend>(
 ) -> (Router, RouteManifest) {
     let auth_router = hs_auth::routes::router().with_state(auth.clone());
     let auth_routes = crate::auth_manifest::routes();
+    let openid_store = auth.store.clone();
     // `GET /capabilities` takes an access token (the `Requester` extractor), so it is built on
     // the auth state rather than in the stateless block below.
     let (capabilities_router, capabilities_manifest) = Builder::<AuthState>::new()
@@ -504,6 +505,18 @@ fn build_router<B: KvBackend>(
                 exchange_manifest.routes,
             );
     }
+    // `/openid/userinfo` is the client side's as much as federation's: an integration manager
+    // checks the OpenID token a user of this server handed it, whether or not this server
+    // federates (Synapse's `openid` listener resource). Unsigned; served with federation off
+    // too (`hs_federation::transport::openid`).
+    let (openid_router, openid_manifest) = hs_federation::transport::openid::router(Arc::new(
+        crate::federation::AuthOpenIdUserinfo::new(openid_store),
+    ));
+    builder = builder.merge_router(
+        "/_matrix/federation/v1",
+        openid_router,
+        openid_manifest.routes,
+    );
     // Mounted with federation off too: a third-party invite in a room of this server's own
     // users needs nothing from other servers.
     builder = builder.merge_router(
@@ -1875,8 +1888,20 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
                 Ok(())
             });
             let client = mount.client.clone();
+            let sender = mount.sender.clone();
             live.on_change("federation", move |config| {
                 let federation = &config.federation;
+                // The durable EDU bound is read for each one queued.
+                let durable_bound =
+                    usize::try_from(federation.max_queued_durable_edus_per_destination)
+                        .unwrap_or(usize::MAX);
+                if sender.max_queued_durable_edus_per_destination() != durable_bound {
+                    sender.set_max_queued_durable_edus_per_destination(durable_bound);
+                    tracing::info!(
+                        max_queued_durable_edus_per_destination = durable_bound,
+                        "the bound on each server's waiting to-device and device-list updates is now in force"
+                    );
+                }
                 inbound.set_allow_public_rooms(federation.allow_public_rooms_over_federation);
                 inbound.set_allow_device_names(federation.allow_device_name_lookup_over_federation);
                 client
@@ -2093,11 +2118,16 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         crate::edu_forward::install(&cluster_handles, &sender);
         // Local device-list changes are announced to the servers that share a room with the
         // user (`crate::edus::DeviceListAnnouncer`), through the same sender.
+        // Each federation shard's place in the device-list stream is moved on by its owner.
         let device_lists = crate::edus::DeviceListAnnouncer::start(
             user_state.hub.clone(),
             e2e_state.clone(),
             sender.clone(),
             server_name.clone(),
+            crate::edus::AnnouncerShards::new(
+                cluster_handles.cluster.ownership().clone(),
+                cluster_handles.layout,
+            ),
         );
         (
             crate::federation_sender::OutboundFederation::start(

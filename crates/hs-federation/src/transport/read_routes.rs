@@ -73,23 +73,6 @@ pub(super) fn add_routes(builder: Builder<FederationState>) -> Builder<Federatio
         )
 }
 
-/// The one federation route that is not called by a homeserver and so carries no `X-Matrix`
-/// signature: `GET /openid/userinfo`, which an integration manager or a widget's backend calls
-/// with the OpenID token a user handed it. [`super::router`] mounts it beside, not inside, the
-/// `X-Matrix` layer (before 2026-10-05 it sat inside, and every real call was refused
-/// "signature verification failed"; `hs serve` answered it ahead of routing instead).
-pub(super) fn add_unsigned_routes(builder: Builder<FederationState>) -> Builder<FederationState> {
-    builder.get(
-        "/openid/userinfo",
-        openid_userinfo,
-        hs_http::router::RouteMeta::new(
-            hs_http::router::Surface::MatrixFederation,
-            hs_http::router::AuthKind::None,
-        )
-        .with_operation_id("federationOpenIdUserinfo"),
-    )
-}
-
 /// Extracts the requesting server's name from the (already-verified, by the layer above) request.
 /// The `X-Matrix` middleware runs before every handler and only forwards requests whose signature
 /// checked out; the origin it verified is not otherwise threaded into extensions in this pass, so
@@ -335,22 +318,6 @@ async fn timestamp_to_event(
         )
         .into_response(),
         Err(e) => room_source_error_to_response(e).into_response(),
-    }
-}
-
-/// `GET /openid/userinfo?access_token=`: `{"sub": user_id}` for a live OpenID token. A missing
-/// token is `401 M_MISSING_TOKEN` and an unknown or expired one `401 M_UNKNOWN_TOKEN`, as
-/// Synapse's `OpenIdUserInfo` answers.
-async fn openid_userinfo(
-    State(state): State<FederationState>,
-    Query(params): Query<std::collections::HashMap<String, String>>,
-) -> Response {
-    let Some(token) = params.get("access_token") else {
-        return MatrixError::missing_token().into_response();
-    };
-    match state.queries.openid_userinfo(token).await {
-        Some(user_id) => axum::Json(serde_json::json!({ "sub": user_id })).into_response(),
-        None => MatrixError::unknown_token("Access Token unknown or expired").into_response(),
     }
 }
 

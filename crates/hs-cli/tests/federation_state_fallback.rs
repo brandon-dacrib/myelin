@@ -1188,3 +1188,103 @@ async fn a_missing_auth_event_is_fetched_by_id_and_its_rejection_carries_over() 
     let _ = sentinel_id;
     server.handle.shutdown().await;
 }
+
+/// Synapse's `on_receive_pdu` ignores a PDU for a room no user of the receiving server is joined
+/// to ("Ignoring PDU ... as we're not in the room"): the sending server has not heard this one
+/// left, or the room's state was reset. So does this server now: while alice is in the room,
+/// bob's message is taken; once she has left, bob's next one, citing the first, is answered `{}`
+/// and not placed (it cited nothing missing, so before this it went into the room), logged and
+/// counted as `not_in_room`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pdu_for_a_room_nobody_here_is_in_is_ignored() {
+    let server = start().await;
+    let peer = spawn_peer().await;
+    let client = reqwest::Client::new();
+    let room = room_with_bob(&client, &server, &peer, "alice", |_, _| {}).await;
+    let r = &room;
+    let message = |prev: &str, depth: i64, body: &str| {
+        pdu(
+            &peer,
+            json!({
+                "type": "m.room.message", "sender": r.bob, "room_id": r.room_id,
+                "origin_server_ts": 1_000 + depth, "depth": depth,
+                "content": {"msgtype": "m.text", "body": body},
+                "prev_events": [prev],
+                "auth_events": r.auth(&r.power_id),
+            }),
+        )
+    };
+    let send = |txn: &'static str, pdu: Value| {
+        let (client, peer, server) = (&client, &peer, &server);
+        async move {
+            let body =
+                json!({"origin": peer.name, "origin_server_ts": 1, "pdus": [pdu], "edus": []});
+            signed(
+                client,
+                peer,
+                server,
+                "PUT",
+                &format!("/_matrix/federation/v1/send/{txn}"),
+                Some(&body),
+            )
+            .await
+        }
+    };
+    let held = |event_id: String| {
+        let (client, peer, server) = (&client, &peer, &server);
+        async move {
+            signed(
+                client,
+                peer,
+                server,
+                "GET",
+                &format!("/_matrix/federation/v1/event/{event_id}"),
+                None,
+            )
+            .await
+            .0
+        }
+    };
+
+    let (first, first_id) = message(&r.join_id, r.join_depth + 1, "while alice is here");
+    let (status, answer) = send("txn-in-room", first).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["pdus"][&first_id], json!({}), "{answer}");
+    assert_eq!(held(first_id.clone()).await, StatusCode::OK);
+
+    let left = client
+        .post(format!(
+            "{}/_matrix/client/v3/rooms/{}/leave",
+            server.base, r.room_id
+        ))
+        .bearer_auth(&r.token)
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert!(left.is_success(), "{left}");
+
+    let dropped = "hs_federation_pdus_dropped_total{reason=\"not_in_room\"}";
+    let before = counter(&metrics(&client, &server.base).await, dropped);
+    let (second, second_id) = message(&first_id, r.join_depth + 2, "after alice left");
+    let (status, answer) = send("txn-not-in-room", second).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["pdus"][&second_id], json!({}), "{answer}");
+    assert_eq!(
+        held(second_id.clone()).await,
+        StatusCode::NOT_FOUND,
+        "the event was not placed"
+    );
+    assert_eq!(
+        counter(&metrics(&client, &server.base).await, dropped),
+        before + 1
+    );
+    assert!(
+        !peer.requested("/get_missing_events/") && !peer.requested("/backfill/"),
+        "nothing was fetched for it: {:?}",
+        peer.requests.lock().unwrap()
+    );
+
+    server.handle.shutdown().await;
+}

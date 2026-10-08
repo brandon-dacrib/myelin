@@ -1,5 +1,4 @@
-//! The small query-data seam this router's `/query/*`, `/user/devices/*` and
-//! `/openid/userinfo` handlers need, kept separate from [`crate::room_source::RoomDataSource`]
+//! The small query-data seam this router's `/query/*` and `/user/devices/*` handlers need, kept separate from [`crate::room_source::RoomDataSource`]
 //! because these are not room-scoped lookups (profile/device/alias data belongs to a user or an
 //! alias, not a room membership check).
 
@@ -20,10 +19,6 @@ pub trait FederationQuerySource: Send + Sync {
 
     /// A local user's device list, in the `/user/devices/{userId}` response shape.
     async fn devices(&self, user_id: &str) -> Option<Value>;
-
-    /// Resolves an OpenID access token (from `/openid/userinfo`) to the local Matrix user ID it
-    /// belongs to.
-    async fn openid_userinfo(&self, access_token: &str) -> Option<String>;
 
     /// Answers `POST /user/keys/query` for `origin`: `device_keys` is the request's field of the
     /// same name (`{user_id: [device_id, ...]}`, an empty list meaning every device). The
@@ -95,7 +90,10 @@ impl FederationQuerySource for InMemoryQuerySource {
     async fn devices(&self, user_id: &str) -> Option<Value> {
         self.devices.lock().unwrap().get(user_id).cloned()
     }
+}
 
+#[async_trait]
+impl super::openid::OpenIdUserinfoSource for InMemoryQuerySource {
     async fn openid_userinfo(&self, access_token: &str) -> Option<String> {
         self.openid_tokens
             .lock()

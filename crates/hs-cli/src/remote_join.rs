@@ -330,6 +330,9 @@ impl<B: KvBackend + 'static> hs_room::remote_join::RemoteJoin for FederationRemo
             )));
         }
         let content = with_synapse_profile_keys(content);
+        // Until the join is held here, what the resident sends over `/send` for the room is
+        // taken, not ignored as for a room nobody of this server is in.
+        let _joining = self.rooms.remote_join_started(room_id);
         let own_name = self.identity.server_name.as_str();
         let mut last_error: Option<RoomError> = None;
         for destination in via.iter().filter(|d| d.as_str() != own_name) {

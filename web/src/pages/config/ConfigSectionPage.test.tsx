@@ -195,9 +195,12 @@ describe("ConfigSectionPage", () => {
         name: "Most changes here take effect at the next restart; some apply on save",
       }),
     );
-    expect(legend.getByText("5 settings")).toBeInTheDocument();
+    expect(legend.getByText("6 settings")).toBeInTheDocument();
     const allowlist = document.getElementById("setting-domain_allowlist")!;
     expect(within(allowlist).getByText("Applies on save")).toBeInTheDocument();
+    // The bound on each server's waiting to-device and device-list updates is read per update.
+    const durable = document.getElementById("setting-max_queued_durable_edus_per_destination")!;
+    expect(within(durable).getByText("Applies on save")).toBeInTheDocument();
     const timeout = document.getElementById("setting-client_timeout")!;
     expect(within(timeout).getByText("Needs a restart")).toBeInTheDocument();
   });

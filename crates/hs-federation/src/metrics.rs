@@ -331,17 +331,35 @@ static PDUS_DROPPED: std::sync::LazyLock<Family<PduDroppedLabels, Counter>> =
 /// Labels of `hs_federation_pdus_dropped_total`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, prometheus_client::encoding::EncodeLabelSet)]
 pub struct PduDroppedLabels {
-    /// `missing_ancestors` (prev events the sending server would not, or could not, supply) or
-    /// `missing_auth_events` (auth events that could not be fetched or judged).
+    /// `missing_ancestors` (prev events the sending server would not, or could not, supply),
+    /// `missing_auth_events` (auth events that could not be fetched or judged), `not_in_room`
+    /// (no user of this server is joined to the room: Synapse's "Ignoring PDU ... as we're not
+    /// in the room") or `unknown_room` (a room this server has never held).
     pub reason: &'static str,
 }
 
-/// Counts one PDU received over `/send` and dropped because what it stands on could not be
-/// obtained (answered `{}`, as Synapse answers every pushed PDU; see `crate::inbound`).
+/// Counts one PDU received over `/send` and dropped, for `reason` ([`PduDroppedLabels`]; see
+/// `crate::inbound` for what each is answered).
 pub fn record_pdu_dropped(reason: &'static str) {
     PDUS_DROPPED
         .get_or_create(&PduDroppedLabels { reason })
         .inc();
+}
+
+static DEVICE_LIST_CATCH_UPS: std::sync::LazyLock<Counter> =
+    std::sync::LazyLock::new(Counter::default);
+
+/// Counts one catch-up of the device-list announcer (`hs-cli`'s `edus::DeviceListAnnouncer`):
+/// federation shards this replica took on whose stored place in the device-list stream was
+/// behind, so the changes since were announced to their destinations now.
+pub fn record_device_list_catch_up() {
+    DEVICE_LIST_CATCH_UPS.inc();
+}
+
+/// How many device-list catch-ups this process ran ([`record_device_list_catch_up`]).
+#[must_use]
+pub fn device_list_catch_ups() -> u64 {
+    DEVICE_LIST_CATCH_UPS.get()
 }
 
 /// How many pushed PDUs were dropped for `reason`, in this process.
@@ -424,9 +442,12 @@ pub fn record_notary_answer(answered: bool) {
 /// - `hs_federation_state_fallbacks_total{outcome}`: missing prev events the `/state_ids`
 ///   fallback tried to take with the state another server answered for them, by outcome
 ///   ([`STATE_FALLBACK_OUTCOMES`]).
-/// - `hs_federation_pdus_dropped_total{reason}`: PDUs received over `/send` and dropped because
-///   their missing prev events (`missing_ancestors`) or auth events (`missing_auth_events`) could
-///   not be obtained.
+/// - `hs_federation_pdus_dropped_total{reason}`: PDUs received over `/send` and dropped
+///   ([`PduDroppedLabels`]): their missing prev events (`missing_ancestors`) or auth events
+///   (`missing_auth_events`) could not be obtained, no user of this server is in their room
+///   (`not_in_room`), or their room is unknown here (`unknown_room`).
+/// - `hs_federation_device_list_catch_ups_total`: federation shards taken on whose device-list
+///   announcements were behind ([`record_device_list_catch_up`]).
 pub fn register_transport_metrics(registry: &mut Registry) {
     // Registered without `_total`: the text encoder appends it.
     registry.register(
@@ -449,9 +470,17 @@ pub fn register_transport_metrics(registry: &mut Registry) {
     );
     registry.register(
         "hs_federation_pdus_dropped",
-        "PDUs received over /send and dropped because their missing prev events \
-         (missing_ancestors) or auth events (missing_auth_events) could not be obtained",
+        "PDUs received over /send and dropped: their missing prev events \
+         (missing_ancestors) or auth events (missing_auth_events) could not be obtained, no user \
+         of this server is joined to their room (not_in_room), or their room is unknown here \
+         (unknown_room)",
         PDUS_DROPPED.clone(),
+    );
+    registry.register(
+        "hs_federation_device_list_catch_ups",
+        "Federation shards taken on whose device-list announcements were behind, and the \
+         changes since announced to their destinations",
+        DEVICE_LIST_CATCH_UPS.clone(),
     );
 }
 

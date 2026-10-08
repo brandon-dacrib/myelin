@@ -509,7 +509,20 @@ async fn profile_propagates_into_join_invite_and_knock_membership_content() {
     carol_member.assert_ok();
     assert_eq!(carol_member.json["displayname"], "Carol");
 
-    // --- a profile change is not retroactive, but re-sending join picks up the new one ---
+    // --- a profile change edits no event already sent, and re-sending join picks up the new
+    // one. `PUT /profile` also re-stamps the member event of every joined room with a new
+    // event (Synapse does the same), in the background, so the room's *state* may say either
+    // name at this point; the join event itself, read by its ID, is what must not change. ---
+    let bob_join = scenario
+        .send(
+            Some("alice"),
+            Method::GET,
+            &format!("/rooms/{room_id}/state/m.room.member/@bob:example.org?format=event"),
+            None,
+        )
+        .await;
+    bob_join.assert_ok();
+    let bob_join_id = bob_join.str_field("event_id").to_string();
     scenario
         .send(
             Some("bob"),
@@ -524,13 +537,13 @@ async fn profile_propagates_into_join_invite_and_knock_membership_content() {
         .send(
             Some("alice"),
             Method::GET,
-            &format!("/rooms/{room_id}/state/m.room.member/@bob:example.org"),
+            &format!("/rooms/{room_id}/event/{bob_join_id}"),
             None,
         )
         .await;
     still_old.assert_ok();
     assert_eq!(
-        still_old.json["displayname"], "Bob T. Builder",
+        still_old.json["content"]["displayname"], "Bob T. Builder",
         "a profile change must not retroactively edit an already-sent membership event"
     );
 

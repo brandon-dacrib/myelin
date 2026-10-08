@@ -1,5 +1,124 @@
 # 06 Federation: status
 
+## 2026-10-08 (branch `agent/fed-cluster`): a room nobody here is in, the durable-EDU bound as a setting, the announcer's place per shard, `/members?at=` 404, `/openid/userinfo` with federation off
+
+Wave 4's leftovers for tracks 06, 04 and 07. Crates: `hs-federation`, `hs-room`, `hs-config`
+(federation section), `hs-cli` (wiring and tests), `web/` (the schema fixture, the mock
+configuration, one unit test). No OpenAPI change, no decision or RFC number taken.
+
+**1. A PDU pushed for a room no user of this server is joined to is ignored** (`hs-federation`
+`inbound`, `hs-cli` `RegistryWriteSink::accept_pushed_event`, `hs-room` `RoomRegistry`), as
+Synapse's `on_receive_pdu` ignores it ("Ignoring PDU ... as we're not in the room"). `/send`'s
+first attempt at a PDU goes through the new `RoomWriteSink::accept_pushed_event` (default:
+`accept_verified_event`); the sink answers the new `WriteOutcome::NotInRoom` when no local user
+is joined, and `/send` answers `{}`, logs it at `info` and counts it in
+`hs_federation_pdus_dropped_total{reason="not_in_room"}`. Nothing is backfilled or fetched for
+it. Two exceptions, both kept: the end of a local user's invite or knock (the inviter's leave
+citing the invite, a resident refusing a knock: `out_of_room_ending`, recorded out of band as
+before; Synapse records a rescinded invite the same way), and a join of the room through another
+server under way in this process (`RoomRegistry::remote_join_started`, a guard
+`FederationRemoteJoin::join` holds; `remote_join_in_progress`), whose resident already sends
+the room's events before the join is held here (Synapse queues them). The invite-out-of-band
+paths `fed-wave3` relies on are unchanged: an invite still arrives over `PUT /invite`, and a
+local user who is joined still gets everything over `/send`. A PDU for a room this server has
+never held is still answered `{"error": "unknown room"}` and is now logged and counted
+(`reason="unknown_room"`). Before, a PDU in a room every local user had left was placed in the
+graph (or, citing what was not held, backfilled for).
+
+**2. `federation.max_queued_durable_edus_per_destination`** (`hs-config`, hot; `hs-federation`
+`FederationSender::set_max_queued_durable_edus_per_destination`; `hs-cli` `serve`). RFC 0023's
+bound (10 000 by default, at least 1) is a setting: the sender reads it for each durable EDU it
+queues, and the `federation` applier puts a change in force at once, logged ("the bound on each
+server's waiting to-device and device-list updates is now in force") and counted in
+`hs_config_settings_applied_total`. Synapse keeps these without a bound and has no equivalent.
+`docs/config.md` and `web/src/test/fixtures/hs-config-schema.json` regenerated; the mock
+configuration carries it; the Configuration page's federation section shows it with "Applies on
+save" (its legend counts six such settings now).
+
+**3. The device-list announcer keeps its place per federation shard** (`hs-cli` `edus`;
+`hs-federation` `OutboundStore::set_cursors`, `FederationSender::store_positions`). Each shard's
+place (`device_list_announcer/federation/{n}`, `edus::announcer_position`) is moved on only by
+the replica that owns the shard, after what it read is in the sender's durable store. A shard a
+replica takes on -- at start, or from a replica that died or left -- is read from its own place,
+and the changes since go to its destinations as whole device lists, logged ("announcing the
+device-list changes federation shards taken on were not told") and counted in
+`hs_federation_device_list_catch_ups_total`. Shards owned at the previous look move together and
+are told differences, as before. A shard with no place yet starts at the old whole-server place
+(`device_list_announcer`, so an upgraded single node resumes where it was) or now. Before, the
+one place for the whole cluster was the furthest any replica read: a replica that died holding
+a shard's lease left the change made meanwhile unannounced to that shard's destinations, since
+the other replica read past it while it could not send there.
+
+**4. `GET /rooms/{roomId}/members?at=` a token no event precedes is `404 M_NOT_FOUND`**
+(`hs-room` `routes::query::get_members`), as Synapse answers ("Can't find event for token"); it
+answered the current members.
+
+**5. `/_matrix/federation/v1/openid/userinfo` is served whether or not federation is enabled**
+(`hs-federation` `transport::openid`, a router of its own on the new `OpenIdUserinfoSource`;
+`hs-cli` `federation::AuthOpenIdUserinfo`, mounted in `build_router` beside the client routes).
+It was inside the federation router (beside the `X-Matrix` layer since `auth-leftovers`), so
+`federation.enabled: false` stopped serving it; an integration manager checks a token there
+whether or not the user's server federates (Synapse's `openid` resource). The federation router
+now has no unsigned route; `FederationQuerySource::openid_userinfo` is gone.
+
+**Also** (coordinator): `hs-room`'s `tests/scenario.rs`
+`profile_propagates_into_join_invite_and_knock_membership_content` asserted the room's *state*
+still had bob's old name after `PUT /profile`, which re-stamps the member event of every joined
+room in the background; it read the new name under load. It now reads the join event itself by
+its ID, which no profile change edits.
+
+**Verified.**
+
+- Unit tests: `hs-federation` 228 (new `inbound::tests::{a_pdu_for_a_room_this_server_is_not_in_is_ignored_and_counted,
+  a_pdu_for_an_unknown_room_is_counted}`, `transport::openid::tests::openid_userinfo_answers_an_unsigned_request`,
+  `transport::tests::the_federation_router_has_no_unsigned_route`,
+  `outbound_store::tests::cursors_are_stored_one_at_a_time_and_together`, the durable-EDU bound
+  test extended to the live bound); `hs-room` (`registry::tests::a_remote_join_is_under_way_while_its_guard_is_held`,
+  `routes::query::tests::members_at_a_token_before_every_event_are_not_found`); `hs-config`
+  (`a_zero_durable_edu_bound_is_rejected`, the web fixture test); `hs-cli` lib
+  (`edus::tests::{a_look_reads_steady_shards_from_their_place_and_taken_ones_from_theirs,
+  each_shard_has_its_own_place}`). The whole of `cargo test -p` for `hs-federation`, `hs-room`,
+  `hs-config` and `hs-cli` (94 result lines, none failed; `HS_CLUSTER_TEST_POSTGRES_DSN` set).
+- Real `hs serve`, new: `federation_state_fallback::a_pdu_for_a_room_nobody_here_is_in_is_ignored`
+  (bob's message taken while alice is in; after she leaves, his next one is `{}`, not held,
+  counted, nothing fetched); `openid_userinfo` (both `federation.enabled` settings; with it off
+  `/version` is still `404`); `config_hot::the_durable_edu_bound_applies_without_a_restart` (the
+  real binary: `hot` in the schema, `PATCH` reloads `federation`, the log line, the
+  applied counter, `0` refused); `members_at` (Complement's `TestGetRoomMembersAtPoint` step for
+  step, and the `404`); `cluster_device_lists` (two replicas on PostgreSQL, one the real binary,
+  `SIGKILL`ed holding B's federation shard; fails on the old announcer with "bob was never told
+  alice's devices changed", passes in 16 s). Unchanged and passing: `federation_membership`,
+  `federation_two_servers`, `third_party_invites_federation`, `guest_access_federation`,
+  `federation_writes`, `push_federated_invite`, `auth_sessions`, `cluster_edus`,
+  `federation_edus`, `federation_restart`, `e2e`.
+- `cargo fmt --all --check`; `cargo clippy -p hs-federation -p hs-room -p hs-config -p hs-cli
+  --all-targets -- -D warnings`: clean. `web/`: `npm run check` and `npm run test:e2e` (68)
+  pass.
+- **Complement** (image `complement-hs-fedcluster:dev`: `complement-hs-main:w3` with this
+  branch's bookworm `hs`; patches applied, under the shared lock): the whole federation
+  `./tests/` package fails only `TestDeviceListsUpdateOverFederationOnRoomJoin`, failing in the
+  measured baseline too (Synapse skips it); csapi `TestGetRoomMembersAtPoint`,
+  `TestGetRoomMembers`, `TestGetFilteredRoomMembers`, `TestRoomMembers` pass.
+- **Sytest** (`SYTEST_HS_BINARY` of this branch): `50federation/{30room-join,31room-send,
+  35room-invite,36state,40devicelists,52soft-fail}.pl` and `30rooms/{12thirdpartyinvite,
+  13guestaccess}.pl`: 90 pass, 2 fail, both failing before this branch ("Can invite unbound 3pid
+  over federation with users from both servers", the test's race, item 6 of 2026-10-05; "If a
+  device list update goes missing, the server resyncs on the next one", inbound, failing since
+  wave 2).
+
+Found on `main`, not changed: a federation `send_join` that reaches a replica not owning the
+room's shard is refused `501 M_HS_INBOUND_INGESTION_UNSUPPORTED` ("fenced: this replica no
+longer owns shard ...") instead of being forwarded to the owner, so a remote join into a
+clustered server fails whenever the room is not on the replica the request lands on
+(`cluster_device_lists` puts its room on the surviving replica's shard to stay clear of it).
+
+**Left.** The join-in-progress mark is per process: in a cluster, a `/send` for a room being
+joined that lands on another replica than the one making the join is still ignored until the
+join is held. `/members?at=` for a point the reader may not see still answers what they may see
+now (Synapse: `403`). A shard's place can be moved on by a replica that lost the shard during
+the look (the place is stored only for shards still owned after it, which narrows but does not
+close the window).
+
 ## 2026-10-05 (branch `agent/fed-wave3`): two regressions, durable EDUs (RFC 0023), dropped PDUs, two Sytest races, bridge aliases over federation
 
 Wave 3's federation brief. Crates: `hs-federation`, `hs-room` (actor: `fetched_state`,

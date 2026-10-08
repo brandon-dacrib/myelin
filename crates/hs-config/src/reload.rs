@@ -259,6 +259,10 @@ pub const SETTINGS: &[Setting] = &[
         "built into the federation sender's queues",
     ),
     hot(
+        "/federation/max_queued_durable_edus_per_destination",
+        "the federation sender reads it for each update it queues",
+    ),
+    hot(
         "/federation/allow_public_rooms_over_federation",
         "the federation routes read it per request",
     ),

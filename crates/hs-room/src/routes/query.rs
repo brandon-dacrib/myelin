@@ -367,65 +367,72 @@ pub async fn get_members<B: KvBackend + 'static>(
     )
     .await?;
     let handle = state.rooms.get_or_load(&room_id).await?;
+    let at_text = filter.at.clone().unwrap_or_default();
     // `members_for_reader`, not `members`: a departed member must not see a member who joined
     // after they left (`room_leave_test.go`'s `TestLeftRoomFixture`).
     let chunk = handle
-        .query(move |actor| {
-            actor.members_for_reader(&requester.user_id).map(|found| {
-                // `at`: the members in the state after the newest event before the token
-                // (Complement's `TestGetRoomMembersAtPoint`, Synapse's reading), when the reader
-                // may see that event; otherwise what they may see now.
-                let found = found.map(|now| {
-                    at.and_then(|at| {
-                        let (newest, _) = actor.paginate(Some(at), Direction::Backward, 1);
-                        let point = newest.first().copied()?;
-                        if !actor
-                            .event_visible_to(point, &requester.user_id)
-                            .unwrap_or(false)
-                        {
-                            return None;
-                        }
-                        let snapshot = actor.state_at_event(point.event_id()).ok()??;
-                        let members: Vec<&hs_model::Event> = snapshot
-                            .state
-                            .iter()
-                            .filter(|e| e.header().event_type == "m.room.member")
-                            .filter_map(|e| actor.event_by_id(e.event_id()))
-                            .collect();
-                        Some(members)
-                    })
-                    .unwrap_or(now)
-                });
-                found
-                    .unwrap_or_default()
-                    .into_iter()
-                    // `membership` and `not_membership`: how a client asks for "everyone who is
-                    // here" without paging through everyone who ever was. Both were ignored, so
-                    // `?not_membership=leave` came back with the people who had left.
-                    .filter(|e| {
-                        let membership = e
-                            .json()
-                            .get("content")
-                            .and_then(hs_model::canonical::CanonicalJsonValue::as_object)
-                            .and_then(|c| c.get("membership"))
-                            .and_then(hs_model::canonical::CanonicalJsonValue::as_str);
-                        filter
-                            .membership
+        .query(move |actor| -> Result<Vec<serde_json::Value>, RoomError> {
+            let found = actor.members_for_reader(&requester.user_id)?;
+            // `at`: the members in the state after the newest event before the token
+            // (Complement's `TestGetRoomMembersAtPoint`, Synapse's reading), when the reader
+            // may see that event; otherwise what they may see now. No event before the token
+            // at all is `404`, as Synapse answers ("Can't find event for token"): there is no
+            // point in the room to read the members at, and the current members are not the
+            // members then.
+            let found = match (found, at) {
+                (Some(now), Some(at)) => {
+                    let (newest, _) = actor.paginate(Some(at), Direction::Backward, 1);
+                    let Some(point) = newest.first().copied() else {
+                        return Err(RoomError::EventNotFound(format!(
+                            "before the token {at_text}"
+                        )));
+                    };
+                    let then = actor
+                        .event_visible_to(point, &requester.user_id)
+                        .unwrap_or(false)
+                        .then(|| actor.state_at_event(point.event_id()).ok().flatten())
+                        .flatten()
+                        .map(|snapshot| {
+                            snapshot
+                                .state
+                                .iter()
+                                .filter(|e| e.header().event_type == "m.room.member")
+                                .filter_map(|e| actor.event_by_id(e.event_id()))
+                                .collect::<Vec<&hs_model::Event>>()
+                        });
+                    Some(then.unwrap_or(now))
+                }
+                (found, _) => found,
+            };
+            Ok(found
+                .unwrap_or_default()
+                .into_iter()
+                // `membership` and `not_membership`: how a client asks for "everyone who is
+                // here" without paging through everyone who ever was. Both were ignored, so
+                // `?not_membership=leave` came back with the people who had left.
+                .filter(|e| {
+                    let membership = e
+                        .json()
+                        .get("content")
+                        .and_then(hs_model::canonical::CanonicalJsonValue::as_object)
+                        .and_then(|c| c.get("membership"))
+                        .and_then(hs_model::canonical::CanonicalJsonValue::as_str);
+                    filter
+                        .membership
+                        .as_deref()
+                        .is_none_or(|want| membership == Some(want))
+                        && filter
+                            .not_membership
                             .as_deref()
-                            .is_none_or(|want| membership == Some(want))
-                            && filter
-                                .not_membership
-                                .as_deref()
-                                .is_none_or(|unwanted| membership != Some(unwanted))
-                    })
-                    .map(|e| {
-                        attach_replaced_state(
-                            client_event_json(e),
-                            actor.replaced_state_for(e, &requester.user_id).as_ref(),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            })
+                            .is_none_or(|unwanted| membership != Some(unwanted))
+                })
+                .map(|e| {
+                    attach_replaced_state(
+                        client_event_json(e),
+                        actor.replaced_state_for(e, &requester.user_id).as_ref(),
+                    )
+                })
+                .collect::<Vec<_>>())
         })
         .await?;
     Ok(Json(json!({"chunk": chunk})).into_response())
@@ -1894,5 +1901,45 @@ mod tests {
             members(None).await,
             vec![alice.to_string(), bob.to_string()]
         );
+    }
+
+    /// `at` a token no event precedes (the room's very start) is `404 M_NOT_FOUND`, as
+    /// Synapse answers ("Can't find event for token"), not the current members.
+    #[tokio::test]
+    async fn members_at_a_token_before_every_event_are_not_found() {
+        let state = app();
+        let alice = user_id!("@alice:hs1");
+        let bob = user_id!("@bob:hs1");
+        let (handle, room_id) = public_room(&state, alice).await;
+        join(&handle, bob).await;
+        let first = handle
+            .query(|actor| {
+                let create = actor
+                    .state_event("m.room.create", "")
+                    .unwrap()
+                    .unwrap()
+                    .event_id()
+                    .to_owned();
+                actor.timeline_position(&create).unwrap()
+            })
+            .await;
+        let response = get_members::<MemoryBackend>(
+            State(state.clone()),
+            Path(room_id.to_string()),
+            Query(MembersQuery {
+                at: Some(PaginationToken::new(first, Direction::Backward).to_string()),
+                ..Default::default()
+            }),
+            requester(alice),
+        )
+        .await
+        .expect_err("no event before the token");
+        let error = response.to_matrix_error();
+        assert_eq!(
+            error.status,
+            axum::http::StatusCode::NOT_FOUND,
+            "{response}"
+        );
+        assert_eq!(error.errcode, hs_http::error::MatrixErrorCode::NotFound);
     }
 }

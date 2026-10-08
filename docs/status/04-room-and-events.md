@@ -2,7 +2,7 @@
 
 Track brief: `docs/workstreams/04-room-and-events.md`. Owner crate: `hs-room`.
 
-Last updated: 2026-10-05 (session 20: a version-12 create event's `room_id`, appservice `?ts=`,
+Last updated: 2026-10-08 (`fed-cluster`: `/members?at=` 404, below). Before that, 2026-10-05 (session 20: a version-12 create event's `room_id`, appservice `?ts=`,
 push rules follow an upgrade, below). Before that, 2026-10-04 (session 19: the room read
 endpoints a client pages and previews with, below).
 Before that, 2026-10-01 (session 16: upgrading a room to version 12; session 15: `POST
@@ -17,6 +17,15 @@ version 12; session 15: `POST /search`, below) and 2026-09-30 (session
 session 13: the state at backfilled history is asked for; session 12: the history between a
 leave and a rejoin; session 11: the client space hierarchy) and 2026-09-28 (session 10: the
 admin API's room long tail).
+
+> **2026-10-08 (branch `agent/fed-cluster`): `/members?at=` before every event, and a join under way.**
+> `GET /rooms/{roomId}/members?at=` a token no event precedes is `404 M_NOT_FOUND`, as Synapse
+> answers (`routes::query::get_members`; `members_at_a_token_before_every_event_are_not_found`).
+> `RoomRegistry::remote_join_started`/`remote_join_in_progress`: a join through another server
+> under way, so `/send` takes the room's events meanwhile while it ignores a room no local user is
+> in (status 06, 2026-10-08). `tests/scenario.rs`'s profile test reads the join event by ID
+> instead of the room's state, which `PUT /profile`'s re-stamp changes. Left: `?at=` a point the
+> reader may not see answers what they may see now (Synapse: `403`).
 
 > **2026-10-05, session 20: how a room's events render, and what follows a member to an
 > upgraded room** (branch `agent/room-render`). Verified in unit tests, against the real binary

@@ -488,6 +488,18 @@ pub trait OutboundStore: Send + Sync {
     /// # Errors
     /// Returns the backend's error.
     fn set_cursor(&self, name: &str, position: u64) -> Result<(), OutboundStoreError>;
+
+    /// Stores each `(name, position)` of `cursors`, in one write where the backend can. The
+    /// default stores them one by one.
+    ///
+    /// # Errors
+    /// Returns the backend's error; with the default, the ones before the failing one are
+    /// stored.
+    fn set_cursors(&self, cursors: &[(String, u64)]) -> Result<(), OutboundStoreError> {
+        cursors
+            .iter()
+            .try_for_each(|(name, position)| self.set_cursor(name, *position))
+    }
 }
 
 /// An [`OutboundStore`] that lives and dies with the process. What a sender built without a
@@ -1615,6 +1627,18 @@ impl<B: KvBackend> OutboundStore for KvOutboundStore<B> {
         })?;
         Ok(())
     }
+
+    fn set_cursors(&self, cursors: &[(String, u64)]) -> Result<(), OutboundStoreError> {
+        if cursors.is_empty() {
+            return Ok(());
+        }
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            cursors.iter().try_for_each(|(name, position)| {
+                txn.put(&self.meta, &cursor_key(name), &position.to_be_bytes())
+            })
+        })?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1634,6 +1658,20 @@ mod tests {
                 Box::new(KvOutboundStore::open(MemoryBackend::new()).unwrap()),
             ),
         ]
+    }
+
+    #[test]
+    fn cursors_are_stored_one_at_a_time_and_together() {
+        for (name, store) in stores() {
+            assert_eq!(store.cursor("a").unwrap(), None, "{name}");
+            store.set_cursor("a", 3).unwrap();
+            store
+                .set_cursors(&[("a".to_owned(), 7), ("b".to_owned(), 9)])
+                .unwrap();
+            store.set_cursors(&[]).unwrap();
+            assert_eq!(store.cursor("a").unwrap(), Some(7), "{name}");
+            assert_eq!(store.cursor("b").unwrap(), Some(9), "{name}");
+        }
     }
 
     #[test]

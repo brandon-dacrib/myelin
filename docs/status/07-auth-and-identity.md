@@ -16,6 +16,14 @@ unfixed (held by another track this session), checked for Element-Web findings i
 `docs/status/16-management-web-interface.md` (none landed as of this write-up), and designed
 (without implementing) a UIA session-correlation scheme left open at the end of session 5).
 
+## 2026-10-08 (branch `agent/fed-cluster`)
+
+`/_matrix/federation/v1/openid/userinfo` is served with `federation.enabled: false` too: it is
+its own router (`hs_federation::transport::openid`, over `hs_cli::federation::AuthOpenIdUserinfo`)
+mounted whenever the client listener runs, as Synapse's `openid` resource can be. Verified on a
+real `hs serve` with both settings (`crates/hs-cli/tests/openid_userinfo.rs`). Details in status
+06, 2026-10-08.
+
 ## 2026-10-05: email password reset, `next_link`, CAS client whitelist and bridge namespaces, admin deactivation unbinds, the public address reload, OpenID outside `X-Matrix` (branch `agent/auth-leftovers`)
 
 What `agent/auth-gaps` left.

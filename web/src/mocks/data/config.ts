@@ -746,6 +746,14 @@ const properties: Record<string, JsonSchemaNode> = {
         description:
           "How many events the outbound queue holds for one destination before it is dropped and the destination, once it answers again, is caught up with the latest event of each room it is behind in instead (it fetches the rest itself). Bounds what a server that is down for days costs this one's database. Corresponds to Synapse's catch-up mode (destination_rooms), which Synapse enters on the first failure; Synapse has no setting for it. At least 1.",
       },
+      max_queued_durable_edus_per_destination: {
+        type: "integer",
+        format: "uint32",
+        minimum: 0,
+        default: 10000,
+        description:
+          "How many to-device messages and device-list and cross-signing key updates this server keeps waiting for one other server before it drops the oldest. They are kept on disk until that server accepts them, so a server that is down for a while still gets the encryption keys and device changes it missed when it is back; this bounds what one that never comes back costs. A dropped update is logged; the other server re-learns a user's devices on their next change or when one of its users asks. Synapse keeps them without a bound and has no setting for it. At least 1; a change applies to the next update queued.",
+      },
       allow_public_rooms_over_federation: {
         type: "boolean",
         default: false,
@@ -1210,6 +1218,7 @@ export const configValues: Record<string, Record<string, JsonValue>> = {
     client_timeout: "45s",
     max_retry_backoff: "1d",
     max_queued_pdus_per_destination: 10000,
+    max_queued_durable_edus_per_destination: 10000,
     allow_public_rooms_over_federation: false,
     allow_device_name_lookup_over_federation: false,
   },

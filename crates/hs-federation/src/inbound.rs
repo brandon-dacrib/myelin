@@ -271,6 +271,12 @@ pub enum WriteOutcome {
     AlreadyKnown,
     /// Newly and durably stored.
     Stored,
+    /// Not taken, and not an error: no user of this server is joined to the room, so the event
+    /// is ignored, as Synapse ignores it ("Ignoring PDU ... as we're not in the room":
+    /// probably a server that has not heard this one left, or a state reset). Only
+    /// [`RoomWriteSink::accept_pushed_event`] answers this. `/send` answers `{}` for it, logs
+    /// it and counts it in `hs_federation_pdus_dropped_total{reason="not_in_room"}`.
+    NotInRoom,
 }
 
 /// Why a [`RoomWriteSink`] could not apply an event.
@@ -340,6 +346,22 @@ pub trait RoomWriteSink: Send + Sync {
         event_id: &str,
         event_json: &Value,
     ) -> Result<WriteOutcome, WriteRejected>;
+
+    /// [`RoomWriteSink::accept_verified_event`] for a PDU another server pushed over `/send`,
+    /// which may first be refused for the room this server is in -- or not: a sink that knows
+    /// no user of this server is joined to the room answers [`WriteOutcome::NotInRoom`] without
+    /// placing it (save the end of a local user's invite or knock, which is recorded out of
+    /// band). Only `/send`'s first attempt at a PDU calls this; backfill and `send_join` call
+    /// [`RoomWriteSink::accept_verified_event`]. The default takes every PDU.
+    async fn accept_pushed_event(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        event_json: &Value,
+    ) -> Result<WriteOutcome, WriteRejected> {
+        self.accept_verified_event(room_id, event_id, event_json)
+            .await
+    }
 
     /// Which of `event_ids` this server does not hold in `room_id` in any form (in the
     /// timeline, as an outlier, or as rejected): what the `/state_ids` fallback
@@ -557,6 +579,15 @@ pub async fn process_transaction(
         };
 
         let Some(room_version_str) = rooms.room_version(room_id).await else {
+            // A room this server has never held: ignored, as Synapse ignores it ("Ignoring PDU
+            // for unknown room_id"). Answered with the error it always was.
+            crate::metrics::record_pdu_dropped("unknown_room");
+            tracing::info!(
+                origin,
+                room_id,
+                event_id = %fallback_id,
+                "ignored a PDU received over federation for a room this server does not know"
+            );
             results.insert(fallback_id, serde_json::json!({"error": "unknown room"}));
             continue;
         };
@@ -601,7 +632,19 @@ pub async fn process_transaction(
         let event_id = event.event_id().to_string();
         let logged_id = event_id.clone();
         let value = event_json(&event);
-        match sink.accept_verified_event(room_id, &event_id, &value).await {
+        match sink.accept_pushed_event(room_id, &event_id, &value).await {
+            // No user of this server is in the room: ignored, as Synapse ignores it, answered
+            // `{}` (Synapse's `process_pdu` answers it so too).
+            Ok(WriteOutcome::NotInRoom) => {
+                crate::metrics::record_pdu_dropped("not_in_room");
+                tracing::info!(
+                    origin,
+                    room_id,
+                    event_id = %event_id,
+                    "ignored a PDU received over federation: no user of this server is in its room"
+                );
+                results.insert(event_id, serde_json::json!({}));
+            }
             Ok(_) => {
                 results.insert(event_id, serde_json::json!({}));
             }
@@ -1137,6 +1180,101 @@ mod tests {
                 assert_eq!(*result, serde_json::json!({}));
             }
         }
+    }
+
+    /// A PDU for a room no user of this server is joined to is ignored: answered `{}`, never
+    /// placed (the sink's `accept_verified_event` is not reached, so nothing is backfilled for
+    /// it either), and counted as `not_in_room`.
+    #[tokio::test]
+    async fn a_pdu_for_a_room_this_server_is_not_in_is_ignored_and_counted() {
+        struct NotIn(std::sync::atomic::AtomicUsize);
+        #[async_trait]
+        impl RoomWriteSink for NotIn {
+            async fn accept_verified_event(
+                &self,
+                _room_id: &str,
+                _event_id: &str,
+                _event_json: &Value,
+            ) -> Result<WriteOutcome, WriteRejected> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(WriteRejected::missing_ancestors(
+                    vec!["$gone".to_owned()],
+                    "missing",
+                ))
+            }
+            async fn accept_pushed_event(
+                &self,
+                _room_id: &str,
+                _event_id: &str,
+                _event_json: &Value,
+            ) -> Result<WriteOutcome, WriteRejected> {
+                Ok(WriteOutcome::NotInRoom)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let keys = OwnSigningKeys::load_or_generate(dir.path()).unwrap();
+        let cache = key_cache(&keys, "origin.example.org");
+        let raw = signed_event(&keys, "!r:origin.example.org", "@alice:origin.example.org");
+        let event_id = Event::parse(&raw, RoomVersionId::V11)
+            .unwrap()
+            .event_id()
+            .to_string();
+        let rooms = room_source("!r:origin.example.org");
+        let sink = NotIn(std::sync::atomic::AtomicUsize::new(0));
+        let before = crate::metrics::pdus_dropped("not_in_room");
+        let response = process_transaction(
+            "origin.example.org",
+            "txn-not-in-room",
+            &serde_json::json!({"pdus": [raw], "edus": []}),
+            &rooms,
+            &sink,
+            &cache,
+            &InMemoryTransactionStore::new(),
+            None,
+            &crate::backfill::BackfillLimits::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["pdus"][event_id.as_str()], serde_json::json!({}));
+        assert_eq!(sink.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(crate::metrics::pdus_dropped("not_in_room") > before);
+    }
+
+    /// A PDU for a room this server has never held is answered with an error, as before, and
+    /// counted as `unknown_room`.
+    #[tokio::test]
+    async fn a_pdu_for_an_unknown_room_is_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = OwnSigningKeys::load_or_generate(dir.path()).unwrap();
+        let cache = key_cache(&keys, "origin.example.org");
+        let raw = signed_event(
+            &keys,
+            "!elsewhere:origin.example.org",
+            "@alice:origin.example.org",
+        );
+        let rooms = room_source("!r:origin.example.org");
+        let before = crate::metrics::pdus_dropped("unknown_room");
+        let response = process_transaction(
+            "origin.example.org",
+            "txn-unknown-room",
+            &serde_json::json!({"pdus": [raw], "edus": []}),
+            &rooms,
+            &StaticWriteSink::new(Vec::<String>::new(), "unknown"),
+            &cache,
+            &InMemoryTransactionStore::new(),
+            None,
+            &crate::backfill::BackfillLimits::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        let results = response["pdus"].as_object().unwrap();
+        assert!(
+            results.values().all(|r| r["error"] == "unknown room"),
+            "{response}"
+        );
+        assert!(crate::metrics::pdus_dropped("unknown_room") > before);
     }
 
     /// A PDU in a room whose server ACL denies the transaction's origin is refused with an

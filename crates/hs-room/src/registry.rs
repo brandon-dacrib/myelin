@@ -145,6 +145,32 @@ pub struct RoomRegistry<B: KvBackend> {
     send_limiter: crate::moderation::SendLimiter,
     /// The room-event search index (`crate::search`), in this registry's store.
     search: crate::search::SearchIndex<B>,
+    /// The rooms a user of this server is joining through another server right now, with how
+    /// many such joins are under way ([`RoomRegistry::remote_join_started`]).
+    joining: Arc<std::sync::Mutex<HashMap<OwnedRoomId, usize>>>,
+}
+
+/// A join through another server under way, from [`RoomRegistry::remote_join_started`] until
+/// this is dropped.
+#[must_use = "the join counts as under way only while this is held"]
+pub struct RemoteJoinInProgress {
+    joining: Arc<std::sync::Mutex<HashMap<OwnedRoomId, usize>>>,
+    room_id: OwnedRoomId,
+}
+
+impl Drop for RemoteJoinInProgress {
+    fn drop(&mut self) {
+        let mut joining = self
+            .joining
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = joining.get_mut(&self.room_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                joining.remove(&self.room_id);
+            }
+        }
+    }
 }
 
 impl<B: KvBackend + 'static> RoomRegistry<B> {
@@ -184,7 +210,37 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
             reports,
             send_limiter: crate::moderation::SendLimiter::new(),
             search,
+            joining: Arc::default(),
         })
+    }
+
+    /// Marks a join of `room_id` through another server as under way, until the returned guard
+    /// is dropped. Between the resident server accepting the join and this server holding it,
+    /// the resident already sends this server the room's new events, while no user of this
+    /// server is joined here yet; `/send` takes them rather than ignoring them as it ignores a
+    /// room this server is not in ([`RoomRegistry::remote_join_in_progress`]; Synapse queues
+    /// them for the same reason). Per process.
+    pub fn remote_join_started(&self, room_id: &ruma::RoomId) -> RemoteJoinInProgress {
+        *self
+            .joining
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(room_id.to_owned())
+            .or_default() += 1;
+        RemoteJoinInProgress {
+            joining: self.joining.clone(),
+            room_id: room_id.to_owned(),
+        }
+    }
+
+    /// Whether a join of `room_id` through another server is under way in this process
+    /// ([`RoomRegistry::remote_join_started`]).
+    #[must_use]
+    pub fn remote_join_in_progress(&self, room_id: &ruma::RoomId) -> bool {
+        self.joining
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(room_id)
     }
 
     /// The room-event search index (`crate::search`).
@@ -895,6 +951,24 @@ mod tests {
             )
             .expect("opening an in-memory registry cannot fail"),
         )
+    }
+
+    /// A join through another server counts as under way while any guard for it is held, and
+    /// only for its own room.
+    #[test]
+    fn a_remote_join_is_under_way_while_its_guard_is_held() {
+        let registry = registry();
+        let room = ruma::room_id!("!joining:elsewhere.test");
+        let other = ruma::room_id!("!other:elsewhere.test");
+        assert!(!registry.remote_join_in_progress(room));
+        let first = registry.remote_join_started(room);
+        let second = registry.remote_join_started(room);
+        assert!(registry.remote_join_in_progress(room));
+        assert!(!registry.remote_join_in_progress(other));
+        drop(first);
+        assert!(registry.remote_join_in_progress(room));
+        drop(second);
+        assert!(!registry.remote_join_in_progress(room));
     }
 
     /// A room ID is the create event's hash from room version 12, so one user creating two rooms

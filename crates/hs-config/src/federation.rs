@@ -23,6 +23,10 @@ const fn default_max_queued_pdus_per_destination() -> u32 {
     10_000
 }
 
+const fn default_max_queued_durable_edus_per_destination() -> u32 {
+    10_000
+}
+
 fn default_ip_range_blocklist() -> Vec<String> {
     vec![
         "127.0.0.0/8".into(),
@@ -137,6 +141,16 @@ pub struct FederationConfig {
     #[serde(default = "default_max_queued_pdus_per_destination")]
     pub max_queued_pdus_per_destination: u32,
 
+    /// How many to-device messages and device-list and cross-signing key updates this server
+    /// keeps waiting for one other server before it drops the oldest. They are kept on disk
+    /// until that server accepts them, so a server that is down for a while still gets the
+    /// encryption keys and device changes it missed when it is back; this bounds what one that
+    /// never comes back costs. A dropped update is logged; the other server re-learns a user's
+    /// devices on their next change or when one of its users asks. Synapse keeps them without
+    /// a bound and has no setting for it. At least 1; a change applies to the next update queued.
+    #[serde(default = "default_max_queued_durable_edus_per_destination")]
+    pub max_queued_durable_edus_per_destination: u32,
+
     /// Whether other servers may read this server's public room directory, so their users can
     /// find this server's public rooms by browsing it. Off by default, as in Synapse.
     /// Corresponds to Synapse's `allow_public_rooms_over_federation`.
@@ -163,6 +177,8 @@ impl Default for FederationConfig {
             client_timeout: default_client_timeout(),
             max_retry_backoff: default_max_retry_backoff(),
             max_queued_pdus_per_destination: default_max_queued_pdus_per_destination(),
+            max_queued_durable_edus_per_destination:
+                default_max_queued_durable_edus_per_destination(),
             allow_public_rooms_over_federation: false,
             allow_device_name_lookup_over_federation: false,
         }
@@ -234,6 +250,12 @@ impl Validate for FederationConfig {
                 "must be at least 1",
             );
         }
+        if self.max_queued_durable_edus_per_destination == 0 {
+            errors.push(
+                format!("{prefix}.max_queued_durable_edus_per_destination"),
+                "must be at least 1",
+            );
+        }
     }
 }
 
@@ -295,6 +317,19 @@ mod tests {
         assert_eq!(
             errors.0[0].path,
             "federation.max_queued_pdus_per_destination"
+        );
+    }
+
+    #[test]
+    fn a_zero_durable_edu_bound_is_rejected() {
+        let mut cfg = FederationConfig::default();
+        assert_eq!(cfg.max_queued_durable_edus_per_destination, 10_000);
+        cfg.max_queued_durable_edus_per_destination = 0;
+        let mut errors = ValidationErrors::new();
+        cfg.validate("federation", &mut errors);
+        assert_eq!(
+            errors.0[0].path,
+            "federation.max_queued_durable_edus_per_destination"
         );
     }
 

@@ -26,7 +26,8 @@
 //!   differs whenever the event is itself a state event. An outlier this server has not placed
 //!   in its timeline has no known state and is `404`, as in Synapse.
 //! - **`/openid/userinfo`** resolves the tokens `POST /user/{userId}/openid/request_token`
-//!   issues (`hs_auth::openid::userinfo`); any other token is `401`.
+//!   issues (`hs_auth::openid::userinfo`); any other token is `401`. [`AuthOpenIdUserinfo`]
+//!   answers it, mounted whether or not federation is enabled.
 //!
 //! Auth chains are computed by walking `auth_events` transitively from the stored events
 //! themselves (bounded by [`MAX_AUTH_CHAIN`]), not from `hs-state`'s chain-cover index: the room
@@ -1063,6 +1064,55 @@ impl<B: KvBackend + 'static> hs_federation::inbound::RoomWriteSink for RegistryW
         }
     }
 
+    /// A PDU pushed for a room no user of this server is joined to is ignored
+    /// ([`WriteOutcome::NotInRoom`](hs_federation::inbound::WriteOutcome::NotInRoom)), as
+    /// Synapse's `on_receive_pdu` ignores it ("Ignoring PDU ... as we're not in the room"):
+    /// whatever this server holds of the room is from when a user of it was there, or the
+    /// shell an invite made, and the event is not placed in it -- a remote server that has
+    /// not heard this one left, or the inviter's server telling the invitee's of the room's
+    /// changes. Two exceptions. The end of a local user's invite or knock is recorded out of
+    /// band (`out_of_room_ending`: the inviter rescinding with a leave that cites the invite,
+    /// a resident refusing a knock), as Synapse records a rescinded invite. And a join of the
+    /// room through another server under way in this process
+    /// (`RoomRegistry::remote_join_in_progress`) takes what the resident sends meanwhile, as
+    /// Synapse queues it.
+    async fn accept_pushed_event(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        event_json: &Value,
+    ) -> Result<hs_federation::inbound::WriteOutcome, hs_federation::inbound::WriteRejected> {
+        use hs_federation::inbound::{WriteOutcome, WriteRejected};
+
+        let Some(handle) = self.handle(room_id).await else {
+            return Err(WriteRejected::other("unknown room"));
+        };
+        let joined = handle.query(|actor| actor.local_user_joined()).await;
+        let joining = ruma::RoomId::parse(room_id)
+            .is_ok_and(|parsed| self.rooms.remote_join_in_progress(&parsed));
+        if joined || joining {
+            return self
+                .accept_verified_event(room_id, event_id, event_json)
+                .await;
+        }
+        let room_version = handle.query(|actor| actor.room_version().clone()).await;
+        let Ok(event) = hs_model::Event::parse(event_json, room_version) else {
+            return Ok(WriteOutcome::NotInRoom);
+        };
+        if !out_of_room_ending(&handle, &event).await {
+            return Ok(WriteOutcome::NotInRoom);
+        }
+        match handle.accept_out_of_room_membership(event).await {
+            Ok(
+                hs_room::actor::RemoteEventOutcome::Stored(_)
+                | hs_room::actor::RemoteEventOutcome::SoftFailed(_),
+            ) => Ok(WriteOutcome::Stored),
+            Ok(hs_room::actor::RemoteEventOutcome::AlreadyKnown) => Ok(WriteOutcome::AlreadyKnown),
+            Err(e @ hs_room::RoomError::Forbidden(_)) => Err(WriteRejected::auth(e.to_string())),
+            Err(e) => Err(WriteRejected::other(e.to_string())),
+        }
+    }
+
     async fn unknown_events(&self, room_id: &str, event_ids: &[String]) -> Vec<String> {
         let Some(handle) = self.handle(room_id).await else {
             return event_ids.to_vec();
@@ -1271,6 +1321,39 @@ impl<B: KvBackend + 'static> hs_federation::invite::InviteSink for RegistryInvit
 // Non-room queries
 // ------------------------------------------------------------------------------------------
 
+/// [`hs_federation::transport::openid::OpenIdUserinfoSource`] over `hs-auth`'s store: the
+/// tokens `POST /user/{userId}/openid/request_token` hands out (`hs_auth::openid`). `hs serve`
+/// mounts `/_matrix/federation/v1/openid/userinfo` on it whatever `federation.enabled` says
+/// (`hs_federation::transport::openid`'s module docs).
+pub struct AuthOpenIdUserinfo {
+    auth: Arc<dyn hs_auth::store::AuthStore>,
+}
+
+impl AuthOpenIdUserinfo {
+    /// Wraps an already-open store.
+    #[must_use]
+    pub fn new(auth: Arc<dyn hs_auth::store::AuthStore>) -> Self {
+        Self { auth }
+    }
+}
+
+#[async_trait]
+impl hs_federation::transport::openid::OpenIdUserinfoSource for AuthOpenIdUserinfo {
+    async fn openid_userinfo(&self, access_token: &str) -> Option<String> {
+        // Tokens from `POST /user/{userId}/openid/request_token` (`hs_auth::openid`).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        match hs_auth::openid::userinfo(self.auth.as_ref(), access_token, now).await {
+            Ok(user) => user.map(|u| u.to_string()),
+            Err(error) => {
+                tracing::warn!(%error, "could not look up an OpenID token");
+                None
+            }
+        }
+    }
+}
+
 /// [`FederationQuerySource`] over this server's auth store (users and devices), `hs-e2e`'s device
 /// key store and `hs-room`'s alias keyspace.
 pub struct ServerQuerySource<B: KvBackend> {
@@ -1416,20 +1499,6 @@ impl<B: KvBackend + 'static> FederationQuerySource for ServerQuerySource<B> {
             "stream_id": stream_id,
             "devices": devices,
         }))
-    }
-
-    async fn openid_userinfo(&self, access_token: &str) -> Option<String> {
-        // Tokens from `POST /user/{userId}/openid/request_token` (`hs_auth::openid`).
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
-        match hs_auth::openid::userinfo(self.auth.as_ref(), access_token, now).await {
-            Ok(user) => user.map(|u| u.to_string()),
-            Err(error) => {
-                tracing::warn!(%error, "could not look up an OpenID token");
-                None
-            }
-        }
     }
 
     async fn keys_query(&self, origin: &str, device_keys: &Value) -> Option<Value> {
@@ -1621,6 +1690,10 @@ pub fn build_mount<B: KvBackend + 'static>(
             store_rescan_interval,
             max_queued_pdus_per_destination: usize::try_from(
                 config.federation.max_queued_pdus_per_destination,
+            )
+            .unwrap_or(usize::MAX),
+            max_queued_durable_edus_per_destination: usize::try_from(
+                config.federation.max_queued_durable_edus_per_destination,
             )
             .unwrap_or(usize::MAX),
             ..hs_federation::sender::SenderConfig::for_client(&client)

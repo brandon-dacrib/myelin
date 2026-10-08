@@ -157,6 +157,7 @@
         "client_timeout": "30s",
         "max_retry_backoff": "1h",
         "max_queued_pdus_per_destination": 10000,
+        "max_queued_durable_edus_per_destination": 10000,
         "allow_public_rooms_over_federation": false,
         "allow_device_name_lookup_over_federation": false
       }
@@ -1517,6 +1518,14 @@
           "minimum": 0,
           "default": 10000,
           "x-applies": "restart"
+        },
+        "max_queued_durable_edus_per_destination": {
+          "description": "How many to-device messages and device-list and cross-signing key updates this server\nkeeps waiting for one other server before it drops the oldest. They are kept on disk\nuntil that server accepts them, so a server that is down for a while still gets the\nencryption keys and device changes it missed when it is back; this bounds what one that\nnever comes back costs. A dropped update is logged; the other server re-learns a user's\ndevices on their next change or when one of its users asks. Synapse keeps them without\na bound and has no setting for it. At least 1; a change applies to the next update queued.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "default": 10000,
+          "x-applies": "hot"
         },
         "allow_public_rooms_over_federation": {
           "description": "Whether other servers may read this server's public room directory, so their users can\nfind this server's public rooms by browsing it. Off by default, as in Synapse.\nCorresponds to Synapse's `allow_public_rooms_over_federation`.",

@@ -124,9 +124,6 @@ mod tests {
         async fn devices(&self, _: &str) -> Option<Value> {
             None
         }
-        async fn openid_userinfo(&self, _: &str) -> Option<String> {
-            None
-        }
         async fn keys_query(&self, origin: &str, device_keys: &Value) -> Option<Value> {
             self.0.lock().unwrap().push(origin.to_owned());
             Some(serde_json::json!({"device_keys": device_keys}))

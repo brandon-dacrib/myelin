@@ -20,6 +20,7 @@ mod join;
 pub mod key_server;
 mod keys;
 mod membership;
+pub mod openid;
 mod queries;
 mod read_routes;
 mod seams;
@@ -153,15 +154,10 @@ pub fn router(
     let builder = join::add_routes(builder);
     let builder = membership::add_routes(builder);
     let builder = keys::add_routes(builder);
-    let (merged, mut manifest) = builder.build();
-    // `/openid/userinfo` is called by whoever holds a user's OpenID token, never signed by a
-    // server: it is merged in after the layer, so the layer does not wrap it.
-    let (unsigned, unsigned_manifest) =
-        read_routes::add_unsigned_routes(Builder::<FederationState>::new()).build();
-    manifest.routes.extend(unsigned_manifest.routes);
-
-    let signed = apply_x_matrix_layer(merged, state.clone(), x_matrix_ctx);
-    (signed.merge(unsigned.with_state(state)), manifest)
+    let (merged, manifest) = builder.build();
+    // `/openid/userinfo`, the one unsigned route under the prefix, is not here: it is served
+    // whether or not federation is enabled ([`openid::router`]).
+    (apply_x_matrix_layer(merged, state, x_matrix_ctx), manifest)
 }
 
 /// Builds the **v2** federation router: `send_join`, `send_leave` and `invite`, under the same
@@ -324,58 +320,23 @@ mod tests {
         }
     }
 
-    /// `/openid/userinfo` is the one route outside the layer, and the only one the manifest
-    /// marks unauthenticated: an unsigned call with a live token gets the user, and without a
-    /// token or with an unknown one the spec's `401` codes rather than the layer's refusal.
+    /// Every route of the federation router is signed: `/openid/userinfo`, the one unsigned
+    /// route under the prefix, is its own router ([`openid::router`]), served with federation
+    /// off too.
     #[tokio::test]
-    async fn openid_userinfo_answers_an_unsigned_request() {
-        let queries = Arc::new(InMemoryQuerySource::default());
-        queries.insert_openid_token("opaque", "@alice:us.example.org");
-        let state = FederationState {
-            queries,
-            ..test_state()
-        };
-        let (router, manifest) = router(state, test_ctx());
+    async fn the_federation_router_has_no_unsigned_route() {
+        let (_router, manifest) = router(test_state(), test_ctx());
         let unsigned: Vec<&str> = manifest
             .routes
             .iter()
             .filter(|r| r.auth == hs_http::router::AuthKind::None)
             .map(|r| r.path.as_str())
             .collect();
-        assert_eq!(unsigned, ["/openid/userinfo"]);
-        for (uri, status, body) in [
-            (
-                "/openid/userinfo?access_token=opaque",
-                StatusCode::OK,
-                serde_json::json!({"sub": "@alice:us.example.org"}),
-            ),
-            (
-                "/openid/userinfo",
-                StatusCode::UNAUTHORIZED,
-                serde_json::json!("M_MISSING_TOKEN"),
-            ),
-            (
-                "/openid/userinfo?access_token=nope",
-                StatusCode::UNAUTHORIZED,
-                serde_json::json!("M_UNKNOWN_TOKEN"),
-            ),
-        ] {
-            let response = router
-                .clone()
-                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(response.status(), status, "{uri}");
-            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            if status == StatusCode::OK {
-                assert_eq!(json, body);
-            } else {
-                assert_eq!(json["errcode"], body, "{uri}");
-            }
-        }
+        assert!(unsigned.is_empty(), "{unsigned:?}");
+        assert!(
+            !manifest.routes.iter().any(|r| r.path == "/openid/userinfo"),
+            "the federation router does not serve /openid/userinfo"
+        );
     }
 
     /// Every route whose path names a `{roomId}` -- `make_join`, `send_join` (both versions),

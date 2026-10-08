@@ -14,9 +14,12 @@
 //! - `rate_limits` — the room layer's [`hs_room::moderation::SendLimiter`] gets the new
 //!   server-wide `message` limit ([`message_limit`]).
 //! - `migration` — read when a migration starts; nothing to swap.
-//! - `federation` (its allow and block lists) — the outbound client's
+//! - `federation` (its allow and block lists, what the inbound routes allow, and the bound on
+//!   each destination's durable EDUs) — the outbound client's
 //!   [`hs_federation::client::DomainPolicy`] and [`hs_federation::client::IpPolicy`] are
-//!   replaced in place. Only when federation is enabled.
+//!   replaced in place, and the sender's
+//!   `FederationSender::set_max_queued_durable_edus_per_destination` is called. Only when
+//!   federation is enabled.
 //! - `network` (`outbound.ipv4_only`) — [`apply_network`] puts the outbound address policy in
 //!   force for every client in the process (`hs_http::outbound`, read per new connection).
 //! - `telemetry` (its log level) — [`hs_telemetry::LogLevelHandle::set_level`], wired in
