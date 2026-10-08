@@ -195,6 +195,22 @@ fn encode_query(fields: &BTreeMap<String, String>) -> String {
     format!("?{}", parts.join("&"))
 }
 
+/// Runs `questions` at once and returns the first answer that is `Some`, dropping (and so
+/// cancelling) the rest; `None` once every one has answered `None`.
+async fn first_yes<F, T>(questions: impl IntoIterator<Item = F>) -> Option<T>
+where
+    F: std::future::Future<Output = Option<T>>,
+{
+    use futures::StreamExt;
+    let mut pending: futures::stream::FuturesUnordered<F> = questions.into_iter().collect();
+    while let Some(answer) = pending.next().await {
+        if answer.is_some() {
+            return answer;
+        }
+    }
+    None
+}
+
 /// Queries the appservice user/room-alias existence protocol and third-party lookups.
 pub struct QueryService<B: KvBackend> {
     registry: Arc<Registry<B>>,
@@ -258,9 +274,11 @@ impl<B: KvBackend> QueryService<B> {
 
     /// Asks each appservice whose user namespace covers `user_id` (`GET
     /// /_matrix/app/v1/users/{userId}`) whether it has that user, as Synapse does for an
-    /// unknown local user before it delivers an event naming them
-    /// (`ApplicationServicesHandler.query_user_exists`). `true` at the first that says yes: by
-    /// the spec it has created the user by then.
+    /// unknown local user (`ApplicationServicesHandler.query_user_exists`). `true` at the first
+    /// that says yes: by the spec it has created the user by then.
+    ///
+    /// The appservices are asked at once, not one after another, so one that never answers
+    /// does not hold up another's answer for the query timeout.
     pub async fn user_exists(&self, user_id: &str) -> bool {
         let rows = match self.registry.interested(NamespaceKind::Users, user_id) {
             Ok(rows) => rows,
@@ -270,11 +288,26 @@ impl<B: KvBackend> QueryService<B> {
             }
         };
         let path = format!("/users/{}", encode_path_segment(user_id));
-        for row in rows {
-            if self.ask(&row, "user", &path).await.is_some() {
-                tracing::info!(appservice = %row.id, user_id, "an appservice provided a user the homeserver asked about");
-                return true;
-            }
+        let asked = rows
+            .iter()
+            .map(|row| async { self.ask(row, "user", &path).await.map(|_| row.id.clone()) });
+        if let Some(appservice) = first_yes(asked).await {
+            tracing::info!(%appservice, user_id, "an appservice provided a user the homeserver asked about");
+            return true;
+        }
+        false
+    }
+
+    /// Asks one appservice, `row`, whether it has `user_id` (`GET
+    /// /_matrix/app/v1/users/{userId}`): what an appservice's own delivery worker asks before
+    /// it sends that appservice an event naming a user of its namespace who has no account
+    /// ([`crate::known_users`]). Asking only the appservice being delivered to is what keeps a
+    /// bridge that never answers from holding up any other bridge's delivery.
+    pub async fn user_exists_at(&self, row: &AppserviceRow, user_id: &str) -> bool {
+        let path = format!("/users/{}", encode_path_segment(user_id));
+        if self.ask(row, "user", &path).await.is_some() {
+            tracing::info!(appservice = %row.id, user_id, "an appservice provided a user the homeserver asked about");
+            return true;
         }
         false
     }
@@ -283,7 +316,8 @@ impl<B: KvBackend> QueryService<B> {
     /// /_matrix/app/v1/rooms/{roomAlias}`) whether it can provide that room, for a local alias
     /// the directory does not hold (`DirectoryHandler.get_association`'s
     /// `query_room_alias_exists`). `true` at the first that says yes: by the spec it has created
-    /// the room and the alias by then, so the caller looks the alias up again.
+    /// the room and the alias by then, so the caller looks the alias up again. Asked at once, as
+    /// [`QueryService::user_exists`] is.
     pub async fn room_alias_exists(&self, alias: &str) -> bool {
         let rows = match self.registry.interested(NamespaceKind::Aliases, alias) {
             Ok(rows) => rows,
@@ -293,11 +327,14 @@ impl<B: KvBackend> QueryService<B> {
             }
         };
         let path = format!("/rooms/{}", encode_path_segment(alias));
-        for row in rows {
-            if self.ask(&row, "room_alias", &path).await.is_some() {
-                tracing::info!(appservice = %row.id, alias, "an appservice provided a room alias the homeserver asked about");
-                return true;
-            }
+        let asked = rows.iter().map(|row| async {
+            self.ask(row, "room_alias", &path)
+                .await
+                .map(|_| row.id.clone())
+        });
+        if let Some(appservice) = first_yes(asked).await {
+            tracing::info!(%appservice, alias, "an appservice provided a room alias the homeserver asked about");
+            return true;
         }
         false
     }

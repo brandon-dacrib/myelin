@@ -26,6 +26,16 @@
 //!   an answer that was not what the spec asks for), `error` (unreachable, or another status), or
 //!   `cached` (protocol metadata answered from the last five minutes).
 //!
+//! - `hs_appservice_queue_depth{appservice}`, `hs_appservice_queue_dead_lettered{appservice}`
+//!   and `hs_appservice_queue_oldest_age_seconds{appservice}`: gauges read from the queue on
+//!   every scrape ([`QueueCollector`]): how many queued entries wait to be sent (a backing-off
+//!   one included; each is one room's page of events or one ephemeral batch, merged up to
+//!   twenty to a transaction), how many ran out of attempts and wait for a replay, and how long
+//!   the oldest waiting one has waited (0 when none does). A bridge that keeps up holds the depth
+//!   near 0 and the age under a second; a depth that climbs while the other bridges' stay flat
+//!   is that bridge falling behind. Reported by the replica that delivers to the appservice
+//!   (the owner of its shard), so a cluster's series never count one queue twice.
+//!
 //! `appservice` is the registration id: bounded by how many bridges an operator runs, and what
 //! the operator looks at the numbers by.
 
@@ -33,6 +43,11 @@ use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::registry::Registry;
 
+use std::sync::Arc;
+
+use hs_kv::KvBackend;
+
+use crate::store::QueueSummary;
 use crate::transaction::BodyCounts;
 
 /// Labels of `hs_appservice_transactions_total`.
@@ -201,6 +216,116 @@ impl AppserviceMetrics {
     }
 }
 
+/// Which appservices' queues this replica reports, and their numbers: what [`QueueCollector`]
+/// reads on every scrape.
+pub type QueueReader = Arc<dyn Fn() -> Vec<(String, QueueSummary)> + Send + Sync>;
+
+/// Renders the queue gauges (see the module docs) on every scrape. Register it with
+/// `registry.register_collector(Box::new(collector))`.
+#[derive(Clone)]
+pub struct QueueCollector {
+    read: QueueReader,
+    now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
+}
+
+impl std::fmt::Debug for QueueCollector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueueCollector").finish_non_exhaustive()
+    }
+}
+
+impl QueueCollector {
+    /// Reports the queue of every appservice in `registry` that `delivers_here` says this
+    /// replica delivers to.
+    #[must_use]
+    pub fn over_registry<B: KvBackend + 'static>(
+        registry: Arc<crate::registry::Registry<B>>,
+        delivers_here: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    ) -> Self {
+        let clock = registry.clone();
+        let read: QueueReader = Arc::new(move || {
+            let rows = match registry.list() {
+                Ok(rows) => rows,
+                Err(error) => {
+                    tracing::warn!(%error, "could not list appservices for the queue gauges");
+                    return Vec::new();
+                }
+            };
+            rows.into_iter()
+                .filter(|row| row.url.is_some() && delivers_here(&row.id))
+                .filter_map(|row| match registry.store().queue_summary(&row.id) {
+                    Ok(summary) => Some((row.id, summary)),
+                    Err(error) => {
+                        tracing::warn!(appservice = %row.id, %error, "could not read an appservice's queue for the queue gauges");
+                        None
+                    }
+                })
+                .collect()
+        });
+        Self {
+            read,
+            now_ms: Arc::new(move || clock.now_ms()),
+        }
+    }
+}
+
+impl prometheus_client::collector::Collector for QueueCollector {
+    fn encode(
+        &self,
+        mut encoder: prometheus_client::encoding::DescriptorEncoder,
+    ) -> Result<(), std::fmt::Error> {
+        use prometheus_client::metrics::MetricType;
+        let mut queues = (self.read)();
+        queues.sort_by(|a, b| a.0.cmp(&b.0));
+        let now = (self.now_ms)();
+
+        let mut family = encoder.encode_descriptor(
+            "hs_appservice_queue_depth",
+            "Queued entries waiting to be sent to an appservice (a backing-off one included), by \
+             appservice",
+            None,
+            MetricType::Gauge,
+        )?;
+        for (id, summary) in &queues {
+            family
+                .encode_family(&[("appservice", id.as_str())])?
+                .encode_gauge(&summary.pending)?;
+        }
+        let mut family = encoder.encode_descriptor(
+            "hs_appservice_queue_dead_lettered",
+            "Queued entries that ran out of delivery attempts and wait for an operator's replay, \
+             by appservice",
+            None,
+            MetricType::Gauge,
+        )?;
+        for (id, summary) in &queues {
+            family
+                .encode_family(&[("appservice", id.as_str())])?
+                .encode_gauge(&summary.dead_lettered)?;
+        }
+        let mut family = encoder.encode_descriptor(
+            "hs_appservice_queue_oldest_age_seconds",
+            "How long the oldest entry waiting to be sent to an appservice has waited (0 when \
+             none waits), by appservice",
+            None,
+            MetricType::Gauge,
+        )?;
+        for (id, summary) in &queues {
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "milliseconds of waiting fit an f64"
+            )]
+            let age = summary
+                .oldest_pending_at_ms
+                .map_or(0.0, |at| now.saturating_sub(at) as f64 / 1000.0);
+            family
+                .encode_family(&[("appservice", id.as_str())])?
+                .encode_gauge(&age)?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,5 +394,92 @@ mod tests {
             !text.contains("kind=\"receipts\""),
             "a zero is not a series: {text}"
         );
+    }
+
+    /// The queue gauges read the queue as it is at the scrape, for the appservices this replica
+    /// delivers to.
+    #[test]
+    fn the_queue_gauges_say_what_waits_for_each_appservice_this_replica_delivers_to() {
+        use crate::registration::Registration;
+        use hs_kv::memory::MemoryBackend;
+        let store = Arc::new(
+            crate::registry::Registry::open(
+                MemoryBackend::new(),
+                ruma::server_name!("example.org"),
+            )
+            .unwrap(),
+        );
+        for id in ["irc", "slack", "elsewhere"] {
+            store
+                .add(
+                    &Registration::parse_yaml(&format!(
+                        "id: {id}\nurl: 'http://{id}'\nas_token: as_{id}\nhs_token: hs_{id}\n\
+                         sender_localpart: {id}bot\nnamespaces: {{}}\n"
+                    ))
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        let now = store.now_ms();
+        for _ in 0..3 {
+            store
+                .store()
+                .enqueue(
+                    "irc",
+                    serde_json::json!({"events": []}),
+                    now.saturating_sub(4_000),
+                )
+                .unwrap();
+        }
+        let seq = store
+            .store()
+            .enqueue("irc", serde_json::json!({"events": []}), now)
+            .unwrap();
+        let mut entry = store
+            .store()
+            .queue_for("irc")
+            .unwrap()
+            .into_iter()
+            .find(|e| e.seq == seq)
+            .unwrap();
+        entry.status = crate::store::QueueStatus::DeadLettered;
+        store.store().put_queue_entry("irc", &entry).unwrap();
+        store
+            .store()
+            .enqueue("elsewhere", serde_json::json!({"events": []}), now)
+            .unwrap();
+
+        let mut registry = Registry::default();
+        registry.register_collector(Box::new(QueueCollector::over_registry(
+            store,
+            Arc::new(|id: &str| id != "elsewhere"),
+        )));
+        let mut text = String::new();
+        prometheus_client::encoding::text::encode(&mut text, &registry).unwrap();
+        assert!(
+            text.contains("hs_appservice_queue_depth{appservice=\"irc\"} 3"),
+            "{text}"
+        );
+        assert!(
+            text.contains("hs_appservice_queue_depth{appservice=\"slack\"} 0"),
+            "{text}"
+        );
+        assert!(
+            text.contains("hs_appservice_queue_dead_lettered{appservice=\"irc\"} 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("hs_appservice_queue_oldest_age_seconds{appservice=\"slack\"} 0"),
+            "{text}"
+        );
+        let age: f64 = text
+            .lines()
+            .find(|l| l.starts_with("hs_appservice_queue_oldest_age_seconds{appservice=\"irc\"}"))
+            .and_then(|l| l.rsplit(' ').next())
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((4.0..60.0).contains(&age), "{text}");
+        assert!(!text.contains("elsewhere"), "another replica's: {text}");
     }
 }

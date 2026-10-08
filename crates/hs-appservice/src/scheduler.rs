@@ -41,6 +41,7 @@ use hs_kv::KvBackend;
 use serde_json::Value;
 
 use crate::error::AppserviceError;
+use crate::known_users::UserQueries;
 use crate::metrics::AppserviceMetrics;
 use crate::registry::Registry;
 use crate::store::{QueueStatus, QueuedTransaction};
@@ -268,6 +269,9 @@ pub struct Scheduler<B: KvBackend> {
     sender: Arc<dyn TransactionSender>,
     config: SchedulerConfig,
     metrics: Option<AppserviceMetrics>,
+    /// Asks an appservice about the unknown users of its namespace a batch names, before the
+    /// batch is sent ([`crate::known_users`]). `None` asks nobody.
+    user_queries: Option<Arc<UserQueries<B>>>,
 }
 
 impl<B: KvBackend> Scheduler<B> {
@@ -284,7 +288,19 @@ impl<B: KvBackend> Scheduler<B> {
             sender,
             config: SchedulerConfig::default(),
             metrics: None,
+            user_queries: None,
         }
+    }
+
+    /// Before each batch is sent to an appservice, asks that appservice about each user of its
+    /// namespace the batch's events name who has no account, and waits for the answers
+    /// ([`crate::known_users`]). The asking is done by whoever calls [`Scheduler::drain`] for
+    /// that appservice -- its own worker -- so a bridge that never answers holds only its own
+    /// delivery.
+    #[must_use]
+    pub fn with_user_queries(mut self, user_queries: Arc<UserQueries<B>>) -> Self {
+        self.user_queries = Some(user_queries);
+        self
     }
 
     /// Overrides the default [`SchedulerConfig`].
@@ -397,6 +413,10 @@ impl<B: KvBackend> Scheduler<B> {
             .map(|e| e.body.clone())
             .reduce(|a, b| merge_json(&a, &b))
             .unwrap_or(Value::Object(serde_json::Map::new()));
+
+        if let Some(user_queries) = &self.user_queries {
+            user_queries.before_delivery(&row, &merged).await;
+        }
 
         let txn_id = through_seq.to_string();
         let outcome = self

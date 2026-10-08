@@ -909,6 +909,20 @@ pub struct AdminAppservice {
     /// Where an operator can go from here. `login_url` is where a bridge with its own login
     /// flow puts it; nothing sets it yet.
     pub links: AdminAppserviceLinks,
+    /// What waits to be sent to it (`AppService.queue`), read when the row is answered.
+    #[serde(default)]
+    pub queue: AdminAppserviceQueue,
+}
+
+/// The OpenAPI `AppServiceQueue` schema: what waits to be sent to one appservice.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminAppserviceQueue {
+    /// Entries waiting to be sent, a backing-off one included.
+    pub pending: u64,
+    /// Entries that ran out of attempts and wait for a replay.
+    pub dead_lettered: u64,
+    /// How long the oldest waiting entry has waited, in milliseconds; `None` when none waits.
+    pub oldest_pending_age_ms: Option<u64>,
 }
 
 /// `AppService.links`.

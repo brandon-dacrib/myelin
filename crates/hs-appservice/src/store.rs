@@ -189,6 +189,17 @@ pub struct QueuedTransaction {
     pub last_error: Option<String>,
 }
 
+/// [`AppserviceStore::queue_summary`]: one appservice's queue in three numbers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueueSummary {
+    /// Entries waiting to be sent, those backing off after a failure included.
+    pub pending: u64,
+    /// Entries that ran out of attempts and wait for an operator's replay.
+    pub dead_lettered: u64,
+    /// When the oldest waiting entry was queued; `None` when nothing waits.
+    pub oldest_pending_at_ms: Option<u64>,
+}
+
 /// The [`AppserviceStore`] `pump_meta` row whose presence means the pump has started before.
 const PUMP_STARTED: &str = "started";
 
@@ -700,6 +711,42 @@ impl<B: KvBackend> AppserviceStore<B> {
                 decode(&v)
             })
             .collect()
+    }
+
+    /// How many of `id`'s queue entries are waiting to be sent and how many are dead-lettered,
+    /// and when the oldest waiting one was queued: the queue gauges
+    /// ([`crate::metrics::QueueCollector`]) and the admin API's `AppService.queue`. Reads each
+    /// entry's status without building its body.
+    ///
+    /// # Errors
+    /// Returns [`AppserviceError::Store`]/[`AppserviceError::Decode`] on failure.
+    pub fn queue_summary(&self, id: &str) -> Result<QueueSummary, AppserviceError> {
+        /// A queue row without its body.
+        #[derive(Deserialize)]
+        struct Head {
+            enqueued_at_ms: u64,
+            status: QueueStatus,
+        }
+        let snap = self.backend.snapshot();
+        let prefix = TypedKeyspace::<B::Keyspace, (String, u64)>::prefix(&(id.to_string(),));
+        let mut summary = QueueSummary::default();
+        for item in self.txn_queue.range(&snap, prefix) {
+            let (_k, v) = item?;
+            let head: Head = decode(&v)?;
+            match head.status {
+                QueueStatus::Pending => {
+                    summary.pending += 1;
+                    summary.oldest_pending_at_ms = Some(
+                        summary
+                            .oldest_pending_at_ms
+                            .map_or(head.enqueued_at_ms, |at| at.min(head.enqueued_at_ms)),
+                    );
+                }
+                QueueStatus::DeadLettered => summary.dead_lettered += 1,
+                QueueStatus::Delivered => {}
+            }
+        }
+        Ok(summary)
     }
 
     /// Overwrites one queue entry (used by the scheduler to record an attempt's outcome).

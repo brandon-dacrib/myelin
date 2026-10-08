@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { bridgeHealthMeta, formatBacklogEntry } from "./bridge-state";
+import { bridgeHealthMeta, describeQueue, formatBacklogEntry } from "./bridge-state";
 
 describe("formatBacklogEntry", () => {
   it("formats a pending entry's age in minutes", () => {
@@ -27,5 +27,35 @@ describe("bridgeHealthMeta", () => {
 
   it("treats paused as muted", () => {
     expect(bridgeHealthMeta.paused.status).toBe("muted");
+  });
+});
+
+describe("describeQueue", () => {
+  it("says a bridge with nothing waiting is up to date", () => {
+    expect(describeQueue({ pending: 0, dead_lettered: 0, oldest_pending_age_ms: null })).toEqual({
+      text: "Up to date",
+      status: "success",
+    });
+  });
+
+  it("says how much waits and for how long, and warns past a minute", () => {
+    expect(describeQueue({ pending: 3, dead_lettered: 0, oldest_pending_age_ms: 4_000 })).toEqual({
+      text: "3 waiting, oldest 4s",
+      status: "neutral",
+    });
+    expect(
+      describeQueue({ pending: 12, dead_lettered: 0, oldest_pending_age_ms: 130_000 }).status,
+    ).toBe("warning");
+  });
+
+  it("puts dead-lettered transactions in red", () => {
+    expect(describeQueue({ pending: 1, dead_lettered: 2, oldest_pending_age_ms: 5_000 })).toEqual({
+      text: "1 waiting, oldest 5s · 2 failed",
+      status: "danger",
+    });
+  });
+
+  it("reads as a dash from a server that sends no queue", () => {
+    expect(describeQueue(undefined).text).toBe("—");
   });
 });

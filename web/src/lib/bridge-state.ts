@@ -1,4 +1,5 @@
-import type { AppService, AppServiceHealthStatus } from "@/api/bridges";
+import type { AppService, AppServiceHealthStatus, AppServiceQueue } from "@/api/bridges";
+import { formatDuration } from "@/lib/format";
 import type { BadgeProps } from "@/components/ui/badge/Badge";
 
 /**
@@ -38,4 +39,33 @@ export function formatBacklogEntry(ageMs: number, deadLettered: boolean): string
   const age =
     seconds >= 3600 ? `${Math.round(seconds / 3600)} h` : `${Math.round(seconds / 60)} min`;
   return deadLettered ? `Dead-lettered, ${age} old` : `Pending, ${age} old`;
+}
+
+/** Past this, a bridge's oldest waiting transaction is worth a warning colour in the list. */
+const QUEUE_BEHIND_MS = 60_000;
+
+/**
+ * `AppService.queue` in words for the bridges list: "Up to date", or how many transactions wait
+ * and how long the oldest has waited, and how many ran out of attempts. The colour says whether
+ * to look: a bridge whose oldest transaction has waited over a minute is falling behind, and a
+ * dead-lettered one needs a replay from its page. A server older than OpenAPI 0.1.11 sends no
+ * queue, which reads as a dash.
+ */
+export function describeQueue(queue: AppServiceQueue | undefined): {
+  text: string;
+  status: NonNullable<BadgeProps["status"]>;
+} {
+  if (!queue) return { text: "—", status: "neutral" };
+  const parts: string[] = [];
+  let status: NonNullable<BadgeProps["status"]> = "success";
+  if (queue.pending > 0) {
+    const age = queue.oldest_pending_age_ms ?? 0;
+    parts.push(`${queue.pending} waiting, oldest ${formatDuration(age)}`);
+    status = age > QUEUE_BEHIND_MS ? "warning" : "neutral";
+  }
+  if (queue.dead_lettered > 0) {
+    parts.push(`${queue.dead_lettered} failed`);
+    status = "danger";
+  }
+  return parts.length === 0 ? { text: "Up to date", status } : { text: parts.join(" · "), status };
 }

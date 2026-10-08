@@ -154,6 +154,7 @@ mod tests {
             created_at: "2026-09-25T00:00:00.000Z".to_owned(),
             bridge_type: bridge_type.map(str::to_owned),
             links: Default::default(),
+            queue: Default::default(),
         }
     }
 

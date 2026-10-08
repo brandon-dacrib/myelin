@@ -18,8 +18,11 @@
 //! - [`pump`]: what queues a room's events for the appservices that want them, from a durable
 //!   cursor per room; [`ephemeral`]: the same for typing, receipts, presence (MSC2409),
 //!   to-device messages (MSC2409/MSC4203) and device lists with key counts (MSC3202), from a
-//!   durable position per appservice and stream; [`delivery`]: the per-appservice workers.
-//! - [`metrics`]: the `hs_appservice_*` counters.
+//!   durable position per appservice and stream; [`delivery`]: the per-appservice workers;
+//!   [`known_users`]: what a worker asks its appservice about the users a batch names before it
+//!   sends it.
+//! - [`metrics`]: the `hs_appservice_*` counters, and the per-appservice queue gauges
+//!   ([`metrics::QueueCollector`]).
 //! - [`ping`]: ping in both directions ([`ping::PingService`]) plus the inbound axum route
 //!   ([`routes::ping_router`]).
 //! - [`provisioning`]: asking a bridge's own provisioning API who has signed in
@@ -42,6 +45,7 @@ pub mod client_routes;
 pub mod delivery;
 pub mod ephemeral;
 pub mod error;
+pub mod known_users;
 pub mod metrics;
 pub mod namespace;
 pub mod ping;

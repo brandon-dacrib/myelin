@@ -2589,6 +2589,7 @@ export interface components {
             namespaces?: Record<string, never>;
             paused?: boolean;
             protocols?: string[];
+            queue?: components["schemas"]["AppServiceQueue"];
             rate_limited?: boolean;
             sender_localpart?: string;
             url?: string | null;
@@ -2627,6 +2628,15 @@ export interface components {
         };
         AppServicePage: components["schemas"]["PageEnvelope"] & {
             items: components["schemas"]["AppService"][];
+        };
+        /** @description What waits to be sent to this appservice, read from its delivery queue when the row is answered. Each entry is one room's page of events or one batch of ephemeral data; up to twenty are merged into one transaction. A bridge that keeps up holds pending near 0. The hs_appservice_queue_depth, hs_appservice_queue_dead_lettered and hs_appservice_queue_oldest_age_seconds gauges say the same per appservice. */
+        AppServiceQueue: {
+            /** @description Entries that ran out of delivery attempts and wait for a replay (appservices.replay). */
+            dead_lettered: number;
+            /** @description How long the oldest waiting entry has waited, in milliseconds; null when nothing waits. */
+            oldest_pending_age_ms?: number | null;
+            /** @description Entries waiting to be sent, including any backing off after a failed attempt. */
+            pending: number;
         };
         AppServiceReplayRequest: {
             /** Format: date-time */

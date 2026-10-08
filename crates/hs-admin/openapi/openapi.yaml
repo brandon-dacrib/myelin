@@ -10,7 +10,7 @@ openapi: 3.1.0
 info:
   title: hs-admin API
   summary: The native administration and moderation API for the homeserver.
-  version: 0.1.10
+  version: 0.1.11
   description: 'The only API the management interface (track 16) talks to. See docs/rfcs/0004-admin-api.md for the full design rationale: resource modeling, naming, pagination, filtering, errors, idempotency, scopes, versioning and the event stream. This document is the contract; the hs-admin router''s contract tests assert the router and this document agree on paths and methods (RFC 0004 section 1, decision D15.16).'
   contact:
     name: 'Track 15: Admin API and modules'
@@ -86,6 +86,12 @@ info:
       0 when search is up to date) and ClusterStatus.search_index_documents (events that index
       holds, hs_room_search_index_documents). Both are set for a single node too, and absent
       until the indexer has counted once since the replica started.'
+  - version: 0.1.11
+    date: '2026-10-08'
+    notes: 'Additive: AppService.queue (schema AppServiceQueue): how many transactions wait to
+      be sent to the appservice, how many were dead-lettered, and how long the oldest waiting
+      one has waited, on every row of appservices.list, so a list shows which bridge is falling
+      behind without a request per bridge. The same numbers as the hs_appservice_queue_* gauges.'
 servers:
 - url: /api/v1
   description: Same origin as /_matrix on the client listener.
@@ -8056,6 +8062,26 @@ components:
               type:
               - string
               - 'null'
+        queue:
+          $ref: '#/components/schemas/AppServiceQueue'
+    AppServiceQueue:
+      type: object
+      description: What waits to be sent to this appservice, read from its delivery queue when the row is answered. Each entry is one room's page of events or one batch of ephemeral data; up to twenty are merged into one transaction. A bridge that keeps up holds pending near 0. The hs_appservice_queue_depth, hs_appservice_queue_dead_lettered and hs_appservice_queue_oldest_age_seconds gauges say the same per appservice.
+      required:
+      - pending
+      - dead_lettered
+      properties:
+        pending:
+          type: integer
+          description: Entries waiting to be sent, including any backing off after a failed attempt.
+        dead_lettered:
+          type: integer
+          description: Entries that ran out of delivery attempts and wait for a replay (appservices.replay).
+        oldest_pending_age_ms:
+          type:
+          - integer
+          - 'null'
+          description: How long the oldest waiting entry has waited, in milliseconds; null when nothing waits.
     AppServiceCreate:
       type: object
       properties:

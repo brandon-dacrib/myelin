@@ -319,6 +319,28 @@ two settings, and which one decides what to do:
 Running it: `cargo build -p hs-cli --bin hs`, then `cargo test -p hs-bridge-conformance --test
 real_mautrix_login -- --nocapture` with Docker reachable.
 
+## 2026-10-08: one bridge falling behind never holds up another, and each one's queue is a gauge
+
+Every bridge has its own delivery worker and queue; since 2026-10-08 nothing a bridge does
+(including never answering the server's "does this user exist" question) delays another bridge's
+transactions (decision 0033). What to watch, per bridge (`appservice` is the registration id):
+
+- `hs_appservice_queue_depth{appservice}`: queued entries waiting to be sent. Near 0 for a
+  bridge that keeps up; climbing while the others stay flat is that bridge falling behind.
+- `hs_appservice_queue_oldest_age_seconds{appservice}`: how long the oldest has waited. A
+  starting alert: `max by (appservice) (hs_appservice_queue_oldest_age_seconds) > 300` for ten
+  minutes.
+- `hs_appservice_queue_dead_lettered{appservice}`: entries that ran out of attempts; replay them
+  from the bridge's page (Backlog) once the bridge is back.
+- `hs_appservice_transactions_total{appservice,outcome}` and
+  `hs_appservice_queries_total{appservice,kind,outcome}`: failed deliveries, and questions the
+  bridge did not answer (`outcome="error"`, logged at `WARN`: "an appservice did not answer the
+  homeserver's question").
+
+The bridges list (Bridges, Registrations) shows the same queue numbers in its "Waiting to send"
+column (`AppService.queue` in the admin API), so the bridge that is behind is visible without
+opening each one.
+
 ## 2026-10-04: the demo's shared WhatsApp registration becomes an offering
 
 RFC 0017 section 6: the shared `mautrix-whatsapp` registration the demo got on 2026-09-25

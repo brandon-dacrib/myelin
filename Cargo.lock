@@ -2193,6 +2193,7 @@ dependencies = [
  "async-trait",
  "axum",
  "fancy-regex",
+ "futures",
  "hex",
  "hs-admin",
  "hs-auth",

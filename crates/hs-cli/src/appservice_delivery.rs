@@ -36,8 +36,10 @@ use hs_appservice::ephemeral::{
     Change, DeviceKeyCounts, DeviceSource, EphemeralPump, EphemeralSource, KeyCountSource,
     PresenceChange, ReceiptChange, RoomFacts, ToDeviceChange, ToDeviceMessage,
 };
+use hs_appservice::known_users::LocalUsers;
 use hs_appservice::metrics::AppserviceMetrics;
-use hs_appservice::pump::{LocalUsers, Pump, RoomEvent, RoomPage, RoomSource};
+use hs_appservice::metrics::QueueCollector;
+use hs_appservice::pump::{Pump, RoomEvent, RoomPage, RoomSource};
 use hs_appservice::registry::Registry;
 use hs_appservice::scheduler::{HttpTransactionSender, Scheduler};
 use hs_cluster::ownership::{Ownership, OwnershipEvent};
@@ -500,8 +502,9 @@ pub struct DeliveryDeps<B: KvBackend + 'static> {
     pub layout: ShardLayout,
     /// The `hs_appservice_*` counters, if registered.
     pub metrics: Option<AppserviceMetrics>,
-    /// The accounts, and who to ask: the pump asks appservices about an unknown local user an
-    /// event names before delivering it (`Pump::with_user_queries`). `None` asks nobody.
+    /// The accounts, and who to ask: an appservice's worker asks it about an unknown local user
+    /// of its namespace a batch names before sending the batch
+    /// (`Scheduler::with_user_queries`, `hs_appservice::known_users`). `None` asks nobody.
     pub user_queries: Option<UserQueries<B>>,
 }
 
@@ -511,8 +514,8 @@ pub type UserQueries<B> = (
     Arc<hs_appservice::query::QueryService<B>>,
 );
 
-/// [`LocalUsers`] over `hs-auth`'s accounts: what the pump asks before it asks an appservice
-/// about a user.
+/// [`LocalUsers`] over `hs-auth`'s accounts: what a delivery worker looks up before it asks an
+/// appservice about a user.
 pub struct Accounts(pub Arc<dyn hs_auth::store::AuthStore>);
 
 #[async_trait]
@@ -536,6 +539,8 @@ impl LocalUsers for Accounts {
 /// shutdown calls.
 pub struct AppserviceDelivery<B: KvBackend + 'static> {
     delivery: Arc<Delivery<B>>,
+    /// The `hs_appservice_queue_*` gauges for the appservices this replica delivers to.
+    queue_collector: QueueCollector,
     pump_task: tokio::task::AbortHandle,
     ephemeral_task: tokio::task::AbortHandle,
     /// What the admin API's `appservices.*` operations run against: the same registry,
@@ -578,6 +583,13 @@ impl<B: KvBackend + 'static> AppserviceDelivery<B> {
             bridge_logins = bridge_logins.with_metrics(metrics.clone());
             scheduler = scheduler.with_metrics(metrics);
         }
+        // Asked by each appservice's own worker, so a bridge that never answers holds only its
+        // own delivery (`hs_appservice::known_users`, decision 0033).
+        if let Some((users, queries)) = user_queries {
+            scheduler = scheduler.with_user_queries(Arc::new(
+                hs_appservice::known_users::UserQueries::new(users, queries),
+            ));
+        }
         let scheduler = Arc::new(scheduler);
         let gate = Arc::new(Gate {
             delivery: Delivery::new(scheduler.clone()),
@@ -602,17 +614,19 @@ impl<B: KvBackend + 'static> AppserviceDelivery<B> {
             rooms: rooms.clone(),
             e2e,
         });
-        let mut pump = Pump::new(
-            appservices.clone(),
-            Arc::new(Rooms {
-                registry: rooms.clone(),
-            }),
-        )
-        .with_key_counts(sources.clone());
-        if let Some((users, queries)) = user_queries {
-            pump = pump.with_user_queries(users, queries);
-        }
-        let pump = Arc::new(pump);
+        let pump = Arc::new(
+            Pump::new(
+                appservices.clone(),
+                Arc::new(Rooms {
+                    registry: rooms.clone(),
+                }),
+            )
+            .with_key_counts(sources.clone()),
+        );
+        let queue_collector = QueueCollector::over_registry(appservices.clone(), {
+            let gate = gate.clone();
+            Arc::new(move |id: &str| gate.delivers_here(id))
+        });
         let ephemeral = Arc::new(EphemeralPump::new(appservices, sources.clone(), sources));
         // Installed before the first tick, so that a change in between rings a bell the tick
         // answers, rather than waiting for the timer.
@@ -636,6 +650,7 @@ impl<B: KvBackend + 'static> AppserviceDelivery<B> {
             tokio::spawn(Self::follow_ephemeral(ephemeral, gate.clone())).abort_handle();
         Ok(Self {
             delivery: gate.delivery.clone(),
+            queue_collector,
             pump_task,
             ephemeral_task,
             admin_directory,
@@ -663,6 +678,13 @@ impl<B: KvBackend + 'static> AppserviceDelivery<B> {
             }
             let _ = tokio::time::timeout(EPHEMERAL_POLL, pump.wait()).await;
         }
+    }
+
+    /// The `hs_appservice_queue_depth`, `_dead_lettered` and `_oldest_age_seconds` gauges, for
+    /// the appservices this replica delivers to; `hs serve` registers it with the other series.
+    #[must_use]
+    pub fn queue_collector(&self) -> QueueCollector {
+        self.queue_collector.clone()
     }
 
     /// The admin API's view onto this machinery.

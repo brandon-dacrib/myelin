@@ -27,7 +27,7 @@ import {
   healthCounts,
   sortByAttention,
 } from "@/lib/bridge-catalogue";
-import { bridgeHealthMeta, healthKeyOf } from "@/lib/bridge-state";
+import { bridgeHealthMeta, describeQueue, healthKeyOf } from "@/lib/bridge-state";
 import { cn } from "@/lib/cn";
 import { BridgesTabs } from "./BridgesTabs";
 
@@ -123,6 +123,20 @@ export function BridgesListPage() {
       renderCompact: (b) => bridgeHealthMeta[healthKeyOf(b)].label,
     },
     {
+      key: "queue",
+      header: "Waiting to send",
+      priority: 2,
+      render: (b) => {
+        const queue = describeQueue(b.queue);
+        return (
+          <span data-testid={`queue-${b.id}`}>
+            <Badge status={queue.status}>{queue.text}</Badge>
+          </span>
+        );
+      },
+      renderCompact: (b) => describeQueue(b.queue).text,
+    },
+    {
       key: "bot",
       header: "Bot",
       priority: 2,
@@ -206,6 +220,12 @@ export function BridgesListPage() {
           <p className="mt-0.5 text-sm text-text-muted">
             Every bridge registered with this server: each person&apos;s own bridge, and any you run
             yourself. Delivery and health are looked at here.
+          </p>
+          <p className="mt-0.5 text-sm text-text-muted">
+            Waiting to send counts what the server has queued for a bridge and not yet delivered.
+            Each bridge has its own queue, so one that is slow or down never holds up another; a
+            count that keeps growing, or an oldest wait past a minute, is a bridge falling behind,
+            and failed ones can be sent again from the bridge&apos;s page.
           </p>
         </div>
         <Button

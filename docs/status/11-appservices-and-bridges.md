@@ -1,6 +1,8 @@
 # Status: track 11, appservices and bridges
 
-Last updated: 2026-10-04, late (a bridge's namespaces, protocols and room directory mean what
+Last updated: 2026-10-08 (one bridge's slowness never delays another's delivery: the "does this
+user exist" question is asked by the bridge's own worker, and each bridge's queue is a gauge and a
+column on the bridges list; below); before that 2026-10-04, late (a bridge's namespaces, protocols and room directory mean what
 Sytest's `tests/60app-services/` says, and a ghost acts once it is registered; below); before
 that 2026-10-04 (the demo's shared WhatsApp registration becomes a declared offering,
 and the server names a bridge registered by hand beside an offering; a changed double puppeting
@@ -18,6 +20,63 @@ manager) and an instance's Kubernetes objects say whose bridge they are; before 
 (who has signed in to a bridge; the `cluster` runtime run on kind); before that 2026-09-30
 (ephemeral, to-device and device-list delivery); before that 2026-09-27 (RFC 0017 run against
 the real binary), 2026-09-27 (the bridge manager) and 2026-09-25.
+
+## Session 2026-10-08 (branch `agent/appservice-pump`): delivery is per bridge all the way, and each bridge's queue is watched
+
+Decision 0030 left one place where a bridge's slowness reached the others: the room pump, one
+task for every room and bridge, asked a bridge about an unknown user of its namespace before
+queueing an event naming them, and waited up to the query's ten-second timeout. Decision
+`docs/decisions/0033-a-bridge-is-asked-about-its-users-by-its-own-delivery-worker.md` moves it.
+
+**What changed.**
+
+- `hs_appservice::known_users` (new): `LocalUsers` (moved from `pump`), `UserQueries`
+  (`before_delivery(row, body)`) and `UNKNOWN_USER_RETRY_MS` (now kept per appservice and user).
+  `Scheduler::with_user_queries` runs it in `drain`, just before a batch is sent, for that
+  appservice only; the users of one batch are asked at once. `Pump::with_user_queries` is gone;
+  the pump waits on nothing remote (module docs, "Nothing here waits on a bridge").
+- `QueryService::user_exists_at(row, user)` (new: one appservice); `user_exists` and
+  `room_alias_exists` ask their appservices at once and take the first yes (`first_yes`), so a
+  hung bridge does not hold another's answer on the request path.
+- Gauges `hs_appservice_queue_depth{appservice}`, `hs_appservice_queue_dead_lettered{appservice}`,
+  `hs_appservice_queue_oldest_age_seconds{appservice}` (`metrics::QueueCollector`, read per
+  scrape from `AppserviceStore::queue_summary`, which reads each entry's status without building
+  its body), reported only for the appservices whose shard this replica owns. `hs serve`
+  registers it (`AppserviceDelivery::queue_collector`).
+- Admin API: `AppService.queue` (`AppServiceQueue`: `pending`, `dead_lettered`,
+  `oldest_pending_age_ms`), OpenAPI **0.1.11**; `hs_admin::model::AdminAppserviceQueue`, filled
+  by `RegistryAppserviceDirectory`. Web: the bridges list's "Waiting to send" column
+  (`describeQueue` in `web/src/lib/bridge-state.ts`; amber past a minute, red with dead letters)
+  and a sentence explaining it; mock fixtures agree with their backlogs.
+- Ordering per appservice is the queue's, unchanged; shard gating unchanged (pump on the global
+  shard's owner, an appservice's worker and now its questions on its shard's owner).
+
+**Verified.** `cargo test -p hs-appservice` (116; new
+`known_users::tests::only_the_appservice_being_delivered_to_is_asked_and_only_about_its_unknown_users`,
+`delivery::tests::a_bridge_that_never_answers_a_user_query_holds_only_its_own_delivery`,
+`metrics::tests::the_queue_gauges_say_what_waits_for_each_appservice_this_replica_delivers_to`;
+the pump's user-query test moved to `known_users`), `-p hs-admin`, `-p hs-bridges`, `-p hs-cli
+--lib appservice`, clippy on each. **Real binary:** `cargo test -p hs-cli --test
+appservice_isolation` (new): two bridges, `stuck` never answers `GET /users/{userId}`; after
+alice invites `@stuck_ghost` and speaks, `fine` has both events within a second of the send,
+`stuck` is sent nothing while its question is open and the invitation after the timeout;
+meanwhile `/metrics` says `hs_appservice_queue_depth{appservice="stuck"}` >= 1 with an oldest age
+over a second and `fine`'s 0, and `GET /api/v1/appservices` says the same in `queue`. On `main`
+the pump asked that question itself, so `fine` would have waited the ten seconds (by
+construction; the test was not run against `main`'s binary). Again green: `appservice_queries`
+(the Sytest story; the bridge is still asked about its invited user once, before it hears of
+them), `appservice_ephemeral`, `bridge_offerings`, `bridge_logins`, and
+`hs-bridge-conformance` with the real mautrix-whatsapp and mautrix-signal under Docker
+(`real_mautrix_login`, 4 of 4, not skipped). Web: `npm run check` (618 tests, new
+`BridgesListPage.test.tsx` and `describeQueue` cases), `npm run test:e2e` (68, `bridges-list`
+checks the column).
+
+`hs-appservice` now depends on `futures` (already a workspace dependency).
+
+**Left.** No alert rule ships for the queue (`deploy/observability/alerts/hs-rules.yaml` is track
+12's; `docs/bridges/mautrix.md` suggests one). The bridge's detail page still reads its counts
+from the backlog list, not `queue`. Sytest `tests/60app-services/` was not rerun on this branch
+(the question's behaviour from a bridge's side is unchanged; `appservice_queries` covers it).
 
 ## Session 2026-10-04, late (branch `agent/appservice-gaps`): what a bridge's namespaces, protocols and room directory mean outside delivery
 

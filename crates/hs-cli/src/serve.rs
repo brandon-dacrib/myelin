@@ -2064,6 +2064,9 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     )
     .await
     .map_err(|e| ServeError::Sessions(Box::new(e)))?;
+    // How much waits for each bridge (`hs_appservice_queue_*`), read from the queue per scrape.
+    let queue_collector = appservice_delivery.queue_collector();
+    metrics.with_registry(|registry| registry.register_collector(Box::new(queue_collector)));
     // This server's own events reach remote servers from here, from the replica that owns each
     // destination's federation shard. Subscribes to the room stream inside, so it is started
     // before any listener is bound: an event sent before the subscription existed would never

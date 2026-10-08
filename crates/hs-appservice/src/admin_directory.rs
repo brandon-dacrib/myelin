@@ -15,8 +15,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use hs_admin::model::{
     AdminAppservice, AdminAppserviceBacklogEntry, AdminAppserviceCreate, AdminAppserviceHealth,
-    AdminAppserviceLinks, AdminAppserviceReplay, AdminAppserviceTokens, AdminBridgeLogins,
-    AdminKeyWithheld,
+    AdminAppserviceLinks, AdminAppserviceQueue, AdminAppserviceReplay, AdminAppserviceTokens,
+    AdminBridgeLogins, AdminKeyWithheld,
 };
 use hs_admin::sources::{AdminAppserviceRegistration, AppserviceDirectory, SourceError};
 use hs_kv::KvBackend;
@@ -88,6 +88,20 @@ impl<B: KvBackend + 'static> RegistryAppserviceDirectory<B> {
                 .and_then(Value::as_str)
                 .map(str::to_owned),
             links: AdminAppserviceLinks::default(),
+            queue: self.queue(&row.id)?,
+        })
+    }
+
+    /// `AppService.queue`, from the same summary the queue gauges read.
+    fn queue(&self, id: &str) -> Result<AdminAppserviceQueue, SourceError> {
+        let summary = self.registry.store().queue_summary(id).map_err(to_source)?;
+        let now = self.registry.now_ms();
+        Ok(AdminAppserviceQueue {
+            pending: summary.pending,
+            dead_lettered: summary.dead_lettered,
+            oldest_pending_age_ms: summary
+                .oldest_pending_at_ms
+                .map(|at| now.saturating_sub(at)),
         })
     }
 }

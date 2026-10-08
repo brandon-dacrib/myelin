@@ -1,6 +1,7 @@
 # 0030: 2026-10-04: an appservice's namespaces reach registration, aliases and the room directory through `hs-auth`'s registry trait, and a ghost acts once it is registered
 
 Status: accepted (track 11; touches 07's `hs-auth` and 04's `hs-room` at named call sites).
+Amended 2026-10-08 by decision 0033 (where the user question is asked).
 
 ## The problem
 
@@ -49,8 +50,13 @@ neither depends on `hs-appservice` (which depends on `hs-auth`).
 
 ## Consequences
 
-- The pump is one task for every room: a bridge that never answers `/users/{userId}` holds
+- ~~The pump is one task for every room: a bridge that never answers `/users/{userId}` holds
   delivery for the query timeout (ten seconds) once per unknown user per minute
-  (`UNKNOWN_USER_RETRY_MS`). Synapse blocks the same way, per room. Accepted for now.
+  (`UNKNOWN_USER_RETRY_MS`). Synapse blocks the same way, per room. Accepted for now.~~
+  Superseded on 2026-10-08 by decision 0033: the question is asked by the appservice's own
+  delivery worker (`hs_appservice::known_users`), just before it sends, so a bridge that never
+  answers holds only its own delivery. `Pump::with_user_queries` is gone; point 2's "asking
+  about an unknown local user before an event naming them is delivered" is
+  `Scheduler::with_user_queries` now.
 - Synapse's `instance_id` spelling (`{appservice id}|{network id}`) is what a client passes back
   as `third_party_instance_id`; Sytest relies on it.

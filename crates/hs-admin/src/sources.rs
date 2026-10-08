@@ -2615,6 +2615,7 @@ impl InMemoryAppserviceDirectory {
                 .and_then(Value::as_str)
                 .map(str::to_owned),
             links: AdminAppserviceLinks::default(),
+            queue: crate::model::AdminAppserviceQueue::default(),
         }
     }
 

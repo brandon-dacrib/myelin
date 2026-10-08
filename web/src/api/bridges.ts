@@ -31,6 +31,8 @@ import { unwrap } from "./problem";
 import type { components } from "./schema";
 
 export type AppService = components["schemas"]["AppService"];
+/** `AppService.queue`: what waits to be sent to the bridge (OpenAPI 0.1.11). */
+export type AppServiceQueue = components["schemas"]["AppServiceQueue"];
 // AppService.health is optional in the schema (no `required` list on
 // AppService); every appservice in practice always reports one of these,
 // so callers normalise a missing value to "unknown" (see bridge-state.ts).

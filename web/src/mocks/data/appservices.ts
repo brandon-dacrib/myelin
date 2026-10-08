@@ -9,6 +9,7 @@ import type {
 const now = Date.now();
 const iso = (msAgo: number) => new Date(now - msAgo).toISOString();
 
+/** Each `queue` agrees with the bridge's `appserviceBacklog` entry below. */
 export const appservices: AppService[] = [
   {
     id: "whatsapp",
@@ -22,6 +23,7 @@ export const appservices: AppService[] = [
     health: "healthy",
     created_at: iso(30 * 24 * 3_600_000),
     links: { login_url: null },
+    queue: { pending: 0, dead_lettered: 0, oldest_pending_age_ms: null },
   },
   {
     id: "telegram",
@@ -35,6 +37,7 @@ export const appservices: AppService[] = [
     health: "degraded",
     created_at: iso(20 * 24 * 3_600_000),
     links: { login_url: null },
+    queue: { pending: 1, dead_lettered: 0, oldest_pending_age_ms: 6 * 60_000 },
   },
   {
     id: "signal",
@@ -48,6 +51,7 @@ export const appservices: AppService[] = [
     health: "down",
     created_at: iso(10 * 24 * 3_600_000),
     links: { login_url: null },
+    queue: { pending: 0, dead_lettered: 2, oldest_pending_age_ms: null },
   },
   {
     id: "discord",
@@ -61,6 +65,7 @@ export const appservices: AppService[] = [
     health: "paused",
     created_at: iso(60 * 24 * 3_600_000),
     links: { login_url: null },
+    queue: { pending: 0, dead_lettered: 0, oldest_pending_age_ms: null },
   },
   {
     id: "slack",
@@ -74,6 +79,7 @@ export const appservices: AppService[] = [
     health: "unknown",
     created_at: iso(2 * 3_600_000),
     links: { login_url: null },
+    queue: { pending: 0, dead_lettered: 0, oldest_pending_age_ms: null },
   },
 ];
 

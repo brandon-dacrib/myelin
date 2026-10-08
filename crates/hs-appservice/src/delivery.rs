@@ -292,6 +292,86 @@ mod tests {
         assert!(inner.calls()[0].0.contains("fine"));
     }
 
+    /// A bridge that never answers "does this user exist" holds its own delivery for the
+    /// question's timeout, and nobody else's: the question is asked by its own worker
+    /// (`crate::known_users`), not by anything the other bridges wait on.
+    #[tokio::test]
+    async fn a_bridge_that_never_answers_a_user_query_holds_only_its_own_delivery() {
+        use crate::known_users::{LocalUsers, UserQueries};
+        use crate::query::{AppserviceQueryTransport, QueryService};
+
+        struct NoAccounts;
+        #[async_trait]
+        impl LocalUsers for NoAccounts {
+            async fn is_registered(&self, _user_id: &str) -> bool {
+                false
+            }
+        }
+        /// "stuck" answers its user query only when the test lets it.
+        struct StuckAnswersLate(Arc<Notify>);
+        #[async_trait]
+        impl AppserviceQueryTransport for StuckAnswersLate {
+            async fn get(&self, url: &str, _: &str, _: &str) -> Result<Option<Value>, String> {
+                if url.contains("stuck") {
+                    self.0.notified().await;
+                    return Err("timed out".to_owned());
+                }
+                Ok(None)
+            }
+        }
+
+        let sender = MockSender::new();
+        let registry = Arc::new(
+            Registry::open(MemoryBackend::new(), ruma::server_name!("example.org")).unwrap(),
+        );
+        for (id, prefix) in [("stuck", "stuck_"), ("fine", "fine_")] {
+            registry
+                .add(
+                    &Registration::parse_yaml(&format!(
+                        "id: {id}\nurl: 'http://{id}.local'\nas_token: as_{id}\nhs_token: hs_{id}\n\
+                         sender_localpart: {id}bot\nnamespaces:\n  users:\n    - regex: '@{prefix}.*:example\\.org'\n      exclusive: true\n"
+                    ))
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        let answer = Arc::new(Notify::new());
+        let queries = Arc::new(QueryService::new(
+            registry.clone(),
+            Arc::new(StuckAnswersLate(answer.clone())),
+        ));
+        let scheduler = Arc::new(
+            Scheduler::new(registry, Arc::new(SystemClock), Arc::new(sender.clone()))
+                .with_user_queries(Arc::new(UserQueries::new(Arc::new(NoAccounts), queries))),
+        );
+        let delivery = Delivery::new(scheduler.clone());
+        let invite = |target: &str| Transaction {
+            events: vec![json!({
+                "type": "m.room.member", "sender": "@alice:example.org", "state_key": target,
+                "content": {"membership": "invite"},
+            })],
+            ..Transaction::default()
+        };
+        scheduler
+            .enqueue("stuck", &invite("@stuck_ghost:example.org"))
+            .unwrap();
+        delivery.nudge("stuck");
+        // Give the stuck worker time to be waiting on its question.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        scheduler
+            .enqueue("fine", &invite("@fine_ghost:example.org"))
+            .unwrap();
+        delivery.nudge("fine");
+
+        eventually("the other bridge delivered", || sender.calls().len() == 1).await;
+        assert!(sender.calls()[0].0.contains("fine"));
+
+        // Once the question is over (here, failed), the stuck bridge is sent its invite anyway.
+        answer.notify_one();
+        eventually("the stuck bridge delivered", || sender.calls().len() == 2).await;
+        assert!(sender.calls()[1].0.contains("stuck"));
+    }
+
     #[tokio::test]
     async fn a_worker_ends_when_its_appservice_is_removed_and_a_new_one_starts_on_demand() {
         let sender = MockSender::new();

@@ -32,6 +32,9 @@ test.describe("Bridges list", () => {
     const names = page.getByRole("table").getByRole("link");
     await expect(names.first()).toHaveText("Signal");
     await expect(names.last()).toHaveText("Discord");
+    // Each bridge's own queue: Telegram has one transaction waiting, Signal two that failed.
+    await expect(page.getByTestId("queue-telegram")).toHaveText(/1 waiting, oldest 6m/);
+    await expect(page.getByTestId("queue-signal")).toHaveText(/2 failed/);
     // The summary strip counts each state and filters the table.
     await page.getByRole("button", { name: /^Down 1$/ }).click();
     await expect(page).toHaveURL(/state=down/);
