@@ -282,6 +282,52 @@ async fn a_rate_limit_override_is_set_read_and_cleared() {
 }
 
 #[tokio::test]
+async fn the_rate_limit_answer_carries_the_server_wide_limits_it_replaces() {
+    let f = fixture();
+    let config = crate::sources::InMemoryConfigSource::new()
+        .with_file(
+            "/etc/hs/config.yaml",
+            json!({"server": {"server_name": "example.org"}}),
+        )
+        .with_database(json!({
+            "rate_limits": {"message": {"per_second": 0.5}, "admin_redaction": {"burst_count": 40}}
+        }));
+    let state = f.state.clone().with_config(Arc::new(config));
+    let path = format!("/api/v1/users/{ALICE_PATH}/rate-limit");
+    let (status, _, read) = call(&state, "GET", &path, Some("read"), None, None).await;
+    assert_eq!(status, StatusCode::OK, "{read}");
+    // No override: no override fields, and the bucket written in part keeps its other default.
+    assert_eq!(read.get("messages_per_second"), None);
+    assert_eq!(
+        read["server_wide"],
+        json!({
+            "enabled": true,
+            "message": {"per_second": 0.5, "burst_count": 10},
+            "admin_redaction": {"per_second": 1.0, "burst_count": 40},
+        })
+    );
+
+    let (status, _, _) = call(
+        &state,
+        "PUT",
+        &path,
+        Some("admin"),
+        Some(json!({"messages_per_second": 0})),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, _, read) = call(&state, "GET", &path, Some("read"), None, None).await;
+    assert_eq!(read["messages_per_second"], json!(0.0));
+    assert_eq!(read["burst_count"], 10);
+    assert_eq!(read["server_wide"]["message"]["per_second"], json!(0.5));
+
+    // Without a configuration source the override is still answered, and nothing else.
+    let (_, _, bare) = call(&f.state, "GET", &path, Some("read"), None, None).await;
+    assert_eq!(bare, json!({"messages_per_second": 0.0, "burst_count": 10}));
+}
+
+#[tokio::test]
 async fn login_as_mints_a_support_session_and_never_records_the_token() {
     let f = fixture();
     let mut events = f.state.events.subscribe();

@@ -64,10 +64,6 @@ fn docker_generator_output_needs_the_override_and_then_translates() {
         config.auth.registration_shared_secret.as_str(),
         Some("generated-docker-shared-secret")
     );
-    assert_eq!(
-        config.auth.session_secret.as_str(),
-        Some("generated-docker-macaroon-key")
-    );
     // sqlite3 has no native backend; falls back to the embedded default
     // rather than erroring.
     assert!(matches!(config.storage, StorageConfig::Embedded(_)));
@@ -183,7 +179,6 @@ fn kitchen_sink_translates_every_mapped_key_with_no_override() {
         config.server.admin_contact.as_deref(),
         Some("mailto:admin@example.org")
     );
-    assert!(config.server.report_stats);
     assert_eq!(
         config.server.signing_key_path.to_str(),
         Some("/etc/hs/signing.key")
@@ -251,10 +246,6 @@ fn kitchen_sink_translates_every_mapped_key_with_no_override() {
     assert_eq!(
         config.auth.registration_shared_secret.as_str(),
         Some("registration-shared-secret-from-file")
-    );
-    assert_eq!(
-        config.auth.session_secret.as_str(),
-        Some("macaroon-secret-from-file")
     );
     assert_eq!(
         config.auth.refresh_token_lifetime,

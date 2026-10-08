@@ -2261,7 +2261,7 @@ export interface paths {
         };
         /**
          * Get a user's rate-limit override
-         * @description The override replaces the server's rate_limits.message bucket for this user's event sending. An empty object means none is set.
+         * @description The override replaces the server's rate_limits.message bucket for this user's event sending (and, for a server administrator, rate_limits.admin_redaction for their redactions). No override fields means none is set; server_wide is what the server applies without one.
          */
         get: operations["users.rate_limit.get"];
         /** Set a user's rate-limit override */
@@ -3281,6 +3281,11 @@ export interface components {
              */
             type: string;
         };
+        RateLimitBucket: {
+            burst_count: number;
+            /** @description Actions per second once the burst is spent; 0 switches this limit off. */
+            per_second: number;
+        };
         /** @description Replaces the server's rate_limits.message bucket for one user. messages_per_second 0 exempts the user. On PUT messages_per_second is required and burst_count defaults to 10. */
         RateLimitOverride: {
             burst_count?: number;
@@ -3625,6 +3630,15 @@ export interface components {
         ServerNoticePage: components["schemas"]["PageEnvelope"] & {
             items: components["schemas"]["ServerNotice"][];
         };
+        /** @description The rate_limits configuration section as the server runs it, for what a per-user override replaces. Absent from UserRateLimit when the configuration cannot be read. */
+        ServerRateLimits: {
+            /** @description rate_limits.admin_redaction, for a server administrator's redactions without an override. */
+            admin_redaction: components["schemas"]["RateLimitBucket"];
+            /** @description rate_limits.enabled. When false nobody without an override is limited; an override still applies. */
+            enabled: boolean;
+            /** @description rate_limits.message, for sending messages, state events and redactions by everybody without an override. */
+            message: components["schemas"]["RateLimitBucket"];
+        };
         ServerSigningKey: {
             algorithm: string;
             /** @description ed25519:<version>. */
@@ -3812,6 +3826,13 @@ export interface components {
         };
         UserPage: components["schemas"]["PageEnvelope"] & {
             items: components["schemas"]["User"][];
+        };
+        /** @description A user's rate-limit override (messages_per_second and burst_count, both absent when none is set) and the server-wide limits beside it. */
+        UserRateLimit: {
+            burst_count?: number;
+            /** @description The override's sustained rate; 0 exempts the user. Absent when no override is set. */
+            messages_per_second?: number;
+            server_wide?: components["schemas"]["ServerRateLimits"];
         };
         UserUpdate: {
             admin?: boolean;
@@ -9160,13 +9181,13 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Override, if any. */
+            /** @description Override, if any, and the server-wide limits. */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["RateLimitOverride"];
+                    "application/json": components["schemas"]["UserRateLimit"];
                 };
             };
             401: components["responses"]["Unauthenticated"];

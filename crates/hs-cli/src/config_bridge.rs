@@ -50,6 +50,7 @@ pub fn auth_config_from(
         refresh_token_ttl_ms: config.auth.refresh_token_lifetime.map(|d| d.as_millis()),
         registration_enabled: config.auth.enable_registration,
         guest_registration_enabled: config.auth.allow_guest_access,
+        password_login_enabled: config.auth.password.enabled,
         ..hs_auth::config::AuthConfig::default()
     };
 

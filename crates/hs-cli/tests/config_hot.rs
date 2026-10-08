@@ -499,3 +499,175 @@ async fn hot_settings_apply_to_the_running_server_without_a_restart() {
         assert!(text.contains(line), "{line} not in:\n{text}");
     }
 }
+
+/// The settings decision 0016's amendment found read by nothing (status 16, 2026-10-08): the
+/// ones that should be read now are, on the running server, and the ones removed from the schema
+/// no longer stop a configuration that still carries them from loading.
+///
+/// - A bootstrap file with `server.report_stats`, `auth.session_secret` and
+///   `appservices.enabled` starts, and the log names each as ignored.
+/// - `server.admin_contact` is `/.well-known/matrix/support`.
+/// - `auth.password.enabled` off: `GET /login` does not offer a password and `POST /login`
+///   refuses one; back on, it works again.
+/// - A write of a removed setting is refused, naming it.
+#[tokio::test]
+async fn settings_that_had_no_reader_are_read_or_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let config_path = dir.path().join("hs.yaml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "server:\n  server_name: example.org\n  report_stats: true\n\
+             listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, health, metrics]\n\
+             storage:\n  backend: embedded\n  data_dir: {:?}\n\
+             media:\n  storage:\n    backend: local\n    path: {:?}\n\
+             federation:\n  enabled: false\n\
+             appservices:\n  enabled: true\n\
+             auth:\n  enable_registration: true\n  session_secret: an-old-macaroon-key\n",
+            dir.path().join("db"),
+            dir.path().join("media"),
+        ),
+    )
+    .unwrap();
+
+    let mut hs = HsProcess::serve(&config_path);
+    let setup_line = hs.wait_for(&["setup_link="]);
+    // Logged once the log is listening: at the latest the follower's ten-second re-read.
+    for pointer in [
+        "/server/report_stats",
+        "/auth/session_secret",
+        "/appservices/enabled",
+    ] {
+        hs.wait_for(&["ignoring a setting that no longer exists", pointer]);
+    }
+    let setup_token = setup_line
+        .rsplit_once("#token=")
+        .unwrap()
+        .1
+        .trim()
+        .to_owned();
+    let nobody = Caller {
+        base: format!("http://127.0.0.1:{port}"),
+        token: None,
+        from: None,
+    };
+    let session = nobody
+        .expect(
+            Method::POST,
+            "/api/v1/setup",
+            Some(json!({"setup_token": setup_token, "username": "ops", "password": "hunter2-first-admin"})),
+            StatusCode::CREATED,
+        )
+        .await;
+    let ops = nobody.with(session["access_token"].as_str().unwrap());
+    let (status, body) = nobody.register("alice").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // `server.admin_contact`: the support document appears, and says who.
+    nobody
+        .expect(
+            Method::GET,
+            "/.well-known/matrix/support",
+            None,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+    ops.apply(
+        "server",
+        json!({"admin_contact": "mailto:abuse@example.org"}),
+    )
+    .await;
+    let support = nobody
+        .expect(
+            Method::GET,
+            "/.well-known/matrix/support",
+            None,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(
+        support,
+        json!({"contacts": [{"role": "m.role.admin", "email_address": "abuse@example.org"}]})
+    );
+
+    // `auth.password.enabled`.
+    let flows = |caller: Caller| async move {
+        caller
+            .expect(
+                Method::GET,
+                "/_matrix/client/v3/login",
+                None,
+                StatusCode::OK,
+            )
+            .await["flows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["type"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        flows(nobody.clone())
+            .await
+            .contains(&"m.login.password".to_owned())
+    );
+    ops.apply("auth", json!({"password": {"enabled": false}}))
+        .await;
+    hs.wait_for(&["configuration setting applied", "/auth/password/enabled"]);
+    let offered = flows(nobody.clone()).await;
+    assert!(
+        !offered.contains(&"m.login.password".to_owned()),
+        "{offered:?}"
+    );
+    let (status, body) = nobody.login("alice").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["errcode"], "M_FORBIDDEN", "{body}");
+    ops.apply("auth", json!({"password": {"enabled": true}}))
+        .await;
+    let (status, body) = nobody.login("alice").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // A removed setting cannot be written back, and the answer says why it went.
+    let refused = ops
+        .expect(
+            Method::PATCH,
+            "/api/v1/config/auth",
+            Some(json!({"enable_legacy_login": false})),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+    assert_eq!(
+        refused["errors"][0]["pointer"], "/auth/enable_legacy_login",
+        "{refused}"
+    );
+    // ...and none is served as a setting.
+    let schema = ops
+        .expect(Method::GET, "/api/v1/config/schema", None, StatusCode::OK)
+        .await;
+    let pointers: Vec<&str> = schema["settings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["pointer"].as_str().unwrap())
+        .collect();
+    for gone in [
+        "/server/report_stats",
+        "/auth/session_secret",
+        "/appservices/enabled",
+    ] {
+        assert!(!pointers.contains(&gone), "{gone} is still a setting");
+    }
+    assert!(pointers.contains(&"/media/remote_media_retention"));
+    let applies = |pointer: &str| {
+        schema["settings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["pointer"] == pointer)
+            .unwrap()["applies"]
+            .clone()
+    };
+    assert_eq!(applies("/auth/password/enabled"), "hot");
+    assert_eq!(applies("/server/admin_contact"), "hot");
+}

@@ -11,6 +11,7 @@ Versions follow [semantic versioning](https://semver.org). Nothing is released y
 
 ## Unreleased
 
+- Every setting does something: `server.admin_contact` is published as `/.well-known/matrix/support`, `auth.password.enabled: false` stops password login (a password still confirms a sensitive change), `media.remote_media_retention` deletes cached remote media nobody asked for in that long, hourly; `server.report_stats`, `auth.enable_legacy_login`, `auth.session_secret(_file)` and `appservices.enabled` are gone, and a configuration that still has them starts with a warning (decision 0034). The web interface shows a user's server-wide message limit beside their override, and an offering's settings say what saving does to bridges people already have (2026-10-08, `agent/web-items`).
 - A user's profile and a room alias of another server are read through this server (`GET /profile/{userId}`, `GET /directory/room/{alias}`), and so is another server's public room list (`/publicRooms?server=`); the federation `/query/profile` answers the stored display name and avatar, and the federation `/publicRooms` lists the rooms published to the directory.
 - A join, leave, knock or invite that is not canonical JSON for its room version is `400 M_BAD_JSON` before its signature is checked; an unsigned invite is `403`.
 - Backfill from events of another room answers nothing; `/state` and `/state_ids` at a rejected event are `404`; an event citing a rejected event is readable and reaches `/sync`.

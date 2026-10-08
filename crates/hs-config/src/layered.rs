@@ -132,11 +132,17 @@ impl Layers {
         }
     }
 
-    /// Merges every layer into one document, without deserializing or validating it.
+    /// Merges every layer into one document, without deserializing or validating it. A setting
+    /// removed from the schema ([`crate::retired`]) is left out, with a warning the first time.
     #[must_use]
     pub fn merged(&self) -> Value {
         let ordered = self.ordered();
-        document::merge_all(ordered.iter().map(|(_, doc)| doc.as_ref()))
+        let mut merged = document::merge_all(ordered.iter().map(|(_, doc)| doc.as_ref()));
+        crate::retired::warn_dropped(
+            &crate::retired::strip_json(&mut merged),
+            "configuration layers",
+        );
+        merged
     }
 
     /// Merges, deserializes, resolves file-backed secrets and validates.

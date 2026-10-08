@@ -1,5 +1,15 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { getAccessToken, getSession, hasScope, signIn, signOut } from "./auth";
+import { http, HttpResponse } from "msw";
+import { server } from "@/mocks/node";
+import {
+  PASSWORD_LOGIN_OFF,
+  getAccessToken,
+  getSession,
+  hasScope,
+  signIn,
+  signInWithPassword,
+  signOut,
+} from "./auth";
 
 afterEach(() => {
   signOut();
@@ -52,5 +62,17 @@ describe("auth", () => {
     signOut();
     expect(getSession()).toBeNull();
     expect(hasScope("admin:read")).toBe(false);
+  });
+
+  it("says password sign-in is turned off when the server refuses it so", async () => {
+    server.use(
+      http.post("*/_matrix/client/v3/login", () =>
+        HttpResponse.json(
+          { errcode: "M_FORBIDDEN", error: "Password login has been disabled on this server" },
+          { status: 403 },
+        ),
+      ),
+    );
+    await expect(signInWithPassword("ops", "hunter2")).rejects.toThrow(PASSWORD_LOGIN_OFF);
   });
 });

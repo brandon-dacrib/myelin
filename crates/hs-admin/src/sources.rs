@@ -1099,6 +1099,9 @@ pub fn config_validation_errors(error: &hs_config::ConfigError) -> Vec<hs_http::
 /// would write, as validation errors. The database cannot hold them -- every replica would
 /// ignore the stored value -- so a candidate that sets one is not a configuration this server
 /// would accept, and saying "valid" would promise an edit `config.update` then refuses.
+///
+/// A setting removed from the schema ([`hs_config::retired`]) is refused here too, naming why it
+/// went: a stored copy would be dropped at the next load.
 #[must_use]
 pub fn bootstrap_validation_errors(candidate: &Value) -> Vec<hs_http::ValidationError> {
     let Some(sections) = candidate.as_object() else {
@@ -1116,8 +1119,24 @@ pub fn bootstrap_validation_errors(candidate: &Value) -> Vec<hs_http::Validation
                 hs_config::store::StoreError::bootstrap(section, vec![pointer.clone()]).to_string();
             out.push(hs_http::ValidationError::new(pointer, message));
         }
+        out.extend(retired_validation_errors(section, patch));
     }
     out
+}
+
+/// The settings removed from the schema ([`hs_config::retired`]) that a patch of `section`
+/// writes, as validation errors naming why each went.
+#[must_use]
+pub fn retired_validation_errors(section: &str, patch: &Value) -> Vec<hs_http::ValidationError> {
+    hs_config::retired::in_patch(section, patch)
+        .into_iter()
+        .map(|(dotted, setting)| {
+            hs_http::ValidationError::new(
+                setting.pointer,
+                format!("{dotted} no longer exists: {}", setting.why),
+            )
+        })
+        .collect()
 }
 
 /// `auth.oidc_providers[0].client_secret` becomes `/auth/oidc_providers/0/client_secret`.

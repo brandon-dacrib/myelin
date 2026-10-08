@@ -1,6 +1,94 @@
 # 16. Management web interface: status
 
-Last updated: 2026-10-04 (the Cluster page's Epoch and the e2e-real harness; branch `agent/ops-web`).
+Last updated: 2026-10-08 (effective values beside overrides, what offering settings do to
+existing bridges, every setting read or removed; branch `agent/web-items`).
+
+## 2026-10-08: effective values, offering settings, and every setting read or gone (branch `agent/web-items`)
+
+Items 7, 8 and 9 of "Next web items" below. OpenAPI **0.1.12** (0.1.11 is `agent/appservice-pump`'s);
+decision **0034**.
+
+**Done.**
+
+- **A user's rate limit says what it replaces** (item 7). `GET /users/{id}/rate-limit` answers
+  `UserRateLimit`: the override as before plus `server_wide` (`ServerRateLimits`:
+  `rate_limits.enabled`, `.message`, `.admin_redaction` as the server runs them; absent when the
+  configuration cannot be read; `hs_admin::user_moderation::server_rate_limits`). The section
+  (`pages/users/RateLimitSection.tsx`, words in `lib/rate-limits.ts`) reads "Override: …" or "No
+  override: the server's own limits apply.", then "Server-wide limit: 0.2 messages a second,
+  bursts of 10." and what clearing does ("This override replaces it for them; clearing the
+  override puts them back on it.", or with limits switched off "This override still applies to
+  them; clearing it leaves them unlimited."), with a link to the setting; for a server
+  administrator, the redaction limit an override also replaces; for a bridge's account, that the
+  bridge's own `rate_limited: false` exempts what it sends. Each field's hint gives the
+  server-wide value ("0 exempts them from the limit. Server-wide: 0.2."). A save or clear keeps
+  the `server_wide` the read carried.
+- **Offering settings say what saving does to bridges people already have** (item 7, "bridge
+  option defaults"). Checked against `hs_bridges::manager`'s tick with a throwaway test, not
+  assumed: who-can-have-one applies to requests from now on (nobody's bridge is removed); the
+  image tag and options reach every existing bridge (redeployed and restarted once in the
+  cluster; run elsewhere, each keeps its old files until downloaded again); the runtime is the
+  offering's, not each bridge's. The dialog (`OfferingSettingsDialog.tsx`,
+  `lib/bridge-offerings.ts::settingsEffects`) says so under each section, and warns on a
+  changed runtime with bridges in place. The old claim "a changed runtime applies to bridges
+  started from now on" was wrong and is gone; the image tag hint no longer says "every new
+  bridge".
+- **Item 8** was done by `7ca60aa6` (the search-index lag, OpenAPI 0.1.10); marked below.
+- **Settings with no reader** (item 9; decision 0034). There was no "has no effect yet" badge
+  in `web/`: the words were in each setting's description, which the page renders from the
+  server's schema (`hs-config` doc comments). Each setting now has a reader or is gone:
+
+  | Setting | Now |
+  |---|---|
+  | `server.admin_contact` | Read: `GET /.well-known/matrix/support` (`hs_cli::well_known`), hot |
+  | `auth.password.enabled` | Read: `GET`/`POST /login` (`hs_auth::routes::login`), hot; the web sign-in says "This server has password sign-in turned off…" |
+  | `media.remote_media_retention` | Read: hourly sweeper `hs_media::retention`, `hs_media_remote_retention_deleted_total` |
+  | `rate_limits.third_party_id_validation` | Already read (`hs_auth::threepid`) before this branch |
+  | `server.report_stats` | Removed |
+  | `auth.enable_legacy_login` | Removed |
+  | `auth.session_secret`, `auth.session_secret_file` | Removed |
+  | `appservices.enabled` | Removed (`appservices` is now a reloadable section) |
+
+  A removed setting in a file, `HS__` variable or stored database layer is dropped with a
+  `warn` (`hs_config::retired`), so an older configuration still starts; a write of one through
+  the admin API is `400` naming why it went. `hs-compat` maps `report_stats` and the macaroon
+  keys to nothing ("Not needed", not blocking) and `password_config.enabled: only_for_reauth` to
+  `false`; `docs/compat/synapse-config-table.md` and its (stale) summary counts updated.
+  `docs/config.md` and `web/src/test/fixtures/hs-config-schema.json` regenerated; the mock's
+  hand-written schema lost the removed settings.
+- **Erase on deactivate** was already offered: "Also erase their data" in the deactivate dialog
+  and "Erase data" for a deactivated account, explained inline (since 2026-10-02); item 9's note
+  that it waited for the server was stale. `e2e-real/user-erase.spec.ts` passes on this branch.
+- Fixed on the way: `e2e-real/bridge-offerings.spec.ts` expected the Add dialog to close on Add
+  (it became a two-step dialog on 2026-10-02); it now clicks Done.
+
+**Verified.** `npm run check` (lint 0 errors, types, **631 unit tests** after rebasing on `2ef00ef7`, build); `npm run
+test:e2e` **69 of 69** (`user-moderation.spec.ts` checks the server-wide line and the link to
+the setting; `offer-bridge.spec.ts` new test with axe). Rust: `cargo test -p hs-config -p
+hs-compat -p hs-media -p hs-auth`, `cargo test -p hs-admin --lib --test contract`, per-crate
+clippy `-D warnings` for those and `hs-cli`; new tests
+`user_moderation::tests::the_rate_limit_answer_carries_the_server_wide_limits_it_replaces`,
+`router::tests::config_update_refuses_a_retired_setting_and_a_stored_one_is_not_read_back`,
+`retired::tests::*`, `retention::tests::a_pass_deletes_old_remote_copies_and_keeps_the_rest`,
+`login::tests::a_password_login_is_neither_offered_nor_accepted_when_turned_off`,
+`well_known::tests::support_document_*`. **Real binary:** `crates/hs-cli/tests/config_hot.rs`
+`settings_that_had_no_reader_are_read_or_gone` (a file with three removed settings starts and
+logs each; `admin_contact` is the support document; password login off and on; a removed
+setting's write refused) and the existing hot-settings test; `web/e2e-real/effective-values.spec.ts`
+(3, new) plus `user-erase`, `user-moderation`, `configuration`, `explained-pages`,
+`bridge-offerings`, `web-items`: all green against `hs serve` of this branch (`test.local`,
+single node). Screenshots in `test-results/real-screenshots/effective-values-*-real.png`.
+
+**Left.**
+
+- The runtime of an offering is read per pass, not per bridge: switching to the cluster
+  deploys existing hand-run bridges there too, and switching away leaves pods running that no
+  later change reaches. The dialog now says so; `hs_bridges` should record each instance's
+  runtime (or move them deliberately). Track 11.
+- `media.remote_media_retention` runs on every replica of a cluster (idempotent, a list each
+  per hour); one owner per pass would be cheaper.
+- `crates/hs-federation/scripts/two-server-federation.sh` still writes
+  `auth.enable_legacy_login` (loads with the warning).
 
 ## 2026-10-04: the Cluster page's Epoch, fitted at 1280 px; e2e-real for one node or many; screenshots stay out of the tree (branch `agent/ops-web`)
 
@@ -546,15 +634,16 @@ closes that and audits every page. Branched from `agent/config-hot` (for `applie
 6. ~~**Federation and Overview at scale**: both read the first 50 destinations; the Overview
    counts failing ones from that page instead of `federation_destinations_failing_count`.
    Needs paging and a failing-first filter.~~ Done 2026-10-04.
-7. **Effective server-wide values beside per-user overrides** (a user's rate limit section) and
-   bridge option defaults ("applies to bridges created after saving").
+7. ~~**Effective server-wide values beside per-user overrides** (a user's rate limit section) and
+   bridge option defaults ("applies to bridges created after saving").~~ Done 2026-10-08.
 8. ~~**Cluster series in the admin API**: drains that released at once, heartbeat sequence, and a
    search index lag (`hs_room_search_rooms_behind`, once it exists) need admin API fields before
    the Cluster or Statistics page can show them.~~ Done 2026-10-04 for the heartbeat sequence
-   and drains released at once; the search-index lag still has no admin API field.
-9. **Settings with no reader** (listed above) should either get one or leave the schema; the UI
+   and drains released at once; the search-index lag shipped in `7ca60aa6` (OpenAPI 0.1.10).
+9. ~~**Settings with no reader** (listed above) should either get one or leave the schema; the UI
    says "has no effect yet" meanwhile. **Erase on deactivate** waits for an eraser on the
-   server (`erase: true` is refused).
+   server (`erase: true` is refused).~~ Done 2026-10-08 (decision 0034); erase on deactivate
+   was in the UI since 2026-10-02.
 10. ~~Smaller wording left: the audit page's action filter is free text with a wire placeholder;
     raw Kubernetes phases on the offering page; server notice "m.image without a text body";
     the sign-in page's `is_admin`; the task result keys humanised from snake_case.~~ Done

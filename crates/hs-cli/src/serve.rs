@@ -362,6 +362,12 @@ fn build_router<B: KvBackend>(
                 .with_operation_id("getWellKnownClient"),
         )
         .get(
+            "/.well-known/matrix/support",
+            crate::well_known::get_support,
+            RouteMeta::new(Surface::MatrixClient, AuthKind::None)
+                .with_operation_id("getWellKnownSupport"),
+        )
+        .get(
             "/health/live",
             health_live,
             RouteMeta::new(Surface::Admin, AuthKind::None).with_operation_id("healthLive"),
@@ -1140,6 +1146,9 @@ struct Running {
     /// Samples the statistics every quarter hour (`crate::statistics`); stopped on shutdown so
     /// it does not keep the store open after the server has gone.
     statistics_sampler: tokio::task::JoinHandle<()>,
+    /// Deletes cached remote media past `media.remote_media_retention` once an hour
+    /// (`hs_media::retention`); stopped on shutdown with the sampler.
+    media_retention: tokio::task::JoinHandle<()>,
     shutdown_tx: watch::Sender<bool>,
     join: tokio::task::JoinHandle<()>,
     /// Ends every `/sync` long-poll in flight (`hs_user::hub::SessionHub::begin_shutdown`), so
@@ -1299,6 +1308,7 @@ impl Running {
     async fn stop(self) {
         stop_named("bridge manager", self.bridge_manager).await;
         stop_named("statistics sampler", self.statistics_sampler).await;
+        stop_named("remote media retention", self.media_retention).await;
         let report = self.cluster.drain(CLUSTER_DRAIN_DEADLINE).await;
         if report.handed_off > 0 || report.released_unclaimed > 0 {
             tracing::info!(
@@ -2175,6 +2185,10 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     let statistics_sampler = statistics
         .clone()
         .spawn_sampler(crate::statistics::SAMPLE_INTERVAL);
+    let media_retention = hs_media::retention::spawn_sweeper(
+        media_state.repository.clone(),
+        hs_media::retention::RetentionMetrics::register(&metrics),
+    );
     let media_source: Arc<dyn hs_admin::media::MediaSource> = Arc::new(
         hs_media::admin_source::RepositoryMediaSource::new(media_state.repository.clone()),
     );
@@ -2340,7 +2354,18 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         tracing::info!(
             server = ?well_known.server,
             client_base_url = ?well_known.client_base_url,
+            support = ?well_known.support,
             "publishing .well-known discovery documents"
+        );
+    }
+    if well_known.support.is_none()
+        && let Some(contact) = config.server.admin_contact.as_deref()
+        && !contact.trim().is_empty()
+    {
+        tracing::warn!(
+            admin_contact = contact,
+            "server.admin_contact is neither an email address, a Matrix ID nor an http(s) page, \
+             so /.well-known/matrix/support is not served"
         );
     }
 
@@ -2522,6 +2547,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         running: Some(Running {
             bridge_manager,
             statistics_sampler,
+            media_retention,
             shutdown_tx,
             join,
             release_long_polls,

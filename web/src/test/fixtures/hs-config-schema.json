@@ -13,7 +13,6 @@
         "well_known_server": null,
         "signing_key_path": "./signing-keys",
         "admin_contact": null,
-        "report_stats": false,
         "unstable_features": {},
         "sync": {
           "feed_retention_entries": 10000,
@@ -211,9 +210,6 @@
         "registration_shared_secret": null,
         "registration_shared_secret_file": null,
         "user_directory_search_all_users": false,
-        "enable_legacy_login": true,
-        "session_secret": null,
-        "session_secret_file": null,
         "access_token_lifetime": "1h",
         "refresh_token_lifetime": "1y",
         "password": {
@@ -248,7 +244,6 @@
       "description": "Bridges and other appservices: delivering events to them, and registration files to\nimport once.",
       "$ref": "#/$defs/AppservicesConfig",
       "default": {
-        "enabled": true,
         "registration_files": [],
         "tracking_failure_threshold": 50
       }
@@ -380,18 +375,12 @@
           "x-applies": "bootstrap"
         },
         "admin_contact": {
-          "description": "An address (`mailto:abuse@example.org`) for people and other servers' operators to report\nabuse to. Nothing publishes it yet. Corresponds to Synapse's `admin_contact`.",
+          "description": "How to reach this server's administrator: an email address (`mailto:abuse@example.org`)\nor a Matrix ID (`@admin:example.org`). It is published as the administrator contact in\n`/.well-known/matrix/support`, the document clients read to tell people who to ask for\nhelp or report abuse to; a `https://` address is published there as the support page\ninstead. Unset, that document is not served. Corresponds to Synapse's `admin_contact`.",
           "type": [
             "string",
             "null"
           ],
           "default": null,
-          "x-applies": "hot"
-        },
-        "report_stats": {
-          "description": "Whether to send anonymous usage statistics to the Matrix.org Foundation, as Synapse can.\nNothing sends them yet, so this has no effect. Corresponds to Synapse's `report_stats`.",
-          "type": "boolean",
-          "default": false,
           "x-applies": "hot"
         },
         "unstable_features": {
@@ -850,7 +839,7 @@
           "x-applies": "hot"
         },
         "remote_media_retention": {
-          "description": "How long to keep copies of other servers' media. Nothing evicts remote media yet, so\nthis setting has no effect. Unset means keep forever. Corresponds to Synapse's\n`media_retention.remote_media_lifetime`.",
+          "description": "How long to keep copies of other servers' media that nobody has asked for. Once an hour\nthis server deletes the cached copies unused for longer than this (last served, or\nfetched if never served); protected and quarantined copies are kept, and a deleted copy\nis fetched again from its server when next asked for. Unset means keep forever.\nCorresponds to Synapse's `media_retention.remote_media_lifetime`.",
           "anyOf": [
             {
               "$ref": "#/$defs/Duration"
@@ -1697,27 +1686,6 @@
           "default": false,
           "x-applies": "hot"
         },
-        "enable_legacy_login": {
-          "description": "Whether to serve the classic Matrix sign-in (`/login` and user-interactive auth) beside\nthe OAuth 2.0 issuer. Every client today, and bridges, sign in this way. Nothing reads\nthis setting yet: the classic sign-in is always served.",
-          "type": "boolean",
-          "default": true,
-          "x-applies": "restart"
-        },
-        "session_secret": {
-          "description": "The key that signs session cookies and OAuth state. Nothing reads this setting yet.\nPrefer `session_secret_file`. Corresponds to Synapse's `macaroon_secret_key`.",
-          "$ref": "#/$defs/SecretString",
-          "default": null,
-          "x-applies": "restart"
-        },
-        "session_secret_file": {
-          "description": "Path to a file holding the session-signing key, read in place of `session_secret`.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null,
-          "x-applies": "restart"
-        },
         "access_token_lifetime": {
           "description": "How long an access token from the OAuth issuer works before the client must refresh it.\nShorter limits the damage of a leaked token; clients refresh on their own, so people do\nnot notice. Tokens from the classic sign-in that cannot be refreshed are not affected,\nas in Synapse. Corresponds to Synapse's `access_token_lifetime`.",
           "$ref": "#/$defs/Duration",
@@ -1828,10 +1796,10 @@
       "type": "object",
       "properties": {
         "enabled": {
-          "description": "Whether people may sign in with a password. Nothing reads this setting yet: password\nsign-in is always offered, so changing it has no effect. Corresponds to Synapse's\n`password_config.enabled`.",
+          "description": "Whether people may sign in with a password (`m.login.password`). Turned off, `/login`\nneither offers nor accepts it, so people sign in through single sign-on or the OAuth\nissuer, and signing in to this interface with a password stops working too (paste an\naccess token instead). Re-entering a password to confirm a sensitive change, such as\nremoving a device, still works, as with Synapse's `only_for_reauth`. Corresponds to\nSynapse's `password_config.enabled`.",
           "type": "boolean",
           "default": true,
-          "x-applies": "restart"
+          "x-applies": "hot"
         },
         "pepper": {
           "description": "A secret mixed into every password hash, so a copy of the database alone is not enough to\nguess passwords from. Set it once and keep it: changing or losing it makes every existing\npassword stop working. Migrating from Synapse, set the same value Synapse had. Prefer\n`pepper_file`. Corresponds to Synapse's `password_config.pepper`.",
@@ -2083,12 +2051,6 @@
       "description": "Appservice delivery settings, and registration files to import once.",
       "type": "object",
       "properties": {
-        "enabled": {
-          "description": "Whether events are delivered to bridges and other appservices. Nothing reads this\nsetting yet: delivery is always on, and a bridge is paused on its own page instead.",
-          "type": "boolean",
-          "default": true,
-          "x-applies": "restart"
-        },
         "registration_files": {
           "description": "Registration YAML files to import into the appservice registry, once each. Corresponds to\nSynapse's `app_service_config_files`, and exists for migrating from it: the first start\nthat sees a file imports it (unless the registry already has an appservice with that id)\nand records the import; every later start skips it, even if the file has changed. From\nthen on the bridge is managed in the Bridges section of the interface. Bootstrap only: set\nin the bootstrap file or the environment, never stored in the database.",
           "type": "array",

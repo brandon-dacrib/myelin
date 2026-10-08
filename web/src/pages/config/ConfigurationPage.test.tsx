@@ -61,9 +61,10 @@ describe("ConfigurationPage", () => {
     renderIndex();
     await screen.findByRole("link", { name: "Rate limits" });
 
-    // Every administered setting re-read by a running server: `server`, `rate_limits` and
-    // `migration` (from the schema's `x-applies`). `storage` and `listeners` are set at install.
-    expect(screen.getAllByText("Reloadable")).toHaveLength(3);
+    // Every administered setting re-read by a running server: `server`, `rate_limits`,
+    // `appservices` and `migration` (from the schema's `x-applies`). `storage` and `listeners`
+    // are set at install.
+    expect(screen.getAllByText("Reloadable")).toHaveLength(4);
     expect(screen.getAllByText("Bootstrap only")).toHaveLength(2);
     expect(screen.getAllByText("Restart required").length).toBeGreaterThan(0);
   });
@@ -72,7 +73,7 @@ describe("ConfigurationPage", () => {
     renderIndex();
     const card = (await screen.findByRole("link", { name: "Server" })).closest("li")!;
     expect(within(card).getByText("1 pinned by environment")).toBeInTheDocument();
-    expect(within(card).getByText(/of 6$/)).toBeInTheDocument();
+    expect(within(card).getByText(/of 5$/)).toBeInTheDocument();
   });
 
   it("searches across every setting in every section", async () => {
@@ -110,7 +111,7 @@ describe("ConfigurationPage", () => {
     ).toBeInTheDocument();
     await user.click(dialog.getByRole("button", { name: "Re-read files" }));
 
-    expect(await screen.findByText("Reloaded 3 sections")).toBeInTheDocument();
+    expect(await screen.findByText("Reloaded 4 sections")).toBeInTheDocument();
     await waitFor(() => expect(configLastReloaded.rate_limits).not.toBeNull());
   });
 });

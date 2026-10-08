@@ -79,7 +79,7 @@ describe("normalizeConfigSchema", () => {
       origin: "file",
       editable: false,
     });
-    expect(schema.settings["auth.session_secret"]).toMatchObject({ secret: true });
+    expect(schema.settings["auth.registration_shared_secret"]).toMatchObject({ secret: true });
   });
 
   it("still accepts the older origins map, inferring editable from the origin", () => {
@@ -165,7 +165,7 @@ describe("buildSectionModel", () => {
 
   it("carries the server's editable answer onto the field", () => {
     expect(fieldsOf("server").get("server_name")?.editable).toBe(false);
-    expect(fieldsOf("server").get("report_stats")?.editable).toBe(true);
+    expect(fieldsOf("server").get("admin_contact")?.editable).toBe(true);
     expect(fieldsOf("storage").get("data_dir")?.editable).toBe(false);
   });
 

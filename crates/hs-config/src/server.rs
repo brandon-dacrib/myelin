@@ -47,15 +47,13 @@ pub struct ServerConfig {
     #[serde(default = "default_signing_key_path")]
     pub signing_key_path: PathBuf,
 
-    /// An address (`mailto:abuse@example.org`) for people and other servers' operators to report
-    /// abuse to. Nothing publishes it yet. Corresponds to Synapse's `admin_contact`.
+    /// How to reach this server's administrator: an email address (`mailto:abuse@example.org`)
+    /// or a Matrix ID (`@admin:example.org`). It is published as the administrator contact in
+    /// `/.well-known/matrix/support`, the document clients read to tell people who to ask for
+    /// help or report abuse to; a `https://` address is published there as the support page
+    /// instead. Unset, that document is not served. Corresponds to Synapse's `admin_contact`.
     #[serde(default)]
     pub admin_contact: Option<String>,
-
-    /// Whether to send anonymous usage statistics to the Matrix.org Foundation, as Synapse can.
-    /// Nothing sends them yet, so this has no effect. Corresponds to Synapse's `report_stats`.
-    #[serde(default)]
-    pub report_stats: bool,
 
     /// Extra `unstable_features` flags advertised by `GET /_matrix/client/versions`, by MSC
     /// identifier (`org.matrix.msc3202: true`). Merged over the server's built-in set, which is
@@ -127,7 +125,6 @@ impl Default for ServerConfig {
             well_known_server: None,
             signing_key_path: default_signing_key_path(),
             admin_contact: None,
-            report_stats: false,
             unstable_features: BTreeMap::new(),
             sync: SyncConfig::default(),
         }

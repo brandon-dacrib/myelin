@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from "react";
+import { useState, type FormEvent, type ReactNode } from "react";
 import {
   useBridgeDeploymentTarget,
   usePutBridgeOffering,
@@ -10,7 +10,7 @@ import { ApiProblemError } from "@/api/problem";
 import { Button } from "@/components/ui/button/Button";
 import { Dialog, DialogContent } from "@/components/ui/dialog/Dialog";
 import { toast } from "@/components/ui/toast/toast-store";
-import { accessIsValid, requestFromOffering } from "@/lib/bridge-offerings";
+import { accessIsValid, requestFromOffering, settingsEffects } from "@/lib/bridge-offerings";
 import {
   AccessFields,
   OptionFields,
@@ -96,6 +96,12 @@ function SettingsForm({
   // An offering already running in the cluster stays choosable while the target loads.
   const clusterAvailable = cluster.available || (!target && offering.runtime === "cluster");
   const name = offering.name ?? offering.type;
+  const existing = Object.values(offering.instances ?? {}).reduce((a, b) => a + b, 0);
+  const effects = settingsEffects(
+    offering.runtime,
+    effectiveRuntime(draft, clusterAvailable),
+    existing,
+  );
 
   function patch(p: Partial<Draft>) {
     setDraft((d) => ({ ...d, ...p }));
@@ -139,7 +145,7 @@ function SettingsForm({
     <DialogContent
       size="form"
       title={`${name} settings`}
-      description="A new image or options reach the bridges people already have: the server re-renders each one and restarts the ones it runs, once. A changed runtime applies to bridges started from now on."
+      description="Each section says what saving it does to bridges created after saving and to the ones people already have."
     >
       <form onSubmit={handleSubmit} noValidate className="flex flex-col gap-6">
         <SettingSwitch
@@ -158,6 +164,7 @@ function SettingsForm({
             onChange={patch}
             serverName={serverName}
           />
+          <AppliesNote testId="applies-access">{effects.access}</AppliesNote>
         </section>
         <section aria-labelledby="settings-runtime">
           <h3 id="settings-runtime" className="mb-2 text-sm font-medium text-text">
@@ -173,12 +180,23 @@ function SettingsForm({
             imageTag={draft.imageTag}
             onImageTag={(imageTag) => patch({ imageTag })}
           />
+          <AppliesNote testId="applies-image">Image tag: {effects.imageAndOptions}</AppliesNote>
+          {effects.runtimeChange && (
+            <p
+              role="status"
+              className="mt-2 rounded-md border border-warning-border bg-warning-bg p-2 text-sm text-text"
+              data-testid="runtime-change"
+            >
+              {effects.runtimeChange}
+            </p>
+          )}
         </section>
         <section aria-labelledby="settings-options">
           <h3 id="settings-options" className="mb-2 text-sm font-medium text-text">
             Options
           </h3>
           <OptionFields values={draft} onChange={patch} type={type} />
+          <AppliesNote testId="applies-options">{effects.imageAndOptions}</AppliesNote>
           <DoublePuppetingChange
             from={offering.options?.double_puppeting ?? false}
             to={draft.doublePuppeting}
@@ -201,6 +219,15 @@ function SettingsForm({
         </div>
       </form>
     </DialogContent>
+  );
+}
+
+/** One "what saving this does" line under a section of the dialog. */
+function AppliesNote({ children, testId }: { children: ReactNode; testId: string }) {
+  return (
+    <p className="mt-2 text-xs text-text-muted" data-testid={testId}>
+      {children}
+    </p>
   );
 }
 

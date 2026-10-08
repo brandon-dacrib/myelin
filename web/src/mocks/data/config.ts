@@ -570,12 +570,7 @@ const properties: Record<string, JsonSchemaNode> = {
       admin_contact: {
         anyOf: [{ type: "string" }, { type: "null" }],
         description:
-          "Contact address advertised for abuse reports and shown to operators of other servers.",
-      },
-      report_stats: {
-        type: "boolean",
-        default: false,
-        description: "Whether this server opts in to the anonymised statistics-reporting endpoint.",
+          "How to reach this server's administrator: an email address or a Matrix ID, published in /.well-known/matrix/support.",
       },
     },
   },
@@ -804,20 +799,6 @@ const properties: Record<string, JsonSchemaNode> = {
         anyOf: [{ type: "string" }, { type: "null" }],
         description: "Path to a file containing the shared-secret-registration secret.",
       },
-      enable_legacy_login: {
-        type: "boolean",
-        default: true,
-        description:
-          "Serve the legacy /login and user-interactive-auth flows in addition to the native OAuth 2.0 issuer. Needed for older clients, bridges and m.login.application_service.",
-      },
-      session_secret: {
-        $ref: "#/$defs/SecretString",
-        description: "Key the session cookies and OAuth state are signed with.",
-      },
-      session_secret_file: {
-        anyOf: [{ type: "string" }, { type: "null" }],
-        description: "Path to a file containing the session-signing secret.",
-      },
       access_token_lifetime: {
         $ref: "#/$defs/Duration",
         description: "How long an access token stays valid before it must be refreshed.",
@@ -841,11 +822,6 @@ const properties: Record<string, JsonSchemaNode> = {
     type: "object",
     description: "Appservice (bridge) registry bootstrap settings.",
     properties: {
-      enabled: {
-        type: "boolean",
-        default: true,
-        description: "Master switch for appservice transaction delivery.",
-      },
       registration_files: {
         type: "array",
         items: { type: "string" },
@@ -942,7 +918,6 @@ export const configOrigins: Record<string, ConfigOrigin> = {
   "/rate_limits/login/burst_count": "database",
   "/auth/enable_registration": "database",
   "/auth/registration_shared_secret": "database",
-  "/auth/session_secret": "file",
   "/auth/password/policy/minimum_length": "database",
   "/appservices/registration_files": "file",
   "/telemetry/metrics/enabled": "database",
@@ -953,7 +928,6 @@ export const configOrigins: Record<string, ConfigOrigin> = {
 /** The settings served redacted, whether or not anything has set them. */
 const SECRET_POINTERS = [
   "/auth/registration_shared_secret",
-  "/auth/session_secret",
   "/auth/password/pepper",
   "/telemetry/sentry/dsn",
   "/storage/password",
@@ -1194,7 +1168,6 @@ export const configValues: Record<string, Record<string, JsonValue>> = {
     well_known_server: null,
     signing_key_path: "/var/lib/myelin/signing-keys",
     admin_contact: "mailto:abuse@example.org",
-    report_stats: false,
   },
   listeners: {
     listeners: [
@@ -1255,9 +1228,6 @@ export const configValues: Record<string, Record<string, JsonValue>> = {
     enable_registration: true,
     registration_shared_secret: { $secret: true },
     registration_shared_secret_file: null,
-    enable_legacy_login: true,
-    session_secret: { $secret: true },
-    session_secret_file: "/run/secrets/session_secret",
     access_token_lifetime: "1h",
     refresh_token_lifetime: "1y",
     password: {
@@ -1284,7 +1254,6 @@ export const configValues: Record<string, Record<string, JsonValue>> = {
     ],
   },
   appservices: {
-    enabled: true,
     registration_files: ["/etc/myelin/appservices/discord.yaml"],
     tracking_failure_threshold: 50,
   },

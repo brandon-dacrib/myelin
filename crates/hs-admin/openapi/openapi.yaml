@@ -10,7 +10,7 @@ openapi: 3.1.0
 info:
   title: hs-admin API
   summary: The native administration and moderation API for the homeserver.
-  version: 0.1.11
+  version: 0.1.12
   description: 'The only API the management interface (track 16) talks to. See docs/rfcs/0004-admin-api.md for the full design rationale: resource modeling, naming, pagination, filtering, errors, idempotency, scopes, versioning and the event stream. This document is the contract; the hs-admin router''s contract tests assert the router and this document agree on paths and methods (RFC 0004 section 1, decision D15.16).'
   contact:
     name: 'Track 15: Admin API and modules'
@@ -92,6 +92,14 @@ info:
       be sent to the appservice, how many were dead-lettered, and how long the oldest waiting
       one has waited, on every row of appservices.list, so a list shows which bridge is falling
       behind without a request per bridge. The same numbers as the hs_appservice_queue_* gauges.'
+  - version: 0.1.12
+    date: '2026-10-08'
+    notes: 'Additive: users.rate_limit.get answers UserRateLimit, the override as before plus
+      server_wide (schema ServerRateLimits: rate_limits.enabled, .message and .admin_redaction
+      as the server runs them), the limits the override replaces and that apply once it is
+      cleared; absent when the configuration cannot be read. config.update and config.validate
+      refuse a setting removed from the configuration schema with 400 naming it and why
+      (decision 0034).'
 servers:
 - url: /api/v1
   description: Same origin as /_matrix on the client listener.
@@ -5820,7 +5828,7 @@ paths:
   /users/{user_id}/rate-limit:
     get:
       summary: Get a user's rate-limit override
-      description: The override replaces the server's rate_limits.message bucket for this user's event sending. An empty object means none is set.
+      description: The override replaces the server's rate_limits.message bucket for this user's event sending (and, for a server administrator, rate_limits.admin_redaction for their redactions). No override fields means none is set; server_wide is what the server applies without one.
       operationId: users.rate_limit.get
       tags:
       - Users
@@ -5831,11 +5839,11 @@ paths:
       - $ref: '#/components/parameters/UserId'
       responses:
         '200':
-          description: Override, if any.
+          description: Override, if any, and the server-wide limits.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/RateLimitOverride'
+                $ref: '#/components/schemas/UserRateLimit'
         '401':
           $ref: '#/components/responses/Unauthenticated'
         '403':
@@ -7308,6 +7316,49 @@ components:
         messages_per_second:
           type: number
           minimum: 0
+        burst_count:
+          type: integer
+          minimum: 1
+    UserRateLimit:
+      type: object
+      description: A user's rate-limit override (messages_per_second and burst_count, both absent when none is set) and the server-wide limits beside it.
+      properties:
+        messages_per_second:
+          type: number
+          minimum: 0
+          description: The override's sustained rate; 0 exempts the user. Absent when no override is set.
+        burst_count:
+          type: integer
+          minimum: 1
+        server_wide:
+          $ref: '#/components/schemas/ServerRateLimits'
+    ServerRateLimits:
+      type: object
+      description: The rate_limits configuration section as the server runs it, for what a per-user override replaces. Absent from UserRateLimit when the configuration cannot be read.
+      required:
+      - enabled
+      - message
+      - admin_redaction
+      properties:
+        enabled:
+          type: boolean
+          description: rate_limits.enabled. When false nobody without an override is limited; an override still applies.
+        message:
+          $ref: '#/components/schemas/RateLimitBucket'
+          description: rate_limits.message, for sending messages, state events and redactions by everybody without an override.
+        admin_redaction:
+          $ref: '#/components/schemas/RateLimitBucket'
+          description: rate_limits.admin_redaction, for a server administrator's redactions without an override.
+    RateLimitBucket:
+      type: object
+      required:
+      - per_second
+      - burst_count
+      properties:
+        per_second:
+          type: number
+          minimum: 0
+          description: Actions per second once the burst is spent; 0 switches this limit off.
         burst_count:
           type: integer
           minimum: 1

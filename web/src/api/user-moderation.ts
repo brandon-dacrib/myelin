@@ -15,6 +15,8 @@ import type { components, operations } from "./schema";
 import type { Task } from "./tasks";
 
 export type RateLimitOverride = components["schemas"]["RateLimitOverride"];
+/** What `GET /users/{user_id}/rate-limit` answers: the override and the server-wide limits. */
+export type UserRateLimit = components["schemas"]["UserRateLimit"];
 export type Session = components["schemas"]["Session"];
 export type Membership = components["schemas"]["RoomMember"];
 export type MembershipState = NonNullable<Membership["membership"]>;
@@ -55,7 +57,9 @@ export const useShadowBanUser = () => useShadowBanAction("/users/{user_id}/shado
 export const useUnshadowBanUser = () => useShadowBanAction("/users/{user_id}/unshadow-ban");
 
 /** Whether an override is set at all: the server answers `{}` when there is none. */
-export function hasRateLimitOverride(o: RateLimitOverride | undefined): o is RateLimitOverride {
+export function hasRateLimitOverride(
+  o: RateLimitOverride | UserRateLimit | undefined,
+): o is RateLimitOverride {
   return o?.messages_per_second != null;
 }
 
@@ -92,7 +96,12 @@ export function useSetUserRateLimit() {
       });
       return unwrap(result);
     },
-    onSuccess: (saved, { userId }) => qc.setQueryData(["user-rate-limit", userId], saved),
+    // The answer is the override alone; keep the server-wide limits the read carried.
+    onSuccess: (saved, { userId }) =>
+      qc.setQueryData<UserRateLimit>(["user-rate-limit", userId], (old) => ({
+        ...saved,
+        server_wide: old?.server_wide,
+      })),
   });
 }
 
@@ -106,7 +115,10 @@ export function useClearUserRateLimit() {
       });
       unwrap(result);
     },
-    onSuccess: (_data, { userId }) => qc.setQueryData(["user-rate-limit", userId], {}),
+    onSuccess: (_data, { userId }) =>
+      qc.setQueryData<UserRateLimit>(["user-rate-limit", userId], (old) => ({
+        server_wide: old?.server_wide,
+      })),
   });
 }
 

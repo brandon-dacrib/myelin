@@ -1,4 +1,5 @@
 import { useState, type FormEvent } from "react";
+import { Link } from "@tanstack/react-router";
 import {
   DEFAULT_BURST_COUNT,
   describeRateLimit,
@@ -15,18 +16,34 @@ import { MutationError } from "@/components/MutationError";
 import { QueryProblemState } from "@/components/QueryProblemState";
 import { toast } from "@/components/ui/toast/toast-store";
 import { hasScope } from "@/lib/auth";
+import { rateLimitContext, type ServerRateLimits } from "@/lib/rate-limits";
+import { settingRowId } from "@/lib/config-model";
 
 type FieldErrors = { rate?: string; burst?: string; other?: unknown };
 
 /**
  * A per-user override of the server's message rate limit (`/users/{user_id}/rate-limit`):
- * tighter for somebody flooding rooms, 0 to exempt a bot. Clearing it puts them back on the
- * server's own limits.
+ * tighter for somebody flooding rooms, 0 to exempt a bot. Beside it, the server-wide limit it
+ * replaces (the answer's `server_wide`), what applies once it is cleared, and, for a server
+ * administrator, the redaction limit an override also replaces. Clearing it puts them back on
+ * the server's own limits.
  */
-export function RateLimitSection({ userId }: { userId: string }) {
+export function RateLimitSection({
+  userId,
+  admin = false,
+  appserviceId,
+}: {
+  userId: string;
+  /** Whether they are a server administrator: their redactions have their own limit. */
+  admin?: boolean;
+  /** The bridge whose namespace holds the account, if any. */
+  appserviceId?: string | null;
+}) {
   const { data, isLoading, isError, error, refetch } = useUserRateLimit(userId);
   const override = hasRateLimitOverride(data) ? data : undefined;
+  const server = data?.server_wide;
   const canWrite = hasScope("admin:write");
+  const context = rateLimitContext(server, Boolean(override), admin);
 
   return (
     <div>
@@ -42,15 +59,48 @@ export function RateLimitSection({ userId }: { userId: string }) {
         <p className="mt-1 text-sm text-text-muted">Loading…</p>
       ) : (
         <>
-          <p className="mt-1 text-sm text-text-muted" data-testid="rate-limit-current">
-            {override ? describeRateLimit(override) : "The server's own limits apply."}
+          <p className="mt-1 text-sm text-text" data-testid="rate-limit-current">
+            {override
+              ? `Override: ${describeRateLimit(override)}`
+              : "No override: the server's own limits apply."}
           </p>
+          <div className="mt-1 flex flex-col gap-1 text-sm text-text-muted">
+            <p data-testid="rate-limit-server-wide">
+              {context.serverWide}
+              {context.override && ` ${context.override}`}{" "}
+              <Link
+                to="/configuration/$section"
+                params={{ section: "rate_limits" }}
+                hash={settingRowId(server && !server.enabled ? "enabled" : "message")}
+                className="text-accent underline underline-offset-2"
+              >
+                Change it under Configuration, Rate limits
+              </Link>
+              .
+            </p>
+            {context.redactions && <p data-testid="rate-limit-redactions">{context.redactions}</p>}
+            {appserviceId && (
+              <p data-testid="rate-limit-bridge">
+                This account belongs to the bridge{" "}
+                <Link
+                  to="/bridges/$bridgeId"
+                  params={{ bridgeId: appserviceId }}
+                  className="text-accent underline underline-offset-2"
+                >
+                  {appserviceId}
+                </Link>
+                . What the bridge sends for it is never limited when the bridge is registered with
+                rate limiting off, override or not (its Edit dialog says which).
+              </p>
+            )}
+          </div>
           {canWrite ? (
             <RateLimitForm
               // Remount when the saved override changes, so the fields show what is saved.
-              key={JSON.stringify(override ?? null)}
+              key={JSON.stringify(override ? overrideFields(override) : null)}
               userId={userId}
               override={override}
+              server={server}
             />
           ) : (
             <p className="mt-2 text-xs text-text-muted">Changing it needs admin:write.</p>
@@ -61,7 +111,20 @@ export function RateLimitSection({ userId }: { userId: string }) {
   );
 }
 
-function RateLimitForm({ userId, override }: { userId: string; override?: RateLimitOverride }) {
+/** The override's own fields, without the server-wide limits the answer carries beside them. */
+function overrideFields(o: RateLimitOverride): RateLimitOverride {
+  return { messages_per_second: o.messages_per_second, burst_count: o.burst_count };
+}
+
+function RateLimitForm({
+  userId,
+  override,
+  server,
+}: {
+  userId: string;
+  override?: RateLimitOverride;
+  server?: ServerRateLimits;
+}) {
   const save = useSetUserRateLimit();
   const clear = useClearUserRateLimit();
   const [rate, setRate] = useState(
@@ -114,7 +177,11 @@ function RateLimitForm({ userId, override }: { userId: string; override?: RateLi
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
         <Field
           label="Messages per second"
-          hint="0 exempts them from the limit."
+          hint={
+            server
+              ? `0 exempts them from the limit. Server-wide: ${server.message.per_second.toLocaleString()}.`
+              : "0 exempts them from the limit."
+          }
           error={errors.rate}
         >
           {(fieldProps) => (
@@ -129,7 +196,15 @@ function RateLimitForm({ userId, override }: { userId: string; override?: RateLi
             />
           )}
         </Field>
-        <Field label="Burst" hint="Messages they may send at once." error={errors.burst}>
+        <Field
+          label="Burst"
+          hint={
+            server
+              ? `Messages they may send at once. Server-wide: ${server.message.burst_count.toLocaleString()}.`
+              : "Messages they may send at once."
+          }
+          error={errors.burst}
+        >
           {(fieldProps) => (
             <Input
               {...fieldProps}

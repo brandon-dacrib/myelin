@@ -35,6 +35,8 @@
 //! - [`preview`]: `GET .../preview_url` — OpenGraph extraction, the SSRF guard, and the response
 //!   cache. Read this module's doc first: it states exactly what the SSRF guard does and does not
 //!   defend against, per this crate's convention for a security control.
+//! - [`retention`]: `media.remote_media_retention`, the hourly sweeper that deletes cached
+//!   copies of other servers' media nobody asked for in that long.
 //! - [`admin_source`]: the admin API's Media area (`hs_admin::media::MediaSource`) over the
 //!   repository: listing, quarantine, protection, deletion.
 
@@ -49,6 +51,7 @@ pub mod policy;
 pub mod preview;
 pub mod remote;
 pub mod repository;
+pub mod retention;
 pub mod router;
 pub mod routes;
 pub mod scanning;

@@ -60,6 +60,54 @@ pub struct RateLimitOverride {
 /// The burst a `PUT` without `burst_count` gets.
 pub const DEFAULT_OVERRIDE_BURST: u32 = 10;
 
+/// The OpenAPI `RateLimitBucket` schema: one bucket of the `rate_limits` configuration section
+/// as the server runs it.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ServerRateLimitBucket {
+    /// How fast the bucket refills, in actions per second. `0` switches this one limit off.
+    pub per_second: f64,
+    /// How many actions may happen back to back before the refill rate applies.
+    pub burst_count: u32,
+}
+
+impl From<hs_config::ratelimit::RateLimitBucket> for ServerRateLimitBucket {
+    fn from(b: hs_config::ratelimit::RateLimitBucket) -> Self {
+        Self {
+            per_second: b.per_second,
+            burst_count: b.burst_count,
+        }
+    }
+}
+
+/// The OpenAPI `ServerRateLimits` schema: the server-wide limits a per-user override stands in
+/// for, read from the `rate_limits` configuration section, so the user's page can say what the
+/// override replaces and what applies once it is cleared.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ServerRateLimits {
+    /// `rate_limits.enabled`. When `false` nobody without an override is limited; an override
+    /// still applies.
+    pub enabled: bool,
+    /// `rate_limits.message`: sending messages, state events and redactions, for everybody
+    /// without an override.
+    pub message: ServerRateLimitBucket,
+    /// `rate_limits.admin_redaction`: a server administrator's redactions, in place of
+    /// `message`, unless they have an override.
+    pub admin_redaction: ServerRateLimitBucket,
+}
+
+/// The OpenAPI `UserRateLimit` schema, what `users.rate_limit.get` answers: the user's
+/// override (its fields absent when none is set) and the server-wide limits beside it
+/// (`server_wide`, absent when the configuration cannot be read).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct UserRateLimit {
+    /// The override, flattened: `{}` here is "no override".
+    #[serde(flatten)]
+    pub overridden: RateLimitOverride,
+    /// The server-wide limits the override replaces, and that apply once it is cleared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_wide: Option<ServerRateLimits>,
+}
+
 /// The OpenAPI `Session` schema: one signed-in device, as the server last saw it.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AdminSession {
@@ -787,7 +835,8 @@ pub(crate) async fn users_unshadow_ban(
 // rate limit
 // -------------------------------------------------------------------------------------------
 
-/// `GET /api/v1/users/{user_id}/rate-limit` (`admin:read`): the override, or `{}` for none.
+/// `GET /api/v1/users/{user_id}/rate-limit` (`admin:read`): the override (no override fields
+/// for none) and the server-wide limits beside it ([`UserRateLimit`]).
 pub(crate) async fn users_rate_limit_get(
     State(state): State<AdminState>,
     headers: HeaderMap,
@@ -801,9 +850,40 @@ pub(crate) async fn users_rate_limit_get(
         Ok(m) => m,
         Err(response) => return response,
     };
-    match moderation.rate_limit(&user_id).await {
-        Ok(value) => axum::Json(value.unwrap_or_default()).into_response(),
-        Err(e) => source_problem(&e, &user_id, &instance),
+    let overridden = match moderation.rate_limit(&user_id).await {
+        Ok(value) => value.unwrap_or_default(),
+        Err(e) => return source_problem(&e, &user_id, &instance),
+    };
+    axum::Json(UserRateLimit {
+        overridden,
+        server_wide: server_rate_limits(&state).await,
+    })
+    .into_response()
+}
+
+/// The `rate_limits` section as the server runs it, or `None` when this server has no
+/// configuration source or it cannot be read (the override is still answered; the page then
+/// says it cannot show the server-wide value).
+async fn server_rate_limits(state: &AdminState) -> Option<ServerRateLimits> {
+    let config = state.config.as_ref()?;
+    let section = match config.get_section("rate_limits").await {
+        Ok(Some(section)) => section,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::warn!(target: "hs_admin::users", error = %e, "could not read rate_limits for a user's rate-limit answer");
+            return None;
+        }
+    };
+    match serde_json::from_value::<hs_config::RateLimitConfig>(section.values) {
+        Ok(limits) => Some(ServerRateLimits {
+            enabled: limits.enabled,
+            message: limits.message.into(),
+            admin_redaction: limits.admin_redaction.into(),
+        }),
+        Err(e) => {
+            tracing::warn!(target: "hs_admin::users", error = %e, "the rate_limits section did not read as one");
+            None
+        }
     }
 }
 

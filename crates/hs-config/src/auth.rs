@@ -33,9 +33,12 @@ fn default_minimum_password_length() -> u32 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PasswordConfig {
-    /// Whether people may sign in with a password. Nothing reads this setting yet: password
-    /// sign-in is always offered, so changing it has no effect. Corresponds to Synapse's
-    /// `password_config.enabled`.
+    /// Whether people may sign in with a password (`m.login.password`). Turned off, `/login`
+    /// neither offers nor accepts it, so people sign in through single sign-on or the OAuth
+    /// issuer, and signing in to this interface with a password stops working too (paste an
+    /// access token instead). Re-entering a password to confirm a sensitive change, such as
+    /// removing a device, still works, as with Synapse's `only_for_reauth`. Corresponds to
+    /// Synapse's `password_config.enabled`.
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// A secret mixed into every password hash, so a copy of the database alone is not enough to
@@ -307,18 +310,6 @@ pub struct AuthConfig {
     /// Synapse's `user_directory.search_all_users`.
     #[serde(default)]
     pub user_directory_search_all_users: bool,
-    /// Whether to serve the classic Matrix sign-in (`/login` and user-interactive auth) beside
-    /// the OAuth 2.0 issuer. Every client today, and bridges, sign in this way. Nothing reads
-    /// this setting yet: the classic sign-in is always served.
-    #[serde(default = "default_true")]
-    pub enable_legacy_login: bool,
-    /// The key that signs session cookies and OAuth state. Nothing reads this setting yet.
-    /// Prefer `session_secret_file`. Corresponds to Synapse's `macaroon_secret_key`.
-    #[serde(default)]
-    pub session_secret: SecretString,
-    /// Path to a file holding the session-signing key, read in place of `session_secret`.
-    #[serde(default)]
-    pub session_secret_file: Option<PathBuf>,
     /// How long an access token from the OAuth issuer works before the client must refresh it.
     /// Shorter limits the damage of a leaked token; clients refresh on their own, so people do
     /// not notice. Tokens from the classic sign-in that cannot be refreshed are not affected,
@@ -379,9 +370,6 @@ impl Default for AuthConfig {
             user_directory_search_all_users: false,
             registration_shared_secret: SecretString::default(),
             registration_shared_secret_file: None,
-            enable_legacy_login: true,
-            session_secret: SecretString::default(),
-            session_secret_file: None,
             access_token_lifetime: default_access_token_lifetime(),
             refresh_token_lifetime: default_refresh_token_lifetime(),
             password: PasswordConfig::default(),
@@ -520,11 +508,6 @@ impl AuthConfig {
             &format!("{prefix}.registration_shared_secret"),
             &mut self.registration_shared_secret,
             &self.registration_shared_secret_file,
-        )?;
-        resolve_secret_pair(
-            &format!("{prefix}.session_secret"),
-            &mut self.session_secret,
-            &self.session_secret_file,
         )?;
         resolve_secret_pair(
             &format!("{prefix}.password.pepper"),

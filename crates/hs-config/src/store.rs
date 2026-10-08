@@ -406,6 +406,11 @@ impl<B: KvBackend> ConfigStore<B> {
             .map(str::to_owned);
         let mut administered = document.clone();
         strip_bootstrap(&mut administered);
+        // A file written before a setting was removed seeds the database without it.
+        crate::retired::warn_dropped(
+            &crate::retired::strip_json(&mut administered),
+            "the file seeding the database",
+        );
         let sections: Vec<(String, Value)> = administered
             .as_object()
             .map(|map| {
@@ -1125,7 +1130,7 @@ mod tests {
                 "lease_ttl": "20s",
                 "mesh": {"port": 9449, "advertise_address": "hs-0.hs-headless"},
             },
-            "appservices": {"registration_files": ["/etc/hs/irc.yaml"], "enabled": true},
+            "appservices": {"registration_files": ["/etc/hs/irc.yaml"], "tracking_failure_threshold": 7},
             "auth": {"enable_registration": true},
         });
         assert!(store.seed(&document, "homeserver.yaml", 10).unwrap());
@@ -1150,7 +1155,7 @@ mod tests {
             json!({
                 "server": {"public_baseurl": "https://matrix.example.org"},
                 "cluster": {"lease_ttl": "20s"},
-                "appservices": {"enabled": true},
+                "appservices": {"tracking_failure_threshold": 7},
                 "auth": {"enable_registration": true},
             }),
             "every administered setting is seeded"

@@ -5,7 +5,8 @@
 //! current" section for the regeneration procedure and
 //! `tools/synapse_inventory.py` for the upstream option list).
 //!
-//! `native` is empty for `Unsupported` rows. Where non-empty it names the
+//! `native` is empty for `Unsupported` rows, and for the few `Mapped (diff)`
+//! rows whose note says the key is not needed here. Where non-empty it names the
 //! `hs-config` `Config` path(s) the translator writes to; for `Mapped` and
 //! `Mapped (diff)` rows in [`OPTIONS`], `crate::translate` has a matching
 //! translation function. `note` carries the reason code (see the table's
@@ -285,9 +286,9 @@ pub const OPTIONS: &[KeyInfo] = &[
     },
     KeyInfo {
         key: "admin_contact",
-        classification: Classification::Mapped,
+        classification: Classification::MappedDiff,
         native: "`server.admin_contact`",
-        note: "",
+        note: "Published as the administrator contact in `/.well-known/matrix/support` (an email address, a Matrix ID, or an https:// support page); Synapse puts it only in resource-limit errors, which this server does not raise.",
     },
     KeyInfo {
         key: "hs_disabled",
@@ -1059,9 +1060,9 @@ pub const OPTIONS: &[KeyInfo] = &[
     },
     KeyInfo {
         key: "report_stats",
-        classification: Classification::Mapped,
-        native: "`server.report_stats`",
-        note: "",
+        classification: Classification::MappedDiff,
+        native: "",
+        note: "Not needed: this server never sends usage statistics, so there is nothing to switch (`server.report_stats` was removed 2026-10-08).",
     },
     KeyInfo {
         key: "report_stats_endpoint",
@@ -1102,14 +1103,14 @@ pub const OPTIONS: &[KeyInfo] = &[
     KeyInfo {
         key: "macaroon_secret_key",
         classification: Classification::MappedDiff,
-        native: "`auth.session_secret`",
-        note: "Synapse's macaroon key signs guest tokens, SSO short-term login tokens and email-unsubscribe tokens using the macaroon caveat scheme specifically; the native session secret signs native OAuth-issued tokens with a different (non-macaroon) scheme. Same operational role (rotate and every session in flight is invalidated), different format.",
+        native: "",
+        note: "Not needed: Synapse's macaroon key signs guest tokens, SSO short-term login tokens and email-unsubscribe tokens; this server keeps sessions, tokens and sign-in state in its store, so nothing is signed with a shared secret (`auth.session_secret` was removed 2026-10-08).",
     },
     KeyInfo {
         key: "macaroon_secret_key_path",
-        classification: Classification::Mapped,
-        native: "`auth.session_secret_file`",
-        note: "",
+        classification: Classification::MappedDiff,
+        native: "",
+        note: "Not needed, as `macaroon_secret_key` (`auth.session_secret_file` was removed 2026-10-08).",
     },
     KeyInfo {
         key: "form_secret",
@@ -1193,7 +1194,7 @@ pub const OPTIONS: &[KeyInfo] = &[
         key: "password_config",
         classification: Classification::MappedDiff,
         native: "`auth.password`",
-        note: "Synapse's `localdb_enabled` (disable the local password DB while keeping password login via a custom Python provider) has no equivalent — see `modules`/R-MODULE. `enabled`, `pepper`/`pepper_path` and `policy` map directly.",
+        note: "Synapse's `localdb_enabled` (disable the local password DB while keeping password login via a custom Python provider) has no equivalent — see `modules`/R-MODULE. `pepper`/`pepper_path` and `policy` map directly. `enabled: false` and `enabled: only_for_reauth` both become `auth.password.enabled: false`, which refuses password login and still lets a password confirm a sensitive change (Synapse's `only_for_reauth`; its `false` also refuses that).",
     },
     KeyInfo {
         key: "push",
@@ -1762,7 +1763,17 @@ mod tests {
 
     #[test]
     fn mapped_rows_always_name_a_native_path() {
+        // ...except a `Mapped (diff)` row whose note says the key is not needed here (a setting
+        // removed from the native schema, `hs_config::retired`).
         for k in OPTIONS.iter().chain(EXPERIMENTAL.iter()) {
+            if k.classification == Classification::MappedDiff && k.note.starts_with("Not needed") {
+                assert!(
+                    k.native.is_empty(),
+                    "{} is not needed yet names a path",
+                    k.key
+                );
+                continue;
+            }
             if matches!(
                 k.classification,
                 Classification::Mapped | Classification::MappedDiff

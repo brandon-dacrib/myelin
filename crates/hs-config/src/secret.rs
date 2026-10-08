@@ -121,7 +121,7 @@ mod tests {
         std::fs::write(&path, "hunter2\n").unwrap();
         let mut secret = SecretString::default();
         let file = Some(path);
-        resolve_secret_pair("auth.session_secret", &mut secret, &file).unwrap();
+        resolve_secret_pair("auth.registration_shared_secret", &mut secret, &file).unwrap();
         assert_eq!(secret.as_str(), Some("hunter2"));
         std::fs::remove_dir_all(dir).ok();
     }
@@ -130,9 +130,10 @@ mod tests {
     fn conflict_when_both_set() {
         let mut secret = SecretString::from("inline");
         let file = Some(PathBuf::from("/nonexistent"));
-        let err = resolve_secret_pair("auth.session_secret", &mut secret, &file).unwrap_err();
+        let err =
+            resolve_secret_pair("auth.registration_shared_secret", &mut secret, &file).unwrap_err();
         assert!(
-            matches!(err, ConfigError::SecretConflict { field } if field == "auth.session_secret")
+            matches!(err, ConfigError::SecretConflict { field } if field == "auth.registration_shared_secret")
         );
     }
 

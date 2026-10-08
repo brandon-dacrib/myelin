@@ -95,6 +95,9 @@ test.describe("bridge offerings against the real server", () => {
     // is nothing here to run it; someone downloads the files and does).
     await add.getByLabel(/Matrix ID/).fill(user);
     await add.getByRole("button", { name: "Add bridge" }).click();
+    // The dialog's second step (since 2026-10-02) follows the new bridge; Done closes it.
+    await expect(add.getByRole("heading", { name: `${user}'s WhatsApp bridge` })).toBeVisible();
+    await add.getByRole("button", { name: "Done" }).click();
     await expect(add).toBeHidden();
     const row = page.getByRole("table").getByRole("row", { name: new RegExp(user) });
     await expect(row).toBeVisible();

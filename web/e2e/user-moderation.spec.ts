@@ -60,14 +60,30 @@ test.describe("User moderation", () => {
     await moderation.getByRole("button", { name: "Lift shadow-ban" }).click();
     await expect(moderation.getByRole("button", { name: "Shadow-ban", exact: true })).toBeVisible();
 
-    // A rate limit: set it, see it worded, clear it.
-    await expect(moderation.getByText("The server's own limits apply.")).toBeVisible();
+    // A rate limit: set it, see it worded beside the server-wide limit it replaces, clear it.
+    const serverWide = moderation.getByTestId("rate-limit-server-wide");
+    await expect(moderation.getByText("No override: the server's own limits apply.")).toBeVisible();
+    await expect(serverWide).toContainText(
+      "Server-wide limit: 0.5 messages a second, bursts of 25.",
+    );
+    await expect(
+      moderation.getByText("0 exempts them from the limit. Server-wide: 0.5."),
+    ).toBeVisible();
     await moderation.getByLabel("Messages per second").fill("2");
     await moderation.getByLabel("Burst").fill("5");
     await moderation.getByRole("button", { name: "Save limit" }).click();
-    await expect(moderation.getByText("2 messages a second, bursts of 5")).toBeVisible();
+    await expect(moderation.getByText("Override: 2 messages a second, bursts of 5")).toBeVisible();
+    await expect(serverWide).toContainText(
+      "This override replaces it for them; clearing the override puts them back on it.",
+    );
     await moderation.getByRole("button", { name: "Clear override" }).click();
-    await expect(moderation.getByText("The server's own limits apply.")).toBeVisible();
+    await expect(moderation.getByText("No override: the server's own limits apply.")).toBeVisible();
+    // The link goes to the setting it names.
+    await serverWide
+      .getByRole("link", { name: "Change it under Configuration, Rate limits" })
+      .click();
+    await expect(page).toHaveURL(/\/configuration\/rate_limits#setting-message$/);
+    await page.goBack();
     await expectNoAxeViolations(page, "user page after moderation");
     guard.assertClean();
   });

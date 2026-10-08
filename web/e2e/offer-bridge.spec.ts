@@ -118,6 +118,30 @@ test.describe("Offer a bridge", () => {
     domGuard.assertClean();
   });
 
+  test("the settings dialog says what saving does to bridges people already have", async ({
+    page,
+  }) => {
+    const domGuard = installDomNestingGuard(page);
+    await signInAsOperator(page);
+    await page.goto("/admin/bridges/offerings/mautrix-whatsapp");
+    await page.getByRole("button", { name: "Edit settings" }).click();
+    const dialog = page.getByRole("dialog", { name: "WhatsApp settings" });
+    await expect(dialog.getByTestId("applies-access")).toContainText(
+      "Applies to people who ask from now on.",
+    );
+    await expect(dialog.getByTestId("applies-options")).toContainText(
+      "the server redeploys each with its new files, and it restarts once.",
+    );
+    await expect(dialog.getByTestId("runtime-change")).toHaveCount(0);
+    await dialog.getByRole("radio", { name: /Runs elsewhere/ }).click();
+    await expect(dialog.getByTestId("runtime-change")).toContainText(
+      "the ones in the cluster keep running there, and later changes to the image or options no longer reach them.",
+    );
+    await expectNoAxeViolations(page, "offering settings: a changed runtime");
+    await dialog.getByRole("button", { name: "Cancel" }).click();
+    domGuard.assertClean();
+  });
+
   test("when this server can't deploy, the wizard says why and offers it elsewhere", async ({
     page,
   }) => {

@@ -196,6 +196,10 @@ export async function signInWithToken(accessToken: string): Promise<Session> {
  * then verified the same way `signInWithToken` verifies a pasted one; a login that succeeds for a
  * non-admin user still fails sign-in here with the same 403 message.
  */
+/** What the sign-in says when the server has password sign-in turned off. */
+export const PASSWORD_LOGIN_OFF =
+  "This server has password sign-in turned off (the setting auth.password.enabled). Sign in with an access token instead; an administrator can turn it back on under Configuration, Auth.";
+
 export async function signInWithPassword(username: string, password: string): Promise<Session> {
   if (!username.trim() || !password) {
     throw new AuthSignInError("Enter a username and password.");
@@ -220,6 +224,10 @@ export async function signInWithPassword(username: string, password: string): Pr
 
   if (!res.ok) {
     const body = (await res.json().catch(() => ({}))) as { error?: string; errcode?: string };
+    // `auth.password.enabled` off: the server neither offers nor accepts a password.
+    if (res.status === 403 && /password login has been disabled/i.test(body.error ?? "")) {
+      throw new AuthSignInError(PASSWORD_LOGIN_OFF);
+    }
     throw new AuthSignInError(
       body.error ?? `Sign-in failed (${body.errcode ?? `HTTP ${res.status}`}).`,
     );

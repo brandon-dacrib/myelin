@@ -2,6 +2,18 @@
 
 Track brief: `docs/workstreams/15-admin-api-and-modules.md`. Owner crates: `hs-admin`, `hs-modules`, `hs-identity`, `hs-http` (shared with 07 and 14).
 
+## 2026-10-08: a user's rate limit carries the server-wide limits; removed settings are refused
+
+Branch `agent/web-items` (tracks 16, 15). **Contract** (`openapi.yaml` **0.1.12**):
+`users.rate_limit.get` answers `UserRateLimit` (the override's fields as before, plus
+`server_wide`: `ServerRateLimits` with `enabled`, `message` and `admin_redaction` as
+`RateLimitBucket`s, read from the `rate_limits` section; absent without a configuration
+source). `config.update` and `config.validate` refuse a setting removed from the schema
+(`hs_config::retired`, decision 0034) with `400` naming it and why
+(`sources::retired_validation_errors`). The web shows both (status 16). Tests:
+`user_moderation::tests::the_rate_limit_answer_carries_the_server_wide_limits_it_replaces`,
+`router::tests::config_update_refuses_a_retired_setting_and_a_stored_one_is_not_read_back`.
+
 ## 2026-10-04: `GET /cluster` says how far the search index is behind
 
 Branch `agent/room-client-gaps` (tracks 15, 04, 16). The search indexer's lag was a Prometheus

@@ -56,7 +56,7 @@ impl SecretPaths {
     }
 
     /// True when the setting at `pointer` (a whole-configuration JSON Pointer such as
-    /// `/auth/session_secret`) holds a secret.
+    /// `/auth/registration_shared_secret`) holds a secret.
     #[must_use]
     pub fn is_secret(&self, pointer: &str) -> bool {
         let tokens = split_pointer(pointer);
@@ -458,7 +458,6 @@ mod tests {
     fn every_secret_in_the_real_config_is_found_through_the_schema() {
         let paths = secret_paths();
         for pointer in [
-            "/auth/session_secret",
             "/auth/registration_shared_secret",
             "/auth/password/pepper",
             "/auth/mas_delegation/shared_secret",
@@ -485,7 +484,7 @@ mod tests {
     fn ordinary_settings_are_not_secrets() {
         let paths = secret_paths();
         for pointer in [
-            "/auth/session_secret_file",
+            "/auth/registration_shared_secret_file",
             "/auth/enable_registration",
             "/storage/password_file",
             "/storage/host",
@@ -537,16 +536,16 @@ mod tests {
     #[test]
     fn an_unset_secret_is_not_reported_as_set() {
         let paths = secret_paths();
-        let mut section = json!({"session_secret": Value::Null});
+        let mut section = json!({"registration_shared_secret": Value::Null});
         paths.redact(&mut section, "/auth");
-        assert_eq!(section["session_secret"], Value::Null);
+        assert_eq!(section["registration_shared_secret"], Value::Null);
     }
 
     #[test]
     fn an_echoed_placeholder_is_dropped_from_the_patch() {
         let paths = secret_paths();
         let mut patch = json!({
-            "session_secret": {"$secret": true},
+            "registration_shared_secret": {"$secret": true},
             "enable_registration": true,
         });
         assert!(paths.strip_echoed_secrets(&mut patch, "/auth"));
@@ -567,9 +566,9 @@ mod tests {
     #[test]
     fn a_real_new_secret_survives_stripping() {
         let paths = secret_paths();
-        let mut patch = json!({"session_secret": "a-new-one"});
+        let mut patch = json!({"registration_shared_secret": "a-new-one"});
         assert!(!paths.strip_echoed_secrets(&mut patch, "/auth"));
-        assert_eq!(patch, json!({"session_secret": "a-new-one"}));
+        assert_eq!(patch, json!({"registration_shared_secret": "a-new-one"}));
     }
 
     /// RFC 0020: editing one OIDC provider sends the whole list back, and the secrets the

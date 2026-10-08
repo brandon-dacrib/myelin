@@ -189,7 +189,7 @@ impl<B: KvBackend> MediaRepository<B> {
         self
     }
 
-    fn now_ms(&self) -> u64 {
+    pub(crate) fn now_ms(&self) -> u64 {
         (self.clock)()
     }
 

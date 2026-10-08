@@ -540,11 +540,9 @@ fn translate_key(key: &str, v: &Value, config: &mut Config) {
         }
         "public_baseurl" => config.server.public_baseurl = v.as_str().map(str::to_owned),
         "admin_contact" => config.server.admin_contact = v.as_str().map(str::to_owned),
-        "report_stats" => {
-            if let Some(b) = v.as_bool() {
-                config.server.report_stats = b;
-            }
-        }
+        // Nothing to carry over (`hs_config::retired`): this server sends no usage statistics,
+        // and keeps sessions and tokens in its store, so nothing is signed with a macaroon key.
+        "report_stats" | "macaroon_secret_key" | "macaroon_secret_key_path" => {}
         "signing_key_path" => {
             if let Some(s) = v.as_str() {
                 config.server.signing_key_path = PathBuf::from(s);
@@ -782,16 +780,6 @@ fn translate_key(key: &str, v: &Value, config: &mut Config) {
                 config.auth.registration_shared_secret_file = Some(PathBuf::from(s));
             }
         }
-        "macaroon_secret_key" => {
-            if let Some(s) = v.as_str() {
-                config.auth.session_secret = SecretString::from(s);
-            }
-        }
-        "macaroon_secret_key_path" => {
-            if let Some(s) = v.as_str() {
-                config.auth.session_secret_file = Some(PathBuf::from(s));
-            }
-        }
         "refresh_token_lifetime" => {
             if let Some(d) = get_duration_value(v) {
                 config.auth.refresh_token_lifetime = Some(d);
@@ -804,8 +792,12 @@ fn translate_key(key: &str, v: &Value, config: &mut Config) {
         }
         "password_config" => {
             let mut password = PasswordConfig::default();
+            // `only_for_reauth` is what the native `false` does: no password login, and a
+            // password still confirms a sensitive change.
             if let Some(b) = get_bool(v, "enabled") {
                 password.enabled = b;
+            } else if get_str(v, "enabled").as_deref() == Some("only_for_reauth") {
+                password.enabled = false;
             }
             if let Some(s) = get_str(v, "pepper") {
                 password.pepper = SecretString::from(s);
@@ -1395,12 +1387,24 @@ database:
     }
 
     #[test]
-    fn translates_macaroon_secret_key_inline() {
-        // The inline form; the kitchen-sink corpus fixture uses the
-        // `_path` form instead (the two cannot coexist in one file).
-        let yaml = "server_name: example.org\nmacaroon_secret_key: inline-macaroon\n";
-        let (config, _) = translate(yaml, TranslateOptions::default()).unwrap();
-        assert_eq!(config.auth.session_secret.as_str(), Some("inline-macaroon"));
+    fn the_keys_this_server_does_not_need_translate_to_nothing_and_say_so() {
+        // `report_stats` and the macaroon key are in nearly every Synapse config; neither has a
+        // native setting any more, and neither blocks a translation.
+        let yaml = "server_name: example.org\nreport_stats: true\nmacaroon_secret_key: inline-macaroon\npassword_config:\n  enabled: only_for_reauth\n";
+        let (config, report) = translate(yaml, TranslateOptions::default()).unwrap();
+        assert!(!report.has_blocking());
+        for key in ["report_stats", "macaroon_secret_key"] {
+            let outcome = report.outcomes.iter().find(|o| o.key == key).unwrap();
+            assert!(
+                outcome.note.starts_with("Not needed"),
+                "{key}: {}",
+                outcome.note
+            );
+        }
+        assert!(
+            !config.auth.password.enabled,
+            "only_for_reauth is the native false"
+        );
     }
 
     #[test]

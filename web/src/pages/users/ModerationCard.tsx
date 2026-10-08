@@ -151,7 +151,7 @@ export function ModerationCard({ user }: { user: User }) {
         </Block>
 
         <div className="p-4">
-          <RateLimitSection userId={id} />
+          <RateLimitSection userId={id} admin={user.admin} appserviceId={user.appservice_id} />
         </div>
 
         <Block

@@ -16,10 +16,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Validate, ValidationErrors};
 
-const fn default_true() -> bool {
-    true
-}
-
 fn default_tracking_failure_threshold() -> u32 {
     50
 }
@@ -28,10 +24,6 @@ fn default_tracking_failure_threshold() -> u32 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AppservicesConfig {
-    /// Whether events are delivered to bridges and other appservices. Nothing reads this
-    /// setting yet: delivery is always on, and a bridge is paused on its own page instead.
-    #[serde(default = "default_true")]
-    pub enabled: bool,
     /// Registration YAML files to import into the appservice registry, once each. Corresponds to
     /// Synapse's `app_service_config_files`, and exists for migrating from it: the first start
     /// that sees a file imports it (unless the registry already has an appservice with that id)
@@ -51,7 +43,6 @@ pub struct AppservicesConfig {
 impl Default for AppservicesConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
             registration_files: Vec::new(),
             tracking_failure_threshold: default_tracking_failure_threshold(),
         }

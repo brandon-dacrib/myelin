@@ -206,3 +206,57 @@ export function deploymentPhaseMeta(phase: string): {
       return { label: phase, status: "neutral" };
   }
 }
+
+/**
+ * What saving an offering's settings does to the bridges people already have, by section of the
+ * settings dialog, as `hs_bridges::manager` does it (checked against its tick, 2026-10-08):
+ *
+ * - **Who can have one** is asked when somebody requests one; nobody's bridge is removed when
+ *   they leave the list.
+ * - **The image tag and the options** are rendered into every instance's files on the next pass:
+ *   a bridge the cluster runs is redeployed and restarts once; one run elsewhere keeps running
+ *   its old files until somebody downloads the new ones and restarts it.
+ * - **The runtime** is the offering's, read on every pass, not each bridge's: from elsewhere to
+ *   the cluster, every bridge people have is deployed into the cluster on the next pass (a copy
+ *   still run by hand then runs twice); from the cluster to elsewhere, the pods keep running and
+ *   later changes no longer reach them.
+ *
+ * `existing` is how many bridges people have. `runtimeChange` is `null` when the runtime is
+ * unchanged or nobody has a bridge yet.
+ */
+export interface SettingsEffects {
+  access: string;
+  imageAndOptions: string;
+  runtimeChange: string | null;
+}
+
+export function settingsEffects(
+  savedRuntime: BridgeOfferingRequest["runtime"],
+  draftRuntime: BridgeOfferingRequest["runtime"],
+  existing: number,
+): SettingsEffects {
+  const access =
+    "Applies to people who ask from now on. Somebody you take off the list keeps the bridge they have; remove it from the table on this page.";
+  const imageAndOptions =
+    existing === 0
+      ? "Applies to every bridge created after saving, and to any people already have."
+      : savedRuntime === "cluster"
+        ? `Applies to ${bridgesPeopleHave(existing)} as well as to new ones: the server redeploys each with its new files, and it restarts once.`
+        : `Applies to new bridges at once. ${capitalise(bridgesPeopleHave(existing))} run elsewhere: each keeps its old settings until its files are downloaded again (Files on its row) and it is restarted with them.`;
+  let runtimeChange: string | null = null;
+  if (existing > 0 && savedRuntime !== draftRuntime) {
+    runtimeChange =
+      draftRuntime === "cluster"
+        ? `Saving moves ${bridgesPeopleHave(existing)} too: the server deploys each into the cluster on its next pass. Stop any copy run by hand first, or it runs twice with the same registration.`
+        : `Saving does not move ${bridgesPeopleHave(existing)}: the ones in the cluster keep running there, and later changes to the image or options no longer reach them. To move one, remove it and add it again.`;
+  }
+  return { access, imageAndOptions, runtimeChange };
+}
+
+function bridgesPeopleHave(n: number): string {
+  return n === 1 ? "the 1 bridge people already have" : `the ${n} bridges people already have`;
+}
+
+function capitalise(s: string): string {
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}

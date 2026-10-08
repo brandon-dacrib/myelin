@@ -77,6 +77,12 @@ pub struct AuthConfig {
     /// `docs/rfcs/0002-auth-tokens-and-requester.md`.
     pub valid_registration_tokens: HashSet<String>,
 
+    /// Whether `m.login.password` is offered by `GET /login` and accepted by `POST /login`:
+    /// `hs_config::auth::PasswordConfig::enabled`, Synapse's `password_config.enabled`. Read per
+    /// request. Off, a password login is refused `403 M_FORBIDDEN`; re-authenticating with a
+    /// password for a sensitive change (UIA) still works, as Synapse's `only_for_reauth`.
+    pub password_login_enabled: bool,
+
     /// Whether `POST /register?kind=guest` is accepted: `hs_config::auth::AuthConfig::
     /// allow_guest_access`, Synapse's `allow_guest_access`. Read per request, so turning it off
     /// stops new guest sessions at once; guests already signed in keep theirs.
@@ -177,6 +183,7 @@ impl Default for AuthConfig {
             user_directory_search_all_users: false,
             registration_requires_token: false,
             valid_registration_tokens: HashSet::new(),
+            password_login_enabled: true,
             guest_registration_enabled: false,
             recaptcha: None,
             terms_enabled: false,
@@ -290,6 +297,7 @@ impl TryFrom<&hs_config::Config> for AuthConfig {
             refresh_token_ttl_ms: config.auth.refresh_token_lifetime.map(|d| d.as_millis()),
             registration_enabled: config.auth.enable_registration,
             guest_registration_enabled: config.auth.allow_guest_access,
+            password_login_enabled: config.auth.password.enabled,
             user_directory_search_all_users: config.auth.user_directory_search_all_users,
             // See this method's doc comment: deliberately reused, not left at the default.
             shared_secret_auth_secret: config
@@ -530,6 +538,22 @@ mod tests {
             AuthConfig::try_from(&config)
                 .unwrap()
                 .guest_registration_enabled
+        );
+    }
+
+    #[test]
+    fn try_from_maps_password_login_on_by_default_and_off_when_set() {
+        let mut config = minimal_native_config();
+        assert!(
+            AuthConfig::try_from(&config)
+                .unwrap()
+                .password_login_enabled
+        );
+        config.auth.password.enabled = false;
+        assert!(
+            !AuthConfig::try_from(&config)
+                .unwrap()
+                .password_login_enabled
         );
     }
 

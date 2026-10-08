@@ -44,10 +44,12 @@ const SHARED_SECRET_AUTH_LOGIN_TYPE: &str = "com.devture.shared_secret_auth";
 /// behavior only): a bridge falls back to `m.login.password` when the flow isn't offered, so a
 /// server that never enabled the feature should not pretend to.
 pub async fn get_login_types(State(state): State<AuthState>) -> Json<Value> {
-    let mut flows = vec![
-        json!({"type": "m.login.password"}),
-        json!({"type": "m.login.token"}),
-    ];
+    let mut flows = Vec::new();
+    // `auth.password.enabled` (Synapse's `password_config.enabled`): not offered when off.
+    if state.config.get().password_login_enabled {
+        flows.push(json!({"type": "m.login.password"}));
+    }
+    flows.push(json!({"type": "m.login.token"}));
     if state.config.get().shared_secret_auth_secret.is_some() {
         flows.push(json!({"type": SHARED_SECRET_AUTH_LOGIN_TYPE}));
     }
@@ -119,6 +121,16 @@ pub async fn post_login(
     } else {
         match login_info {
             LoginInfo::Password(p) => {
+                if !state.config.get().password_login_enabled {
+                    tracing::info!(
+                        "refused a password login: auth.password.enabled is off on this server"
+                    );
+                    return Err(MatrixError::new(
+                        StatusCode::FORBIDDEN,
+                        ErrCode::Forbidden,
+                        "Password login has been disabled on this server",
+                    ));
+                }
                 resolve_password_login(&state, &p, legacy_threepid.as_ref()).await?
             }
             LoginInfo::Token(t) => resolve_token_login(&state, &t.token).await?,
@@ -428,6 +440,53 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// `auth.password.enabled` off: `GET /login` does not offer `m.login.password` and a
+    /// password login is refused `403 M_FORBIDDEN`, read from the live configuration so turning
+    /// it back on applies to the next request.
+    #[tokio::test]
+    async fn a_password_login_is_neither_offered_nor_accepted_when_turned_off() {
+        let state = state_with_password_user(user_id!("@alice:example.org"), "hunter2").await;
+        let types = |state: AuthState| async move {
+            let Json(body) = get_login_types(State(state)).await;
+            body["flows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|f| f["type"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        let login = |state: AuthState| async move {
+            let body = json!({"type": "m.login.password", "identifier": {"type": "m.id.user", "user": "alice"}, "password": "hunter2"});
+            post_login(
+                State(state),
+                HeaderMap::new(),
+                Query(HashMap::new()),
+                hs_http::buckets::ClientIp(None),
+                PermissiveJson(body),
+            )
+            .await
+        };
+        assert!(
+            types(state.clone())
+                .await
+                .contains(&"m.login.password".to_owned())
+        );
+
+        let mut config = state.config.get().as_ref().clone();
+        config.password_login_enabled = false;
+        state.set_config(config.clone());
+        let flows = types(state.clone()).await;
+        assert!(!flows.contains(&"m.login.password".to_owned()), "{flows:?}");
+        assert!(flows.contains(&"m.login.token".to_owned()));
+        let err = login(state.clone()).await.unwrap_err();
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+        assert_eq!(err.errcode(), ErrCode::Forbidden);
+
+        config.password_login_enabled = true;
+        state.set_config(config);
+        assert_eq!(login(state).await.unwrap().status(), StatusCode::OK);
     }
 
     /// `rate_limits.login` is per client address, and a request with no address (this host's own

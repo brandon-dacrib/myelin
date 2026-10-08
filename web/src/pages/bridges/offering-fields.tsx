@@ -285,8 +285,8 @@ export function RuntimeFields({
           label="Image tag"
           hint={
             repository
-              ? `Of ${repository}. Every new bridge uses it; pin a version to upgrade deliberately.`
-              : "Every new bridge uses it; pin a version to upgrade deliberately."
+              ? `Of ${repository}. Every bridge of this kind runs it; pin a version to upgrade deliberately.`
+              : "Every bridge of this kind runs it; pin a version to upgrade deliberately."
           }
         >
           {(f) => (

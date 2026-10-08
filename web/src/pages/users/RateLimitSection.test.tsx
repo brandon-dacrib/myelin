@@ -1,23 +1,23 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { http, HttpResponse } from "msw";
 import { server } from "@/mocks/node";
 import { getRateLimit } from "@/mocks/data/user-moderation";
 import { signIn, signOut } from "@/lib/auth";
 import { describeRateLimit } from "@/api/user-moderation";
+import { configValues } from "@/mocks/data/config";
+import { renderRoutes } from "@/test/render-route";
 import { RateLimitSection } from "./RateLimitSection";
 
 const ALICE = "@alice:example.org";
 const BRIDGED = "@whatsapp_15551234:example.org";
 
-function renderSection(userId: string) {
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  render(
-    <QueryClientProvider client={client}>
-      <RateLimitSection userId={userId} />
-    </QueryClientProvider>,
+function renderSection(userId: string, props: { admin?: boolean; appserviceId?: string } = {}) {
+  renderRoutes(
+    [{ path: "/", component: () => <RateLimitSection userId={userId} {...props} /> }],
+    "/",
+    ["/configuration/$section", "/bridges/$bridgeId"],
   );
 }
 
@@ -38,25 +38,46 @@ describe("RateLimitSection", () => {
     await signIn();
     const user = userEvent.setup();
     renderSection(ALICE);
-    expect(await screen.findByText("The server's own limits apply.")).toBeInTheDocument();
+    expect(
+      await screen.findByText("No override: the server's own limits apply."),
+    ).toBeInTheDocument();
+    // The server-wide limit it would replace, from the answer's server_wide.
+    expect(screen.getByTestId("rate-limit-server-wide")).toHaveTextContent(
+      "Server-wide limit: 0.5 messages a second, bursts of 25.",
+    );
+    expect(screen.getByText(/Server-wide: 0\.5\./)).toBeInTheDocument();
+    expect(screen.getByText(/Server-wide: 25\./)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Clear override" })).not.toBeInTheDocument();
 
     await user.type(screen.getByLabelText("Messages per second"), "2");
     await user.clear(screen.getByLabelText("Burst"));
     await user.type(screen.getByLabelText("Burst"), "5");
     await user.click(screen.getByRole("button", { name: "Save limit" }));
-    expect(await screen.findByText("2 messages a second, bursts of 5")).toBeInTheDocument();
+    expect(
+      await screen.findByText("Override: 2 messages a second, bursts of 5"),
+    ).toBeInTheDocument();
     expect(getRateLimit(ALICE)).toEqual({ messages_per_second: 2, burst_count: 5 });
+    // The save's answer has no server_wide; the section keeps the one it read.
+    expect(screen.getByTestId("rate-limit-server-wide")).toHaveTextContent(
+      "Server-wide limit: 0.5 messages a second, bursts of 25. This override replaces it for them; clearing the override puts them back on it.",
+    );
 
     await user.click(screen.getByRole("button", { name: "Clear override" }));
-    expect(await screen.findByText("The server's own limits apply.")).toBeInTheDocument();
+    expect(
+      await screen.findByText("No override: the server's own limits apply."),
+    ).toBeInTheDocument();
+    expect(screen.getByTestId("rate-limit-server-wide")).toHaveTextContent(
+      "Server-wide limit: 0.5 messages a second, bursts of 25.",
+    );
     expect(getRateLimit(ALICE)).toEqual({});
   });
 
   it("shows an existing exemption in the fields", async () => {
     await signIn();
     renderSection(BRIDGED);
-    expect(await screen.findByText("Exempt from message rate limits")).toBeInTheDocument();
+    expect(
+      await screen.findByText("Override: Exempt from message rate limits"),
+    ).toBeInTheDocument();
     expect(screen.getByLabelText("Messages per second")).toHaveValue(0);
   });
 
@@ -98,5 +119,41 @@ describe("RateLimitSection", () => {
     renderSection(BRIDGED);
     expect(await screen.findByText("Changing it needs admin:write.")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Save limit" })).not.toBeInTheDocument();
+  });
+  it("says an override still applies when rate limits are off server-wide", async () => {
+    await signIn();
+    const limits = configValues.rate_limits as { enabled: boolean };
+    limits.enabled = false;
+    try {
+      renderSection(BRIDGED, { appserviceId: "whatsapp" });
+      const line = await screen.findByTestId("rate-limit-server-wide");
+      expect(line).toHaveTextContent(
+        "Server-wide, rate limits are switched off, so nobody without an override is limited. This override still applies to them; clearing it leaves them unlimited.",
+      );
+      expect(screen.getByTestId("rate-limit-bridge")).toHaveTextContent(
+        "This account belongs to the bridge whatsapp.",
+      );
+      expect(screen.getByRole("link", { name: "whatsapp" })).toBeInTheDocument();
+    } finally {
+      limits.enabled = true;
+    }
+  });
+
+  it("gives a server administrator's redaction limit", async () => {
+    await signIn();
+    renderSection(ALICE, { admin: true });
+    expect(await screen.findByTestId("rate-limit-redactions")).toHaveTextContent(
+      "As a server administrator, their redactions have the administrator redaction limit instead: 1 redaction a second, bursts of 50.",
+    );
+  });
+
+  it("says so when the server-wide limit is not in the answer", async () => {
+    await signIn();
+    server.use(http.get("*/api/v1/users/:user_id/rate-limit", () => HttpResponse.json({})));
+    renderSection(ALICE);
+    expect(await screen.findByTestId("rate-limit-server-wide")).toHaveTextContent(
+      "The server-wide limit could not be read here.",
+    );
+    expect(screen.getByLabelText("Messages per second")).toBeInTheDocument();
   });
 });

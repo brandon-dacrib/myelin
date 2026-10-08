@@ -44,6 +44,7 @@ pub mod migration;
 pub mod network;
 pub mod ratelimit;
 pub mod reload;
+pub mod retired;
 pub mod scanning;
 pub mod schema;
 pub mod secret;
@@ -161,7 +162,11 @@ impl Config {
 
     /// Deserializes an already-parsed YAML value, then resolves secrets and
     /// validates.
-    pub fn from_value(value: serde_yaml_ng::Value) -> Result<Config, ConfigError> {
+    ///
+    /// A setting removed from the schema ([`retired::RETIRED_SETTINGS`]) is dropped with a
+    /// warning rather than refused, so a configuration written before it went still loads.
+    pub fn from_value(mut value: serde_yaml_ng::Value) -> Result<Config, ConfigError> {
+        retired::warn_dropped(&retired::strip_yaml(&mut value), "configuration");
         let mut config: Config = serde_yaml_ng::from_value(value)?;
         config.resolve_secrets()?;
         config.validate()?;

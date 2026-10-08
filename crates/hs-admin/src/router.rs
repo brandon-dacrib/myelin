@@ -4214,6 +4214,14 @@ async fn config_update(
                     .with_instance(instance)
                     .into_response();
             }
+            // A setting removed from the schema: stored, it would be dropped at the next load.
+            let retired = crate::sources::retired_validation_errors(&section, &patch);
+            if !retired.is_empty() {
+                return Problem::validation_failed()
+                    .with_errors(retired)
+                    .with_instance(instance)
+                    .into_response();
+            }
 
             // Inside a list (sent back whole, since a merge patch replaces arrays), an untouched
             // secret is put back from what is stored now rather than dropped with its entry's
@@ -7956,7 +7964,7 @@ mod tests {
                     }),
                 )
                 .with_database(json!({
-                    "auth": {"enable_registration": true, "session_secret": "s3kr1t"},
+                    "auth": {"enable_registration": true, "registration_shared_secret": "s3kr1t"},
                 })),
         ))
     }
@@ -8021,7 +8029,7 @@ mod tests {
             "the database outranks the bootstrap file that says otherwise"
         );
         assert_eq!(
-            section.origins["/auth/enable_legacy_login"], "default",
+            section.origins["/auth/user_directory_search_all_users"], "default",
             "a setting nothing sets is reported, not omitted"
         );
         assert_eq!(section.source, "database");
@@ -8063,7 +8071,10 @@ mod tests {
             .unwrap();
         let raw = body_bytes(response).await;
         let section: ConfigSection = serde_json::from_slice(&raw).unwrap();
-        assert_eq!(section.values["session_secret"], json!({"$secret": true}));
+        assert_eq!(
+            section.values["registration_shared_secret"],
+            json!({"$secret": true})
+        );
         assert!(
             !String::from_utf8_lossy(&raw).contains("s3kr1t"),
             "the secret appeared somewhere in the response body"
@@ -8071,7 +8082,12 @@ mod tests {
 
         // And the same secret, set again through this API, is not readable back out of its own
         // history.
-        let response = patch_section(&router, "auth", r#"{"session_secret":"a-new-one"}"#).await;
+        let response = patch_section(
+            &router,
+            "auth",
+            r#"{"registration_shared_secret":"a-new-one"}"#,
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
         let response = router
             .clone()
@@ -8100,7 +8116,7 @@ mod tests {
         let response = patch_section(
             &router,
             "auth",
-            r#"{"session_secret":{"$secret":true},"enable_registration":false}"#,
+            r#"{"registration_shared_secret":{"$secret":true},"enable_registration":false}"#,
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -8108,7 +8124,7 @@ mod tests {
         let section = get_section(&router, "auth").await;
         assert_eq!(section.values["enable_registration"], json!(false));
         assert_eq!(
-            section.values["session_secret"],
+            section.values["registration_shared_secret"],
             json!({"$secret": true}),
             "the secret is still set — it was not replaced by the placeholder"
         );
@@ -8307,6 +8323,53 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    /// A setting removed from the schema (`hs_config::retired`) is refused with why it went,
+    /// and one already stored (an older version wrote it) is left out of what is read back.
+    #[tokio::test]
+    async fn config_update_refuses_a_retired_setting_and_a_stored_one_is_not_read_back() {
+        use crate::sources::InMemoryConfigSource;
+
+        let state = test_state().with_config(Arc::new(
+            InMemoryConfigSource::new()
+                .with_file(
+                    "/etc/myelin/homeserver.yaml",
+                    json!({"server": {"server_name": "example.org", "report_stats": true}}),
+                )
+                .with_database(json!({"appservices": {"enabled": false}})),
+        ));
+        let (router, _manifest) = build_router(state);
+
+        let response = patch_section(&router, "auth", r#"{"enable_legacy_login":false}"#).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let problem: serde_json::Value =
+            serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(problem["errors"][0]["pointer"], "/auth/enable_legacy_login");
+        assert!(
+            problem["errors"][0]["detail"]
+                .as_str()
+                .unwrap()
+                .starts_with("auth.enable_legacy_login no longer exists: "),
+            "{problem}"
+        );
+
+        let server = get_section(&router, "server").await;
+        assert!(
+            server.values.get("report_stats").is_none(),
+            "{:?}",
+            server.values
+        );
+        let appservices = get_section(&router, "appservices").await;
+        assert!(appservices.values.get("enabled").is_none());
+        // And the rest of the section still saves.
+        let response = patch_section(
+            &router,
+            "appservices",
+            r#"{"tracking_failure_threshold":5}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
     /// A patch is legal only if the configuration it *produces* is. The rejection carries every
     /// problem, and nothing is written.
     #[tokio::test]
@@ -8334,22 +8397,41 @@ mod tests {
     #[tokio::test]
     async fn a_null_resets_the_setting_to_its_schema_default() {
         let (router, _manifest) = build_router(config_state());
-        let response = patch_section(&router, "auth", r#"{"enable_legacy_login":false}"#).await;
+        let response = patch_section(
+            &router,
+            "auth",
+            r#"{"user_directory_search_all_users":true}"#,
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
         let changed = get_section(&router, "auth").await;
-        assert_eq!(changed.values["enable_legacy_login"], json!(false));
-        assert_eq!(changed.origins["/auth/enable_legacy_login"], "database");
+        assert_eq!(
+            changed.values["user_directory_search_all_users"],
+            json!(true)
+        );
+        assert_eq!(
+            changed.origins["/auth/user_directory_search_all_users"],
+            "database"
+        );
 
-        let response = patch_section(&router, "auth", r#"{"enable_legacy_login":null}"#).await;
+        let response = patch_section(
+            &router,
+            "auth",
+            r#"{"user_directory_search_all_users":null}"#,
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
 
         let after = get_section(&router, "auth").await;
         assert_eq!(
-            after.values["enable_legacy_login"],
-            json!(true),
+            after.values["user_directory_search_all_users"],
+            json!(false),
             "the schema's own default is back"
         );
-        assert_eq!(after.origins["/auth/enable_legacy_login"], "default");
+        assert_eq!(
+            after.origins["/auth/user_directory_search_all_users"],
+            "default"
+        );
     }
 
     /// A reset of a setting the bootstrap file *also* sets falls back to the file, not to the
@@ -8434,7 +8516,7 @@ mod tests {
                     json!({"server": {"server_name": "example.org"}}),
                 )
                 .with_database(json!({
-                    "auth": {"enable_registration": true, "session_secret": "s3kr1t"},
+                    "auth": {"enable_registration": true, "registration_shared_secret": "s3kr1t"},
                 })),
         );
         (test_state().with_config(source.clone()), source)
@@ -8558,7 +8640,12 @@ mod tests {
     async fn config_history_and_revert_never_put_a_secret_on_the_wire() {
         let (state, source) = config_state_with_source();
         let (router, _manifest) = build_router(state);
-        let r = patch_section(&router, "auth", r#"{"session_secret":"rotated-value"}"#).await;
+        let r = patch_section(
+            &router,
+            "auth",
+            r#"{"registration_shared_secret":"rotated-value"}"#,
+        )
+        .await;
         assert_eq!(r.status(), StatusCode::OK);
 
         let (status, _, history, text) =
@@ -8592,7 +8679,7 @@ mod tests {
 
         let stored = source.get_section("auth").await.unwrap().unwrap();
         assert_eq!(
-            stored.values["session_secret"], "s3kr1t",
+            stored.values["registration_shared_secret"], "s3kr1t",
             "the revert put the old secret back without anyone sending it"
         );
         let (_, _, _, text) = send(&router, "GET", "/api/v1/config/auth", &[], "").await;
@@ -8807,7 +8894,7 @@ mod tests {
                     "/etc/myelin/homeserver.yaml",
                     json!({"server": {"server_name": "example.org"}}),
                 )
-                .with_database(json!({"auth": {"session_secret": "s3kr1t"}}))
+                .with_database(json!({"auth": {"registration_shared_secret": "s3kr1t"}}))
                 .with_environment(json!({"federation": {"client_timeout": "30s"}})),
         ));
         let (router, _manifest) = build_router(state);
@@ -8843,7 +8930,7 @@ mod tests {
                 .clone()
         };
 
-        let secret = setting("/auth/session_secret");
+        let secret = setting("/auth/registration_shared_secret");
         assert!(secret.secret);
         assert!(secret.editable);
 
@@ -8867,7 +8954,7 @@ mod tests {
             "a bootstrap setting in an otherwise hot section is not reloadable"
         );
         assert_eq!(setting("/auth/enable_registration").applies, "hot");
-        assert_eq!(setting("/auth/session_secret").applies, "restart");
+        assert_eq!(setting("/auth/registration_shared_secret").applies, "hot");
 
         let bootstrap = setting("/storage/data_dir");
         assert!(!bootstrap.editable);

@@ -12,7 +12,7 @@ Native field paths are dotted `hs-config` `Config` paths, e.g. `federation.domai
 
 | List | Mapped | Mapped (diff) | Unsupported | Total |
 |---|---|---|---|---|
-| Top-level options | 28 | 27 | 174 | 229 |
+| Top-level options | 30 | 31 | 168 | 229 |
 | `experimental_features` flags | 0 | 1 | 50 | 51 |
 
 (Counts are exact against the tables below; regenerate this summary whenever a row changes. See "Keeping this current".)
@@ -91,7 +91,7 @@ Native field paths are dotted `hs-config` `Config` paths, e.g. `federation.domai
 
 | Option | Status | Native | Notes |
 |---|---|---|---|
-| `admin_contact` | Mapped | `server.admin_contact` | |
+| `admin_contact` | Mapped (diff) | `server.admin_contact` | Published as the administrator contact in `/.well-known/matrix/support` (an email address, a Matrix ID, or an https:// support page); Synapse puts it only in resource-limit errors, which this server does not raise. |
 | `hs_disabled` | Unsupported | — | R-PHASE1 (hs-admin). A global kill switch is a plausible admin-API action, not a static config key, in this design; not yet implemented either way. |
 | `hs_disabled_message` | Unsupported | — | R-PHASE1 (hs-admin), paired with `hs_disabled`. |
 | `limit_usage_by_mau` | Unsupported | — | R-MAU. |
@@ -281,7 +281,7 @@ Native field paths are dotted `hs-config` `Config` paths, e.g. `federation.domai
 | `enable_metrics` | Mapped | `telemetry.metrics.enabled` | |
 | `sentry` | Mapped (diff) | `telemetry.sentry` | `dsn`/`dsn_path` → `dsn`/`dsn_file`; arbitrary extra Sentry SDK kwargs Synapse passes through are not supported. |
 | `metrics_flags` | Unsupported | — | R-PHASE1 (hs-telemetry). Per-metric detail toggles (e.g. `known_servers`) not yet exposed. |
-| `report_stats` | Mapped | `server.report_stats` | |
+| `report_stats` | Mapped (diff) | — | Not needed: this server never sends usage statistics, so there is nothing to switch (`server.report_stats` was removed 2026-10-08). |
 | `report_stats_endpoint` | Unsupported | — | R-PHASE1 (hs-telemetry). Custom stats-reporting URL override. |
 
 ## API Configuration
@@ -293,8 +293,8 @@ Native field paths are dotted `hs-config` `Config` paths, e.g. `federation.domai
 | `app_service_config_files` | Mapped (diff) | `appservices.registration_files` | Synapse reads these files at every start and they are how its bridges exist. Here they are imported once into the appservice registry on the first start that sees each file (an appservice already registered under the same id is left alone), the import is recorded and audited as `appservices.import`, and the file is never read again: the bridge is then managed in the admin API and the Bridges section (decision 0010; `crates/hs-cli/src/appservices.rs`). A bootstrap setting, never stored in the configuration database. |
 | `track_appservice_user_ips` | Unsupported | — | R-PHASE1 (hs-appservice). |
 | `use_appservice_legacy_authorization` | Unsupported | — | R-SECURITY. Only the `Authorization: Bearer` header form of appservice auth is supported; the insecure legacy `access_token` query-parameter form is not offered, matching Synapse's own recommendation against it. |
-| `macaroon_secret_key` | Mapped (diff) | `auth.session_secret` | Synapse's macaroon key signs guest tokens, SSO short-term login tokens and email-unsubscribe tokens using the macaroon caveat scheme specifically; the native session secret signs native OAuth-issued tokens with a different (non-macaroon) scheme. Same operational role (rotate and every session in flight is invalidated), different format. |
-| `macaroon_secret_key_path` | Mapped | `auth.session_secret_file` | |
+| `macaroon_secret_key` | Mapped (diff) | — | Not needed: Synapse's macaroon key signs guest tokens, SSO short-term login tokens and email-unsubscribe tokens; this server keeps sessions, tokens and sign-in state in its store, so nothing is signed with a shared secret (`auth.session_secret` was removed 2026-10-08). |
+| `macaroon_secret_key_path` | Mapped (diff) | — | Not needed, as `macaroon_secret_key` (`auth.session_secret_file` was removed 2026-10-08). |
 | `form_secret` | Unsupported | — | R-PHASE1 (hs-auth). CSRF-form-signing secret for the SSO fallback login page; the native SSO page implementation does not exist yet. |
 | `form_secret_path` | Unsupported | — | R-PHASE1, paired with `form_secret`. |
 
@@ -318,7 +318,7 @@ Native field paths are dotted `hs-config` `Config` paths, e.g. `federation.domai
 | `cas_config` | Mapped (diff) | `auth.cas` | `server_url`, `service_url`, `displayname_attribute`, `required_attributes` and `idp_name` map directly; `enabled: false` leaves CAS off. CAS 2/3 `/proxyValidate` is always used (no `protocol_version`), a first sign-in always creates the account (no `enable_registration`), and `allow_numeric_ids`, `numeric_ids_prefix`, `idp_icon` and `idp_brand` are not carried over. |
 | `sso` | Mapped (diff) | `auth.sso.client_whitelist` | `client_whitelist` maps directly (a prefix match; this server's login fallback is always trusted, as in Synapse). `update_profile_information` and the template overrides (`templates`) are not carried over. |
 | `jwt_config` | Unsupported | — | R-PHASE1 (hs-auth). `m.login.jwt` is not implemented in the Phase 0 auth schema. |
-| `password_config` | Mapped (diff) | `auth.password` | Synapse's `localdb_enabled` (disable the local password DB while keeping password login via a custom Python provider) has no equivalent — see `modules`/R-MODULE. `enabled`, `pepper`/`pepper_path` and `policy` map directly. |
+| `password_config` | Mapped (diff) | `auth.password` | Synapse's `localdb_enabled` (disable the local password DB while keeping password login via a custom Python provider) has no equivalent — see `modules`/R-MODULE. `pepper`/`pepper_path` and `policy` map directly. `enabled: false` and `enabled: only_for_reauth` both become `auth.password.enabled: false`, which refuses password login and still lets a password confirm a sensitive change (Synapse's `only_for_reauth`; its `false` also refuses that). |
 
 ## Push
 

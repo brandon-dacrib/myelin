@@ -1519,7 +1519,20 @@ export const handlers = [
     const userId = decodeURIComponent(String(params.user_id));
     if (!findUser(userId))
       return problem(404, "not-found", "Not found", { detail: "no such user" });
-    return HttpResponse.json(getRateLimit(userId));
+    // As the server answers: the override, and the server-wide limits read from `rate_limits`.
+    const limits = configValues.rate_limits as {
+      enabled: boolean;
+      message: { per_second: number; burst_count: number };
+      admin_redaction: { per_second: number; burst_count: number };
+    };
+    return HttpResponse.json({
+      ...getRateLimit(userId),
+      server_wide: {
+        enabled: limits.enabled,
+        message: limits.message,
+        admin_redaction: limits.admin_redaction,
+      },
+    });
   }),
   http.put(`${API}/users/:user_id/rate-limit`, async ({ params, request }) => {
     const userId = decodeURIComponent(String(params.user_id));

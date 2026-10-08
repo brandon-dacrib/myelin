@@ -15,8 +15,13 @@
 //! |---|---|---|
 //! | `GET /.well-known/matrix/server` | `server.well_known_server` is set | `{"m.server": "<host[:port]>"}` |
 //! | `GET /.well-known/matrix/client` | `server.public_baseurl` is set | `{"m.homeserver": {"base_url": "<url>"}}` |
+//! | `GET /.well-known/matrix/support` | `server.admin_contact` is set | `{"contacts": [{"role": "m.role.admin", "email_address" or "matrix_id": ...}]}`, or `{"support_page": "<url>"}` |
 //!
-//! Both are **absent** (404 `M_NOT_FOUND`, the same answer as any unrouted path) when their
+//! The support document (spec v1.10, MSC1929) is what clients read to tell people who to ask for
+//! help or report abuse to; `server.admin_contact` is a `mailto:` address, a bare email address,
+//! a Matrix ID, or an `http(s)://` support page ([`SupportContact::parse`]).
+//!
+//! All three are **absent** (404 `M_NOT_FOUND`, the same answer as any unrouted path) when their
 //! config field is unset, rather than being served with a value derived from `server_name`. A
 //! well-known document that points at the server name it was fetched from is indistinguishable
 //! from no document at all in the spec's resolution order — both end at "connect to the server
@@ -53,6 +58,56 @@ pub struct WellKnown {
     /// `server.public_baseurl`: the client-facing base URL. `None` means
     /// `/.well-known/matrix/client` is not served.
     pub client_base_url: Option<String>,
+    /// `server.admin_contact`: who to ask for help. `None` means
+    /// `/.well-known/matrix/support` is not served.
+    pub support: Option<SupportContact>,
+}
+
+/// How to reach the administrator, as `/.well-known/matrix/support` publishes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SupportContact {
+    /// An email address (`mailto:` stripped), published as the admin contact's `email_address`.
+    Email(String),
+    /// A Matrix user ID, published as the admin contact's `matrix_id`.
+    MatrixId(String),
+    /// A web page, published as `support_page`.
+    Page(String),
+}
+
+impl SupportContact {
+    /// Reads `server.admin_contact`: `mailto:a@example.org` or `a@example.org` (email),
+    /// `@admin:example.org` (Matrix ID), `https://example.org/help` (a support page). `None` for
+    /// an empty value or one that is none of these.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        let value = raw.trim();
+        if let Some(email) = value.strip_prefix("mailto:") {
+            let email = email.trim();
+            return email.contains('@').then(|| Self::Email(email.to_owned()));
+        }
+        if value.starts_with("https://") || value.starts_with("http://") {
+            return Some(Self::Page(value.to_owned()));
+        }
+        if value.starts_with('@') {
+            return ruma::UserId::parse(value)
+                .ok()
+                .map(|id| Self::MatrixId(id.to_string()));
+        }
+        (value.contains('@') && !value.contains(char::is_whitespace))
+            .then(|| Self::Email(value.to_owned()))
+    }
+
+    /// The document's body.
+    #[must_use]
+    pub fn document(&self) -> serde_json::Value {
+        match self {
+            Self::Email(email) => {
+                json!({"contacts": [{"role": "m.role.admin", "email_address": email}]})
+            }
+            Self::MatrixId(id) => json!({"contacts": [{"role": "m.role.admin", "matrix_id": id}]}),
+            Self::Page(url) => json!({"support_page": url}),
+        }
+    }
 }
 
 impl WellKnown {
@@ -74,6 +129,11 @@ impl WellKnown {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(|s| s.trim_end_matches('/').to_owned()),
+            support: config
+                .server
+                .admin_contact
+                .as_deref()
+                .and_then(SupportContact::parse),
         }
     }
 
@@ -81,7 +141,7 @@ impl WellKnown {
     /// who expected delegation and configured nothing sees why nothing is served.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.server.is_none() && self.client_base_url.is_none()
+        self.server.is_none() && self.client_base_url.is_none() && self.support.is_none()
     }
 }
 
@@ -130,6 +190,18 @@ pub async fn get_client(
     }
 }
 
+/// `GET /.well-known/matrix/support` — who to ask for help, from `server.admin_contact`, or 404
+/// when it is unset.
+pub async fn get_support(
+    axum::Extension(well_known): axum::Extension<hs_config::Live<WellKnown>>,
+) -> Response {
+    let well_known = well_known.get();
+    match &well_known.support {
+        Some(contact) => with_cors(Json(contact.document()).into_response()),
+        None => not_found(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,6 +215,7 @@ mod tests {
         axum::Router::new()
             .route("/.well-known/matrix/server", get(get_server))
             .route("/.well-known/matrix/client", get(get_client))
+            .route("/.well-known/matrix/support", get(get_support))
             .layer(Extension(hs_config::Live::new(well_known)))
     }
 
@@ -158,6 +231,7 @@ mod tests {
         let response = app(WellKnown {
             server: Some("matrix.example.org:8448".into()),
             client_base_url: None,
+            support: None,
         })
         .oneshot(
             Request::builder()
@@ -201,6 +275,7 @@ mod tests {
         let response = app(WellKnown {
             server: None,
             client_base_url: Some("https://matrix.example.org".into()),
+            support: None,
         })
         .oneshot(
             Request::builder()
@@ -256,5 +331,68 @@ mod tests {
         config.server.public_baseurl = Some("   ".into());
         let well_known = WellKnown::from_config(&config);
         assert!(well_known.is_empty());
+    }
+
+    #[tokio::test]
+    async fn support_document_names_the_admin_contact_and_is_absent_without_one() {
+        let get = |well_known: WellKnown| async move {
+            app(well_known)
+                .oneshot(
+                    Request::builder()
+                        .uri("/.well-known/matrix/support")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        };
+        let response = get(WellKnown::default()).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = get(WellKnown {
+            support: SupportContact::parse("mailto:abuse@example.org"),
+            ..WellKnown::default()
+        })
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(response).await,
+            json!({"contacts": [{"role": "m.role.admin", "email_address": "abuse@example.org"}]})
+        );
+    }
+
+    #[test]
+    fn an_admin_contact_reads_as_an_email_a_matrix_id_or_a_page() {
+        assert_eq!(
+            SupportContact::parse(" mailto:a@example.org "),
+            Some(SupportContact::Email("a@example.org".into()))
+        );
+        assert_eq!(
+            SupportContact::parse("a@example.org"),
+            Some(SupportContact::Email("a@example.org".into()))
+        );
+        assert_eq!(
+            SupportContact::parse("@admin:example.org"),
+            Some(SupportContact::MatrixId("@admin:example.org".into()))
+        );
+        assert_eq!(
+            SupportContact::parse("https://example.org/help"),
+            Some(SupportContact::Page("https://example.org/help".into()))
+        );
+        assert_eq!(
+            SupportContact::parse("@admin:example.org")
+                .unwrap()
+                .document(),
+            json!({"contacts": [{"role": "m.role.admin", "matrix_id": "@admin:example.org"}]})
+        );
+        assert_eq!(
+            SupportContact::parse("https://example.org/help")
+                .unwrap()
+                .document(),
+            json!({"support_page": "https://example.org/help"})
+        );
+        for nothing in ["", "   ", "mailto:", "call the front desk", "@not a user"] {
+            assert_eq!(SupportContact::parse(nothing), None, "{nothing:?}");
+        }
     }
 }

@@ -16,14 +16,15 @@
 //! setting is hot only when the change that makes it hot also wires something to re-read it.
 //! The schema-walk test below fails the moment a setting is added without a classification.
 //!
-//! # Read by nothing yet
+//! # Read by something, every one
 //!
-//! A few settings are declared but nothing in the server reads them at all. Those that are
-//! plain data a future reader would look up per operation are classified hot
-//! (`server.admin_contact`, `server.report_stats` and `media.remote_media_retention`); those whose
-//! reader would be built at startup are classified restart (`auth.enable_legacy_login`,
-//! `auth.password.enabled`, `auth.session_secret`, `appservices.enabled`). Either way a change
-//! has no effect today; `docs/status/13-config-compat-and-migration.md` lists them.
+//! Since 2026-10-08 every setting has a reader. The ones decision 0016's amendment found read
+//! by nothing either got one (`server.admin_contact` is `/.well-known/matrix/support`,
+//! `auth.password.enabled` is read by `GET` and `POST /login`, `media.remote_media_retention`
+//! by the remote-media sweeper) or left the schema because nothing should read them
+//! (`server.report_stats`, `auth.enable_legacy_login`, `auth.session_secret(_file)`,
+//! `appservices.enabled`; [`crate::retired`] drops them from older configurations with a
+//! warning).
 //!
 //! # What stays restart, and why
 //!
@@ -33,9 +34,9 @@
 //! - `federation.enabled`, the TLS trust settings, `client_timeout`, `max_retry_backoff`,
 //!   `max_queued_pdus_per_destination` -- built into the federation client and sender, whose
 //!   connection pools and queues are in use.
-//! - `auth.session_secret`, `auth.oidc_providers`, `auth.mas_delegation` -- issued sessions and
-//!   upstream clients depend on them; changing them under a running server would invalidate
-//!   sessions on an uncontrolled boundary.
+//! - `auth.oidc_providers`, `auth.mas_delegation` -- upstream clients and the issuer depend on
+//!   them; changing them under a running server would invalidate sessions on an uncontrolled
+//!   boundary.
 //! - `telemetry` other than the log level -- the subscriber, exporters and Sentry client are
 //!   installed once per process.
 //! - `cluster.room_shards`, `user_shards` (fixed at cluster creation), `heartbeat_interval`,
@@ -127,8 +128,10 @@ pub const SETTINGS: &[Setting] = &[
         "/server/well_known_server",
         "the server .well-known document reads it per request",
     ),
-    hot("/server/admin_contact", "read by nothing yet"),
-    hot("/server/report_stats", "read by nothing yet"),
+    hot(
+        "/server/admin_contact",
+        "GET /.well-known/matrix/support reads it per request",
+    ),
     hot(
         "/server/unstable_features",
         "GET /versions reads it per request",
@@ -175,7 +178,7 @@ pub const SETTINGS: &[Setting] = &[
     ),
     hot(
         "/media/remote_media_retention",
-        "read by nothing yet (nothing evicts remote media on a schedule)",
+        "the remote-media sweeper reads it on every pass",
     ),
     restart(
         "/media/allow_legacy_unauthenticated_media",
@@ -322,26 +325,14 @@ pub const SETTINGS: &[Setting] = &[
         "/auth/user_directory_search_all_users",
         "the user directory reads it per search",
     ),
-    restart(
-        "/auth/enable_legacy_login",
-        "read by nothing yet; the legacy routes are mounted at startup",
-    ),
-    restart(
-        "/auth/session_secret",
-        "issued sessions depend on it; rotated on a controlled boundary",
-    ),
-    restart(
-        "/auth/session_secret_file",
-        "issued sessions depend on it; rotated on a controlled boundary",
-    ),
     hot("/auth/access_token_lifetime", "read when a token is issued"),
     hot(
         "/auth/refresh_token_lifetime",
         "read when a token is issued",
     ),
-    restart(
+    hot(
         "/auth/password/enabled",
-        "read by nothing yet; the login flows are built at startup",
+        "GET and POST /login read it per request",
     ),
     hot("/auth/password/pepper", "read when a password is checked"),
     hot(
@@ -365,10 +356,6 @@ pub const SETTINGS: &[Setting] = &[
         "delegation replaces the native issuer at startup",
     ),
     // appservices
-    restart(
-        "/appservices/enabled",
-        "read by nothing yet; delivery starts at startup",
-    ),
     bootstrap(
         "/appservices/registration_files",
         "imported once into the registry at startup",
@@ -739,7 +726,16 @@ mod tests {
         sections.sort_unstable();
         assert_eq!(
             sections,
-            vec!["email", "migration", "network", "rate_limits", "server"]
+            // `appservices` since `appservices.enabled` left the schema (2026-10-08): what is
+            // left is the hot failure threshold and the bootstrap registration files.
+            vec![
+                "appservices",
+                "email",
+                "migration",
+                "network",
+                "rate_limits",
+                "server"
+            ]
         );
     }
 

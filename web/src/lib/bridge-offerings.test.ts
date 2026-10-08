@@ -8,6 +8,7 @@ import {
   looksLikeUserId,
   parseUserList,
   requestFromOffering,
+  settingsEffects,
   totalInstances,
 } from "./bridge-offerings";
 
@@ -114,5 +115,36 @@ describe("deploymentPhaseMeta", () => {
       status: "danger",
     });
     expect(deploymentPhaseMeta("Evicted")).toEqual({ label: "Evicted", status: "neutral" });
+  });
+});
+
+describe("settingsEffects", () => {
+  it("says who-can-have-one applies from now on", () => {
+    expect(settingsEffects("cluster", "cluster", 3).access).toMatch(
+      /^Applies to people who ask from now on\./,
+    );
+  });
+
+  it("says the image and options reach existing bridges, and how, by runtime", () => {
+    expect(settingsEffects("cluster", "cluster", 0).imageAndOptions).toBe(
+      "Applies to every bridge created after saving, and to any people already have.",
+    );
+    expect(settingsEffects("cluster", "cluster", 1).imageAndOptions).toMatch(
+      /^Applies to the 1 bridge people already have as well as to new ones: the server redeploys/,
+    );
+    expect(settingsEffects("elsewhere", "elsewhere", 2).imageAndOptions).toMatch(
+      /The 2 bridges people already have run elsewhere: each keeps its old settings until its files are downloaded again/,
+    );
+  });
+
+  it("warns what a changed runtime does to existing bridges, and nothing when none exist", () => {
+    expect(settingsEffects("cluster", "cluster", 2).runtimeChange).toBeNull();
+    expect(settingsEffects("elsewhere", "cluster", 0).runtimeChange).toBeNull();
+    expect(settingsEffects("elsewhere", "cluster", 2).runtimeChange).toMatch(
+      /deploys each into the cluster on its next pass\. Stop any copy run by hand first/,
+    );
+    expect(settingsEffects("cluster", "elsewhere", 1).runtimeChange).toMatch(
+      /^Saving does not move the 1 bridge people already have: the ones in the cluster keep running there/,
+    );
   });
 });

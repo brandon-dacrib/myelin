@@ -248,6 +248,25 @@ describe("Bridge offering page", () => {
     expect(note).toHaveTextContent(/Each restarts once/);
   });
 
+  it("says what saving each section does to bridges people already have", async () => {
+    renderOffering("mautrix-whatsapp");
+    await userEvent.click(await screen.findByRole("button", { name: "Edit settings" }));
+    const dialog = await screen.findByRole("dialog", { name: "WhatsApp settings" });
+    expect(within(dialog).getByTestId("applies-access")).toHaveTextContent(
+      /Applies to people who ask from now on\. Somebody you take off the list keeps the bridge they have/,
+    );
+    // The mock's WhatsApp offering runs in the cluster with bridges people already have.
+    expect(within(dialog).getByTestId("applies-options")).toHaveTextContent(
+      /as well as to new ones: the server redeploys each with its new files, and it restarts once\./,
+    );
+    expect(within(dialog).getByTestId("applies-image")).toHaveTextContent(/^Image tag: Applies to/);
+    expect(within(dialog).queryByTestId("runtime-change")).toBeNull();
+    await userEvent.click(within(dialog).getByRole("radio", { name: /Runs elsewhere/ }));
+    expect(await within(dialog).findByTestId("runtime-change")).toHaveTextContent(
+      /Saving does not move the \d+ bridges people already have: the ones in the cluster keep running there/,
+    );
+  });
+
   it("shows a shared bridge as one status panel, not a table", async () => {
     putOffering("heisenbridge", { runtime: "cluster", enabled: true });
     renderOffering("heisenbridge");

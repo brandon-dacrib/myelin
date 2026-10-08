@@ -187,9 +187,11 @@ pub struct MediaConfig {
     /// private and loopback range. Corresponds to Synapse's `url_preview_ip_range_blacklist`.
     #[serde(default = "default_preview_blocklist")]
     pub url_preview_ip_range_blocklist: Vec<String>,
-    /// How long to keep copies of other servers' media. Nothing evicts remote media yet, so
-    /// this setting has no effect. Unset means keep forever. Corresponds to Synapse's
-    /// `media_retention.remote_media_lifetime`.
+    /// How long to keep copies of other servers' media that nobody has asked for. Once an hour
+    /// this server deletes the cached copies unused for longer than this (last served, or
+    /// fetched if never served); protected and quarantined copies are kept, and a deleted copy
+    /// is fetched again from its server when next asked for. Unset means keep forever.
+    /// Corresponds to Synapse's `media_retention.remote_media_lifetime`.
     #[serde(default = "default_remote_media_retention")]
     pub remote_media_retention: Option<Duration>,
     /// Serve the pre-authentication-media (legacy, unauthenticated)
