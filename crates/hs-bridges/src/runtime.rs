@@ -51,6 +51,12 @@ pub trait Runtime: Send + Sync + 'static {
     async fn status(&self, name: &str) -> Result<Option<BridgeDeployment>, String>;
     /// Removes it, and everything it owns; a missing one is not an error.
     async fn delete(&self, name: &str) -> Result<(), String>;
+    /// Something an administrator should fix about where instances run that does not stop
+    /// them running, in one sentence with the fix: the cluster's `Bridge` CRD is older than
+    /// this server, say. Shown on each deployed instance's page. `None` when all is well.
+    fn warning(&self) -> Option<String> {
+        None
+    }
 }
 
 /// A Secret holding the files and a `Bridge` resource running them, for `kubectl apply` on a

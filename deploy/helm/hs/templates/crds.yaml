@@ -1,0 +1,24 @@
+{{- if and .Values.bridges.enabled .Values.crds.enabled }}
+{{- /*
+The `Bridge` CRD (docs/decisions/0036). A template, not `crds/`: Helm installs `crds/` on the
+first `helm install` only and never upgrades it, so a cluster kept the CRD of its first install
+and refused every field added since (`.spec.owner: field not declared in schema`, the demo on
+2026-10-09). As a template it is applied on every `helm upgrade` like everything else, and
+`helm.sh/resource-policy: keep` (crds.keep) stops `helm uninstall` from deleting it, which
+would delete every `Bridge` in the cluster with it.
+
+files/crds/bridge.yaml is generated (`cargo run -p hs-operator --bin gen-crds`, the same text
+as deploy/crds/bridge.yaml) and read here as data, so nothing in its descriptions is ever
+taken for a template; only the release's labels and the keep annotation are added.
+*/}}
+{{- $crd := .Files.Get "files/crds/bridge.yaml" | fromYaml }}
+{{- if or $crd.Error (not $crd.spec) }}
+{{- fail (printf "files/crds/bridge.yaml is missing or does not parse: %v" $crd.Error) }}
+{{- end }}
+{{- $metadata := dict "name" $crd.metadata.name "labels" (include "hs.labels" . | fromYaml) }}
+{{- if .Values.crds.keep }}
+{{- $_ := set $metadata "annotations" (dict "helm.sh/resource-policy" "keep") }}
+{{- end }}
+{{- $_ := set $crd "metadata" $metadata }}
+{{ toYaml $crd }}
+{{- end }}

@@ -71,8 +71,10 @@ fn with_kubernetes_formats(crd: CustomResourceDefinition) -> CustomResourceDefin
 }
 
 /// Where the Helm chart keeps its copy of the `Bridge` CRD, relative to the workspace root.
-/// `gen-crds` writes it beside `deploy/crds/bridge.yaml`.
-pub const CHART_BRIDGE_CRD: &str = "deploy/helm/hs/crds/bridge.yaml";
+/// `gen-crds` writes it beside `deploy/crds/bridge.yaml`. The chart's `templates/crds.yaml`
+/// reads it as data and renders it on every install and upgrade (not from `crds/`, which Helm
+/// never upgrades: decision 0036).
+pub const CHART_BRIDGE_CRD: &str = "deploy/helm/hs/files/crds/bridge.yaml";
 
 /// The exact text `gen-crds` writes for one CRD: a do-not-edit header and the YAML.
 ///
@@ -112,6 +114,92 @@ mod tests {
                     "{CHART_BRIDGE_CRD} differs from deploy/crds/bridge.yaml: run gen-crds"
                 );
             }
+        }
+    }
+
+    /// `helm template` of the chart with `args`, as JSON documents.
+    fn helm_template(args: &[&str]) -> Option<Vec<serde_json::Value>> {
+        let chart = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/helm/hs");
+        let output = match std::process::Command::new("helm")
+            .args(["template", "myelin"])
+            .arg(&chart)
+            .args(["--namespace", "myelin", "--set", "serverName=example.org"])
+            .args(args)
+            .output()
+        {
+            Ok(output) => output,
+            Err(e) => {
+                assert!(
+                    std::env::var_os("HS_REQUIRE_HELM").is_none(),
+                    "HS_REQUIRE_HELM is set but `helm` cannot run: {e}"
+                );
+                eprintln!("helm is not on PATH: skipping the chart's CRD check");
+                return None;
+            }
+        };
+        assert!(
+            output.status.success(),
+            "helm template failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        Some(
+            serde_yaml_ng::Deserializer::from_str(&text)
+                .map(|d| serde::Deserialize::deserialize(d).unwrap())
+                .filter(|v: &serde_json::Value| !v.is_null())
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn the_chart_renders_the_generated_bridge_crd_kept_on_uninstall() {
+        // The chart applies the CRD on every install and upgrade (templates/crds.yaml): what
+        // it renders must be the generated CRD, with the release's labels and the keep
+        // annotation, and nothing else changed by going through the template.
+        let Some(objects) = helm_template(&[]) else {
+            return;
+        };
+        let crds: Vec<_> = objects
+            .iter()
+            .filter(|o| o["kind"] == "CustomResourceDefinition")
+            .collect();
+        assert_eq!(crds.len(), 1, "one CRD, the Bridge's");
+        let rendered = crds[0];
+        let (label, bridge) = all_crds()
+            .into_iter()
+            .find(|(label, _)| *label == "bridge")
+            .unwrap();
+        let generated: serde_json::Value =
+            serde_yaml_ng::from_str(&render(label, &bridge).unwrap()).unwrap();
+        assert_eq!(rendered["spec"], generated["spec"]);
+        assert_eq!(rendered["metadata"]["name"], "bridges.hs.matrix.org");
+        assert_eq!(
+            rendered["metadata"]["annotations"]["helm.sh/resource-policy"],
+            "keep"
+        );
+        assert_eq!(
+            rendered["metadata"]["labels"]["app.kubernetes.io/managed-by"],
+            "Helm"
+        );
+        // Nowhere else: the chart has no `crds/` directory for Helm to install on the side.
+        let chart = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/helm/hs");
+        assert!(!chart.join("crds").exists(), "deploy/helm/hs/crds/ is back");
+
+        // keep off: no annotation. crds off, or bridges off: no CRD.
+        let unkept = helm_template(&["--set", "crds.keep=false"]).unwrap();
+        let crd = unkept
+            .iter()
+            .find(|o| o["kind"] == "CustomResourceDefinition")
+            .unwrap();
+        assert!(crd["metadata"].get("annotations").is_none(), "{crd}");
+        for off in ["crds.enabled=false", "bridges.enabled=false"] {
+            let objects = helm_template(&["--set", off]).unwrap();
+            assert!(
+                !objects
+                    .iter()
+                    .any(|o| o["kind"] == "CustomResourceDefinition"),
+                "{off} still renders the CRD"
+            );
         }
     }
 

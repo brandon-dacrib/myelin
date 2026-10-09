@@ -1,7 +1,8 @@
 //! `gen-crds`: renders every CRD in [`hs_operator::crds::all_crds`] to
 //! `deploy/crds/<kind>.yaml`, one `CustomResourceDefinition` manifest per file (`kubectl apply
 //! -f deploy/crds/` applies all five), and copies the `Bridge` CRD into the Helm chart's
-//! `deploy/helm/hs/crds/` (the chart installs that one; RFC 0017). Run with `cargo run -p
+//! `deploy/helm/hs/files/crds/` (the chart's `templates/crds.yaml` renders that one on every
+//! install and upgrade; RFC 0017, decision 0036). Run with `cargo run -p
 //! hs-operator --bin gen-crds` from the workspace root after changing any CRD's Rust struct, and
 //! commit the regenerated YAML. `crds::tests::generated_files_are_up_to_date` fails when they
 //! drift.

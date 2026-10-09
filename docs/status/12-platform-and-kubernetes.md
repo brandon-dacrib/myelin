@@ -1,5 +1,32 @@
 # 12. Platform and Kubernetes
 
+## 2026-10-09 (branch `agent/crd-upgrade`): the chart keeps the Bridge CRD current, and a bridge keeps its own pickle key
+
+Three bugs from rolling `a6f02c48` to the demo, decision 0036.
+
+- **The CRD is applied on every `helm upgrade`.** `deploy/helm/hs/crds/` is gone; the generated
+  CRD is `deploy/helm/hs/files/crds/bridge.yaml` (gen-crds writes it), rendered by
+  `templates/crds.yaml` with `helm.sh/resource-policy: keep`. New values `crds.enabled`,
+  `crds.keep`. New `deploy/helm/hs/README.md` with the one-time adoption for older releases
+  (`--take-ownership`, plus `--force-conflicts` on Helm 4). CD's chart job checks the template.
+- **A server ahead of the cluster's CRD degrades.** `KubeBridgeClient::apply` drops informational
+  fields the CRD refuses (`.spec.owner`) and retries, or fails with `DeployError::OutdatedCrd`;
+  `outdated_crd()` feeds `Runtime::warning`, shown on each deployed instance. It writes an
+  existing `Bridge`'s Secret before the `Bridge`, so a failure between them never restarts a pod.
+- **Bridge pods report why they crashed**: `terminationMessagePolicy: FallbackToLogsOnError`,
+  and a degraded status carries the last log line. The init script carries a bridge's own
+  `pickle_key`/`signing_key`/`server_key` into a rendered file without them (and no longer
+  says "carried" when it did not).
+
+Verified: `cargo test -p hs-operator` (fake API server: `an_older_crd_without_the_owner_field_...`,
+`a_new_bridge_is_written_before_its_files_...`; `the_chart_renders_the_generated_bridge_crd_...`
+against `helm template`; the copy script under `/bin/sh`); `deploy/helm/hs/ci/crd-upgrade-smoke.sh
+--context kind-crd-upgrade` passed on kind v1.33.1 with Helm 4.3 (the real API server's refusal
+is the text the client parses; install without `--take-ownership` stops; with it the CRD is
+adopted and updated; uninstall keeps CRD and Bridge); the real mautrix-whatsapp roll test (track
+11's status). Left: the smoke is not in CD yet (it needs a cluster without the CRD; the kind leg
+installs the chart first); the degraded apply has run against the fake API server, not kind.
+
 ## 2026-10-02: a bridge's Kubernetes objects are named after what they are (branch `agent/bridge-names`)
 
 The owner's WhatsApp bridge was a pod called `bridge-7c1e92a0-…`. Now an instance's `Bridge`,

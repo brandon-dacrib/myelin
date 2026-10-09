@@ -30,3 +30,7 @@ matrix-sdk-crypto = { workspace = true }
 reqwest = { workspace = true }
 tempfile = { workspace = true }
 anyhow = { workspace = true }
+# The roll test runs the operator's own init-container script (`copy_files_script`) in the
+# real bridge image, and reads the configs it leaves.
+hs-operator = { path = "../hs-operator" }
+serde_yaml_ng = { workspace = true }

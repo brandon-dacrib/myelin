@@ -21,6 +21,33 @@ manager) and an instance's Kubernetes objects say whose bridge they are; before 
 (ephemeral, to-device and device-list delivery); before that 2026-09-27 (RFC 0017 run against
 the real binary), 2026-09-27 (the bridge manager) and 2026-09-25.
 
+## Session 2026-10-09 (branch `agent/crd-upgrade`): failing bridge steps back off, and a roll keeps a bridge's own pickle key
+
+- **Back-off** (`hs-bridges` manager): a failing instance step waits 3 s, doubling to 5 min
+  (`step_backoff`, `STEP_BACKOFF_MAX`), logged with `failures` and `retry_in_secs`; asking for the
+  instance or changing its offering ends the wait; "the bridge instance's deployment changed:
+  applied it" is logged after the apply went through. The fingerprint was already recorded right
+  after the runtime accepted an apply: on the demo nothing was applied at all (the cluster refused
+  the `Bridge`), so the every-3-s line was the manager retrying, not restarting the pod.
+- **No pickle key is minted for an instance from before 2026-10-02** (`settle_pickle_key` is
+  gone): its bridge's own key is carried by the operator's init container, which now does so even
+  when the render has no `pickle_key` line (decision 0036).
+- **"The supplied account key is invalid" is explained** on the instance (`explain_deployment`),
+  from the bridge's last log line the operator now carries; the recovery is in
+  `docs/bridges/mautrix.md` (2026-10-09), as done on the demo.
+- **`Runtime::warning`**: the outdated-CRD sentence on every deployed instance.
+
+Verified: `cargo test -p hs-bridges` (`a_refused_deployment_is_applied_once_and_then_backed_off`,
+`asking_for_an_instance_again_or_changing_its_offering_ends_the_wait`,
+`a_bridge_that_cannot_read_its_crypto_store_says_so_with_the_recovery`,
+`what_the_runtime_says_needs_fixing_is_on_each_deployed_instance`);
+`real_mautrix_login::a_bridge_rolled_with_a_render_without_its_pickle_key_keeps_its_own` with the
+real `dock.mau.dev/mautrix/whatsapp:latest` and `hs`: passes, and with the old init script it
+reproduces the demo's `FTL ... the supplied account key is invalid`; `bridge_offerings` and
+`bridge_logins` green. Left: the backoff is per process (a restart retries at once), and the
+manager does not watch a ready bridge's pod, so the explanation shows on its page but the state
+stays `ready`.
+
 ## Session 2026-10-08 (branch `agent/appservice-pump`): delivery is per bridge all the way, and each bridge's queue is watched
 
 Decision 0030 left one place where a bridge's slowness reached the others: the room pump, one

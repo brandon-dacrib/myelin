@@ -561,6 +561,17 @@ async fn set_up(label: &'static str, options: Value) -> Result<Scene> {
 
 /// [`set_up`] for `network`'s bridge.
 async fn set_up_for(network: Network, label: &'static str, options: Value) -> Result<Scene> {
+    set_up_with(network, label, options, str::to_owned).await
+}
+
+/// [`set_up_for`], with the rendered `config.yaml` passed through `edit` before the bridge's
+/// first start.
+async fn set_up_with(
+    network: Network,
+    label: &'static str,
+    options: Value,
+    edit: fn(&str) -> String,
+) -> Result<Scene> {
     let dir = tempfile::tempdir()?;
     let port = reserve_port();
     let server = Server::start(dir.path(), port)?;
@@ -610,7 +621,7 @@ async fn set_up_for(network: Network, label: &'static str, options: Value) -> Re
     std::fs::create_dir_all(&bridge_dir)?;
     std::fs::write(
         bridge_dir.join("config.yaml"),
-        files["config_yaml"].as_str().unwrap_or_default(),
+        edit(files["config_yaml"].as_str().unwrap_or_default()),
     )?;
     std::fs::write(
         bridge_dir.join("registration.yaml"),
@@ -1156,4 +1167,176 @@ fn a_chat_the_bot_started_is_repaired_in_place_and_login_qr_gets_a_qr_code() {
 #[test]
 fn a_person_types_login_to_their_signal_bridge_and_gets_a_qr_code() {
     run_with(SIGNAL.image, signal_login());
+}
+
+// ---- a roll keeps the bridge's own pickle key (2026-10-09) --------------------------------------
+
+/// The rendered config as the server wrote it before 2026-10-02: no `pickle_key`, so the
+/// bridge generates its own on its first start and pickles its crypto store with it.
+fn without_pickle_key(config: &str) -> String {
+    config
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("pickle_key:"))
+        .map(|l| format!("{l}\n"))
+        .collect()
+}
+
+fn pickle_key_of(config: &str) -> Option<String> {
+    let parsed: Value = serde_yaml_ng::from_str(config).ok()?;
+    parsed["encryption"]["pickle_key"]
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// The demo's WhatsApp bridge on 2026-10-09: first started before the server rendered a pickle
+/// key, so its store is pickled with the key the bridge generated. Each roll writes the files
+/// Secret over `/data` with the operator's init container: here the real script, run in the
+/// real bridge image, then the real bridge started again. Once with the old render (no
+/// `pickle_key` line, which until that day dropped the bridge's key and crash-looped it with
+/// "the supplied account key is invalid"), once with a render carrying another key (what the
+/// manager minted that day). Both times the bridge keeps its own key and comes back.
+async fn rolled_keeps_its_own_pickle_key() -> Result<()> {
+    let scene = set_up_with(
+        WHATSAPP,
+        "roll",
+        json!({"encryption": true}),
+        without_pickle_key,
+    )
+    .await?;
+    let own = pickle_key_of(&scene.bridge.read_file("/data/config.yaml")?)
+        .context("the bridge wrote no pickle key of its own")?;
+    let files = scene
+        .admin
+        .ok(
+            reqwest::Method::POST,
+            &format!("{}/files", scene.instance_path),
+            None,
+        )
+        .await?;
+    let rendered = files["config_yaml"].as_str().unwrap_or_default().to_owned();
+    let bridge_dir = scene._dir.path().join("bridge");
+    let secret_dir = scene._dir.path().join("files");
+    std::fs::create_dir_all(&secret_dir)?;
+    std::fs::write(
+        secret_dir.join("registration.yaml"),
+        files["registration_yaml"].as_str().unwrap_or_default(),
+    )?;
+    let other_key = format!("pickle_key: {}", "f".repeat(64));
+    let rolls = [
+        ("no pickle_key line", without_pickle_key(&rendered)),
+        (
+            "another pickle_key",
+            match pickle_key_of(&rendered) {
+                Some(k) => rendered.replace(&format!("pickle_key: {k}"), &other_key),
+                None => rendered.replace("encryption:\n", &format!("encryption:\n  {other_key}\n")),
+            },
+        ),
+    ];
+    for (what, config) in rolls {
+        std::fs::write(secret_dir.join("config.yaml"), &config)?;
+        docker(&["stop", "-t", "10", &scene.bridge.name])?;
+        let init = docker(&[
+            "run",
+            "--rm",
+            "--user",
+            "0",
+            "--entrypoint",
+            "sh",
+            "-v",
+            &format!("{}:/files:ro", secret_dir.display()),
+            "-v",
+            &format!("{}:/data", bridge_dir.display()),
+            WHATSAPP.image,
+            "-c",
+            hs_operator::bridge::copy_files_script(),
+        ])?;
+        let carried = pickle_key_of(&scene.bridge_file_after_stop(&bridge_dir)?);
+        assert_eq!(
+            carried.as_deref(),
+            Some(own.as_str()),
+            "{what}: the init container kept the bridge's own key; it said:\n{init}"
+        );
+        let since = docker(&["inspect", "-f", "{{.State.FinishedAt}}", &scene.bridge.name])?;
+        docker(&["start", &scene.bridge.name])?;
+        let started = Instant::now();
+        // Back up: running, answering this server's ping, and not saying it cannot read its
+        // store.
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            let log = docker_logs_since(&scene.bridge.name, since.trim());
+            if log.contains("the supplied account key is invalid") {
+                bail!(
+                    "{what}: the bridge cannot read its crypto store:\n{}",
+                    tail(&log, 20)
+                );
+            }
+            let running = docker(&["inspect", "-f", "{{.State.Running}}", &scene.bridge.name])?;
+            if running.trim() != "true" {
+                bail!("{what}: the bridge exited:\n{}", tail(&log, 20));
+            }
+            let (status, ping) = scene
+                .admin
+                .call(
+                    reqwest::Method::POST,
+                    &format!("/appservices/{}/ping", scene.appservice_id),
+                    None,
+                )
+                .await?;
+            // Twenty seconds up: a bridge that cannot read its store exits within a second or
+            // two of starting (the demo's did, every time).
+            if status == 200 && ping["health"] == "healthy" && started.elapsed().as_secs() >= 20 {
+                break;
+            }
+            if Instant::now() > deadline {
+                bail!(
+                    "{what}: the bridge did not come back: ping {status} {ping}\n{}",
+                    tail(&log, 30)
+                );
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        let after = pickle_key_of(&scene.bridge.read_file("/data/config.yaml")?);
+        assert_eq!(after.as_deref(), Some(own.as_str()), "{what}");
+    }
+    scene.keep_logs();
+    Ok(())
+}
+
+fn docker_logs_since(name: &str, since: &str) -> String {
+    Command::new("docker")
+        .args(["logs", "--since", since, name])
+        .output()
+        .map(|o| {
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            )
+        })
+        .unwrap_or_default()
+}
+
+impl Scene {
+    /// `/data/config.yaml` while the bridge is stopped (`docker exec` needs it running): read
+    /// through a throwaway container of the same image, as root.
+    fn bridge_file_after_stop(&self, bridge_dir: &Path) -> Result<String> {
+        docker(&[
+            "run",
+            "--rm",
+            "--user",
+            "0",
+            "--entrypoint",
+            "cat",
+            "-v",
+            &format!("{}:/data", bridge_dir.display()),
+            self.network.image,
+            "/data/config.yaml",
+        ])
+    }
+}
+
+/// A bridge whose store was pickled with its own key keeps it through rolls of either kind.
+#[test]
+fn a_bridge_rolled_with_a_render_without_its_pickle_key_keeps_its_own() {
+    run(rolled_keeps_its_own_pickle_key());
 }

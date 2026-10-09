@@ -71,6 +71,27 @@ const IDENTITY_REASON: &str = "the bot's cross-signing";
 /// How often the manager looks for bridges registered by hand that overlap an offering
 /// ([`crate::overlap`]), to log the ones that appeared or went.
 const OVERLAP_LOG_MS: u64 = 60_000;
+/// The longest a failing instance waits before its step is tried again. Each failure in a row
+/// doubles the wait from [`TICK`] up to this ([`BridgeManager::tick`]), so a step that cannot
+/// succeed (a cluster refusing the `Bridge`) is tried a few times a minute at first and then
+/// every five minutes, not every three seconds.
+pub const STEP_BACKOFF_MAX: Duration = Duration::from_secs(5 * 60);
+
+/// How long an instance whose step has failed `failures` times in a row waits before the next
+/// try: [`TICK`] doubled for each failure after the first, at most [`STEP_BACKOFF_MAX`].
+#[must_use]
+pub fn step_backoff(failures: u32) -> Duration {
+    let doublings = failures.saturating_sub(1).min(16);
+    TICK.saturating_mul(1 << doublings).min(STEP_BACKOFF_MAX)
+}
+
+/// One instance's failing streak: how many steps in a row failed and when to try again.
+#[derive(Debug, Clone, Copy)]
+struct Backoff {
+    failures: u32,
+    retry_at_ms: u64,
+}
+
 /// The reason an instance run elsewhere carries once its registration changed under it.
 const REREGISTERED_REASON: &str =
     "its registration changed: download its files again and restart it with them";
@@ -189,6 +210,10 @@ pub struct BridgeManager<B: KvBackend> {
     /// then, so that each one is logged when it appears and when it goes. In memory: a restart
     /// logs the current ones once more.
     overlaps_logged: Mutex<(u64, BTreeSet<(String, String)>)>,
+    /// Instances whose last step failed, by `(bridge type, owner)`, and when each is tried
+    /// again ([`step_backoff`]). In memory: a restart tries each once more straight away.
+    /// Cleared for an instance when someone asks for it again or its offering changes.
+    backoff: Mutex<HashMap<(String, String), Backoff>>,
 }
 
 impl<B: KvBackend> std::fmt::Debug for BridgeManager<B> {
@@ -237,6 +262,7 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             identity_checked_ms: Mutex::new(HashMap::new()),
             declared: Mutex::new(Vec::new()),
             overlaps_logged: Mutex::new((0, BTreeSet::new())),
+            backoff: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -627,11 +653,33 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             bridge_types::instance_names(&row.bridge_type, owner_of(row))
                 .map(|(bot, _)| self.mxid(&bot))
         });
+        // What the runtime says needs fixing, on every instance it runs (the step that
+        // failed because of it has usually said so already, in the same words).
+        let warning = match (&self.runtime, &deployment) {
+            (Some(runtime), Some(d)) => {
+                let notes: Vec<String> = d
+                    .message
+                    .as_deref()
+                    .and_then(explain_deployment)
+                    .into_iter()
+                    .chain(runtime.warning())
+                    .collect();
+                (!notes.is_empty()).then(|| notes.join(". "))
+            }
+            _ => None,
+        };
+        let reason = match (row.reason.clone(), warning) {
+            (Some(reason), Some(warning)) if !reason.contains(&warning) => {
+                Some(format!("{reason}. {warning}"))
+            }
+            (None, Some(warning)) => Some(warning),
+            (reason, _) => reason,
+        };
         BridgeInstance {
             bridge_type: row.bridge_type.clone(),
             user_id: owner_of(row).map(str::to_owned),
             state: row.state.as_str().to_owned(),
-            reason: row.reason.clone(),
+            reason,
             appservice_id: row.appservice_id.clone(),
             bot,
             deployment,
@@ -774,8 +822,41 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             }
         };
         for row in rows {
-            if let Err(e) = self.step(&row).await {
-                tracing::warn!(bridge_type = %row.bridge_type, owner = %row.owner, error = %e, "bridge instance step failed");
+            let key = (row.bridge_type.clone(), row.owner.clone());
+            let waiting = self
+                .backoff
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&key)
+                .copied();
+            if waiting.is_some_and(|b| now_ms() < b.retry_at_ms) {
+                continue;
+            }
+            let result = self.step(&row).await;
+            let mut backoff = self
+                .backoff
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Err(e) = result {
+                let failures = waiting.map_or(1, |b| b.failures.saturating_add(1));
+                let wait = step_backoff(failures);
+                backoff.insert(
+                    key,
+                    Backoff {
+                        failures,
+                        retry_at_ms: now_ms()
+                            .saturating_add(u64::try_from(wait.as_millis()).unwrap_or(u64::MAX)),
+                    },
+                );
+                drop(backoff);
+                tracing::warn!(
+                    bridge_type = %row.bridge_type,
+                    owner = %row.owner,
+                    error = %e,
+                    failures,
+                    retry_in_secs = wait.as_secs(),
+                    "bridge instance step failed; trying it again after the wait"
+                );
                 let message = e.to_string();
                 let _ = self
                     .store
@@ -786,13 +867,36 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
                         r.reason = Some(message.clone());
                         true
                     });
+            } else if let Some(streak) = backoff.remove(&key) {
+                drop(backoff);
+                tracing::info!(
+                    bridge_type = %row.bridge_type,
+                    owner = %row.owner,
+                    failures = streak.failures,
+                    "bridge instance step went through again"
+                );
             }
         }
     }
 
+    /// Forgets the failing streak of `owner`'s instance of `bridge_type` (all of the type's,
+    /// with `owner` `None`), so that its next step runs on the next tick: someone asked for it
+    /// again, or its offering changed.
+    fn clear_backoff(&self, bridge_type: &str, owner: Option<&str>) {
+        self.backoff
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(t, o), _| t != bridge_type || owner.is_some_and(|owner| o != owner));
+    }
+
     async fn step(&self, row: &InstanceRow) -> Result<(), String> {
         let row = &self.settle_deploy_name(row).await?;
-        let row = &self.settle_pickle_key(row)?;
+        // No pickle key is minted for an instance registered before the manager kept one
+        // (2026-10-02): its bridge made its own on its first start and its crypto store is
+        // pickled with that, so its config is rendered without one and the operator's init
+        // container carries the bridge's own into every new copy. Minting one here (as the
+        // manager did until 2026-10-09) put a second key in front of a bridge that had lost its
+        // own, which made its store unreadable.
         let Some(offering) = self
             .store
             .offering(&row.bridge_type)
@@ -845,14 +949,14 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
                     .runtime
                     .clone()
                     .ok_or("this server cannot deploy bridges any more")?;
+                self.apply_deployment(row, &offering, &runtime).await?;
                 tracing::info!(
                     bridge_type = %row.bridge_type,
                     owner = %row.owner,
                     deploy_name = row.deploy_name.as_deref().unwrap_or_default(),
                     from = row.state.as_str(),
-                    "the bridge instance's deployment changed: applying it, which restarts the pod"
+                    "the bridge instance's deployment changed: applied it, which restarts the pod"
                 );
-                self.apply_deployment(row, &offering, &runtime).await?;
                 self.set_state(
                     row,
                     InstanceState::Deploying,
@@ -886,12 +990,12 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
                                 row,
                                 InstanceState::Failed,
                                 Some(
-                                    d.message
+                                    explained(d.message)
                                         .unwrap_or_else(|| "the pod never became ready".into()),
                                 ),
                             );
                         } else {
-                            self.set_reason(row, d.message);
+                            self.set_reason(row, explained(d.message));
                         }
                     }
                 }
@@ -1023,31 +1127,6 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
                     return false;
                 }
                 r.deploy_name = Some(name.clone());
-                true
-            })
-            .map_err(|e| e.to_string())?;
-        self.store
-            .instance(&row.bridge_type, &row.owner)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "the instance was removed".to_owned())
-    }
-
-    /// The row with a pickle key for its config. A registered row from before the manager
-    /// minted one gets one now, so that its config renders complete; the key the running
-    /// bridge generated is carried over the rendered one by the operator's init container
-    /// when the pod next restarts, so the bridge's crypto store stays readable.
-    fn settle_pickle_key(&self, row: &InstanceRow) -> Result<InstanceRow, String> {
-        if row.appservice_id.is_none() || row.pickle_key.is_some() {
-            return Ok(row.clone());
-        }
-        let key = crate::random_hex(32);
-        tracing::info!(bridge_type = %row.bridge_type, owner = %row.owner, "minted a pickle key for a bridge instance registered before the manager kept one");
-        self.store
-            .update_instance(&row.bridge_type, &row.owner, |r| {
-                if r.pickle_key.is_some() {
-                    return false;
-                }
-                r.pickle_key = Some(key.clone());
                 true
             })
             .map_err(|e| e.to_string())?;
@@ -1748,6 +1827,7 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
         front_door_room: Option<&str>,
     ) -> Result<(InstanceRow, bool), StoreError> {
         let now = now_ms();
+        self.clear_backoff(bridge_type, Some(owner));
         let mut row = InstanceRow::new(bridge_type, owner, now);
         row.front_door_room = front_door_room.map(str::to_owned);
         let (existing, created) = self.store.insert_instance(&row)?;
@@ -1806,6 +1886,7 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
     /// Stops and removes `owner`'s instance of `bridge_type` now.
     pub(crate) async fn stop(&self, bridge_type: &str, owner: &str) -> Result<bool, String> {
         tracing::info!(bridge_type, owner, "asked to stop a bridge instance");
+        self.clear_backoff(bridge_type, Some(owner));
         let Some(row) = self
             .store
             .instance(bridge_type, owner)
@@ -1822,6 +1903,34 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
         self.remove(&row).await?;
         Ok(true)
     }
+}
+
+/// What a bridge that will not start is telling, in the words of its own log line (which the
+/// operator carries into the `Bridge`'s status), said as what it means and how to recover; `None`
+/// for anything not recognised.
+///
+/// - `the supplied account key is invalid` (mautrix): the bridge was started with a
+///   `pickle_key` other than the one its crypto store was made with. It happened on the demo
+///   on 2026-10-09, to a bridge first started before the server rendered a key, when a roll
+///   dropped the bridge's own; the operator's init container has carried it since. The store
+///   cannot be read without the old key, so the recovery is resetting it.
+#[must_use]
+pub fn explain_deployment(message: &str) -> Option<String> {
+    message
+        .contains("the supplied account key is invalid")
+        .then(|| {
+            "the bridge cannot read its encryption store: it was started with a different \
+             pickle key from the one the store was made with (\"the supplied account key is \
+             invalid\"), and it will not start until the store is reset. The steps are in \
+             docs/bridges/mautrix.md, \"The supplied account key is invalid\"; the person's \
+             sign-in survives them"
+                .to_owned()
+        })
+}
+
+/// `message` explained where [`explain_deployment`] knows it, else as it is.
+fn explained(message: Option<String>) -> Option<String> {
+    message.map(|m| explain_deployment(&m).unwrap_or(m))
 }
 
 /// A fingerprint of what a deployment asks the runtime for: the image, the port, the arguments
@@ -2018,6 +2127,9 @@ impl<B: KvBackend + 'static> BridgeOfferingSource for BridgeManager<B> {
                 other => other,
             });
         }
+        // Its instances are tried again now, with the offering as it is now.
+        self.clear_backoff(bridge_type, None);
+        self.wake();
         if kind.mode == "shared" {
             self.request(bridge_type, SHARED_INSTANCE, None)
                 .map_err(store_err)?;
@@ -2352,6 +2464,15 @@ mod tests {
     #[derive(Default)]
     struct FakeRuntime {
         objects: Mutex<BTreeMap<String, DeploySpec>>,
+        /// Every `apply` asked for, refused or not.
+        applies: Mutex<usize>,
+        /// When set, `apply` is refused with this message and nothing changes: what a cluster
+        /// whose `Bridge` CRD is older than the server answers.
+        refuse: Mutex<Option<String>>,
+        /// What `warning` says.
+        warning: Mutex<Option<String>>,
+        /// When set, every deployment is degraded with this message: a crash-looping bridge.
+        crash: Mutex<Option<String>>,
     }
 
     impl FakeRuntime {
@@ -2413,6 +2534,10 @@ mod tests {
         }
 
         async fn apply(&self, spec: &DeploySpec) -> Result<BridgeDeployment, String> {
+            *self.applies.lock().unwrap() += 1;
+            if let Some(refusal) = self.refuse.lock().unwrap().clone() {
+                return Err(refusal);
+            }
             self.objects
                 .lock()
                 .unwrap()
@@ -2421,13 +2546,262 @@ mod tests {
         }
 
         async fn status(&self, name: &str) -> Result<Option<BridgeDeployment>, String> {
-            Ok(self.spec(name).as_ref().map(Self::deployment))
+            let crash = self.crash.lock().unwrap().clone();
+            Ok(self.spec(name).as_ref().map(|spec| {
+                let mut d = Self::deployment(spec);
+                if let Some(message) = crash {
+                    d.phase = "Degraded".into();
+                    d.ready = false;
+                    d.message = Some(message);
+                }
+                d
+            }))
         }
 
         async fn delete(&self, name: &str) -> Result<(), String> {
             self.objects.lock().unwrap().remove(name);
             Ok(())
         }
+
+        fn warning(&self) -> Option<String> {
+            self.warning.lock().unwrap().clone()
+        }
+    }
+
+    #[test]
+    fn a_failing_step_waits_twice_as_long_each_time_up_to_five_minutes() {
+        assert_eq!(step_backoff(0), TICK);
+        assert_eq!(step_backoff(1), TICK);
+        assert_eq!(step_backoff(2), TICK * 2);
+        assert_eq!(step_backoff(3), TICK * 4);
+        assert_eq!(step_backoff(7), STEP_BACKOFF_MAX.min(TICK * 64));
+        assert_eq!(step_backoff(8), STEP_BACKOFF_MAX);
+        assert_eq!(step_backoff(u32::MAX), STEP_BACKOFF_MAX);
+    }
+
+    /// Makes `owner`'s instance's wait run out, as if the time had passed.
+    fn wait_out(manager: &BridgeManager<MemoryBackend>, owner: &str) {
+        if let Some(b) = manager
+            .backoff
+            .lock()
+            .unwrap()
+            .get_mut(&("mautrix-whatsapp".to_owned(), owner.to_owned()))
+        {
+            b.retry_at_ms = 0;
+        }
+    }
+
+    fn streak(manager: &BridgeManager<MemoryBackend>, owner: &str) -> Option<Backoff> {
+        manager
+            .backoff
+            .lock()
+            .unwrap()
+            .get(&("mautrix-whatsapp".to_owned(), owner.to_owned()))
+            .copied()
+    }
+
+    /// The demo on 2026-10-09: the cluster's `Bridge` CRD predates `spec.owner`, so every apply
+    /// of a changed deployment was refused, and the manager asked again (and logged that it
+    /// was restarting the pod) every three seconds. A refused apply is now asked once, then
+    /// again after a wait that doubles, and the instance says why.
+    #[tokio::test]
+    async fn a_refused_deployment_is_applied_once_and_then_backed_off() {
+        const OWNER: &str = "@brandon:example.org";
+        const REFUSAL: &str = "kubernetes API: ApiError: failed to create typed patch object \
+            (myelin/bridge-whatsapp-brandon; hs.matrix.org/v1alpha1, Kind=Bridge): .spec.owner: \
+            field not declared in schema";
+        let (manager, runtime) = cluster_manager();
+        manager.put("mautrix-whatsapp", cluster()).await.unwrap();
+        manager
+            .put_instance("mautrix-whatsapp", OWNER)
+            .await
+            .unwrap();
+        manager.tick().await; // registered
+        manager.tick().await; // deploying
+        let row = manager
+            .store
+            .update_instance("mautrix-whatsapp", OWNER, |r| {
+                r.enter(InstanceState::Ready, 5);
+                r.reason = None;
+                r.dm_room = Some("!chat:example.org".into());
+                r.dm_started_by = Some(CHAT_BY_OWNER.into());
+                true
+            })
+            .unwrap()
+            .unwrap();
+        let applied = row.applied_fingerprint.clone().unwrap();
+        let applies_before = *runtime.applies.lock().unwrap();
+
+        // The deployment changes, and the cluster refuses it.
+        *runtime.refuse.lock().unwrap() = Some(REFUSAL.into());
+        manager
+            .put(
+                "mautrix-whatsapp",
+                BridgeOfferingRequest {
+                    image_tag: Some("v0.13.0".into()),
+                    ..BridgeOfferingRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        for _ in 0..10 {
+            manager.tick().await;
+        }
+        assert_eq!(*runtime.applies.lock().unwrap(), applies_before + 1);
+        let row = manager
+            .store
+            .instance("mautrix-whatsapp", OWNER)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, InstanceState::Ready, "nothing was applied");
+        assert_eq!(row.applied_fingerprint.as_deref(), Some(applied.as_str()));
+        assert_eq!(row.reason.as_deref(), Some(REFUSAL));
+        assert_eq!(streak(&manager, OWNER).unwrap().failures, 1);
+
+        // The wait runs out: asked once more, and the next wait is twice as long.
+        wait_out(&manager, OWNER);
+        manager.tick().await;
+        manager.tick().await;
+        assert_eq!(*runtime.applies.lock().unwrap(), applies_before + 2);
+        let second = streak(&manager, OWNER).unwrap();
+        assert_eq!(second.failures, 2);
+        let wait_ms = second.retry_at_ms.saturating_sub(now_ms());
+        assert!(
+            wait_ms > 3_000 && wait_ms <= 6_000,
+            "the second wait is about six seconds: {wait_ms} ms"
+        );
+
+        // The CRD is applied; the next try goes through, once, and the streak is forgotten.
+        *runtime.refuse.lock().unwrap() = None;
+        wait_out(&manager, OWNER);
+        manager.tick().await;
+        manager.tick().await;
+        assert_eq!(*runtime.applies.lock().unwrap(), applies_before + 3);
+        assert!(streak(&manager, OWNER).is_none());
+        assert_eq!(
+            runtime.spec("bridge-whatsapp-brandon").unwrap().image_tag,
+            "v0.13.0"
+        );
+        let row = manager
+            .store
+            .instance("mautrix-whatsapp", OWNER)
+            .unwrap()
+            .unwrap();
+        assert_ne!(row.applied_fingerprint.as_deref(), Some(applied.as_str()));
+        assert_ne!(
+            row.state,
+            InstanceState::Ready,
+            "it watches the pod come back"
+        );
+    }
+
+    #[tokio::test]
+    async fn asking_for_an_instance_again_or_changing_its_offering_ends_the_wait() {
+        const OWNER: &str = "@brandon:example.org";
+        let (manager, runtime) = cluster_manager();
+        manager.put("mautrix-whatsapp", cluster()).await.unwrap();
+        manager
+            .put_instance("mautrix-whatsapp", OWNER)
+            .await
+            .unwrap();
+        manager.tick().await; // registered
+        *runtime.refuse.lock().unwrap() = Some("refused".into());
+        manager.tick().await; // the apply is refused
+        assert_eq!(streak(&manager, OWNER).unwrap().failures, 1);
+        manager
+            .put_instance("mautrix-whatsapp", OWNER)
+            .await
+            .unwrap();
+        assert!(streak(&manager, OWNER).is_none());
+        manager.tick().await;
+        assert_eq!(streak(&manager, OWNER).unwrap().failures, 1);
+        manager.put("mautrix-whatsapp", cluster()).await.unwrap();
+        assert!(streak(&manager, OWNER).is_none());
+    }
+
+    /// The demo's WhatsApp bridge on 2026-10-09, after a roll gave it a pickle key other than
+    /// its own: the operator carries its last log line into the status, and the instance says
+    /// what it means and where the recovery is, while deploying and once ready alike.
+    #[tokio::test]
+    async fn a_bridge_that_cannot_read_its_crypto_store_says_so_with_the_recovery() {
+        const OWNER: &str = "@brandon:example.org";
+        let (manager, runtime) = cluster_manager();
+        manager.put("mautrix-whatsapp", cluster()).await.unwrap();
+        manager
+            .put_instance("mautrix-whatsapp", OWNER)
+            .await
+            .unwrap();
+        manager.tick().await; // registered
+        manager.tick().await; // deploying
+        *runtime.crash.lock().unwrap() = Some(
+            "bridge: CrashLoopBackOff: back-off 5m0s; it last exited saying: FTL Failed to \
+             start bridge error=\"failed to start Matrix connector: the supplied account key is \
+             invalid\""
+                .into(),
+        );
+        manager.tick().await;
+        let row = row_of(&manager);
+        assert_eq!(row.state, InstanceState::Deploying);
+        let reason = row.reason.unwrap();
+        assert!(
+            reason.starts_with("the bridge cannot read its encryption store"),
+            "{reason}"
+        );
+        assert!(reason.contains("docs/bridges/mautrix.md"), "{reason}");
+
+        // Crashing after it was ready: the page says so too.
+        manager
+            .store
+            .update_instance("mautrix-whatsapp", OWNER, |r| {
+                r.enter(InstanceState::Ready, 5);
+                r.reason = None;
+                true
+            })
+            .unwrap();
+        let view = manager
+            .instance("mautrix-whatsapp", OWNER)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            view.reason
+                .as_deref()
+                .is_some_and(|r| r.starts_with("the bridge cannot read its encryption store")),
+            "{:?}",
+            view.reason
+        );
+        assert!(explain_deployment("bridge: CrashLoopBackOff").is_none());
+    }
+
+    #[tokio::test]
+    async fn what_the_runtime_says_needs_fixing_is_on_each_deployed_instance() {
+        const OWNER: &str = "@brandon:example.org";
+        let (manager, runtime) = cluster_manager();
+        manager.put("mautrix-whatsapp", cluster()).await.unwrap();
+        manager
+            .put_instance("mautrix-whatsapp", OWNER)
+            .await
+            .unwrap();
+        manager.tick().await; // registered
+        manager.tick().await; // deploying
+        let note = "the Bridge CRD in the cluster is older than this server (it does not \
+                    declare .spec.owner): apply deploy/crds/bridge.yaml";
+        *runtime.warning.lock().unwrap() = Some(note.into());
+        let view = manager
+            .instance("mautrix-whatsapp", OWNER)
+            .await
+            .unwrap()
+            .unwrap();
+        let reason = view.reason.unwrap();
+        assert!(reason.contains(note), "{reason}");
+        assert!(reason.starts_with("waiting for the pod"), "{reason}");
+        *runtime.warning.lock().unwrap() = None;
+        let view = manager
+            .instance("mautrix-whatsapp", OWNER)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(view.reason.as_deref(), Some("waiting for the pod"));
     }
 
     fn cluster_manager() -> (Arc<BridgeManager<MemoryBackend>>, Arc<FakeRuntime>) {

@@ -157,6 +157,10 @@ impl Runtime for KubernetesRuntime {
     async fn delete(&self, name: &str) -> Result<(), String> {
         self.client.delete(name).await.map_err(|e| e.to_string())
     }
+
+    fn warning(&self) -> Option<String> {
+        self.client.outdated_crd()
+    }
 }
 
 #[cfg(test)]

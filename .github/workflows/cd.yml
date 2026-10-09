@@ -520,8 +520,13 @@ jobs:
             echo "bridges.enabled=false still rendered bridge objects" >&2
             exit 1
           fi
-          # The chart's copy of the Bridge CRD is the generated one (gen-crds writes both).
-          diff -u deploy/crds/bridge.yaml deploy/helm/hs/crds/bridge.yaml
+          # The chart's copy of the Bridge CRD is the generated one (gen-crds writes both), and
+          # it is a template (applied on every upgrade, kept on uninstall: decision 0036), not
+          # a file in crds/, which Helm installs once and never upgrades.
+          diff -u deploy/crds/bridge.yaml deploy/helm/hs/files/crds/bridge.yaml
+          test ! -e deploy/helm/hs/crds
+          helm template myelin deploy/helm/hs --set serverName=example.org --show-only templates/crds.yaml \
+            | grep -q 'helm.sh/resource-policy: keep'
 
       - name: Work out the chart version and the image it pulls
         # deploy/helm/hs/ci/chart-version.sh has the rule and why: a tag publishes its version;

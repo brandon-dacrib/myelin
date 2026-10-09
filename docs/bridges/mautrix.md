@@ -319,6 +319,69 @@ two settings, and which one decides what to do:
 Running it: `cargo build -p hs-cli --bin hs`, then `cargo test -p hs-bridge-conformance --test
 real_mautrix_login -- --nocapture` with Docker reachable.
 
+## 2026-10-09: "The supplied account key is invalid": a roll lost the bridge's own pickle key
+
+**What happened.** The demo's WhatsApp instance was registered before 2026-10-02, when the
+server did not render `encryption.pickle_key`, so the bridge generated its own on its first
+start and pickled its crypto store with it. On 2026-10-09 the roll of `a6f02c48` restarted its
+pod with a files Secret rendered without a `pickle_key` line. The operator's init container
+carried the bridge's key only into a rendered file that already had the line (and printed
+`carried pickle_key into /data/config.yaml` either way), so the key was dropped, mautrix's config
+upgrader generated a new random one, and the bridge crash-looped with
+`FTL Failed to start bridge error="failed to start Matrix connector: the supplied account key is
+invalid"`. The server had also minted a key for the old instance that day (`minted a pickle key
+for a bridge instance registered before the manager kept one`), a second key that was not the
+store's either.
+
+**What changed** (branch `agent/crd-upgrade`, decision 0036):
+
+- The init container (`COPY_FILES_SCRIPT`, `crates/hs-operator/src/bridge.rs`) carries the
+  bridge's own `pickle_key`, `signing_key` and `server_key` into every new copy: replacing a
+  rendered value, adding the key under its section when the rendered file lacks it, or
+  appending the section. The bridge's own value always wins.
+- The server never mints a key for an instance registered before it kept one; only a new
+  instance gets one, with its tokens.
+- A crash-looping bridge's last log line reaches its page: the operator sets
+  `terminationMessagePolicy: FallbackToLogsOnError` and carries the line into the `Bridge`'s
+  status, and the manager turns "the supplied account key is invalid" into "the bridge cannot
+  read its encryption store ... the steps are in docs/bridges/mautrix.md".
+- Verified with the real bridge: `crates/hs-bridge-conformance/tests/real_mautrix_login.rs`,
+  `a_bridge_rolled_with_a_render_without_its_pickle_key_keeps_its_own`, starts
+  `dock.mau.dev/mautrix/whatsapp:latest` on the old render, then runs the operator's script in
+  that image twice (a render with no key line, then one with another key) and starts the bridge
+  again: it keeps its key and answers the server. With the old script the same test reproduces
+  the demo's `FTL ... the supplied account key is invalid`.
+
+**The recovery, as done on the demo on 2026-10-09.** A store pickled with a lost key cannot be
+read again; resetting it costs the bridge's encryption keys, not its WhatsApp sign-in. On the
+demo it took one helper pod and no data loss beyond that:
+
+1. Make sure nothing holds the database: the demo's bridge was crash-looping, so it held
+   nothing; a running one is stopped first (`kubectl scale` its Deployment to 0, with the
+   operator stopped so it does not scale it back).
+2. Run a helper pod on the bridge's claim `<bridge name>-data`. `kubectl proxy` (how the session
+   reached the cluster) refuses `exec`, so the helper does its work as its own command rather
+   than in a shell opened into it. The database is `/data/<appservice id>.db`
+   (`whatsapp-brandon.db` on the demo, not `wa.db`). A script of this shape (any image with
+   `sqlite3`), with the claim mounted at `/data`:
+
+   ```sh
+   cp /data/whatsapp-brandon.db /data/whatsapp-brandon.db.bak-20261009
+   for t in $(sqlite3 /data/whatsapp-brandon.db \
+       "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'crypto%' AND name != 'crypto_version'"); do
+     sqlite3 /data/whatsapp-brandon.db "DELETE FROM $t"
+   done
+   ```
+
+   Keep `crypto_version`: it is the schema version, and an empty one makes the bridge try to
+   create tables that exist.
+3. Delete the helper and let the bridge start. It makes a new crypto account and a new bot
+   device (`BQBMQVR81T` on the demo), the server cross-signs that device on its next step
+   (`signed_bot_device` on the instance), and the WhatsApp login, kept in the bridge's own
+   tables, survives. The `Bridge` went `Ready`.
+4. People's clients see a new device for the bot; old encrypted messages to the bridge cannot
+   be decrypted by it, new ones can.
+
 ## 2026-10-08: one bridge falling behind never holds up another, and each one's queue is a gauge
 
 Every bridge has its own delivery worker and queue; since 2026-10-08 nothing a bridge does

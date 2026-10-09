@@ -436,18 +436,34 @@ serviceMonitor:
 networkPolicy:
   enabled: false
 
+## -- CustomResourceDefinitions ----------------------------------------------------------------
+## The chart's one CRD, `Bridge` (hs.matrix.org/v1alpha1), rendered with the bridges below
+## (templates/crds.yaml). It is a template rather than a file in `crds/` so that `helm upgrade`
+## keeps it current: Helm installs `crds/` on the first install only, and a cluster then refuses
+## every field a later server writes (docs/decisions/0036).
+##
+## Upgrading a release installed before 2026-10-09, whose CRD came from `crds/` and so has no
+## Helm ownership, needs Helm to adopt it once: `helm upgrade --take-ownership ...` (Helm 3.17
+## and later), or label and annotate it first (deploy/helm/hs/README.md, "Upgrading").
+crds:
+  ## Render the CRD. Exactly one release in a cluster can own a cluster-scoped object: a second
+  ## release of this chart in another namespace sets this to false and uses the first one's.
+  enabled: true
+  ## Annotate it `helm.sh/resource-policy: keep`, so that `helm uninstall` (or turning bridges
+  ## off) leaves it, and every `Bridge` in the cluster, in place. Remove it by hand:
+  ## `kubectl delete crd bridges.hs.matrix.org` deletes every `Bridge` and every bridge with it.
+  keep: true
+
 ## -- Bridges ----------------------------------------------------------------------------------
 ## The server deploys bridges itself, one instance per person (docs/rfcs/0017). With this on, the
-## chart installs the `Bridge` CRD (`crds/bridge.yaml`), runs `hs operator` -- the same image,
+## chart installs the `Bridge` CRD (`crds` above), runs `hs operator` -- the same image,
 ## one replica -- which turns each `Bridge` into a pod, a Service and a volume in this namespace,
 ## and lets the server's service account write `Bridge`s and their Secrets in this namespace
 ## only. The server learns it can deploy from `MYELIN_BRIDGES_NAMESPACE` and
 ## `MYELIN_BRIDGES_HOMESERVER_URL`, set on it here. Off, none of that is rendered and bridges can
 ## only run elsewhere, from files downloaded in the admin interface.
 ##
-## Helm installs `crds/` on `helm install` only and never upgrades or deletes it; after a chart
-## upgrade that changes the CRD, `kubectl apply -f crds/bridge.yaml` (or --skip-crds on a
-## cluster where someone else owns it). The file is generated: `cargo run -p hs-operator --bin
+## The CRD's file, files/crds/bridge.yaml, is generated: `cargo run -p hs-operator --bin
 ## gen-crds` writes it beside deploy/crds/bridge.yaml, and a test fails if the two drift.
 bridges:
   enabled: true

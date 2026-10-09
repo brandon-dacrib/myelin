@@ -104,9 +104,10 @@ pub struct InstanceRow {
     /// The key its crypto store is pickled with (`encryption.pickle_key` in its config), minted
     /// with its tokens, so that its config can be rendered again, complete, and written over
     /// the bridge's own copy on a restart without the bridge generating a new key. `None` for
-    /// an instance registered before the manager minted one: the manager mints it on the next
-    /// step, and the operator's init container carries the key the bridge generated over the
-    /// rendered one, so the first rolled restart keeps the crypto store readable.
+    /// an instance registered before the manager minted one (2026-10-02), and it stays `None`:
+    /// that bridge generated its own key on its first start, its config is rendered without
+    /// one, and the operator's init container carries the bridge's own into every new copy.
+    /// (Rows the manager gave a key on 2026-10-09 keep it; the carried key wins over it.)
     #[serde(default)]
     pub pickle_key: Option<String>,
     /// The seeds of the bot's cross-signing master and self-signing keys

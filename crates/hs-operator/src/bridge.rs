@@ -62,15 +62,25 @@ const FILES_DIR: &str = "/files";
 /// changed config reaches the bridge on every start. A mautrix bridge completes and rewrites
 /// its `config.yaml` on its first start, generating the secrets it was not given
 /// (`encryption.pickle_key`, `public_media.signing_key`, `direct_media.server_key`); replacing
-/// the file with one that lacks them would have the bridge generate new ones and make its
-/// crypto store unreadable. So where `/data` already has the file, the values of those three
-/// keys are carried from it into the new copy (keeping the new copy's indentation; a value of
-/// `generate` is the bridge's placeholder and is not carried), and the new copy is then
-/// written in its place. The homeserver renders `pickle_key` itself since 2026-10-02, so the
-/// carry matters for bridges first started before that. `/files/*` skips the Secret volume's
-/// dot-prefixed bookkeeping entries (`..data`), and `-f` follows the symlinks the kubelet puts
-/// in their place. POSIX `sh`, `grep`, `sed` and `awk` only: every bridge image has busybox or
-/// coreutils.
+/// the file with one that lacks them would have the bridge generate new ones, and a new
+/// `pickle_key` makes its crypto store unreadable for good (`failed to start Matrix connector:
+/// the supplied account key is invalid`). So where `/data` already has the file, the value of
+/// each of those three keys is carried from it into the new copy, written in its place:
+///
+/// - where the new copy has the key, its value is replaced (keeping the new copy's
+///   indentation);
+/// - where it has the key's section (`encryption:`) but not the key, the key is added as the
+///   section's first entry, at the indentation of the section's other entries;
+/// - where it has neither, the section and the key are appended.
+///
+/// The bridge's own value always wins over a rendered one: it is the one its store was made
+/// with. A value of `generate` (or none) is the bridge's placeholder and is not carried.
+/// The homeserver renders `pickle_key` itself for instances it registered since 2026-10-02 and
+/// never for older ones (they keep the key their bridge made); until 2026-10-09 a rendered file
+/// without the key line dropped the bridge's key, which broke the demo's WhatsApp bridge.
+/// `/files/*` skips the Secret volume's dot-prefixed bookkeeping entries (`..data`), and `-f`
+/// follows the symlinks the kubelet puts in their place. POSIX `sh`, `grep`, `sed` and `awk`
+/// only: every bridge image has busybox or coreutils.
 const COPY_FILES_SCRIPT: &str = r#"set -eu
 for f in /files/*; do
   [ -f "$f" ] || continue
@@ -78,15 +88,38 @@ for f in /files/*; do
   if [ -e "$t" ]; then
     cp "$f" "$t.new"
     for key in pickle_key signing_key server_key; do
+      case "$key" in
+        pickle_key) section=encryption ;;
+        signing_key) section=public_media ;;
+        server_key) section=direct_media ;;
+      esac
       old=$(grep -m1 -E "^[[:space:]]*$key:" "$t" || true)
       [ -n "$old" ] || continue
       val=$(printf '%s' "${old#*:}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
       [ -n "$val" ] || continue
       [ "$val" != "generate" ] || continue
-      awk -v key="$key" -v val="$val" '
-        !done && match($0, "^[ \t]*" key ":") { print substr($0, 1, RSTART + RLENGTH - 1) " " val; done = 1; next }
-        { print }
-      ' "$t.new" > "$t.tmp"
+      if grep -q -E "^[[:space:]]*$key:" "$t.new"; then
+        awk -v key="$key" -v val="$val" '
+          !done && match($0, "^[ \t]*" key ":") { print substr($0, 1, RSTART + RLENGTH - 1) " " val; done = 1; next }
+          { print }
+        ' "$t.new" > "$t.tmp"
+      elif grep -q -E "^$section:[[:space:]]*(#.*)?$" "$t.new"; then
+        awk -v section="$section" -v key="$key" -v val="$val" '
+          FNR == NR {
+            if (!at && $0 ~ "^" section ":[ \t]*(#.*)?$") { at = FNR; next }
+            if (at && !found && $0 !~ /^[ \t]*(#.*)?$/) {
+              match($0, /^[ \t]*/); ind = substr($0, 1, RLENGTH); found = 1
+            }
+            next
+          }
+          { print }
+          FNR == at { if (ind == "") ind = "  "; print ind key ": " val }
+        ' "$t.new" "$t.new" > "$t.tmp"
+      else
+        cp "$t.new" "$t.tmp"
+        [ -z "$(tail -c 1 "$t.tmp")" ] || echo >> "$t.tmp"
+        printf '%s:\n  %s: %s\n' "$section" "$key" "$val" >> "$t.tmp"
+      fi
       mv "$t.tmp" "$t.new"
       echo "carried $key into $t"
     done
@@ -98,6 +131,14 @@ for f in /files/*; do
   fi
 done
 "#;
+
+/// The script the operator's init container runs before each start of a bridge
+/// ([`COPY_FILES_SCRIPT`]): `sh -c` it with the files Secret at `/files` and the bridge's volume
+/// at `/data`. Public so that the real-bridge tests run exactly it.
+#[must_use]
+pub fn copy_files_script() -> &'static str {
+    COPY_FILES_SCRIPT
+}
 
 /// Container waiting reasons that mean the bridge will not come up without someone changing
 /// something: [`status_from`] reports them as [`Phase::Degraded`].
@@ -362,6 +403,11 @@ pub fn desired_deployment(bridge: &Bridge) -> Deployment {
             ..ContainerPort::default()
         }]),
         readiness_probe: Some(tcp_probe(5, 5, 3)),
+        // A bridge that exits says why on its last log line (mautrix: `FTL Failed to start
+        // bridge error=...`); with this the kubelet keeps the end of the log as the
+        // container's termination message, which the `Bridge`'s status then carries
+        // ([`status_from`]), so the homeserver can say what went wrong on the bridge's page.
+        termination_message_policy: Some("FallbackToLogsOnError".to_owned()),
         // Generous: a bridge that is slow to answer while it syncs a large account is still
         // better left alone than restarted into the same sync.
         liveness_probe: Some(tcp_probe(60, 20, 6)),
@@ -558,14 +604,40 @@ fn degraded_reason(pods: &[Pod]) -> Option<(String, String)> {
     pods.iter().flat_map(all_container_statuses).find_map(|cs| {
         let (reason, message) = waiting(cs)?;
         DEGRADED_REASONS.contains(&reason).then(|| {
-            let text = match message {
+            let mut text = match message {
                 Some(m) if !m.is_empty() => format!("{}: {reason}: {m}", cs.name),
                 _ => format!("{}: {reason}", cs.name),
             };
+            if let Some(last) = last_exit_line(cs) {
+                text.push_str("; it last exited saying: ");
+                text.push_str(&last);
+            }
             (reason.to_owned(), text)
         })
     })
 }
+
+/// The last non-empty line of what a container said when it last exited (its termination
+/// message, which `FallbackToLogsOnError` fills from the end of its log), at most
+/// [`LAST_EXIT_MAX`] characters.
+fn last_exit_line(status: &ContainerStatus) -> Option<String> {
+    let message = status
+        .last_state
+        .as_ref()?
+        .terminated
+        .as_ref()?
+        .message
+        .as_deref()?;
+    let line = message
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty())?;
+    Some(line.chars().take(LAST_EXIT_MAX).collect())
+}
+
+/// The most of a container's last words [`status_from`] carries.
+const LAST_EXIT_MAX: usize = 400;
 
 fn pending_reason(pods: &[Pod]) -> (String, String) {
     if let Some((reason, _)) = pods
@@ -881,16 +953,70 @@ mod tests {
             2,
             "no bookkeeping entry, no leftover temporary file: {data:?}"
         );
+    }
 
-        // A rendered file without the key keeps none: nothing to carry it into.
+    /// The demo on 2026-10-09: a WhatsApp bridge started before the server rendered a pickle
+    /// key wrote its own into `/data/config.yaml`; a roll with a rendered file that had no
+    /// `pickle_key` line dropped it, the bridge generated another, and its crypto store could
+    /// no longer be read. The bridge's key is carried whatever the rendered file has.
+    #[test]
+    fn the_bridges_own_keys_are_carried_into_a_rendered_file_without_them() {
+        let bridge_written = "homeserver:\n    address: http://old:8008\nencryption:\n    allow: true\n    pickle_key: THE_BRIDGES_OWN\npublic_media:\n    signing_key: SIGNING\ndirect_media:\n    server_key: generate\n";
+
+        // The section is there and the key is not: added as its first entry, at its indentation.
+        let rendered = "homeserver:\n  address: http://new:8008\nencryption:\n  # what it does\n  allow: true\n  appservice: true\nprovisioning:\n  shared_secret: s\n";
         let Some(data) = run_copy_script(
-            "missing",
-            &[("config.yaml", "a: 1\n")],
+            "section",
+            &[("config.yaml", rendered)],
+            &[("config.yaml", bridge_written)],
+        ) else {
+            return;
+        };
+        assert_eq!(
+            data["config.yaml"],
+            "homeserver:\n  address: http://new:8008\nencryption:\n  pickle_key: THE_BRIDGES_OWN\n  # what it does\n  allow: true\n  appservice: true\nprovisioning:\n  shared_secret: s\npublic_media:\n  signing_key: SIGNING\n"
+        );
+        let parsed: serde_json::Value = serde_yaml_ng::from_str(&data["config.yaml"]).unwrap();
+        assert_eq!(parsed["encryption"]["pickle_key"], "THE_BRIDGES_OWN");
+        assert_eq!(parsed["encryption"]["appservice"], true);
+        assert_eq!(parsed["public_media"]["signing_key"], "SIGNING");
+        assert!(
+            parsed.get("direct_media").is_none(),
+            "`generate` is not carried"
+        );
+
+        // Neither the section nor the key, and no newline at the end: both appended.
+        let Some(data) = run_copy_script(
+            "neither",
+            &[("config.yaml", "a: 1")],
             &[("config.yaml", "a: 0\nencryption:\n    pickle_key: K\n")],
         ) else {
             return;
         };
-        assert_eq!(data["config.yaml"], "a: 1\n");
+        assert_eq!(data["config.yaml"], "a: 1\nencryption:\n  pickle_key: K\n");
+
+        // A section with nothing under it yet, followed by another one.
+        let Some(data) = run_copy_script(
+            "empty",
+            &[("config.yaml", "encryption:\nother: 1\n")],
+            &[("config.yaml", "encryption:\n    pickle_key: K\n")],
+        ) else {
+            return;
+        };
+        let parsed: serde_json::Value = serde_yaml_ng::from_str(&data["config.yaml"]).unwrap();
+        assert_eq!(parsed["encryption"]["pickle_key"], "K");
+        assert_eq!(parsed["other"], 1);
+
+        // Started again with the file it now has: nothing changes.
+        let first = data["config.yaml"].clone();
+        let Some(again) = run_copy_script(
+            "again",
+            &[("config.yaml", "encryption:\nother: 1\n")],
+            &[("config.yaml", first.as_str())],
+        ) else {
+            return;
+        };
+        assert_eq!(again["config.yaml"], first);
     }
 
     #[test]
@@ -1108,6 +1234,49 @@ mod tests {
             assert_eq!(s.phase, Phase::Degraded, "{reason}");
             assert_eq!(s.conditions[0].message, format!("bridge: {reason}"));
         }
+    }
+
+    #[test]
+    fn a_crash_loop_carries_the_bridges_last_words() {
+        // What mautrix-whatsapp printed on the demo on 2026-10-09, as the kubelet keeps it.
+        let mut pod = pod_waiting(false, "CrashLoopBackOff", Some("back-off 5m0s"));
+        let status = &mut pod
+            .status
+            .as_mut()
+            .unwrap()
+            .container_statuses
+            .as_mut()
+            .unwrap()[0];
+        status.last_state = Some(ContainerState {
+            terminated: Some(k8s_openapi::api::core::v1::ContainerStateTerminated {
+                exit_code: 1,
+                message: Some(
+                    "INF Starting bridge\nFTL Failed to start bridge error=\"failed to start \
+                     Matrix connector: the supplied account key is invalid\"\n\n"
+                        .to_owned(),
+                ),
+                ..Default::default()
+            }),
+            ..ContainerState::default()
+        });
+        let s = status_at(&bridge(), Some(&deployment_with_ready(0)), &[pod], t(10));
+        assert_eq!(s.phase, Phase::Degraded);
+        assert_eq!(
+            s.conditions[0].message,
+            "bridge: CrashLoopBackOff: back-off 5m0s; it last exited saying: FTL Failed to start \
+             bridge error=\"failed to start Matrix connector: the supplied account key is invalid\""
+        );
+        let main = &desired_deployment(&bridge())
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap()
+            .containers[0];
+        assert_eq!(
+            main.termination_message_policy.as_deref(),
+            Some("FallbackToLogsOnError")
+        );
     }
 
     #[test]
