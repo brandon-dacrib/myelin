@@ -925,9 +925,12 @@ fn stateful_set(
         ports: Some(ports),
         env: Some(env_vars),
         volume_mounts: Some(mounts),
+        // The chart's `probes` defaults (deploy/helm/hs/values.yaml), set from the measured
+        // 5-6 s from container start to Ready on 2026-10-09: a 150 s startup budget asked
+        // every 2 s, readiness every 3 s. `helm_equivalence` holds the two together.
         startup_probe: Some(Probe {
-            period_seconds: Some(5),
-            failure_threshold: Some(30),
+            period_seconds: Some(2),
+            failure_threshold: Some(75),
             ..http_probe("/health/live")
         }),
         liveness_probe: Some(Probe {
@@ -938,8 +941,8 @@ fn stateful_set(
             ..http_probe("/health/live")
         }),
         readiness_probe: Some(Probe {
-            initial_delay_seconds: Some(5),
-            period_seconds: Some(5),
+            initial_delay_seconds: Some(2),
+            period_seconds: Some(3),
             timeout_seconds: Some(5),
             failure_threshold: Some(3),
             ..http_probe("/health/ready")
