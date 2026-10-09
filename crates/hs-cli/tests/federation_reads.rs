@@ -291,9 +291,10 @@ impl Harness {
 #[tokio::test]
 async fn an_unsigned_request_never_reaches_a_handler() {
     let harness = Harness::new().await;
+    // `/publicRooms`, not `/version`: the spec leaves `/version` unsigned (2026-10-09).
     let request = Request::builder()
         .method("GET")
-        .uri("/_matrix/federation/v1/version")
+        .uri("/_matrix/federation/v1/publicRooms")
         .body(Body::empty())
         .unwrap();
     let response = harness.router.clone().oneshot(request).await.unwrap();
@@ -304,12 +305,13 @@ async fn an_unsigned_request_never_reaches_a_handler() {
 async fn a_signed_request_is_accepted_and_a_tampered_one_is_not() {
     let harness = Harness::new().await;
 
-    let (status, body) = harness.signed_get("/version").await;
+    // A route that requires a signature (`/version` does not, by the spec).
+    let (status, body) = harness.signed_get("/publicRooms").await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
     // The same request with one character of the signature changed must fail: this is what makes
     // the test above a signature check rather than a "header is present" check.
-    let uri = "/_matrix/federation/v1/version";
+    let uri = "/_matrix/federation/v1/publicRooms";
     let auth =
         hs_federation::xmatrix::sign_request("GET", uri, REMOTE, US, None, &harness.remote_key)
             .unwrap();
@@ -324,7 +326,7 @@ async fn a_signed_request_is_accepted_and_a_tampered_one_is_not() {
     };
     let request = Request::builder()
         .method("GET")
-        .uri("/_matrix/federation/v1/version")
+        .uri("/_matrix/federation/v1/publicRooms")
         .header("Authorization", tampered)
         .body(Body::empty())
         .unwrap();

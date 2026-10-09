@@ -944,10 +944,11 @@ async fn the_key_server_publishes_a_self_signed_key_and_federation_requires_sign
     hs_model::signing::verify_object(&canonical, "example.org", key_id, &verifying_key)
         .expect("the key response must verify against the key it publishes");
 
-    // Every other federation endpoint is behind the X-Matrix layer, including under the real
-    // mount prefix (which is where a prefix-stripping router would silently break verification).
+    // Every other federation endpoint the spec signs is behind the X-Matrix layer, including
+    // under the real mount prefix (which is where a prefix-stripping router would silently break
+    // verification). `/version` is not one of them: the spec leaves it unsigned.
     let unsigned = client
-        .get(format!("{base}/_matrix/federation/v1/version"))
+        .get(format!("{base}/_matrix/federation/v1/publicRooms"))
         .send()
         .await
         .unwrap();
