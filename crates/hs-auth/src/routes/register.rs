@@ -18,7 +18,8 @@
 //!   "Registration without a session fails"). A one-shot registration that never asked for a
 //!   session is unaffected, as are a guest upgrading itself (Sytest's "Guest user can upgrade to
 //!   fully featured user" sends its stage without the session it was given) and a stage carrying
-//!   its own proof, such as an invite link's registration token.
+//!   its own proof, such as an invite link's registration token. The pending names live in the
+//!   store (`UiaStore::remember_pending_registration`), so every replica checks them.
 //!
 //! Supported UIA stages: `m.login.dummy` (the flow when nothing else is required),
 //! `m.login.registration_token` (checked against
@@ -246,54 +247,6 @@ const PASSWORD_HASH_KEY: &str = "registration_password_hash";
 /// Where a registration's UIA session records the account it made, so finishing the same
 /// session again logs that account in instead of making another.
 const REGISTERED_USER_KEY: &str = "registered_user_id";
-
-/// The registrations that were handed a UIA session, by the username they asked for, so that a
-/// stage submitted for that username without the session can be sent back to it (see the module
-/// docs). Kept in this process's memory and bounded: it is a strictness check, not state a
-/// registration depends on -- behind a load balancer, a request that reaches another replica
-/// simply is not checked.
-#[derive(Debug, Default)]
-pub struct PendingRegistrations {
-    by_username: std::sync::Mutex<HashMap<String, (String, u64)>>,
-}
-
-impl PendingRegistrations {
-    /// The most usernames remembered at once; the oldest is forgotten first.
-    const CAPACITY: usize = 10_000;
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, (String, u64)>> {
-        self.by_username
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    fn remember(&self, username: &str, session_id: &str, now_ms: u64, timeout_ms: u64) {
-        let mut map = self.lock();
-        map.retain(|_, (_, at)| at.saturating_add(timeout_ms) >= now_ms);
-        if map.len() >= Self::CAPACITY
-            && !map.contains_key(username)
-            && let Some(oldest) = map
-                .iter()
-                .min_by_key(|(_, (_, at))| *at)
-                .map(|(name, _)| name.clone())
-        {
-            map.remove(&oldest);
-        }
-        map.entry(username.to_owned())
-            .or_insert_with(|| (session_id.to_owned(), now_ms));
-    }
-
-    fn session_for(&self, username: &str, now_ms: u64, timeout_ms: u64) -> Option<String> {
-        self.lock()
-            .get(username)
-            .filter(|(_, at)| at.saturating_add(timeout_ms) >= now_ms)
-            .map(|(session, _)| session.clone())
-    }
-
-    fn forget(&self, username: &str) {
-        self.lock().remove(username);
-    }
-}
 
 /// Where a registration's UIA session remembers the email address its `m.login.email.identity`
 /// stage validated (the [`crate::store::ThreepidValidationRecord`]), so that creating the
@@ -759,8 +712,9 @@ async fn register_user(
         && upgrading.is_none()
         && let Some(username) = &username
         && let Some(pending) = state
-            .pending_registrations
-            .session_for(username, now, timeout)
+            .store
+            .pending_registration_session(username, now, timeout)
+            .await?
         && state.store.session_exists(&pending, now, timeout).await?
     {
         tracing::info!(
@@ -833,8 +787,9 @@ async fn register_user(
             && upgrading.is_none()
         {
             state
-                .pending_registrations
-                .remember(username, &session_id, now, timeout);
+                .store
+                .remember_pending_registration(username, &session_id, now, timeout)
+                .await?;
         }
         let body = uia::incomplete_body_with_params(
             flows,
@@ -845,7 +800,7 @@ async fn register_user(
         return Ok((StatusCode::UNAUTHORIZED, Json(body)).into_response());
     }
     if let Some(username) = &username {
-        state.pending_registrations.forget(username);
+        state.store.forget_pending_registration(username).await?;
     }
 
     let inhibit_login = params

@@ -871,7 +871,72 @@ pub(crate) async fn recovery_token_is_replaced_consumed_once_and_cleared<S: Auth
     assert_eq!(s.setup_token().await.unwrap().as_deref(), Some("setup"));
 }
 
+pub(crate) async fn pending_registrations_are_remembered_until_forgotten_or_expired<
+    S: AuthStore,
+>(
+    s: &S,
+) {
+    const TIMEOUT: u64 = 1_000;
+    assert_eq!(
+        s.pending_registration_session("alice", 0, TIMEOUT)
+            .await
+            .unwrap(),
+        None
+    );
+    s.remember_pending_registration("alice", "s1", 100, TIMEOUT)
+        .await
+        .unwrap();
+    // The first session wins while it lives.
+    s.remember_pending_registration("alice", "s2", 200, TIMEOUT)
+        .await
+        .unwrap();
+    assert_eq!(
+        s.pending_registration_session("alice", 500, TIMEOUT)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("s1")
+    );
+    // Expired: gone, and a new session can be remembered.
+    assert_eq!(
+        s.pending_registration_session("alice", 1_200, TIMEOUT)
+            .await
+            .unwrap(),
+        None
+    );
+    s.remember_pending_registration("alice", "s3", 1_200, TIMEOUT)
+        .await
+        .unwrap();
+    assert_eq!(
+        s.pending_registration_session("alice", 1_300, TIMEOUT)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("s3")
+    );
+    // Another name is its own entry; forgetting one leaves the other.
+    s.remember_pending_registration("bob", "s4", 1_300, TIMEOUT)
+        .await
+        .unwrap();
+    s.forget_pending_registration("alice").await.unwrap();
+    s.forget_pending_registration("nobody").await.unwrap();
+    assert_eq!(
+        s.pending_registration_session("alice", 1_300, TIMEOUT)
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        s.pending_registration_session("bob", 1_300, TIMEOUT)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("s4")
+    );
+}
+
 pub(crate) async fn run_all<S: AuthStore>(make_store: impl Fn() -> S) {
+    pending_registrations_are_remembered_until_forgotten_or_expired(&make_store()).await;
     recovery_token_is_replaced_consumed_once_and_cleared(&make_store()).await;
     create_user_then_get_round_trips(&make_store()).await;
     create_user_conflict_is_case_insensitive(&make_store()).await;

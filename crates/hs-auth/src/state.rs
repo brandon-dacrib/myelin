@@ -210,9 +210,6 @@ pub struct AuthState {
     pub(crate) room_departure: Arc<OnceLock<Arc<dyn RoomDeparture>>>,
     /// What checks a CAPTCHA answer; see [`AuthState::recaptcha_verifier`].
     pub(crate) recaptcha_verifier: Arc<OnceLock<Arc<dyn RecaptchaVerifier>>>,
-    /// Registrations waiting on a user-interactive auth session, by the username they asked
-    /// for; see [`crate::routes::register`]'s "a session, once issued, is required".
-    pub(crate) pending_registrations: Arc<crate::routes::register::PendingRegistrations>,
     /// Checks CAS tickets ([`crate::cas`]): [`crate::cas::HttpCasValidator`] unless replaced
     /// with [`AuthState::with_cas_validator`].
     pub(crate) cas_validator: Arc<dyn crate::cas::CasValidator>,
@@ -247,7 +244,6 @@ impl AuthState {
             profile_refresh: Arc::new(OnceLock::new()),
             room_departure: Arc::new(OnceLock::new()),
             recaptcha_verifier: Arc::new(OnceLock::new()),
-            pending_registrations: Arc::default(),
             cas_validator: Arc::new(crate::cas::HttpCasValidator::default()),
             email_sender: Arc::new(OnceLock::new()),
             identity_server_client: Arc::new(OnceLock::new()),

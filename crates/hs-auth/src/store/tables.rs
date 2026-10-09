@@ -18,6 +18,7 @@
 //! | `hs_auth.login_tokens` | `(hash_hex,)` | none — only ever looked up by its own hash | `TokenStore`'s login-token methods |
 //! | `hs_auth.openid_tokens` | `(hash_hex,)` | none — looked up by its own hash; expired rows are swept on each insert | `TokenStore`'s OpenID-token methods |
 //! | `hs_auth.uia_sessions` | `(session_id,)` | none | `UiaStore` |
+//! | `hs_auth.pending_registrations` | `(username,)` | none — rows older than the UIA session timeout are swept on each insert, as the OpenID tokens are | `UiaStore`'s pending-registration methods |
 //! | `hs_auth.threepids` | `(medium, address_lower)` | `hs_auth.threepids_by_user` (`(user_id, medium, address_lower)`, the whole record, written in the same transaction) | `UserStore::get_user_by_threepid`, `IdentityStore`'s 3PID methods |
 //! | `hs_auth.external_ids` | `(provider, external_id)` | `hs_auth.external_ids_by_user` (`(user_id, provider, external_id)`, likewise) | `IdentityStore`'s external-id methods |
 //! | `hs_auth.experimental_features` | `(user_id,)` | none | `IdentityStore`'s experimental-feature methods |
@@ -49,6 +50,14 @@ use super::{
 use crate::token::TokenHash;
 
 /// One user-interactive-auth session's stored state.
+/// One `hs_auth.pending_registrations` row: the UIA session a registration for the username
+/// was handed, and when.
+#[derive(Debug, Serialize, Deserialize)]
+struct PendingRegistrationRow {
+    session_id: String,
+    at_ms: u64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct UiaSessionRow {
     created_at_ms: u64,
@@ -133,6 +142,7 @@ pub struct TablesAuthStore<B: KvBackend> {
     login_tokens: TypedKeyspace<B::Keyspace, (String,)>,
     openid_tokens: TypedKeyspace<B::Keyspace, (String,)>,
     uia_sessions: TypedKeyspace<B::Keyspace, (String,)>,
+    pending_registrations: TypedKeyspace<B::Keyspace, (String,)>,
     threepids: TypedKeyspace<B::Keyspace, (String, String)>,
     threepids_by_user: TypedKeyspace<B::Keyspace, (String, String, String)>,
     external_ids: TypedKeyspace<B::Keyspace, (String, String)>,
@@ -178,6 +188,7 @@ impl<B: KvBackend> TablesAuthStore<B> {
         let login_tokens = TypedKeyspace::new(open("hs_auth.login_tokens")?);
         let openid_tokens = TypedKeyspace::new(open("hs_auth.openid_tokens")?);
         let uia_sessions = TypedKeyspace::new(open("hs_auth.uia_sessions")?);
+        let pending_registrations = TypedKeyspace::new(open("hs_auth.pending_registrations")?);
         let threepids = TypedKeyspace::new(open("hs_auth.threepids")?);
         let threepids_by_user = TypedKeyspace::new(open("hs_auth.threepids_by_user")?);
         let external_ids = TypedKeyspace::new(open("hs_auth.external_ids")?);
@@ -200,6 +211,7 @@ impl<B: KvBackend> TablesAuthStore<B> {
             login_tokens,
             openid_tokens,
             uia_sessions,
+            pending_registrations,
             threepids,
             threepids_by_user,
             external_ids,
@@ -1218,6 +1230,9 @@ impl<B: KvBackend> TokenStore for TablesAuthStore<B> {
 /// How many `hs_auth.openid_tokens` rows one insert reads looking for expired ones to delete.
 const OPENID_SWEEP_LIMIT: usize = 256;
 
+/// How many `hs_auth.pending_registrations` rows one insert reads looking for expired ones.
+const PENDING_SWEEP_LIMIT: usize = 256;
+
 /// The only key in the `hs_auth.setup` keyspace.
 const SETUP_TOKEN_KEY: &str = "token";
 
@@ -1456,6 +1471,81 @@ impl<B: KvBackend> UiaStore for TablesAuthStore<B> {
         };
         let row: UiaSessionRow = decode(&bytes)?;
         Ok(now_ms.saturating_sub(row.created_at_ms) < timeout_ms)
+    }
+
+    async fn remember_pending_registration(
+        &self,
+        username: &str,
+        session_id: &str,
+        now_ms: u64,
+        timeout_ms: u64,
+    ) -> Result<(), StoreError> {
+        let key = (username.to_owned(),);
+        let value = encode(&PendingRegistrationRow {
+            session_id: session_id.to_owned(),
+            at_ms: now_ms,
+        })?;
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            // Sweep some of the expired ones, as `put_openid_token` does: at most
+            // `PENDING_SWEEP_LIMIT` rows are read per insert.
+            let mut stale = Vec::new();
+            for item in self
+                .pending_registrations
+                .range(&*txn, RangeSpec::full())
+                .take(PENDING_SWEEP_LIMIT)
+            {
+                let (stale_key, bytes) = item.map_err(to_kv)?;
+                let expired = serde_json::from_slice::<PendingRegistrationRow>(&bytes)
+                    .map(|r| r.at_ms.saturating_add(timeout_ms) < now_ms)
+                    .unwrap_or(true);
+                if expired {
+                    stale.push(stale_key);
+                }
+            }
+            for stale_key in &stale {
+                self.pending_registrations
+                    .delete(txn, stale_key)
+                    .map_err(to_kv)?;
+            }
+            // The first session wins while it lives.
+            if let Some(bytes) = self.pending_registrations.get(txn, &key).map_err(to_kv)?
+                && let Ok(row) = serde_json::from_slice::<PendingRegistrationRow>(&bytes)
+                && row.at_ms.saturating_add(timeout_ms) >= now_ms
+            {
+                return Ok(());
+            }
+            self.pending_registrations
+                .put(txn, &key, &value)
+                .map_err(to_kv)
+        })
+        .map_err(store_err)
+    }
+
+    async fn pending_registration_session(
+        &self,
+        username: &str,
+        now_ms: u64,
+        timeout_ms: u64,
+    ) -> Result<Option<String>, StoreError> {
+        let snap = self.backend.snapshot();
+        let key = (username.to_owned(),);
+        let Some(bytes) = self
+            .pending_registrations
+            .get(&snap, &key)
+            .map_err(|e| StoreError::Backend(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let row: PendingRegistrationRow = decode(&bytes)?;
+        Ok((row.at_ms.saturating_add(timeout_ms) >= now_ms).then_some(row.session_id))
+    }
+
+    async fn forget_pending_registration(&self, username: &str) -> Result<(), StoreError> {
+        let key = (username.to_owned(),);
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            self.pending_registrations.delete(txn, &key).map_err(to_kv)
+        })
+        .map_err(store_err)
     }
 }
 

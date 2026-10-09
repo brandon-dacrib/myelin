@@ -33,6 +33,8 @@ struct Inner {
     login_tokens: HashMap<TokenHash, LoginTokenRecord>,
     openid_tokens: HashMap<TokenHash, OpenIdTokenRecord>,
     uia_sessions: HashMap<String, UiaSession>,
+    /// Registrations waiting on a UIA session, by the username asked for: `(session id, when)`.
+    pending_registrations: HashMap<String, (String, u64)>,
     /// Keyed `(medium, address lower-cased)`.
     threepids: HashMap<(String, String), ThreepidRecord>,
     /// Keyed `(provider, external_id)`.
@@ -774,6 +776,10 @@ impl SetupStore for InMemoryAuthStore {
     }
 }
 
+/// The most pending registrations the in-memory store remembers at once (the KV store sweeps
+/// expired ones instead); the oldest is forgotten first.
+const PENDING_REGISTRATIONS_CAPACITY: usize = 10_000;
+
 #[async_trait]
 impl UiaStore for InMemoryAuthStore {
     async fn create_session(&self, created_at_ms: u64) -> Result<String, StoreError> {
@@ -851,6 +857,50 @@ impl UiaStore for InMemoryAuthStore {
             .uia_sessions
             .get(session_id)
             .is_some_and(|s| now_ms.saturating_sub(s.created_at_ms) < timeout_ms))
+    }
+
+    async fn remember_pending_registration(
+        &self,
+        username: &str,
+        session_id: &str,
+        now_ms: u64,
+        timeout_ms: u64,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.lock();
+        let map = &mut inner.pending_registrations;
+        map.retain(|_, (_, at)| at.saturating_add(timeout_ms) >= now_ms);
+        // Bounded, like a cache: the oldest goes when the table is full and the name is new.
+        if map.len() >= PENDING_REGISTRATIONS_CAPACITY
+            && !map.contains_key(username)
+            && let Some(oldest) = map
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(name, _)| name.clone())
+        {
+            map.remove(&oldest);
+        }
+        map.entry(username.to_owned())
+            .or_insert_with(|| (session_id.to_owned(), now_ms));
+        Ok(())
+    }
+
+    async fn pending_registration_session(
+        &self,
+        username: &str,
+        now_ms: u64,
+        timeout_ms: u64,
+    ) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .lock()
+            .pending_registrations
+            .get(username)
+            .filter(|(_, at)| at.saturating_add(timeout_ms) >= now_ms)
+            .map(|(session, _)| session.clone()))
+    }
+
+    async fn forget_pending_registration(&self, username: &str) -> Result<(), StoreError> {
+        self.lock().pending_registrations.remove(username);
+        Ok(())
     }
 }
 

@@ -565,6 +565,34 @@ pub trait UiaStore: Send + Sync {
         now_ms: u64,
         timeout_ms: u64,
     ) -> Result<bool, StoreError>;
+
+    /// Remembers that a registration asking for `username` was handed UIA session `session_id`
+    /// at `now_ms`, unless one still within `timeout_ms` is remembered already (the first session
+    /// wins, so a client retrying its first call is not bounced between sessions). Shared by
+    /// every replica, so a stage sent to another replica without the session is checked there
+    /// too (see `crate::routes::register`'s "a session, once issued, is required"). Entries older
+    /// than `timeout_ms` are swept as a side effect, so the table stays about one timeout's worth
+    /// of names.
+    async fn remember_pending_registration(
+        &self,
+        username: &str,
+        session_id: &str,
+        now_ms: u64,
+        timeout_ms: u64,
+    ) -> Result<(), StoreError>;
+
+    /// The session a registration for `username` was handed within the last `timeout_ms`, if
+    /// one was remembered by [`UiaStore::remember_pending_registration`] and not yet forgotten.
+    async fn pending_registration_session(
+        &self,
+        username: &str,
+        now_ms: u64,
+        timeout_ms: u64,
+    ) -> Result<Option<String>, StoreError>;
+
+    /// Forgets `username`'s pending registration: the account was made, or the session is done
+    /// with. Not an error when nothing was remembered.
+    async fn forget_pending_registration(&self, username: &str) -> Result<(), StoreError>;
 }
 
 /// Storage for the first-run setup token: the one-time credential that lets whoever can read
