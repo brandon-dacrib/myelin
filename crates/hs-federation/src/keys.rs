@@ -351,6 +351,14 @@ pub struct RemoteKeyCache<F: KeyServerFetcher> {
     /// Where accepted responses are also written, so a restart starts with them
     /// ([`RemoteKeyCache::with_store`]); `None` keeps them in memory only.
     store: Option<Arc<dyn crate::key_store::HeldKeyStore>>,
+    /// This server's own verify keys, by `(own server_name, key_id)`, seeded by
+    /// [`RemoteKeyCache::seed_own_keys`]. Consulted before any cache lookup or fetch, so an event
+    /// this server signed itself -- its own user's membership echoed back in a `send_join`,
+    /// `invite` or `make_join` response -- verifies against the keys already in memory rather
+    /// than being fetched over federation from this server (which cannot answer a request to
+    /// itself: the fetch would always fail, as it did against a real Synapse on 2026-10-09). An
+    /// own key is trusted at any timestamp: whatever this server signed, it signed.
+    own: std::sync::Mutex<HashMap<(String, String), VerifyingKey>>,
 }
 
 /// One response held for the notary endpoints: the document and its `valid_until_ts`.
@@ -401,6 +409,23 @@ impl<F: KeyServerFetcher> RemoteKeyCache<F> {
             fetched_at: std::sync::Mutex::new(HashMap::new()),
             responses: std::sync::Mutex::new(HashMap::new()),
             store: None,
+            own: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Seeds this server's own verify keys under `own_server_name`, so an event this server
+    /// signed itself verifies against the keys in memory instead of being fetched over
+    /// federation from this server (a fetch that can never succeed, since this server does not
+    /// federate with itself). Every key in `own_keys` -- current and rotated-out -- is seeded,
+    /// and each is trusted for a signature made at any time: whatever this server signed, it
+    /// signed. Call once at startup, after the signing keys are loaded.
+    pub fn seed_own_keys(&self, own_server_name: &str, own_keys: &OwnSigningKeys) {
+        let mut own = self.own.lock().unwrap();
+        for key in own_keys.all() {
+            own.insert(
+                (own_server_name.to_owned(), key.key_id()),
+                key.verifying_key(),
+            );
         }
     }
 
@@ -663,6 +688,17 @@ impl<F: KeyServerFetcher> RemoteKeyCache<F> {
     }
 
     fn cached_current(&self, server_name: &str, key_id: &str) -> Option<CachedCurrent> {
+        if let Some(verifying_key) = self
+            .own
+            .lock()
+            .unwrap()
+            .get(&(server_name.to_string(), key_id.to_string()))
+        {
+            return Some(CachedCurrent {
+                verifying_key: *verifying_key,
+                valid_until_ts: u64::MAX,
+            });
+        }
         let now = now_ms();
         let map = self.current.lock().unwrap();
         map.get(&(server_name.to_string(), key_id.to_string()))
@@ -672,6 +708,9 @@ impl<F: KeyServerFetcher> RemoteKeyCache<F> {
 
     fn cached_valid_at(&self, server_name: &str, key_id: &str, ts: u64) -> Option<VerifyingKey> {
         let key = (server_name.to_string(), key_id.to_string());
+        if let Some(verifying_key) = self.own.lock().unwrap().get(&key) {
+            return Some(*verifying_key);
+        }
         if let Some(c) = self.current.lock().unwrap().get(&key)
             && ts <= c.valid_until_ts
         {
@@ -1081,6 +1120,41 @@ mod tests {
             KeyLookupError::FetchFailed("gone.example.org".to_owned())
         );
         assert_eq!(cache.cached_keys("gone.example.org"), None);
+    }
+
+    #[tokio::test]
+    async fn own_keys_verify_without_a_fetch() {
+        // An event this server signed itself -- echoed back in a `send_join`/`invite` response --
+        // must verify against the seeded own key, never a fetch from this server (which, against a
+        // real Synapse on 2026-10-09, failed with "could not fetch keys for server `<self>`").
+        let dir = tempfile::tempdir().unwrap();
+        let own = OwnSigningKeys::load_or_generate(dir.path()).unwrap();
+        let fetcher = Arc::new(FixedFetcher::new());
+        struct Shared(Arc<FixedFetcher>);
+        #[async_trait]
+        impl KeyServerFetcher for Shared {
+            async fn fetch_server_key(&self, server_name: &str) -> Option<serde_json::Value> {
+                self.0.fetch_server_key(server_name).await
+            }
+        }
+        let cache = RemoteKeyCache::new(Shared(fetcher.clone()));
+        cache.seed_own_keys("me.example.org", &own);
+        let key_id = own.primary().key_id();
+
+        // Current and at-a-past-timestamp both resolve to the seeded key.
+        assert_eq!(
+            cache.get_current("me.example.org", &key_id).await.unwrap(),
+            own.primary().verifying_key()
+        );
+        assert_eq!(
+            cache
+                .get_valid_at("me.example.org", &key_id, 1)
+                .await
+                .unwrap(),
+            own.primary().verifying_key()
+        );
+        // Nothing was fetched: the fetcher never saw our own name.
+        assert_eq!(fetcher.count_for("me.example.org"), 0);
     }
 
     #[tokio::test]

@@ -1692,6 +1692,11 @@ pub fn build_mount<B: KvBackend + 'static>(
                 as Box<dyn hs_federation::keys::KeyServerFetcher>,
             held_keys,
         ));
+    // Our own verify keys, so an event this server signed itself -- its own user's membership
+    // echoed back in a `send_join`, `invite` or `make_join` response -- verifies against the keys
+    // in memory instead of being fetched over federation from this server, which cannot answer a
+    // request to itself.
+    key_cache.seed_own_keys(&server_name, &own_keys);
 
     // The same client again: a transaction to a destination that is backing off waits for the
     // same `retry_at` every other outbound call to it does, and an administrator's reset of that
@@ -2004,6 +2009,10 @@ pub async fn run_join_room(args: &crate::cli::FederationJoinRoomArgs) -> i32 {
     let key_cache: hs_federation::keys::DynRemoteKeyCache =
         hs_federation::keys::RemoteKeyCache::new(Box::new(ClientKeyFetcher::new(client.clone()))
             as Box<dyn hs_federation::keys::KeyServerFetcher>);
+    // Our own event in the response verifies against the key in memory, not a fetch from us.
+    let own_keys =
+        hs_federation::keys::OwnSigningKeys::from_keys(vec![(*identity.signing_key).clone()]);
+    key_cache.seed_own_keys(identity.server_name.as_str(), &own_keys);
 
     match hs_federation::outbound_join::join_room(
         &client,
