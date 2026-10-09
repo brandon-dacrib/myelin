@@ -1,6 +1,6 @@
 # 05 Sync: status
 
-Last updated: 2026-10-06 (session 18: two long-polls that never saw their change were a lost
+Last updated: 2026-10-09 (session 19: wave 2's three named leftovers were already closed by session 17, rechecked on `6e24c2c0`; `event_fields` is applied; a real-binary test for the peeked long-poll. Session 18: two long-polls that never saw their change were a lost
 push-rule write and a membership event that lost to the room's state, not the long-poll. Session 17: a filtered long-poll waits for real news, a fresh
 batch's `prev_batch` and order follow Synapse's initial sync, peeked hot rooms wake a long-poll and
 are pruned for erased senders. Session 16: Sytest's sync leftovers -- timelines from the newest end with holes, gap state, peeking, presence on joins, filters for presence/account data/ephemeral, remote users in the directory. Session 15: `device_lists` counts invites and rejoins, `/keys/changes` walks memberships between two tokens, a remote copy goes stale with the last shared room. Session 14: the owner's fan-out in batches, and feed retention.
@@ -8,6 +8,81 @@ Session 13: `/joined_rooms` read-your-writes. Session 12: RFC 0018, a non-owner'
 catches up instead of reloading. Session 11, session 10, session 9, session 8, session 7 and
 the integration note follow; sessions 1-6 are preserved unchanged further down.)
 
+
+## Session 19 (2026-10-09, branch `agent/sync-leftovers`): wave 2's leftovers rechecked, `event_fields` applied
+
+`docs/next-steps.md` ("What wave 2 left", item 3) names three 05 items. Each was rechecked on
+`6e24c2c0` (main) before anything was changed:
+
+- **`TestGetRoomMembersAtPoint`** (`/members?at=` from a fresh sync's `prev_batch`): closed by
+  session 17 (a fresh batch holding the whole room keeps the sync position as its `prev_batch`,
+  as Synapse does). PASS on main's image and on this branch's; pinned by
+  `sync::polling_cases` and `crates/hs-cli/tests/sync_polling.rs` (`/members?at=` is alice alone
+  after bob joined). `docs/status/04-room-and-events.md`'s note that `hs-user` "leaves out"
+  the token is out of date: the token is there, and `hs-room`'s `at` reads it.
+- **A peeked room does not wake a long-poll**: closed by session 17 for a room above the fan-out
+  threshold (`has_new_data` reads the device's peeks against the hot-room stream); a room below
+  it wrote the peeker's feed since session 16. Unit: `routes::peek::tests::
+  a_new_event_in_a_peeked_room_wakes_a_long_poll`, both thresholds. **New** this session: the
+  real binary, `crates/hs-cli/tests/peeking.rs` -- a 10 s long-poll on the peeking device
+  started before alice's message returns within 5 s with the message in `rooms.peek`. There is
+  no Complement test for MSC2753.
+- **`TestSyncOmitsStateChangeOnFilteredEvents`**: closed by session 17 (a fresh batch ordered by
+  depth, then arrival). PASS on main's image and on this branch's.
+
+**`event_fields` is applied** (session 17's "Left"; the last filter field parsed but ignored
+apart from `limit`, below). Every timeline and state event of a joined, left or peeked room is
+pruned to the dotted paths the filter names (`SyncFilter::prune_event_fields`,
+`crate::filter`): `content.body` keeps `body` under `content`, `\.` and `\\` are the spec's
+literal dot and backslash, a path the event lacks adds nothing, a whole object named by one path
+and a field inside it by another come as the whole object, and an empty list means every field,
+as Synapse reads it. Stripped state (`invite_state`, `knock_state`), account data, ephemeral
+events and presence are rendered whole, as Synapse's are (its stripped serializer takes no
+allowlist). The pruning is the last step of a room's assembly, after the lazy-member memory,
+the device-list and the own-membership bookkeeping that read an event's `type`, `state_key` and
+`event_id`. Debug line when a filter names fields: "this sync's timeline and state events are
+pruned to the fields its filter names". The filter structs' doc comments said the presence,
+account-data, ephemeral and state filters were parsed only; they have been applied since
+session 16, and each field's doc now says what is applied.
+
+**Decision: `limit` outside `room.timeline` stays parsed only.** Synapse does the same: its
+typing and receipt sources take `ephemeral_limit` as a parameter and never use it, and
+`presence_limit` has no caller. There is no behaviour for a client to miss, and inventing one
+(a cap on `ephemeral.events`?) would differ from the reference. The module docs of
+`crate::filter` say so.
+
+Verified:
+- unit: `filter::tests::{event_field_paths_split_on_dots_and_honour_the_escapes,
+  only_fields_keeps_the_named_fields_and_skips_what_the_event_lacks,
+  prune_event_fields_is_a_no_op_without_the_filter_or_with_an_empty_list}` and
+  `sync::tests::event_fields_prunes_timeline_and_state_events_but_not_invite_state` (an
+  initial and an incremental sync; invite state whole). `cargo test -p hs-user`: 241 + 7 pass.
+- real binary: `cargo test -p hs-cli --test peeking` (the long-poll case above) and
+  `--test sync_polling` (`/members?at=` from a fresh `prev_batch`): pass.
+- `cargo clippy -p hs-user --all-targets -- -D warnings`, `cargo clippy -p hs-cli --all-targets
+  -- -D warnings`, `cargo fmt --all --check`: clean.
+- Complement, image `complement-hs-reimplement:sync-leftovers` built from this branch, under
+  `tests/complement/lock.sh` (`-run 'TestSync|TestGetRoomMembersAtPoint|
+  TestGetFilteredRoomMembers|TestMembershipOnEvents|TestArchivedRoomsHistory|TestRoomForget|
+  TestFilter'`): federation `TestSyncOmitsStateChangeOnFilteredEvents` PASS; csapi
+  `TestGetRoomMembersAtPoint`, `TestSync` (all 24 subtests), `TestSyncTimelineGap`,
+  `TestSyncFilter`, `TestSyncLeaveSection`, `TestFilter`, `TestGetFilteredRoomMembers`,
+  `TestMembershipOnEvents`, `TestArchivedRoomsHistory`, `TestRoomForget` PASS. Before any
+  change, `TestGetRoomMembersAtPoint` and `TestSyncOmitsStateChangeOnFilteredEvents` also
+  passed on main's image (`complement-hs-main:w3`). Two tests in MSC packages the regex also
+  matched fail on this branch **and on main's image**, so they are gaps, not regressions:
+  msc4222 `TestSync` (`state_after` is not sent with `use_state_after=true`; owed since
+  session 7's matrix-sdk run, below) and msc3874 `TestFilterMessagesByRelType` (`/messages`
+  does not filter by `rel_types`: `hs-room`'s).
+
+Left:
+- Nothing of wave 2's 05 list. `docs/next-steps.md` item 3's 05 entry and
+  `docs/status/04-room-and-events.md`'s `/members?at=` note can be struck (the coordinator's
+  files).
+- `limit` outside `room.timeline`: parsed only, by the decision above.
+- MSC4222 `state_after` (Complement msc4222 `TestSync`): `/sync?use_state_after=true` is
+  accepted and ignored; the room's state at the end of the timeline in `state_after` is still
+  owed. More than a day: the incremental case changes what `state` means for a gap.
 
 ## Session 18 (2026-10-06, branch `agent/sync-wakes`): two `/sync`s that never showed their change
 
