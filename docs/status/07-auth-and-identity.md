@@ -2,7 +2,9 @@
 
 Track brief: `docs/workstreams/07-auth-and-identity.md`. Owner crate: `hs-auth`.
 
-Last updated: 2026-10-05 (email password reset, `next_link`, CAS whitelist and bridge
+Last updated: 2026-10-09 (self-service deactivation leaves rooms, the rest of Synapse's CAS
+and SSO settings, the pending-registration check across replicas, identity-server bind/unbind
+against the real binary; 2026-10-05: email password reset, `next_link`, CAS whitelist and bridge
 namespaces, admin deactivation unbinds, the public address reload, OpenID outside `X-Matrix`;
 2026-10-04: UIA binding, registration sessions, CAPTCHA, CAS, self-service 3PIDs,
 OpenID and whois, below; session 12: account erasure; session 11: guest access and
@@ -15,6 +17,95 @@ found and fixed a real case-sensitivity bug in `POST /login`, re-confirmed `/cap
 unfixed (held by another track this session), checked for Element-Web findings in
 `docs/status/16-management-web-interface.md` (none landed as of this write-up), and designed
 (without implementing) a UIA session-correlation scheme left open at the end of session 5).
+
+## 2026-10-09: self-service deactivation leaves rooms, the rest of CAS and SSO, pending registrations across replicas, bind/unbind against the real binary (branch `agent/auth-leftovers`)
+
+The 2026-10-05 "Left" list, less what needs another track. The four items `docs/next-steps.md`
+named for this track (email password reset and `next_link`, CAS and appservice namespaces,
+admin deactivation unbinding, `public_baseurl` reaching `hs-auth`) were already on `main` as
+`786f975a`; checked, nothing to redo.
+
+**A person deactivating their own account leaves every room they are in** (`POST
+/account/deactivate`, with or without `erase`), as Synapse's `DeactivateAccountHandler` parts a
+deactivated account and as an administrator's `users.deactivate` with `erase: true` already did.
+Before, only the administrator's erasure left rooms; a self-deactivated account stayed joined
+everywhere and kept its invites. The hook is `hs_auth::state::RoomDeparture`
+(`install_room_departure`, the `ProfileRefresh` pattern: this crate cannot reach rooms), answered
+by `hs_cli::room_departure::RoomDepartureSource` over `hs_room::admin_users::RoomRegistryUserActivity`
+-- the same adapter the admin API uses, so both leave rooms the same way (through the room, through
+another server, or by rejecting the invite or knock alone), held weakly to avoid the
+registry/auth-state cycle. The leaves come after the account is deactivated and before any
+erasure, awaited (as the admin route awaits them); a room that cannot be left is logged at `WARN`
+and does not fail the deactivation; log line "a deactivated account left its rooms" with
+`rooms_left`/`rooms_failed`. Without a room layer (a test of this crate alone) the route logs that
+at debug level and goes on.
+
+**CAS carries the rest of Synapse's `cas_config`, and `sso.update_profile_information`**
+(`hs-config`, `hs-auth` `cas.rs`/`routes/sso.rs`, `hs-compat`): `auth.cas.protocol_version`
+(`3` checks tickets at `/p3/proxyValidate`, else `/proxyValidate`, as Synapse's handler picks it;
+validated 1..=3), `auth.cas.enable_registration` (default on; off, a first sign-in is refused with
+a `403` page and no account is made, log "refused a CAS sign-in: no account here and
+auth.cas.enable_registration is off"), `auth.cas.allow_numeric_ids` with
+`auth.cas.numeric_ids_prefix` (default `u`, letters and digits only; a digits-only CAS user name
+is prefixed before mapping and linking, so `1234` is `@u1234:...` and its external id `u1234`),
+and `auth.sso.update_profile_information` (an existing account's display name follows
+`displayname_attribute` at each sign-in, carried into rooms through the profile refresh hook; log
+"a display name followed the sign-on provider's at sign-in"). All hot through the `auth` applier.
+`CasValidator::validate` now takes the validate URL (`cas::validate_url`) rather than the server
+URL. `hs-compat` translates the four `cas_config` keys and `sso.update_profile_information`; the
+classification notes, `docs/compat/synapse-config-table.md`, `docs/config.md` and the web schema
+fixture are regenerated (the web renders them through the generic Configuration page with their
+doc comments; `npm run check` passes). Still not carried over: `idp_icon`, `idp_brand` (no icon on
+the sign-in button) and `sso.templates`.
+
+**The pending-registration check is shared by every replica**: the names handed a UIA session
+live in the store (`UiaStore::{remember,forget}_pending_registration`,
+`pending_registration_session`; `hs_auth.pending_registrations` keyed by username, rows older than
+the UIA timeout swept on each insert as the OpenID tokens are; the in-memory store keeps its
+10 000 bound), not in a per-process map, so a stage sent to another replica without its session is
+challenged there too. `PendingRegistrations` is gone from `AuthState`.
+
+**Binding and unbinding at an identity server are proved against the real binary**
+(`crates/hs-cli/tests/threepid_bindings.rs`, a fake identity server over TLS with `/3pid/bind` and
+`/3pid/unbind` added to the shared `support/fake_identity.rs` router from the test itself): the
+bind's bearer token, session and `mxid`; the unbind's `X-Matrix origin="example.org"` signature
+and body; `no-support` with nothing bound; `M_SERVER_NOT_TRUSTED` for an unlisted identity
+server; a `502` for the owner when the identity server fails; an administrator's deactivation
+unbinding both addresses, logging the one that failed and deactivating regardless; the
+`hs_auth_threepid_changes_total{action}` counts.
+
+**Verified.** `cargo test -p hs-auth` (327: `routes::account::tests::deactivation_leaves_the_rooms_before_erasing_and_survives_a_room_layer_failure`,
+`cas::tests::{the_validate_url_follows_the_protocol_version,a_digits_only_user_name_gets_the_prefix_only_when_one_is_set}`,
+`routes::sso::tests::{protocol_version_3_checks_the_ticket_at_the_p3_endpoint,a_digits_only_cas_user_is_prefixed_when_numeric_ids_are_allowed,with_registration_off_only_people_with_an_account_sign_in,the_display_name_follows_the_provider_only_when_asked}`,
+`config::tests::the_sso_and_next_link_settings_come_from_the_native_configuration`, the shared
+store test `pending_registrations_are_remembered_until_forgotten_or_expired` against both
+stores), `-p hs-config` (the fixture test regenerated with `HS_UPDATE_WEB_SCHEMA_FIXTURE=1`),
+`-p hs-compat`; clippy `-D warnings` on `hs-auth`, `hs-config`, `hs-compat`, `hs-cli`
+(`--all-targets`); `cargo fmt --all --check`; `npm run check` in `web/`. Real binary:
+`crates/hs-cli/tests/account_deactivation.rs` (two tests: with `erase`, the lobby's state and
+bob's `/sync` carry her leave, the unanswered invite is rejected, the admin API lists both
+memberships as `leave`, her token is refused; a plain deactivation leaves rooms too),
+`cas_sso.rs` (the second test now saves `protocol_version: 3` and `enable_registration: false`
+through `PATCH /api/v1/config/auth` and sees the next check at `/p3/proxyValidate`, a newcomer
+refused with no account made, an existing account still signing in; the counters),
+`threepid_bindings.rs` (above), `auth_sessions.rs` (the strict session, now store-backed).
+Sytest and Complement: no test covers these (Sytest's CAS file uses `/proxyValidate` with the
+defaults, which did not change); not run.
+
+**Left.** `idp_icon`, `idp_brand` and `sso.templates` are not carried over. Self-service
+deactivation awaits the leaves inside the request, like the admin route; an account in very many
+rooms makes a slow `POST /account/deactivate` (Synapse parts in the background). No Complement
+`TestPasswordReset*` exists in our checkout. The admin API's plain `users.deactivate` (without
+`erase`) still keeps the account in its rooms, by design: it is reversible with `users.reactivate`.
+
+**Decisions made.** Self-service deactivation leaves rooms whether or not `erase` is set (Synapse
+parity; the spec's `erase` is about data, and Synapse parts on every deactivation). A digits-only
+CAS user name without `allow_numeric_ids` is used as it is (a valid localpart here; Synapse
+refuses it only because its guests are numeric). No `docs/decisions/` entry: the `RoomDeparture`
+hook follows the existing hook pattern (`ProfileRefresh`, `RemoteProfileSource`) and the config
+keys are additive.
+
+**Shared dependencies added**: none.
 
 ## 2026-10-08 (branch `agent/fed-cluster`)
 
