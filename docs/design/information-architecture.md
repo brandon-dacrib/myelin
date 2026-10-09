@@ -26,6 +26,16 @@ Scopes from track 15 (`admin:read`, `admin:write`, `bridges:read`, `bridges:writ
 
 The sidebar, in order. The order is by frequency of use, then by severity of what can go wrong.
 
+Amended 2026-10-09 (branch `agent/web-simpler`): the sidebar shows these sections under three
+headings, because fourteen flat entries gave a new operator no way to tell the pages for every
+day from the pages for when something is wrong or when the server itself is being changed.
+**Manage**: Users, Rooms, Bridges, Reports, Media. **Watch**: Federation, Statistics, Tasks,
+Audit log. **Server**: Cluster, Migration, Configuration, Invites and tokens. The Overview sits
+above the headings. "Settings" beside "Configuration" read as two names for one thing, so the
+section at `/settings` is called **Invites and tokens** (its views: Invite links, API tokens,
+Server notices); the routes keep their addresses. The table below keeps the original names for
+the routes it documents.
+
 | Section | Route | Answers |
 |---|---|---|
 | Overview | `/` | Is the server fine right now? What needs my attention? |

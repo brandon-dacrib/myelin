@@ -154,7 +154,10 @@ export function RoomsPage() {
                   title="No rooms yet"
                   description="Rooms appear here when people on this server create or join them, from any Matrix client."
                   action={
-                    <Link to="/users" className="text-sm text-accent hover:underline">
+                    <Link
+                      to="/users"
+                      className="text-sm text-accent underline underline-offset-2 hover:no-underline"
+                    >
                       Add people under Users
                     </Link>
                   }

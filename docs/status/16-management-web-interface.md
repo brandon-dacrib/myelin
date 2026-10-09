@@ -1,7 +1,68 @@
 # 16. Management web interface: status
 
-Last updated: 2026-10-08 (effective values beside overrides, what offering settings do to
-existing bridges, every setting read or removed; branch `agent/web-items`).
+Last updated: 2026-10-09 (simpler to use and understand: first-run Overview, grouped sidebar,
+Configuration that leads with the settings; branch `agent/web-simpler`).
+
+## 2026-10-09: simpler to use and understand (branch `agent/web-simpler`)
+
+The owner's instruction: "it needs to be simpler to use and understand". The interface was walked
+as a first-time operator would walk it, against the real `hs serve` of this branch from an empty
+data directory (`hs serve --data-dir <scratch> --server-name example.org`, the setup link from
+the log, then every page) and against the mock for the populated states, with a screenshot of
+each page. No Rust changed.
+
+**What a first-time operator met, and what was done about each.**
+
+| Where | What was confusing | Now |
+|---|---|---|
+| Overview, first run | The first screen after creating the administrator was a warning, "Bridge Myelin Bridges is unknown. Open bridge": the server's own registration (`hs_bridges::manager::MANAGER_ID`), which nobody added and nothing probes. | Named "This server's bridge manager", kind "Built in: runs the bridges offered here" (`api/bridges.ts::isBuiltInAppservice`); not under Attention, not in the Overview's bridges strip, "Built in" in the registrations list instead of "Unknown". |
+| Overview | Nothing said what the server is (name, address) or what to do next on an empty server; three tiles (Version, Uptime, Mode) said little; the health card listed every probe with "Answering." under it when all was well. | One line under the title: `example.org · version 0.0.1 · one process, which serves everything · up 10m` (a cluster links to Cluster). A server with only its administrator, nothing offered and no import gets **Get started**: Add people, Let people sign up themselves, Offer a bridge, Move here from Synapse, each a sentence and a link; it goes away once people are here. The health card is its sentence, with the per-check rows behind "Show the checks" while every probe is ok, opening on their own when one is not. The bridges strip's empty state links to "Offer one". |
+| Sidebar | Fourteen flat entries; "Settings" beside "Configuration" read as two names for one thing. | Grouped under **Manage** (Users, Rooms, Bridges, Reports, Media), **Watch** (Federation, Statistics, Tasks, Audit log) and **Server** (Cluster, Migration, Configuration, Invites and tokens), each a named `group` for a screen reader, headings in the full sidebar only. `/settings` is **Invites and tokens**, its views **Invite links** ("the Matrix specification calls the token in the link a registration token"), **API tokens** and **Server notices**; routes unchanged. |
+| Configuration index | Three paragraphs on how a change takes effect, with "bootstrap file", "HS__ environment variable" and "Helm values", before the search box; six lines of counts and sources on every card; a "Re-read files" button with no hint of when it is needed. | The paragraphs are behind "How a change takes effect"; a card is its summary, one badge (Reloadable, Restart required, Bootstrap only, N pinned by environment) and "Changed from default: N of M"; the button is "Re-read the bootstrap file" and its dialog says it is only needed after editing the file by hand. |
+| Configuration section | The same two paragraphs again at the top of every section, then on Rate limits a third box, before the first control; every row badged "Default" or "From database" beside its "Default: …" line; sections titled `Auth`, `Telemetry`, `Appservices`, `Network`. | One line ("Most changes here apply on save; some wait for a restart") with the counts, the paragraphs behind "What that means"; a row badges only an origin the operator did not choose here (file, environment), beside its applies badge and "Changed from default"; `lib/config-model.ts::sectionTitle` names the sections Sign-in and registration, Logs and metrics, Bridges and appservices, Outbound connections, Migration from Synapse, with the name still beside each title and in search. |
+| Bridges, offered | "This server can't run bridges itself. this server is not running in Kubernetes … so bridges run elsewhere, from their files Bridges offered here run elsewhere, from their files." | `lib/bridge-offerings.ts::cannotRunBridgesWhy`: the server's reason as one sentence; the second sentence only when the reason did not already say it. |
+| Bridges, registrations | A four-line paragraph on queues above the button and the tabs. | "What the columns mean", which also says what Unknown means (nothing has been sent since the server started). |
+| Rooms | "Find an event by ID" and a "Find event" button that wrapped onto two lines, beside the main search, on a page with no rooms; an empty state with no way forward. | The finder is behind "Find an event by its ID" with a sentence on where an ID comes from; the empty state links to Users. |
+| Top bar | "Updated 3:26 PM" with nothing saying what; the account menu listed `admin:read, admin:write`. | The server's name beside the product name; "Checked 3:26 PM" with a tooltip ("When this page last read the server's state; it does so every 30 seconds"); the menu says "Full administrator" (`lib/scopes.ts::describeScopes`). |
+
+**Screenshots** (real server, `docs/design/screenshots/`): `simpler-overview-first-run-before-real.png`
+and `simpler-overview-first-run-real.png`, `simpler-sidebar-invites-real.png`,
+`simpler-configuration-index-real.png`, `simpler-configuration-sign-in-real.png`,
+`simpler-bridge-registrations-real.png`.
+
+**Verified.** `npm run check` (lint, types, **645 unit tests** in 85 files, build) green; `npm run
+test:e2e` (mock) green, see the line below; against the real `hs serve` of this branch from an
+empty data directory: the first-run setup page, every page walked by script, and
+`e2e-real/explained-pages.spec.ts`, `configuration.spec.ts`, `admin-tokens.spec.ts`,
+`web-items.spec.ts`, `bridge-offerings.spec.ts` green (22 passed; the one failure in
+`real-server.spec.ts` is its hard-coded `@ops:test.local`, a server-name assumption of that spec,
+not of this branch). New or changed tests: `DashboardPage.test.tsx` (server line, cluster line,
+Get started shown and withdrawn, the built-in manager silent, the checks closed when ok and open
+when not), `Sidebar.test.tsx` (new: groups, order, the rail), `api/bridges.test.ts` (new),
+`BridgesListPage.test.tsx` (columns disclosure, built-in row), `BridgeOfferingsPage.test.tsx`
+(`cannotRunBridgesWhy`), `RoomsPage.test.tsx`, `ConfigSectionPage.test.tsx` (no "From database"
+badge), `ConfigurationPage.test.tsx`, `e2e/overview-health.spec.ts`, `e2e/configuration.spec.ts`,
+`e2e/invites-and-notices.spec.ts`, `e2e/admin-tokens.spec.ts`, `e2e-real/explained-pages.spec.ts`,
+`e2e-real/configuration.spec.ts`, `e2e-real/admin-tokens.spec.ts`, `e2e-real/web-items.spec.ts`.
+
+**Decisions made.** Section names and routes are unchanged (`/settings`, `/configuration/auth`);
+only what the operator reads changed, so links, audit entries and the command palette still land
+where they did. The built-in registration is recognised by its id (`myelin-bridges`), which is a
+constant in `hs-bridges`; the admin API does not mark it, and an `AppService.built_in` flag would
+be the honest way (noted under "Interfaces needed"). Section titles are a web-side map
+(`SECTION_TITLES`), because the server's schema carries no `title` for any section; if `hs-config`
+grows titles, the map wins for the five it names and the schema's title for the rest.
+
+**Left.**
+
+- The Audit log page still opens with seven filters and "Export NDJSON" above the list; the
+  Migration page is long by nature; neither was walked past a first look.
+- Setting rows still badge "Applies on save" on every row of an all-hot section, because the
+  rule that every setting says when it applies (`explained-pages.spec.ts`) is worth keeping;
+  a section where every row says the same thing could say it once.
+- `hs-admin` could mark the built-in registration (`AppService.built_in: true`) so the page need
+  not know the id.
+
 
 ## 2026-10-08: effective values, offering settings, and every setting read or gone (branch `agent/web-items`)
 

@@ -403,7 +403,10 @@ export function DashboardPage() {
               {!isLoading && !appservices.isError && bridges.length === 0 && (
                 <li className="text-sm text-text-muted">
                   No bridges yet.{" "}
-                  <Link to="/bridges/new" className="text-accent hover:underline">
+                  <Link
+                    to="/bridges/new"
+                    className="text-accent underline underline-offset-2 hover:no-underline"
+                  >
                     Offer one
                   </Link>{" "}
                   to let people here reach WhatsApp, Signal, Telegram and more.
@@ -675,7 +678,7 @@ function ServerLine({
     parts.push(
       <>
         a cluster of {replicas} replicas (
-        <Link to="/cluster" className="text-accent hover:underline">
+        <Link to="/cluster" className="text-accent underline underline-offset-2 hover:no-underline">
           see Cluster
         </Link>
         )
