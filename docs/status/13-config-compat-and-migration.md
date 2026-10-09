@@ -4,6 +4,80 @@ Track brief: `docs/workstreams/13-config-compat-and-migration.md`. Owner
 crates/files: `crates/hs-config`, `crates/hs-compat`,
 `tools/synapse_inventory.py`, `docs/synapse-inventory.md`.
 
+## 2026-10-09 (branch `agent/migration-95`): the migration rehearsed against a real Synapse 1.162, sessions survive whole, synapse-admin's screens served
+
+**The brief:** README's "Synapse migration" sat at ~75%; the owner wants 95% earned by verified
+work. The gap list, in the order a migrating operator hits each, and what happened to each:
+
+| # | Gap | Result |
+|---|---|---|
+| 1 | The translator refused Synapse's own generated `homeserver.yaml` (`pid_file`, `form_secret`, `trusted_key_servers`) | **Closed.** Inert keys (decision 0038 point 1) are reported and never block; `testdata/generated-1.162.yaml` (what the 1.162 image's `generate` writes, secrets replaced) translates as it is: 12 keys, 9 mapped, 3 inert. `user_directory.search_all_users`, `registration_requires_token` (a closed server with tokens, decision 0011) and `enable_registration_without_verification` are mapped now: 30 mapped, 34 mapped (diff), 165 unsupported of 229; 38 of the 165 inert. |
+| 2 | Room version 12 rooms (Synapse's default since 1.139) did not import at all | **Closed, found by the rehearsal.** Synapse stores a `room_id` inside its v12 create event; the reader strips it as Synapse does when serving (`source::as_synapse_serves_it`), and `hs-room`'s import path no longer hands a v12 create event the room id it knows (`crates/hs-room/src/actor.rs`, one line; `crates/hs-room/tests/import.rs::a_room_version_12_history_imports_with_its_create_event` fails without it). Track 04, please review. |
+| 3 | Refresh tokens were not copied: a client whose access token expired after cutover was signed out | **Closed.** Stream `refresh_tokens`: each unspent token by its SHA-256 beside its access token (whose record then names it); `/refresh` exchanges it here. Exchanged ones left out and logged. |
+| 4 | Email addresses and phone numbers (`user_threepids`) | **Closed.** Stream `threepids`; sign-in by email proven. |
+| 5 | Upstream identities (`user_external_ids`): SSO sign-ins would have made new accounts | **Closed.** Stream `external_ids`; `GET /users/lookup?provider=&external_id=` finds the account. |
+| 6 | Erasures (`erased_users`) | **Closed.** Inside `users`; the account arrives erased, verification compares the erasure only. |
+| 7 | Room keys waiting for offline phones (`device_inbox`) | **Closed.** Stream `to_device`; the phone's first `/sync` here carries them, in order, from before and after the copy; a second pass queues nothing twice (read back by sender, type and content); a message for a device not here is left out. |
+| 8 | Registration tokens | **Closed.** Stream `registration_tokens`; a token handed out before the migration registers an account on this closed server, with its use count moved. |
+| 9 | Threaded receipts (README's basis) | Was already closed on 2026-10-08 (section below); the web page still says otherwise (hand-off to 16 below). |
+| 10 | Partial-state rooms | Not movable until Synapse finishes the join; skipped and logged, as before. Kept in "What does not move". |
+| 11 | The cutover with Synapse read-only and a final delta | **Closed as a runbook step with a test.** Runbook section 4 says stop Synapse or make it read-only (a write-refusing proxy) and what the final pass brings over; the rehearsal writes a message, a sign-up and a to-device message to Synapse after the copy, stops it, cuts over, and finds all three. |
+| 12 | A rehearsal against a real Synapse with real sessions surviving | **Closed at the API level.** `crates/hs-cli/tests/migration_rehearsal.rs`: Synapse 1.162 + PostgreSQL 17 in Docker, populated through the client and admin APIs (a phone with identity, one-time and fallback keys; a web session signed in with a refresh token; a backup; a public room; receipts; tag; account data; filter; push rule; pusher; upload and avatar; email; upstream identity; registration token; an erased account; a room-key request waiting), migrated while Synapse runs, delta, stop, cutover, and 30-odd client-side checks. No real Element or matrix-rust-sdk process was driven: the keys are shaped as a client uploads them, not produced by one. |
+| 13 | `/_synapse/admin` for synapse-admin's top screens | **Closed.** 69 of 77 routes (8 before): users (create or modify with 3PIDs and external ids, admin flag, devices, joined rooms, pushers, media, account data, whois, reset password, act as, shadow ban, suspend, username check, lookups, redaction), rooms (members, state, delete and status, block, make admin, join, messages, context, extremities, media), registration tokens, reports, media statistics and quarantine, federation destinations. `crates/hs-compat/src/admin_screens.rs`; `SYNAPSE_ADMIN_ROUTES` is the one list, the crate's tests hold the router to it, `hs-cli`'s manifest derives from it. The eight not mounted and why: `docs/compat/synapse-admin-routes.md`. |
+| 14 | Media, room directory, account data kinds, user directory, appservice state, push-rule edge cases (the brief's list) | Media, directory, account data and user directory were already copied or need no copy (the directory is computed from accounts and rooms); each is now asserted in the rehearsal. Appservice positions and dehydrated devices do not move, by design and for want of a home (runbook). |
+
+**Verified by** (all on 2026-10-09, this worktree):
+
+```sh
+cargo fmt --all --check
+cargo clippy -p hs-compat -p hs-cli -p hs-room --all-targets -- -D warnings
+cargo test -p hs-compat                                   # 80 unit (inert keys, v12 create, the shims), 8 corpus, 7 engine (PostgreSQL at 5439)
+cargo test -p hs-room --test import                       # the v12 import test (fails without the actor fix)
+cargo test -p hs-cli --test migration                     # the fixture through the real binary: 19 streams, refresh exchange, email sign-in, lookup, erasure, to-device, token registration
+cargo test -p hs-cli --test migration_rehearsal           # the real Synapse 1.162 in Docker, ~40 s
+cargo test -p hs-cli --test synapse_admin                 # synapse-admin's screens through the real server, and the manifest sweep over all 69 routes
+```
+
+The fixture `synapse-small` gained rows of each new table by hand (its README says how a real
+Synapse writes the same), `facts.json` names them, and `export.py` keeps them on a regeneration.
+
+**Left**, in order: a run against a large Synapse on a quiet machine (`synapse-big`'s scripts);
+a real Element Web or matrix-rust-sdk session driven through a cutover (the rehearsal shapes
+keys as a client would, it does not run one); unread counts (nothing imported counts as a
+notification; badges reset at cutover); Synapse's server-notice rooms as this server's notice
+rooms (the first notice after cutover opens a new room); dehydrated devices (this server has
+none); the eight `/_synapse/admin` routes not mounted; `rooms.join` through the shim takes a
+room id, not an alias; the translator's 165 unsupported keys that are real features this server
+lacks (`retention`, `turn_*`, `auto_join_rooms`, `rc_invites`, `max_avatar_size`, ...), which
+need readers in their owning crates before they can have fields (decision 0034).
+
+**Hand-off to track 16 (web, not edited here: another agent is in `web/`).** `web/src/lib/
+migration.ts`: add `STREAMS` entries, in copy order, for `refresh_tokens` ("Refresh tokens":
+"The tokens apps use to renew their sessions, so nobody is signed out when a session's access
+token expires after the cutover"), `threepids` ("Email addresses and phone numbers": "The
+addresses people sign in by and are found by"), `external_ids` ("Sign-in identities": "Links
+from an SSO provider's identity to the account, so a sign-in through the same provider lands in
+the same account"), `to_device` ("Messages waiting for devices": "Room keys and requests sent
+to phones that were offline, delivered in their first sync here"), `registration_tokens`
+("Registration tokens": "Tokens handed out before the migration still open this server");
+in `WHAT_DOES_NOT_MOVE` drop "Receipts in threads" (copied since 2026-10-08) and add "Unread
+counts", "Server-notice rooms", "Bridges' positions", "Dehydrated devices", "A registration
+under way" with the runbook's wording; `MigrationPage.test.tsx` line 54 and `e2e-real/
+explained-pages.spec.ts` line 126 expect 14 copied streams: 19 now. The page already names an
+unknown stream in words, so nothing is wrong until then, only unexplained.
+
+**Decisions made:** decision 0038 (inert keys; sessions whole; events as Synapse serves them;
+the admin surface mounts what can be answered honestly; the cutover step). Also: a to-device
+message is recognized by content rather than tracked by Synapse stream id (no table of imported
+ids to keep); registration tokens are re-created when their limits change (the store sets the
+use count only at creation); erased accounts are compared on the erasure alone.
+
+**Shared dependencies added:** none.
+
+**Cross-crate change:** `crates/hs-room/src/actor.rs` (one `room_id` for a v12 create event in
+`authorize_remote_at`) and `crates/hs-room/tests/import.rs` (its test), for track 04 to review.
+`crates/hs-cli/src/serve.rs` passes `auth_state.registration_tokens` to the migration target.
+
 ## 2026-10-08 (branch `agent/push-receipts`): Synapse's threaded receipts are imported in their threads
 
 The importer took a receipt in a thread other than `main` as "not copied" and a `main` one as

@@ -217,11 +217,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("homeserver.yaml");
-        std::fs::write(
-            &path,
-            "server_name: example.org\ngc_thresholds: [100, 10, 10]\n",
-        )
-        .unwrap();
+        std::fs::write(&path, "server_name: example.org\nmax_avatar_size: 10M\n").unwrap();
 
         let err = load_synapse_config(&path, false, std::iter::empty()).unwrap_err();
         assert!(matches!(err, SynapseServeError::Unsupported(_)));
