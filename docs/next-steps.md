@@ -58,8 +58,8 @@ admin API ~92, web ~88, bridges ~90, operations ~80, migration ~92, federation ~
 row says keeps it from 95% is the next wave's list; the lowest are **operations** (the
 graceful-delete window, the operator's cluster mode and the degraded CRD apply on kind) and
 **storage** (nothing measured since 2026-10-02: an online snapshot of the embedded store, and a
-load run). The measurements table's "Spec routes served" and "Rust" lines are refreshed in the
-commit after this one if the dashboard run finished (`python3 tools/dashboard.py`).
+load run). The measurements table's "Spec routes served" (185/235, from today's manifest) and "Rust"
+(3,235 tests) lines are refreshed too (`python3 tools/dashboard.py`, `8d7530d0` and after).
 
 **CD.** Green on `7cb865ee` (run 37982139184). Later commits: Docker Hub rate-limited the runner
 (429 on the node image, then BuildKit's own image) until `9a8666e4`; and GitHub keeps only the
