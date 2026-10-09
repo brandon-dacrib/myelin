@@ -1310,6 +1310,11 @@ async fn build_batch<B: KvBackend + 'static, R: RoomSource<B>>(
             continue;
         }
 
+        // Last, after everything above that reads an event's type, state key or id: the
+        // client's `event_fields`, if it set one.
+        params.filter.prune_event_fields(&mut timeline.events);
+        params.filter.prune_event_fields(&mut state_events);
+
         let bucket_key = room_id.to_string();
         match membership_value.as_str() {
             "leave" | "ban" => {
@@ -1788,10 +1793,12 @@ async fn build_peeks<B: KvBackend + 'static, R: RoomSource<B>>(
             })
             .await?;
         match entry {
-            Ok(Some((mut timeline, state))) => {
+            Ok(Some((mut timeline, mut state))) => {
                 // A peeker was never joined, so an erased local sender's events are shown to
                 // them pruned, as to any later member (`timeline::apply_erasure`).
                 timeline::apply_erasure(hub.account_store(), &mut timeline).await;
+                params.filter.prune_event_fields(&mut timeline.events);
+                params.filter.prune_event_fields(&mut state);
                 peek.insert(
                     room_id.to_string(),
                     json!({
@@ -2935,6 +2942,113 @@ mod tests {
         assert!(
             !events.iter().any(|e| e["type"] == "m.reaction"),
             "m.reaction should have been filtered out of the timeline: {events:?}"
+        );
+    }
+
+    /// `event_fields` prunes every timeline and state event to the fields named, on an initial
+    /// sync and an incremental one; stripped invite state is rendered whole, as Synapse's is.
+    #[tokio::test]
+    async fn event_fields_prunes_timeline_and_state_events_but_not_invite_state() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let bob = user_id!("@bob:sync.test").to_owned();
+        let handle = hub
+            .rooms()
+            .create_room(alice.clone(), CreateRoomRequest::default(), 1)
+            .await
+            .unwrap();
+        hub.watch_room(handle.clone()).await;
+        handle
+            .send_event(
+                alice.clone(),
+                "m.room.message".to_owned(),
+                None,
+                serde_json::json!({"body": "a message", "msgtype": "m.text"}),
+                None,
+                2,
+            )
+            .await
+            .unwrap();
+        let bobs_room = hub
+            .rooms()
+            .create_room(bob.clone(), CreateRoomRequest::default(), 3)
+            .await
+            .unwrap();
+        hub.watch_room(bobs_room.clone()).await;
+        bobs_room
+            .send_event(
+                bob.clone(),
+                "m.room.member".to_owned(),
+                Some(alice.to_string()),
+                serde_json::json!({"membership": "invite"}),
+                None,
+                4,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let filter: SyncFilter = serde_json::from_value(serde_json::json!({
+            "event_fields": ["type", "content.body", "state_key", "content.membership"],
+            "room": {"timeline": {"limit": 1}}
+        }))
+        .unwrap();
+        let mut p = params(None);
+        p.filter = filter.clone();
+        let (response, token) = build(&hub, &e2e, &alice, p).await.unwrap();
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+        let room = &response["rooms"]["join"][room_id.as_str()];
+        assert_eq!(
+            room["timeline"]["events"],
+            serde_json::json!([{"type": "m.room.message", "content": {"body": "a message"}}]),
+            "{response}"
+        );
+        let state = room["state"]["events"].as_array().unwrap();
+        assert!(!state.is_empty(), "{response}");
+        for event in state {
+            let keys: Vec<&str> = event
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert!(
+                keys.iter()
+                    .all(|k| ["type", "state_key", "content"].contains(k)),
+                "{event}"
+            );
+            assert!(event.get("event_id").is_none(), "{event}");
+        }
+        let invite_room = bobs_room.query(|a| a.room_id().to_owned()).await;
+        let invite_state =
+            response["rooms"]["invite"][invite_room.as_str()]["invite_state"]["events"]
+                .as_array()
+                .unwrap();
+        assert!(
+            invite_state.iter().any(|e| e.get("sender").is_some()),
+            "stripped state is whole: {response}"
+        );
+
+        handle
+            .send_event(
+                alice.clone(),
+                "m.room.message".to_owned(),
+                None,
+                serde_json::json!({"body": "another", "msgtype": "m.text"}),
+                None,
+                5,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let mut p = params(Some(token));
+        p.filter = filter;
+        let (response, _) = build(&hub, &e2e, &alice, p).await.unwrap();
+        assert_eq!(
+            response["rooms"]["join"][room_id.as_str()]["timeline"]["events"],
+            serde_json::json!([{"type": "m.room.message", "content": {"body": "another"}}]),
+            "{response}"
         );
     }
 

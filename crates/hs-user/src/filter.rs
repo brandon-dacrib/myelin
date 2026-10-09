@@ -42,11 +42,17 @@
 //! - `account_data` (top-level) and `room.account_data`: by event type (and, for the room one,
 //!   `rooms`/`not_rooms`); account data has no sender, and the user's own id stands for one.
 //! - `room.ephemeral`: by event type (`m.typing`, `m.receipt`) and `rooms`/`not_rooms`.
+//! - `event_fields`: every timeline and state event of a joined, left or peeked room is pruned
+//!   to the fields named ([`SyncFilter::prune_event_fields`]): dotted paths name sub-fields
+//!   (`content.body`), `\.` and `\\` are a literal dot and backslash, a path the event does
+//!   not have is skipped, and an empty list means every field, as Synapse reads it. Stripped
+//!   state (`invite_state`, `knock_state`), account data, ephemeral events and presence are
+//!   rendered whole, as Synapse renders them.
 //!
 //! **Parsed but ignored** (present in [`SyncFilter`]'s fields so a client's filter round-trips
 //! and is never rejected, but `crate::sync` does not act on it):
-//! - `event_fields`: no field pruning; every event is rendered whole.
-//! - `limit` anywhere but `room.timeline`.
+//! - `limit` anywhere but `room.timeline`. Synapse does the same: its presence and ephemeral
+//!   sources take the filter's limit and never apply it, so a client has no behaviour to miss.
 //!
 //! This asymmetry (timeline vs. state cannot independently restrict which rooms they cover) is a
 //! known simplification: the spec allows `room.timeline.rooms` and `room.state.rooms` to differ,
@@ -63,8 +69,7 @@ pub struct EventFilter {
     /// Maximum number of events to return. Applied only for `room.timeline` -- see the module
     /// docs.
     pub limit: Option<usize>,
-    /// Event types to include (a `*` suffix wildcard is spec-legal; this crate does not expand
-    /// it, since content-type filtering is not applied at all -- see the module docs).
+    /// Event types to include; a trailing `*` is the spec's wildcard (`m.room.*`).
     pub types: Option<Vec<String>>,
     /// Event types to exclude.
     pub not_types: Option<Vec<String>>,
@@ -197,14 +202,15 @@ pub struct RoomFilter {
     pub not_rooms: Option<Vec<String>>,
     /// Whether rooms the user has left should appear in an initial sync's room set. Applied.
     pub include_leave: Option<bool>,
-    /// Timeline filter. `limit`, `rooms`/`not_rooms` and (via `RoomEventFilter`) nothing else
-    /// applied.
+    /// Timeline filter: `limit`, `rooms`/`not_rooms`, the content rule and
+    /// `unread_thread_notifications` applied.
     pub timeline: Option<RoomEventFilter>,
-    /// State filter. `lazy_load_members` applied; everything else parsed only.
+    /// State filter: the content rule, `lazy_load_members` and `include_redundant_members`
+    /// applied; `limit` parsed only.
     pub state: Option<RoomEventFilter>,
-    /// Ephemeral-event filter. Parsed only (`crate::sync` sends no ephemeral events at all yet).
+    /// Ephemeral-event filter: by type and `rooms`/`not_rooms`; `limit` parsed only.
     pub ephemeral: Option<RoomEventFilter>,
-    /// Room-scoped account-data filter. Parsed only.
+    /// Room-scoped account-data filter: by type and `rooms`/`not_rooms`; `limit` parsed only.
     pub account_data: Option<RoomEventFilter>,
 }
 
@@ -214,13 +220,14 @@ pub struct RoomFilter {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct SyncFilter {
-    /// Which event fields to include. Parsed only.
+    /// Which event fields to include, as dotted paths (`content.body`). Applied to timeline
+    /// and state events -- see the module docs and [`SyncFilter::prune_event_fields`].
     pub event_fields: Option<Vec<String>>,
-    /// `"client"` or `"federation"`. Parsed only (this crate always renders client format).
+    /// `"client"` (the default) or `"federation"`. Applied.
     pub event_format: Option<String>,
-    /// Presence filter. Parsed only (presence is not implemented in this crate yet).
+    /// Presence filter: `types`/`not_types`/`senders`/`not_senders` applied.
     pub presence: Option<EventFilter>,
-    /// Global account-data filter. Parsed only.
+    /// Global account-data filter: by type, with the user's own id as the sender. Applied.
     pub account_data: Option<EventFilter>,
     /// Room filter. See [`RoomFilter`].
     pub room: Option<RoomFilter>,
@@ -390,6 +397,31 @@ impl SyncFilter {
         self.event_format.as_deref() == Some("federation")
     }
 
+    /// The `event_fields` paths, split into their keys: `None` when the filter names none or
+    /// an empty list (every field, as Synapse reads an empty list).
+    #[must_use]
+    pub fn event_field_paths(&self) -> Option<Vec<Vec<String>>> {
+        let fields = self.event_fields.as_ref()?;
+        if fields.is_empty() {
+            return None;
+        }
+        Some(fields.iter().map(|field| split_field_path(field)).collect())
+    }
+
+    /// Prunes each of `events` to the fields `event_fields` names, in place; a no-op without
+    /// the filter. The spec lets a server send more than was asked for; this one sends exactly
+    /// what was asked for among the fields the event has, as Synapse does. Call it last: the
+    /// batch's own bookkeeping (lazy-loaded members, device-list changes, the user's own
+    /// membership) reads `type`, `state_key` and `event_id` first.
+    pub fn prune_event_fields(&self, events: &mut [serde_json::Value]) {
+        let Some(paths) = self.event_field_paths() else {
+            return;
+        };
+        for event in events {
+            *event = only_fields(event, &paths);
+        }
+    }
+
     /// Whether the top-level `presence` filter passes an `m.presence` event from `sender`.
     #[must_use]
     pub fn presence_allows(&self, sender: &str) -> bool {
@@ -491,8 +523,13 @@ pub async fn resolve(
 /// client-server API has no protocol-level way to tell the client "this part was ignored".
 fn log_ignored_fields(filter: &SyncFilter) {
     let mut ignored = Vec::new();
-    if filter.event_fields.is_some() {
-        ignored.push("event_fields");
+    if let Some(fields) = &filter.event_fields
+        && !fields.is_empty()
+    {
+        tracing::debug!(
+            event_fields = ?fields,
+            "this sync's timeline and state events are pruned to the fields its filter names"
+        );
     }
     if filter
         .event_format
@@ -503,6 +540,90 @@ fn log_ignored_fields(filter: &SyncFilter) {
     }
     if !ignored.is_empty() {
         tracing::debug!(?ignored, "filter fields present but not applied by hs-user");
+    }
+}
+
+/// Splits one `event_fields` entry into its keys: a `.` separates keys, `\.` is a literal dot
+/// and `\\` a literal backslash (the spec's escaping); any other backslash is kept as it is.
+fn split_field_path(field: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    let mut key = String::new();
+    let mut chars = field.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some(escaped @ ('.' | '\\')) => key.push(escaped),
+                Some(other) => {
+                    key.push('\\');
+                    key.push(other);
+                }
+                None => key.push('\\'),
+            },
+            '.' => keys.push(std::mem::take(&mut key)),
+            other => key.push(other),
+        }
+    }
+    keys.push(key);
+    keys
+}
+
+/// A copy of `event` holding only the fields `paths` name. A path leads through objects to the
+/// value it names, which is copied whole (`content` keeps all of `content`); a path the event
+/// does not have, or that runs into a non-object, adds nothing. An event that is not an object
+/// is returned as it is.
+fn only_fields(event: &serde_json::Value, paths: &[Vec<String>]) -> serde_json::Value {
+    let serde_json::Value::Object(source) = event else {
+        return event.clone();
+    };
+    let mut pruned = serde_json::Map::new();
+    for path in paths {
+        let Some((last, parents)) = path.split_last() else {
+            continue;
+        };
+        let mut from = source;
+        let mut found = true;
+        for parent in parents {
+            match from.get(parent) {
+                Some(serde_json::Value::Object(inner)) => from = inner,
+                _ => {
+                    found = false;
+                    break;
+                }
+            }
+        }
+        if !found {
+            continue;
+        }
+        let Some(value) = from.get(last) else {
+            continue;
+        };
+        insert_at(&mut pruned, path, value.clone());
+    }
+    serde_json::Value::Object(pruned)
+}
+
+/// Puts `value` at `path` under `into`, making the objects on the way. Along a path only
+/// objects are made, and a value an earlier, shorter path copied whole was an object in the
+/// source at this key too, so a non-object on the way is not reached; if it ever were, the
+/// whole value already there stands.
+fn insert_at(
+    into: &mut serde_json::Map<String, serde_json::Value>,
+    path: &[String],
+    value: serde_json::Value,
+) {
+    match path {
+        [] => {}
+        [last] => {
+            into.insert(last.clone(), value);
+        }
+        [parent, rest @ ..] => {
+            let entry = into
+                .entry(parent.clone())
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+            if let serde_json::Value::Object(inner) = entry {
+                insert_at(inner, rest, value);
+            }
+        }
     }
 }
 
@@ -544,6 +665,83 @@ fn room_section_allows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn event_field_paths_split_on_dots_and_honour_the_escapes() {
+        assert_eq!(split_field_path("type"), vec!["type"]);
+        assert_eq!(split_field_path("content.body"), vec!["content", "body"]);
+        assert_eq!(
+            split_field_path("content.m\\.relates_to.rel_type"),
+            vec!["content", "m.relates_to", "rel_type"]
+        );
+        assert_eq!(split_field_path("a\\\\b.c"), vec!["a\\b", "c"]);
+        assert_eq!(split_field_path("a\\nb"), vec!["a\\nb"]);
+        assert_eq!(split_field_path("trailing\\"), vec!["trailing\\"]);
+        assert_eq!(split_field_path(""), vec![""]);
+    }
+
+    #[test]
+    fn only_fields_keeps_the_named_fields_and_skips_what_the_event_lacks() {
+        let event = serde_json::json!({
+            "type": "m.room.message",
+            "event_id": "$e",
+            "sender": "@alice:example.org",
+            "content": {"body": "hi", "msgtype": "m.text", "m.relates_to": {"rel_type": "m.thread", "event_id": "$root"}},
+            "unsigned": {"age": 1},
+        });
+        let paths: Vec<Vec<String>> = [
+            "type",
+            "content.body",
+            "content.m\\.relates_to.rel_type",
+            "content.missing",
+            "origin_server_ts",
+            "sender.not_an_object",
+        ]
+        .iter()
+        .map(|p| split_field_path(p))
+        .collect();
+        assert_eq!(
+            only_fields(&event, &paths),
+            serde_json::json!({
+                "type": "m.room.message",
+                "content": {"body": "hi", "m.relates_to": {"rel_type": "m.thread"}},
+            })
+        );
+        // A whole object named by one path and a field inside it by another: the object wins
+        // whole, whichever order the paths come in.
+        for order in [["content", "content.body"], ["content.body", "content"]] {
+            let paths: Vec<Vec<String>> = order.iter().map(|p| split_field_path(p)).collect();
+            assert_eq!(
+                only_fields(&event, &paths)["content"],
+                event["content"],
+                "{order:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prune_event_fields_is_a_no_op_without_the_filter_or_with_an_empty_list() {
+        let event = serde_json::json!({"type": "m.room.message", "content": {"body": "hi"}});
+        for filter in [
+            SyncFilter::none(),
+            serde_json::from_value(serde_json::json!({"event_fields": []})).unwrap(),
+        ] {
+            let mut events = vec![event.clone()];
+            filter.prune_event_fields(&mut events);
+            assert_eq!(events, vec![event.clone()]);
+        }
+        let filter: SyncFilter =
+            serde_json::from_value(serde_json::json!({"event_fields": ["content.body"]})).unwrap();
+        let mut events = vec![event.clone(), serde_json::json!({"type": "m.room.name"})];
+        filter.prune_event_fields(&mut events);
+        assert_eq!(
+            events,
+            vec![
+                serde_json::json!({"content": {"body": "hi"}}),
+                serde_json::json!({})
+            ]
+        );
+    }
 
     #[test]
     fn room_event_filter_types_is_an_allowlist_with_wildcard_support() {
