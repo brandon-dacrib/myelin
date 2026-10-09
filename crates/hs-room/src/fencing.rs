@@ -229,6 +229,90 @@ pub(crate) mod tests {
         assert!(matches!(err, RoomError::Fenced(_)), "got {err:?}");
     }
 
+    /// The check inside the write itself for a copy of the room that is behind the store
+    /// (`RoomActor::persist`): two copies of one room with the same, valid fence -- what a
+    /// resident copy kept across losing and regaining a shard amounted to before the registry
+    /// dropped such copies (2026-10-09) -- and the one that fell behind is refused, with the
+    /// room, the position, the event there and who wrote it in the error, and the store left
+    /// as it was.
+    #[test]
+    fn a_copy_behind_the_store_is_refused_rather_than_writing_over_a_row() {
+        let backend = MemoryBackend::new();
+        let cluster_store = ClusterStore::open(backend.clone()).unwrap();
+        let shard = ShardId::new(hs_cluster::ShardKind::Room, 0);
+        let record = cluster_store
+            .acquire_shard(shard, &ReplicaId::new("hs-a"), Generation(1), |_| false)
+            .unwrap()
+            .expect("acquiring a free shard must succeed");
+        let fence = Some(Fence::clustered(shard, record.epoch));
+        let mut stale = room_with_fencing(backend.clone(), fence);
+        let room_id = stale.room_id().to_owned();
+        let identity = HomeserverIdentity::for_tests("hs1");
+        let mut current = crate::actor::RoomActor::load(
+            backend.clone(),
+            Tables::open(&backend).unwrap(),
+            identity.clone(),
+            &room_id,
+        )
+        .unwrap()
+        .unwrap();
+        current.set_fencing(Some(Arc::new(RoomFencing {
+            ownership: Arc::new(FixedFence {
+                me: ReplicaId::new("hs-b"),
+                fence,
+            }),
+            layout: hs_cluster::ShardLayout::small(4),
+            cluster_store: ClusterStore::open(backend.clone()).unwrap(),
+        })));
+        let message = |body: &str| serde_json::json!({"msgtype": "m.text", "body": body});
+        let theirs = current
+            .send_event(
+                user_id!("@alice:hs1").to_owned(),
+                "m.room.message".to_owned(),
+                None,
+                message("written by the current copy"),
+                None,
+                2,
+            )
+            .unwrap();
+        let position = current.timeline_position(theirs.event_id()).unwrap();
+
+        let err = stale
+            .send_event(
+                user_id!("@alice:hs1").to_owned(),
+                "m.room.message".to_owned(),
+                None,
+                message("from a copy that is behind"),
+                None,
+                3,
+            )
+            .expect_err("a copy behind the store must not write over the current copy's row");
+        let text = err.to_string();
+        assert!(matches!(err, RoomError::Internal(_)), "got {err:?}");
+        for needle in [
+            "behind the store",
+            room_id.as_str(),
+            "replica hs-a (epoch",
+            &format!("position {position} already holds event"),
+            theirs.event_id().as_str(),
+            "written by hs-b (epoch",
+        ] {
+            assert!(text.contains(needle), "{needle:?} is not in {text:?}");
+        }
+
+        // The store is as the current copy left it: a fresh load holds its event where it
+        // was, and nothing of the refused one.
+        let fresh = crate::actor::RoomActor::load(
+            backend.clone(),
+            Tables::open(&backend).unwrap(),
+            identity,
+            &room_id,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(fresh.timeline_position(theirs.event_id()), Some(position));
+    }
+
     /// `Ownership::fence` returning `None` (this replica's own view no longer includes the
     /// shard) is treated identically to a failed epoch check -- also a rejection, not a silent
     /// pass.

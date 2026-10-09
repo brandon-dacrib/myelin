@@ -19,6 +19,12 @@ use crate::protocol::RoomUpdate;
 struct Entry<B: KvBackend> {
     handle: RoomActorHandle<B>,
     last_used: Instant,
+    /// The fence this replica held for the room's shard when the actor was loaded or created:
+    /// `None` with no fencing installed, or when this replica did not own the shard then. A
+    /// resident copy is only as current as the ownership it was loaded under: once the shard
+    /// has changed hands (the fencing epoch moved) another replica may have written rows the
+    /// copy never read, and [`RoomRegistry::get_or_load`] drops it rather than hand it out.
+    fence: Option<hs_cluster::Fence>,
 }
 
 /// A hook `GET /rooms/{roomId}/messages` (`crate::routes::query::get_messages`) calls when a
@@ -430,7 +436,40 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
         }
     }
 
+    /// The fence this replica holds for `room_id`'s shard right now: `None` with no fencing
+    /// installed, or when this replica does not own the shard. Computed fresh on every call
+    /// (`hs_cluster::Ownership::fence`), never captured.
+    fn current_fence(&self, room_id: &ruma::RoomId) -> Option<hs_cluster::Fence> {
+        let fencing = self.fencing.get()?;
+        fencing
+            .ownership
+            .fence(fencing.layout.room_shard(room_id.as_str()))
+    }
+
+    /// Whether a resident copy loaded under `loaded_under` may be handed out now that this
+    /// replica holds `current` for its shard: not when it owns the shard under a different
+    /// fence than the copy was loaded under. The epoch advances on every release and every
+    /// acquisition (decision 0023), so a shard this replica lost and got back always shows a
+    /// new one, and so does a shard it never owned when the copy was loaded. A shard it does
+    /// not own now (`current` is `None`) keeps the copy: nothing writes through it (the fence
+    /// check in `RoomActor::persist` refuses), and reads of a room another replica owns go
+    /// through `hs-user`'s mirror, not here.
+    fn copy_is_stale(
+        loaded_under: Option<hs_cluster::Fence>,
+        current: Option<hs_cluster::Fence>,
+    ) -> bool {
+        current.is_some() && current != loaded_under
+    }
+
     /// The handle for `room_id`, loading it from the store if it is not already resident.
+    ///
+    /// A resident copy is dropped and the room loaded again when the room's shard has changed
+    /// hands since the copy was loaded ([`Entry::fence`]). Until 2026-10-09 the copy was handed
+    /// out as it was: a replica that lost a shard to a peer and got it back (a scale-down after a
+    /// scale-up, a roll) wrote the next event from a copy whose timeline head was behind the
+    /// store, onto the position of an event the peer had written, and every replica that then
+    /// loaded the room from the store found a forward extremity its timeline no longer held
+    /// (`/sync` `500 unknown event EventSn#...`, sends `500 cited event not in history`).
     ///
     /// # Errors
     /// Returns [`RoomError::RoomNotFound`] if the room does not exist, or any error
@@ -439,11 +478,32 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
         &self,
         room_id: &ruma::RoomId,
     ) -> Result<RoomActorHandle<B>, RoomError> {
+        // Read before the load, so that a handoff during the load shows as a mismatch on the
+        // next call rather than being hidden behind a fence read after it.
+        let fence = self.current_fence(room_id);
         {
             let mut rooms = self.rooms.lock().await;
             if let Some(entry) = rooms.get_mut(room_id) {
-                entry.last_used = Instant::now();
-                return Ok(entry.handle.clone());
+                if Self::copy_is_stale(entry.fence, fence) {
+                    let shard = self
+                        .fencing
+                        .get()
+                        .map(|f| f.layout.room_shard(room_id.as_str()).to_string())
+                        .unwrap_or_default();
+                    tracing::info!(
+                        %room_id,
+                        shard,
+                        loaded_under_epoch = ?entry.fence.and_then(|f| f.epoch).map(|e| e.0),
+                        epoch = ?fence.and_then(|f| f.epoch).map(|e| e.0),
+                        "the room's shard changed hands since this copy was loaded; dropping \
+                         the copy and loading the room again from the store"
+                    );
+                    crate::metrics::count_stale_copy_reloaded();
+                    rooms.remove(room_id);
+                } else {
+                    entry.last_used = Instant::now();
+                    return Ok(entry.handle.clone());
+                }
             }
         }
 
@@ -491,6 +551,7 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
                 slot.insert(Entry {
                     handle: RoomActorHandle::new(actor),
                     last_used: Instant::now(),
+                    fence,
                 })
             }
         };
@@ -554,6 +615,7 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
     /// stream.
     async fn register(&self, actor: RoomActor<B>) -> RoomActorHandle<B> {
         let room_id = actor.room_id().to_owned();
+        let fence = self.current_fence(&room_id);
         let handle = RoomActorHandle::new(actor);
         let mut rooms = self.rooms.lock().await;
         rooms.insert(
@@ -561,6 +623,7 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
             Entry {
                 handle: handle.clone(),
                 last_used: Instant::now(),
+                fence,
             },
         );
         handle
@@ -575,6 +638,7 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
     async fn insert_if_absent(&self, mut actor: RoomActor<B>) -> RoomActorHandle<B> {
         actor.set_fencing(self.fencing.get().cloned());
         let room_id = actor.room_id().to_owned();
+        let fence = self.current_fence(&room_id);
         let mut rooms = self.rooms.lock().await;
         let entry = match rooms.entry(room_id) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
@@ -583,6 +647,7 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
                 slot.insert(Entry {
                     handle: RoomActorHandle::new(actor),
                     last_used: Instant::now(),
+                    fence,
                 })
             }
         };
@@ -951,6 +1016,172 @@ mod tests {
             )
             .expect("opening an in-memory registry cannot fail"),
         )
+    }
+
+    /// A scripted [`hs_cluster::Ownership`] whose fence can be switched: what a replica holds
+    /// for a shard across losing it to a peer and getting it back.
+    struct SwitchableFence {
+        me: hs_cluster::ReplicaId,
+        fence: std::sync::Mutex<Option<hs_cluster::Fence>>,
+    }
+
+    impl SwitchableFence {
+        fn set(&self, fence: Option<hs_cluster::Fence>) {
+            *self.fence.lock().unwrap() = fence;
+        }
+    }
+
+    impl hs_cluster::Ownership for SwitchableFence {
+        fn me(&self) -> &hs_cluster::ReplicaId {
+            &self.me
+        }
+
+        fn owner_of(&self, _shard: hs_cluster::ShardId) -> Option<hs_cluster::ReplicaId> {
+            self.fence.lock().unwrap().map(|_| self.me.clone())
+        }
+
+        fn is_mine(&self, _shard: hs_cluster::ShardId) -> bool {
+            self.fence.lock().unwrap().is_some()
+        }
+
+        fn fence(&self, _shard: hs_cluster::ShardId) -> Option<hs_cluster::Fence> {
+            *self.fence.lock().unwrap()
+        }
+
+        fn subscribe(&self) -> tokio::sync::broadcast::Receiver<hs_cluster::OwnershipEvent> {
+            tokio::sync::broadcast::channel(1).1
+        }
+
+        fn shard_map(&self) -> tokio::sync::watch::Receiver<Arc<hs_cluster::ShardMap>> {
+            tokio::sync::watch::channel(Arc::new(hs_cluster::ShardMap::default())).1
+        }
+    }
+
+    /// The scale 1 -> 2 bug of 2026-10-09 (`crates/hs-cli/tests/cluster_rejoin.rs` is the same
+    /// on real replicas): a copy loaded while this replica owned the shard is handed out again
+    /// while it still does, and loaded again from the store once the shard has changed hands
+    /// -- a peer took it (and wrote to the room) and this replica got it back at a new epoch.
+    /// The copy handed out then holds the peer's event, and writes after it.
+    #[tokio::test]
+    async fn a_copy_is_loaded_again_once_its_shard_changed_hands() {
+        use hs_cluster::{Fence, Generation, ReplicaId, ShardId, ShardKind};
+        let backend = MemoryBackend::new();
+        let cluster_store = hs_cluster::store::ClusterStore::open(backend.clone()).unwrap();
+        let identity = HomeserverIdentity::for_tests("registry.test");
+        let registry = Arc::new(RoomRegistry::open(backend.clone(), identity.clone()).unwrap());
+        let (me, peer) = (ReplicaId::new("hs-a"), ReplicaId::new("hs-b"));
+        // Every room hashes to this one shard's fence here; `Fence::check` reads its row.
+        let shard = ShardId::new(ShardKind::Room, 0);
+        let ownership = Arc::new(SwitchableFence {
+            me: me.clone(),
+            fence: std::sync::Mutex::new(None),
+        });
+        registry.install_fencing(Arc::new(crate::fencing::RoomFencing {
+            ownership: ownership.clone(),
+            layout: hs_cluster::ShardLayout::small(4),
+            cluster_store: cluster_store.clone(),
+        }));
+        let alice = user_id!("@alice:registry.test").to_owned();
+
+        // Owned: the room is made, and handed out again as the same copy.
+        let first = cluster_store
+            .acquire_shard(shard, &me, Generation(1), |_| false)
+            .unwrap()
+            .unwrap();
+        ownership.set(Some(Fence::clustered(shard, first.epoch)));
+        let created = registry
+            .create_room(alice.clone(), CreateRoomRequest::default(), 1)
+            .await
+            .unwrap();
+        let room_id = created.query(|actor| actor.room_id().to_owned()).await;
+        let again = registry.get_or_load(&room_id).await.unwrap();
+        assert!(
+            again.same_actor(&created),
+            "the owner's copy is handed out again"
+        );
+        let before = crate::metrics::stale_copies_reloaded();
+
+        // Lost: a peer takes the shard and writes to the room. This replica's copy knows
+        // nothing of it.
+        ownership.set(None);
+        let taken = cluster_store
+            .acquire_shard(shard, &peer, Generation(1), |_| true)
+            .unwrap()
+            .unwrap();
+        let mut peers_copy = RoomActor::load(
+            backend.clone(),
+            Tables::open(&backend).unwrap(),
+            identity,
+            &room_id,
+        )
+        .unwrap()
+        .unwrap();
+        peers_copy.set_fencing(Some(Arc::new(crate::fencing::RoomFencing {
+            ownership: Arc::new(SwitchableFence {
+                me: peer.clone(),
+                fence: std::sync::Mutex::new(Some(Fence::clustered(shard, taken.epoch))),
+            }),
+            layout: hs_cluster::ShardLayout::small(4),
+            cluster_store: cluster_store.clone(),
+        })));
+        let peers_event = peers_copy
+            .send_event(
+                alice.clone(),
+                "m.room.message".to_owned(),
+                None,
+                serde_json::json!({"msgtype": "m.text", "body": "from the peer"}),
+                None,
+                2,
+            )
+            .unwrap();
+        let peers_position = peers_copy
+            .timeline_position(peers_event.event_id())
+            .unwrap();
+
+        // Back, at a new epoch: the next request gets a copy loaded from the store, which
+        // holds the peer's event, and the next event lands after it.
+        let back = cluster_store
+            .acquire_shard(shard, &me, Generation(2), |_| true)
+            .unwrap()
+            .unwrap();
+        assert_ne!(back.epoch, first.epoch);
+        ownership.set(Some(Fence::clustered(shard, back.epoch)));
+        let reloaded = registry.get_or_load(&room_id).await.unwrap();
+        assert!(
+            !reloaded.same_actor(&created),
+            "a copy from before the shard changed hands must not be handed out"
+        );
+        assert_eq!(crate::metrics::stale_copies_reloaded(), before + 1);
+        assert_eq!(registry.resident_count().await, 1);
+        let peers_event_id = peers_event.event_id().to_owned();
+        let seen_at = reloaded
+            .query(move |actor| actor.timeline_position(&peers_event_id))
+            .await;
+        assert_eq!(
+            seen_at,
+            Some(peers_position),
+            "the reloaded copy holds the peer's event"
+        );
+        let ours = reloaded
+            .send_event(
+                alice,
+                "m.room.message".to_owned(),
+                None,
+                serde_json::json!({"msgtype": "m.text", "body": "after getting the shard back"}),
+                None,
+                3,
+            )
+            .await
+            .unwrap();
+        let ours_id = ours.event_id().to_owned();
+        let ours_at = reloaded
+            .query(move |actor| actor.timeline_position(&ours_id))
+            .await;
+        assert_eq!(ours_at, Some(peers_position + 1));
+        // And while the shard stays with this replica, the copy is handed out again.
+        let same = registry.get_or_load(&room_id).await.unwrap();
+        assert!(same.same_actor(&reloaded));
+        assert_eq!(crate::metrics::stale_copies_reloaded(), before + 1);
     }
 
     /// A join through another server counts as under way while any guard for it is held, and

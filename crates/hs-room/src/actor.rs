@@ -1377,9 +1377,35 @@ impl<B: KvBackend> RoomActor<B> {
         if let Some(root) = self.placed_outlier_roots.get(&sn) {
             return Ok(*root);
         }
-        self.store
-            .state_at(sn)
-            .map_err(|e| RoomError::State(e.to_string()))
+        self.store.state_at(sn).map_err(|e| {
+            // The store not knowing an event the room cites (an extremity, a prev event) is a
+            // room whose rows disagree with each other -- what a copy behind the store writing
+            // over a peer's row left behind until 2026-10-09 -- so the error says which room,
+            // which event, and who wrote its row, for the log line that carries it.
+            let snapshot = self.backend.snapshot();
+            let event_id = self
+                .tables
+                .event_sn
+                .resolve(&snapshot, sn)
+                .ok()
+                .flatten()
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_else(|| "<unknown event id>".to_owned());
+            let written_by = self
+                .tables
+                .events
+                .get(&snapshot, &(sn,))
+                .ok()
+                .flatten()
+                .and_then(|bytes| serde_json::from_slice::<PersistedEvent>(&bytes).ok())
+                .and_then(|row| row.written_by)
+                .unwrap_or_else(|| "<unrecorded writer>".to_owned());
+            RoomError::State(format!(
+                "{e} in room {} ({event_id}, written by {written_by}): the room cites an \
+                 event its timeline does not hold",
+                self.room_id
+            ))
+        })
     }
 
     /// A root holding exactly the state events `state` (one per `(type, state_key)`, a later
@@ -2271,6 +2297,7 @@ impl<B: KvBackend> RoomActor<B> {
             flags: event.header().flags.to_byte(),
             room_pos: Some(room_pos),
             purged: false,
+            written_by: self.writer_tag(),
         };
         let persisted_bytes =
             serde_json::to_vec(&persisted).map_err(|e| RoomError::Internal(e.to_string()))?;
@@ -2317,6 +2344,10 @@ impl<B: KvBackend> RoomActor<B> {
         // Set from inside the closure, like `fence_failure`, when a new room's ID turns out to
         // be one a room already has (`PersistKind::NewRoom`).
         let id_taken = std::cell::Cell::new(false);
+        // Set from inside the closure when the timeline position this copy would write to is
+        // already taken: the copy is behind the store (see the check below).
+        let stale_copy: std::cell::Cell<Option<(i64, Option<EventSn>)>> =
+            std::cell::Cell::new(None);
         let event_sn = transact(&self.backend, TransactConfig::default(), |txn| {
             if must_be_new
                 && self
@@ -2342,6 +2373,26 @@ impl<B: KvBackend> RoomActor<B> {
                 .events
                 .put(txn, &(event_sn,), &persisted_bytes)
                 .map_err(to_kv)?;
+            // The position this copy is about to use must be free. A copy whose head is behind
+            // the store (loaded, the shard lost to a peer that wrote, the shard back) would put
+            // its event over the peer's row, and every later load of the room would find an
+            // extremity the timeline no longer holds (the scale 1 -> 2 bug of 2026-10-09). The
+            // registry drops such a copy before handing it out; this is the check inside the
+            // write itself, so that nothing else that holds an actor can do it either.
+            if let Some(held) = self
+                .tables
+                .timeline
+                .get(txn, &(room_sn, room_pos))
+                .map_err(to_kv)?
+            {
+                let held_sn = <[u8; 8]>::try_from(held.as_ref())
+                    .ok()
+                    .map(EventSn::from_be_bytes);
+                stale_copy.set(Some((room_pos, held_sn)));
+                return Err(hs_kv::KvError::Aborted(Box::new(std::io::Error::other(
+                    "this copy of the room is behind the store",
+                ))));
+            }
             self.tables
                 .timeline
                 .put(txn, &(room_sn, room_pos), &event_sn.to_be_bytes())
@@ -2408,7 +2459,10 @@ impl<B: KvBackend> RoomActor<B> {
         .map_err(|e| match fence_failure.take() {
             Some(msg) => RoomError::Fenced(msg),
             None if id_taken.get() => RoomError::RoomAlreadyExists(self.room_id.to_string()),
-            None => RoomError::from(e),
+            None => match stale_copy.take() {
+                Some((room_pos, held)) => self.stale_copy_error(room_pos, held),
+                None => RoomError::from(e),
+            },
         })?;
 
         // Feed the production state store. This runs as its own write after the room's own KV
@@ -2533,6 +2587,61 @@ impl<B: KvBackend> RoomActor<B> {
         Ok(())
     }
 
+    /// Who this actor writes as, for `PersistedEvent::written_by`: this replica's id and the
+    /// fencing epoch it holds for the room's shard, or `None` with no fencing installed.
+    fn writer_tag(&self) -> Option<String> {
+        let fencing = self.fencing.as_ref()?;
+        let shard = fencing.layout.room_shard(self.room_id.as_str());
+        Some(
+            match fencing.ownership.fence(shard).and_then(|fence| fence.epoch) {
+                Some(epoch) => format!("{} (epoch {})", fencing.ownership.me(), epoch.0),
+                None => fencing.ownership.me().to_string(),
+            },
+        )
+    }
+
+    /// The error for a write [`RoomActor::persist`] refused because `room_pos`, the position
+    /// this copy would have used, already holds an event (`held`): this copy is behind the
+    /// store. Logged at `error` with everything an operator needs: the room, the replica, the
+    /// position, the event there and who wrote it, and this copy's own head. The room's rows
+    /// are untouched; the copy must be loaded again
+    /// (`crate::registry::RoomRegistry::get_or_load` does that when the shard changed hands).
+    fn stale_copy_error(&self, room_pos: i64, held: Option<EventSn>) -> RoomError {
+        let snapshot = self.backend.snapshot();
+        let held_id = held
+            .and_then(|sn| self.tables.event_sn.resolve(&snapshot, sn).ok().flatten())
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_else(|| "<unknown event id>".to_owned());
+        let held_writer = held
+            .and_then(|sn| self.tables.events.get(&snapshot, &(sn,)).ok().flatten())
+            .and_then(|bytes| serde_json::from_slice::<PersistedEvent>(&bytes).ok())
+            .and_then(|row| row.written_by)
+            .unwrap_or_else(|| "<unrecorded writer>".to_owned());
+        let me = self
+            .writer_tag()
+            .unwrap_or_else(|| "<no cluster fence>".to_owned());
+        let head = self.timeline.keys().next_back().copied().unwrap_or(0);
+        let held = held.map_or_else(|| "<corrupt row>".to_owned(), |sn| sn.to_string());
+        let message = format!(
+            "this copy of room {} on replica {me} is behind the store: timeline position \
+             {room_pos} already holds event {held} ({held_id}, written by {held_writer}) and this \
+             copy's head is position {head}; nothing was written, and the copy must be loaded \
+             again from the store",
+            self.room_id
+        );
+        tracing::error!(
+            room_id = %self.room_id,
+            replica = %me,
+            room_pos,
+            held_event = %held,
+            held_event_id = %held_id,
+            held_written_by = %held_writer,
+            copy_head = head,
+            "refused a write from a copy of the room that is behind the store"
+        );
+        RoomError::Internal(message)
+    }
+
     /// Persists `outliers` -- events this actor should hold the bodies of, and index by ID and in
     /// the state store, without ever placing them in the timeline: the `state` and `auth_chain`
     /// of a federation `send_join` response. Each is written with
@@ -2579,6 +2688,7 @@ impl<B: KvBackend> RoomActor<B> {
                     flags: event.header().flags.to_byte(),
                     room_pos: None,
                     purged: false,
+                    written_by: self.writer_tag(),
                 };
                 let bytes = serde_json::to_vec(&persisted)
                     .map_err(|e| RoomError::Internal(e.to_string()))?;
@@ -2770,6 +2880,7 @@ impl<B: KvBackend> RoomActor<B> {
                     flags: flags.to_byte(),
                     room_pos: Some(p.room_pos),
                     purged: false,
+                    written_by: self.writer_tag(),
                 };
                 let bytes = serde_json::to_vec(&persisted)
                     .map_err(|e| RoomError::Internal(e.to_string()))?;

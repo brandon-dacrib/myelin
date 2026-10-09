@@ -1911,7 +1911,13 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
                     let woken = match self.handle_room_update(update).await {
                         Ok(woken) => woken,
                         Err(e) => {
-                            tracing::warn!(error = %e, "failed to process a room update into user feeds");
+                            tracing::warn!(
+                                error = %e,
+                                %room_id,
+                                room_pos,
+                                global_seq = seq,
+                                "failed to process a room update into user feeds"
+                            );
                             Vec::new()
                         }
                     };

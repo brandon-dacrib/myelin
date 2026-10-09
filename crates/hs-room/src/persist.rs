@@ -153,6 +153,13 @@ pub struct PersistedEvent {
     /// written before purging existed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub purged: bool,
+    /// The replica that wrote the row and the fencing epoch it held for the room's shard
+    /// (`"<replica id> (epoch N)"`), when a cluster fence was installed; absent in single-node
+    /// mode and on every row written before 2026-10-09. For diagnosis only: when a row is found
+    /// where it should not be (a copy of the room behind the store about to write over it,
+    /// `RoomActor::persist`), the error names who wrote what is there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written_by: Option<String>,
 }
 
 /// A room's fixed metadata.

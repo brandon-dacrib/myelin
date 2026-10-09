@@ -33,6 +33,13 @@ static CREATE_ROOM_ID_TAKEN: LazyLock<Counter> = LazyLock::new(Counter::default)
 /// row"). Counts once per room load that found some, so a non-owner's copies count too.
 static OUTLIER_STATE_ROWS_REPAIRED: LazyLock<Counter> = LazyLock::new(Counter::default);
 
+/// `hs_room_stale_copies_reloaded_total`: resident copies of a room `RoomRegistry::get_or_load`
+/// dropped because the room's shard changed hands since the copy was loaded (the fencing epoch
+/// moved: this replica lost the shard and got it back), each followed by a load from the store.
+/// Expected on every scale-down and roll; a copy written from instead would have put an event
+/// on a timeline position another replica had already used.
+static STALE_COPIES_RELOADED: LazyLock<Counter> = LazyLock::new(Counter::default);
+
 /// `hs_room_search_indexed_events_total`: events whose words this replica wrote to the index.
 static SEARCH_INDEXED_EVENTS: LazyLock<Counter> = LazyLock::new(Counter::default);
 
@@ -114,6 +121,18 @@ pub(crate) fn count_room_upgrade(outcome: &str) {
 /// Counts one new room's ID found already taken in `hs_room_create_room_id_taken_total`.
 pub(crate) fn count_create_room_id_taken() {
     CREATE_ROOM_ID_TAKEN.inc();
+}
+
+/// Counts one resident copy dropped for a shard that changed hands in
+/// `hs_room_stale_copies_reloaded_total`.
+pub(crate) fn count_stale_copy_reloaded() {
+    STALE_COPIES_RELOADED.inc();
+}
+
+/// `hs_room_stale_copies_reloaded_total` as it stands.
+#[must_use]
+pub fn stale_copies_reloaded() -> u64 {
+    STALE_COPIES_RELOADED.get()
 }
 
 /// Counts `repaired` placed outliers given a state row on a room load in
@@ -225,6 +244,13 @@ pub fn register_metrics(registry: &mut prometheus_client::registry::Registry) {
         "Events received over federation that the auth rules allow at the state before them \
          and refuse at the room's current state: held, kept from clients",
         SOFT_FAILED_EVENTS.clone(),
+    );
+    // Registered without `_total`: the text encoder appends it.
+    registry.register(
+        "hs_room_stale_copies_reloaded",
+        "Resident copies of a room dropped because the room's shard changed hands since the \
+         copy was loaded, each followed by a load from the store",
+        STALE_COPIES_RELOADED.clone(),
     );
     // Registered without `_total`: the text encoder appends it.
     registry.register(

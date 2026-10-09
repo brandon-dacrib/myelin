@@ -143,6 +143,7 @@ impl<B: KvBackend> RoomActor<B> {
                 flags: skeleton.header().flags.to_byte(),
                 room_pos: Some(*pos),
                 purged: true,
+                written_by: self.writer_tag(),
             };
             let bytes = serde_json::to_vec(&row).map_err(|e| RoomError::Internal(e.to_string()))?;
             let full: serde_json::Value = serde_json::from_slice(event.canonical_bytes())
