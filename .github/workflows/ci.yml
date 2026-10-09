@@ -4,10 +4,13 @@ on: [push, pull_request]
 
 # Cancel superseded runs on the same ref so the shared amd64/arm64 runner pool (and the shared
 # target/ this project's contributors are warned to be careful with locally) is not doing
-# redundant work for a branch that already has a newer push.
+# redundant work for a branch that already has a newer push -- except on `main`, where runs
+# queue instead: `cd.yml` waits for *its own commit's* ci run and refuses to release a commit
+# whose ci was cancelled, so on 2026-10-09, with a merge every twenty minutes, five of six
+# merges got no image. A queued run costs runner minutes; a cancelled one costs the release.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   CARGO_TERM_COLOR: always
