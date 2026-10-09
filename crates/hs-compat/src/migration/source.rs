@@ -16,15 +16,22 @@ use tokio_postgres::{Client, NoTls};
 use super::MigrationError;
 use super::model::{
     RoomShape, Stream, SynapseAccessToken, SynapseAccountData, SynapseBackupVersion,
-    SynapseCrossSigning, SynapseDevice, SynapseDeviceKeys, SynapseEvent, SynapseFilter,
-    SynapseMedia, SynapsePushRules, SynapsePusher, SynapseReceipt, SynapseRemoteJoin,
-    SynapseRemoteMedia, SynapseRoom, SynapseRoomKey, SynapseUser,
+    SynapseCrossSigning, SynapseDevice, SynapseDeviceKeys, SynapseEvent, SynapseExternalId,
+    SynapseFilter, SynapseMedia, SynapsePushRules, SynapsePusher, SynapseReceipt,
+    SynapseRefreshToken, SynapseRegistrationToken, SynapseRemoteJoin, SynapseRemoteMedia,
+    SynapseRoom, SynapseRoomKey, SynapseThreepid, SynapseToDeviceMessage, SynapseUser,
 };
 use super::rows;
 
 /// Tables a Synapse may not have (an older one, or one that never had the feature), each read
 /// as empty when it is absent rather than failing the copy.
-const OPTIONAL_TABLES: [&str; 17] = [
+const OPTIONAL_TABLES: [&str; 23] = [
+    "refresh_tokens",
+    "user_threepids",
+    "user_external_ids",
+    "erased_users",
+    "device_inbox",
+    "registration_tokens",
     "e2e_device_keys_json",
     "e2e_one_time_keys_json",
     "e2e_fallback_keys_json",
@@ -103,8 +110,9 @@ fn parse_row(raw: &str) -> Result<Value, MigrationError> {
     serde_json::from_str(raw).map_err(|e| MigrationError::Source(format!("unreadable row: {e}")))
 }
 
-/// An account and its profile, as one JSON row.
-const USER_SELECT: &str = "SELECT (to_jsonb(u) || jsonb_build_object('displayname', p.displayname, 'avatar_url', p.avatar_url))::text \
+/// An account and its profile, as one JSON row; `{erased}` is filled in by
+/// [`SynapseSource::user_select`] (a Synapse without `erased_users` has erased nobody).
+const USER_SELECT: &str = "SELECT (to_jsonb(u) || jsonb_build_object('displayname', p.displayname, 'avatar_url', p.avatar_url, 'erased', {erased}))::text \
      FROM users u LEFT JOIN profiles p ON p.user_id = split_part(substr(u.name, 2), ':', 1)";
 
 fn parse_user(raw: &str) -> Result<SynapseUser, MigrationError> {
@@ -124,6 +132,7 @@ fn parse_user(raw: &str) -> Result<SynapseUser, MigrationError> {
         user_type: text(&r, "user_type"),
         displayname: text(&r, "displayname"),
         avatar_url: text(&r, "avatar_url"),
+        erased: flag(&r, "erased"),
     })
 }
 
@@ -287,6 +296,11 @@ impl SynapseSource {
             Stream::Filters => &["user_filters"],
             Stream::Receipts => &["receipts_linearized"],
             Stream::RemoteMedia => &["remote_media_cache"],
+            Stream::RefreshTokens => &["refresh_tokens"],
+            Stream::Threepids => &["user_threepids"],
+            Stream::ExternalIds => &["user_external_ids"],
+            Stream::ToDevice => &["device_inbox"],
+            Stream::RegistrationTokens => &["registration_tokens"],
             _ => &[],
         };
         if needs.iter().any(|t| !self.has(t)) {
@@ -297,6 +311,11 @@ impl SynapseSource {
             Stream::Users => "SELECT count(*) FROM users".to_owned(),
             Stream::Devices => "SELECT count(*) FROM devices".to_owned(),
             Stream::AccessTokens => "SELECT count(*) FROM access_tokens".to_owned(),
+            Stream::RefreshTokens => "SELECT count(*) FROM refresh_tokens".to_owned(),
+            Stream::Threepids => "SELECT count(*) FROM user_threepids".to_owned(),
+            Stream::ExternalIds => "SELECT count(*) FROM user_external_ids".to_owned(),
+            Stream::ToDevice => "SELECT count(*) FROM device_inbox".to_owned(),
+            Stream::RegistrationTokens => "SELECT count(*) FROM registration_tokens".to_owned(),
             Stream::AccountData => {
                 "SELECT (SELECT count(*) FROM account_data) + (SELECT count(*) FROM room_account_data) \
                  + (SELECT count(*) FROM (SELECT DISTINCT user_id, room_id FROM room_tags) t)"
@@ -344,6 +363,214 @@ impl SynapseSource {
         }
     }
 
+    /// [`USER_SELECT`] with the erasure flag filled in.
+    fn user_select(&self) -> String {
+        let erased = if self.has("erased_users") {
+            "EXISTS (SELECT 1 FROM erased_users e WHERE e.user_id = u.name)"
+        } else {
+            "false"
+        };
+        USER_SELECT.replace("{erased}", erased)
+    }
+
+    /// Refresh tokens after `after` (a row id), each with the access token Synapse minted
+    /// beside it.
+    ///
+    /// # Errors
+    /// [`MigrationError::Source`] on a database error.
+    pub async fn refresh_tokens(
+        &self,
+        after: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<SynapseRefreshToken>, MigrationError> {
+        self.json_rows(
+            "refresh_tokens",
+            "SELECT (to_jsonb(r) || jsonb_build_object('access_token', \
+               (SELECT a.token FROM access_tokens a WHERE a.refresh_token_id = r.id LIMIT 1)))::text \
+             FROM refresh_tokens r WHERE $1::bigint IS NULL OR r.id > $1 ORDER BY r.id LIMIT $2",
+            &[&after, &limit],
+        )
+        .await?
+        .iter()
+        .map(|r| {
+            Ok(SynapseRefreshToken {
+                id: number(r, "id").unwrap_or(0),
+                user_id: text(r, "user_id").unwrap_or_default(),
+                device_id: text(r, "device_id").unwrap_or_default(),
+                token: text(r, "token").unwrap_or_default(),
+                access_token: text(r, "access_token"),
+                next_token_id: number(r, "next_token_id"),
+                expiry_ms: unsigned(r, "expiry_ts"),
+                ultimate_session_expiry_ms: unsigned(r, "ultimate_session_expiry_ts"),
+            })
+        })
+        .collect()
+    }
+
+    /// One refresh token by its string, for verification.
+    ///
+    /// # Errors
+    /// [`MigrationError::Source`] on a database error.
+    pub async fn refresh_token(
+        &self,
+        token: &str,
+    ) -> Result<Option<SynapseRefreshToken>, MigrationError> {
+        Ok(self
+            .json_rows(
+                "refresh_tokens",
+                "SELECT (to_jsonb(r) || jsonb_build_object('access_token', \
+                   (SELECT a.token FROM access_tokens a WHERE a.refresh_token_id = r.id LIMIT 1)))::text \
+                 FROM refresh_tokens r WHERE r.token = $1",
+                &[&token],
+            )
+            .await?
+            .first()
+            .map(|r| SynapseRefreshToken {
+                id: number(r, "id").unwrap_or(0),
+                user_id: text(r, "user_id").unwrap_or_default(),
+                device_id: text(r, "device_id").unwrap_or_default(),
+                token: text(r, "token").unwrap_or_default(),
+                access_token: text(r, "access_token"),
+                next_token_id: number(r, "next_token_id"),
+                expiry_ms: unsigned(r, "expiry_ts"),
+                ultimate_session_expiry_ms: unsigned(r, "ultimate_session_expiry_ts"),
+            }))
+    }
+
+    /// Third-party identifiers after `after` (the key [`threepid_key`] makes), in
+    /// `(user_id, medium, address)` order.
+    ///
+    /// # Errors
+    /// [`MigrationError::Source`] on a database error.
+    pub async fn threepids(
+        &self,
+        after: Option<&[String; 3]>,
+        limit: i64,
+    ) -> Result<Vec<SynapseThreepid>, MigrationError> {
+        let (user, medium, address) = match after {
+            Some([u, m, a]) => (Some(u.as_str()), Some(m.as_str()), Some(a.as_str())),
+            None => (None, None, None),
+        };
+        self.json_rows(
+            "user_threepids",
+            "SELECT to_jsonb(t)::text FROM user_threepids t \
+             WHERE $1::text IS NULL OR (t.user_id, t.medium, t.address) > ($1::text, $2::text, $3::text) \
+             ORDER BY t.user_id, t.medium, t.address LIMIT $4",
+            &[&user, &medium, &address, &limit],
+        )
+        .await?
+        .iter()
+        .map(|r| {
+            Ok(SynapseThreepid {
+                user_id: text(r, "user_id").unwrap_or_default(),
+                medium: text(r, "medium").unwrap_or_default(),
+                address: text(r, "address").unwrap_or_default(),
+                validated_at_ms: unsigned(r, "validated_at").unwrap_or(0),
+                added_at_ms: unsigned(r, "added_at").unwrap_or(0),
+            })
+        })
+        .collect()
+    }
+
+    /// External identity links after `after` (the key [`external_id_key`] makes), in
+    /// `(user_id, auth_provider, external_id)` order.
+    ///
+    /// # Errors
+    /// [`MigrationError::Source`] on a database error.
+    pub async fn external_ids(
+        &self,
+        after: Option<&[String; 3]>,
+        limit: i64,
+    ) -> Result<Vec<SynapseExternalId>, MigrationError> {
+        let (user, provider, external) = match after {
+            Some([u, p, e]) => (Some(u.as_str()), Some(p.as_str()), Some(e.as_str())),
+            None => (None, None, None),
+        };
+        self.json_rows(
+            "user_external_ids",
+            "SELECT to_jsonb(x)::text FROM user_external_ids x \
+             WHERE $1::text IS NULL OR (x.user_id, x.auth_provider, x.external_id) > ($1::text, $2::text, $3::text) \
+             ORDER BY x.user_id, x.auth_provider, x.external_id LIMIT $4",
+            &[&user, &provider, &external, &limit],
+        )
+        .await?
+        .iter()
+        .map(|r| {
+            Ok(SynapseExternalId {
+                user_id: text(r, "user_id").unwrap_or_default(),
+                provider: text(r, "auth_provider").unwrap_or_default(),
+                external_id: text(r, "external_id").unwrap_or_default(),
+            })
+        })
+        .collect()
+    }
+
+    /// To-device messages not yet received after `after` (a stream position), in the order
+    /// they were sent. `message_json` is `{"sender", "type", "content"}` as Synapse queues it.
+    ///
+    /// # Errors
+    /// [`MigrationError::Source`] on a database error or an unreadable message.
+    pub async fn to_device_messages(
+        &self,
+        after: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<SynapseToDeviceMessage>, MigrationError> {
+        self.json_rows(
+            "device_inbox",
+            "SELECT to_jsonb(d)::text FROM device_inbox d \
+             WHERE $1::bigint IS NULL OR d.stream_id > $1 ORDER BY d.stream_id LIMIT $2",
+            &[&after, &limit],
+        )
+        .await?
+        .iter()
+        .map(|r| {
+            let stream_id = number(r, "stream_id").unwrap_or(0);
+            let message: Value = text(r, "message_json")
+                .and_then(|m| serde_json::from_str(&m).ok())
+                .ok_or_else(|| {
+                    MigrationError::Source(format!("to-device message {stream_id} is unreadable"))
+                })?;
+            Ok(SynapseToDeviceMessage {
+                stream_id,
+                user_id: text(r, "user_id").unwrap_or_default(),
+                device_id: text(r, "device_id").unwrap_or_default(),
+                sender: text(&message, "sender").unwrap_or_default(),
+                event_type: text(&message, "type").unwrap_or_default(),
+                content: message.get("content").cloned().unwrap_or(Value::Null),
+            })
+        })
+        .collect()
+    }
+
+    /// Registration tokens after `after` (a token), in token order.
+    ///
+    /// # Errors
+    /// [`MigrationError::Source`] on a database error.
+    pub async fn registration_tokens(
+        &self,
+        after: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<SynapseRegistrationToken>, MigrationError> {
+        self.json_rows(
+            "registration_tokens",
+            "SELECT to_jsonb(t)::text FROM registration_tokens t \
+             WHERE $1::text IS NULL OR t.token > $1 ORDER BY t.token LIMIT $2",
+            &[&after, &limit],
+        )
+        .await?
+        .iter()
+        .map(|r| {
+            Ok(SynapseRegistrationToken {
+                token: text(r, "token").unwrap_or_default(),
+                uses_allowed: unsigned(r, "uses_allowed"),
+                pending: unsigned(r, "pending").unwrap_or(0),
+                completed: unsigned(r, "completed").unwrap_or(0),
+                expiry_ms: number(r, "expiry_time"),
+            })
+        })
+        .collect()
+    }
+
     /// Accounts after `after` (a user id), in name order.
     ///
     /// # Errors
@@ -354,7 +581,8 @@ impl SynapseSource {
         limit: i64,
     ) -> Result<Vec<SynapseUser>, MigrationError> {
         let sql = format!(
-            "{USER_SELECT} WHERE u.name IS NOT NULL AND ($1::text IS NULL OR u.name > $1) ORDER BY u.name LIMIT $2"
+            "{} WHERE u.name IS NOT NULL AND ($1::text IS NULL OR u.name > $1) ORDER BY u.name LIMIT $2",
+            self.user_select()
         );
         let rows = self
             .client
@@ -369,7 +597,7 @@ impl SynapseSource {
     /// # Errors
     /// [`MigrationError::Source`] on a database error.
     pub async fn user(&self, user_id: &str) -> Result<Option<SynapseUser>, MigrationError> {
-        let sql = format!("{USER_SELECT} WHERE u.name = $1");
+        let sql = format!("{} WHERE u.name = $1", self.user_select());
         self.client
             .query_opt(&sql, &[&user_id])
             .await
@@ -1158,7 +1386,12 @@ impl SynapseSource {
             | Stream::Pushers
             | Stream::Filters
             | Stream::Receipts
-            | Stream::RemoteMedia => return Ok(Vec::new()),
+            | Stream::RemoteMedia
+            | Stream::RefreshTokens
+            | Stream::Threepids
+            | Stream::ExternalIds
+            | Stream::ToDevice
+            | Stream::RegistrationTokens => return Ok(Vec::new()),
             Stream::Users => {
                 "SELECT name FROM users WHERE name IS NOT NULL ORDER BY random() LIMIT $1"
             }
@@ -1593,6 +1826,33 @@ impl SynapseSource {
             })
             .collect()
     }
+}
+
+/// The checkpoint key of a third-party identifier: `user_id medium address`, space-separated
+/// (a user id and a medium never contain a space).
+#[must_use]
+pub fn threepid_key(threepid: &SynapseThreepid) -> String {
+    format!(
+        "{} {} {}",
+        threepid.user_id, threepid.medium, threepid.address
+    )
+}
+
+/// The checkpoint key of an external identity link: `user_id provider external_id`.
+#[must_use]
+pub fn external_id_key(link: &SynapseExternalId) -> String {
+    format!("{} {} {}", link.user_id, link.provider, link.external_id)
+}
+
+/// The three parts of a key [`threepid_key`] or [`external_id_key`] made; the last part may
+/// itself contain spaces.
+#[must_use]
+pub fn parse_triple_key(key: &str) -> Option<[String; 3]> {
+    let mut parts = key.splitn(3, ' ');
+    let a = parts.next()?;
+    let b = parts.next()?;
+    let c = parts.next()?;
+    Some([a.to_owned(), b.to_owned(), c.to_owned()])
 }
 
 /// The checkpoint key of a device row.

@@ -445,8 +445,18 @@ async fn a_synapse_database_is_migrated_verified_and_cut_over_through_the_admin_
         ("pushers", 1),
         ("filters", 2),
         ("receipts", 4),
+        ("threepids", 2),
+        ("external_ids", 1),
+        ("registration_tokens", 2),
     ] {
         assert_eq!(stream(name)["copied_count"], count, "{name}: {ready}");
+        assert_eq!(stream(name)["failed_count"], 0, "{name}: {ready}");
+    }
+    // Refresh tokens: the two unspent ones; bob's exchanged one is left out. To-device
+    // messages: the two waiting for alice's phone; the one for a device nobody has is left out.
+    for name in ["refresh_tokens", "to_device"] {
+        assert_eq!(stream(name)["copied_count"], 2, "{name}: {ready}");
+        assert_eq!(stream(name)["skipped_count"], 1, "{name}: {ready}");
         assert_eq!(stream(name)["failed_count"], 0, "{name}: {ready}");
     }
 
@@ -829,6 +839,140 @@ async fn a_synapse_database_is_migrated_verified_and_cut_over_through_the_admin_
             .is_some(),
         "{dm_receipts}"
     );
+
+    // The two to-device messages that were waiting for alice's phone in Synapse are in its
+    // first sync here, from bob, as they were.
+    let fresh = alice.get("/_matrix/client/v3/sync").await;
+    let waiting = fresh["to_device"]["events"].as_array().cloned().unwrap_or_default();
+    let types: Vec<&str> = waiting.iter().filter_map(|e| e["type"].as_str()).collect();
+    assert!(
+        types.contains(&"m.room_key_request") && types.contains(&"m.room.encrypted"),
+        "{fresh}"
+    );
+    assert!(
+        waiting
+            .iter()
+            .all(|e| e["sender"] == "@bob:fixture.test"),
+        "{waiting:?}"
+    );
+    assert!(
+        waiting.iter().any(|e| e["content"]["request_id"] == "req1"),
+        "{waiting:?}"
+    );
+
+    // Her email address came with her: she sees it, and signs in by it.
+    let threepids = alice.get("/_matrix/client/v3/account/3pid").await;
+    assert!(
+        threepids["threepids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["medium"] == "email" && t["address"] == "alice@fixture.test"),
+        "{threepids}"
+    );
+    nobody
+        .expect(
+            Method::POST,
+            "/_matrix/client/v3/login",
+            Some(json!({
+                "type": "m.login.password",
+                "identifier": {"type": "m.id.thirdparty", "medium": "email", "address": "alice@fixture.test"},
+                "password": "alice-password-1",
+            })),
+            StatusCode::OK,
+        )
+        .await;
+    // Her identity at the upstream provider is linked to her account, so a sign-in through
+    // that provider lands in it; and dave's erasure came over with him.
+    let found = ops
+        .get("/api/v1/users/lookup?provider=oidc-fixture&external_id=alice-at-the-provider")
+        .await;
+    assert_eq!(found["user_id"], "@alice:fixture.test", "{found}");
+    let dave = ops.get("/api/v1/users/@dave:fixture.test").await;
+    assert_eq!(dave["erased"], true, "{dave}");
+    assert_eq!(dave["deactivated"], true, "{dave}");
+
+    // Synapse's registration tokens open this (closed) server: one still has uses left.
+    let tokens = ops.get("/api/v1/registration-tokens").await;
+    let token_one = tokens["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["token"] == "fixture-token-one")
+        .cloned()
+        .unwrap_or_else(|| panic!("{tokens}"));
+    assert_eq!(token_one["uses_allowed"], 5, "{token_one}");
+    assert_eq!(token_one["completed"], 2, "{token_one}");
+    let (status, flows) = nobody
+        .call(
+            Method::POST,
+            "/_matrix/client/v3/register",
+            Some(json!({"username": "erin", "password": "erin-password-1"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{flows}");
+    assert!(
+        flows["flows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["stages"].as_array().unwrap().contains(&json!("m.login.registration_token"))),
+        "{flows}"
+    );
+    nobody
+        .expect(
+            Method::POST,
+            "/_matrix/client/v3/register",
+            Some(json!({
+                "username": "erin",
+                "password": "erin-password-1",
+                "auth": {
+                    "type": "m.login.registration_token",
+                    "token": "fixture-token-two",
+                    "session": flows["session"],
+                },
+            })),
+            StatusCode::OK,
+        )
+        .await;
+
+    // Refresh tokens: alice's phone exchanges its Synapse refresh token here for a new pair,
+    // and the access token it was minted with stops working, as a refresh does; bob's
+    // exchanged one is unknown here, as it is in Synapse.
+    let refreshed = nobody
+        .expect(
+            Method::POST,
+            "/_matrix/client/v3/refresh",
+            Some(json!({"refresh_token": facts["alice_refresh_token"]})),
+            StatusCode::OK,
+        )
+        .await;
+    assert!(refreshed["access_token"].is_string(), "{refreshed}");
+    assert!(refreshed["refresh_token"].is_string(), "{refreshed}");
+    let renewed = nobody.with(refreshed["access_token"].as_str().unwrap());
+    let whoami = renewed.get("/_matrix/client/v3/account/whoami").await;
+    assert_eq!(whoami["device_id"], "ALICEPHONE", "{whoami}");
+    let (status, _) = alice
+        .call(Method::GET, "/_matrix/client/v3/account/whoami", None)
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, refused) = nobody
+        .call(
+            Method::POST,
+            "/_matrix/client/v3/refresh",
+            Some(json!({"refresh_token": facts["bob_spent_refresh_token"]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{refused}");
+    assert_eq!(refused["errcode"], "M_UNKNOWN_TOKEN", "{refused}");
+    nobody
+        .expect(
+            Method::POST,
+            "/_matrix/client/v3/refresh",
+            Some(json!({"refresh_token": facts["bob_refresh_token"]})),
+            StatusCode::OK,
+        )
+        .await;
 
     // The record: each step audited, the log kept, the metrics.
     let audit = ops.get("/api/v1/audit-log?limit=200").await;

@@ -16,5 +16,18 @@
   "bob_master_key": "5o2aNmMjNaOcCt9PNGuHS+Iu8WOzIFzjNBUEvM0ES1s",
   "alice_self_signing_key": "aZOp/zQkWrbG/7lUc3c2JDyZEFl+z9mzsMWHxfA8A34",
   "remote_picture": "mxc://other.test/RemoteCachedPictureOne",
-  "remote_missing": "mxc://other.test/RemoteMissingFileTwo"
+  "remote_missing": "mxc://other.test/RemoteMissingFileTwo",
+  "alice_refresh_token": "syr_YWxpY2U_AlicePhoneRefreshOne_0aBcDe",
+  "bob_spent_refresh_token": "syr_Ym9i_BobLaptopRefreshSpent_1fGhIj",
+  "bob_refresh_token": "syr_Ym9i_BobLaptopRefreshTwo_2kLmNo",
+  "alice_email": "alice@fixture.test",
+  "bob_msisdn": "441234567890",
+  "alice_external_id": {
+    "provider": "oidc-fixture",
+    "external_id": "alice-at-the-provider"
+  },
+  "registration_tokens": [
+    "fixture-token-one",
+    "fixture-token-two"
+  ]
 }

@@ -24,9 +24,10 @@ use hs_admin::tasks::TaskRegistry;
 use hs_compat::migration::engine::MigratorParts;
 use hs_compat::migration::model::{
     MigrationRecord, Phase, Stream, SynapseAccessToken, SynapseAccountData, SynapseBackupVersion,
-    SynapseCrossSigning, SynapseDevice, SynapseDeviceKeys, SynapseEvent, SynapseFilter,
-    SynapseMedia, SynapsePushRules, SynapsePusher, SynapseReceipt, SynapseRemoteJoin,
-    SynapseRemoteMedia, SynapseRoom, SynapseRoomKey, SynapseUser,
+    SynapseCrossSigning, SynapseDevice, SynapseDeviceKeys, SynapseEvent, SynapseExternalId,
+    SynapseFilter, SynapseMedia, SynapsePushRules, SynapsePusher, SynapseReceipt,
+    SynapseRefreshToken, SynapseRegistrationToken, SynapseRemoteJoin, SynapseRemoteMedia,
+    SynapseRoom, SynapseRoomKey, SynapseThreepid, SynapseToDeviceMessage, SynapseUser,
 };
 use hs_compat::migration::rooms::{EventPages, copy_room};
 use hs_compat::migration::source::EventKey;
@@ -191,6 +192,11 @@ struct MemoryTarget {
     users: Mutex<HashMap<String, TargetUser>>,
     devices: Mutex<HashMap<(String, String), Option<String>>>,
     tokens: Mutex<HashMap<String, (String, Option<String>)>>,
+    refresh_tokens: Mutex<HashMap<String, SynapseRefreshToken>>,
+    threepids: Mutex<HashMap<(String, String), String>>,
+    external_ids: Mutex<HashMap<(String, String), String>>,
+    to_device: Mutex<Vec<SynapseToDeviceMessage>>,
+    registration_tokens: Mutex<HashMap<String, SynapseRegistrationToken>>,
     account_data: Mutex<HashMap<AccountDataKey, Value>>,
     device_keys: Mutex<HashMap<(String, String), SynapseDeviceKeys>>,
     cross_signing: Mutex<HashMap<String, SynapseCrossSigning>>,
@@ -261,6 +267,7 @@ impl MigrationTarget for MemoryTarget {
             avatar_url: user.avatar_url.clone(),
             admin: user.admin,
             deactivated: user.deactivated,
+            erased: user.erased,
         };
         let mut users = self.users.lock().unwrap();
         Ok(match users.insert(user.user_id.clone(), ours.clone()) {
@@ -296,6 +303,82 @@ impl MigrationTarget for MemoryTarget {
             Imported::AlreadyThere
         } else {
             Imported::Created
+        })
+    }
+
+    async fn import_refresh_token(
+        &self,
+        token: &SynapseRefreshToken,
+    ) -> Result<Imported, TargetError> {
+        let mut held = self.refresh_tokens.lock().unwrap();
+        Ok(match held.insert(token.token.clone(), token.clone()) {
+            None => Imported::Created,
+            Some(before) if before == *token => Imported::AlreadyThere,
+            Some(_) => Imported::Updated,
+        })
+    }
+
+    async fn import_threepid(&self, threepid: &SynapseThreepid) -> Result<Imported, TargetError> {
+        let key = (threepid.medium.clone(), threepid.address.clone());
+        let mut held = self.threepids.lock().unwrap();
+        Ok(match held.get(&key) {
+            Some(user) if *user == threepid.user_id => Imported::AlreadyThere,
+            Some(_) => return Err(TargetError::row("bound to another account here")),
+            None => {
+                held.insert(key, threepid.user_id.clone());
+                Imported::Created
+            }
+        })
+    }
+
+    async fn import_external_id(&self, link: &SynapseExternalId) -> Result<Imported, TargetError> {
+        let key = (link.provider.clone(), link.external_id.clone());
+        let mut held = self.external_ids.lock().unwrap();
+        Ok(match held.get(&key) {
+            Some(user) if *user == link.user_id => Imported::AlreadyThere,
+            Some(_) => return Err(TargetError::row("linked to another account here")),
+            None => {
+                held.insert(key, link.user_id.clone());
+                Imported::Created
+            }
+        })
+    }
+
+    async fn import_to_device(
+        &self,
+        message: &SynapseToDeviceMessage,
+    ) -> Result<Imported, TargetError> {
+        if !self
+            .devices
+            .lock()
+            .unwrap()
+            .contains_key(&(message.user_id.clone(), message.device_id.clone()))
+        {
+            return Ok(Imported::Skipped("its device was not copied".to_owned()));
+        }
+        let mut queue = self.to_device.lock().unwrap();
+        if queue.iter().any(|m| {
+            m.user_id == message.user_id
+                && m.device_id == message.device_id
+                && m.sender == message.sender
+                && m.event_type == message.event_type
+                && m.content == message.content
+        }) {
+            return Ok(Imported::AlreadyThere);
+        }
+        queue.push(message.clone());
+        Ok(Imported::Created)
+    }
+
+    async fn import_registration_token(
+        &self,
+        token: &SynapseRegistrationToken,
+    ) -> Result<Imported, TargetError> {
+        let mut held = self.registration_tokens.lock().unwrap();
+        Ok(match held.insert(token.token.clone(), token.clone()) {
+            None => Imported::Created,
+            Some(before) if before == *token => Imported::AlreadyThere,
+            Some(_) => Imported::Updated,
         })
     }
 
@@ -598,6 +681,66 @@ impl MigrationTarget for MemoryTarget {
             .unwrap()
             .get(&(origin.to_owned(), media_id.to_owned()))
             .cloned())
+    }
+
+    async fn verify_refresh_token(
+        &self,
+        token: &SynapseRefreshToken,
+    ) -> Result<Check, TargetError> {
+        Ok(check(
+            self.refresh_tokens.lock().unwrap().get(&token.token),
+            token,
+        ))
+    }
+
+    async fn verify_threepid(&self, threepid: &SynapseThreepid) -> Result<Check, TargetError> {
+        Ok(check(
+            self.threepids
+                .lock()
+                .unwrap()
+                .get(&(threepid.medium.clone(), threepid.address.clone())),
+            &threepid.user_id,
+        ))
+    }
+
+    async fn verify_external_id(&self, link: &SynapseExternalId) -> Result<Check, TargetError> {
+        Ok(check(
+            self.external_ids
+                .lock()
+                .unwrap()
+                .get(&(link.provider.clone(), link.external_id.clone())),
+            &link.user_id,
+        ))
+    }
+
+    async fn verify_to_device(
+        &self,
+        message: &SynapseToDeviceMessage,
+    ) -> Result<Check, TargetError> {
+        let queue = self.to_device.lock().unwrap();
+        Ok(
+            if queue.iter().any(|m| {
+                m.user_id == message.user_id
+                    && m.device_id == message.device_id
+                    && m.sender == message.sender
+                    && m.event_type == message.event_type
+                    && m.content == message.content
+            }) {
+                Check::Same
+            } else {
+                Check::Missing
+            },
+        )
+    }
+
+    async fn verify_registration_token(
+        &self,
+        token: &SynapseRegistrationToken,
+    ) -> Result<Check, TargetError> {
+        Ok(check(
+            self.registration_tokens.lock().unwrap().get(&token.token),
+            token,
+        ))
     }
 
     async fn verify_device_keys(&self, keys: &SynapseDeviceKeys) -> Result<Check, TargetError> {
@@ -1033,7 +1176,61 @@ async fn a_copy_is_verified_and_cut_over_and_nothing_can_follow_it() {
     assert_eq!(copied(&record, Stream::Media), 2);
     let remote = record.stream(Stream::RemoteMedia).unwrap();
     assert_eq!((remote.copied, remote.skipped), (1, 1), "{remote:?}");
+    // The identity streams: the unspent refresh tokens (bob's exchanged one is left out), the
+    // email and the phone number, the external identity, and two registration tokens; the two
+    // to-device messages waiting for alice's phone, and not the one for a device nobody has.
+    let refresh = record.stream(Stream::RefreshTokens).unwrap();
+    assert_eq!((refresh.copied, refresh.skipped), (2, 1), "{refresh:?}");
+    assert_eq!(copied(&record, Stream::Threepids), 2);
+    assert_eq!(copied(&record, Stream::ExternalIds), 1);
+    let to_device = record.stream(Stream::ToDevice).unwrap();
+    assert_eq!(
+        (to_device.copied, to_device.skipped),
+        (2, 1),
+        "{to_device:?}"
+    );
+    assert_eq!(copied(&record, Stream::RegistrationTokens), 2);
     assert!(record.streams.iter().all(|s| s.done && s.failed == 0));
+    assert!(
+        rig.target.users.lock().unwrap()["@dave:fixture.test"].erased,
+        "dave was erased in Synapse"
+    );
+    assert!(
+        !rig.target.users.lock().unwrap()["@alice:fixture.test"].erased,
+        "alice was not"
+    );
+    assert_eq!(
+        rig.target
+            .refresh_tokens
+            .lock()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        [
+            facts["alice_refresh_token"].as_str().unwrap(),
+            facts["bob_refresh_token"].as_str().unwrap()
+        ]
+        .into_iter()
+        .collect()
+    );
+    assert_eq!(
+        rig.target.threepids.lock().unwrap()
+            [&("email".to_owned(), "alice@fixture.test".to_owned())],
+        "@alice:fixture.test"
+    );
+    assert_eq!(
+        rig.target.external_ids.lock().unwrap()[&(
+            "oidc-fixture".to_owned(),
+            "alice-at-the-provider".to_owned()
+        )],
+        "@alice:fixture.test"
+    );
+    assert_eq!(rig.target.to_device.lock().unwrap().len(), 2);
+    assert_eq!(
+        rig.target.registration_tokens.lock().unwrap()["fixture-token-one"].completed,
+        2
+    );
     assert_eq!(
         rig.target
             .remote_media

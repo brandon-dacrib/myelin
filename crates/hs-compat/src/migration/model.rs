@@ -16,6 +16,15 @@ pub enum Stream {
     Devices,
     /// Access tokens (`access_tokens`), so that signed-in clients stay signed in.
     AccessTokens,
+    /// Refresh tokens (`refresh_tokens`), so that a client whose access token expires after the
+    /// cutover exchanges its refresh token here instead of being signed out.
+    RefreshTokens,
+    /// Third-party identifiers bound to accounts (`user_threepids`): the email addresses and
+    /// phone numbers people sign in with and are found by.
+    Threepids,
+    /// Links from an upstream identity provider's subject to an account (`user_external_ids`),
+    /// so a person signing in through the same provider lands in the same account.
+    ExternalIds,
     /// Global and per-room account data, and room tags (`account_data`, `room_account_data`,
     /// `room_tags`).
     AccountData,
@@ -29,12 +38,19 @@ pub enum Stream {
     /// Server-side key backups: each version and the room keys in it (`e2e_room_keys_versions`,
     /// `e2e_room_keys`). One row per version.
     KeyBackups,
+    /// To-device messages a device has not yet received (`device_inbox`): room keys sent to a
+    /// device that was offline, key requests, verification requests. After the devices and
+    /// their keys.
+    ToDevice,
     /// Each account's push rules (`push_rules`, `push_rules_enable`). One row per account.
     PushRules,
     /// Pushers (`pushers`).
     Pushers,
     /// Sync filters, under the ids Synapse gave them (`user_filters`).
     Filters,
+    /// Registration tokens (`registration_tokens`): the ones handed out but not yet used still
+    /// open the door here.
+    RegistrationTokens,
     /// Rooms: every event of each room, its aliases and its directory listing (`rooms`,
     /// `events`, `event_json`, `redactions`, `room_aliases`).
     Rooms,
@@ -52,17 +68,22 @@ pub enum Stream {
 
 impl Stream {
     /// Every stream, in copy order.
-    pub const ALL: [Stream; 14] = [
+    pub const ALL: [Stream; 19] = [
         Stream::Users,
         Stream::Devices,
         Stream::AccessTokens,
+        Stream::RefreshTokens,
+        Stream::Threepids,
+        Stream::ExternalIds,
         Stream::AccountData,
         Stream::E2eKeys,
         Stream::CrossSigning,
         Stream::KeyBackups,
+        Stream::ToDevice,
         Stream::PushRules,
         Stream::Pushers,
         Stream::Filters,
+        Stream::RegistrationTokens,
         Stream::Rooms,
         Stream::Receipts,
         Stream::Media,
@@ -76,13 +97,18 @@ impl Stream {
             Stream::Users => "users",
             Stream::Devices => "devices",
             Stream::AccessTokens => "access_tokens",
+            Stream::RefreshTokens => "refresh_tokens",
+            Stream::Threepids => "threepids",
+            Stream::ExternalIds => "external_ids",
             Stream::AccountData => "account_data",
             Stream::E2eKeys => "e2e_keys",
             Stream::CrossSigning => "cross_signing",
             Stream::KeyBackups => "key_backups",
+            Stream::ToDevice => "to_device",
             Stream::PushRules => "push_rules",
             Stream::Pushers => "pushers",
             Stream::Filters => "filters",
+            Stream::RegistrationTokens => "registration_tokens",
             Stream::Rooms => "rooms",
             Stream::Receipts => "receipts",
             Stream::Media => "media",
@@ -125,6 +151,10 @@ pub struct SynapseUser {
     pub displayname: Option<String>,
     /// The profile's avatar (`mxc://`).
     pub avatar_url: Option<String>,
+    /// Erased (`erased_users`): the person asked for their data to be forgotten. Copied as
+    /// erased here, so that nothing of theirs is served again.
+    #[serde(default)]
+    pub erased: bool,
 }
 
 /// A Synapse device (`devices`).
@@ -173,6 +203,108 @@ impl std::fmt::Debug for SynapseAccessToken {
             .field("puppets_user_id", &self.puppets_user_id)
             .finish()
     }
+}
+
+/// A Synapse refresh token (`refresh_tokens`), with the access token it was minted beside
+/// (`access_tokens.refresh_token_id`).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SynapseRefreshToken {
+    /// Synapse's row id, which only grows: the stream's checkpoint.
+    pub id: i64,
+    /// Whose token it is.
+    pub user_id: String,
+    /// The device it belongs to.
+    pub device_id: String,
+    /// The token itself. Never logged.
+    pub token: String,
+    /// The access token minted beside it, if Synapse still has it. Never logged. A refresh
+    /// token whose access token is gone has been exchanged or revoked, and is not copied.
+    pub access_token: Option<String>,
+    /// Set once Synapse exchanged this token for the next one: it is spent, and not copied.
+    pub next_token_id: Option<i64>,
+    /// When this token stops working, in milliseconds; `None` for never.
+    pub expiry_ms: Option<u64>,
+    /// When the whole session it extends stops working, in milliseconds; `None` for never.
+    pub ultimate_session_expiry_ms: Option<u64>,
+}
+
+impl std::fmt::Debug for SynapseRefreshToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SynapseRefreshToken")
+            .field("id", &self.id)
+            .field("user_id", &self.user_id)
+            .field("device_id", &self.device_id)
+            .field("token", &"<redacted>")
+            .field(
+                "access_token",
+                &self.access_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("next_token_id", &self.next_token_id)
+            .field("expiry_ms", &self.expiry_ms)
+            .field(
+                "ultimate_session_expiry_ms",
+                &self.ultimate_session_expiry_ms,
+            )
+            .finish()
+    }
+}
+
+/// A third-party identifier bound to an account (`user_threepids`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SynapseThreepid {
+    /// The account.
+    pub user_id: String,
+    /// `email` or `msisdn`.
+    pub medium: String,
+    /// The address, as Synapse stored it (an email address lower-cased).
+    pub address: String,
+    /// When it was validated, in milliseconds.
+    pub validated_at_ms: u64,
+    /// When it was bound, in milliseconds.
+    pub added_at_ms: u64,
+}
+
+/// A link from an upstream identity provider's subject to an account (`user_external_ids`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SynapseExternalId {
+    /// The account.
+    pub user_id: String,
+    /// The provider, as Synapse's `idp_id` names it (`oidc-google`, `saml`, ...).
+    pub provider: String,
+    /// The subject at that provider.
+    pub external_id: String,
+}
+
+/// A to-device message a device has not received yet (`device_inbox`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SynapseToDeviceMessage {
+    /// Synapse's stream position: the checkpoint.
+    pub stream_id: i64,
+    /// The recipient.
+    pub user_id: String,
+    /// The recipient's device.
+    pub device_id: String,
+    /// Who sent it.
+    pub sender: String,
+    /// The event type (`m.room_key_request`, `m.room.encrypted`, ...).
+    pub event_type: String,
+    /// The content, as it is.
+    pub content: Value,
+}
+
+/// A registration token (`registration_tokens`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SynapseRegistrationToken {
+    /// The token: the stream's checkpoint.
+    pub token: String,
+    /// How many registrations it admits in all; `None` for no limit.
+    pub uses_allowed: Option<u64>,
+    /// Registrations under way with it when Synapse was read.
+    pub pending: u64,
+    /// Registrations completed with it.
+    pub completed: u64,
+    /// When it stops working, in milliseconds; `None` for never.
+    pub expiry_ms: Option<i64>,
 }
 
 /// One piece of account data: global when `room_id` is `None`. Room tags arrive as one `m.tag`

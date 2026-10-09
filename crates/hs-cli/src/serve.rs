@@ -2345,6 +2345,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             e2e: e2e_state.store.clone(),
             rulesets: push_state.rulesets.clone(),
             pushers: push_state.pushers.clone(),
+            registration_tokens: auth_state.registration_tokens.clone(),
         },
         tasks: migration_tasks,
         events: admin.events.clone(),

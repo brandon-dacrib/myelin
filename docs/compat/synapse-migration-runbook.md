@@ -49,11 +49,13 @@ curl -X PATCH -H "authorization: Bearer $ADMIN" -H 'content-type: application/js
 `{"source_secret_ref": "/migration/synapse"}`). The start connects to Synapse and checks the
 server name before anything is copied; an unreachable database or a wrong name is refused with a
 `400` saying so. The copy then runs as a task (`migration.copy`, on the Tasks page too), in this
-order: accounts (with password hashes, flags and profiles), devices, access tokens, account data
-and room tags, end-to-end keys (`e2e_keys`, one row per device), cross-signing keys
-(`cross_signing`, per account), key backups (`key_backups`, per version), push rules
-(`push_rules`, per account), pushers, filters, rooms, receipts, media, other servers' media
-(`remote_media`). The page shows each stream's rows copied, not copied on purpose, failed, and
+order: accounts (with password hashes, flags, profiles and erasures), devices, access tokens,
+refresh tokens (`refresh_tokens`), third-party identifiers (`threepids`), external identities
+(`external_ids`), account data and room tags, end-to-end keys (`e2e_keys`, one row per device),
+cross-signing keys (`cross_signing`, per account), key backups (`key_backups`, per version),
+to-device messages still waiting (`to_device`), push rules (`push_rules`, per account), pushers,
+filters, registration tokens (`registration_tokens`), rooms, receipts, media, other servers'
+media (`remote_media`). The page shows each stream's rows copied, not copied on purpose, failed, and
 the rate, and an estimate of the time left.
 
 A room is copied a page of `batch_size` events at a time, so a room of any size is copied in
@@ -77,9 +79,12 @@ When everything has been copied once the status is `ready_for_cutover`.
 "Verify" (`POST /api/v1/migration/verify`, `202` and a task) counts every stream in Synapse and
 looks each row up here, then compares field by field: every account's sample (password hash,
 display name, avatar, administrator, deactivation), each device's name, the account and device
-every access token signs in, each piece of account data, each device's identity keys, one-time
+every access token signs in, each piece of account data, each unspent refresh token (the same account, device and expiries, unspent here), each email
+address, phone number and upstream identity (bound to the same account), each device's identity keys, one-time
 key counts and unused fallback keys, each account's cross-signing keys, each backup version and
-how many room keys it holds, each account's push rules, each pusher, filter and receipt, every
+how many room keys it holds, each to-device message still waiting (in the same device's queue),
+each account's push rules, each pusher, filter and receipt, each registration token's limits
+and use count, every
 room's events (from its join, for a room joined over federation) and its current state against
 Synapse's `current_state_events`, media files byte for byte (a sample), and other servers'
 media whose file Synapse still had (each here, a sample byte for byte; an entry whose file is
@@ -112,9 +117,14 @@ servers must never answer for the same name at once.
 
 | Synapse | Here |
 |---|---|
-| `users`, `profiles` | accounts: bcrypt password hash, administrator, guest, deactivated, locked, shadow-banned, creation time, appservice, display name and avatar |
+| `users`, `profiles`, `erased_users` | accounts: bcrypt password hash, administrator, guest, deactivated, locked, shadow-banned, creation time, appservice, display name and avatar; an erased account arrives erased |
 | `devices` (not hidden ones) | devices, with their names and last-seen |
 | `access_tokens` (not an administrator's "login as" tokens) | sessions: the same token strings sign in the same account and device |
+| `refresh_tokens` (unspent ones) | refresh tokens, beside their access tokens: a client whose access token expires after the cutover exchanges its refresh token here (`/refresh`) and is not signed out. One Synapse already exchanged is left out: it would be refused there too |
+| `user_threepids` | email addresses and phone numbers: people sign in by them and see them under `/account/3pid`; an address already bound to another account here is a row error |
+| `user_external_ids` | identities at upstream providers (OIDC, SAML, CAS): a sign-in through the same provider (`auth.oidc_providers[].idp_id` matching Synapse's `idp_id`) lands in the same account |
+| `device_inbox` | to-device messages a device had not yet received -- room keys sent to an offline phone, key and verification requests -- queued for the same device, so its first `/sync` here carries them; one for a device that is not here is left out |
+| `registration_tokens` | registration tokens with the same limits and use counts: one handed out before the migration still opens this closed server |
 | `account_data`, `room_account_data`, `room_tags` | global and per-room account data; tags as `m.tag` |
 | `e2e_device_keys_json`, `e2e_one_time_keys_json`, `e2e_fallback_keys_json` | each copied device's identity keys (with the cross-signing signatures on them), its unclaimed one-time keys in the order they are handed out, and its fallback key: other people's clients find the same keys in `/keys/query` and `/keys/claim`, and nobody has to verify anybody again |
 | `e2e_cross_signing_keys`, `e2e_cross_signing_signatures` | each account's master, self-signing and user-signing keys, with the signatures on them (a verified device, a verified person) |
@@ -142,10 +152,23 @@ servers must never answer for the same name at once.
   (the row outlived the file, or the media store is not mounted) is left out and logged, and
   fetched again from its server when somebody asks, as a cache miss would have been in Synapse.
 - **Presence**: by design. It is how people are right now, and starts again as they come back.
-- **Receipts in threads** (other than the main timeline) are left out and logged: this server
-  keeps one receipt per person and type in a room. **Pushers turned off** in Synapse are left
-  out. **Push rules of kinds this server does not have** (MSC4306 `postcontent`), and changes to
-  server-default rules the specification has retired, are logged and left out.
+- **Unread counts and notification badges** are not carried: nothing imported counts as a
+  notification, so every room shows as read until the next message after cutover; the receipts
+  that decide what is read from then on are copied.
+- **Server-notice rooms**: Synapse's are copied as the rooms they are (with their `m.server_notice`
+  tag), so their history stays, but this server sends its notices from its own notices user, and
+  the first notice to a person after cutover opens a new "Server Notices" room beside the old.
+- **Bridges' positions** (`application_services_state`, `application_services_txns`): Synapse's
+  stream ids name nothing here. A bridge starts reading this server's streams from where it is
+  registered, as it does after any restart of its homeserver.
+- **Dehydrated devices** (`dehydrated_devices`): this server has none yet (MSC3814); a client that
+  kept one makes it again.
+- **A registration under way** (`registration_tokens.pending`): the token's limits and completed
+  count come over; a sign-up that had presented the token on Synapse starts again here.
+- **Pushers turned off** in Synapse are left out. **Push rules of kinds this server does not have**
+  (MSC4306 `postcontent`), and changes to server-default rules the specification has retired, are
+  logged and left out. **A refresh token Synapse already exchanged** is left out: it would be
+  refused there too.
 - **A backed-up room key deleted in Synapse after an earlier pass** stays here (cutover's final
   pass adds and updates keys, it does not delete them); the backup is still the user's own.
 - **Rejected events and outliers** are left out of each room's history, as Synapse held them

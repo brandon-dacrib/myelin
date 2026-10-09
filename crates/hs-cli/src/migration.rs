@@ -29,18 +29,33 @@
 //! - Receipts: `hs-user`'s receipt store through `SessionHub::import_receipt` (in `/sync`, and
 //!   on the receipt stream appservices read), not sent to other servers again.
 //! - Media: `hs-media`'s object store and metadata, under the same media id.
+//! - Refresh tokens: `hs-auth`'s token store, by their SHA-256 beside the access token Synapse
+//!   minted with them (whose record then names its refresh token, as a login here does), so
+//!   `/refresh` exchanges them. Third-party identifiers and external identities: `hs-auth`'s
+//!   identity store, as an administrator's binding would make them. An erased account is
+//!   erased here (`AuthStore::erase_user`).
+//! - To-device messages still waiting: `hs-e2e`'s to-device queue, through `send_to_device`
+//!   (so the device's next `/sync` carries them, and the to-device stream appservices read
+//!   does too); one already in the queue is recognized by sender, type and content.
+//! - Registration tokens: `hs-auth`'s registration token store, with their use counts.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use hs_auth::store::{AccessTokenRecord, AuthStore, DeviceRecord, UserRecord};
+use hs_auth::registration_tokens::{RegistrationTokenRecord, RegistrationTokenStore};
+use hs_auth::store::{
+    AccessTokenRecord, AuthStore, DeviceRecord, ExternalIdRecord, RefreshTokenRecord,
+    ThreepidRecord, UserRecord,
+};
 use hs_auth::token::TokenHash;
 use hs_compat::migration::model::{
     LogEntry, MigrationRecord, Phase, Stream, SynapseAccessToken, SynapseAccountData,
     SynapseBackupVersion, SynapseCrossSigning, SynapseDevice, SynapseDeviceKeys, SynapseEvent,
-    SynapseFilter, SynapseMedia, SynapsePushRules, SynapsePusher, SynapseReceipt,
-    SynapseRemoteJoin, SynapseRemoteMedia, SynapseRoom, SynapseRoomKey, SynapseUser,
+    SynapseExternalId, SynapseFilter, SynapseMedia, SynapsePushRules, SynapsePusher,
+    SynapseReceipt, SynapseRefreshToken, SynapseRegistrationToken, SynapseRemoteJoin,
+    SynapseRemoteMedia, SynapseRoom, SynapseRoomKey, SynapseThreepid, SynapseToDeviceMessage,
+    SynapseUser,
 };
 use hs_compat::migration::{
     Check, CurrentState, Imported, MigrationError, MigrationObserver, MigrationStore,
@@ -77,6 +92,44 @@ pub type Hub<B> = SessionHub<B, Arc<RoomRegistry<B>>>;
 /// A running server's push rules, cached as `hs-push` reads them.
 pub type Rulesets<B> = Arc<CachedRulesetStore<TablesRulesetStore<B>>>;
 
+/// How many queued to-device messages of one device the importer reads back to recognize one
+/// it already copied. A device's queue is what it has not synced; a queue longer than this is
+/// a device that is gone, and a message past it would be queued twice on a second pass.
+const TO_DEVICE_QUEUE_SCAN: usize = 10_000;
+
+fn now_ms() -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+/// Synapse's registration token as this server's record: the same limits and completed count,
+/// made now (Synapse keeps no creation time), with nothing pending (a registration under way on
+/// Synapse at cutover starts again here).
+fn registration_token_record(token: &SynapseRegistrationToken) -> RegistrationTokenRecord {
+    RegistrationTokenRecord {
+        token: token.token.clone(),
+        uses_allowed: token.uses_allowed,
+        completed: token.completed,
+        expires_at_ms: token.expiry_ms,
+        created_at_ms: i64::try_from(now_ms()).unwrap_or(i64::MAX),
+        pending: BTreeMap::new(),
+    }
+}
+
+/// Whether two registration token records admit the same registrations (the creation time
+/// and the sessions under way are each server's own).
+fn same_registration_token(a: &RegistrationTokenRecord, b: &RegistrationTokenRecord) -> bool {
+    a.token == b.token
+        && a.uses_allowed == b.uses_allowed
+        && a.completed == b.completed
+        && a.expires_at_ms == b.expires_at_ms
+}
+
 fn row(e: impl std::fmt::Display) -> TargetError {
     TargetError::row(e.to_string())
 }
@@ -95,16 +148,19 @@ pub struct StoreTarget<B: KvBackend> {
     e2e: Arc<dyn E2eStore>,
     rulesets: Rulesets<B>,
     pushers: Arc<dyn PusherStore>,
+    registration_tokens: Arc<dyn RegistrationTokenStore>,
 }
 
 /// The stores a [`StoreTarget`] writes, beyond accounts, rooms and media.
 pub struct SessionStores<B: KvBackend> {
-    /// End-to-end keys, cross-signing keys and key backups.
+    /// End-to-end keys, cross-signing keys, key backups and the to-device queue.
     pub e2e: Arc<dyn E2eStore>,
     /// Push rules.
     pub rulesets: Rulesets<B>,
     /// Pushers.
     pub pushers: Arc<dyn PusherStore>,
+    /// Registration tokens.
+    pub registration_tokens: Arc<dyn RegistrationTokenStore>,
 }
 
 impl<B: KvBackend + 'static> StoreTarget<B> {
@@ -127,7 +183,32 @@ impl<B: KvBackend + 'static> StoreTarget<B> {
             e2e: sessions.e2e,
             rulesets: sessions.rulesets,
             pushers: sessions.pushers,
+            registration_tokens: sessions.registration_tokens,
         }
+    }
+
+    /// The stream id of a message equal to `message` (same sender, type and content) waiting
+    /// in `device`'s queue, if one is.
+    async fn waiting_to_device(
+        &self,
+        user: &ruma::UserId,
+        device: &ruma::DeviceId,
+        message: &SynapseToDeviceMessage,
+    ) -> Result<Option<u64>, TargetError> {
+        // A device's queue is what it has not synced yet: small, and read whole.
+        let (queued, _) = self
+            .e2e
+            .poll_since(user, device, 0, TO_DEVICE_QUEUE_SCAN)
+            .await
+            .map_err(fatal)?;
+        Ok(queued
+            .iter()
+            .find(|m| {
+                m.sender.as_str() == message.sender
+                    && m.event_type == message.event_type
+                    && m.content == message.content
+            })
+            .map(|m| m.stream_id))
     }
 
     /// `raw` as a user id of this server whose account was copied: `Err(Skipped)` with why not.
@@ -319,6 +400,9 @@ impl<B: KvBackend + 'static> MigrationTarget for StoreTarget<B> {
             record.display_name.clone_from(&user.displayname);
             record.avatar_url.clone_from(&user.avatar_url);
             record.appservice_id.clone_from(&user.appservice_id);
+            if user.erased {
+                record.erase_in_place(now_ms());
+            }
             return match self.auth.create_user(record).await {
                 Ok(()) => Ok(Imported::Created),
                 Err(hs_auth::store::StoreError::Conflict(_)) => Err(row(
@@ -365,6 +449,11 @@ impl<B: KvBackend + 'static> MigrationTarget for StoreTarget<B> {
                 .set_profile_avatar_url(&id, user.avatar_url.clone())
                 .await
                 .map_err(fatal)?;
+            changed = true;
+        }
+        if user.erased && !existing.erased {
+            // Erasure is permanent here as in Synapse: once Synapse has it, so does this.
+            self.auth.erase_user(&id, now_ms()).await.map_err(fatal)?;
             changed = true;
         }
         Ok(if changed {
@@ -430,6 +519,192 @@ impl<B: KvBackend + 'static> MigrationTarget for StoreTarget<B> {
             .await
             .map_err(fatal)?;
         Ok(Imported::Created)
+    }
+
+    async fn import_refresh_token(
+        &self,
+        token: &SynapseRefreshToken,
+    ) -> Result<Imported, TargetError> {
+        let id = match self.local_account(&token.user_id).await? {
+            Ok(id) => id,
+            Err(skipped) => return Ok(skipped),
+        };
+        let device_id: ruma::OwnedDeviceId = token.device_id.as_str().into();
+        let hash = TokenHash::of(&token.token);
+        let Some(access_token) = &token.access_token else {
+            return Ok(Imported::Skipped("its access token is gone".to_owned()));
+        };
+        let access_hash = TokenHash::of(access_token);
+        let Some(mut access) = self
+            .auth
+            .get_access_token(&access_hash)
+            .await
+            .map_err(fatal)?
+        else {
+            return Ok(Imported::Skipped(
+                "its access token was not copied".to_owned(),
+            ));
+        };
+        if access.user_id != id {
+            return Err(row("its access token signs in another account here"));
+        }
+        if let Some(existing) = self.auth.get_refresh_token(&hash).await.map_err(fatal)? {
+            return if existing.user_id == id && existing.device_id == device_id {
+                Ok(Imported::AlreadyThere)
+            } else {
+                Err(row(
+                    "the same refresh token belongs to another session here",
+                ))
+            };
+        }
+        self.auth
+            .put_refresh_token(RefreshTokenRecord {
+                hash,
+                user_id: id,
+                device_id,
+                access_token_hash: access_hash,
+                used: false,
+                replaced_by: None,
+                expires_at_ms: token.expiry_ms,
+                ultimate_session_expiry_ms: token.ultimate_session_expiry_ms,
+            })
+            .await
+            .map_err(fatal)?;
+        // The access token names its refresh token, as a login here leaves them, so that a
+        // sign-out of one ends the other.
+        if access.refresh_token_hash.as_ref() != Some(&hash) {
+            access.refresh_token_hash = Some(hash);
+            self.auth.put_access_token(access).await.map_err(fatal)?;
+        }
+        Ok(Imported::Created)
+    }
+
+    async fn import_threepid(&self, threepid: &SynapseThreepid) -> Result<Imported, TargetError> {
+        let id = match self.local_account(&threepid.user_id).await? {
+            Ok(id) => id,
+            Err(skipped) => return Ok(skipped),
+        };
+        let address = if threepid.medium == "email" {
+            threepid.address.to_ascii_lowercase()
+        } else {
+            threepid.address.clone()
+        };
+        let here = self.auth.list_threepids(&id).await.map_err(fatal)?;
+        if here
+            .iter()
+            .any(|t| t.medium == threepid.medium && t.address == address)
+        {
+            return Ok(Imported::AlreadyThere);
+        }
+        self.auth
+            .add_threepid(ThreepidRecord {
+                user_id: id,
+                medium: threepid.medium.clone(),
+                address,
+                added_at_ms: threepid.added_at_ms,
+                validated_at_ms: threepid.validated_at_ms,
+            })
+            .await
+            .map_err(|e| match e {
+                hs_auth::store::StoreError::Conflict(why) => {
+                    row(format!("bound to another account here: {why}"))
+                }
+                e => fatal(e),
+            })?;
+        Ok(Imported::Created)
+    }
+
+    async fn import_external_id(&self, link: &SynapseExternalId) -> Result<Imported, TargetError> {
+        let id = match self.local_account(&link.user_id).await? {
+            Ok(id) => id,
+            Err(skipped) => return Ok(skipped),
+        };
+        let here = self.auth.list_external_ids(&id).await.map_err(fatal)?;
+        if here
+            .iter()
+            .any(|x| x.provider == link.provider && x.external_id == link.external_id)
+        {
+            return Ok(Imported::AlreadyThere);
+        }
+        self.auth
+            .add_external_id(ExternalIdRecord {
+                user_id: id,
+                provider: link.provider.clone(),
+                external_id: link.external_id.clone(),
+                added_at_ms: now_ms(),
+            })
+            .await
+            .map_err(|e| match e {
+                hs_auth::store::StoreError::Conflict(why) => {
+                    row(format!("linked to another account here: {why}"))
+                }
+                e => fatal(e),
+            })?;
+        Ok(Imported::Created)
+    }
+
+    async fn import_to_device(
+        &self,
+        message: &SynapseToDeviceMessage,
+    ) -> Result<Imported, TargetError> {
+        let id = match self.local_account(&message.user_id).await? {
+            Ok(id) => id,
+            Err(skipped) => return Ok(skipped),
+        };
+        let Ok(sender) = ruma::OwnedUserId::try_from(message.sender.as_str()) else {
+            return Err(row(format!("{:?} is not a user id", message.sender)));
+        };
+        let device_id: ruma::OwnedDeviceId = message.device_id.as_str().into();
+        if self
+            .waiting_to_device(&id, &device_id, message)
+            .await?
+            .is_some()
+        {
+            return Ok(Imported::AlreadyThere);
+        }
+        self.e2e
+            .send_to_device(
+                &sender,
+                &id,
+                &device_id,
+                &message.event_type,
+                message.content.clone(),
+            )
+            .await
+            .map_err(fatal)?;
+        Ok(Imported::Created)
+    }
+
+    async fn import_registration_token(
+        &self,
+        token: &SynapseRegistrationToken,
+    ) -> Result<Imported, TargetError> {
+        let record = registration_token_record(token);
+        let existing = self
+            .registration_tokens
+            .get(&token.token)
+            .await
+            .map_err(fatal)?;
+        if let Some(existing) = &existing {
+            if same_registration_token(existing, &record) {
+                return Ok(Imported::AlreadyThere);
+            }
+            // The limits and the use count can only be set at creation (the use count is the
+            // store's own to move), so a changed token is made again.
+            self.registration_tokens
+                .delete(&token.token)
+                .await
+                .map_err(fatal)?;
+        }
+        self.registration_tokens
+            .create(record)
+            .await
+            .map_err(fatal)?;
+        Ok(if existing.is_some() {
+            Imported::Updated
+        } else {
+            Imported::Created
+        })
     }
 
     async fn import_account_data(
@@ -1188,6 +1463,7 @@ impl<B: KvBackend + 'static> MigrationTarget for StoreTarget<B> {
                 avatar_url: u.avatar_url,
                 admin: u.is_admin,
                 deactivated: u.deactivated,
+                erased: u.erased,
             }))
     }
 
@@ -1495,6 +1771,108 @@ impl<B: KvBackend + 'static> MigrationTarget for StoreTarget<B> {
         } else {
             Check::Differs("the rules differ".to_owned())
         })
+    }
+
+    async fn verify_refresh_token(
+        &self,
+        token: &SynapseRefreshToken,
+    ) -> Result<Check, TargetError> {
+        let id = user_id(&token.user_id)?;
+        let Some(here) = self
+            .auth
+            .get_refresh_token(&TokenHash::of(&token.token))
+            .await
+            .map_err(fatal)?
+        else {
+            return Ok(Check::Missing);
+        };
+        Ok(
+            if here.user_id != id || here.device_id.as_str() != token.device_id {
+                Check::Differs("it belongs to another session here".to_owned())
+            } else if here.used {
+                Check::Differs("already exchanged here".to_owned())
+            } else if here.expires_at_ms != token.expiry_ms
+                || here.ultimate_session_expiry_ms != token.ultimate_session_expiry_ms
+            {
+                Check::Differs("its expiry differs".to_owned())
+            } else {
+                Check::Same
+            },
+        )
+    }
+
+    async fn verify_threepid(&self, threepid: &SynapseThreepid) -> Result<Check, TargetError> {
+        let id = user_id(&threepid.user_id)?;
+        let address = if threepid.medium == "email" {
+            threepid.address.to_ascii_lowercase()
+        } else {
+            threepid.address.clone()
+        };
+        let here = self.auth.list_threepids(&id).await.map_err(fatal)?;
+        Ok(
+            if here
+                .iter()
+                .any(|t| t.medium == threepid.medium && t.address == address)
+            {
+                Check::Same
+            } else {
+                Check::Missing
+            },
+        )
+    }
+
+    async fn verify_external_id(&self, link: &SynapseExternalId) -> Result<Check, TargetError> {
+        let id = user_id(&link.user_id)?;
+        let here = self.auth.list_external_ids(&id).await.map_err(fatal)?;
+        Ok(
+            if here
+                .iter()
+                .any(|x| x.provider == link.provider && x.external_id == link.external_id)
+            {
+                Check::Same
+            } else {
+                Check::Missing
+            },
+        )
+    }
+
+    async fn verify_to_device(
+        &self,
+        message: &SynapseToDeviceMessage,
+    ) -> Result<Check, TargetError> {
+        let id = user_id(&message.user_id)?;
+        let device_id: ruma::OwnedDeviceId = message.device_id.as_str().into();
+        Ok(
+            if self
+                .waiting_to_device(&id, &device_id, message)
+                .await?
+                .is_some()
+            {
+                Check::Same
+            } else {
+                Check::Missing
+            },
+        )
+    }
+
+    async fn verify_registration_token(
+        &self,
+        token: &SynapseRegistrationToken,
+    ) -> Result<Check, TargetError> {
+        Ok(
+            match self
+                .registration_tokens
+                .get(&token.token)
+                .await
+                .map_err(fatal)?
+            {
+                None => Check::Missing,
+                Some(here) if same_registration_token(&here, &registration_token_record(token)) => {
+                    Check::Same
+                }
+                Some(_) => Check::Differs("its limits or use count differ".to_owned()),
+            },
+        )
     }
 
     async fn verify_pusher(&self, pusher: &SynapsePusher) -> Result<Check, TargetError> {

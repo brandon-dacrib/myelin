@@ -44,6 +44,21 @@ would have refused the first (it checks that a thread receipt's event is in the 
 importer does not check, and the row's shape is Synapse's. `populate.py` does not make them:
 a regeneration drops them unless it gains a thread and the two receipts.
 
+Added by hand on 2026-10-09 (no Synapse was run; the shapes are Synapse's schema 72 and the
+`59/14refresh_tokens` delta): `access_tokens.refresh_token_id`; `refresh_tokens` (alice's phone
+holds an unspent one beside access token 6; bob's laptop exchanged token 2 for token 3, which
+access token 7 was minted with, with an expiry and an ultimate session expiry); `user_threepids`
+(alice's email, bob's phone number); `user_external_ids` (alice at `oidc-fixture`);
+`erased_users` (dave); `device_inbox` (two messages waiting for alice's phone, a room-key request
+and an Olm-encrypted one from bob, and one for a device of carol's that does not exist);
+`registration_tokens` (one with uses left, one with no limit and an expiry). `facts.json` names
+the tokens, the addresses and the external id. `populate.py` does not make them: a regeneration
+drops them unless it gains them (a real Synapse writes the same rows for a login with
+`refresh_token: true`, an admin `PUT /_synapse/admin/v2/users/<id>` with `threepids` and
+`external_ids`, a deactivation with `erase`, a `/sendToDevice` to a device that has not synced,
+and `POST /_synapse/admin/v1/registration_tokens/new`; `crates/hs-cli/tests/migration_rehearsal.rs`
+does exactly that against a real Synapse).
+
 Used by `crates/hs-compat/tests/migration.rs` (the engine, against an in-memory target) and
 `crates/hs-cli/tests/migration.rs` (the real `hs` binary, through the admin API), which load
 `schema.sql` and `data.sql` into a fresh PostgreSQL database each.

@@ -40,7 +40,52 @@ CREATE TABLE access_tokens (
     device_id text,
     token text NOT NULL,
     valid_until_ms bigint,
-    puppets_user_id text
+    puppets_user_id text,
+    refresh_token_id bigint
+);
+
+CREATE TABLE refresh_tokens (
+    id bigint PRIMARY KEY,
+    user_id text NOT NULL,
+    device_id text NOT NULL,
+    token text NOT NULL,
+    next_token_id bigint,
+    expiry_ts bigint,
+    ultimate_session_expiry_ts bigint
+);
+
+CREATE TABLE user_threepids (
+    user_id text NOT NULL,
+    medium text NOT NULL,
+    address text NOT NULL,
+    validated_at bigint NOT NULL,
+    added_at bigint NOT NULL
+);
+
+CREATE TABLE user_external_ids (
+    auth_provider text NOT NULL,
+    external_id text NOT NULL,
+    user_id text NOT NULL
+);
+
+CREATE TABLE erased_users (
+    user_id text NOT NULL
+);
+
+CREATE TABLE device_inbox (
+    user_id text NOT NULL,
+    device_id text NOT NULL,
+    stream_id bigint NOT NULL,
+    message_json text NOT NULL,
+    instance_name text
+);
+
+CREATE TABLE registration_tokens (
+    token text NOT NULL,
+    uses_allowed integer,
+    pending integer NOT NULL,
+    completed integer NOT NULL,
+    expiry_time bigint
 );
 
 CREATE TABLE account_data (

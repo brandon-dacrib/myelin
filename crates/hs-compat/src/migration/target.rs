@@ -15,9 +15,10 @@ use serde_json::Value;
 
 use super::model::{
     SynapseAccessToken, SynapseAccountData, SynapseBackupVersion, SynapseCrossSigning,
-    SynapseDevice, SynapseDeviceKeys, SynapseEvent, SynapseFilter, SynapseMedia, SynapsePushRules,
-    SynapsePusher, SynapseReceipt, SynapseRemoteJoin, SynapseRemoteMedia, SynapseRoom,
-    SynapseRoomKey, SynapseUser,
+    SynapseDevice, SynapseDeviceKeys, SynapseEvent, SynapseExternalId, SynapseFilter, SynapseMedia,
+    SynapsePushRules, SynapsePusher, SynapseReceipt, SynapseRefreshToken, SynapseRegistrationToken,
+    SynapseRemoteJoin, SynapseRemoteMedia, SynapseRoom, SynapseRoomKey, SynapseThreepid,
+    SynapseToDeviceMessage, SynapseUser,
 };
 
 /// What importing one row did.
@@ -119,6 +120,8 @@ pub struct TargetUser {
     pub admin: bool,
     /// Deactivated.
     pub deactivated: bool,
+    /// Erased here.
+    pub erased: bool,
 }
 
 /// A room's current state: `(type, state_key) -> event_id`.
@@ -149,6 +152,32 @@ pub trait MigrationTarget: Send + Sync + 'static {
         token: &SynapseAccessToken,
     ) -> Result<Imported, TargetError>;
     /// Imports one piece of account data.
+    /// A refresh token, beside the access token Synapse minted with it (already copied), so
+    /// that the client exchanges it here when its access token expires.
+    async fn import_refresh_token(
+        &self,
+        token: &SynapseRefreshToken,
+    ) -> Result<Imported, TargetError>;
+
+    /// A third-party identifier bound to an account.
+    async fn import_threepid(&self, threepid: &SynapseThreepid) -> Result<Imported, TargetError>;
+
+    /// An upstream identity provider's subject linked to an account.
+    async fn import_external_id(&self, link: &SynapseExternalId) -> Result<Imported, TargetError>;
+
+    /// A to-device message the recipient's device has not received yet, queued for it here. A
+    /// message already in the device's queue (same sender, type and content) is recognized.
+    async fn import_to_device(
+        &self,
+        message: &SynapseToDeviceMessage,
+    ) -> Result<Imported, TargetError>;
+
+    /// A registration token, with what it still admits.
+    async fn import_registration_token(
+        &self,
+        token: &SynapseRegistrationToken,
+    ) -> Result<Imported, TargetError>;
+
     async fn import_account_data(&self, data: &SynapseAccountData)
     -> Result<Imported, TargetError>;
     /// Imports one device's end-to-end keys: its identity keys, and its one-time and fallback
@@ -256,6 +285,28 @@ pub trait MigrationTarget: Send + Sync + 'static {
     ) -> Result<Option<TargetMedia>, TargetError>;
     /// Whether one device's end-to-end keys are here as in Synapse (identity keys the same,
     /// as many one-time keys of each algorithm, the fallback keys there).
+    /// Whether this refresh token signs in the same account and device here, unspent.
+    async fn verify_refresh_token(&self, token: &SynapseRefreshToken)
+    -> Result<Check, TargetError>;
+
+    /// Whether this third-party identifier is bound to the same account here.
+    async fn verify_threepid(&self, threepid: &SynapseThreepid) -> Result<Check, TargetError>;
+
+    /// Whether this external identity is linked to the same account here.
+    async fn verify_external_id(&self, link: &SynapseExternalId) -> Result<Check, TargetError>;
+
+    /// Whether this to-device message waits in the device's queue here.
+    async fn verify_to_device(
+        &self,
+        message: &SynapseToDeviceMessage,
+    ) -> Result<Check, TargetError>;
+
+    /// Whether this registration token is here with the same limits and use count.
+    async fn verify_registration_token(
+        &self,
+        token: &SynapseRegistrationToken,
+    ) -> Result<Check, TargetError>;
+
     async fn verify_device_keys(&self, keys: &SynapseDeviceKeys) -> Result<Check, TargetError>;
     /// Whether one account's cross-signing keys are here as in Synapse.
     async fn verify_cross_signing(&self, keys: &SynapseCrossSigning) -> Result<Check, TargetError>;

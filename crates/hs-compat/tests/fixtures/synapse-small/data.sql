@@ -183,3 +183,21 @@ INSERT INTO user_filters (user_id, full_user_id, filter_id, filter_json) VALUES 
 INSERT INTO remote_media_cache (media_origin, media_id, media_type, created_ts, upload_name, media_length, filesystem_id, last_access_ts, quarantined_by, authenticated, sha256) VALUES ('other.test', 'RemoteCachedPictureOne', 'image/png', 1790833120000, 'blue.png', 72, 'RemoteCachedPictureOne', 1790833130000, NULL, false, NULL);
 INSERT INTO remote_media_cache (media_origin, media_id, media_type, created_ts, upload_name, media_length, filesystem_id, last_access_ts, quarantined_by, authenticated, sha256) VALUES ('other.test', 'RemoteMissingFileTwo', 'image/jpeg', 1790833121000, 'gone.jpg', 4096, 'RemoteMissingFileTwo', NULL, NULL, false, NULL);
 INSERT INTO remote_media_cache_thumbnails (media_origin, media_id, thumbnail_width, thumbnail_height, thumbnail_method, thumbnail_type, thumbnail_length, filesystem_id) VALUES ('other.test', 'RemoteCachedPictureOne', 32, 32, 'crop', 'image/png', 70, 'RemoteCachedPictureOne');
+-- Added by hand on 2026-10-09 (no Synapse was run; the shapes are Synapse's schema, see the README):
+-- refresh tokens (alice's phone has one unspent, bob's laptop exchanged one for the next),
+-- third-party identifiers, an external identity, dave erased, two to-device messages waiting for
+-- alice's phone and one for a device that does not exist, and two registration tokens.
+UPDATE access_tokens SET refresh_token_id = 1 WHERE id = 6;
+UPDATE access_tokens SET refresh_token_id = 3 WHERE id = 7;
+INSERT INTO refresh_tokens (id, user_id, device_id, token, next_token_id, expiry_ts, ultimate_session_expiry_ts) VALUES (1, '@alice:fixture.test', 'ALICEPHONE', 'syr_YWxpY2U_AlicePhoneRefreshOne_0aBcDe', NULL, NULL, NULL);
+INSERT INTO refresh_tokens (id, user_id, device_id, token, next_token_id, expiry_ts, ultimate_session_expiry_ts) VALUES (2, '@bob:fixture.test', 'BOBLAPTOP', 'syr_Ym9i_BobLaptopRefreshSpent_1fGhIj', 3, NULL, NULL);
+INSERT INTO refresh_tokens (id, user_id, device_id, token, next_token_id, expiry_ts, ultimate_session_expiry_ts) VALUES (3, '@bob:fixture.test', 'BOBLAPTOP', 'syr_Ym9i_BobLaptopRefreshTwo_2kLmNo', NULL, 4102444800000, 4133980800000);
+INSERT INTO user_threepids (user_id, medium, address, validated_at, added_at) VALUES ('@alice:fixture.test', 'email', 'alice@fixture.test', 1790833100000, 1790833100000);
+INSERT INTO user_threepids (user_id, medium, address, validated_at, added_at) VALUES ('@bob:fixture.test', 'msisdn', '441234567890', 1790833101000, 1790833101000);
+INSERT INTO user_external_ids (auth_provider, external_id, user_id) VALUES ('oidc-fixture', 'alice-at-the-provider', '@alice:fixture.test');
+INSERT INTO erased_users (user_id) VALUES ('@dave:fixture.test');
+INSERT INTO device_inbox (user_id, device_id, stream_id, message_json, instance_name) VALUES ('@alice:fixture.test', 'ALICEPHONE', 1, '{"content":{"action":"request","body":{"algorithm":"m.megolm.v1.aes-sha2","room_id":"!uNhvnjDrEOeHakWJfZ:fixture.test","sender_key":"bobcurve25519key","session_id":"fixturesession1"},"request_id":"req1","requesting_device_id":"BOBLAPTOP"},"sender":"@bob:fixture.test","type":"m.room_key_request"}', 'master');
+INSERT INTO device_inbox (user_id, device_id, stream_id, message_json, instance_name) VALUES ('@alice:fixture.test', 'ALICEPHONE', 2, '{"content":{"algorithm":"m.olm.v1.curve25519-aes-sha2","ciphertext":{"alicecurve25519key":{"body":"AwogFixtureOlmCiphertext","type":0}},"sender_key":"bobcurve25519key"},"sender":"@bob:fixture.test","type":"m.room.encrypted"}', 'master');
+INSERT INTO device_inbox (user_id, device_id, stream_id, message_json, instance_name) VALUES ('@carol:fixture.test', 'NOSUCHDEVICE', 3, '{"content":{"ping":1},"sender":"@bob:fixture.test","type":"fixture.test.ping"}', 'master');
+INSERT INTO registration_tokens (token, uses_allowed, pending, completed, expiry_time) VALUES ('fixture-token-one', 5, 0, 2, NULL);
+INSERT INTO registration_tokens (token, uses_allowed, pending, completed, expiry_time) VALUES ('fixture-token-two', NULL, 1, 0, 4102444800000);

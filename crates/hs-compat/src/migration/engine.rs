@@ -24,8 +24,8 @@ use super::model::{
 };
 use super::rooms::{RoomFailure, SynapseRoomPages, copy_room};
 use super::source::{
-    SynapseSource, account_data_key, device_key, device_pair_key, pair_key, parse_account_data_key,
-    parse_device_key, parse_pair_key,
+    SynapseSource, account_data_key, device_key, device_pair_key, external_id_key, pair_key,
+    parse_account_data_key, parse_device_key, parse_pair_key, parse_triple_key, threepid_key,
 };
 use super::store::MigrationStore;
 use super::target::{Check, Imported, MigrationTarget, TargetError};
@@ -760,6 +760,64 @@ impl Migrator {
                     }
                 }
             }
+            Stream::RefreshTokens => {
+                let after = after.and_then(|a| a.parse::<i64>().ok());
+                for token in source.refresh_tokens(after, limit).await? {
+                    if ctx.is_cancelled() {
+                        break;
+                    }
+                    let key = format!("refresh token {} of {}", token.id, token.user_id);
+                    let outcome = if token.next_token_id.is_some() {
+                        Ok(Imported::Skipped(
+                            "already exchanged for a newer one in Synapse".to_owned(),
+                        ))
+                    } else if token.access_token.is_none() {
+                        Ok(Imported::Skipped(
+                            "its access token is gone: revoked, or a client signed out".to_owned(),
+                        ))
+                    } else {
+                        self.target.import_refresh_token(&token).await
+                    };
+                    batch.tally(stream, &key, outcome);
+                    batch.next = Some(token.id.to_string());
+                    if batch.fatal.is_some() {
+                        break;
+                    }
+                }
+            }
+            Stream::Threepids => {
+                let after = after.and_then(parse_triple_key);
+                for threepid in source.threepids(after.as_ref(), limit).await? {
+                    if ctx.is_cancelled() {
+                        break;
+                    }
+                    let key = format!(
+                        "{}'s {} {}",
+                        threepid.user_id, threepid.medium, threepid.address
+                    );
+                    let outcome = self.target.import_threepid(&threepid).await;
+                    batch.tally(stream, &key, outcome);
+                    batch.next = Some(threepid_key(&threepid));
+                    if batch.fatal.is_some() {
+                        break;
+                    }
+                }
+            }
+            Stream::ExternalIds => {
+                let after = after.and_then(parse_triple_key);
+                for link in source.external_ids(after.as_ref(), limit).await? {
+                    if ctx.is_cancelled() {
+                        break;
+                    }
+                    let key = format!("{}'s identity at {}", link.user_id, link.provider);
+                    let outcome = self.target.import_external_id(&link).await;
+                    batch.tally(stream, &key, outcome);
+                    batch.next = Some(external_id_key(&link));
+                    if batch.fatal.is_some() {
+                        break;
+                    }
+                }
+            }
             Stream::AccountData => {
                 let after = after.and_then(parse_account_data_key);
                 for (data, key) in source.account_data(after.as_ref(), limit).await? {
@@ -875,6 +933,36 @@ impl Migrator {
                     }
                 }
             }
+            Stream::ToDevice => {
+                let after = after.and_then(|a| a.parse::<i64>().ok());
+                for message in source.to_device_messages(after, limit).await? {
+                    if ctx.is_cancelled() {
+                        break;
+                    }
+                    let key = format!(
+                        "a {} message from {} waiting for {}'s device {}",
+                        message.event_type, message.sender, message.user_id, message.device_id
+                    );
+                    // A message for a device that is not here (Synapse's row outlived the
+                    // device, or the device was hidden) has nobody to wait for.
+                    let device_here = self
+                        .target
+                        .device(&message.user_id, &message.device_id)
+                        .await
+                        .map_err(|e| MigrationError::Target(e.message))?
+                        .is_some();
+                    let outcome = if device_here {
+                        self.target.import_to_device(&message).await
+                    } else {
+                        Ok(Imported::Skipped("its device was not copied".to_owned()))
+                    };
+                    batch.tally(stream, &key, outcome);
+                    batch.next = Some(message.stream_id.to_string());
+                    if batch.fatal.is_some() {
+                        break;
+                    }
+                }
+            }
             Stream::PushRules => {
                 for rules in source.push_rules(after, limit).await? {
                     if ctx.is_cancelled() {
@@ -954,6 +1042,20 @@ impl Migrator {
                     };
                     batch.tally(stream, &key, outcome);
                     batch.next = Some(receipt.stream_id.to_string());
+                    if batch.fatal.is_some() {
+                        break;
+                    }
+                }
+            }
+            Stream::RegistrationTokens => {
+                for token in source.registration_tokens(after, limit).await? {
+                    if ctx.is_cancelled() {
+                        break;
+                    }
+                    let key = format!("registration token {}", token.token);
+                    let outcome = self.target.import_registration_token(&token).await;
+                    batch.tally(stream, &key, outcome);
+                    batch.next = Some(token.token.clone());
                     if batch.fatal.is_some() {
                         break;
                     }
@@ -1292,13 +1394,16 @@ impl Migrator {
             };
             users.sampled += 1;
             let mut differs = Vec::new();
-            if theirs.password_hash != ours.password_hash {
+            // An erased account has no password, name or avatar here, by design, whatever
+            // Synapse's rows still hold of them: only the erasure itself is compared.
+            let erased = theirs.erased && ours.erased;
+            if !erased && theirs.password_hash != ours.password_hash {
                 differs.push("password hash");
             }
-            if theirs.displayname != ours.displayname {
+            if !erased && theirs.displayname != ours.displayname {
                 differs.push("display name");
             }
-            if theirs.avatar_url != ours.avatar_url {
+            if !erased && theirs.avatar_url != ours.avatar_url {
                 differs.push("avatar");
             }
             if theirs.admin != ours.admin {
@@ -1306,6 +1411,9 @@ impl Migrator {
             }
             if theirs.deactivated != ours.deactivated {
                 differs.push("deactivation");
+            }
+            if theirs.erased != ours.erased {
+                differs.push("erasure");
             }
             if !differs.is_empty() {
                 users.mismatch(format!("{user_id}: {} differ", differs.join(", ")));
@@ -1405,6 +1513,74 @@ impl Migrator {
             Some("access tokens checked"),
         )
         .await;
+
+        // Refresh tokens: each unspent one must sign in the same account and device here.
+        let mut refresh = StreamVerification::new(Stream::RefreshTokens.as_str());
+        let mut after: Option<i64> = None;
+        loop {
+            let page = source.refresh_tokens(after, 500).await?;
+            let Some(last) = page.last() else { break };
+            after = Some(last.id);
+            for token in &page {
+                if token.next_token_id.is_some() || token.access_token.is_none() {
+                    refresh.skipped_count += 1;
+                    continue;
+                }
+                let check = self
+                    .target
+                    .verify_refresh_token(token)
+                    .await
+                    .map_err(target_err)?;
+                refresh.checked(
+                    &format!("refresh token {} of {}", token.id, token.user_id),
+                    check,
+                );
+            }
+        }
+        streams.push(refresh);
+
+        // Third-party identifiers and external identities: each bound to the same account.
+        let mut threepids = StreamVerification::new(Stream::Threepids.as_str());
+        let mut after: Option<[String; 3]> = None;
+        loop {
+            let page = source.threepids(after.as_ref(), 500).await?;
+            let Some(last) = page.last() else { break };
+            after = parse_triple_key(&threepid_key(last));
+            for threepid in &page {
+                let check = self
+                    .target
+                    .verify_threepid(threepid)
+                    .await
+                    .map_err(target_err)?;
+                threepids.checked(
+                    &format!(
+                        "{}'s {} {}",
+                        threepid.user_id, threepid.medium, threepid.address
+                    ),
+                    check,
+                );
+            }
+        }
+        streams.push(threepids);
+        let mut external = StreamVerification::new(Stream::ExternalIds.as_str());
+        let mut after: Option<[String; 3]> = None;
+        loop {
+            let page = source.external_ids(after.as_ref(), 500).await?;
+            let Some(last) = page.last() else { break };
+            after = parse_triple_key(&external_id_key(last));
+            for link in &page {
+                let check = self
+                    .target
+                    .verify_external_id(link)
+                    .await
+                    .map_err(target_err)?;
+                external.checked(
+                    &format!("{}'s identity at {}", link.user_id, link.provider),
+                    check,
+                );
+            }
+        }
+        streams.push(external);
 
         // Account data: each must be here with the same content.
         let mut account = StreamVerification::new(Stream::AccountData.as_str());
@@ -1590,6 +1766,55 @@ impl Migrator {
             }
         }
         streams.push(filters);
+        // To-device messages still waiting, and registration tokens.
+        let mut to_device = StreamVerification::new(Stream::ToDevice.as_str());
+        let mut after: Option<i64> = None;
+        loop {
+            let page = source.to_device_messages(after, 500).await?;
+            let Some(last) = page.last() else { break };
+            after = Some(last.stream_id);
+            for message in &page {
+                if self
+                    .target
+                    .device(&message.user_id, &message.device_id)
+                    .await
+                    .map_err(target_err)?
+                    .is_none()
+                {
+                    to_device.skipped_count += 1;
+                    continue;
+                }
+                let check = self
+                    .target
+                    .verify_to_device(message)
+                    .await
+                    .map_err(target_err)?;
+                to_device.checked(
+                    &format!(
+                        "a {} message from {} for {}'s device {}",
+                        message.event_type, message.sender, message.user_id, message.device_id
+                    ),
+                    check,
+                );
+            }
+        }
+        streams.push(to_device);
+        let mut registration = StreamVerification::new(Stream::RegistrationTokens.as_str());
+        let mut after: Option<String> = None;
+        loop {
+            let page = source.registration_tokens(after.as_deref(), 500).await?;
+            let Some(last) = page.last() else { break };
+            after = Some(last.token.clone());
+            for token in &page {
+                let check = self
+                    .target
+                    .verify_registration_token(token)
+                    .await
+                    .map_err(target_err)?;
+                registration.checked(&format!("registration token {}", token.token), check);
+            }
+        }
+        streams.push(registration);
         ctx.progress(
             6,
             Some(steps),
