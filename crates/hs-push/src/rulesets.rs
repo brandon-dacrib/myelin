@@ -18,11 +18,12 @@
 pub mod memory;
 pub mod tables;
 
-use std::sync::{Arc, OnceLock};
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock, PoisonError};
 use std::time::Duration;
 
 use crate::ruleset::Ruleset;
-use ruma::UserId;
+use ruma::{OwnedUserId, UserId};
 
 use crate::compiled::RuleCache;
 use crate::error::StoreError;
@@ -124,6 +125,84 @@ pub trait RulesetChangeFeed: Send + Sync {
     fn changed(&self, user_id: &UserId, seq: u64);
 }
 
+/// One write lock per user with a write under way, so a user's rule writes are made one at a
+/// time without any user waiting on another's. A user's lock exists only while a write holds
+/// or waits for it: the last guard out removes it.
+#[derive(Default)]
+pub struct UserWriteLocks {
+    locks: std::sync::Mutex<HashMap<OwnedUserId, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl UserWriteLocks {
+    /// Waits for `user_id`'s turn to write.
+    pub async fn lock(&self, user_id: &UserId) -> UserWriteGuard<'_> {
+        let lock = self
+            .locks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(user_id.to_owned())
+            .or_default()
+            .clone();
+        // `lock` goes into the guard: once the guard is dropped, only the map and any waiter
+        // hold the user's lock.
+        let guard = lock.lock_owned().await;
+        UserWriteGuard {
+            guard: Some(guard),
+            locks: self,
+            user_id: user_id.to_owned(),
+        }
+    }
+
+    /// Drops `user_id`'s lock once nothing holds or waits for it.
+    fn release(&self, user_id: &UserId) {
+        let mut locks = self.locks.lock().unwrap_or_else(PoisonError::into_inner);
+        if locks
+            .get(user_id)
+            .is_some_and(|lock| Arc::strong_count(lock) == 1)
+        {
+            locks.remove(user_id);
+        }
+    }
+
+    /// How many users have a write under way or waiting (tests).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.locks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    /// No user has a write under way.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl std::fmt::Debug for UserWriteLocks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserWriteLocks")
+            .field("users", &self.len())
+            .finish()
+    }
+}
+
+/// One user's turn to write, from [`UserWriteLocks::lock`]; the turn ends when it is dropped.
+pub struct UserWriteGuard<'a> {
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    locks: &'a UserWriteLocks,
+    user_id: OwnedUserId,
+}
+
+impl Drop for UserWriteGuard<'_> {
+    fn drop(&mut self) {
+        // The mutex first (its `Arc` goes with the guard), then the map entry if nobody waits.
+        self.guard.take();
+        self.locks.release(&self.user_id);
+    }
+}
+
 /// A [`RulesetStore`] fronted by a [`RuleCache`]: the seam `crate::compiled`'s module docs
 /// describe. Every read goes through the cache first; every write invalidates the cache entry it
 /// just changed, and tells the other replicas when there are any ([`RulesetChangeFeed`]).
@@ -133,14 +212,16 @@ pub trait RulesetChangeFeed: Send + Sync {
 /// upgraded room while the user edits another) must not both start from the same read: the
 /// second write would drop the first one's rule. [`CachedRulesetStore::update_ruleset`] makes
 /// each change under one lock, reading the store rather than the cache, and
-/// [`CachedRulesetStore::set_ruleset`] takes the same lock. Writes are rare (a person editing
-/// their notification settings), so one lock for every user is plenty. The lock covers one
-/// process; between replicas the write itself is conditional on the change-seq the edit
-/// started from ([`RulesetStore::set_ruleset_if`]), and an edit that lost starts over.
+/// [`CachedRulesetStore::set_ruleset`] takes the same lock. The lock is per user
+/// ([`UserWriteLocks`]): one user's slow write never holds up another's, which matters when
+/// every member of a big room joins its upgraded replacement at once and each join copies
+/// that member's rules. The lock covers one process; between replicas the write itself is
+/// conditional on the change-seq the edit started from ([`RulesetStore::set_ruleset_if`]),
+/// and an edit that lost starts over.
 pub struct CachedRulesetStore<S: RulesetStore> {
     inner: S,
     cache: Arc<RuleCache>,
-    writes: tokio::sync::Mutex<()>,
+    writes: UserWriteLocks,
     /// Told of every write, in a cluster.
     feed: OnceLock<Arc<dyn RulesetChangeFeed>>,
     /// How long an entry is used on the evaluation path before its seq is checked against
@@ -154,7 +235,7 @@ impl<S: RulesetStore> CachedRulesetStore<S> {
         Self {
             inner,
             cache: Arc::new(RuleCache::new()),
-            writes: tokio::sync::Mutex::new(()),
+            writes: UserWriteLocks::default(),
             feed: OnceLock::new(),
             revalidate_after: OnceLock::new(),
         }
@@ -288,7 +369,7 @@ impl<S: RulesetStore> CachedRulesetStore<S> {
         user_id: &UserId,
         ruleset: &Ruleset,
     ) -> Result<u64, StoreError> {
-        let _write = self.writes.lock().await;
+        let _write = self.writes.lock(user_id).await;
         let seq = self.inner.set_ruleset(user_id, ruleset).await?;
         self.written(user_id, seq);
         Ok(seq)
@@ -322,7 +403,7 @@ impl<S: RulesetStore> CachedRulesetStore<S> {
     where
         E: From<StoreError>,
     {
-        let _write = self.writes.lock().await;
+        let _write = self.writes.lock(user_id).await;
         for attempt in 1..=UPDATE_ATTEMPTS {
             // The seq first: a write between the two reads makes the conditional write below
             // fail, and the edit runs again on what that write left.
@@ -482,6 +563,97 @@ mod tests {
         async fn changed_seq(&self, user_id: &UserId) -> Result<u64, StoreError> {
             self.0.changed_seq(user_id).await
         }
+    }
+
+    /// A store whose reads of one user wait until told to go on: a slow write for that user.
+    struct HeldUser {
+        inner: InMemoryRulesetStore,
+        held: ruma::OwnedUserId,
+        go: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl RulesetStore for HeldUser {
+        async fn get_ruleset(&self, user_id: &UserId) -> Result<Option<Ruleset>, StoreError> {
+            if user_id == self.held {
+                self.go.notified().await;
+            }
+            self.inner.get_ruleset(user_id).await
+        }
+        async fn set_ruleset(
+            &self,
+            user_id: &UserId,
+            ruleset: &Ruleset,
+        ) -> Result<u64, StoreError> {
+            self.inner.set_ruleset(user_id, ruleset).await
+        }
+        async fn set_ruleset_if(
+            &self,
+            user_id: &UserId,
+            ruleset: &Ruleset,
+            expected: u64,
+        ) -> Result<Option<u64>, StoreError> {
+            self.inner.set_ruleset_if(user_id, ruleset, expected).await
+        }
+        async fn changed_seq(&self, user_id: &UserId) -> Result<u64, StoreError> {
+            self.inner.changed_seq(user_id).await
+        }
+    }
+
+    /// The write lock is per user: bob's edit lands while alice's is stuck in the store, and a
+    /// user's lock exists only while a write of theirs is under way.
+    #[tokio::test]
+    async fn one_users_slow_write_does_not_hold_up_anothers() {
+        let alice = user_id!("@alice:example.org");
+        let bob = user_id!("@bob:example.org");
+        let go = Arc::new(tokio::sync::Notify::new());
+        let store = Arc::new(CachedRulesetStore::new(HeldUser {
+            inner: InMemoryRulesetStore::new(),
+            held: alice.to_owned(),
+            go: go.clone(),
+        }));
+        let alices = tokio::spawn({
+            let store = store.clone();
+            async move {
+                store
+                    .update_ruleset::<_, StoreError>(alice, |ruleset| {
+                        ruleset
+                            .insert(room_rule("!a:example.org"), None, None)
+                            .unwrap();
+                        Ok(Some(()))
+                    })
+                    .await
+                    .unwrap()
+            }
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(store.writes.len(), 1, "alice's write holds her lock");
+
+        let bobs = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            store.update_ruleset::<_, StoreError>(bob, |ruleset| {
+                ruleset
+                    .insert(room_rule("!b:example.org"), None, None)
+                    .unwrap();
+                Ok(Some(()))
+            }),
+        )
+        .await
+        .expect("bob's write must not wait for alice's")
+        .unwrap();
+        assert!(bobs.is_some());
+        assert_eq!(store.writes.len(), 1, "bob's lock went with his write");
+
+        go.notify_one();
+        assert!(alices.await.unwrap().is_some());
+        assert!(store.writes.is_empty(), "alice's lock went with hers");
+        // Read beneath `HeldUser`, which would wait for alice again.
+        let plain = &store.inner.inner;
+        assert_eq!(
+            plain.get_ruleset(alice).await.unwrap().unwrap().room.len(),
+            1
+        );
+        assert_eq!(plain.get_ruleset(bob).await.unwrap().unwrap().room.len(), 1);
     }
 
     /// A store that another replica writes to, once, right after this one's first read of the

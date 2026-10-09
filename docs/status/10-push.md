@@ -1,5 +1,73 @@
 # 10 Push: status
 
+## 2026-10-09 (branch `agent/push-leftovers`): the wave-2 leftovers checked off, a room stays in its email while a dropped line is unread, the rule-write lock is per user
+
+The three leftovers `docs/next-steps.md` names for track 10 were all on `main` already, and each
+was re-verified on this tree:
+
+- **MSC4306's `postcontent` push-rule kind**: done 2026-10-05 (`ruleset.rs`, `engine.rs`,
+  `routes/tests.rs`' `postcontent_is_a_kind_with_no_rules_and_none_a_client_may_add`).
+  Complement `TestThreadedReceipts` and `TestThreadReceiptsInSyncMSC4102`: PASS on `main`'s
+  csapi run 18 (status 14, session 11); not re-run on this branch (see Verified).
+- **Push rules copied on a room upgrade**: done by `room-render` in `hs-user`'s join hook
+  (`SessionHub::copy_room_push_rules`, `crates/hs-user/src/hub.rs`; Synapse's
+  `copy_push_rules_from_room_to_room_for_user`), through `hs-push`'s `update_ruleset`. It had no
+  test of its own: new real-binary test
+  `push_rules_about_the_old_room_follow_its_members_into_the_replacement`
+  (`crates/hs-cli/tests/room_upgrade.rs`): alice's room rule is there for the replacement the
+  moment `/upgrade` answers; bob's disabled override rule named after the old room, with a
+  `room_id` condition on it, is copied renamed, rewritten and still disabled when he joins; the
+  old rules stay; his next `/sync` carries both. Nothing in `hs-room` or `hs-user` was touched.
+  Complement `TestPushRuleRoomUpgrade`: 4/4 on `main` after `sync-wakes` (status 05); not re-run
+  on this branch (see Verified).
+- **A HELO fallback for the pusher's mailer**: done 2026-10-05 (`crates/hs-push/src/email/helo.rs`;
+  `a_relay_that_refuses_ehlo_gets_the_email_over_helo`).
+
+### Done
+
+- **A room stays in its held email while a line the per-room limit dropped is unread**
+  (`crates/hs-push/src/email/{held,mod}.rs`). A held email shows a room's last 10 lines; before,
+  an older line was simply dropped, so a receipt that read every line still shown took the room
+  out of the email (and the email with it, if it was the only room) even when the dropped line,
+  on another scope, was never read. `HeldRoom::unshown` now records, per scope (main timeline or
+  thread), the newest dropped position (`UnshownLine`; serde-defaulted, so rows an older build
+  stored restore); `HeldRoom::{push_line, take_read, is_empty}` keep it. A receipt takes out
+  what it covers of both, and a room leaves the email only when nothing shown or dropped is
+  left. A room with no line left but something dropped is emailed with its count from the
+  counts store and no lines. Logged at debug when that happens.
+- **The push-rule write lock is per user** (`crates/hs-push/src/rulesets.rs`,
+  `UserWriteLocks`/`UserWriteGuard`): `CachedRulesetStore::{set_ruleset, update_ruleset}` take
+  the user's lock, not one for every user, so a user's slow write (a store waiting on
+  PostgreSQL) holds up nobody else's. A user's lock exists only while a write of theirs holds
+  or waits for it: the last guard out removes the entry. The cross-replica conditional write is
+  unchanged.
+
+### Verified
+
+- `cargo test -p hs-push`: 101 passed (new:
+  `a_receipt_reading_every_shown_line_keeps_a_room_whose_dropped_line_is_unread`,
+  `one_users_slow_write_does_not_hold_up_anothers`); `cargo fmt --all`.
+- **Not verified before the session was cut off** (the machine was under a merge gate, load
+  28): `cargo clippy -p hs-push --all-targets -- -D warnings` was running; `cargo clippy -p
+  hs-cli --all-targets` and the new real-binary test `cargo test -p hs-cli --test room_upgrade
+  push_rules_about` had not run; the Complement image `complement-hs-reimplement:push-leftovers`
+  was mid-rebuild and the three Complement tests were not run through `tests/complement/lock.sh`
+  on this branch. Whoever picks this up: run those four, in that order.
+
+### Left
+
+- Thread subscriptions themselves (MSC4306: the subscription endpoints, the sync extension and
+  the two `postcontent` rules). More than a day, and it needs the sync routes, which another
+  track is in now.
+- `synapse-small`'s `populate.py` does not make the threaded receipts (status 13).
+
+### Interfaces changed
+
+- `hs_push::email::held::HeldRoom` has a field `unshown: Vec<UnshownLine>` (serde default);
+  `HeldRoom::{push_line, take_read, is_empty}` and `UnshownLine` are new.
+- `hs_push::rulesets::{UserWriteLocks, UserWriteGuard}` are new; the store's public calls are
+  unchanged.
+
 ## 2026-10-08 (branch `agent/push-receipts`): everything a receipt reads follows its thread; push rules across replicas
 
 ### Done
