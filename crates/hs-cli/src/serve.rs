@@ -106,6 +106,15 @@ pub enum ServeError {
         #[source]
         source: std::io::Error,
     },
+    /// A listener's `tls:` material could not be used.
+    #[error("listener {addr} declares TLS it cannot serve: {source}")]
+    ListenerTls {
+        /// The address.
+        addr: String,
+        /// What was wrong with the certificate or key.
+        #[source]
+        source: crate::tls_listener::TlsListenerError,
+    },
     /// A configured listener address could not be bound.
     #[error("failed to bind listener {addr}: {source}")]
     Bind {
@@ -1222,6 +1231,13 @@ type ReleaseLongPolls =
 /// listeners' own drain afterwards. A no-op in single-node mode regardless (`SingleNode::drain`
 /// returns immediately, per its own doc comment).
 const CLUSTER_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// A bound listener, as `axum::serve` takes it: plaintext, or TLS terminated by this process
+/// (`crate::tls_listener`).
+enum Bound {
+    Plain(TcpListener),
+    Tls(crate::tls_listener::TlsListener),
+}
 
 impl ServeHandle {
     /// Records how long this process took to boot, measured by the caller from wherever its
@@ -2496,14 +2512,33 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
                 addr: addr_str.clone(),
                 source,
             })?;
-            if listener_cfg.tls.is_some() {
-                tracing::warn!(
-                    listener = %addr_str,
-                    "listener declares TLS but hs serve does not terminate TLS yet; \
-                     serving plaintext. Terminate TLS at a reverse proxy in front of this listener."
-                );
-            }
-            listeners.push((tcp, actual_addr, listener_cfg.x_forwarded));
+            // A listener with `tls:` is served as HTTPS by this process (`crate::tls_listener`);
+            // the material is read now, so a bad path or key stops the start with its name.
+            let bound =
+                match &listener_cfg.tls {
+                    Some(tls) => {
+                        let config =
+                            crate::tls_listener::load_server_config(tls).map_err(|source| {
+                                ServeError::ListenerTls {
+                                    addr: addr_str.clone(),
+                                    source,
+                                }
+                            })?;
+                        tracing::info!(
+                            listener = %addr_str,
+                            certificate = %tls.certificate_path.display(),
+                            "listener serves TLS itself"
+                        );
+                        let tls_listener = crate::tls_listener::TlsListener::new(tcp, config)
+                            .map_err(|source| ServeError::Bind {
+                                addr: addr_str.clone(),
+                                source,
+                            })?;
+                        Bound::Tls(tls_listener)
+                    }
+                    None => Bound::Plain(tcp),
+                };
+            listeners.push((bound, actual_addr, listener_cfg.x_forwarded));
         }
     }
 
@@ -2511,7 +2546,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let mut tasks = tokio::task::JoinSet::new();
-    for (tcp, addr, x_forwarded) in listeners {
+    for (bound, addr, x_forwarded) in listeners {
         // A listener behind a proxy (`x_forwarded`) has its `X-Forwarded-For` believed when a
         // per-address rate limit asks who the client is (`hs_http::buckets::ClientIp`).
         let app = if x_forwarded {
@@ -2521,12 +2556,22 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             app.clone()
         };
         let mut shutdown_rx = shutdown_rx.clone();
+        let shutdown = async move {
+            let _ = shutdown_rx.changed().await;
+        };
         tasks.spawn(async move {
-            let result = axum::serve(tcp, app.into_make_service_with_connect_info::<SocketAddr>())
-                .with_graceful_shutdown(async move {
-                    let _ = shutdown_rx.changed().await;
-                })
-                .await;
+            let result = match bound {
+                Bound::Plain(tcp) => {
+                    axum::serve(tcp, app.into_make_service_with_connect_info::<SocketAddr>())
+                        .with_graceful_shutdown(shutdown)
+                        .await
+                }
+                Bound::Tls(tls) => {
+                    axum::serve(tls, crate::tls_listener::WithConnectInfo::new(app))
+                        .with_graceful_shutdown(shutdown)
+                        .await
+                }
+            };
             if let Err(e) = result {
                 tracing::error!(listener = %addr, error = %e, "listener task exited with an error");
             }

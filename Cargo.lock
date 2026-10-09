@@ -2355,6 +2355,7 @@ dependencies = [
  "rpassword",
  "ruma 0.15.1",
  "rustls",
+ "rustls-pemfile",
  "rustls-pki-types",
  "schemars 1.2.2",
  "serde",

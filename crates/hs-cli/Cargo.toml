@@ -45,7 +45,7 @@ clap = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 http = { workspace = true }
-tower = { workspace = true }
+tower = { workspace = true, features = ["util"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml_ng = { workspace = true }
@@ -64,6 +64,12 @@ reqwest = { workspace = true }
 ruma = { workspace = true }
 # `hs admin-token create --expires-in`: an instant as RFC 3339 (`src/admin_tokens.rs`).
 time = { workspace = true }
+# A listener with `tls:` is served as HTTPS by the server itself (`src/tls_listener.rs`): the
+# PEM chain and key are read with `rustls-pemfile`, the handshake runs on `tokio-rustls`.
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+rustls-pemfile = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
@@ -76,12 +82,6 @@ postgres = { workspace = true }
 # The fake federation peer `tests/federation_sender.rs` sends real transactions to; the same
 # double `hs-federation`'s own client and sender tests use.
 hs-testkit = { path = "../hs-testkit" }
-# `tests/federation_restart.rs`: two real `hs serve` processes federate over TLS, which the
-# binary does not terminate itself, so the test terminates it -- `rcgen` mints a private CA and a
-# leaf certificate for 127.0.0.1, `rustls`/`tokio-rustls`/`rustls-pki-types` run a
-# TLS-terminating proxy in front of each process's plaintext listener. All four are already
-# `[workspace.dependencies]` entries used elsewhere in the workspace.
+# `tests/federation_restart.rs` and `tests/tls_listener.rs`: `rcgen` mints a private CA and
+# leaf certificates for 127.0.0.1 (the TLS crates above serve the proxy and the listener).
 rcgen = { workspace = true }
-rustls = { workspace = true }
-tokio-rustls = { workspace = true }
-rustls-pki-types = { workspace = true }
