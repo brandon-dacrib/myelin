@@ -1,5 +1,153 @@
 # 06 Federation: status
 
+## 2026-10-09 (branch `agent/federation-95`): the suites re-measured today, the leave-then-rejoin race closed, what is left named
+
+README.md rated Federation at ~60% on numbers from 2026-10-01/02 (Sytest's federation group
+78 of 105, Complement's federation package 50 of 90) that had been overtaken by waves 1-3
+(status 14 session 11: 103 of 105 and 88 of 90 on 2026-10-05) and never carried back into the
+table. This session re-measured both suites on an image of today's `main`, fixed the one race
+the interop run had left, and recorded the evidence for every test still failing. Crates:
+`hs-federation` (the sender's delivery barrier), `hs-cli` (the forwarder's position, the hook,
+the wiring, one real-binary test), `tests/federation-synapse/run.sh` (a two-replica mode).
+No OpenAPI change, no decision or RFC number taken (no interface another track consumes changed:
+`OutboundFederation::start` keeps its signature, `start_with_position` is added beside it).
+
+**Measured today, before any change of this branch** (images `complement-hs-reimplement:federation-95`
+and `myelin-sytest:federation-95` of `main` at `00fe0c01`, the merge gate running beside them):
+
+| Suite | README said (2026-10-01/02) | Today | Left, by name |
+|---|---|---|---|
+| Sytest, federation group | 78 / 105 | **103 / 105** (98%) | "Can invite unbound 3pid over federation with users from both servers" (a race in the test), "If a device list update goes missing, the server resyncs on the next one" (a race in the test; track 08) |
+| Sytest, per file | auth 16/20, send_join 8/9, invites 9/10, state 7/10, backfill 3/5, get_missing_events 2/3, federation API 9/14, device keys 4/9, query API 1/5, public rooms 0/1 | auth **19/20**, send_join **9/9**, invites **10/10**, state **10/10**, backfill **5/5**, get_missing_events **3/3**, federation API **14/14**, device keys **8/9**, query API **5/5**, public rooms **1/1**; make_join 3/3, send_leave 1/1, room versions 7/7, key API 6/6, send-to-device 2/2 unchanged | the two above (one in auth, one in device keys) |
+| Sytest, whole suite | 548 / 772 | **754 / 772** (3 fail, 15 skip; 99.6% of tests run), client-server 523/534, application services 22/22, non-spec 102/107 | the two above and "The only membership state included in a gapped incremental sync is for senders in the timeline" (on Synapse's own blacklist) |
+| Complement, federation package (`./tests`) | 225 / 314 assertions, 50 / 90 tests | **316 / 317 assertions, 89 / 90 top-level** (1 skipped: `TestSendJoinPartialStateResponse`, faster joins), 737 s | `TestDeviceListsUpdateOverFederationOnRoomJoin` (skipped by Synapse and Dendrite; below) |
+| Complement, restricted rooms, invites and knocks | 17 / 18 | **18 / 18** | -- |
+
+Against the committed baseline (run 13, 2026-10-05): FAIL -> PASS `TestUnbanViaInvite` (the
+`sync-wakes` fix, `a1fa71a6`), no PASS -> FAIL. Per-test results: `docs/status/sytest/2026-10-09-federation-95-{results,summary,are-we-synapse-yet}.txt`
+(Sytest `747315856`), `docs/status/complement-federation-results.txt` (run 14). The numbers did
+not move today because nothing in this branch is aimed at a suite test: every federation test
+that still fails is a race in the test or a test no server passes, and the evidence is below.
+
+**Fixed: a leave followed at once by a rejoin let the rejoin through.** The interop run of this
+morning had left a race: a Myelin user leaving an invite-only Synapse room and rejoining it in
+the next request was sometimes let back in without a new invite. Found and fixed, and it is
+federation-side, not the room actor's. After the leave nobody of this server is in the room, so
+the rejoin goes out as `make_join` to the inviting server (Synapse's `_should_perform_remote_join`
+rule, the same here); the leave is still in the outbound queue (the sender learns of local
+events off the registry's broadcast stream, after `/leave` has answered), the `make_join`
+overtakes it, the other server finds the user joined and hands back a join-to-join template, and
+`send_join` is accepted. Reproduced on two copies of this server: one round in three
+(`crates/hs-cli/tests/federation_membership.rs`,
+`a_leave_then_an_immediate_rejoin_of_an_invite_only_room_is_refused_on_both_servers`, three
+rounds of leave, rejoin, re-invite, join; it failed at round 3 before the fix and passed 15
+rounds in a row after). The fix is a delivery barrier before any membership handshake
+(`make_join`, `make_leave`, `make_knock`) for a room this server holds with its state: first the
+outbound forwarder has to have handed the registry's global stream up to the request's position
+to the sender (`hs_cli::federation_sender::ForwardedPosition`, the same `global_seq` the session
+hub uses for `/sync`'s read-your-writes; 2 s), then the destination has to have accepted
+everything queued for it (`FederationSender::wait_until_delivered`, 3 s, polled every 10 ms).
+Both bounded: a destination that is down keeps its queue, the wait ends and the handshake goes
+ahead (and fails against the same server); a replica that does not send for the destination
+sees nothing pending. A room held as a shell (an invite, a knock) or not held at all waits for
+nothing, so Sytest and Complement joins into fresh rooms cost nothing. Logged at `debug` when a
+wait starts, `info` with the wait when it ends, `warn` when it gives up (the operator's trail
+for "why was that join slow"). Unit test `sender::tests::the_delivery_barrier_...` covers the
+three outcomes. Synapse has the same race in principle (its sender is woken by the notifier
+after persistence, too); it is slower, so it rarely loses it.
+
+**Recorded, not worked around.**
+
+- Sytest **"Can invite unbound 3pid over federation with users from both servers"**
+  (`30rooms/12thirdpartyinvite.pl`): a race in the test, confirmed again against Synapse's code.
+  The joiner is a `remote_user_fixture` that has never called `GET /events`, so its first
+  `await_event_for` sends no `from` and Synapse's `Notifier.get_events_for` (and `hs-user`'s
+  route) starts at the current token: an `m.room.third_party_invite` that reached the second
+  server before that request is never seen. It reaches it 1 ms after the first server stored it
+  here; Synapse passes because its `/send` handling is slower than Sytest's next request.
+- Sytest **"If a device list update goes missing, the server resyncs on the next one"**
+  (`50federation/40devicelists.pl`, track 08): racy by construction (status 08, 2026-10-05): the
+  user's first `sync_until_user_in_device_list` is an initial sync, which carries no
+  `device_lists`, started after the first update was handled.
+- Complement **`TestDeviceListsUpdateOverFederationOnRoomJoin`**: Complement skips it for
+  Synapse and Dendrite (`runtime.SkipIf`), because no server sends an `m.device_list_update` on
+  a join: Synapse's PR 16875, which did, was closed on 2024-02-02 ("for this to be useful, it
+  requires MSC4081 to be included as well ... this PR just adds more network traffic without
+  concretely fixing anything"); the remote server fetches the list over `/user/devices` when
+  it first needs it, which this server does (status 08). Not implemented, by the same reasoning.
+  It is not on `tests/complement/blacklist.txt` (track 14's) so the measure keeps counting it.
+
+**The interop harness against a two-replica Myelin** (`REPLICAS=2 tests/federation-synapse/run.sh`,
+new this session: a `fed-synapse-pg` PostgreSQL container, two `hs serve` replicas sharing the
+server name, the signing key and the database with the mesh on 8459/8460, the TLS front
+round-robinning Synapse's requests over both, five extra checks through the second replica). It
+found one real cluster bug and one harness race, and ends at **51 / 51 PASS (the 46 checks plus five through the second replica), with the single-server run rerun at 46 / 46 on the same binary**:
+
+- **Fixed: a PDU queued for a destination another replica sends for waited for a rescan, or
+  forever.** The first message after a join made on replica 1 took **62 s** to reach Synapse:
+  replica 2 sends for Synapse's destination, replica 1 wrote the row to the shared outbound
+  store, and replica 2 found it only when something else made it start a worker for that
+  destination (an idle worker rescans every 10 s; a destination with no worker yet is never
+  looked at until `resume`). Now the replica that queues tells the owner over the mesh
+  (`EduForwarder::wake_sender_for`, `hs_cli::edu_forward::WAKE_ROUTE` beside the forwarded
+  EDUs) and the owner looks at the store at once (`FederationSender::wake_destination`: a
+  worker that exists is woken, one that does not is started with the store's backlog). Same
+  message, same topology: **21 ms**. Best effort: a wake that fails is logged and the rescan
+  still finds the row; counted in `hs_federation_pdu_wakes_total{outcome}`. Unit test
+  `sender::tests::a_wake_sends_what_another_replica_queued_with_or_without_a_worker_here`
+  (no rescan interval at all, so only the wake can deliver).
+- **A harness race, fixed in the harness:** "the ban did not reach Synapse". The ban *was*
+  persisted by Synapse 16 ms after the harness's first poll of the banned user's initial
+  `/sync`, and Synapse answers an identical initial `/sync` from its response cache for two
+  minutes, so every later poll got the pre-ban answer. With one server the ban is sent before
+  the first poll; with two, the request is forwarded to the room's owner first. The check now
+  polls an incremental `/sync` from a token taken before the ban, like the receipt and
+  to-device checks.
+- **Seen, recorded, not this track's:** a `PUT /profile/displayname` on replica 1 refreshes
+  the member event in every room the user is in, and for a room replica 2 owns it is fenced
+  (`hs_room::routes::profile`, "profile refresh failed for one room ... fenced") -- but loading
+  that room on the non-owner republished its latest event on replica 1's stream, and the
+  forwarder queued the ban a second time (Synapse deduplicated it; "handling received PDU" twice
+  for one event id, 33 s apart). A duplicate send is harmless; the non-owner reload is RFC
+  0018's subject (track 04/03). Also `postgres:17`'s first start answers `pg_isready` on its
+  socket from a temporary server; the harness asks over TCP.
+
+**Verified.**
+
+- Sytest whole suite on `myelin-sytest:federation-95` (`main` at `00fe0c01`): 754 / 772, federation
+  group 103 / 105 (`target/sytest/before`, copied to `docs/status/sytest/2026-10-09-federation-95-*`).
+- Complement `./tests` on `complement-hs-reimplement:federation-95`, patches applied, under
+  `tests/complement/lock.sh`: 316 / 317 assertions, 89 / 90 top-level, 737 s
+  (`docs/status/complement-federation-results.txt`, run 14).
+- `cargo test -p hs-federation --lib`: 233 (two new: `sender::tests::the_delivery_barrier_...`,
+  `sender::tests::a_wake_sends_what_another_replica_queued_with_or_without_a_worker_here`).
+- `cargo test -p hs-cli --test federation_membership` (13, one new) `--test federation_sender`
+  (5), `--lib edu_forward`; the new membership test 15 rounds in a row.
+- `cargo fmt --all --check`; `cargo clippy -p hs-federation -p hs-cli --all-targets -- -D
+  warnings`: clean.
+- `tests/federation-synapse/run.sh` against Synapse 1.162.0 with the branch's binary: **46 / 46**
+  single-server; `REPLICAS=2` **51 / 51** (after the wake fix and the harness's ban check; 49 / 51
+  and 50 / 51 before, as above). Every `fed-synapse*` container and both `hs` processes removed
+  on exit.
+
+**Interfaces.** `FederationSender::wait_until_delivered` / `DeliveryWait` / `DELIVERY_POLL_INTERVAL`,
+`FederationSender::wake_destination`, `EduForwarder::wake_sender_for` (a defaulted trait method,
+so other implementors compile unchanged), `hs_federation::metrics::{record_pdu_wake, pdu_wakes}`
+(`hs_federation_pdu_wakes_total{outcome}`); `hs_cli::federation_sender::{ForwardedPosition,
+OutboundFederation::start_with_position}`, `hs_cli::remote_join::DeliveryBarrier`,
+`FederationRemoteJoin::with_delivery_barrier`, `hs_cli::edu_forward::{WAKE_ROUTE, WakeRequest}`.
+Nothing another track consumes changed shape.
+
+**Left.**
+
+- `TestDeviceListsUpdateOverFederationOnRoomJoin`, the two Sytest races and the one Synapse
+  blacklists, as above: nothing to fix on the server.
+- A real-binary cluster test of the wake (`crates/hs-cli/tests/cluster_edus.rs` has the two-replica
+  harness and a PostgreSQL skip) would pin the 21 ms; the sender's unit test and the interop run
+  are what proves it now.
+- `hs serve` terminating TLS itself (removing the nginx front) is hs-cli/track 12; putting the
+  interop run, single and two-replica, in a CI leg with Docker is track 12's.
+
 ## 2026-10-09 (branch `agent/federation`): the federation milestone -- Myelin federates with a real Synapse, end to end
 
 Myelin had never been pointed at a Synapse: every federation number was Complement, Sytest or two

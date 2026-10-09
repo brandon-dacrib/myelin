@@ -231,8 +231,11 @@ if [ "$REPLICAS" = 2 ]; then
   docker rm -f fed-synapse-pg >/dev/null 2>&1 || true
   docker run -d --name fed-synapse-pg -e POSTGRES_PASSWORD=fedpg -e POSTGRES_DB=myelin \
     -p "127.0.0.1:$PG_PORT:5432" "$PG_IMAGE" >/dev/null || { echo "postgres did not start"; exit 1; }
-  for _ in $(seq 1 60); do docker exec fed-synapse-pg pg_isready -U postgres >/dev/null 2>&1 && break; sleep 1; done
-  docker exec fed-synapse-pg pg_isready -U postgres >/dev/null 2>&1 || { echo "postgres did not become ready"; exit 1; }
+  # Over TCP, not the socket: the image's first start runs a temporary server on the socket
+  # only while it initialises, and a readiness read off that one is answered just before it
+  # goes away again.
+  for _ in $(seq 1 60); do docker exec fed-synapse-pg pg_isready -h 127.0.0.1 -U postgres >/dev/null 2>&1 && break; sleep 1; done
+  docker exec fed-synapse-pg pg_isready -h 127.0.0.1 -U postgres >/dev/null 2>&1 || { echo "postgres did not become ready"; exit 1; }
 fi
 myelin_config 8449 8459 > "$WORKDIR/myelin/hs.yaml"
 RUST_LOG="${RUST_LOG:-info,hs_federation=debug}" "$HS_BINARY" serve --config "$WORKDIR/myelin/hs.yaml" > "$WORKDIR/myelin/hs.log" 2>&1 &
@@ -359,16 +362,20 @@ R=$(api "$MY_CLIENT" "$MY_TOK2" POST "/join/$ROOM_P?server_name=$SYN_NAME" '{}')
 wait_membership "$SYN_CLIENT" "$SYN_TOK" "$ROOM_P" "$MY_USER2" join >/dev/null && record "4 rejoin" PASS "the rejoin reached Synapse's state" || record "4 rejoin" FAIL "the rejoin did not reach Synapse's state"
 R=$(api "$SYN_CLIENT" "$SYN_TOK" POST "/rooms/$ROOM_P/kick" "{\"user_id\":\"$MY_USER2\"}"); expect "4 kick" "Synapse kicks the Myelin user" "$R" "{}"
 wait_membership "$MY_CLIENT" "$MY_TOK2" "$ROOM_P" "$MY_USER2" leave >/dev/null && record "4 kick" PASS "the kick reached Myelin's state" || record "4 kick" FAIL "the kick did not reach Myelin's state"
-# Ban the Synapse user from Myelin's room; verify via Synapse's room state (a banned user's own
-# /sync is not a reliable place to see the ban).
+# Ban the Synapse user from Myelin's room. A banned user cannot read the room's state endpoint,
+# so the ban is looked for in the leave section of the banned user's own /sync -- an incremental
+# one, from a token taken before the ban: Synapse answers an identical initial /sync from a cache
+# for two minutes, so a first poll that lands before the ban is persisted (with two replicas the
+# request is forwarded to the room's owner, and the race was lost by 16 ms) would be answered
+# the same for the rest of the wait.
+BAN_SINCE=$(api "$SYN_CLIENT" "$SYN_TOK2" GET "/sync?timeout=0" | jq -r .next_batch)
 R=$(api "$MY_CLIENT" "$MY_TOK" POST "/rooms/$ROOM_I/ban" "{\"user_id\":\"$SYN_USER2\"}"); expect "4 ban" "Myelin bans the Synapse user" "$R" "{}"
-# A banned user cannot read the room's state endpoint, so look for the ban in the room's leave
-# section of the banned user's own /sync.
 BAN_OK=0
 for _ in $(seq 1 30); do
-  M=$(api "$SYN_CLIENT" "$SYN_TOK2" GET "/sync?timeout=0" | jq -r --arg r "$ROOM_I" --arg u "$SYN_USER2" '[.rooms.leave[$r].timeline.events[]?|select(.type=="m.room.member" and .state_key==$u)|.content.membership]|last // empty')
+  RESP=$(api "$SYN_CLIENT" "$SYN_TOK2" GET "/sync?since=$BAN_SINCE&timeout=1000")
+  M=$(echo "$RESP" | jq -r --arg r "$ROOM_I" --arg u "$SYN_USER2" '[.rooms.leave[$r].timeline.events[]?|select(.type=="m.room.member" and .state_key==$u)|.content.membership]|last // empty')
   [ "$M" = ban ] && { BAN_OK=1; break; }
-  sleep 1
+  BAN_SINCE=$(echo "$RESP" | jq -r .next_batch)
 done
 [ "$BAN_OK" = 1 ] && record "4 ban" PASS "the ban reached Synapse (the banned user's leave sync)" || record "4 ban" FAIL "the ban did not reach Synapse"
 # Redaction: Synapse redacts its own message in the Myelin room.

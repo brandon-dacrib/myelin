@@ -1,7 +1,7 @@
 # Complement tests, top-level results. One line per test so that two runs can be compared
 # by name: a change is worth something when it moves a *named* test and that survives a re-run.
 # Written and read by tools/complement_triage.py (--write-baseline, --diff).
-# Run 13, 2026-10-05, dcd02f4c (wave 3; run 12 on 731d2433 was 300 of 317, 82 of 90): 315 of 317 assertions, 88 of 90 top-level (1 skipped).
+# Run 14, 2026-10-09, 00fe0c01 (main, image complement-hs-reimplement:federation-95; run 13 on dcd02f4c was 315 of 317, 88 of 90): 316 of 317 assertions, 89 of 90 top-level (1 skipped).
 PASS TestACLs
 PASS TestACLsForEDUs
 PASS TestBannedUserCannotSendJoin
@@ -88,7 +88,7 @@ PASS TestRoomSummaryAllowedRoomIDs
 SKIP TestSendJoinPartialStateResponse
 PASS TestSyncOmitsStateChangeOnFilteredEvents
 PASS TestToDeviceMessagesOverFederation
-FAIL TestUnbanViaInvite
+PASS TestUnbanViaInvite
 PASS TestUnknownEndpoints
 PASS TestUnrejectRejectedEvents
 PASS TestUserAppearsInChangedDeviceListOnJoinOverFederation
