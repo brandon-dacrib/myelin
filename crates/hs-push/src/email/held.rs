@@ -27,6 +27,66 @@ pub struct HeldRoom {
     pub name: Option<String>,
     /// The latest notifications in the room, oldest first, at most the email's per-room limit.
     pub lines: Vec<NotificationLine>,
+    /// The notifications the limit dropped from [`HeldRoom::lines`], one entry per scope (the
+    /// main timeline, or a thread) with the newest dropped position in it: what keeps the room
+    /// in the email when a receipt reads every line still shown but not an older one. Empty
+    /// for rows an older build stored.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unshown: Vec<UnshownLine>,
+}
+
+/// The newest notification an email will not show in one scope of a room (see
+/// [`HeldRoom::unshown`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnshownLine {
+    /// The root of the thread the notifications are in (`None`: the room's main timeline).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<ruma::OwnedEventId>,
+    /// The newest dropped notification's room position (`None` when it was held by a build
+    /// that kept none: any receipt for the scope reads it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pos: Option<i64>,
+}
+
+impl HeldRoom {
+    /// Pushes `line`, dropping the oldest shown line once more than `limit` are held; a dropped
+    /// line is remembered in [`HeldRoom::unshown`] by its scope and position.
+    pub fn push_line(&mut self, line: NotificationLine, limit: usize) {
+        self.lines.push(line);
+        if self.lines.len() > limit {
+            let dropped = self.lines.remove(0);
+            match self.unshown.iter_mut().find(|u| u.thread == dropped.thread) {
+                Some(entry) => entry.pos = entry.pos.max(dropped.pos),
+                None => self.unshown.push(UnshownLine {
+                    thread: dropped.thread,
+                    pos: dropped.pos,
+                }),
+            }
+        }
+    }
+
+    /// Takes out everything `covers` reads, shown or not; returns how many shown lines went
+    /// and whether any dropped scope did.
+    pub fn take_read(
+        &mut self,
+        mut covers: impl FnMut(Option<&ruma::EventId>, Option<i64>) -> bool,
+    ) -> (usize, bool) {
+        let before = self.lines.len();
+        self.lines
+            .retain(|line| !covers(line.thread.as_deref(), line.pos));
+        let unshown_before = self.unshown.len();
+        self.unshown.retain(|u| !covers(u.thread.as_deref(), u.pos));
+        (
+            before - self.lines.len(),
+            self.unshown.len() != unshown_before,
+        )
+    }
+
+    /// Nothing is left to say about the room.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.lines.is_empty() && self.unshown.is_empty()
+    }
 }
 
 /// An email held for one address.
@@ -255,6 +315,10 @@ mod tests {
                         thread: None,
                     },
                 ],
+                unshown: vec![UnshownLine {
+                    thread: None,
+                    pos: Some(3),
+                }],
             },
         );
         HeldMail {

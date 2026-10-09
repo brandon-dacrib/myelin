@@ -561,14 +561,12 @@ impl EmailPushersWorker {
             .or_insert_with(|| HeldRoom {
                 name: None,
                 lines: Vec::new(),
+                unshown: Vec::new(),
             });
         if notification.room_name.is_some() {
             room.name = notification.room_name;
         }
-        room.lines.push(line);
-        if room.lines.len() > LINES_PER_ROOM {
-            room.lines.remove(0);
-        }
+        room.push_line(line, LINES_PER_ROOM);
         let due_in_ms = pending.due.saturating_duration_since(now).as_millis();
         // Stored first, then said: whoever reads "holding" (an operator, the restart test) can
         // rely on the held email surviving a stop from then on.
@@ -592,8 +590,9 @@ impl EmailPushersWorker {
     /// A read receipt: takes the lines it covers out of everything held for the user (those
     /// in `thread`'s scope up to room position `pos`, or all of the scope's when `pos` is not
     /// known; a line held by an older build has no position and goes with any receipt for its
-    /// scope), drops a room with no line left and an email with no room left, and forgets the
-    /// room's throttle: the user is reading it.
+    /// scope), drops a room with nothing left, shown or dropped by the per-room limit
+    /// ([`HeldRoom::unshown`]), and an email with no room left, and forgets the room's
+    /// throttle: the user is reading it.
     pub async fn read(
         &mut self,
         user_id: &UserId,
@@ -601,9 +600,9 @@ impl EmailPushersWorker {
         thread: &ReceiptThread,
         pos: Option<i64>,
     ) {
-        let covers = |line: &template::NotificationLine| {
-            thread.reads(line.thread.as_deref())
-                && match (pos, line.pos) {
+        let covers = |scope: Option<&ruma::EventId>, at: Option<i64>| {
+            thread.reads(scope)
+                && match (pos, at) {
                     (Some(read), Some(at)) => at <= read,
                     _ => true,
                 }
@@ -617,14 +616,19 @@ impl EmailPushersWorker {
             let Some(room) = pending.held.rooms.get_mut(room_id) else {
                 continue;
             };
-            let before = room.lines.len();
-            room.lines.retain(|line| !covers(line));
-            if room.lines.len() == before {
+            let (read, unshown_read) = room.take_read(covers);
+            if read == 0 && !unshown_read {
                 continue;
             }
-            lines_read += before - room.lines.len();
-            if room.lines.is_empty() {
+            lines_read += read;
+            if room.is_empty() {
                 pending.held.rooms.remove(room_id);
+            } else if room.lines.is_empty() {
+                tracing::debug!(
+                    user = %user_id,
+                    room = %room_id,
+                    "a receipt read every line shown of a room, but not an older one the email dropped; the room stays in it"
+                );
             }
             touched.push(key.clone());
         }
@@ -1095,6 +1099,88 @@ mod tests {
         assert!(h.held.held_by("hs-0").await.unwrap().is_empty());
     }
 
+    /// An email shows a room's last `LINES_PER_ROOM` lines; what the limit dropped is still
+    /// unread until a receipt covers it. A receipt that reads every line shown but not an
+    /// older, dropped one on another scope leaves the room in the email (with no lines, and
+    /// the count from the counts store); a receipt covering the dropped line takes it out.
+    #[tokio::test(start_paused = true)]
+    async fn a_receipt_reading_every_shown_line_keeps_a_room_whose_dropped_line_is_unread() {
+        let mut h = harness(Settings {
+            delay_before_mail: Duration::from_secs(600),
+            ..settings()
+        })
+        .await;
+        let alice = user_id!("@alice:example.org");
+        let room = room_id!("!busy:example.org");
+        let root = ruma::event_id!("$root:example.org");
+        let in_thread = notify_in(&mut h, room, "thread one", Some(root)).await;
+        let mut last_main = 0;
+        for i in 0..LINES_PER_ROOM {
+            last_main = notify_in(&mut h, room, &format!("main {i}"), None).await;
+        }
+        assert_eq!(
+            held_lines(&h, room).len(),
+            LINES_PER_ROOM,
+            "the thread line was dropped"
+        );
+        let unshown = &h.worker.pending.values().next().unwrap().held.rooms[room].unshown;
+        assert_eq!(unshown.len(), 1);
+        assert_eq!(unshown[0].thread.as_deref(), Some(root));
+        assert_eq!(unshown[0].pos, Some(in_thread));
+
+        // Every shown line read (the pipeline marks the counts read, then tells the worker):
+        // the room stays, for the thread line nobody read.
+        h.counts
+            .mark_read(alice, room, &ReceiptThread::Main, last_main)
+            .await
+            .unwrap();
+        h.worker
+            .read(alice, room, &ReceiptThread::Main, Some(last_main))
+            .await;
+        assert_eq!(
+            h.worker.pending_count(),
+            1,
+            "the room's thread is still unread"
+        );
+        assert!(held_lines(&h, room).is_empty());
+        let stored = h.held.held_by("hs-0").await.unwrap();
+        assert_eq!(
+            stored[0].2.rooms[room].unshown.len(),
+            1,
+            "the store follows"
+        );
+        // Due, the email still goes, saying how much is unread.
+        tokio::time::advance(Duration::from_secs(601)).await;
+        h.worker.send_due().await;
+        let sent = h.mailer.sent();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].text.contains("(1 unread)"), "{}", sent[0].text);
+
+        // The same again, but the thread receipt comes too: nothing is left and no email goes.
+        let in_thread = notify_in(&mut h, room, "thread two", Some(root)).await;
+        for i in 0..LINES_PER_ROOM {
+            last_main = notify_in(&mut h, room, &format!("more {i}"), None).await;
+        }
+        h.counts
+            .mark_read(alice, room, &ReceiptThread::Main, last_main)
+            .await
+            .unwrap();
+        h.worker
+            .read(alice, room, &ReceiptThread::Main, Some(last_main))
+            .await;
+        assert_eq!(h.worker.pending_count(), 1);
+        h.worker
+            .read(
+                alice,
+                room,
+                &ReceiptThread::Thread(root.to_owned()),
+                Some(in_thread),
+            )
+            .await;
+        assert_eq!(h.worker.pending_count(), 0, "everything was read");
+        assert!(h.held.held_by("hs-0").await.unwrap().is_empty());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn the_first_email_goes_at_once_and_the_next_waits_longer_each_time() {
         let mut h = harness(settings()).await;
@@ -1296,6 +1382,7 @@ mod tests {
             HeldRoom {
                 name: Some("Lunch".to_owned()),
                 lines: vec![line],
+                unshown: Vec::new(),
             },
         );
         let stale = HeldMail {
