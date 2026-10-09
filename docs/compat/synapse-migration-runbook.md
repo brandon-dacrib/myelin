@@ -94,18 +94,35 @@ like while Synapse is still in service; a difference is a bug report, not someth
 
 ## 4. Cut over
 
-1. **Stop Synapse** (every process and worker). Anything written to Synapse after the cutover
-   is not carried over.
+The copy ran while Synapse was in service, so people kept writing to Synapse after it: messages,
+sign-ups, read receipts, room keys sent to phones that were offline. The cutover's final pass
+brings that delta over, and it can only be complete if nothing is written to Synapse while it
+runs.
+
+1. **Stop Synapse, or make it read-only.** Stopping it (every process and worker) is the
+   simple way, and the one the rehearsal below tests: clients see a few minutes of "server
+   unreachable" until the DNS flip. A deployment that would rather keep serving reads can
+   instead put Synapse's ingress in front of a reverse proxy that answers every write (`PUT`,
+   `POST`, `DELETE`) with `503` and lets `GET` through; either way, from this step on Synapse's
+   database changes no more. Anything written to Synapse after the final pass starts is not
+   carried over.
 2. Tick the checklist on the page and **Cut over** (`POST /api/v1/migration/cutover`, `202` and
    a task). The cutover reads everything in Synapse again (whatever changed since the copy is
    brought over; what is unchanged is recognized), verifies, and finishes (`completed`) only if
    verification passes. If it does not, nothing is cut over, the status goes back to
    `ready_for_cutover` with the differences, and Synapse can be started again.
 3. **Point clients and other servers at Myelin**: the DNS name or ingress that served Synapse,
-   and its `.well-known` delegation.
+   and its `.well-known` delegation. The server name is unchanged, so nothing else moves.
 
-Signed-in clients keep working: their access tokens were copied. People sign in with the
-passwords they had.
+Signed-in clients keep working: their access tokens were copied, and a client whose access token
+expires after the cutover exchanges its refresh token here. People sign in with the passwords
+they had, by user id or by the email address or phone number they had bound. A phone that was
+offline through the cutover gets the room keys that were waiting for it in its first sync here.
+
+The real-binary test `crates/hs-cli/tests/migration_rehearsal.rs` is exactly this: a real
+Synapse on a real PostgreSQL, populated through its own client and admin APIs, copied while it
+runs, written to again (a message, a sign-up, a to-device message), stopped, cut over, and every
+one of the claims above checked from the client's side (2026-10-09, Synapse 1.162).
 
 ## Rolling back
 
@@ -191,8 +208,23 @@ servers must never answer for the same name at once.
 
 ## Rehearse it
 
+The whole runbook against a real Synapse, in Docker, with nothing but the two images present
+(`docker pull mirror.gcr.io/matrixdotorg/synapse:latest public.ecr.aws/docker/library/postgres:17`):
+
+```sh
+cargo test -p hs-cli --test migration_rehearsal   # Synapse 1.162 + PostgreSQL 17 in Docker, ~40 s
+```
+
+It starts both, fills Synapse the way clients and admin tools do, migrates it into a fresh `hs`
+through the admin API with a delta written after the copy, stops Synapse, cuts over, and checks
+every client-visible result; it skips, saying so, without Docker or the images. Its first run
+found that Synapse 1.162's default room version (12) did not import at all (Synapse keeps a
+`room_id` inside its stored create event, which that version forbids on the wire; fixed the
+same day in the reader and in `hs-room`'s import path) -- the kind of thing only a real Synapse
+shows.
+
 `crates/hs-compat/tests/fixtures/synapse-small` is a real Synapse 1.161 database (see its
-README). To rehearse against it with the real binary:
+README). To rehearse against it with the real binary, with no Synapse to run:
 
 ```sh
 docker run --rm -d --name hs-mig-pg -e POSTGRES_PASSWORD=hspg -p 127.0.0.1:5439:5432 postgres:17

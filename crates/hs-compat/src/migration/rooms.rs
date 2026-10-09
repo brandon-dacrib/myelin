@@ -205,7 +205,26 @@ pub async fn copy_room(
             "it cites an event that is not part of the room's history in Synapse".to_owned(),
         ));
     }
-    let finished = target.finish_room(room).await?;
+    // A room this server would not keep (nothing stored, its create event first) is refused
+    // with the first reasons in the message: they are what an operator needs, and the log
+    // line for a failed room is all that survives of this outcome.
+    let finished = target.finish_room(room).await.map_err(|mut e| {
+        if !outcome.refused.is_empty() {
+            let first: Vec<String> = outcome
+                .refused
+                .iter()
+                .take(3)
+                .map(|(id, why)| format!("{id}: {why}"))
+                .collect();
+            e.message = format!(
+                "{} ({} refused, the first: {})",
+                e.message,
+                outcome.refused.len(),
+                first.join("; ")
+            );
+        }
+        e
+    })?;
     outcome.absorb(finished);
     let stats = stats(&outcome, events_read, bytes);
     Ok(RoomCopy {

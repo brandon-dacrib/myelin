@@ -187,3 +187,82 @@ async fn a_shell_whose_first_event_is_refused_is_forgotten() {
         Err(RoomError::RoomNotFound(_))
     ));
 }
+
+/// A room version 12 room (the Synapse 1.162 default): its create event is the room id's own
+/// hash and carries no `room_id`, and must import like any other -- the actor must not judge
+/// it against the room id it already knows (`check_room_create` refuses a create event with
+/// one). Found by the migration rehearsal against a real Synapse 1.162 (2026-10-09).
+#[tokio::test]
+async fn a_room_version_12_history_imports_with_its_create_event() {
+    let backend = MemoryBackend::new();
+    let tables = Tables::open(&backend).expect("open tables");
+    let mut actor = RoomActor::create_room(
+        backend,
+        tables,
+        HomeserverIdentity::for_tests("old.example"),
+        alice(),
+        CreateRoomRequest {
+            preset: Some("public_chat".to_owned()),
+            room_version: Some(RoomVersionId::V12),
+            name: Some("twelve".to_owned()),
+            ..Default::default()
+        },
+        1,
+    )
+    .expect("create the room");
+    actor
+        .send_event(
+            alice(),
+            "m.room.message".into(),
+            None,
+            json!({"msgtype": "m.text", "body": "in a version 12 room"}),
+            None,
+            2,
+        )
+        .expect("message");
+    let events: Vec<Event> = actor
+        .events_after(0, 1000)
+        .into_iter()
+        .map(|(_, e)| e.clone())
+        .collect();
+    let room_id = actor.room_id().to_owned();
+    assert!(room_id.server_name().is_none(), "a hash-based room id");
+    assert!(events[0].json().get("room_id").is_none());
+
+    let rooms = Arc::new(
+        RoomRegistry::open(
+            MemoryBackend::new(),
+            HomeserverIdentity::for_tests("old.example"),
+        )
+        .expect("open registry"),
+    );
+    let handle = rooms
+        .import_shell(&room_id, RoomVersionId::V12)
+        .await
+        .expect("shell");
+    for event in &events {
+        let outcome = handle.import_event(event.clone()).await.expect("import");
+        assert!(
+            matches!(outcome, RemoteEventOutcome::Stored(_)),
+            "{}: {outcome:?}",
+            event.header().event_type
+        );
+    }
+    let name = handle
+        .query(|a| {
+            a.state_event("m.room.name", "")
+                .expect("state")
+                .map(|e| e.event_id().to_owned())
+        })
+        .await;
+    assert_eq!(
+        name.as_deref(),
+        Some(
+            events
+                .iter()
+                .find(|e| e.header().event_type == "m.room.name")
+                .unwrap()
+                .event_id()
+        )
+    );
+}

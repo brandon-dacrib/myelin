@@ -2085,10 +2085,20 @@ impl<B: KvBackend> RoomActor<B> {
                 .get(&prev_sns[0])
                 .is_some_and(|e| e.header().event_type == "m.room.create");
 
+        // From room version 12 the create event carries no `room_id` (its id is the room's),
+        // and `check_room_create` refuses one that does: an imported or received create event
+        // is judged without the room id this actor already knows.
+        let room_id: Option<&RoomId> = if self.rules.room_create_event_id_as_room_id
+            && event.header().event_type == "m.room.create"
+        {
+            None
+        } else {
+            Some(&self.room_id)
+        };
         let incoming = IncomingEvent {
             event_type: &event.header().event_type,
             sender: AsRef::<UserId>::as_ref(&event.header().sender),
-            room_id: Some(&self.room_id),
+            room_id,
             state_key: event.header().state_key.as_deref(),
             content: &content_obj,
             // An event whose prev events this server does not hold (`StateBefore::None`) is

@@ -843,16 +843,17 @@ async fn a_synapse_database_is_migrated_verified_and_cut_over_through_the_admin_
     // The two to-device messages that were waiting for alice's phone in Synapse are in its
     // first sync here, from bob, as they were.
     let fresh = alice.get("/_matrix/client/v3/sync").await;
-    let waiting = fresh["to_device"]["events"].as_array().cloned().unwrap_or_default();
+    let waiting = fresh["to_device"]["events"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     let types: Vec<&str> = waiting.iter().filter_map(|e| e["type"].as_str()).collect();
     assert!(
         types.contains(&"m.room_key_request") && types.contains(&"m.room.encrypted"),
         "{fresh}"
     );
     assert!(
-        waiting
-            .iter()
-            .all(|e| e["sender"] == "@bob:fixture.test"),
+        waiting.iter().all(|e| e["sender"] == "@bob:fixture.test"),
         "{waiting:?}"
     );
     assert!(
@@ -916,7 +917,10 @@ async fn a_synapse_database_is_migrated_verified_and_cut_over_through_the_admin_
             .as_array()
             .unwrap()
             .iter()
-            .any(|f| f["stages"].as_array().unwrap().contains(&json!("m.login.registration_token"))),
+            .any(|f| f["stages"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("m.login.registration_token"))),
         "{flows}"
     );
     nobody

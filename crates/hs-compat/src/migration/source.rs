@@ -136,6 +136,31 @@ fn parse_user(raw: &str) -> Result<SynapseUser, MigrationError> {
     })
 }
 
+/// An event's JSON as Synapse serves it, from the JSON as Synapse stores it (`event_json.json`):
+/// without `unsigned` (Synapse's own annotations), and, for a room version 12 create event,
+/// without the `room_id` Synapse keeps inside it for its own convenience. In room versions 12
+/// and later the create event has no `room_id` (the room id *is* the create event's id, with
+/// `!` for `$`), Synapse strips it when it serializes the event, and this server's
+/// authorization refuses a create event that carries one. Recognized by that relationship, so
+/// no room version needs looking up: a create event whose `room_id` is its own id.
+fn as_synapse_serves_it(event_id: &str, json: &mut Value) {
+    let Some(object) = json.as_object_mut() else {
+        return;
+    };
+    object.remove("unsigned");
+    let is_create = object.get("type").and_then(Value::as_str) == Some("m.room.create")
+        && object
+            .get("state_key")
+            .and_then(Value::as_str)
+            .is_some_and(str::is_empty);
+    if is_create
+        && let Some(hash) = event_id.strip_prefix('$')
+        && object.get("room_id").and_then(Value::as_str) == Some(&format!("!{hash}"))
+    {
+        object.remove("room_id");
+    }
+}
+
 /// Where Synapse keeps a local media item's file, relative to its `media_store_path`:
 /// `local_content/ab/cd/efgh...` for media id `abcdefgh...`.
 #[must_use]
@@ -892,9 +917,7 @@ impl SynapseSource {
             let mut json: Value = serde_json::from_str(&raw).map_err(|e| {
                 MigrationError::Source(format!("event {event_id} holds unreadable JSON: {e}"))
             })?;
-            if let Some(object) = json.as_object_mut() {
-                object.remove("unsigned");
-            }
+            as_synapse_serves_it(&event_id, &mut json);
             let key = (row.get::<_, i64>(2), row.get::<_, i64>(3));
             events.push((
                 SynapseEvent {
@@ -981,9 +1004,7 @@ impl SynapseSource {
                 let mut json: Value = serde_json::from_str(&raw).map_err(|e| {
                     MigrationError::Source(format!("event {event_id} holds unreadable JSON: {e}"))
                 })?;
-                if let Some(object) = json.as_object_mut() {
-                    object.remove("unsigned");
-                }
+                as_synapse_serves_it(&event_id, &mut json);
                 out.push(SynapseEvent {
                     event_id,
                     json,
@@ -1948,5 +1969,41 @@ mod tests {
             "m.direct".to_owned(),
         ];
         assert_eq!(parse_account_data_key(&account_data_key(&key)), Some(key));
+    }
+}
+
+#[cfg(test)]
+mod create_event_tests {
+    use super::*;
+
+    #[test]
+    fn a_room_version_12_create_event_loses_the_room_id_synapse_stores_in_it() {
+        let mut json = serde_json::json!({
+            "type": "m.room.create", "state_key": "", "sender": "@a:s",
+            "room_id": "!abc", "content": {"room_version": "12"}, "unsigned": {"age": 1},
+        });
+        as_synapse_serves_it("$abc", &mut json);
+        assert!(json.get("room_id").is_none(), "{json}");
+        assert!(json.get("unsigned").is_none(), "{json}");
+
+        // A create event of an older room version keeps its room id, and so does any other
+        // event, and a create event whose room id is somebody else's.
+        for (id, mut json) in [
+            (
+                "$e1",
+                serde_json::json!({"type": "m.room.create", "state_key": "", "room_id": "!r:s"}),
+            ),
+            (
+                "$abc",
+                serde_json::json!({"type": "m.room.member", "state_key": "@a:s", "room_id": "!abc"}),
+            ),
+            (
+                "$abc",
+                serde_json::json!({"type": "m.room.create", "state_key": "", "room_id": "!other"}),
+            ),
+        ] {
+            as_synapse_serves_it(id, &mut json);
+            assert!(json.get("room_id").is_some(), "{id}: {json}");
+        }
     }
 }
