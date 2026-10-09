@@ -82,7 +82,7 @@ against a real SMTP server (`crates/hs-cli/tests/email_pushers.rs`).
 | Complement `TestSearch`, `TestMessagesOverFederation` | 1 / 1 each, in both runs of 2026-10-01 (0 / 1 before 2026-09-30) |
 | Sytest, whole suite | **754 / 772 (3 failed, 15 skipped; 99.6% of tests run)** on 2026-10-09 on `main` at `00fe0c01` (the same on 2026-10-05); client-server group 523 of 534, federation group **103 of 105** (15 on its first run, 2026-09-30; 78 on 2026-10-02), application services 22 of 22; the three left are two races in the tests and one Synapse blacklists itself; 548 / 772 on 2026-10-02, 407 that morning; per-test results in `docs/status/sytest/` |
 | `cargo fuzz` | 8 targets, 18.7 million executions under ASan, no crash (2026-10-01) |
-| Spec routes served | 138 / 235 (58.7%) — client-server 108/166, server-server 30/36 |
+| Spec routes served | 185 / 235 (78.7%) on 2026-10-09 — client-server 151/166, server-server 34/36 (138 / 235 on 2026-10-05); the rest of the 235 are the appservice, identity and push-gateway APIs, which a homeserver calls rather than serves (`docs/status/dashboard.md`) |
 | Rust | 27 crates, ~250k lines including tests, 2,534 tests |
 
 **It runs for real.** PostgreSQL (over TLS, with libpq's five modes) or an embedded store, a
