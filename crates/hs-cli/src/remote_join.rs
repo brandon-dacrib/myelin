@@ -10,6 +10,7 @@
 //! command (`hs federation-join-room`) whose result nothing could keep.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use hs_federation::client::FederationClient;
@@ -28,6 +29,78 @@ pub struct FederationRemoteJoin<B: KvBackend> {
     key_cache: Arc<DynRemoteKeyCache>,
     rooms: Arc<RoomRegistry<B>>,
     identity: HomeserverIdentity,
+    barrier: Option<DeliveryBarrier>,
+}
+
+/// The longest a handshake waits for the forwarder to hand this server's latest events to the
+/// sender: normally microseconds, since the forwarder reads a broadcast channel.
+const FORWARDER_WAIT: Duration = Duration::from_secs(2);
+
+/// The longest a handshake waits for the other server to accept what is queued for it. A
+/// destination that is down keeps its queue; the handshake then goes ahead (and most likely
+/// fails against the same server) rather than hang the client.
+const DELIVERY_WAIT: Duration = Duration::from_secs(3);
+
+/// What a membership handshake through another server waits for first, when the room is one
+/// this server holds: that this server's own events of the room -- the leave the user just
+/// made, say -- have been queued for that server and accepted by it. Without it a `make_join`
+/// sent right after a leave overtakes the leave in flight, finds the user still joined there,
+/// and an invite-only room is rejoined without an invite (seen against Synapse on 2026-10-09;
+/// `crates/hs-cli/tests/federation_membership.rs`, the leave-then-rejoin test, one round in
+/// three on two copies of this server). Two waits, both bounded: the forwarder's position on
+/// the registry's global stream ([`crate::federation_sender::ForwardedPosition`]) has to reach
+/// what was published before the request, and the sender's queue for the destination has to
+/// drain (`FederationSender::wait_until_delivered`).
+#[derive(Clone)]
+pub struct DeliveryBarrier {
+    forwarded: Arc<crate::federation_sender::ForwardedPosition>,
+    sender: Arc<hs_federation::sender::FederationSender>,
+}
+
+impl DeliveryBarrier {
+    /// A barrier over the forwarder `forwarded` reports for and the sender it feeds.
+    #[must_use]
+    pub fn new(
+        forwarded: Arc<crate::federation_sender::ForwardedPosition>,
+        sender: Arc<hs_federation::sender::FederationSender>,
+    ) -> Self {
+        Self { forwarded, sender }
+    }
+
+    /// Waits for `destination` to have this server's events of `room_id` published up to
+    /// `published_seq` (see the type docs). Logs what it waited for; never fails.
+    async fn settle(&self, destination: &str, room_id: &RoomId, published_seq: u64) {
+        if !self.forwarded.wait_for(published_seq, FORWARDER_WAIT).await {
+            tracing::warn!(
+                %room_id,
+                destination,
+                published_seq,
+                forwarded_seq = self.forwarded.processed(),
+                "the outbound forwarder has not reached this server's latest events; the \
+                 handshake goes ahead without them"
+            );
+            return;
+        }
+        match self
+            .sender
+            .wait_until_delivered(destination, DELIVERY_WAIT)
+            .await
+        {
+            hs_federation::sender::DeliveryWait::NothingPending => {}
+            hs_federation::sender::DeliveryWait::Delivered { waited } => {
+                tracing::info!(
+                    %room_id,
+                    destination,
+                    waited_ms = waited.as_millis() as u64,
+                    "waited for the other server to accept this server's events before the \
+                     membership handshake"
+                );
+            }
+            hs_federation::sender::DeliveryWait::TimedOut { .. } => {
+                // Logged by the sender.
+            }
+        }
+    }
 }
 
 impl<B: KvBackend + 'static> FederationRemoteJoin<B> {
@@ -45,7 +118,38 @@ impl<B: KvBackend + 'static> FederationRemoteJoin<B> {
             key_cache,
             rooms,
             identity,
+            barrier: None,
         }
+    }
+
+    /// Installs the delivery barrier every handshake for a room this server holds waits on
+    /// first ([`DeliveryBarrier`]). Without one, a handshake goes out at once.
+    #[must_use]
+    pub fn with_delivery_barrier(mut self, barrier: DeliveryBarrier) -> Self {
+        self.barrier = Some(barrier);
+        self
+    }
+
+    /// The delivery barrier for `room_id` before a handshake with `destination`: only for a
+    /// room this server holds with its state (one it was in, or is in), since only there can
+    /// this server have made events the other side has not seen yet. A room held as a shell
+    /// (an invite, a knock) or not at all has nothing to wait for.
+    async fn settle_before_handshake(&self, destination: &str, room_id: &RoomId) {
+        let Some(barrier) = &self.barrier else {
+            return;
+        };
+        let Ok(handle) = self.rooms.get_or_load(room_id).await else {
+            return;
+        };
+        let held_with_state = handle
+            .query(|actor| matches!(actor.state_event("m.room.create", ""), Ok(Some(_))))
+            .await;
+        if !held_with_state {
+            return;
+        }
+        barrier
+            .settle(destination, room_id, self.rooms.global_published_seq())
+            .await;
     }
 }
 
@@ -124,6 +228,7 @@ impl<B: KvBackend + 'static> FederationRemoteJoin<B> {
         room_id: &RoomId,
         content: &Value,
     ) -> Result<OwnedRoomId, JoinAttempt> {
+        self.settle_before_handshake(destination, room_id).await;
         match hs_federation::outbound_join::join_room_with_content(
             &self.client,
             &self.key_cache,
@@ -363,6 +468,7 @@ impl<B: KvBackend + 'static> hs_room::remote_join::RemoteJoin for FederationRemo
         let content = &content;
         let outcome = self
             .through_each(via, "leave", |destination| async move {
+                self.settle_before_handshake(&destination, room_id).await;
                 hs_federation::outbound_membership::leave_room(
                     &self.client,
                     &destination,
@@ -393,6 +499,7 @@ impl<B: KvBackend + 'static> hs_room::remote_join::RemoteJoin for FederationRemo
         let content = &content;
         let outcome = self
             .through_each(via, "knock", |destination| async move {
+                self.settle_before_handshake(&destination, room_id).await;
                 hs_federation::outbound_membership::knock_room(
                     &self.client,
                     &destination,

@@ -304,6 +304,26 @@ impl SenderConfig {
 /// and no network traffic (`FederationClient::send` refuses before resolving anything).
 pub const BACKOFF_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
+/// How often [`FederationSender::wait_until_delivered`] looks at the queue it waits on.
+pub const DELIVERY_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// How [`FederationSender::wait_until_delivered`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryWait {
+    /// Nothing was queued for the destination when asked.
+    NothingPending,
+    /// The queue drained (every PDU accepted, or dropped) after this long.
+    Delivered {
+        /// How long the wait took.
+        waited: Duration,
+    },
+    /// The timeout passed with this many PDUs still queued.
+    TimedOut {
+        /// PDUs still queued for the destination.
+        pending: usize,
+    },
+}
+
 /// The outbound sender. See the module docs. Cheap to share behind an `Arc`; every method takes
 /// `&self`.
 pub struct FederationSender {
@@ -1072,6 +1092,56 @@ impl FederationSender {
             .unwrap_or_else(PoisonError::into_inner)
             .get(destination)
             .map_or(0, |queue| queue.pending.load(Ordering::Acquire))
+    }
+
+    /// Waits until every PDU queued for `destination` has been accepted by it (or dropped),
+    /// for at most `timeout`: a delivery barrier for a request that is about to ask
+    /// `destination` something whose answer depends on what this server has already sent it --
+    /// a `make_join` after a leave of the same room, say, which must find the leave applied
+    /// there rather than overtake it in flight. Only PDUs count; EDUs carry no room state.
+    ///
+    /// Best effort, never a guarantee: a destination that is down keeps its queue, so the wait
+    /// ends at `timeout` with [`DeliveryWait::TimedOut`] and the caller goes on; and on a
+    /// replica that does not send for `destination` (its PDUs go to the store for the one that
+    /// does) the queue reads empty at once. The queue is polled every
+    /// [`DELIVERY_POLL_INTERVAL`]: this is a rare operation (a membership handshake), and a
+    /// poll keeps the worker free of one more channel.
+    pub async fn wait_until_delivered(&self, destination: &str, timeout: Duration) -> DeliveryWait {
+        let started = std::time::Instant::now();
+        let deadline = started + timeout;
+        let mut first = true;
+        loop {
+            let pending = self.pending_pdus_for(destination);
+            if pending == 0 {
+                return if first {
+                    DeliveryWait::NothingPending
+                } else {
+                    DeliveryWait::Delivered {
+                        waited: started.elapsed(),
+                    }
+                };
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                tracing::warn!(
+                    destination,
+                    pending,
+                    waited_ms = started.elapsed().as_millis() as u64,
+                    "gave up waiting for the destination to accept this server's queued \
+                     events; the request that waited goes ahead against its state as it is"
+                );
+                return DeliveryWait::TimedOut { pending };
+            }
+            if first {
+                tracing::debug!(
+                    destination,
+                    pending,
+                    "waiting for the destination to accept this server's queued events"
+                );
+                first = false;
+            }
+            tokio::time::sleep(DELIVERY_POLL_INTERVAL.min(deadline - now)).await;
+        }
     }
 
     /// Every destination a worker exists for, with its pending count, sorted by name.
@@ -3341,5 +3411,56 @@ mod tests {
         assert!(store.queued().unwrap().is_empty());
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(peer.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_delivery_barrier_returns_at_once_when_nothing_is_queued_waits_for_an_accepted_queue_and_gives_up_on_a_failing_one()
+     {
+        let peer = FakeFederationPeer::new("peer.example.org");
+        let (destination, _auth) = spawn_peer(&peer).await;
+        let sender = FederationSender::with_config(client(), US, fast());
+
+        assert_eq!(
+            sender
+                .wait_until_delivered(&destination, Duration::from_secs(1))
+                .await,
+            DeliveryWait::NothingPending
+        );
+
+        sender.enqueue_pdu([destination.clone()], pdu(0));
+        match sender
+            .wait_until_delivered(&destination, Duration::from_secs(10))
+            .await
+        {
+            DeliveryWait::Delivered { .. } | DeliveryWait::NothingPending => {}
+            other => panic!("the accepted queue should have drained: {other:?}"),
+        }
+        assert_eq!(sender.pending_pdus_for(&destination), 0);
+        assert_eq!(peer.request_count(), 1);
+
+        // A destination that keeps failing holds its queue: the wait ends at the timeout with
+        // the PDU still pending, and the caller is told so.
+        let failing = FakeFederationPeer::new("failing.example.org");
+        for _ in 0..50 {
+            failing.queue_response(CannedResponse::new(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({"errcode": "M_UNKNOWN"}),
+            ));
+        }
+        let (failing_destination, _auth) = spawn_peer(&failing).await;
+        sender.enqueue_pdu([failing_destination.clone()], pdu(1));
+        let started = Instant::now();
+        assert_eq!(
+            sender
+                .wait_until_delivered(&failing_destination, Duration::from_millis(300))
+                .await,
+            DeliveryWait::TimedOut { pending: 1 }
+        );
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(300) && waited < Duration::from_secs(5),
+            "{waited:?}"
+        );
+        sender.shutdown();
     }
 }

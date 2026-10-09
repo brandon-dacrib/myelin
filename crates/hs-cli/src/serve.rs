@@ -1846,6 +1846,8 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     let federation_source: Arc<dyn hs_admin::sources::FederationSource>;
     // The sender, to be fed once the cluster is up (its feeder is gated on shard ownership).
     let federation_sender: Option<Arc<hs_federation::sender::FederationSender>>;
+    // How far that feeder has read the room stream (`crate::federation_sender::ForwardedPosition`).
+    let forwarded_position = Arc::new(crate::federation_sender::ForwardedPosition::default());
     // What the server's running parts own on behalf of a hook that holds it weakly (to break a
     // reference cycle), dropped at shutdown.
     let mut keep_alive: Vec<Arc<dyn std::any::Any + Send + Sync>> = Vec::new();
@@ -1964,12 +1966,21 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         );
         federation_sender = Some(mount.sender.clone());
         components.watch("federation sender", &mount.sender);
-        remote_join = Some(Arc::new(crate::remote_join::FederationRemoteJoin::new(
-            mount.client.clone(),
-            mount.x_matrix.key_cache.clone(),
-            rooms.clone(),
-            identity.clone(),
-        )));
+        // A membership handshake for a room this server holds first waits for this server's
+        // own events of it to reach the other server (`crate::remote_join::DeliveryBarrier`):
+        // the forwarder started below moves `forwarded_position` on.
+        remote_join = Some(Arc::new(
+            crate::remote_join::FederationRemoteJoin::new(
+                mount.client.clone(),
+                mount.x_matrix.key_cache.clone(),
+                rooms.clone(),
+                identity.clone(),
+            )
+            .with_delivery_barrier(crate::remote_join::DeliveryBarrier::new(
+                forwarded_position.clone(),
+                mount.sender.clone(),
+            )),
+        ));
         // And how `GET /profile/{userId}` reaches a user of another server
         // (`crate::remote_profile`): the same client.
         auth_state.install_remote_profiles(Arc::new(
@@ -2144,12 +2155,13 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             ),
         );
         (
-            crate::federation_sender::OutboundFederation::start(
+            crate::federation_sender::OutboundFederation::start_with_position(
                 rooms.clone(),
                 sender,
                 server_name.clone(),
                 cluster_handles.cluster.ownership().clone(),
                 cluster_handles.layout,
+                forwarded_position.clone(),
             ),
             device_lists,
         )

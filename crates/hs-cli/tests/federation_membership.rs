@@ -1463,3 +1463,62 @@ async fn only_the_inviter_rescinds_an_invite_across_servers() {
     a.handle.shutdown().await;
     b.handle.shutdown().await;
 }
+
+/// A leave followed at once by a rejoin of an invite-only room, by the same user, is refused:
+/// the rejoin goes through the inviting server (nobody of B is in the room any more), and that
+/// server has to have seen the leave first, not a `make_join` that overtakes it in flight and
+/// finds the user still joined. Both servers end with the user `leave` (the 2026-10-09 Synapse
+/// interop run saw the rejoin let through when the two were back to back).
+#[tokio::test]
+async fn a_leave_then_an_immediate_rejoin_of_an_invite_only_room_is_refused_on_both_servers() {
+    let (a, b) = (start().await, start().await);
+    let client = reqwest::Client::new();
+    let alice = register(&client, &a, "alice").await;
+    let bob = register(&client, &b, "bob").await;
+
+    let room_id = create_room(
+        &client,
+        &alice,
+        json!({"preset": "private_chat", "invite": [bob.id], "room_version": "11"}),
+    )
+    .await;
+    sync_until(&client, &bob, |s| {
+        s["rooms"]["invite"].get(&room_id).is_some()
+    })
+    .await;
+    let (status, body) = post(&client, &bob, &format!("join/{room_id}"), json!({})).await;
+    assert_eq!(status, 200, "the join failed: {body}");
+    wait_for_membership(&client, &alice, &room_id, &bob.id, "join").await;
+
+    for round in 1..=3 {
+        let (status, body) =
+            post(&client, &bob, &format!("rooms/{room_id}/leave"), json!({})).await;
+        assert_eq!(status, 200, "round {round}: the leave failed: {body}");
+        let (status, body) = post(&client, &bob, &format!("join/{room_id}"), json!({})).await;
+        assert_eq!(
+            status, 403,
+            "round {round}: a rejoin of an invite-only room without a new invite must be refused, got {status}: {body}"
+        );
+        wait_for_membership(&client, &alice, &room_id, &bob.id, "leave").await;
+        wait_for_membership(&client, &bob, &room_id, &bob.id, "leave").await;
+        // Invite him again for the next round.
+        let (status, body) = post(
+            &client,
+            &alice,
+            &format!("rooms/{room_id}/invite"),
+            json!({"user_id": bob.id}),
+        )
+        .await;
+        assert_eq!(status, 200, "round {round}: the re-invite failed: {body}");
+        wait_for_membership(&client, &bob, &room_id, &bob.id, "invite").await;
+        let (status, body) = post(&client, &bob, &format!("join/{room_id}"), json!({})).await;
+        assert_eq!(
+            status, 200,
+            "round {round}: the join after the re-invite failed: {body}"
+        );
+        wait_for_membership(&client, &alice, &room_id, &bob.id, "join").await;
+    }
+
+    a.handle.shutdown().await;
+    b.handle.shutdown().await;
+}

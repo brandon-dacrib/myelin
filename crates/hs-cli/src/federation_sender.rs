@@ -99,6 +99,52 @@ pub struct OutboundFederation {
     sender: Arc<FederationSender>,
 }
 
+/// How far the forwarder has read the registry's global update stream: the `global_seq`
+/// (`RoomUpdate::global_seq`) of the newest update it has handed to the sender. A reader that
+/// wants its own event to be *queued* for its destination before it goes on -- the delivery
+/// barrier before a membership handshake, [`crate::remote_join::DeliveryBarrier`] -- takes
+/// `RoomRegistry::global_published_seq` and waits for the forwarder to reach it. The same
+/// arrangement `hs-user`'s `/sync` uses to read its own writes off the session hub.
+#[derive(Default)]
+pub struct ForwardedPosition {
+    seq: std::sync::atomic::AtomicU64,
+    notify: tokio::sync::Notify,
+}
+
+impl ForwardedPosition {
+    /// The newest `global_seq` handed to the sender, `0` before any.
+    #[must_use]
+    pub fn processed(&self) -> u64 {
+        self.seq.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Records that every update up to `seq` has been handled, and wakes the waiters.
+    pub fn advance(&self, seq: u64) {
+        self.seq.fetch_max(seq, std::sync::atomic::Ordering::AcqRel);
+        self.notify.notify_waiters();
+    }
+
+    /// Waits until the forwarder has handled every update up to `seq`, for at most `timeout`.
+    /// `true` when it has; `false` when the time ran out first (the forwarder is behind, or
+    /// not running).
+    pub async fn wait_for(&self, seq: u64, timeout: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            // Arm the notification before the check, so an advance between the two is not
+            // missed (`Notify::notify_waiters` wakes only waiters already registered).
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.processed() >= seq {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return self.processed() >= seq;
+            }
+        }
+    }
+}
+
 impl OutboundFederation {
     /// Subscribes to `rooms`' update stream and starts following it; gates the sender on
     /// `ownership` (see the module docs) and follows that too; and resumes whatever the
@@ -115,6 +161,29 @@ impl OutboundFederation {
         ownership: Arc<dyn Ownership>,
         layout: ShardLayout,
     ) -> Self {
+        Self::start_with_position(
+            rooms,
+            sender,
+            own_server_name,
+            ownership,
+            layout,
+            Arc::new(ForwardedPosition::default()),
+        )
+    }
+
+    /// [`OutboundFederation::start`], moving `position` on as each update of the stream is
+    /// handled: what [`crate::remote_join::DeliveryBarrier`] waits on before a membership
+    /// handshake, so the handshake follows this server's own events to the other server instead
+    /// of overtaking them.
+    #[must_use]
+    pub fn start_with_position<B: KvBackend + 'static>(
+        rooms: Arc<RoomRegistry<B>>,
+        sender: Arc<FederationSender>,
+        own_server_name: OwnedServerName,
+        ownership: Arc<dyn Ownership>,
+        layout: ShardLayout,
+        position: Arc<ForwardedPosition>,
+    ) -> Self {
         let updates = rooms.subscribe_global();
         let ownership_events = ownership.subscribe();
         sender.set_gate(Arc::new(ShardGate::new(ownership, layout)));
@@ -123,8 +192,14 @@ impl OutboundFederation {
             own_server_name.clone(),
         )));
         resume_logged(&sender);
-        let task =
-            tokio::spawn(follow(rooms, sender.clone(), own_server_name, updates)).abort_handle();
+        let task = tokio::spawn(follow(
+            rooms,
+            sender.clone(),
+            own_server_name,
+            updates,
+            position,
+        ))
+        .abort_handle();
         let ownership_task =
             tokio::spawn(follow_ownership(sender.clone(), ownership_events)).abort_handle();
         Self {
@@ -200,14 +275,14 @@ async fn follow<B: KvBackend + 'static>(
     sender: Arc<FederationSender>,
     own_server_name: OwnedServerName,
     mut updates: tokio::sync::broadcast::Receiver<RoomUpdate>,
+    position: Arc<ForwardedPosition>,
 ) {
     loop {
         match updates.recv().await {
             Ok(update) => {
-                if update.sender.server_name() != own_server_name {
-                    continue;
-                }
-                if let Err(error) = forward_update(&rooms, &sender, &own_server_name, &update).await
+                if update.sender.server_name() == own_server_name
+                    && let Err(error) =
+                        forward_update(&rooms, &sender, &own_server_name, &update).await
                 {
                     tracing::error!(
                         room_id = %update.room_id,
@@ -217,6 +292,9 @@ async fn follow<B: KvBackend + 'static>(
                          will not receive it"
                     );
                 }
+                // Handed to the sender (queued, or nothing to queue, or failed and logged):
+                // either way this update is behind the forwarder now.
+                position.advance(update.global_seq);
             }
             Err(RecvError::Lagged(missed)) => {
                 tracing::warn!(
