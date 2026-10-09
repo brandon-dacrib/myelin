@@ -7,7 +7,8 @@
 //! `session`, deletes a device as the account CAS vouched for and refuses it as anybody else.
 //! `/metrics` counts each outcome. The same steps as Sytest's `12login/02cas.pl` and the SSO
 //! tests of `10apidoc/13ui-auth.pl`, every one of which failed before: `GET /login` offered no
-//! SSO and the routes did not exist.
+//! SSO and the routes did not exist. The second test also saves `auth.cas.protocol_version: 3`
+//! and `enable_registration: false` through the admin API and sees them in force at once.
 
 use std::sync::{Arc, Mutex};
 
@@ -37,28 +38,44 @@ impl Drop for HsProcess {
 struct FakeCas {
     user: Mutex<String>,
     validations: Mutex<Vec<(String, String)>>,
+    /// How many checks came to the CAS 3 endpoint, `/cas/p3/proxyValidate`.
+    p3_validations: Mutex<u32>,
 }
 
 async fn start_fake_cas(fake: Arc<FakeCas>) -> u16 {
     use axum::extract::{Query, State};
     use std::collections::HashMap;
+    async fn validate(fake: &FakeCas, q: &HashMap<String, String>, p3: bool) -> String {
+        fake.validations.lock().unwrap().push((
+            q.get("ticket").cloned().unwrap_or_default(),
+            q.get("service").cloned().unwrap_or_default(),
+        ));
+        if p3 {
+            *fake.p3_validations.lock().unwrap() += 1;
+        }
+        let user = fake.user.lock().unwrap().clone();
+        format!(
+            "<cas:serviceResponse xmlns:cas='http://www.yale.edu/tp/cas'>\n\
+             <cas:authenticationSuccess><cas:user>{user}</cas:user>\
+             <cas:attributes><cas:displayName>Casey User</cas:displayName></cas:attributes>\
+             </cas:authenticationSuccess></cas:serviceResponse>"
+        )
+    }
     let app = axum::Router::new()
         .route("/cas/login", axum::routing::get(|| async { "CAS login page" }))
         .route(
             "/cas/proxyValidate",
             axum::routing::get(
                 |State(fake): State<Arc<FakeCas>>, Query(q): Query<HashMap<String, String>>| async move {
-                    fake.validations.lock().unwrap().push((
-                        q.get("ticket").cloned().unwrap_or_default(),
-                        q.get("service").cloned().unwrap_or_default(),
-                    ));
-                    let user = fake.user.lock().unwrap().clone();
-                    format!(
-                        "<cas:serviceResponse xmlns:cas='http://www.yale.edu/tp/cas'>\n\
-                         <cas:authenticationSuccess><cas:user>{user}</cas:user>\
-                         <cas:attributes><cas:displayName>Casey User</cas:displayName></cas:attributes>\
-                         </cas:authenticationSuccess></cas:serviceResponse>"
-                    )
+                    validate(&fake, &q, false).await
+                },
+            ),
+        )
+        .route(
+            "/cas/p3/proxyValidate",
+            axum::routing::get(
+                |State(fake): State<Arc<FakeCas>>, Query(q): Query<HashMap<String, String>>| async move {
+                    validate(&fake, &q, true).await
                 },
             ),
         )
@@ -535,6 +552,57 @@ async fn cas_follows_the_public_address_trusts_listed_clients_and_respects_bridg
     assert_eq!(status, StatusCode::NOT_FOUND, "no account was made");
     wait_for("refused a registration in an appservice's exclusive namespace");
 
+    // CAS protocol 3 and sign-in only, saved through the admin API and in force at once: the
+    // next check goes to `/p3/proxyValidate`, a newcomer is refused without an account being
+    // made, and somebody with an account still signs in.
+    assert_eq!(*fake.p3_validations.lock().unwrap(), 0);
+    let (status, updated) = client
+        .json(
+            Method::PATCH,
+            "/api/v1/config/auth",
+            Some(&ops_token),
+            Some(json!({"cas": {"protocol_version": 3, "enable_registration": false}})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{updated}");
+    wait_for("the auth settings are now in force");
+    *fake.user.lock().unwrap() = "newcomer".to_owned();
+    let page = client.raw(&format!("{service}&ticket=t4")).await;
+    assert_eq!(page.status(), StatusCode::FORBIDDEN);
+    assert!(
+        page.text()
+            .await
+            .unwrap()
+            .contains("does not create one here")
+    );
+    assert_eq!(
+        *fake.p3_validations.lock().unwrap(),
+        1,
+        "checked at the CAS 3 endpoint"
+    );
+    let (status, _) = client
+        .json(
+            Method::GET,
+            "/_matrix/client/v3/profile/@newcomer:example.org",
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "no account was made");
+    *fake.user.lock().unwrap() = "trusted".to_owned();
+    let back = client
+        .raw(&format!(
+            "{}&ticket=t5",
+            service_for("https://trusted.example/app").await
+        ))
+        .await;
+    assert_eq!(
+        back.status(),
+        StatusCode::FOUND,
+        "an existing account signs in"
+    );
+    assert_eq!(*fake.p3_validations.lock().unwrap(), 2);
+
     let metrics = client
         .http
         .get(format!("{base}/metrics"))
@@ -544,7 +612,7 @@ async fn cas_follows_the_public_address_trusts_listed_clients_and_respects_bridg
         .text()
         .await
         .unwrap();
-    for (outcome, count) in [("registered", "2"), ("failed", "1")] {
+    for (outcome, count) in [("registered", "2"), ("login", "1"), ("failed", "2")] {
         let line =
             format!("hs_auth_sso_logins_total{{provider=\"cas\",outcome=\"{outcome}\"}} {count}");
         assert!(metrics.contains(&line), "{line} not in /metrics");

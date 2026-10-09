@@ -235,7 +235,8 @@
         "oidc_providers": [],
         "cas": null,
         "sso": {
-          "client_whitelist": []
+          "client_whitelist": [],
+          "update_profile_information": false
         },
         "next_link_domain_whitelist": null,
         "mas_delegation": null
@@ -1768,7 +1769,8 @@
           "description": "What happens after single sign-on, for every provider: `client_whitelist` lists the\naddress prefixes of applications people are sent straight back to, without the page\nasking them to confirm (end each with a `/` after the host name). Empty by default.\nCorresponds to Synapse's `sso`.",
           "$ref": "#/$defs/SsoConfig",
           "default": {
-            "client_whitelist": []
+            "client_whitelist": [],
+            "update_profile_information": false
           },
           "x-applies": "hot"
         },
@@ -2007,6 +2009,32 @@
           "description": "The name shown on the sign-in button (\"Sign in with ...\"). Corresponds to Synapse's\n`cas_config.idp_name`.",
           "type": "string",
           "default": "CAS"
+        },
+        "protocol_version": {
+          "description": "The version of the CAS protocol the server speaks: `3` checks tickets at\n`<server_url>/p3/proxyValidate`, the CAS 3 endpoint that returns a person's attributes;\n`1` or `2`, or unset (the default), at `<server_url>/proxyValidate`, which CAS 3 servers\nanswer too. Corresponds to Synapse's `cas_config.protocol_version`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint8",
+          "minimum": 0,
+          "maximum": 255,
+          "default": null
+        },
+        "enable_registration": {
+          "description": "Whether a person CAS signs in for the first time gets an account here. Off, only people\nwho already have an account -- linked at an earlier sign-in, or with the user name CAS\ngives them -- can sign in, and the rest see a page saying so. On by default. Corresponds\nto Synapse's `cas_config.enable_registration`.",
+          "type": "boolean",
+          "default": true
+        },
+        "allow_numeric_ids": {
+          "description": "Whether a CAS user name made of digits only (a student number, `12345`) gets\n`numeric_ids_prefix` put in front of it (`@u12345:example.org`), so it cannot be mistaken\nfor a guest's number. Off by default: the name is used as it is. Corresponds to Synapse's\n`cas_config.allow_numeric_ids`.",
+          "type": "boolean",
+          "default": false
+        },
+        "numeric_ids_prefix": {
+          "description": "What goes in front of a digits-only CAS user name when `allow_numeric_ids` is on:\nletters and digits only. `u` by default. Choose it so it cannot collide with a name\nsomebody already has (`1234` becomes `u1234`). Corresponds to Synapse's\n`cas_config.numeric_ids_prefix`.",
+          "type": "string",
+          "default": "u"
         }
       },
       "additionalProperties": false,
@@ -2025,6 +2053,11 @@
             "type": "string"
           },
           "default": []
+        },
+        "update_profile_information": {
+          "description": "Whether a person's display name here follows the name the sign-on provider gives at\neach sign-in (`auth.cas.displayname_attribute`), so a name changed at the provider shows\nin their rooms after their next sign-in. Off by default: the provider's name is used\nonly when the account is created, and the person keeps whatever name they set since.\nCorresponds to Synapse's `sso.update_profile_information`.",
+          "type": "boolean",
+          "default": false
         }
       },
       "additionalProperties": false

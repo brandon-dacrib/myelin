@@ -229,10 +229,13 @@ async fn validate(
     })?;
     let checked = match state
         .cas_validator
-        .validate(&cas.server_url, ticket, &service)
+        .validate(&cas::validate_url(cas), ticket, &service)
         .await
     {
-        Ok(body) => cas::parse_response(&body),
+        Ok(body) => cas::parse_response(&body).map(|mut response| {
+            cas::prefix_numeric_user(&mut response, cas);
+            response
+        }),
         Err(e) => Err(e),
     };
     let response = checked.map_err(|e| {
@@ -359,6 +362,12 @@ async fn login_ticket(
     {
         return *page;
     }
+    let display_name = cas
+        .displayname_attribute
+        .as_ref()
+        .and_then(|attr| response.attributes.get(attr))
+        .and_then(|values| values.first().cloned())
+        .filter(|name| !name.is_empty());
     let (user_id, created) = match account {
         CasAccount::Linked(user_id) | CasAccount::Existing(user_id) => {
             match state.store.get_user(&user_id).await {
@@ -366,7 +375,32 @@ async fn login_ticket(
                     cas::count("failed");
                     return error_page(StatusCode::FORBIDDEN, "This account has been deactivated.");
                 }
-                Ok(_) => {}
+                Ok(Some(user)) => {
+                    // `auth.sso.update_profile_information`: the name CAS gives now replaces
+                    // the account's, and the change is carried into the user's rooms, as
+                    // Synapse's `complete_sso_login_request` does with `_sso_update_profile_information`.
+                    if state.config.get().sso_update_profile_information
+                        && let Some(name) = &display_name
+                        && user.display_name.as_deref() != Some(name.as_str())
+                    {
+                        match state
+                            .store
+                            .set_profile_display_name(&user_id, Some(name.clone()))
+                            .await
+                        {
+                            Ok(()) => {
+                                tracing::info!(%user_id, "a display name followed the sign-on provider's at sign-in");
+                                if let Some(refresh) = state.profile_refresh() {
+                                    refresh.profile_changed(state, &user_id);
+                                }
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, %user_id, "could not update a display name from the sign-on provider");
+                            }
+                        }
+                    }
+                }
+                Ok(None) => {}
                 Err(error) => {
                     tracing::warn!(%error, "could not read a CAS sign-in's account");
                     return internal();
@@ -376,6 +410,17 @@ async fn login_ticket(
             (user_id, false)
         }
         CasAccount::New(user_id) => {
+            if !cas.enable_registration {
+                // `auth.cas.enable_registration: false`: sign-in only, as Synapse's
+                // `registration_enabled=False` aborts the flow for an unknown user.
+                cas::count("failed");
+                tracing::info!(cas_user = %response.user, %user_id, "refused a CAS sign-in: no account here and auth.cas.enable_registration is off");
+                return error_page(
+                    StatusCode::FORBIDDEN,
+                    "You have no account on this server, and signing in through the sign-in \
+                     service does not create one here. Ask this server's administrator.",
+                );
+            }
             match state
                 .store
                 .is_localpart_available(user_id.localpart())
@@ -395,12 +440,7 @@ async fn login_ticket(
                 }
             }
             let mut record = UserRecord::new(user_id.clone(), state.now_ms());
-            record.display_name = cas
-                .displayname_attribute
-                .as_ref()
-                .and_then(|attr| response.attributes.get(attr))
-                .and_then(|values| values.first().cloned())
-                .filter(|name| !name.is_empty());
+            record.display_name = display_name;
             if let Err(error) = state.store.create_user(record).await {
                 tracing::warn!(%error, %user_id, "could not create an account at a CAS sign-in");
                 return internal();
@@ -589,11 +629,23 @@ mod tests {
                 displayname_attribute: Some("name".to_owned()),
                 required_attributes: BTreeMap::new(),
                 idp_name: "Campus CAS".to_owned(),
+                protocol_version: None,
+                enable_registration: true,
+                numeric_ids_prefix: None,
             }),
             ..AuthConfig::default()
         };
         let state = AuthState::in_memory_with_config(config).with_cas_validator(fake.clone());
         (state, fake)
+    }
+
+    /// Replaces the CAS settings in `state`'s live configuration.
+    fn set_cas(state: &AuthState, change: impl FnOnce(&mut CasSettings, &mut AuthConfig)) {
+        let mut config = state.config.get().as_ref().clone();
+        let mut cas = config.cas.take().unwrap();
+        change(&mut cas, &mut config);
+        config.cas = Some(cas);
+        state.set_config(config);
     }
 
     async fn get(state: &AuthState, uri: &str) -> (StatusCode, Option<String>, String) {
@@ -756,7 +808,7 @@ mod tests {
         assert_eq!(
             asked,
             vec![(
-                "https://cas.example.edu/cas".to_owned(),
+                "https://cas.example.edu/cas/proxyValidate".to_owned(),
                 "goldenticket".to_owned(),
                 service_for_client()
             )]
@@ -789,6 +841,123 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(consumed.user_id, user_id);
+    }
+
+    #[tokio::test]
+    async fn protocol_version_3_checks_the_ticket_at_the_p3_endpoint() {
+        let (state, fake) = state_with_cas(success("cas_user!"));
+        set_cas(&state, |cas, _| cas.protocol_version = Some(3));
+        let uri = format!(
+            "/login/cas/ticket?redirectUrl={}&ticket=goldenticket",
+            cas::encode_component(CLIENT)
+        );
+        let (status, _, body) = get(&state, &uri).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            fake.asked.lock().unwrap()[0].0,
+            "https://cas.example.edu/cas/p3/proxyValidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_digits_only_cas_user_is_prefixed_when_numeric_ids_are_allowed() {
+        let (state, _) = state_with_cas(success("1234"));
+        set_cas(&state, |cas, _| {
+            cas.numeric_ids_prefix = Some("u".to_owned())
+        });
+        let uri = format!(
+            "/login/cas/ticket?redirectUrl={}&ticket=goldenticket",
+            cas::encode_component(CLIENT)
+        );
+        let (status, _, body) = get(&state, &uri).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let user_id = ruma::user_id!("@u1234:example.org");
+        assert!(state.store.get_user(user_id).await.unwrap().is_some());
+        // Linked under the prefixed name, so the next sign-in finds the same account.
+        assert_eq!(
+            state
+                .store
+                .get_user_by_external_id("cas", "u1234")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(user_id)
+        );
+        assert!(
+            state
+                .store
+                .get_user(ruma::user_id!("@1234:example.org"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn with_registration_off_only_people_with_an_account_sign_in() {
+        let (state, _) = state_with_cas(success("Newcomer"));
+        set_cas(&state, |cas, _| cas.enable_registration = false);
+        let uri = format!(
+            "/login/cas/ticket?redirectUrl={}&ticket=goldenticket",
+            cas::encode_component(CLIENT)
+        );
+        let (status, _, body) = get(&state, &uri).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(body.contains("does not create one here"), "{body}");
+        assert!(
+            state
+                .store
+                .get_user(ruma::user_id!("@newcomer:example.org"))
+                .await
+                .unwrap()
+                .is_none(),
+            "no account is made"
+        );
+
+        // Somebody with an account under the mapped name still signs in.
+        let alice = ruma::user_id!("@alice:example.org").to_owned();
+        state
+            .store
+            .create_user(UserRecord::new(alice.clone(), 0))
+            .await
+            .unwrap();
+        let (state2, _) = state_with_cas(success("Alice"));
+        set_cas(&state2, |cas, _| cas.enable_registration = false);
+        state2
+            .store
+            .create_user(UserRecord::new(alice.clone(), 0))
+            .await
+            .unwrap();
+        let (status, _, body) = get(&state2, &uri).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("loginToken="), "{body}");
+    }
+
+    #[tokio::test]
+    async fn the_display_name_follows_the_provider_only_when_asked() {
+        let alice = ruma::user_id!("@alice:example.org").to_owned();
+        let uri = format!(
+            "/login/cas/ticket?redirectUrl={}&ticket=goldenticket",
+            cas::encode_component(CLIENT)
+        );
+        for update in [false, true] {
+            let (state, _) = state_with_cas(success("Alice"));
+            set_cas(&state, |_, config| {
+                config.sso_update_profile_information = update
+            });
+            let mut record = UserRecord::new(alice.clone(), 0);
+            record.display_name = Some("Old Name".to_owned());
+            state.store.create_user(record).await.unwrap();
+            let (status, _, body) = get(&state, &uri).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let user = state.store.get_user(&alice).await.unwrap().unwrap();
+            let expected = if update { "Casey" } else { "Old Name" };
+            assert_eq!(
+                user.display_name.as_deref(),
+                Some(expected),
+                "update={update}"
+            );
+        }
     }
 
     #[tokio::test]

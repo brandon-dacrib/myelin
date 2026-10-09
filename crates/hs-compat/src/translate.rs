@@ -843,6 +843,9 @@ fn translate_key(key: &str, v: &Value, config: &mut Config) {
             if let Some(clients) = get_str_list(v, "client_whitelist") {
                 config.auth.sso.client_whitelist = clients;
             }
+            if let Some(update) = get_bool(v, "update_profile_information") {
+                config.auth.sso.update_profile_information = update;
+            }
         }
         "next_link_domain_whitelist" => {
             config.auth.next_link_domain_whitelist = get_str_list_value(v);
@@ -981,10 +984,9 @@ fn apply_database(v: &Value, config: &mut Config) {
 }
 
 /// Synapse's `cas_config` onto `auth.cas`. `enabled: false` (or no `server_url`) leaves CAS
-/// off. Synapse's `protocol_version`, `enable_registration`, `allow_numeric_ids`,
-/// `numeric_ids_prefix`, `idp_icon` and `idp_brand` have no native counterpart (the classification
-/// row says so): CAS 2/3 `/proxyValidate` is always used and a first sign-in always creates the
-/// account.
+/// off. `protocol_version`, `enable_registration`, `allow_numeric_ids` and `numeric_ids_prefix`
+/// carry over with Synapse's defaults; `idp_icon` and `idp_brand` have no native counterpart
+/// (the classification row says so).
 fn apply_cas(v: &Value, config: &mut Config) {
     if get_bool(v, "enabled") == Some(false) {
         return;
@@ -1008,6 +1010,10 @@ fn apply_cas(v: &Value, config: &mut Config) {
         displayname_attribute: get_str(v, "displayname_attribute"),
         required_attributes,
         idp_name: get_str(v, "idp_name").unwrap_or_else(|| "CAS".to_owned()),
+        protocol_version: get_u64(v, "protocol_version").and_then(|n| u8::try_from(n).ok()),
+        enable_registration: get_bool(v, "enable_registration").unwrap_or(true),
+        allow_numeric_ids: get_bool(v, "allow_numeric_ids").unwrap_or(false),
+        numeric_ids_prefix: get_str(v, "numeric_ids_prefix").unwrap_or_else(|| "u".to_owned()),
     });
 }
 
@@ -1340,6 +1346,7 @@ database:
         let (config, report) = translate(yaml, TranslateOptions::default()).unwrap();
         assert!(!report.has_blocking());
         assert_eq!(config.auth.sso.client_whitelist, ["https://app.example/"]);
+        assert!(config.auth.sso.update_profile_information);
         assert_eq!(
             config.auth.next_link_domain_whitelist,
             Some(vec!["app.example".to_owned()])
@@ -1379,7 +1386,27 @@ database:
             Some(&Some("staff".to_owned()))
         );
         assert_eq!(cas.required_attributes.get("department"), Some(&None));
+        // Synapse's defaults for what the file does not say.
+        assert_eq!(cas.protocol_version, None);
+        assert!(cas.enable_registration);
+        assert!(!cas.allow_numeric_ids);
+        assert_eq!(cas.numeric_ids_prefix, "u");
         let _ = report;
+
+        let full = "server_name: example.org
+cas_config:
+  server_url: https://cas.example.edu/cas
+  protocol_version: 3
+  enable_registration: false
+  allow_numeric_ids: true
+  numeric_ids_prefix: numericuser
+";
+        let (config, _) = translate(full, TranslateOptions::default()).unwrap();
+        let cas = config.auth.cas.unwrap();
+        assert_eq!(cas.protocol_version, Some(3));
+        assert!(!cas.enable_registration);
+        assert!(cas.allow_numeric_ids);
+        assert_eq!(cas.numeric_ids_prefix, "numericuser");
 
         let disabled = "server_name: example.org\ncas_config:\n  enabled: false\n  server_url: https://cas.example.edu/cas\n";
         let (config, _) = translate(disabled, TranslateOptions::default()).unwrap();

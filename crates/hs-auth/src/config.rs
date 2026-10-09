@@ -142,6 +142,11 @@ pub struct AuthConfig {
     /// `sso.client_whitelist`). See [`AuthConfig::sso_client_is_trusted`].
     pub sso_client_whitelist: Vec<String>,
 
+    /// Whether a single-sign-on provider's display name replaces the account's at each sign-in
+    /// (`auth.sso.update_profile_information`, Synapse's `sso.update_profile_information`);
+    /// off, it is used only when the account is created.
+    pub sso_update_profile_information: bool,
+
     /// The hosts a validation email's `next_link` may name (`auth.next_link_domain_whitelist`,
     /// Synapse's `next_link_domain_whitelist`): `None` allows any `http(s)` address. See
     /// [`crate::threepid::check_next_link`].
@@ -163,6 +168,16 @@ pub struct CasSettings {
     pub required_attributes: std::collections::BTreeMap<String, Option<String>>,
     /// The provider's name, shown on the sign-in button.
     pub idp_name: String,
+    /// The CAS protocol version (`auth.cas.protocol_version`): `Some(3)` checks tickets at
+    /// `/p3/proxyValidate`, anything else at `/proxyValidate`. See [`crate::cas::validate_url`].
+    pub protocol_version: Option<u8>,
+    /// Whether a first sign-in creates the account (`auth.cas.enable_registration`); off, a
+    /// person without an account here is refused.
+    pub enable_registration: bool,
+    /// What goes in front of a digits-only CAS user name (`auth.cas.numeric_ids_prefix` when
+    /// `auth.cas.allow_numeric_ids` is on); `None` leaves such a name as it is. See
+    /// [`crate::cas::prefix_numeric_user`].
+    pub numeric_ids_prefix: Option<String>,
 }
 
 impl Default for AuthConfig {
@@ -193,6 +208,7 @@ impl Default for AuthConfig {
             public_baseurl: None,
             cas: None,
             sso_client_whitelist: Vec::new(),
+            sso_update_profile_information: false,
             next_link_domain_whitelist: None,
         }
     }
@@ -340,8 +356,14 @@ impl TryFrom<&hs_config::Config> for AuthConfig {
                 displayname_attribute: cas.displayname_attribute.clone(),
                 required_attributes: cas.required_attributes.clone(),
                 idp_name: cas.idp_name.clone(),
+                protocol_version: cas.protocol_version,
+                enable_registration: cas.enable_registration,
+                numeric_ids_prefix: cas
+                    .allow_numeric_ids
+                    .then(|| cas.numeric_ids_prefix.clone()),
             }),
             sso_client_whitelist: config.auth.sso.client_whitelist.clone(),
+            sso_update_profile_information: config.auth.sso.update_profile_information,
             next_link_domain_whitelist: config.auth.next_link_domain_whitelist.clone(),
             ..Self::default()
         };
@@ -459,12 +481,34 @@ mod tests {
         native.server.server_name = "example.org".to_owned();
         native.auth.sso.client_whitelist = vec!["https://app.example/".to_owned()];
         native.auth.next_link_domain_whitelist = Some(vec!["app.example".to_owned()]);
+        native.auth.sso.update_profile_information = true;
+        native.auth.cas = Some(hs_config::auth::CasConfig {
+            server_url: "https://cas.example.edu/cas/".to_owned(),
+            service_url: None,
+            displayname_attribute: None,
+            required_attributes: Default::default(),
+            idp_name: "CAS".to_owned(),
+            protocol_version: Some(3),
+            enable_registration: false,
+            allow_numeric_ids: true,
+            numeric_ids_prefix: "student".to_owned(),
+        });
         let config = AuthConfig::try_from(&native).unwrap();
         assert_eq!(config.sso_client_whitelist, ["https://app.example/"]);
+        assert!(config.sso_update_profile_information);
         assert_eq!(
             config.next_link_domain_whitelist,
             Some(vec!["app.example".to_owned()])
         );
+        let cas = config.cas.unwrap();
+        assert_eq!(cas.protocol_version, Some(3));
+        assert!(!cas.enable_registration);
+        assert_eq!(cas.numeric_ids_prefix.as_deref(), Some("student"));
+
+        // `allow_numeric_ids` off: no prefix, whatever `numeric_ids_prefix` says.
+        native.auth.cas.as_mut().unwrap().allow_numeric_ids = false;
+        let config = AuthConfig::try_from(&native).unwrap();
+        assert_eq!(config.cas.unwrap().numeric_ids_prefix, None);
     }
 
     #[test]

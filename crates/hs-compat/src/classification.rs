@@ -1176,13 +1176,13 @@ pub const OPTIONS: &[KeyInfo] = &[
         key: "cas_config",
         classification: Classification::MappedDiff,
         native: "`auth.cas`",
-        note: "`server_url`, `service_url`, `displayname_attribute`, `required_attributes` and `idp_name` map directly; `enabled: false` leaves CAS off. CAS 2/3 `/proxyValidate` is always used (no `protocol_version`), a first sign-in always creates the account (no `enable_registration`), and `allow_numeric_ids`, `numeric_ids_prefix`, `idp_icon` and `idp_brand` are not carried over.",
+        note: "`server_url`, `service_url`, `displayname_attribute`, `required_attributes`, `idp_name`, `protocol_version` (3 checks tickets at `/p3/proxyValidate`), `enable_registration`, `allow_numeric_ids` and `numeric_ids_prefix` map directly; `enabled: false` leaves CAS off. `idp_icon` and `idp_brand` are not carried over (the sign-in button has no icon).",
     },
     KeyInfo {
         key: "sso",
         classification: Classification::MappedDiff,
         native: "`auth.sso.client_whitelist`",
-        note: "`client_whitelist` maps directly (a prefix match; this server's login fallback is always trusted, as in Synapse). `update_profile_information` and the template overrides (`templates`) are not carried over.",
+        note: "`client_whitelist` (a prefix match; this server's login fallback is always trusted, as in Synapse) and `update_profile_information` map directly. The template overrides (`templates`) are not carried over.",
     },
     KeyInfo {
         key: "jwt_config",

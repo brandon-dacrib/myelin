@@ -12,8 +12,11 @@
 //! 2. The person signs in at CAS, which sends them back to the service address with
 //!    `&ticket=<ticket>` added.
 //! 3. This server checks the ticket at `<server_url>/proxyValidate?ticket=..&service=..` (the
-//!    service exactly as it was sent in step 1, which CAS compares), and reads the CAS user name
-//!    and attributes out of the XML answer ([`parse_response`]).
+//!    service exactly as it was sent in step 1, which CAS compares; `/p3/proxyValidate` with
+//!    `auth.cas.protocol_version: 3`, see [`validate_url`]), and reads the CAS user name and
+//!    attributes out of the XML answer ([`parse_response`]). A digits-only user name gets
+//!    `auth.cas.numeric_ids_prefix` in front when `allow_numeric_ids` is on
+//!    ([`prefix_numeric_user`]).
 //! 4. The CAS user name becomes a localpart ([`map_username_to_localpart`], the spec's "mapping
 //!    from other character sets"): an account linked to it before (external id `cas`), or an
 //!    existing account with that localpart, signs in; otherwise the account is created. A
@@ -115,6 +118,31 @@ pub fn service_url(
         arg.0,
         encode_component(arg.1)
     ))
+}
+
+/// Where a ticket is checked: `<server_url>/p3/proxyValidate` with
+/// [`CasSettings::protocol_version`] `Some(3)` (the CAS 3 endpoint, which returns attributes),
+/// `<server_url>/proxyValidate` otherwise -- as Synapse's `CasHandler._validate_ticket` picks it.
+#[must_use]
+pub fn validate_url(cas: &CasSettings) -> String {
+    match cas.protocol_version {
+        Some(3) => format!("{}/p3/proxyValidate", cas.server_url),
+        _ => format!("{}/proxyValidate", cas.server_url),
+    }
+}
+
+/// Puts [`CasSettings::numeric_ids_prefix`] in front of a CAS user name made of digits only
+/// (`1234` becomes `u1234`), as Synapse's `allow_numeric_ids` does, before the name is mapped
+/// onto a localpart or linked as an external id -- so the account is linked under the prefixed
+/// name, and a later sign-in finds it the same way. Nothing without a prefix, or for a name
+/// with anything but ASCII digits in it.
+pub fn prefix_numeric_user(response: &mut CasResponse, cas: &CasSettings) {
+    if let Some(prefix) = &cas.numeric_ids_prefix
+        && !response.user.is_empty()
+        && response.user.bytes().all(|b| b.is_ascii_digit())
+    {
+        response.user = format!("{prefix}{}", response.user);
+    }
 }
 
 /// Where a person is sent to sign in: `<server_url>/login?service=<service>`.
@@ -270,17 +298,17 @@ pub fn map_username_to_localpart(username: &str) -> String {
     out
 }
 
-/// Checks a ticket with the CAS server: `GET <server_url>/proxyValidate?ticket=..&service=..`,
-/// answering the response body.
+/// Checks a ticket with the CAS server: `GET <validate_url>?ticket=..&service=..`, answering
+/// the response body. `validate_url` is [`validate_url`]'s.
 #[async_trait::async_trait]
 pub trait CasValidator: Send + Sync {
-    /// The CAS server's answer to the ticket check.
+    /// The CAS server's answer to the ticket check at `validate_url`.
     ///
     /// # Errors
     /// [`CasError::Transport`] when the server cannot be reached or answers other than `200`.
     async fn validate(
         &self,
-        server_url: &str,
+        validate_url: &str,
         ticket: &str,
         service: &str,
     ) -> Result<String, CasError>;
@@ -310,12 +338,12 @@ impl HttpCasValidator {
 impl CasValidator for HttpCasValidator {
     async fn validate(
         &self,
-        server_url: &str,
+        validate_url: &str,
         ticket: &str,
         service: &str,
     ) -> Result<String, CasError> {
         let url = format!(
-            "{server_url}/proxyValidate?ticket={}&service={}",
+            "{validate_url}?ticket={}&service={}",
             encode_component(ticket),
             encode_component(service)
         );
@@ -387,7 +415,49 @@ mod tests {
             displayname_attribute: None,
             required_attributes: BTreeMap::new(),
             idp_name: "CAS".to_owned(),
+            protocol_version: None,
+            enable_registration: true,
+            numeric_ids_prefix: None,
         }
+    }
+
+    #[test]
+    fn the_validate_url_follows_the_protocol_version() {
+        let mut cas = settings();
+        assert_eq!(
+            validate_url(&cas),
+            "https://cas.example.edu/cas/proxyValidate"
+        );
+        cas.protocol_version = Some(2);
+        assert_eq!(
+            validate_url(&cas),
+            "https://cas.example.edu/cas/proxyValidate"
+        );
+        cas.protocol_version = Some(3);
+        assert_eq!(
+            validate_url(&cas),
+            "https://cas.example.edu/cas/p3/proxyValidate"
+        );
+    }
+
+    #[test]
+    fn a_digits_only_user_name_gets_the_prefix_only_when_one_is_set() {
+        let mut cas = settings();
+        let mut response = CasResponse {
+            user: "1234".to_owned(),
+            attributes: BTreeMap::new(),
+        };
+        prefix_numeric_user(&mut response, &cas);
+        assert_eq!(response.user, "1234");
+        cas.numeric_ids_prefix = Some("u".to_owned());
+        prefix_numeric_user(&mut response, &cas);
+        assert_eq!(response.user, "u1234");
+        // Not again, and not for a name with letters in it.
+        prefix_numeric_user(&mut response, &cas);
+        assert_eq!(response.user, "u1234");
+        response.user = "12a4".to_owned();
+        prefix_numeric_user(&mut response, &cas);
+        assert_eq!(response.user, "12a4");
     }
 
     #[test]

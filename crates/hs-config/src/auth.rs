@@ -220,6 +220,34 @@ pub struct CasConfig {
     /// `cas_config.idp_name`.
     #[serde(default = "default_cas_idp_name")]
     pub idp_name: String,
+    /// The version of the CAS protocol the server speaks: `3` checks tickets at
+    /// `<server_url>/p3/proxyValidate`, the CAS 3 endpoint that returns a person's attributes;
+    /// `1` or `2`, or unset (the default), at `<server_url>/proxyValidate`, which CAS 3 servers
+    /// answer too. Corresponds to Synapse's `cas_config.protocol_version`.
+    #[serde(default)]
+    pub protocol_version: Option<u8>,
+    /// Whether a person CAS signs in for the first time gets an account here. Off, only people
+    /// who already have an account -- linked at an earlier sign-in, or with the user name CAS
+    /// gives them -- can sign in, and the rest see a page saying so. On by default. Corresponds
+    /// to Synapse's `cas_config.enable_registration`.
+    #[serde(default = "default_true")]
+    pub enable_registration: bool,
+    /// Whether a CAS user name made of digits only (a student number, `12345`) gets
+    /// `numeric_ids_prefix` put in front of it (`@u12345:example.org`), so it cannot be mistaken
+    /// for a guest's number. Off by default: the name is used as it is. Corresponds to Synapse's
+    /// `cas_config.allow_numeric_ids`.
+    #[serde(default)]
+    pub allow_numeric_ids: bool,
+    /// What goes in front of a digits-only CAS user name when `allow_numeric_ids` is on:
+    /// letters and digits only. `u` by default. Choose it so it cannot collide with a name
+    /// somebody already has (`1234` becomes `u1234`). Corresponds to Synapse's
+    /// `cas_config.numeric_ids_prefix`.
+    #[serde(default = "default_numeric_ids_prefix")]
+    pub numeric_ids_prefix: String,
+}
+
+fn default_numeric_ids_prefix() -> String {
+    "u".to_owned()
 }
 
 /// Settings shared by every single-sign-on provider (CAS today). Corresponds to Synapse's
@@ -237,6 +265,13 @@ pub struct SsoConfig {
     /// Synapse's `sso.client_whitelist`.
     #[serde(default)]
     pub client_whitelist: Vec<String>,
+    /// Whether a person's display name here follows the name the sign-on provider gives at
+    /// each sign-in (`auth.cas.displayname_attribute`), so a name changed at the provider shows
+    /// in their rooms after their next sign-in. Off by default: the provider's name is used
+    /// only when the account is created, and the person keeps whatever name they set since.
+    /// Corresponds to Synapse's `sso.update_profile_information`.
+    #[serde(default)]
+    pub update_profile_information: bool,
 }
 
 /// Matrix Authentication Service delegation mode: this server introspects
@@ -466,6 +501,25 @@ impl Validate for AuthConfig {
             if cas.idp_name.trim().is_empty() {
                 errors.push(format!("{prefix}.cas.idp_name"), "must not be empty");
             }
+            if let Some(version) = cas.protocol_version
+                && !(1..=3).contains(&version)
+            {
+                errors.push(
+                    format!("{prefix}.cas.protocol_version"),
+                    "must be 1, 2 or 3",
+                );
+            }
+            if cas.numeric_ids_prefix.is_empty()
+                || !cas
+                    .numeric_ids_prefix
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric())
+            {
+                errors.push(
+                    format!("{prefix}.cas.numeric_ids_prefix"),
+                    "must be letters and digits only",
+                );
+            }
         }
         for (i, client) in self.sso.client_whitelist.iter().enumerate() {
             if !(client.starts_with("https://") || client.starts_with("http://")) {
@@ -606,9 +660,25 @@ mod tests {
             displayname_attribute: None,
             required_attributes: Default::default(),
             idp_name: default_cas_idp_name(),
+            protocol_version: Some(4),
+            enable_registration: true,
+            allow_numeric_ids: true,
+            numeric_ids_prefix: "u-".into(),
         });
         let mut errors = ValidationErrors::new();
         cfg.validate("auth", &mut errors);
+        assert!(
+            errors
+                .0
+                .iter()
+                .any(|e| e.path == "auth.cas.protocol_version")
+        );
+        assert!(
+            errors
+                .0
+                .iter()
+                .any(|e| e.path == "auth.cas.numeric_ids_prefix")
+        );
         assert!(errors.0.iter().any(|e| e.path == "auth.cas.server_url"));
 
         let cfg: AuthConfig = serde_json::from_value(
