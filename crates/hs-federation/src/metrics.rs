@@ -346,6 +346,33 @@ pub fn record_pdu_dropped(reason: &'static str) {
         .inc();
 }
 
+static PDU_WAKES: std::sync::LazyLock<Family<PduWakeLabels, Counter>> =
+    std::sync::LazyLock::new(Family::default);
+
+/// Labels of `hs_federation_pdu_wakes_total`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, prometheus_client::encoding::EncodeLabelSet)]
+pub struct PduWakeLabels {
+    /// On the replica that queued the PDU: `sent` (the replica that sends for the destination
+    /// took the wake), `failed` (it did not, or the wake could not be encoded; its rescan finds
+    /// the PDU), `no_owner` (nobody owns the destination's federation shard right now; whoever
+    /// takes it resumes the queue). On the replica woken: `received`, or
+    /// `received_not_sent_here` (the shard moved on meanwhile).
+    pub outcome: &'static str,
+}
+
+/// Counts one wake of the replica that sends for a destination, for a PDU another replica
+/// queued (`hs-cli`'s `edu_forward`, `hs_federation::sender::EduForwarder::wake_sender_for`),
+/// by `outcome` ([`PduWakeLabels`]).
+pub fn record_pdu_wake(outcome: &'static str) {
+    PDU_WAKES.get_or_create(&PduWakeLabels { outcome }).inc();
+}
+
+/// How many sender wakes ended in `outcome`, in this process ([`record_pdu_wake`]).
+#[must_use]
+pub fn pdu_wakes(outcome: &'static str) -> u64 {
+    PDU_WAKES.get_or_create(&PduWakeLabels { outcome }).get()
+}
+
 static DEVICE_LIST_CATCH_UPS: std::sync::LazyLock<Counter> =
     std::sync::LazyLock::new(Counter::default);
 
@@ -448,6 +475,8 @@ pub fn record_notary_answer(answered: bool) {
 ///   (`not_in_room`), or their room is unknown here (`unknown_room`).
 /// - `hs_federation_device_list_catch_ups_total`: federation shards taken on whose device-list
 ///   announcements were behind ([`record_device_list_catch_up`]).
+/// - `hs_federation_pdu_wakes_total{outcome}`: wakes of the replica that sends for a
+///   destination, for PDUs another replica queued ([`PduWakeLabels`]).
 pub fn register_transport_metrics(registry: &mut Registry) {
     // Registered without `_total`: the text encoder appends it.
     registry.register(
@@ -475,6 +504,13 @@ pub fn register_transport_metrics(registry: &mut Registry) {
          of this server is joined to their room (not_in_room), or their room is unknown here \
          (unknown_room)",
         PDUS_DROPPED.clone(),
+    );
+    registry.register(
+        "hs_federation_pdu_wakes",
+        "Wakes of the replica that sends for a destination, for PDUs another replica queued, \
+         by outcome (sent, failed, no_owner on the replica that queued; received, \
+         received_not_sent_here on the replica woken)",
+        PDU_WAKES.clone(),
     );
     registry.register(
         "hs_federation_device_list_catch_ups",

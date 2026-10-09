@@ -274,6 +274,17 @@ pub trait EduForwarder: Send + Sync {
         content: &Value,
         coalesce_key: Option<&str>,
     );
+
+    /// Tells the replica that sends for `destination` that a PDU was just written to the
+    /// shared store for it ([`FederationSender::enqueue_pdu`] from a replica that does not
+    /// send for it), so it looks at the store now ([`FederationSender::wake_destination`])
+    /// rather than at its next rescan -- or never, if it has no worker for the destination
+    /// yet: before this existed, the first message after a remote join made on one replica
+    /// waited over a minute to leave the other (the 2026-10-09 two-replica interop run).
+    /// Best effort, never blocks; the default does nothing.
+    fn wake_sender_for(&self, destination: &str) {
+        let _ = destination;
+    }
 }
 
 /// The single-process gate: every destination is sent for here.
@@ -615,6 +626,45 @@ impl FederationSender {
         Ok(marked)
     }
 
+    /// Makes this sender look at the store for `destination` now: another replica wrote a PDU
+    /// there for it ([`EduForwarder::wake_sender_for`]). A worker that exists is woken
+    /// ([`Queued::Wake`], the same look a rescan makes); one that does not is started, counting
+    /// what the store holds as its backlog, the way [`FederationSender::resume`] starts one.
+    /// Returns whether this replica sends for the destination at all (`false` also after
+    /// [`FederationSender::shutdown`]). Must be called from within a Tokio runtime.
+    pub fn wake_destination(&self, destination: &str) -> bool {
+        if self.shared.shut_down.load(Ordering::Acquire)
+            || destination == self.shared.own_server_name
+            || !self.shared.sends_here(destination)
+        {
+            return false;
+        }
+        let mut queues = self.queues.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(queue) = queues.get(destination) {
+            let _ = queue.tx.send(Queued::Wake);
+            return true;
+        }
+        let backlog = match self.shared.store.queue_len(destination) {
+            Ok(count) => count,
+            Err(error) => {
+                tracing::error!(destination, %error, "cannot read the outbound queue");
+                0
+            }
+        };
+        match spawn_worker(&self.shared, destination, backlog) {
+            Some(queue) => {
+                tracing::debug!(
+                    destination,
+                    backlog,
+                    "started sending for a destination another replica queued for"
+                );
+                queues.insert(destination.to_owned(), queue);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Every destination in catch-up mode, with its mark, sorted by name. What the admin API
     /// shows as `catch_up_since`.
     ///
@@ -821,6 +871,9 @@ impl FederationSender {
                     seq,
                     "queued a PDU for a destination another replica sends for"
                 );
+                if let Some(forwarder) = self.shared.edu_forwarder.get() {
+                    forwarder.wake_sender_for(&destination);
+                }
                 continue;
             };
             queue.pending.fetch_add(1, Ordering::AcqRel);
@@ -3462,5 +3515,66 @@ mod tests {
             "{waited:?}"
         );
         sender.shutdown();
+    }
+
+    /// A PDU another replica wrote to the shared store for a destination this one sends for is
+    /// sent as soon as that replica says so (`wake_destination`), with no rescan interval at
+    /// all: whether this replica has a worker for the destination yet or not. A replica that
+    /// does not send for it says so and starts nothing.
+    #[tokio::test]
+    async fn a_wake_sends_what_another_replica_queued_with_or_without_a_worker_here() {
+        let peer = FakeFederationPeer::new("peer.example.org");
+        let (destination, _auth) = spawn_peer(&peer).await;
+        let store: Arc<dyn OutboundStore> = Arc::new(InMemoryOutboundStore::new());
+        let sends_nothing = FederationSender::with_store(client(), US, fast(), store.clone());
+        sends_nothing.set_gate(Arc::new(Only(Mutex::new(HashSet::new()))));
+        let sends_for_it = FederationSender::with_store(client(), US, fast(), store.clone());
+        sends_for_it.set_gate(Arc::new(Only(Mutex::new(HashSet::from([
+            destination.clone()
+        ])))));
+        // Neither sender rescans (`fast()` leaves `store_rescan_interval` at `None`): only a
+        // wake can deliver what the other replica wrote.
+
+        // No worker for the destination here yet: the wake starts one with the backlog.
+        sends_nothing.enqueue_pdu([destination.clone()], pdu(0));
+        assert_eq!(store.queued().unwrap(), vec![(destination.clone(), 1)]);
+        assert!(!sends_nothing.wake_destination(&destination));
+        assert!(sends_for_it.wake_destination(&destination));
+        assert!(wait_for(Duration::from_secs(10), || peer.request_count() == 1).await);
+        assert_eq!(peer.requests()[0].body["pdus"][0]["i"], 0);
+        assert!(wait_for(Duration::from_secs(10), || sends_for_it.pending_pdus() == 0).await);
+
+        // A worker exists now: the wake makes it look at the store again.
+        sends_nothing.enqueue_pdu([destination.clone()], pdu(1));
+        assert!(sends_for_it.wake_destination(&destination));
+        assert!(wait_for(Duration::from_secs(10), || peer.request_count() == 2).await);
+        assert_eq!(peer.requests()[1].body["pdus"][0]["i"], 1);
+        assert!(
+            wait_for(Duration::from_secs(10), || store
+                .queued()
+                .unwrap()
+                .is_empty())
+            .await
+        );
+        assert_eq!(sends_for_it.pending_pdus(), 0, "never negative");
+
+        // And the forwarder is told, per destination, by the replica that cannot send.
+        let recording = Arc::new(RecordingWakes::default());
+        sends_nothing.install_edu_forwarder(recording.clone());
+        sends_nothing.enqueue_pdu([destination.clone()], pdu(2));
+        assert_eq!(*recording.0.lock().unwrap(), vec![destination.clone()]);
+        sends_for_it.shutdown();
+        assert!(!sends_for_it.wake_destination(&destination));
+    }
+
+    /// Records the destinations it is asked to wake a sender for.
+    #[derive(Default)]
+    struct RecordingWakes(Mutex<Vec<String>>);
+
+    impl EduForwarder for RecordingWakes {
+        fn forward_edu(&self, _: &str, _: &str, _: &Value, _: Option<&str>) {}
+        fn wake_sender_for(&self, destination: &str) {
+            self.0.lock().unwrap().push(destination.to_owned());
+        }
     }
 }

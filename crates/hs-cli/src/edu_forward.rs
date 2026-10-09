@@ -41,6 +41,13 @@ use tokio::sync::mpsc;
 
 /// The mesh route forwarded EDUs travel on, and the prefix [`install`] adds the handler for.
 pub const EDU_ROUTE: &str = "federation.edu";
+/// The mesh route a wake travels on: "a PDU for a destination you send for is in the store"
+/// ([`hs_federation::sender::EduForwarder::wake_sender_for`]), answered by
+/// [`FederationSender::wake_destination`] on the replica that sends for it. Without it, that
+/// replica found the row at its next store rescan (every 10 s) at best, and not before it had
+/// a worker for the destination at all: in the two-replica interop run of 2026-10-09 the first
+/// message after a join made on the other replica took 62 s to reach Synapse.
+pub const WAKE_ROUTE: &str = "federation.wake";
 /// The route prefix [`EduPeerHandler`] is added for.
 pub const ROUTE_PREFIX: &str = "federation.";
 /// How long one batch may take to reach the owner before it is counted as failed.
@@ -58,6 +65,13 @@ pub struct ForwardedEdu {
     /// The sender's coalescing key, if it had one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coalesce_key: Option<String>,
+}
+
+/// One wake as it travels to the replica that sends for a destination ([`WAKE_ROUTE`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WakeRequest {
+    /// The server a PDU was queued for.
+    pub destination: String,
 }
 
 /// The sender's [`EduForwarder`] over the mesh. See the module docs.
@@ -144,6 +158,51 @@ impl EduForwarder for MeshEduForwarder {
                 .record_forwarded(edu_type, EduForwardOutcome::Failed);
         }
     }
+
+    fn wake_sender_for(&self, destination: &str) {
+        let shard = self.layout.federation_shard(destination);
+        let owner = self
+            .ownership
+            .owner_of(shard)
+            .filter(|owner| owner != self.ownership.me());
+        let Some(owner) = owner else {
+            // A handoff in progress: whoever takes the shard resumes the store's queues
+            // (`OutboundFederation::follow_ownership`), which includes this row.
+            hs_federation::metrics::record_pdu_wake("no_owner");
+            return;
+        };
+        let payload = match serde_json::to_vec(&WakeRequest {
+            destination: destination.to_owned(),
+        }) {
+            Ok(payload) => Bytes::from(payload),
+            Err(error) => {
+                tracing::warn!(destination, %error, "could not encode a sender wake");
+                hs_federation::metrics::record_pdu_wake("failed");
+                return;
+            }
+        };
+        let forwarder = self.forwarder.clone();
+        let destination = destination.to_owned();
+        tokio::spawn(async move {
+            match forwarder
+                .send_to_peer(&owner, WAKE_ROUTE, payload, FORWARD_DEADLINE)
+                .await
+            {
+                Ok(reply) if reply.status == 200 => {
+                    tracing::debug!(%owner, destination, "woke the replica that sends for the destination");
+                    hs_federation::metrics::record_pdu_wake("sent");
+                }
+                Ok(reply) => {
+                    tracing::warn!(%owner, destination, status = reply.status, "the replica that sends for the destination refused a wake; its rescan will find the PDU");
+                    hs_federation::metrics::record_pdu_wake("failed");
+                }
+                Err(error) => {
+                    tracing::warn!(%owner, destination, %error, "a wake did not reach the replica that sends for the destination; its rescan will find the PDU");
+                    hs_federation::metrics::record_pdu_wake("failed");
+                }
+            }
+        });
+    }
 }
 
 /// Drains `rx` into one `federation.edu` message per round trip to `owner`, in order, until
@@ -212,6 +271,25 @@ impl EduPeerHandler {
 #[async_trait::async_trait]
 impl PeerHandler for EduPeerHandler {
     async fn handle(&self, from: ReplicaId, route: &str, payload: Bytes) -> Reply {
+        if route == WAKE_ROUTE {
+            let wake: WakeRequest = match serde_json::from_slice(&payload) {
+                Ok(wake) => wake,
+                Err(error) => {
+                    return Reply {
+                        status: 400,
+                        payload: Bytes::from(format!("bad sender wake from {from}: {error}")),
+                    };
+                }
+            };
+            let sends_here = self.sender.wake_destination(&wake.destination);
+            tracing::debug!(%from, destination = wake.destination, sends_here, "a peer queued a PDU for a destination this replica sends for");
+            hs_federation::metrics::record_pdu_wake(if sends_here {
+                "received"
+            } else {
+                "received_not_sent_here"
+            });
+            return Reply::ok(Bytes::new());
+        }
         if route != EDU_ROUTE {
             return Reply {
                 status: 404,
@@ -262,7 +340,8 @@ pub fn install(handles: &crate::cluster::ClusterHandles, sender: &Arc<Federation
         Arc::new(EduPeerHandler::new(sender.clone(), metrics)),
     );
     tracing::info!(
-        "EDUs for destinations another replica sends for are forwarded to it over the mesh"
+        "EDUs for destinations another replica sends for are forwarded to it over the mesh, \
+         and it is woken for the PDUs queued for them"
     );
 }
 
