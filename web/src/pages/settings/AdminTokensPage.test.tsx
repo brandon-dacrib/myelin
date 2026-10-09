@@ -9,7 +9,7 @@ import { signIn, signOut } from "@/lib/auth";
 const PATH = "/settings/admin-tokens";
 
 async function table() {
-  return within(await screen.findByRole("table", { name: "Admin tokens" }));
+  return within(await screen.findByRole("table", { name: "API tokens" }));
 }
 
 beforeEach(async () => {
@@ -38,7 +38,7 @@ describe("AdminTokensPage", () => {
       row("Bridge team dashboard").getByText("bridges:read").closest("span[title]"),
     ).toHaveAttribute("title", expect.stringMatching(/See the bridges/));
     expect(
-      screen.getByText(/A request outside its scopes is refused, and the refusal names the scope/),
+      screen.getByText(/a request outside them is refused, and the refusal names the scope/),
     ).toBeInTheDocument();
   });
 

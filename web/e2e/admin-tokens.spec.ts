@@ -10,7 +10,7 @@ test.describe("admin tokens", () => {
     const domGuard = installDomNestingGuard(page);
     await signInAsOperator(page);
     await page.goto("/admin/settings/admin-tokens");
-    await expect(page.getByRole("heading", { name: "Admin tokens" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "API tokens" })).toBeVisible();
     const seeded = page.getByRole("row", { name: /Bridge team dashboard/ });
     await expect(seeded.getByText("bridges:read")).toBeVisible();
     await expect(

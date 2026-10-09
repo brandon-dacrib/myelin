@@ -2,9 +2,11 @@ import { Link } from "@tanstack/react-router";
 import { cn } from "@/lib/cn";
 
 /**
- * The views of Settings (information-architecture.md, Settings): registration tokens, admin
- * tokens and server notices so far. Links, not tabs, as in Bridges: each view has its own address, so it can be
- * linked to, bookmarked and reached from the command palette.
+ * The views of "Invites and tokens" (information-architecture.md, Settings; the `/settings`
+ * routes keep their addresses): invite links (registration tokens, as the Matrix spec calls
+ * them), API tokens for scripts and bots (admin tokens), and server notices. Links, not tabs,
+ * as in Bridges: each view has its own address, so it can be linked to, bookmarked and reached
+ * from the command palette.
  */
 export function SettingsTabs({
   current,
@@ -20,20 +22,20 @@ export function SettingsTabs({
       "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--color-focus)]",
     );
   return (
-    <nav aria-label="Settings views" className="mt-4 flex gap-1 border-b border-border">
+    <nav aria-label="Invites and tokens views" className="mt-4 flex gap-1 border-b border-border">
       <Link
         to="/settings/registration-tokens"
         aria-current={current === "registration-tokens" ? "page" : undefined}
         className={item(current === "registration-tokens")}
       >
-        Registration tokens
+        Invite links
       </Link>
       <Link
         to="/settings/admin-tokens"
         aria-current={current === "admin-tokens" ? "page" : undefined}
         className={item(current === "admin-tokens")}
       >
-        Admin tokens
+        API tokens
       </Link>
       <Link
         to="/settings/server-notices"

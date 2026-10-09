@@ -10,7 +10,7 @@ import { UserDetailPage } from "./UserDetailPage";
 
 /**
  * The Users page's own ways into Settings' flows: "Invite by link" on the list opens the same
- * registration-token dialog as Settings, Registration tokens, and "Send notice" on a user's page
+ * registration-token dialog as Invites and tokens, Invite links, and "Send notice" on a user's page
  * opens the server-notice form with that user as the one recipient. The dialogs themselves are
  * tested beside them (`settings/CreateTokenDialog.test.tsx`, `settings/ServerNoticesPage.test.tsx`);
  * this is about where they are reachable from, and who may reach them.

@@ -52,7 +52,7 @@ export function RegistrationTokensPage() {
   if (!canRead) {
     return (
       <div className="p-6">
-        <h1 className="text-xl text-text">Settings</h1>
+        <h1 className="text-xl text-text">Invites and tokens</h1>
         <ForbiddenState scope="admin:read" />
       </div>
     );
@@ -153,16 +153,16 @@ export function RegistrationTokensPage() {
 
   return (
     <div className="mx-auto max-w-[90rem] p-6">
-      <h1 className="text-xl text-text">Settings</h1>
+      <h1 className="text-xl text-text">Invites and tokens</h1>
       <SettingsTabs current="registration-tokens" />
 
       <div className="mt-6 flex flex-wrap items-start justify-between gap-3">
         <div className="max-w-2xl">
-          <h2 className="text-md font-medium text-text">Registration tokens</h2>
+          <h2 className="text-md font-medium text-text">Invite links</h2>
           <p className="mt-1 text-sm text-text-muted">
-            A token lets somebody create an account on this server while registration is closed.
-            Each one is an invite link: send it, and the person picks their own username and
-            password.
+            An invite link lets somebody create an account on this server while sign-up is closed to
+            everyone else: send it, and the person picks their own username and password. (The
+            Matrix specification calls the token in the link a registration token.)
           </p>
         </div>
         {canWrite && (
@@ -225,7 +225,7 @@ export function RegistrationTokensPage() {
       ) : (
         <div className="mt-4">
           <DataTable
-            caption="Registration tokens"
+            caption="Invite links"
             columns={columns}
             rows={data?.items ?? []}
             getRowId={(t) => t.token}
@@ -233,8 +233,8 @@ export function RegistrationTokensPage() {
             empty={
               <EmptyState
                 icon={<KeyRound aria-hidden="true" />}
-                title="No registration tokens"
-                description="Create an invite link to let somebody register while registration is closed."
+                title="No invite links yet"
+                description="Create one and send it to somebody: they pick their own username and password, while sign-up stays closed to everyone else."
                 action={
                   canWrite ? (
                     <Button onClick={() => setCreateOpen(true)}>Create invite link</Button>

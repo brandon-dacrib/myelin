@@ -9,7 +9,7 @@ import { signIn, signOut } from "@/lib/auth";
 const PATH = "/settings/registration-tokens";
 
 async function table() {
-  return within(await screen.findByRole("table", { name: "Registration tokens" }));
+  return within(await screen.findByRole("table", { name: "Invite links" }));
 }
 
 beforeEach(async () => {

@@ -39,7 +39,7 @@ test.describe("Admin tokens against the real server", () => {
     test.setTimeout(120_000);
     await signIn(page);
     await page.goto("/admin/settings/admin-tokens");
-    await expect(page.getByRole("heading", { name: "Admin tokens" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "API tokens" })).toBeVisible();
     await shot(page, "list");
 
     const name = `bridge watcher ${run}`;

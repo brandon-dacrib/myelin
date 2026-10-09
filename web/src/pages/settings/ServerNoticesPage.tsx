@@ -71,7 +71,7 @@ export function ServerNoticesPage() {
 
   return (
     <div className="mx-auto max-w-[90rem] p-6">
-      <h1 className="text-xl text-text">Settings</h1>
+      <h1 className="text-xl text-text">Invites and tokens</h1>
       <SettingsTabs current="server-notices" />
 
       <section aria-labelledby="send-notice-heading" className="mt-6 max-w-2xl">

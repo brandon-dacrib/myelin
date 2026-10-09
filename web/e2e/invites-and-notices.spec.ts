@@ -28,7 +28,7 @@ test.describe("invite links", () => {
     await expectNoAxeViolations(page, "invite link ready");
     await done.getByRole("button", { name: "Done" }).click();
 
-    await page.getByRole("link", { name: "Settings" }).first().click();
+    await page.getByRole("link", { name: "Invites and tokens" }).first().click();
     await expect(page).toHaveURL(/\/admin\/settings\/registration-tokens$/);
     const row = page.getByRole("row", { name: /e2e-invite/ });
     await expect(row.getByText("Valid")).toBeVisible();

@@ -59,7 +59,7 @@ export function AdminTokensPage() {
   if (!canRead) {
     return (
       <div className="p-6">
-        <h1 className="text-xl text-text">Settings</h1>
+        <h1 className="text-xl text-text">Invites and tokens</h1>
         <ForbiddenState scope="admin:read" />
       </div>
     );
@@ -140,17 +140,18 @@ export function AdminTokensPage() {
 
   return (
     <div className="mx-auto max-w-[90rem] p-6">
-      <h1 className="text-xl text-text">Settings</h1>
+      <h1 className="text-xl text-text">Invites and tokens</h1>
       <SettingsTabs current="admin-tokens" />
 
       <div className="mt-6 flex flex-wrap items-start justify-between gap-3">
         <div className="max-w-2xl">
-          <h2 className="text-md font-medium text-text">Admin tokens</h2>
+          <h2 className="text-md font-medium text-text">API tokens</h2>
           <p className="mt-1 text-sm text-text-muted">
-            A token lets a script, a bot or another team use this admin API with only the scopes it
-            carries. A request outside its scopes is refused, and the refusal names the scope. Each
-            token is shown once when it is minted; this list shows what it can do, never the token
-            itself. Signing in here with your own account still gives every scope.
+            A token lets a script, a bot or another team use this server&apos;s admin API with only
+            the permissions (scopes) it carries; a request outside them is refused, and the refusal
+            names the scope. Each token is shown once when it is minted; this list shows what it can
+            do, never the token itself. Signing in here with your own account still gives every
+            scope.
           </p>
         </div>
         {canWrite && (
@@ -210,7 +211,7 @@ export function AdminTokensPage() {
       ) : (
         <div className="mt-4">
           <DataTable
-            caption="Admin tokens"
+            caption="API tokens"
             columns={columns}
             rows={data?.items ?? []}
             getRowId={(t) => t.id}
