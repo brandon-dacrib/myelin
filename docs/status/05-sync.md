@@ -78,8 +78,21 @@ copies with one valid fence; the one behind is refused with the room, position, 
 writer in the message; the store unchanged). `cargo fmt --all --check`, `cargo clippy -p
 hs-room -p hs-user --all-targets -- -D warnings`, `cargo clippy -p hs-cli --test
 cluster_rejoin -- -D warnings`, `cargo test -p hs-room` (212 + the rest), `cargo test -p
-hs-user`. The ops branch's cluster smoke against an image of this branch: see the end of this
-section.
+hs-user`. **The ops branch's cluster smoke** (`agent/ops-95`'s `deploy/helm/hs/ci/cluster-smoke.sh`
+and chart, copied to a scratch directory, not committed here) against `myelin:scale-sync-bug`
+(built from this branch with `deploy/Dockerfile` through the mirror) on a kind v1.33.1 cluster,
+without `--rotate-certs` or `--upgrade-from`: **scale-up 174/0, scale-down 514/0, scale-to-two
+460/0 `ok`, restart 523/0, rollback 551/0** (run 4 on the ops branch had scale-to-two 547/25
+`BROKEN` and every later phase broken). No `failed to process a room update`, no `unknown
+event`, no `cited event not in history` in either pod's log; the registry's reload line fired
+twice (`loaded_under_epoch=None epoch=Some(11)`: copies loaded before the replica owned the
+shard, loaded again on the first request after it did). The run's verdict is still FAILED on
+one failure in graceful-delete, a different thing: one send `500 transaction_retry_budget (10
+attempts) exhausted` at t+23.4 s, as hs-1 returned and took its shards back (run 4's one
+failure was in the same window, a forward that waited out its deadline); the ops status lists
+that window as the next thing to shave. The persist check added here reads one row nobody
+else writes (the position the actor is about to use), so it is not what conflicted, but that
+is reasoning, not a measurement.
 
 **Left**:
 - A room already written over this way (the smoke's throwaway clusters; any cluster that
