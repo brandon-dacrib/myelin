@@ -2007,6 +2007,13 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         None
     };
 
+    // A person deactivating their own account leaves every room they are in, as an
+    // administrator's erasure does and as Synapse's deactivation parts them: the same room-layer
+    // adapter, through a hook held weakly for the same reason.
+    auth_state.install_room_departure(Arc::new(crate::room_departure::RoomDepartureSource::new(
+        &rooms,
+        remote_join.clone(),
+    )));
     // For the room mirror `crate::sync_cluster::install` opens below; `identity` itself moves
     // into `RoomState` here.
     let mirror_identity = identity.clone();

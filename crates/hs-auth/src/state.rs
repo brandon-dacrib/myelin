@@ -110,6 +110,31 @@ pub trait ProfileRefresh: Send + Sync {
     fn profile_changed(&self, auth: &AuthState, user_id: &UserId);
 }
 
+/// What a deactivation does to the account's rooms: leaves every room the user is joined to,
+/// invited to or knocking on, as the user, the way an administrator's `users.deactivate` with
+/// `erase: true` does (`hs-admin`'s `UserActivitySource::leave_all_rooms`, answered by
+/// `hs-room`). Synapse parts a deactivated account from all its rooms (`DeactivateAccountHandler`),
+/// erased or not; this crate cannot reach rooms (`hs-room` depends on it, not the reverse), so,
+/// like [`ProfileRefresh`], the departure is a trait defined here and installed by `hs serve`
+/// through [`AuthState::install_room_departure`]. Unset, the account is deactivated and its rooms
+/// keep it as a member (a test of this crate alone); the route logs that at debug level.
+#[async_trait::async_trait]
+pub trait RoomDeparture: Send + Sync {
+    /// Leaves every room `user_id` is in. A room that cannot be left is reported in
+    /// [`RoomDepartureReport::rooms_failed`], not an error; `Err` only when nothing could be
+    /// attempted (the room layer unavailable), in which case the deactivation still goes through.
+    async fn leave_all_rooms(&self, user_id: &UserId) -> Result<RoomDepartureReport, String>;
+}
+
+/// What [`RoomDeparture::leave_all_rooms`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RoomDepartureReport {
+    /// The rooms left, by id.
+    pub rooms_left: Vec<String>,
+    /// The rooms the user is still in, each with why the leave failed.
+    pub rooms_failed: Vec<(String, String)>,
+}
+
 /// Where `GET /profile/{userId}`, `/displayname` and `/avatar_url` get the profile of a user of
 /// another server: that server, over federation (`GET /_matrix/federation/v1/query/profile`).
 /// This crate cannot speak federation (`hs-federation` is a peer, and `hs serve` is where the
@@ -181,6 +206,8 @@ pub struct AuthState {
     pub(crate) remote_profiles: Arc<OnceLock<Arc<dyn RemoteProfileSource>>>,
     /// See [`ProfileRefresh`] and [`AuthState::install_profile_refresh`].
     pub(crate) profile_refresh: Arc<OnceLock<Arc<dyn ProfileRefresh>>>,
+    /// See [`RoomDeparture`] and [`AuthState::install_room_departure`].
+    pub(crate) room_departure: Arc<OnceLock<Arc<dyn RoomDeparture>>>,
     /// What checks a CAPTCHA answer; see [`AuthState::recaptcha_verifier`].
     pub(crate) recaptcha_verifier: Arc<OnceLock<Arc<dyn RecaptchaVerifier>>>,
     /// Registrations waiting on a user-interactive auth session, by the username they asked
@@ -218,6 +245,7 @@ impl AuthState {
             session_revocation_observer: Arc::new(OnceLock::new()),
             remote_profiles: Arc::new(OnceLock::new()),
             profile_refresh: Arc::new(OnceLock::new()),
+            room_departure: Arc::new(OnceLock::new()),
             recaptcha_verifier: Arc::new(OnceLock::new()),
             pending_registrations: Arc::default(),
             cas_validator: Arc::new(crate::cas::HttpCasValidator::default()),
@@ -400,6 +428,24 @@ impl AuthState {
     #[must_use]
     pub fn profile_refresh(&self) -> Option<&Arc<dyn ProfileRefresh>> {
         self.profile_refresh.get()
+    }
+
+    /// Installs what leaves a deactivated account's rooms (`hs serve`, from the room layer).
+    /// Same one-installer convention as [`AuthState::install_remote_profiles`].
+    pub fn install_room_departure(&self, departure: Arc<dyn RoomDeparture>) {
+        if self.room_departure.set(departure).is_err() {
+            tracing::warn!(
+                "a room departure was already installed on this auth state; ignoring the second \
+                 install"
+            );
+        }
+    }
+
+    /// The installed [`RoomDeparture`], if any. `None` means this process has no room layer (a
+    /// test of this crate alone), so a deactivated account stays in its rooms.
+    #[must_use]
+    pub fn room_departure(&self) -> Option<&Arc<dyn RoomDeparture>> {
+        self.room_departure.get()
     }
 
     /// Installs what checks a CAPTCHA answer at registration, in place of the HTTP

@@ -233,6 +233,32 @@ async fn change_password(
     Ok(Json(json!({})).into_response())
 }
 
+/// Leaves every room `user_id` is in through the installed [`crate::state::RoomDeparture`],
+/// logging what happened; nothing without one (a test of this crate alone, or a process without
+/// a room layer).
+async fn leave_rooms(state: &AuthState, user_id: &ruma::UserId) {
+    let Some(departure) = state.room_departure() else {
+        tracing::debug!(user = %user_id, "no room layer is installed; a deactivated account's rooms keep it as a member");
+        return;
+    };
+    match departure.leave_all_rooms(user_id).await {
+        Ok(report) => {
+            for (room_id, reason) in &report.rooms_failed {
+                tracing::warn!(user = %user_id, room = %room_id, %reason, "a deactivated account could not leave a room");
+            }
+            tracing::info!(
+                user = %user_id,
+                rooms_left = report.rooms_left.len(),
+                rooms_failed = report.rooms_failed.len(),
+                "a deactivated account left its rooms"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(user = %user_id, %error, "a deactivated account's rooms could not be left; it stays in them");
+        }
+    }
+}
+
 /// `POST /account/deactivate`.
 pub async fn post_account_deactivate(
     State(state): State<AuthState>,
@@ -270,10 +296,16 @@ pub async fn post_account_deactivate(
         .delete_all_refresh_tokens_for_user(&requester.user_id)
         .await?;
 
+    // The account leaves every room it is in, as Synapse's deactivation parts it from them
+    // (`DeactivateAccountHandler._part_user`), erased or not: through the room layer's hook when
+    // `hs serve` installed one (`crate::state::RoomDeparture`), before any erasure so that the
+    // leaves are authored by an account that still has its profile. A room that cannot be left
+    // does not fail the deactivation: it is logged, and the account is deactivated either way.
+    leave_rooms(&state, &requester.user_id).await;
+
     // The spec's `erase` (MSC2438): the same erasure an administrator's `users.deactivate`
-    // with `erase: true` performs, minus leaving the account's rooms, which this crate cannot
-    // see (see `crate::erasure`); the devices' keys go with the devices, through the
-    // device-list hook.
+    // with `erase: true` performs (see `crate::erasure`); the devices' keys go with the
+    // devices, through the device-list hook.
     if body.get("erase").and_then(Value::as_bool) == Some(true) {
         let erased =
             crate::erasure::erase_account(state.store.as_ref(), &requester.user_id, state.now_ms())
@@ -349,6 +381,7 @@ mod tests {
     use crate::store::UserRecord;
     use crate::token::TokenHash;
     use ruma::user_id;
+    use std::sync::Arc;
 
     /// The signed-in call, as every test below but the email reset makes it.
     async fn post_account_password(
@@ -632,6 +665,78 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// A room layer that records whom it was asked to part, and what the profile was then.
+    struct RecordingDeparture {
+        asked: std::sync::Mutex<Vec<(String, Option<String>)>>,
+        store: Arc<dyn crate::store::AuthStore>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::state::RoomDeparture for RecordingDeparture {
+        async fn leave_all_rooms(
+            &self,
+            user_id: &ruma::UserId,
+        ) -> Result<crate::state::RoomDepartureReport, String> {
+            let name = self
+                .store
+                .get_user(user_id)
+                .await
+                .unwrap()
+                .and_then(|u| u.display_name);
+            self.asked.lock().unwrap().push((user_id.to_string(), name));
+            if self.fail {
+                return Err("the room store is away".to_owned());
+            }
+            Ok(crate::state::RoomDepartureReport {
+                rooms_left: vec!["!lobby:example.org".to_owned()],
+                rooms_failed: vec![("!stuck:example.org".to_owned(), "no server".to_owned())],
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn deactivation_leaves_the_rooms_before_erasing_and_survives_a_room_layer_failure() {
+        for fail in [false, true] {
+            let (state, requester) = state_with_user("oldpassword1").await;
+            state
+                .store
+                .set_profile_display_name(&requester.user_id, Some("Alice".into()))
+                .await
+                .unwrap();
+            let departure = Arc::new(RecordingDeparture {
+                asked: std::sync::Mutex::new(Vec::new()),
+                store: state.store.clone(),
+                fail,
+            });
+            state.install_room_departure(departure.clone());
+            let body = json!({"erase": true, "auth": {"type": "m.login.password", "identifier": {"type": "m.id.user", "user": "alice"}, "password": "oldpassword1"}});
+            let response = post_account_deactivate(
+                State(state.clone()),
+                requester.clone(),
+                PermissiveJson(body),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "fail={fail}");
+            // Asked once, for this account, while its profile was still there (the erasure
+            // comes after, so a leave event is stamped with the name).
+            assert_eq!(
+                *departure.asked.lock().unwrap(),
+                vec![(requester.user_id.to_string(), Some("Alice".to_owned()))],
+                "fail={fail}"
+            );
+            let user = state
+                .store
+                .get_user(&requester.user_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(user.deactivated && user.erased, "fail={fail}");
+            assert_eq!(user.display_name, None, "fail={fail}");
+        }
     }
 
     #[tokio::test]
