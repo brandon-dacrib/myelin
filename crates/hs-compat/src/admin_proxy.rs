@@ -4,16 +4,11 @@
 //! and storage live entirely in `hs-admin`.
 //!
 //! `docs/compat/synapse-admin-routes.md` maps all 77 Synapse admin routes onto a native
-//! `/api/v1` resource; this module *implements* the handful the task that produced it called out
-//! explicitly (a capability probe, plus user and room queries): `GET
-//! /_synapse/admin/v1/server_version`, `GET /_synapse/admin/v2/users`, `GET
-//! /_synapse/admin/v2/users/{user_id}`, `GET /_synapse/admin/v1/rooms`, and `GET
-//! /_synapse/admin/v1/rooms/{room_id}`. Every other row in that table remains exactly what it
-//! already said (mapped/mapped-diff/unsupported) — this module does not change any
-//! classification, it just makes five of the "mapped (diff)" rows real. See
-//! `docs/status/13-config-compat-and-migration.md` for the mounting instructions and the list of
-//! rows this module does *not* yet implement (writes — `PUT`/`POST`/`PATCH` — are out of scope
-//! for this pass; every route here is read-only).
+//! `/api/v1` resource. This module holds the shim's core (the state, the forwarding and the
+//! error translation) and its first routes: the capability probe, the user and room listings,
+//! server notices and deactivation. [`crate::admin_screens`] adds the rest of the routes
+//! `synapse-admin`'s screens call, and names every mounted route in
+//! [`crate::admin_screens::ROUTES`].
 //!
 //! # Why forward in-process rather than over HTTP
 //!
@@ -63,7 +58,7 @@ const MAX_NATIVE_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 /// router this module forwards every request into.
 #[derive(Clone)]
 pub struct AdminProxyState {
-    native: Router,
+    pub(crate) native: Router,
 }
 
 impl AdminProxyState {
@@ -82,7 +77,7 @@ impl AdminProxyState {
 /// `hs_auth::synapse_admin_router()`'s `/_synapse/admin/v1/register`) — see
 /// `docs/status/13-config-compat-and-migration.md` for the exact merge call `hs-cli` needs.
 pub fn router(state: AdminProxyState) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/_synapse/admin/v1/server_version", get(server_version))
         .route("/_synapse/admin/v2/users", get(users_list))
         .route("/_synapse/admin/v2/users/{user_id}", get(users_get))
@@ -99,8 +94,53 @@ pub fn router(state: AdminProxyState) -> Router {
         .route(
             "/_synapse/admin/v1/deactivate/{user_id}",
             axum::routing::post(deactivate_user),
-        )
-        .with_state(state)
+        );
+    crate::admin_screens::add_routes(router).with_state(state)
+}
+
+/// Forwards `method` `path` (with `body` as JSON, if any) into the native router with the
+/// caller's `Authorization`, and answers the status and parsed body on `2xx` (`Null` for an
+/// empty body), or `Err` with the Synapse-shaped error response built from the native one.
+pub(crate) async fn forward(
+    native: &Router,
+    method: Method,
+    path: &str,
+    headers: &HeaderMap,
+    body: Option<Value>,
+) -> Result<(StatusCode, Value), Box<Response>> {
+    let mut builder = Request::builder().method(method).uri(path);
+    if let Some(auth) = headers.get(header::AUTHORIZATION) {
+        builder = builder.header(header::AUTHORIZATION, auth.clone());
+    }
+    let request = match body {
+        Some(body) => builder
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string())),
+        None => builder.body(Body::empty()),
+    };
+    let Ok(request) = request else {
+        return Err(Box::new(translate_error_body(
+            StatusCode::BAD_REQUEST,
+            b"{\"detail\":\"malformed path\"}",
+        )));
+    };
+    let response = native
+        .clone()
+        .oneshot(request)
+        .await
+        .unwrap_or_else(|infallible: std::convert::Infallible| match infallible {});
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), MAX_NATIVE_RESPONSE_BYTES)
+        .await
+        .unwrap_or_default();
+    if status.is_success() {
+        Ok((
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        ))
+    } else {
+        Err(Box::new(translate_error_body(status, &bytes)))
+    }
 }
 
 /// `POST /_synapse/admin/v1/deactivate/{user_id}` with `{"erase": bool}` (Synapse's "Deactivate
@@ -195,7 +235,7 @@ async fn forward_get(
 /// `M_UNKNOWN`) — Synapse's admin API has finer-grained errcodes in a few places this does not
 /// attempt to reproduce; a caller that branches on `errcode` rather than the HTTP status for one
 /// of those cases should treat this as a known, coarser gap, not a bug to route around silently.
-fn translate_error_body(status: StatusCode, native_body: &[u8]) -> Response {
+pub(crate) fn translate_error_body(status: StatusCode, native_body: &[u8]) -> Response {
     let detail = serde_json::from_slice::<Value>(native_body)
         .ok()
         .and_then(|v| {
@@ -353,7 +393,7 @@ async fn forward_server_notice(
 /// `last_seen_at` carry) into milliseconds since the Unix epoch. Returns `None` rather than
 /// panicking on a native response this shim did not expect the shape of — a translation gap
 /// should degrade to a missing field, never a crashed handler.
-fn parse_rfc3339_ms(s: &str) -> Option<i64> {
+pub(crate) fn parse_rfc3339_ms(s: &str) -> Option<i64> {
     let dt = time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok()?;
     i64::try_from((dt - time::OffsetDateTime::UNIX_EPOCH).whole_milliseconds()).ok()
 }
@@ -502,11 +542,61 @@ async fn users_get(
     headers: HeaderMap,
     Path(user_id): Path<String>,
 ) -> Response {
-    let path = format!("/api/v1/users/{}", urlencoding_light(&user_id));
-    match forward_get(&state.native, &path, &headers).await {
-        Ok(user) => axum::Json(admin_user_to_synapse_full_record(&user)).into_response(),
+    match full_record(&state, &headers, &user_id).await {
+        Ok(record) => axum::Json(record).into_response(),
         Err(resp) => *resp,
     }
+}
+
+/// The full user record of `user_id` in Synapse's shape, with the third-party identifiers and
+/// upstream identities synapse-admin's user page shows, each from its own native listing (a
+/// listing that cannot be read leaves its array empty rather than failing the record).
+pub(crate) async fn full_record(
+    state: &AdminProxyState,
+    headers: &HeaderMap,
+    user_id: &str,
+) -> Result<Value, Box<Response>> {
+    let path = format!("/api/v1/users/{}", urlencoding_light(user_id));
+    let user = forward_get(&state.native, &path, headers).await?;
+    let mut record = admin_user_to_synapse_full_record(&user);
+    if let Ok(threepids) = forward_get(&state.native, &format!("{path}/threepids"), headers).await {
+        record["threepids"] = Value::Array(
+            threepids
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|t| {
+                    let added = t
+                        .get("added_at")
+                        .and_then(Value::as_str)
+                        .and_then(parse_rfc3339_ms)
+                        .map(Value::from)
+                        .unwrap_or(Value::Null);
+                    json!({
+                        "medium": t.get("medium").cloned().unwrap_or(Value::Null),
+                        "address": t.get("address").cloned().unwrap_or(Value::Null),
+                        "validated_at": added,
+                        "added_at": added,
+                    })
+                })
+                .collect(),
+        );
+    }
+    if let Ok(ids) = forward_get(&state.native, &format!("{path}/external-ids"), headers).await {
+        record["external_ids"] = Value::Array(
+            ids.as_array()
+                .into_iter()
+                .flatten()
+                .map(|x| {
+                    json!({
+                        "auth_provider": x.get("provider").cloned().unwrap_or(Value::Null),
+                        "external_id": x.get("external_id").cloned().unwrap_or(Value::Null),
+                    })
+                })
+                .collect(),
+        );
+    }
+    Ok(record)
 }
 
 /// One item of `GET /_synapse/admin/v2/users`' `users` array
@@ -542,16 +632,14 @@ fn admin_user_to_synapse_list_item(u: &Value) -> Value {
 
 /// The full user record `GET /_synapse/admin/v2/users/{user_id}` returns
 /// (`refs/synapse/docs/admin_api/user_admin_api.md`'s "Query User Account", checked). `threepids`
-/// and `external_ids` are always empty arrays: `hs_admin::model::AdminUser` (checked) carries
-/// neither — those live behind separate native resources
-/// (`GET /users/{user_id}/threepids`-equivalent, `GET /users/lookup`) this first pass does not
-/// call out to. `creation_ts` here is **seconds**, not milliseconds, matching
+/// and `external_ids` start empty here and are filled by [`users_get`] from their own native
+/// listings. `creation_ts` here is **seconds**, not milliseconds, matching
 /// `refs/synapse/synapse/handlers/admin.py`'s `get_user` (checked: `is_trial = (now -
 /// info.creation_ts * 1000) < trial_duration_ms` only type-checks if `creation_ts` is
 /// seconds) -- deliberately different from the list endpoint's milliseconds above, because
 /// Synapse itself is inconsistent between the two endpoints, and this shim reproduces Synapse's
 /// actual behavior rather than "fixing" it into a shape that looks more consistent.
-fn admin_user_to_synapse_full_record(u: &Value) -> Value {
+pub(crate) fn admin_user_to_synapse_full_record(u: &Value) -> Value {
     let created_at_ms = u
         .get("created_at")
         .and_then(Value::as_str)
@@ -749,7 +837,7 @@ fn encryption_algorithm_or_null(r: &Value) -> Value {
 /// crate in `[workspace.dependencies]` yet, and pulling one in for five call sites that only ever
 /// see user IDs, room IDs and simple search terms was judged not worth a new shared dependency.
 /// Revisit if a value with characters outside this set turns out to matter in practice.
-fn urlencoding_light(s: &str) -> String {
+pub(crate) fn urlencoding_light(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {

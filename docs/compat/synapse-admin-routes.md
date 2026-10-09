@@ -24,26 +24,51 @@ registration protocol, `crate::synapse_shims` for everything else, which forward
 into the native `/api/v1` router in-process, behind the native tokens and scope checks, and
 reshapes the answer). At startup the log says so, with the list: `the Synapse admin
 compatibility surface is mounted under /_synapse/admin ...` with `routes=` and `operations=`;
-`routes.json` (`--routes-manifest`) lists the same under the `synapse-admin-compat` surface.
-Real-binary test: `crates/hs-cli/tests/synapse_admin.rs` (and `invites_and_notices.rs` for
-server notices, `e2e.rs` for registration).
+`routes.json` (`--routes-manifest`) lists the same under the `synapse-admin-compat` surface,
+from `hs_compat::SYNAPSE_ADMIN_ROUTES`, which `hs-compat`'s own tests hold to what its router
+mounts. Real-binary test: `crates/hs-cli/tests/synapse_admin.rs` walks synapse-admin's screens
+(and `invites_and_notices.rs` server notices, `e2e.rs` registration, `migration_rehearsal.rs`
+the user page after a migration).
 
-| Route | Answers | Needs |
-|---|---|---|
-| `GET /_synapse/admin/v1/server_version` | `{server_version, python_version: "n/a"}` | an administrator's token |
-| `GET /_synapse/admin/v2/users` | `{users: [{name, admin, deactivated, ...}], total, next_token?}` | an administrator's token (`users.read`) |
-| `GET /_synapse/admin/v2/users/{user_id}` | the user record, `404 M_NOT_FOUND` for nobody | an administrator's token |
-| `POST /_synapse/admin/v1/deactivate/{user_id}` | `{"erase": bool}` → `{id_server_unbind_result: "no-support"}`; the native deactivation, audited | an administrator's token (`users.write`) |
-| `GET /_synapse/admin/v1/rooms` | `{rooms: [{room_id, name, joined_members, creator, ...}], total_rooms, next_batch?}` (`order_by`/`dir` accepted, not honoured) | an administrator's token |
-| `GET /_synapse/admin/v1/rooms/{room_id}` | the room's details | an administrator's token |
-| `POST /_synapse/admin/v1/send_server_notice`, `PUT .../send_server_notice/{txn_id}` | `{event_id}` | an administrator's token |
-| `GET`, `POST /_synapse/admin/v1/register` | the shared-secret registration protocol (`docs/compat/cli-shims.md`) | `auth.registration_shared_secret` set; without it both answer `404 M_UNRECOGNIZED` |
+**69 routes since 2026-10-09** (8 before). The routes are the ones `synapse-admin`'s screens
+call -- users, rooms, registration tokens, reports, media, federation -- plus what Draupnir and
+operator scripts reach for. A caller without an administrator's token gets the native status
+(`401` for no token or a token the admin API does not know, `403` for one without the scope)
+with `errcode M_FORBIDDEN`; a native `404` is `M_NOT_FOUND`, a `400`/`422` is
+`M_INVALID_PARAM`. Every other row of the tables further down is a mapping only: the native
+resource exists, the `/_synapse/admin` path for it is not mounted, and a tool that calls it gets
+`404 M_UNRECOGNIZED`.
 
-A caller without an administrator's token gets the native status (`401` for no token or a
-token the admin API does not know, `403` for one without the scope) with `errcode
-M_FORBIDDEN`. Every other row of the tables below is a mapping only: the native resource exists,
-the `/_synapse/admin` path for it is not mounted, and a tool that calls it gets `404
-M_UNRECOGNIZED`.
+| Screen | Routes | Native | Differences from Synapse |
+|---|---|---|---|
+| Probe | `GET /v1/server_version` | `GET /server` | `python_version` is `"n/a"`. |
+| Users: list | `GET /v2/users` | `GET /users` | `order_by`/`dir` accepted, not honoured. `is_guest` always false. |
+| Users: one | `GET /v2/users/{user_id}` | `GET /users/{id}`, `/threepids`, `/external-ids` | `creation_ts` in seconds (as Synapse's own single-user route); `consent_*` null. |
+| Users: create or modify | `PUT /v2/users/{user_id}` | `POST /users` (new, `201`), else `PATCH /users/{id}`, `reset-password`, `deactivate`/`reactivate`, `lock`/`unlock`, 3PID and external-id add/remove | Each field goes through the native operation for it, so each is audited on its own; `logout_devices` defaults to true as in Synapse; `avatar_url`, `locked` and `deactivated` on a new account are applied right after creation. |
+| Users: administrator flag | `GET`/`PUT /v1/users/{user_id}/admin` | `GET`/`PATCH /users/{id}` | |
+| Users: devices | `GET /v2/users/{user_id}/devices`, `GET`/`PUT`/`DELETE .../devices/{device_id}`, `POST .../delete_devices` | `/users/{id}/devices`, `/devices/{device_id}`, `/devices/bulk-delete` | `last_seen_user_agent` null. |
+| Users: rooms, pushers, media | `GET /v1/users/{user_id}/joined_rooms`, `/pushers`, `/media` | `/memberships?membership=join`, `/pushers`, `/media` | `quarantined_by` is `"admin"` or null (who quarantined is not kept); `next_token` is the native cursor. |
+| Users: account data | `GET /v1/users/{user_id}/accountdata` | `/users/{id}/account-data` | `global` only; `rooms` is empty (no native listing of per-room account data). |
+| Users: whois | `GET /v1/whois/{user_id}` | `/users/{id}/sessions` | One connection per session. |
+| Users: password, act as | `POST /v1/reset_password/{user_id}`, `POST /v1/users/{user_id}/login` | `reset-password`, `login-as` | `valid_until_ms` becomes `valid_for_seconds`; the native records a reason ("Synapse admin API: login as user"). |
+| Users: shadow ban, suspend | `PUT`/`DELETE /v1/users/{user_id}/shadow_ban`, `PUT /v1/suspend/{user_id}` | `shadow-ban`/`unshadow-ban`, `suspend`/`unsuspend` | Already in that state (native `409`) answers success, as Synapse does. |
+| Users: username check | `GET /v1/username_available?username=` | `/users/availability?localpart=` | `400 M_USER_IN_USE` when taken, as Synapse. |
+| Users: experimental features | `GET`/`PUT /v1/experimental_features/{user_id}` | `/users/{id}/experimental-features` | |
+| Users: lookups | `GET /v1/auth_providers/{provider}/users/{external_id}`, `GET /v1/threepid/{medium}/users/{address}` | `/users/lookup` | |
+| Users: redact | `POST /v1/user/{user_id}/redact`, `GET /v1/user/redact_status/{redact_id}` | `redact-events` (a task), `/tasks/{id}` | Only the first of `rooms` is honoured (the native takes one room or all); `failed_redactions` is always `{}`. |
+| Rooms: list, one | `GET /v1/rooms`, `GET /v1/rooms/{room_id}` | `/rooms`, `/rooms/{id}` | `order_by`/`dir` accepted, not honoured; `joined_local_devices` 0. |
+| Rooms: members, state | `GET /v1/rooms/{room_id}/members`, `/state` | `/rooms/{id}/members`, `/state` | |
+| Rooms: delete | `DELETE /v1/rooms/{room_id}`, `DELETE /v2/rooms/{room_id}`, `GET /v2/rooms/{room_id}/delete_status`, `GET /v2/rooms/delete_status/{delete_id}` | `POST /rooms/{id}/delete` (a task), `/tasks`, `/tasks/{id}` | Both versions answer `{"delete_id"}` (the task): the deletion runs in the background here, so v1's synchronous list of kicked users cannot be answered; `shutdown_room` carries what the task's result has. |
+| Rooms: block, make admin, join | `GET`/`PUT /v1/rooms/{room_id}/block`, `POST .../make_room_admin`, `POST /v1/join/{room_id}` | `block`/`unblock`, `make-admin`, `join` | `block`'s `user_id` (who blocked) is null; `join` takes a room id, not an alias. |
+| Rooms: messages, context, extremities, media | `GET .../messages`, `GET .../context/{event_id}`, `GET`/`DELETE .../forward_extremities`, `GET /v1/room/{room_id}/media` | `/messages`, `/events/{id}/context`, `/forward-extremities`, `/media` | `state_group` null; `received_ts` is `origin_server_ts`; `context`'s `start`/`end` empty. |
+| Registration tokens | `GET /v1/registration_tokens`, `POST .../new`, `GET`/`PUT`/`DELETE .../{token}` | `/registration-tokens` | `expiry_time` in milliseconds both ways. |
+| Reports | `GET /v1/event_reports`, `GET`/`DELETE .../{report_id}` | `/reports` | `canonical_alias` and `name` null; `event_json` is the native `event`. |
+| Media | `GET /v1/statistics/users/media`, `DELETE /v1/media/{server}/{id}`, `POST /v1/media/quarantine|unquarantine/{server}/{id}`, `POST /v1/media/protect|unprotect/{id}` | `/statistics/users/media`, `/media/{server}/{id}`, `/quarantine`, `/unquarantine`, `/protect`, `/unprotect` | `displayname` null in the statistics; protect/unprotect act on this server's own media. Bulk deletes and the cache purge (tasks here) are not mounted. |
+| Federation | `GET /v1/federation/destinations`, `GET .../{destination}`, `GET .../{destination}/rooms`, `POST .../{destination}/reset_connection` | `/federation/destinations...` | `last_successful_stream_ordering` and `stream_ordering` null. |
+| Notices, deactivation | `POST /v1/send_server_notice`, `PUT .../{txn_id}`, `POST /v1/deactivate/{user_id}` | `/server-notices`, `/users/{id}/deactivate` | `id_server_unbind_result` is `"no-support"`. |
+| Registration | `GET`, `POST /v1/register` | `hs-auth`'s shared-secret protocol | Needs `auth.registration_shared_secret`; without it both answer `404 M_UNRECOGNIZED`. |
+
+Not mounted, and why: background updates (`R-MIGRATE`), `purge_history` and its status (the native `purge-history` is a task with no Synapse-shaped status yet), `purge_media_cache` and bulk media deletes (tasks), room-wide and user-wide media quarantine (tasks), `quarantine_media/{room_id}`, `scheduled_tasks`, `statistics/database/rooms`, `search_users` (deprecated in Synapse), `account_validity`, `user_reports`, `timestamp_to_event`, `hierarchy`, `fetch_event`, `cumulative_joined_room_count`, `sent_invite_count`, `override_ratelimit`, `memberships`, `_allow_cross_signing_replacement_without_uia`, `media/{server}/{id}` `GET`.
 
 ## How to read the table
 

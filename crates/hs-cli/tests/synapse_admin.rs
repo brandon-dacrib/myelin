@@ -217,6 +217,315 @@ async fn synapse_era_tooling_finds_the_admin_operations_it_expects() {
     assert_eq!(room["joined_members"], 1, "{room}");
     assert_eq!(room["creator"], "@alice:example.org", "{room}");
 
+    // synapse-admin's user page: create a user through Synapse's create-or-modify route (with
+    // an email address and an upstream identity), read the record back with them, change the
+    // display name and the administrator flag, list devices, joined rooms and pushers, reset
+    // the password, act as the user, whois, and check a username.
+    let (status, bob) = call(
+        &base,
+        Method::PUT,
+        "/_synapse/admin/v2/users/@bob:example.org",
+        Some(&admin),
+        Some(json!({
+            "password": "bob-password-1",
+            "displayname": "Bob",
+            "threepids": [{"medium": "email", "address": "bob@example.org"}],
+            "external_ids": [{"auth_provider": "oidc-example", "external_id": "bob-at-idp"}],
+            "admin": false,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{bob}");
+    assert_eq!(bob["name"], "@bob:example.org", "{bob}");
+    assert_eq!(bob["displayname"], "Bob", "{bob}");
+    assert_eq!(bob["threepids"][0]["address"], "bob@example.org", "{bob}");
+    assert_eq!(
+        bob["external_ids"][0]["auth_provider"], "oidc-example",
+        "{bob}"
+    );
+    let (status, bob) = call(
+        &base,
+        Method::PUT,
+        "/_synapse/admin/v2/users/@bob:example.org",
+        Some(&admin),
+        Some(json!({"displayname": "Robert", "admin": true, "threepids": []})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{bob}");
+    assert_eq!(bob["displayname"], "Robert", "{bob}");
+    assert_eq!(bob["admin"], true, "{bob}");
+    assert_eq!(bob["threepids"], json!([]), "{bob}");
+    assert_eq!(bob["external_ids"][0]["external_id"], "bob-at-idp", "{bob}");
+    let (_, is_admin) = call(
+        &base,
+        Method::GET,
+        "/_synapse/admin/v1/users/@bob:example.org/admin",
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(is_admin, json!({"admin": true}));
+    call(
+        &base,
+        Method::PUT,
+        "/_synapse/admin/v1/users/@bob:example.org/admin",
+        Some(&admin),
+        Some(json!({"admin": false})),
+    )
+    .await;
+    let (_, found) = call(
+        &base,
+        Method::GET,
+        "/_synapse/admin/v1/auth_providers/oidc-example/users/bob-at-idp",
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(found, json!({"user_id": "@bob:example.org"}));
+    let (status, reset) = call(
+        &base,
+        Method::POST,
+        "/_synapse/admin/v1/reset_password/@bob:example.org",
+        Some(&admin),
+        Some(json!({"new_password": "bob-password-2", "logout_devices": true})),
+    )
+    .await;
+    assert_eq!((status, reset), (StatusCode::OK, json!({})));
+    let (status, login) = call(
+        &base,
+        Method::POST,
+        "/_matrix/client/v3/login",
+        None,
+        Some(json!({
+            "type": "m.login.password",
+            "identifier": {"type": "m.id.user", "user": "bob"},
+            "password": "bob-password-2",
+            "device_id": "BOBPHONE",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{login}");
+    let bob_token = login["access_token"].as_str().unwrap().to_owned();
+    let (_, devices) = call(
+        &base,
+        Method::GET,
+        "/_synapse/admin/v2/users/@bob:example.org/devices",
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(devices["total"], 1, "{devices}");
+    assert_eq!(devices["devices"][0]["device_id"], "BOBPHONE", "{devices}");
+    call(
+        &base,
+        Method::PUT,
+        "/_synapse/admin/v2/users/@bob:example.org/devices/BOBPHONE",
+        Some(&admin),
+        Some(json!({"display_name": "Bob's phone"})),
+    )
+    .await;
+    let (_, device) = call(
+        &base,
+        Method::GET,
+        "/_synapse/admin/v2/users/@bob:example.org/devices/BOBPHONE",
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(device["display_name"], "Bob's phone", "{device}");
+    call(
+        &base,
+        Method::POST,
+        &format!("/_matrix/client/v3/join/{}", urlencode(&room_id)),
+        Some(&bob_token),
+        Some(json!({})),
+    )
+    .await;
+    let (_, joined) = call(
+        &base,
+        Method::GET,
+        "/_synapse/admin/v1/users/@bob:example.org/joined_rooms",
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(joined["joined_rooms"], json!([room_id]), "{joined}");
+    let (_, pushers) = call(
+        &base,
+        Method::GET,
+        "/_synapse/admin/v1/users/@bob:example.org/pushers",
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(pushers["total"], 0, "{pushers}");
+    let (status, acting) = call(
+        &base,
+        Method::POST,
+        "/_synapse/admin/v1/users/@bob:example.org/login",
+        Some(&admin),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{acting}");
+    let (_, whoami) = call(
+        &base,
+        Method::GET,
+        "/_matrix/client/v3/account/whoami",
+        acting["access_token"].as_str(),
+        None,
+    )
+    .await;
+    assert_eq!(whoami["user_id"], "@bob:example.org", "{whoami}");
+    let (_, whois) = call(
+        &base,
+        Method::GET,
+        "/_synapse/admin/v1/whois/@bob:example.org",
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(whois["user_id"], "@bob:example.org", "{whois}");
+    assert!(whois["devices"]["BOBPHONE"].is_object(), "{whois}");
+    let (status, _) = call(
+        &base,
+        Method::GET,
+        "/_synapse/admin/v1/username_available?username=carol",
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, taken) = call(
+        &base,
+        Method::GET,
+        "/_synapse/admin/v1/username_available?username=bob",
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{taken}");
+    assert_eq!(taken["errcode"], "M_USER_IN_USE", "{taken}");
+
+    // The room page: members, state, block, make admin; the registration tokens page; the
+    // reports page; the federation page; the media statistics page.
+    let (_, members) = call(
+        &base,
+        Method::GET,
+        &format!("/_synapse/admin/v1/rooms/{room_id}/members"),
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(members["total"], 2, "{members}");
+    let (_, state) = call(
+        &base,
+        Method::GET,
+        &format!("/_synapse/admin/v1/rooms/{room_id}/state"),
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert!(
+        state["state"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["type"] == "m.room.create"),
+        "{state}"
+    );
+    let (status, blocked) = call(
+        &base,
+        Method::PUT,
+        &format!("/_synapse/admin/v1/rooms/{room_id}/block"),
+        Some(&admin),
+        Some(json!({"block": true})),
+    )
+    .await;
+    assert_eq!((status, blocked), (StatusCode::OK, json!({"block": true})));
+    let (_, block_status) = call(
+        &base,
+        Method::GET,
+        &format!("/_synapse/admin/v1/rooms/{room_id}/block"),
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(block_status["block"], true, "{block_status}");
+    call(
+        &base,
+        Method::PUT,
+        &format!("/_synapse/admin/v1/rooms/{room_id}/block"),
+        Some(&admin),
+        Some(json!({"block": false})),
+    )
+    .await;
+    let (_, token) = call(
+        &base,
+        Method::POST,
+        "/_synapse/admin/v1/registration_tokens/new",
+        Some(&admin),
+        Some(json!({"token": "compat-token", "uses_allowed": 2})),
+    )
+    .await;
+    assert_eq!(token["token"], "compat-token", "{token}");
+    assert_eq!(token["uses_allowed"], 2, "{token}");
+    let (_, tokens) = call(
+        &base,
+        Method::GET,
+        "/_synapse/admin/v1/registration_tokens",
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert!(
+        tokens["registration_tokens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["token"] == "compat-token"),
+        "{tokens}"
+    );
+    let (status, _) = call(
+        &base,
+        Method::DELETE,
+        "/_synapse/admin/v1/registration_tokens/compat-token",
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, reports) = call(
+        &base,
+        Method::GET,
+        "/_synapse/admin/v1/event_reports",
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reports}");
+    assert_eq!(reports["event_reports"], json!([]), "{reports}");
+    let (status, destinations) = call(
+        &base,
+        Method::GET,
+        "/_synapse/admin/v1/federation/destinations",
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{destinations}");
+    assert!(destinations["destinations"].is_array(), "{destinations}");
+    let (status, statistics) = call(
+        &base,
+        Method::GET,
+        "/_synapse/admin/v1/statistics/users/media",
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{statistics}");
+    assert!(statistics["users"].is_array(), "{statistics}");
+
     // Deactivation through the Synapse route is the native deactivation: alice's token stops
     // working and the listing says so.
     let (status, deactivated) = call(
@@ -278,7 +587,7 @@ async fn synapse_era_tooling_finds_the_admin_operations_it_expects() {
         })
         .collect();
     assert!(
-        compat.len() >= 9,
+        compat.len() >= 60,
         "the compat surface has shrunk: {compat:?}"
     );
     for (method, path) in &compat {
@@ -286,7 +595,20 @@ async fn synapse_era_tooling_finds_the_admin_operations_it_expects() {
         let path = path
             .replace("{user_id}", "@alice:example.org")
             .replace("{room_id}", &room_id)
-            .replace("{txn_id}", "t1");
+            .replace("{txn_id}", "t1")
+            .replace("{device_id}", "NOSUCHDEVICE")
+            .replace("{event_id}", "$nosuchevent")
+            .replace("{delete_id}", "nosuchtask")
+            .replace("{redact_id}", "nosuchtask")
+            .replace("{token}", "nosuchtoken")
+            .replace("{report_id}", "nosuchreport")
+            .replace("{server_name}", "example.org")
+            .replace("{media_id}", "nosuchmedia")
+            .replace("{destination}", "other.example")
+            .replace("{provider}", "oidc-example")
+            .replace("{external_id}", "nobody")
+            .replace("{medium}", "email")
+            .replace("{address}", "nobody@example.org");
         let method = Method::from_bytes(method.as_bytes()).unwrap();
         let (status, body) =
             call(&base, method.clone(), &path, Some(&admin), Some(json!({}))).await;
@@ -297,4 +619,10 @@ async fn synapse_era_tooling_finds_the_admin_operations_it_expects() {
     }
 
     handle.shutdown().await;
+}
+
+fn urlencode(s: &str) -> String {
+    s.replace('!', "%21")
+        .replace(':', "%3A")
+        .replace('#', "%23")
 }

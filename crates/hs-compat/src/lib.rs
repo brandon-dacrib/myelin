@@ -8,6 +8,7 @@
 //! admin-API surface, and the online importer from a Synapse deployment ([`migration`]).
 
 pub mod admin_proxy;
+pub mod admin_screens;
 pub mod classification;
 pub mod migration;
 pub mod report;
@@ -15,6 +16,7 @@ pub mod shared_secret;
 pub mod translate;
 
 pub use admin_proxy::{AdminProxyState, router as admin_proxy_router};
+pub use admin_screens::ROUTES as SYNAPSE_ADMIN_ROUTES;
 pub use classification::{Classification, KeyInfo};
 pub use report::{KeyOutcome, TranslationReport};
 pub use translate::{TranslateError, TranslateOptions, translate};

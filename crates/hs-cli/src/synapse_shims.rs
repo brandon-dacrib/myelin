@@ -1,11 +1,11 @@
-//! Mounts `hs-compat`'s read-only `/_synapse/admin` compatibility routes, and mirrors their
-//! `routes.json` entries by hand.
+//! Mounts `hs-compat`'s `/_synapse/admin` compatibility routes, and lists their `routes.json`
+//! entries from the list `hs-compat` keeps beside its router.
 //!
 //! `hs-compat` hands over a plain `axum::Router` rather than something built through
 //! `hs_http::router::Builder` (the same shape `hs-auth`'s fragments use, and for the same reason:
 //! that crate does not depend on `hs-http`), so mounting it produces no manifest entries by
-//! itself. This module is the mechanical mirror, kept beside the mount so the two are obvious to
-//! change together — exactly the arrangement `crate::auth_manifest` documents for `hs-auth`.
+//! itself. `hs-compat` names every route it mounts in `SYNAPSE_ADMIN_ROUTES` (and tests that the
+//! two agree); this module turns that list into manifest entries.
 //!
 //! These routes exist so that tooling written against Synapse's admin API keeps working: they
 //! forward into this server's own `/api/v1` router and reshape the response, rather than
@@ -20,56 +20,27 @@ pub fn router(native_admin: axum::Router) -> (axum::Router, Vec<Route>) {
     (router, routes())
 }
 
-fn route(path: &str, operation_id: &str) -> Route {
-    Route {
-        method: "GET".to_owned(),
-        path: path.to_owned(),
-        surface: Surface::SynapseAdminCompat,
-        operation_id: Some(operation_id.to_owned()),
-        // The shim forwards the caller's `Authorization` header into the native admin router,
-        // which is where the token is actually verified and its scope checked. `Admin` is the
-        // honest description of what a caller needs, even though this layer does not check it
-        // itself.
-        auth: AuthKind::Admin,
-        required_scope: None,
-        rate_limited: false,
-    }
-}
-
-/// Every route `hs_compat::admin_proxy_router` registers, mirrored by hand.
+/// Every route `hs_compat::admin_proxy_router` registers, from the list `hs-compat` keeps
+/// beside its router (`hs_compat::SYNAPSE_ADMIN_ROUTES`, which its own tests hold to what is
+/// mounted).
 #[must_use]
 pub fn routes() -> Vec<Route> {
-    vec![
-        route(
-            "/_synapse/admin/v1/server_version",
-            "synapseAdminServerVersion",
-        ),
-        route("/_synapse/admin/v2/users", "synapseAdminUsersList"),
-        route("/_synapse/admin/v2/users/{user_id}", "synapseAdminUsersGet"),
-        route("/_synapse/admin/v1/rooms", "synapseAdminRoomsList"),
-        route("/_synapse/admin/v1/rooms/{room_id}", "synapseAdminRoomsGet"),
-        Route {
-            method: "POST".to_owned(),
-            ..route(
-                "/_synapse/admin/v1/send_server_notice",
-                "synapseAdminSendServerNotice",
-            )
-        },
-        Route {
-            method: "PUT".to_owned(),
-            ..route(
-                "/_synapse/admin/v1/send_server_notice/{txn_id}",
-                "synapseAdminSendServerNoticeTxn",
-            )
-        },
-        Route {
-            method: "POST".to_owned(),
-            ..route(
-                "/_synapse/admin/v1/deactivate/{user_id}",
-                "synapseAdminDeactivateUser",
-            )
-        },
-    ]
+    hs_compat::SYNAPSE_ADMIN_ROUTES
+        .iter()
+        .map(|(method, path, operation_id)| Route {
+            method: (*method).to_owned(),
+            path: (*path).to_owned(),
+            surface: Surface::SynapseAdminCompat,
+            operation_id: Some((*operation_id).to_owned()),
+            // The shim forwards the caller's `Authorization` header into the native admin
+            // router, which is where the token is actually verified and its scope checked.
+            // `Admin` is the honest description of what a caller needs, even though this layer
+            // does not check it itself.
+            auth: AuthKind::Admin,
+            required_scope: None,
+            rate_limited: false,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -79,8 +50,17 @@ mod tests {
     #[test]
     fn mirrors_every_shimmed_route_on_the_compat_surface() {
         let routes = routes();
-        assert_eq!(routes.len(), 8);
-        assert_eq!(routes.iter().filter(|r| r.method == "GET").count(), 5);
+        assert!(routes.len() >= 60, "{}", routes.len());
+        assert!(routes.iter().filter(|r| r.method == "GET").count() >= 30);
+        let mut seen = std::collections::HashSet::new();
+        for r in &routes {
+            assert!(
+                seen.insert((r.method.clone(), r.path.clone())),
+                "{} {} twice",
+                r.method,
+                r.path
+            );
+        }
         assert!(
             routes
                 .iter()
