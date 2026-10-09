@@ -917,6 +917,9 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await });
         let url: axum::http::Uri = format!("http://{addr}").parse().unwrap();
+        // As `connect` does: the workspace links both rustls providers, so none is the default
+        // until one is installed (each test passes alone and panics in the workspace gate).
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let client = kube::Client::try_from(kube::Config::new(url)).unwrap();
         (KubeBridgeClient::new(client, "myelin"), shared)
     }
