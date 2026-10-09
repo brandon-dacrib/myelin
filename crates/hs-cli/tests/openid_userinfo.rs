@@ -127,10 +127,11 @@ async fn openid_round_trip(federation: bool) {
     let (status, body) = userinfo(String::new()).await;
     assert_eq!((status, &body["errcode"]), (401, &json!("M_MISSING_TOKEN")));
 
-    // The signed federation routes: mounted only with federation on. Unsigned, `/version` is
-    // refused by the `X-Matrix` layer when it is there, and not found when it is not.
+    // The signed federation routes: mounted only with federation on. Unsigned, `/publicRooms`
+    // is refused by the `X-Matrix` layer when it is there, and not found when it is not.
+    // (`/version` is unsigned by the spec: `federation_version.rs`.)
     let version = client
-        .get(format!("{base}/_matrix/federation/v1/version"))
+        .get(format!("{base}/_matrix/federation/v1/publicRooms"))
         .send()
         .await
         .unwrap()

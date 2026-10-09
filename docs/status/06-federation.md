@@ -1,5 +1,43 @@
 # 06 Federation: status
 
+## 2026-10-09 (branch `agent/fed-version`): `GET /_matrix/federation/v1/version` answers an unsigned request
+
+The live demo (image `a6f02c48`) answered an unsigned `GET /_matrix/federation/v1/version`
+`401 M_UNAUTHORIZED` ("signature verification failed"): the route was registered inside the
+`X-Matrix` layer. The spec (`server-server/version.yaml`) gives it no `security` block, Synapse
+answers it unsigned, and federation testers and other servers call it unsigned. Crates:
+`hs-federation`, `hs-cli` (tests only). No OpenAPI change, no decision or RFC number taken.
+
+- **`/version` is its own router** (`crates/hs-federation/src/transport/version.rs`), merged by
+  `transport::router` *beside* the `X-Matrix` layer (`Router::layer` wraps only the routes present
+  when applied), and marked `AuthKind::None` in the manifest. The `Authorization` header is not
+  read, so a signed request (this server's own client signs it) still gets `200`, and so does one
+  whose signature would not verify. Logged at `debug`; counted by the HTTP layer like every route.
+- **Served only with federation on** (`404` with `federation.enabled: false`), following Synapse,
+  which serves `/version` only from its `federation` listener resource. `/openid/userinfo` stays
+  served either way.
+- **Audit of every route under `/_matrix/federation` and `/_matrix/key` against the spec's
+  `security` blocks**: the spec's unsigned operations are `/version`, `/openid/userinfo`,
+  `PUT /3pid/onbind` and the key server (`/_matrix/key/v2/server`, `GET`/`POST /query`). Only
+  `/version` was wrong; the other three were already outside the layer (`openid.rs`, `hs-cli`'s
+  `onbind_router`, `key_server.rs`). `timestamp_to_event` says `accessToken` in the spec, which is
+  a spec slip (it is a federation endpoint; Synapse authenticates it as one): kept signed.
+- **Tests**: `transport::tests::version_answers_an_unsigned_request`,
+  `version_answers_a_signed_request_and_ignores_a_bad_signature` (replacing
+  `version_endpoint_works_when_properly_signed`), `the_only_unsigned_federation_route_is_version`
+  (replacing `the_federation_router_has_no_unsigned_route`; v2 routes all signed);
+  `every_route_is_behind_the_x_matrix_layer` still covers every signed route. Real binary:
+  `crates/hs-cli/tests/federation_version.rs` (`unsigned_federation_version_is_answered`: `200`,
+  `server.name == "hs"`, unsigned `/publicRooms` still `401`;
+  `federation_version_is_not_served_with_federation_off`: `404`). `openid_userinfo.rs` now probes
+  `/publicRooms` for "a signed route is mounted" instead of `/version`.
+- **Verified**: `cargo test -p hs-federation` (230 passed), `cargo test -p hs-cli --test
+  federation_version --test openid_userinfo`, per-crate clippy clean.
+- **Left**: `docs/status/routes.json` still lists `federationVersion` (and
+  `federationOpenIdUserinfo`) as `auth: matrix`; it is generated and stale since 2026-10-05,
+  `hs routes-manifest -o docs/status/routes.json` refreshes it. The demo needs a redeploy to
+  pick this up.
+
 ## 2026-10-08 (branch `agent/fed-cluster`): a room nobody here is in, the durable-EDU bound as a setting, the announcer's place per shard, `/members?at=` 404, `/openid/userinfo` with federation off
 
 Wave 4's leftovers for tracks 06, 04 and 07. Crates: `hs-federation`, `hs-room`, `hs-config`

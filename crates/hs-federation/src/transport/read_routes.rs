@@ -24,7 +24,6 @@ pub(super) fn add_routes(builder: Builder<FederationState>) -> Builder<Federatio
     }
 
     builder
-        .get("/version", version, meta("federationVersion"))
         // The spec names these two query types as their own paths (`query.yaml`'s
         // `queryProfile` and `queryRoomDirectory`) as well as reaching them through the generic
         // `{queryType}` form. Registering all three means the manifest reports what this server
@@ -115,13 +114,6 @@ fn room_source_error_to_response(err: RoomSourceError) -> MatrixError {
         }
         RoomSourceError::NotVisible => MatrixError::forbidden("not visible to this server"),
     }
-}
-
-async fn version() -> Response {
-    axum::Json(serde_json::json!({
-        "server": { "name": "hs", "version": env!("CARGO_PKG_VERSION") }
-    }))
-    .into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -575,38 +567,6 @@ mod tests {
             edu_sink: None,
         };
         build().with_state(state)
-    }
-
-    #[tokio::test]
-    async fn version_returns_server_info() {
-        let router = build();
-        let state = FederationState {
-            own_server_name: Arc::from("us.example.org"),
-            rooms: Arc::new(InMemoryRoomSource::new()),
-            queries: Arc::new(InMemoryQuerySource::default()),
-            policy: crate::transport::InboundPolicy::new(false, false),
-            write_sink: Arc::new(crate::inbound::StaticWriteSink::new(
-                Vec::new(),
-                "not supported",
-            )),
-            transactions: Arc::new(crate::inbound::InMemoryTransactionStore::new()),
-            ancestor_fetcher: None,
-            backfill_limits: crate::backfill::BackfillLimits::default(),
-            sender: None,
-            invites: None,
-            edu_sink: None,
-        };
-        let response = router
-            .with_state(state)
-            .oneshot(
-                Request::builder()
-                    .uri("/version")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

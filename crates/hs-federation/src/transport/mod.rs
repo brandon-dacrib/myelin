@@ -7,7 +7,10 @@
 //! [`seam_router`] — never per-handler. This is the structural guarantee named in this crate's
 //! decisions: a route added to either sub-router in the future is automatically covered, because
 //! there is no code path into a handler that does not first pass through the layer.  See
-//! [`tests::every_route_is_behind_the_x_matrix_layer`] for the test that enforces this.
+//! [`tests::every_route_is_behind_the_x_matrix_layer`] for the test that enforces this. The one
+//! exception is `/version`, which the spec leaves unsigned: it is merged beside the layer from
+//! its own router (`version`), marked [`AuthKind::None`] in the manifest, and
+//! [`tests::the_only_unsigned_federation_route_is_version`] keeps it the only one.
 //!
 //! Read/query endpoints (`docs/design/06-federation-threat-model.md` section 2.4) are fully
 //! implemented against [`FederationState`]'s [`RoomDataSource`] and [`FederationQuerySource`]
@@ -25,6 +28,7 @@ mod queries;
 mod read_routes;
 mod seams;
 mod send;
+mod version;
 
 use std::sync::Arc;
 
@@ -133,7 +137,7 @@ fn matrix_federation(operation_id: &str) -> RouteMeta {
 
 /// Builds the full **v1** federation router: every read/query endpoint, every seam, `/send`,
 /// `make_join` and the v1 `send_join` spelling, with the `X-Matrix` verification layer wrapping
-/// the whole thing. Paths are spec-relative (registered as `/version`, `/send/{txnId}`, etc. —
+/// all of them, plus the unsigned `/version` beside that layer. Paths are spec-relative (registered as `/version`, `/send/{txnId}`, etc. —
 /// mounting under `/_matrix/federation/v1` and composing with other listeners is the caller's job,
 /// matching `hs-media`'s convention).
 ///
@@ -154,10 +158,17 @@ pub fn router(
     let builder = join::add_routes(builder);
     let builder = membership::add_routes(builder);
     let builder = keys::add_routes(builder);
-    let (merged, manifest) = builder.build();
-    // `/openid/userinfo`, the one unsigned route under the prefix, is not here: it is served
-    // whether or not federation is enabled ([`openid::router`]).
-    (apply_x_matrix_layer(merged, state, x_matrix_ctx), manifest)
+    let (merged, mut manifest) = builder.build();
+    // `/version` is unsigned (the spec gives it no `security`), so it is merged *beside* the
+    // `X-Matrix` layer, not under it: `Router::layer` wraps only the routes present when it is
+    // applied. `/openid/userinfo`, the other unsigned route under the prefix, is not here at all:
+    // it is served whether or not federation is enabled ([`openid::router`]).
+    let (version_router, version_manifest) = version::router();
+    manifest.routes.extend(version_manifest.routes);
+    (
+        apply_x_matrix_layer(merged, state, x_matrix_ctx).merge(version_router),
+        manifest,
+    )
 }
 
 /// Builds the **v2** federation router: `send_join`, `send_leave` and `invite`, under the same
@@ -320,22 +331,30 @@ mod tests {
         }
     }
 
-    /// Every route of the federation router is signed: `/openid/userinfo`, the one unsigned
-    /// route under the prefix, is its own router ([`openid::router`]), served with federation
-    /// off too.
+    /// Every route of the federation router is signed except `/version`, which the spec gives
+    /// no `security` requirement. `/openid/userinfo`, the other unsigned route under the prefix,
+    /// is its own router ([`openid::router`]), served with federation off too.
     #[tokio::test]
-    async fn the_federation_router_has_no_unsigned_route() {
+    async fn the_only_unsigned_federation_route_is_version() {
         let (_router, manifest) = router(test_state(), test_ctx());
-        let unsigned: Vec<&str> = manifest
+        let unsigned: Vec<(&str, &str)> = manifest
             .routes
             .iter()
             .filter(|r| r.auth == hs_http::router::AuthKind::None)
-            .map(|r| r.path.as_str())
+            .map(|r| (r.method.as_str(), r.path.as_str()))
             .collect();
-        assert!(unsigned.is_empty(), "{unsigned:?}");
+        assert_eq!(unsigned, [("GET", "/version")]);
         assert!(
             !manifest.routes.iter().any(|r| r.path == "/openid/userinfo"),
             "the federation router does not serve /openid/userinfo"
+        );
+        let (_router, manifest_v2) = router_v2(test_state(), test_ctx());
+        assert!(
+            manifest_v2
+                .routes
+                .iter()
+                .all(|r| r.auth != hs_http::router::AuthKind::None),
+            "every v2 route is signed"
         );
     }
 
@@ -531,8 +550,43 @@ mod tests {
         assert_eq!(body["pdus"][0]["event_id"], event_id);
     }
 
+    /// `GET /version` with the body of a 200, asserting the spec's `server.name`.
+    async fn get_version(router: axum::Router, authorization: Option<String>) -> serde_json::Value {
+        let mut request = Request::builder().method("GET").uri("/version");
+        if let Some(header) = authorization {
+            request = request.header(axum::http::header::AUTHORIZATION, header);
+        }
+        let response = router
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["server"]["name"], version::SERVER_NAME, "{body}");
+        assert_eq!(
+            body["server"]["version"],
+            env!("CARGO_PKG_VERSION"),
+            "{body}"
+        );
+        body
+    }
+
+    /// The spec gives `/version` no `security` requirement, and federation testers and other
+    /// servers call it unsigned: it answers `200` with no `Authorization` header at all. On
+    /// the live demo before 2026-10-09 it was `401 M_UNAUTHORIZED`.
     #[tokio::test]
-    async fn version_endpoint_works_when_properly_signed() {
+    async fn version_answers_an_unsigned_request() {
+        let (router, _manifest) = router(test_state(), test_ctx());
+        get_version(router, None).await;
+    }
+
+    /// A server that signs every request anyway (as this one's own client does) still gets the
+    /// answer, and so does one whose signature would not verify: the header is not read.
+    #[tokio::test]
+    async fn version_answers_a_signed_request_and_ignores_a_bad_signature() {
         let dir = tempfile::tempdir().unwrap();
         let keys = OwnSigningKeys::load_or_generate(dir.path()).unwrap();
 
@@ -563,18 +617,15 @@ mod tests {
             keys.primary(),
         )
         .unwrap();
-
-        let response = router
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri("/version")
-                    .header(axum::http::header::AUTHORIZATION, header)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        get_version(router.clone(), Some(header)).await;
+        get_version(
+            router,
+            Some(
+                "X-Matrix origin=\"origin.example.org\",destination=\"us.example.org\",\
+                 key=\"ed25519:1\",sig=\"AAAA\""
+                    .to_owned(),
+            ),
+        )
+        .await;
     }
 }
