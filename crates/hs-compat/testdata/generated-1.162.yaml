@@ -1,0 +1,46 @@
+# `homeserver.yaml` exactly as the matrixdotorg/synapse 1.162.0 image wrote it on 2026-10-09
+# (`docker run ... -e SYNAPSE_SERVER_NAME=generated.example.org -e SYNAPSE_REPORT_STATS=no
+# mirror.gcr.io/matrixdotorg/synapse:latest generate`), with its three generated secrets
+# replaced by placeholders. Nothing else is edited: this is what an operator's first
+# translation sees. `tests/corpus.rs` requires it to translate without
+# `--allow-unsupported-synapse-config`: `pid_file`, `form_secret` and `trusted_key_servers`
+# (matrix.org only) are inert here, and everything else is mapped.
+# Configuration file for Synapse.
+#
+# This is a YAML file: see [1] for a quick introduction. Note in particular
+# that *indentation is important*: all the elements of a list or dictionary
+# should have the same indentation.
+#
+# [1] https://docs.ansible.com/ansible/latest/reference_appendices/YAMLSyntax.html
+#
+# For more information on how to configure Synapse, including a complete accounting of
+# each option, go to docs/usage/configuration/config_documentation.md or
+# https://element-hq.github.io/synapse/latest/usage/configuration/config_documentation.html
+server_name: "generated.example.org"
+pid_file: /data/homeserver.pid
+listeners:
+  - port: 8008
+    resources:
+    - compress: false
+      names:
+      - client
+      - federation
+    tls: false
+    type: http
+    x_forwarded: true
+database:
+  name: sqlite3
+  args:
+    database: /data/homeserver.db
+log_config: "/data/generated.example.org.log.config"
+media_store_path: /data/media_store
+registration_shared_secret: "generated-1-162-shared-secret"
+report_stats: false
+macaroon_secret_key: "generated-1-162-macaroon-key"
+form_secret: "generated-1-162-form-secret"
+signing_key_path: "/data/generated.example.org.signing.key"
+trusted_key_servers:
+  - server_name: "matrix.org"
+
+
+# vim:ft=yaml

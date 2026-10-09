@@ -37,6 +37,10 @@ pub enum OutcomeClassification {
     /// — either a typo, a very new option, or a private/undocumented one.
     /// Treated the same as `Unsupported` for the fail-closed check.
     Unrecognized,
+    /// Unsupported, and set to something that changes nothing here: a process-supervision or
+    /// Python-tuning key, a worker-topology key (one process does all of it), or a key at
+    /// Synapse's own default. Reported, never blocking (`crate::translate::inert_reason`).
+    Inert,
 }
 
 impl From<Classification> for OutcomeClassification {
@@ -56,6 +60,7 @@ impl fmt::Display for OutcomeClassification {
             OutcomeClassification::MappedDiff => "mapped (diff)",
             OutcomeClassification::Unsupported => "unsupported",
             OutcomeClassification::Unrecognized => "unrecognized",
+            OutcomeClassification::Inert => "inert (no effect here)",
         })
     }
 }

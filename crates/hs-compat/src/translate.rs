@@ -12,7 +12,12 @@
 //! of the 182 unsupported options (infeasible to keep in sync release over
 //! release); a key an operator bothered to write down is a decision that
 //! must be acknowledged, not silently dropped, whether or not its value
-//! happens to match what Synapse would have used anyway.
+//! happens to match what Synapse would have used anyway. The one exception is a
+//! named handful of keys that cannot change anything here whatever they say
+//! ([`inert_reason`]): process supervision, Python tuning, worker topology, a
+//! generated secret this server never reads, and a few keys at Synapse's own
+//! default that every generated `homeserver.yaml` carries. Those are reported
+//! as `inert` and never block, so a file straight out of `generate` translates.
 
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -55,7 +60,7 @@ pub enum TranslateError {
         keys.join("\n")
     )]
     Unsupported {
-        /// One line per blocking key, e.g. `` `gc_thresholds`: R-PY. ``.
+        /// One line per blocking key, e.g. `` `max_avatar_size`: R-PHASE1 (hs-auth). ``.
         keys: Vec<String>,
     },
     /// The translated configuration failed `hs-config`'s own validation.
@@ -117,6 +122,14 @@ pub fn translate(
         apply_and_report(key, v, &mut config, &mut report);
     }
 
+    // --- Pass 3: keys whose effect depends on another key, whichever order they came in ---
+    // Synapse's `registration_requires_token: true` with `enable_registration: true` admits
+    // only token holders; here a registration token opens a closed server (decision 0011), so
+    // that is a closed server with tokens, and the tokens come over with the importer.
+    if get_bool(&doc, "registration_requires_token") == Some(true) {
+        config.auth.enable_registration = false;
+    }
+
     if !options.allow_unsupported && report.has_blocking() {
         let keys = report
             .blocking()
@@ -143,8 +156,104 @@ fn apply_and_report(key: &str, value: &Value, config: &mut Config, report: &mut 
     };
     if info.classification != Classification::Unsupported {
         translate_key(key, value, config);
+    } else if let Some(why) = inert_reason(key, value) {
+        report.record(key, OutcomeClassification::Inert, "", why);
+        return;
     }
     report.record(key, info.classification.into(), info.native, info.note);
+}
+
+/// Why an unsupported `key` set to `value` changes nothing on this server, if it does not:
+/// such a key is reported as inert and never blocks a translation.
+///
+/// The list is deliberately short and literal. A key is here only when every value it can
+/// take is without effect (process supervision, Python's garbage collector, Synapse's worker
+/// topology -- one process does all of it here, decision `PLAN.md` D2 -- its caches and
+/// background-update queue, a form-signing secret this server never reads, a warning switch)
+/// or when the value given is Synapse's own default and that default is what this server does
+/// anyway (`trusted_key_servers` naming only matrix.org, presence on). Anything else that is
+/// unsupported still blocks: a key an operator wrote down is a decision to acknowledge.
+#[must_use]
+pub fn inert_reason(key: &str, value: &Value) -> Option<&'static str> {
+    const PROCESS: &[&str] = &[
+        "pid_file",
+        "daemonize",
+        "print_pidfile",
+        "soft_file_limit",
+        "manhole",
+        "manhole_settings",
+    ];
+    const PYTHON: &[&str] = &["gc_thresholds", "gc_min_interval", "use_frozen_dicts"];
+    const WORKERS: &[&str] = &[
+        "worker_app",
+        "worker_name",
+        "worker_listeners",
+        "worker_manhole",
+        "worker_daemonize",
+        "worker_pid_file",
+        "worker_log_config",
+        "worker_replication_secret",
+        "worker_replication_secret_path",
+        "instance_map",
+        "stream_writers",
+        "run_background_tasks_on",
+        "update_user_directory_from_worker",
+        "notify_appservices_from_worker",
+        "media_instance_running_background_jobs",
+        "pusher_instances",
+        "federation_sender_instances",
+        "start_pushers",
+        "send_federation",
+        "redis",
+    ];
+    const OWN_ENGINE: &[&str] = &["caches", "event_cache_size", "background_updates"];
+    if PROCESS.contains(&key) {
+        return Some(
+            "R-PROC: the process runs in the foreground under its supervisor; no effect here.",
+        );
+    }
+    if PYTHON.contains(&key) {
+        return Some("R-PY: tuning for a Python runtime; no effect here.");
+    }
+    if WORKERS.contains(&key) {
+        return Some(
+            "R-WORKER: one process (or identical replicas) does everything a worker did; no effect here.",
+        );
+    }
+    if OWN_ENGINE.contains(&key) {
+        return Some(
+            "this server's storage engine has its own caches and migrations; no effect here.",
+        );
+    }
+    match key {
+        "form_secret" | "form_secret_path" => Some(
+            "a secret for Synapse's own SSO fallback forms, which this server does not serve; no effect here.",
+        ),
+        "suppress_key_server_warning" | "report_stats_endpoint" => {
+            Some("a switch for a warning or a report this server never emits; no effect here.")
+        }
+        "trusted_key_servers" => {
+            // Synapse's default is `[{server_name: matrix.org}]`, with or without that
+            // server's verify keys spelled out. Only ever having asked matrix.org (or nobody)
+            // is what this server does without the key; naming another notary is not.
+            let only_matrix_org = value.as_sequence().is_some_and(|servers| {
+                servers
+                    .iter()
+                    .all(|server| get_str(server, "server_name").as_deref() == Some("matrix.org"))
+            });
+            only_matrix_org.then_some(
+                "at Synapse's default (matrix.org only, or nobody); this server asks no other notary either.",
+            )
+        }
+        "presence" => {
+            let enabled = get_bool(value, "enabled").unwrap_or(true);
+            let has_other_keys = value
+                .as_mapping()
+                .is_some_and(|m| m.keys().any(|k| k.as_str().is_some_and(|k| k != "enabled")));
+            (enabled && !has_other_keys).then_some("presence on, as it always is here; no effect.")
+        }
+        _ => None,
+    }
 }
 
 fn translate_experimental(value: &Value, config: &mut Config, report: &mut TranslationReport) {
@@ -636,6 +745,14 @@ fn translate_key(key: &str, v: &Value, config: &mut Config) {
                 config.rate_limits.admin_redaction = b;
             }
         }
+        "user_directory" => {
+            if let Some(all) = get_bool(v, "search_all_users") {
+                config.auth.user_directory_search_all_users = all;
+            }
+        }
+        // Applied in `translate`'s pass 3 (it depends on `enable_registration`), and a no-op
+        // respectively; both are here so `translate_key` names every mapped key.
+        "registration_requires_token" | "enable_registration_without_verification" => {}
         "rc_joins" => {
             if let Some(local) = get(v, "local").and_then(rate_limit_bucket) {
                 config.rate_limits.joins_local = local;
@@ -1056,14 +1173,14 @@ mod tests {
 
     #[test]
     fn unsupported_key_blocks_by_default() {
-        let yaml = "server_name: example.org\ngc_thresholds: [100, 10, 10]\n";
+        let yaml = "server_name: example.org\nmax_avatar_size: 10M\n";
         let err = translate(yaml, TranslateOptions::default()).unwrap_err();
         assert!(matches!(err, TranslateError::Unsupported { .. }));
     }
 
     #[test]
     fn unsupported_key_is_allowed_with_the_override() {
-        let yaml = "server_name: example.org\ngc_thresholds: [100, 10, 10]\n";
+        let yaml = "server_name: example.org\nmax_avatar_size: 10M\n";
         let (config, report) = translate(
             yaml,
             TranslateOptions {
@@ -1205,6 +1322,118 @@ email:
         let yaml = "server_name: example.org\nthis_is_not_a_real_synapse_option: true\n";
         let err = translate(yaml, TranslateOptions::default()).unwrap_err();
         assert!(matches!(err, TranslateError::Unsupported { .. }));
+    }
+
+    #[test]
+    fn a_generated_homeserver_yaml_s_unsupported_keys_are_inert_and_do_not_block() {
+        let yaml = r#"
+server_name: "gen.example.org"
+pid_file: /data/homeserver.pid
+form_secret: "a-form-secret"
+trusted_key_servers:
+  - server_name: "matrix.org"
+suppress_key_server_warning: true
+presence:
+  enabled: true
+caches:
+  global_factor: 2
+worker_app: synapse.app.generic_worker
+"#;
+        let (_, report) = translate(yaml, TranslateOptions::default()).unwrap();
+        assert!(!report.has_blocking(), "{}", report.to_markdown());
+        let inert: Vec<&str> = report
+            .outcomes
+            .iter()
+            .filter(|o| o.classification == OutcomeClassification::Inert)
+            .map(|o| o.key.as_str())
+            .collect();
+        assert_eq!(
+            inert,
+            [
+                "pid_file",
+                "form_secret",
+                "trusted_key_servers",
+                "suppress_key_server_warning",
+                "presence",
+                "caches",
+                "worker_app"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unsupported_key_away_from_its_default_still_blocks() {
+        for yaml in [
+            "server_name: a.example.org
+trusted_key_servers:
+  - server_name: keys.example.org
+",
+            "server_name: a.example.org
+presence:
+  enabled: false
+",
+            "server_name: a.example.org
+presence:
+  enabled: true
+  include_offline_users_on_initial_sync: true
+",
+            "server_name: a.example.org
+max_avatar_size: 10M
+",
+        ] {
+            let err = translate(yaml, TranslateOptions::default()).unwrap_err();
+            assert!(
+                matches!(err, TranslateError::Unsupported { .. }),
+                "{yaml}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn registration_requires_token_closes_registration_whichever_order_the_keys_come_in() {
+        for yaml in [
+            "server_name: a.example.org
+enable_registration: true
+registration_requires_token: true
+",
+            "server_name: a.example.org
+registration_requires_token: true
+enable_registration: true
+",
+        ] {
+            let (config, report) = translate(yaml, TranslateOptions::default()).unwrap();
+            assert!(!config.auth.enable_registration, "{yaml}");
+            assert!(!report.has_blocking());
+        }
+        let (config, _) = translate(
+            "server_name: a.example.org
+enable_registration: true
+registration_requires_token: false
+enable_registration_without_verification: true
+",
+            TranslateOptions::default(),
+        )
+        .unwrap();
+        assert!(config.auth.enable_registration);
+    }
+
+    #[test]
+    fn the_user_directory_and_3pid_validation_rate_limit_translate() {
+        let (config, report) = translate(
+            "server_name: a.example.org
+user_directory:
+  search_all_users: true
+  prefer_local_users: true
+rc_3pid_validation:
+  per_second: 0.5
+  burst_count: 7
+",
+            TranslateOptions::default(),
+        )
+        .unwrap();
+        assert!(config.auth.user_directory_search_all_users);
+        assert_eq!(config.rate_limits.third_party_id_validation.burst_count, 7);
+        assert!(!report.has_blocking());
     }
 
     #[test]

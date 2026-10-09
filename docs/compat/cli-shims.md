@@ -53,7 +53,11 @@ Runs a replica whose configuration comes from translating a Synapse
    sections (`hs_config::reload`).
 6. `--allow-unsupported-synapse-config` is required whenever the source
    sets a key `docs/compat/synapse-config-table.md` classifies
-   `Unsupported`, or an unrecognized key not in that table at all
+   `Unsupported` -- except the inert ones that table lists (process
+   supervision, Python tuning, worker topology, `form_secret`,
+   `trusted_key_servers` at its default), which are reported and never
+   block, so a `homeserver.yaml` straight out of `generate` serves without
+   the flag -- or an unrecognized key not in that table at all
    (a typo, or an option from a Synapse release newer than the pinned
    inventory). Without it, step 3 applies. With it, translation proceeds
    and every blocking key still appears in the report, now as a warning

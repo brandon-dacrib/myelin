@@ -12,7 +12,7 @@ Native field paths are dotted `hs-config` `Config` paths, e.g. `federation.domai
 
 | List | Mapped | Mapped (diff) | Unsupported | Total |
 |---|---|---|---|---|
-| Top-level options | 30 | 31 | 168 | 229 |
+| Top-level options | 30 | 34 | 165 | 229 |
 | `experimental_features` flags | 0 | 1 | 50 | 51 |
 
 (Counts are exact against the tables below; regenerate this summary whenever a row changes. See "Keeping this current".)
@@ -31,6 +31,23 @@ Native field paths are dotted `hs-config` `Config` paths, e.g. `federation.domai
 | **R-SECURITY** | Deliberately not implemented because it weakens a security boundary this design does not want to offer (e.g. legacy query-string appservice tokens, certificate-verification bypass lists). |
 | **R-NOFLAG** | (`experimental_features` list only.) The corresponding functionality, once implemented, ships unconditionally rather than behind an opt-in flag: there is no `experimental_features`-style gate here (`PLAN.md` D10, section 10.4, names the MSCs this server commits to). |
 | **R-NOTPLANNED** | (`experimental_features` list only.) Not on the required MSC list in `PLAN.md` section 10.4. Tracked on demand if a bridge, client or the spec itself promotes it; not a gap in Phase 0. |
+
+## Inert keys (unsupported, never blocking)
+
+Since 2026-10-09 the translator reports a named handful of Unsupported keys as **inert** when what they say cannot change anything here, and an inert key never blocks a translation (`hs_compat::translate::inert_reason`). Every other Unsupported key still blocks without `--allow-unsupported-synapse-config`: a key an operator wrote down is a decision to acknowledge, and the translator does not try to know Synapse's default for each of them.
+
+| Keys | Why inert |
+|---|---|
+| `pid_file`, `daemonize`, `print_pidfile`, `soft_file_limit`, `manhole`, `manhole_settings` | R-PROC: the process runs in the foreground under its supervisor. |
+| `gc_thresholds`, `gc_min_interval`, `use_frozen_dicts` | R-PY: Python runtime tuning. |
+| `worker_app`, `worker_name`, `worker_listeners`, `worker_manhole`, `worker_daemonize`, `worker_pid_file`, `worker_log_config`, `worker_replication_secret`, `worker_replication_secret_path`, `instance_map`, `stream_writers`, `run_background_tasks_on`, `update_user_directory_from_worker`, `notify_appservices_from_worker`, `media_instance_running_background_jobs`, `pusher_instances`, `federation_sender_instances`, `start_pushers`, `send_federation`, `redis` | R-WORKER: one process (or identical replicas) does everything a worker did. |
+| `caches`, `event_cache_size`, `background_updates` | This server's storage engine has its own caches and migrations. |
+| `form_secret`, `form_secret_path` | A secret for Synapse's own SSO fallback forms, which this server does not serve. |
+| `suppress_key_server_warning`, `report_stats_endpoint` | A switch for a warning or a report this server never emits. |
+| `trusted_key_servers` (only when every entry is `matrix.org`, or the list is empty) | Synapse's default; this server asks no other notary either. Naming another notary still blocks. |
+| `presence` (only `enabled: true` and nothing else) | Presence is on here, always. `enabled: false` or any tuning key still blocks. |
+
+`crates/hs-compat/testdata/generated-1.162.yaml` is what the Synapse 1.162.0 image's `generate` writes (secrets replaced): 12 keys, 9 mapped, 3 inert (`pid_file`, `form_secret`, `trusted_key_servers`), and it translates as it is (`tests/corpus.rs`).
 
 ## Keeping this current
 
@@ -239,12 +256,12 @@ Native field paths are dotted `hs-config` `Config` paths, e.g. `federation.domai
 | Option | Status | Native | Notes |
 |---|---|---|---|
 | `enable_registration` | Mapped | `auth.enable_registration` | |
-| `enable_registration_without_verification` | Unsupported | — | R-PHASE1 (hs-auth). |
+| `enable_registration_without_verification` | Mapped (diff) | `auth.enable_registration` | No-op: Synapse refuses open registration without this key or a 3PID verification requirement; registration here never requires a verified email or phone, so the flag changes nothing. |
 | `registrations_require_3pid` | Unsupported | — | R-PHASE1 (hs-auth). |
 | `disable_msisdn_registration` | Unsupported | — | R-PHASE1 (hs-auth). |
 | `allowed_local_3pids` | Unsupported | — | R-PHASE1 (hs-auth). |
 | `enable_3pid_lookup` | Unsupported | — | R-PHASE1 (hs-auth). |
-| `registration_requires_token` | Unsupported | — | R-PHASE1 (hs-auth, registration tokens). |
+| `registration_requires_token` | Mapped (diff) | `auth.enable_registration` | `true` becomes `auth.enable_registration: false`, whichever order the two keys come in: here a registration token opens a closed server (decision 0011), so a server admitting only token holders is a closed one with tokens. The tokens themselves come over with the importer (stream `registration_tokens`). |
 | `registration_shared_secret` | Mapped | `auth.registration_shared_secret` | Also see `docs/compat/synapse-admin-routes.md` and the shared-secret registration protocol in `hs-compat`. |
 | `registration_shared_secret_path` | Mapped | `auth.registration_shared_secret_file` | |
 | `bcrypt_rounds` | Unsupported | — | R-PHASE1 (hs-auth). Password hashing cost factor is not yet tunable; a fixed, at-least-as-strong default is used. |
@@ -332,7 +349,7 @@ Native field paths are dotted `hs-config` `Config` paths, e.g. `federation.domai
 | Option | Status | Native | Notes |
 |---|---|---|---|
 | `encryption_enabled_by_default_for_room_type` | Unsupported | — | R-PHASE1 (hs-room). |
-| `user_directory` | Unsupported | — | R-PHASE1 (hs-search). |
+| `user_directory` | Mapped (diff) | `auth.user_directory_search_all_users` | Only `search_all_users` has a counterpart (same default: off). `enabled`, `prefer_local_users`, `show_locked_users` and `exclude_remote_users` have none: the directory here is always on, searches the floor the specification sets (people sharing a room, members of public rooms) and never other servers. |
 | `user_consent` | Unsupported | — | R-PHASE1 (hs-auth). Template-driven consent-tracking flow; low priority. |
 | `stats` | Unsupported | — | R-PHASE1 (hs-room, room/user stats collection toggle). |
 | `server_notices` | Unsupported | — | R-PHASE1 (hs-room, server-notices bot). |

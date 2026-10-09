@@ -868,9 +868,9 @@ pub const OPTIONS: &[KeyInfo] = &[
     },
     KeyInfo {
         key: "enable_registration_without_verification",
-        classification: Classification::Unsupported,
-        native: "",
-        note: "R-PHASE1 (hs-auth).",
+        classification: Classification::MappedDiff,
+        native: "`auth.enable_registration`",
+        note: "No-op. Synapse refuses `enable_registration: true` without this key or a 3PID verification requirement; registration here never requires a verified email or phone, so the flag changes nothing and never blocks.",
     },
     KeyInfo {
         key: "registrations_require_3pid",
@@ -898,9 +898,9 @@ pub const OPTIONS: &[KeyInfo] = &[
     },
     KeyInfo {
         key: "registration_requires_token",
-        classification: Classification::Unsupported,
-        native: "",
-        note: "R-PHASE1 (hs-auth, registration tokens).",
+        classification: Classification::MappedDiff,
+        native: "`auth.enable_registration`",
+        note: "`true` translates to `auth.enable_registration: false`: here a registration token opens a closed server (decision 0011), so a server that admits only token holders is a closed one with tokens, whichever order the two keys appear in. The tokens themselves are copied by the importer (stream `registration_tokens`).",
     },
     KeyInfo {
         key: "registration_shared_secret",
@@ -1216,9 +1216,9 @@ pub const OPTIONS: &[KeyInfo] = &[
     },
     KeyInfo {
         key: "user_directory",
-        classification: Classification::Unsupported,
-        native: "",
-        note: "R-PHASE1 (hs-search).",
+        classification: Classification::MappedDiff,
+        native: "`auth.user_directory_search_all_users`",
+        note: "Only `search_all_users` has a counterpart (`auth.user_directory_search_all_users`, same default: off). `enabled`, `prefer_local_users`, `show_locked_users` and `exclude_remote_users` have none: the directory here is always on, always searches the floor the specification sets (people sharing a room, members of public rooms), and never searches other servers; a non-default value of those is reported, not blocking.",
     },
     KeyInfo {
         key: "user_consent",

@@ -9,6 +9,7 @@
 //! Paths are relative to the crate root, matching `cargo test`'s working
 //! directory.
 
+use hs_compat::report::OutcomeClassification;
 use hs_compat::translate::{TranslateOptions, translate};
 use hs_config::listeners::ListenerResource;
 use hs_config::storage::StorageConfig;
@@ -44,21 +45,13 @@ fn minimal_fails_without_override_is_not_the_case() {
 }
 
 #[test]
-fn docker_generator_output_needs_the_override_and_then_translates() {
+fn docker_generator_output_translates_without_an_override() {
+    // Generated output sets `pid_file`, `form_secret` and `trusted_key_servers` (matrix.org
+    // only): unsupported, but without effect here, so they are reported as inert and the file
+    // translates as it is -- what an operator's first translation sees.
     let yaml = fixture("docker.yaml");
-    let blocked = translate(&yaml, TranslateOptions::default());
-    assert!(
-        blocked.is_err(),
-        "docker.yaml sets pid_file/form_secret/trusted_key_servers, all unsupported"
-    );
-
-    let (config, report) = translate(
-        &yaml,
-        TranslateOptions {
-            allow_unsupported: true,
-        },
-    )
-    .unwrap();
+    let (config, report) = translate(&yaml, TranslateOptions::default())
+        .expect("generated output should translate without an override");
     assert_eq!(config.server.server_name, "docker.example.org");
     assert_eq!(
         config.auth.registration_shared_secret.as_str(),
@@ -67,13 +60,56 @@ fn docker_generator_output_needs_the_override_and_then_translates() {
     // sqlite3 has no native backend; falls back to the embedded default
     // rather than erroring.
     assert!(matches!(config.storage, StorageConfig::Embedded(_)));
-    assert!(report.outcomes.iter().any(|o| o.key == "pid_file"));
-    assert!(report.outcomes.iter().any(|o| o.key == "form_secret"));
-    assert!(
+    assert!(!report.has_blocking(), "{}", report.to_markdown());
+    for key in ["pid_file", "form_secret", "trusted_key_servers"] {
+        let outcome = report
+            .outcomes
+            .iter()
+            .find(|o| o.key == key)
+            .unwrap_or_else(|| panic!("no outcome for {key}"));
+        assert_eq!(
+            outcome.classification,
+            OutcomeClassification::Inert,
+            "{key}: {}",
+            outcome.note
+        );
+    }
+}
+
+/// What the Synapse 1.162.0 image's `generate` wrote (`testdata/generated-1.162.yaml`, secrets
+/// replaced): 12 keys set, 9 of them mapped, 3 inert, none blocking.
+#[test]
+fn a_homeserver_yaml_generated_by_synapse_1_162_translates_as_it_is() {
+    let yaml = fixture("generated-1.162.yaml");
+    let (config, report) = translate(&yaml, TranslateOptions::default())
+        .expect("Synapse 1.162's generated homeserver.yaml should translate as it is");
+    assert_eq!(config.server.server_name, "generated.example.org");
+    assert!(!report.has_blocking(), "{}", report.to_markdown());
+    let count = |c: OutcomeClassification| {
         report
             .outcomes
             .iter()
-            .any(|o| o.key == "trusted_key_servers")
+            .filter(|o| o.classification == c)
+            .count()
+    };
+    assert_eq!(report.outcomes.len(), 12, "{}", report.to_markdown());
+    assert_eq!(
+        count(OutcomeClassification::Inert),
+        3,
+        "{}",
+        report.to_markdown()
+    );
+    assert_eq!(count(OutcomeClassification::Unsupported), 0);
+    assert_eq!(count(OutcomeClassification::Unrecognized), 0);
+    assert_eq!(
+        count(OutcomeClassification::Mapped) + count(OutcomeClassification::MappedDiff),
+        9
+    );
+    assert_eq!(config.listeners.listeners.len(), 1);
+    assert!(
+        config.listeners.listeners[0]
+            .resources
+            .contains(&ListenerResource::Client)
     );
 }
 
