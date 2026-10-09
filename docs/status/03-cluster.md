@@ -37,6 +37,23 @@ the two drains of the scale-down (hs-2 then hs-1, each releasing to hs-0), that 
 invariant; the chaos suite's checker over recorded writes is the tool to settle it. If not, it
 is the non-owner copy's catch-up (decision 0022) or the hub's feed update (track 05/04).
 Reproducer and logs: status 12 of this date, "What the smoke found".
+## 2026-10-09 (branch `agent/scale-sync-bug`): the scale 1 -> 2 bug was not fencing
+
+The question 03 was asked on 2026-10-09 ("What the smoke found", below): did two owners write
+one room's rows across the two drains of the scale-down? No. Each write was made by the
+replica that held the shard at that moment, under a fence that passed; what was wrong was the
+writer's memory. hs-0 kept its resident copy of each room hs-2 had taken at the scale-up, and
+when the scale-down handed those rooms back it wrote from that copy, whose timeline head was
+behind the store, over a row hs-2 had written (status 05 and 04 of this date; the fix is in
+`hs-room`'s registry, which now reloads a copy whose shard changed hands, keyed on the epoch
+every release and acquisition advances -- decision 0023 is what makes that detection sound).
+Evidence: `crates/hs-cli/tests/cluster_rejoin.rs` reproduces it with graceful drains only
+(SIGTERM, the shards released at once and acquired by the peer), every send `200`, and the
+room's `/messages` afterwards missing the overwritten event; `fencing::tests::
+a_copy_behind_the_store_is_refused_rather_than_writing_over_a_row` shows two copies holding
+one valid fence. A fence proves the writer owns the shard now; it cannot say the writer's copy
+is current, so `hs-room` checks that in the write itself as well. Nothing in this crate
+changed.
 
 ## 2026-10-08: another server's requests for a room reach the room's owner (branch `agent/fed-forward`, decision 0035)
 

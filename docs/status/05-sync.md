@@ -1,6 +1,6 @@
 # 05 Sync: status
 
-Last updated: 2026-10-09 (session 19: wave 2's three named leftovers were already closed by session 17, rechecked on `6e24c2c0`; `event_fields` is applied; a real-binary test for the peeked long-poll. Session 18: two long-polls that never saw their change were a lost
+Last updated: 2026-10-09 (the scale 1 -> 2 bug, below; then session 19: wave 2's three named leftovers were already closed by session 17, rechecked on `6e24c2c0`; `event_fields` is applied; a real-binary test for the peeked long-poll. Session 18: two long-polls that never saw their change were a lost
 push-rule write and a membership event that lost to the room's state, not the long-poll. Session 17: a filtered long-poll waits for real news, a fresh
 batch's `prev_batch` and order follow Synapse's initial sync, peeked hot rooms wake a long-poll and
 are pruned for erased senders. Session 16: Sytest's sync leftovers -- timelines from the newest end with holes, gap state, peeking, presence on joins, filters for presence/account data/ephemeral, remote users in the directory. Session 15: `device_lists` counts invites and rejoins, `/keys/changes` walks memberships between two tokens, a remote copy goes stale with the last shared room. Session 14: the owner's fan-out in batches, and feed retention.
@@ -8,6 +8,90 @@ Session 13: `/joined_rooms` read-your-writes. Session 12: RFC 0018, a non-owner'
 catches up instead of reloading. Session 11, session 10, session 9, session 8, session 7 and
 the integration note follow; sessions 1-6 are preserved unchanged further down.)
 
+
+## 2026-10-09 (branch `agent/scale-sync-bug`): the scale 1 -> 2 bug the cluster smoke found
+
+**Symptom** (status 12 of 2026-10-09, "What the smoke found", on `agent/ops-95`): after
+`replicaCount` 3 -> 1 -> 2, within ten seconds of hs-1 rejoining, both pods logged
+`hs_user::hub: failed to process a room update into user feeds error=state error: unknown event
+EventSn#3809`, every `/sync` for the account was `500` from then on, and after the next roll
+sends failed `internal_room_actor_invariant_violated: cited event not in history`. Three runs
+of three, also on the 2026-09-30 image.
+
+**Root cause** (`hs-room`, not sync and not fencing): `RoomRegistry::get_or_load` handed out a
+resident `RoomActor` as it was, whatever had happened to the room's shard since the actor was
+loaded. A replica that owned a room (resident copy loaded), lost its shard to a peer (the
+scale-up to three: the peer writes events to the room from its own fresh load), and got the
+shard back (the scale-down to one) answered the next send from the copy it kept: its timeline
+head was behind the store, so `persist` put the new event on `next_room_pos`, the position of
+the first event the peer had written, replacing that row (`timeline.put` has no "must be
+absent"), and deleted only the extremities it knew about. The store then held an extremity
+(the peer's last event) whose ancestor's timeline row was gone. Every replica that loaded the
+room from the store after that (hs-1 rejoining; hs-0 after the next roll) replayed a timeline
+with a hole, found no state at that extremity (`state_at` -> `unknown event EventSn#3809`),
+and `members()`, `/sync`'s state reads and `send`'s extremity check failed from then on, which
+is why it never healed. The sends in the scale phases were all `200` because the writer was the
+legitimate owner at that moment: the fence passed. Reproduced in
+`crates/hs-cli/tests/cluster_rejoin.rs` before the fix: after B stopped, back, stopped and A
+wrote, `/messages` showed `["m3", "m4", "m1"]`, `m2` written over by `m4`.
+
+Why the kill and the plain delete did not trigger it: a replica that restarts has no copies.
+Why the scale-down did: hs-0 kept copies of the rooms hs-2 took at the scale-up and got those
+rooms back without restarting. The same happens on any roll where a replica loses and
+regains a shard without restarting in between.
+
+**Fix** (`crates/hs-room/src/registry.rs`, `actor.rs`, `persist.rs`; `hs-user`'s `hub.rs` for
+the log line):
+
+- The registry records the fence (`hs_cluster::Fence`: shard and epoch) this replica held for
+  the room's shard when each resident copy was loaded or created, and on every `get_or_load`
+  compares it with the fence it holds now (`Ownership::fence`, computed fresh). Owned under a
+  different fence than the copy was loaded under: the copy is dropped and the room loaded from
+  the store, with an `info` line (`the room's shard changed hands since this copy was loaded;
+  dropping the copy and loading the room again from the store`, room, shard, both epochs) and
+  `hs_room_stale_copies_reloaded_total`. The epoch moves on every release and every
+  acquisition (decision 0023), so a shard lost and regained always shows a new one. Not owned
+  now: the copy is kept (nothing writes through it, reads go through the mirror), as before.
+- `RoomActor::persist` checks, inside its transaction, that the timeline position it is about
+  to use is free. If a row is there the write is refused with `RoomError::Internal` and an
+  `error` line naming the room, the replica (`<id> (epoch N)`), the position, the event there,
+  who wrote it and this copy's own head: `this copy of room !x on replica hs-0 (epoch 9) is
+  behind the store: timeline position 41 already holds event EventSn#3809 ($abc, written by
+  hs-2 (epoch 7)) and this copy's head is position 40; nothing was written, and the copy must
+  be loaded again from the store`. `PersistedEvent` gained `written_by` (the writing replica
+  and its epoch, absent in single-node mode and on old rows) so that line can say who.
+- A state-store miss for an event the room cites (`RoomActor::root_after`) now reads
+  `unknown event EventSn#3809 in room !x ($abc, written by hs-2 (epoch 7)): the room cites an
+  event its timeline does not hold`, and the hub's `failed to process a room update into user
+  feeds` carries `room_id`, `room_pos` and `global_seq`.
+
+**Verified**: `crates/hs-cli/tests/cluster_rejoin.rs` (two real replicas on the gate's
+PostgreSQL; a room B owns; B stopped with SIGTERM, A writes m1; B back, writes m2 and m3; B
+stopped, A writes m4; B back: `/messages`, `/members` and `/sync` through both replicas are
+`200` with all four messages in order, a send after the rejoin works, no hub failure in any
+log, A's log has the reload line) -- failed before the fix as described, passes after
+(13.6 s). `hs-room`: `registry::tests::a_copy_is_loaded_again_once_its_shard_changed_hands`
+(a scripted ownership: owned, lost to a peer that writes, back at a new epoch; the copy handed
+out holds the peer's event and writes after it; the counter moved once) and
+`fencing::tests::a_copy_behind_the_store_is_refused_rather_than_writing_over_a_row` (two
+copies with one valid fence; the one behind is refused with the room, position, event and
+writer in the message; the store unchanged). `cargo fmt --all --check`, `cargo clippy -p
+hs-room -p hs-user --all-targets -- -D warnings`, `cargo clippy -p hs-cli --test
+cluster_rejoin -- -D warnings`, `cargo test -p hs-room` (212 + the rest), `cargo test -p
+hs-user`. The ops branch's cluster smoke against an image of this branch: see the end of this
+section.
+
+**Left**:
+- A room already written over this way (the smoke's throwaway clusters; any cluster that
+  scaled down and up on the old code) does not heal: its rows disagree. A repair (on load,
+  drop a forward extremity whose event the timeline does not hold, with a warning and a
+  counter) is a `hs-room` change for its owner to weigh; the error now says exactly which
+  room and event.
+- `hs-cli` never installs the registry's idle eviction sweeper, so resident copies of rooms a
+  replica no longer owns stay until they are reloaded or the process ends. Harmless now that a
+  regained shard reloads them; memory, not correctness.
+- Cluster fencing is ruled out as the cause (status 03 of this date): the writer held the
+  shard legitimately each time, and a fence cannot see that an actor's memory is old.
 
 ## Session 19 (2026-10-09, branch `agent/sync-leftovers`): wave 2's leftovers rechecked, `event_fields` applied
 

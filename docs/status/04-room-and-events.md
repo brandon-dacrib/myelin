@@ -2,6 +2,37 @@
 
 Track brief: `docs/workstreams/04-room-and-events.md`. Owner crate: `hs-room`.
 
+## 2026-10-09 (branch `agent/scale-sync-bug`): a resident copy is only as current as the ownership it was loaded under
+
+The cluster smoke's scale 3 -> 1 -> 2 (status 12 of this date) broke rooms for good:
+`RoomRegistry::get_or_load` handed out a resident actor loaded while this replica owned the
+room's shard after the shard had gone to a peer -- which wrote to the room -- and come back.
+The copy's `next_room_pos` was behind the store, so `persist` wrote the next event over the
+peer's first row, and every later load found a forward extremity whose history the timeline
+no longer held (`state_at` -> `unknown event EventSn#...`; `send` -> `cited event not in
+history`). Status 05 of this date has the full account. In this crate:
+
+- `registry.rs`: `Entry::fence` records the `hs_cluster::Fence` held for the room's shard at
+  load or creation (`current_fence`); `get_or_load` drops a copy whose shard this replica owns
+  under a different fence (`copy_is_stale`) and loads the room again, with an `info` line and
+  `hs_room_stale_copies_reloaded_total` (`metrics.rs`). Every insertion path (`get_or_load`,
+  `register`, `insert_if_absent`) records the fence.
+- `actor.rs` `persist_with`: the timeline position is checked free inside the transaction; a
+  row there is refused as `RoomError::Internal` with an `error` line (`stale_copy_error`: room,
+  replica and epoch, position, the event there, who wrote it, this copy's head). `writer_tag`
+  gives `PersistedEvent::written_by` (`persist.rs`, new, serde-default: the writing replica and
+  epoch; `None` in single-node mode) on every row this crate writes. `root_after`'s miss names
+  the room, the event id and its writer.
+- Tests: `registry::tests::a_copy_is_loaded_again_once_its_shard_changed_hands`,
+  `fencing::tests::a_copy_behind_the_store_is_refused_rather_than_writing_over_a_row`, and
+  `crates/hs-cli/tests/cluster_rejoin.rs` on two real replicas (fails before, passes after).
+
+Left for this crate: a load-time repair of a room already written over (drop a forward
+extremity the timeline does not hold, with a warning and a counter) -- the error now names the
+room and event, and the smoke's clusters were throwaway; and `hs-cli` installing
+`spawn_eviction_sweeper`, which nothing does today (memory only, now that a regained shard
+reloads its copies).
+
 Last updated: 2026-10-08 (`fed-cluster`: `/members?at=` 404, below). Before that, 2026-10-05 (session 20: a version-12 create event's `room_id`, appservice `?ts=`,
 push rules follow an upgrade, below). Before that, 2026-10-04 (session 19: the room read
 endpoints a client pages and previews with, below).

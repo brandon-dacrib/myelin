@@ -48,6 +48,13 @@ bridge once (above); afterwards check `kubectl get pods,bridges -n myelin` and t
   sessions, cut-over runbook, translation-table coverage, synapse-admin's routes; README's row.
 - `agent/federation-95` (06): Sytest federation group and Complement federation on today's `main`,
   then fixes by tests unlocked; README's federation rows; the same-user leave-then-rejoin race.
+- `agent/scale-sync-bug` (04, with 05 and 03 ruled in or out): the scale 1 -> 2 bug `ops-95`'s
+  cluster smoke found. Root cause in `hs-room`'s registry: a resident copy of a room was handed
+  out after its shard had gone to a peer and come back, and wrote over the peer's row. Fixed
+  (the registry reloads a copy whose shard changed hands; `persist` refuses a taken position,
+  loudly), proved on two real replicas (`crates/hs-cli/tests/cluster_rejoin.rs`); status 05, 04
+  and 03 of 2026-10-09. Once merged, `ops-95`'s CD cluster smoke can lose its
+  `continue-on-error`.
 
 Merge each through `tools/merge-queue.sh` as it reports (stack disjoint ones), remove its
 worktree, and do a README pass at the end: each agent updates only its own row, with a dated,
