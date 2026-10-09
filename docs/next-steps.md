@@ -4,7 +4,65 @@ Written 2026-09-20 by the integration lead, last revised 2026-10-04, afternoon E
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
-## Resume here: 2026-10-05 -- wave 2 is merged; roll to the first green image of `731d2433` or later
+## Resume here: 2026-10-09 -- the demo rolled to `a6f02c48`; what broke, how it was fixed, what we learned
+
+**The roll.** The owner rolled the demo to `sha-a6f02c48…` with `deploy/demo/values-bridges.yaml`
+(14:37 UTC). The server came up healthy (client API, signing key), but the owner's WhatsApp bridge
+went down for about 35 minutes. Three faults, in order:
+
+1. **The `Bridge` CRD in the cluster was the first install's.** Helm installs a chart's `crds/`
+   once and never upgrades it; `spec.owner` (added 2026-10-02, `f923b8d9`) was not in the cluster's
+   schema, so every Bridge patch was refused (`.spec.owner: field not declared in schema`, a `500`
+   every 3 s). **Fixed live** with `kubectl apply --server-side --force-conflicts -f
+   deploy/helm/hs/crds/bridge.yaml`. **Fixed in code** on `agent/crd-upgrade` (the chart applies the
+   CRD on every upgrade and keeps it on uninstall; a manager that meets an older CRD says so once).
+2. **The manager re-applied the bridge's deployment every tick** while a later step failed
+   ("deployment changed: applying it, which restarts the pod" every 3 s), because the applied
+   fingerprint was recorded only after the whole step. Restart churn. **Fixed in code** on the same
+   branch (recorded when applied; a failing step backs off).
+3. **The bridge's pickle key was replaced.** The bridge predated 2026-10-02, so it had generated its
+   own `encryption.pickle_key`; at the roll the manager minted one ("minted a pickle key for a bridge
+   instance registered before the manager kept one", 14:37:30) and the bridge started with it, so
+   its crypto store was unreadable: `FTL ... the supplied account key is invalid`, CrashLoopBackOff.
+   The original key was gone (nothing on the volume kept it). **Recovered live** by resetting the bot's
+   Matrix encryption identity: a helper pod on the bridge's volume backed up
+   `/data/whatsapp-brandon.db` (the file is `<appservice id>.db`, not `wa.db`) as `*.bak-20261009`
+   and emptied every `crypto*` table except `crypto_version`; the WhatsApp login (whatsmeow tables)
+   was kept, so no re-pairing; the bridge made a new bot device (`BQBMQVR81T`), the `Bridge` went
+   `Ready`, and the queued message was delivered at 15:14:22. **Fixed in code** on
+   `agent/crd-upgrade` (the init script carries a bridge's key even into a render without the line;
+   the manager never mints over a key a running bridge has; a bridge that cannot read its store
+   says so on its page). To check on the bridge page: the new device shows as signed (the manager
+   logs nothing when it signs a device, only errors: a log line belongs there).
+
+Also found from outside: `GET /_matrix/federation/v1/version` answered `401` unsigned (the spec gives
+it no authentication); **fixed** on `agent/fed-version` (an unsigned request gets `200`).
+
+**Lessons** (AGENTS.md and the memory notes carry the operational ones):
+
+- **A roll is not done until the bridges are.** After every roll, check the bridge pods and the
+  `Bridge` resources (`kubectl get pods,bridges -n myelin`) and the server's `WARN`s, not only the
+  client API.
+- **Helm does not upgrade CRDs.** Any change to `deploy/helm/hs/crds/` needs the CRD applied on the
+  cluster (until `agent/crd-upgrade` is merged and rolled, by hand with the command above), and a
+  field the server writes must exist in the cluster's schema before the server that writes it runs.
+- **A secret a running program generated is the program's.** The server may render a secret only
+  for an instance it creates; for one that already ran, it must carry what is on the volume.
+  Re-rendering is a migration, and needs a test that rolls a bridge started on the old render
+  (`agent/crd-upgrade` adds one with the real mautrix image).
+- **`:latest` images move under a roll.** The bridge pulled a mautrix build from 25 minutes before;
+  it was not the cause this time, but it was a suspect. Pin bridge images per offering.
+- **Cluster access from a session:** macOS Local Network privacy refuses Homebrew `kubectl` started
+  by Claude Code even over SSH; a `kubectl proxy` started from the owner's plain SSH shell (not
+  tmux) on `127.0.0.1:8001` works, and refuses `exec` (helper pods run their script as the command).
+
+**Where things are.** Main `a6f02c48` plus the docs below; **unmerged**: `agent/crd-upgrade` (the
+three fixes above) and `agent/fed-version` (the version endpoint; its first gate failed three
+tests that used `/version` as their signed-route example, being fixed). Both merge before the next
+roll. The proxy the owner started for this session should be stopped (`pkill -f "kubectl --context
+admin@dacrib0 proxy"`).
+
+## Earlier: 2026-10-05 -- wave 2 is merged; roll to the first green image of `731d2433` or later
 
 **Where `main` is.** `731d2433`. All eight wave-2 branches are merged through the queue, plus three
 fixes found on the way, each gate green: `ops-web` `385a748d`, `pycache` `7dd22356`, `e2ee-gaps`
