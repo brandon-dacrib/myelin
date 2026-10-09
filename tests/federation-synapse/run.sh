@@ -13,6 +13,10 @@
 #
 # Exit 0 with "SKIP" when Docker is not usable, so CI without Docker stays green.
 # Usage: tests/federation-synapse/run.sh [workdir]; HS_BINARY=... skips the cargo build;
+#        REPLICAS=2 runs Myelin as a two-replica cluster on one PostgreSQL (a `fed-synapse-pg`
+#        container on 127.0.0.1:${PG_PORT:-5465}): both replicas share the server name and the
+#        signing key, the TLS front round-robins Synapse's requests over both, the harness's own
+#        client calls go to the first, and a few extra checks read through the second;
 #        SYNAPSE_IMAGE overrides the image; KEEP=1 leaves the containers up for inspection.
 set -uo pipefail
 
@@ -27,10 +31,16 @@ SYN_NAME="127.0.0.1:8448"
 SYN_CLIENT="http://127.0.0.1:8408"
 MY_NAME="fed-synapse-myelin:8449"
 MY_CLIENT="http://127.0.0.1:8449"
+# The second replica's client listener, with REPLICAS=2 (same server name, same database).
+MY_CLIENT2="http://127.0.0.1:8450"
+REPLICAS="${REPLICAS:-1}"
+PG_PORT="${PG_PORT:-5465}"
+PG_IMAGE="${PG_IMAGE:-public.ecr.aws/docker/library/postgres:17}"
 RESULTS="$WORKDIR/results.tsv"
 mkdir -p "$WORKDIR"
 : > "$RESULTS"
 HS_PID=""
+HS_PID2=""
 
 command -v docker >/dev/null 2>&1 || { echo "SKIP: docker is not installed; the Myelin<->Synapse interop run needs it."; exit 0; }
 # OrbStack's socket, and a Docker config with no credential store: the owner's config names the
@@ -54,7 +64,8 @@ done
 cleanup() {
   [ "${KEEP:-0}" = "1" ] && { echo "== KEEP=1: leaving containers and $WORKDIR"; return; }
   [ -n "$HS_PID" ] && kill "$HS_PID" 2>/dev/null && wait "$HS_PID" 2>/dev/null
-  docker rm -f fed-synapse-synapse fed-synapse-myelin >/dev/null 2>&1 || true
+  [ -n "$HS_PID2" ] && kill "$HS_PID2" 2>/dev/null && wait "$HS_PID2" 2>/dev/null
+  docker rm -f fed-synapse-synapse fed-synapse-myelin fed-synapse-pg >/dev/null 2>&1 || true
   docker network rm fed-synapse >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -147,9 +158,14 @@ docker run -d --name fed-synapse-synapse --network fed-synapse \
   -v "$WORKDIR/synapse:/data" "$SYNAPSE_IMAGE" >/dev/null || { echo "synapse did not start"; exit 1; }
 
 # ---- 2. TLS in front of Myelin ---------------------------------------------------------------
-cat > "$WORKDIR/myelin/nginx.conf" <<'NGINX'
+UPSTREAM="server host.docker.internal:8449;"
+[ "$REPLICAS" = 2 ] && UPSTREAM="server host.docker.internal:8449; server host.docker.internal:8450;"
+cat > "$WORKDIR/myelin/nginx.conf" <<NGINX
 events {}
 http {
+  # With REPLICAS=2, Synapse's requests land on either replica in turn: inbound federation and
+  # the forwarding between replicas are exercised by every step, not by a step of their own.
+  upstream myelin { $UPSTREAM }
   server {
     listen 8449 ssl;
     server_name fed-synapse-myelin;
@@ -157,9 +173,9 @@ http {
     ssl_certificate_key /pki/myelin.key;
     client_max_body_size 100m;
     location / {
-      proxy_pass http://host.docker.internal:8449;
-      proxy_set_header Host $host;
-      proxy_set_header X-Forwarded-For $remote_addr;
+      proxy_pass http://myelin;
+      proxy_set_header Host \$host;
+      proxy_set_header X-Forwarded-For \$remote_addr;
       proxy_set_header X-Forwarded-Proto https;
     }
   }
@@ -172,17 +188,35 @@ docker run -d --name fed-synapse-myelin --network fed-synapse \
   "$NGINX_IMAGE" >/dev/null || { echo "nginx did not start"; exit 1; }
 
 # ---- 3. Myelin ------------------------------------------------------------------------------
-cat > "$WORKDIR/myelin/hs.yaml" <<YAML
+wait_for() { for _ in $(seq 1 120); do curl -fsS "$1" >/dev/null 2>&1 && return 0; sleep 1; done; return 1; }
+# myelin_config <client port> <mesh port> <log suffix>
+myelin_config() {
+  local storage cluster
+  if [ "$REPLICAS" = 2 ]; then
+    storage="storage: { backend: postgres, host: 127.0.0.1, port: $PG_PORT, database: myelin, user: postgres, password: fedpg, tls: false }"
+    cluster="cluster:
+  single_node: false
+  room_shards: 4
+  user_shards: 4
+  heartbeat_interval: 500ms
+  lease_ttl: 3s
+  mesh: { port: $2, shared_secret: fed-synapse-mesh }"
+  else
+    storage="storage: { backend: embedded, data_dir: \"$WORKDIR/myelin/data\" }"
+    cluster=""
+  fi
+  cat <<YAML
 server:
   server_name: "$MY_NAME"
   signing_key_path: "$WORKDIR/myelin/signing-keys"
 listeners:
   listeners:
-    - port: 8449
+    - port: $1
       bind_addresses: ["0.0.0.0"]
       resources: [client, federation, media, health]
       x_forwarded: true
-storage: { backend: embedded, data_dir: "$WORKDIR/myelin/data" }
+$storage
+$cluster
 media: { storage: { backend: local, path: "$WORKDIR/myelin/media" } }
 auth: { enable_registration: true }
 federation:
@@ -192,11 +226,25 @@ federation:
   allow_device_name_lookup_over_federation: true
 rate_limits: { enabled: false }
 YAML
+}
+if [ "$REPLICAS" = 2 ]; then
+  docker rm -f fed-synapse-pg >/dev/null 2>&1 || true
+  docker run -d --name fed-synapse-pg -e POSTGRES_PASSWORD=fedpg -e POSTGRES_DB=myelin \
+    -p "127.0.0.1:$PG_PORT:5432" "$PG_IMAGE" >/dev/null || { echo "postgres did not start"; exit 1; }
+  for _ in $(seq 1 60); do docker exec fed-synapse-pg pg_isready -U postgres >/dev/null 2>&1 && break; sleep 1; done
+  docker exec fed-synapse-pg pg_isready -U postgres >/dev/null 2>&1 || { echo "postgres did not become ready"; exit 1; }
+fi
+myelin_config 8449 8459 > "$WORKDIR/myelin/hs.yaml"
 RUST_LOG="${RUST_LOG:-info,hs_federation=debug}" "$HS_BINARY" serve --config "$WORKDIR/myelin/hs.yaml" > "$WORKDIR/myelin/hs.log" 2>&1 &
 HS_PID=$!
-
-wait_for() { for _ in $(seq 1 120); do curl -fsS "$1" >/dev/null 2>&1 && return 0; sleep 1; done; return 1; }
 wait_for "$MY_CLIENT/_matrix/client/versions" || { echo "hs did not come up; see $WORKDIR/myelin/hs.log"; exit 1; }
+if [ "$REPLICAS" = 2 ]; then
+  # The first replica has created the schema and the signing key; the second shares both.
+  myelin_config 8450 8460 > "$WORKDIR/myelin/hs2.yaml"
+  RUST_LOG="${RUST_LOG:-info,hs_federation=debug}" "$HS_BINARY" serve --config "$WORKDIR/myelin/hs2.yaml" > "$WORKDIR/myelin/hs2.log" 2>&1 &
+  HS_PID2=$!
+  wait_for "$MY_CLIENT2/_matrix/client/versions" || { echo "the second replica did not come up; see $WORKDIR/myelin/hs2.log"; exit 1; }
+fi
 wait_for "$SYN_CLIENT/_matrix/client/versions" || { echo "synapse did not come up: docker logs fed-synapse-synapse"; exit 1; }
 
 # ---- helpers ---------------------------------------------------------------------------------
@@ -274,6 +322,18 @@ if [[ "$JOIN" == *"$ROOM_M"* ]]; then
   wait_event "$SYN_CLIENT" "$SYN_TOK" "$ROOM_M" '.chunk[]|select(.content.body=="before the join")' && record "3 join" PASS "history before the join backfilled" || record "3 join" FAIL "pre-join history not on Synapse"
   A=$(api "$SYN_CLIENT" "$SYN_TOK" GET "/rooms/$ROOM_M/joined_members" | jq -c '.joined|keys'); B=$(api "$MY_CLIENT" "$MY_TOK" GET "/rooms/$ROOM_M/joined_members" | jq -c '.joined|keys')
   [ "$A" = "$B" ] && [ "$A" != null ] && record "3 join" PASS "member lists agree: $A" || record "3 join" FAIL "member lists differ: synapse=$A myelin=$B"
+fi
+
+# ---- Step 3b (REPLICAS=2): the same rooms through the second replica ----------------------
+if [ "$REPLICAS" = 2 ]; then
+  R=$(api "$MY_CLIENT2" "$MY_TOK" GET "/rooms/$ROOM_S/messages?dir=b&limit=100"); expect "3b replica" "the second replica serves the Synapse room's history to a session the first minted" "$R" "hello from synapse"
+  api "$MY_CLIENT2" "$MY_TOK" PUT "/rooms/$ROOM_S/send/m.room.message/m2" '{"msgtype":"m.text","body":"hello from the second replica"}' >/dev/null
+  wait_event "$SYN_CLIENT" "$SYN_TOK" "$ROOM_S" '.chunk[]|select(.content.body=="hello from the second replica")' && record "3b replica" PASS "a message sent through the second replica reaches Synapse" || record "3b replica" FAIL "the second replica's message was not seen on Synapse"
+  api "$SYN_CLIENT" "$SYN_TOK" PUT "/rooms/$ROOM_M/send/m.room.message/s2" '{"msgtype":"m.text","body":"to both replicas"}' >/dev/null
+  wait_event "$MY_CLIENT2" "$MY_TOK" "$ROOM_M" '.chunk[]|select(.content.body=="to both replicas")' && record "3b replica" PASS "Synapse's message in a Myelin room is read through the second replica" || record "3b replica" FAIL "Synapse's message not seen through the second replica"
+  read MY_TOK3 _ <<<"$(reg "$MY_CLIENT2" myerin)"; MY_USER3="@myerin:$MY_NAME"
+  R=$(api "$MY_CLIENT2" "$MY_TOK3" POST "/join/$(enc "#onsynapse:$SYN_NAME")?server_name=$SYN_NAME" '{}'); expect "3b replica" "a user registered on the second replica joins the Synapse room through it" "$R" "$ROOM_S"
+  wait_membership "$SYN_CLIENT" "$SYN_TOK" "$ROOM_S" "$MY_USER3" join >/dev/null && record "3b replica" PASS "that join reached Synapse's state" || record "3b replica" FAIL "that join did not reach Synapse's state"
 fi
 
 # ---- Step 4: membership, redaction, EDUs, queries, media, directory --------------------------
@@ -390,5 +450,5 @@ api "$MY_CLIENT" "$MY_TOK" POST "/join/$(enc "#space:$SYN_NAME")?server_name=$SY
 R=$(api "$MY_CLIENT" "$MY_TOK" POST "/join/$(enc "#restricted:$SYN_NAME")?server_name=$SYN_NAME" '{}'); expect "5 restricted" "Myelin user joins a restricted Synapse room via the space" "$R" "$RESTRICTED"
 
 echo; echo "== results ($RESULTS)"; column -t -s $'\t' "$RESULTS" 2>/dev/null || cat "$RESULTS"
-echo "== logs: $WORKDIR/myelin/hs.log, docker logs fed-synapse-synapse"
+echo "== logs: $WORKDIR/myelin/hs.log${HS_PID2:+, $WORKDIR/myelin/hs2.log}, docker logs fed-synapse-synapse"
 grep -q $'\tFAIL\t' "$RESULTS" && exit 1 || exit 0
