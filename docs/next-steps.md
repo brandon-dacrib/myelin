@@ -1,10 +1,65 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-10-04, afternoon EDT (measured on a quiet machine, nine branches of one wave merged). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+Written 2026-09-20 by the integration lead, last revised 2026-10-09, evening EDT (six merges, a 95% wave in flight). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
-## Resume here: 2026-10-09 -- the demo rolled to `a6f02c48`; what broke, how it was fixed, what we learned
+## Resume here: 2026-10-09, evening EDT -- the morning's leftovers, the real-Synapse milestone and wave 3's first three tracks are merged; a 95% wave is running
+
+**Where `main` is.** `72dc8210`. Merged today after the morning handover, each through the queue
+with a green gate (both PostgreSQL servers): `27ad5d76` (CD's image smoke read its log through
+`grep -q` under `pipefail` and failed on a SIGPIPE race while printing the setup link it said was
+missing; every `| grep -q` in `cd.yml` and the Helm smoke scripts now reads to the end),
+`0fa28bf1` (**the CRD upgrade smoke is in CD**, between the install and operator smokes on the
+kind leg; `crd-upgrade-smoke.sh --set K=V`), `6e24c2c0` (`agent/bridge-sign-log`: one log line per
+bot device the manager cross-signs, with appservice, bot and device ids, and the instance page
+names the device signed just now), `f0b80590` (`agent/bridge-image-pins`, **decision 0037**: every
+offering pins a release tag, `latest` asked for resolves to the pin; table in
+`docs/bridges/mautrix.md`; verified by the real mautrix-whatsapp and -signal tests on `v0.2609.0`),
+`00fe0c01` (`agent/federation` and `agent/sync-leftovers` stacked: **Myelin has federated with a
+real Synapse 1.162.0, 46/46 checks** in `tests/federation-synapse/run.sh`, after one real fix, a
+server could not verify the events it had signed itself, `hs-federation` `keys.rs`
+`seed_own_keys`; `routes.json` regenerated; sync filters apply `event_fields`; a peeked room wakes
+a long-poll, proved on the real binary; wave 2's three sync leftovers were already closed) and
+`72dc8210` (`agent/auth-leftovers`: self-service deactivation leaves rooms, the rest of CAS and
+SSO as settings, pending registrations shared across replicas, bind/unbind proved against the real
+binary; wave 2's four auth leftovers were already on `main` since `786f975a`). The `:latest`
+consequence: **the demo's WhatsApp instance rolls once to `v0.2609.0` at the next roll of the
+server** (the stored offering row's `latest` now reads as the pin).
+
+**CD.** Green on `0fa28bf1` (run 37972465598; the CRD smoke passed inside it). Each later merge's
+push cancelled the previous commit's CI (`ci.yml` cancels in-progress runs per ref), so CD
+refused those commits ("ci concluded 'cancelled'"): with a merge every twenty minutes and CI plus
+CD at forty, only the last commit of a run of merges gets an image. **Roll candidate: the first
+green image of `72dc8210` or later** (check `gh run list --workflow cd`). The roll adopts the CRD
+once (`--take-ownership --force-conflicts`, `deploy/helm/hs/README.md`) and rolls the WhatsApp
+bridge once (above); afterwards check `kubectl get pods,bridges -n myelin` and the bridge page.
+
+**In flight** (branches pushed as they commit; none merged yet; the owner's instruction was
+"everything at 95%+", earned, and "the web UI needs to be simpler to use and understand"):
+
+- `agent/push-leftovers` (10): MSC4306 `postcontent`, push rules on room upgrade, a HELO fallback.
+- `agent/web-simpler` (16): walks the interface against the real server, lists what confuses a
+  first-time operator, fixes the list; README's web row.
+- `agent/ops-95` (12, 03): handoff fix on real pods on kind, RFC 0018 if cluster-side, the degraded
+  apply on kind, day-two tasks (backup and restore, upgrade and rollback, scaling, alerts); README's
+  operations row.
+- `agent/migration-95` (13): what the importer does not move, a rehearsal with surviving client
+  sessions, cut-over runbook, translation-table coverage, synapse-admin's routes; README's row.
+- `agent/federation-95` (06): Sytest federation group and Complement federation on today's `main`,
+  then fixes by tests unlocked; README's federation rows; the same-user leave-then-rejoin race.
+
+Merge each through `tools/merge-queue.sh` as it reports (stack disjoint ones), remove its
+worktree, and do a README pass at the end: each agent updates only its own row, with a dated,
+measured basis. Client-server (~80%) and bridges (~85%) are the rows without an agent yet;
+client-server waits for `push-leftovers` to merge (hs-push, hs-room overlap).
+
+**Left from the morning:** nothing; all three items (CRD smoke in CD, the signing log line, pinned
+images) are merged. New: `ghcr.io` pulls fail from a session on the keychain like Docker Hub
+(memory note); CI's cancel-in-progress starves CD on merge days (consider letting CD wait for the
+newest CI of the ref instead of its own commit's, or not cancelling CI on `main`).
+
+## Earlier: 2026-10-09, morning -- the demo rolled to `a6f02c48`; what broke, how it was fixed, what we learned
 
 **The roll.** The owner rolled the demo to `sha-a6f02c48…` with `deploy/demo/values-bridges.yaml`
 (14:37 UTC). The server came up healthy (client API, signing key), but the owner's WhatsApp bridge

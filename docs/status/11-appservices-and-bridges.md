@@ -1,9 +1,8 @@
 # Status: track 11, appservices and bridges
 
 Last updated: 2026-10-09, later (the manager says, in its log, which bridge bot device it
-cross-signed; below); before that 2026-10-08 (one bridge's slowness never delays another's delivery: the "does this
-Last updated: 2026-10-09 (bridge offerings pin a release tag, decision 0037; below); before
-that 2026-10-08 (one bridge's slowness never delays another's delivery: the "does this
+cross-signed, and bridge offerings pin a release tag, decision 0037; both below); before that
+2026-10-08 (one bridge's slowness never delays another's delivery: the "does this
 user exist" question is asked by the bridge's own worker, and each bridge's queue is a gauge and a
 column on the bridges list; below); before that 2026-10-04, late (a bridge's namespaces, protocols and room directory mean what
 Sytest's `tests/60app-services/` says, and a ghost acts once it is registered; below); before
