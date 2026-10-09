@@ -151,6 +151,10 @@ epoch() {
 }
 
 PF_PID=""
+# Whether the Bridge CRD was on the cluster before this run. The chart keeps it on uninstall
+# (`helm.sh/resource-policy: keep`, decision 0036), so a run that created it deletes it again;
+# one that found it leaves it, since deleting a CRD deletes every Bridge on the cluster.
+CRD_EXISTED=1
 DIAGNOSED=0
 diagnose() {
   [ "$DIAGNOSED" -eq 1 ] && return 0
@@ -183,6 +187,9 @@ cleanup() {
     # The data volume is kept by helm uninstall on purpose (storage.embedded.resourcePolicy);
     # deleting the namespace is what removes it.
     kubectl --context "$CONTEXT" delete namespace "$NAMESPACE" --wait=true --timeout=120s 2>&1 || true
+    if [ "$CRD_EXISTED" -eq 0 ]; then
+      kubectl --context "$CONTEXT" delete crd bridges.hs.matrix.org --ignore-not-found --wait=true 2>&1 || true
+    fi
   fi
   if [ "$rc" -eq 0 ]; then
     say "PASSED: the chart installed $IMAGE with one value, and it is a server"
@@ -217,6 +224,7 @@ else
 fi
 if [ -n "$PULL_POLICY" ]; then image_args+=(--set-string "image.pullPolicy=$PULL_POLICY"); fi
 install_started=$SECONDS
+if kubectl --context "$CONTEXT" get crd bridges.hs.matrix.org >/dev/null 2>&1; then CRD_EXISTED=1; else CRD_EXISTED=0; fi
 if ! run helm --kube-context "$CONTEXT" -n "$NAMESPACE" install "$RELEASE" "$CHART" \
       --set serverName=smoke.invalid \
       "${image_args[@]}" "${EXTRA_SETS[@]+"${EXTRA_SETS[@]}"}" \
