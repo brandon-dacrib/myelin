@@ -21,7 +21,9 @@ test("a migration from Synapse, from the source to the cutover", async ({ page }
   const notCopied = page.getByRole("region", { name: "Not copied" });
   await expect(notCopied.getByText("Thumbnails", { exact: true })).toBeVisible();
   const copied = page.getByRole("region", { name: "Copied, in this order" });
+  await expect(copied.getByRole("listitem")).toHaveCount(19);
   await expect(copied.getByText("Key backups")).toBeVisible();
+  await expect(copied.getByText("Messages waiting for devices")).toBeVisible();
   await expect(copied.getByText("Other servers' media", { exact: true })).toBeVisible();
   await expectNoAxeViolations(page, "migration, nothing set");
 

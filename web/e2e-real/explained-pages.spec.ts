@@ -128,8 +128,9 @@ test.describe("pages that explain themselves, against the real server", () => {
     } else {
       await page.getByText("What is copied, and what is not").click();
     }
-    await expect(copied.getByRole("listitem")).toHaveCount(14);
+    await expect(copied.getByRole("listitem")).toHaveCount(19);
     await expect(copied.getByText("Device encryption keys")).toBeVisible();
+    await expect(copied.getByText("Refresh tokens", { exact: true })).toBeVisible();
     await expect(copied.getByText("Other servers' media", { exact: true })).toBeVisible();
     const notCopied = page.getByRole("region", { name: "Not copied" });
     await expect(notCopied.getByText("Thumbnails", { exact: true })).toBeVisible();

@@ -51,13 +51,18 @@ describe("Migration", () => {
     const details = summary.closest("details")!;
     expect(details).toHaveAttribute("open");
     const moves = within(within(details).getByRole("region", { name: "Copied, in this order" }));
-    expect(moves.getAllByRole("listitem")).toHaveLength(14);
+    expect(moves.getAllByRole("listitem")).toHaveLength(19);
     expect(moves.getByText("Sessions (access tokens)")).toBeInTheDocument();
+    expect(moves.getByText("Refresh tokens")).toBeInTheDocument();
+    expect(moves.getByText("Messages waiting for devices")).toBeInTheDocument();
+    expect(moves.getByText("Registration tokens")).toBeInTheDocument();
     expect(moves.getByText("Other servers' media")).toBeInTheDocument();
     const stays = within(within(details).getByRole("region", { name: "Not copied" }));
     expect(stays.getByText("Thumbnails")).toBeInTheDocument();
     expect(stays.getByText("Presence")).toBeInTheDocument();
-    expect(stays.getByText("Receipts in threads")).toBeInTheDocument();
+    expect(stays.queryByText("Receipts in threads")).not.toBeInTheDocument();
+    expect(stays.getByText("Unread counts")).toBeInTheDocument();
+    expect(stays.getByText("A registration under way")).toBeInTheDocument();
     expect(stays.getByText("Bridges")).toBeInTheDocument();
   });
 

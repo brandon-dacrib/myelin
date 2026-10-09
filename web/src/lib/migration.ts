@@ -45,6 +45,20 @@ export const STREAMS: Record<string, StreamInfo> = {
     explanation:
       "The tokens signed-in apps hold, so nobody has to sign in again after the cutover.",
   },
+  refresh_tokens: {
+    label: "Refresh tokens",
+    explanation:
+      "The tokens apps use to renew their sessions, so nobody is signed out when a session's access token expires after the cutover.",
+  },
+  threepids: {
+    label: "Email addresses and phone numbers",
+    explanation: "The addresses people sign in by and are found by.",
+  },
+  external_ids: {
+    label: "Sign-in identities",
+    explanation:
+      "Links from an SSO provider's identity to the account, so a sign-in through the same provider lands in the same account.",
+  },
   account_data: {
     label: "Account data and room tags",
     explanation:
@@ -65,6 +79,11 @@ export const STREAMS: Record<string, StreamInfo> = {
     explanation:
       "Server-side backups of message keys, under the same version numbers: encrypted history stays readable on a new sign-in.",
   },
+  to_device: {
+    label: "Messages waiting for devices",
+    explanation:
+      "Room keys and requests sent to phones that were offline, delivered in their first sync here.",
+  },
   push_rules: {
     label: "Notification rules (push rules)",
     explanation:
@@ -79,6 +98,10 @@ export const STREAMS: Record<string, StreamInfo> = {
     label: "Sync filters",
     explanation:
       "The filters apps registered, under the ids Synapse gave them, so an app's next sync works unchanged.",
+  },
+  registration_tokens: {
+    label: "Registration tokens",
+    explanation: "Tokens handed out before the migration still open this server.",
   },
   rooms: {
     label: "Rooms",
@@ -146,14 +169,33 @@ export const WHAT_DOES_NOT_MOVE: readonly NotMoved[] = [
     detail: "Who is online is how people are right now; it starts again as they come back.",
   },
   {
-    title: "Receipts in threads",
+    title: "Unread counts",
     detail:
-      "Read receipts inside threads are left out and logged: this server keeps one receipt per person and type in a room.",
+      "Unread counts and notification badges are not carried: nothing imported counts as a notification, so every room shows as read until the next message after the cutover. The receipts that decide what is read from then on are copied.",
+  },
+  {
+    title: "Server-notice rooms",
+    detail:
+      "Synapse's are copied as the rooms they are, with their m.server_notice tag, so their history stays; but this server sends its notices from its own notices user, and the first notice to a person after the cutover opens a new Server Notices room beside the old one.",
+  },
+  {
+    title: "Bridges' positions",
+    detail:
+      "Where each bridge had read up to in Synapse's streams names nothing here. A bridge starts reading this server's streams from where it is registered, as it does after any restart of its homeserver.",
+  },
+  {
+    title: "Dehydrated devices",
+    detail: "This server has none yet; a client that kept one makes it again.",
+  },
+  {
+    title: "A registration under way",
+    detail:
+      "A registration token's limits and completed count come over; a sign-up that had presented the token on Synapse starts again here.",
   },
   {
     title: "Turned-off pushers and retired push rules",
     detail:
-      "Pushers turned off in Synapse are left out, as are push rules of kinds this server does not have and changes to default rules the specification has retired; each is logged.",
+      "Pushers turned off in Synapse are left out, as are push rules of kinds this server does not have and changes to default rules the specification has retired; each is logged. A refresh token Synapse had already exchanged is left out too: it would be refused there as well.",
   },
   {
     title: "Room keys deleted from a backup after the copy",

@@ -1,7 +1,25 @@
 # 16. Management web interface: status
 
-Last updated: 2026-10-09 (simpler to use and understand: first-run Overview, grouped sidebar,
-Configuration that leads with the settings; branch `agent/web-simpler`).
+Last updated: 2026-10-09 (the Migration page explains the five streams track 13's
+`agent/migration-95` added, and what no longer or newly does not move; branch
+`agent/web-migration-streams`).
+
+## 2026-10-09: the Migration page names the five new streams (branch `agent/web-migration-streams`)
+
+Track 13's `agent/migration-95` copies five more streams (`refresh_tokens`, `threepids`,
+`external_ids`, `to_device`, `registration_tokens`: 19 in all) and changed what does not move.
+`web/src/lib/migration.ts` now explains each new stream in one sentence, in its copy-order
+place (`hs_compat::migration::Stream::ALL`), with the labels from track 13's status file:
+Refresh tokens, Email addresses and phone numbers, Sign-in identities, Messages waiting for
+devices, Registration tokens. "Not copied" drops "Receipts in threads" (copied in their threads
+since 2026-10-08) and adds Unread counts, Server-notice rooms, Bridges' positions, Dehydrated
+devices and A registration under way, in the runbook's words
+(`docs/compat/synapse-migration-runbook.md`, "What does not move"); the pushers item also says
+an already-exchanged refresh token is left out. The mock (`web/src/mocks/data/migration.ts`)
+copies the 19 streams, so the mock-backed page, the unit test, `e2e/migration.spec.ts` and
+`e2e-real/explained-pages.spec.ts` count 19. The admin OpenAPI document is unchanged on that
+branch (stream names are plain strings), so the generated client was not regenerated.
+Verified: `npm run check` and `npm run test:e2e`.
 
 ## 2026-10-09: simpler to use and understand (branch `agent/web-simpler`)
 

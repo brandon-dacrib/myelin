@@ -22,13 +22,18 @@ const TOTALS: Record<string, number> = {
   users: 1_240,
   devices: 3_115,
   access_tokens: 2_890,
+  refresh_tokens: 1_974,
+  threepids: 1_063,
+  external_ids: 212,
   account_data: 5_402,
   e2e_keys: 2_977,
   cross_signing: 1_088,
   key_backups: 612,
+  to_device: 486,
   push_rules: 1_236,
   pushers: 1_301,
   filters: 4_455,
+  registration_tokens: 7,
   rooms: 318,
   receipts: 22_964,
   media: 7_730,
@@ -176,7 +181,8 @@ export function migrationStatus(): MigrationStatus {
             copied_count: Math.round(total * share),
             total_count: share > 0 || f > 0 ? total : null,
             rate_per_second: state.status === "copying" && share > 0 && share < 1 ? 420 : 0,
-            // Rooms only invited to, and receipts in threads, are left out on purpose.
+            // Rooms only invited to, and receipts of kinds this server does not keep, are left
+            // out on purpose.
             skipped_count:
               name === "rooms"
                 ? Math.round(4 * share)
