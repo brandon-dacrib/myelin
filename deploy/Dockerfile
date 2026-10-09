@@ -30,9 +30,12 @@
 # --chown`) has been in BuildKit's built-in frontend since Docker 20.10.
 #
 ARG RUST_VERSION=1.98
-ARG RUST_IMAGE=rust:${RUST_VERSION}-slim-bookworm
+# Through Google's mirror of Docker Hub by default: CD's runners hit Docker Hub's anonymous pull
+# limit (429 on the node image, 2026-10-09, run 37991028160), and the project's desktop cannot
+# pull from Docker Hub from an agent session at all. Override with --build-arg to use the Hub.
+ARG RUST_IMAGE=mirror.gcr.io/library/rust:${RUST_VERSION}-slim-bookworm
 ARG NODE_VERSION=22
-ARG NODE_IMAGE=node:${NODE_VERSION}-bookworm-slim
+ARG NODE_IMAGE=mirror.gcr.io/library/node:${NODE_VERSION}-bookworm-slim
 ARG RUNTIME_IMAGE=gcr.io/distroless/static-debian12:nonroot
 #
 # ---------------------------------------------------------------------------------------------
