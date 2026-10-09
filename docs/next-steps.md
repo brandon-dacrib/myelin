@@ -1,10 +1,94 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-10-09, evening EDT (six merges, a 95% wave in flight). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+Written 2026-09-20 by the integration lead, last revised 2026-10-09, night EDT (thirteen merges, the 95% wave merged). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
-## Resume here: 2026-10-09, evening EDT -- the morning's leftovers, the real-Synapse milestone and wave 3's first three tracks are merged; a 95% wave is running
+## Resume here: 2026-10-09, night EDT -- the 95% wave is merged: every row has a dated basis; roll to the first green image of `c7551603` or later
+
+**Where `main` is.** `c7551603`; **nothing is unmerged, no agent worktree, no agent process, no
+kind cluster, no lock.** Thirteen merges today after the morning handover, each through the queue
+with a green gate; in order after the evening entry below: `bbc0bb3b` (`agent/web-simpler`),
+`5d5617e5` (`agent/federation-95`), `9db8e2b0` (the stack `agent/ops-95`, `agent/push-leftovers`,
+`agent/scale-sync-bug`, `agent/web-migration-streams`; its push failed once on a GitHub SSH
+outage and the gated commit was pushed by hand), `c8e9268e` (the rejoin test waits for replica B
+to own a shard), `9a8666e4` (**the image builds from Docker Hub's mirror by default**:
+`deploy/Dockerfile` and buildx in `cd.yml`, after Docker Hub rate-limited two CD runs),
+`c7551603` (`agent/migration-95` plus the README pass). Decisions **0037** (offerings pin a
+release tag), **0038** (a listener that declares TLS is served as TLS by `hs serve`), **0039**
+(a migration keeps every session whole; an inert Synapse setting does not block a translation).
+
+**What the wave holds** (each track's status file has a dated 2026-10-09 section):
+
+- **Federation (06)**: Myelin federated with a real Synapse 1.162.0, **46/46** single server and
+  **51/51 as a two-replica cluster** (`tests/federation-synapse/run.sh`, `REPLICAS=2`), after
+  three real fixes: a server verifies the events it signed itself from its own keys; a
+  leave-then-rejoin through another server no longer overtakes the leave (a bounded delivery
+  barrier before `make_join`); a PDU queued for a destination another replica sends for wakes
+  that replica over the mesh (62 s to 21 ms). Measured on `00fe0c01`: **Sytest 754/772 (99.6%)**,
+  federation group 103/105, **Complement federation 316/317 assertions, 89/90**, restricted
+  18/18. The three left are test races or a thing no server does (named in status 06).
+- **Operations (12, 03)**: day two on real pods on kind (`deploy/helm/hs/ci/`, in CD): two
+  replicas under traffic lose 1 in 953 on a graceful delete, 0 in 1,803 on a kill, 0 scaling
+  2→3→1, 4 in 979 on a roll from the 2026-09-30 image; backup and restore in both layouts; 15
+  alert rules proven by promtool; probes from measurement; `hs serve` terminates TLS; the interop
+  harness in CI nightly (`.github/workflows/interop.yml`); bridge image pins checked weekly.
+- **The scale bug (04)**: the smoke found that scaling 3→1→2 broke `/sync` for the account and
+  then sends. Root cause in `hs-room`: a replica that got a room's shard back kept writing from
+  the resident copy it had before, over a timeline row the other replica had written. Fixed:
+  `RoomRegistry::get_or_load` reloads a copy whose shard changed hands (counter
+  `hs_room_stale_copies_reloaded_total`); `persist` refuses to write over an occupied position
+  and names who wrote it. Real-binary test `crates/hs-cli/tests/cluster_rejoin.rs`; the cluster
+  smoke's scale phases pass. **CD's cluster-smoke step still has `continue-on-error: true`**;
+  drop it once the one graceful-delete failure is dealt with.
+- **Synapse migration (13)**: rehearsed end to end against a real Synapse 1.162 in Docker
+  (`crates/hs-cli/tests/migration_rehearsal.rs`); five new streams (refresh tokens, 3PIDs, SSO
+  identities, waiting to-device messages, registration tokens); **room version 12 rooms did not
+  import at all** (Synapse stores a `room_id` in the create event), fixed in `hs-room`; a
+  generated `homeserver.yaml` translates as it is; 69 of 77 `/_synapse/admin` routes.
+- **Web (16)**: walked as a first-time operator against an empty real server; the Overview says
+  what the server is and what to do first instead of warning about its own bridge registration;
+  the sidebar is three groups; "Settings" is "Invites and tokens"; Configuration leads with the
+  settings and explains itself on request; the Migration page lists the 19 streams.
+- **Bridges (11)**, **push (10)**, **auth (07)**, **sync (05)**: as the evening entry says.
+
+**README.** Every capability row now has a dated, measured basis (the owner's instruction:
+"everything at 95%+", earned). As merged: client-server ~93, storage ~85, configuration ~95,
+admin API ~92, web ~88, bridges ~90, operations ~80, migration ~92, federation ~95. What each
+row says keeps it from 95% is the next wave's list; the lowest are **operations** (the
+graceful-delete window, the operator's cluster mode and the degraded CRD apply on kind) and
+**storage** (nothing measured since 2026-10-02: an online snapshot of the embedded store, and a
+load run). The measurements table's "Spec routes served" and "Rust" lines are refreshed in the
+commit after this one if the dashboard run finished (`python3 tools/dashboard.py`).
+
+**CD.** Green on `7cb865ee` (run 37982139184). Later commits: Docker Hub rate-limited the runner
+(429 on the node image, then BuildKit's own image) until `9a8666e4`; and GitHub keeps only the
+newest *queued* run of a workflow's concurrency group, so a run of merges still yields one image,
+the last. **Roll candidate: the first green image of `c7551603` or later** (`gh run list
+--workflow cd`). The roll adopts the CRD once (`--take-ownership --force-conflicts`,
+`deploy/helm/hs/README.md`), rolls the WhatsApp bridge once to `v0.2609.0` (decision 0037), and
+is the first image with the scale fix and TLS listeners; afterwards check
+`kubectl get pods,bridges -n myelin`, the bridge page, and the server's `WARN`s.
+
+**Tooling found today:** `tests/complement/run_single_node.sh` looks for `refs/complement`
+beside the checkout, so it fails from a worktree (agents ran `lock.sh go test` by hand); the
+harness cuts an agent off while it waits on a long background job, so agents should run long
+steps in the background and the coordinator watches their logs; a `cargo test --workspace`
+gate on a loaded machine timed out the rejoin test twice (now waits for B's shards; keep the
+machine quiet for gates); `ghcr.io` pulls fail from a session like Docker Hub (memory note).
+
+**Next, in order:** (1) roll the demo and check the bridges; (2) the operations row: the
+graceful-delete window (a `421` from a replica that just released, or a fresh owner lookup), the
+operator's `Homeserver` cluster mode and the degraded CRD apply on kind, then drop
+`continue-on-error`; (3) storage: an online snapshot of the embedded store so a backup needs no
+stop, and a load run with numbers; (4) web: the Audit log and Migration pages walked, pages that
+adapt their wording to a narrow token, an `AppService.built_in` flag in the OpenAPI instead of
+the web recognising `myelin-bridges` by id; (5) client-server: declare `can_change_power_levels`
+so Sytest runs its 13 power-level tests, MSC4222 `state_after`, `/messages` by relation type;
+(6) migration: a real Element session driven through a cutover, a large Synapse on a quiet
+machine; (7) bridges: a second network with a real phone, hookshot and IRC for real.
+
+## Earlier: 2026-10-09, evening EDT (written mid-wave) -- the morning's leftovers, the real-Synapse milestone and wave 3's first three tracks are merged; a 95% wave is running
 
 **Where `main` is.** `72dc8210`. Merged today after the morning handover, each through the queue
 with a green gate (both PostgreSQL servers): `27ad5d76` (CD's image smoke read its log through
