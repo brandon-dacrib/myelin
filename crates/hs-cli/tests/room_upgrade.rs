@@ -588,3 +588,162 @@ async fn an_upgraded_direct_chat_is_still_a_direct_chat_for_the_upgrader() {
     assert!(rooms.contains(&new.as_str()), "{direct}");
     assert!(rooms.contains(&old.as_str()), "{direct}");
 }
+
+/// Push rules about the old room follow its members into the replacement (Complement's
+/// `TestPushRuleRoomUpgrade`, Synapse's `copy_push_rules_from_room_to_room_for_user`): the
+/// upgrader's room rule is there for the new room the moment the upgrade answers (her join is
+/// part of it), and a follower's override rule naming the old room in its `rule_id` and its
+/// `room_id` condition is copied, renamed and rewritten for the new room, when he joins; a
+/// disabled rule stays disabled. The old rules stay as they were.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn push_rules_about_the_old_room_follow_its_members_into_the_replacement() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = reserve_port();
+    let config = dir.path().join("hs.yaml");
+    std::fs::write(&config, config_yaml(port, &dir.path().join("data"))).unwrap();
+    let client = Client {
+        http: reqwest::Client::new(),
+        base: format!("http://127.0.0.1:{port}"),
+    };
+    let mut hs = HsProcess::serve(&config);
+    hs.wait_for("listening");
+
+    let alice = client.register("alice").await;
+    let bob = client.register("bob").await;
+    let post = reqwest::Method::POST;
+    let put = reqwest::Method::PUT;
+
+    let old = client
+        .call(
+            post.clone(),
+            "/_matrix/client/v3/createRoom",
+            &alice,
+            json!({"preset": "public_chat", "room_version": "10"}),
+        )
+        .await["room_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    client
+        .call(
+            post.clone(),
+            &format!("/_matrix/client/v3/join/{}", segment(&old)),
+            &bob,
+            json!({}),
+        )
+        .await;
+
+    // Alice mutes the room; bob has a (disabled) override rule about it, named after it.
+    client
+        .call(
+            put.clone(),
+            &format!("/_matrix/client/v3/pushrules/global/room/{}", segment(&old)),
+            &alice,
+            json!({"actions": ["dont_notify"]}),
+        )
+        .await;
+    let bob_rule = format!("loud-{old}");
+    client
+        .call(
+            put.clone(),
+            &format!(
+                "/_matrix/client/v3/pushrules/global/override/{}",
+                segment(&bob_rule)
+            ),
+            &bob,
+            json!({
+                "conditions": [{"kind": "event_match", "key": "room_id", "pattern": old}],
+                "actions": ["notify", {"set_tweak": "sound", "value": "loud"}],
+            }),
+        )
+        .await;
+    client
+        .call(
+            put.clone(),
+            &format!(
+                "/_matrix/client/v3/pushrules/global/override/{}/enabled",
+                segment(&bob_rule)
+            ),
+            &bob,
+            json!({"enabled": false}),
+        )
+        .await;
+
+    let new = client
+        .call(
+            post.clone(),
+            &format!("/_matrix/client/v3/rooms/{}/upgrade", segment(&old)),
+            &alice,
+            json!({"new_version": "11"}),
+        )
+        .await["replacement_room"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Alice is in the replacement already: her rule for it is readable right away.
+    let copied = client
+        .get(
+            &format!("/_matrix/client/v3/pushrules/global/room/{}", segment(&new)),
+            &alice,
+        )
+        .await;
+    assert_eq!(copied["actions"], json!(["dont_notify"]), "{copied}");
+    assert_eq!(copied["rule_id"], new.as_str());
+    let kept = client
+        .get(
+            &format!("/_matrix/client/v3/pushrules/global/room/{}", segment(&old)),
+            &alice,
+        )
+        .await;
+    assert_eq!(
+        kept["actions"],
+        json!(["dont_notify"]),
+        "the old rule stays"
+    );
+
+    client
+        .call(
+            post.clone(),
+            &format!("/_matrix/client/v3/join/{}", segment(&new)),
+            &bob,
+            json!({}),
+        )
+        .await;
+    let bob_copy = format!("loud-{new}");
+    let copied = client
+        .get(
+            &format!(
+                "/_matrix/client/v3/pushrules/global/override/{}",
+                segment(&bob_copy)
+            ),
+            &bob,
+        )
+        .await;
+    assert_eq!(copied["rule_id"], bob_copy.as_str(), "{copied}");
+    assert_eq!(
+        copied["enabled"], false,
+        "a disabled rule is copied disabled"
+    );
+    assert_eq!(copied["conditions"][0]["pattern"], new.as_str());
+    assert_eq!(copied["actions"][1]["value"], "loud");
+    hs.wait_for("their push rules for the old room followed");
+
+    // The copy is account data the next /sync carries, as any rule change is.
+    let sync = client.get("/_matrix/client/v3/sync?timeout=0", &bob).await;
+    let rules = sync["account_data"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["type"] == "m.push_rules")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let ids: Vec<&str> = rules["content"]["global"]["override"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["rule_id"].as_str())
+        .collect();
+    assert!(ids.contains(&bob_copy.as_str()), "{ids:?}");
+    assert!(ids.contains(&bob_rule.as_str()), "{ids:?}");
+}
