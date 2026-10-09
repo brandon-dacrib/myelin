@@ -324,6 +324,44 @@ jobs:
         if: matrix.arch == 'amd64'
         run: deploy/operator/ci/kind-smoke.sh myelin:smoke --kind smoke --homeserver
 
+      - name: Prove two replicas lose no request through a delete, a kill, a scale, a roll and a rollback
+        # The same kind cluster and image. deploy/helm/hs/ci/cluster-smoke.sh installs the
+        # chart in cluster mode (two replicas on a PostgreSQL it starts, a shared media
+        # volume), creates the first administrator, and runs a traffic pod against the
+        # Service -- sends, /messages and /sync on sixteen rooms, four at a time -- while a
+        # replica is deleted gracefully, a replica is killed outright, the release is scaled
+        # to three and to one, rolled from the published `main` image to this one and rolled
+        # back. analyze.py judges every request against decision 0017: nothing may fail but
+        # what reaches a killed replica's shards before its lease lapses. It also prints each
+        # pod's boot time and memory and CPU next to the chart's requests and limits, which is
+        # where values.yaml's defaults come from (docs/status/12-platform-and-kubernetes.md).
+        #
+        # `ghcr.io/brandon-dacrib/myelin:main` is the image the roll starts from, so this is
+        # also the one place an upgrade from the published image to the candidate is run
+        # under traffic before the candidate becomes `main`. About fifteen minutes.
+        #
+        # Reported, not yet blocking: on 2026-10-09 the first runs found a bug outside this
+        # script's remit (docs/status/12-platform-and-kubernetes.md, "What the smoke found"):
+        # after a scale from one replica back to two, `hs_user::hub` fails to apply room
+        # updates ("state error: unknown event EventSn#...") on both replicas and every
+        # `/sync` for the account answers 500 from then on. Until track 05 closes it this
+        # step's failure is in the log and the job summary but does not stop `manifest`;
+        # drop `continue-on-error` once it passes.
+        if: matrix.arch == 'amd64'
+        continue-on-error: true
+        run: deploy/helm/hs/ci/cluster-smoke.sh myelin:smoke --kind smoke --rotate-certs --upgrade-from ghcr.io/brandon-dacrib/myelin:main
+
+      - name: Prove a backup of a release restores it, in both layouts
+        # deploy/helm/hs/ci/backup-restore-smoke.sh: a single-node release's data volume is
+        # copied with the server scaled to zero, the release and its claim are destroyed, a
+        # fresh install comes up as a different server, and the copy put back makes it the
+        # original again (same signing key, same administrator and password, the message from
+        # before the backup and not the one after). Then the cluster layout: pg_dump, the media
+        # volume and the signing-key Secret, dropped and restored the same way, the media
+        # byte for byte. The chart's README has the procedure; this is it, run.
+        if: matrix.arch == 'amd64'
+        run: deploy/helm/hs/ci/backup-restore-smoke.sh myelin:smoke --kind smoke
+
       - name: Export the digest
         id: export
         if: github.event_name != 'workflow_dispatch' || inputs.publish
@@ -548,6 +586,14 @@ jobs:
           test ! -e deploy/helm/hs/crds
           helm template myelin deploy/helm/hs --set serverName=example.org --show-only templates/crds.yaml \
             | grep 'helm.sh/resource-policy: keep' >/dev/null
+
+      - name: Prove the alert rules are well-formed and fire on what they watch
+        # deploy/helm/hs/ci/alerts-test.sh renders templates/prometheusrule.yaml with every
+        # group on, then `promtool check rules` and `promtool test rules` with
+        # ci/alerts/tests.yaml: each alert is fed the series it is written for and must fire
+        # with the labels and summary an operator would see; a healthy release must stay
+        # silent. promtool runs from the Prometheus image.
+        run: deploy/helm/hs/ci/alerts-test.sh
 
       - name: Work out the chart version and the image it pulls
         # deploy/helm/hs/ci/chart-version.sh has the rule and why: a tag publishes its version;

@@ -1,3 +1,43 @@
+## 2026-10-09 (branch `agent/ops-95`, track 12): the handoff fix on real pods, measured, and what a scale from one replica to two does
+
+The two-replica cluster has now run on real pods with decision 0017's forwards, under
+continuous traffic, through every disruption an operator causes
+(`deploy/helm/hs/ci/cluster-smoke.sh`; status 12 of this date has the method and the full
+table; kind v1.33.1, PostgreSQL, mutual TLS on the mesh, a traffic pod at the Service):
+
+| disruption | requests | failed | worst served |
+|---|---|---|---|
+| `kubectl delete pod hs-1` (SIGTERM, drain, replacement) | 953 | **1** (`503 M_HS_NOT_SHARD_OWNER (believed owner: hs-1)` after 9.0 s) | 2.4 s |
+| `kubectl delete pod hs-0 --grace-period=0 --force` | 1,803 | **0** | 2.2 s |
+| `replicaCount` 2 → 3 | 497 | 0 | 2.3 s |
+| `replicaCount` 3 → 1 (two drains in a row) | 580 | 0 | 2.4 s |
+| roll from the 2026-09-30 image to this tree | 979 | 4 (`no owner is currently known` after ~9 s, at t+18 s) | 2.1 s |
+| three CA rotation rolls | 2,042 | 0 cluster errors (the 500s are the bug below) | 8.0 s |
+
+Compared with 2026-09-28's first run on the owner's cluster (7 of 240 sends failed in a
+failover, 322 over three windows of a rolling update, each in milliseconds): the forward now
+waits, and what it waits is the handoff's length. The forced kill costing nothing is the
+StatefulSet replacing the pod under the same name within seconds and the replacement
+reclaiming its own shards before its lease lapsed (`hs-0 is Ready again after 31s` includes
+the API server noticing; forwards waited at most 2.2 s); a node loss would be the lease
+instead. The one failure on the graceful delete is a forward that dialled the pod being
+replaced for its whole deadline: the replica had released the shard (`hs_cluster_
+ownership_changes_total{reason="release"}` moved) but the forwarder's belief did not, or the
+new owner had not claimed it. That and the roll's four are the next thing to shave: a `421`
+from a replica that has just released, or a fresh owner lookup before the backoff reaches
+250 ms, would end them well inside the deadline.
+
+**What the smoke found, and 03 should rule itself in or out of**: after `replicaCount`
+3 → 1 → 2, within ten seconds of hs-1 rejoining, both replicas log `hs_user::hub: failed to
+process a room update into user feeds error=state error: unknown event EventSn#3809` and the
+account's every `/sync` is `500` from then on; after the next roll sends to some rooms fail
+with `internal_room_actor_invariant_violated: cited event not in history`. Reproduced three
+times in three runs, once on the 2026-09-30 image. If two owners wrote one room's rows across
+the two drains of the scale-down (hs-2 then hs-1, each releasing to hs-0), that is the fencing
+invariant; the chaos suite's checker over recorded writes is the tool to settle it. If not, it
+is the non-owner copy's catch-up (decision 0022) or the hub's feed update (track 05/04).
+Reproducer and logs: status 12 of this date, "What the smoke found".
+
 ## 2026-10-08: another server's requests for a room reach the room's owner (branch `agent/fed-forward`, decision 0035)
 
 Found by `fed-cluster`: a federation `send_join` that reached a replica not owning the room's

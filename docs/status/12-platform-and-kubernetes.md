@@ -1,5 +1,211 @@
 # 12. Platform and Kubernetes
 
+## 2026-10-09 (branch `agent/ops-95`): day two on real pods -- the chaos smoke, backup and restore, alerts, CA rotation, TLS in `hs serve`, and the bug the smoke found
+
+Goal: README's "Operations (HA, scale-out)" row from ~60% toward 95%, earned on kind. What
+separated the two, in the order an operator meets it, and what each got:
+
+| gap | result |
+|---|---|
+| the handoff fix (0017) had never run on real pods | **run, on kind, under traffic**: `deploy/helm/hs/ci/cluster-smoke.sh`; graceful delete 1 failure in 953, forced kill 0 in 1,803, scale 2→3→1 0 in 1,077 (table below) |
+| scaling one to three and back with no lost requests | 0 failures in the scale-up and scale-down phases; **the scale from one back to two breaks `/sync` for the account** (bug below, not this track's) |
+| upgrade and rollback of the server across a version | the roll from the 2026-09-30 image (`sha-a01c1e0f`, 325 commits back) to this tree: 4 requests of 979 failed at the forward deadline in the mixed-version window; the rollback runs but inherits the corruption the scale phase left, and a sync token from the new version is `400 invalid_since_token` on the old one (expected: a token format changed) |
+| certificate rotation | the mesh CA rotated in three rolls under traffic (`--rotate-certs`), each roll clean of cluster errors (the 500s in those phases are the same bug, carried over); procedure in the chart README |
+| backup and restore with a verified restore | `deploy/helm/hs/ci/backup-restore-smoke.sh` **passed** in both layouts on the first run |
+| alerts an operator must have | 15 rules in `templates/prometheusrule.yaml`, each proven to fire by `promtool test rules` |
+| resource limits and probes from measurement | measured (34-96 MiB, about a third of a core per replica under the smoke's traffic; Ready 5-6 s after container start every time); the startup and readiness probes tightened to it, resources documented |
+| the interop harness in a CI leg with Docker | `.github/workflows/interop.yml` |
+| `hs serve` terminating TLS itself | done, decision 0038; the harness can drop its nginx (track 06/14's file) |
+| bridge image bumps as a release step | `.github/workflows/bridge-images.yml` + `deploy/bridges/check-image-tags.py`; all 14 pins current today |
+| the degraded CRD apply on kind | **not done**; still only against the fake API server |
+| a non-owner replica reloading a room per event (RFC 0018) | already closed by track 05 on 2026-10-01 (decision 0022); nothing cluster-side left of it |
+
+### The cluster smoke (`deploy/helm/hs/ci/cluster-smoke.sh`)
+
+Two replicas on PostgreSQL in cluster mode with mutual TLS on the mesh, a shared media volume
+(a hostPath PV on kind, since local-path refuses ReadWriteMany; `--media-claim` elsewhere), the
+first administrator claimed through hs-0's setup link and logged in through hs-1, then a
+traffic pod inside the cluster (`cluster-smoke/traffic.py`, python:3-alpine, stdlib) at the
+ClusterIP Service: four loops of sends, `/messages` and short `/sync`s over sixteen rooms, one
+line per request. Phases, each judged by `cluster-smoke/analyze.py` against decision 0017's
+rule (`none`: no failure; `window:N`: failures only in the first N seconds): with
+`--upgrade-from`, the roll from the previous image to the candidate first, so every disruption
+runs on the candidate; baseline; `kubectl delete pod hs-1`; `kubectl delete pod hs-0
+--grace-period=0 --force`; `replicaCount` 2→3, 3→1, 1→2; with `--rotate-certs` the three CA
+rotation rolls; the `helm rollback` last. It prints each pod's time from container start to
+Ready and (with `--kind`) its memory and CPU from the node's cgroup, and the `hs_cluster_*`
+metrics of each pod before and after. `--log-dir` keeps the traffic log. Secrets never reach
+the transcript (files, not `--from-literal`; the first run printed one, fixed).
+
+**Run 4, the one that counts** (kind v1.33.1, Helm 4.3, the release image built from this
+branch, the machine otherwise idle, 2026-10-09 20:00 UTC; 10,674 requests):
+
+| phase | requests | failed | p50 | p99 | max | what the failures were |
+|---|---|---|---|---|---|---|
+| upgrade (09-30 image → this) | 979 | 4 | 36 ms | 1.6 s | 9.6 s | `503 M_HS_NOT_SHARD_OWNER ... no owner is currently known` after ~9 s, all at t+18 s, as hs-1 (new) joined hs-0 (old) |
+| baseline | 600 | 0 | 34 ms | 716 ms | 943 ms | |
+| graceful delete of hs-1 | 953 | 1 | 36 ms | 875 ms | 9.0 s | one `503 ... (believed owner: hs-1)` at t+9.0 s: a forward that waited its whole deadline on the pod being replaced |
+| kill of hs-0 (`--force`) | 1,803 | 0 | 39 ms | 944 ms | 2.2 s | none: the StatefulSet replaced the pod under the same name within seconds and it took its own shards back before its lease lapsed, so forwards waited at most 2.2 s |
+| scale 2 → 3 | 497 | 0 | 50 ms | 1.5 s | 2.3 s | |
+| scale 3 → 1 | 580 | 0 | 44 ms | 1.4 s | 2.4 s | |
+| scale 1 → 2 | 547 | 25 | 48 ms | 1.6 s | 2.1 s | **`sync 500 M_UNKNOWN state error: unknown event EventSn#3809`** from t+8.7 s (hs-1 Ready again) to the end, every `/sync` |
+| CA rotation roll 1, 2, 3 | 791 / 607 / 644 | 241 / 219 / 232 | 24-31 ms | 2.2-3.0 s | 4.3-8.0 s | the same, plus `send 500 internal_room_actor_invariant_violated: cited event not in history` and `messages 500 unknown event EventSn#3784`; no cluster error (`503`, `421`, fenced) in any of the three |
+| rollback (→ 09-30 image) | 2,256 | 1,012 | 12 ms | 920 ms | 2.2 s | the same room errors, and `sync 400 invalid_since_token: sync token payload is 73 bytes` for a token the new version minted |
+
+Pods: Ready 5-6 s after container start on every start (first boot, roll, replacement, the
+third replica); hs-1 back 16 s after `delete pod`, hs-0 back 31 s after the forced kill; memory
+34 and 96 MiB, CPU 38 and 58 s over the first ~2 minutes under traffic.
+
+So, on real pods with the fix: a graceful termination, a forced kill, a scale up and a scale
+down cost nothing (one request in 953 on the graceful delete waited out its deadline, which is
+decision 0017's bound and not a regression; it is the number to beat). A roll between
+versions costs a handful at the deadline. And **the smoke found a bug that is not the cluster's**:
+
+### What the smoke found: a scale from one replica to two breaks the account's `/sync` and then the rooms (tracks 05 and 04; 03 to rule itself out)
+
+Reproduced three times out of three (runs 2, 3 and 4; run 3 on the 2026-09-30 image, so it is
+not new): after `replicaCount` 3 → 1 → 2, within ten seconds of hs-1 being Ready again, both
+pods log
+
+    WARN hs_user::hub: failed to process a room update into user feeds error=state error: unknown event EventSn#3809
+
+(four distinct sequence numbers, 3784/3790/3809/3810, hs-1 first at 20:01:39, hs-0 six seconds
+later), every `/sync` for the account answers `500 M_UNKNOWN state_error: unknown event
+EventSn#3809` from then on, and after the next roll sends to some rooms fail with `500
+internal_room_actor_invariant_violated: cited event not in history` and `/messages` with
+`unknown event`. It does not heal: a roll, a rollback to the older version and three more rolls
+later it is the same four events. Sends never failed in the scale phases themselves (all 200),
+so the writes went somewhere; what the hub and then the room actor cannot find is in the rows
+both replicas read. Whether two owners wrote one room's rows across the 3 → 1 handoffs (a
+fencing hole: track 03's invariant), or the replica's copy of a room it does not own advanced
+past rows it never loaded (RFC 0018's catch-up, track 05/04), is the question; the `kill`
+phase with its instant same-name replacement and the plain `delete` do not trigger it, the
+scale-down to one followed by a rejoin does. **Reproducer**: `kind create cluster --name x
+--image mirror.gcr.io/kindest/node:v1.33.1 && deploy/helm/hs/ci/cluster-smoke.sh <image> --kind
+x --log-dir ./out` (about six minutes to the `scale-to-two` phase; `--keep` leaves the
+namespace up with both pods' logs). The transcript of run 4 without its per-request lines is
+`docs/status/transcripts/2026-10-09-cluster-smoke-run4.txt`.
+
+CD runs the smoke on every push to `main` (the amd64 image leg, after the operator smoke, with
+`--rotate-certs --upgrade-from ghcr.io/brandon-dacrib/myelin:main`) **with `continue-on-error`
+until that bug is fixed**, so its result is in the log and the summary but does not stop
+`manifest`; dropping that one line makes it the gate it should be.
+
+### Backup and restore (`deploy/helm/hs/ci/backup-restore-smoke.sh`, passed on the first run)
+
+Embedded: install, claim, a room, "before the backup"; scale to 0 (gone in seconds), a helper
+pod tars `data-hs-0` out (the whole volume: `db/`, `keys/`, `media/`), scale to 1, "after the
+backup"; uninstall and delete the claim; reinstall comes up with a different key id and
+`needs_setup: true` (proof the data was gone); scale to 0, empty the claim, tar back in, scale
+to 1: the old key id, the administrator's password works, "before the backup" is there and
+"after the backup" is not. PostgreSQL (one replica in cluster mode, mesh shared secret, a
+20,000-byte media upload): `pg_dump -Fc` online, the media claim tarred, the signing-key Secret
+saved; `DROP DATABASE` and `CREATE DATABASE`, the claim emptied, the Secret deleted; Secret
+applied, `pg_restore --no-owner`, media back, `helm install`: same key, login, the right
+messages, the media byte for byte. Both in CD after the cluster smoke. The chart README's "Day
+two" section is the operator's version. Left: the embedded engine has no online snapshot API,
+so the copy needs the server stopped or a storage-layer snapshot (crash-consistent); an
+`hs backup` that snapshots the open store is track 01's to offer (interfaces needed).
+
+### Alerts (`templates/prometheusrule.yaml`, `prometheusRule.enabled`)
+
+Fifteen rules scoped to the release's namespace and Service: `HsReplicaDown`,
+`HsReplicasNotReady`, `HsRestartingOften`, `HsErrorRateHigh`, `HsRequestsSlow` (p99 over 2 s,
+`/sync`, `/events` and `/initialSync` excluded), and in cluster mode `HsClusterReplicaMissing`
+(`hs_cluster_live_replicas` under `replicaCount`), `HsClusterShardsUnowned` (the sum of
+`hs_cluster_owned_shards` by kind under `roomShards`/`userShards`), `HsClusterLeaseStale`
+(`hs_cluster_lease_age_seconds` over `leaseTtl`), `HsClusterFencedWrites`; `HsPostgresFlushSlow`
+(postgres only); `HsDataVolumeFilling` (embedded only) and `HsMediaVolumeFilling` (a local media
+claim) from the kubelet's volume stats; `HsFederationPdusDropped`; `HsAppserviceNotAccepting`
+and `HsAppserviceDeadLettered`; `HsMemoryNearLimit`. `ci/alerts-test.sh` renders the template
+(release `myelin`, every group on) and runs `promtool check rules` and `promtool test rules`
+against `ci/alerts/tests.yaml` (13 cases, a healthy release included) from the Prometheus
+image; `SUCCESS` on both; in CD's chart job. The old skeleton `deploy/observability/alerts/
+hs-rules.yaml` (never evaluated, metric names it guessed) is deleted. Left: the bridge operator
+Deployment exposes no metrics port, so its `hs_operator_*` metrics are not scraped and have no
+alert; `kube_statefulset_*`, `kube_pod_*`, `container_memory_*` and `kubelet_volume_stats_*`
+need a kube-prometheus-stack, as the values comment says.
+
+### `hs serve` terminates TLS (decision 0038)
+
+`crates/hs-cli/src/tls_listener.rs`: a listener with `tls:` reads its PEM chain and key at
+start (a missing file, an empty one or a mismatched key is `ServeError::ListenerTls` naming
+the listener; the warn-and-serve-plaintext path is gone), offers `h2` and `http/1.1` through
+ALPN, runs each handshake on its own task (`TlsListener`, an `axum::serve::Listener`), and
+hands handlers `ConnectInfo<SocketAddr>` through `WithConnectInfo` (axum's own connect-info
+make-service is tied to its `TcpListener`). `crates/hs-cli/tests/tls_listener.rs` against the
+real binary: HTTPS with a private CA, ALPN negotiates `h2` (a raw rustls handshake), an
+untrusted CA and plaintext on the port are refused and the next request is served, the
+plaintext listener beside it answers, eight handshakes at once, and a mismatched key stops the
+start naming the listener. Three unit tests on the loader. `rustls`, `tokio-rustls`,
+`rustls-pki-types` moved from dev-dependencies to dependencies of `hs-cli`, `rustls-pemfile`
+added (a workspace dependency already), `tower` gained `util` there.
+
+### Probes and resources, from measurement
+
+`values.yaml`: `probes.startup.periodSeconds` 5 → 2 (`failureThreshold` 30 → 75, the same
+150 s budget), `probes.readiness.initialDelaySeconds` 5 → 2 and `periodSeconds` 5 → 3, with
+the measurements in the comment: Ready 5-6 s after container start on every start in the
+smoke, so a pod is now Ready within a probe period of being able to be, and a withdrawn
+readiness leaves the endpoints within 3 s. Resources unchanged (requests 100m/256Mi, limit
+1Gi) with the measured 34-96 MiB and about a third of a core per replica under the smoke's
+~30 requests/s written beside them.
+
+### CI and release steps
+
+- `.github/workflows/interop.yml`: `tests/federation-synapse/run.sh` on every push to `main`
+  that touches crates or the harness, nightly, and by hand (the Synapse image an input); the
+  `results.tsv` as a table in the job summary, the transcript and `hs.log` as artifacts. A
+  workflow of its own, not a `ci` job: Docker, a debug build and a moving upstream.
+- `.github/workflows/bridge-images.yml` (weekly, by hand): `deploy/bridges/check-image-tags.py`
+  reads the catalogue's pins out of `crates/hs-admin/src/bridge_types.rs` (read-only) and
+  compares each with its upstream's latest GitHub release (highest version tag for
+  heisenbridge, which publishes none; `hif1/` on Docker Hub is `hifi/` on GitHub), and opens or
+  updates one issue when a pin is behind. Run here: 0 of 14 behind.
+- CD's image leg: the cluster smoke and the backup smoke after the operator smoke; the chart
+  job: the alerts test. Not seen green on GitHub from this branch (CD runs on `main`).
+
+### Verified
+
+`cargo fmt --all --check`; `cargo clippy -p hs-cli --all-targets -- -D warnings`; `cargo test
+-p hs-cli --lib tls_listener` (3) and `--test tls_listener` (2, 9.6 s); `helm lint`;
+`shellcheck` and `bash -n` on the three scripts; `actionlint` on the three workflows;
+`deploy/helm/hs/ci/alerts-test.sh` (15 rules, 13 tests, SUCCESS); `backup-restore-smoke.sh
+myelin:ops-95 --kind ops95` PASSED; `cluster-smoke.sh` runs 2, 3 and 4 as described (the
+image `myelin:ops-95` built from this branch with `deploy/Dockerfile` through the mirror).
+Not run: the full workspace gate (the queue's), the Sytest and Complement measurements (a
+quiet machine, as asked), the chart's `install-smoke.sh` and `kind-smoke.sh` (unchanged).
+
+### Left, in order
+
+1. The scale 1 → 2 bug above (tracks 05/04, 03 to check fencing); then drop `continue-on-error`
+   from CD's cluster smoke step.
+2. The one forward in 953 that waits out its deadline on a graceful delete (track 03: the
+   forward keeps dialling the pod being replaced for its whole 10 s; a `421` or a fresh owner
+   lookup sooner would end it).
+3. The mixed-version roll's `no owner is currently known` for 9 s (4 of 979); same lever.
+4. The degraded CRD apply on kind: `kind-smoke.sh --heisenbridge` with an older CRD applied
+   first.
+5. The operator's metrics port and alerts; a `Homeserver` in cluster mode on kind.
+6. An online snapshot for the embedded store (track 01), so a backup needs no stop.
+7. The interop harness without its nginx (`hs serve` now terminates TLS; track 06/14).
+
+### Decisions made
+
+- 0038: a listener that declares TLS is served as TLS (the warning-and-plaintext path is gone).
+- The cluster smoke reports rather than blocks in CD until the bug it found is fixed (one line).
+- A backup of the embedded layout stops the server for the copy; the alternative is a
+  storage-layer snapshot, crash-consistent. Documented, not a decision record.
+- The chart's probe defaults follow the measured 5-6 s boot; resources stay as they were.
+
+### Interfaces provided / needed
+
+Provided: `prometheusRule.*` values; the three `ci/` scripts and their CD steps; the `--log-dir`
+traffic log format (`R <epoch> <kind> <status> <ms> [reason]`). Needed: from 05/04/03 the fix
+above; from 01 an online snapshot of the embedded store; from 11 a metrics port on the operator
+(or its Deployment template, which is mine, once `hs operator` serves `/metrics`). Shared
+dependencies added: none (features only: `tower/util` in `hs-cli`).
+
 ## 2026-10-09 (on `main`, `27ad5d76` and the commit after it): CD runs the CRD upgrade smoke, and its image smoke no longer fails on a pipe race
 
 - **The CRD upgrade smoke is in CD** (`deploy/helm/hs/ci/crd-upgrade-smoke.sh`), on the

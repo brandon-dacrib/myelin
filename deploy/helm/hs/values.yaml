@@ -294,6 +294,14 @@ service:
   metricsPort: 9090
   annotations: {}
 
+## Measured on kind with the release image (ci/cluster-smoke.sh, 2026-10-09): a replica on
+## PostgreSQL is Ready 5-6 s after its container starts, first boot and restarts alike (the
+## install smoke prints the same timings for a single-node first boot on the embedded engine).
+## So the startup probe asks every 2 s (a pod is Ready within a probe period of being able to
+## be, which is what every roll and scale waits on) and still allows 150 s before liveness
+## counts, for a large embedded recovery; readiness asks every 3 s, so a replica that withdrew
+## readiness at the start of its handoff (crates/hs-cli/src/serve.rs) leaves the Service's
+## endpoints within 3 s of doing so, while its listeners keep serving the drain.
 probes:
   liveness:
     path: /health/live
@@ -303,17 +311,23 @@ probes:
     failureThreshold: 3
   readiness:
     path: /health/ready
-    initialDelaySeconds: 5
-    periodSeconds: 5
+    initialDelaySeconds: 2
+    periodSeconds: 3
     timeoutSeconds: 5
     failureThreshold: 3
   ## Startup probe gives a slow first boot (large embedded-storage recovery, cold PostgreSQL
   ## connection pool) more time before liveness starts counting failures against it.
   startup:
     enabled: true
-    periodSeconds: 5
-    failureThreshold: 30
+    periodSeconds: 2
+    failureThreshold: 75
 
+## Measured on kind with the release image under ci/cluster-smoke.sh's traffic (four loops of
+## sends, /messages and /sync on sixteen rooms through the Service, about thirty requests a
+## second over two replicas; 2026-10-09): 34-96 MiB working set per replica and about a third
+## of a core each. The requests below are what a replica of a small deployment needs with
+## headroom; the memory limit is where the embedded engine's and the sync feeds' caches on a
+## busy server would have to be looked at (HsMemoryNearLimit, prometheusRule).
 resources:
   requests:
     cpu: 100m
