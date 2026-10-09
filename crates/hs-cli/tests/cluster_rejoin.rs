@@ -334,6 +334,23 @@ async fn owner_of(client: &reqwest::Client, base: &str, admin: &str, room: &str)
         .map(str::to_owned)
 }
 
+/// How many shards `owner` owns, as `base`'s admin API says (0 when it cannot be asked).
+async fn shards_owned_by(client: &reqwest::Client, base: &str, admin: &str, owner: &str) -> usize {
+    let Ok(response) = client
+        .get(format!("{base}/api/v1/cluster/shards?limit=500"))
+        .bearer_auth(admin)
+        .send()
+        .await
+    else {
+        return 0;
+    };
+    let shards: Value = response.json().await.unwrap_or(Value::Null);
+    shards["items"]
+        .as_array()
+        .map(|items| items.iter().filter(|s| s["owner"] == owner).count())
+        .unwrap_or(0)
+}
+
 /// Waits until `owner` owns `room`'s shard, as `base`'s admin API says.
 async fn wait_for_owner(
     client: &reqwest::Client,
@@ -490,9 +507,15 @@ async fn a_replica_that_gets_a_room_back_writes_from_the_store_not_its_old_copy(
     let alice = register(&client, &a, "alice").await;
     let bob = register(&client, &a, "bob").await;
 
-    // A room B owns, with both of them in it. B builds it; A has never loaded it.
-    let room = eventually(Duration::from_secs(90), "a room on B", || async {
-        // Until both replicas own shards, a room may land nowhere; try again.
+    // A room B owns, with both of them in it. B builds it; A has never loaded it. Until B owns
+    // room shards every room lands on A, and under a loaded machine B's first claims can take
+    // a while (the merge gate of 2026-10-09 saw 90 s of rooms on A), so wait for B's shards
+    // before looking for a room, each with the budget the boot wait has.
+    eventually(Duration::from_secs(300), "B to own a shard", || async {
+        (shards_owned_by(&client, &a, &admin, &id_b).await > 0).then_some(())
+    })
+    .await;
+    let room = eventually(Duration::from_secs(300), "a room on B", || async {
         let room = create_room(&client, &a, &alice, "rejoin").await;
         (owner_of(&client, &a, &admin, &room).await.as_deref() == Some(id_b.as_str()))
             .then_some(room)
