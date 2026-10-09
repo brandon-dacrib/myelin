@@ -84,8 +84,74 @@ describe("Overview", () => {
 
     expect((await tile("Users")).getByText("1")).toBeInTheDocument();
     expect((await tile("Rooms")).getByText("0")).toBeInTheDocument();
-    expect((await tile("Mode")).getByText("Single node")).toBeInTheDocument();
-    expect((await tile("Uptime")).getByText("5m")).toBeInTheDocument();
+  });
+
+  it("says what the server is in one line: name, version, mode and uptime", async () => {
+    serveLikeTheRealServer();
+    renderDashboard();
+    const line = await screen.findByTestId("server-line");
+    expect(line).toHaveTextContent("localhost");
+    expect(line).toHaveTextContent("version 0.0.1");
+    expect(line).toHaveTextContent("one process, which serves everything");
+    expect(line).toHaveTextContent("up 5m");
+    // Those three are no longer tiles.
+    expect(screen.queryByText("Mode")).not.toBeInTheDocument();
+    expect(screen.queryByText("Uptime")).not.toBeInTheDocument();
+  });
+
+  it("names the cluster in the line, with a link to it", async () => {
+    server.use(
+      http.get("/api/v1/cluster", () => HttpResponse.json({ mode: "cluster", replica_count: 3 })),
+    );
+    renderDashboard();
+    const line = await screen.findByTestId("server-line");
+    expect(line).toHaveTextContent("a cluster of 3 replicas");
+    expect(within(line).getByRole("link", { name: "see Cluster" })).toBeInTheDocument();
+  });
+
+  it("offers the first steps on a server that has only its administrator", async () => {
+    serveLikeTheRealServer();
+    server.use(http.get("/api/v1/bridge-offerings", () => HttpResponse.json(emptyPage)));
+    renderDashboard();
+    const section = within(await screen.findByRole("region", { name: "Get started" }));
+    expect(section.getByRole("button", { name: /Add people/ })).toBeInTheDocument();
+    expect(
+      section.getByRole("button", { name: /Let people sign up themselves/ }),
+    ).toBeInTheDocument();
+    expect(section.getByRole("button", { name: /Offer a bridge/ })).toBeInTheDocument();
+    expect(section.getByRole("button", { name: /Move here from Synapse/ })).toBeInTheDocument();
+  });
+
+  it("drops the first steps once the server has people", async () => {
+    // The mock's defaults: hundreds of users and two offerings.
+    renderDashboard();
+    await screen.findByText("Attention");
+    await screen.findByTestId("server-line");
+    expect(screen.queryByRole("region", { name: "Get started" })).not.toBeInTheDocument();
+  });
+
+  it("does not raise the server's own bridge manager as a bridge in trouble", async () => {
+    server.use(
+      http.get("/api/v1/statistics/overview", () =>
+        HttpResponse.json({ users_count: 3, rooms_count: 2, pending_reports_count: 0 }),
+      ),
+      http.get("/api/v1/appservices", () =>
+        HttpResponse.json({
+          items: [{ id: "myelin-bridges", sender_localpart: "bridges", health: "unknown" }],
+          next_cursor: null,
+          prev_cursor: null,
+        }),
+      ),
+      http.get("/api/v1/federation/destinations", () => HttpResponse.json(emptyPage)),
+      http.get("/api/v1/tasks", () => HttpResponse.json(emptyPage)),
+    );
+    renderDashboard();
+    expect(await screen.findByText("Nothing needs your attention.")).toBeInTheDocument();
+    expect(screen.queryByText(/bridge manager is unknown/)).not.toBeInTheDocument();
+    // Nor is it listed as one of the bridges: there are none, and the strip says what to do.
+    const strip = within(screen.getByRole("region", { name: "Bridges" }));
+    expect(strip.getByText(/No bridges yet/)).toBeInTheDocument();
+    expect(strip.getByRole("link", { name: "Offer one" })).toBeInTheDocument();
   });
 
   it("does not give an all-clear about things it could not check", async () => {
@@ -212,6 +278,21 @@ describe("Overview", () => {
     expect(card.getByText("User directory")).toBeInTheDocument();
     expect(card.getAllByText("Ok")).toHaveLength(4);
     expect(screen.queryByText(/Server health is degraded/)).not.toBeInTheDocument();
+    // An ok server keeps the rows behind a closed disclosure: the sentence already said it all.
+    const details = card.getByText("Show the checks").closest("details");
+    expect(details).not.toHaveAttribute("open");
+  });
+
+  it("opens the checks by itself when one of them is not ok", async () => {
+    server.use(
+      http.get("/api/v1/server/health", () =>
+        HttpResponse.json({ status: "down", checks: { audit: "ok", events: "down", users: "ok" } }),
+      ),
+    );
+    renderDashboard();
+    const card = within(await screen.findByRole("region", { name: "Health" }));
+    const details = (await card.findByText("The checks")).closest("details");
+    expect(details).toHaveAttribute("open");
   });
 
   it("names a check the server cannot vouch for, and puts the degraded server under Attention", async () => {

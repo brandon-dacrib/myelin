@@ -1,7 +1,16 @@
 import { useMemo, type ReactNode } from "react";
 import { formatBytes, formatCount, formatUptime, joinWithOr } from "@/lib/format";
 import { Link, useNavigate } from "@tanstack/react-router";
-import { CheckCircle2, TriangleAlert, CircleX, Info } from "lucide-react";
+import {
+  CheckCircle2,
+  TriangleAlert,
+  CircleX,
+  Info,
+  UserPlus,
+  Cable,
+  ArrowRightLeft,
+  KeyRound,
+} from "lucide-react";
 import {
   useStatisticsOverview,
   useServerInfo,
@@ -10,7 +19,13 @@ import {
   useRecentAuditEntries,
   useServerHealth,
 } from "@/api/dashboard";
-import { useAppservices, deriveDisplayName } from "@/api/bridges";
+import {
+  useAppservices,
+  useBridgeOfferings,
+  deriveDisplayName,
+  isBuiltInAppservice,
+} from "@/api/bridges";
+import { useMigration } from "@/api/migration";
 import { useTasks } from "@/api/tasks";
 import { isCounter, useTimeseries, type Metric } from "@/api/statistics";
 import { Sparkline } from "@/components/Sparkline";
@@ -65,6 +80,10 @@ export function DashboardPage() {
   const auditLog = useRecentAuditEntries(5);
   const failedTasks = useTasks({ status: "failed", limit: 20 });
   const health = useServerHealth();
+  // For "Get started": a server with nobody but its administrator, nothing offered and no import
+  // under way is one the operator has just set up, and the page says what to do first.
+  const offerings = useBridgeOfferings();
+  const migration = useMigration();
 
   const isLoading =
     stats.isLoading ||
@@ -92,9 +111,15 @@ export function DashboardPage() {
   if (failedTasks.isError) unchecked.push("tasks");
   if (health.isError) unchecked.push("server health");
 
-  const unhealthyBridges = useMemo(
-    () => (appservices.data?.items ?? []).filter((b) => b.health !== "healthy" && !b.paused),
+  // The server's own bridge manager is a registration too, and its health is "unknown" because
+  // nothing probes it: that is not a bridge in trouble, so it is not under Attention.
+  const bridges = useMemo(
+    () => (appservices.data?.items ?? []).filter((b) => !isBuiltInAppservice(b)),
     [appservices.data],
+  );
+  const unhealthyBridges = useMemo(
+    () => bridges.filter((b) => b.health !== "healthy" && !b.paused),
+    [bridges],
   );
   const failingDestinations = useMemo(
     () => (failing.data?.items ?? []).filter((d) => d.failing_since),
@@ -187,12 +212,27 @@ export function DashboardPage() {
   ]);
 
   const singleNode = (cluster.data?.replica_count ?? 1) <= 1;
+  const justSetUp =
+    stats.data?.users_count != null &&
+    stats.data.users_count <= 1 &&
+    (offerings.data?.length ?? 0) === 0 &&
+    (migration.data?.status == null || migration.data.status === "idle");
 
   return (
     <div className="mx-auto max-w-[90rem] p-6">
       <h1 className="text-xl text-text">Overview</h1>
+      <ServerLine
+        name={server.data?.name}
+        version={server.data?.version}
+        uptimeMs={server.data?.uptime_ms}
+        mode={cluster.isError ? undefined : singleNode ? "single" : "cluster"}
+        replicas={cluster.data?.replica_count}
+        loading={server.isLoading || cluster.isLoading}
+      />
 
       <div className="mt-6 flex flex-col gap-8">
+        {justSetUp && <GetStarted />}
+
         {/* Attention */}
         <section aria-labelledby="attention-heading">
           <h2 id="attention-heading" className="text-md font-medium text-text">
@@ -276,54 +316,13 @@ export function DashboardPage() {
           <div className="mt-3">
             <ServerHealthCard />
           </div>
-          <div className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-4">
+          <div className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-3">
             {isLoading &&
-              Array.from({ length: 6 }).map((_, i) => (
+              Array.from({ length: 3 }).map((_, i) => (
                 <Skeleton key={i} className="h-20 rounded-md" />
               ))}
             {!isLoading && (
               <>
-                <Tile
-                  label="Version"
-                  value={
-                    server.isError ? (
-                      <TileProblem error={server.error} />
-                    ) : (
-                      (server.data?.version ?? "—")
-                    )
-                  }
-                />
-                <Tile
-                  label="Uptime"
-                  value={
-                    server.isError ? (
-                      <TileProblem error={server.error} />
-                    ) : server.data?.uptime_ms != null ? (
-                      formatUptime(server.data.uptime_ms)
-                    ) : (
-                      "—"
-                    )
-                  }
-                />
-                <Tile
-                  label="Mode"
-                  value={
-                    cluster.isError ? (
-                      <TileProblem error={cluster.error} />
-                    ) : singleNode ? (
-                      "Single node"
-                    ) : (
-                      "Cluster"
-                    )
-                  }
-                  hint={
-                    cluster.isError
-                      ? undefined
-                      : singleNode
-                        ? "One process serves everything."
-                        : "Work is shared between replicas; see Cluster."
-                  }
-                />
                 <Tile
                   label="Users"
                   value={
@@ -382,7 +381,7 @@ export function DashboardPage() {
               )}
               {!isLoading &&
                 !appservices.isError &&
-                appservices.data?.items.map((b) => {
+                bridges.map((b) => {
                   const meta = bridgeHealthMeta[healthKeyOf(b)];
                   return (
                     <li key={b.id}>
@@ -401,8 +400,14 @@ export function DashboardPage() {
                     </li>
                   );
                 })}
-              {!isLoading && !appservices.isError && appservices.data?.items.length === 0 && (
-                <p className="text-sm text-text-muted">No bridges yet.</p>
+              {!isLoading && !appservices.isError && bridges.length === 0 && (
+                <li className="text-sm text-text-muted">
+                  No bridges yet.{" "}
+                  <Link to="/bridges/new" className="text-accent hover:underline">
+                    Offer one
+                  </Link>{" "}
+                  to let people here reach WhatsApp, Signal, Telegram and more.
+                </li>
               )}
             </ul>
           </section>
@@ -638,6 +643,134 @@ function ActivityTile({
         </>
       )}
     </Link>
+  );
+}
+
+/**
+ * One line under the title saying what this server is: its name, version, whether it is one
+ * process or a cluster, and how long it has been up. What the Health tiles used to spend three
+ * tiles on, in the words an operator would use to describe the server to somebody else.
+ */
+function ServerLine({
+  name,
+  version,
+  uptimeMs,
+  mode,
+  replicas,
+  loading,
+}: {
+  name?: string;
+  version?: string;
+  uptimeMs?: number;
+  mode?: "single" | "cluster";
+  replicas?: number;
+  loading: boolean;
+}) {
+  if (loading) return <Skeleton className="mt-1 h-5 w-96 max-w-full" />;
+  const parts: ReactNode[] = [];
+  if (name) parts.push(<span className="font-identifier text-text">{name}</span>);
+  if (version) parts.push(<>version {version}</>);
+  if (mode === "single") parts.push(<>one process, which serves everything</>);
+  if (mode === "cluster")
+    parts.push(
+      <>
+        a cluster of {replicas} replicas (
+        <Link to="/cluster" className="text-accent hover:underline">
+          see Cluster
+        </Link>
+        )
+      </>,
+    );
+  if (uptimeMs != null) parts.push(<>up {formatUptime(uptimeMs)}</>);
+  if (parts.length === 0) return null;
+  return (
+    <p className="mt-1 text-sm text-text-muted" data-testid="server-line">
+      {parts.map((part, i) => (
+        <span key={i}>
+          {i > 0 && <span aria-hidden="true"> &middot; </span>}
+          {part}
+        </span>
+      ))}
+    </p>
+  );
+}
+
+const GET_STARTED: {
+  icon: typeof UserPlus;
+  title: string;
+  text: string;
+  href: string;
+  scope?: Parameters<typeof hasScope>[0];
+}[] = [
+  {
+    icon: UserPlus,
+    title: "Add people",
+    text: "Create an account for somebody, or make an invite link they use to pick their own username and password.",
+    href: "/users",
+    scope: "admin:read",
+  },
+  {
+    icon: KeyRound,
+    title: "Let people sign up themselves",
+    text: "Registration is off until you turn it on, so nobody can create an account here without you.",
+    href: "/configuration/auth",
+    scope: "admin:read",
+  },
+  {
+    icon: Cable,
+    title: "Offer a bridge",
+    text: "Connect WhatsApp, Signal, Telegram, Discord and more; each person then gets their own bridge by messaging its bot.",
+    href: "/bridges/new",
+    scope: "bridges:read",
+  },
+  {
+    icon: ArrowRightLeft,
+    title: "Move here from Synapse",
+    text: "Copy accounts, rooms, keys and media from a Synapse while it keeps running, and cut over when you are ready.",
+    href: "/migration",
+    scope: "admin:read",
+  },
+];
+
+/**
+ * The first things to do on a server that has only its administrator: one card per task, each a
+ * sentence and a link to where it is done. Shown until the server has people, an offered bridge
+ * or an import under way, whichever comes first.
+ */
+function GetStarted() {
+  const navigate = useNavigate();
+  const items = GET_STARTED.filter((item) => !item.scope || hasScope(item.scope));
+  if (items.length === 0) return null;
+  return (
+    <section aria-labelledby="get-started-heading">
+      <h2 id="get-started-heading" className="text-md font-medium text-text">
+        Get started
+      </h2>
+      <p className="mt-1 text-sm text-text-muted">
+        This server is running and has only you on it. These are the usual first steps; this section
+        goes away once people are here.
+      </p>
+      <ul className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        {items.map((item) => {
+          const Icon = item.icon;
+          return (
+            <li key={item.href}>
+              <button
+                type="button"
+                onClick={() => navigateToHref(navigate, item.href)}
+                className="flex h-full w-full flex-col items-start gap-2 rounded-md border border-border bg-surface p-4 text-left hover:bg-surface-sunken focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--color-focus)]"
+              >
+                <span className="flex items-center gap-2 text-sm font-medium text-text">
+                  <Icon size={16} aria-hidden="true" className="text-accent" />
+                  {item.title}
+                </span>
+                <span className="text-xs text-text-muted">{item.text}</span>
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+    </section>
   );
 }
 

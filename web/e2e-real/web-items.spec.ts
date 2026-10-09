@@ -179,6 +179,8 @@ test.describe("Overview health against the real server", () => {
     await expect(
       card.getByText(health.status === "ok" ? "Ok" : /Degraded|Down/).first(),
     ).toBeVisible();
+    // An ok server keeps the per-check rows behind "Show the checks"; one that is not opens them.
+    if (health.status === "ok") await card.getByText("Show the checks").click();
     for (const key of Object.keys(health.checks)) {
       const label = { audit: "Audit log", events: "Event stream", users: "User directory" }[key];
       if (label) await expect(card.getByText(label, { exact: true })).toBeVisible();

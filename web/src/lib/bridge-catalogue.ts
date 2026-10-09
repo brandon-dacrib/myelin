@@ -94,7 +94,7 @@ export function bridgeTitle(
 
 /** The kind column: the catalogue's name, or what the registration's `protocols` say. */
 export function bridgeKind(
-  appservice: Pick<AppService, "protocols" | "bridge_type">,
+  appservice: Pick<AppService, "protocols" | "bridge_type"> & Partial<Pick<AppService, "id">>,
   type: Pick<BridgeType, "name"> | undefined,
 ): string {
   return type?.name ?? deriveKindLabel(appservice);

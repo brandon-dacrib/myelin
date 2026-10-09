@@ -45,10 +45,24 @@ export type BridgeTypeSignIn = NonNullable<BridgeType["sign_in"]>;
 export type BridgeTypeRenderResult = components["schemas"]["BridgeTypeRenderResult"];
 export type Task = components["schemas"]["Task"];
 
+/**
+ * The registration the server makes for itself so it can run each person's offered bridge
+ * (`hs_bridges::manager::MANAGER_ID`). Nobody added it, nothing can be done to it from here, and
+ * its health is not probed the way a bridge's is; the pages name it as the server's own and keep
+ * it out of what needs attention.
+ */
+export const BUILT_IN_APPSERVICE_ID = "myelin-bridges";
+
+/** Whether `appservice` is the server's own built-in registration, not a bridge somebody added. */
+export function isBuiltInAppservice(appservice: Pick<AppService, "id">): boolean {
+  return appservice.id === BUILT_IN_APPSERVICE_ID;
+}
+
 /** `id` humanised for display: real appservices have no display-name field. */
 export function deriveDisplayName(appservice: Pick<AppService, "id">): string {
   const id = appservice.id ?? "";
   if (!id) return "(unknown)";
+  if (isBuiltInAppservice(appservice)) return "This server's bridge manager";
   return id
     .split(/[-_]/)
     .filter(Boolean)
@@ -57,7 +71,11 @@ export function deriveDisplayName(appservice: Pick<AppService, "id">): string {
 }
 
 /** `protocols` read as the bridge "kind": real appservices carry no bridge-type reference. */
-export function deriveKindLabel(appservice: Pick<AppService, "protocols">): string {
+export function deriveKindLabel(
+  appservice: Pick<AppService, "protocols"> & Partial<Pick<AppService, "id">>,
+): string {
+  if (appservice.id && isBuiltInAppservice({ id: appservice.id }))
+    return "Built in: runs the bridges offered here";
   return appservice.protocols && appservice.protocols.length > 0
     ? appservice.protocols.join(", ")
     : "Custom appservice";
