@@ -7,20 +7,30 @@
 # `--take-ownership`, adopts and updates it; the same Bridge is then accepted; and
 # `helm uninstall` leaves the CRD and the Bridge in place (`helm.sh/resource-policy: keep`).
 #
-# Usage: deploy/helm/hs/ci/crd-upgrade-smoke.sh [--context CTX]
+# Usage: deploy/helm/hs/ci/crd-upgrade-smoke.sh [--context CTX] [--set K=V ...]
 #
 #   kind create cluster --name crd-upgrade
 #   deploy/helm/hs/ci/crd-upgrade-smoke.sh --context kind-crd-upgrade
 #
-# Refuses to run on a cluster that already has the Bridge CRD: it replaces it. Needs kubectl,
-# helm (3.17 or later, for --take-ownership; with Helm 4 also --force-conflicts) and jq. Exit status 0 only if every check passed.
+#   --set K=V   Passed to both `helm install`s; repeatable. CD uses it to point the release at
+#               the image already loaded on its kind node (`image.tag=smoke`,
+#               `image.pullPolicy=Never`) so the server pod this install starts, and which the
+#               checks never wait for, pulls nothing from a registry.
+#
+# Refuses to run on a cluster that already has the Bridge CRD: it replaces it, and deleting a
+# CRD deletes every Bridge on the cluster. Cleans up after itself, the CRD included, so a
+# smoke that needs a cluster without it can follow. Needs kubectl, helm (3.17 or later, for
+# --take-ownership; with Helm 4 also --force-conflicts) and jq. Exit status 0 only if every
+# check passed.
 
 set -euo pipefail
 
 CONTEXT="$(kubectl config current-context)"
+SET_ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --context) CONTEXT="$2"; shift 2 ;;
+    --set) SET_ARGS+=(--set "$2"); shift 2 ;;
     *) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
   esac
 done
@@ -71,7 +81,7 @@ grep -q '.spec.owner: field not declared in schema' <<<"$out" || fail "unexpecte
 
 say "helm install without --take-ownership stops on the unowned CRD"
 if out="$(helm --kube-context "$CONTEXT" -n "$NS" install myelin "$ROOT/deploy/helm/hs" \
-    --set serverName=example.org 2>&1)"; then
+    --set serverName=example.org "${SET_ARGS[@]}" 2>&1)"; then
   fail "helm installed over an unowned CRD: $out"
 fi
 echo "$out" | tail -2
@@ -82,7 +92,7 @@ say "helm install --take-ownership adopts it and brings it up to date"
 force=()
 helm version --short | grep '^v4' >/dev/null && force=(--force-conflicts)
 helm --kube-context "$CONTEXT" -n "$NS" install myelin "$ROOT/deploy/helm/hs" \
-  --set serverName=example.org --take-ownership "${force[@]}" >/dev/null
+  --set serverName=example.org "${SET_ARGS[@]}" --take-ownership "${force[@]}" >/dev/null
 kc get crd "$CRD" -o json | jq -e '
   .spec.versions[0].schema.openAPIV3Schema.properties.spec.properties.owner != null
   and .metadata.annotations["helm.sh/resource-policy"] == "keep"

@@ -1,5 +1,29 @@
 # 12. Platform and Kubernetes
 
+## 2026-10-09 (on `main`, `27ad5d76` and the commit after it): CD runs the CRD upgrade smoke, and its image smoke no longer fails on a pipe race
+
+- **The CRD upgrade smoke is in CD** (`deploy/helm/hs/ci/crd-upgrade-smoke.sh`), on the
+  amd64 image leg's kind cluster between the install smoke and the operator smoke: the install
+  smoke deletes the CRD it created and this script deletes its own, so each finds a cluster
+  without one. The script took a repeatable `--set K=V` (passed to both `helm install`s); CD
+  points the release at `docker.io/library/myelin:smoke` with `pullPolicy Never`, the image
+  `kind load` put on the node, so the server pod it starts (and never waits for) pulls nothing.
+  A Bridge gets no finalizer, so the CRD delete in its cleanup cannot hang on one.
+- **The image smoke failed on CD run 37968906221 with "the first boot did not log a setup link"
+  while printing the link.** Under `pipefail`, `grep -q` exits on the first match and `docker
+  logs` gets SIGPIPE on the lines after it. Every `| grep -q` in `cd.yml`, `install-smoke.sh`
+  and `crd-upgrade-smoke.sh` now reads to the end (`grep ... >/dev/null`); the two that read a
+  file or a here-string were fine. Green on `27ad5d76`? See CD; the fix went in before this
+  smoke was added.
+
+Verified: the smoke with CD's exact arguments on a local kind (`kindest/node:v1.33.1`, Helm
+4.3): PASS in 2.3 s, the CRD gone afterwards, the rendered pod image
+`docker.io/library/myelin:smoke` with `imagePullPolicy: Never`; `actionlint` and `shellcheck`
+clean. Left: the degraded apply has still run only against the fake API server, not kind.
+(Pulling `ghcr.io/brandon-dacrib/myelin:main` from an agent session fails on the keychain
+credential helper like Docker Hub does, even with a `DOCKER_CONFIG` that has none; the local
+run used an older image already on the machine, which the smoke never waits for.)
+
 ## 2026-10-09 (branch `agent/crd-upgrade`): the chart keeps the Bridge CRD current, and a bridge keeps its own pickle key
 
 Three bugs from rolling `a6f02c48` to the demo, decision 0036.

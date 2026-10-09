@@ -53,4 +53,6 @@ deploy/crds/bridge.yaml`.
 
 `ci/crd-upgrade-smoke.sh` runs this whole path against a real API server (a kind cluster):
 the old CRD refusing `.spec.owner`, the plain install stopping, `--take-ownership` adopting and
-updating it, and `helm uninstall` keeping it.
+updating it, and `helm uninstall` keeping it. CD runs it on every push to `main`, on the kind cluster of the
+image job, between the install smoke and the operator smoke (`--set K=V` points its release at
+the image already on the node).

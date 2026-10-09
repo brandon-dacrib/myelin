@@ -286,6 +286,25 @@ jobs:
         if: matrix.arch == 'amd64'
         run: deploy/helm/hs/ci/install-smoke.sh myelin:smoke --kind smoke
 
+      - name: Prove a helm upgrade adopts and updates the Bridge CRD a first install left behind
+        # The 2026-10-09 outage (docs/decisions/0036): Helm installs a chart's crds/ once and
+        # never upgrades them, so the demo's Bridge CRD lacked `.spec.owner` and every Bridge
+        # patch was refused. The chart now renders the CRD as a template, kept on uninstall.
+        # deploy/helm/hs/ci/crd-upgrade-smoke.sh walks the whole path on this kind cluster: a
+        # CRD as the first install left it refuses `.spec.owner` with the text the server's
+        # client parses; a plain install stops on the unowned CRD; `--take-ownership` adopts
+        # and updates it; the Bridge is then accepted; `helm uninstall` keeps both.
+        #
+        # Here, between the two other smokes, because it needs a cluster without the CRD: the
+        # install smoke deletes the one it created, and this script deletes its own, so the
+        # operator smoke after it finds no orphan. The release it installs points at the image
+        # already on the node, so its server pod (never waited for) pulls nothing.
+        if: matrix.arch == 'amd64'
+        run: |
+          deploy/helm/hs/ci/crd-upgrade-smoke.sh --context kind-smoke \
+            --set image.registry=docker.io --set image.repository=library/myelin \
+            --set image.tag=smoke --set image.pullPolicy=Never
+
       - name: Prove the operator reconciles a Bridge and a Homeserver on that cluster
         # The same kind cluster and image, after the install smoke has cleaned up after itself.
         # deploy/operator/ci/kind-smoke.sh installs the chart again and checks its bridge
