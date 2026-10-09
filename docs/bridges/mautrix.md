@@ -322,6 +322,52 @@ two settings, and which one decides what to do:
 Running it: `cargo build -p hs-cli --bin hs`, then `cargo test -p hs-bridge-conformance --test
 real_mautrix_login -- --nocapture` with Docker reachable.
 
+## 2026-10-09: offerings pin a release tag
+
+Every offering's image was `:latest`, and during the roll above the WhatsApp bridge pulled a
+mautrix-whatsapp built 25 minutes earlier. The catalogue now names a release tag for each image
+(decision 0037), and an offering whose row still says `latest` (every one made before this)
+reads and deploys as the pin. The pins, each the newest release of its upstream whose manifest
+the registry served on 2026-10-09 (checked with the registry's v2 API and an anonymous token):
+
+| Offering | Image | Release | Where it came from |
+| --- | --- | --- | --- |
+| mautrix-whatsapp | `dock.mau.dev/mautrix/whatsapp:v0.2609.0` | 2026-09-16 | github.com/mautrix/whatsapp/releases; manifest on dock.mau.dev |
+| mautrix-telegram | `dock.mau.dev/mautrix/telegram:v0.2609.0` | 2026-09-16 | github.com/mautrix/telegram/releases; manifest on dock.mau.dev |
+| mautrix-signal | `dock.mau.dev/mautrix/signal:v0.2609.0` | 2026-09-16 | github.com/mautrix/signal/releases; manifest on dock.mau.dev |
+| mautrix-gmessages | `dock.mau.dev/mautrix/gmessages:v0.2609.0` | 2026-09-16 | github.com/mautrix/gmessages/releases; manifest on dock.mau.dev |
+| mautrix-gvoice | `dock.mau.dev/mautrix/gvoice:v0.2605.0` | 2026-05-16 | github.com/mautrix/gvoice/releases; manifest on dock.mau.dev |
+| mautrix-meta | `dock.mau.dev/mautrix/meta:v0.2609.0` | 2026-09-16 | github.com/mautrix/meta/releases; manifest on dock.mau.dev |
+| mautrix-discord | `dock.mau.dev/mautrix/discord:v0.7.7` | 2026-08-16 | github.com/mautrix/discord/releases; manifest on dock.mau.dev |
+| mautrix-slack | `dock.mau.dev/mautrix/slack:v0.2609.1` | 2026-09-25 | github.com/mautrix/slack/releases; manifest on dock.mau.dev |
+| mautrix-twitter | `dock.mau.dev/mautrix/twitter:v0.2609.0` | 2026-09-16 | github.com/mautrix/twitter/releases; manifest on dock.mau.dev |
+| mautrix-linkedin | `dock.mau.dev/mautrix/linkedin:v0.2609.0` | 2026-09-16 | github.com/mautrix/linkedin/releases; manifest on dock.mau.dev |
+| mautrix-bluesky | `dock.mau.dev/mautrix/bluesky:v0.2510.0` | 2025-10-16 | github.com/mautrix/bluesky/releases; manifest on dock.mau.dev |
+| heisenbridge | `hif1/heisenbridge:1.15.4` | 2025-10-04 | github.com/hifi/heisenbridge/releases (v1.15.4); Docker Hub tag `1.15.4`, amd64 and arm64 |
+| matrix-appservice-irc | `matrixdotorg/matrix-appservice-irc:release-4.0.0` | 2025-10-24 | github.com/matrix-org/matrix-appservice-irc/releases (4.0.0); Docker Hub tag `release-4.0.0`. Was `ghcr.io/...:release-3.0.0`, whose package refuses an anonymous pull token |
+| matrix-hookshot | `ghcr.io/matrix-org/matrix-hookshot:7.5.0` | 2026-09-22 | github.com/matrix-org/matrix-hookshot/releases; manifest on ghcr.io. Docker Hub's `halfshot/matrix-hookshot` has no release tag after 7.3.2 (2026-01-30) |
+
+mau.dev tags each release twice, `v0.2609.0` (the Go module version, the GitHub release's name)
+and `v26.09`; the catalogue uses the release's name. The dock.mau.dev check:
+`TOKEN=$(curl -s 'https://mau.dev/jwt/auth?service=container_registry&scope=repository:mautrix/whatsapp:pull' | jq -r .token)`,
+then `curl -sI -H "Authorization: Bearer $TOKEN" -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' https://dock.mau.dev/v2/mautrix/whatsapp/manifests/v0.2609.0`
+answers 200. Docker Hub: `https://hub.docker.com/v2/repositories/hif1/heisenbridge/tags/1.15.4`.
+ghcr.io: a token from `https://ghcr.io/token?scope=repository:matrix-org/matrix-hookshot:pull`.
+
+To bump one: check the manifest the same way, change the catalogue, the web mock
+(`web/src/mocks/data/bridge-types.ts`) and, for WhatsApp or Signal, the real-bridge story's
+constant and `web/e2e-real/*.spec.ts`; run `cargo test -p hs-bridge-conformance --test
+real_mautrix_login` with Docker (it fails before anything boots when the catalogue and the test
+disagree); add the row here.
+
+Verified 2026-10-09 with that story on this machine (Docker 29.4.0, the debug `hs` of this
+branch): all five pass on the pins, WhatsApp `v0.2609.0` (`Initializing bridge
+built_at=2026-09-16T11:28:18Z go_version=go1.27.1 name=mautrix-whatsapp version=v26.09`) in
+the encrypted chat, in the clear, in a chat the bot started and repaired in place, and through
+the roll that keeps its own pickle key; Signal `v0.2609.0` (`built_at=2026-09-16T11:22:20Z
+name=mautrix-signal version=v26.09`) answering `login` with its linking code. 102 s for the
+five.
+
 ## 2026-10-09: "The supplied account key is invalid": a roll lost the bridge's own pickle key
 
 **What happened.** The demo's WhatsApp instance was registered before 2026-10-02, when the

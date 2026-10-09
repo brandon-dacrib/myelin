@@ -385,7 +385,8 @@ export function putOffering(type: string, body: BridgeOfferingRequest): BridgeOf
     type,
     enabled: body.enabled ?? existing?.enabled ?? true,
     runtime: body.runtime ?? existing?.runtime ?? "elsewhere",
-    imageTag: body.image_tag || existing?.imageTag || "latest",
+    // No tag asked for: the catalogue's pin, never `latest` (decision 0037).
+    imageTag: body.image_tag || existing?.imageTag || entry?.image?.split(":").pop() || "latest",
     access: {
       all_local_users: body.access?.all_local_users ?? existing?.access.all_local_users ?? true,
       users: body.access?.users ?? existing?.access.users ?? [],

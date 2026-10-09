@@ -513,14 +513,17 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             .image
             .rsplit_once(':')
             .map_or(kind.image.as_str(), |(r, _)| r);
+        // A row from before the catalogue pinned its images says `latest`; it runs the pin.
+        let image_tag = bridge_types::image_tag(&row.bridge_type, Some(&row.image_tag))
+            .unwrap_or_else(|| row.image_tag.clone());
         Ok(BridgeOffering {
             bridge_type: row.bridge_type.clone(),
             name: kind.name.clone(),
             mode: kind.mode.clone(),
             enabled: row.enabled,
             runtime: row.runtime.clone(),
-            image: format!("{repository}:{}", row.image_tag),
-            image_tag: row.image_tag.clone(),
+            image: format!("{repository}:{image_tag}"),
+            image_tag,
             front_door: (kind.mode == "per_user")
                 .then(|| bridge_types::front_door_localpart(&row.bridge_type).map(|l| self.mxid(l)))
                 .flatten(),
@@ -2099,11 +2102,17 @@ impl<B: KvBackend + 'static> BridgeOfferingSource for BridgeManager<B> {
                 });
             }
         }
-        let default_tag = kind
-            .image
-            .rsplit_once(':')
-            .map_or("latest", |(_, t)| t)
-            .to_owned();
+        // The tag asked for, else the one kept, else (and for `latest`, which is not a pin:
+        // decision 0037) the catalogue's.
+        let image_tag = bridge_types::image_tag(
+            bridge_type,
+            request
+                .image_tag
+                .as_deref()
+                .filter(|t| !t.trim().is_empty())
+                .or(current.as_ref().map(|c| c.image_tag.as_str())),
+        )
+        .unwrap_or_else(|| "latest".to_owned());
         let row = OfferingRow {
             bridge_type: bridge_type.to_owned(),
             enabled: request
@@ -2111,12 +2120,7 @@ impl<B: KvBackend + 'static> BridgeOfferingSource for BridgeManager<B> {
                 .or(current.as_ref().map(|c| c.enabled))
                 .unwrap_or(true),
             runtime,
-            image_tag: request
-                .image_tag
-                .clone()
-                .filter(|t| !t.trim().is_empty())
-                .or(current.as_ref().map(|c| c.image_tag.clone()))
-                .unwrap_or(default_tag),
+            image_tag,
             access: request
                 .access
                 .clone()

@@ -703,10 +703,18 @@ export const handlers = [
           `  allow: ${Boolean(values.encryption)}`,
         ].join("\n")
       : null;
+    // No tag chosen: the catalogue's pin, as the real wizard renders (decision 0037).
+    const imageTag =
+      values.imageTag ??
+      bridgeTypes
+        .find((t) => t.id === typeId)
+        ?.image?.split(":")
+        .pop() ??
+      "latest";
     const compose_yaml = [
       "services:",
       `  ${id}:`,
-      `    image: dock.mau.dev/mautrix/${typeId.replace(/^mautrix-/, "")}:${values.imageTag ?? "latest"}`,
+      `    image: dock.mau.dev/mautrix/${typeId.replace(/^mautrix-/, "")}:${imageTag}`,
       "    volumes:",
       `      - ./${id}:/data`,
       "    restart: unless-stopped",
@@ -719,7 +727,7 @@ export const handlers = [
       `  namespace: ${namespace}`,
       "spec:",
       `  type: ${typeId}`,
-      `  image: dock.mau.dev/mautrix/${typeId.replace(/^mautrix-/, "")}:${values.imageTag ?? "latest"}`,
+      `  image: dock.mau.dev/mautrix/${typeId.replace(/^mautrix-/, "")}:${imageTag}`,
     ].join("\n");
 
     return HttpResponse.json({

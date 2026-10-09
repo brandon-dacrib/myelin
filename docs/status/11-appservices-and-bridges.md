@@ -2,6 +2,8 @@
 
 Last updated: 2026-10-09, later (the manager says, in its log, which bridge bot device it
 cross-signed; below); before that 2026-10-08 (one bridge's slowness never delays another's delivery: the "does this
+Last updated: 2026-10-09 (bridge offerings pin a release tag, decision 0037; below); before
+that 2026-10-08 (one bridge's slowness never delays another's delivery: the "does this
 user exist" question is asked by the bridge's own worker, and each bridge's queue is a gauge and a
 column on the bridges list; below); before that 2026-10-04, late (a bridge's namespaces, protocols and room directory mean what
 Sytest's `tests/60app-services/` says, and a ghost acts once it is registered; below); before
@@ -54,6 +56,56 @@ test's thread alone sees nothing once a parallel test has hit the callsite witho
 (already a workspace dependency) is a dev-dependency of `hs-bridges` for that. Not run against
 the real bridge: the path is the one `real_mautrix_login::bot_is_cross_signed` proved on
 2026-10-03; only its log line and the device it records changed.
+## Session 2026-10-09 (branch `agent/bridge-image-pins`): offerings pin a release tag
+
+Every offering's image was `:latest`; during the demo roll the same day the WhatsApp bridge
+pulled a mautrix-whatsapp built 25 minutes earlier, a suspect in the outage. The catalogue
+(`crates/hs-admin/src/bridge_types.rs`) now names a release tag for each image, and a test fails
+if any entry says `latest` (decision 0037, `docs/decisions/0037-bridge-offerings-pin-a-release-tag.md`).
+
+| Offering | Image | Release |
+| --- | --- | --- |
+| mautrix-whatsapp, -telegram, -signal, -gmessages, -meta, -twitter, -linkedin | `dock.mau.dev/mautrix/<network>:v0.2609.0` | 2026-09-16 |
+| mautrix-slack | `dock.mau.dev/mautrix/slack:v0.2609.1` | 2026-09-25 |
+| mautrix-gvoice | `dock.mau.dev/mautrix/gvoice:v0.2605.0` | 2026-05-16 |
+| mautrix-discord | `dock.mau.dev/mautrix/discord:v0.7.7` | 2026-08-16 |
+| mautrix-bluesky | `dock.mau.dev/mautrix/bluesky:v0.2510.0` | 2025-10-16 |
+| heisenbridge | `hif1/heisenbridge:1.15.4` | 2025-10-04 |
+| matrix-appservice-irc | `matrixdotorg/matrix-appservice-irc:release-4.0.0` (was ghcr.io `release-3.0.0`, whose package refuses an anonymous pull) | 2025-10-24 |
+| matrix-hookshot | `ghcr.io/matrix-org/matrix-hookshot:7.5.0` (Docker Hub's `halfshot/matrix-hookshot` has no release tag after 7.3.2) | 2026-09-22 |
+
+Each is the newest release of its upstream (GitHub releases) whose manifest the registry served
+on 2026-10-09; the full table with each source and the `curl` that checks a manifest is in
+`docs/bridges/mautrix.md` ("2026-10-09: offerings pin a release tag").
+
+- **`latest` is not a pin.** `bridge_types::image_tag(type, requested)` resolves a blank or
+  `latest` tag to the catalogue's pin and keeps any other. The manager (`hs-bridges`) and the
+  admin API's in-memory source use it on `PUT /bridge-offerings/{type}` and when an offering is
+  read, so the demo's WhatsApp offering, whose row says `latest` from before the pins, reads and
+  deploys as `v0.2609.0`: its instance rolls once at the next roll of this server (the deploy
+  fingerprint and the operator's pod-template hash both include the tag; a failing apply backs
+  off per decision 0036). The wizard's render does the same with its `imageTag`.
+- **The real-bridge story runs the pin.** `tests/real_mautrix_login.rs` names
+  `dock.mau.dev/mautrix/whatsapp:v0.2609.0` and `signal:v0.2609.0`, and fails before anything
+  boots when the offering the server made names a different image, so the catalogue and the test
+  are bumped together. Run 2026-10-09 with Docker on this machine: 5 passed in 102 s, the
+  bridges reporting `name=mautrix-whatsapp version=v26.09 built_at=2026-09-16T11:28:18Z` and
+  `name=mautrix-signal version=v26.09 built_at=2026-09-16T11:22:20Z` (the images tag the release
+  `v0.2609.0`; the bridge calls it `v26.09`).
+- Fixtures and tests that asserted `:latest`: `crates/hs-cli/tests/bridge_offerings.rs`,
+  `crates/hs-bridges/tests/manager.rs` (which also checks that `latest` asked for is the pin and
+  a chosen release is kept), `crates/hs-operator/src/deploy.rs`, `hs-admin-mock`'s fixtures,
+  `web/src/mocks/data/bridge-types.ts` (a `MAUTRIX_PINS` map mirroring the catalogue),
+  `web/src/mocks/handlers.ts` and `web/src/mocks/data/bridge-offerings.ts` (no tag chosen means
+  the pin), and `web/e2e-real/{bridge-offerings,add-mautrix-bridge}.spec.ts`.
+- `deploy/helm/hs/values.yaml` and `deploy/demo/values-bridges.yaml` name no bridge image, so
+  nothing there follows; `bridges.offerings[].image_tag` may still name a release.
+
+Checks: `cargo fmt --all --check`; `cargo clippy -p hs-admin -p hs-cli -p hs-operator -p
+hs-bridges -p hs-bridge-conformance --all-targets -- -D warnings`; `cargo test -p hs-admin`,
+`cargo test -p hs-bridges`, `cargo test -p hs-operator`, `cargo test -p hs-cli --test
+bridge_offerings`; `npm run check` in `web/`. All green on 2026-10-09 (hs-admin, hs-bridges 44+6, hs-operator 103,
+hs-cli bridge_offerings 4; web 83 files, 631 tests, 0 lint errors).
 
 ## Session 2026-10-09 (branch `agent/crd-upgrade`): failing bridge steps back off, and a roll keeps a bridge's own pickle key
 
@@ -1513,6 +1565,10 @@ to anything broken.
   needed to run `hs-bridge-conformance` against a real `hs serve` or against Synapse.
 
 ## Decisions made
+
+- **2026-10-09, decision 0037: offerings pin a release tag.** No catalogue image says `latest`;
+  `image_tag` blank or `latest` resolves to the pin; bumping a pin is a release step verified by
+  the real-bridge story and recorded in `docs/bridges/mautrix.md`.
 
 - **2026-10-04: decision 0030.** The appservice seam into registration, aliases and
   `/publicRooms` is `hs-auth`'s `AppserviceRegistry` trait (default methods, no new crate edge);

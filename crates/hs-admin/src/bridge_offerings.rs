@@ -139,6 +139,20 @@ impl BridgeOfferingSource for InMemoryBridgeOfferings {
         }
         let mut offerings = self.offerings.write().expect("lock");
         let current = offerings.get(bridge_type).cloned();
+        // The tag asked for, else the one kept, else (and for `latest`) the catalogue's pin.
+        let image_tag = crate::bridge_types::image_tag(
+            bridge_type,
+            request
+                .image_tag
+                .as_deref()
+                .filter(|t| !t.trim().is_empty())
+                .or(current.as_ref().map(|c| c.image_tag.as_str())),
+        )
+        .unwrap_or_else(|| "latest".to_owned());
+        let repository = kind
+            .image
+            .rsplit_once(':')
+            .map_or(kind.image.as_str(), |(r, _)| r);
         let offering = BridgeOffering {
             bridge_type: bridge_type.to_owned(),
             name: kind.name.clone(),
@@ -148,18 +162,8 @@ impl BridgeOfferingSource for InMemoryBridgeOfferings {
                 .or(current.as_ref().map(|c| c.enabled))
                 .unwrap_or(true),
             runtime,
-            image_tag: request
-                .image_tag
-                .clone()
-                .filter(|t| !t.trim().is_empty())
-                .or(current.as_ref().map(|c| c.image_tag.clone()))
-                .unwrap_or_else(|| {
-                    kind.image
-                        .rsplit_once(':')
-                        .map_or("latest", |(_, t)| t)
-                        .to_owned()
-                }),
-            image: kind.image.clone(),
+            image_tag: image_tag.clone(),
+            image: format!("{repository}:{image_tag}"),
             front_door: (kind.mode == "per_user").then(|| {
                 kind.default_namespaces["users"][1]["regex"]
                     .as_str()

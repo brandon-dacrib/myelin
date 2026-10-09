@@ -492,8 +492,9 @@ async fn an_offering_takes_an_instance_from_requested_to_ready_and_removes_it_ag
     assert_eq!(offering["mode"], "per_user");
     assert_eq!(offering["runtime"], "elsewhere");
     assert_eq!(offering["front_door"], "@whatsappbot:example.org");
-    assert_eq!(offering["image"], "dock.mau.dev/mautrix/whatsapp:latest");
-    assert_eq!(offering["image_tag"], "latest");
+    // The catalogue's pin (decision 0037), never `latest`.
+    assert_eq!(offering["image"], "dock.mau.dev/mautrix/whatsapp:v0.2609.0");
+    assert_eq!(offering["image_tag"], "v0.2609.0");
     assert_eq!(offering["instances"], json!({}));
     let offerings = admin.admin(GET, "/bridge-offerings", None).await;
     assert_eq!(
@@ -617,7 +618,7 @@ async fn an_offering_takes_an_instance_from_requested_to_ready_and_removes_it_ag
         files["compose_yaml"]
             .as_str()
             .unwrap()
-            .contains("dock.mau.dev/mautrix/whatsapp:latest")
+            .contains("dock.mau.dev/mautrix/whatsapp:v0.2609.0")
     );
     assert!(
         files["manifest_yaml"]
@@ -1055,7 +1056,7 @@ async fn a_shared_offering_has_its_one_instance_from_the_start_and_heisenbridge_
     let files = admin.admin(POST, &format!("{path}/files"), None).await;
     assert!(files["config_yaml"].is_null(), "{files}");
     let compose = files["compose_yaml"].as_str().unwrap();
-    assert!(compose.contains("hif1/heisenbridge:latest"), "{compose}");
+    assert!(compose.contains("hif1/heisenbridge:1.15.4"), "{compose}");
     assert!(
         !compose.contains("\"-o\""),
         "no owner for a shared bouncer: {compose}"

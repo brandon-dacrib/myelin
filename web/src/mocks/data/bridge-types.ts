@@ -95,6 +95,24 @@ function provisioning(id: string): Pick<BridgeType, "provisioning_api" | "provis
  * mock-backed wizard shows what the real one shows. Written for the mock server's own name
  * (`example.org`), as the real catalogue writes them for its.
  */
+/**
+ * The release each mautrix image is pinned to, as the real catalogue pins it
+ * (`crates/hs-admin/src/bridge_types.rs`; decision 0037: no offering runs `latest`).
+ */
+const MAUTRIX_PINS: Record<string, string> = {
+  whatsapp: "v0.2609.0",
+  telegram: "v0.2609.0",
+  signal: "v0.2609.0",
+  gmessages: "v0.2609.0",
+  gvoice: "v0.2605.0",
+  meta: "v0.2609.0",
+  discord: "v0.7.7",
+  slack: "v0.2609.1",
+  twitter: "v0.2609.0",
+  linkedin: "v0.2609.0",
+  bluesky: "v0.2510.0",
+};
+
 function type(spec: Spec): BridgeType {
   const net = spec.id.replace(/^mautrix-/, "");
   const short = spec.id.replace(/^mautrix-/, "").replace(/^matrix-/, "");
@@ -108,7 +126,7 @@ function type(spec: Spec): BridgeType {
     category: spec.category,
     upstream_project: spec.project ?? `mautrix/${net}`,
     docs_url: spec.docs ?? `https://docs.mau.fi/bridges/go/${net}/index.html`,
-    image: spec.image ?? `dock.mau.dev/mautrix/${net}:latest`,
+    image: spec.image ?? `dock.mau.dev/mautrix/${net}:${MAUTRIX_PINS[net] ?? "latest"}`,
     port: spec.port ?? PORTS[spec.id] ?? 29999,
     // `default_namespaces` is an untyped OpenAPI object (`Record<string, never>` once
     // generated); this is the one sanctioned cast for it, as the wizard's is for a render.
@@ -275,7 +293,7 @@ export const bridgeTypes: BridgeType[] = [
     needs: ["owner", "The Matrix user who drives the bridge; it opens a control room for them"],
     project: "hifi/heisenbridge",
     docs: "https://github.com/hifi/heisenbridge",
-    image: "hif1/heisenbridge:latest",
+    image: "hif1/heisenbridge:1.15.4",
     bot: "heisenbridge",
     prefix: "irc_",
     steps: [
@@ -295,7 +313,7 @@ export const bridgeTypes: BridgeType[] = [
     needs: ["network", "The IRC network to connect to, in the bridge's config"],
     project: "matrix-org/matrix-appservice-irc",
     docs: "https://matrix-org.github.io/matrix-appservice-irc/latest/",
-    image: "ghcr.io/matrix-org/matrix-appservice-irc:release-3.0.0",
+    image: "matrixdotorg/matrix-appservice-irc:release-4.0.0",
     bot: "ircbot",
     prefix: "irc_",
     steps: [
@@ -313,7 +331,7 @@ export const bridgeTypes: BridgeType[] = [
     needs: ["public_url", "A URL the services it listens to can reach it on, for webhooks"],
     project: "matrix-org/matrix-hookshot",
     docs: "https://matrix-org.github.io/matrix-hookshot/latest/",
-    image: "halfshot/matrix-hookshot:latest",
+    image: "ghcr.io/matrix-org/matrix-hookshot:7.5.0",
     bot: "hookshot",
     prefix: "hookshot_",
     steps: [

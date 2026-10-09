@@ -1,6 +1,6 @@
 //! A person signs in to their own mautrix-whatsapp bridge: the real bridge, the real `hs`
 //! binary, and a real encrypting client (`matrix-sdk` with `e2e-encryption`). Since
-//! 2026-10-04 also a second real bridge, mautrix-signal (`dock.mau.dev/mautrix/signal:latest`),
+//! 2026-10-04 also a second real bridge, mautrix-signal (`dock.mau.dev/mautrix/signal`),
 //! through the same story: offered, run from its rendered files, `login` answered with a QR
 //! code in the encrypted chat.
 //!
@@ -13,8 +13,11 @@
 //!
 //! Skipped, saying why, when Docker cannot be reached, the image cannot be had, or the `hs`
 //! binary is not built (`cargo build -p hs-cli --bin hs`; `HS_BIN` names it explicitly). Docker
-//! Hub is not involved: the image is `dock.mau.dev/mautrix/whatsapp:latest`, and a `DOCKER_HOST`
-//! or `DOCKER_CONFIG` in the environment is passed through. `HS_BRIDGE_LOGIN_LOG_DIR` names a
+//! Hub is not involved: the image is `dock.mau.dev/mautrix/whatsapp` at the tag the catalogue
+//! pins (decision 0037; [`IMAGE`]), and a `DOCKER_HOST` or `DOCKER_CONFIG` in the environment
+//! is passed through. Each story checks that the offering the server made names the image it
+//! ran, so a pin bumped in the catalogue without bumping it here fails here, and the other way
+//! round. Since 2026-10-09 it is this test that says a pin boots against this server. `HS_BRIDGE_LOGIN_LOG_DIR` names a
 //! directory to copy the server's and the bridge's logs into; `HS_BRIDGE_LOGIN_TEXT` replaces
 //! what alice types.
 //!
@@ -42,7 +45,9 @@ use matrix_sdk::ruma::{OwnedRoomId, RoomId};
 use matrix_sdk_crypto::CollectStrategy;
 use serde_json::{Value, json};
 
-const IMAGE: &str = "dock.mau.dev/mautrix/whatsapp:latest";
+/// The catalogue's pin for WhatsApp (`crates/hs-admin/src/bridge_types.rs`); the two are
+/// bumped together, and the story fails when they differ.
+const IMAGE: &str = "dock.mau.dev/mautrix/whatsapp:v0.2609.0";
 
 /// Which mautrix bridge a story runs: its catalogue type, its image, the port it listens on
 /// (its `DefaultPort`, which the catalogue renders), and what a person types to sign in.
@@ -64,10 +69,10 @@ const WHATSAPP: Network = Network {
 };
 
 /// The second real mautrix bridge (2026-10-04): mautrix-signal, `bridgev2` like WhatsApp, from
-/// mau.dev's registry as well.
+/// mau.dev's registry as well, at the catalogue's pin.
 const SIGNAL: Network = Network {
     type_id: "mautrix-signal",
-    image: "dock.mau.dev/mautrix/signal:latest",
+    image: "dock.mau.dev/mautrix/signal:v0.2609.0",
     port: 29328,
     login: "login",
 };
@@ -580,14 +585,23 @@ async fn set_up_with(
     let alice_id = alice.user_id().context("alice's id")?.to_string();
     let since = alice.sync_once(SyncSettings::default()).await?.next_batch;
 
-    // The offering, as an administrator sets it up; the instance for alice; its files.
-    admin
+    // The offering, as an administrator sets it up; the instance for alice; its files. The
+    // image it names is the catalogue's pin, and the one this story runs: a pin bumped on one
+    // side only is caught here, before anything boots.
+    let offering = admin
         .ok(
             reqwest::Method::PUT,
             &format!("/bridge-offerings/{}", network.type_id),
             Some(json!({"runtime": "elsewhere", "options": options})),
         )
         .await?;
+    if offering["image"].as_str() != Some(network.image) {
+        bail!(
+            "the offering names {} but this test runs {}: bump the catalogue's pin and this test together",
+            offering["image"],
+            network.image
+        );
+    }
     let instance_path = format!(
         "/bridge-offerings/{}/instances/{}",
         network.type_id,

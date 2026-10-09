@@ -32,8 +32,8 @@
 #   --homeserver         Also run deploy/operator and a single-node `Homeserver` (installs the
 #                        `Homeserver` CRD if it is missing, and removes it afterwards if it did).
 #   --heisenbridge       Also offer heisenbridge with the `cluster` runtime and walk its instance
-#                        to `ready`. Needs the cluster to pull hif1/heisenbridge:latest (the
-#                        catalogue's image) from Docker Hub.
+#                        to `ready`. Needs the cluster to pull hif1/heisenbridge at the tag the
+#                        catalogue pins (1.15.4 on 2026-10-09) from Docker Hub.
 #   --timeout SECONDS    How long any one state may take. Default: 300.
 #   --local-port PORT    The local end of port-forwards. Default: 18018.
 #   --keep               Leave everything in place afterwards.

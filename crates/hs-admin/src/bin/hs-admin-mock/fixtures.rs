@@ -171,9 +171,9 @@ fn appservices() -> Vec<Value> {
 
 fn bridge_types() -> Vec<Value> {
     vec![
-        json!({"id": "telegram", "name": "Telegram", "upstream_project": "mautrix-telegram", "image": "dock.mau.dev/mautrix/telegram:latest", "default_namespaces": {"users": "@telegram_.*"}, "config_keys": [{"key": "api_id", "description": "Telegram API id", "required": true}, {"key": "api_hash", "description": "Telegram API hash", "required": true}], "supports_double_puppeting": true, "required_features": []}),
-        json!({"id": "whatsapp", "name": "WhatsApp", "upstream_project": "mautrix-whatsapp", "image": "dock.mau.dev/mautrix/whatsapp:latest", "default_namespaces": {"users": "@whatsapp_.*"}, "config_keys": [], "supports_double_puppeting": true, "required_features": []}),
-        json!({"id": "discord", "name": "Discord", "upstream_project": "mautrix-discord", "image": "dock.mau.dev/mautrix/discord:latest", "default_namespaces": {"users": "@discord_.*"}, "config_keys": [{"key": "bot_token", "description": "Discord bot token", "required": false}], "supports_double_puppeting": false, "required_features": ["appservice.login"]}),
+        json!({"id": "telegram", "name": "Telegram", "upstream_project": "mautrix-telegram", "image": "dock.mau.dev/mautrix/telegram:v0.2609.0", "default_namespaces": {"users": "@telegram_.*"}, "config_keys": [{"key": "api_id", "description": "Telegram API id", "required": true}, {"key": "api_hash", "description": "Telegram API hash", "required": true}], "supports_double_puppeting": true, "required_features": []}),
+        json!({"id": "whatsapp", "name": "WhatsApp", "upstream_project": "mautrix-whatsapp", "image": "dock.mau.dev/mautrix/whatsapp:v0.2609.0", "default_namespaces": {"users": "@whatsapp_.*"}, "config_keys": [], "supports_double_puppeting": true, "required_features": []}),
+        json!({"id": "discord", "name": "Discord", "upstream_project": "mautrix-discord", "image": "dock.mau.dev/mautrix/discord:v0.7.7", "default_namespaces": {"users": "@discord_.*"}, "config_keys": [{"key": "bot_token", "description": "Discord bot token", "required": false}], "supports_double_puppeting": false, "required_features": ["appservice.login"]}),
     ]
 }
 

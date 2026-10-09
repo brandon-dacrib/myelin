@@ -100,6 +100,31 @@ struct Entry {
     sign_in_notes: Option<&'static str>,
 }
 
+impl Entry {
+    /// The tag part of [`Entry::image`]: the release this catalogue pins (decision 0037).
+    fn image_tag(&self) -> &'static str {
+        self.image.rsplit_once(':').map_or("latest", |(_, tag)| tag)
+    }
+}
+
+/// The image tag an offering of `type_id` runs when `requested` is what it asked for: the
+/// requested tag, unless nothing was asked, or `latest` was. `latest` is not a pin, and an
+/// offering recorded before the catalogue pinned its images (every one of them said `latest`
+/// then) follows the catalogue's pin from now on, as a new offering does (decision 0037). An
+/// operator who wants another release names it. `None` for a type not in the catalogue.
+#[must_use]
+pub fn image_tag(type_id: &str, requested: Option<&str>) -> Option<String> {
+    let entry = entry(type_id)?;
+    Some(resolve_image_tag(entry, requested))
+}
+
+fn resolve_image_tag(entry: &Entry, requested: Option<&str>) -> String {
+    match requested.map(str::trim) {
+        Some(tag) if !tag.is_empty() && tag != "latest" => tag.to_owned(),
+        _ => entry.image_tag().to_owned(),
+    }
+}
+
 const MSC2409: &str = "de.sorunome.msc2409.push_ephemeral";
 const MSC3202: &str = "org.matrix.msc3202";
 const MSC4190: &str = "io.element.msc4190";
@@ -108,7 +133,8 @@ const MAUTRIX_FEATURES: &[&str] = &[MSC2409, MSC3202, MSC4190];
 
 macro_rules! mautrix {
     (
-        $id:literal, $name:literal, $net:literal, $port:literal, $prefix:literal, $bot:literal,
+        $id:literal, $name:literal, $net:literal, $tag:literal, $port:literal, $prefix:literal,
+        $bot:literal,
         category: $category:expr,
         description: $description:literal,
         needs: [$(($k:literal, $d:literal, $r:literal)),* $(,)?],
@@ -122,7 +148,7 @@ macro_rules! mautrix {
             category: $category,
             upstream_project: concat!("mautrix/", $net),
             docs_url: concat!("https://docs.mau.fi/bridges/go/", $net, "/index.html"),
-            image: concat!("dock.mau.dev/mautrix/", $net, ":latest"),
+            image: concat!("dock.mau.dev/mautrix/", $net, ":", $tag),
             port: $port,
             ghost_prefix: $prefix,
             bot: $bot,
@@ -136,9 +162,16 @@ macro_rules! mautrix {
     };
 }
 
+/// The offerings. Every image names a release tag, never `latest` (decision 0037): `:latest`
+/// moves under a roll, and on 2026-10-09 the demo's WhatsApp bridge pulled a build from 25
+/// minutes earlier mid-roll. Each pin is the newest release of its upstream whose manifest
+/// exists in its registry when it was set; the table, with where each came from, is in
+/// `docs/bridges/mautrix.md` ("2026-10-09: offerings pin a release tag"). Bumping one is a
+/// release step: check the registry, then run `tests/real_mautrix_login.rs` for a mautrix
+/// bridge, and record the new row in that table.
 const CATALOGUE: &[Entry] = &[
     mautrix!(
-        "mautrix-whatsapp", "WhatsApp", "whatsapp", 29318, "whatsapp_", "whatsappbot",
+        "mautrix-whatsapp", "WhatsApp", "whatsapp", "v0.2609.0", 29318, "whatsapp_", "whatsappbot",
         category: Category::Messaging,
         description: "Personal and group chats, linked to your phone the way WhatsApp Web is.",
         needs: [("phone", "A phone with WhatsApp, to link the bridge to by scanning a code", true)],
@@ -150,7 +183,7 @@ const CATALOGUE: &[Entry] = &[
         notes: Some("WhatsApp unlinks the bridge if the phone stays offline for more than two weeks; the bot warns after twelve days."),
     ),
     mautrix!(
-        "mautrix-telegram", "Telegram", "telegram", 29317, "telegram_", "telegrambot",
+        "mautrix-telegram", "Telegram", "telegram", "v0.2609.0", 29317, "telegram_", "telegrambot",
         category: Category::Messaging,
         description: "Chats, groups and channels, through Telegram's own API.",
         needs: [
@@ -165,7 +198,7 @@ const CATALOGUE: &[Entry] = &[
         notes: Some("Telegram's official API is used. Brand-new accounts signed in from third-party apps are sometimes suspended; established ones are fine."),
     ),
     mautrix!(
-        "mautrix-signal", "Signal", "signal", 29328, "signal_", "signalbot",
+        "mautrix-signal", "Signal", "signal", "v0.2609.0", 29328, "signal_", "signalbot",
         category: Category::Messaging,
         description: "Signal conversations, with the bridge linked as one of your devices.",
         needs: [("phone", "A phone with Signal, to link the bridge to as a secondary device", true)],
@@ -177,7 +210,7 @@ const CATALOGUE: &[Entry] = &[
         notes: Some("The bridge links as a secondary device. It cannot register a number of its own."),
     ),
     mautrix!(
-        "mautrix-gmessages", "Google Messages", "gmessages", 29336, "gmessages_", "gmessagesbot",
+        "mautrix-gmessages", "Google Messages", "gmessages", "v0.2609.0", 29336, "gmessages_", "gmessagesbot",
         category: Category::Messaging,
         description: "SMS and RCS from an Android phone running Google Messages.",
         needs: [("phone", "An Android phone with Google Messages, to pair with", true)],
@@ -189,7 +222,7 @@ const CATALOGUE: &[Entry] = &[
         notes: Some("Every message goes through the phone, which has to stay online. QR pairing no longer works; Google removed it."),
     ),
     mautrix!(
-        "mautrix-gvoice", "Google Voice", "gvoice", 29338, "gvoice_", "gvoicebot",
+        "mautrix-gvoice", "Google Voice", "gvoice", "v0.2605.0", 29338, "gvoice_", "gvoicebot",
         category: Category::Messaging,
         description: "Texts and voicemail from a Google Voice number.",
         needs: [("account", "A Google account with a Google Voice number", true)],
@@ -199,7 +232,7 @@ const CATALOGUE: &[Entry] = &[
         notes: None,
     ),
     mautrix!(
-        "mautrix-meta", "Messenger and Instagram", "meta", 29319, "meta_", "metabot",
+        "mautrix-meta", "Messenger and Instagram", "meta", "v0.2609.0", 29319, "meta_", "metabot",
         category: Category::Messaging,
         description: "Facebook Messenger and Instagram direct messages.",
         needs: [("account", "A Facebook or Instagram account to sign in with from the bridge", true)],
@@ -210,7 +243,7 @@ const CATALOGUE: &[Entry] = &[
         notes: Some("Meta sometimes asks for a checkpoint (a captcha, phone verification) after a new login. Two-factor authentication on the account makes that rarer."),
     ),
     mautrix!(
-        "mautrix-discord", "Discord", "discord", 29334, "discord_", "discordbot",
+        "mautrix-discord", "Discord", "discord", "v0.7.7", 29334, "discord_", "discordbot",
         category: Category::Social,
         description: "Servers and DMs, as yourself or as a Discord bot.",
         needs: [("account", "A Discord account to sign in with from the bridge", true)],
@@ -222,7 +255,7 @@ const CATALOGUE: &[Entry] = &[
         notes: Some("Discord may flag accounts that look automated. A bot account carries none of that risk."),
     ),
     mautrix!(
-        "mautrix-slack", "Slack", "slack", 29335, "slack_", "slackbot",
+        "mautrix-slack", "Slack", "slack", "v0.2609.1", 29335, "slack_", "slackbot",
         category: Category::Social,
         description: "Workspaces and DMs, as yourself or through a Slack app.",
         needs: [("account", "A Slack account to sign in with from the bridge", true)],
@@ -234,7 +267,7 @@ const CATALOGUE: &[Entry] = &[
         notes: None,
     ),
     mautrix!(
-        "mautrix-twitter", "X (Twitter)", "twitter", 29327, "twitter_", "twitterbot",
+        "mautrix-twitter", "X (Twitter)", "twitter", "v0.2609.0", 29327, "twitter_", "twitterbot",
         category: Category::Social,
         description: "Direct messages on X.",
         needs: [("account", "An X account to sign in with from the bridge", true)],
@@ -246,7 +279,7 @@ const CATALOGUE: &[Entry] = &[
     // The port is mautrix-linkedin's `DefaultPort`, 29341 (`pkg/connector/connector.go`,
     // `GetName`, at commit af73c518, read 2026-10-04); the catalogue said 29325 until then.
     mautrix!(
-        "mautrix-linkedin", "LinkedIn", "linkedin", 29341, "linkedin_", "linkedinbot",
+        "mautrix-linkedin", "LinkedIn", "linkedin", "v0.2609.0", 29341, "linkedin_", "linkedinbot",
         category: Category::Social,
         description: "LinkedIn messaging.",
         needs: [("account", "A LinkedIn account to sign in with from the bridge", true)],
@@ -256,7 +289,7 @@ const CATALOGUE: &[Entry] = &[
         notes: None,
     ),
     mautrix!(
-        "mautrix-bluesky", "Bluesky", "bluesky", 29340, "bluesky_", "blueskybot",
+        "mautrix-bluesky", "Bluesky", "bluesky", "v0.2510.0", 29340, "bluesky_", "blueskybot",
         category: Category::Social,
         description: "Bluesky direct messages.",
         needs: [("account", "A Bluesky account and an app password", true)],
@@ -272,7 +305,7 @@ const CATALOGUE: &[Entry] = &[
         category: Category::Irc,
         upstream_project: "hifi/heisenbridge",
         docs_url: "https://github.com/hifi/heisenbridge",
-        image: "hif1/heisenbridge:latest",
+        image: "hif1/heisenbridge:1.15.4",
         port: 9898,
         ghost_prefix: "irc_",
         bot: "heisenbridge",
@@ -300,7 +333,7 @@ const CATALOGUE: &[Entry] = &[
         category: Category::Irc,
         upstream_project: "matrix-org/matrix-appservice-irc",
         docs_url: "https://matrix-org.github.io/matrix-appservice-irc/latest/",
-        image: "ghcr.io/matrix-org/matrix-appservice-irc:release-3.0.0",
+        image: "matrixdotorg/matrix-appservice-irc:release-4.0.0",
         port: 9999,
         ghost_prefix: "irc_",
         bot: "ircbot",
@@ -325,7 +358,7 @@ const CATALOGUE: &[Entry] = &[
         category: Category::Integrations,
         upstream_project: "matrix-org/matrix-hookshot",
         docs_url: "https://matrix-org.github.io/matrix-hookshot/latest/",
-        image: "halfshot/matrix-hookshot:latest",
+        image: "ghcr.io/matrix-org/matrix-hookshot:7.5.0",
         port: 9993,
         ghost_prefix: "hookshot_",
         bot: "hookshot",
@@ -784,7 +817,7 @@ fn choices(entry: &Entry, server_name: &str, values: &Map<String, Value>) -> Cho
         admin_user: string(values, "adminUser").filter(|u| u.starts_with('@') && u.contains(':')),
         kubernetes,
         k8s_namespace,
-        image_tag: string(values, "imageTag").unwrap_or_else(|| "latest".to_owned()),
+        image_tag: resolve_image_tag(entry, string(values, "imageTag").as_deref()),
         double_puppeting: flag(values, "doublePuppeting", entry.double_puppeting),
         encryption: flag(values, "encryption", entry.runtime == Runtime::Mautrix),
         rate_limit_exempt: flag(values, "rateLimitExempt", true),
@@ -1102,7 +1135,7 @@ fn compose(entry: &Entry, c: &Choices, image: &str, server_name: &str) -> String
 }
 
 fn bridge_resource(entry: &Entry, c: &Choices, image: &str) -> String {
-    let (repository, tag) = image.rsplit_once(':').unwrap_or((image, "latest"));
+    let (repository, tag) = image.rsplit_once(':').unwrap_or((image, entry.image_tag()));
     format!(
         "# For a cluster running the Myelin operator (RFC 0017). The Secret named in\n\
          # filesSecret holds config.yaml and registration.yaml, from the files above.\n\
@@ -1364,11 +1397,7 @@ pub fn render_instance(spec: &InstanceSpec<'_>) -> Option<InstanceRender> {
         .rsplit_once(':')
         .map_or(entry.image, |(name, _)| name)
         .to_owned();
-    let image_tag = if spec.image_tag.trim().is_empty() {
-        "latest".to_owned()
-    } else {
-        spec.image_tag.trim().to_owned()
-    };
+    let image_tag = resolve_image_tag(entry, Some(spec.image_tag));
     let mut compose_yaml = String::new();
     compose_yaml
         .push_str("# Save config.yaml and registration.yaml into the directory mounted at\n");
@@ -1434,6 +1463,64 @@ fn regex_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Decision 0037: no offering runs `latest`; each image names a release.
+    #[test]
+    fn every_catalogue_image_pins_a_release_tag() {
+        for entry in CATALOGUE {
+            let tag = entry.image_tag();
+            assert_ne!(tag, "latest", "{} runs {}", entry.id, entry.image);
+            assert!(
+                tag.chars()
+                    .next()
+                    .is_some_and(|c| c == 'v' || c.is_ascii_digit())
+                    || tag.starts_with("release-"),
+                "{} runs {}, which is not a release tag",
+                entry.id,
+                entry.image
+            );
+            assert!(entry.image.ends_with(&format!(":{tag}")));
+        }
+    }
+
+    #[test]
+    fn a_blank_or_latest_tag_is_the_catalogue_pin_and_any_other_is_kept() {
+        assert_eq!(
+            image_tag("mautrix-whatsapp", None).as_deref(),
+            Some("v0.2609.0")
+        );
+        assert_eq!(
+            image_tag("mautrix-whatsapp", Some("")).as_deref(),
+            Some("v0.2609.0")
+        );
+        assert_eq!(
+            image_tag("mautrix-whatsapp", Some(" latest ")).as_deref(),
+            Some("v0.2609.0")
+        );
+        assert_eq!(
+            image_tag("mautrix-whatsapp", Some("v0.2608.0")).as_deref(),
+            Some("v0.2608.0")
+        );
+        assert_eq!(
+            image_tag("heisenbridge", Some("latest")).as_deref(),
+            Some("1.15.4")
+        );
+        assert_eq!(image_tag("no-such-bridge", None), None);
+        // The wizard: no tag chosen, or `latest` typed, is the pin as well.
+        let r = render(
+            "mautrix-whatsapp",
+            "test.local",
+            &json!({"imageTag": "latest"}),
+        )
+        .unwrap();
+        assert!(
+            r.compose_yaml
+                .contains("dock.mau.dev/mautrix/whatsapp:v0.2609.0"),
+            "{}",
+            r.compose_yaml
+        );
+        assert!(r.bridge_resource_yaml.contains("tag: v0.2609.0"));
+    }
 
     #[test]
     fn the_catalogue_writes_namespaces_for_the_server_it_is_asked_about() {
@@ -1578,7 +1665,7 @@ mod tests {
         assert!(
             result
                 .compose_yaml
-                .contains("dock.mau.dev/mautrix/telegram:latest")
+                .contains("dock.mau.dev/mautrix/telegram:v0.2609.0")
         );
         assert!(result.bridge_resource_yaml.contains("kind: Bridge"));
 
@@ -1738,7 +1825,7 @@ mod tests {
             result.config_yaml.is_none(),
             "heisenbridge has no config file"
         );
-        assert!(result.compose_yaml.contains("hif1/heisenbridge:latest"));
+        assert!(result.compose_yaml.contains("hif1/heisenbridge:1.15.4"));
         assert!(result.compose_yaml.contains("\"-o\", \"@me:test.local\""));
         assert!(result.compose_yaml.contains("\"http://myelin:8008\""));
     }
@@ -1864,7 +1951,7 @@ mod tests {
             heisen.registration[BRIDGE_INSTANCE_KEY],
             crate::bridge_offerings::SHARED_INSTANCE
         );
-        assert_eq!(heisen.image_tag, "latest");
+        assert_eq!(heisen.image_tag, "1.15.4");
     }
 
     fn instance_config(type_id: &str, owner: Option<&str>, pickle_key: Option<&str>) -> Value {

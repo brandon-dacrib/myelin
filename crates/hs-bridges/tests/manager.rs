@@ -98,13 +98,43 @@ async fn without_a_runtime_an_offering_runs_elsewhere_and_its_front_door_is_regi
         .unwrap();
     assert_eq!(offering.runtime, "elsewhere");
     assert_eq!(offering.mode, "per_user");
-    assert_eq!(offering.image, "dock.mau.dev/mautrix/whatsapp:latest");
-    assert_eq!(offering.image_tag, "latest");
+    assert_eq!(offering.image, "dock.mau.dev/mautrix/whatsapp:v0.2609.0");
+    assert_eq!(offering.image_tag, "v0.2609.0");
     assert_eq!(
         offering.front_door.as_deref(),
         Some("@whatsappbot:example.org")
     );
     assert!(offering.enabled && offering.access.all_local_users);
+
+    // `latest` is not a pin (decision 0037): asked for, it is the catalogue's release, as a
+    // row from before the pins reads; another release is kept as given.
+    let latest = manager
+        .put(
+            "mautrix-whatsapp",
+            BridgeOfferingRequest {
+                image_tag: Some("latest".into()),
+                ..BridgeOfferingRequest::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(latest.image_tag, "v0.2609.0");
+    let older = manager
+        .put(
+            "mautrix-whatsapp",
+            BridgeOfferingRequest {
+                image_tag: Some("v0.2608.0".into()),
+                ..BridgeOfferingRequest::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(older.image, "dock.mau.dev/mautrix/whatsapp:v0.2608.0");
+    let kept = manager
+        .put("mautrix-whatsapp", BridgeOfferingRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(kept.image_tag, "v0.2608.0", "a chosen release is kept");
 
     // The manager's own registration: `@bridges` and the offering's front door, exclusively,
     // its URL under this server's own route.
@@ -255,7 +285,7 @@ async fn an_instance_is_registered_then_waits_for_its_bridge_then_is_ready() {
     assert!(
         files
             .compose_yaml
-            .contains("dock.mau.dev/mautrix/whatsapp:latest")
+            .contains("dock.mau.dev/mautrix/whatsapp:v0.2609.0")
     );
     assert!(files.manifest_yaml.contains("kind: Bridge"));
     let counts = manager
@@ -396,7 +426,7 @@ async fn instances_are_for_local_users_of_the_right_kind_of_offering() {
         files.config_yaml.is_none(),
         "heisenbridge has no config file"
     );
-    assert!(files.compose_yaml.contains("hif1/heisenbridge:latest"));
+    assert!(files.compose_yaml.contains("hif1/heisenbridge:1.15.4"));
     assert!(
         !files.compose_yaml.contains("\"-o\""),
         "a shared bouncer names no owner: {}",
