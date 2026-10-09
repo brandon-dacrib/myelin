@@ -56,7 +56,7 @@ it no authentication); **fixed** on `agent/fed-version` (an unsigned request get
   by Claude Code even over SSH; a `kubectl proxy` started from the owner's plain SSH shell (not
   tmux) on `127.0.0.1:8001` works, and refuses `exec` (helper pods run their script as the command).
 
-**Where things are.** Main `ea2b73b5`; **nothing is unmerged**, no agent worktree, no lock. Merged
+**Where things are.** Main `95d3aabe` (CI, CD and fuzz green; the image `sha-95d3aabe…` is the one to roll; two CD fixes after `ea2b73b5`: the install smoke deletes the Bridge CRD it created, `8963d141`, and the published-chart check renders without the CRD, `95d3aabe`, both broken by the CRD moving into the chart); **nothing is unmerged**, no agent worktree, no lock. Merged
 after the roll: `agent/fed-version` (`415d5e9e`, an unsigned `/federation/v1/version` gets `200`) and
 `agent/crd-upgrade` (`9c03f21a`, `ea2b73b5`, decision 0036): the chart renders the `Bridge` CRD from
 `templates/crds.yaml` with `helm.sh/resource-policy: keep` (values `crds.enabled`, `crds.keep`); a
