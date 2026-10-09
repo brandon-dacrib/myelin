@@ -565,8 +565,11 @@ jobs:
           set -euo pipefail
           mkdir pulled
           helm pull "oci://$REGISTRY/${{ github.repository_owner }}/charts/hs" --version "$VERSION" -d pulled
+          # Without the Bridge CRD (rendered first since decision 0036): its schema has an
+          # `image:` property with no value, which this line would read as the image.
           image="$(helm template myelin "pulled/hs-$VERSION.tgz" --set serverName=example.org \
-                    | sed -n 's/^ *image: *//p' | tr -d '"' | head -1)"
+                    --set crds.enabled=false \
+                    | sed -n 's/^ *image: *//p' | tr -d '"' | grep -v '^$' | head -1)"
           echo "the published chart renders image $image"
           if [ "${image##*:}" != "$APP_VERSION" ]; then
             echo "expected it to pull the tag $APP_VERSION" >&2
