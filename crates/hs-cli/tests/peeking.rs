@@ -1,7 +1,8 @@
 //! Room peeking (MSC2753) through the real `hs` binary: `POST /peek/{roomIdOrAlias}` into a
 //! world-readable room, the room in `rooms.peek` of the peeking device's `/sync` and of no other
-//! device's, `403` for a room that is not world-readable, and joining moving the room to
-//! `rooms.join`. Sytest's `31sync/17peeking.pl` is the same story.
+//! device's, `403` for a room that is not world-readable, a long-poll on the peeking device
+//! woken by the room's next event, and joining moving the room to `rooms.join`. Sytest's
+//! `31sync/17peeking.pl` is the same story, less the long-poll.
 
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
@@ -300,6 +301,49 @@ async fn a_device_peeks_into_a_world_readable_room_and_only_that_device_sees_it(
         "{body}"
     );
     assert!(body["rooms"]["join"].is_null(), "{body}");
+
+    // A long-poll on the peeking device is woken by the room's next event, not left to its
+    // timeout: the hub wakes a peeker as it wakes a member (`SessionHub::fan_out_to_peekers`,
+    // and the hot-room stream for a room above the fan-out threshold).
+    let poll = {
+        let phone = phone.clone();
+        let since = since.clone();
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let body = phone
+                .expect(
+                    Method::GET,
+                    &format!("/_matrix/client/v3/sync?timeout=10000&since={since}"),
+                    None,
+                    StatusCode::OK,
+                )
+                .await;
+            (started.elapsed(), body)
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    alice
+        .expect(
+            Method::PUT,
+            &format!(
+                "/_matrix/client/v3/rooms/{}/send/m.room.message/t2",
+                escape(&room)
+            ),
+            Some(json!({"msgtype": "m.text", "body": "wakes the peeker"})),
+            StatusCode::OK,
+        )
+        .await;
+    let (elapsed, body) = poll.await.unwrap();
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "the peeking device's long-poll was woken, not timed out: {elapsed:?}"
+    );
+    assert_eq!(
+        bodies(&body["rooms"]["peek"][room.as_str()]),
+        vec!["wakes the peeker".to_owned()],
+        "{body}"
+    );
+    since = body["next_batch"].as_str().unwrap().to_owned();
 
     // The other device: nothing peeked.
     let other = laptop
