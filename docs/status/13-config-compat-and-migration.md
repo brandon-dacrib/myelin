@@ -66,7 +66,7 @@ under way" with the runbook's wording; `MigrationPage.test.tsx` line 54 and `e2e
 explained-pages.spec.ts` line 126 expect 14 copied streams: 19 now. The page already names an
 unknown stream in words, so nothing is wrong until then, only unexplained.
 
-**Decisions made:** decision 0038 (inert keys; sessions whole; events as Synapse serves them;
+**Decisions made:** decision 0039 (inert keys; sessions whole; events as Synapse serves them;
 the admin surface mounts what can be answered honestly; the cutover step). Also: a to-device
 message is recognized by content rather than tracked by Synapse stream id (no table of imported
 ids to keep); registration tokens are re-created when their limits change (the store sets the

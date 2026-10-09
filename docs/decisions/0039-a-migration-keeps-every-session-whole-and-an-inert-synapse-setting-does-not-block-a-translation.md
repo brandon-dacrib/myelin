@@ -1,4 +1,4 @@
-# 0038. A migration keeps every session whole, and an inert Synapse setting does not block a translation
+# 0039. A migration keeps every session whole, and an inert Synapse setting does not block a translation
 
 Date: 2026-10-09. Track 13 (`agent/migration-95`). Affects tracks 04 (one line in `hs-room`'s
 import path), 16 (the Migration page's stream list) and anyone running the translator.
