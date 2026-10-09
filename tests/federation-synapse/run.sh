@@ -19,16 +19,30 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 WORKDIR="${1:-$(mktemp -d /tmp/fed-synapse.XXXXXX)}"
-SYNAPSE_IMAGE="${SYNAPSE_IMAGE:-ghcr.io/element-hq/synapse:latest}"
+# Docker Hub's `matrixdotorg/synapse` through Google's mirror: an agent session cannot pull from
+# Docker Hub or ghcr.io (the keychain credential helper), and the mirror needs no credentials.
+SYNAPSE_IMAGE="${SYNAPSE_IMAGE:-mirror.gcr.io/matrixdotorg/synapse:latest}"
 NGINX_IMAGE="${NGINX_IMAGE:-public.ecr.aws/docker/library/nginx:alpine}"
 SYN_NAME="127.0.0.1:8448"
 SYN_CLIENT="http://127.0.0.1:8408"
 MY_NAME="fed-synapse-myelin:8449"
 MY_CLIENT="http://127.0.0.1:8449"
 RESULTS="$WORKDIR/results.tsv"
+mkdir -p "$WORKDIR"
 : > "$RESULTS"
 HS_PID=""
 
+command -v docker >/dev/null 2>&1 || { echo "SKIP: docker is not installed; the Myelin<->Synapse interop run needs it."; exit 0; }
+# OrbStack's socket, and a Docker config with no credential store: the owner's config names the
+# macOS keychain, which an agent session cannot open, and every pull would fail on it.
+if [ -z "${DOCKER_HOST:-}" ] && [ -S "$HOME/.orbstack/run/docker.sock" ]; then
+  export DOCKER_HOST="unix://$HOME/.orbstack/run/docker.sock"
+fi
+if [ -z "${DOCKER_CONFIG:-}" ]; then
+  DOCKER_CONFIG="$(mktemp -d)"
+  echo '{"auths":{}}' >"$DOCKER_CONFIG/config.json"
+  export DOCKER_CONFIG
+fi
 if ! docker info >/dev/null 2>&1; then
   echo "SKIP: Docker is not available; the Myelin<->Synapse interop run needs it."
   exit 0
@@ -76,9 +90,6 @@ chmod 644 "$WORKDIR"/pki/*
 docker network create fed-synapse >/dev/null 2>&1 || true
 cp "$WORKDIR"/pki/{ca.crt,synapse.crt,synapse.key} "$WORKDIR/synapse/"
 if [ ! -f "$WORKDIR/synapse/signing.key" ]; then
-  docker run --rm -v "$WORKDIR/synapse:/data" "$SYNAPSE_IMAGE" \
-    python -m synapse.app.homeserver --config-path /dev/null --generate-keys \
-    --server-name "$SYN_NAME" --report-stats no -c /data/gen.yaml >/dev/null 2>&1 || true
   # `generate` writes homeserver.yaml and the signing key; we keep only the key.
   docker run --rm -v "$WORKDIR/synapse:/data" -e SYNAPSE_SERVER_NAME="$SYN_NAME" -e SYNAPSE_REPORT_STATS=no \
     "$SYNAPSE_IMAGE" generate >/dev/null 2>&1
@@ -112,6 +123,9 @@ enable_registration: true
 enable_registration_without_verification: true
 allow_public_rooms_over_federation: true
 allow_device_name_lookup_over_federation: true
+# Synapse forbids publishing to the room directory by default since 1.126; the interop run
+# publishes rooms to list them over federation, so allow it.
+room_list_publication_rules: [{action: allow}]
 rc_message: { per_second: 1000, burst_count: 1000 }
 rc_registration: { per_second: 1000, burst_count: 1000 }
 rc_login: { address: { per_second: 1000, burst_count: 1000 }, account: { per_second: 1000, burst_count: 1000 }, failed_attempts: { per_second: 1000, burst_count: 1000 } }
@@ -161,6 +175,7 @@ docker run -d --name fed-synapse-myelin --network fed-synapse \
 cat > "$WORKDIR/myelin/hs.yaml" <<YAML
 server:
   server_name: "$MY_NAME"
+  signing_key_path: "$WORKDIR/myelin/signing-keys"
 listeners:
   listeners:
     - port: 8449
@@ -185,9 +200,9 @@ wait_for "$MY_CLIENT/_matrix/client/versions" || { echo "hs did not come up; see
 wait_for "$SYN_CLIENT/_matrix/client/versions" || { echo "synapse did not come up: docker logs fed-synapse-synapse"; exit 1; }
 
 # ---- helpers ---------------------------------------------------------------------------------
-reg() { # reg <base> <user> -> token
+reg() { # reg <base> <user> -> "<token> <device_id>"
   curl -s -X POST "$1/_matrix/client/v3/register" -H 'content-type: application/json' \
-    -d "{\"username\":\"$2\",\"password\":\"fed-synapse-pw\",\"auth\":{\"type\":\"m.login.dummy\"}}" | jq -r .access_token
+    -d "{\"username\":\"$2\",\"password\":\"fed-synapse-pw\",\"auth\":{\"type\":\"m.login.dummy\"}}" | jq -r '"\(.access_token) \(.device_id)"'
 }
 api() { # api <base> <token> <method> <path> [json]
   curl -s -X "$3" "$1/_matrix/client/v3$4" -H "authorization: Bearer $2" -H 'content-type: application/json' ${5:+-d "$5"}
@@ -200,8 +215,26 @@ wait_event() { # wait_event <base> <token> <room> <jq filter> -> 0/1
   done; return 1
 }
 enc() { jq -rn --arg v "$1" '$v|@uri'; }
+# poll until <base>/<token> sees <user>'s membership in <room> equal <membership>, up to ~30s;
+# reads the member state event, which a server serves even to the member once they have left/been
+# banned (so a banned user can confirm their own ban).
+wait_membership() { # wait_membership <base> <token> <room> <user> <membership> -> 0/1
+  for _ in $(seq 1 30); do
+    local m; m=$(api "$1" "$2" GET "/rooms/$3/state/m.room.member/$(enc "$4")" | jq -r '.membership // empty' 2>/dev/null)
+    [ "$m" = "$5" ] && { echo "$m"; return 0; }
+    sleep 1
+  done; return 1
+}
+# poll <base> <token> <jq filter over a full /sync body> until it matches, up to ~20s
+wait_sync() { # wait_sync <base> <token> <jq filter> -> prints the first match, or empty
+  for _ in $(seq 1 20); do
+    local out; out=$(api "$1" "$2" GET "/sync?timeout=1000" | jq -c "$3" 2>/dev/null)
+    if [ -n "$out" ] && [ "$out" != null ] && [ "$out" != '""' ]; then echo "$out"; return 0; fi
+    sleep 1
+  done; return 1
+}
 
-SYN_TOK=$(reg "$SYN_CLIENT" synalice); MY_TOK=$(reg "$MY_CLIENT" mybob)
+read SYN_TOK SYN_DEV <<<"$(reg "$SYN_CLIENT" synalice)"; read MY_TOK MY_DEV <<<"$(reg "$MY_CLIENT" mybob)"
 SYN_USER="@synalice:$SYN_NAME"; MY_USER="@mybob:$MY_NAME"
 [ "$SYN_TOK" != null ] && [ "$MY_TOK" != null ] || { echo "registration failed: syn=$SYN_TOK my=$MY_TOK"; exit 1; }
 
@@ -209,7 +242,9 @@ SYN_USER="@synalice:$SYN_NAME"; MY_USER="@mybob:$MY_NAME"
 expect "1 keys" "Myelin serves /_matrix/key/v2/server" "$(curl -s "$MY_CLIENT/_matrix/key/v2/server")" '"server_name":"'"$MY_NAME"'"'
 expect "1 keys" "Synapse serves /_matrix/key/v2/server over TLS" "$(curl -s --cacert "$WORKDIR/pki/ca.crt" "https://$SYN_NAME/_matrix/key/v2/server")" '"server_name":"'"$SYN_NAME"'"'
 expect "1 keys" "Myelin fetches Synapse's keys through its notary" "$(curl -s "$MY_CLIENT/_matrix/key/v2/query/$SYN_NAME")" '"server_name":"'"$SYN_NAME"'"'
-expect "1 keys" "Synapse fetches Myelin's keys through its notary" "$(curl -s "$SYN_CLIENT/_matrix/key/v2/query/$(enc "$MY_NAME")")" '"server_name":"'"$MY_NAME"'"'
+# The reverse -- that Synapse can serve Myelin's keys through its own notary -- is asserted at the
+# end of step 4, once the two servers have federated and Synapse holds Myelin's keys (a fresh
+# Synapse's notary cache is empty and the deprecated GET form does not fetch on demand).
 
 # ---- Step 2: Myelin joins a Synapse room ----------------------------------------------------
 ROOM_S=$(api "$SYN_CLIENT" "$SYN_TOK" POST /createRoom '{"preset":"public_chat","name":"on synapse","room_alias_name":"onsynapse"}' | jq -r .room_id)
@@ -243,37 +278,75 @@ fi
 
 # ---- Step 4: membership, redaction, EDUs, queries, media, directory --------------------------
 # Invite Myelin->Synapse (accepted), then leave and rejoin, kick, ban.
-SYN_TOK2=$(reg "$SYN_CLIENT" syncarol); MY_TOK2=$(reg "$MY_CLIENT" mydave)
+read SYN_TOK2 _ <<<"$(reg "$SYN_CLIENT" syncarol)"; read MY_TOK2 _ <<<"$(reg "$MY_CLIENT" mydave)"
 SYN_USER2="@syncarol:$SYN_NAME"; MY_USER2="@mydave:$MY_NAME"
 ROOM_I=$(api "$MY_CLIENT" "$MY_TOK" POST /createRoom '{"preset":"private_chat"}' | jq -r .room_id)
 api "$MY_CLIENT" "$MY_TOK" POST "/rooms/$ROOM_I/invite" "{\"user_id\":\"$SYN_USER2\"}" >/dev/null
 R=$(api "$SYN_CLIENT" "$SYN_TOK2" POST "/join/$ROOM_I?server_name=$(enc "$MY_NAME")" '{}'); expect "4 invite" "Myelin invites a Synapse user, who accepts" "$R" "$ROOM_I"
+# Invite into Synapse's invite-only room, accepted (rejoin-after-leave of an invite-only room is
+# not allowed without a new invite, so leave/rejoin is tested on the public room below).
 ROOM_J=$(api "$SYN_CLIENT" "$SYN_TOK" POST /createRoom '{"preset":"private_chat"}' | jq -r .room_id)
 api "$SYN_CLIENT" "$SYN_TOK" POST "/rooms/$ROOM_J/invite" "{\"user_id\":\"$MY_USER2\"}" >/dev/null
 R=$(api "$MY_CLIENT" "$MY_TOK2" POST "/join/$ROOM_J?server_name=$SYN_NAME" '{}'); expect "4 invite" "Synapse invites a Myelin user, who accepts" "$R" "$ROOM_J"
-R=$(api "$MY_CLIENT" "$MY_TOK2" POST "/rooms/$ROOM_J/leave" '{}'); expect "4 leave" "Myelin user leaves the Synapse room" "$R" "{}"
-R=$(api "$MY_CLIENT" "$MY_TOK2" POST "/join/$ROOM_J?server_name=$SYN_NAME" '{}'); expect "4 rejoin" "Myelin user rejoins the Synapse room" "$R" "$ROOM_J"
-R=$(api "$SYN_CLIENT" "$SYN_TOK" POST "/rooms/$ROOM_J/kick" "{\"user_id\":\"$MY_USER2\"}"); expect "4 kick" "Synapse kicks the Myelin user" "$R" "{}"
-wait_event "$MY_CLIENT" "$MY_TOK2" "$ROOM_J" ".chunk[]|select(.type==\"m.room.member\" and .state_key==\"$MY_USER2\" and .content.membership==\"leave\" and .sender==\"$SYN_USER\")" && record "4 kick" PASS "the kick reached Myelin" || record "4 kick" FAIL "the kick did not reach Myelin's /messages"
+# Leave, rejoin and kick on a PUBLIC Synapse room, settling each membership across federation
+# before the next step so the servers do not resolve state over concurrent branches.
+ROOM_P=$(api "$SYN_CLIENT" "$SYN_TOK" POST /createRoom '{"preset":"public_chat","room_alias_name":"leaverejoin"}' | jq -r .room_id)
+R=$(api "$MY_CLIENT" "$MY_TOK2" POST "/join/$(enc "#leaverejoin:$SYN_NAME")?server_name=$SYN_NAME" '{}'); expect "4 join-public" "Myelin user joins a public Synapse room" "$R" "$ROOM_P"
+wait_membership "$SYN_CLIENT" "$SYN_TOK" "$ROOM_P" "$MY_USER2" join >/dev/null
+R=$(api "$MY_CLIENT" "$MY_TOK2" POST "/rooms/$ROOM_P/leave" '{}'); expect "4 leave" "Myelin user leaves the public Synapse room" "$R" "{}"
+wait_membership "$SYN_CLIENT" "$SYN_TOK" "$ROOM_P" "$MY_USER2" leave >/dev/null && record "4 leave" PASS "the leave reached Synapse's state" || record "4 leave" FAIL "the leave did not reach Synapse's state"
+R=$(api "$MY_CLIENT" "$MY_TOK2" POST "/join/$ROOM_P?server_name=$SYN_NAME" '{}'); expect "4 rejoin" "Myelin user rejoins the public Synapse room" "$R" "$ROOM_P"
+wait_membership "$SYN_CLIENT" "$SYN_TOK" "$ROOM_P" "$MY_USER2" join >/dev/null && record "4 rejoin" PASS "the rejoin reached Synapse's state" || record "4 rejoin" FAIL "the rejoin did not reach Synapse's state"
+R=$(api "$SYN_CLIENT" "$SYN_TOK" POST "/rooms/$ROOM_P/kick" "{\"user_id\":\"$MY_USER2\"}"); expect "4 kick" "Synapse kicks the Myelin user" "$R" "{}"
+wait_membership "$MY_CLIENT" "$MY_TOK2" "$ROOM_P" "$MY_USER2" leave >/dev/null && record "4 kick" PASS "the kick reached Myelin's state" || record "4 kick" FAIL "the kick did not reach Myelin's state"
+# Ban the Synapse user from Myelin's room; verify via Synapse's room state (a banned user's own
+# /sync is not a reliable place to see the ban).
 R=$(api "$MY_CLIENT" "$MY_TOK" POST "/rooms/$ROOM_I/ban" "{\"user_id\":\"$SYN_USER2\"}"); expect "4 ban" "Myelin bans the Synapse user" "$R" "{}"
-wait_event "$SYN_CLIENT" "$SYN_TOK2" "$ROOM_I" ".chunk[]|select(.type==\"m.room.member\" and .content.membership==\"ban\")" && record "4 ban" PASS "the ban reached Synapse" || record "4 ban" FAIL "the ban did not reach Synapse"
+# A banned user cannot read the room's state endpoint, so look for the ban in the room's leave
+# section of the banned user's own /sync.
+BAN_OK=0
+for _ in $(seq 1 30); do
+  M=$(api "$SYN_CLIENT" "$SYN_TOK2" GET "/sync?timeout=0" | jq -r --arg r "$ROOM_I" --arg u "$SYN_USER2" '[.rooms.leave[$r].timeline.events[]?|select(.type=="m.room.member" and .state_key==$u)|.content.membership]|last // empty')
+  [ "$M" = ban ] && { BAN_OK=1; break; }
+  sleep 1
+done
+[ "$BAN_OK" = 1 ] && record "4 ban" PASS "the ban reached Synapse (the banned user's leave sync)" || record "4 ban" FAIL "the ban did not reach Synapse"
 # Redaction: Synapse redacts its own message in the Myelin room.
 EV=$(api "$SYN_CLIENT" "$SYN_TOK" PUT "/rooms/$ROOM_M/send/m.room.message/r1" '{"msgtype":"m.text","body":"to be redacted"}' | jq -r .event_id)
 api "$SYN_CLIENT" "$SYN_TOK" PUT "/rooms/$ROOM_M/redact/$(enc "$EV")/rd1" '{"reason":"interop"}' >/dev/null
 wait_event "$MY_CLIENT" "$MY_TOK" "$ROOM_M" ".chunk[]|select(.event_id==\"$EV\" and (.content|length)==0)" && record "4 redaction" PASS "Synapse's redaction applied on Myelin" || record "4 redaction" FAIL "redaction of $EV not applied on Myelin"
 # Typing and receipts: Myelin -> Synapse.
 api "$MY_CLIENT" "$MY_TOK" PUT "/rooms/$ROOM_M/typing/$(enc "$MY_USER")" '{"typing":true,"timeout":30000}' >/dev/null
-T=$(api "$SYN_CLIENT" "$SYN_TOK" GET "/sync?timeout=5000" | jq -c ".rooms.join[\"$ROOM_M\"].ephemeral.events[]?|select(.type==\"m.typing\")|.content.user_ids")
+T=$(wait_sync "$SYN_CLIENT" "$SYN_TOK" ".rooms.join[\"$ROOM_M\"].ephemeral.events[]?|select(.type==\"m.typing\")|.content.user_ids")
 expect "4 typing" "Myelin's typing EDU shows in Synapse's /sync" "$T" "$MY_USER"
 LAST=$(api "$MY_CLIENT" "$MY_TOK" GET "/rooms/$ROOM_M/messages?dir=b&limit=1" | jq -r '.chunk[0].event_id')
-api "$MY_CLIENT" "$MY_TOK" POST "/rooms/$ROOM_M/receipt/m.read/$(enc "$LAST")" '{}' >/dev/null; sleep 2
-T=$(api "$SYN_CLIENT" "$SYN_TOK" GET "/sync?timeout=5000" | jq -c ".rooms.join[\"$ROOM_M\"].ephemeral.events[]?|select(.type==\"m.receipt\")|.content")
+RC_SINCE=$(api "$SYN_CLIENT" "$SYN_TOK" GET "/sync?timeout=0" | jq -r .next_batch)
+api "$MY_CLIENT" "$MY_TOK" POST "/rooms/$ROOM_M/receipt/m.read/$(enc "$LAST")" '{}' >/dev/null
+T=""
+for _ in $(seq 1 20); do
+  RESP=$(api "$SYN_CLIENT" "$SYN_TOK" GET "/sync?since=$RC_SINCE&timeout=2000")
+  T=$(echo "$RESP" | jq -c ".rooms.join[\"$ROOM_M\"].ephemeral.events[]?|select(.type==\"m.receipt\")|.content" 2>/dev/null)
+  [ -n "$T" ] && [[ "$T" == *"$MY_USER"* ]] && break
+  RC_SINCE=$(echo "$RESP" | jq -r .next_batch)
+done
 expect "4 receipt" "Myelin's read receipt shows in Synapse's /sync" "$T" "$MY_USER"
-# Device keys: Synapse queries the Myelin user's keys over federation.
-api "$MY_CLIENT" "$MY_TOK" POST /keys/upload '{"device_keys":{"user_id":"'"$MY_USER"'","device_id":"MYDEV","algorithms":["m.olm.v1.curve25519-aes-sha2"],"keys":{"curve25519:MYDEV":"AAAA","ed25519:MYDEV":"BBBB"},"signatures":{}}}' >/dev/null
-R=$(api "$SYN_CLIENT" "$SYN_TOK" POST /keys/query "{\"device_keys\":{\"$MY_USER\":[]}}"); expect "4 keys/query" "Synapse's /keys/query of the Myelin user" "$R" '"ed25519:'
+# Device keys: Synapse queries the Myelin user's keys over federation. The keys are uploaded
+# under this session's real device id (an upload for any other device id is M_BAD_JSON). Device
+# keys over federation are track 08's; this step is here so the whole story runs in one place.
+C43=$(printf 'c%.0s' $(seq 1 43)); D43=$(printf 'd%.0s' $(seq 1 43)); E86=$(printf 'e%.0s' $(seq 1 86))
+api "$MY_CLIENT" "$MY_TOK" POST /keys/upload "{\"device_keys\":{\"user_id\":\"$MY_USER\",\"device_id\":\"$MY_DEV\",\"algorithms\":[\"m.olm.v1.curve25519-aes-sha2\",\"m.megolm.v1.aes-sha2\"],\"keys\":{\"curve25519:$MY_DEV\":\"$C43\",\"ed25519:$MY_DEV\":\"$D43\"},\"signatures\":{\"$MY_USER\":{\"ed25519:$MY_DEV\":\"$E86\"}}}}" >/dev/null
+R=$(api "$SYN_CLIENT" "$SYN_TOK" POST /keys/query "{\"device_keys\":{\"$MY_USER\":[]}}"); expect "4 keys/query" "Synapse's /keys/query of the Myelin user (device keys over federation; track 08)" "$R" '"ed25519:'
+# A to-device message is delivered only in an incremental (since-based) /sync, so take a token
+# before sending and poll from it.
+TD_SINCE=$(api "$SYN_CLIENT" "$SYN_TOK" GET "/sync?timeout=0" | jq -r .next_batch)
 R=$(api "$MY_CLIENT" "$MY_TOK" PUT "/sendToDevice/m.fed.test/td1" "{\"messages\":{\"$SYN_USER\":{\"*\":{\"hello\":\"synapse\"}}}}"); expect "4 to-device" "Myelin sends a to-device message to a Synapse user" "$R" "{}"
-T=$(api "$SYN_CLIENT" "$SYN_TOK" GET "/sync?timeout=5000" | jq -c '.to_device.events[]?|select(.type=="m.fed.test")')
+T=""
+for _ in $(seq 1 20); do
+  RESP=$(api "$SYN_CLIENT" "$SYN_TOK" GET "/sync?since=$TD_SINCE&timeout=2000")
+  T=$(echo "$RESP" | jq -c '.to_device.events[]?|select(.type=="m.fed.test")' 2>/dev/null)
+  [ -n "$T" ] && break
+  TD_SINCE=$(echo "$RESP" | jq -r .next_batch)
+done
 expect "4 to-device" "the to-device message is in Synapse's /sync" "$T" "synapse"
 # Media uploaded on Myelin, viewed from Synapse (and the other way).
 MXC=$(curl -s -X POST "$MY_CLIENT/_matrix/media/v3/upload?filename=a.txt" -H "authorization: Bearer $MY_TOK" -H 'content-type: text/plain' -d 'media from myelin' | jq -r .content_uri)
@@ -291,6 +364,16 @@ api "$SYN_CLIENT" "$SYN_TOK" PUT "/profile/$(enc "$SYN_USER")/displayname" '{"di
 R=$(api "$MY_CLIENT" "$MY_TOK" GET "/profile/$(enc "$SYN_USER")"); expect "4 query/profile" "Myelin reads the Synapse user's profile" "$R" "Alice of Synapse"
 R=$(api "$SYN_CLIENT" "$SYN_TOK" GET "/directory/room/$(enc "#onmyelin:$MY_NAME")"); expect "4 query/directory" "Synapse resolves a Myelin alias" "$R" "$ROOM_M"
 R=$(api "$MY_CLIENT" "$MY_TOK" GET "/directory/room/$(enc "#onsynapse:$SYN_NAME")"); expect "4 query/directory" "Myelin resolves a Synapse alias" "$R" "$ROOM_S"
+# Now that the servers have federated, Synapse holds Myelin's keys: its notary serves them (the
+# reverse of the step-1 Myelin-notary check). Synapse serves the notary on its TLS federation
+# listener, and may need one on-demand fetch, so poll briefly.
+NOTARY=""
+for _ in $(seq 1 10); do
+  NOTARY=$(curl -s --cacert "$WORKDIR/pki/ca.crt" "https://$SYN_NAME/_matrix/key/v2/query/$(enc "$MY_NAME")")
+  [[ "$NOTARY" == *'"server_name":"'"$MY_NAME"'"'* ]] && break
+  sleep 1
+done
+expect "4 keys/notary" "Synapse serves Myelin's keys through its notary" "$NOTARY" '"server_name":"'"$MY_NAME"'"'
 
 # ---- Step 5: room versions 10, 11, 12 and a restricted join authorised by Synapse ----------
 for v in 10 11 12; do
