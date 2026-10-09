@@ -253,6 +253,25 @@ const ACRONYMS: Record<string, string> = {
   yaml: "YAML",
 };
 
+/**
+ * What a section is called in the index and as a page title. The server's section names are
+ * its own (`auth`, `telemetry`, `network`); where the name is jargon to somebody who has not
+ * read the code, the title says what the section is for. The name itself stays beside the
+ * title on every page, and in search.
+ */
+const SECTION_TITLES: Record<string, string> = {
+  auth: "Sign-in and registration",
+  telemetry: "Logs and metrics",
+  appservices: "Bridges and appservices",
+  network: "Outbound connections",
+  migration: "Migration from Synapse",
+};
+
+/** The title of section `name`: the operator's words for it, or its name humanised. */
+export function sectionTitle(name: string): string {
+  return SECTION_TITLES[name] ?? humanizeKey(name);
+}
+
 /** `enable_registration` → "Enable registration"; `ip_range_blocklist` → "IP range blocklist". */
 export function humanizeKey(key: string): string {
   const words = key.split(/[_\s]+/).filter(Boolean);
@@ -1105,7 +1124,7 @@ export function buildSectionModel(
 ): SettingGroup {
   const raw = schema.root.properties?.[sectionName];
   if (!raw) {
-    return { path: "", label: humanizeKey(sectionName), fields: [], groups: [] };
+    return { path: "", label: sectionTitle(sectionName), fields: [], groups: [] };
   }
   const resolved = pickVariant(
     unwrapNullable(resolveRef(raw, schema.defs), schema.defs),
@@ -1115,7 +1134,9 @@ export function buildSectionModel(
   const nested = walk(resolved, schema.defs, "", sectionName, values, schema.settings ?? {}, 0);
   return {
     path: "",
-    label: resolved.title ? cleanDoc(resolved.title)! : humanizeKey(sectionName),
+    label:
+      SECTION_TITLES[sectionName] ??
+      (resolved.title ? cleanDoc(resolved.title)! : humanizeKey(sectionName)),
     summary: summarize(resolved.description),
     description: cleanDoc(resolved.description),
     ...nested,

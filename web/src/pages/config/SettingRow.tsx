@@ -172,7 +172,9 @@ export function SettingRow({
         )}
 
         <div className="mt-2.5 flex flex-wrap items-center gap-2">
-          {origin && <OriginBadge origin={origin} />}
+          {/* "Default" is said by the "Default: …" line and "From database" by "Changed from
+              default": only an origin the operator did not choose here gets a badge. */}
+          {(origin === "file" || origin === "environment") && <OriginBadge origin={origin} />}
           {applies ? (
             <AppliesBadge applies={applies} />
           ) : (

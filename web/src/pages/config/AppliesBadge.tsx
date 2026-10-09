@@ -15,8 +15,9 @@ export function AppliesBadge({ applies }: { applies: Applies }) {
 }
 
 /**
- * "When changes apply", once per section: a headline, then each class this section has, with
- * how many of its settings are in it and what the class means.
+ * "When changes apply", once per section: a headline, each class this section has with how many
+ * settings are in it, and what each class means behind "What that means". The headline and the
+ * badges are the answer; the paragraphs are for the first time, and start closed.
  */
 export function AppliesLegend({ counts }: { counts: Record<Applies, number> }) {
   const present = APPLIES_ORDER.filter((a) => counts[a] > 0);
@@ -29,22 +30,30 @@ export function AppliesLegend({ counts }: { counts: Record<Applies, number> }) {
       <h2 id="applies-legend-heading" className="text-sm font-medium text-text">
         {appliesHeadline(counts)}
       </h2>
-      <dl className="mt-2 flex flex-col gap-2">
+      <p className="mt-1 flex flex-wrap items-center gap-2 text-xs text-text-muted">
         {present.map((applies) => (
-          <div
-            key={applies}
-            className="grid gap-x-4 gap-y-1 sm:grid-cols-[minmax(0,15rem)_minmax(0,1fr)]"
-          >
-            <dt className="flex flex-wrap items-center gap-2 text-sm text-text">
-              <AppliesBadge applies={applies} />
-              <span className="text-xs text-text-muted">
-                {counts[applies]} {counts[applies] === 1 ? "setting" : "settings"}
-              </span>
-            </dt>
-            <dd className="text-sm text-text-muted">{APPLIES_COPY[applies].explanation}</dd>
-          </div>
+          <span key={applies} className="flex items-center gap-1.5">
+            <AppliesBadge applies={applies} />
+            {counts[applies]} {counts[applies] === 1 ? "setting" : "settings"}
+          </span>
         ))}
-      </dl>
+      </p>
+      <details className="mt-2">
+        <summary className="cursor-pointer text-xs text-accent hover:underline">
+          What that means
+        </summary>
+        <dl className="mt-2 flex flex-col gap-2">
+          {present.map((applies) => (
+            <div
+              key={applies}
+              className="grid gap-x-4 gap-y-1 sm:grid-cols-[minmax(0,15rem)_minmax(0,1fr)]"
+            >
+              <dt className="text-sm font-medium text-text">{APPLIES_COPY[applies].label}:</dt>
+              <dd className="text-sm text-text-muted">{APPLIES_COPY[applies].explanation}</dd>
+            </div>
+          ))}
+        </dl>
+      </details>
     </section>
   );
 }

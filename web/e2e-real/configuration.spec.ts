@@ -174,7 +174,7 @@ test.describe("configuration against the real server", () => {
     await alpha.getByLabel(/^IdP name/).fill("Alpha, renamed");
     await alpha.getByLabel(/^IdP name/).blur();
     await shot(page, "oidc-reordered");
-    await saveSection(page, "Auth");
+    await saveSection(page, "Sign-in and registration");
 
     const auth = await api("GET", "/config/auth");
     const saved = auth.json.values.oidc_providers;

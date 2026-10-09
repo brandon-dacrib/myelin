@@ -32,6 +32,10 @@ test.describe("configuration", () => {
     const legend = page.getByRole("region", { name: /^Most changes here/ });
     await expect(legend.getByText("Applies on save", { exact: true })).toBeVisible();
     await expect(legend.getByText("Needs a restart", { exact: true })).toBeVisible();
+    // The paragraphs explaining each class start closed.
+    await expect(legend.getByText(/keeps using the old one until it next starts/)).toBeHidden();
+    await legend.getByText("What that means").click();
+    await expect(legend.getByText(/keeps using the old one until it next starts/)).toBeVisible();
     await expect(
       page.locator("#setting-client_timeout").getByText("Needs a restart", { exact: true }),
     ).toBeVisible();

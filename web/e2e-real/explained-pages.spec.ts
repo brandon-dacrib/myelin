@@ -55,6 +55,11 @@ test.describe("pages that explain themselves, against the real server", () => {
     await signIn(page);
     await page.goto("/admin/configuration");
     await expect(page.getByText(/Every setting has a default the server works with/)).toBeVisible();
+    // The three classes are explained once, behind a disclosure that starts closed.
+    await expect(page.getByText(/Per replica \(file or environment\)/)).toBeHidden();
+    await page.getByText("How a change takes effect").click();
+    await expect(page.getByText(/Per replica \(file or environment\)/).first()).toBeVisible();
+    await expect(page.getByRole("link", { name: "Sign-in and registration" })).toBeVisible();
     await shot(page, "configuration-index");
 
     await page.goto("/admin/configuration/federation");

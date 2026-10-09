@@ -8,13 +8,7 @@
  * sections have been changed from their defaults, which ones a restart is
  * needed for, and which ones the deployment has taken out of your hands.
  */
-import {
-  APPLIES_COPY,
-  APPLIES_ORDER,
-  countApplies,
-  describeSource,
-  type Applies,
-} from "@/lib/config-applies";
+import { APPLIES_COPY, APPLIES_ORDER, countApplies, type Applies } from "@/lib/config-applies";
 import { AppliesBadge } from "./AppliesBadge";
 import { useMemo, useState } from "react";
 import { Link } from "@tanstack/react-router";
@@ -46,7 +40,7 @@ import {
   buildSectionModel,
   flattenFields,
   getPath,
-  humanizeKey,
+  sectionTitle,
   isChanged,
   settingRowId,
   type SettingField,
@@ -60,7 +54,6 @@ import { Input } from "@/components/ui/input/Input";
 import { SkeletonText } from "@/components/ui/skeleton/Skeleton";
 import { EmptyState } from "@/components/ui/empty-state/EmptyState";
 import { QueryProblemState } from "@/components/QueryProblemState";
-import { RelativeTime } from "@/components/RelativeTime";
 import { toast } from "@/components/ui/toast/toast-store";
 import { hasScope } from "@/lib/auth";
 
@@ -84,8 +77,6 @@ interface SectionCard {
   summary?: string;
   reloadable: boolean;
   bootstrap: boolean;
-  source: string;
-  lastReloadedAt?: string | null;
   settingCount: number;
   changedCount: number;
   pinnedCount: number;
@@ -138,29 +129,34 @@ export function ConfigurationPage() {
             host. Every setting has a default the server works with untouched; each section page
             says what a setting does, its default, and when a change to it applies.
           </p>
-          <ul className="mt-2 flex max-w-3xl flex-col gap-1.5 text-sm text-text-muted">
-            {APPLIES_ORDER.map((applies) => (
-              <li key={applies} className="flex flex-wrap items-start gap-2">
-                <AppliesBadge applies={applies} />
-                <span className="min-w-0 flex-1">{APPLIES_COPY[applies].explanation}</span>
-              </li>
-            ))}
-          </ul>
+          <details className="mt-2 max-w-3xl">
+            <summary className="cursor-pointer text-sm text-accent hover:underline">
+              How a change takes effect
+            </summary>
+            <ul className="mt-2 flex flex-col gap-1.5 text-sm text-text-muted">
+              {APPLIES_ORDER.map((applies) => (
+                <li key={applies} className="flex flex-wrap items-start gap-2">
+                  <AppliesBadge applies={applies} />
+                  <span className="min-w-0 flex-1">{APPLIES_COPY[applies].explanation}</span>
+                </li>
+              ))}
+            </ul>
+          </details>
         </div>
         <Dialog>
           <DialogTrigger asChild>
             <Button
-              variant="secondary"
+              variant="ghost"
               disabled={!canWrite}
               title={!canWrite ? "Needs admin:write" : undefined}
               leadingIcon={<RefreshCw size={16} aria-hidden="true" />}
             >
-              Re-read files
+              Re-read the bootstrap file
             </Button>
           </DialogTrigger>
           <DialogContent
-            title="Re-read configuration files?"
-            description="Re-reads the bootstrap file and hot-applies every reloadable section. Settings stored in the database still win over the file, so nothing you changed here is undone."
+            title="Re-read the bootstrap file?"
+            description="Only needed after editing the file on the host by hand: the server reads it again and applies every reloadable section. Settings saved here, in the database, still win over the file, so nothing you changed here is undone."
             footer={
               <>
                 <DialogClose asChild>
@@ -184,7 +180,7 @@ export function ConfigurationPage() {
                       })
                     }
                   >
-                    Re-read files
+                    Re-read the bootstrap file
                   </Button>
                 </DialogClose>
               </>
@@ -302,35 +298,13 @@ function SectionCardView({ card }: { card: SectionCard }) {
           )}
         </div>
         {card.settingCount > 0 && (
-          <p className="mt-2 text-xs text-text-muted">
-            {APPLIES_ORDER.filter((a) => card.applies[a] > 0)
-              .map((a) => `${card.applies[a]} ${APPLIES_COPY[a].label.toLowerCase()}`)
-              .join(" · ")}
+          <p className="mt-3 text-xs text-text-muted">
+            Changed from default:{" "}
+            <span className="text-text">
+              {card.changedCount} of {card.settingCount}
+            </span>
           </p>
         )}
-
-        <dl className="mt-3 flex flex-wrap gap-x-6 gap-y-1 text-xs text-text-muted">
-          {card.settingCount > 0 && (
-            <div className="flex gap-1">
-              <dt>Changed from default:</dt>
-              <dd className="text-text">
-                {card.changedCount} of {card.settingCount}
-              </dd>
-            </div>
-          )}
-          <div className="flex gap-1">
-            <dt>Values from:</dt>
-            <dd className="text-text">{describeSource(card.source)}</dd>
-          </div>
-          {card.reloadable && (
-            <div className="flex gap-1">
-              <dt>Last reloaded:</dt>
-              <dd className="text-text">
-                <RelativeTime at={card.lastReloadedAt} />
-              </dd>
-            </div>
-          )}
-        </dl>
 
         {card.matches.length > 0 && (
           <ul className="mt-3 border-t border-border pt-3">
@@ -363,7 +337,7 @@ function describeSection(
   query: string,
 ): SectionCard {
   const meta = schema?.sections.find((s) => s.name === name);
-  const empty: SettingGroup = { path: "", label: humanizeKey(name), fields: [], groups: [] };
+  const empty: SettingGroup = { path: "", label: sectionTitle(name), fields: [], groups: [] };
   const model = schema ? buildSectionModel(schema, name, section.values) : empty;
   const fields = flattenFields(model);
   const needle = query.trim().toLowerCase();
@@ -394,8 +368,6 @@ function describeSection(
     summary: model.summary,
     reloadable: meta?.reloadable ?? section.reloadable,
     bootstrap: meta?.bootstrap ?? false,
-    source: section.source,
-    lastReloadedAt: section.last_reloaded_at,
     settingCount: fields.length,
     changedCount: changed,
     pinnedCount: pinned,

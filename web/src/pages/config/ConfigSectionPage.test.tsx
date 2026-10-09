@@ -135,8 +135,10 @@ describe("ConfigSectionPage", () => {
     await screen.findByText("Client timeout");
 
     const row = document.getElementById("setting-client_timeout")!;
-    expect(within(row).getByText("From database")).toBeInTheDocument();
     expect(within(row).getByText("Changed from default")).toBeInTheDocument();
+    // "From database" said no more than "Changed from default" does; only a value from the
+    // bootstrap file or the environment, which the operator did not set here, gets a badge.
+    expect(within(row).queryByText("From database")).not.toBeInTheDocument();
   });
 
   it("reviews the merge patch before saving, then saves it", async () => {

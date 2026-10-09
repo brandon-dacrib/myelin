@@ -104,12 +104,12 @@ describe("ConfigurationPage", () => {
     renderIndex();
     await screen.findByRole("link", { name: "Rate limits" });
 
-    await user.click(screen.getByRole("button", { name: "Re-read files" }));
+    await user.click(screen.getByRole("button", { name: "Re-read the bootstrap file" }));
     const dialog = within(await screen.findByRole("dialog"));
     expect(
-      dialog.getByText(/Settings stored in the database still win over the file/),
+      dialog.getByText(/Settings saved here, in the database, still win over the file/),
     ).toBeInTheDocument();
-    await user.click(dialog.getByRole("button", { name: "Re-read files" }));
+    await user.click(dialog.getByRole("button", { name: "Re-read the bootstrap file" }));
 
     expect(await screen.findByText("Reloaded 4 sections")).toBeInTheDocument();
     await waitFor(() => expect(configLastReloaded.rate_limits).not.toBeNull());

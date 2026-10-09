@@ -38,7 +38,7 @@ import {
   fieldErrorsFor,
   flattenFields,
   getPath,
-  humanizeKey,
+  sectionTitle,
   ownerFieldPath,
   settingRowId,
   type Draft,
@@ -146,7 +146,7 @@ function SectionForm({ section, data, schema, schemaSettled, onReread }: Section
     () =>
       schema
         ? buildSectionModel(schema, section, values)
-        : { path: "", label: humanizeKey(section), fields: [], groups: [] },
+        : { path: "", label: sectionTitle(section), fields: [], groups: [] },
     [schema, section, values],
   );
   const fields = useMemo(() => flattenFields(model), [model]);
