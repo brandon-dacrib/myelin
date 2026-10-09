@@ -32,8 +32,10 @@ went down for about 35 minutes. Three faults, in order:
    `Ready`, and the queued message was delivered at 15:14:22. **Fixed in code** on
    `agent/crd-upgrade` (the init script carries a bridge's key even into a render without the line;
    the manager never mints over a key a running bridge has; a bridge that cannot read its store
-   says so on its page). To check on the bridge page: the new device shows as signed (the manager
-   logs nothing when it signs a device, only errors: a log line belongs there).
+   says so on its page). To check on the bridge page: the new device shows as signed; and the
+   manager now logs one line per device it signs, with the appservice, bot and device ids
+   (**fixed** on `agent/bridge-sign-log`; before, the line lacked the appservice id and the
+   page could name the old device).
 
 Also found from outside: `GET /_matrix/federation/v1/version` answered `401` unsigned (the spec gives
 it no authentication); **fixed** on `agent/fed-version` (an unsigned request gets `200`).
@@ -66,8 +68,8 @@ key for an instance from before 2026-10-02; a bridge whose store is unreadable s
 with the recovery (`docs/bridges/mautrix.md`). **The next roll must adopt the CRD once**: add
 `--take-ownership --force-conflicts` to that one `helm upgrade` (`deploy/helm/hs/README.md`). The
 demo's bridge has run since 15:12 with no restart. Left: the CRD smoke script
-(`deploy/helm/hs/ci/crd-upgrade-smoke.sh`) is not in CD; the manager logs nothing when it signs a bot
-device; bridge images are still `:latest`.
+(`deploy/helm/hs/ci/crd-upgrade-smoke.sh`) is not in CD; bridge images are still `:latest`. The
+manager's log line for a signed bot device is on `agent/bridge-sign-log`.
 
 ## Earlier: 2026-10-05 -- wave 2 is merged; roll to the first green image of `731d2433` or later
 

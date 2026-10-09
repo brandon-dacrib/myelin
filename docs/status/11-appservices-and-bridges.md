@@ -1,6 +1,7 @@
 # Status: track 11, appservices and bridges
 
-Last updated: 2026-10-08 (one bridge's slowness never delays another's delivery: the "does this
+Last updated: 2026-10-09, later (the manager says, in its log, which bridge bot device it
+cross-signed; below); before that 2026-10-08 (one bridge's slowness never delays another's delivery: the "does this
 user exist" question is asked by the bridge's own worker, and each bridge's queue is a gauge and a
 column on the bridges list; below); before that 2026-10-04, late (a bridge's namespaces, protocols and room directory mean what
 Sytest's `tests/60app-services/` says, and a ghost acts once it is registered; below); before
@@ -20,6 +21,39 @@ manager) and an instance's Kubernetes objects say whose bridge they are; before 
 (who has signed in to a bridge; the `cluster` runtime run on kind); before that 2026-09-30
 (ephemeral, to-device and device-list delivery); before that 2026-09-27 (RFC 0017 run against
 the real binary), 2026-09-27 (the bridge manager) and 2026-09-25.
+
+## Session 2026-10-09, later (branch `agent/bridge-sign-log`): the manager says which bot device it cross-signed
+
+On 2026-10-09 the owner recovered the demo's WhatsApp bridge by resetting its crypto store, which
+made a new bot device, and found no log line confirming the manager had signed it. The manager
+had logged one since 2026-10-03 ("cross-signed the bot's device with its own self-signing key"),
+but keyed by `bridge_type` and `owner` only, not the appservice id the other bridge lines are
+found by; and the instance could name the old device as the signed one, since both devices stay
+on the server, signed, and the row took whichever `/keys/query` listed last.
+
+- **The line** (`settle_bot_identity`, `hs-bridges` manager), at `INFO`, once per signature
+  uploaded and never for a look that signs nothing:
+  `cross-signed the bridge bot's device with the server-held self-signing key
+  bridge_type=mautrix-whatsapp owner=@brandon:example.org appservice=whatsapp-brandon
+  bot=@whatsappbot_brandon:example.org device=BQBMQVR81T first_signing=false
+  previous_device=I36QDLYXYI` (`first_signing=true` and no `previous_device` on the first
+  signing by this identity). The ids print bare, so `grep whatsapp-brandon` and
+  `grep BQBMQVR81T` both find it; the "published the bot's cross-signing keys" line prints its
+  `bot` and `master_key` bare too.
+- **`signed_bot_device` names the device signed in this look** ahead of one found signed
+  already, so after a reset the instance page says the bridge's current device.
+- No counter: `hs-bridges` has no metrics of its own, and the signing is one line a week at
+  most.
+
+Verified: `cargo fmt --all --check`, `cargo clippy -p hs-bridges --all-targets -- -D warnings`,
+`cargo test -p hs-bridges` (45 lib tests, among them the new
+`signing_a_bot_device_is_logged_once_with_the_appservice_bot_and_device`, which captures the
+manager's log through a global `tracing` subscriber routed per thread: a subscriber set on the
+test's thread alone sees nothing once a parallel test has hit the callsite without one, since
+`tracing` caches a callsite's interest from the first thread that hits it). `tracing-subscriber`
+(already a workspace dependency) is a dev-dependency of `hs-bridges` for that. Not run against
+the real bridge: the path is the one `real_mautrix_login::bot_is_cross_signed` proved on
+2026-10-03; only its log line and the device it records changed.
 
 ## Session 2026-10-09 (branch `agent/crd-upgrade`): failing bridge steps back off, and a roll keeps a bridge's own pickle key
 

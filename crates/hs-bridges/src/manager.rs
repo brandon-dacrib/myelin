@@ -1172,7 +1172,12 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
     /// self-signing keys published when the server's are not this identity's (none yet, or
     /// another instance's for the same owner, which the appservice may replace without
     /// user-interactive auth); each device of the bot without the self-signing key's signature
-    /// signed. Records the signed device on the row for the admin API.
+    /// signed, each one logged at `INFO` ("cross-signed the bridge bot's device") with the
+    /// appservice, the bot, the device and the device the instance named before, so that an
+    /// operator who reset a bridge's crypto store sees its new device signed; a look that signs
+    /// nothing logs nothing. Records the signed device on the row for the admin API: the one
+    /// signed in this look (after a reset, the bridge's current device) ahead of one found signed
+    /// already.
     async fn settle_bot_identity(&self, row: &InstanceRow) -> Result<(), String> {
         let now = now_ms();
         let key = (row.bridge_type.clone(), row.owner.clone());
@@ -1215,8 +1220,8 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             tracing::info!(
                 bridge_type = %row.bridge_type,
                 owner = %row.owner,
-                bot,
-                master_key = identity.master_key_id(),
+                bot = %bot,
+                master_key = %identity.master_key_id(),
                 "published the bot's cross-signing keys"
             );
         }
@@ -1225,10 +1230,14 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             .and_then(serde_json::Value::as_object)
             .cloned()
             .unwrap_or_default();
-        let mut signed = None;
+        // A device found signed already, and the one signed in this look: the latter is the
+        // one the instance names, since after a reset of the bridge's crypto store the old
+        // device stays on the server, signed, in whatever order `/keys/query` lists them.
+        let mut already_signed = None;
+        let mut signed_now: Option<String> = None;
         for (device_id, device_keys) in &devices {
             if identity.has_signed_device(device_keys) {
-                signed = Some(device_id.clone());
+                already_signed = Some(device_id.clone());
                 continue;
             }
             if device_keys.get("keys").is_none() {
@@ -1238,15 +1247,22 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
                 .upload_signatures(&token, &bot, identity.sign_device(device_id, device_keys)?)
                 .await
                 .map_err(|e| format!("could not sign the bot's device {device_id}: {e}"))?;
+            // One line per signature uploaded, never per look: the previous device is the one
+            // the instance named (none on the first signing by this identity).
+            let previous_device = signed_now.as_deref().or(row.signed_bot_device.as_deref());
             tracing::info!(
                 bridge_type = %row.bridge_type,
                 owner = %row.owner,
-                bot,
+                appservice = %row.appservice_id.as_deref().unwrap_or_default(),
+                bot = %bot,
                 device = %device_id,
-                "cross-signed the bot's device with its own self-signing key"
+                first_signing = previous_device.is_none(),
+                previous_device = previous_device.map(tracing::field::display),
+                "cross-signed the bridge bot's device with the server-held self-signing key"
             );
-            signed = Some(device_id.clone());
+            signed_now = Some(device_id.clone());
         }
+        let signed = signed_now.or(already_signed);
         self.identity_checked_ms
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3933,6 +3949,164 @@ mod tests {
             row_of(&manager).signed_bot_device.as_deref(),
             Some("LATEDEVICE")
         );
+    }
+
+    thread_local! {
+        /// The buffer the test on this thread captures the log into, if one does.
+        static LOG_BUFFER: std::cell::RefCell<Option<Arc<Mutex<Vec<u8>>>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// The writer of this binary's one global `tracing` subscriber: a line goes to the buffer
+    /// of the test on the thread that logged it (`LogSink::capture`), and nowhere otherwise.
+    /// One global subscriber rather than one per test: `tracing` caches each callsite's
+    /// interest from whichever thread hits it first, so a subscriber set on a test's thread
+    /// alone sees nothing once a parallel test has hit the callsite without one.
+    #[derive(Clone, Copy)]
+    struct ThreadLog;
+
+    impl std::io::Write for ThreadLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            LOG_BUFFER.with(|b| {
+                if let Some(buffer) = b.borrow().as_ref() {
+                    buffer.lock().unwrap().extend_from_slice(buf);
+                }
+            });
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ThreadLog {
+        type Writer = ThreadLog;
+
+        fn make_writer(&'a self) -> ThreadLog {
+            *self
+        }
+    }
+
+    /// What the manager logged at `INFO` and above on this thread (a `#[tokio::test]` runs its
+    /// steps on it) while the test holds this, one line per event, without time or target.
+    struct LogSink(Arc<Mutex<Vec<u8>>>);
+
+    impl LogSink {
+        fn capture() -> LogSink {
+            static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            INSTALLED.get_or_init(|| {
+                let subscriber = tracing_subscriber::fmt()
+                    .with_writer(ThreadLog)
+                    .with_ansi(false)
+                    .with_target(false)
+                    .without_time()
+                    .with_max_level(tracing::Level::INFO)
+                    .finish();
+                // Refused only if a test set another global subscriber first: none does.
+                let _ = tracing::subscriber::set_global_default(subscriber);
+            });
+            let buffer = Arc::new(Mutex::new(Vec::new()));
+            LOG_BUFFER.with(|b| *b.borrow_mut() = Some(buffer.clone()));
+            LogSink(buffer)
+        }
+
+        /// The lines logged so far that contain `needle`.
+        fn lines_with(&self, needle: &str) -> Vec<String> {
+            String::from_utf8_lossy(&self.0.lock().unwrap())
+                .lines()
+                .filter(|l| l.contains(needle))
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+
+    impl Drop for LogSink {
+        fn drop(&mut self) {
+            LOG_BUFFER.with(|b| *b.borrow_mut() = None);
+        }
+    }
+
+    /// The owner recovered a bridge on 2026-10-09 by resetting its crypto store, which made a
+    /// new bot device, and had no log line saying the manager had signed it: there is one now,
+    /// naming the appservice, the bot and the device, once per signature and never for a look
+    /// that signs nothing; and the instance names the device signed just now, not the old one
+    /// the server still lists.
+    #[tokio::test]
+    async fn signing_a_bot_device_is_logged_once_with_the_appservice_bot_and_device() {
+        let fake = Arc::new(FakeMatrix::default());
+        fake.add_device(BOT, "IEXNEKZESJ");
+        let manager = ready_with_an_unsigned_bot(&fake).await;
+        let appservice_id = row_of(&manager).appservice_id.expect("an appservice id");
+        let log = LogSink::capture();
+
+        manager.tick().await;
+        let signed = log.lines_with("cross-signed the bridge bot's device");
+        assert_eq!(signed.len(), 1, "{signed:?}");
+        for expected in [
+            format!("appservice={appservice_id}"),
+            format!("bot={BOT}"),
+            "device=IEXNEKZESJ".to_owned(),
+            "first_signing=true".to_owned(),
+            "bridge_type=mautrix-whatsapp".to_owned(),
+            format!("owner={OWNER}"),
+        ] {
+            assert!(signed[0].contains(&expected), "{expected} in {}", signed[0]);
+        }
+        assert!(!signed[0].contains("previous_device"), "{}", signed[0]);
+
+        // Looks that sign nothing log nothing, whether skipped (settled) or made (a recheck).
+        manager.tick().await;
+        manager.identity_checked_ms.lock().unwrap().clear();
+        manager.tick().await;
+        assert_eq!(
+            fake.take_calls(),
+            vec![
+                format!("POST keys/query as={BOT}"),
+                format!("POST keys/device_signing/upload as={BOT}"),
+                format!("POST keys/signatures/upload as={BOT}"),
+                format!("POST keys/query as={BOT}"),
+            ]
+        );
+        assert_eq!(
+            log.lines_with("cross-signed the bridge bot's device").len(),
+            1,
+            "a look that signs nothing logs nothing"
+        );
+
+        // The bridge's crypto store is reset: a new device, which the server happens to list
+        // before the old (still signed) one.
+        {
+            let mut keys = fake.keys.lock().unwrap();
+            let devices = keys["device_keys"][BOT].as_object_mut().unwrap();
+            let old = devices.remove("IEXNEKZESJ").unwrap();
+            drop(keys);
+            fake.add_device(BOT, "BQBMQVR81T");
+            fake.keys.lock().unwrap()["device_keys"][BOT]["IEXNEKZESJ"] = old;
+        }
+        manager.identity_checked_ms.lock().unwrap().clear();
+        manager.tick().await;
+        let signed = log.lines_with("cross-signed the bridge bot's device");
+        assert_eq!(signed.len(), 2, "{signed:?}");
+        for expected in [
+            format!("appservice={appservice_id}"),
+            "device=BQBMQVR81T".to_owned(),
+            "first_signing=false".to_owned(),
+            "previous_device=IEXNEKZESJ".to_owned(),
+        ] {
+            assert!(signed[1].contains(&expected), "{expected} in {}", signed[1]);
+        }
+        assert_eq!(
+            row_of(&manager).signed_bot_device.as_deref(),
+            Some("BQBMQVR81T"),
+            "the instance names the device signed just now, not the old one listed after it"
+        );
+        let view = manager
+            .instance("mautrix-whatsapp", OWNER)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(view.signed_bot_device.as_deref(), Some("BQBMQVR81T"));
     }
 
     #[tokio::test]

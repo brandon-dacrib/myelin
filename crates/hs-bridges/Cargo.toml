@@ -34,3 +34,4 @@ tracing = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
 tower = { workspace = true }
+tracing-subscriber = { workspace = true }

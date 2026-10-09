@@ -270,7 +270,10 @@ instance row beside the pickle key, publishes the public keys with
 auth for an appservice, MSC4190; `hs-e2e` already did this, the same rule as Synapse's), and
 signs the bot's device (`POST /keys/signatures/upload`) with the self-signing key. It looks again
 every minute and signs a device the bridge made since; an instance recreated for the same owner
-replaces the keys. `config.yaml` is unchanged (`self_sign` stays at its default, off); mautrix-go
+replaces the keys. Each signature is one `INFO` line in the server's log, "cross-signed the
+bridge bot's device with the server-held self-signing key", with `appservice`, `bot`, `device`,
+`first_signing` and (after the first) `previous_device`; a look that signs nothing logs nothing
+(since 2026-10-09; before that the line lacked the appservice id). `config.yaml` is unchanged (`self_sign` stays at its default, off); mautrix-go
 tolerates its own user's keys on the server when it does not self-sign (`crypto/devicelist.go`
 only compares them). The server announces a device-list change on both uploads, so a client
 already tracking the bot (the owner's) re-fetches the identity and the signature.
@@ -376,9 +379,13 @@ demo it took one helper pod and no data loss beyond that:
    Keep `crypto_version`: it is the schema version, and an empty one makes the bridge try to
    create tables that exist.
 3. Delete the helper and let the bridge start. It makes a new crypto account and a new bot
-   device (`BQBMQVR81T` on the demo), the server cross-signs that device on its next step
-   (`signed_bot_device` on the instance), and the WhatsApp login, kept in the bridge's own
-   tables, survives. The `Bridge` went `Ready`.
+   device (`BQBMQVR81T` on the demo), the server cross-signs that device on its next look
+   (within a minute: `signed_bot_device` on the instance names it, and the server's log has
+   one line, `cross-signed the bridge bot's device with the server-held self-signing key
+   ... appservice=whatsapp-brandon ... device=BQBMQVR81T first_signing=false
+   previous_device=<the old device>`; `grep` the server's log for the appservice id or the new
+   device id), and the WhatsApp login, kept in the bridge's own tables, survives. The `Bridge`
+   went `Ready`.
 4. People's clients see a new device for the bot; old encrypted messages to the bridge cannot
    be decrypted by it, new ones can.
 
