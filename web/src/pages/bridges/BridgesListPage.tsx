@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { useNavigate, useSearch, Link } from "@tanstack/react-router";
 import { Cable, Play, Pause } from "lucide-react";
 import {
+  isBuiltInAppservice,
   useAppservices,
   useBridgeTypes,
   usePauseAppservice,
@@ -117,10 +118,19 @@ export function BridgesListPage() {
       header: "State",
       priority: 1,
       render: (b) => {
+        // The server's own bridge manager is not probed, so "Unknown" would read as a fault.
+        if (isBuiltInAppservice(b)) {
+          return (
+            <span title="The server's own registration; it is not probed.">
+              <Badge status="muted">Built in</Badge>
+            </span>
+          );
+        }
         const meta = bridgeHealthMeta[healthKeyOf(b)];
         return <Badge status={meta.status}>{meta.label}</Badge>;
       },
-      renderCompact: (b) => bridgeHealthMeta[healthKeyOf(b)].label,
+      renderCompact: (b) =>
+        isBuiltInAppservice(b) ? "Built in" : bridgeHealthMeta[healthKeyOf(b)].label,
     },
     {
       key: "queue",
@@ -221,12 +231,33 @@ export function BridgesListPage() {
             Every bridge registered with this server: each person&apos;s own bridge, and any you run
             yourself. Delivery and health are looked at here.
           </p>
-          <p className="mt-0.5 text-sm text-text-muted">
-            Waiting to send counts what the server has queued for a bridge and not yet delivered.
-            Each bridge has its own queue, so one that is slow or down never holds up another; a
-            count that keeps growing, or an oldest wait past a minute, is a bridge falling behind,
-            and failed ones can be sent again from the bridge&apos;s page.
-          </p>
+          <details className="mt-1">
+            <summary className="cursor-pointer text-sm text-accent hover:underline">
+              What the columns mean
+            </summary>
+            <dl className="mt-1 flex max-w-3xl flex-col gap-1 text-sm text-text-muted">
+              <div>
+                <dt className="inline font-medium text-text">State: </dt>
+                <dd className="inline">
+                  whether the bridge answers the server. Unknown means nothing has been sent to it
+                  since the server started, so there is nothing to judge by yet.
+                </dd>
+              </div>
+              <div>
+                <dt className="inline font-medium text-text">Waiting to send: </dt>
+                <dd className="inline">
+                  what the server has queued for a bridge and not yet delivered. Each bridge has its
+                  own queue, so one that is slow or down never holds up another; a count that keeps
+                  growing, or an oldest wait past a minute, is a bridge falling behind, and failed
+                  ones can be sent again from the bridge&apos;s page.
+                </dd>
+              </div>
+              <div>
+                <dt className="inline font-medium text-text">Bot: </dt>
+                <dd className="inline">the Matrix account people message to use the bridge.</dd>
+              </div>
+            </dl>
+          </details>
         </div>
         <Button
           variant="secondary"

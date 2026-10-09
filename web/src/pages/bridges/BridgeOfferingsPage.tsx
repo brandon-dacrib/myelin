@@ -17,6 +17,7 @@ import { ForbiddenState } from "@/components/ui/error-state/ErrorState";
 import { DataTable, type Column } from "@/components/ui/table/DataTable";
 import { hasScope } from "@/lib/auth";
 import {
+  cannotRunBridgesWhy,
   instanceCountList,
   instanceStateBadge,
   instanceStateLabel,
@@ -144,8 +145,7 @@ export function BridgeOfferingsPage() {
       {target && !target.available && (
         <p className="mt-4 rounded-md border border-border bg-surface px-4 py-3 text-sm text-text-muted">
           <span className="font-medium text-text">This server can&apos;t run bridges itself.</span>{" "}
-          {target.reason ?? "It isn't running in Kubernetes with the chart's bridges enabled."}{" "}
-          Bridges offered here run elsewhere, from their files.
+          {cannotRunBridgesWhy(target.reason)}
         </p>
       )}
 

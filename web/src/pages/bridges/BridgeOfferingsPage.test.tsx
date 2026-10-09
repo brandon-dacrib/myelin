@@ -4,6 +4,7 @@ import { setDeploymentTarget } from "@/mocks/data/bridge-offerings";
 import { signIn, signOut } from "@/lib/auth";
 import { renderBridgesRoute } from "./test-utils";
 import { BridgeOfferingsPage } from "./BridgeOfferingsPage";
+import { cannotRunBridgesWhy } from "@/lib/bridge-offerings";
 
 beforeEach(async () => {
   await signIn();
@@ -26,6 +27,20 @@ describe("Offered bridges", () => {
     expect(imessage.getByText("Runs elsewhere")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Offer a bridge" })).toBeEnabled();
     expect(screen.getByRole("link", { name: "Registrations" })).toBeInTheDocument();
+  });
+
+  it("gives the server's reason as one sentence, without saying 'run elsewhere' twice", () => {
+    expect(
+      cannotRunBridgesWhy(
+        "this server is not running in Kubernetes with the chart's bridges enabled, so bridges run elsewhere, from their files",
+      ),
+    ).toBe(
+      "This server is not running in Kubernetes with the chart's bridges enabled, so bridges run elsewhere, from their files.",
+    );
+    expect(cannotRunBridgesWhy("Not in Kubernetes.")).toBe(
+      "Not in Kubernetes. Each bridge offered here runs elsewhere, from the files on its page.",
+    );
+    expect(cannotRunBridgesWhy(null)).toMatch(/^It isn't running in Kubernetes/);
   });
 
   it("says when this server can't run bridges itself", async () => {

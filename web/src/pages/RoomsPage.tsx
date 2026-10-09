@@ -152,7 +152,12 @@ export function RoomsPage() {
                 <EmptyState
                   icon={<DoorOpen aria-hidden="true" />}
                   title="No rooms yet"
-                  description="Rooms appear when users create or join them."
+                  description="Rooms appear here when people on this server create or join them, from any Matrix client."
+                  action={
+                    <Link to="/users" className="text-sm text-accent hover:underline">
+                      Add people under Users
+                    </Link>
+                  }
                 />
               )
             }
@@ -180,9 +185,16 @@ function FindEvent() {
   const find = useFindEvent();
   const navigate = useNavigate({ from: "/rooms" });
   return (
-    <div className="mt-3 max-w-md">
+    <details className="mt-3 max-w-md">
+      <summary className="cursor-pointer text-sm text-accent hover:underline">
+        Find an event by its ID
+      </summary>
+      <p className="mt-1 text-xs text-text-muted">
+        Paste an event ID (it starts with $) from a report or a client&apos;s &quot;view
+        source&quot;, and it opens in its room&apos;s timeline.
+      </p>
       <form
-        className="flex gap-2"
+        className="mt-2 flex gap-2"
         onSubmit={(e) => {
           e.preventDefault();
           const id = eventId.trim();
@@ -198,18 +210,23 @@ function FindEvent() {
         }}
       >
         <Input
-          aria-label="Find an event by its ID"
-          placeholder="Find an event by ID"
+          aria-label="Event ID"
+          placeholder="$event-id"
           value={eventId}
           onChange={(e) => setEventId(e.target.value)}
         />
-        <Button type="submit" variant="secondary" disabled={!eventId.trim() || find.isPending}>
+        <Button
+          type="submit"
+          variant="secondary"
+          className="whitespace-nowrap"
+          disabled={!eventId.trim() || find.isPending}
+        >
           Find event
         </Button>
       </form>
       {find.isError && (
         <MutationError className="mt-2" error={find.error} action="find that event" />
       )}
-    </div>
+    </details>
   );
 }

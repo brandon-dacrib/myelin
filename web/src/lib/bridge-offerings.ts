@@ -260,3 +260,21 @@ function bridgesPeopleHave(n: number): string {
 function capitalise(s: string): string {
   return s.charAt(0).toUpperCase() + s.slice(1);
 }
+
+/**
+ * The server's reason it cannot deploy bridges, as a sentence that follows "This server can't run
+ * bridges itself.": the reason starts with a capital and ends with a full stop, and the sentence
+ * about running them elsewhere is added only when the reason did not already say so (the
+ * server's own reason does, and the page used to say it twice).
+ */
+export function cannotRunBridgesWhy(reason: string | null | undefined): string {
+  const given = (reason ?? "").trim();
+  if (!given) {
+    return "It isn't running in Kubernetes with the chart's bridges enabled, so each bridge offered here runs elsewhere, from the files on its page.";
+  }
+  const sentence =
+    given.charAt(0).toUpperCase() + given.slice(1) + (/[.!?]$/.test(given) ? "" : ".");
+  return /elsewhere/.test(given)
+    ? sentence
+    : `${sentence} Each bridge offered here runs elsewhere, from the files on its page.`;
+}

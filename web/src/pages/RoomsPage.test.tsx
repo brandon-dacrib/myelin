@@ -24,7 +24,8 @@ describe("RoomsPage", () => {
   it("finds an event by its id and opens it in its room's timeline", async () => {
     await signIn();
     const { router } = renderRoutes(ROUTES, "/rooms");
-    await userEvent.type(await screen.findByLabelText("Find an event by its ID"), "$msg-gener-4");
+    await userEvent.click(await screen.findByText("Find an event by its ID"));
+    await userEvent.type(screen.getByLabelText("Event ID"), "$msg-gener-4");
     await userEvent.click(screen.getByRole("button", { name: "Find event" }));
     await waitFor(() =>
       expect(router.state.location.pathname).toBe("/rooms/!general%3Aexample.org"),
@@ -35,7 +36,8 @@ describe("RoomsPage", () => {
   it("says so when no event has that id", async () => {
     await signIn();
     renderRoutes(ROUTES, "/rooms");
-    await userEvent.type(await screen.findByLabelText("Find an event by its ID"), "$nope");
+    await userEvent.click(await screen.findByText("Find an event by its ID"));
+    await userEvent.type(screen.getByLabelText("Event ID"), "$nope");
     await userEvent.click(screen.getByRole("button", { name: "Find event" }));
     expect(await screen.findByText(/Couldn.t find that event/)).toBeInTheDocument();
   });
@@ -44,6 +46,6 @@ describe("RoomsPage", () => {
     await signIn(["moderation:read"]);
     renderRoutes(ROUTES, "/rooms");
     expect(await screen.findByRole("link", { name: "General" })).toBeInTheDocument();
-    expect(screen.queryByLabelText("Find an event by its ID")).toBeNull();
+    expect(screen.queryByText("Find an event by its ID")).toBeNull();
   });
 });

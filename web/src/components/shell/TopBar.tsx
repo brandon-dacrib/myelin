@@ -4,7 +4,8 @@ import { Root, Trigger, Portal, Content, Item, Separator } from "radix-ui/dropdo
 import { cn } from "@/lib/cn";
 import { applyTheme, readTheme, type Theme } from "@/lib/theme";
 import { getSession, signOut, subscribeSession } from "@/lib/auth";
-import { useClusterStatus } from "@/api/dashboard";
+import { useClusterStatus, useServerInfo } from "@/api/dashboard";
+import { describeScopes } from "@/lib/scopes";
 import { PRODUCT_NAME } from "@/lib/brand";
 
 export interface TopBarProps {
@@ -17,6 +18,7 @@ const themeIcons: Record<Theme, typeof Sun> = { light: Sun, dark: Moon, system: 
 export function TopBar({ onOpenPalette, onOpenNavDrawer }: TopBarProps) {
   const session = useSyncExternalStore(subscribeSession, getSession, getSession);
   const { data: cluster, dataUpdatedAt, isFetching } = useClusterStatus();
+  const { data: server } = useServerInfo();
   const [theme, setTheme] = useState<Theme>(() => readTheme());
   const ThemeIcon = themeIcons[theme];
 
@@ -40,6 +42,14 @@ export function TopBar({ onOpenPalette, onOpenNavDrawer }: TopBarProps) {
 
       <div className="flex items-center gap-2 text-sm font-medium text-text">
         <span>{PRODUCT_NAME}</span>
+        {server?.name && (
+          <>
+            <span className="text-text-faint" aria-hidden="true">
+              &middot;
+            </span>
+            <span className="hidden font-identifier text-text-muted sm:inline">{server.name}</span>
+          </>
+        )}
         <span className="text-text-faint" aria-hidden="true">
           &middot;
         </span>
@@ -68,6 +78,7 @@ export function TopBar({ onOpenPalette, onOpenNavDrawer }: TopBarProps) {
         <span
           className="hidden items-center gap-1.5 rounded-xs px-2 py-1 text-xs text-text-muted sm:flex"
           aria-live="polite"
+          title="When this page last read the server's state; it does so every 30 seconds."
         >
           <RefreshCw
             size={12}
@@ -75,8 +86,8 @@ export function TopBar({ onOpenPalette, onOpenNavDrawer }: TopBarProps) {
             className={cn("text-text-faint", isFetching && "animate-spin")}
           />
           {dataUpdatedAt
-            ? `Updated ${new Date(dataUpdatedAt).toLocaleTimeString()}`
-            : "Polling every 30s"}
+            ? `Checked ${new Date(dataUpdatedAt).toLocaleTimeString()}`
+            : "Checks every 30 s"}
         </span>
 
         <button
@@ -107,7 +118,9 @@ export function TopBar({ onOpenPalette, onOpenNavDrawer }: TopBarProps) {
             >
               <div className="px-3 py-2">
                 <p className="text-sm font-medium text-text">{session?.operator.name}</p>
-                <p className="mt-1 text-xs text-text-muted">Scopes: {session?.scopes.join(", ")}</p>
+                <p className="mt-1 text-xs text-text-muted">
+                  {session ? describeScopes(session.scopes) : ""}
+                </p>
               </div>
               <Separator className="my-1 h-px bg-border" />
               <Item
