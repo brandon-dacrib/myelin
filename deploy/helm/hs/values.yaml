@@ -433,6 +433,20 @@ serviceMonitor:
   scrapeTimeout: 10s
   labels: {}
 
+## Alert rules for the Prometheus Operator (a `PrometheusRule`, templates/prometheusrule.yaml),
+## for what an operator must be told: a replica down or not Ready, restarts, a 5xx rate, slow
+## requests, and in cluster mode a replica missing from the registry, shards with no owner, a
+## stale lease and fenced writes; slow PostgreSQL commits; a data or media volume filling up;
+## dropped outbound federation events; a bridge that stopped accepting or had transactions
+## dead-lettered; memory near its limit. Each is scoped to this release and names the command
+## or page to look at. `ci/alerts-test.sh` proves every alert fires on the series it is written
+## for (`promtool test rules`). Off by default, like the ServiceMonitor it goes with: it needs
+## the CRD, and the kube-state-metrics and kubelet series of a kube-prometheus-stack.
+prometheusRule:
+  enabled: false
+  namespace: ""
+  labels: {}
+
 networkPolicy:
   enabled: false
 

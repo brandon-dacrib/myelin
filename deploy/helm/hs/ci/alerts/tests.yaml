@@ -1,0 +1,334 @@
+# promtool unit tests for the chart's alert rules (templates/prometheusrule.yaml), run by
+# ci/alerts-test.sh against the rules it renders for a release named `myelin` in namespace
+# `hs`, in cluster mode on PostgreSQL with a local media claim `hs-media` (so every group is
+# rendered). Each test feeds the series an alert is written for and asserts it fires with the
+# labels and summary an operator would see; the first test feeds a healthy server and asserts
+# nothing fires.
+rule_files:
+  - rules.yaml
+
+evaluation_interval: 30s
+
+tests:
+  - interval: 30s
+    name: a healthy two-replica release raises nothing
+    input_series:
+      - series: 'up{namespace="hs", service="myelin", pod="myelin-0"}'
+        values: '1x60'
+      - series: 'up{namespace="hs", service="myelin", pod="myelin-1"}'
+        values: '1x60'
+      - series: 'hs_cluster_live_replicas{namespace="hs", service="myelin", pod="myelin-0"}'
+        values: '2x60'
+      - series: 'hs_cluster_live_replicas{namespace="hs", service="myelin", pod="myelin-1"}'
+        values: '2x60'
+      - series: 'hs_cluster_owned_shards{namespace="hs", service="myelin", pod="myelin-0", kind="room"}'
+        values: '128x60'
+      - series: 'hs_cluster_owned_shards{namespace="hs", service="myelin", pod="myelin-1", kind="room"}'
+        values: '128x60'
+      - series: 'hs_cluster_owned_shards{namespace="hs", service="myelin", pod="myelin-0", kind="user"}'
+        values: '128x60'
+      - series: 'hs_cluster_owned_shards{namespace="hs", service="myelin", pod="myelin-1", kind="user"}'
+        values: '128x60'
+      - series: 'hs_cluster_lease_age_seconds{namespace="hs", service="myelin", pod="myelin-0"}'
+        values: '1x60'
+      - series: 'hs_http_requests_total{namespace="hs", service="myelin", pod="myelin-0", status_class="2xx", route="/_matrix/client/v3/sync"}'
+        values: '0+100x60'
+      - series: 'hs_http_requests_total{namespace="hs", service="myelin", pod="myelin-0", status_class="5xx", route="/_matrix/client/v3/sync"}'
+        values: '0+1x60'
+      - series: 'hs_appservice_queue_oldest_age_seconds{namespace="hs", service="myelin", pod="myelin-0", appservice="whatsapp"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: HsReplicaDown
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: HsClusterReplicaMissing
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: HsClusterShardsUnowned
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: HsClusterLeaseStale
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: HsErrorRateHigh
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: HsAppserviceNotAccepting
+        exp_alerts: []
+
+  - interval: 30s
+    name: a replica that stops answering scrapes is critical after two minutes
+    input_series:
+      - series: 'up{namespace="hs", service="myelin", pod="myelin-1"}'
+        values: '1x4 0x20'
+      - series: 'up{namespace="hs", service="other", pod="other-0"}'
+        values: '0x24'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: HsReplicaDown
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: HsReplicaDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              namespace: hs
+              service: myelin
+              pod: myelin-1
+            exp_annotations:
+              summary: "myelin-1 has not answered a scrape for 2 minutes"
+              description: >-
+                Prometheus cannot scrape the pod's /metrics. See `kubectl -n hs get pods`,
+                `kubectl -n hs describe pod myelin-1` and its log; a pod that is
+                Running but not Ready is failing /health/ready (in cluster mode that is a
+                heartbeat that does not reach the database).
+
+  - interval: 30s
+    name: fewer Ready replicas than desired for ten minutes is a warning
+    input_series:
+      - series: 'kube_statefulset_status_replicas_ready{namespace="hs", statefulset="myelin"}'
+        values: '1x40'
+      - series: 'kube_statefulset_status_replicas{namespace="hs", statefulset="myelin"}'
+        values: '2x40'
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: HsReplicasNotReady
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: HsReplicasNotReady
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: hs
+              statefulset: myelin
+            exp_annotations:
+              summary: "myelin has had fewer Ready replicas than it asks for, for 10 minutes"
+              description: >-
+                A roll or a scale takes well under a minute per replica (the pod hands its
+                shards on and the next one boots in seconds); ten minutes means a replica cannot
+                start or cannot become Ready. `kubectl -n hs rollout status statefulset/myelin`,
+                then the events and log of the pod that is not Ready.
+
+  - interval: 30s
+    name: a 5xx rate over five percent for five minutes is critical
+    input_series:
+      - series: 'hs_http_requests_total{namespace="hs", service="myelin", pod="myelin-0", status_class="2xx", route="/_matrix/client/v3/sync"}'
+        values: '0+100x40'
+      - series: 'hs_http_requests_total{namespace="hs", service="myelin", pod="myelin-0", status_class="5xx", route="/_matrix/client/v3/sync"}'
+        values: '0+20x40'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: HsErrorRateHigh
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "more than 5% of requests to myelin have failed with a 5xx for 5 minutes"
+              description: >-
+                `sum by (route) (rate(hs_http_requests_total{status_class="5xx"}[5m]))` names the
+                routes; the pods' logs at `error` have the cause. A `503` on every route in
+                cluster mode is a shard with no owner (HsClusterShardsUnowned).
+
+  - interval: 30s
+    name: slow requests are judged without the long-polls
+    input_series:
+      # /sync takes 30 s by design: every observation in the top bucket. Not an alert.
+      - series: 'hs_http_request_duration_seconds_bucket{namespace="hs", service="myelin", pod="myelin-0", route="/_matrix/client/v3/sync", le="1"}'
+        values: '0x40'
+      - series: 'hs_http_request_duration_seconds_bucket{namespace="hs", service="myelin", pod="myelin-0", route="/_matrix/client/v3/sync", le="32.768"}'
+        values: '0+10x40'
+      - series: 'hs_http_request_duration_seconds_bucket{namespace="hs", service="myelin", pod="myelin-0", route="/_matrix/client/v3/sync", le="+Inf"}'
+        values: '0+10x40'
+      # Sends under a second.
+      - series: 'hs_http_request_duration_seconds_bucket{namespace="hs", service="myelin", pod="myelin-0", route="/_matrix/client/v3/rooms/{room_id}/send/{event_type}/{txn_id}", le="1"}'
+        values: '0+10x40'
+      - series: 'hs_http_request_duration_seconds_bucket{namespace="hs", service="myelin", pod="myelin-0", route="/_matrix/client/v3/rooms/{room_id}/send/{event_type}/{txn_id}", le="32.768"}'
+        values: '0+10x40'
+      - series: 'hs_http_request_duration_seconds_bucket{namespace="hs", service="myelin", pod="myelin-0", route="/_matrix/client/v3/rooms/{room_id}/send/{event_type}/{txn_id}", le="+Inf"}'
+        values: '0+10x40'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: HsRequestsSlow
+        exp_alerts: []
+
+  - interval: 30s
+    name: sends over two seconds at the 99th percentile for ten minutes are a warning
+    input_series:
+      - series: 'hs_http_request_duration_seconds_bucket{namespace="hs", service="myelin", pod="myelin-0", route="/_matrix/client/v3/rooms/{room_id}/send/{event_type}/{txn_id}", le="1"}'
+        values: '0x40'
+      - series: 'hs_http_request_duration_seconds_bucket{namespace="hs", service="myelin", pod="myelin-0", route="/_matrix/client/v3/rooms/{room_id}/send/{event_type}/{txn_id}", le="4.096"}'
+        values: '0+10x40'
+      - series: 'hs_http_request_duration_seconds_bucket{namespace="hs", service="myelin", pod="myelin-0", route="/_matrix/client/v3/rooms/{room_id}/send/{event_type}/{txn_id}", le="+Inf"}'
+        values: '0+10x40'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: HsRequestsSlow
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "the slowest 1% of requests to myelin have taken over 2 s for 10 minutes"
+              description: >-
+                Long-polls (/sync, /events) are excluded, since they wait on purpose. Look at the
+                database first (HsPostgresFlushSlow; the volume's latency for the embedded engine),
+                then at `hs_cluster_forward_latency_seconds` in cluster mode.
+
+  - interval: 30s
+    name: a replica missing from the registry for five minutes is a warning
+    input_series:
+      - series: 'hs_cluster_live_replicas{namespace="hs", service="myelin", pod="myelin-0"}'
+        values: '1x40'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: HsClusterReplicaMissing
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: HsClusterReplicaMissing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "the replicas of myelin see fewer live peers than the 2 the chart asks for"
+              description: >-
+                A replica is missing from the registry for longer than a roll takes: it is not
+                running, or its heartbeats do not reach the database (HsClusterLeaseStale on that
+                replica). The survivors own every shard meanwhile, so the server is up but a
+                replica short.
+
+  - interval: 30s
+    name: room shards with no owner for two minutes are critical
+    input_series:
+      - series: 'hs_cluster_owned_shards{namespace="hs", service="myelin", pod="myelin-0", kind="room"}'
+        values: '128x40'
+      - series: 'hs_cluster_owned_shards{namespace="hs", service="myelin", pod="myelin-0", kind="user"}'
+        values: '256x40'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: HsClusterShardsUnowned
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: HsClusterShardsUnowned
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "some of myelin's shards have had no owner for 2 minutes"
+              description: >-
+                Every room and user shard should be owned by exactly one live replica; a shard
+                with none refuses its requests (`503 M_HS_NOT_SHARD_OWNER` once the forward's
+                deadline passes). A replica that died keeps its shards until its lease
+                (10s) lapses, which is seconds, not minutes: this is a
+                replica that is up but cannot claim (its own heartbeat is stale), or no replica at
+                all. `kubectl -n hs logs <pod> | grep -i shard`, and the Cluster page of the
+                admin interface.
+
+  - interval: 30s
+    name: a lease older than its TTL for a minute is a warning on that pod
+    input_series:
+      - series: 'hs_cluster_lease_age_seconds{namespace="hs", service="myelin", pod="myelin-1"}'
+        values: '1x4 15x20'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: HsClusterLeaseStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: hs
+              service: myelin
+              pod: myelin-1
+            exp_annotations:
+              summary: "myelin-1's last heartbeat reached the database over 10s ago"
+              description: >-
+                The replica's lease has lapsed: its peers have taken its shards and it is refusing
+                what lands on it until a heartbeat succeeds (decision 0028). Its heartbeat row is
+                one small write every 2s, so this is the database
+                refusing or stalling writes from this pod. Its log has the error at `warn`.
+
+  - interval: 30s
+    name: a bridge whose oldest queued transaction is over five minutes old for ten minutes
+    input_series:
+      - series: 'hs_appservice_queue_oldest_age_seconds{namespace="hs", service="myelin", pod="myelin-0", appservice="whatsapp"}'
+        values: '0+30x60'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: HsAppserviceNotAccepting
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: hs
+              service: myelin
+              pod: myelin-0
+              appservice: whatsapp
+            exp_annotations:
+              summary: "the bridge whatsapp has not accepted a transaction for over 5 minutes"
+              description: >-
+                Its queue's oldest entry has waited that long; the server is backing off against
+                it. The bridge's pod (`kubectl -n hs get bridges`) is down or refusing, and its
+                page in the admin interface's Bridges section says what it last answered.
+
+  - interval: 30s
+    name: dropped outbound federation events in the last hour
+    input_series:
+      - series: 'hs_federation_outbound_pdus_dropped_total{namespace="hs", service="myelin", pod="myelin-0"}'
+        values: '0x10 3x10'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: HsFederationPdusDropped
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: hs
+              service: myelin
+              pod: myelin-0
+            exp_annotations:
+              summary: "myelin dropped outbound federation events in the last hour"
+              description: >-
+                The outbound queue for a destination is bounded; a destination down for longer
+                than it holds has events dropped from it, and is caught up from the rooms when it
+                returns (the Federation page shows the catch-up). Dropped events are the sign
+                that a destination has been unreachable for a long time.
+
+  - interval: 30s
+    name: a data or media volume under ten percent free for fifteen minutes
+    input_series:
+      - series: 'kubelet_volume_stats_available_bytes{namespace="hs", persistentvolumeclaim="hs-media"}'
+        values: '1000x40'
+      - series: 'kubelet_volume_stats_capacity_bytes{namespace="hs", persistentvolumeclaim="hs-media"}'
+        values: '100000x40'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: HsMediaVolumeFilling
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: hs
+              persistentvolumeclaim: hs-media
+            exp_annotations:
+              summary: "the media volume hs-media has less than 10% free"
+              description: >-
+                Uploads fail once it is full. Grow the claim, or shorten the remote media
+                retention in the admin interface's Configuration page.
+
+  - interval: 30s
+    name: memory over ninety percent of the limit for fifteen minutes
+    input_series:
+      - series: 'container_memory_working_set_bytes{namespace="hs", pod="myelin-0", container="hs"}'
+        values: '950x40'
+      - series: 'kube_pod_container_resource_limits{namespace="hs", pod="myelin-0", container="hs", resource="memory"}'
+        values: '1000x40'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: HsMemoryNearLimit
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: hs
+              pod: myelin-0
+              container: hs
+            exp_annotations:
+              summary: "myelin-0 has used over 90% of its memory limit for 15 minutes"
+              description: >-
+                The next step is an OOMKill and a restart with its shards handed on. Raise
+                resources.limits.memory (1Gi now) if the load
+                is real; a steady climb at steady load is a leak to report.

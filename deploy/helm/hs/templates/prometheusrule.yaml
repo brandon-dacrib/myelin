@@ -1,0 +1,264 @@
+{{- if .Values.prometheusRule.enabled }}
+{{- $ns := .Release.Namespace }}
+{{- $svc := include "hs.fullname" . }}
+{{- $pods := printf "%s-[0-9]+" $svc }}
+{{- $leaseTtl := .Values.cluster.leaseTtl | trimSuffix "s" }}
+# What an operator must be told about this release, as Prometheus Operator alert rules (the
+# same operator whose ServiceMonitor templates/servicemonitor.yaml targets). Every expression
+# names a metric this server registers (crates/*/src/metrics.rs; docs/decisions/0004 for the
+# naming) or one kube-state-metrics and the kubelet export in any kube-prometheus-stack, and is
+# scoped to this namespace and this release's Service. deploy/helm/hs/ci/alerts-test.sh renders
+# this file and runs `promtool check rules` and `promtool test rules` against
+# ci/alerts/tests.yaml, so each alert is known to fire on the series it is written for.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ $svc }}
+  {{- if .Values.prometheusRule.namespace }}
+  namespace: {{ .Values.prometheusRule.namespace }}
+  {{- end }}
+  labels:
+    {{- include "hs.labels" . | nindent 4 }}
+    {{- with .Values.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: {{ $svc }}.availability
+      rules:
+        - alert: HsReplicaDown
+          expr: up{namespace="{{ $ns }}", service="{{ $svc }}"} == 0
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "{{ "{{ $labels.pod }}" }} has not answered a scrape for 2 minutes"
+            description: >-
+              Prometheus cannot scrape the pod's /metrics. See `kubectl -n {{ $ns }} get pods`,
+              `kubectl -n {{ $ns }} describe pod {{ "{{ $labels.pod }}" }}` and its log; a pod that is
+              Running but not Ready is failing /health/ready (in cluster mode that is a
+              heartbeat that does not reach the database).
+        - alert: HsReplicasNotReady
+          expr: |
+            kube_statefulset_status_replicas_ready{namespace="{{ $ns }}", statefulset="{{ $svc }}"}
+            < kube_statefulset_status_replicas{namespace="{{ $ns }}", statefulset="{{ $svc }}"}
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $svc }} has had fewer Ready replicas than it asks for, for 10 minutes"
+            description: >-
+              A roll or a scale takes well under a minute per replica (the pod hands its
+              shards on and the next one boots in seconds); ten minutes means a replica cannot
+              start or cannot become Ready. `kubectl -n {{ $ns }} rollout status statefulset/{{ $svc }}`,
+              then the events and log of the pod that is not Ready.
+        - alert: HsRestartingOften
+          expr: |
+            increase(kube_pod_container_status_restarts_total{namespace="{{ $ns }}", pod=~"{{ $pods }}", container="hs"}[1h]) > 3
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ "{{ $labels.pod }}" }} restarted more than three times in the last hour"
+            description: >-
+              `kubectl -n {{ $ns }} logs {{ "{{ $labels.pod }}" }} --previous` says why the last one stopped.
+              An OOMKilled reason in `describe pod` means resources.limits.memory is too small
+              for this server's load (see HsMemoryNearLimit).
+    - name: {{ $svc }}.requests
+      rules:
+        - alert: HsErrorRateHigh
+          expr: |
+            sum(rate(hs_http_requests_total{namespace="{{ $ns }}", service="{{ $svc }}", status_class="5xx"}[5m]))
+            /
+            sum(rate(hs_http_requests_total{namespace="{{ $ns }}", service="{{ $svc }}"}[5m]))
+            > 0.05
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "more than 5% of requests to {{ $svc }} have failed with a 5xx for 5 minutes"
+            description: >-
+              `sum by (route) (rate(hs_http_requests_total{status_class="5xx"}[5m]))` names the
+              routes; the pods' logs at `error` have the cause. A `503` on every route in
+              cluster mode is a shard with no owner (HsClusterShardsUnowned).
+        - alert: HsRequestsSlow
+          expr: |
+            histogram_quantile(0.99,
+              sum by (le) (rate(hs_http_request_duration_seconds_bucket{namespace="{{ $ns }}", service="{{ $svc }}", route!~".*/sync|.*/events|.*/initialSync"}[5m])))
+            > 2
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "the slowest 1% of requests to {{ $svc }} have taken over 2 s for 10 minutes"
+            description: >-
+              Long-polls (/sync, /events) are excluded, since they wait on purpose. Look at the
+              database first (HsPostgresFlushSlow; the volume's latency for the embedded engine),
+              then at `hs_cluster_forward_latency_seconds` in cluster mode.
+{{- if eq .Values.mode "cluster" }}
+    - name: {{ $svc }}.cluster
+      rules:
+        - alert: HsClusterReplicaMissing
+          expr: |
+            min(hs_cluster_live_replicas{namespace="{{ $ns }}", service="{{ $svc }}"}) < {{ include "hs.replicaCount" . }}
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "the replicas of {{ $svc }} see fewer live peers than the {{ include "hs.replicaCount" . }} the chart asks for"
+            description: >-
+              A replica is missing from the registry for longer than a roll takes: it is not
+              running, or its heartbeats do not reach the database (HsClusterLeaseStale on that
+              replica). The survivors own every shard meanwhile, so the server is up but a
+              replica short.
+        - alert: HsClusterShardsUnowned
+          expr: |
+            sum(hs_cluster_owned_shards{namespace="{{ $ns }}", service="{{ $svc }}", kind="room"}) < {{ .Values.cluster.roomShards }}
+            or
+            sum(hs_cluster_owned_shards{namespace="{{ $ns }}", service="{{ $svc }}", kind="user"}) < {{ .Values.cluster.userShards }}
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "some of {{ $svc }}'s shards have had no owner for 2 minutes"
+            description: >-
+              Every room and user shard should be owned by exactly one live replica; a shard
+              with none refuses its requests (`503 M_HS_NOT_SHARD_OWNER` once the forward's
+              deadline passes). A replica that died keeps its shards until its lease
+              ({{ .Values.cluster.leaseTtl }}) lapses, which is seconds, not minutes: this is a
+              replica that is up but cannot claim (its own heartbeat is stale), or no replica at
+              all. `kubectl -n {{ $ns }} logs <pod> | grep -i shard`, and the Cluster page of the
+              admin interface.
+        - alert: HsClusterLeaseStale
+          expr: hs_cluster_lease_age_seconds{namespace="{{ $ns }}", service="{{ $svc }}"} > {{ $leaseTtl }}
+          for: 1m
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ "{{ $labels.pod }}" }}'s last heartbeat reached the database over {{ .Values.cluster.leaseTtl }} ago"
+            description: >-
+              The replica's lease has lapsed: its peers have taken its shards and it is refusing
+              what lands on it until a heartbeat succeeds (decision 0028). Its heartbeat row is
+              one small write every {{ .Values.cluster.heartbeatInterval }}, so this is the database
+              refusing or stalling writes from this pod. Its log has the error at `warn`.
+        - alert: HsClusterFencedWrites
+          expr: sum(rate(hs_cluster_fenced_total{namespace="{{ $ns }}", service="{{ $svc }}"}[5m])) > 0.1
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $svc }} has been fencing writes for 15 minutes"
+            description: >-
+              A fenced write is one made by a replica whose shard moved away meanwhile; a
+              handoff produces a few and then stops. A steady rate means ownership is
+              flapping: heartbeats late on a loaded database, or a lease TTL too short for it
+              (`hs_cluster_ownership_changes_total` by reason says which).
+{{- end }}
+{{- if eq (include "hs.storageBackend" .) "postgres" }}
+    - name: {{ $svc }}.storage
+      rules:
+        - alert: HsPostgresFlushSlow
+          expr: |
+            histogram_quantile(0.99,
+              sum by (le) (rate(hs_kv_postgres_flush_duration_seconds_bucket{namespace="{{ $ns }}", service="{{ $svc }}"}[5m])))
+            > 1
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "the slowest 1% of {{ $svc }}'s PostgreSQL commits have taken over 1 s to flush for 10 minutes"
+            description: >-
+              Every write to this server is a commit through this path, so its latency is the
+              server's. Look at the database's own load, its disk, and whether a replica is
+              far from it.
+{{- end }}
+{{- if eq (include "hs.storageBackend" .) "embedded" }}
+    - name: {{ $svc }}.storage
+      rules:
+        - alert: HsDataVolumeFilling
+          expr: |
+            kubelet_volume_stats_available_bytes{namespace="{{ $ns }}", persistentvolumeclaim=~"data-{{ $pods }}"}
+            /
+            kubelet_volume_stats_capacity_bytes{namespace="{{ $ns }}", persistentvolumeclaim=~"data-{{ $pods }}"}
+            < 0.1
+          for: 15m
+          labels:
+            severity: critical
+          annotations:
+            summary: "{{ "{{ $labels.persistentvolumeclaim }}" }} has less than 10% free"
+            description: >-
+              The data volume holds the database, the signing key and the media; a full one
+              stops every write. Grow the claim (if its StorageClass allows expansion) or clear
+              media through the admin interface's Media page.
+{{- end }}
+{{- if and (eq .Values.media.storage.backend "local") .Values.media.storage.local.existingClaim }}
+    - name: {{ $svc }}.media
+      rules:
+        - alert: HsMediaVolumeFilling
+          expr: |
+            kubelet_volume_stats_available_bytes{namespace="{{ $ns }}", persistentvolumeclaim="{{ .Values.media.storage.local.existingClaim }}"}
+            /
+            kubelet_volume_stats_capacity_bytes{namespace="{{ $ns }}", persistentvolumeclaim="{{ .Values.media.storage.local.existingClaim }}"}
+            < 0.1
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "the media volume {{ .Values.media.storage.local.existingClaim }} has less than 10% free"
+            description: >-
+              Uploads fail once it is full. Grow the claim, or shorten the remote media
+              retention in the admin interface's Configuration page.
+{{- end }}
+    - name: {{ $svc }}.federation
+      rules:
+        - alert: HsFederationPdusDropped
+          expr: increase(hs_federation_outbound_pdus_dropped_total{namespace="{{ $ns }}", service="{{ $svc }}"}[1h]) > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $svc }} dropped outbound federation events in the last hour"
+            description: >-
+              The outbound queue for a destination is bounded; a destination down for longer
+              than it holds has events dropped from it, and is caught up from the rooms when it
+              returns (the Federation page shows the catch-up). Dropped events are the sign
+              that a destination has been unreachable for a long time.
+    - name: {{ $svc }}.appservices
+      rules:
+        - alert: HsAppserviceNotAccepting
+          expr: hs_appservice_queue_oldest_age_seconds{namespace="{{ $ns }}", service="{{ $svc }}"} > 300
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "the bridge {{ "{{ $labels.appservice }}" }} has not accepted a transaction for over 5 minutes"
+            description: >-
+              Its queue's oldest entry has waited that long; the server is backing off against
+              it. The bridge's pod (`kubectl -n {{ $ns }} get bridges`) is down or refusing, and its
+              page in the admin interface's Bridges section says what it last answered.
+        - alert: HsAppserviceDeadLettered
+          expr: increase(hs_appservice_queue_dead_lettered_total{namespace="{{ $ns }}", service="{{ $svc }}"}[1h]) > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: "transactions for {{ "{{ $labels.appservice }}" }} were dead-lettered in the last hour"
+            description: >-
+              The bridge refused them for longer than the queue keeps retrying, so what they
+              carried did not reach it. The Bridges page lists dead-lettered transactions and
+              can replay them.
+    - name: {{ $svc }}.resources
+      rules:
+        - alert: HsMemoryNearLimit
+          expr: |
+            container_memory_working_set_bytes{namespace="{{ $ns }}", pod=~"{{ $pods }}", container="hs"}
+            / on (namespace, pod, container)
+            kube_pod_container_resource_limits{namespace="{{ $ns }}", pod=~"{{ $pods }}", container="hs", resource="memory"}
+            > 0.9
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ "{{ $labels.pod }}" }} has used over 90% of its memory limit for 15 minutes"
+            description: >-
+              The next step is an OOMKill and a restart with its shards handed on. Raise
+              resources.limits.memory ({{ .Values.resources.limits.memory }} now) if the load
+              is real; a steady climb at steady load is a leak to report.
+{{- end }}
