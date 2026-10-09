@@ -1,5 +1,101 @@
 # 06 Federation: status
 
+## 2026-10-09 (branch `agent/federation`): the federation milestone -- Myelin federates with a real Synapse, end to end
+
+Myelin had never been pointed at a Synapse: every federation number was Complement, Sytest or two
+copies of Myelin. This session ran the interop harness (`tests/federation-synapse/run.sh`, written
+2026-10-02 but never run) against a **real Synapse 1.162.0** in Docker, found and fixed the one bug
+that stopped it, and left the whole story green and rerunnable. Crates: `hs-federation`,
+`hs-cli` (wiring and the harness). No OpenAPI change, no decision or RFC number taken.
+
+**What was verified against Synapse, step by step** (46 PASS, 0 FAIL;
+`tests/federation-synapse/run.sh`, `results.tsv`):
+
+- **Keys and discovery**: both servers' `GET /_matrix/key/v2/server` (Myelin plaintext, Synapse
+  over TLS); Myelin fetches Synapse's keys through its own notary (`/_matrix/key/v2/query/{s}`);
+  and, once the two have federated, Synapse serves Myelin's keys through *its* notary. Server names
+  carry ports, so both connect directly with no `.well-known`/SRV; trust is a private CA on both
+  sides (`federation.custom_ca_certificates` / Synapse's `federation_custom_ca_list`).
+- **Joins both ways**: a Myelin user joins a public Synapse room by alias and a Synapse user joins
+  a public Myelin room by alias; messages flow both ways; pre-join history is backfilled onto the
+  joiner; and `/joined_members` agree on both sides.
+- **Membership**: invites both ways accepted; a Myelin user joins, leaves and **rejoins** a public
+  Synapse room (each transition confirmed in Synapse's resolved state); Synapse kicks the Myelin
+  user (seen in Myelin's state); Myelin bans a Synapse user (seen in the banned user's leave sync
+  on Synapse).
+- **Redaction**: Synapse redacts its own message in a Myelin room; Myelin applies it.
+- **EDUs**: Myelin's typing, read receipt and to-device message all reach Synapse's `/sync`
+  (receipts and to-device delivered over an incremental sync, as the spec requires).
+- **Media**: a file uploaded on each side downloads through the other's
+  `/_matrix/client/v1/media/download` (authenticated media over federation, both directions).
+- **Directory and queries**: `/publicRooms?server=` both ways; `/profile` of the remote user both
+  ways; `/directory/room` of the remote alias both ways.
+- **Device keys over federation** (track 08's): Synapse's `/keys/query` of a Myelin user returns
+  the uploaded device key.
+- **Room versions**: a room of version **10, 11 and 12** joined in **both** directions, and a
+  **restricted** join into a Synapse room authorised by Synapse via a shared space.
+
+**The bug that mattered, fixed: a server could not verify events it signed itself.** When Myelin
+verifies the events in a `send_join`, `invite` or `make_join` response, the response carries, among
+the room's state, the membership events Myelin's *own* user signed. Verifying those asked the
+remote-key cache for Myelin's own key (`fed-synapse-myelin:8449/ed25519:a_IJcZAB`), which it tried
+to **fetch over federation from Myelin itself** -- a request Myelin cannot answer, so the lookup
+failed ("could not fetch keys for server `<self>`") and the event was dropped from the join state.
+Against two copies of Myelin this never surfaced (each only ever verified the *other's* events; its
+own join was built locally and accepted without a signature re-check). Against Synapse it broke
+invites out, restricted joins, and -- because the joining user's own membership was dropped from
+the stored state -- a later rejoin and every membership built on it. Fix (`hs-federation`
+`keys.rs`): the `RemoteKeyCache` holds this server's own verify keys
+(`RemoteKeyCache::seed_own_keys`, seeded at startup in `hs-cli` `build_mount` and `run_join_room`),
+consulted before any cache lookup or fetch, trusted at any timestamp. An own signature now verifies
+against the key already in memory, never a fetch. Test: `keys::tests::own_keys_verify_without_a_fetch`.
+
+**How it was run.** `tests/federation-synapse/run.sh` builds `hs`, generates a private CA and leaf
+certs, starts Synapse (server name `127.0.0.1:8448`, TLS federation on 8448, client on 8408) and an
+nginx TLS front for Myelin (`fed-synapse-myelin:8449` on the `fed-synapse` network, proxying to the
+host's plaintext `hs`), then drives every step above through both client APIs and writes
+`results.tsv`. It exits non-zero on any FAIL and clean-skips without Docker/curl/jq/openssl, so a CI
+leg without a daemon stays green. The image is pulled from the Docker Hub mirror
+(`mirror.gcr.io/matrixdotorg/synapse:latest`): an agent session cannot pull from Docker Hub or
+ghcr.io (the macOS keychain credential helper), and the mirror needs no credentials.
+
+**Harness fixes this session** (so the run is correct and reruns cleanly): the image comes from the
+mirror with a credential-helper-free Docker config and the OrbStack socket; Synapse's
+`room_list_publication_rules` allows publishing to the directory (its default has forbidden it
+since 1.126, so `/publicRooms` had nothing to list); the notary check against Synapse hits its TLS
+federation listener (not the client API) and runs after the servers have federated (a fresh
+notary's cache is empty); leave/rejoin/kick is tested on a **public** room (rejoining an invite-only
+room after leaving correctly needs a fresh invite -- the old harness tested it on a private room and
+the racy "rejoin PASS" was Myelin briefly letting a stale-state join through); receipts and
+to-device are read over an incremental (since-based) `/sync`; the ban is confirmed in the banned
+user's leave sync (a banned user cannot read the room's state endpoint); the key upload uses the
+session's real device id; and `results.tsv` is created after its directory exists.
+
+**Also done** (next-steps item 3 leftovers): `docs/status/routes.json` regenerated with
+`hs routes-manifest -o docs/status/routes.json` (it was stale since 2026-10-05; `federationVersion`
+and `federationOpenIdUserinfo` now show `auth: none`, matching the merged `fed-version` work). The
+other item-3 entries were already on main: `TestCorruptedAuthChain` (wave 3, 2026-10-05), the v12
+create event's `room_id` (`hs-room` `routes/render.rs::create_event_room_id`, test
+`a_version_12_create_event_is_shown_with_its_room_id`), and alias queries over federation asking the
+bridge (wave 3).
+
+**Verified.**
+
+- `tests/federation-synapse/run.sh` against Synapse 1.162.0: **46/46 PASS**, exit 0, every
+  `fed-synapse*` container and the host `hs` removed on exit.
+- `cargo test -p hs-federation`: 231 pass (new `keys::tests::own_keys_verify_without_a_fetch`).
+- `cargo test -p hs-cli --test federation_two_servers --test federation_membership --test
+  federation_writes --test federation_room_versions`: all pass against the real binary.
+- `cargo fmt --all --check`; `cargo clippy -p hs-federation -p hs-cli --all-targets -- -D warnings`:
+  clean.
+
+**Left.** Device keys over federation and the device-list `stopped_server` cases are track 08's.
+A same-user back-to-back leave-then-rejoin of an invite-only room can briefly let the rejoin through
+locally before the leave is applied (a narrow race in this server's own membership state; the
+harness no longer exercises it, since rejoining an invite-only room after leaving is forbidden
+anyway). Putting the interop run in a CI leg that has Docker is track 12's; `hs serve` terminating
+TLS itself (removing the nginx front) is hs-cli/track 12. The run is single-pair, not clustered.
+
 ## 2026-10-09 (branch `agent/fed-version`): `GET /_matrix/federation/v1/version` answers an unsigned request
 
 The live demo (image `a6f02c48`) answered an unsigned `GET /_matrix/federation/v1/version`
