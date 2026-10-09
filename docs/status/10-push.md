@@ -7,8 +7,8 @@ was re-verified on this tree:
 
 - **MSC4306's `postcontent` push-rule kind**: done 2026-10-05 (`ruleset.rs`, `engine.rs`,
   `routes/tests.rs`' `postcontent_is_a_kind_with_no_rules_and_none_a_client_may_add`).
-  Complement `TestThreadedReceipts` and `TestThreadReceiptsInSyncMSC4102`: PASS on `main`'s
-  csapi run 18 (status 14, session 11); not re-run on this branch (see Verified).
+  Complement `TestThreadedReceipts` and `TestThreadReceiptsInSyncMSC4102`: PASS on this branch's
+  image (Verified below).
 - **Push rules copied on a room upgrade**: done by `room-render` in `hs-user`'s join hook
   (`SessionHub::copy_room_push_rules`, `crates/hs-user/src/hub.rs`; Synapse's
   `copy_push_rules_from_room_to_room_for_user`), through `hs-push`'s `update_ruleset`. It had no
@@ -18,8 +18,7 @@ was re-verified on this tree:
   moment `/upgrade` answers; bob's disabled override rule named after the old room, with a
   `room_id` condition on it, is copied renamed, rewritten and still disabled when he joins; the
   old rules stay; his next `/sync` carries both. Nothing in `hs-room` or `hs-user` was touched.
-  Complement `TestPushRuleRoomUpgrade`: 4/4 on `main` after `sync-wakes` (status 05); not re-run
-  on this branch (see Verified).
+  Complement `TestPushRuleRoomUpgrade`: PASS on this branch's image (Verified below).
 - **A HELO fallback for the pusher's mailer**: done 2026-10-05 (`crates/hs-push/src/email/helo.rs`;
   `a_relay_that_refuses_ehlo_gets_the_email_over_helo`).
 
@@ -46,13 +45,20 @@ was re-verified on this tree:
 
 - `cargo test -p hs-push`: 101 passed (new:
   `a_receipt_reading_every_shown_line_keeps_a_room_whose_dropped_line_is_unread`,
-  `one_users_slow_write_does_not_hold_up_anothers`); `cargo fmt --all`.
-- **Not verified before the session was cut off** (the machine was under a merge gate, load
-  28): `cargo clippy -p hs-push --all-targets -- -D warnings` was running; `cargo clippy -p
-  hs-cli --all-targets` and the new real-binary test `cargo test -p hs-cli --test room_upgrade
-  push_rules_about` had not run; the Complement image `complement-hs-reimplement:push-leftovers`
-  was mid-rebuild and the three Complement tests were not run through `tests/complement/lock.sh`
-  on this branch. Whoever picks this up: run those four, in that order.
+  `one_users_slow_write_does_not_hold_up_anothers`).
+- Real binary, `cargo test -p hs-cli --test room_upgrade`: 4 passed, the new
+  `push_rules_about_the_old_room_follow_its_members_into_the_replacement` among them. Its
+  first run failed reading bob's copied rule right after his join answered: the copy is made
+  by the session hub as it processes the join, just after it, so the test now waits for the
+  hook's log line ("their push rules for the old room followed") for each user before
+  reading. A test race, not a server gap.
+- Complement csapi, image `complement-hs-reimplement:push-leftovers` built from this tree with
+  `tests/complement/build.sh`, run through `tests/complement/lock.sh` with the harness's
+  patches and skip list (as `run_single_node.sh` does; that script wants `refs/` beside the
+  checkout, which a worktree has not): `TestPushRuleRoomUpgrade` PASS (17 s),
+  `TestThreadedReceipts` PASS (11 s), `TestThreadReceiptsInSyncMSC4102` PASS (6 s).
+- `cargo fmt --all --check`, `cargo clippy -p hs-push --all-targets -- -D warnings`,
+  `cargo clippy -p hs-cli --all-targets -- -D warnings`: clean.
 
 ### Left
 

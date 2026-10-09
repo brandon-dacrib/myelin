@@ -681,7 +681,19 @@ async fn push_rules_about_the_old_room_follow_its_members_into_the_replacement()
         .unwrap()
         .to_owned();
 
-    // Alice is in the replacement already: her rule for it is readable right away.
+    // The copy is made by the session hub as it processes the join, just after the join
+    // itself: wait for its log line for each user before reading.
+    let copied_for = |hs: &mut HsProcess, user: &str| {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let line = hs.wait_for("their push rules for the old room followed");
+            if line.contains(user) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "no copy logged for {user}");
+        }
+    };
+    copied_for(&mut hs, "@alice:");
     let copied = client
         .get(
             &format!("/_matrix/client/v3/pushrules/global/room/{}", segment(&new)),
@@ -710,6 +722,7 @@ async fn push_rules_about_the_old_room_follow_its_members_into_the_replacement()
             json!({}),
         )
         .await;
+    copied_for(&mut hs, "@bob:");
     let bob_copy = format!("loud-{new}");
     let copied = client
         .get(
@@ -727,7 +740,6 @@ async fn push_rules_about_the_old_room_follow_its_members_into_the_replacement()
     );
     assert_eq!(copied["conditions"][0]["pattern"], new.as_str());
     assert_eq!(copied["actions"][1]["value"], "loud");
-    hs.wait_for("their push rules for the old room followed");
 
     // The copy is account data the next /sync carries, as any rule change is.
     let sync = client.get("/_matrix/client/v3/sync?timeout=0", &bob).await;
