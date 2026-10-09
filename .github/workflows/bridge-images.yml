@@ -1,0 +1,56 @@
+name: bridge images
+
+# The bridge catalogue pins every bridge image to a release tag (decision 0037), so a bump is
+# a release step and not something a roll does by itself. This is the reminder: weekly, and by
+# hand, deploy/bridges/check-image-tags.py compares each pin with its upstream's latest GitHub
+# release and, when any is behind, opens (or updates) one issue with the table. Bumping is
+# still a person's decision: edit crates/hs-admin/src/bridge_types.rs, run the real-bridge
+# login test for a mautrix bridge (tests/real_mautrix_login.rs), roll the demo, and close the
+# issue. Nothing here edits the catalogue.
+
+on:
+  schedule:
+    - cron: '23 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    name: pins against upstream releases
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare the pins with the latest releases
+        id: check
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          python3 deploy/bridges/check-image-tags.py --markdown > report.md
+          echo "behind=$?" >> "$GITHUB_OUTPUT"
+          cat report.md
+          { echo "## Bridge image pins"; echo; cat report.md; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Open or update the issue
+        if: steps.check.outputs.behind == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title="Bridge image pins are behind upstream releases"
+          {
+            echo "deploy/bridges/check-image-tags.py found pins behind their upstream's latest release (run ${{ github.run_id }}):"
+            echo
+            cat report.md
+            echo
+            echo "To bump one: edit \`crates/hs-admin/src/bridge_types.rs\`, run \`tests/real_mautrix_login.rs\` for a mautrix bridge (or the bridge's own smoke), roll the demo, then close this issue. See decision 0037 and \`docs/bridges/mautrix.md\`."
+          } > body.md
+          number="$(gh issue list --state open --search "\"$title\" in:title" --json number --jq '.[0].number // empty')"
+          if [ -n "$number" ]; then
+            gh issue edit "$number" --body-file body.md
+            echo "updated #$number"
+          else
+            gh issue create --title "$title" --body-file body.md --label bridges
+            echo "opened a new issue"
+          fi

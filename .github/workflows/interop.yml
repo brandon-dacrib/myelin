@@ -1,0 +1,95 @@
+name: interop
+
+# Myelin against a real Synapse: tests/federation-synapse/run.sh starts Synapse in Docker next
+# to an `hs` built from this tree, federating over TLS with a private CA, and drives the whole
+# interop story through both client APIs -- keys and the notary both ways, joins both ways
+# with pre-join backfill, invites, leave and rejoin, kick, ban, redaction, typing, receipts,
+# to-device, authenticated media, public rooms, profile and directory queries, device keys, and
+# rooms of version 10 to 12 (46 checks on 2026-10-09, docs/status/06-federation.md). The
+# script passes only when every check in its results.tsv passes.
+#
+# A workflow of its own, not a `ci` job: it needs Docker and a debug build of `hs` (about ten
+# minutes with a warm cache), and its subject is a moving target (Synapse's `latest`), so a
+# failure here is something to look at, not a reason to block a merge. It runs on every push
+# to `main`, nightly, and by hand.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'Cargo.*'
+      - 'tests/federation-synapse/**'
+      - '.github/workflows/interop.yml'
+  schedule:
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+    inputs:
+      synapse_image:
+        description: The Synapse image to federate with
+        default: mirror.gcr.io/matrixdotorg/synapse:latest
+        required: false
+
+concurrency:
+  group: interop-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: 2
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  synapse:
+    name: myelin <-> synapse
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust
+          shared-key: interop
+          cache-on-failure: true
+      - name: Build hs
+        # The script builds it itself when HS_BINARY is unset; building here keeps the
+        # compiler output in this step's log instead of hidden behind the script's >/dev/null.
+        run: cargo build -p hs-cli --bin hs
+      - name: Federate with a real Synapse
+        env:
+          HS_BINARY: ${{ github.workspace }}/target/debug/hs
+          SYNAPSE_IMAGE: ${{ inputs.synapse_image || 'mirror.gcr.io/matrixdotorg/synapse:latest' }}
+        run: |
+          set -o pipefail
+          mkdir -p interop-run
+          tests/federation-synapse/run.sh "$PWD/interop-run" 2>&1 | tee interop-run/transcript.log
+      - name: Summarize
+        if: always()
+        run: |
+          {
+            echo "## Myelin <-> Synapse interop"
+            echo
+            if [ -f interop-run/results.tsv ]; then
+              pass=$(grep -c $'\tPASS\t' interop-run/results.tsv || true)
+              total=$(wc -l < interop-run/results.tsv | tr -d ' ')
+              echo "**$pass of $total checks passed** (Synapse image: ${SYNAPSE_IMAGE:-mirror.gcr.io/matrixdotorg/synapse:latest})"
+              echo
+              echo '| step | result | detail |'
+              echo '|---|---|---|'
+              awk -F'\t' '{printf "| %s | %s | %s |\n", $1, $2, $3}' interop-run/results.tsv
+            else
+              echo "no results.tsv: the run did not get as far as the checks (see the transcript)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Keep the transcript and the servers' logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: interop-synapse
+          path: |
+            interop-run/results.tsv
+            interop-run/transcript.log
+            interop-run/myelin/hs.log
+          if-no-files-found: ignore
+          retention-days: 14
