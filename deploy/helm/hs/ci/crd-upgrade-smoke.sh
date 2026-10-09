@@ -80,7 +80,7 @@ say "helm install --take-ownership adopts it and brings it up to date"
 # Helm 4 applies server-side, and the old CRD's fields belong to whoever created it
 # (`kubectl-create` here, Helm 3's own manager on a real install): --force-conflicts takes them.
 force=()
-helm version --short | grep -q '^v4' && force=(--force-conflicts)
+helm version --short | grep '^v4' >/dev/null && force=(--force-conflicts)
 helm --kube-context "$CONTEXT" -n "$NS" install myelin "$ROOT/deploy/helm/hs" \
   --set serverName=example.org --take-ownership "${force[@]}" >/dev/null
 kc get crd "$CRD" -o json | jq -e '

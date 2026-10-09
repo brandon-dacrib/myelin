@@ -294,7 +294,7 @@ body="$(curl -sf "$base/_matrix/client/versions")" || fail "/_matrix/client/vers
 echo "GET /_matrix/client/versions    200 ${body:0:80}..."
 
 admin="$(curl -sf "$base/admin/")" || fail "/admin/ did not answer 200"
-if ! printf '%s' "$admin" | grep -q '<div id="root">'; then
+if ! printf '%s' "$admin" | grep '<div id="root">' >/dev/null; then
   echo "/admin/ served:" >&2
   printf '%s\n' "$admin" | head -20 >&2
   fail "/admin/ is not the management interface (no <div id=\"root\">)"
@@ -303,7 +303,7 @@ echo "GET /admin/                     200 and it is the interface (<div id=\"roo
 
 status="$(curl -sf "$base/api/v1/setup")" || fail "/api/v1/setup did not answer 200"
 echo "GET /api/v1/setup               200 $status"
-printf '%s' "$status" | grep -q '"needs_setup":true' || fail "a fresh server should say needs_setup:true"
+printf '%s' "$status" | grep '"needs_setup":true' >/dev/null || fail "a fresh server should say needs_setup:true"
 
 say "Claiming the server through the setup link, as the operator would"
 # The link the NOTES tell the operator to open. The interface POSTs the token from its fragment
@@ -315,9 +315,9 @@ code="${created_body##*$'\n'}"
 created_json="${created_body%$'\n'*}"
 echo "POST /api/v1/setup              $code $(printf '%s' "$created_json" | sed -E 's/"access_token":"[^"]*"/"access_token":"<redacted>"/')"
 [ "$code" = "201" ] || fail "the setup link did not create the first administrator (expected 201)"
-printf '%s' "$created_json" | grep -q '"user_id":"@smoke:smoke.invalid"' || fail "the session is not for @smoke:smoke.invalid"
+printf '%s' "$created_json" | grep '"user_id":"@smoke:smoke.invalid"' >/dev/null || fail "the session is not for @smoke:smoke.invalid"
 status="$(curl -sf "$base/api/v1/setup")" || fail "/api/v1/setup did not answer 200 after setup"
 echo "GET /api/v1/setup               200 $status"
-printf '%s' "$status" | grep -q '"needs_setup":false' || fail "after setup the server should say needs_setup:false"
+printf '%s' "$status" | grep '"needs_setup":false' >/dev/null || fail "after setup the server should say needs_setup:false"
 
 say "All checks passed"

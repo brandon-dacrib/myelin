@@ -223,14 +223,16 @@ jobs:
           # The image has to carry the management interface, not the page that says it was left
           # out. Both answer 200, so look at what came back.
           admin="$(curl -sf http://127.0.0.1:8008/admin/)"
-          if ! printf '%s' "$admin" | grep -q '<div id="root">'; then
+          if ! printf '%s' "$admin" | grep '<div id="root">' >/dev/null; then
             echo "/admin/ is not the management interface; it served:" >&2
             printf '%s\n' "$admin" | head -20 >&2
             docker rm -f myelin-smoke >/dev/null 2>&1 || true
             exit 1
           fi
-          # And a new server has to say how to get into it.
-          if ! docker logs myelin-smoke 2>&1 | grep -q 'setup_link=http://localhost:8008/admin/setup#token='; then
+          # And a new server has to say how to get into it. Not `grep -q`: under `pipefail` it
+          # exits on the first match, `docker logs` gets SIGPIPE on the lines after it, and the
+          # pipeline fails although the link is there (CD run 37968906221, 2026-10-09).
+          if ! docker logs myelin-smoke 2>&1 | grep 'setup_link=http://localhost:8008/admin/setup#token=' >/dev/null; then
             echo "the first boot did not log a setup link; logs follow" >&2
             docker logs myelin-smoke >&2 || true
             docker rm -f myelin-smoke >/dev/null 2>&1 || true
@@ -430,7 +432,7 @@ jobs:
             exit 1
           fi
           admin="$(curl -sf http://127.0.0.1:8008/admin/)"
-          if ! printf '%s' "$admin" | grep -q '<div id="root">'; then
+          if ! printf '%s' "$admin" | grep '<div id="root">' >/dev/null; then
             echo "/admin/ is not the management interface; it served:" >&2
             printf '%s\n' "$admin" | head -20 >&2
             kill "$pid" 2>/dev/null || true
@@ -526,7 +528,7 @@ jobs:
           diff -u deploy/crds/bridge.yaml deploy/helm/hs/files/crds/bridge.yaml
           test ! -e deploy/helm/hs/crds
           helm template myelin deploy/helm/hs --set serverName=example.org --show-only templates/crds.yaml \
-            | grep -q 'helm.sh/resource-policy: keep'
+            | grep 'helm.sh/resource-policy: keep' >/dev/null
 
       - name: Work out the chart version and the image it pulls
         # deploy/helm/hs/ci/chart-version.sh has the rule and why: a tag publishes its version;
