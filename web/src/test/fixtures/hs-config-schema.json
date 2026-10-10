@@ -162,6 +162,7 @@
         "max_retry_backoff": "1h",
         "max_queued_pdus_per_destination": 10000,
         "max_queued_durable_edus_per_destination": 10000,
+        "forget_unused_destinations_after": "1w",
         "allow_public_rooms_over_federation": false,
         "allow_device_name_lookup_over_federation": false
       }
@@ -1565,6 +1566,12 @@
           "format": "uint32",
           "minimum": 0,
           "default": 10000,
+          "x-applies": "hot"
+        },
+        "forget_unused_destinations_after": {
+          "description": "How long a server this one shares no room with is kept on the Federation page before it\nis forgotten. Every server this one ever sent to is remembered with its retry state; once\nno room brings the two together it is only state, and nothing will be sent to it until a\nroom does again (decision 0042). A sweep runs every hour and forgets each such server once\nit has had nothing queued and nothing happen (no attempt, no success, no failure) for\nthis long, and each one failing for this long whose queued events are only for rooms\nthis server has since left (leaving a large room leaves one row per server that was in\nit, most of them never answering). A server this one still shares a room with is never\nswept. `0` turns the sweep off; the Federation page's Forget and Prune do the same by\nhand at any time. Synapse keeps every destination for ever and has no setting for it. A\nchange applies to the next sweep.",
+          "$ref": "#/$defs/Duration",
+          "default": "1w",
           "x-applies": "hot"
         },
         "allow_public_rooms_over_federation": {

@@ -901,7 +901,8 @@ impl<B: KvBackend + 'static> RoomDataSource for RegistryRoomSource<B> {
 /// The server of every currently joined member, deduplicated and sorted. Empty if the state
 /// store cannot be read: a `send_join` that cannot find out who else is in the room forwards to
 /// nobody rather than failing the join it has already stored.
-fn joined_servers<B: KvBackend>(actor: &RoomActor<B>) -> Vec<String> {
+/// Every server with a joined member in the room, this one included when it has one, by name.
+pub(crate) fn joined_servers<B: KvBackend>(actor: &RoomActor<B>) -> Vec<String> {
     let Ok(members) = actor.joined_members() else {
         return Vec::new();
     };

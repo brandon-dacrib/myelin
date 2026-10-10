@@ -1869,6 +1869,13 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     // The admin API's view of federation. With federation off there are no destinations, and
     // an empty list is the honest answer -- not a 503, which would read as "could not check".
     let federation_source: Arc<dyn hs_admin::sources::FederationSource>;
+    // The same source, concretely, for the destination sweep (`crate::destination_sweep`);
+    // `None` with federation off.
+    let destination_source: Option<Arc<hs_federation::admin_source::DestinationStoreSource>>;
+    // `federation.forget_unused_destinations_after`, as the sweep reads it (hot).
+    let forget_after = Arc::new(crate::destination_sweep::Retention::new(
+        config.federation.forget_unused_destinations_after.into(),
+    ));
     // The sender, to be fed once the cluster is up (its feeder is gated on shard ownership).
     let federation_sender: Option<Arc<hs_federation::sender::FederationSender>>;
     // How far that feeder has read the room stream (`crate::federation_sender::ForwardedPosition`).
@@ -1916,8 +1923,18 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             });
             let client = mount.client.clone();
             let sender = mount.sender.clone();
+            let retention = forget_after.clone();
             live.on_change("federation", move |config| {
                 let federation = &config.federation;
+                // The destination sweep reads the retention at each run.
+                let after: std::time::Duration = federation.forget_unused_destinations_after.into();
+                if retention.get() != (!after.is_zero()).then_some(after) {
+                    retention.set(after);
+                    tracing::info!(
+                        forget_unused_destinations_after_secs = after.as_secs(),
+                        "the retention of destinations sharing no room is now in force (0 turns the sweep off)"
+                    );
+                }
                 // The durable EDU bound is read for each one queued.
                 let durable_bound =
                     usize::try_from(federation.max_queued_durable_edus_per_destination)
@@ -1983,12 +2000,22 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         // Another server's avatars and attachments: fetched over the same client, cached in
         // the media repository (`hs_media::remote`).
         crate::media::install_remote_media(&media_state.repository, mount.client.clone(), &metrics);
-        federation_source = Arc::new(
+        let source = Arc::new(
             hs_federation::admin_source::DestinationStoreSource::new(mount.destinations.clone())
                 .with_sender(mount.sender.clone())
                 // The Federation page's keys: ours, and the cache `X-Matrix` checks against.
-                .with_keys(mount.own_keys.clone(), mount.x_matrix.key_cache.clone()),
+                .with_keys(mount.own_keys.clone(), mount.x_matrix.key_cache.clone())
+                // Which rooms this server shares with each destination: what every row says,
+                // and what a forget, a prune and the sweep decide by (decision 0042).
+                .with_room_sharing(
+                    Arc::new(crate::destination_sweep::RegistryRoomSharing::new(
+                        rooms.clone(),
+                    )),
+                    server_name.to_string(),
+                ),
         );
+        federation_source = source.clone();
+        destination_source = Some(source);
         federation_sender = Some(mount.sender.clone());
         components.watch("federation sender", &mount.sender);
         // A membership handshake for a room this server holds first waits for this server's
@@ -2038,6 +2065,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     } else {
         tracing::info!("federation is disabled; not mounting the federation transport server");
         federation_source = Arc::new(hs_admin::sources::InMemoryFederationSource::new());
+        destination_source = None;
         federation_sender = None;
         remote_join = None;
         None
@@ -2190,6 +2218,12 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             ),
             device_lists,
         )
+    });
+
+    // The hourly sweep that forgets destinations this server shares no room with once they
+    // are idle or failing for `federation.forget_unused_destinations_after` (decision 0042).
+    let destination_sweep = destination_source.map(|source| {
+        crate::destination_sweep::DestinationSweep::start(source, forget_after.clone())
     });
 
     let bridge_runtime = crate::bridges::runtime()
@@ -2673,6 +2707,9 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             release_long_polls,
             stop_appservice_delivery: Box::new(move || appservice_delivery.stop()),
             stop_outbound_federation: Box::new(move || {
+                if let Some(sweep) = &destination_sweep {
+                    sweep.stop();
+                }
                 if let Some((outbound, device_lists)) = &outbound_federation {
                     device_lists.stop();
                     outbound.stop();
