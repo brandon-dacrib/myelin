@@ -1,0 +1,21 @@
+# The demo's public door: a Tailscale Funnel at https://myelin.longhair-tet.ts.net, served by
+# the Tailscale Kubernetes operator (deploy/demo/tailscale-funnel.md has the whole procedure).
+# The server keeps its name, myelin.dacrib.net; federation and clients are delegated here by
+# the .well-known documents, which the server publishes from server.public_baseurl.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: myelin-funnel
+  namespace: myelin
+  annotations:
+    tailscale.com/funnel: "true"
+spec:
+  ingressClassName: tailscale
+  defaultBackend:
+    service:
+      name: myelin-hs
+      port:
+        number: 8008
+  tls:
+    - hosts:
+        - myelin
