@@ -8,7 +8,15 @@ it. The server **keeps its name**: renaming a Matrix server is a new identity. I
 Tailscale Funnel gives it a public hostname, `myelin.longhair-tet.ts.net`, and the two
 `.well-known` documents send federation and clients there.
 
-## 1. Tailnet (owner, admin console)
+**Done on 2026-10-10 (16:40 EDT):** the cluster already ran the Tailscale operator
+(`tailscale-system`, 436 days, with Funnel ingresses for other apps), so steps 1 and 2 were not
+needed; `kubectl apply -f deploy/demo/tailscale-funnel-ingress.yaml` gave
+`myelin.longhair-tet.ts.net` within seconds (proxy pod `ts-myelin-funnel-*`), and from the
+public Funnel address (`curl --resolve` to 199.38.181.54, not over the tailnet)
+`/_matrix/client/versions` is 200 and `/_matrix/key/v2/server` serves `ed25519:a_JBQV7r`.
+Left: steps 3 and 4.
+
+## 1. Tailnet (owner, admin console) -- not needed where the operator already runs
 
 ACL (`https://login.tailscale.com/admin/acls`), merged into the policy:
 
@@ -27,7 +35,7 @@ OAuth client (`https://login.tailscale.com/admin/settings/oauth`): scopes **Devi
 HTTPS certificates and MagicDNS must be on for the tailnet (they are: `silver` has `funnel`
 and `https` in its capabilities).
 
-## 2. The operator (through the owner's `kubectl proxy`)
+## 2. The operator (through the owner's `kubectl proxy`) -- not needed where it already runs
 
 ```sh
 helm repo add tailscale https://pkgs.tailscale.com/helmcharts && helm repo update
@@ -47,8 +55,10 @@ through a session (then `--set oauth.existingSecret`-style values; see the chart
 ## 3. The server (Configuration page, server section; or the release's values)
 
 - `server.public_baseurl`: `https://myelin.longhair-tet.ts.net` (chart value `publicBaseUrl`).
-- `server.well_known_server`: `myelin.longhair-tet.ts.net:443`. From decision 0040 on, this is
-  derived from `public_baseurl` when unset; until that is rolled, set it.
+- `server.well_known_server`: `myelin.longhair-tet.ts.net:443`. Set it explicitly: decision
+  0040 derives the document from `public_baseurl` when unset, and that is the LAN name here.
+  The chart's `extraConfig` cannot carry it (it is appended as a second top-level `server:`
+  key); the Configuration page or `PATCH /api/v1/config/server` can.
 
 Both are hot. The LAN ingress for `myelin.dacrib.net` stays; it serves the same documents.
 
