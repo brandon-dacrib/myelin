@@ -263,6 +263,10 @@ pub const SETTINGS: &[Setting] = &[
         "the federation sender reads it for each update it queues",
     ),
     hot(
+        "/federation/forget_unused_destinations_after",
+        "the destination sweep reads it each time it runs (hourly)",
+    ),
+    hot(
         "/federation/allow_public_rooms_over_federation",
         "the federation routes read it per request",
     ),

@@ -27,6 +27,10 @@ const fn default_max_queued_durable_edus_per_destination() -> u32 {
     10_000
 }
 
+fn default_forget_unused_destinations_after() -> Duration {
+    Duration::from_secs(7 * 24 * 60 * 60)
+}
+
 fn default_ip_range_blocklist() -> Vec<String> {
     vec![
         "127.0.0.0/8".into(),
@@ -151,6 +155,20 @@ pub struct FederationConfig {
     #[serde(default = "default_max_queued_durable_edus_per_destination")]
     pub max_queued_durable_edus_per_destination: u32,
 
+    /// How long a server this one shares no room with is kept on the Federation page before it
+    /// is forgotten. Every server this one ever sent to is remembered with its retry state; once
+    /// no room brings the two together it is only state, and nothing will be sent to it until a
+    /// room does again (decision 0042). A sweep runs every hour and forgets each such server once
+    /// it has had nothing queued and nothing happen (no attempt, no success, no failure) for
+    /// this long, and each one failing for this long whose queued events are only for rooms
+    /// this server has since left (leaving a large room leaves one row per server that was in
+    /// it, most of them never answering). A server this one still shares a room with is never
+    /// swept. `0` turns the sweep off; the Federation page's Forget and Prune do the same by
+    /// hand at any time. Synapse keeps every destination for ever and has no setting for it. A
+    /// change applies to the next sweep.
+    #[serde(default = "default_forget_unused_destinations_after")]
+    pub forget_unused_destinations_after: Duration,
+
     /// Whether other servers may read this server's public room directory, so their users can
     /// find this server's public rooms by browsing it. Off by default, as in Synapse.
     /// Corresponds to Synapse's `allow_public_rooms_over_federation`.
@@ -179,6 +197,7 @@ impl Default for FederationConfig {
             max_queued_pdus_per_destination: default_max_queued_pdus_per_destination(),
             max_queued_durable_edus_per_destination:
                 default_max_queued_durable_edus_per_destination(),
+            forget_unused_destinations_after: default_forget_unused_destinations_after(),
             allow_public_rooms_over_federation: false,
             allow_device_name_lookup_over_federation: false,
         }
