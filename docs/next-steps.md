@@ -43,6 +43,12 @@ with the fake key server). **Rolled to the demo as revision 15, `sha-2d11ea2e…
 next: the owner retries the join. Left for 06: keys through a notary (why Synapse joins that
 room in tens of seconds and keeps gone servers' events), `federation.key_fetch_timeout` in
 hs-config, one in-flight join per (room, user).
+**All three done on branch `agent/notary-keys` (2026-10-10, late evening; status 06), not
+merged:** a key a server no longer publishes, or a gone server's, is asked of
+`federation.trusted_key_servers` (matrix.org by default, answers verified by the notary's
+configured key and the server's own); `federation.key_fetch_timeout` (hot, 10 s); a repeated
+`/join` for the same room and user attaches to the join under way. Checks in status 06; the
+workspace gate is the coordinator's. `agent/fed-destinations` touches `keys.rs` too.
 
 **Unmerged:** `origin/agent/bridge-stale-devices` (the owner's, 16:46: the manager removes a
 bot's device left behind after a crypto reset; a bridge is sent its owner's key counts as

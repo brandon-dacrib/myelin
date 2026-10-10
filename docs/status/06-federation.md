@@ -74,6 +74,114 @@ decision says why; the page says so and offers the preview). No two-replica run 
 (the source forgets through this replica's sender; a queue another replica is sending for is
 dropped from the store and that replica's worker notices on its next read). The Overview's
 federation strip does not count the servers sharing no room.
+## 2026-10-10 (branch `agent/notary-keys`): keys of gone servers come from a notary, `federation.key_fetch_timeout`, one join per (room, user)
+
+The three items the join-verify entry below left open, finished on the branch another session
+started and left uncommitted (about 1,900 lines, not compiling: the `ensure_keys` prefetch
+closed over `&str` in a way `tokio::spawn` in `hs-cli` could not prove `Send` for every
+lifetime, `hs-cli`'s key fetcher never implemented the notary query, the cache was never given
+the notaries, and the timeout setting and the join de-duplication did not exist).
+
+**1. Keys through a notary** (`crates/hs-federation/src/keys.rs`). `RemoteKeyCache` holds a
+list of `TrustedKeyServer`s (name and the verify keys its answers must be signed with), from
+`federation.trusted_key_servers` (`crates/hs-config/src/federation.rs`; default matrix.org with
+its published `ed25519:auto` key, as Synapse's `trusted_key_servers`; an empty list turns the
+notaries off; validated: a key id is `ed25519:<version>`, a key is 43 characters of standard
+base64). On a key lookup the cache asks the server and, concurrently, every notary not backed
+off from and not already known to lack the key (`POST /_matrix/key/v2/query`, one body naming
+the key with `minimum_valid_until_ts` = the event's `origin_server_ts`); the server's answer is
+waited for first, and when it carries the key the notaries' query is dropped, so a lookup the
+server answers does not also wait on matrix.org. A notary's document is taken only when it is
+signed by one of the notary's configured keys *and* self-signed by the server it is about
+(`ingest_notary_answer`; a document about a server not asked about is refused however well
+signed), and is cached with the validity the server gave it: an expired document's keys go to
+the retrospective cache, so an event signed while the key was valid verifies and one signed
+after does not. The negative cache is consulted first: a backed-off server is not asked, a
+notary that lacked a key is not asked about it again for `NOTARY_MISS_INTERVAL` (60 s), and a
+notary that failed is backed off from like a server (60 s doubling to 1 h). The join's prefetch
+(`ensure_keys`, called by `verify_array` before verifying a `send_join` answer) asks the
+servers 64 at a time and then the notaries once, for only the keys the servers did not provide,
+in queries of at most 100 servers each, logging `asking the notaries for the keys their servers
+did not provide` at `info` with the counts. A dropped `m.room.create` is now its own error
+(`OutboundJoinError::UnverifiedCreateEvent`, naming the key and what the server and each notary
+answered) instead of the room layer's "state must hold exactly one m.room.create".
+`hs-cli`'s `ClientKeyFetcher` implements `query_notary` through the federation client (signed,
+discovered, backed off like every other outbound call); `build_mount` and `hs
+federation-join-room` give the cache the configured notaries and budget; a change to
+`federation.trusted_key_servers` or `federation.key_fetch_timeout` applies at once
+(`serve.rs`'s `on_change("federation", ..)` → `set_trusted_key_servers`, `set_fetch_timeout`;
+both log only when they change). Logs: `accepted a server's key response from a notary` at
+`info` with `server` and `notary`; `could not ask a notary for keys; not asking it again until
+the backoff ends` at `warn` per failing notary; `a notary's answer is not signed by any of its
+configured keys; refusing it` at `warn` (with the hint to update the configuration if the
+notary rotated). Metrics: `hs_federation_key_fetch_total{source=cache|origin|notary}` (new,
+registered) and `hs_federation_key_fetch_failures_total{reason}` gained `notary`.
+
+**2. `federation.key_fetch_timeout`** (hot, default `10s`, must not be zero): the budget for
+one key fetch or one notary query, read per fetch (`RemoteKeyCache::fetch_timeout` is an
+atomic). `docs/config.md` regenerated (`cargo run -p hs-config --bin gen_config_docs`; 58 hot
+settings), the web schema fixture regenerated (`HS_UPDATE_WEB_SCHEMA_FIXTURE=1 cargo test -p
+hs-config --test web_schema_fixture`); the Configuration page is schema-driven and renders
+both new settings with their descriptions (`config-model.real-schema.test.ts` passes).
+
+**3. One join per (room, user)** (`crates/hs-federation/src/outbound_join.rs`,
+`InFlightJoins<T>`; used by `crates/hs-cli/src/remote_join.rs`). A `/join` for a pair whose
+join is running attaches to it and is answered with its outcome (`JoinShare::Attached`; `info`
+`a join of this room for this user is already under way; answering with its outcome rather
+than starting another`) instead of running a second `make_join`/`send_join` and verifying the
+same events again. The join still runs in its own task and outlives the request; a dropped
+request's retry attaches. A task that panics answers every waiter with `JoinTaskLost` and
+leaves no entry behind (a removal guard). `RoomError` is not `Clone`, so the shared outcome is
+an `Arc<Result<..>>` and an attached request gets a copy of the error that keeps its status
+(`shared_join_error`: `Forbidden`, `RoomNotFound`, `RemoteRefused`, `RemoteJoinFailed`, ...).
+Metric: `hs_federation_join_requests_total{share=started|attached}` (new, registered).
+
+**Tests added** (`cargo test -p hs-federation`, 256 unit tests + the timing test, all pass):
+`a_rotated_out_key_found_only_at_the_notary_verifies_an_old_event`,
+`a_gone_servers_key_is_found_at_the_notary_and_the_server_is_backed_off` (the gone server is
+asked once, backed off from, the notary answers; a key nobody has names both and the lookup
+after it is refused at once), `a_notary_answer_with_a_bad_notary_signature_is_rejected`,
+`a_bad_origin_signature_inside_a_notary_answer_is_rejected`,
+`a_notary_that_is_down_falls_back_to_the_next` (two notaries, one down: the other's answer is
+taken, the down one is backed off and not asked on the next pass),
+`an_expired_key_from_a_notary_verifies_before_its_expiry_and_not_after`,
+`the_batch_query_carries_every_miss_in_one_request_per_notary`,
+`the_origin_is_preferred_when_both_answer`, `a_notary_that_does_not_answer_is_backed_off_and_named`,
+`the_notaries_can_be_replaced_on_a_running_cache`,
+`the_fetch_budget_can_be_changed_on_a_running_cache`; `InFlightJoins`:
+`two_requests_for_the_same_room_and_user_share_one_join`, `different_rooms_or_users_run_separately`,
+`a_dropped_request_leaves_the_join_running_for_the_retry_to_attach_to`,
+`a_join_task_that_panics_is_reported_to_every_waiter`. `hs-config`:
+`the_default_notary_is_matrix_org_with_its_published_key`,
+`an_empty_notary_list_turns_notary_lookups_off_and_is_valid`,
+`a_notary_without_keys_or_with_a_malformed_key_is_rejected`,
+`the_key_fetch_timeout_defaults_to_ten_seconds_and_must_not_be_zero`.
+
+**Checks run, this session.** `cargo fmt --all --check` (clean); `cargo clippy -p
+hs-federation -p hs-config -p hs-cli --all-targets -- -D warnings` (clean); `cargo test -p
+hs-federation` (256 + 1 pass); `cargo test -p hs-config` (187 + 4 + 1 + 1 pass); `cargo test
+-p hs-cli --test federation_keys` (the real two-server key server and notary, pass);
+`cargo test -p hs-cli --test federation_two_servers --test federation_membership` (two real
+`hs` binaries: 4 + 13 pass in 10 s of test time, so a join whose servers answer costs no
+notary wait); `cargo test -p hs-cli --lib remote_join` (4 pass); `npm run check` in `web/`
+(0 errors, 87 files, 661 tests, build). Not run: the whole-workspace gate (the coordinator's,
+under the merge lock); the Synapse harness.
+
+**What is left.**
+
+- *A real notary test.* `federation_keys.rs` proves the notary's server side on the real
+  binary; the client side (a third `hs` configured with the first as its notary, verifying an
+  event from a second that has been shut down) is proven by the unit tests' fakes only. Worth a
+  three-server test once there is a way to make a server "gone" mid-test (shut it down after
+  the notary has its keys).
+- *The demo's join of `#matrix:matrix.org`*: not retried from here (no cluster access). Expect
+  `accepted a server's key response from a notary ... notary=matrix.org` lines and far fewer
+  `dropping an event from a send_join response that did not verify`.
+- *The Federation page* could show the notaries in force and a notary's backoff
+  (`RemoteKeyCache::trusted_key_servers`, `notary_failure`); both exist in the crate, neither
+  is in `admin_source.rs` yet.
+- *Branch `agent/fed-destinations`* also touches `keys.rs` and `hs-config/src/federation.rs`;
+  the coordinator rebases.
 
 ## 2026-10-10 (branch `agent/join-verify`): a join of a large room no longer takes hours -- keys are fetched in parallel, a gone server is remembered, the join outlives the client
 
