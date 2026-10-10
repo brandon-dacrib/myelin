@@ -1,5 +1,80 @@
 # 06 Federation: status
 
+## 2026-10-10 (branch `agent/fed-destinations`): a destination this server shares no room with can be forgotten, by hand, by a prune, or by the hourly sweep (decision 0042)
+
+**Why.** After one join-and-leave of `#matrix:matrix.org` the Federation page listed thousands
+of servers, most "failing" for ever, and nothing could remove one. Every server ever sent to was
+kept with its queue, backoff, catch-up mark and cached keys; Synapse does the same and has no
+setting for it.
+
+**What the branch does, end to end** (`docs/decisions/0042-a-destination-sharing-no-room-is-state-and-may-be-forgotten.md`):
+
+- `hs-federation`: `room_sharing.rs` (the `RoomSharing` trait and `Sharing`: which rooms this
+  server shares with each destination, from a room-to-servers listing), `admin_source.rs`
+  (`shared_rooms_count` on every row, cached for a short while; `forget_destination` with the
+  409-or-force rule; `prune_destinations` and `sweep` over `hs_admin::federation::decide`'s
+  rules), `outbound_store.rs`/`sender.rs` (`forget_destination`: queue, retry state, catch-up
+  mark and positions dropped, counts answered), `keys.rs` (`forget_server` on the cache),
+  `destination_store.rs` (`forget`), `metrics.rs`
+  (`hs_federation_destinations_forgotten_total{reason,by}`).
+- `hs-admin` (`federation.rs`, OpenAPI 0.1.14): `DELETE /federation/destinations/{server_name}`
+  (`federation.destinations.forget`; `409 conflict` naming the shared rooms unless `force=true`;
+  `404` for a server never tried; audited; `federation.destination_forgotten` on the stream),
+  `POST /federation/destinations/prune` (`dry_run`, `failing_for`; `DestinationPruneReport`
+  with both sides by reason and the first 50 names; audited unless a dry run),
+  `Destination.shared_rooms_count` and the list's `shares_room` filter.
+- `hs-config`: `federation.forget_unused_destinations_after` (default `1w`, hot, `0` off), in
+  `docs/config.md` and the schema fixture.
+- `hs-cli`: `destination_sweep.rs` (`Retention` the applier writes; the sweep five minutes after
+  start then hourly, through `DestinationStoreSource::sweep`; `RegistryRoomSharing` over the room
+  registry), wired in `serve.rs`, stopped on shutdown.
+- `web/`: the Federation page's "No shared room" filter (`show=no-shared-room` in the URL,
+  `shares_room=false` to the server) with its own count and empty state, a Shared rooms column
+  (`none`, a number, or `unknown` when the server cannot say), Forget on every row and on the
+  destination's page (`pages/federation/ForgetDestination.tsx`: what is dropped from the row's
+  own numbers, the warning and the "Forget it anyway" switch when a room is shared, the server's
+  `409` shown and the switch revealed when the list could not say), the prune panel
+  (`pages/federation/PruneDestinations.tsx`: the sweep's setting in words with a link to the
+  Configuration row, `failing_for` as a choice, a preview before a "Forget N servers" button,
+  both sides of the report with reasons in plain words), the "What the statuses mean" key
+  extended, the setting on the Configuration page (its legend now leads with "apply on save":
+  seven of the federation section's fourteen settings are hot). Mocks in
+  `src/mocks/data/federation.ts` (`forgetDestination`, `pruneDestinations`, eight quiet servers
+  sharing no room) and `handlers.ts`; the destinations reset after every test.
+
+**Observability.** `INFO` lines: `forgot a federation destination: its queue, backoff,
+catch-up mark and cached keys are gone` with `destination`, `reason` (`administrator`,
+`unused`, `failing`), `by` (`administrator`, `sweep`) and the dropped counts, once per
+destination whoever decided (`hs-federation` `admin_source.rs`, added on this branch's last
+day); `an administrator forgot a federation destination` and `an administrator pruned the
+federation destinations` (`hs-admin`); `swept the federation destinations: forgot ...` with the
+counts by reason, how many were kept, the retention and the first eight names (`hs-cli`, only
+when something was forgotten; `debug` otherwise); `the federation destination sweep could not
+run` at `WARN`. Metric `hs_federation_destinations_forgotten_total{reason,by}`, registered in
+`hs_federation::metrics::register`. The audit log carries each forget and each real prune.
+
+**Verified by running** (2026-10-10 evening, this worktree, each command as written):
+
+- `cargo fmt --all --check`: clean. `cargo clippy -p hs-federation -p hs-admin -p hs-cli
+  -p hs-config --all-targets -- -D warnings`: clean.
+- `cargo test -p hs-config`: 183 passed. `cargo test -p hs-federation`: 246 passed.
+  `cargo test -p hs-admin`: 315 passed (plus the integration binaries, all green).
+- `cargo test -p hs-cli --test federation_destinations`: 1 passed in 30.7 s. Two real `hs serve`
+  instances: while A's user is in B's room, A's forget of B is `409` naming the shared room and
+  the prune's dry run keeps it (`shares_rooms`); after the user leaves and the leave reaches B,
+  the dry run says `unused`, the forget is `200`, B is then `404`, and a rejoin starts afresh.
+- `web/`: `npm run check` (lint, typecheck, 35 federation tests among the suite, production
+  build with the client regenerated from OpenAPI 0.1.14) and `npm run test:e2e`
+  (`e2e/federation-forget.spec.ts`: the filter, a forget from a row, a preview then a prune, the
+  setting's row on the Configuration page; a forced forget from the destination's page; axe at
+  desktop and phone width). Results in the final report of the session.
+
+**Not done on this branch.** The sweep's result is not kept anywhere but the log (the
+decision says why; the page says so and offers the preview). No two-replica run of a forget
+(the source forgets through this replica's sender; a queue another replica is sending for is
+dropped from the store and that replica's worker notices on its next read). The Overview's
+federation strip does not count the servers sharing no room.
+
 ## 2026-10-10 (branch `agent/join-verify`): a join of a large room no longer takes hours -- keys are fetched in parallel, a gone server is remembered, the join outlives the client
 
 The first time the demo federated with the public internet (2026-10-10, 20:50 UTC) the owner
