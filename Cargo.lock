@@ -2345,6 +2345,7 @@ dependencies = [
  "hs-testkit",
  "hs-user",
  "http",
+ "libc",
  "object_store",
  "postgres",
  "prometheus-client",

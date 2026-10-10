@@ -481,7 +481,14 @@ impl FederationClient {
 
         match &result {
             Ok(_) => self.destinations.record_success(destination).await,
-            Err(ClientError::Request(..) | ClientError::ResponseTooLarge(..)) => {
+            // A destination that does not resolve (`Discovery`) is backed off like one that does
+            // not answer: before 2026-10-10 it was not, and nothing stopped a caller retrying a
+            // dead server as fast as its own loop allowed (`docs/status/06-federation.md`).
+            Err(
+                ClientError::Request(..)
+                | ClientError::ResponseTooLarge(..)
+                | ClientError::Discovery(..),
+            ) => {
                 self.destinations
                     .record_failure(
                         destination,
@@ -884,7 +891,7 @@ impl FederationClient {
             .await;
         match &result {
             Ok(_) => self.destinations.record_success(destination).await,
-            Err(ClientError::Request(..)) => {
+            Err(ClientError::Request(..) | ClientError::Discovery(..)) => {
                 self.destinations
                     .record_failure(
                         destination,

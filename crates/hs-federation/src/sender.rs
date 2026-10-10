@@ -335,6 +335,25 @@ pub enum DeliveryWait {
     },
 }
 
+/// What the sender holds in this process at one moment ([`FederationSender::snapshot`]): the
+/// `hs_federation_sender_*` gauges (`crate::metrics::SenderGauges`). Counts are this process's
+/// workers' alone, like [`FederationSender::pending_pdus`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SenderSnapshot {
+    /// Destinations with a worker here.
+    pub destinations: usize,
+    /// PDUs queued for them and not yet accepted or dropped ([`FederationSender::pending_pdus`]).
+    pub pdus_pending: usize,
+    /// In-memory EDUs (typing, receipts, presence) waiting, across destinations.
+    pub edus_queued: usize,
+    /// Workers waiting out a retry backoff right now.
+    pub destinations_backing_off: usize,
+    /// An estimate of the memory the per-destination state takes: each queue's structures, its
+    /// channel entries (one per pending PDU, the PDU itself shared across destinations) and
+    /// its in-memory EDUs ([`approx_json_bytes`]). Not the store, not the client's pools.
+    pub state_bytes: usize,
+}
+
 /// The outbound sender. See the module docs. Cheap to share behind an `Arc`; every method takes
 /// `&self`.
 pub struct FederationSender {
@@ -372,6 +391,9 @@ struct Shared {
     /// The bound in force on each destination's durable EDUs: `config`'s at first, replaced
     /// live by [`FederationSender::set_max_queued_durable_edus_per_destination`].
     max_durable_edus: AtomicUsize,
+    /// Workers waiting out a retry backoff right now ([`BackingOff`] guards it), for
+    /// `hs_federation_sender_destinations_backing_off`.
+    backing_off: AtomicUsize,
 }
 
 struct DestinationQueue {
@@ -397,6 +419,9 @@ enum Queued {
 #[derive(Default)]
 struct EduQueue {
     queue: Mutex<std::collections::VecDeque<(Option<String>, Arc<Value>)>>,
+    /// An estimate of what the queue holds, in bytes ([`approx_json_bytes`] of each EDU plus
+    /// its key and entry), kept as entries come and go so a scrape never walks the queue.
+    bytes: AtomicUsize,
 }
 
 impl EduQueue {
@@ -408,13 +433,18 @@ impl EduQueue {
             && let Some(position) = queue
                 .iter()
                 .position(|(existing, _)| existing.as_ref() == Some(key))
+            && let Some((old_key, old)) = queue.remove(position)
         {
-            queue.remove(position);
+            sub_saturating(&self.bytes, edu_entry_bytes(old_key.as_ref(), &old));
         }
+        self.bytes
+            .fetch_add(edu_entry_bytes(key.as_ref(), &edu), Ordering::AcqRel);
         queue.push_back((key, edu));
         let mut dropped = 0;
         while queue.len() > MAX_QUEUED_EDUS_PER_DESTINATION {
-            queue.pop_front();
+            if let Some((old_key, old)) = queue.pop_front() {
+                sub_saturating(&self.bytes, edu_entry_bytes(old_key.as_ref(), &old));
+            }
             dropped += 1;
         }
         dropped
@@ -424,7 +454,18 @@ impl EduQueue {
     fn take(&self, limit: usize) -> Vec<Arc<Value>> {
         let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
         let n = queue.len().min(limit);
-        queue.drain(..n).map(|(_, edu)| edu).collect()
+        queue
+            .drain(..n)
+            .map(|(key, edu)| {
+                sub_saturating(&self.bytes, edu_entry_bytes(key.as_ref(), &edu));
+                edu
+            })
+            .collect()
+    }
+
+    /// The estimate kept by [`EduQueue::push`] and [`EduQueue::take`].
+    fn bytes(&self) -> usize {
+        self.bytes.load(Ordering::Acquire)
     }
 
     fn len(&self) -> usize {
@@ -535,6 +576,7 @@ impl FederationSender {
                 max_durable_edus: AtomicUsize::new(
                     config.max_queued_durable_edus_per_destination.max(1),
                 ),
+                backing_off: AtomicUsize::new(0),
             }),
             queues: Mutex::new(HashMap::new()),
         }
@@ -755,6 +797,7 @@ impl FederationSender {
             backlog.entry(destination).or_insert(0);
         }
         let mut resumed = 0usize;
+        let mut resumed_queues = 0usize;
         for (destination, count) in backlog {
             if destination == self.shared.own_server_name
                 || queues.contains_key(&destination)
@@ -769,8 +812,32 @@ impl FederationSender {
                     "resuming an outbound federation queue left by a previous run"
                 );
                 resumed += count;
+                resumed_queues += 1;
                 queues.insert(destination, queue);
             }
+        }
+        if resumed_queues > 0 {
+            // Each resumed worker waits out what is left of its destination's persisted
+            // backoff before its first attempt (logged per destination at `debug`); the count
+            // is what an operator wants at boot, not one line per dead server.
+            let now = now_ms();
+            let waiting_out_backoff = self
+                .shared
+                .store
+                .states()
+                .map(|states| {
+                    states
+                        .iter()
+                        .filter(|(_, state)| !state.is_ready(now))
+                        .count()
+                })
+                .unwrap_or(0);
+            tracing::info!(
+                destinations = resumed_queues,
+                pdus = resumed,
+                waiting_out_backoff,
+                "resumed the outbound federation queues left by a previous run"
+            );
         }
         Ok(resumed)
     }
@@ -1194,6 +1261,30 @@ impl FederationSender {
                 first = false;
             }
             tokio::time::sleep(DELIVERY_POLL_INTERVAL.min(deadline - now)).await;
+        }
+    }
+
+    /// What this process's sender holds right now ([`SenderSnapshot`]): read at every scrape by
+    /// `crate::metrics::SenderGauges`. One pass over the queue map, no store reads.
+    #[must_use]
+    pub fn snapshot(&self) -> SenderSnapshot {
+        let queues = self.queues.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut edus_queued = 0usize;
+        let mut state_bytes = 0usize;
+        for (name, queue) in queues.iter() {
+            edus_queued += queue.edus.len();
+            state_bytes += name.capacity()
+                + std::mem::size_of::<String>()
+                + std::mem::size_of::<DestinationQueue>()
+                + queue.pending.load(Ordering::Acquire) * std::mem::size_of::<Queued>()
+                + queue.edus.bytes();
+        }
+        SenderSnapshot {
+            destinations: queues.len(),
+            pdus_pending: self.shared.pending_total.load(Ordering::Acquire),
+            edus_queued,
+            destinations_backing_off: self.shared.backing_off.load(Ordering::Acquire),
+            state_bytes,
         }
     }
 
@@ -1649,6 +1740,7 @@ impl Shared {
     /// early when the store no longer says to wait (an administrator's reset). Returns `false`
     /// if the sender was shut down meanwhile.
     async fn wait_until(&self, destination: &str, until_ms: u64) -> bool {
+        let _waiting = BackingOff::new(&self.backing_off);
         let slice = self.config.reset_poll_interval;
         loop {
             if self.shut_down.load(Ordering::Acquire) {
@@ -1896,7 +1988,7 @@ impl Shared {
         if let Some(next_attempt) = persisted.next_attempt_ms
             && next_attempt > now_ms()
         {
-            tracing::info!(
+            tracing::debug!(
                 destination,
                 txn_id,
                 failures,
@@ -1920,6 +2012,8 @@ impl Shared {
                 .await
             {
                 Ok(response) if (200..300).contains(&response.status) => {
+                    crate::metrics::record_transaction("accepted");
+                    crate::metrics::record_pdus_sent(pdus.len() as u64);
                     self.log_rejections(destination, txn_id, &response.body);
                     tracing::debug!(
                         destination,
@@ -1935,15 +2029,16 @@ impl Shared {
                     return Delivery::Delivered;
                 }
                 Ok(response) => {
+                    crate::metrics::record_transaction("rejected");
                     failures += 1;
                     let delay = self.backoff(failures);
-                    tracing::warn!(
+                    self.log_retry(
                         destination,
                         txn_id,
-                        status = response.status,
                         failures,
-                        retry_in_ms = delay.as_millis() as u64,
-                        "federation transaction rejected; will retry"
+                        delay,
+                        &format!("HTTP {}", response.status),
+                        "federation transaction rejected; will retry",
                     );
                     let until = now_ms().saturating_add(delay.as_millis() as u64);
                     let error = format!("HTTP {}: {}", response.status, response.body);
@@ -1951,6 +2046,7 @@ impl Shared {
                     Wait::Until(until)
                 }
                 Err(ClientError::Backoff { retry_at_ms, .. }) => {
+                    crate::metrics::record_transaction("deferred");
                     // The client's destination store's judgement, not this loop's: wait it out
                     // (in slices, so a reset of that store is noticed) without counting it as
                     // another failure of this transaction.
@@ -1972,6 +2068,7 @@ impl Shared {
                     | ClientError::DomainDenied(_)
                     | ClientError::IpDenied(_)),
                 ) => {
+                    crate::metrics::record_transaction("dropped");
                     tracing::error!(
                         destination,
                         txn_id,
@@ -1983,23 +2080,32 @@ impl Shared {
                     return Delivery::Dropped;
                 }
                 Err(error) => {
+                    // A destination that does not resolve is a failure like any other: the
+                    // same persisted, doubling backoff, named for the operator. Before
+                    // 2026-10-10 the client did not record it either, so a room naming
+                    // thousands of dead servers had each retried from one second at every
+                    // start (`docs/status/06-federation.md`).
+                    let (outcome, message) = if matches!(error, ClientError::Discovery(..)) {
+                        (
+                            "unresolvable",
+                            "federation destination did not resolve; will retry",
+                        )
+                    } else {
+                        ("failed", "federation transaction failed; will retry")
+                    };
+                    crate::metrics::record_transaction(outcome);
                     failures += 1;
                     let delay = self.backoff(failures);
-                    tracing::warn!(
-                        destination,
-                        txn_id,
-                        failures,
-                        %error,
-                        retry_in_ms = delay.as_millis() as u64,
-                        "federation transaction failed; will retry"
-                    );
+                    let error = error.to_string();
+                    self.log_retry(destination, txn_id, failures, delay, &error, message);
                     let until = now_ms().saturating_add(delay.as_millis() as u64);
-                    self.record_failure(destination, &error.to_string(), until);
+                    self.record_failure(destination, &error, until);
                     Wait::Until(until)
                 }
             };
             let keep_going = match (mode, wait) {
                 (_, Wait::For(delay)) => {
+                    let _waiting = BackingOff::new(&self.backing_off);
                     tokio::time::sleep(delay).await;
                     !self.shut_down.load(Ordering::Acquire)
                 }
@@ -2025,6 +2131,61 @@ impl Shared {
                 }
                 Mode::Queue => {}
             }
+        }
+    }
+
+    /// Logs one failed attempt at a transaction: at `warn` when [`Shared::warn_on_attempt`]
+    /// says so, at `debug` otherwise, with the same fields either way.
+    fn log_retry(
+        &self,
+        destination: &str,
+        txn_id: &str,
+        failures: u32,
+        delay: Duration,
+        error: &str,
+        message: &'static str,
+    ) {
+        let retry_in_ms = delay.as_millis() as u64;
+        if self.warn_on_attempt(failures) {
+            tracing::warn!(
+                destination,
+                txn_id,
+                failures,
+                error,
+                retry_in_ms,
+                "{message}"
+            );
+        } else {
+            tracing::debug!(
+                destination,
+                txn_id,
+                failures,
+                error,
+                retry_in_ms,
+                "{message}"
+            );
+        }
+    }
+
+    /// Whether the `failures`th consecutive failed attempt is logged at `warn`: the first of
+    /// a run, and each one whose wait reaches a new [`Shared::backoff_level`] (a minute, then
+    /// the ceiling). Every other attempt is `debug`. The run of failures is persisted, so a
+    /// destination that stays dead costs three warnings in all, across restarts, instead of
+    /// one per attempt: on 2026-10-10 the demo logged 2,790 of them in 400 seconds.
+    fn warn_on_attempt(&self, failures: u32) -> bool {
+        failures <= 1 || self.backoff_level(failures) != self.backoff_level(failures - 1)
+    }
+
+    /// 0 while the wait after `failures` failures is under a minute, 1 from a minute up, 2
+    /// once it has reached [`SenderConfig::max_backoff`].
+    fn backoff_level(&self, failures: u32) -> u8 {
+        let delay = self.backoff(failures);
+        if delay >= self.config.max_backoff {
+            2
+        } else if delay >= Duration::from_secs(60) {
+            1
+        } else {
+            0
         }
     }
 
@@ -2062,6 +2223,51 @@ impl Shared {
             }
         }
     }
+}
+
+/// Counts a worker among those waiting out a retry ([`Shared::backing_off`]) for as long as it
+/// lives.
+struct BackingOff<'a>(&'a AtomicUsize);
+
+impl<'a> BackingOff<'a> {
+    fn new(counter: &'a AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self(counter)
+    }
+}
+
+impl Drop for BackingOff<'_> {
+    fn drop(&mut self) {
+        sub_saturating(self.0, 1);
+    }
+}
+
+/// An estimate of the heap a JSON value takes: each node's own size plus its strings' and
+/// keys' bytes. Within a factor of two of the allocator's truth for the EDUs and PDUs this
+/// module carries, which is what `hs_federation_sender_state_bytes` needs.
+#[must_use]
+pub fn approx_json_bytes(value: &Value) -> usize {
+    const NODE: usize = std::mem::size_of::<Value>();
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => NODE,
+        Value::String(s) => NODE + s.capacity(),
+        Value::Array(items) => NODE + items.iter().map(approx_json_bytes).sum::<usize>(),
+        Value::Object(map) => {
+            NODE + map
+                .iter()
+                .map(|(key, item)| {
+                    key.len() + std::mem::size_of::<String>() + approx_json_bytes(item)
+                })
+                .sum::<usize>()
+        }
+    }
+}
+
+/// What one [`EduQueue`] entry takes: its key, its EDU and the entry itself.
+fn edu_entry_bytes(key: Option<&String>, edu: &Value) -> usize {
+    key.map_or(0, |k| k.capacity())
+        + approx_json_bytes(edu)
+        + std::mem::size_of::<(Option<String>, Arc<Value>)>()
 }
 
 /// `counter -= n`, stopping at zero: a count that is only ever an operator's number must never
@@ -2542,6 +2748,7 @@ mod tests {
             catch_up_source: std::sync::OnceLock::new(),
             catch_up_metrics: std::sync::OnceLock::new(),
             max_durable_edus: AtomicUsize::new(1),
+            backing_off: AtomicUsize::new(0),
         };
         assert_eq!(shared.backoff(1), Duration::from_millis(100));
         assert_eq!(shared.backoff(2), Duration::from_millis(200));
@@ -3576,5 +3783,208 @@ mod tests {
         fn wake_sender_for(&self, destination: &str) {
             self.0.lock().unwrap().push(destination.to_owned());
         }
+    }
+
+    /// A resolver that finds nothing, so every request ends in `ClientError::Discovery`: the
+    /// shape of a server whose DNS is gone, which a room with thousands of members names by the
+    /// hundred (the 2026-10-10 demo).
+    struct Nowhere;
+    #[async_trait]
+    impl AddrResolver for Nowhere {
+        async fn resolve_addr(&self, _hostname: &str) -> Vec<IpAddr> {
+            Vec::new()
+        }
+    }
+    #[async_trait]
+    impl SrvResolver for Nowhere {
+        async fn lookup_srv(&self, _service: &str, _hostname: &str) -> Vec<(String, u16)> {
+            Vec::new()
+        }
+    }
+
+    fn client_nowhere(destinations: Arc<dyn DestinationStore>) -> Arc<FederationClient> {
+        Arc::new(FederationClient::new(
+            US,
+            SigningKeyPair::generate("a_1"),
+            ClientConfig {
+                scheme: "http",
+                ..ClientConfig::default()
+            },
+            destinations,
+            Arc::new(NoWellKnown),
+            Arc::new(Nowhere),
+            Arc::new(Nowhere),
+        ))
+    }
+
+    /// A destination that does not resolve is retried under the sender's persisted, doubling
+    /// backoff like any other failure, counted as `unresolvable`, and -- new on 2026-10-10 --
+    /// backed off by the client's own destination store too, so the attempts in between are
+    /// `deferred` without asking the resolver again, and every other caller of the client
+    /// (joins, key fetches) leaves the dead server alone for the same while.
+    #[tokio::test]
+    async fn an_unresolvable_destination_backs_off_like_any_other_failure() {
+        let destinations = Arc::new(InMemoryDestinationStore::new());
+        let before_unresolvable = crate::metrics::transactions("unresolvable");
+        let sender =
+            FederationSender::with_config(client_nowhere(destinations.clone()), US, fast());
+        sender.enqueue_pdu(["dead.example.org".to_owned()], pdu(0));
+        assert!(
+            wait_for(Duration::from_secs(15), || {
+                sender
+                    .destination_state("dead.example.org")
+                    .unwrap()
+                    .is_some_and(|state| state.failures >= 2)
+            })
+            .await,
+            "the run of failures is persisted and grows"
+        );
+        let state = sender
+            .destination_state("dead.example.org")
+            .unwrap()
+            .unwrap();
+        assert!(
+            state
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("did not resolve")),
+            "{state:?}"
+        );
+        assert!(state.next_attempt_ms.is_some(), "{state:?}");
+        assert!(
+            crate::metrics::transactions("unresolvable") >= before_unresolvable + 2,
+            "every attempt is counted as unresolvable"
+        );
+        let client_state = destinations.get("dead.example.org").await;
+        assert!(
+            client_state.failure_count >= 1,
+            "the client's own store backs the destination off: {client_state:?}"
+        );
+        // While it waits, it is one destination backing off with one PDU pending.
+        assert!(
+            wait_for(Duration::from_secs(5), || {
+                sender.snapshot().destinations_backing_off == 1
+            })
+            .await
+        );
+        assert_eq!(sender.snapshot().pdus_pending, 1);
+        sender.shutdown();
+    }
+
+    /// With the default policy (a second, doubling to an hour) a destination that stays dead is
+    /// warned about three times in all: at its first failure, when the wait reaches a minute
+    /// (the seventh) and when it reaches the ceiling (the thirteenth). Every other attempt is
+    /// logged at debug. The run of failures is persisted, so this holds across restarts too.
+    #[tokio::test]
+    async fn a_failing_destination_warns_once_per_backoff_level() {
+        let sender = FederationSender::with_config(client(), US, SenderConfig::default());
+        let warned: Vec<u32> = (1..=30)
+            .filter(|failures| sender.shared.warn_on_attempt(*failures))
+            .collect();
+        assert_eq!(warned, vec![1, 7, 13]);
+        assert_eq!(sender.shared.backoff(7), Duration::from_secs(64));
+        assert_eq!(sender.shared.backoff(13), Duration::from_secs(3600));
+    }
+
+    /// `snapshot` and the `hs_federation_sender_*` gauges say what the sender holds: the
+    /// destinations with a worker, their pending PDUs and waiting EDUs, how many are waiting
+    /// out a retry, and an estimate of the bytes -- and go back to nothing after `shutdown`.
+    #[tokio::test]
+    async fn the_snapshot_and_its_gauges_follow_the_queues() {
+        let sender = Arc::new(FederationSender::with_config(
+            client_nowhere(Arc::new(InMemoryDestinationStore::new())),
+            US,
+            fast(),
+        ));
+        assert_eq!(sender.snapshot(), SenderSnapshot::default());
+        sender.enqueue_pdu(
+            ["dead.example.org".to_owned(), "gone.example.org".to_owned()],
+            pdu(0),
+        );
+        assert!(
+            wait_for(Duration::from_secs(10), || {
+                sender.snapshot().destinations_backing_off == 2
+            })
+            .await,
+            "{:?}",
+            sender.snapshot()
+        );
+        // An EDU queued while the head transaction is being retried waits in memory.
+        sender.enqueue_edu(
+            ["dead.example.org".to_owned()],
+            "m.typing",
+            serde_json::json!({"room_id": "!r:us.example.org", "typing": true}),
+            Some("typing:!r".to_owned()),
+        );
+        let snapshot = sender.snapshot();
+        assert_eq!(snapshot.destinations, 2);
+        assert_eq!(snapshot.pdus_pending, 2);
+        assert_eq!(snapshot.edus_queued, 1, "{snapshot:?}");
+        assert!(
+            snapshot.state_bytes > 2 * std::mem::size_of::<DestinationQueue>(),
+            "{snapshot:?}"
+        );
+
+        let mut registry = prometheus_client::registry::Registry::default();
+        crate::metrics::register_sender_gauges(&mut registry, sender.clone());
+        let mut text = String::new();
+        prometheus_client::encoding::text::encode(&mut text, &registry).unwrap();
+        for line in [
+            "hs_federation_sender_destinations 2\n",
+            "hs_federation_sender_pdus_pending 2\n",
+            "hs_federation_sender_edus_queued 1\n",
+            "hs_federation_sender_destinations_backing_off 2\n",
+            "# TYPE hs_federation_sender_state_bytes gauge\n",
+        ] {
+            assert!(text.contains(line), "missing {line:?} in {text}");
+        }
+
+        sender.shutdown();
+        // Aborting a worker drops its wait, and with it its place among those backing off.
+        assert!(
+            wait_for(Duration::from_secs(5), || {
+                sender.snapshot().destinations_backing_off == 0
+            })
+            .await,
+            "{:?}",
+            sender.snapshot()
+        );
+        assert_eq!(sender.snapshot().destinations, 0);
+        assert_eq!(sender.snapshot().pdus_pending, 0);
+    }
+
+    /// The EDU queue's byte estimate follows what it holds: a coalesced EDU replaces its
+    /// predecessor's bytes, a taken one gives them back, an empty queue is zero.
+    #[test]
+    fn the_edu_queue_keeps_an_estimate_of_its_bytes() {
+        let queue = EduQueue::default();
+        assert_eq!(queue.bytes(), 0);
+        let edu = Arc::new(serde_json::json!({
+            "edu_type": "m.typing",
+            "content": {"room_id": "!r:us.example.org", "typing": true},
+        }));
+        queue.push(Some("k".to_owned()), edu.clone());
+        let one = queue.bytes();
+        assert!(one >= approx_json_bytes(&edu), "{one}");
+        queue.push(Some("k".to_owned()), edu.clone());
+        assert_eq!(queue.len(), 1, "coalesced");
+        assert_eq!(queue.bytes(), one);
+        queue.push(None, edu.clone());
+        assert!(queue.bytes() > one);
+        assert_eq!(queue.take(10).len(), 2);
+        assert_eq!(queue.bytes(), 0);
+        assert_eq!(queue.len(), 0);
+    }
+
+    /// The estimate counts the bytes of strings and keys and a node's own size, so a large
+    /// value is large and a nested one is more than its parts.
+    #[test]
+    fn approx_json_bytes_follows_the_value() {
+        let text = serde_json::json!("x".repeat(1000));
+        assert!(approx_json_bytes(&text) >= 1000);
+        let inner = serde_json::json!({"a": 1, "b": "two"});
+        let outer = serde_json::json!({"inner": inner.clone(), "list": [1, 2, 3]});
+        assert!(approx_json_bytes(&outer) > approx_json_bytes(&inner));
+        assert!(approx_json_bytes(&serde_json::Value::Null) > 0);
     }
 }

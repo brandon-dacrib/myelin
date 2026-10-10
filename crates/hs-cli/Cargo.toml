@@ -23,6 +23,9 @@ hs-auth = { path = "../hs-auth" }
 hs-kv = { path = "../hs-kv" }
 hs-tables = { path = "../hs-tables" }
 bytes = { workspace = true }
+# `crate::process_metrics`: the process's own resident and virtual size (`sysconf` on Linux,
+# `task_info` on macOS), for `process_resident_memory_bytes` on /metrics.
+libc = { workspace = true }
 hs-telemetry = { path = "../hs-telemetry" }
 prometheus-client = { workspace = true }
 hs-http = { path = "../hs-http" }

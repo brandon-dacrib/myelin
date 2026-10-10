@@ -38,6 +38,7 @@ pub mod media;
 pub mod metrics_layer;
 pub mod migration;
 pub mod overview;
+pub mod process_metrics;
 pub mod profile_refresh;
 pub mod push_cluster;
 pub mod push_delivery;
