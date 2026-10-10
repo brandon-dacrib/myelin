@@ -896,6 +896,11 @@ pub struct AdminDestination {
     /// "Catch-up".
     #[serde(default)]
     pub catch_up_since: Option<String>,
+    /// How many rooms this server shares with the destination (a room where both have a joined
+    /// member); `None` when the server cannot say (no room directory wired). A destination
+    /// sharing none is state, not a relationship, and may be forgotten (decision 0042).
+    #[serde(default)]
+    pub shared_rooms_count: Option<u64>,
 }
 
 /// The OpenAPI `AppService` schema: one row of `GET /appservices` and the body of every

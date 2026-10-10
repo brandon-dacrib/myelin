@@ -97,6 +97,10 @@ pub trait DestinationStore: Send + Sync {
     /// What an administrator does when the other side says it is back. The record stays; only
     /// the failure run is cleared.
     async fn reset(&self, destination: &str);
+    /// Drops the destination's record altogether: what `federation.destinations.forget` does
+    /// to a server this one shares no room with (decision 0042). The next request to it starts
+    /// from nothing, as if it had never been tried. A destination with no record is left alone.
+    async fn forget(&self, destination: &str);
 }
 
 /// An in-memory [`DestinationStore`], for tests and for a deployment that accepts losing backoff
@@ -156,6 +160,10 @@ impl DestinationStore for InMemoryDestinationStore {
             entry.retry_at_ms = None;
             entry.failing_since_ms = None;
         }
+    }
+
+    async fn forget(&self, destination: &str) {
+        self.state.lock().unwrap().remove(destination);
     }
 }
 
@@ -263,6 +271,13 @@ impl<B: KvBackend> DestinationStore for KvDestinationStore<B> {
             self.table.put(txn, &key, &bytes).map_err(to_kv_err)
         });
     }
+
+    async fn forget(&self, destination: &str) {
+        let key = (destination.to_string(),);
+        let _ = transact(&self.backend, TransactConfig::default(), |txn| {
+            self.table.delete(txn, &key).map_err(to_kv_err)
+        });
+    }
 }
 
 fn to_kv_err(e: TableError) -> hs_kv::KvError {
@@ -336,6 +351,24 @@ mod tests {
         let store2 = KvDestinationStore::open(backend).unwrap();
         let state = store2.get("b.example.org").await;
         assert_eq!(state.failure_count, 2);
+    }
+
+    #[tokio::test]
+    async fn a_forgotten_destination_has_no_record_in_either_store() {
+        let memory = InMemoryDestinationStore::new();
+        memory.record_failure("gone.example.org", 60_000).await;
+        memory.forget("gone.example.org").await;
+        assert!(memory.list().await.is_empty());
+        assert!(memory.get("gone.example.org").await.is_ready(now_ms()));
+
+        let kv = KvDestinationStore::open(MemoryBackend::new()).unwrap();
+        kv.record_failure("gone.example.org", 60_000).await;
+        kv.record_success("kept.example.org").await;
+        kv.forget("gone.example.org").await;
+        kv.forget("never.example.org").await;
+        let names: Vec<String> = kv.list().await.into_iter().map(|(name, _)| name).collect();
+        assert_eq!(names, vec!["kept.example.org".to_owned()]);
+        assert!(kv.get("gone.example.org").await.is_ready(now_ms()));
     }
 
     #[tokio::test]

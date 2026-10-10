@@ -1272,6 +1272,101 @@ impl FederationSender {
         self.shared.store.reset(destination)
     }
 
+    /// Forgets `destination` altogether (decision 0042): its worker, if this replica has one,
+    /// is stopped and what it had in memory dropped; then everything the store holds for it --
+    /// queued PDUs, retry state, room positions, catch-up mark, durable EDUs -- is dropped in
+    /// one transaction ([`OutboundStore::forget_destination`]). The next PDU queued for it
+    /// starts a worker and a queue from nothing, as for a server never seen. What
+    /// `federation.destinations.forget` and the destination sweep do.
+    ///
+    /// # Errors
+    /// Returns the store's error; the worker is stopped either way, and what the store holds
+    /// is then resumed by the next start.
+    pub fn forget_destination(
+        &self,
+        destination: &str,
+    ) -> Result<crate::outbound_store::ForgottenQueue, OutboundStoreError> {
+        let stopped = {
+            let mut queues = self.queues.lock().unwrap_or_else(PoisonError::into_inner);
+            queues.remove(destination)
+        };
+        let had_worker = stopped.is_some();
+        if let Some(queue) = stopped {
+            queue.worker.abort();
+            let left = queue.pending.swap(0, Ordering::AcqRel);
+            sub_saturating(&self.shared.pending_total, left);
+        }
+        let forgotten = self.shared.store.forget_destination(destination)?;
+        tracing::info!(
+            destination,
+            pdus_dropped = forgotten.pdus,
+            edus_dropped = forgotten.edus,
+            was_catching_up = forgotten.was_catching_up,
+            had_worker,
+            "forgot an outbound federation destination"
+        );
+        Ok(forgotten)
+    }
+
+    /// PDUs the store holds for `destination`, whichever replica sends for it. Unlike
+    /// [`FederationSender::pending_pdus_for`], which is this replica's worker's count, this is
+    /// what is durably queued: what forgetting the destination would drop.
+    ///
+    /// # Errors
+    /// Returns the store's error.
+    pub fn queued_pdus_in_store(&self, destination: &str) -> Result<usize, OutboundStoreError> {
+        self.shared.store.queue_len(destination)
+    }
+
+    /// Every destination the store holds a PDU queue or durable EDUs for, whichever replica
+    /// sends for it, by name: the destinations with something durably waiting.
+    ///
+    /// # Errors
+    /// Returns the store's error.
+    pub fn destinations_with_queues_in_store(&self) -> Result<Vec<String>, OutboundStoreError> {
+        let mut names: std::collections::BTreeSet<String> = self
+            .shared
+            .store
+            .queued()?
+            .into_iter()
+            .filter(|(_, len)| *len > 0)
+            .map(|(name, _)| name)
+            .collect();
+        names.extend(
+            self.shared
+                .store
+                .durable_edus_queued()?
+                .into_iter()
+                .filter(|(_, len)| *len > 0)
+                .map(|(name, _)| name),
+        );
+        Ok(names.into_iter().collect())
+    }
+
+    /// Durable EDUs the store holds for `destination` (to-device messages, device-list
+    /// updates): what forgetting the destination would drop.
+    ///
+    /// # Errors
+    /// Returns the store's error.
+    pub fn durable_edus_in_store(&self, destination: &str) -> Result<usize, OutboundStoreError> {
+        self.shared.store.durable_edu_len(destination)
+    }
+
+    /// The rooms `destination` is behind in: those with a PDU queued (or, in catch-up mode,
+    /// noted) for it that it has not accepted yet, oldest first, at most `limit`
+    /// ([`OutboundStore::rooms_behind`]). What decides whether what is queued for a destination
+    /// is only for rooms this server has since left.
+    ///
+    /// # Errors
+    /// Returns the store's error.
+    pub fn rooms_behind(
+        &self,
+        destination: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::outbound_store::RoomBehind>, OutboundStoreError> {
+        self.shared.store.rooms_behind(destination, limit)
+    }
+
     /// Stops every worker at once. What is still queued stays in a durable store for the next
     /// start (logged at `info` with the count); in an in-memory store it is lost (logged at
     /// `warn`). Idempotent; `enqueue_pdu` is a no-op afterwards.
@@ -2450,6 +2545,9 @@ mod tests {
         async fn reset(&self, destination: &str) {
             self.inner.reset(destination).await;
         }
+        async fn forget(&self, destination: &str) {
+            self.inner.forget(destination).await;
+        }
     }
 
     #[tokio::test]
@@ -2934,6 +3032,7 @@ mod tests {
             Vec::new()
         }
         async fn reset(&self, _destination: &str) {}
+        async fn forget(&self, _destination: &str) {}
     }
 
     /// Each room's latest event, as the test says it is; `None` for a room the destination has

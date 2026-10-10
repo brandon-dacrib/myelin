@@ -105,6 +105,19 @@ pub struct QueuedEdu {
     pub edu: Value,
 }
 
+/// What [`OutboundStore::forget_destination`] dropped.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ForgottenQueue {
+    /// PDUs that were queued and are now gone, unsent.
+    pub pdus: usize,
+    /// Durable EDUs (to-device messages, device-list updates) that were queued and are now gone.
+    pub edus: usize,
+    /// Whether the destination was in catch-up mode.
+    pub was_catching_up: bool,
+    /// Whether a retry state was kept for it.
+    pub had_state: bool,
+}
+
 /// How the sender's retrying of one destination's head transaction is going. Persisted, so a
 /// restart resumes the backoff where it was rather than hammering a destination that was failing
 /// a moment ago.
@@ -426,6 +439,16 @@ pub trait OutboundStore: Send + Sync {
     /// # Errors
     /// Returns the backend's error.
     fn reset(&self, destination: &str) -> Result<(), OutboundStoreError>;
+
+    /// Drops everything held for `destination`, in one transaction: its queued PDUs, its retry
+    /// state, its room positions (queued and sent), its catch-up mark and its durable EDUs.
+    /// What `federation.destinations.forget` does (decision 0042). The next PDU queued for it
+    /// starts a queue from nothing. Stream cursors ([`OutboundStore::cursor`]) are not per
+    /// destination and are untouched.
+    ///
+    /// # Errors
+    /// Returns the backend's error; nothing was dropped then.
+    fn forget_destination(&self, destination: &str) -> Result<ForgottenQueue, OutboundStoreError>;
 
     /// Queues `edu` durably for every destination, in one transaction: with a `coalesce_key`,
     /// it replaces the destination's unsent durable EDU with the same key; past
@@ -793,6 +816,25 @@ impl OutboundStore for InMemoryOutboundStore {
             inner.states.insert(destination.to_owned(), current.reset());
         }
         Ok(())
+    }
+
+    fn forget_destination(&self, destination: &str) -> Result<ForgottenQueue, OutboundStoreError> {
+        let mut inner = self.lock();
+        let pdus = inner
+            .queues
+            .remove(destination)
+            .map_or(0, |queue| queue.len());
+        let had_state = inner.states.remove(destination).is_some();
+        let was_catching_up = inner.marks.remove(destination).is_some();
+        let edus = inner.edus.remove(destination).map_or(0, |edus| edus.len());
+        inner.room_queued.retain(|(d, _), _| d != destination);
+        inner.room_sent.retain(|(d, _), _| d != destination);
+        Ok(ForgottenQueue {
+            pdus,
+            edus,
+            was_catching_up,
+            had_state,
+        })
     }
 
     fn enqueue_durable_edu(
@@ -1492,6 +1534,85 @@ impl<B: KvBackend> OutboundStore for KvOutboundStore<B> {
         })
     }
 
+    fn forget_destination(&self, destination: &str) -> Result<ForgottenQueue, OutboundStoreError> {
+        let forgotten = transact(&self.backend, TransactConfig::default(), |txn| {
+            let name = destination.to_owned();
+            // The queue: every row under the destination's prefix.
+            let spec = TypedKeyspace::<B::Keyspace, (String, u64)>::prefix(&(name.clone(),));
+            let mut queue_keys: Vec<(String, u64)> = Vec::new();
+            for item in self.queue.range(txn, spec) {
+                let (key, _) = item.map_err(|e| into_kv(e.into()))?;
+                queue_keys.push(key);
+            }
+            let pdus = queue_keys.len();
+            for key in queue_keys {
+                self.queue
+                    .delete(txn, &key)
+                    .map_err(|e| into_kv(e.into()))?;
+            }
+            txn.delete(&self.lengths, &length_key(destination))?;
+            // The retry state and the catch-up mark.
+            let had_state = self
+                .destinations
+                .get(txn, &(name.clone(),))
+                .map_err(|e| into_kv(e.into()))?
+                .is_some();
+            self.destinations
+                .delete(txn, &(name.clone(),))
+                .map_err(|e| into_kv(e.into()))?;
+            let was_catching_up = self
+                .marks
+                .get(txn, &(name.clone(),))
+                .map_err(|e| into_kv(e.into()))?
+                .is_some();
+            self.marks
+                .delete(txn, &(name.clone(),))
+                .map_err(|e| into_kv(e.into()))?;
+            // The room positions, queued and sent.
+            for keyspace in [&self.room_queued, &self.room_sent] {
+                let spec = TypedKeyspace::<B::Keyspace, (String, String)>::prefix(&(name.clone(),));
+                let mut keys: Vec<(String, String)> = Vec::new();
+                for item in keyspace.range(txn, spec) {
+                    let (key, _) = item.map_err(|e| into_kv(e.into()))?;
+                    keys.push(key);
+                }
+                for key in keys {
+                    keyspace.delete(txn, &key).map_err(|e| into_kv(e.into()))?;
+                }
+            }
+            // The durable EDUs and their coalescing index.
+            let spec = TypedKeyspace::<B::Keyspace, (String, u64)>::prefix(&(name.clone(),));
+            let mut edu_keys: Vec<(String, u64)> = Vec::new();
+            for item in self.edus.range(txn, spec) {
+                let (key, _) = item.map_err(|e| into_kv(e.into()))?;
+                edu_keys.push(key);
+            }
+            let edus = edu_keys.len();
+            for key in edu_keys {
+                self.edus.delete(txn, &key).map_err(|e| into_kv(e.into()))?;
+            }
+            let spec = TypedKeyspace::<B::Keyspace, (String, String)>::prefix(&(name.clone(),));
+            let mut index_keys: Vec<(String, String)> = Vec::new();
+            for item in self.edu_keys.range(txn, spec) {
+                let (key, _) = item.map_err(|e| into_kv(e.into()))?;
+                index_keys.push(key);
+            }
+            for key in index_keys {
+                self.edu_keys
+                    .delete(txn, &key)
+                    .map_err(|e| into_kv(e.into()))?;
+            }
+            txn.delete(&self.edu_lengths, &length_key(destination))?;
+            Ok(ForgottenQueue {
+                pdus,
+                edus,
+                was_catching_up,
+                had_state,
+            })
+        })?;
+        Ok(forgotten)
+    }
+
     fn enqueue_durable_edu(
         &self,
         destinations: &[String],
@@ -1658,6 +1779,109 @@ mod tests {
                 Box::new(KvOutboundStore::open(MemoryBackend::new()).unwrap()),
             ),
         ]
+    }
+
+    /// Forgetting a destination drops everything held for it and nothing of anyone else's,
+    /// in both stores: its queue and length, its retry state, its room positions, its
+    /// catch-up mark, its durable EDUs and their coalescing index.
+    #[test]
+    fn forgetting_a_destination_drops_everything_held_for_it_and_nothing_else() {
+        for (name, store) in stores() {
+            let both = ["gone.example".to_owned(), "kept.example".to_owned()];
+            store.enqueue(&both, Some("!a:x"), &pdu(1), 100).unwrap();
+            store.enqueue(&both, Some("!b:x"), &pdu(2), 100).unwrap();
+            store
+                .record_sent("gone.example", &[("!a:x".to_owned(), 1)])
+                .unwrap();
+            store
+                .record_failure("gone.example", "HTTP 502", u64::MAX / 2)
+                .unwrap();
+            store
+                .enqueue_durable_edu(
+                    &both,
+                    &serde_json::json!({"edu_type": "m.x"}),
+                    Some("k"),
+                    10,
+                )
+                .unwrap();
+            store
+                .enqueue_durable_edu(&both, &serde_json::json!({"edu_type": "m.y"}), None, 10)
+                .unwrap();
+            store
+                .mark_catch_up("gone.example", CATCH_UP_REQUESTED)
+                .unwrap();
+            assert_eq!(store.queue_len("gone.example").unwrap(), 2, "{name}");
+
+            let forgotten = store.forget_destination("gone.example").unwrap();
+            assert_eq!(
+                forgotten,
+                ForgottenQueue {
+                    pdus: 2,
+                    edus: 2,
+                    was_catching_up: true,
+                    had_state: true,
+                },
+                "{name}"
+            );
+            assert_eq!(store.queue_len("gone.example").unwrap(), 0, "{name}");
+            assert!(store.peek("gone.example", 10).unwrap().is_empty(), "{name}");
+            assert!(store.state("gone.example").unwrap().is_none(), "{name}");
+            assert!(
+                store.catch_up_mark("gone.example").unwrap().is_none(),
+                "{name}"
+            );
+            assert!(
+                store.rooms_behind("gone.example", 10).unwrap().is_empty(),
+                "{name}"
+            );
+            assert_eq!(store.durable_edu_len("gone.example").unwrap(), 0, "{name}");
+            assert!(
+                store
+                    .peek_durable_edus("gone.example", 10)
+                    .unwrap()
+                    .is_empty(),
+                "{name}"
+            );
+            assert_eq!(
+                store.queued().unwrap(),
+                vec![("kept.example".to_owned(), 2)],
+                "{name}"
+            );
+            assert_eq!(
+                store.durable_edus_queued().unwrap(),
+                vec![("kept.example".to_owned(), 2)],
+                "{name}"
+            );
+            assert_eq!(
+                store.rooms_behind("kept.example", 10).unwrap().len(),
+                2,
+                "{name}"
+            );
+            // Forgotten twice: nothing to drop, no error.
+            assert_eq!(
+                store.forget_destination("gone.example").unwrap(),
+                ForgottenQueue::default(),
+                "{name}"
+            );
+            // A queue starts again from nothing, and the coalescing key is not confused by
+            // the forgotten index.
+            store.enqueue(&both, Some("!a:x"), &pdu(3), 100).unwrap();
+            assert_eq!(store.queue_len("gone.example").unwrap(), 1, "{name}");
+            store
+                .enqueue_durable_edu(
+                    &both,
+                    &serde_json::json!({"edu_type": "m.z"}),
+                    Some("k"),
+                    10,
+                )
+                .unwrap();
+            assert_eq!(store.durable_edu_len("gone.example").unwrap(), 1, "{name}");
+            assert_eq!(
+                store.durable_edu_len("kept.example").unwrap(),
+                2,
+                "{name}: replaced"
+            );
+        }
     }
 
     #[test]

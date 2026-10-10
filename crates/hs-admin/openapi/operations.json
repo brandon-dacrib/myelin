@@ -361,6 +361,24 @@
       "idempotent_post": false
     },
     {
+      "method": "DELETE",
+      "path": "/federation/destinations/{server_name}",
+      "operation_id": "federation.destinations.forget",
+      "scope": "admin:write",
+      "public": false,
+      "tag": "Federation",
+      "idempotent_post": false
+    },
+    {
+      "method": "POST",
+      "path": "/federation/destinations/prune",
+      "operation_id": "federation.destinations.prune",
+      "scope": "admin:write",
+      "public": false,
+      "tag": "Federation",
+      "idempotent_post": true
+    },
+    {
       "method": "GET",
       "path": "/federation/keys",
       "operation_id": "federation.keys.list",

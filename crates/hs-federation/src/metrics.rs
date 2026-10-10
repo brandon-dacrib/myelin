@@ -353,6 +353,36 @@ pub struct KeyFetchFailureLabels {
 static KEY_FETCH_FAILURES: std::sync::LazyLock<Family<KeyFetchFailureLabels, Counter>> =
     std::sync::LazyLock::new(Family::default);
 
+/// Labels of `hs_federation_destinations_forgotten_total`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, prometheus_client::encoding::EncodeLabelSet)]
+pub struct DestinationForgottenLabels {
+    /// `administrator` (`federation.destinations.forget`), or a prune reason: `unused` (shares
+    /// no room, nothing queued) or `failing` (failing long enough, queue only for rooms this
+    /// server left), whether the administrator's prune or the background sweep decided it.
+    pub reason: &'static str,
+    /// `administrator` or `sweep`.
+    pub by: &'static str,
+}
+
+static DESTINATIONS_FORGOTTEN: std::sync::LazyLock<Family<DestinationForgottenLabels, Counter>> =
+    std::sync::LazyLock::new(Family::default);
+
+/// Counts one destination forgotten (decision 0042), for `reason` by `by`
+/// ([`DestinationForgottenLabels`]).
+pub fn record_destination_forgotten(reason: &'static str, by: &'static str) {
+    DESTINATIONS_FORGOTTEN
+        .get_or_create(&DestinationForgottenLabels { reason, by })
+        .inc();
+}
+
+/// How many destinations were forgotten for `reason` by `by` so far (for tests).
+#[must_use]
+pub fn destinations_forgotten(reason: &'static str, by: &'static str) -> u64 {
+    DESTINATIONS_FORGOTTEN
+        .get_or_create(&DestinationForgottenLabels { reason, by })
+        .get()
+}
+
 /// `hs_federation_join_verify_seconds`: how long verifying the `state` and `auth_chain` of a
 /// `send_join` answer took, per join through another server
 /// (`crate::outbound_join::join_room`). The buckets reach 30 minutes: a large public room's
@@ -569,6 +599,13 @@ pub fn register_transport_metrics(registry: &mut Registry) {
          invalid_response) or were not made because an earlier failure is still backed off \
          from (backoff)",
         KEY_FETCH_FAILURES.clone(),
+    );
+    registry.register(
+        "hs_federation_destinations_forgotten",
+        "Outbound federation destinations forgotten (queue, backoff, catch-up mark and cached \
+         keys dropped), by reason (administrator, unused, failing) and by who decided \
+         (administrator, sweep)",
+        DESTINATIONS_FORGOTTEN.clone(),
     );
     registry.register(
         "hs_federation_join_verify_seconds",
