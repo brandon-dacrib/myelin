@@ -1,5 +1,16 @@
 # 12. Platform and Kubernetes
 
+## 2026-10-10: the demo rolled to `87d57288` (revision 13) through the owner's kubectl proxy
+
+23 s to "Upgrade complete"; server and operator pods on `sha-87d57288…`, 0 restarts, the
+bridge pod untouched, signing key unchanged, client API and unsigned federation `/version` 200
+from outside, no server-side warning in 75 min. Found: the demo publishes no
+`/.well-known/matrix/server` and 8448 is closed, so other servers cannot fetch its key
+(maunium.net answered our media fetches `401 Failed to find any key to satisfy`); the chart
+has no value for `server.well_known_server` yet. Also the pinned bridge tag did not reach the
+deployed instance (track 11), and the owner's Element withholds keys from the bot's new,
+unverified device (client setting). `docs/next-steps.md` has the three in full.
+
 ## 2026-10-09 (branch `agent/ops-95`): day two on real pods -- the chaos smoke, backup and restore, alerts, CA rotation, TLS in `hs serve`, and the bug the smoke found
 
 Goal: README's "Operations (HA, scale-out)" row from ~60% toward 95%, earned on kind. What

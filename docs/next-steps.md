@@ -1,10 +1,54 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-10-09, night EDT (thirteen merges, the 95% wave merged). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+Written 2026-09-20 by the integration lead, last revised 2026-10-10, 16:30 EDT (the demo rolled to 87d57288; three findings). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
-## Resume here: 2026-10-09, night EDT -- the 95% wave is merged: every row has a dated basis; roll to the first green image of `c7551603` or later
+## Resume here: 2026-10-10, 16:30 EDT -- the demo runs `87d57288`; three findings from the roll
+
+**The roll** (through the owner's `kubectl proxy` on 127.0.0.1:8001, 19:26 UTC): `helm upgrade`
+with revision 12's values, `deploy/demo/values-bridges.yaml` and `image.tag=sha-87d57288…`,
+"Upgrade complete" in 23 s, revision 13. The CRD was already Helm's with `spec.owner` from the
+morning's roll to `95d3aabe`, so no adoption flags were needed. After 75 minutes: server and
+operator pods on the new image, 0 restarts; the WhatsApp bridge pod untouched (22 h, 0
+restarts), `Bridge` Ready; signing key `ed25519:a_JBQV7r` unchanged; from outside
+`/_matrix/client/versions`, `/.well-known/matrix/client` and an unsigned
+`/_matrix/federation/v1/version` all 200; no `ERROR` and no server-side `WARN` in the log.
+
+**Findings** (none caused by the roll; each has its owner):
+
+1. **"Your message was not bridged: your client refused to share decryption keys"** (the
+   owner, from Element, 19:35 UTC). The server logged `a client withheld a room's keys from an
+   appservice's device` with `code=m.unverified`, "The sender has disabled encrypting to
+   unverified devices", for the bot's devices `BQBMQVR81T` (current, made by the 2026-10-09
+   crypto reset) and `BSLXZIVKIV` (the device from before the reset, **still registered**; the
+   bridge drops what is sent to it). The owner's Element session has "Never send encrypted
+   messages to unverified sessions" on, and the bot's new session is unverified from their
+   side. Fix on the client: verify the bot's session `BQBMQVR81T` manually (the bot's user →
+   sessions), or turn that setting off (globally, or in the chat's security settings). For
+   track 11: the manager should remove a bot's previous device after a reset (or the bridge
+   page should offer it), and the bridge page should say which devices a client has withheld
+   keys from (the health line exists; the device ids are in the log).
+2. **The pinned bridge image did not reach the deployed instance.** Decision 0037 said the
+   demo's WhatsApp instance rolls once to `v0.2609.0`; 75 min after the roll the `Bridge` spec
+   and the pod still say `latest`, and the manager logged no "deployment changed". The manager
+   is otherwise quiet by design (`apply_declared` skips an offering it already declared;
+   `tick` logs only changes), so this is the re-render path: `render_instance` resolves
+   `latest` to the pin and `deploy_fingerprint` includes the tag, so `deployment_changed`
+   should have been true for the stored row. Track 11: reproduce with a stored instance row
+   from before the pins (the real mautrix roll test starts from the old render; it may not
+   start from an old *row*), and check the instance's state and reason on the Bridges page
+   (the owner can read it there now). The bridge is healthy on `:latest` meanwhile.
+3. **The demo is not discoverable by other servers.** `/.well-known/matrix/server` answers 404
+   and port 8448 is closed, so maunium.net (and anyone) cannot fetch our signing key and
+   answers our signed requests `401 Failed to find any key to satisfy ... ed25519:a_JBQV7r`
+   (10 remote-media fetches during the hour). Every federation number in the README is from
+   servers that could reach each other; the demo itself has never been reachable. Track 12:
+   publish `m.server: myelin.dacrib.net:443` (the server has `server.well_known_server`; the
+   chart has no value for it yet, and the values carry `publicBaseUrl` only), with a check in
+   the install smoke, and make the Federation page say when nobody can reach this server.
+
+## Earlier: 2026-10-09, night EDT -- the 95% wave is merged: every row has a dated basis; roll to the first green image of `c7551603` or later
 
 **Where `main` is.** `c7551603`; **nothing is unmerged, no agent worktree, no agent process, no
 kind cluster, no lock.** Thirteen merges today after the morning handover, each through the queue
