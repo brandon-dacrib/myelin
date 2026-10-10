@@ -14,7 +14,11 @@ needed; `kubectl apply -f deploy/demo/tailscale-funnel-ingress.yaml` gave
 `myelin.longhair-tet.ts.net` within seconds (proxy pod `ts-myelin-funnel-*`), and from the
 public Funnel address (`curl --resolve` to 199.38.181.54, not over the tailnet)
 `/_matrix/client/versions` is 200 and `/_matrix/key/v2/server` serves `ed25519:a_JBQV7r`.
-Left: steps 3 and 4.
+Steps 3 and 4 followed the same afternoon (the owner set both settings on the Configuration
+page after the `publicBaseUrl` pin was removed from the release, revision 14, and added the
+Cloudflare record and rule); at 17:05 EDT the public federation tester answered
+`FederationOK: true` for `myelin.dacrib.net`: the redirect delivers the document, the Funnel
+name resolves to four addresses, and each serves `ed25519:a_JBQV7r` with a matching signature.
 
 ## 1. Tailnet (owner, admin console) -- not needed where the operator already runs
 

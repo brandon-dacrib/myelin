@@ -37,6 +37,19 @@ key. The demo gets it on its next roll with no value change.
   can (track 16, if the page should offer it). A Federation page note that says when nobody
   can reach this server (finding 3's last item) is not in this branch.
 
+## 2026-10-10, later: the demo is reachable from the public internet through a Tailscale Funnel
+
+`deploy/demo/tailscale-funnel.md` and `tailscale-funnel-ingress.yaml`: the cluster's Tailscale
+operator (there since 2025) exposes `myelin-hs:8008` as `https://myelin.longhair-tet.ts.net`
+over Funnel; the release no longer pins `publicBaseUrl` (revision 14), so the owner set
+`public_baseurl` and `well_known_server` on the Configuration page, live; a proxied Cloudflare
+record and a redirect rule send `myelin.dacrib.net/.well-known/matrix/*` to the Funnel name.
+The server keeps its name. federationtester.matrix.org: `FederationOK: true`, the key valid
+with a matching signature on all four Funnel addresses. Learned: a `kubectl proxy` loses its
+network grant when the SSH session it was started from ends (the stale one answered "no route
+to host" for 45 minutes while Apple's curl reached the API server); kill it and start another
+from a live session.
+
 ## 2026-10-10: the demo rolled to `87d57288` (revision 13) through the owner's kubectl proxy
 
 23 s to "Upgrade complete"; server and operator pods on `sha-87d57288…`, 0 restarts, the

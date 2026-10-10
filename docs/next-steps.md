@@ -39,7 +39,7 @@ restarts), `Bridge` Ready; signing key `ed25519:a_JBQV7r` unchanged; from outsid
    from before the pins (the real mautrix roll test starts from the old render; it may not
    start from an old *row*), and check the instance's state and reason on the Bridges page
    (the owner can read it there now). The bridge is healthy on `:latest` meanwhile.
-3. **The demo is not discoverable by other servers.** `/.well-known/matrix/server` answers 404
+3. **The demo is not discoverable by other servers** (**closed the same day**, see `deploy/demo/tailscale-funnel.md`: a Tailscale Funnel at `myelin.longhair-tet.ts.net` through the operator already in the cluster, both well-known documents pointing there, a Cloudflare record and redirect for the name; the public federation tester says `FederationOK: true`; the server document is derived by default since `5af1a08d`, decision 0040). `/.well-known/matrix/server` answers 404
    and port 8448 is closed, so maunium.net (and anyone) cannot fetch our signing key and
    answers our signed requests `401 Failed to find any key to satisfy ... ed25519:a_JBQV7r`
    (10 remote-media fetches during the hour). Every federation number in the README is from
