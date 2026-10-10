@@ -44,6 +44,9 @@
 # docker with --kind.
 
 set -euo pipefail
+# errtrace, or the ERR trap below does not fire inside a function: on CD run 38008712117 a
+# `helm install --wait` failed inside `run` and the script cleaned up without the diagnostics.
+set -o errtrace
 
 usage() { sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; }
 

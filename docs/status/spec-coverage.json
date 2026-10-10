@@ -1,19 +1,19 @@
 {
-  "generated_at": "2026-10-06T02:10:06Z",
+  "generated_at": "2026-10-09T23:07:50Z",
   "routes_manifest": "docs/status/routes.json",
-  "routes_manifest_generated_at": "2026-10-05T00:41:36.986Z",
+  "routes_manifest_generated_at": "2026-10-09T18:53:24.291Z",
   "summary": {
-    "overall_percent": 68.08510638297872,
+    "overall_percent": 78.72340425531915,
     "total_spec_routes": 235,
-    "total_registered": 160,
+    "total_registered": 185,
     "apis": [
       {
         "family": "client-server",
         "spec_total": 166,
-        "registered": 126,
-        "missing": 40,
-        "extra": 200,
-        "percent": 75.90361445783132
+        "registered": 151,
+        "missing": 15,
+        "extra": 245,
+        "percent": 90.96385542168674
       },
       {
         "family": "server-server",

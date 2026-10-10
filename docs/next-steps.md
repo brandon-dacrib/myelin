@@ -64,7 +64,7 @@ load run). The measurements table's "Spec routes served" (185/235, from today's 
 **CD.** Green on `7cb865ee` (run 37982139184). Later commits: Docker Hub rate-limited the runner
 (429 on the node image, then BuildKit's own image) until `9a8666e4`; and GitHub keeps only the
 newest *queued* run of a workflow's concurrency group, so a run of merges still yields one image,
-the last. **Roll candidate: the first green image of `c7551603` or later** (`gh run list
+the last. **Roll candidate: the first green image of `c7551603` or later** (the images of `1d10e551` and `9cdcccf9` are pushed and their manifests exist, but the chart job and then the backup smoke failed on the runner: the alerts test could not read its rules, fixed in `9cdcccf9`; the backup smoke's first install never went Ready in 5 min on the two-CPU runner right after the cluster smoke, though it passes locally in 4 min, so it reports without blocking until seen green there, like the cluster smoke) (`gh run list
 --workflow cd`). The roll adopts the CRD once (`--take-ownership --force-conflicts`,
 `deploy/helm/hs/README.md`), rolls the WhatsApp bridge once to `v0.2609.0` (decision 0037), and
 is the first image with the scale fix and TLS listeners; afterwards check
