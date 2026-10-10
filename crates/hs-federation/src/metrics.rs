@@ -23,6 +23,7 @@
 
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
+use prometheus_client::metrics::histogram::Histogram;
 use prometheus_client::registry::Registry;
 
 /// The EDU types counted under their own name; anything else is `other`.
@@ -338,6 +339,52 @@ pub struct PduDroppedLabels {
     pub reason: &'static str,
 }
 
+/// Labels of `hs_federation_key_fetch_failures_total`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, prometheus_client::encoding::EncodeLabelSet)]
+pub struct KeyFetchFailureLabels {
+    /// `timeout` (the key server did not answer within the fetch budget), `unreachable` (the
+    /// fetch failed: discovery, connection, a non-200 answer or an unreadable body),
+    /// `invalid_response` (what it answered was not a validly self-signed key response for it)
+    /// or `backoff` (not asked: an earlier failure is still being backed off from, see
+    /// `crate::keys::RemoteKeyCache`).
+    pub reason: &'static str,
+}
+
+static KEY_FETCH_FAILURES: std::sync::LazyLock<Family<KeyFetchFailureLabels, Counter>> =
+    std::sync::LazyLock::new(Family::default);
+
+/// `hs_federation_join_verify_seconds`: how long verifying the `state` and `auth_chain` of a
+/// `send_join` answer took, per join through another server
+/// (`crate::outbound_join::join_room`). The buckets reach 30 minutes: a large public room's
+/// snapshot cites thousands of servers, and the time is dominated by the key fetches to the
+/// ones that are gone.
+static JOIN_VERIFY_SECONDS: std::sync::LazyLock<Histogram> = std::sync::LazyLock::new(|| {
+    Histogram::new([
+        0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0,
+    ])
+});
+
+/// Counts one failed (or skipped, for `backoff`) fetch of a server's keys, for `reason`
+/// ([`KeyFetchFailureLabels`]).
+pub fn record_key_fetch_failure(reason: &'static str) {
+    KEY_FETCH_FAILURES
+        .get_or_create(&KeyFetchFailureLabels { reason })
+        .inc();
+}
+
+/// How many key fetches failed for `reason` so far (for tests and the admin API).
+#[must_use]
+pub fn key_fetch_failures(reason: &'static str) -> u64 {
+    KEY_FETCH_FAILURES
+        .get_or_create(&KeyFetchFailureLabels { reason })
+        .get()
+}
+
+/// Records how long one join's `send_join` answer took to verify.
+pub fn record_join_verify_seconds(seconds: f64) {
+    JOIN_VERIFY_SECONDS.observe(seconds);
+}
+
 /// Counts one PDU received over `/send` and dropped, for `reason` ([`PduDroppedLabels`]; see
 /// `crate::inbound` for what each is answered).
 pub fn record_pdu_dropped(reason: &'static str) {
@@ -477,6 +524,10 @@ pub fn record_notary_answer(answered: bool) {
 ///   announcements were behind ([`record_device_list_catch_up`]).
 /// - `hs_federation_pdu_wakes_total{outcome}`: wakes of the replica that sends for a
 ///   destination, for PDUs another replica queued ([`PduWakeLabels`]).
+/// - `hs_federation_key_fetch_failures_total{reason}`: fetches of other servers' signing keys
+///   that failed, or were skipped under backoff ([`KeyFetchFailureLabels`]).
+/// - `hs_federation_join_verify_seconds`: a histogram of how long each join through another
+///   server spent verifying the `send_join` answer ([`record_join_verify_seconds`]).
 pub fn register_transport_metrics(registry: &mut Registry) {
     // Registered without `_total`: the text encoder appends it.
     registry.register(
@@ -511,6 +562,19 @@ pub fn register_transport_metrics(registry: &mut Registry) {
          by outcome (sent, failed, no_owner on the replica that queued; received, \
          received_not_sent_here on the replica woken)",
         PDU_WAKES.clone(),
+    );
+    registry.register(
+        "hs_federation_key_fetch_failures",
+        "Fetches of other servers' signing keys that failed, by reason (timeout, unreachable, \
+         invalid_response) or were not made because an earlier failure is still backed off \
+         from (backoff)",
+        KEY_FETCH_FAILURES.clone(),
+    );
+    registry.register(
+        "hs_federation_join_verify_seconds",
+        "Seconds spent verifying the state and auth chain a send_join answer carried, per join \
+         through another server",
+        JOIN_VERIFY_SECONDS.clone(),
     );
     registry.register(
         "hs_federation_device_list_catch_ups",

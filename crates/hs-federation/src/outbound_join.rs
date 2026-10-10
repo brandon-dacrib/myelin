@@ -38,11 +38,16 @@
 //! real and observable on its side, e.g. via `GET /_matrix/client/v3/rooms/{roomId}/members`), but
 //! the joining server cannot yet represent the room for its own user to read or post into.
 
+use std::collections::HashMap;
+use std::time::Duration;
+
+use futures::StreamExt as _;
 use hs_model::Event;
 use hs_model::canonical::{CanonicalJsonObject, CanonicalJsonValue, to_canonical_object};
 use hs_model::signing::{SigningKeyPair, sign_object};
 use ruma::{RoomVersionId, ServerName};
 use serde_json::Value;
+use tokio::time::Instant;
 
 use crate::client::{ClientError, FederationClient};
 use crate::inbound::{PduError, verify_pdu};
@@ -213,12 +218,14 @@ pub async fn join_room_with_content(
     )
     .await?;
 
+    let progress = VerifyProgress::new(destination, room_id);
     let state = verify_array(
         &send_join_response.body,
         "state",
         &room_version,
         key_cache,
         destination,
+        &progress,
     )
     .await?;
     let auth_chain = verify_array(
@@ -227,8 +234,10 @@ pub async fn join_room_with_content(
         &room_version,
         key_cache,
         destination,
+        &progress,
     )
     .await?;
+    progress.finish();
     let members_omitted = send_join_response
         .body
         .get("members_omitted")
@@ -539,6 +548,195 @@ fn now_ms() -> i64 {
     .unwrap_or(i64::MAX)
 }
 
+/// How many servers' events of a `send_join` answer are verified at once. Verifying is waiting
+/// for key fetches, one per server the snapshot cites, and the servers are independent: the
+/// events are grouped by their sender's server, the groups are verified this many at a time,
+/// and within a group one after another (the first event fetches the key, or learns the
+/// server is gone; the rest find it cached, or refused at once). A snapshot citing `n` servers
+/// that are gone costs `ceil(n / 64)` fetch budgets ([`crate::keys::DEFAULT_KEY_FETCH_TIMEOUT`]),
+/// not `n` request timeouts. Each slot is at most one key fetch in flight, so this also bounds
+/// the connections a join opens at once.
+pub const JOIN_VERIFY_CONCURRENCY: usize = 64;
+
+/// How often a join that is still verifying says so in the log.
+pub const JOIN_VERIFY_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
+
+/// The verification of one join's `send_join` answer, as the log and the metrics see it: an
+/// `info` line every [`JOIN_VERIFY_PROGRESS_INTERVAL`] while it runs (verified and dropped so
+/// far, the servers whose events are in flight, the slowest server so far) and one at the end
+/// with the totals and the elapsed time, observed into `hs_federation_join_verify_seconds`.
+/// An operator reading the log sees that a slow join is alive and which server is making it
+/// slow; before this, a join of a large room was silent for hours.
+pub struct VerifyProgress {
+    destination: String,
+    room_id: String,
+    started: Instant,
+    inner: std::sync::Mutex<ProgressInner>,
+}
+
+#[derive(Default)]
+struct ProgressInner {
+    verified: usize,
+    dropped: usize,
+    /// The servers whose events are being verified now, with how many of their events are in
+    /// flight and when the earliest of those started.
+    in_flight: HashMap<String, (usize, Instant)>,
+    /// The server whose event took longest to verify so far, and how long.
+    slowest: Option<(String, Duration)>,
+}
+
+impl VerifyProgress {
+    /// A fresh report for a join of `room_id` through `destination`, starting now.
+    #[must_use]
+    pub fn new(destination: &str, room_id: &str) -> Self {
+        Self {
+            destination: destination.to_owned(),
+            room_id: room_id.to_owned(),
+            started: Instant::now(),
+            inner: std::sync::Mutex::new(ProgressInner::default()),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ProgressInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// One of `server`'s events starts verifying.
+    fn begin(&self, server: &str) -> Instant {
+        let now = Instant::now();
+        let mut inner = self.lock();
+        let entry = inner.in_flight.entry(server.to_owned()).or_insert((0, now));
+        entry.0 += 1;
+        now
+    }
+
+    /// One of `server`'s events, started at `began`, finished: verified or dropped.
+    fn end(&self, server: &str, began: Instant, verified: bool) {
+        let took = began.elapsed();
+        let mut inner = self.lock();
+        if verified {
+            inner.verified += 1;
+        } else {
+            inner.dropped += 1;
+        }
+        if let Some(entry) = inner.in_flight.get_mut(server) {
+            entry.0 = entry.0.saturating_sub(1);
+            if entry.0 == 0 {
+                inner.in_flight.remove(server);
+            }
+        }
+        if inner
+            .slowest
+            .as_ref()
+            .is_none_or(|(_, slowest)| took > *slowest)
+        {
+            inner.slowest = Some((server.to_owned(), took));
+        }
+    }
+
+    /// The counts so far: `(verified, dropped)`.
+    #[must_use]
+    pub fn counts(&self) -> (usize, usize) {
+        let inner = self.lock();
+        (inner.verified, inner.dropped)
+    }
+
+    /// The slowest server so far: the longest a completed event took, or the longest an event
+    /// still in flight has been waiting, whichever is longer.
+    fn slowest(&self, inner: &ProgressInner) -> Option<(String, Duration)> {
+        let now = Instant::now();
+        let mut slowest = inner.slowest.clone();
+        for (server, (_, since)) in &inner.in_flight {
+            let waiting = now.saturating_duration_since(*since);
+            if slowest.as_ref().is_none_or(|(_, took)| waiting > *took) {
+                slowest = Some((server.clone(), waiting));
+            }
+        }
+        slowest
+    }
+
+    /// The periodic line: what has been verified, what is in flight and who is slow.
+    fn report(&self, field: &'static str, total: usize) {
+        let inner = self.lock();
+        let slowest = self.slowest(&inner);
+        let mut pending: Vec<&String> = inner.in_flight.keys().collect();
+        pending.sort();
+        let pending_shown: Vec<&str> = pending.iter().take(8).map(|s| s.as_str()).collect();
+        tracing::info!(
+            destination = %self.destination,
+            room_id = %self.room_id,
+            field,
+            total,
+            verified = inner.verified,
+            dropped = inner.dropped,
+            elapsed_secs = self.started.elapsed().as_secs(),
+            servers_pending = pending.len(),
+            pending = ?pending_shown,
+            slowest_server = slowest.as_ref().map(|(server, _)| server.as_str()).unwrap_or("-"),
+            slowest_secs = slowest.as_ref().map_or(0, |(_, took)| took.as_secs()),
+            "still verifying the events a send_join answer carried"
+        );
+    }
+
+    /// The final line, and the histogram observation.
+    pub fn finish(&self) {
+        let elapsed = self.started.elapsed();
+        let inner = self.lock();
+        let slowest = self.slowest(&inner);
+        crate::metrics::record_join_verify_seconds(elapsed.as_secs_f64());
+        tracing::info!(
+            destination = %self.destination,
+            room_id = %self.room_id,
+            verified = inner.verified,
+            dropped = inner.dropped,
+            elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+            slowest_server = slowest.as_ref().map(|(server, _)| server.as_str()).unwrap_or("-"),
+            slowest_ms = slowest
+                .as_ref()
+                .map_or(0, |(_, took)| u64::try_from(took.as_millis()).unwrap_or(u64::MAX)),
+            "verified the events a send_join answer carried"
+        );
+    }
+}
+
+/// The server of a raw event's `sender`, or `?` when it has none to speak of (the event is
+/// then dropped as malformed by [`verify_pdu`], and grouped with the other malformed ones).
+fn sender_server(raw: &Value) -> &str {
+    raw.get("sender")
+        .and_then(Value::as_str)
+        .and_then(|sender| sender.split_once(':').map(|(_, server)| server))
+        .unwrap_or("?")
+}
+
+/// One event of a `send_join` answer through [`verify_pdu`], told to `progress`, and logged
+/// with its reason when it is dropped.
+async fn verify_one(
+    raw: &Value,
+    field: &'static str,
+    room_version: &RoomVersionId,
+    key_cache: &DynRemoteKeyCache,
+    destination: &str,
+    progress: &VerifyProgress,
+) -> Result<Event, PduError> {
+    let sender = sender_server(raw);
+    let began = progress.begin(sender);
+    let result = verify_pdu(raw, room_version, key_cache).await;
+    progress.end(sender, began, result.is_ok());
+    if let Err(failure) = &result {
+        tracing::warn!(
+            destination,
+            field,
+            event_type = raw.get("type").and_then(serde_json::Value::as_str).unwrap_or("?"),
+            sender = raw.get("sender").and_then(serde_json::Value::as_str).unwrap_or("?"),
+            %failure,
+            "dropping an event from a send_join response that did not verify"
+        );
+    }
+    result
+}
+
 /// Reads `body[field]` as an array of raw PDUs and verifies each one, **dropping** any that do
 /// not verify. A resident relays events from every server that was ever in the room, and one of
 /// those servers' keys being unobtainable, or one event arriving with its signatures stripped,
@@ -548,12 +746,20 @@ fn now_ms() -> i64 {
 /// state event and expects the join to succeed). What was dropped is logged with its reason, and
 /// [`OutboundJoinError::UnverifiedEvent`] is kept for the one case that is not survivable: a
 /// snapshot in which nothing verified at all.
+///
+/// The events are grouped by their sender's server and the groups verified
+/// [`JOIN_VERIFY_CONCURRENCY`] at a time (see that constant), and what verified is answered in
+/// the order it came, since the caller's auth chain is ordered. Until 2026-10-10 the events
+/// were verified one after another, and a large room's snapshot, citing thousands of servers,
+/// took hours. `progress` is told of every event, and reports every
+/// [`JOIN_VERIFY_PROGRESS_INTERVAL`] while this runs.
 async fn verify_array(
     body: &Value,
     field: &'static str,
     room_version: &RoomVersionId,
     key_cache: &DynRemoteKeyCache,
     destination: &str,
+    progress: &VerifyProgress,
 ) -> Result<Vec<Event>, OutboundJoinError> {
     let raw_events = body.get(field).and_then(Value::as_array).ok_or_else(|| {
         OutboundJoinError::MalformedResponse(
@@ -561,20 +767,65 @@ async fn verify_array(
             format!("missing or non-array `{field}`"),
         )
     })?;
-    let mut verified = Vec::with_capacity(raw_events.len());
+    let total = raw_events.len();
+    // The events of each server, in the answer's order, the servers in order of first
+    // appearance.
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut group_of: HashMap<&str, usize> = HashMap::new();
+    for (index, raw) in raw_events.iter().enumerate() {
+        let server = sender_server(raw);
+        let group = *group_of.entry(server).or_insert_with(|| {
+            groups.push(Vec::new());
+            groups.len() - 1
+        });
+        groups[group].push(index);
+    }
+    let verify_group = |indexes: Vec<usize>| async move {
+        let mut results = Vec::with_capacity(indexes.len());
+        for index in indexes {
+            let result = verify_one(
+                &raw_events[index],
+                field,
+                room_version,
+                key_cache,
+                destination,
+                progress,
+            )
+            .await;
+            results.push((index, result));
+        }
+        results
+    };
+    let results = futures::stream::iter(groups)
+        .map(verify_group)
+        .buffer_unordered(JOIN_VERIFY_CONCURRENCY);
+    let mut results = std::pin::pin!(results);
+    let mut ticker = tokio::time::interval_at(
+        Instant::now() + JOIN_VERIFY_PROGRESS_INTERVAL,
+        JOIN_VERIFY_PROGRESS_INTERVAL,
+    );
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    let mut outcomes: Vec<Option<Result<Event, PduError>>> = (0..total).map(|_| None).collect();
+    loop {
+        tokio::select! {
+            next = results.next() => match next {
+                Some(group) => {
+                    for (index, result) in group {
+                        outcomes[index] = Some(result);
+                    }
+                }
+                None => break,
+            },
+            _ = ticker.tick() => progress.report(field, total),
+        }
+    }
+    let mut verified = Vec::with_capacity(total);
     let mut first_failure: Option<PduError> = None;
-    for raw in raw_events {
-        match verify_pdu(raw, room_version, key_cache).await {
+    for outcome in outcomes.into_iter().flatten() {
+        match outcome {
             Ok(event) => verified.push(event),
             Err(failure) => {
-                tracing::warn!(
-                    destination,
-                    field,
-                    event_type = raw.get("type").and_then(serde_json::Value::as_str).unwrap_or("?"),
-                    sender = raw.get("sender").and_then(serde_json::Value::as_str).unwrap_or("?"),
-                    %failure,
-                    "dropping an event from a send_join response that did not verify"
-                );
                 first_failure.get_or_insert(failure);
             }
         }
@@ -1222,17 +1473,34 @@ mod tests {
         );
         stripped["signatures"] = serde_json::json!({});
 
+        let progress = VerifyProgress::new("resident", "!r:resident.example.org");
         let body = serde_json::json!({"state": [good.clone(), stripped.clone()]});
-        let kept = verify_array(&body, "state", &RoomVersionId::V11, &cache, "resident")
-            .await
-            .unwrap();
+        let kept = verify_array(
+            &body,
+            "state",
+            &RoomVersionId::V11,
+            &cache,
+            "resident",
+            &progress,
+        )
+        .await
+        .unwrap();
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].event_id().as_str(), event_id_of(&good));
 
+        assert_eq!(progress.counts(), (1, 1));
+
         let nothing = serde_json::json!({"state": [stripped]});
-        let err = verify_array(&nothing, "state", &RoomVersionId::V11, &cache, "resident")
-            .await
-            .unwrap_err();
+        let err = verify_array(
+            &nothing,
+            "state",
+            &RoomVersionId::V11,
+            &cache,
+            "resident",
+            &progress,
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(err, OutboundJoinError::UnverifiedEvent { .. }),
             "{err}"
@@ -1240,11 +1508,234 @@ mod tests {
 
         let empty = serde_json::json!({"state": []});
         assert!(
-            verify_array(&empty, "state", &RoomVersionId::V11, &cache, "resident")
-                .await
-                .unwrap()
-                .is_empty()
+            verify_array(
+                &empty,
+                "state",
+                &RoomVersionId::V11,
+                &cache,
+                "resident",
+                &progress
+            )
+            .await
+            .unwrap()
+            .is_empty()
         );
+    }
+
+    /// A fetcher with one key document per server, a delay before answering per server, and
+    /// servers that never answer (gone: the connection hangs until a timeout).
+    #[derive(Default)]
+    struct ScenarioFetcher {
+        docs: std::collections::HashMap<String, Value>,
+        delays: std::collections::HashMap<String, std::time::Duration>,
+        gone: Vec<String>,
+        calls: Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
+    }
+
+    #[async_trait]
+    impl KeyServerFetcher for ScenarioFetcher {
+        async fn fetch_server_key(&self, server_name: &str) -> Option<Value> {
+            *self
+                .calls
+                .lock()
+                .unwrap()
+                .entry(server_name.to_owned())
+                .or_insert(0) += 1;
+            if self.gone.iter().any(|s| s == server_name) {
+                std::future::pending::<()>().await;
+            }
+            if let Some(delay) = self.delays.get(server_name) {
+                tokio::time::sleep(*delay).await;
+            }
+            self.docs.get(server_name).cloned()
+        }
+    }
+
+    fn scenario_cache(fetcher: ScenarioFetcher) -> Arc<DynRemoteKeyCache> {
+        Arc::new(RemoteKeyCache::new(
+            Box::new(fetcher) as Box<dyn KeyServerFetcher>
+        ))
+    }
+
+    /// A state event of `!r:resident.example.org` sent by a user of `server`, signed by
+    /// `keys` under that server's name.
+    fn event_from(keys: &OwnSigningKeys, server: &str, depth: i64) -> Value {
+        signed_state_event(
+            keys,
+            "!r:resident.example.org",
+            "m.room.member",
+            &format!("@u{depth}:{server}"),
+            &format!("@u{depth}:{server}"),
+            serde_json::json!({"membership": "join"}),
+            vec![],
+            vec![],
+            depth,
+        )
+    }
+
+    /// The measured fix for the join that took hours (status 06, 2026-10-10): a snapshot
+    /// citing 20 servers that are gone, 10 events each, among 20 events from the resident.
+    /// Before: one event after another, 30 s (the client's request timeout) per event from a
+    /// gone server, 200 x 30 s = 100 minutes. After: the gone servers' fetches run in
+    /// parallel and each costs the 10 s budget once, the other events from a gone server are
+    /// refused at once by the backoff, and the whole snapshot verifies in 10 s. The kept events
+    /// come back in the answer's order.
+    #[tokio::test(start_paused = true)]
+    async fn events_from_gone_servers_cost_one_budget_in_parallel_and_keep_their_order() {
+        let keys = OwnSigningKeys::from_keys(vec![own_signing_key()]);
+        let mut fetcher = ScenarioFetcher::default();
+        fetcher.docs.insert(
+            "resident.example.org".to_owned(),
+            build_server_key_response("resident.example.org", &keys, &[], 3600).unwrap(),
+        );
+        let gone: Vec<String> = (0..20).map(|i| format!("gone-{i}.example.org")).collect();
+        fetcher.gone = gone.clone();
+        let calls = fetcher.calls.clone();
+        let cache = scenario_cache(fetcher);
+
+        let mut events = Vec::new();
+        let mut depth = 1;
+        for gone_server in &gone {
+            events.push(event_from(&keys, "resident.example.org", depth));
+            depth += 1;
+            for _ in 0..10 {
+                events.push(event_from(&keys, gone_server, depth));
+                depth += 1;
+            }
+        }
+        let expected: Vec<String> = events
+            .iter()
+            .filter(|e| {
+                e["sender"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with(":resident.example.org")
+            })
+            .map(event_id_of)
+            .collect();
+        assert_eq!(events.len(), 220);
+
+        let timeouts_before = crate::metrics::key_fetch_failures("timeout");
+        let backoffs_before = crate::metrics::key_fetch_failures("backoff");
+        let progress = VerifyProgress::new("resident.example.org", "!r:resident.example.org");
+        let body = serde_json::json!({ "state": events });
+        let started = tokio::time::Instant::now();
+        let kept = verify_array(
+            &body,
+            "state",
+            &RoomVersionId::V11,
+            &cache,
+            "resident.example.org",
+            &progress,
+        )
+        .await
+        .unwrap();
+        let elapsed = started.elapsed();
+        progress.finish();
+
+        let kept_ids: Vec<String> = kept.iter().map(|e| e.event_id().to_string()).collect();
+        assert_eq!(
+            kept_ids, expected,
+            "the resident's events, in the answer's order"
+        );
+        assert_eq!(progress.counts(), (20, 200));
+        assert_eq!(
+            elapsed,
+            crate::keys::DEFAULT_KEY_FETCH_TIMEOUT,
+            "one fetch budget for the whole snapshot, not one per event"
+        );
+        let calls = calls.lock().unwrap().clone();
+        for server in &gone {
+            assert_eq!(calls.get(server), Some(&1), "{server} asked once");
+        }
+        assert_eq!(calls.get("resident.example.org"), Some(&1));
+        // The counters are process-wide and other tests count into them at the same time.
+        assert!(crate::metrics::key_fetch_failures("timeout") - timeouts_before >= 20);
+        assert!(crate::metrics::key_fetch_failures("backoff") - backoffs_before >= 180);
+    }
+
+    /// Events are answered in the order they came, however their servers' fetches finish:
+    /// three servers answering after 3 s, 1 s and at once, their events interleaved.
+    #[tokio::test(start_paused = true)]
+    async fn verification_keeps_the_answers_order_whatever_order_the_fetches_finish_in() {
+        let keys = OwnSigningKeys::from_keys(vec![own_signing_key()]);
+        let mut fetcher = ScenarioFetcher::default();
+        let servers = ["slow.example.org", "medium.example.org", "fast.example.org"];
+        for (server, delay) in servers.iter().zip([3u64, 1, 0]) {
+            fetcher.docs.insert(
+                (*server).to_owned(),
+                build_server_key_response(server, &keys, &[], 3600).unwrap(),
+            );
+            fetcher
+                .delays
+                .insert((*server).to_owned(), std::time::Duration::from_secs(delay));
+        }
+        let calls = fetcher.calls.clone();
+        let cache = scenario_cache(fetcher);
+        let events: Vec<Value> = (1..=30)
+            .map(|depth| event_from(&keys, servers[(depth as usize) % 3], depth))
+            .collect();
+        let expected: Vec<String> = events.iter().map(event_id_of).collect();
+
+        let progress = VerifyProgress::new("resident.example.org", "!r:resident.example.org");
+        let body = serde_json::json!({ "auth_chain": events });
+        let started = tokio::time::Instant::now();
+        let kept = verify_array(
+            &body,
+            "auth_chain",
+            &RoomVersionId::V11,
+            &cache,
+            "resident.example.org",
+            &progress,
+        )
+        .await
+        .unwrap();
+        let kept_ids: Vec<String> = kept.iter().map(|e| e.event_id().to_string()).collect();
+        assert_eq!(kept_ids, expected);
+        assert_eq!(progress.counts(), (30, 0));
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(3));
+        let calls = calls.lock().unwrap().clone();
+        for server in servers {
+            assert_eq!(calls.get(server), Some(&1), "{server} fetched once");
+        }
+    }
+
+    /// More events than the pool is wide, from one gone server: still one budget.
+    #[tokio::test(start_paused = true)]
+    async fn a_gone_server_with_more_events_than_the_pool_still_costs_one_budget() {
+        let keys = OwnSigningKeys::from_keys(vec![own_signing_key()]);
+        let mut fetcher = ScenarioFetcher {
+            gone: vec!["gone.example.org".to_owned()],
+            ..Default::default()
+        };
+        fetcher.docs.insert(
+            "resident.example.org".to_owned(),
+            build_server_key_response("resident.example.org", &keys, &[], 3600).unwrap(),
+        );
+        let calls = fetcher.calls.clone();
+        let cache = scenario_cache(fetcher);
+        let mut events: Vec<Value> = (1..=(JOIN_VERIFY_CONCURRENCY as i64 * 3))
+            .map(|depth| event_from(&keys, "gone.example.org", depth))
+            .collect();
+        events.push(event_from(&keys, "resident.example.org", 1000));
+
+        let progress = VerifyProgress::new("resident.example.org", "!r:resident.example.org");
+        let body = serde_json::json!({ "state": events });
+        let started = tokio::time::Instant::now();
+        let kept = verify_array(
+            &body,
+            "state",
+            &RoomVersionId::V11,
+            &cache,
+            "resident.example.org",
+            &progress,
+        )
+        .await
+        .unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(progress.counts(), (1, JOIN_VERIFY_CONCURRENCY * 3));
+        assert_eq!(started.elapsed(), crate::keys::DEFAULT_KEY_FETCH_TIMEOUT);
+        assert_eq!(calls.lock().unwrap().get("gone.example.org"), Some(&1));
     }
 
     #[test]

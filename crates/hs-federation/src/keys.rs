@@ -9,7 +9,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use ed25519_dalek::VerifyingKey;
@@ -27,6 +28,22 @@ pub const MAX_KEY_RESPONSE_BODY_BYTES: usize = 64 * 1024;
 /// How long our own published key response asserts itself valid for before a fetcher must
 /// refetch. Chosen conservatively (24h); operators rotate keys far less often than this.
 pub const OWN_KEY_VALID_FOR_SECS: u64 = 24 * 60 * 60;
+
+/// How long one fetch of another server's keys may take, connect and answer together, before
+/// it is given up ([`RemoteKeyCache::with_fetch_timeout`] changes it). Shorter than the
+/// federation client's general request timeout (30 s) on purpose: a key fetch is on the path
+/// of verifying every event, and a server that is gone -- most of the servers a large room's
+/// state cites -- costs this much once (then [`KEY_FETCH_BACKOFF_MIN`]). Synapse's direct key
+/// fetch uses the same 10 s.
+pub const DEFAULT_KEY_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a server whose key fetch failed is left alone before it is asked again; doubled
+/// after each further failure up to [`KEY_FETCH_BACKOFF_MAX`], cleared by a fetch that
+/// succeeds. Keys already held are never affected: this only governs fetching.
+pub const KEY_FETCH_BACKOFF_MIN: Duration = Duration::from_secs(60);
+
+/// The ceiling of the key-fetch backoff ([`KEY_FETCH_BACKOFF_MIN`]).
+pub const KEY_FETCH_BACKOFF_MAX: Duration = Duration::from_secs(60 * 60);
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -329,13 +346,71 @@ pub enum KeyLookupError {
     FetchFailed(String),
     #[error("fetched key response for `{0}` failed self-signature verification")]
     InvalidResponse(String),
+    /// Not asked: an earlier fetch failed and the server is being left alone for a while
+    /// ([`KEY_FETCH_BACKOFF_MIN`]). Names what failed and when the next attempt may be made,
+    /// so every event from a gone server after the first fails at once and says why.
+    #[error(
+        "not asking `{server_name}` for keys again for {retry_in_secs} s: its last fetch failed \
+         ({reason})"
+    )]
+    FetchBackoff {
+        server_name: String,
+        /// What the failed fetch reported: timed out, unreachable, or an invalid response.
+        reason: String,
+        /// Seconds until the next fetch may be made (0 when it is due now).
+        retry_in_secs: u64,
+    },
+}
+
+/// A server whose last key fetch failed, left alone until `retry_at`
+/// ([`RemoteKeyCache::fetch_failure`]).
+#[derive(Debug, Clone)]
+pub struct FetchFailure {
+    /// What the fetch reported: timed out, unreachable, or an invalid response.
+    pub reason: String,
+    /// When it failed.
+    pub failed_at: tokio::time::Instant,
+    /// When the server may be asked again.
+    pub retry_at: tokio::time::Instant,
+    /// The wait this failure set, doubled from the one before it.
+    pub backoff: Duration,
+}
+
+impl FetchFailure {
+    /// The error a lookup that is not made because of this failure answers.
+    fn error(&self, server_name: &str, now: tokio::time::Instant) -> KeyLookupError {
+        KeyLookupError::FetchBackoff {
+            server_name: server_name.to_owned(),
+            reason: self.reason.clone(),
+            retry_in_secs: self.retry_at.saturating_duration_since(now).as_secs(),
+        }
+    }
 }
 
 /// Caches other servers' verify keys, fetched (and self-signature-checked) on demand, with
 /// per-origin in-flight de-duplication (threat model 2.3's confused-deputy defence: N concurrent
-/// callers asking about the same unknown origin trigger exactly one fetch).
+/// callers asking about the same unknown origin trigger exactly one fetch, and the ones that
+/// waited share its outcome, success or failure, instead of fetching again in turn).
+///
+/// A fetch has a budget ([`DEFAULT_KEY_FETCH_TIMEOUT`]), and a server whose fetch failed is
+/// not asked again until a backoff ends ([`KEY_FETCH_BACKOFF_MIN`], doubling to
+/// [`KEY_FETCH_BACKOFF_MAX`]; a success clears it). Without both, joining a large room through
+/// another server took hours: its state cites thousands of servers, many gone, and every event
+/// from a gone server cost the client's full 30 s request timeout, one after another (the demo
+/// server joining `#matrix:matrix.org` on 2026-10-10). Keys already held are never affected by
+/// the backoff: it only decides whether a fetch is made.
 pub struct RemoteKeyCache<F: KeyServerFetcher> {
     fetcher: F,
+    /// How long one fetch may take.
+    fetch_timeout: Duration,
+    /// The servers whose last fetch failed, with when they may be asked again.
+    failures: std::sync::Mutex<HashMap<String, FetchFailure>>,
+    /// Counts every fetch that finished (either way), and per server the count when its last
+    /// fetch finished: a caller that waited for the in-flight lock learns from it whether a
+    /// fetch for its server completed while it waited, and takes that outcome instead of
+    /// fetching again.
+    fetch_seq: AtomicU64,
+    last_fetch_seq: std::sync::Mutex<HashMap<String, u64>>,
     current: std::sync::Mutex<HashMap<(String, String), CachedCurrent>>,
     old: std::sync::Mutex<HashMap<(String, String), CachedOld>>,
     in_flight: std::sync::Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
@@ -403,6 +478,10 @@ impl<F: KeyServerFetcher> RemoteKeyCache<F> {
     pub fn new(fetcher: F) -> Self {
         Self {
             fetcher,
+            fetch_timeout: DEFAULT_KEY_FETCH_TIMEOUT,
+            failures: std::sync::Mutex::new(HashMap::new()),
+            fetch_seq: AtomicU64::new(0),
+            last_fetch_seq: std::sync::Mutex::new(HashMap::new()),
             current: std::sync::Mutex::new(HashMap::new()),
             old: std::sync::Mutex::new(HashMap::new()),
             in_flight: std::sync::Mutex::new(HashMap::new()),
@@ -411,6 +490,28 @@ impl<F: KeyServerFetcher> RemoteKeyCache<F> {
             store: None,
             own: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Changes how long one fetch of a server's keys may take, connect and answer together
+    /// (the default is [`DEFAULT_KEY_FETCH_TIMEOUT`]). A fetch over the budget counts as a
+    /// failure for the backoff.
+    #[must_use]
+    pub fn with_fetch_timeout(mut self, timeout: Duration) -> Self {
+        self.fetch_timeout = timeout;
+        self
+    }
+
+    /// The failure `server_name` is being backed off from, if its last key fetch failed and the
+    /// backoff has not ended (for the operator's view and for tests).
+    #[must_use]
+    pub fn fetch_failure(&self, server_name: &str) -> Option<FetchFailure> {
+        let now = tokio::time::Instant::now();
+        self.failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(server_name)
+            .filter(|failure| now < failure.retry_at)
+            .cloned()
     }
 
     /// Seeds this server's own verify keys under `own_server_name`, so an event this server
@@ -605,15 +706,16 @@ impl<F: KeyServerFetcher> RemoteKeyCache<F> {
         })
     }
 
-    /// Fetches `server_name`'s keys again now, whatever is cached (an administrator's
-    /// `federation.keys.refresh`), and answers what the cache then holds for it.
+    /// Fetches `server_name`'s keys again now, whatever is cached and whatever backoff an
+    /// earlier failure set (an administrator's `federation.keys.refresh`), and answers what the
+    /// cache then holds for it.
     ///
     /// # Errors
     /// [`KeyLookupError::FetchFailed`] when the server could not be reached, and
     /// [`KeyLookupError::InvalidResponse`] when what it answered was not a validly self-signed
     /// key response for it; the cache is unchanged either way.
     pub async fn refetch(&self, server_name: &str) -> Result<CachedServerKeys, KeyLookupError> {
-        self.refresh(server_name).await?;
+        self.refresh_inner(server_name, true).await?;
         self.cached_keys(server_name)
             .ok_or_else(|| KeyLookupError::InvalidResponse(server_name.to_owned()))
     }
@@ -724,8 +826,16 @@ impl<F: KeyServerFetcher> RemoteKeyCache<F> {
         None
     }
 
-    /// Fetches (de-duplicated per `server_name`) and ingests a fresh key response.
+    /// Fetches (de-duplicated per `server_name`) and ingests a fresh key response, unless the
+    /// server is being backed off from after an earlier failure.
     async fn refresh(&self, server_name: &str) -> Result<(), KeyLookupError> {
+        self.refresh_inner(server_name, false).await
+    }
+
+    /// [`RemoteKeyCache::refresh`]; `force` fetches through the backoff, and through a fetch
+    /// another caller completed meanwhile.
+    async fn refresh_inner(&self, server_name: &str, force: bool) -> Result<(), KeyLookupError> {
+        let seq_before = self.fetch_seq.load(Ordering::SeqCst);
         let lock = {
             let mut in_flight = self.in_flight.lock().unwrap();
             in_flight
@@ -734,15 +844,118 @@ impl<F: KeyServerFetcher> RemoteKeyCache<F> {
                 .clone()
         };
         let _guard = lock.lock().await;
-        // Another caller may have already populated the cache while we waited for the lock; the
-        // public getters re-check the cache after calling `refresh`, so an early return here is
-        // safe and just avoids one redundant fetch.
-        let doc = self
-            .fetcher
-            .fetch_server_key(server_name)
-            .await
-            .ok_or_else(|| KeyLookupError::FetchFailed(server_name.to_string()))?;
-        self.ingest_response(server_name, &doc)
+        if !force {
+            // A fetch for this server finished while this caller waited for the lock: its
+            // outcome is this caller's too. Success: the public getters re-check the cache
+            // after `refresh`. Failure: the backoff it set says so.
+            let fetched_meanwhile = self
+                .last_fetch_seq
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(server_name)
+                .is_some_and(|seq| *seq > seq_before);
+            let now = tokio::time::Instant::now();
+            let backed_off = self
+                .failures
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(server_name)
+                .filter(|failure| now < failure.retry_at)
+                .map(|failure| failure.error(server_name, now));
+            match (fetched_meanwhile, backed_off) {
+                (true, None) => return Ok(()),
+                (true, Some(error)) => return Err(error),
+                (false, Some(error)) => {
+                    crate::metrics::record_key_fetch_failure("backoff");
+                    return Err(error);
+                }
+                (false, None) => {}
+            }
+        }
+
+        let started = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            self.fetch_timeout,
+            self.fetcher.fetch_server_key(server_name),
+        )
+        .await;
+        let result: Result<(), (&'static str, String)> = match outcome {
+            Err(_elapsed) => Err((
+                "timeout",
+                format!("timed out after {} s", self.fetch_timeout.as_secs()),
+            )),
+            Ok(None) => Err((
+                "unreachable",
+                "the key server could not be reached, or did not answer 200 with a key \
+                 response"
+                    .to_owned(),
+            )),
+            Ok(Some(doc)) => self
+                .ingest_response(server_name, &doc)
+                .map_err(|error| ("invalid_response", error.to_string())),
+        };
+        let seq = self.fetch_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        self.last_fetch_seq
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(server_name.to_owned(), seq);
+        match result {
+            Ok(()) => {
+                self.failures
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(server_name);
+                Ok(())
+            }
+            Err((label, reason)) => {
+                crate::metrics::record_key_fetch_failure(label);
+                let backoff = self.record_fetch_failure(server_name, &reason, started);
+                tracing::info!(
+                    server = server_name,
+                    reason = %reason,
+                    took_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    backoff_secs = backoff.as_secs(),
+                    "could not fetch a server's keys; not asking it again until the backoff ends"
+                );
+                Err(match label {
+                    "invalid_response" => KeyLookupError::InvalidResponse(server_name.to_owned()),
+                    _ => KeyLookupError::FetchFailed(server_name.to_owned()),
+                })
+            }
+        }
+    }
+
+    /// Records a failed fetch of `server_name`'s keys at `now`: the wait before the next
+    /// attempt doubles from the previous failure's ([`KEY_FETCH_BACKOFF_MIN`] for the first,
+    /// at most [`KEY_FETCH_BACKOFF_MAX`]). Answers the wait set.
+    fn record_fetch_failure(
+        &self,
+        server_name: &str,
+        reason: &str,
+        now: tokio::time::Instant,
+    ) -> Duration {
+        let mut failures = self
+            .failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let backoff = failures
+            .get(server_name)
+            .map_or(KEY_FETCH_BACKOFF_MIN, |previous| {
+                previous
+                    .backoff
+                    .saturating_mul(2)
+                    .min(KEY_FETCH_BACKOFF_MAX)
+            });
+        failures.insert(
+            server_name.to_owned(),
+            FetchFailure {
+                reason: reason.to_owned(),
+                failed_at: now,
+                retry_at: now + backoff,
+                backoff,
+            },
+        );
+        backoff
     }
 
     /// Verifies a fetched key response is validly self-signed by a key it itself claims, then
@@ -1321,6 +1534,236 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, KeyLookupError::FetchFailed(_)));
+    }
+
+    /// A fetcher that never answers for some servers (a server that is gone: the connection
+    /// hangs until a timeout), and answers at once for the rest.
+    struct StallingFetcher {
+        inner: FixedFetcher,
+        stalls: Vec<String>,
+    }
+
+    #[async_trait]
+    impl KeyServerFetcher for StallingFetcher {
+        async fn fetch_server_key(&self, server_name: &str) -> Option<serde_json::Value> {
+            if self.stalls.iter().any(|s| s == server_name) {
+                *self
+                    .inner
+                    .fetch_count
+                    .lock()
+                    .unwrap()
+                    .entry(server_name.to_string())
+                    .or_insert(0) += 1;
+                std::future::pending::<()>().await;
+            }
+            self.inner.fetch_server_key(server_name).await
+        }
+    }
+
+    /// A server whose fetch failed is not asked again until a backoff ends: 60 s after the
+    /// first failure, doubling after each further one, and a success clears it. Until
+    /// 2026-10-10 every lookup asked again, and a join of a large room asked each gone server
+    /// once per event it had sent.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_fetch_is_backed_off_and_the_backoff_doubles_until_a_success_clears_it() {
+        let fetcher = FixedFetcher::new();
+        let cache = RemoteKeyCache::new(fetcher);
+        let gone = "gone.example.org";
+        async fn lookup(cache: &RemoteKeyCache<FixedFetcher>) -> KeyLookupError {
+            cache
+                .get_current("gone.example.org", "ed25519:a_1")
+                .await
+                .unwrap_err()
+        }
+
+        assert!(matches!(
+            lookup(&cache).await,
+            KeyLookupError::FetchFailed(_)
+        ));
+        assert_eq!(cache.fetcher.count_for(gone), 1);
+        let failure = cache
+            .fetch_failure(gone)
+            .expect("the failure is remembered");
+        assert_eq!(failure.backoff, KEY_FETCH_BACKOFF_MIN);
+        assert!(failure.reason.contains("could not be reached"));
+
+        // Asked again at once: refused without a fetch, naming the failure and the wait.
+        let err = lookup(&cache).await;
+        match &err {
+            KeyLookupError::FetchBackoff {
+                server_name,
+                reason,
+                retry_in_secs,
+            } => {
+                assert_eq!(server_name, gone);
+                assert!(reason.contains("could not be reached"));
+                assert_eq!(*retry_in_secs, 60);
+            }
+            other => panic!("expected a backoff, got {other:?}"),
+        }
+        assert!(err.to_string().contains("not asking `gone.example.org`"));
+        assert_eq!(cache.fetcher.count_for(gone), 1);
+
+        // Just short of the backoff: still not asked. At it: asked, and the wait doubles.
+        tokio::time::advance(Duration::from_secs(59)).await;
+        assert!(matches!(
+            lookup(&cache).await,
+            KeyLookupError::FetchBackoff { .. }
+        ));
+        assert_eq!(cache.fetcher.count_for(gone), 1);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(matches!(
+            lookup(&cache).await,
+            KeyLookupError::FetchFailed(_)
+        ));
+        assert_eq!(cache.fetcher.count_for(gone), 2);
+        assert_eq!(
+            cache.fetch_failure(gone).unwrap().backoff,
+            KEY_FETCH_BACKOFF_MIN * 2
+        );
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert!(matches!(
+            lookup(&cache).await,
+            KeyLookupError::FetchBackoff { .. }
+        ));
+        assert_eq!(cache.fetcher.count_for(gone), 2);
+
+        // The server comes back: the next attempt succeeds and the backoff is gone.
+        let (doc, keys) = signed_response(gone, 3600);
+        cache.fetcher.set(gone, doc);
+        tokio::time::advance(Duration::from_secs(60)).await;
+        cache
+            .get_current(gone, &keys.primary().key_id())
+            .await
+            .unwrap();
+        assert_eq!(cache.fetcher.count_for(gone), 3);
+        assert!(cache.fetch_failure(gone).is_none());
+    }
+
+    /// The backoff never climbs past an hour.
+    #[tokio::test(start_paused = true)]
+    async fn the_fetch_backoff_is_capped_at_an_hour() {
+        let cache = RemoteKeyCache::new(FixedFetcher::new());
+        let gone = "gone.example.org";
+        let mut backoff = Duration::ZERO;
+        for _ in 0..10 {
+            tokio::time::advance(backoff).await;
+            let _ = cache.get_current(gone, "ed25519:a_1").await;
+            backoff = cache.fetch_failure(gone).unwrap().backoff;
+        }
+        assert_eq!(backoff, KEY_FETCH_BACKOFF_MAX);
+    }
+
+    /// A fetch that takes longer than the budget is given up and counts as a failure (with the
+    /// timeout as its reason), so a gone server costs the budget, not the client's 30 s request
+    /// timeout, and only once.
+    #[tokio::test(start_paused = true)]
+    async fn a_fetch_over_the_budget_is_given_up_and_backed_off() {
+        let gone = "gone.example.org";
+        let fetcher = StallingFetcher {
+            inner: FixedFetcher::new(),
+            stalls: vec![gone.to_owned()],
+        };
+        let cache = RemoteKeyCache::new(fetcher);
+        let before = tokio::time::Instant::now();
+        let err = cache.get_current(gone, "ed25519:a_1").await.unwrap_err();
+        assert!(matches!(err, KeyLookupError::FetchFailed(_)), "{err}");
+        assert_eq!(before.elapsed(), DEFAULT_KEY_FETCH_TIMEOUT);
+        let failure = cache.fetch_failure(gone).unwrap();
+        assert!(
+            failure.reason.contains("timed out after 10 s"),
+            "{}",
+            failure.reason
+        );
+
+        let before = tokio::time::Instant::now();
+        let err = cache.get_current(gone, "ed25519:a_1").await.unwrap_err();
+        assert!(matches!(err, KeyLookupError::FetchBackoff { .. }), "{err}");
+        assert_eq!(before.elapsed(), Duration::ZERO, "refused without a fetch");
+        assert_eq!(cache.fetcher.inner.count_for(gone), 1);
+
+        let quick = RemoteKeyCache::new(StallingFetcher {
+            inner: FixedFetcher::new(),
+            stalls: vec![gone.to_owned()],
+        })
+        .with_fetch_timeout(Duration::from_secs(2));
+        let before = tokio::time::Instant::now();
+        let _ = quick.get_current(gone, "ed25519:a_1").await;
+        assert_eq!(before.elapsed(), Duration::from_secs(2));
+    }
+
+    /// Lookups that wait for one in-flight fetch share its outcome: when it fails, every
+    /// waiter is answered with the backoff at once, instead of each fetching again in turn.
+    /// Eight events from a gone server cost one budget, not eight.
+    #[tokio::test(start_paused = true)]
+    async fn waiters_on_one_in_flight_fetch_share_its_failure() {
+        let gone = "gone.example.org";
+        let cache = Arc::new(RemoteKeyCache::new(StallingFetcher {
+            inner: FixedFetcher::new(),
+            stalls: vec![gone.to_owned()],
+        }));
+        let before = tokio::time::Instant::now();
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let cache = cache.clone();
+            handles.push(tokio::spawn(async move {
+                cache.get_current(gone, "ed25519:a_1").await.unwrap_err()
+            }));
+        }
+        let mut failed = 0;
+        let mut backed_off = 0;
+        for handle in handles {
+            match handle.await.unwrap() {
+                KeyLookupError::FetchFailed(_) => failed += 1,
+                KeyLookupError::FetchBackoff { .. } => backed_off += 1,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!((failed, backed_off), (1, 7));
+        assert_eq!(cache.fetcher.inner.count_for(gone), 1);
+        assert_eq!(before.elapsed(), DEFAULT_KEY_FETCH_TIMEOUT);
+    }
+
+    /// Keys already held are served through a backoff: a failure to fetch a server's keys
+    /// again (for a key it has never published) does not touch what is cached for it, and an
+    /// administrator's refetch asks the server regardless of the backoff.
+    #[tokio::test(start_paused = true)]
+    async fn held_keys_are_served_through_a_backoff_and_refetch_ignores_it() {
+        let server = "flaky.example.org";
+        let fetcher = FixedFetcher::new();
+        let (doc, keys) = signed_response(server, 3600);
+        fetcher.set(server, doc);
+        let cache = RemoteKeyCache::new(fetcher);
+        let known = keys.primary().key_id();
+        cache.get_current(server, &known).await.unwrap();
+        assert_eq!(cache.fetcher.count_for(server), 1);
+
+        // The server goes away, and an unknown key id forces a fetch that fails.
+        cache.fetcher.responses.lock().unwrap().remove(server);
+        let err = cache
+            .get_current(server, "ed25519:never_published")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, KeyLookupError::FetchFailed(_)), "{err}");
+        assert!(cache.fetch_failure(server).is_some());
+
+        // The held key still verifies, with no fetch.
+        cache.get_current(server, &known).await.unwrap();
+        assert_eq!(cache.fetcher.count_for(server), 2);
+        assert!(
+            cache
+                .cached_keys(server)
+                .is_some_and(|held| held.keys.iter().any(|k| k.key_id == known))
+        );
+
+        // The administrator's refetch goes through the backoff, and clears it on success.
+        let err = cache.refetch(server).await.unwrap_err();
+        assert!(matches!(err, KeyLookupError::FetchFailed(_)), "{err}");
+        assert_eq!(cache.fetcher.count_for(server), 3);
+        let (doc, _) = signed_response(server, 3600);
+        cache.fetcher.set(server, doc);
+        cache.refetch(server).await.unwrap();
+        assert!(cache.fetch_failure(server).is_none());
     }
 
     /// The key responses a cache accepts are kept in its store, and a cache built over the same
