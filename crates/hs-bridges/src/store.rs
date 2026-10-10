@@ -77,6 +77,21 @@ impl InstanceState {
     }
 }
 
+/// How many of a bot's removed devices an instance row remembers ([`InstanceRow::removed_bot_devices`]).
+pub const REMOVED_BOT_DEVICES_KEPT: usize = 5;
+
+/// One of a bot's devices the manager removed: a device the bridge had left behind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemovedBotDevice {
+    pub device_id: String,
+    /// When the manager removed it, milliseconds since the Unix epoch.
+    pub removed_at_ms: u64,
+    /// When the server had last seen it in use (or made it), if it knew.
+    pub last_seen_ms: Option<u64>,
+    /// The device the bridge uses instead, which the manager kept.
+    pub kept_device: String,
+}
+
 /// An instance as stored. Holds its tokens: the manager renders its files from them, and its bot
 /// speaks with them.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -123,6 +138,12 @@ pub struct InstanceRow {
     /// database makes a new device, which the manager signs on a later step and records here.
     #[serde(default)]
     pub signed_bot_device: Option<String>,
+    /// The bot's devices the manager removed because the bridge had moved on to a newer one
+    /// (`manager::BridgeManager::settle_bot_devices`: a reset crypto store leaves the old
+    /// device registered, and clients go on encrypting to it), newest last, the last
+    /// [`REMOVED_BOT_DEVICES_KEPT`] of them.
+    #[serde(default)]
+    pub removed_bot_devices: Vec<RemovedBotDevice>,
     /// Where this server reaches it: the registration's `url`.
     pub url: Option<String>,
     /// The room its owner asked for it in, to tell them there when it is ready.
@@ -191,6 +212,7 @@ impl InstanceRow {
             cross_signing_master_seed: None,
             cross_signing_self_signing_seed: None,
             signed_bot_device: None,
+            removed_bot_devices: Vec::new(),
             url: None,
             front_door_room: None,
             dm_room: None,

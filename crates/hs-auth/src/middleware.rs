@@ -96,10 +96,15 @@ pub(crate) async fn extract_token(
     }
 }
 
+/// How often a device an appservice acts as (`device_id` masquerading) has its `last_seen_ts`
+/// written: at most once a minute, so that a bridge's crypto requests do not each cost a write.
+const APPSERVICE_DEVICE_SEEN_EVERY_MS: u64 = 60_000;
+
 async fn authenticate_appservice(
     token: &str,
     query: &HashMap<String, String>,
     state: &AuthState,
+    client_ip: Option<String>,
 ) -> Result<Option<Requester>, MatrixError> {
     let Some(record) = state.appservices.lookup_by_token(token).await else {
         return Ok(None);
@@ -135,15 +140,28 @@ async fn authenticate_appservice(
     let masqueraded_device_id = match device_param {
         Some(raw) => {
             let device_id: OwnedDeviceId = raw.as_str().into();
-            let exists = state
+            let Some(device) = state
                 .store
                 .get_device(&effective_user_id, &device_id)
                 .await?
-                .is_some();
-            if !exists {
+            else {
                 return Err(MatrixError::unknown_device(format!(
                     "Application service trying to use a device that doesn't exist ('{raw}' for {effective_user_id})"
                 )));
+            };
+            // The device is in use: its `last_seen_ts` says so (at most once a minute), as an
+            // ordinary login's does on every request. Without it a bridge's device keeps the
+            // time it was made, and the bridge manager could not tell the device a bridge uses
+            // from the one it left behind when its crypto store was reset.
+            let now = state.now_ms();
+            if device
+                .last_seen_ms
+                .is_none_or(|seen| now.saturating_sub(seen) >= APPSERVICE_DEVICE_SEEN_EVERY_MS)
+            {
+                state
+                    .store
+                    .record_seen(&effective_user_id, &device_id, now, client_ip)
+                    .await?;
             }
             Some(device_id)
         }
@@ -221,10 +239,6 @@ async fn authenticate(parts: &mut Parts, state: &AuthState) -> Result<Requester,
     let token = extract_token(parts, state).await?;
     let query = query_params(parts, state).await;
 
-    if let Some(requester) = authenticate_appservice(&token, &query, state).await? {
-        return Ok(requester);
-    }
-
     // The address a device was last seen at, for the admin `whois` and the devices list: the
     // forwarded client behind a trusted proxy, as the rate limiter's buckets read it, or else the
     // peer itself -- loopback included, which the buckets leave out (a request from this host is
@@ -237,6 +251,11 @@ async fn authenticate(parts: &mut Parts, state: &AuthState) -> Result<Requester,
                 .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
                 .map(|axum::extract::ConnectInfo(addr)| addr.ip().to_string())
         });
+    if let Some(requester) =
+        authenticate_appservice(&token, &query, state, client_ip.clone()).await?
+    {
+        return Ok(requester);
+    }
     authenticate_user_token(&token, state, client_ip).await
 }
 
@@ -799,6 +818,93 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(requester.device_id.as_deref(), Some(device_id!("BOTDEV")));
+    }
+
+    /// A device an appservice acts as is seen, so that its `last_seen_ts` tells the device a
+    /// bridge uses from one it left behind; written at most once a minute.
+    #[tokio::test]
+    async fn a_device_an_appservice_acts_as_is_recorded_as_seen_at_most_once_a_minute() {
+        let clock = std::sync::Arc::new(crate::clock::FixedClock::new(1_000_000));
+        let state = AuthState {
+            clock: clock.clone(),
+            ..AuthState::in_memory()
+        };
+        let sender = user_id!("@bridge:example.org").to_owned();
+        state
+            .store
+            .create_user(UserRecord::new(sender.clone(), 0))
+            .await
+            .unwrap();
+        state
+            .store
+            .upsert_device(DeviceRecord {
+                user_id: sender.clone(),
+                device_id: device_id!("BOTDEV").to_owned(),
+                display_name: None,
+                last_seen_ms: Some(5),
+                last_seen_ip: None,
+            })
+            .await
+            .unwrap();
+        let registry = crate::appservice::InMemoryAppserviceRegistry::new();
+        registry.insert(
+            "as_token",
+            AppserviceRecord::new("bridge1", sender.clone(), vec![]),
+        );
+        let state = AuthState {
+            appservices: std::sync::Arc::new(registry),
+            ..state
+        };
+        let seen = || async {
+            let mut parts = parts_for(
+                Request::builder()
+                    .uri("/x?device_id=BOTDEV")
+                    .header(AUTHORIZATION, "Bearer as_token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            Requester::from_request_parts(&mut parts, &state)
+                .await
+                .unwrap();
+            state
+                .store
+                .get_device(&sender, device_id!("BOTDEV"))
+                .await
+                .unwrap()
+                .unwrap()
+                .last_seen_ms
+        };
+        assert_eq!(seen().await, Some(1_000_000));
+        clock.advance(59_000);
+        assert_eq!(
+            seen().await,
+            Some(1_000_000),
+            "not written again within a minute"
+        );
+        clock.advance(1_000);
+        assert_eq!(seen().await, Some(1_060_000));
+
+        // Acting as the appservice without a device touches no device.
+        clock.advance(120_000);
+        let mut parts = parts_for(
+            Request::builder()
+                .uri("/x")
+                .header(AUTHORIZATION, "Bearer as_token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        Requester::from_request_parts(&mut parts, &state)
+            .await
+            .unwrap();
+        let device = state
+            .store
+            .get_device(&sender, device_id!("BOTDEV"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(device.last_seen_ms, Some(1_060_000));
     }
 
     #[tokio::test]

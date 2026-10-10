@@ -876,6 +876,11 @@ async fn login_qr(encrypted: bool) -> Result<()> {
             .await?;
         assert_eq!(instance["signed_bot_device"], signed_device, "{instance}");
         assert!(instance["last_key_withheld"].is_null(), "{instance}");
+        // The manager's look at the bot's devices (`GET /devices` as the bot, decision 0041)
+        // worked against the real server and kept the one device the bridge uses: a failure
+        // would be the instance's reason, a removal would be listed.
+        assert!(instance["reason"].is_null(), "{instance}");
+        assert_eq!(instance["removed_bot_devices"], json!([]), "{instance}");
     }
     Ok(())
 }

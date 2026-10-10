@@ -316,7 +316,8 @@ export function BridgeDetailPage() {
           <RelativeTime at={health.last_key_withheld.at} />,{" "}
           <span className="font-identifier">{health.last_key_withheld.sender}</span>&apos;s chat app
           refused to share a message&apos;s keys with this bridge&apos;s{" "}
-          <span className="font-identifier">{health.last_key_withheld.to_user_id}</span> (
+          <span className="font-identifier">{health.last_key_withheld.to_user_id}</span>, device{" "}
+          <span className="font-identifier">{health.last_key_withheld.to_device_id}</span> (
           <code className="font-identifier">{health.last_key_withheld.code}</code>
           {health.last_key_withheld.reason ? `, ${health.last_key_withheld.reason}` : ""}), so the
           bridge could not read that message and said so in the chat.{" "}

@@ -4,6 +4,16 @@ Last updated: 2026-10-09 (the Migration page explains the five streams track 13'
 `agent/migration-95` added, and what no longer or newly does not move; branch
 `agent/web-migration-streams`).
 
+## 2026-10-10: the bridge pages name a bot's devices (branch `agent/bridge-stale-devices`, track 11)
+
+OpenAPI 0.1.13 adds `BridgeInstance.removed_bot_devices` (schema `RemovedBotDevice`);
+`src/api/schema.d.ts` regenerated. `InstanceNextSteps` moved its withheld-key and device lines
+into `BotDeviceNotes`, shown in the sign-in and signed-in phases: the withheld line names the
+device (`to_device_id`) and says when it is one the bridge left behind (removed by the server, or
+removed once a day unseen); a new line lists the removed devices and the one kept. The appservice
+page's withheld line names the device. Three new `InstanceNextSteps` tests; `npm run check`
+green. Decision 0041.
+
 ## 2026-10-09: the Migration page names the five new streams (branch `agent/web-migration-streams`)
 
 Track 13's `agent/migration-95` copies five more streams (`refresh_tokens`, `threepids`,

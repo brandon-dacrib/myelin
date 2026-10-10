@@ -127,10 +127,66 @@ describe("InstanceNextSteps", () => {
     );
     const line = await screen.findByTestId("key-withheld");
     expect(line).toHaveTextContent(
-      "@carol:example.org's chat app refused to share a message's keys with the bridge (m.unverified)",
+      "@carol:example.org's chat app refused to share a message's keys with the bridge's device IEXNEKZESJ (m.unverified)",
     );
     expect(line).toHaveTextContent("IEXNEKZESJ has been cross-signed since");
+    expect(line).not.toHaveTextContent("is not the device the bridge uses");
     expect(screen.queryByTestId("signed-bot-device")).toBeNull();
+    expect(screen.queryByTestId("removed-bot-devices")).toBeNull();
+  });
+
+  it("says when a key was withheld from a device the bridge left behind, and that the server removed it", async () => {
+    renderSteps(
+      instance("@carol:example.org", {
+        signed_bot_device: "BQBMQVR81T",
+        last_key_withheld: {
+          at: "2026-10-10T19:35:00.000Z",
+          sender: "@carol:example.org",
+          code: "m.unverified",
+          reason: null,
+          room_id: "!chat:example.org",
+          to_user_id: "@whatsappbot_carol:example.org",
+          to_device_id: "BSLXZIVKIV",
+        },
+        removed_bot_devices: [
+          {
+            device_id: "BSLXZIVKIV",
+            removed_at: "2026-10-11T00:00:00.000Z",
+            last_seen_at: "2026-10-02T21:08:21.162Z",
+            kept_device: "BQBMQVR81T",
+          },
+        ],
+      }),
+    );
+    const line = await screen.findByTestId("key-withheld");
+    expect(line).toHaveTextContent("with the bridge's device BSLXZIVKIV (m.unverified)");
+    expect(line).toHaveTextContent(
+      "BSLXZIVKIV is not the device the bridge uses (BQBMQVR81T): the bridge left it behind when its encryption was reset, and the server has removed it",
+    );
+    expect(await screen.findByTestId("removed-bot-devices")).toHaveTextContent(
+      "The server removed the bot's device BSLXZIVKIV, which the bridge left behind when its encryption was reset (it uses BQBMQVR81T)",
+    );
+  });
+
+  it("says a left-behind device is removed once a day unseen when the server has not yet", async () => {
+    renderSteps(
+      instance("@carol:example.org", {
+        signed_bot_device: "BQBMQVR81T",
+        last_key_withheld: {
+          at: "2026-10-10T19:35:00.000Z",
+          sender: "@carol:example.org",
+          code: "m.unverified",
+          reason: null,
+          room_id: "!chat:example.org",
+          to_user_id: "@whatsappbot_carol:example.org",
+          to_device_id: "BSLXZIVKIV",
+        },
+      }),
+    );
+    expect(await screen.findByTestId("key-withheld")).toHaveTextContent(
+      "the server removes it once it has gone a day unseen",
+    );
+    expect(screen.queryByTestId("removed-bot-devices")).toBeNull();
   });
 
   it("warns, with the prefix, when the chat was started by the bot", async () => {
@@ -174,6 +230,26 @@ describe("InstanceNextSteps", () => {
     expect(await screen.findByText(/Signed in as/)).toHaveTextContent("+1 555-123-4567");
     expect(screen.queryByRole("list")).toBeNull();
     expect(screen.queryByText(/Tell them/)).toBeNull();
+  });
+
+  it("says which of the bot's devices the server removed even once they have signed in", async () => {
+    renderSteps(
+      instance("@alice:example.org", {
+        signed_bot_device: "BQBMQVR81T",
+        removed_bot_devices: [
+          {
+            device_id: "BSLXZIVKIV",
+            removed_at: "2026-10-11T00:00:00.000Z",
+            last_seen_at: null,
+            kept_device: "BQBMQVR81T",
+          },
+        ],
+      }),
+    );
+    await screen.findByText(/Signed in as/);
+    expect(screen.getByTestId("removed-bot-devices")).toHaveTextContent(
+      "The server removed the bot's device BSLXZIVKIV",
+    );
   });
 
   it("keeps the steps when the bridge could not be asked, and says so", async () => {

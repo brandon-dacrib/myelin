@@ -2736,6 +2736,8 @@ export interface components {
             ready_at?: string | null;
             /** @description Why it failed, or what it is waiting for. */
             reason?: string | null;
+            /** @description The bot's devices the manager removed because the bridge had moved on to a newer one, newest last; the last five. A bridge whose crypto store was reset makes a new device and leaves the old one registered, and clients go on encrypting room keys to it (and withholding keys from it). The manager removes a bot's device once another device of the bot with keys was seen in use after it and it has gone unseen for a day; the device in use is never removed. */
+            removed_bot_devices?: components["schemas"]["RemovedBotDevice"][];
             /** @description The bot's device the manager has cross-signed with the bot's own self-signing key. The manager keeps the bot's cross-signing identity (master and self-signing keys, published as the appservice), so a client that excludes insecure devices (Element's "Exclude insecure devices", Element X's invisible crypto) still shares room keys with the bridge. Null until a device has been signed; a bridge with a reset database makes a new device, which is signed on a later step. */
             signed_bot_device?: string | null;
             /** @enum {string} */
@@ -3387,6 +3389,22 @@ export interface components {
             /** @description Current keys first, then old ones. */
             keys: components["schemas"]["ServerSigningKey"][];
             server_name: string;
+        };
+        RemovedBotDevice: {
+            /** @description The removed device. */
+            device_id: string;
+            /** @description The bot's device the bridge uses, which the manager kept. */
+            kept_device: string;
+            /**
+             * Format: date-time
+             * @description When the server had last seen the device in use (or made it), if it knew.
+             */
+            last_seen_at?: string | null;
+            /**
+             * Format: date-time
+             * @description When the manager removed it.
+             */
+            removed_at: string;
         };
         /** @description One replica of the cluster, as the replica answering the request sees it. A server not running as a cluster is a cluster of one (`role` is `single-node`). */
         Replica: {
