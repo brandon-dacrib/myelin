@@ -1,5 +1,144 @@
 # 06 Federation: status
 
+## 2026-10-10 (branch `agent/join-verify`): a join of a large room no longer takes hours -- keys are fetched in parallel, a gone server is remembered, the join outlives the client
+
+The first time the demo federated with the public internet (2026-10-10, 20:50 UTC) the owner
+ran `/join #matrix:matrix.org` from Element. `send_join` to matrix.org succeeded in seconds, and
+the server then sat idle at 8 millicores with the `/join` request open, logging `dropping an
+event from a send_join response that did not verify ... could not fetch keys for server <gone
+server>` about once a minute. Element gave up; the room never appeared. Synapse joins the same
+room in tens of seconds.
+
+**Cause.** `crates/hs-federation/src/outbound_join.rs`'s `verify_array` verified the `state`
+and `auth_chain` of the `send_join` answer one event at a time (`for raw in raw_events {
+verify_pdu(raw, ..).await }`). Every event's sender needs that server's key through
+`RemoteKeyCache`; a server that is gone (no longer answers, or IPv6-only against this server's
+`ipv4_only` policy, or firewalled) cost the federation client's full 30 s request timeout; and
+`keys.rs` kept no memory of a failed fetch, so a gone server with 50 member events in the room
+cost 50 timeouts, one after another. `#matrix:matrix.org`'s state cites thousands of servers,
+many gone: hours. Measured here before any change, with a key server that hangs 30 s then fails
+(`crates/hs-federation/tests/join_verify_timing.rs`, tokio's paused clock): **50 events from
+one gone server, verified one after another: 50 fetches, 1500 s**.
+
+**Fix**, all in `hs-federation` except the last item:
+
+1. *Concurrent verification, grouped by server* (`outbound_join.rs`, `verify_array`). The
+   events of an answer are grouped by their sender's server, the groups are verified
+   `JOIN_VERIFY_CONCURRENCY` (64) at a time (`futures::StreamExt::buffer_unordered`) and
+   within a group one after another: the first event fetches the key, or learns the server is
+   gone, and the rest find it cached or are refused at once. What verified is answered in the
+   answer's order (the caller's auth chain is ordered). A snapshot citing `n` gone servers
+   costs `ceil(n / 64)` fetch budgets. Grouping by server (not a flat pool over events) matters:
+   with a flat pool, the other events of a gone server each hold a slot while they wait on the
+   cache's per-server lock, and 64 slots fill with waiters.
+2. *A negative cache in `RemoteKeyCache`* (`keys.rs`). A server whose key fetch failed (timed
+   out, unreachable, or an invalid response) is not asked again for
+   `KEY_FETCH_BACKOFF_MIN` (60 s), doubling after each further failure to
+   `KEY_FETCH_BACKOFF_MAX` (1 h); a successful fetch clears it; the administrator's
+   `federation.keys.refresh` (`refetch`) fetches through it. A lookup refused under the backoff
+   answers the new `KeyLookupError::FetchBackoff { server_name, reason, retry_in_secs }`
+   (`not asking \`gone.example.org\` for keys again for 60 s: its last fetch failed (timed out
+   after 10 s)`), which `verify_pdu`'s dropped-event warning carries. Keys already held are
+   never affected: the backoff only decides whether a fetch is made, and `get_current` /
+   `get_valid_at` consult the cache first as before. Also fixed on the way: the in-flight
+   de-duplication (threat model 2.3) only ever shared *successes* by accident -- each waiter on
+   the per-server lock fetched again in turn once it got the lock (the existing test passed
+   because a fetcher that never yields let the first task finish before the second started).
+   Now a waiter learns whether a fetch for its server completed while it waited
+   (`fetch_seq` / `last_fetch_seq`) and takes that outcome, success or failure.
+3. *A fetch budget* (`keys.rs`, `DEFAULT_KEY_FETCH_TIMEOUT` = 10 s, connect and answer
+   together; `RemoteKeyCache::with_fetch_timeout` changes it). Applied in the cache around the
+   fetcher (`tokio::time::timeout`), not in the client: the client builds one `reqwest::Client`
+   per destination with the configured 30 s timeout, and the key fetcher (`hs-cli`'s
+   `ClientKeyFetcher`) goes through `FederationClient::send`, which takes no per-request
+   timeout. A budget in the cache applies to every key fetch whatever fetches it, which is
+   also what Synapse does (its direct key fetch asks with a 10 s timeout). Dropping the timed
+   out future cancels the request and frees the client's per-destination slot. **Not yet in
+   `federation` config**: `hs-config::FederationConfig` is track 13's; the one-line wiring is
+   `RemoteKeyCache::with_fetch_timeout(config.key_fetch_timeout.into())` at
+   `crates/hs-cli/src/federation.rs:1690`, with a `key_fetch_timeout` field defaulting to 10 s.
+   Left for track 13 (below).
+4. *Progress in the log, and metrics.* `VerifyProgress` (`outbound_join.rs`) logs one `info`
+   line every 5 s while a join verifies (`still verifying the events a send_join answer
+   carried`: `total`, `verified`, `dropped`, `elapsed_secs`, `servers_pending` with the first
+   eight named, `slowest_server` and `slowest_secs` -- the longest a completed event took or
+   the longest one still waiting has waited, whichever is more) and one at the end (`verified
+   the events a send_join answer carried`: totals, `elapsed_ms`, the slowest server). Every
+   failed fetch logs `could not fetch a server's keys; not asking it again until the backoff
+   ends` with the reason, how long it took and the backoff set. Metrics
+   (`crates/hs-federation/src/metrics.rs`, registered by `register_transport_metrics`):
+   `hs_federation_join_verify_seconds` (histogram, buckets 0.1 s to 30 min) and
+   `hs_federation_key_fetch_failures_total{reason}` with `timeout`, `unreachable`,
+   `invalid_response` and `backoff` (a lookup refused under the backoff).
+5. *The `/join` request outlives the client's connection* (`crates/hs-cli/src/remote_join.rs`,
+   `FederationRemoteJoin::join`; one function in track 13/14's crate, flagged for the
+   coordinator). What was found: `hs-room`'s join route awaits `remote.join(..)` inside the
+   request's future; hyper drops that future when the connection closes, so a client (or a
+   proxy: Cloudflare cuts a proxied request at 100 s, nginx at 60 s by default) giving up
+   mid-way cancelled the verification with nothing persisted, and the client's retry started
+   from `make_join` again. Synapse answers `/join` after the join is persisted too, but
+   Twisted does not cancel a handler on disconnect (Synapse's cancellation is opt-in,
+   `@cancellable`, and `/join` is not), so a join that outlives the connection completes and
+   the room appears from `/sync`; Element waits on the request without its own timeout and
+   shows the room when `/sync` carries it. Now the handshake and the room's bootstrap run in a
+   `tokio::spawn`ed task the request awaits; a dropped request leaves the task running, the
+   room is made resident, the user's next `/sync` carries it, and `JoinRequestWatch` logs
+   `the client went away while its join through another server was under way; the join goes
+   on, and the room appears in /sync when it is done` with how long the client waited. A
+   retry while the first join is still running runs a second handshake (the resident answers
+   it the same, and `join_through` takes the join as one more event of a room already held);
+   sharing one in-flight join per `(room, user)` is a refinement, not done.
+
+**Measured after** (the same fake fetcher and paused clock; `cargo test -p hs-federation`):
+
+| Scenario | Before | After |
+|---|---|---|
+| 50 events from one gone server, one after another (`tests/join_verify_timing.rs`) | 50 fetches, 1500 s | 1 fetch, 10 s |
+| 220 events: 20 gone servers x 10 events among 20 resident events (`events_from_gone_servers_cost_one_budget_in_parallel_and_keep_their_order`) | 200 x 30 s = 6000 s (one after another) | 20 fetches (one per gone server, all in parallel), 10 s; 20 verified, 200 dropped, in the answer's order |
+| 192 events from one gone server, three times the pool (`a_gone_server_with_more_events_than_the_pool_still_costs_one_budget`) | 192 x 30 s = 5760 s | 1 fetch, 10 s |
+| 30 events from three servers answering after 3 s, 1 s and at once (`verification_keeps_the_answers_order_whatever_order_the_fetches_finish_in`) | 30 fetches, one per event: 10 x 3 s + 10 x 1 s = 40 s | 3 fetches, 3 s, the answer's order kept |
+| 8 concurrent lookups of one gone server (`waiters_on_one_in_flight_fetch_share_its_failure`) | 8 fetches, 8 x 30 s | 1 fetch, 10 s; 1 `FetchFailed`, 7 `FetchBackoff` |
+
+For `#matrix:matrix.org` the arithmetic is now `ceil(gone servers / 64) x 10 s` plus the
+reachable servers' fetches: a thousand gone servers is about three minutes, not hours. That
+is still not Synapse's tens of seconds, and the reason is below.
+
+**Checks run.** `cargo fmt --all --check`; `cargo clippy -p hs-federation -p hs-cli
+--all-targets -- -D warnings`; `cargo test -p hs-federation` (241 unit tests and the new
+timing test); `cargo test -p hs-cli --test federation_two_servers --test
+federation_membership` (two real `hs` binaries federating in-process: joins through another
+server, messages both ways, invites, knocks, the leave-then-rejoin barrier). The Synapse
+harness (`tests/federation-synapse/run.sh`) has no room with many gone servers, so the timing
+proof is the fake-fetcher one above.
+
+**What is left.**
+
+- *Keys from a notary (the real reason Synapse is fast).* Synapse's `PerspectivesKeyFetcher`
+  asks its `trusted_key_servers` (matrix.org) for every unknown server's keys in one batched
+  `POST /_matrix/key/v2/query` before asking the servers themselves; matrix.org holds the keys
+  of servers that are gone, so their events verify instead of being dropped, and no connection
+  to a gone server is attempted at all. This server has the notary's *server* side
+  (`transport/key_server.rs`) but `RemoteKeyCache::refresh` only ever asks the origin. Adding a
+  notary fetch step (configured trusted servers, the spec's signature check on the notary's
+  co-signature, fall back to the origin) turns a large join's key work into one request and
+  keeps every gone server's state instead of dropping it. That is the next step for this
+  track; it is a new `KeyServerFetcher` behind the cache plus a config field.
+- *`federation.key_fetch_timeout` in `hs-config`* (track 13): the field and the one-line wiring
+  named in item 3.
+- *One in-flight join per `(room, user)`*: a client retrying `/join` while the first is still
+  verifying should attach to it, not start a second handshake.
+- *Element's view*: the client sees its `/join` end without an answer when a proxy cuts it, and
+  the room appears later from `/sync`; a `202`-style early answer is not in the spec, so this is
+  the behaviour Synapse has too. Nothing to do unless a client is seen to retry in a loop.
+
+**Decisions made.** The fetch budget lives in the key cache, not the client (item 3). The
+backoff's clock is `tokio::time::Instant` so tests drive it with the paused clock. The group
+pool is 64 wide, the number the brief suggested; it bounds concurrent key fetches, each one
+TCP connection. `KeyLookupError` gained a variant; nothing outside `hs-federation` matches on
+it exhaustively (checked). No shared dependency added; no decision or RFC number taken (no
+interface another track consumes changed: `join_room`'s signature is the same, the cache's
+new methods are additive).
+
 ## 2026-10-09 (branch `agent/federation-95`): the suites re-measured today, the leave-then-rejoin race closed, what is left named
 
 README.md rated Federation at ~60% on numbers from 2026-10-01/02 (Sytest's federation group

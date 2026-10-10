@@ -32,6 +32,43 @@ pub struct FederationRemoteJoin<B: KvBackend> {
     barrier: Option<DeliveryBarrier>,
 }
 
+impl<B: KvBackend> Clone for FederationRemoteJoin<B> {
+    fn clone(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            key_cache: self.key_cache.clone(),
+            rooms: self.rooms.clone(),
+            identity: self.identity.clone(),
+            barrier: self.barrier.clone(),
+        }
+    }
+}
+
+/// Logs, when dropped before the join it watches has answered, that the client went away
+/// while its join was under way. The join itself runs in its own task
+/// ([`FederationRemoteJoin::join`]) and goes on; this is the operator's trail for why a room
+/// appears in a user's `/sync` minutes after the client's `/join` ended without an answer.
+struct JoinRequestWatch {
+    room_id: OwnedRoomId,
+    user_id: ruma::OwnedUserId,
+    started: std::time::Instant,
+    answered: bool,
+}
+
+impl Drop for JoinRequestWatch {
+    fn drop(&mut self) {
+        if !self.answered {
+            tracing::warn!(
+                room_id = %self.room_id,
+                user_id = %self.user_id,
+                waited_secs = self.started.elapsed().as_secs(),
+                "the client went away while its join through another server was under way; \
+                 the join goes on, and the room appears in /sync when it is done"
+            );
+        }
+    }
+}
+
 /// The longest a handshake waits for the forwarder to hand this server's latest events to the
 /// sender: normally microseconds, since the forwarder reads a broadcast channel.
 const FORWARDER_WAIT: Duration = Duration::from_secs(2);
@@ -219,6 +256,34 @@ enum JoinAttempt {
 }
 
 impl<B: KvBackend + 'static> FederationRemoteJoin<B> {
+    /// [`FederationRemoteJoin::join_through`] each server in `via` but this one, in order,
+    /// until one sponsors the join or the room refuses it.
+    async fn join_through_each(
+        &self,
+        user_id: &UserId,
+        room_id: &RoomId,
+        via: &[String],
+        content: &Value,
+    ) -> Result<OwnedRoomId, RoomError> {
+        let own_name = self.identity.server_name.as_str();
+        let mut last_error: Option<RoomError> = None;
+        for destination in via.iter().filter(|d| d.as_str() != own_name) {
+            match self
+                .join_through(destination, user_id, room_id, content)
+                .await
+            {
+                Ok(joined) => return Ok(joined),
+                Err(JoinAttempt::Fatal(error)) => return Err(error),
+                Err(JoinAttempt::Next { error }) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            RoomError::RemoteJoinFailed(
+                "join: no server to ask, the only candidate was this one".into(),
+            )
+        }))
+    }
+
     /// One `make_join`/`send_join` handshake through `destination`, and the room made (or kept)
     /// resident from its answer.
     async fn join_through(
@@ -435,26 +500,37 @@ impl<B: KvBackend + 'static> hs_room::remote_join::RemoteJoin for FederationRemo
             )));
         }
         let content = with_synapse_profile_keys(content);
-        // Until the join is held here, what the resident sends over `/send` for the room is
-        // taken, not ignored as for a room nobody of this server is in.
-        let _joining = self.rooms.remote_join_started(room_id);
-        let own_name = self.identity.server_name.as_str();
-        let mut last_error: Option<RoomError> = None;
-        for destination in via.iter().filter(|d| d.as_str() != own_name) {
-            match self
-                .join_through(destination, user_id, room_id, &content)
+        // The handshake runs in its own task, not in the request's future: a join of a large
+        // room verifies thousands of events and can outlive the client's connection (a proxy
+        // or the client gives up after a minute or two), and hyper drops a request's future
+        // when its connection closes. Dropped mid-way, the join was lost with nothing persisted
+        // and the client's retry started over (the demo joining `#matrix:matrix.org` on
+        // 2026-10-10). Detached, it completes, the room is made resident, and the user's next
+        // `/sync` carries it -- as on Synapse, whose request handling is not cancelled by a
+        // disconnect. The watch logs the disconnect.
+        let mut watch = JoinRequestWatch {
+            room_id: room_id.to_owned(),
+            user_id: user_id.to_owned(),
+            started: std::time::Instant::now(),
+            answered: false,
+        };
+        let this = self.clone();
+        let (user_id, room_id, via) = (user_id.to_owned(), room_id.to_owned(), via.to_vec());
+        let task = tokio::spawn(async move {
+            // Until the join is held here, what the resident sends over `/send` for the room
+            // is taken, not ignored as for a room nobody of this server is in.
+            let _joining = this.rooms.remote_join_started(&room_id);
+            this.join_through_each(&user_id, &room_id, &via, &content)
                 .await
-            {
-                Ok(joined) => return Ok(joined),
-                Err(JoinAttempt::Fatal(error)) => return Err(error),
-                Err(JoinAttempt::Next { error }) => last_error = Some(error),
-            }
-        }
-        Err(last_error.unwrap_or_else(|| {
-            RoomError::RemoteJoinFailed(
-                "join: no server to ask, the only candidate was this one".into(),
-            )
-        }))
+        });
+        let result = match task.await {
+            Ok(result) => result,
+            Err(error) => Err(RoomError::RemoteJoinFailed(format!(
+                "join: the join task ended abnormally: {error}"
+            ))),
+        };
+        watch.answered = true;
+        result
     }
 
     async fn leave(
