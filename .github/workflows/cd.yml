@@ -379,7 +379,14 @@ jobs:
         # drop `continue-on-error` once it passes.
         if: matrix.arch == 'amd64'
         continue-on-error: true
-        run: deploy/helm/hs/ci/cluster-smoke.sh myelin:smoke --kind smoke --rotate-certs --upgrade-from ghcr.io/brandon-dacrib/myelin:main
+        run: |
+          # The image rolled from goes onto the node the way myelin:smoke did, through `kind load`,
+          # not pulled by the kubelet: on run 38016787579 the node held one image ID under
+          # `myelin:smoke` (imported), `smoke-roll` (imported) and `ghcr.io/...:main` (pulled, and
+          # byte-identical when only CI files changed), and from that pull on the kubelet answered
+          # ErrImageNeverPull for the imported names while crictl still resolved them.
+          docker pull ghcr.io/brandon-dacrib/myelin:main
+          deploy/helm/hs/ci/cluster-smoke.sh myelin:smoke --kind smoke --rotate-certs --upgrade-from ghcr.io/brandon-dacrib/myelin:main
 
       - name: Prove a backup of a release restores it, in both layouts
         # deploy/helm/hs/ci/backup-restore-smoke.sh: a single-node release's data volume is

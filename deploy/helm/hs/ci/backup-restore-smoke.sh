@@ -151,6 +151,9 @@ node_image_diagnostics() {
   [ -n "$KIND_CLUSTER" ] || return 0
   echo "--- images on node $(kind_node) (crictl)"
   docker exec "$(kind_node)" crictl images 2>&1 | grep -iE 'IMAGE|myelin' || true
+  for ref in "docker.io/library/$IMAGE" "$IMAGE"; do
+    if docker exec "$(kind_node)" crictl inspecti "$ref" >/dev/null 2>&1; then echo "crictl inspecti $ref: present"; else echo "crictl inspecti $ref: NOT present"; fi
+  done
   echo "--- the kubelet's image settings"
   kubectl --context "$CONTEXT" get --raw "/api/v1/nodes/$(kind_node)/proxy/configz" 2>/dev/null \
     | python3 -c 'import json,sys; c=json.load(sys.stdin)["kubeletconfig"]; print({k: c.get(k) for k in ("imageGCHighThresholdPercent","imageGCLowThresholdPercent","imageMinimumGCAge","imageMaximumGCAge","evictionHard")})' 2>&1 || true
