@@ -22,6 +22,7 @@ pub mod metrics;
 pub mod outbound_join;
 pub mod outbound_membership;
 pub mod outbound_store;
+pub mod room_sharing;
 pub mod room_source;
 pub mod sender;
 pub mod state_fallback;

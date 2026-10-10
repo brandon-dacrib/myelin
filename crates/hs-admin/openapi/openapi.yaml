@@ -10,7 +10,7 @@ openapi: 3.1.0
 info:
   title: hs-admin API
   summary: The native administration and moderation API for the homeserver.
-  version: 0.1.13
+  version: 0.1.14
   description: 'The only API the management interface (track 16) talks to. See docs/rfcs/0004-admin-api.md for the full design rationale: resource modeling, naming, pagination, filtering, errors, idempotency, scopes, versioning and the event stream. This document is the contract; the hs-admin router''s contract tests assert the router and this document agree on paths and methods (RFC 0004 section 1, decision D15.16).'
   contact:
     name: 'Track 15: Admin API and modules'
@@ -105,6 +105,15 @@ info:
     notes: 'Additive: BridgeInstance.removed_bot_devices (schema RemovedBotDevice), the bot
       devices the bridge manager removed because the bridge had moved on to a newer one (a
       reset crypto store leaves the old device registered).'
+  - version: 0.1.14
+    date: '2026-10-10'
+    notes: 'Additive: federation.destinations.forget (DELETE /federation/destinations/{server_name},
+      409 while a room is shared unless force=true) drops a destination''s queue, backoff,
+      catch-up mark and cached keys; federation.destinations.prune (POST
+      /federation/destinations/prune, dry_run) forgets every destination sharing no room with
+      nothing queued and, with failing_for, every one failing that long whose queue is only for
+      rooms this server left, answering DestinationPruneReport; Destination.shared_rooms_count
+      and the list''s shares_room filter (decision 0042).'
 servers:
 - url: /api/v1
   description: Same origin as /_matrix on the client listener.
@@ -1822,6 +1831,14 @@ paths:
           only the healthy ones.'
         schema:
           type: boolean
+      - name: shares_room
+        in: query
+        description: '`false` for only the destinations this server shares no room with (state,
+          not relationships: what `federation.destinations.prune` considers), `true` for only
+          those it shares at least one with. Ignored when the server cannot say
+          (`shared_rooms_count` null).'
+        schema:
+          type: boolean
       responses:
         '200':
           description: A page of destinations.
@@ -1867,6 +1884,109 @@ paths:
           $ref: '#/components/responses/RateLimited'
         '404':
           $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+    delete:
+      summary: Forget a destination
+      description: Drops everything this server keeps about the destination -- its outbound
+        queue (unsent events are lost), its backoff and retry state, its catch-up mark and its
+        cached signing keys -- so it is learned again from nothing the next time a room brings
+        the two together (decision 0042). Refused with `409 conflict` while this server still
+        shares a room with it (a room where both have a joined member), naming how many, unless
+        `force=true`. Audited as `federation.destinations.forget`; the event stream carries
+        `federation.destination_forgotten`.
+      operationId: federation.destinations.forget
+      tags:
+      - Federation
+      security:
+      - OAuth2:
+        - admin:write
+      parameters:
+      - $ref: '#/components/parameters/ServerName'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - name: force
+        in: query
+        description: Forget it even though this server shares a room with it.
+        schema:
+          type: boolean
+          default: false
+      responses:
+        '200':
+          description: Forgotten; what was dropped.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DestinationForgotten'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/InsufficientScope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/IdempotencyMismatch'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /federation/destinations/prune:
+    post:
+      summary: Forget unused and failing destinations
+      description: 'Forgets every destination this server shares no room with and has nothing
+        queued for (it is state, not a relationship: decision 0042) and, when the body gives
+        `failing_for`, every destination failing for at least that long whose queued events
+        are only for rooms this server has since left (the queue is dropped with it). A
+        destination this server shares a room with, or with events queued for a room it is
+        still in, is kept; so is one with a queue that is not failing (the events will be
+        delivered) or not failing for long enough. The report counts both sides by reason and
+        names the first 50 of each. `dry_run=true` answers the same report without forgetting
+        anything. Audited as `federation.destinations.prune` (not when a dry run); the event
+        stream carries `federation.destinations_pruned`.'
+      operationId: federation.destinations.prune
+      tags:
+      - Federation
+      security:
+      - OAuth2:
+        - admin:write
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - name: dry_run
+        in: query
+        description: Report what would be forgotten and kept, and forget nothing.
+        schema:
+          type: boolean
+          default: false
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DestinationPruneRequest'
+      responses:
+        '200':
+          description: What was forgotten (or would be) and what was kept, and why.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DestinationPruneReport'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/InsufficientScope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '409':
+          $ref: '#/components/responses/IdempotencyInFlight'
+        '422':
+          $ref: '#/components/responses/IdempotencyMismatch'
         '500':
           $ref: '#/components/responses/Internal'
         '503':
@@ -7736,6 +7856,105 @@ components:
           - 'null'
           format: date-time
           description: When the destination's outbound queue overflowed (or catch-up was otherwise asked for) and it went into catch-up mode; null when it is not catching up. While set, nothing more is queued for it, and once it answers it is sent the latest event of each room it is behind in.
+        shared_rooms_count:
+          type:
+          - integer
+          - 'null'
+          description: How many rooms this server shares with the destination (rooms where both
+            have a joined member); null when the server cannot say. A destination sharing none
+            is state, not a relationship, and may be forgotten (decision 0042).
+    DestinationForgotten:
+      type: object
+      description: What forgetting a destination dropped (`federation.destinations.forget`).
+      required:
+      - server_name
+      - dropped_pdu_count
+      - dropped_edu_count
+      - dropped_key_count
+      - was_catching_up
+      - shared_rooms_count
+      properties:
+        server_name:
+          type: string
+        dropped_pdu_count:
+          type: integer
+          description: Room events that were queued for it and are now gone, unsent.
+        dropped_edu_count:
+          type: integer
+          description: To-device messages and device-list updates that were queued for it and
+            are now gone.
+        dropped_key_count:
+          type: integer
+          description: Signing keys of it this server held and no longer does.
+        was_catching_up:
+          type: boolean
+        shared_rooms_count:
+          type: integer
+          description: How many rooms this server shared with it when it was forgotten
+            (non-zero only with `force=true`).
+    DestinationPruneRequest:
+      type: object
+      description: What `federation.destinations.prune` is asked; every field is optional.
+      properties:
+        failing_for:
+          type: string
+          description: 'A duration (`7d`, `12h`, `30m`, `0s`): also forget every destination
+            failing for at least this long whose queued events are only for rooms this server
+            has since left. Absent, destinations with a queue are kept.'
+    DestinationPruneReport:
+      type: object
+      description: What `federation.destinations.prune` forgot (or would) and kept, and why.
+      required:
+      - dry_run
+      - forgotten
+      - kept
+      properties:
+        dry_run:
+          type: boolean
+          description: Whether nothing was forgotten (a dry run).
+        forgotten:
+          $ref: '#/components/schemas/DestinationPruneGroup'
+        kept:
+          $ref: '#/components/schemas/DestinationPruneGroup'
+    DestinationPruneGroup:
+      type: object
+      description: One side of a prune report.
+      required:
+      - count
+      - by_reason
+      - servers
+      properties:
+        count:
+          type: integer
+          description: How many in all.
+        by_reason:
+          type: object
+          additionalProperties:
+            type: integer
+          description: 'How many for each reason. Forgotten: `unused` (shares no room, nothing
+            queued), `failing` (failing long enough, queue only for rooms this server left).
+            Kept: `shares_rooms`, `queued_for_current_rooms`, `queued_not_failing`,
+            `failing_recently`, `active_recently`.'
+        servers:
+          type: array
+          description: The first 50, by name; `count` is the whole list's.
+          items:
+            $ref: '#/components/schemas/DestinationPruneEntry'
+    DestinationPruneEntry:
+      type: object
+      required:
+      - server_name
+      - reason
+      - detail
+      properties:
+        server_name:
+          type: string
+        reason:
+          type: string
+          description: One of the reasons `by_reason` is keyed by.
+        detail:
+          type: string
+          description: One sentence with the numbers behind the reason.
     DestinationRoom:
       type: object
       description: One room this server shares with a destination (at least one of its users is joined).

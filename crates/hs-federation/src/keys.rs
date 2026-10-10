@@ -706,6 +706,79 @@ impl<F: KeyServerFetcher> RemoteKeyCache<F> {
         })
     }
 
+    /// Drops everything the cache holds for `server_name`: its current and old keys, the
+    /// responses kept for the notary endpoints, when they were fetched, and any fetch backoff;
+    /// and forgets them from the held-key store, so a restart does not bring them back. What
+    /// `federation.destinations.forget` does with a forgotten destination's keys (decision
+    /// 0042). This server's own keys are never dropped. Returns how many keys were dropped.
+    /// A signature of the server seen later fetches its keys afresh.
+    pub fn forget_server(&self, server_name: &str) -> usize {
+        let mut dropped = 0usize;
+        let mut key_ids: Vec<String> = Vec::new();
+        {
+            let mut current = self
+                .current
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            current.retain(|(server, key_id), _| {
+                if server == server_name {
+                    key_ids.push(key_id.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        dropped += key_ids.len();
+        {
+            let mut old = self
+                .old
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let before = old.len();
+            old.retain(|(server, key_id), _| {
+                if server == server_name {
+                    key_ids.push(key_id.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            dropped += before - old.len();
+        }
+        self.responses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(server, key_id), _| {
+                if server == server_name {
+                    key_ids.push(key_id.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        self.fetched_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(server_name);
+        self.failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(server_name);
+        self.last_fetch_seq
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(server_name);
+        if let Some(store) = &self.store {
+            key_ids.sort();
+            key_ids.dedup();
+            for key_id in &key_ids {
+                store.forget(server_name, key_id);
+            }
+        }
+        dropped
+    }
+
     /// Fetches `server_name`'s keys again now, whatever is cached and whatever backoff an
     /// earlier failure set (an administrator's `federation.keys.refresh`), and answers what the
     /// cache then holds for it.
@@ -1769,6 +1842,53 @@ mod tests {
     /// The key responses a cache accepts are kept in its store, and a cache built over the same
     /// store after a restart starts with them: the notary answers for a server that cannot be
     /// reached any more, and a key verifies without a fetch. A response that expired more than
+    /// Forgetting a server drops its keys from the cache and from the held-key store, so a
+    /// restart does not bring them back; a later signature of it fetches afresh; other servers'
+    /// keys and this server's own are untouched.
+    #[tokio::test]
+    async fn a_forgotten_servers_keys_are_gone_from_the_cache_and_the_store() {
+        let backend = hs_kv::memory::MemoryBackend::new();
+        let store: Arc<dyn crate::key_store::HeldKeyStore> =
+            Arc::new(crate::key_store::KvHeldKeyStore::open(backend.clone()).unwrap());
+        let fetcher = FixedFetcher::new();
+        let (doc, keys) = signed_response("gone.example.org", 3600);
+        fetcher.set("gone.example.org", doc);
+        let (kept_doc, kept_keys) = signed_response("kept.example.org", 3600);
+        fetcher.set("kept.example.org", kept_doc);
+        let cache = RemoteKeyCache::with_store(fetcher, store.clone());
+        cache
+            .get_current("gone.example.org", &keys.primary().key_id())
+            .await
+            .unwrap();
+        cache
+            .get_current("kept.example.org", &kept_keys.primary().key_id())
+            .await
+            .unwrap();
+        assert_eq!(store.load().len(), 2);
+
+        assert_eq!(cache.forget_server("gone.example.org"), 1);
+        assert_eq!(cache.cached_keys("gone.example.org"), None);
+        assert!(cache.cached_keys("kept.example.org").is_some());
+        assert_eq!(
+            store.load().len(),
+            1,
+            "only the kept server's response is held"
+        );
+        assert_eq!(store.load()[0].server_name, "kept.example.org");
+        assert_eq!(
+            cache.forget_server("gone.example.org"),
+            0,
+            "nothing left to drop"
+        );
+
+        // The next signature of it fetches again.
+        cache
+            .get_current("gone.example.org", &keys.primary().key_id())
+            .await
+            .unwrap();
+        assert_eq!(cache.fetcher.count_for("gone.example.org"), 2);
+    }
+
     /// a year ago is forgotten at boot. Until 2026-10-01 all of it was in memory only, and a
     /// restarted notary answered nothing for a server that was down.
     #[tokio::test]

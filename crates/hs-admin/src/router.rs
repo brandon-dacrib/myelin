@@ -566,6 +566,8 @@ const REAL_HANDLERS: &[&str] = &[
     "federation.destinations.get",
     "federation.destinations.reset",
     "federation.destinations.rooms",
+    "federation.destinations.forget",
+    "federation.destinations.prune",
     "federation.keys.list",
     "federation.keys.get",
     "federation.keys.refresh",
@@ -2693,6 +2695,7 @@ struct DestinationsQuery {
     include_total: Option<bool>,
     sort: Option<String>,
     failing: Option<bool>,
+    shares_room: Option<bool>,
 }
 
 /// The fields `GET /federation/destinations` sorts by (`sort=<field>` or `sort=-<field>`).
@@ -2754,7 +2757,8 @@ fn sort_destinations(
 
 /// `GET /api/v1/federation/destinations`: failing ones first, then by name, unless `sort`
 /// says otherwise; `?failing=true` narrows to those, and `include_total=true` with it is the
-/// count the Overview also carries as `federation_destinations_failing_count`.
+/// count the Overview also carries as `federation_destinations_failing_count`;
+/// `?shares_room=false` narrows to the destinations this server shares no room with.
 async fn federation_destinations_list(
     State(state): State<AdminState>,
     headers: HeaderMap,
@@ -2776,6 +2780,13 @@ async fn federation_destinations_list(
                 Ok(mut items) => {
                     if let Some(failing) = query.failing {
                         items.retain(|d| d.failing_since.is_some() == failing);
+                    }
+                    if let Some(shares_room) = query.shares_room {
+                        // A row the server cannot say for (`None`) is kept either way.
+                        items.retain(|d| {
+                            d.shared_rooms_count
+                                .is_none_or(|shared| (shared > 0) == shares_room)
+                        });
                     }
                     if let Err(field) = sort_destinations(&mut items, query.sort.as_deref()) {
                         return Problem::validation_failed()
@@ -5749,6 +5760,18 @@ fn register_real_operation(builder: Builder<AdminState>, op: OperationDef) -> Bu
             method,
             &full_path,
             crate::federation::destination_rooms,
+            meta,
+        ),
+        "federation.destinations.forget" => builder.add(
+            method,
+            &full_path,
+            crate::federation::destination_forget,
+            meta,
+        ),
+        "federation.destinations.prune" => builder.add(
+            method,
+            &full_path,
+            crate::federation::destinations_prune,
             meta,
         ),
         "federation.keys.list" => {

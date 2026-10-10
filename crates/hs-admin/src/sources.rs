@@ -2309,6 +2309,35 @@ pub trait FederationSource: Send + Sync + 'static {
     /// for a server there is no record of.
     async fn reset_destination(&self, server_name: &str) -> Result<AdminDestination, SourceError>;
 
+    /// Forgets the destination (`federation.destinations.forget`, decision 0042): its queue,
+    /// backoff, catch-up mark and cached keys. [`ForgetOutcome::SharesRooms`] when this server
+    /// still shares a room with it and `force` is false. `SourceError::NotFound` for a server
+    /// there is no record of; [`SourceError::Unavailable`] when the source cannot tell which
+    /// rooms are shared and `force` is false.
+    async fn forget_destination(
+        &self,
+        server_name: &str,
+        force: bool,
+    ) -> Result<crate::federation::ForgetOutcome, SourceError> {
+        let _ = (server_name, force);
+        Err(SourceError::Unavailable(
+            "this federation source cannot forget destinations".to_owned(),
+        ))
+    }
+
+    /// Forgets every destination [`crate::federation::decide`] says to, with
+    /// [`crate::federation::PruneRules`] `{idle_for: 0, failing_for: options.failing_for}`,
+    /// or only reports when `options.dry_run` (`federation.destinations.prune`).
+    async fn prune_destinations(
+        &self,
+        options: crate::federation::PruneOptions,
+    ) -> Result<crate::federation::AdminPruneReport, SourceError> {
+        let _ = options;
+        Err(SourceError::Unavailable(
+            "this federation source cannot prune destinations".to_owned(),
+        ))
+    }
+
     /// This server's own signing keys (`federation.keys.list`). Unavailable unless the source
     /// knows them.
     async fn own_keys(&self) -> Result<Vec<crate::federation::AdminSigningKey>, SourceError> {
@@ -2447,6 +2476,87 @@ impl FederationSource for InMemoryFederationSource {
         destination.failing_since = None;
         destination.retry_interval_ms = None;
         Ok(destination.clone())
+    }
+
+    async fn forget_destination(
+        &self,
+        server_name: &str,
+        force: bool,
+    ) -> Result<crate::federation::ForgetOutcome, SourceError> {
+        use crate::federation::{AdminDestinationForgotten, ForgetOutcome};
+        let mut destinations = self
+            .destinations
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let destination = destinations.get(server_name).ok_or(SourceError::NotFound)?;
+        let shared = destination.shared_rooms_count.unwrap_or(0);
+        if shared > 0 && !force {
+            return Ok(ForgetOutcome::SharesRooms { rooms: shared });
+        }
+        let destination = destinations
+            .remove(server_name)
+            .ok_or(SourceError::NotFound)?;
+        Ok(ForgetOutcome::Forgotten(AdminDestinationForgotten {
+            server_name: server_name.to_owned(),
+            dropped_pdu_count: destination.pending_pdu_count,
+            dropped_edu_count: destination.pending_edu_count,
+            dropped_key_count: 0,
+            was_catching_up: destination.catch_up_since.is_some(),
+            shared_rooms_count: shared,
+        }))
+    }
+
+    async fn prune_destinations(
+        &self,
+        options: crate::federation::PruneOptions,
+    ) -> Result<crate::federation::AdminPruneReport, SourceError> {
+        use crate::federation::{DestinationFacts, PruneRules, decide, report};
+        let now_ms =
+            u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000)
+                .unwrap_or(0);
+        let ms = |at: &Option<String>| {
+            at.as_deref()
+                .and_then(|s| hs_http::time::parse_rfc3339(s).ok())
+                .and_then(|dt| u64::try_from(dt.unix_timestamp_nanos() / 1_000_000).ok())
+        };
+        let rules = PruneRules {
+            idle_for: std::time::Duration::ZERO,
+            failing_for: options.failing_for,
+        };
+        let mut destinations = self
+            .destinations
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The in-memory rows do not say which rooms the queue is for: what is queued for a
+        // destination sharing no room counts as being for rooms this server has left.
+        let decisions: Vec<_> = destinations
+            .values()
+            .map(|d| {
+                let queued = d.pending_pdu_count + d.pending_edu_count;
+                decide(
+                    &DestinationFacts {
+                        server_name: d.server_name.clone(),
+                        shared_rooms: d.shared_rooms_count.unwrap_or(0),
+                        queued_pdus: d.pending_pdu_count,
+                        queued_edus: d.pending_edu_count,
+                        catching_up: d.catch_up_since.is_some(),
+                        rooms_behind_current: 0,
+                        rooms_behind_left: u64::from(queued > 0 || d.catch_up_since.is_some()),
+                        failing_since_ms: ms(&d.failing_since),
+                        last_attempt_ms: ms(&d.retry_last_at),
+                        last_success_ms: ms(&d.last_successful_at),
+                    },
+                    &rules,
+                    now_ms,
+                )
+            })
+            .collect();
+        if !options.dry_run {
+            for decision in decisions.iter().filter(|d| d.forget()) {
+                destinations.remove(&decision.server_name);
+            }
+        }
+        Ok(report(&decisions, options.dry_run))
     }
 }
 
