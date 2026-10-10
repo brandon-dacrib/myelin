@@ -51,7 +51,7 @@ use tokio::time::Instant;
 
 use crate::client::{ClientError, FederationClient};
 use crate::inbound::{PduError, verify_pdu};
-use crate::keys::DynRemoteKeyCache;
+use crate::keys::{DynRemoteKeyCache, WantedKey};
 
 /// Why a membership handshake this server started ([`join_room`], and the leave, knock and
 /// invite in `crate::outbound_membership`) could not complete. The messages name no handshake;
@@ -97,6 +97,66 @@ pub enum OutboundJoinError {
         #[source]
         source: PduError,
     },
+    /// The room's `m.room.create` event in the `state` did not verify, so the room cannot be
+    /// joined: nothing else in the snapshot can be authorised without it. Names the key it is
+    /// signed with and why it could not be verified -- typically a key the room's server
+    /// rotated out years ago and no longer publishes, and that no notary
+    /// (`federation.trusted_key_servers`) had either -- instead of the "state must hold
+    /// exactly one m.room.create" the room layer answered until 2026-10-10 once the create
+    /// event had been silently dropped with the rest of the unverifiable ones.
+    #[error(
+        "the room's m.room.create event, signed by {sender} with {key_id}, could not be \
+         verified, so the room cannot be joined through {destination}: {reason}"
+    )]
+    UnverifiedCreateEvent {
+        destination: String,
+        /// The server that signed it (the room's creator's).
+        sender: String,
+        /// The key id its signature names, or `?` when it carries none.
+        key_id: String,
+        /// Why: what the server and each notary answered for the key.
+        reason: String,
+    },
+}
+
+/// An event of a `send_join` answer that [`verify_array`] dropped, and why.
+#[derive(Debug)]
+pub struct DroppedEvent {
+    /// Its `type`, or `?`.
+    pub event_type: String,
+    /// The server of its `sender`, or `?`.
+    pub sender_server: String,
+    /// The key id its sender's signature names, or `?`.
+    pub key_id: String,
+    /// What failed.
+    pub failure: PduError,
+}
+
+/// What [`verify_array`] answered: the events that verified, in the answer's order, and the
+/// ones dropped.
+#[derive(Debug)]
+pub struct VerifiedArray {
+    /// Every event that verified, in the order it came.
+    pub events: Vec<Event>,
+    /// Every event that did not, with why.
+    pub dropped: Vec<DroppedEvent>,
+}
+
+impl VerifiedArray {
+    /// The error for a dropped `m.room.create` ([`OutboundJoinError::UnverifiedCreateEvent`]):
+    /// a join cannot proceed without it, and the reason should name the key, not the hole it
+    /// left in the state.
+    fn dropped_create_event(&self, destination: &str) -> Option<OutboundJoinError> {
+        self.dropped
+            .iter()
+            .find(|dropped| dropped.event_type == "m.room.create")
+            .map(|dropped| OutboundJoinError::UnverifiedCreateEvent {
+                destination: destination.to_owned(),
+                sender: dropped.sender_server.clone(),
+                key_id: dropped.key_id.clone(),
+                reason: dropped.failure.to_string(),
+            })
+    }
 }
 
 /// The verified result of successfully joining a room hosted by another server.
@@ -228,6 +288,11 @@ pub async fn join_room_with_content(
         &progress,
     )
     .await?;
+    if let Some(error) = state.dropped_create_event(destination) {
+        progress.finish();
+        return Err(error);
+    }
+    let state = state.events;
     let auth_chain = verify_array(
         &send_join_response.body,
         "auth_chain",
@@ -236,7 +301,8 @@ pub async fn join_room_with_content(
         destination,
         &progress,
     )
-    .await?;
+    .await?
+    .events;
     progress.finish();
     let members_omitted = send_join_response
         .body
@@ -710,6 +776,56 @@ fn sender_server(raw: &Value) -> &str {
         .unwrap_or("?")
 }
 
+/// The key id a raw event's signature by `server` names (the first, as [`verify_pdu`] checks
+/// it), if it carries one.
+fn signature_key_id(raw: &Value, server: &str) -> Option<String> {
+    raw.get("signatures")?
+        .get(server)?
+        .as_object()?
+        .keys()
+        .next()
+        .cloned()
+}
+
+/// The keys verifying `raw_events` will ask for ([`RemoteKeyCache::ensure_keys`]): each
+/// event's sender's signing key, valid at its `origin_server_ts`, and for a restricted join
+/// the authoriser's. An event that names neither a sender nor a key is left to
+/// [`verify_pdu`] to refuse.
+fn wanted_keys(raw_events: &[Value]) -> Vec<WantedKey> {
+    let mut wanted: Vec<WantedKey> = Vec::new();
+    for raw in raw_events {
+        let signed_at_ts = raw
+            .get("origin_server_ts")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let mut servers = vec![sender_server(raw).to_owned()];
+        if let Some(authoriser) = raw
+            .pointer("/content/join_authorised_via_users_server")
+            .and_then(Value::as_str)
+            .and_then(|user| user.split_once(':').map(|(_, server)| server.to_owned()))
+        {
+            servers.push(authoriser);
+        }
+        for server in servers {
+            if server == "?" {
+                continue;
+            }
+            let Some(key_id) = signature_key_id(raw, &server) else {
+                continue;
+            };
+            let key = WantedKey {
+                server_name: server,
+                key_id,
+                signed_at_ts,
+            };
+            if !wanted.contains(&key) {
+                wanted.push(key);
+            }
+        }
+    }
+    wanted
+}
+
 /// One event of a `send_join` answer through [`verify_pdu`], told to `progress`, and logged
 /// with its reason when it is dropped.
 async fn verify_one(
@@ -747,12 +863,15 @@ async fn verify_one(
 /// [`OutboundJoinError::UnverifiedEvent`] is kept for the one case that is not survivable: a
 /// snapshot in which nothing verified at all.
 ///
-/// The events are grouped by their sender's server and the groups verified
-/// [`JOIN_VERIFY_CONCURRENCY`] at a time (see that constant), and what verified is answered in
-/// the order it came, since the caller's auth chain is ordered. Until 2026-10-10 the events
-/// were verified one after another, and a large room's snapshot, citing thousands of servers,
-/// took hours. `progress` is told of every event, and reports every
-/// [`JOIN_VERIFY_PROGRESS_INTERVAL`] while this runs.
+/// The keys every event will need are fetched first, in one pass
+/// ([`RemoteKeyCache::ensure_keys`]): the servers [`JOIN_VERIFY_CONCURRENCY`] at a time and,
+/// for the keys they do not publish, the notaries once for the whole batch. Then the events
+/// are grouped by their sender's server and the groups verified [`JOIN_VERIFY_CONCURRENCY`]
+/// at a time (see that constant), each lookup now a cache hit or an immediate refusal, and
+/// what verified is answered in the order it came, since the caller's auth chain is ordered.
+/// Until 2026-10-10 the events were verified one after another, and a large room's snapshot,
+/// citing thousands of servers, took hours. `progress` is told of every event, and reports
+/// every [`JOIN_VERIFY_PROGRESS_INTERVAL`] while this runs.
 async fn verify_array(
     body: &Value,
     field: &'static str,
@@ -760,7 +879,7 @@ async fn verify_array(
     key_cache: &DynRemoteKeyCache,
     destination: &str,
     progress: &VerifyProgress,
-) -> Result<Vec<Event>, OutboundJoinError> {
+) -> Result<VerifiedArray, OutboundJoinError> {
     let raw_events = body.get(field).and_then(Value::as_array).ok_or_else(|| {
         OutboundJoinError::MalformedResponse(
             destination.to_owned(),
@@ -768,6 +887,29 @@ async fn verify_array(
         )
     })?;
     let total = raw_events.len();
+    let mut ticker = tokio::time::interval_at(
+        Instant::now() + JOIN_VERIFY_PROGRESS_INTERVAL,
+        JOIN_VERIFY_PROGRESS_INTERVAL,
+    );
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    {
+        let wanted = wanted_keys(raw_events);
+        tracing::debug!(
+            destination,
+            field,
+            events = total,
+            keys = wanted.len(),
+            "fetching the keys a send_join answer's events are signed with"
+        );
+        let prefetch = key_cache.ensure_keys(&wanted);
+        let mut prefetch = std::pin::pin!(prefetch);
+        loop {
+            tokio::select! {
+                () = &mut prefetch => break,
+                _ = ticker.tick() => progress.report(field, total),
+            }
+        }
+    }
     // The events of each server, in the answer's order, the servers in order of first
     // appearance.
     let mut groups: Vec<Vec<usize>> = Vec::new();
@@ -800,11 +942,6 @@ async fn verify_array(
         .map(verify_group)
         .buffer_unordered(JOIN_VERIFY_CONCURRENCY);
     let mut results = std::pin::pin!(results);
-    let mut ticker = tokio::time::interval_at(
-        Instant::now() + JOIN_VERIFY_PROGRESS_INTERVAL,
-        JOIN_VERIFY_PROGRESS_INTERVAL,
-    );
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let mut outcomes: Vec<Option<Result<Event, PduError>>> = (0..total).map(|_| None).collect();
     loop {
@@ -821,24 +958,38 @@ async fn verify_array(
         }
     }
     let mut verified = Vec::with_capacity(total);
-    let mut first_failure: Option<PduError> = None;
-    for outcome in outcomes.into_iter().flatten() {
+    let mut dropped: Vec<DroppedEvent> = Vec::new();
+    for (raw, outcome) in raw_events.iter().zip(outcomes) {
         match outcome {
-            Ok(event) => verified.push(event),
-            Err(failure) => {
-                first_failure.get_or_insert(failure);
+            Some(Ok(event)) => verified.push(event),
+            Some(Err(failure)) => {
+                let sender_server = sender_server(raw).to_owned();
+                dropped.push(DroppedEvent {
+                    event_type: raw
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("?")
+                        .to_owned(),
+                    key_id: signature_key_id(raw, &sender_server).unwrap_or_else(|| "?".to_owned()),
+                    sender_server,
+                    failure,
+                });
             }
+            None => {}
         }
     }
     if verified.is_empty()
-        && let Some(source) = first_failure
+        && let Some(first) = dropped.pop()
     {
         return Err(OutboundJoinError::UnverifiedEvent {
             destination: destination.to_owned(),
-            source,
+            source: first.failure,
         });
     }
-    Ok(verified)
+    Ok(VerifiedArray {
+        events: verified,
+        dropped,
+    })
 }
 
 #[cfg(test)]
@@ -1485,8 +1636,12 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0].event_id().as_str(), event_id_of(&good));
+        assert_eq!(kept.events.len(), 1);
+        assert_eq!(kept.events[0].event_id().as_str(), event_id_of(&good));
+        assert_eq!(kept.dropped.len(), 1);
+        assert_eq!(kept.dropped[0].event_type, "m.room.name");
+        assert_eq!(kept.dropped[0].sender_server, "resident.example.org");
+        assert_eq!(kept.dropped[0].key_id, "?");
 
         assert_eq!(progress.counts(), (1, 1));
 
@@ -1518,6 +1673,7 @@ mod tests {
             )
             .await
             .unwrap()
+            .events
             .is_empty()
         );
     }
@@ -1629,7 +1785,8 @@ mod tests {
             &progress,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .events;
         let elapsed = started.elapsed();
         progress.finish();
 
@@ -1689,7 +1846,8 @@ mod tests {
             &progress,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .events;
         let kept_ids: Vec<String> = kept.iter().map(|e| e.event_id().to_string()).collect();
         assert_eq!(kept_ids, expected);
         assert_eq!(progress.counts(), (30, 0));
@@ -1731,7 +1889,8 @@ mod tests {
             &progress,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .events;
         assert_eq!(kept.len(), 1);
         assert_eq!(progress.counts(), (1, JOIN_VERIFY_CONCURRENCY * 3));
         assert_eq!(started.elapsed(), crate::keys::DEFAULT_KEY_FETCH_TIMEOUT);

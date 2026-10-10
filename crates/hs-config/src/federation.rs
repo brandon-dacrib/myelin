@@ -1,6 +1,8 @@
 //! Federation policy: reachability rules, allow/deny lists and outbound
 //! transport tuning. Read at startup; see [`crate::reload`] for what a running server re-reads.
 
+use std::collections::BTreeMap;
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +21,10 @@ fn default_max_retry_backoff() -> Duration {
     Duration::from_mins(60)
 }
 
+fn default_key_fetch_timeout() -> Duration {
+    Duration::from_secs(10)
+}
+
 const fn default_max_queued_pdus_per_destination() -> u32 {
     10_000
 }
@@ -29,6 +35,37 @@ const fn default_max_queued_durable_edus_per_destination() -> u32 {
 
 fn default_forget_unused_destinations_after() -> Duration {
     Duration::from_secs(7 * 24 * 60 * 60)
+}
+
+/// The notary key matrix.org publishes for its notary answers (`ed25519:auto`), as Synapse's
+/// own default `trusted_key_servers` spells it (`synapse/config/key.py`).
+pub const MATRIX_ORG_NOTARY_KEY_ID: &str = "ed25519:auto";
+/// See [`MATRIX_ORG_NOTARY_KEY_ID`].
+pub const MATRIX_ORG_NOTARY_KEY: &str = "Noi6WqcDj0QmPxCNQqgezwTlBKrfqehY1u2FyWP9uYw";
+
+fn default_trusted_key_servers() -> Vec<TrustedKeyServer> {
+    vec![TrustedKeyServer {
+        server_name: "matrix.org".to_owned(),
+        verify_keys: BTreeMap::from([(
+            MATRIX_ORG_NOTARY_KEY_ID.to_owned(),
+            MATRIX_ORG_NOTARY_KEY.to_owned(),
+        )]),
+    }]
+}
+
+/// A notary (Synapse: "trusted key server", "perspectives server") this server asks for
+/// another server's signing keys when that server no longer publishes them, and the keys the
+/// notary's answers must be signed with. See [`FederationConfig::trusted_key_servers`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TrustedKeyServer {
+    /// The notary's server name (`matrix.org`).
+    pub server_name: String,
+    /// The notary's own verify keys, `key_id` (`ed25519:auto`) to the base64 public key, as
+    /// `GET /_matrix/key/v2/server` on the notary publishes them. An answer not signed by one
+    /// of these is refused: without them a notary's answer is only as trustworthy as the
+    /// connection it came over. At least one.
+    pub verify_keys: BTreeMap<String, String>,
 }
 
 fn default_ip_range_blocklist() -> Vec<String> {
@@ -136,6 +173,15 @@ pub struct FederationConfig {
     #[serde(default = "default_max_retry_backoff")]
     pub max_retry_backoff: Duration,
 
+    /// How long one fetch of another server's signing keys (its `/_matrix/key/v2/server`, or
+    /// one query of a notary) may take, connecting and answering together, before it is given
+    /// up and the server is left alone for a while (a minute, doubling to an hour while it
+    /// keeps failing). Shorter than `client_timeout` on purpose: a room's events cite many
+    /// servers, some gone for good, and each gone server costs one of these while a join or a
+    /// backfill verifies them. Synapse asks with 10 s too. A change applies to the next fetch.
+    #[serde(default = "default_key_fetch_timeout")]
+    pub key_fetch_timeout: Duration,
+
     /// How many events the outbound queue holds for one destination before it is dropped and
     /// the destination, once it answers again, is caught up with the latest event of each room
     /// it is behind in instead (it fetches the rest itself). Bounds what a server that is down
@@ -180,6 +226,22 @@ pub struct FederationConfig {
     /// `allow_device_name_lookup_over_federation`.
     #[serde(default)]
     pub allow_device_name_lookup_over_federation: bool,
+
+    /// Notaries this server asks for another server's signing keys when that server does not
+    /// publish them any more, or cannot be reached. A room that has existed for years has its
+    /// creation and early state signed with keys its server has since rotated out, and most
+    /// servers do not publish their retired keys; without a notary, which keeps every key it
+    /// has ever fetched, such a room cannot be joined (the key the `m.room.create` event is
+    /// signed with cannot be found). Each notary's answer must be signed by one of the
+    /// `verify_keys` named for it and by the server the keys belong to, the Matrix
+    /// specification's rule for notary answers.
+    ///
+    /// Defaults to matrix.org with its published notary key, as Synapse does. An empty list
+    /// turns notary lookups off: a key the server itself does not publish is then not found.
+    /// Corresponds to Synapse's `trusted_key_servers`. A change applies to the running server
+    /// at once: the next key the server does not hold is asked of the new list.
+    #[serde(default = "default_trusted_key_servers")]
+    pub trusted_key_servers: Vec<TrustedKeyServer>,
 }
 
 impl Default for FederationConfig {
@@ -194,14 +256,28 @@ impl Default for FederationConfig {
             trust_os_root_store: false,
             client_timeout: default_client_timeout(),
             max_retry_backoff: default_max_retry_backoff(),
+            key_fetch_timeout: default_key_fetch_timeout(),
             max_queued_pdus_per_destination: default_max_queued_pdus_per_destination(),
             max_queued_durable_edus_per_destination:
                 default_max_queued_durable_edus_per_destination(),
             forget_unused_destinations_after: default_forget_unused_destinations_after(),
             allow_public_rooms_over_federation: false,
             allow_device_name_lookup_over_federation: false,
+            trusted_key_servers: default_trusted_key_servers(),
         }
     }
+}
+
+/// Whether `key` looks like an unpadded (or padded) standard-base64 Ed25519 public key: 32
+/// bytes, so 43 characters (44 with one `=`). The decode itself happens where the key is used
+/// (`hs-federation`); this catches a key pasted with its `ed25519:` prefix, a truncated one, or
+/// one in the URL-safe alphabet at configuration time.
+fn looks_like_base64_ed25519_key(key: &str) -> bool {
+    let unpadded = key.strip_suffix('=').unwrap_or(key);
+    unpadded.len() == 43
+        && unpadded
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
 }
 
 fn validate_cidr_list(prefix: &str, field: &str, list: &[String], errors: &mut ValidationErrors) {
@@ -263,6 +339,12 @@ impl Validate for FederationConfig {
         if self.client_timeout.is_zero() {
             errors.push(format!("{prefix}.client_timeout"), "must be greater than 0");
         }
+        if self.key_fetch_timeout.is_zero() {
+            errors.push(
+                format!("{prefix}.key_fetch_timeout"),
+                "must be greater than 0",
+            );
+        }
         if self.max_queued_pdus_per_destination == 0 {
             errors.push(
                 format!("{prefix}.max_queued_pdus_per_destination"),
@@ -274,6 +356,35 @@ impl Validate for FederationConfig {
                 format!("{prefix}.max_queued_durable_edus_per_destination"),
                 "must be at least 1",
             );
+        }
+        for (i, notary) in self.trusted_key_servers.iter().enumerate() {
+            let at = format!("{prefix}.trusted_key_servers[{i}]");
+            if notary.server_name.trim().is_empty() {
+                errors.push(format!("{at}.server_name"), "must not be empty");
+            }
+            if notary.verify_keys.is_empty() {
+                errors.push(
+                    format!("{at}.verify_keys"),
+                    "must name at least one of the notary's verify keys (`ed25519:<version>`: \
+                     base64 public key), as its /_matrix/key/v2/server publishes them; an \
+                     answer this server cannot check the signature of is worth nothing",
+                );
+            }
+            for (key_id, key) in &notary.verify_keys {
+                if !key_id.starts_with("ed25519:") || key_id.len() <= "ed25519:".len() {
+                    errors.push(
+                        format!("{at}.verify_keys.{key_id}"),
+                        "a key id is `ed25519:<version>`",
+                    );
+                }
+                if !looks_like_base64_ed25519_key(key) {
+                    errors.push(
+                        format!("{at}.verify_keys.{key_id}"),
+                        "the value is the base64 (standard alphabet, 43 characters) Ed25519 \
+                         public key, as the notary's /_matrix/key/v2/server publishes it",
+                    );
+                }
+            }
         }
     }
 }
@@ -349,6 +460,81 @@ mod tests {
         assert_eq!(
             errors.0[0].path,
             "federation.max_queued_durable_edus_per_destination"
+        );
+    }
+
+    #[test]
+    fn the_default_notary_is_matrix_org_with_its_published_key() {
+        let cfg = FederationConfig::default();
+        assert_eq!(cfg.trusted_key_servers.len(), 1);
+        let notary = &cfg.trusted_key_servers[0];
+        assert_eq!(notary.server_name, "matrix.org");
+        assert_eq!(
+            notary
+                .verify_keys
+                .get(MATRIX_ORG_NOTARY_KEY_ID)
+                .map(String::as_str),
+            Some(MATRIX_ORG_NOTARY_KEY)
+        );
+        let mut errors = ValidationErrors::new();
+        cfg.validate("federation", &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn an_empty_notary_list_turns_notary_lookups_off_and_is_valid() {
+        let cfg: FederationConfig =
+            serde_yaml_ng::from_str("trusted_key_servers: []").expect("parses");
+        assert!(cfg.trusted_key_servers.is_empty());
+        let mut errors = ValidationErrors::new();
+        cfg.validate("federation", &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn a_notary_without_keys_or_with_a_malformed_key_is_rejected() {
+        let cfg: FederationConfig = serde_yaml_ng::from_str(
+            "trusted_key_servers:\n\
+             \x20 - server_name: notary.example.org\n\
+             \x20   verify_keys: {}\n\
+             \x20 - server_name: \"\"\n\
+             \x20   verify_keys:\n\
+             \x20     \"auto\": \"not base64!\"\n\
+             \x20     \"ed25519:ok\": \"Noi6WqcDj0QmPxCNQqgezwTlBKrfqehY1u2FyWP9uYw\"\n",
+        )
+        .expect("parses");
+        let mut errors = ValidationErrors::new();
+        cfg.validate("federation", &mut errors);
+        let paths: Vec<&str> = errors.0.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "federation.trusted_key_servers[0].verify_keys",
+                "federation.trusted_key_servers[1].server_name",
+                "federation.trusted_key_servers[1].verify_keys.auto",
+                "federation.trusted_key_servers[1].verify_keys.auto",
+            ],
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn the_key_fetch_timeout_defaults_to_ten_seconds_and_must_not_be_zero() {
+        let cfg = FederationConfig::default();
+        assert_eq!(cfg.key_fetch_timeout, Duration::from_secs(10));
+        let cfg: FederationConfig =
+            serde_yaml_ng::from_str("key_fetch_timeout: 3s").expect("parses");
+        assert_eq!(cfg.key_fetch_timeout, Duration::from_secs(3));
+        let mut cfg = FederationConfig::default();
+        cfg.key_fetch_timeout = Duration::ZERO;
+        let mut errors = ValidationErrors::new();
+        cfg.validate("federation", &mut errors);
+        assert!(
+            errors
+                .0
+                .iter()
+                .any(|e| e.path == "federation.key_fetch_timeout"),
+            "{errors:?}"
         );
     }
 
