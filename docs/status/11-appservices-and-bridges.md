@@ -1,6 +1,8 @@
 # Status: track 11, appservices and bridges
 
-Last updated: 2026-10-09, later (the manager says, in its log, which bridge bot device it
+Last updated: 2026-10-10 (the manager removes a bot device the bridge left behind after a crypto
+reset, decision 0041; the OTK-count warning on the demo is Synapse's behaviour; below); before
+that 2026-10-09, later (the manager says, in its log, which bridge bot device it
 cross-signed, and bridge offerings pin a release tag, decision 0037; both below); before that
 2026-10-08 (one bridge's slowness never delays another's delivery: the "does this
 user exist" question is asked by the bridge's own worker, and each bridge's queue is a gauge and a
@@ -22,6 +24,77 @@ manager) and an instance's Kubernetes objects say whose bridge they are; before 
 (who has signed in to a bridge; the `cluster` runtime run on kind); before that 2026-09-30
 (ephemeral, to-device and device-list delivery); before that 2026-09-27 (RFC 0017 run against
 the real binary), 2026-09-27 (the bridge manager) and 2026-09-25.
+
+## Session 2026-10-10 (branch `agent/bridge-stale-devices`): a bot device the bridge left behind is removed; the OTK-count warning is Synapse's behaviour
+
+Seen on the demo the same day: after the 2026-10-09 crypto reset the WhatsApp bot had two
+devices, `BQBMQVR81T` (the reset's) and `BSLXZIVKIV` (2026-10-02's, dead). Clients encrypted room
+keys to both, the bridge dropped the dead one's ("targeted to someone else"), and a withheld key
+was logged for both. And on every transaction the bridge warned `Dropping OTK counts targeted to
+someone else target_user_id=@brandon:...`.
+
+**Fix 1: the manager removes a bot's device the bridge left behind** (decision 0041).
+
+- **The signal is real now.** `hs-auth`'s middleware writes a device's `last_seen_ts` and
+  `last_seen_ip` when an appservice acts as it (`device_id` / `org.matrix.msc3202.device_id`),
+  at most once a minute (`APPSERVICE_DEVICE_SEEN_EVERY_MS`). Before, an appservice device kept
+  the time it was made (the demo's two times, 2026-10-02 21:08 and 2026-10-09 15:12 UTC, are the
+  two creations). Test: `a_device_an_appservice_acts_as_is_recorded_as_seen_at_most_once_a_minute`.
+- **The rule** (`hs_bridges::manager::bot_devices_plan`, pure): the device in use is the bot's
+  device with keys (in `/keys/query`) seen last; a tie or no time means nothing is removed.
+  Another device is left behind when it was last seen before that one and at least
+  `STALE_BOT_DEVICE_MS` (a day) ago; a device without a time is never removed; the device in use
+  never is, whatever its age.
+- **The removal** (`settle_bot_devices`, called from `settle_bot_identity` after signing, so every
+  minute once settled; skipped with no `/devices` call while no device has keys):
+  `GET /devices?user_id=<bot>` then `DELETE /devices/{id}?user_id=<bot>` with the instance's
+  token (MSC4190 skips user-interactive auth; the server deletes the device's keys and records a
+  device-list change). `MatrixClient::devices` and `MatrixClient::delete_device` (404 is fine).
+  A failure is the instance's reason under the identity's prefix.
+- **Observable.** One `INFO` line per removal: `removed a device the bridge bot no longer uses
+  (the bridge moved on to a newer one) bridge_type=... owner=... appservice=whatsapp-brandon
+  bot=@whatsappbot_brandon:... device=BSLXZIVKIV last_seen=2026-10-02T21:08:21.162Z
+  kept_device=BQBMQVR81T`. The row keeps the last five (`InstanceRow::removed_bot_devices`,
+  `RemovedBotDevice`); the admin API serves them as `BridgeInstance.removed_bot_devices` (schema
+  `RemovedBotDevice`, OpenAPI 0.1.13, `hs-admin` model `AdminRemovedBotDevice`).
+  `signed_bot_device` is now the device in use when there is one.
+- **Which device a withheld key was for.** `KeyWithheld` already carried `to_device_id`; the
+  pages did not show it. The offering page's next steps (`InstanceNextSteps`, now also in the
+  signed-in phase, through `BotDeviceNotes`) name the device, say when it is not the one the
+  bridge uses and whether the server removed it, and list the removed devices; the appservice
+  page's withheld line names the device.
+- Tests (manager's fake server, which now answers `GET /devices` and `DELETE /devices/{id}`):
+  `a_device_the_bridge_left_behind_after_a_reset_is_removed_and_the_one_in_use_kept` (the demo's
+  two devices and times; the calls, the fake's devices and keys, the row, the admin view, the log
+  line, and a second look that removes nothing),
+  `a_bots_older_device_is_kept_until_a_day_unseen_and_the_device_in_use_never_removed`,
+  `the_device_in_use_is_the_one_with_keys_seen_last_and_the_rest_wait_a_day`; the four existing
+  identity tests now expect the `GET devices` call. Web: three new `InstanceNextSteps` tests.
+
+**Fix 2: the OTK-count warning is expected.** The demo's registration claims the owner
+non-exclusively (double puppeting). Synapse sends MSC3202 counts for the sender, every local
+member of the transaction's rooms that `ApplicationService.is_interested_in_user` matches (any
+user namespace, exclusive or not), and to-device recipients
+(`synapse/appservice/scheduler.py` `_compute_msc3202_otk_counts_and_fallback_keys`,
+`get_app_service_users_in_room`; read for behaviour, nothing copied). Both our pumps pick the same
+users (`hs-appservice` `pump.rs` and `ephemeral.rs`, through `Interest::user`). No change to
+behaviour; a comment at the selection and the test
+`the_counts_cover_a_user_claimed_non_exclusively_as_synapse_does` say so. The bridge's warning
+for the owner's devices would appear against Synapse too.
+
+Verified: `cargo fmt --all --check`; `cargo clippy --workspace --all-targets -- -D warnings`;
+`cargo test -p hs-bridges -p hs-appservice -p hs-auth -p hs-admin` (831 passed);
+`cargo test -p hs-e2e`, `-p hs-cli --test auth_sessions --test appservice_ephemeral`,
+`-p hs-bridge-conformance --test conformance`; `npm run check` in `web/` (648 tests). The real
+bridges (`cargo test -p hs-bridge-conformance --test real_mautrix_login`, Docker, the real `hs`
+binary, mautrix-whatsapp `v0.2609.0` and mautrix-signal): 5 of 5, and the encrypted story now
+also asserts the instance has no reason and `removed_bot_devices: []` after the manager's
+`GET /devices` against the real server. Not run against the real binary: an actual removal
+(it needs a device a day unseen; the `DELETE` route with MSC4190 and the key removal behind it
+are `hs-auth`'s and `hs-e2e`'s own tests).
+
+**Not on the demo yet**: it needs an image roll of this branch's merge. After it, expect
+`BSLXZIVKIV` removed on the manager's first look at the instance.
 
 ## Session 2026-10-09, later (branch `agent/bridge-sign-log`): the manager says which bot device it cross-signed
 
@@ -1512,6 +1585,11 @@ to anything broken.
 
 ## Interfaces provided
 
+- 2026-10-10: admin API `BridgeInstance.removed_bot_devices` (schema `RemovedBotDevice`, OpenAPI
+  0.1.13; `hs_admin::model::AdminRemovedBotDevice`); `hs_bridges::manager::{bot_devices_plan,
+  STALE_BOT_DEVICE_MS}`; `hs_bridges::matrix::MatrixClient::{devices, delete_device}`. Server
+  behaviour other tracks see: an appservice request acting as a device (`device_id`) updates that
+  device's `last_seen_ts`/`last_seen_ip`, at most once a minute (`hs-auth` middleware).
 - 2026-10-04: `hs_appservice::query::QueryService::{user_exists, room_alias_exists, protocols,
   thirdparty_lookup, set_metrics}`; `hs_appservice::client_routes::client_router` (mount under
   `/_matrix/client/v3` and `r0`); `hs_appservice::pump::{LocalUsers, Pump::with_user_queries}`;
@@ -1565,6 +1643,15 @@ to anything broken.
 
 ## Decisions made
 
+- **2026-10-10, decision 0041: the manager removes a bot's device the bridge left behind.** The
+  device in use is the bot's device with keys seen last (`last_seen_ts`, which the server now
+  writes when an appservice acts as a device); another device last seen before it and a day ago
+  is deleted through the instance's token (MSC4190). Never the device in use, never one without a
+  time, nothing on a tie.
+- **2026-10-10: MSC3202 key counts go to every user the registration claims, exclusive or not**,
+  as Synapse's `is_interested_in_user` does; a double-puppeting bridge's owner is one, and a
+  mautrix bridge's "Dropping OTK counts targeted to someone else" for the owner's devices is
+  expected, not a bug.
 - **2026-10-09, decision 0037: offerings pin a release tag.** No catalogue image says `latest`;
   `image_tag` blank or `latest` resolves to the pin; bumping a pin is a release step verified by
   the real-bridge story and recorded in `docs/bridges/mautrix.md`.

@@ -197,6 +197,67 @@ impl MatrixClient {
         }
     }
 
+    /// `user`'s devices as `GET /devices` lists them, asked as `user`: each device's id and its
+    /// `last_seen_ts` (when the device was made, or last acted as with `device_id`
+    /// masquerading).
+    ///
+    /// # Errors
+    /// On failure.
+    pub async fn devices(
+        &self,
+        token: &str,
+        user: &str,
+    ) -> Result<Vec<(String, Option<u64>)>, MatrixError> {
+        let answer = self
+            .call(
+                reqwest::Method::GET,
+                self.url(&["devices"], Some(user)),
+                token,
+                None,
+                "devices",
+            )
+            .await?;
+        Ok(answer["devices"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|d| {
+                let id = d["device_id"].as_str()?.to_owned();
+                Some((id, d["last_seen_ts"].as_u64()))
+            })
+            .collect())
+    }
+
+    /// Deletes `user`'s device `device_id` as the appservice, which this server lets do without
+    /// user-interactive auth when the registration enables MSC4190; one already gone is fine.
+    /// The server removes the device's keys with it and tells the users who share a room with
+    /// `user` that its device list changed.
+    ///
+    /// # Errors
+    /// On any other failure, including a `401` asking for user-interactive auth from a
+    /// registration without MSC4190.
+    pub async fn delete_device(
+        &self,
+        token: &str,
+        user: &str,
+        device_id: &str,
+    ) -> Result<(), MatrixError> {
+        let result = self
+            .call(
+                reqwest::Method::DELETE,
+                self.url(&["devices", device_id], Some(user)),
+                token,
+                Some(json!({})),
+                "delete device",
+            )
+            .await;
+        match result {
+            Err(e) if e.status == 404 => Ok(()), // gone already
+            other => other.map(|_| ()),
+        }
+    }
+
     /// Joins `room_id` as `user`.
     ///
     /// # Errors

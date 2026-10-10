@@ -817,6 +817,24 @@ pub struct BridgeInstance {
     /// then answers the person that their message was not bridged.
     #[serde(default)]
     pub last_key_withheld: Option<AdminKeyWithheld>,
+    /// The bot's devices the manager removed because the bridge had moved on to a newer one (a
+    /// reset crypto store leaves the old device registered, and clients go on encrypting room
+    /// keys to it), newest last; the last few only.
+    #[serde(default)]
+    pub removed_bot_devices: Vec<AdminRemovedBotDevice>,
+}
+
+/// The OpenAPI `RemovedBotDevice` schema: a bridge bot's device the bridge manager removed.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AdminRemovedBotDevice {
+    /// The removed device.
+    pub device_id: String,
+    /// When the manager removed it. RFC 3339 millisecond-precision UTC.
+    pub removed_at: String,
+    /// When the server had last seen the device in use (or made it), if it knew.
+    pub last_seen_at: Option<String>,
+    /// The bot's device the bridge uses, which the manager kept.
+    pub kept_device: String,
 }
 
 /// The OpenAPI `KeyWithheld` schema: the last `m.room_key.withheld` an appservice was sent.

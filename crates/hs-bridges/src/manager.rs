@@ -65,6 +65,11 @@ const TICK: Duration = Duration::from_secs(3);
 /// How often a ready instance whose bot device is signed has its bot's keys looked at again,
 /// for a device the bridge made since (a reset database): one `/keys/query` over loopback.
 const IDENTITY_RECHECK_MS: u64 = 60_000;
+/// How long a bot's device must have gone unseen, while a newer device of the same bot with
+/// keys is in use, before the manager removes it ([`bot_devices_plan`]). A day: a bridge that
+/// is merely quiet keeps its device (the device in use is never removed whatever its age), and
+/// one left behind by a reset stops drawing clients' room keys the next day.
+pub const STALE_BOT_DEVICE_MS: u64 = 24 * 60 * 60 * 1000;
 /// The start of the reason [`BridgeManager::settle_bot_identity`] leaves on a row when it
 /// cannot, so that its next success clears only its own.
 const IDENTITY_REASON: &str = "the bot's cross-signing";
@@ -700,6 +705,16 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             ),
             signed_bot_device: row.signed_bot_device.clone(),
             last_key_withheld: health.and_then(|h| h.last_key_withheld),
+            removed_bot_devices: row
+                .removed_bot_devices
+                .iter()
+                .map(|d| hs_admin::model::AdminRemovedBotDevice {
+                    device_id: d.device_id.clone(),
+                    removed_at: rfc3339(d.removed_at_ms),
+                    last_seen_at: d.last_seen_ms.map(rfc3339),
+                    kept_device: d.kept_device.clone(),
+                })
+                .collect(),
         }
     }
 
@@ -1265,7 +1280,12 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             );
             signed_now = Some(device_id.clone());
         }
-        let signed = signed_now.or(already_signed);
+        // Every device with keys is signed now. The one the bridge uses is the one the instance
+        // names; the ones it left behind are removed.
+        let in_use = self
+            .settle_bot_devices(row, &client, &token, &bot, &devices, now)
+            .await?;
+        let signed = in_use.or(signed_now).or(already_signed);
         self.identity_checked_ms
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1282,6 +1302,81 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
                 });
         }
         Ok(())
+    }
+
+    /// Removes the bot's devices the bridge left behind, and returns the one it uses.
+    ///
+    /// A bridge whose crypto store is reset (or whose database is) makes a new device and
+    /// leaves the old one registered, with its keys: clients go on encrypting room keys to it,
+    /// the bridge drops what arrives for it ("targeted to someone else"), and a client that
+    /// withholds keys withholds them from both. The rule ([`bot_devices_plan`]): the device in
+    /// use is the bot's device with keys that the server saw last (`GET /devices`'s
+    /// `last_seen_ts`, written when an appservice acts as the device and when the device is
+    /// made); any other device last seen before it and not for [`STALE_BOT_DEVICE_MS`] is
+    /// removed, through the instance's own token (`DELETE /devices/{id}`, which MSC4190 lets
+    /// an appservice do without user-interactive auth; the server removes the device's keys
+    /// and tells the bot's rooms). The device in use is never removed, nor is a device the
+    /// server has no time for, and nothing is removed when two devices were seen at the same
+    /// moment. Each removal is logged at `INFO` with the instance, the bot, the device and the
+    /// device kept, and recorded on the row for the admin API.
+    async fn settle_bot_devices(
+        &self,
+        row: &InstanceRow,
+        client: &MatrixClient,
+        token: &str,
+        bot: &str,
+        keyed: &serde_json::Map<String, Value>,
+        now: u64,
+    ) -> Result<Option<String>, String> {
+        let with_keys: Vec<&str> = keyed
+            .iter()
+            .filter(|(_, keys)| keys.get("keys").is_some())
+            .map(|(id, _)| id.as_str())
+            .collect();
+        if with_keys.is_empty() {
+            return Ok(None); // no device in use yet, so none left behind
+        }
+        let listed = client
+            .devices(token, bot)
+            .await
+            .map_err(|e| format!("could not list the bot's devices: {e}"))?;
+        let Some((in_use, stale)) = bot_devices_plan(&listed, &with_keys, now) else {
+            return Ok(None);
+        };
+        for (device_id, last_seen) in stale {
+            client
+                .delete_device(token, bot, &device_id)
+                .await
+                .map_err(|e| format!("could not remove the bot's old device {device_id}: {e}"))?;
+            tracing::info!(
+                bridge_type = %row.bridge_type,
+                owner = %row.owner,
+                appservice = %row.appservice_id.as_deref().unwrap_or_default(),
+                bot = %bot,
+                device = %device_id,
+                last_seen = %rfc3339(last_seen),
+                kept_device = %in_use,
+                "removed a device the bridge bot no longer uses (the bridge moved on to a newer one)"
+            );
+            let removed = crate::store::RemovedBotDevice {
+                device_id,
+                removed_at_ms: now,
+                last_seen_ms: Some(last_seen),
+                kept_device: in_use.clone(),
+            };
+            let _ = self
+                .store
+                .update_instance(&row.bridge_type, &row.owner, |r| {
+                    r.removed_bot_devices.push(removed.clone());
+                    let over = r
+                        .removed_bot_devices
+                        .len()
+                        .saturating_sub(crate::store::REMOVED_BOT_DEVICES_KEPT);
+                    r.removed_bot_devices.drain(..over);
+                    true
+                });
+        }
+        Ok(Some(in_use))
     }
 
     fn set_state(&self, row: &InstanceRow, state: InstanceState, reason: Option<String>) {
@@ -1998,6 +2093,44 @@ pub fn registration_fingerprint(registration: &Value) -> String {
     hex::encode(&Sha256::digest(canonical.as_bytes())[..8])
 }
 
+/// Which of a bot's devices the bridge uses, and which it left behind.
+///
+/// `listed` is the bot's devices with their `last_seen_ts` (`GET /devices`), `with_keys` the ids
+/// of those with device keys published (`/keys/query`). The device in use is the device with
+/// keys seen last; `None` when no device with keys has a time, or when two share the latest
+/// (nothing can be told apart then, so nothing is removed). Left behind: every other device
+/// last seen before the one in use and at least [`STALE_BOT_DEVICE_MS`] before `now`, with its
+/// last-seen time. A device without a time is never left behind; one without keys is, once a
+/// device with keys was seen after it (a device a reset made and abandoned before uploading
+/// any).
+#[must_use]
+pub fn bot_devices_plan(
+    listed: &[(String, Option<u64>)],
+    with_keys: &[&str],
+    now: u64,
+) -> Option<(String, Vec<(String, u64)>)> {
+    let mut seen_with_keys: Vec<(&str, u64)> = listed
+        .iter()
+        .filter(|(id, _)| with_keys.contains(&id.as_str()))
+        .filter_map(|(id, seen)| seen.map(|s| (id.as_str(), s)))
+        .collect();
+    seen_with_keys.sort_by_key(|(_, seen)| std::cmp::Reverse(*seen));
+    let (in_use, in_use_seen) = *seen_with_keys.first()?;
+    if seen_with_keys
+        .get(1)
+        .is_some_and(|(_, seen)| *seen == in_use_seen)
+    {
+        return None;
+    }
+    let stale = listed
+        .iter()
+        .filter(|(id, _)| id != in_use)
+        .filter_map(|(id, seen)| seen.map(|s| (id.clone(), s)))
+        .filter(|(_, seen)| *seen < in_use_seen && now.saturating_sub(*seen) >= STALE_BOT_DEVICE_MS)
+        .collect();
+    Some((in_use.to_owned(), stale))
+}
+
 pub(crate) fn owner_of(row: &InstanceRow) -> Option<&str> {
     (row.owner != SHARED_INSTANCE).then_some(row.owner.as_str())
 }
@@ -2353,6 +2486,7 @@ fn prefixed_commands_notice(name: &str, bot: &str, prefix: Option<&str>) -> (Str
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::Mutex;
 
     use hs_admin::model::BridgeDeployment;
@@ -3571,6 +3705,9 @@ mod tests {
         /// What `/keys/query` answers: `device_keys` and `master_keys`/`self_signing_keys` by
         /// user, kept up to date by the two upload routes the way the real server would.
         keys: Mutex<serde_json::Value>,
+        /// What `GET /devices` answers, by user: each device's `last_seen_ts`. `add_device`
+        /// makes one seen now; `DELETE /devices/{id}` removes it and its keys.
+        devices: Mutex<BTreeMap<String, BTreeMap<String, Option<u64>>>>,
     }
 
     impl FakeMatrix {
@@ -3587,6 +3724,31 @@ mod tests {
                 "keys": {format!("curve25519:{device_id}"): "c", format!("ed25519:{device_id}"): "e"},
                 "signatures": {user: {format!("ed25519:{device_id}"): "own"}},
             });
+            self.devices
+                .lock()
+                .unwrap()
+                .entry(user.to_owned())
+                .or_default()
+                .insert(device_id.to_owned(), Some(now_ms()));
+        }
+
+        /// Says `user`'s device was last seen at `ms`.
+        fn seen_at(&self, user: &str, device_id: &str, ms: Option<u64>) {
+            self.devices
+                .lock()
+                .unwrap()
+                .entry(user.to_owned())
+                .or_default()
+                .insert(device_id.to_owned(), ms);
+        }
+
+        fn device_ids(&self, user: &str) -> Vec<String> {
+            self.devices
+                .lock()
+                .unwrap()
+                .get(user)
+                .map(|d| d.keys().cloned().collect())
+                .unwrap_or_default()
         }
 
         fn keys(&self) -> serde_json::Value {
@@ -3684,6 +3846,42 @@ mod tests {
                 "m.direct" => ok(json!({})),
                 "register" => ok(json!({"user_id": "@x:example.org"})),
                 "keys/query" => ok(fake.keys()),
+                "devices" => {
+                    let devices: Vec<serde_json::Value> = fake
+                        .devices
+                        .lock()
+                        .unwrap()
+                        .get(&as_user)
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|(id, seen)| json!({"device_id": id, "last_seen_ts": seen}))
+                        .collect();
+                    ok(json!({"devices": devices}))
+                }
+                s if method == Method::DELETE && s.starts_with("devices/") => {
+                    let id = s.trim_start_matches("devices/");
+                    let gone = fake
+                        .devices
+                        .lock()
+                        .unwrap()
+                        .get_mut(&as_user)
+                        .and_then(|d| d.remove(id))
+                        .is_none();
+                    if gone {
+                        return (
+                            StatusCode::NOT_FOUND,
+                            axum::Json(json!({"errcode": "M_NOT_FOUND"})),
+                        );
+                    }
+                    if let Some(keys) = fake.keys.lock().unwrap()["device_keys"]
+                        .get_mut(&as_user)
+                        .and_then(serde_json::Value::as_object_mut)
+                    {
+                        keys.remove(id);
+                    }
+                    ok(json!({}))
+                }
                 "keys/device_signing/upload" => {
                     let mut keys = fake.keys.lock().unwrap();
                     keys["master_keys"][as_user.clone()] = body["master_key"].clone();
@@ -3823,6 +4021,7 @@ mod tests {
                 format!("POST keys/query as={BOT}"),
                 format!("POST keys/device_signing/upload as={BOT}"),
                 format!("POST keys/signatures/upload as={BOT}"),
+                format!("GET devices as={BOT}"),
             ]
         );
         let row = row_of(&manager);
@@ -3876,6 +4075,7 @@ mod tests {
             vec![
                 format!("POST keys/query as={BOT}"),
                 format!("POST keys/signatures/upload as={BOT}"),
+                format!("GET devices as={BOT}"),
             ]
         );
         let keys = fake.keys();
@@ -3906,6 +4106,7 @@ mod tests {
                 format!("POST keys/query as={BOT}"),
                 format!("POST keys/device_signing/upload as={BOT}"),
                 format!("POST keys/signatures/upload as={BOT}"),
+                format!("GET devices as={BOT}"),
             ],
             "the new identity replaces the old one (no user-interactive auth for an appservice), and the device is signed by it"
         );
@@ -3947,11 +4148,235 @@ mod tests {
             vec![
                 format!("POST keys/query as={BOT}"),
                 format!("POST keys/signatures/upload as={BOT}"),
+                format!("GET devices as={BOT}"),
             ]
         );
         assert_eq!(
             row_of(&manager).signed_bot_device.as_deref(),
             Some("LATEDEVICE")
+        );
+    }
+
+    const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+
+    /// The demo on 2026-10-10: the WhatsApp bridge's crypto reset of 2026-10-09 made the bot a
+    /// new device `BQBMQVR81T`, and its device from before, `BSLXZIVKIV`, stayed registered;
+    /// clients went on encrypting room keys to it and withholding keys from it. The manager
+    /// removes it, says so in the log and on the instance, and names the device in use.
+    #[tokio::test]
+    async fn a_device_the_bridge_left_behind_after_a_reset_is_removed_and_the_one_in_use_kept() {
+        let fake = Arc::new(FakeMatrix::default());
+        let now = now_ms();
+        fake.add_device(BOT, "BSLXZIVKIV");
+        fake.seen_at(BOT, "BSLXZIVKIV", Some(now - 8 * DAY_MS));
+        fake.add_device(BOT, "BQBMQVR81T");
+        fake.seen_at(BOT, "BQBMQVR81T", Some(now - DAY_MS));
+        let manager = ready_with_an_unsigned_bot(&fake).await;
+        let appservice_id = row_of(&manager).appservice_id.expect("an appservice id");
+        let log = LogSink::capture();
+
+        manager.tick().await;
+        let calls = fake.take_calls();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| c.starts_with("POST keys/signatures/upload"))
+                .count(),
+            2,
+            "both devices signed first: {calls:?}"
+        );
+        assert_eq!(
+            calls[calls.len() - 2..],
+            [
+                format!("GET devices as={BOT}"),
+                format!("DELETE devices/BSLXZIVKIV as={BOT}"),
+            ],
+            "the old device removed as the bot, through the instance's token"
+        );
+        assert_eq!(fake.device_ids(BOT), vec!["BQBMQVR81T".to_owned()]);
+        assert!(fake.keys()["device_keys"][BOT].get("BSLXZIVKIV").is_none());
+
+        let row = row_of(&manager);
+        assert_eq!(row.signed_bot_device.as_deref(), Some("BQBMQVR81T"));
+        assert!(row.reason.is_none(), "{:?}", row.reason);
+        assert_eq!(row.removed_bot_devices.len(), 1);
+        assert_eq!(row.removed_bot_devices[0].device_id, "BSLXZIVKIV");
+        assert_eq!(row.removed_bot_devices[0].kept_device, "BQBMQVR81T");
+        assert_eq!(
+            row.removed_bot_devices[0].last_seen_ms,
+            Some(now - 8 * DAY_MS)
+        );
+        let view = manager
+            .instance("mautrix-whatsapp", OWNER)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(view.signed_bot_device.as_deref(), Some("BQBMQVR81T"));
+        assert_eq!(view.removed_bot_devices.len(), 1);
+        assert_eq!(view.removed_bot_devices[0].device_id, "BSLXZIVKIV");
+        assert_eq!(view.removed_bot_devices[0].kept_device, "BQBMQVR81T");
+        assert!(view.removed_bot_devices[0].last_seen_at.is_some());
+
+        let removed = log.lines_with("removed a device the bridge bot no longer uses");
+        assert_eq!(removed.len(), 1, "{removed:?}");
+        for expected in [
+            "INFO".to_owned(),
+            format!("appservice={appservice_id}"),
+            format!("bot={BOT}"),
+            "device=BSLXZIVKIV".to_owned(),
+            "kept_device=BQBMQVR81T".to_owned(),
+            "bridge_type=mautrix-whatsapp".to_owned(),
+            format!("owner={OWNER}"),
+        ] {
+            assert!(
+                removed[0].contains(&expected),
+                "{expected} in {}",
+                removed[0]
+            );
+        }
+
+        // The next look finds nothing left behind: no removal, no line.
+        manager.identity_checked_ms.lock().unwrap().clear();
+        manager.tick().await;
+        assert_eq!(
+            fake.take_calls(),
+            vec![
+                format!("POST keys/query as={BOT}"),
+                format!("GET devices as={BOT}"),
+            ]
+        );
+        assert_eq!(
+            log.lines_with("removed a device the bridge bot no longer uses")
+                .len(),
+            1
+        );
+        assert_eq!(row_of(&manager).removed_bot_devices.len(), 1);
+    }
+
+    /// A device seen within the day is kept even when a newer one is in use (the bridge may
+    /// still be on it), and removed once it has gone a day unseen; a device the server has no
+    /// time for is never removed, nor the device in use however long the bridge was quiet.
+    #[tokio::test]
+    async fn a_bots_older_device_is_kept_until_a_day_unseen_and_the_device_in_use_never_removed() {
+        let fake = Arc::new(FakeMatrix::default());
+        let now = now_ms();
+        // The device in use, quiet for a month.
+        fake.add_device(BOT, "INUSE00001");
+        fake.seen_at(BOT, "INUSE00001", Some(now - 30 * DAY_MS));
+        // An older one, seen nearly a day before.
+        fake.add_device(BOT, "OLDER00001");
+        fake.seen_at(BOT, "OLDER00001", Some(now - 30 * DAY_MS - DAY_MS + 60_000));
+        // One the server has no time for.
+        fake.add_device(BOT, "NOTIME0001");
+        fake.seen_at(BOT, "NOTIME0001", None);
+        let manager = ready_with_an_unsigned_bot(&fake).await;
+
+        manager.tick().await;
+        // Both older ones are more than a day old: OLDER00001 goes, NOTIME0001 stays.
+        let calls = fake.take_calls();
+        assert!(
+            calls.contains(&format!("DELETE devices/OLDER00001 as={BOT}")),
+            "{calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.contains("NOTIME0001") && c.starts_with("DELETE"))
+        );
+        assert_eq!(
+            fake.device_ids(BOT),
+            vec!["INUSE00001".to_owned(), "NOTIME0001".to_owned()]
+        );
+        assert_eq!(
+            row_of(&manager).signed_bot_device.as_deref(),
+            Some("INUSE00001")
+        );
+
+        // A reset now: the new device is in use, the old one was seen just now (within the
+        // day), so it stays.
+        fake.seen_at(BOT, "INUSE00001", Some(now - 2 * 60 * 60 * 1000));
+        fake.add_device(BOT, "NEWDEVICE1");
+        manager.identity_checked_ms.lock().unwrap().clear();
+        manager.tick().await;
+        assert!(
+            !fake.take_calls().iter().any(|c| c.starts_with("DELETE")),
+            "a device seen within the day is kept"
+        );
+        assert_eq!(
+            row_of(&manager).signed_bot_device.as_deref(),
+            Some("NEWDEVICE1")
+        );
+        // A day later (as the server's times say): removed.
+        fake.seen_at(BOT, "INUSE00001", Some(now - DAY_MS - 1));
+        manager.identity_checked_ms.lock().unwrap().clear();
+        manager.tick().await;
+        assert!(
+            fake.take_calls()
+                .contains(&format!("DELETE devices/INUSE00001 as={BOT}"))
+        );
+        assert_eq!(
+            fake.device_ids(BOT),
+            vec!["NEWDEVICE1".to_owned(), "NOTIME0001".to_owned()]
+        );
+        let removed: Vec<String> = row_of(&manager)
+            .removed_bot_devices
+            .iter()
+            .map(|d| d.device_id.clone())
+            .collect();
+        assert_eq!(removed, vec!["OLDER00001", "INUSE00001"]);
+    }
+
+    #[test]
+    fn the_device_in_use_is_the_one_with_keys_seen_last_and_the_rest_wait_a_day() {
+        let now = 100 * DAY_MS;
+        let dev = |id: &str, seen: Option<u64>| (id.to_owned(), seen);
+
+        // One device, however old: in use, nothing removed.
+        assert_eq!(
+            bot_devices_plan(&[dev("A", Some(1))], &["A"], now),
+            Some(("A".to_owned(), vec![]))
+        );
+        // No device with keys, or none with a time: nothing in use, nothing removed.
+        assert_eq!(bot_devices_plan(&[dev("A", Some(1))], &[], now), None);
+        assert_eq!(bot_devices_plan(&[dev("A", None)], &["A"], now), None);
+        // Two seen at the same moment: cannot be told apart.
+        assert_eq!(
+            bot_devices_plan(&[dev("A", Some(5)), dev("B", Some(5))], &["A", "B"], now),
+            None
+        );
+        // A newer device without keys does not count as in use, and is not removed.
+        assert_eq!(
+            bot_devices_plan(
+                &[dev("OLD", Some(now - 9 * DAY_MS)), dev("NEW", Some(now))],
+                &["OLD"],
+                now
+            ),
+            Some(("OLD".to_owned(), vec![]))
+        );
+        // An older device without keys (made and abandoned) is removed once a day unseen.
+        assert_eq!(
+            bot_devices_plan(
+                &[dev("BARE", Some(now - 2 * DAY_MS)), dev("NEW", Some(now))],
+                &["NEW"],
+                now
+            ),
+            Some((
+                "NEW".to_owned(),
+                vec![("BARE".to_owned(), now - 2 * DAY_MS)]
+            ))
+        );
+        // Exactly a day unseen is enough; a millisecond less is not.
+        assert_eq!(
+            bot_devices_plan(
+                &[
+                    dev("A", Some(now - DAY_MS)),
+                    dev("B", Some(now - DAY_MS + 1)),
+                    dev("C", Some(now))
+                ],
+                &["A", "B", "C"],
+                now
+            ),
+            Some(("C".to_owned(), vec![("A".to_owned(), now - DAY_MS)]))
         );
     }
 
@@ -4069,7 +4494,9 @@ mod tests {
                 format!("POST keys/query as={BOT}"),
                 format!("POST keys/device_signing/upload as={BOT}"),
                 format!("POST keys/signatures/upload as={BOT}"),
+                format!("GET devices as={BOT}"),
                 format!("POST keys/query as={BOT}"),
+                format!("GET devices as={BOT}"),
             ]
         );
         assert_eq!(

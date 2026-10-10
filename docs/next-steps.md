@@ -56,6 +56,25 @@ restarts), `Bridge` Ready; signing key `ed25519:a_JBQV7r` unchanged; from outsid
    track 11: the manager should remove a bot's previous device after a reset (or the bridge
    page should offer it), and the bridge page should say which devices a client has withheld
    keys from (the health line exists; the device ids are in the log).
+   **Done on branch `agent/bridge-stale-devices` (2026-10-10, decision 0041), not on the demo
+   until an image roll:** the server now writes a device's `last_seen_ts` when an appservice
+   acts as it (`device_id` masquerading, at most once a minute), and the manager, on each look
+   at a ready bot, removes a bot device last seen before the bot's device with keys seen last and
+   a day ago (`DELETE /devices/{id}` with the instance's token, MSC4190), logging `removed a
+   device the bridge bot no longer uses ... device=BSLXZIVKIV kept_device=BQBMQVR81T` at `INFO`.
+   The admin API lists the removals (`BridgeInstance.removed_bot_devices`), and the offering
+   page says which device a withheld key was for and whether the bridge still uses it (the
+   appservice page names the device too). After the roll, expect `BSLXZIVKIV` (last seen
+   2026-10-02, made then; `BQBMQVR81T` made 2026-10-09) removed on the manager's first look.
+   Left: the owner's Element still needs the bot's session verified, or its "never send to
+   unverified sessions" setting off, for `m.unverified` to stop.
+   **The OTK-count warning** (`WRN Dropping OTK counts targeted to someone else
+   target_user_id=@brandon:...`, on every transaction): expected, not a bug. The registration
+   claims the owner non-exclusively for double puppeting, and Synapse sends MSC3202 counts for
+   every local member a registration's namespaces match, exclusive or not
+   (`_compute_msc3202_otk_counts_and_fallback_keys` → `get_app_service_users_in_room` →
+   `is_interested_in_user`); ours matches it, and a test now says so (`hs-appservice` pump,
+   `the_counts_cover_a_user_claimed_non_exclusively_as_synapse_does`).
 2. **The pinned bridge image did not reach the deployed instance.** Decision 0037 said the
    demo's WhatsApp instance rolls once to `v0.2609.0`; 75 min after the roll the `Bridge` spec
    and the pod still say `latest`, and the manager logged no "deployment changed". The manager

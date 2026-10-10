@@ -22,6 +22,19 @@ import { instanceStateBadge, instanceStateLabel } from "@/lib/bridge-offerings";
 import { withInlineCode } from "@/lib/inline-code";
 
 /**
+ * Whether the last withheld key was for a bot device the bridge no longer uses: one the server
+ * removed, or one other than the device the server cross-signed for the bridge. A bridge whose
+ * encryption was reset leaves its old device behind, and a chat app that withholds keys from
+ * the bridge withholds them from both.
+ */
+function withheldFromLeftBehind(instance: BridgeInstance): boolean {
+  const device = instance.last_key_withheld?.to_device_id;
+  if (!device) return false;
+  if ((instance.removed_bot_devices ?? []).some((d) => d.device_id === device)) return true;
+  return Boolean(instance.signed_bot_device) && device !== instance.signed_bot_device;
+}
+
+/**
  * What to do next about one person's bridge, written for the operator who will relay it (RFC
  * 0017 sections 4.1 and 4.2). While the bridge is on its way it says what is happening and that
  * the steps come when it is ready; once ready and not signed in, it names the person's own bot,
@@ -153,6 +166,7 @@ export function InstanceNextStepsBody({
             Signed in as <span className="font-identifier">{phase.as}</span>. Nothing left to do:{" "}
             {isSelf ? "your" : "their"} {name} chats arrive as rooms.
           </p>
+          <BotDeviceNotes instance={instance} />
         </div>
       );
     case "sign-in":
@@ -167,6 +181,55 @@ export function InstanceNextStepsBody({
         />
       );
   }
+}
+
+/**
+ * What the server knows about the bot's devices that the operator may need: the last time a
+ * chat app withheld a message's keys from the bridge (and from which device), and the devices
+ * the bridge left behind that the server removed.
+ */
+function BotDeviceNotes({ instance }: { instance: BridgeInstance }) {
+  const removedDevices = instance.removed_bot_devices ?? [];
+  return (
+    <>
+      {instance.last_key_withheld && (
+        <p
+          className="rounded-md border border-warning-border bg-warning-bg px-3 py-2 text-warning"
+          data-testid="key-withheld"
+        >
+          {new Date(instance.last_key_withheld.at).toLocaleString()}:{" "}
+          <span className="font-identifier">{instance.last_key_withheld.sender}</span>&apos;s chat
+          app refused to share a message&apos;s keys with the bridge&apos;s device{" "}
+          <span className="font-identifier">{instance.last_key_withheld.to_device_id}</span> (
+          <code className="font-identifier">{instance.last_key_withheld.code}</code>
+          {instance.last_key_withheld.reason ? `, ${instance.last_key_withheld.reason}` : ""}), so
+          the bridge could not read that message and said so in the chat.{" "}
+          {instance.last_key_withheld.code === "m.unverified"
+            ? instance.signed_bot_device
+              ? `The bot's device ${instance.signed_bot_device} has been cross-signed since; a chat app that excludes insecure devices shares keys with it once it has seen that, so a message sent again now should go through.`
+              : "The chat app excludes devices their owner has not cross-signed; the server is about to cross-sign the bot's device, after which a message sent again goes through."
+            : "That code is the chat app's own rule for the bridge's device; its encryption settings say which."}
+          {withheldFromLeftBehind(instance) &&
+            ` ${instance.last_key_withheld.to_device_id} is not the device the bridge uses${instance.signed_bot_device ? ` (${instance.signed_bot_device})` : ""}: the bridge left it behind when its encryption was reset, and the server ${removedDevices.some((d) => d.device_id === instance.last_key_withheld?.to_device_id) ? "has removed it" : "removes it once it has gone a day unseen"}, so chat apps stop sharing keys with it.`}
+        </p>
+      )}
+
+      {removedDevices.length > 0 && (
+        <p className="text-text-muted" data-testid="removed-bot-devices">
+          The server removed the bot&apos;s {removedDevices.length === 1 ? "device" : "devices"}{" "}
+          <span className="font-identifier">
+            {removedDevices.map((d) => d.device_id).join(", ")}
+          </span>
+          , which the bridge left behind when its encryption was reset (it uses{" "}
+          <span className="font-identifier">
+            {removedDevices[removedDevices.length - 1].kept_device}
+          </span>
+          ), so chat apps no longer encrypt messages&apos; keys to{" "}
+          {removedDevices.length === 1 ? "it" : "them"}.
+        </p>
+      )}
+    </>
+  );
 }
 
 function StateLine({ instance }: { instance: BridgeInstance }) {
@@ -313,24 +376,7 @@ function SignInSteps({
         </p>
       )}
 
-      {instance.last_key_withheld && (
-        <p
-          className="rounded-md border border-warning-border bg-warning-bg px-3 py-2 text-warning"
-          data-testid="key-withheld"
-        >
-          {new Date(instance.last_key_withheld.at).toLocaleString()}:{" "}
-          <span className="font-identifier">{instance.last_key_withheld.sender}</span>&apos;s chat
-          app refused to share a message&apos;s keys with the bridge (
-          <code className="font-identifier">{instance.last_key_withheld.code}</code>
-          {instance.last_key_withheld.reason ? `, ${instance.last_key_withheld.reason}` : ""}), so
-          the bridge could not read that message and said so in the chat.{" "}
-          {instance.last_key_withheld.code === "m.unverified"
-            ? instance.signed_bot_device
-              ? `The bot's device ${instance.signed_bot_device} has been cross-signed since; a chat app that excludes insecure devices shares keys with it once it has seen that, so a message sent again now should go through.`
-              : "The chat app excludes devices their owner has not cross-signed; the server is about to cross-sign the bot's device, after which a message sent again goes through."
-            : "That code is the chat app's own rule for the bridge's device; its encryption settings say which."}
-        </p>
-      )}
+      <BotDeviceNotes instance={instance} />
 
       {instance.signed_bot_device && !instance.last_key_withheld && (
         <p className="text-text-muted" data-testid="signed-bot-device">

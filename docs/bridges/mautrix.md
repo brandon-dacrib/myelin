@@ -434,6 +434,12 @@ demo it took one helper pod and no data loss beyond that:
    went `Ready`.
 4. People's clients see a new device for the bot; old encrypted messages to the bridge cannot
    be decrypted by it, new ones can.
+5. The old device stays registered until the manager removes it (since 2026-10-10, decision
+   0041): once the new device has been seen in use after it and the old one has gone a day
+   unseen, the manager deletes it with the instance's token, logs `removed a device the bridge
+   bot no longer uses ... device=<old> kept_device=<new>` at `INFO`, and the instance's
+   `removed_bot_devices` (the offering page) lists it. Until then clients go on encrypting to
+   it, and the bridge logs "Dropping to-device event targeted to someone else" for it.
 
 ## 2026-10-08: one bridge falling behind never holds up another, and each one's queue is a gauge
 

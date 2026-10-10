@@ -325,6 +325,10 @@ impl<B: KvBackend> Pump<B> {
                     && !transaction.events.is_empty()
                     && let Some(keys) = &self.keys
                 {
+                    // The bot and the room's members the registration claims, exclusively or
+                    // not, as Synapse picks them (`is_interested_in_user`): a double-puppeting
+                    // bridge's owner included, whose counts the bridge drops ("targeted to
+                    // someone else") as it would Synapse's.
                     let interest = listener.interest();
                     let mut users = BTreeSet::from([listener.bot_user_id.clone()]);
                     for event in &page.events {
@@ -719,6 +723,66 @@ mod tests {
                 "@ircbot:example.org": {"DEV-irc": {"signed_curve25519": 3}},
                 "@irc_bob:example.org": {"DEV-irc": {"signed_curve25519": 3}},
             }),
+            "{body}"
+        );
+    }
+
+    /// A user the registration claims non-exclusively (a bridge's owner, for double puppeting)
+    /// is one of its users, and their devices' counts go with the bot's: Synapse does the same
+    /// (`_compute_msc3202_otk_counts_and_fallback_keys` in `synapse/appservice/scheduler.py`
+    /// takes the sender and `get_app_service_users_in_room`, which filters the room's local
+    /// users by `ApplicationService.is_interested_in_user`, a match of any user namespace,
+    /// exclusive or not). A mautrix bridge logs "Dropping OTK counts targeted to someone else"
+    /// for the owner's devices on such a transaction; that is expected (the demo, 2026-10-10).
+    /// A member the registration does not claim gets nothing.
+    #[tokio::test]
+    async fn the_counts_cover_a_user_claimed_non_exclusively_as_synapse_does() {
+        struct Keys;
+        #[async_trait]
+        impl KeyCountSource for Keys {
+            async fn key_counts(
+                &self,
+                user_id: &str,
+            ) -> Result<Vec<crate::ephemeral::DeviceKeyCounts>, String> {
+                Ok(vec![crate::ephemeral::DeviceKeyCounts {
+                    device_id: format!("DEV-{}", &user_id[1..4]),
+                    one_time_keys: BTreeMap::from([("signed_curve25519".to_owned(), 7)]),
+                    unused_fallback_key_types: vec!["signed_curve25519".to_owned()],
+                }])
+            }
+        }
+        let double_puppeting = "id: wa\nurl: 'http://localhost:1'\nas_token: wa_as\n\
+            hs_token: wa_hs\nsender_localpart: whatsappbot\nnamespaces:\n  users:\n    \
+            - regex: '@whatsapp_.*:example\\.org'\n      exclusive: true\n    \
+            - regex: '@alice:example\\.org'\n      exclusive: false\n\
+            org.matrix.msc3202: true\n";
+        let (registry, rooms, pump) = setup(&[double_puppeting]);
+        let pump = pump.with_key_counts(Arc::new(Keys));
+        pump.start().await.unwrap();
+        rooms.join("!chat:example.org", "@alice:example.org");
+        rooms.join("!chat:example.org", "@carol:example.org");
+        rooms.join("!chat:example.org", "@whatsappbot:example.org");
+        rooms.say("!chat:example.org", "@carol:example.org", "hello");
+        pump.pump_room("!chat:example.org").await.unwrap();
+        let body = &registry.store().queue_for("wa").unwrap()[0].body;
+        let counted: Vec<&String> = body["device_one_time_keys_count"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect();
+        assert_eq!(
+            counted,
+            ["@alice:example.org", "@whatsappbot:example.org"],
+            "{body}"
+        );
+        let fallback: Vec<&String> = body["device_unused_fallback_key_types"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect();
+        assert_eq!(
+            fallback,
+            ["@alice:example.org", "@whatsappbot:example.org"],
             "{body}"
         );
     }
