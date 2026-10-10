@@ -108,7 +108,7 @@ pub const OPTIONS: &[KeyInfo] = &[
         key: "serve_server_wellknown",
         classification: Classification::MappedDiff,
         native: "`server.well_known_server`",
-        note: "Synapse takes a boolean and derives the advertised value from `server_name` itself (`host:443`, or `server_name` verbatim if it already names a port); the native field takes the advertised `host[:port]` directly instead. The translator (`crate::translate::derive_well_known_server`) reproduces Synapse's derivation exactly, so `serve_server_wellknown: true` is fully translated, not merely acknowledged. Unset means the route 404s (`crates/hs-cli/src/well_known.rs`).",
+        note: "Synapse takes a boolean and derives the advertised value from `server_name` itself (`host:443`, or `server_name` verbatim if it already names a port); the native field takes the advertised `host[:port]` directly instead. The translator (`crate::translate::derive_well_known_server`) reproduces Synapse's derivation exactly, so `serve_server_wellknown: true` is fully translated, not merely acknowledged. Unset, the native server derives the document from `server.public_baseurl` when that is an `https://` URL (decision 0040); the empty string turns it off (`crates/hs-cli/src/well_known.rs`).",
     },
     KeyInfo {
         key: "extra_well_known_client_content",

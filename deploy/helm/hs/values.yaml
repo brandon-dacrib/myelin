@@ -64,7 +64,12 @@ image:
 ## The Matrix server name (`server.server_name` in the generated hs-config). Required.
 serverName: ""
 
-## The externally reachable base URL, if different from `https://{serverName}`.
+## The externally reachable base URL, if different from `https://{serverName}`. Clients find the
+## server through the `/.well-known/matrix/client` document it publishes from this, and other
+## servers through `/.well-known/matrix/server`, derived from it as `host:port` (its port, or 443)
+## when it is an `https://` URL (decision 0040). Federation reached at a different host or port
+## is named with `server.well_known_server` under `extraConfig` (the empty string publishes no
+## server document).
 publicBaseUrl: ""
 
 ## Extra native `hs-config` top-level sections, rendered as additional keys alongside the

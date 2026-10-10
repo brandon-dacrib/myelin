@@ -22,22 +22,25 @@ pub struct ServerConfig {
 
     /// The address clients reach this server at (`https://matrix.example.org`), when it is not
     /// `https://` plus the server name. Clients find it through the `.well-known` document this
-    /// server serves when it is set, and links this server hands out use it. Corresponds to
+    /// server serves when it is set, and links this server hands out use it. When it is an
+    /// `https://` URL it also gives other servers their way in: `GET /.well-known/matrix/server`
+    /// advertises its host and port unless `well_known_server` says otherwise. Corresponds to
     /// Synapse's `public_baseurl`.
     #[serde(default)]
     pub public_baseurl: Option<String>,
 
-    /// The value this server advertises at `GET /.well-known/matrix/server`:
-    /// the `host[:port]` a remote server should actually connect to for
-    /// federation, when that differs from `server_name`. Corresponds to
-    /// Synapse's `serve_server_wellknown` plus the document Synapse serves
-    /// from it, collapsed into one field: `None` (the default) means the
-    /// route is not served at all — a deployment that does not delegate
-    /// should 404 there, not serve a document pointing at itself, since a
-    /// well-known that names the server name itself is indistinguishable
-    /// from no delegation and only adds a failure mode
-    /// (`crates/hs-federation/src/discovery.rs` implements the resolution
-    /// order this feeds).
+    /// The `host[:port]` other servers connect to for federation, published at
+    /// `GET /.well-known/matrix/server`. Unset (the default), it is derived from
+    /// `public_baseurl` when that is an `https://` URL: its host, and its port or 443
+    /// (`https://matrix.example.org` advertises `matrix.example.org:443`), so a server with a
+    /// public address can be found by other servers without further configuration. Set it when
+    /// federation is reached at a different host or port than clients use (`matrix.example.org:8448`
+    /// while clients use `https://example.org`); set it to the empty string to publish no
+    /// document (for example, when a reverse proxy serves one). Nothing is derived from an
+    /// `http://` base URL, since federation needs TLS, nor while `federation.enabled` is false.
+    /// Corresponds to Synapse's `serve_server_wellknown` plus the document Synapse serves from
+    /// it, collapsed into one field (`crates/hs-federation/src/discovery.rs` implements the
+    /// resolution order this feeds).
     #[serde(default)]
     pub well_known_server: Option<String>,
 
@@ -155,13 +158,10 @@ impl Validate for ServerConfig {
             );
         }
         if let Some(delegate) = &self.well_known_server {
+            // The empty string is a value: "publish no server document" (decision 0040), as
+            // opposed to unset, which derives one from `public_baseurl`.
             let trimmed = delegate.trim();
-            if trimmed.is_empty() {
-                errors.push(
-                    format!("{prefix}.well_known_server"),
-                    "must not be empty (omit the field to not delegate)",
-                );
-            } else if trimmed.contains("://") || trimmed.contains('/') {
+            if trimmed.contains("://") || trimmed.contains('/') {
                 errors.push(
                     format!("{prefix}.well_known_server"),
                     format!("{delegate:?} must be a host[:port], not a URL"),
@@ -227,6 +227,19 @@ mod tests {
         .validate("server", &mut errors);
         assert_eq!(errors.0.len(), 1);
         assert_eq!(errors.0[0].path, "server.well_known_server");
+    }
+
+    #[test]
+    fn accepts_an_empty_well_known_delegation_as_the_document_turned_off() {
+        let mut errors = ValidationErrors::new();
+        ServerConfig {
+            server_name: "example.org".into(),
+            public_baseurl: Some("https://matrix.example.org".into()),
+            well_known_server: Some(String::new()),
+            ..Default::default()
+        }
+        .validate("server", &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
     }
 
     #[test]

@@ -1,5 +1,42 @@
 # 12. Platform and Kubernetes
 
+## 2026-10-10 (branch `agent/well-known-default`): the server `.well-known` document is published by default
+
+Decision 0040, from finding 3 of the roll: a server with an `https://` `server.public_baseurl`
+and no `server.well_known_server` now answers `/.well-known/matrix/server` with the base URL's
+host and port (`myelin.dacrib.net:443` for the demo), so other servers can fetch its signing
+key. The demo gets it on its next roll with no value change.
+
+- `crates/hs-cli/src/well_known.rs`: `derive_server_document`, `ServerSource` (where the
+  value came from, or why none: derived, set, off, nothing to derive from, `http://`,
+  federation off). Explicit `well_known_server` wins; the empty string turns the document off;
+  `http://` derives nothing (federation needs TLS); `federation.enabled: false` derives
+  nothing. Recomputed on every `server` reload, like the client document.
+- `crates/hs-cli/src/serve.rs`: the boot line `publishing .well-known discovery documents`
+  and the reload line `the server settings are now in force` carry `server_source` /
+  `well_known_server_source`.
+- `crates/hs-config/src/server.rs`: the field's description says the default is derived and
+  when to set it (a different federation host or port); validation accepts the empty string.
+  `docs/config.md` and `web/src/test/fixtures/hs-config-schema.json` regenerated; `npm run
+  check` green (645 tests).
+- `docs/compat/synapse-config-table.md` and its mirror in `crates/hs-compat/src/classification.rs`
+  (one note string, track 13's crate): a translated `public_baseurl` publishes a server
+  document where Synapse's `serve_server_wellknown: false` default did not.
+- Chart: `values.yaml`'s `publicBaseUrl` comment, README "Federation and discovery",
+  `ci/install-smoke.sh` sets `public_baseurl` through the admin API after setup (the install
+  has no `publicBaseUrl`, so the port-forwarded setup link check stays) and checks both
+  documents through the port-forward it already has: `{"m.server":"matrix.smoke.invalid:443"}`.
+  Not yet run on kind from this branch (CD runs it on the next image).
+- Tests: 8 unit tests in `well_known.rs` (derived, explicit, disabled, http, federation off,
+  authority parsing incl. IPv6 and userinfo, every source's message), one in `hs-config`;
+  `crates/hs-cli/tests/well_known_server.rs` against the real binary: derived at boot with the
+  log line, follows a hot `public_baseurl` change, explicit wins, empty turns off, null derives
+  again, `http://` publishes the client document only, at boot and on reload.
+- Left: the Configuration page's text control turns an emptied field into `null` on blur, so
+  "off" (the empty string) cannot be typed there; API, file or `HS__SERVER__WELL_KNOWN_SERVER='""'`
+  can (track 16, if the page should offer it). A Federation page note that says when nobody
+  can reach this server (finding 3's last item) is not in this branch.
+
 ## 2026-10-10: the demo rolled to `87d57288` (revision 13) through the owner's kubectl proxy
 
 23 s to "Upgrade complete"; server and operator pods on `sha-87d57288…`, 0 restarts, the

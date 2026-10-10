@@ -353,7 +353,7 @@
           "x-applies": "bootstrap"
         },
         "public_baseurl": {
-          "description": "The address clients reach this server at (`https://matrix.example.org`), when it is not\n`https://` plus the server name. Clients find it through the `.well-known` document this\nserver serves when it is set, and links this server hands out use it. Corresponds to\nSynapse's `public_baseurl`.",
+          "description": "The address clients reach this server at (`https://matrix.example.org`), when it is not\n`https://` plus the server name. Clients find it through the `.well-known` document this\nserver serves when it is set, and links this server hands out use it. When it is an\n`https://` URL it also gives other servers their way in: `GET /.well-known/matrix/server`\nadvertises its host and port unless `well_known_server` says otherwise. Corresponds to\nSynapse's `public_baseurl`.",
           "type": [
             "string",
             "null"
@@ -362,7 +362,7 @@
           "x-applies": "hot"
         },
         "well_known_server": {
-          "description": "The value this server advertises at `GET /.well-known/matrix/server`:\nthe `host[:port]` a remote server should actually connect to for\nfederation, when that differs from `server_name`. Corresponds to\nSynapse's `serve_server_wellknown` plus the document Synapse serves\nfrom it, collapsed into one field: `None` (the default) means the\nroute is not served at all — a deployment that does not delegate\nshould 404 there, not serve a document pointing at itself, since a\nwell-known that names the server name itself is indistinguishable\nfrom no delegation and only adds a failure mode\n(`crates/hs-federation/src/discovery.rs` implements the resolution\norder this feeds).",
+          "description": "The `host[:port]` other servers connect to for federation, published at\n`GET /.well-known/matrix/server`. Unset (the default), it is derived from\n`public_baseurl` when that is an `https://` URL: its host, and its port or 443\n(`https://matrix.example.org` advertises `matrix.example.org:443`), so a server with a\npublic address can be found by other servers without further configuration. Set it when\nfederation is reached at a different host or port than clients use (`matrix.example.org:8448`\nwhile clients use `https://example.org`); set it to the empty string to publish no\ndocument (for example, when a reverse proxy serves one). Nothing is derived from an\n`http://` base URL, since federation needs TLS, nor while `federation.enabled` is false.\nCorresponds to Synapse's `serve_server_wellknown` plus the document Synapse serves from\nit, collapsed into one field (`crates/hs-federation/src/discovery.rs` implements the\nresolution order this feeds).",
           "type": [
             "string",
             "null"

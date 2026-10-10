@@ -46,7 +46,9 @@ restarts), `Bridge` Ready; signing key `ed25519:a_JBQV7r` unchanged; from outsid
    servers that could reach each other; the demo itself has never been reachable. Track 12:
    publish `m.server: myelin.dacrib.net:443`. `server.well_known_server` is a hot setting
    (`hs-config` `reload.rs`), so the owner can set it now on the Configuration page's server
-   section, or through the chart's `extraConfig`; a chart value next to `publicBaseUrl`, a
+   section, or through the chart's `extraConfig`. **Branch `agent/well-known-default`
+   (decision 0040): the document is derived from `server.public_baseurl` by default, so the
+   next roll publishes `myelin.dacrib.net:443` with no value change.** A chart value next to `publicBaseUrl`, a
    check in the install smoke, and a Federation page that says when nobody can reach this
    server are the durable fix.
 

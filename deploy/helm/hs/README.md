@@ -21,6 +21,21 @@ you mean to (`kubectl delete crd bridges.hs.matrix.org` deletes every bridge wit
 - The file is generated (`cargo run -p hs-operator --bin gen-crds` writes
   `files/crds/bridge.yaml` beside `deploy/crds/bridge.yaml`); do not edit it.
 
+## Federation and discovery
+
+With `publicBaseUrl` set to an `https://` address, the server publishes both discovery
+documents by default: `/.well-known/matrix/client` names the base URL for clients, and
+`/.well-known/matrix/server` names its host and port (`matrix.example.org:443` for
+`https://matrix.example.org`) for other servers, which is how they fetch this server's signing
+key (decision 0040; the demo spent a day answered `401 Failed to find any key` by every remote
+server before this was the default). Route `/.well-known/matrix` to the server at the
+`serverName` host, as the chart's Ingress and HTTPRoute do; no port 8448 is needed. When
+federation is reached at a different host or port than clients use, set
+`server.well_known_server` to that `host:port` under `extraConfig` (or on the Configuration
+page; it is a hot setting); the empty string publishes no server document, for a deployment
+whose reverse proxy serves its own. `ci/install-smoke.sh` checks the derived document on
+every image CD builds.
+
 ## Upgrading
 
 ### From a chart before 2026-10-09: adopt the CRD once

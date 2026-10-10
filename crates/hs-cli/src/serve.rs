@@ -215,8 +215,10 @@ impl std::fmt::Debug for ServeOptions {
 ///   client-server API implementation supports, per `docs/compat/cli-shims.md`'s summary table
 ///   and `PLAN.md`).
 /// - `GET /.well-known/matrix/server` and `GET /.well-known/matrix/client`
-///   ([`crate::well_known`]) — always registered, but each answers 404 unless its configuration
-///   field is set, so an operator who does not delegate publishes no document.
+///   ([`crate::well_known`]) — always registered; the client document answers 404 unless
+///   `server.public_baseurl` is set, and the server document is derived from that same URL
+///   unless `server.well_known_server` names the federation host itself or is the empty string
+///   (decision 0040).
 /// - `/health/live`, `/health/ready`, `/metrics`.
 ///
 /// - `hs-room`'s room routes ([`hs_room::routes::router`]), mounted under both `/_matrix/client/v3`
@@ -2420,12 +2422,18 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     let well_known = crate::well_known::WellKnown::from_config(&config);
     if well_known.is_empty() {
         tracing::info!(
-            "no .well-known documents are published (set server.well_known_server to delegate \
-             federation, server.public_baseurl to advertise a client base URL)"
+            server_source = %well_known.server_source,
+            "no .well-known documents are published (set server.public_baseurl to advertise a \
+             client base URL and derive the federation document from it, or \
+             server.well_known_server to delegate federation)"
         );
     } else {
+        // `server_source` says where the server document came from ("derived from
+        // server.public_baseurl", "set (server.well_known_server)") or, when it is `None`, what
+        // to set: decision 0040, after the demo spent a day undiscoverable with no such line.
         tracing::info!(
             server = ?well_known.server,
+            server_source = %well_known.server_source,
             client_base_url = ?well_known.client_base_url,
             support = ?well_known.support,
             "publishing .well-known discovery documents"
@@ -2618,17 +2626,20 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
                 config.server.sync.feed_retention_entries,
                 config.server.sync.hot_room_stream_retention_entries,
             );
-            well_known.set(crate::well_known::WellKnown::from_config(config));
+            let documents = crate::well_known::WellKnown::from_config(config);
             let public = config.server.public_baseurl.as_deref();
             recovery.set_link_base(link_base(public, &addrs));
             bridges.set_public_base_url(public.unwrap_or(""));
             tracing::info!(
                 public_baseurl = ?public,
+                well_known_server = ?documents.server,
+                well_known_server_source = %documents.server_source,
                 feed_retention_entries = config.server.sync.feed_retention_entries,
                 hot_room_stream_retention_entries =
                     config.server.sync.hot_room_stream_retention_entries,
                 "the server settings are now in force"
             );
+            well_known.set(documents);
             Ok(())
         });
     }

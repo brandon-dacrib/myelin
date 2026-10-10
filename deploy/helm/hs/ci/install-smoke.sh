@@ -2,8 +2,10 @@
 #
 # Install the chart with one value and a given image, and prove the result is a server an
 # operator could use: the pod goes Ready, the log offers a setup link, /health/ready answers
-# 200, /admin/ is the management interface (not the page that says it was left out), and the
-# setup link actually creates the first administrator. Then uninstall and delete the namespace.
+# 200, /admin/ is the management interface (not the page that says it was left out), the
+# setup link actually creates the first administrator, and a public base URL publishes both
+# discovery documents (the server one derived from it, decision 0040). Then uninstall and
+# delete the namespace.
 #
 # CD runs this on a kind cluster against the image it has just built, before that image is
 # tagged and before the chart is published (.github/workflows/cd.yml, job `image`). It is a
@@ -319,5 +321,33 @@ printf '%s' "$created_json" | grep '"user_id":"@smoke:smoke.invalid"' >/dev/null
 status="$(curl -sf "$base/api/v1/setup")" || fail "/api/v1/setup did not answer 200 after setup"
 echo "GET /api/v1/setup               200 $status"
 printf '%s' "$status" | grep '"needs_setup":false' >/dev/null || fail "after setup the server should say needs_setup:false"
+
+say "The discovery documents a publicBaseUrl publishes (decision 0040)"
+# The chart's publicBaseUrl reaches the server as HS__SERVER__PUBLIC_BASEURL
+# (templates/statefulset.yaml). This install has none, so that the setup link above is rooted at
+# the port-forward; `server.public_baseurl` is a hot setting, so the administrator just created
+# sets it through the admin API, which is what the Configuration page does, and the same two
+# documents a release installed with publicBaseUrl publishes appear on the next request: the
+# client document with the base URL, and the server document derived from it as host:port, so
+# that other servers can fetch this one's signing key. No second roll, no second port-forward.
+admin_token="$(printf '%s' "$created_json" | sed -nE 's/.*"access_token":"([^"]*)".*/\1/p')"
+[ -n "$admin_token" ] || fail "the setup answer carried no access_token to set public_baseurl with"
+patched="$(curl -s -w '\n%{http_code}' -X PATCH "$base/api/v1/config/server" \
+  -H "authorization: Bearer $admin_token" -H 'content-type: application/json' \
+  -d '{"public_baseurl":"https://matrix.smoke.invalid"}')"
+code="${patched##*$'\n'}"
+echo "PATCH /api/v1/config/server     $code (public_baseurl: https://matrix.smoke.invalid)"
+[ "$code" = "200" ] || { printf '%s\n' "${patched%$'\n'*}" >&2; fail "setting server.public_baseurl did not answer 200"; }
+printf '%s' "${patched%$'\n'*}" | grep '"reloaded_sections":\["server"\]' >/dev/null || fail "server.public_baseurl should apply at once (reloaded_sections should name server)"
+body="$(curl -s -w '\n%{http_code}' "$base/.well-known/matrix/server")"
+code="${body##*$'\n'}"; doc="${body%$'\n'*}"
+echo "GET /.well-known/matrix/server  $code $doc"
+[ "$code" = "200" ] || fail "/.well-known/matrix/server answered $code, not 200, with public_baseurl set"
+[ "$doc" = '{"m.server":"matrix.smoke.invalid:443"}' ] || fail "the server document should be derived from public_baseurl as host:443, got: $doc"
+body="$(curl -s -w '\n%{http_code}' "$base/.well-known/matrix/client")"
+code="${body##*$'\n'}"; doc="${body%$'\n'*}"
+echo "GET /.well-known/matrix/client  $code $doc"
+[ "$code" = "200" ] || fail "/.well-known/matrix/client answered $code, not 200, with public_baseurl set"
+printf '%s' "$doc" | grep '"base_url":"https://matrix.smoke.invalid"' >/dev/null || fail "the client document should carry public_baseurl, got: $doc"
 
 say "All checks passed"

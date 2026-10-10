@@ -13,7 +13,7 @@
 //!
 //! | route | served when | body |
 //! |---|---|---|
-//! | `GET /.well-known/matrix/server` | `server.well_known_server` is set | `{"m.server": "<host[:port]>"}` |
+//! | `GET /.well-known/matrix/server` | `server.well_known_server` is set, or derived from an `https://` `server.public_baseurl` (decision 0040) | `{"m.server": "<host[:port]>"}` |
 //! | `GET /.well-known/matrix/client` | `server.public_baseurl` is set | `{"m.homeserver": {"base_url": "<url>"}}` |
 //! | `GET /.well-known/matrix/support` | `server.admin_contact` is set | `{"contacts": [{"role": "m.role.admin", "email_address" or "matrix_id": ...}]}`, or `{"support_page": "<url>"}` |
 //!
@@ -21,13 +21,31 @@
 //! help or report abuse to; `server.admin_contact` is a `mailto:` address, a bare email address,
 //! a Matrix ID, or an `http(s)://` support page ([`SupportContact::parse`]).
 //!
-//! All three are **absent** (404 `M_NOT_FOUND`, the same answer as any unrouted path) when their
-//! config field is unset, rather than being served with a value derived from `server_name`. A
-//! well-known document that points at the server name it was fetched from is indistinguishable
-//! from no document at all in the spec's resolution order — both end at "connect to the server
-//! name" — so serving one adds a failure mode (a fetch that can now time out or return a broken
-//! body) without adding a capability. Synapse makes the same choice with its
-//! `serve_server_wellknown` defaulting to false.
+//! # The server document's default (decision 0040)
+//!
+//! `server.well_known_server` unset no longer means "not served". When `server.public_baseurl`
+//! is an `https://` URL, the server document is **derived** from it: its host, and its explicit
+//! port or 443 (`https://matrix.example.org` publishes `m.server: matrix.example.org:443`,
+//! `https://matrix.example.org:8448/` publishes `matrix.example.org:8448`). The reasoning: an
+//! operator who set a public base URL has said where this server is reachable over TLS, and a
+//! server nobody can discover is not federating. The demo found this the hard way on 2026-10-10:
+//! it published a client document and no server document, 8448 was closed, and every signed
+//! request it made was answered `401 Failed to find any key to satisfy ...` because no remote
+//! server could fetch its signing key. [`ServerSource`] says, for the boot log, where the
+//! published value came from and, when nothing is published, why:
+//!
+//! - `server.well_known_server` set to a `host[:port]` wins over the derivation.
+//! - `server.well_known_server` set to the empty string turns the document off (the one way to
+//!   say "I serve this document somewhere else, or not at all" when a public base URL is set).
+//! - An `http://` public base URL derives nothing: federation needs TLS, so a document naming an
+//!   `http://` host would send remote servers to a port that cannot answer them.
+//! - `federation.enabled: false` derives nothing: there is no federation to point at.
+//!
+//! The documents are otherwise **absent** (404 `M_NOT_FOUND`, the same answer as any unrouted
+//! path) when their config field is unset, rather than being served with a value derived from
+//! `server_name`. A well-known document that points at the server name it was fetched from is
+//! indistinguishable from no document at all in the spec's resolution order (both end at
+//! "connect to the server name"), so that one adds a failure mode without adding a capability.
 //!
 //! # CORS
 //!
@@ -48,13 +66,17 @@ use axum::Json;
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
-/// The `.well-known` values this server publishes about itself, read once from configuration at
-/// startup. Cheap to clone (two `Option<String>`s), held by the router's handlers.
+/// The `.well-known` values this server publishes about itself, read from configuration at
+/// startup and again on every change to the `server` section. Cheap to clone, held by the
+/// router's handlers through an [`hs_config::Live`] cell.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WellKnown {
-    /// `server.well_known_server`: the `host[:port]` remote servers should connect to for
-    /// federation. `None` means `/.well-known/matrix/server` is not served.
+    /// The `host[:port]` remote servers should connect to for federation: `server.well_known_server`
+    /// when set, else derived from `server.public_baseurl` ([`ServerSource`] says which). `None`
+    /// means `/.well-known/matrix/server` is not served.
     pub server: Option<String>,
+    /// Where [`Self::server`] came from, or why it is `None`; for the boot log.
+    pub server_source: ServerSource,
     /// `server.public_baseurl`: the client-facing base URL. `None` means
     /// `/.well-known/matrix/client` is not served.
     pub client_base_url: Option<String>,
@@ -110,18 +132,125 @@ impl SupportContact {
     }
 }
 
+/// Where the server document's value came from, or why there is none. Printed in the boot log
+/// and when the `server` section is reloaded, so an operator reading "no server document" also
+/// reads what to set.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ServerSource {
+    /// `server.well_known_server` is set to a `host[:port]`.
+    Configured,
+    /// `server.well_known_server` is unset and the value is `server.public_baseurl`'s host and
+    /// port (its explicit port, or 443).
+    DerivedFromPublicBaseUrl,
+    /// `server.well_known_server` is the empty string: the operator turned the document off.
+    Disabled,
+    /// Neither `server.well_known_server` nor `server.public_baseurl` is set; nothing to publish
+    /// and nothing to derive it from.
+    #[default]
+    NothingToDeriveFrom,
+    /// `server.public_baseurl` is `http://`, and federation needs TLS.
+    PublicBaseUrlIsNotHttps,
+    /// `federation.enabled` is false: there is no federation to point remote servers at.
+    FederationDisabled,
+}
+
+impl ServerSource {
+    /// Whether a document is published.
+    #[must_use]
+    pub fn is_published(self) -> bool {
+        matches!(self, Self::Configured | Self::DerivedFromPublicBaseUrl)
+    }
+}
+
+impl std::fmt::Display for ServerSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Configured => "set (server.well_known_server)",
+            Self::DerivedFromPublicBaseUrl => "derived from server.public_baseurl",
+            Self::Disabled => "off (server.well_known_server is the empty string)",
+            Self::NothingToDeriveFrom => {
+                "not published: set server.public_baseurl (an https:// URL) to derive it, or \
+                 server.well_known_server to name the federation host[:port]"
+            }
+            Self::PublicBaseUrlIsNotHttps => {
+                "not published: server.public_baseurl is not an https:// URL with a host, and \
+                 federation needs TLS; set server.well_known_server to name the federation \
+                 host[:port] to advertise"
+            }
+            Self::FederationDisabled => {
+                "not published: federation.enabled is false, so there is nothing to advertise"
+            }
+        })
+    }
+}
+
+/// The `m.server` value a public base URL implies: its host, and its explicit port or 443.
+/// `None` for anything but an `https://` URL with a host (federation needs TLS; a document naming
+/// an `http://` host would send remote servers to a port that cannot answer them).
+///
+/// Only the authority is read: a path (`https://example.org/matrix`), a query or a fragment is
+/// ignored, as is userinfo. An IPv6 literal keeps its brackets (`[2001:db8::1]:443`), which is
+/// how the spec spells a `host:port` for one.
+#[must_use]
+pub fn derive_server_document(public_baseurl: &str) -> Option<String> {
+    let rest = public_baseurl.trim().strip_prefix("https://")?;
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .rsplit('@')
+        .next()
+        .unwrap_or_default();
+    let (host, port) = if let Some(after_bracket) = authority.strip_prefix('[') {
+        let (inner, after) = after_bracket.split_once(']')?;
+        let host = format!("[{inner}]");
+        let port = after.strip_prefix(':').map(str::to_owned);
+        (host, port)
+    } else {
+        match authority.rsplit_once(':') {
+            Some((host, port)) => (host.to_owned(), Some(port.to_owned())),
+            None => (authority.to_owned(), None),
+        }
+    };
+    if host.is_empty() {
+        return None;
+    }
+    let port = match port {
+        Some(port) => port.parse::<u16>().ok()?.to_string(),
+        None => "443".to_owned(),
+    };
+    Some(format!("{host}:{port}"))
+}
+
 impl WellKnown {
-    /// Reads both values from a native configuration.
+    /// Reads the three documents from a native configuration. The server document is the
+    /// explicit `server.well_known_server`, else derived from `server.public_baseurl`
+    /// ([`derive_server_document`]) when federation is on; `server_source` records which.
     #[must_use]
     pub fn from_config(config: &hs_config::Config) -> Self {
+        let public_baseurl = config
+            .server
+            .public_baseurl
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let (server, server_source) = match config.server.well_known_server.as_deref() {
+            Some(explicit) if !explicit.trim().is_empty() => {
+                (Some(explicit.trim().to_owned()), ServerSource::Configured)
+            }
+            Some(_) => (None, ServerSource::Disabled),
+            None => match public_baseurl {
+                None => (None, ServerSource::NothingToDeriveFrom),
+                Some(_) if !config.federation.enabled => (None, ServerSource::FederationDisabled),
+                Some(url) => match derive_server_document(url) {
+                    Some(derived) => (Some(derived), ServerSource::DerivedFromPublicBaseUrl),
+                    None => (None, ServerSource::PublicBaseUrlIsNotHttps),
+                },
+            },
+        };
         Self {
-            server: config
-                .server
-                .well_known_server
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned),
+            server,
+            server_source,
             client_base_url: config
                 .server
                 .public_baseurl
@@ -230,8 +359,8 @@ mod tests {
     async fn server_document_is_the_configured_delegation() {
         let response = app(WellKnown {
             server: Some("matrix.example.org:8448".into()),
-            client_base_url: None,
-            support: None,
+            server_source: ServerSource::Configured,
+            ..WellKnown::default()
         })
         .oneshot(
             Request::builder()
@@ -273,9 +402,8 @@ mod tests {
     #[tokio::test]
     async fn client_document_carries_the_public_base_url() {
         let response = app(WellKnown {
-            server: None,
             client_base_url: Some("https://matrix.example.org".into()),
-            support: None,
+            ..WellKnown::default()
         })
         .oneshot(
             Request::builder()
@@ -321,7 +449,142 @@ mod tests {
             well_known.server.as_deref(),
             Some("matrix.example.org:8448")
         );
+        assert_eq!(well_known.server_source, ServerSource::Configured);
         assert!(!well_known.is_empty());
+    }
+
+    /// Decision 0040: with a public base URL and no explicit delegation, the server document is
+    /// the base URL's host and port.
+    #[test]
+    fn from_config_derives_the_server_document_from_an_https_public_base_url() {
+        let mut config = hs_config::Config::default();
+        config.server.server_name = "example.org".into();
+        config.server.public_baseurl = Some("https://myelin.dacrib.net".into());
+        let well_known = WellKnown::from_config(&config);
+        assert_eq!(well_known.server.as_deref(), Some("myelin.dacrib.net:443"));
+        assert_eq!(
+            well_known.server_source,
+            ServerSource::DerivedFromPublicBaseUrl
+        );
+        assert!(well_known.server_source.is_published());
+
+        config.server.public_baseurl = Some("https://matrix.example.org:8448/".into());
+        let well_known = WellKnown::from_config(&config);
+        assert_eq!(
+            well_known.server.as_deref(),
+            Some("matrix.example.org:8448")
+        );
+    }
+
+    #[test]
+    fn from_config_publishes_no_server_document_for_an_http_public_base_url() {
+        let mut config = hs_config::Config::default();
+        config.server.server_name = "example.org".into();
+        config.server.public_baseurl = Some("http://localhost:8008".into());
+        let well_known = WellKnown::from_config(&config);
+        assert_eq!(well_known.server, None);
+        assert_eq!(
+            well_known.server_source,
+            ServerSource::PublicBaseUrlIsNotHttps
+        );
+        assert!(!well_known.server_source.is_published());
+        // The client document is unaffected: clients talk to http://localhost happily.
+        assert_eq!(
+            well_known.client_base_url.as_deref(),
+            Some("http://localhost:8008")
+        );
+    }
+
+    #[test]
+    fn from_config_lets_an_empty_well_known_server_turn_the_document_off() {
+        let mut config = hs_config::Config::default();
+        config.server.server_name = "example.org".into();
+        config.server.public_baseurl = Some("https://matrix.example.org".into());
+        config.server.well_known_server = Some(String::new());
+        let well_known = WellKnown::from_config(&config);
+        assert_eq!(well_known.server, None);
+        assert_eq!(well_known.server_source, ServerSource::Disabled);
+
+        config.server.well_known_server = Some("   ".into());
+        assert_eq!(
+            WellKnown::from_config(&config).server_source,
+            ServerSource::Disabled
+        );
+    }
+
+    #[test]
+    fn from_config_derives_nothing_without_federation_or_a_public_base_url() {
+        let mut config = hs_config::Config::default();
+        config.server.server_name = "example.org".into();
+        assert_eq!(
+            WellKnown::from_config(&config).server_source,
+            ServerSource::NothingToDeriveFrom
+        );
+
+        config.server.public_baseurl = Some("https://matrix.example.org".into());
+        config.federation.enabled = false;
+        let well_known = WellKnown::from_config(&config);
+        assert_eq!(well_known.server, None);
+        assert_eq!(well_known.server_source, ServerSource::FederationDisabled);
+
+        // An explicit delegation is published whatever federation.enabled says: the operator
+        // asked for exactly this document.
+        config.server.well_known_server = Some("matrix.example.org:8448".into());
+        assert_eq!(
+            WellKnown::from_config(&config).server_source,
+            ServerSource::Configured
+        );
+    }
+
+    #[test]
+    fn the_derivation_reads_the_authority_only() {
+        for (url, want) in [
+            ("https://example.org", Some("example.org:443")),
+            ("https://example.org/", Some("example.org:443")),
+            ("https://example.org:8448", Some("example.org:8448")),
+            (
+                "https://example.org:8448/matrix/?x=1#y",
+                Some("example.org:8448"),
+            ),
+            ("https://user:pw@example.org", Some("example.org:443")),
+            ("https://[2001:db8::1]", Some("[2001:db8::1]:443")),
+            ("https://[2001:db8::1]:8448/", Some("[2001:db8::1]:8448")),
+            ("  https://example.org  ", Some("example.org:443")),
+            ("http://example.org", None),
+            ("https://", None),
+            ("https:///path", None),
+            ("https://example.org:notaport", None),
+            ("https://[2001:db8::1", None),
+            ("example.org", None),
+        ] {
+            assert_eq!(derive_server_document(url).as_deref(), want, "{url:?}");
+        }
+    }
+
+    #[test]
+    fn every_source_says_where_the_value_came_from_or_what_to_set() {
+        assert_eq!(
+            ServerSource::DerivedFromPublicBaseUrl.to_string(),
+            "derived from server.public_baseurl"
+        );
+        assert_eq!(
+            ServerSource::Configured.to_string(),
+            "set (server.well_known_server)"
+        );
+        for unpublished in [
+            ServerSource::Disabled,
+            ServerSource::NothingToDeriveFrom,
+            ServerSource::PublicBaseUrlIsNotHttps,
+            ServerSource::FederationDisabled,
+        ] {
+            assert!(!unpublished.is_published());
+            assert!(!unpublished.to_string().is_empty());
+        }
+        assert!(
+            ServerSource::NothingToDeriveFrom
+                .to_string()
+                .contains("server.public_baseurl")
+        );
     }
 
     #[test]
