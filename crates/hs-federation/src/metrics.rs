@@ -407,6 +407,34 @@ static JOIN_VERIFY_SECONDS: std::sync::LazyLock<Histogram> = std::sync::LazyLock
     ])
 });
 
+/// Labels of `hs_federation_join_requests_total`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, prometheus_client::encoding::EncodeLabelSet)]
+pub struct JoinRequestLabels {
+    /// `started` (the request started a join through another server) or `attached` (a join of
+    /// the same room for the same user was already under way, and the request waited for that
+    /// one instead; `crate::outbound_join::InFlightJoins`).
+    pub share: &'static str,
+}
+
+static JOIN_REQUESTS: std::sync::LazyLock<Family<JoinRequestLabels, Counter>> =
+    std::sync::LazyLock::new(Family::default);
+
+/// Counts one `/join` of a room through another server, by whether it started the join or
+/// attached to one under way ([`JoinRequestLabels`]).
+pub fn record_join_request(share: &'static str) {
+    JOIN_REQUESTS
+        .get_or_create(&JoinRequestLabels { share })
+        .inc();
+}
+
+/// How many join requests were counted under `share` so far (for tests).
+#[must_use]
+pub fn join_requests(share: &'static str) -> u64 {
+    JOIN_REQUESTS
+        .get_or_create(&JoinRequestLabels { share })
+        .get()
+}
+
 /// Counts one key lookup answered from `source` ([`KeyFetchLabels`]): a cache hit, or a key
 /// response accepted from the origin or from a notary.
 pub fn record_key_fetch(source: &'static str) {
@@ -586,6 +614,8 @@ pub fn record_notary_answer(answered: bool) {
 ///   ([`KeyFetchFailureLabels`]).
 /// - `hs_federation_join_verify_seconds`: a histogram of how long each join through another
 ///   server spent verifying the `send_join` answer ([`record_join_verify_seconds`]).
+/// - `hs_federation_join_requests_total{share}`: joins through another server, by whether the
+///   request started one or attached to one under way ([`JoinRequestLabels`]).
 pub fn register_transport_metrics(registry: &mut Registry) {
     // Registered without `_total`: the text encoder appends it.
     registry.register(
@@ -626,6 +656,13 @@ pub fn register_transport_metrics(registry: &mut Registry) {
         "Key lookups answered, by source: the cache, the origin server's own key response, or \
          a notary (a trusted key server) that held the key",
         KEY_FETCHES.clone(),
+    );
+    registry.register(
+        "hs_federation_join_requests",
+        "Joins of a room through another server, by share: started (the request started the \
+         join) or attached (a join of the same room for the same user was under way, and the \
+         request waited for it instead of starting another)",
+        JOIN_REQUESTS.clone(),
     );
     registry.register(
         "hs_federation_key_fetch_failures",
