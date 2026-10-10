@@ -210,10 +210,12 @@ diagnose() {
     grep -vE '^R [0-9.]+ [a-z]+ 200 ' "$TRAFFIC_LOG" | tail -80 || true
   fi
 }
+# diagnose writes to stderr: the ERR trap fires inside `run`, whose stdout a caller may have
+# sent to /dev/null (CD run 38011878606 printed "FAILED" and nothing else).
 fail() {
   echo
   echo "FAILED: $*" >&2
-  diagnose
+  diagnose >&2
   exit 1
 }
 stop_port_forward() {

@@ -140,7 +140,9 @@ diagnose() {
     echo "--- $p (last 80 lines)"; k logs "$p" --tail=80 2>&1 | redact || true
   done
 }
-fail() { echo; echo "FAILED: $*" >&2; diagnose; exit 1; }
+# diagnose writes to stderr: the ERR trap fires inside `run`, whose stdout a caller may have
+# sent to /dev/null (CD run 38011878606 printed "FAILED" and nothing else).
+fail() { echo; echo "FAILED: $*" >&2; diagnose >&2; exit 1; }
 stop_port_forward() {
   if [ -n "$PF_PID" ]; then kill "$PF_PID" 2>/dev/null || true; wait "$PF_PID" 2>/dev/null || true; PF_PID=""; fi
 }

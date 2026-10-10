@@ -245,6 +245,21 @@ jobs:
           echo "/admin/ serves the interface, and the log offers a setup link"
           docker rm -f myelin-smoke >/dev/null
 
+      - name: Free the runner's disk for the kind smokes
+        # The runner's root disk holds the buildx state of the image just built, the kind node
+        # and every image the smokes load; on run 38011878606 the kubelet garbage-collected
+        # `myelin:smoke` from the node mid-smoke (pullPolicy Never, so a failed smoke). Drop the
+        # toolchains the job never uses and the builder's cache (the image is already pushed and
+        # loaded), and say how much is left, so the next failure has a number.
+        if: matrix.arch == 'amd64'
+        run: |
+          set -euo pipefail
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost 2>/dev/null || true
+          docker builder prune -af >/dev/null 2>&1 || true
+          df -h / | tail -1
+
       - name: Start a kind cluster
         # For the next step; only on the leg that runs it. The action installs kind and kubectl
         # and waits for the node to be Ready (about a minute on these runners). Helm is on the
@@ -253,6 +268,8 @@ jobs:
         uses: helm/kind-action@v1
         with:
           cluster_name: smoke
+          # No image garbage collection on the node: deploy/helm/hs/ci/kind-config.yaml says why.
+          config: deploy/helm/hs/ci/kind-config.yaml
 
       - uses: azure/setup-helm@v4
         if: matrix.arch == 'amd64'

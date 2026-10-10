@@ -1,0 +1,18 @@
+# The kind cluster CD's smokes run on. The kubelet must not garbage-collect images: on CD run
+# 38011878606 `myelin:smoke`, loaded onto the node with pullPolicy Never, was "already present
+# on all nodes" when the cluster smoke started and "not present" by its upgrade phase, after
+# the runner's disk crossed the kubelet's default 85% image-GC threshold; the backup smoke's
+# first pod never started for the same reason. With no pull policy but Never, a collected
+# image is a failed smoke, not a slow one. Eviction on disk is off for the same reason.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+kubeadmConfigPatches:
+  - |
+    kind: KubeletConfiguration
+    apiVersion: kubelet.config.k8s.io/v1beta1
+    imageGCHighThresholdPercent: 100
+    imageGCLowThresholdPercent: 99
+    evictionHard:
+      imagefs.available: "0%"
+      nodefs.available: "0%"
+      nodefs.inodesFree: "0%"
