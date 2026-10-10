@@ -44,9 +44,11 @@ restarts), `Bridge` Ready; signing key `ed25519:a_JBQV7r` unchanged; from outsid
    answers our signed requests `401 Failed to find any key to satisfy ... ed25519:a_JBQV7r`
    (10 remote-media fetches during the hour). Every federation number in the README is from
    servers that could reach each other; the demo itself has never been reachable. Track 12:
-   publish `m.server: myelin.dacrib.net:443` (the server has `server.well_known_server`; the
-   chart has no value for it yet, and the values carry `publicBaseUrl` only), with a check in
-   the install smoke, and make the Federation page say when nobody can reach this server.
+   publish `m.server: myelin.dacrib.net:443`. `server.well_known_server` is a hot setting
+   (`hs-config` `reload.rs`), so the owner can set it now on the Configuration page's server
+   section, or through the chart's `extraConfig`; a chart value next to `publicBaseUrl`, a
+   check in the install smoke, and a Federation page that says when nobody can reach this
+   server are the durable fix.
 
 ## Earlier: 2026-10-09, night EDT -- the 95% wave is merged: every row has a dated basis; roll to the first green image of `c7551603` or later
 
