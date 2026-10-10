@@ -141,6 +141,19 @@ impl DestinationStoreSource {
             None => 0,
         };
         crate::metrics::record_destination_forgotten(reason, by);
+        // One line per destination, whoever decided: the admin API's handlers log the request
+        // and the sweep its summary, but the destination and the reason belong together.
+        tracing::info!(
+            destination = %server_name,
+            reason,
+            by,
+            dropped_pdus = queue.pdus,
+            dropped_edus = queue.edus,
+            dropped_keys,
+            was_catching_up = queue.was_catching_up,
+            shared_rooms,
+            "forgot a federation destination: its queue, backoff, catch-up mark and cached keys are gone"
+        );
         Ok(AdminDestinationForgotten {
             server_name: server_name.to_owned(),
             dropped_pdu_count: queue.pdus as u64,
