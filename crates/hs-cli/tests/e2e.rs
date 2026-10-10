@@ -3927,3 +3927,52 @@ async fn receipts_and_presence_are_still_there_after_a_restart_of_the_real_binar
 
     server.stop();
 }
+
+/// `/metrics` carries the process's own memory and the federation sender's counters and gauges
+/// from the first scrape, at zero where nothing has happened yet. On 2026-10-10 the demo's
+/// dashboards could not tell "no transactions" from "not wired" (a labelled family with nothing
+/// observed renders nothing) and had no process memory at all; the kubelet's working set was the
+/// only view of a 13 MiB/h creep (`docs/status/06-federation.md`, "2026-10-10: the leak hunt").
+#[tokio::test]
+async fn metrics_carry_process_memory_and_the_federation_sender_from_the_first_scrape() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(0, dir.path());
+    config.federation.enabled = true;
+    let handle = hs_cli::serve::spawn_serve(config, hs_cli::serve::ServeOptions::default())
+        .await
+        .expect("server should boot");
+    let base = handle.base_url();
+    let body = reqwest::Client::new()
+        .get(format!("{base}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    for needle in [
+        "process_resident_memory_bytes ",
+        "process_virtual_memory_bytes ",
+        "hs_federation_transactions_total{outcome=\"accepted\"} 0",
+        "hs_federation_transactions_total{outcome=\"unresolvable\"} 0",
+        "hs_federation_transactions_total{outcome=\"deferred\"} 0",
+        "hs_federation_pdus_sent_total 0",
+        "hs_federation_key_fetch_failures_total{reason=\"unreachable\"} 0",
+        "hs_federation_sender_destinations 0",
+        "hs_federation_sender_pdus_pending 0",
+        "hs_federation_sender_edus_queued 0",
+        "hs_federation_sender_destinations_backing_off 0",
+        "hs_federation_sender_state_bytes 0",
+    ] {
+        assert!(body.contains(needle), "missing {needle:?} in:\n{body}");
+    }
+    let resident: f64 = body
+        .lines()
+        .find(|line| line.starts_with("process_resident_memory_bytes "))
+        .and_then(|line| line.split(' ').nth(1))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(resident > 1024.0 * 1024.0, "resident {resident} bytes");
+    handle.shutdown().await;
+}

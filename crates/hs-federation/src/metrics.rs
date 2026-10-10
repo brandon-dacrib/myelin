@@ -558,6 +558,9 @@ pub fn record_notary_answer(answered: bool) {
 ///   that failed, or were skipped under backoff ([`KeyFetchFailureLabels`]).
 /// - `hs_federation_join_verify_seconds`: a histogram of how long each join through another
 ///   server spent verifying the `send_join` answer ([`record_join_verify_seconds`]).
+/// - `hs_federation_transactions_total{outcome}`: attempts at outbound `/send` transactions
+///   ([`TRANSACTION_OUTCOMES`]), and `hs_federation_pdus_sent_total`, the PDUs the accepted
+///   ones carried ([`record_transaction`], [`record_pdus_sent`]).
 pub fn register_transport_metrics(registry: &mut Registry) {
     // Registered without `_total`: the text encoder appends it.
     registry.register(
@@ -619,6 +622,165 @@ pub fn register_transport_metrics(registry: &mut Registry) {
          changes since announced to their destinations",
         DEVICE_LIST_CATCH_UPS.clone(),
     );
+    registry.register(
+        "hs_federation_transactions",
+        "Attempts at outbound /send transactions, by outcome (accepted, rejected, unresolvable, \
+         failed, deferred, dropped)",
+        TRANSACTIONS.clone(),
+    );
+    registry.register(
+        "hs_federation_pdus_sent",
+        "PDUs carried by outbound transactions their destination accepted",
+        PDUS_SENT.clone(),
+    );
+    // A labelled family with nothing observed renders nothing at all: every known label is
+    // created now, so each series is on /metrics at zero from the first scrape.
+    for outcome in TRANSACTION_OUTCOMES {
+        let _ = TRANSACTIONS.get_or_create(&TransactionLabels { outcome });
+    }
+    for reason in KEY_FETCH_FAILURE_REASONS {
+        let _ = KEY_FETCH_FAILURES.get_or_create(&KeyFetchFailureLabels { reason });
+    }
+}
+
+/// Labels of `hs_federation_transactions_total`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, prometheus_client::encoding::EncodeLabelSet)]
+pub struct TransactionLabels {
+    /// One of [`TRANSACTION_OUTCOMES`].
+    pub outcome: &'static str,
+}
+
+/// The outcomes `hs_federation_transactions_total` is counted under, one per attempt
+/// `crate::sender` makes at a `PUT /send` transaction: `accepted` (the destination answered
+/// 2xx), `rejected` (any other status; retried), `unresolvable` (the destination did not resolve
+/// to an address; retried under the same backoff as any other failure), `failed` (the request
+/// could not be made or answered: connection, TLS, timeout, an unreadable body; retried),
+/// `deferred` (not attempted: the client's own backoff for the destination had not ended) and
+/// `dropped` (this server's own policy forbids the destination; not retried). Every label is
+/// rendered from the start, at zero, so a dashboard can tell "none" from "not wired".
+pub const TRANSACTION_OUTCOMES: [&str; 6] = [
+    "accepted",
+    "rejected",
+    "unresolvable",
+    "failed",
+    "deferred",
+    "dropped",
+];
+
+/// The reasons `hs_federation_key_fetch_failures_total` is counted under
+/// ([`KeyFetchFailureLabels`]), rendered at zero from the start like [`TRANSACTION_OUTCOMES`].
+pub const KEY_FETCH_FAILURE_REASONS: [&str; 4] =
+    ["timeout", "unreachable", "invalid_response", "backoff"];
+
+static TRANSACTIONS: std::sync::LazyLock<Family<TransactionLabels, Counter>> =
+    std::sync::LazyLock::new(Family::default);
+static PDUS_SENT: std::sync::LazyLock<Counter> = std::sync::LazyLock::new(Counter::default);
+
+/// Counts one attempt at an outbound transaction, by `outcome` ([`TRANSACTION_OUTCOMES`]).
+pub fn record_transaction(outcome: &'static str) {
+    TRANSACTIONS
+        .get_or_create(&TransactionLabels { outcome })
+        .inc();
+}
+
+/// How many transaction attempts ended in `outcome`, in this process ([`record_transaction`]).
+#[must_use]
+pub fn transactions(outcome: &'static str) -> u64 {
+    TRANSACTIONS
+        .get_or_create(&TransactionLabels { outcome })
+        .get()
+}
+
+/// Counts `n` PDUs carried by a transaction a destination accepted
+/// (`hs_federation_pdus_sent_total`).
+pub fn record_pdus_sent(n: u64) {
+    PDUS_SENT.inc_by(n);
+}
+
+/// How many PDUs destinations accepted in transactions from this process ([`record_pdus_sent`]).
+#[must_use]
+pub fn pdus_sent() -> u64 {
+    PDUS_SENT.get()
+}
+
+/// The `hs_federation_sender_*` gauges, read from a [`crate::sender::FederationSender`] at every
+/// scrape ([`crate::sender::FederationSender::snapshot`]):
+///
+/// - `hs_federation_sender_destinations`: destinations this process has a worker for.
+/// - `hs_federation_sender_pdus_pending`: PDUs queued for them and not yet accepted or dropped.
+/// - `hs_federation_sender_edus_queued`: in-memory EDUs (typing, receipts, presence) waiting.
+/// - `hs_federation_sender_destinations_backing_off`: workers waiting out a retry right now.
+/// - `hs_federation_sender_state_bytes`: an estimate of the memory the per-destination state
+///   takes (queue structures, channel entries, in-memory EDUs).
+///
+/// Registered by `hs serve` with [`register_sender_gauges`]. What the 2026-10-10 leak hunt
+/// lacked: whether the sender's own state was what grew.
+pub struct SenderGauges {
+    sender: std::sync::Arc<crate::sender::FederationSender>,
+}
+
+impl std::fmt::Debug for SenderGauges {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SenderGauges").finish_non_exhaustive()
+    }
+}
+
+impl prometheus_client::collector::Collector for SenderGauges {
+    fn encode(
+        &self,
+        mut encoder: prometheus_client::encoding::DescriptorEncoder,
+    ) -> Result<(), std::fmt::Error> {
+        let snapshot = self.sender.snapshot();
+        let gauges: [(&str, &str, usize); 5] = [
+            (
+                "hs_federation_sender_destinations",
+                "Destinations the outbound federation sender has a worker for in this process",
+                snapshot.destinations,
+            ),
+            (
+                "hs_federation_sender_pdus_pending",
+                "PDUs queued for destinations this process sends for and not yet accepted or \
+                 dropped",
+                snapshot.pdus_pending,
+            ),
+            (
+                "hs_federation_sender_edus_queued",
+                "In-memory EDUs (typing, receipts, presence) waiting for a transaction, across \
+                 destinations",
+                snapshot.edus_queued,
+            ),
+            (
+                "hs_federation_sender_destinations_backing_off",
+                "Destination workers waiting out a retry backoff right now",
+                snapshot.destinations_backing_off,
+            ),
+            (
+                "hs_federation_sender_state_bytes",
+                "Estimated bytes of per-destination sender state held in memory (queues, \
+                 channel entries, in-memory EDUs)",
+                snapshot.state_bytes,
+            ),
+        ];
+        for (name, help, value) in gauges {
+            encoder
+                .encode_descriptor(
+                    name,
+                    help,
+                    None,
+                    prometheus_client::metrics::MetricType::Gauge,
+                )?
+                .encode_gauge(&i64::try_from(value).unwrap_or(i64::MAX))?;
+        }
+        Ok(())
+    }
+}
+
+/// Registers the [`SenderGauges`] of `sender` on `registry`.
+pub fn register_sender_gauges(
+    registry: &mut Registry,
+    sender: std::sync::Arc<crate::sender::FederationSender>,
+) {
+    registry.register_collector(Box::new(SenderGauges { sender }));
 }
 
 /// `edu_type` if it is one of [`KNOWN_EDU_TYPES`], `other` if not.
@@ -662,5 +824,35 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("_total_total"), "{text}");
+    }
+
+    /// Every outcome of `hs_federation_transactions_total` and every reason of
+    /// `hs_federation_key_fetch_failures_total` is on `/metrics` from registration, at zero,
+    /// and `hs_federation_pdus_sent_total` with them: a labelled family with nothing observed
+    /// would otherwise render nothing, and a dashboard could not tell "none" from "not wired"
+    /// (what the 2026-10-10 demo's zeros turned out to be).
+    #[test]
+    fn transaction_outcomes_render_from_registration_and_count() {
+        let mut registry = Registry::default();
+        register_transport_metrics(&mut registry);
+        let mut text = String::new();
+        prometheus_client::encoding::text::encode(&mut text, &registry).unwrap();
+        for outcome in TRANSACTION_OUTCOMES {
+            let series = format!("hs_federation_transactions_total{{outcome=\"{outcome}\"}} ");
+            assert!(text.contains(&series), "missing {series} in {text}");
+        }
+        for reason in KEY_FETCH_FAILURE_REASONS {
+            let series = format!("hs_federation_key_fetch_failures_total{{reason=\"{reason}\"}} ");
+            assert!(text.contains(&series), "missing {series} in {text}");
+        }
+        assert!(text.contains("hs_federation_pdus_sent_total "), "{text}");
+        assert!(!text.contains("_total_total"), "{text}");
+
+        let before = transactions("dropped");
+        record_transaction("dropped");
+        assert_eq!(transactions("dropped"), before + 1);
+        let before = pdus_sent();
+        record_pdus_sent(3);
+        assert_eq!(pdus_sent(), before + 3);
     }
 }

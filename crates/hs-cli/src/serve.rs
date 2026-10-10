@@ -1553,6 +1553,9 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     metrics.with_registry(crate::backfill::register_metrics);
     // Federation requests a room's server ACL refused, and notary key queries.
     metrics.with_registry(hs_federation::metrics::register_transport_metrics);
+    // The process's own resident and virtual memory, read from the OS at each scrape
+    // (`crate::process_metrics`): what the kubelet's working set is made of.
+    metrics.with_registry(crate::process_metrics::register_metrics);
     // Outbound connections made and addresses that did not connect, by address family
     // (`hs_http::outbound`): every outbound client of this server is counted.
     metrics.with_registry(hs_http::outbound::register_metrics);
@@ -1975,6 +1978,10 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         mount.sender.install_catch_up_metrics(
             metrics.with_registry(hs_federation::metrics::CatchUpMetrics::register),
         );
+        // What the sender holds in memory, read at each scrape (`hs_federation_sender_*`).
+        metrics.with_registry(|registry| {
+            hs_federation::metrics::register_sender_gauges(registry, mount.sender.clone());
+        });
         mount.state.edu_sink = Some(Arc::new(crate::edus::EduDispatcher::new(
             user_state.hub.clone(),
             e2e_state.clone(),
