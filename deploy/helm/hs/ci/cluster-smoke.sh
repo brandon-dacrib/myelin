@@ -190,10 +190,42 @@ TRAFFIC_LOG_PID=""
 CRD_EXISTED=1
 DIAGNOSED=0
 
+# --- The smoke image on the kind node -------------------------------------------------------
+#
+# With pullPolicy Never a pod starts only if the node holds the image *by name*. On CD runs
+# 38011878606 and 38014342577 `kind load` found `myelin:smoke` present by name and minutes
+# later the kubelet answered ErrImageNeverPull for it, with nothing in these scripts removing
+# it. Until the node says why (diagnose prints its images and the kubelet's image-removal log
+# lines), every install or upgrade that starts a pod from IMAGE first checks the name on the
+# node and imports the image again if it is gone.
+kind_node() { echo "${KIND_CLUSTER}-control-plane"; }
+node_has_image() { docker exec "$(kind_node)" crictl inspecti "$1" >/dev/null 2>&1; }
+ensure_image_on_node() {
+  [ -n "$KIND_CLUSTER" ] || return 0
+  local ref="docker.io/library/$1"; [[ "$1" == */* ]] && ref="$1"
+  if node_has_image "$ref" || node_has_image "$1"; then return 0; fi
+  echo "$1 is not on node $(kind_node) by name any more; importing it again"
+  docker save "$1" | docker exec -i "$(kind_node)" ctr -n k8s.io images import --all-platforms --digests - >/dev/null \
+    || fail "could not import $1 into node $(kind_node)"
+  node_has_image "$ref" || node_has_image "$1" || fail "$1 is still not on node $(kind_node) after the import"
+}
+node_image_diagnostics() {
+  [ -n "$KIND_CLUSTER" ] || return 0
+  echo "--- images on node $(kind_node) (crictl)"
+  docker exec "$(kind_node)" crictl images 2>&1 | grep -iE 'IMAGE|myelin' || true
+  echo "--- the kubelet's image settings"
+  kubectl --context "$CONTEXT" get --raw "/api/v1/nodes/$(kind_node)/proxy/configz" 2>/dev/null \
+    | python3 -c 'import json,sys; c=json.load(sys.stdin)["kubeletconfig"]; print({k: c.get(k) for k in ("imageGCHighThresholdPercent","imageGCLowThresholdPercent","imageMinimumGCAge","imageMaximumGCAge","evictionHard")})' 2>&1 || true
+  echo "--- the kubelet and containerd on images (journal, last 30 matching lines)"
+  docker exec "$(kind_node)" journalctl --no-pager -u kubelet -u containerd 2>/dev/null \
+    | grep -iE 'garbage|ImageGC|remov.*image|image.*remov|delet.*image|ErrImageNeverPull' | tail -30 || true
+}
+
 diagnose() {
   [ "$DIAGNOSED" -eq 1 ] && return 0
   DIAGNOSED=1
   say "What the cluster says (diagnostics on failure)"
+  node_image_diagnostics
   k get pods,pvc,svc,sts -o wide 2>&1 || true
   echo
   k get events --sort-by=.lastTimestamp 2>&1 | tail -60 || true
@@ -517,6 +549,7 @@ if [ -n "$FROM_IMAGE" ] && [ -n "$KIND_CLUSTER" ] && ! docker image inspect "$FR
   first_image+=(--set-string image.pullPolicy=IfNotPresent)
 fi
 install_started=$SECONDS
+[ -n "$FROM_IMAGE" ] || ensure_image_on_node "$IMAGE"
 run helm --kube-context "$CONTEXT" -n "$NAMESPACE" install "$RELEASE" "$CHART" -f "$WORK/values.yaml" \
   "${first_image[@]}" --wait --timeout "$TIMEOUT" \
   || fail "helm install did not reach Ready within $TIMEOUT"
@@ -600,6 +633,7 @@ revision_before_roll="$(helm --kube-context "$CONTEXT" -n "$NAMESPACE" list -o j
 if [ -n "$FROM_IMAGE" ]; then
   phase_begin upgrade none "helm upgrade from $FROM_IMAGE to $IMAGE: the StatefulSet rolls $STS-1 then $STS-0, each handing its shards on and taking them back"
   mapfile -t target_image < <(image_sets "$IMAGE")
+  ensure_image_on_node "$IMAGE"
   run helm --kube-context "$CONTEXT" -n "$NAMESPACE" upgrade "$RELEASE" "$CHART" --reuse-values "${target_image[@]}" --wait --timeout "$TIMEOUT"
   wait_ready 2 300 || fail "the roll to $IMAGE did not settle"
   running="$(k get pod "$STS-0" -o jsonpath='{.spec.containers[0].image}')"
@@ -641,6 +675,7 @@ settle
 phase_end
 
 phase_begin scale-up none "helm upgrade --set replicaCount=3: a third replica joins and takes a third of the shards from both"
+ensure_image_on_node "$IMAGE"
 run helm --kube-context "$CONTEXT" -n "$NAMESPACE" upgrade "$RELEASE" "$CHART" --reuse-values --set replicaCount=3 --wait --timeout "$TIMEOUT"
 wait_ready 3 300 || fail "three replicas did not become Ready"
 settle
@@ -655,6 +690,7 @@ settle
 phase_end
 
 phase_begin scale-to-two none "back to two replicas for the roll"
+ensure_image_on_node "$IMAGE"
 run helm --kube-context "$CONTEXT" -n "$NAMESPACE" upgrade "$RELEASE" "$CHART" --reuse-values --set replicaCount=2 --wait --timeout "$TIMEOUT"
 wait_ready 2 300 || fail "the release did not settle at two replicas"
 settle

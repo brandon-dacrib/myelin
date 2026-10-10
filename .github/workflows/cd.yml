@@ -271,6 +271,15 @@ jobs:
           # No image garbage collection on the node: deploy/helm/hs/ci/kind-config.yaml says why.
           config: deploy/helm/hs/ci/kind-config.yaml
 
+      - name: Say what the kind node's kubelet does with images
+        # Evidence for the next ErrImageNeverPull: deploy/helm/hs/ci/kind-config.yaml turns
+        # image garbage collection off; this prints what the node actually runs with.
+        if: matrix.arch == 'amd64'
+        run: |
+          kubectl get --raw /api/v1/nodes/smoke-control-plane/proxy/configz \
+            | python3 -c 'import json,sys; c=json.load(sys.stdin)["kubeletconfig"]; print({k: c.get(k) for k in ("imageGCHighThresholdPercent","imageGCLowThresholdPercent","imageMinimumGCAge","imageMaximumGCAge","evictionHard")})'
+          docker exec smoke-control-plane crictl images | head -20
+
       - uses: azure/setup-helm@v4
         if: matrix.arch == 'amd64'
 

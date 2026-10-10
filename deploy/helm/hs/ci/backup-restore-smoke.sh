@@ -128,10 +128,42 @@ redact() { sed -E 's/(token=)[A-Za-z0-9_-]+/\1<redacted>/g; s/"access_token":"[^
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/backup-smoke.XXXXXX")"
 PF_PID=""
 DIAGNOSED=0
+# --- The smoke image on the kind node -------------------------------------------------------
+#
+# With pullPolicy Never a pod starts only if the node holds the image *by name*. On CD runs
+# 38011878606 and 38014342577 `kind load` found `myelin:smoke` present by name and minutes
+# later the kubelet answered ErrImageNeverPull for it, with nothing in these scripts removing
+# it. Until the node says why (diagnose prints its images and the kubelet's image-removal log
+# lines), every install or upgrade that starts a pod from IMAGE first checks the name on the
+# node and imports the image again if it is gone.
+kind_node() { echo "${KIND_CLUSTER}-control-plane"; }
+node_has_image() { docker exec "$(kind_node)" crictl inspecti "$1" >/dev/null 2>&1; }
+ensure_image_on_node() {
+  [ -n "$KIND_CLUSTER" ] || return 0
+  local ref="docker.io/library/$1"; [[ "$1" == */* ]] && ref="$1"
+  if node_has_image "$ref" || node_has_image "$1"; then return 0; fi
+  echo "$1 is not on node $(kind_node) by name any more; importing it again"
+  docker save "$1" | docker exec -i "$(kind_node)" ctr -n k8s.io images import --all-platforms --digests - >/dev/null \
+    || fail "could not import $1 into node $(kind_node)"
+  node_has_image "$ref" || node_has_image "$1" || fail "$1 is still not on node $(kind_node) after the import"
+}
+node_image_diagnostics() {
+  [ -n "$KIND_CLUSTER" ] || return 0
+  echo "--- images on node $(kind_node) (crictl)"
+  docker exec "$(kind_node)" crictl images 2>&1 | grep -iE 'IMAGE|myelin' || true
+  echo "--- the kubelet's image settings"
+  kubectl --context "$CONTEXT" get --raw "/api/v1/nodes/$(kind_node)/proxy/configz" 2>/dev/null \
+    | python3 -c 'import json,sys; c=json.load(sys.stdin)["kubeletconfig"]; print({k: c.get(k) for k in ("imageGCHighThresholdPercent","imageGCLowThresholdPercent","imageMinimumGCAge","imageMaximumGCAge","evictionHard")})' 2>&1 || true
+  echo "--- the kubelet and containerd on images (journal, last 30 matching lines)"
+  docker exec "$(kind_node)" journalctl --no-pager -u kubelet -u containerd 2>/dev/null \
+    | grep -iE 'garbage|ImageGC|remov.*image|image.*remov|delet.*image|ErrImageNeverPull' | tail -30 || true
+}
+
 diagnose() {
   [ "$DIAGNOSED" -eq 1 ] && return 0
   DIAGNOSED=1
   say "What the cluster says (diagnostics on failure)"
+  node_image_diagnostics
   k get pods,pvc,svc,sts,secrets -o wide 2>&1 || true
   echo
   k get events --sort-by=.lastTimestamp 2>&1 | tail -40 || true
@@ -195,6 +227,7 @@ EOF
 }
 helper_rm() { k delete pod backup-helper --wait=true --timeout=120s >/dev/null 2>&1 || true; }
 scale() {
+  [ "$1" = 0 ] || ensure_image_on_node "$IMAGE"
   rk scale "statefulset/$STS" --replicas="$1"
   if [ "$1" = "0" ]; then
     k wait --for=delete "pod/$STS-0" --timeout=180s >/dev/null 2>&1 || true
@@ -268,6 +301,7 @@ run kubectl --context "$CONTEXT" create namespace "$NAMESPACE"
 # =============================================================================================
 if [ "$MODE" = "embedded" ] || [ "$MODE" = "both" ]; then
 say "EMBEDDED: install a single-node release"
+ensure_image_on_node "$IMAGE"
 run helm --kube-context "$CONTEXT" -n "$NAMESPACE" install "$RELEASE" "$CHART" --set fullnameOverride="$STS" \
   --set serverName=smoke.invalid --set bridges.enabled=false --set telemetry.logging.format=text \
   "${IMAGE_ARGS[@]}" --wait --timeout "$TIMEOUT" >/dev/null
@@ -291,6 +325,7 @@ say "EMBEDDED: lose everything (uninstall, delete the claim), reinstall: a diffe
 stop_port_forward
 run helm --kube-context "$CONTEXT" -n "$NAMESPACE" uninstall "$RELEASE" --wait >/dev/null
 rk delete pvc "data-$STS-0" --wait=true
+ensure_image_on_node "$IMAGE"
 run helm --kube-context "$CONTEXT" -n "$NAMESPACE" install "$RELEASE" "$CHART" --set fullnameOverride="$STS" \
   --set serverName=smoke.invalid --set bridges.enabled=false --set telemetry.logging.format=text \
   "${IMAGE_ARGS[@]}" --wait --timeout "$TIMEOUT" >/dev/null
@@ -416,6 +451,7 @@ cluster:
 bridges: {enabled: false}
 telemetry: {logging: {format: text, level: info}}
 EOF
+ensure_image_on_node "$IMAGE"
 run helm --kube-context "$CONTEXT" -n "$NAMESPACE" install "$RELEASE" "$CHART" -f "$WORK/values.yaml" \
   "${IMAGE_ARGS[@]}" --wait --timeout "$TIMEOUT" >/dev/null
 first_run
@@ -454,6 +490,7 @@ run sh -c "kubectl --context '$CONTEXT' -n '$NAMESPACE' exec -i '$PG_POD' -- pg_
 helper_up hs-media
 run sh -c "kubectl --context '$CONTEXT' -n '$NAMESPACE' exec -i backup-helper -- tar xf - -C /data < '$WORK/media.tar'"
 helper_rm
+ensure_image_on_node "$IMAGE"
 run helm --kube-context "$CONTEXT" -n "$NAMESPACE" install "$RELEASE" "$CHART" -f "$WORK/values.yaml" \
   "${IMAGE_ARGS[@]}" --wait --timeout "$TIMEOUT" >/dev/null
 pf "svc/$STS"
