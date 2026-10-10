@@ -1,10 +1,37 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-10-10, 16:30 EDT (the demo rolled to 87d57288; three findings). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+Written 2026-09-20 by the integration lead, last revised 2026-10-10, 18:20 EDT (public federation through a Funnel; the join fix rolled as 2d11ea2e). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
-## Resume here: 2026-10-10, 16:30 EDT -- the demo runs `87d57288`; three findings from the roll
+## Resume here: 2026-10-10, 18:20 EDT -- the demo runs `2d11ea2e` and federates from the public internet; the first public join found two bugs, fixed and rolled
+
+**The afternoon.** Finding 3 of the 16:30 entry is closed (`deploy/demo/tailscale-funnel.md`):
+a Tailscale Funnel at `myelin.longhair-tet.ts.net` through the operator the cluster already ran,
+`publicBaseUrl` unpinned from the release (revision 14) so the owner set `public_baseurl` and
+`well_known_server` live on the Configuration page, a Cloudflare record and redirect for the
+name; federationtester.matrix.org answers `FederationOK: true`. The server document is derived
+from the public base URL by default since `5af1a08d` (decision 0040). The server name stays
+pinned by the chart (`HS__SERVER__SERVER_NAME`): it is the identity, the owner agreed.
+
+**The first public join** (`/join #matrix:matrix.org`, 20:50 UTC) hung: `verify_array` in
+`hs-federation` verified matrix.org's `send_join` answer one event at a time, a gone server cost
+the 30 s request timeout per event with no memory of failing, and when Element stopped
+waiting the request future was dropped and the join cancelled with nothing persisted. Fixed on
+`agent/join-verify` (`564da9bd`, `2d11ea2e`): events grouped by server and verified 64 servers at
+a time, a negative cache (60 s doubling to 1 h) and a 10 s key-fetch budget, progress every 5 s
+with metrics `hs_federation_join_verify_seconds` and `hs_federation_key_fetch_failures_total`,
+and a join that outlives the client's connection (50 events from a gone server: 1500 s to 10 s
+with the fake key server). **Rolled to the demo as revision 15, `sha-2d11ea2e…`, 22:16 UTC**;
+next: the owner retries the join. Left for 06: keys through a notary (why Synapse joins that
+room in tens of seconds and keeps gone servers' events), `federation.key_fetch_timeout` in
+hs-config, one in-flight join per (room, user).
+
+**Unmerged:** `origin/agent/bridge-stale-devices` (the owner's, 16:46: the manager removes a
+bot's device left behind after a crypto reset; a bridge is sent its owner's key counts as
+Synapse does; bridge page changes), not gated yet.
+
+## Earlier: 2026-10-10, 16:30 EDT -- the demo runs `87d57288`; three findings from the roll
 
 **The roll** (through the owner's `kubectl proxy` on 127.0.0.1:8001, 19:26 UTC): `helm upgrade`
 with revision 12's values, `deploy/demo/values-bridges.yaml` and `image.tag=sha-87d57288…`,
