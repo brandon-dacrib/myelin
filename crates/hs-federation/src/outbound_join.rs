@@ -39,6 +39,7 @@
 //! the joining server cannot yet represent the room for its own user to read or post into.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt as _;
@@ -992,6 +993,168 @@ async fn verify_array(
     })
 }
 
+// -------------------------------------------------------------------------------------------
+// One join at a time per (room, user)
+// -------------------------------------------------------------------------------------------
+
+/// Whether a request started the join it was answered with, or attached to one already under
+/// way ([`InFlightJoins::run`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinShare {
+    /// This request started the join.
+    Started,
+    /// A join of the same room for the same user was under way; this request waited for it.
+    Attached,
+}
+
+impl JoinShare {
+    /// The `share` label of `hs_federation_join_requests_total`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::Attached => "attached",
+        }
+    }
+}
+
+/// The task running a join ended without an answer (it panicked, or the runtime shut down), so
+/// the requests waiting on it have nothing to be answered with.
+#[derive(Debug, thiserror::Error)]
+#[error("the join of {room_id} for {user_id} ended without an answer")]
+pub struct JoinTaskLost {
+    pub room_id: String,
+    pub user_id: String,
+}
+
+/// One join at a time per `(room, user)`: a second `/join` for the same pair while one is
+/// running attaches to the running one and is answered with its outcome, instead of starting a
+/// second `make_join`/`send_join` handshake that the room's server answers the same and that
+/// verifies the same thousands of events again. Clients retry a `/join` that did not answer in
+/// time (Element after its proxy's 100 s), and until 2026-10-10 each retry was a whole new join.
+///
+/// The join runs in its own task (`tokio::spawn`), so it outlives the request that started it:
+/// a client that goes away leaves the join running, and its retry finds it and attaches. `T` is
+/// the join's outcome, shared with every request that attached, so it must be `Clone`
+/// (`Arc<Result<..>>` for an error that is not).
+pub struct InFlightJoins<T: Clone + Send + Sync + 'static> {
+    running: RunningJoins<T>,
+}
+
+/// The joins under way, by `(room_id, user_id)`, each with the channel its outcome is announced
+/// on (`None` until it is).
+type RunningJoins<T> =
+    Arc<std::sync::Mutex<HashMap<(String, String), tokio::sync::watch::Receiver<Option<T>>>>>;
+
+/// A join's entry in [`InFlightJoins`], removed when dropped: at the end of the task, or when
+/// the task panics and unwinds, so a lost join does not leave an entry every later request
+/// would attach to and never be answered from.
+struct RunningEntry<T> {
+    running: RunningJoins<T>,
+    key: (String, String),
+}
+
+impl<T> Drop for RunningEntry<T> {
+    fn drop(&mut self) {
+        self.running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.key);
+    }
+}
+
+impl<T: Clone + Send + Sync + 'static> Default for InFlightJoins<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: Clone + Send + Sync + 'static> InFlightJoins<T> {
+    /// Nothing under way.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            running: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// How many joins are under way.
+    #[must_use]
+    pub fn running(&self) -> usize {
+        self.running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    /// The outcome of the join of `room_id` for `user_id`: the one under way if there is one
+    /// ([`JoinShare::Attached`]), else the one `start` makes, run in a task of its own
+    /// ([`JoinShare::Started`]). `start` is called only when a join is started, under the lock
+    /// that decides it, so two requests arriving together start one join.
+    ///
+    /// # Errors
+    /// [`JoinTaskLost`] when the task ended without an outcome (it panicked).
+    pub async fn run<F, Fut>(
+        &self,
+        room_id: &str,
+        user_id: &str,
+        start: F,
+    ) -> Result<(T, JoinShare), JoinTaskLost>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T> + Send + 'static,
+    {
+        let key = (room_id.to_owned(), user_id.to_owned());
+        let (mut receiver, share) = {
+            let mut running = self
+                .running
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match running.get(&key) {
+                Some(receiver) => (receiver.clone(), JoinShare::Attached),
+                None => {
+                    let (sender, receiver) = tokio::sync::watch::channel(None);
+                    running.insert(key.clone(), receiver.clone());
+                    let future = start();
+                    let entry = RunningEntry {
+                        running: Arc::clone(&self.running),
+                        key: key.clone(),
+                    };
+                    tokio::spawn(async move {
+                        let outcome = future.await;
+                        // Out of the map before the answer goes out, so a request arriving now
+                        // starts a join of its own rather than attaching to a finished one.
+                        drop(entry);
+                        // Nobody waiting is fine: the join happened, which is what matters.
+                        let _ = sender.send(Some(outcome));
+                    });
+                    (receiver, JoinShare::Started)
+                }
+            }
+        };
+        crate::metrics::record_join_request(share.as_str());
+        if share == JoinShare::Attached {
+            tracing::info!(
+                room_id,
+                user_id,
+                "a join of this room for this user is already under way; answering with its \
+                 outcome rather than starting another"
+            );
+        }
+        let lost = || JoinTaskLost {
+            room_id: room_id.to_owned(),
+            user_id: user_id.to_owned(),
+        };
+        let outcome = receiver
+            .wait_for(Option::is_some)
+            .await
+            .map_err(|_closed| lost())?
+            .clone()
+            .ok_or_else(lost)?;
+        Ok((outcome, share))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1006,8 +1169,8 @@ mod tests {
     use crate::transport::{FederationState, InMemoryQuerySource};
     use crate::xmatrix::XMatrixContext;
     use async_trait::async_trait;
+    use futures::FutureExt as _;
     use std::net::IpAddr;
-    use std::sync::Arc;
 
     /// A resolver that answers every hostname with `127.0.0.1` and never touches the network --
     /// this module's tests run a fake resident server on loopback instead of over TLS to a real
@@ -1909,5 +2072,151 @@ mod tests {
         assert!(message.contains("resident.example.org"));
         assert!(message.contains("make_join"));
         assert!(message.contains("404"));
+    }
+
+    // --- InFlightJoins ----------------------------------------------------------------------
+
+    /// Two requests for the same (room, user) arriving together: one join runs, both are
+    /// answered with its outcome, one as the starter and one attached, and nothing is left
+    /// running afterwards.
+    #[tokio::test]
+    async fn two_requests_for_the_same_room_and_user_share_one_join() {
+        let joins = Arc::new(InFlightJoins::<u32>::new());
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let released = released.map(|_| ()).shared();
+        let start = {
+            let starts = starts.clone();
+            let released = released.clone();
+            move || {
+                starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    released.await;
+                    7u32
+                }
+            }
+        };
+        let first = tokio::spawn({
+            let joins = joins.clone();
+            async move { joins.run("!r:a", "@u:a", start).await.unwrap() }
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(joins.running(), 1);
+        let attached_before = crate::metrics::join_requests("attached");
+        let second = tokio::spawn({
+            let joins = joins.clone();
+            let starts = starts.clone();
+            async move {
+                joins
+                    .run("!r:a", "@u:a", move || {
+                        starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        async move { 99u32 }
+                    })
+                    .await
+                    .unwrap()
+            }
+        });
+        tokio::task::yield_now().await;
+        release.send(()).unwrap();
+        let (first, second) = (first.await.unwrap(), second.await.unwrap());
+        assert_eq!(first, (7, JoinShare::Started));
+        assert_eq!(second, (7, JoinShare::Attached));
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(crate::metrics::join_requests("attached") > attached_before);
+        assert_eq!(joins.running(), 0);
+        // Done: the next request starts a join of its own.
+        let (again, share) = joins.run("!r:a", "@u:a", || async { 8u32 }).await.unwrap();
+        assert_eq!((again, share), (8, JoinShare::Started));
+    }
+
+    /// A different room, or a different user of the same room, is a join of its own.
+    #[tokio::test]
+    async fn different_rooms_or_users_run_separately() {
+        let joins = InFlightJoins::<&'static str>::new();
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let released = released.map(|_| ()).shared();
+        let gate = released.clone();
+        let a = joins.run("!r:a", "@u:a", move || async move {
+            gate.await;
+            "a"
+        });
+        let b = joins.run("!r:a", "@v:a", || async { "b" });
+        let c = joins.run("!s:a", "@u:a", || async { "c" });
+        let (b, c) = futures::future::join(b, c).await;
+        assert_eq!(b.unwrap(), ("b", JoinShare::Started));
+        assert_eq!(c.unwrap(), ("c", JoinShare::Started));
+        release.send(()).unwrap();
+        assert_eq!(a.await.unwrap(), ("a", JoinShare::Started));
+    }
+
+    /// The request that started the join goes away (the client disconnected): the join goes on
+    /// in its task, and the retry attaches to it and is answered when it is done.
+    #[tokio::test]
+    async fn a_dropped_request_leaves_the_join_running_for_the_retry_to_attach_to() {
+        let joins = Arc::new(InFlightJoins::<u32>::new());
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let first = {
+            let joins = joins.clone();
+            tokio::spawn(async move {
+                joins
+                    .run("!r:a", "@u:a", move || async move {
+                        let _ = released.await;
+                        42u32
+                    })
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        first.abort();
+        let _ = first.await;
+        assert_eq!(joins.running(), 1, "the join is still under way");
+        let retry = {
+            let joins = joins.clone();
+            tokio::spawn(async move { joins.run("!r:a", "@u:a", || async { 0u32 }).await })
+        };
+        tokio::task::yield_now().await;
+        release.send(()).unwrap();
+        assert_eq!(retry.await.unwrap().unwrap(), (42, JoinShare::Attached));
+        assert_eq!(joins.running(), 0);
+    }
+
+    /// A join task that panics answers every request waiting on it with [`JoinTaskLost`], and
+    /// is not left in the map.
+    #[tokio::test]
+    async fn a_join_task_that_panics_is_reported_to_every_waiter() {
+        let joins = Arc::new(InFlightJoins::<u32>::new());
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let released = released.map(|_| ()).shared();
+        let first = {
+            let joins = joins.clone();
+            let gate = released.clone();
+            tokio::spawn(async move {
+                joins
+                    .run("!r:a", "@u:a", move || async move {
+                        gate.await;
+                        panic!("the join task fell over");
+                    })
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        let second = {
+            let joins = joins.clone();
+            tokio::spawn(async move { joins.run("!r:a", "@u:a", || async { 1u32 }).await })
+        };
+        tokio::task::yield_now().await;
+        release.send(()).unwrap();
+        let first = first.await.unwrap().unwrap_err();
+        let second = second.await.unwrap().unwrap_err();
+        assert_eq!(
+            first.to_string(),
+            "the join of !r:a for @u:a ended without an answer"
+        );
+        assert_eq!(second.room_id, "!r:a");
+        // The entry went with the task (its removal guard ran while unwinding), so the next
+        // request starts a join of its own instead of attaching to a closed channel.
+        assert_eq!(joins.running(), 0);
+        let (again, share) = joins.run("!r:a", "@u:a", || async { 5u32 }).await.unwrap();
+        assert_eq!((again, share), (5, JoinShare::Started));
     }
 }

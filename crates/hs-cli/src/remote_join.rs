@@ -15,7 +15,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use hs_federation::client::FederationClient;
 use hs_federation::keys::DynRemoteKeyCache;
-use hs_federation::outbound_join::OutboundJoinError;
+use hs_federation::outbound_join::{InFlightJoins, JoinShare, OutboundJoinError};
 use hs_kv::KvBackend;
 use hs_room::RoomError;
 use hs_room::identity::HomeserverIdentity;
@@ -30,6 +30,10 @@ pub struct FederationRemoteJoin<B: KvBackend> {
     rooms: Arc<RoomRegistry<B>>,
     identity: HomeserverIdentity,
     barrier: Option<DeliveryBarrier>,
+    /// The joins under way, one per (room, user): a retry of a `/join` that is still running
+    /// attaches to it ([`InFlightJoins`]). The outcome is shared with every request that
+    /// attached, and [`RoomError`] is not `Clone`, hence the `Arc` ([`shared_join_error`]).
+    in_flight: Arc<InFlightJoins<Arc<Result<OwnedRoomId, RoomError>>>>,
 }
 
 impl<B: KvBackend> Clone for FederationRemoteJoin<B> {
@@ -40,7 +44,28 @@ impl<B: KvBackend> Clone for FederationRemoteJoin<B> {
             rooms: self.rooms.clone(),
             identity: self.identity.clone(),
             barrier: self.barrier.clone(),
+            in_flight: self.in_flight.clone(),
         }
+    }
+}
+
+/// A copy of the error a shared join ended in, for the requests that attached to it: the
+/// variants `POST /join` answers with (the room refusing, the room not found, another server's
+/// own refusal, a handshake that failed) are carried as they are, so the attached request's
+/// status is the starter's; anything else is reported as a failed join with the same message.
+fn shared_join_error(error: &RoomError) -> RoomError {
+    match error {
+        RoomError::Forbidden(message) => RoomError::Forbidden(message.clone()),
+        RoomError::RoomNotFound(message) => RoomError::RoomNotFound(message.clone()),
+        RoomError::BadRequest(message) => RoomError::BadRequest(message.clone()),
+        RoomError::InvalidParam(message) => RoomError::InvalidParam(message.clone()),
+        RoomError::UnsupportedRoomVersion(version) => {
+            RoomError::UnsupportedRoomVersion(version.clone())
+        }
+        RoomError::RoomBlocked(reason) => RoomError::RoomBlocked(reason.clone()),
+        RoomError::RemoteRefused(refusal) => RoomError::RemoteRefused(refusal.clone()),
+        RoomError::RemoteJoinFailed(message) => RoomError::RemoteJoinFailed(message.clone()),
+        other => RoomError::RemoteJoinFailed(other.to_string()),
     }
 }
 
@@ -156,6 +181,7 @@ impl<B: KvBackend + 'static> FederationRemoteJoin<B> {
             rooms,
             identity,
             barrier: None,
+            in_flight: Arc::new(InFlightJoins::new()),
         }
     }
 
@@ -507,7 +533,10 @@ impl<B: KvBackend + 'static> hs_room::remote_join::RemoteJoin for FederationRemo
         // and the client's retry started over (the demo joining `#matrix:matrix.org` on
         // 2026-10-10). Detached, it completes, the room is made resident, and the user's next
         // `/sync` carries it -- as on Synapse, whose request handling is not cancelled by a
-        // disconnect. The watch logs the disconnect.
+        // disconnect. The watch logs the disconnect. And one join per (room, user): the retry
+        // a client makes when the first `/join` did not answer in time finds the join still
+        // running and is answered with its outcome, instead of running a second handshake
+        // (`InFlightJoins`).
         let mut watch = JoinRequestWatch {
             room_id: room_id.to_owned(),
             user_id: user_id.to_owned(),
@@ -515,18 +544,43 @@ impl<B: KvBackend + 'static> hs_room::remote_join::RemoteJoin for FederationRemo
             answered: false,
         };
         let this = self.clone();
-        let (user_id, room_id, via) = (user_id.to_owned(), room_id.to_owned(), via.to_vec());
-        let task = tokio::spawn(async move {
-            // Until the join is held here, what the resident sends over `/send` for the room
-            // is taken, not ignored as for a room nobody of this server is in.
-            let _joining = this.rooms.remote_join_started(&room_id);
-            this.join_through_each(&user_id, &room_id, &via, &content)
-                .await
-        });
-        let result = match task.await {
-            Ok(result) => result,
-            Err(error) => Err(RoomError::RemoteJoinFailed(format!(
-                "join: the join task ended abnormally: {error}"
+        let (user_id_owned, room_id_owned, via) =
+            (user_id.to_owned(), room_id.to_owned(), via.to_vec());
+        let outcome = self
+            .in_flight
+            .run(room_id.as_str(), user_id.as_str(), move || async move {
+                // Until the join is held here, what the resident sends over `/send` for the
+                // room is taken, not ignored as for a room nobody of this server is in.
+                let _joining = this.rooms.remote_join_started(&room_id_owned);
+                Arc::new(
+                    this.join_through_each(&user_id_owned, &room_id_owned, &via, &content)
+                        .await,
+                )
+            })
+            .await;
+        let result = match outcome {
+            Ok((outcome, JoinShare::Started)) => match Arc::try_unwrap(outcome) {
+                Ok(result) => result,
+                Err(shared) => match &*shared {
+                    Ok(joined) => Ok(joined.clone()),
+                    Err(error) => Err(shared_join_error(error)),
+                },
+            },
+            Ok((shared, JoinShare::Attached)) => {
+                let result = match &*shared {
+                    Ok(joined) => Ok(joined.clone()),
+                    Err(error) => Err(shared_join_error(error)),
+                };
+                tracing::info!(
+                    %room_id,
+                    %user_id,
+                    ok = result.is_ok(),
+                    "answered a repeated join request with the outcome of the join it attached to"
+                );
+                result
+            }
+            Err(lost) => Err(RoomError::RemoteJoinFailed(format!(
+                "join: the join task ended abnormally: {lost}"
             ))),
         };
         watch.answered = true;

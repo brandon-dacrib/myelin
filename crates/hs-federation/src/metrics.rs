@@ -407,6 +407,34 @@ static JOIN_VERIFY_SECONDS: std::sync::LazyLock<Histogram> = std::sync::LazyLock
     ])
 });
 
+/// Labels of `hs_federation_join_requests_total`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, prometheus_client::encoding::EncodeLabelSet)]
+pub struct JoinRequestLabels {
+    /// `started` (the request started a join through another server) or `attached` (a join of
+    /// the same room for the same user was already under way, and the request waited for that
+    /// one instead; `crate::outbound_join::InFlightJoins`).
+    pub share: &'static str,
+}
+
+static JOIN_REQUESTS: std::sync::LazyLock<Family<JoinRequestLabels, Counter>> =
+    std::sync::LazyLock::new(Family::default);
+
+/// Counts one `/join` of a room through another server, by whether it started the join or
+/// attached to one under way ([`JoinRequestLabels`]).
+pub fn record_join_request(share: &'static str) {
+    JOIN_REQUESTS
+        .get_or_create(&JoinRequestLabels { share })
+        .inc();
+}
+
+/// How many join requests were counted under `share` so far (for tests).
+#[must_use]
+pub fn join_requests(share: &'static str) -> u64 {
+    JOIN_REQUESTS
+        .get_or_create(&JoinRequestLabels { share })
+        .get()
+}
+
 /// Counts one key lookup answered from `source` ([`KeyFetchLabels`]): a cache hit, or a key
 /// response accepted from the origin or from a notary.
 pub fn record_key_fetch(source: &'static str) {
@@ -589,6 +617,8 @@ pub fn record_notary_answer(answered: bool) {
 /// - `hs_federation_transactions_total{outcome}`: attempts at outbound `/send` transactions
 ///   ([`TRANSACTION_OUTCOMES`]), and `hs_federation_pdus_sent_total`, the PDUs the accepted
 ///   ones carried ([`record_transaction`], [`record_pdus_sent`]).
+/// - `hs_federation_join_requests_total{share}`: joins through another server, by whether the
+///   request started one or attached to one under way ([`JoinRequestLabels`]).
 pub fn register_transport_metrics(registry: &mut Registry) {
     // Registered without `_total`: the text encoder appends it.
     registry.register(
@@ -629,6 +659,13 @@ pub fn register_transport_metrics(registry: &mut Registry) {
         "Key lookups answered, by source: the cache, the origin server's own key response, or \
          a notary (a trusted key server) that held the key",
         KEY_FETCHES.clone(),
+    );
+    registry.register(
+        "hs_federation_join_requests",
+        "Joins of a room through another server, by share: started (the request started the \
+         join) or attached (a join of the same room for the same user was under way, and the \
+         request waited for it instead of starting another)",
+        JOIN_REQUESTS.clone(),
     );
     registry.register(
         "hs_federation_key_fetch_failures",
@@ -676,6 +713,12 @@ pub fn register_transport_metrics(registry: &mut Registry) {
     for reason in KEY_FETCH_FAILURE_REASONS {
         let _ = KEY_FETCH_FAILURES.get_or_create(&KeyFetchFailureLabels { reason });
     }
+    for source in KEY_FETCH_SOURCES {
+        let _ = KEY_FETCHES.get_or_create(&KeyFetchLabels { source });
+    }
+    for share in JOIN_REQUEST_SHARES {
+        let _ = JOIN_REQUESTS.get_or_create(&JoinRequestLabels { share });
+    }
 }
 
 /// Labels of `hs_federation_transactions_total`.
@@ -704,8 +747,21 @@ pub const TRANSACTION_OUTCOMES: [&str; 6] = [
 
 /// The reasons `hs_federation_key_fetch_failures_total` is counted under
 /// ([`KeyFetchFailureLabels`]), rendered at zero from the start like [`TRANSACTION_OUTCOMES`].
-pub const KEY_FETCH_FAILURE_REASONS: [&str; 4] =
-    ["timeout", "unreachable", "invalid_response", "backoff"];
+pub const KEY_FETCH_FAILURE_REASONS: [&str; 5] = [
+    "timeout",
+    "unreachable",
+    "invalid_response",
+    "backoff",
+    "notary",
+];
+
+/// Every `source` of `hs_federation_key_fetch_total` ([`KeyFetchLabels`]), pre-created at
+/// registration like the failure reasons.
+pub const KEY_FETCH_SOURCES: [&str; 3] = ["cache", "origin", "notary"];
+
+/// Every `share` of `hs_federation_join_requests_total` ([`JoinRequestLabels`]), pre-created at
+/// registration.
+pub const JOIN_REQUEST_SHARES: [&str; 2] = ["started", "attached"];
 
 static TRANSACTIONS: std::sync::LazyLock<Family<TransactionLabels, Counter>> =
     std::sync::LazyLock::new(Family::default);
@@ -878,6 +934,14 @@ mod tests {
         }
         for reason in KEY_FETCH_FAILURE_REASONS {
             let series = format!("hs_federation_key_fetch_failures_total{{reason=\"{reason}\"}} ");
+            assert!(text.contains(&series), "missing {series} in {text}");
+        }
+        for source in KEY_FETCH_SOURCES {
+            let series = format!("hs_federation_key_fetch_total{{source=\"{source}\"}} ");
+            assert!(text.contains(&series), "missing {series} in {text}");
+        }
+        for share in JOIN_REQUEST_SHARES {
+            let series = format!("hs_federation_join_requests_total{{share=\"{share}\"}} ");
             assert!(text.contains(&series), "missing {series} in {text}");
         }
         assert!(text.contains("hs_federation_pdus_sent_total "), "{text}");
