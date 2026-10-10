@@ -754,6 +754,12 @@ const properties: Record<string, JsonSchemaNode> = {
         description:
           "How many to-device messages and device-list and cross-signing key updates this server keeps waiting for one other server before it drops the oldest. They are kept on disk until that server accepts them, so a server that is down for a while still gets the encryption keys and device changes it missed when it is back; this bounds what one that never comes back costs. A dropped update is logged; the other server re-learns a user's devices on their next change or when one of its users asks. Synapse keeps them without a bound and has no setting for it. At least 1; a change applies to the next update queued.",
       },
+      forget_unused_destinations_after: {
+        $ref: "#/$defs/Duration",
+        default: "1w",
+        description:
+          "How long a server this one shares no room with is kept on the Federation page before it is forgotten. Every server this one ever sent to is remembered with its retry state; once no room brings the two together it is only state, and nothing will be sent to it until a room does again (decision 0042). A sweep runs every hour and forgets each such server once it has had nothing queued and nothing happen (no attempt, no success, no failure) for this long, and each one failing for this long whose queued events are only for rooms this server has since left (leaving a large room leaves one row per server that was in it, most of them never answering). A server this one still shares a room with is never swept. `0` turns the sweep off; the Federation page's Forget and Prune do the same by hand at any time. Synapse keeps every destination for ever and has no setting for it. A change applies to the next sweep.",
+      },
       allow_public_rooms_over_federation: {
         type: "boolean",
         default: false,
@@ -1219,6 +1225,7 @@ export const configValues: Record<string, Record<string, JsonValue>> = {
     max_retry_backoff: "1d",
     max_queued_pdus_per_destination: 10000,
     max_queued_durable_edus_per_destination: 10000,
+    forget_unused_destinations_after: "1w",
     allow_public_rooms_over_federation: false,
     allow_device_name_lookup_over_federation: false,
   },

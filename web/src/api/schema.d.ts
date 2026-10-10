@@ -782,7 +782,11 @@ export interface paths {
         get: operations["federation.destinations.get"];
         put?: never;
         post?: never;
-        delete?: never;
+        /**
+         * Forget a destination
+         * @description Drops everything this server keeps about the destination -- its outbound queue (unsent events are lost), its backoff and retry state, its catch-up mark and its cached signing keys -- so it is learned again from nothing the next time a room brings the two together (decision 0042). Refused with `409 conflict` while this server still shares a room with it (a room where both have a joined member), naming how many, unless `force=true`. Audited as `federation.destinations.forget`; the event stream carries `federation.destination_forgotten`.
+         */
+        delete: operations["federation.destinations.forget"];
         options?: never;
         head?: never;
         patch?: never;
@@ -816,6 +820,26 @@ export interface paths {
         get: operations["federation.destinations.rooms"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/federation/destinations/prune": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Forget unused and failing destinations
+         * @description Forgets every destination this server shares no room with and has nothing queued for (it is state, not a relationship: decision 0042) and, when the body gives `failing_for`, every destination failing for at least that long whose queued events are only for rooms this server has since left (the queue is dropped with it). A destination this server shares a room with, or with events queued for a room it is still in, is kept; so is one with a queue that is not failing (the events will be delivered) or not failing for long enough. The report counts both sides by reason and names the first 50 of each. `dry_run=true` answers the same report without forgetting anything. Audited as `federation.destinations.prune` (not when a dry run); the event stream carries `federation.destinations_pruned`.
+         */
+        post: operations["federation.destinations.prune"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3068,9 +3092,54 @@ export interface components {
             /** Format: date-time */
             retry_last_at?: string | null;
             server_name?: string;
+            /** @description How many rooms this server shares with the destination (rooms where both have a joined member); null when the server cannot say. A destination sharing none is state, not a relationship, and may be forgotten (decision 0042). */
+            shared_rooms_count?: number | null;
+        };
+        /** @description What forgetting a destination dropped (`federation.destinations.forget`). */
+        DestinationForgotten: {
+            /** @description To-device messages and device-list updates that were queued for it and are now gone. */
+            dropped_edu_count: number;
+            /** @description Signing keys of it this server held and no longer does. */
+            dropped_key_count: number;
+            /** @description Room events that were queued for it and are now gone, unsent. */
+            dropped_pdu_count: number;
+            server_name: string;
+            /** @description How many rooms this server shared with it when it was forgotten (non-zero only with `force=true`). */
+            shared_rooms_count: number;
+            was_catching_up: boolean;
         };
         DestinationPage: components["schemas"]["PageEnvelope"] & {
             items: components["schemas"]["Destination"][];
+        };
+        DestinationPruneEntry: {
+            /** @description One sentence with the numbers behind the reason. */
+            detail: string;
+            /** @description One of the reasons `by_reason` is keyed by. */
+            reason: string;
+            server_name: string;
+        };
+        /** @description One side of a prune report. */
+        DestinationPruneGroup: {
+            /** @description How many for each reason. Forgotten: `unused` (shares no room, nothing queued), `failing` (failing long enough, queue only for rooms this server left). Kept: `shares_rooms`, `queued_for_current_rooms`, `queued_not_failing`, `failing_recently`, `active_recently`. */
+            by_reason: {
+                [key: string]: number;
+            };
+            /** @description How many in all. */
+            count: number;
+            /** @description The first 50, by name; `count` is the whole list's. */
+            servers: components["schemas"]["DestinationPruneEntry"][];
+        };
+        /** @description What `federation.destinations.prune` forgot (or would) and kept, and why. */
+        DestinationPruneReport: {
+            /** @description Whether nothing was forgotten (a dry run). */
+            dry_run: boolean;
+            forgotten: components["schemas"]["DestinationPruneGroup"];
+            kept: components["schemas"]["DestinationPruneGroup"];
+        };
+        /** @description What `federation.destinations.prune` is asked; every field is optional. */
+        DestinationPruneRequest: {
+            /** @description A duration (`7d`, `12h`, `30m`, `0s`): also forget every destination failing for at least this long whose queued events are only for rooms this server has since left. Absent, destinations with a queue are kept. */
+            failing_for?: string;
         };
         /** @description One room this server shares with a destination (at least one of its users is joined). */
         DestinationRoom: {
@@ -5711,6 +5780,8 @@ export interface operations {
                 include_total?: components["parameters"]["IncludeTotal"];
                 /** @description Page size. Values above the resource's max are clamped, not rejected. */
                 limit?: components["parameters"]["Limit"];
+                /** @description `false` for only the destinations this server shares no room with (state, not relationships: what `federation.destinations.prune` considers), `true` for only those it shares at least one with. Ignored when the server cannot say (`shared_rooms_count` null). */
+                shares_room?: boolean;
                 /** @description One of `server_name`, `failing_since`, `last_successful_at`, `retry_last_at`, `pending_pdu_count`, `pending_edu_count`, with `-` in front for descending; a destination without the timestamp sorts last either way. Absent means failing first, then by name. Anything else is `400 validation-failed` naming `param:sort`. */
                 sort?: string;
             };
@@ -5761,6 +5832,43 @@ export interface operations {
             401: components["responses"]["Unauthenticated"];
             403: components["responses"]["InsufficientScope"];
             404: components["responses"]["NotFound"];
+            429: components["responses"]["RateLimited"];
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    "federation.destinations.forget": {
+        parameters: {
+            query?: {
+                /** @description Forget it even though this server shares a room with it. */
+                force?: boolean;
+            };
+            header?: {
+                /** @description 1-255 visible ASCII characters. Replays return the stored response for 24 hours. */
+                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                /** @description A server name (federation destination). */
+                server_name: components["parameters"]["ServerName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Forgotten; what was dropped. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DestinationForgotten"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["InsufficientScope"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["IdempotencyMismatch"];
             429: components["responses"]["RateLimited"];
             500: components["responses"]["Internal"];
             503: components["responses"]["Unavailable"];
@@ -5832,6 +5940,44 @@ export interface operations {
             401: components["responses"]["Unauthenticated"];
             403: components["responses"]["InsufficientScope"];
             404: components["responses"]["NotFound"];
+            429: components["responses"]["RateLimited"];
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    "federation.destinations.prune": {
+        parameters: {
+            query?: {
+                /** @description Report what would be forgotten and kept, and forget nothing. */
+                dry_run?: boolean;
+            };
+            header?: {
+                /** @description 1-255 visible ASCII characters. Replays return the stored response for 24 hours. */
+                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["DestinationPruneRequest"];
+            };
+        };
+        responses: {
+            /** @description What was forgotten (or would be) and what was kept, and why. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DestinationPruneReport"];
+                };
+            };
+            400: components["responses"]["ValidationFailed"];
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["InsufficientScope"];
+            409: components["responses"]["IdempotencyInFlight"];
+            422: components["responses"]["IdempotencyMismatch"];
             429: components["responses"]["RateLimited"];
             500: components["responses"]["Internal"];
             503: components["responses"]["Unavailable"];

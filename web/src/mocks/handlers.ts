@@ -94,6 +94,10 @@ import {
   startKeyRefresh,
   filterDestinations,
   sortDestinations,
+  forgetDestination,
+  parseFailingFor,
+  pruneDestinations,
+  withSharedRooms,
 } from "./data/federation";
 import { roomStatistics, sortStatistics, timeseries, userMediaStatistics } from "./data/statistics";
 import type { ReportResolve } from "@/api/reports";
@@ -577,7 +581,11 @@ export const handlers = [
   http.get(`${API}/federation/destinations`, ({ request }) => {
     const url = new URL(request.url);
     const q = url.searchParams;
-    const filtered = filterDestinations(federationDestinations, q.get("failing"));
+    const filtered = filterDestinations(
+      federationDestinations.map(withSharedRooms),
+      q.get("failing"),
+      q.get("shares_room"),
+    );
     const sorted = sortDestinations(filtered, q.get("sort"));
     if (!sorted) {
       const field = (q.get("sort") ?? "").replace(/^-/, "");
@@ -2186,7 +2194,39 @@ export const handlers = [
         { type: "urn:hs:problem:not-found", title: "Destination not found", status: 404 },
         { status: 404 },
       );
-    return HttpResponse.json(destination);
+    return HttpResponse.json(withSharedRooms(destination));
+  }),
+
+  // `federation.destinations.forget`: 409 while a room is shared unless force=true (decision 0042).
+  http.delete(`${API}/federation/destinations/:server_name`, ({ params, request }) => {
+    const server = decodeURIComponent(String(params.server_name));
+    const force = new URL(request.url).searchParams.get("force") === "true";
+    const result = forgetDestination(server, force);
+    if (result === "not-found")
+      return problem(404, "not-found", "Not found", {
+        detail: `this server has never tried to reach ${server}`,
+      });
+    if ("shares" in result)
+      return problem(409, "conflict", "Conflict", {
+        detail: `this server still shares ${result.shares} ${result.shares === 1 ? "room" : "rooms"} with ${server}; its users are in them, so it is a relationship, not just state. Forget it anyway with force=true: what is queued for it is dropped and it is learned again from nothing`,
+      });
+    return HttpResponse.json(result);
+  }),
+
+  // `federation.destinations.prune`: the same report with dry_run=true and nothing forgotten.
+  http.post(`${API}/federation/destinations/prune`, async ({ request }) => {
+    const dryRun = new URL(request.url).searchParams.get("dry_run") === "true";
+    const body = (await request.json().catch(() => ({}))) as { failing_for?: string };
+    let failingFor: number | undefined;
+    if (body.failing_for?.trim()) {
+      failingFor = parseFailingFor(body.failing_for);
+      if (failingFor === undefined)
+        return problem(400, "validation-failed", "Validation failed", {
+          detail: `failing_for: not a duration: ${body.failing_for}`,
+          errors: [{ pointer: "/failing_for", detail: "not a duration" }],
+        });
+    }
+    return HttpResponse.json(pruneDestinations(dryRun, failingFor));
   }),
 
   http.get(`${API}/federation/destinations/:server_name/rooms`, ({ params, request }) => {

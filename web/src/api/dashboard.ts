@@ -79,6 +79,8 @@ export interface DestinationListQuery {
   sort?: string;
   /** `true` for only the failing destinations, `false` for only the rest. */
   failing?: boolean;
+  /** `false` for only the destinations this server shares no room with, `true` for the rest. */
+  shares_room?: boolean;
   include_total?: boolean;
 }
 
