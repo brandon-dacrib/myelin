@@ -344,9 +344,10 @@ pub struct PduDroppedLabels {
 pub struct KeyFetchFailureLabels {
     /// `timeout` (the key server did not answer within the fetch budget), `unreachable` (the
     /// fetch failed: discovery, connection, a non-200 answer or an unreadable body),
-    /// `invalid_response` (what it answered was not a validly self-signed key response for it)
-    /// or `backoff` (not asked: an earlier failure is still being backed off from, see
-    /// `crate::keys::RemoteKeyCache`).
+    /// `invalid_response` (what it answered was not a validly self-signed key response for it),
+    /// `backoff` (not asked: an earlier failure is still being backed off from, see
+    /// `crate::keys::RemoteKeyCache`) or `notary` (a notary could not be asked, or answered a
+    /// document not signed by its configured key or by the server it is about).
     pub reason: &'static str,
 }
 
@@ -383,6 +384,18 @@ pub fn destinations_forgotten(reason: &'static str, by: &'static str) -> u64 {
         .get()
 }
 
+/// Labels of `hs_federation_key_fetch_total`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, prometheus_client::encoding::EncodeLabelSet)]
+pub struct KeyFetchLabels {
+    /// Where a key lookup was answered from: `cache` (held already), `origin` (a key response
+    /// fetched from the server itself and accepted) or `notary` (one a trusted key server
+    /// answered for it and that verified; `crate::keys::RemoteKeyCache`).
+    pub source: &'static str,
+}
+
+static KEY_FETCHES: std::sync::LazyLock<Family<KeyFetchLabels, Counter>> =
+    std::sync::LazyLock::new(Family::default);
+
 /// `hs_federation_join_verify_seconds`: how long verifying the `state` and `auth_chain` of a
 /// `send_join` answer took, per join through another server
 /// (`crate::outbound_join::join_room`). The buckets reach 30 minutes: a large public room's
@@ -393,6 +406,18 @@ static JOIN_VERIFY_SECONDS: std::sync::LazyLock<Histogram> = std::sync::LazyLock
         0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0,
     ])
 });
+
+/// Counts one key lookup answered from `source` ([`KeyFetchLabels`]): a cache hit, or a key
+/// response accepted from the origin or from a notary.
+pub fn record_key_fetch(source: &'static str) {
+    KEY_FETCHES.get_or_create(&KeyFetchLabels { source }).inc();
+}
+
+/// How many key lookups were answered from `source` so far (for tests and the admin API).
+#[must_use]
+pub fn key_fetches(source: &'static str) -> u64 {
+    KEY_FETCHES.get_or_create(&KeyFetchLabels { source }).get()
+}
 
 /// Counts one failed (or skipped, for `backoff`) fetch of a server's keys, for `reason`
 /// ([`KeyFetchFailureLabels`]).
@@ -554,8 +579,11 @@ pub fn record_notary_answer(answered: bool) {
 ///   announcements were behind ([`record_device_list_catch_up`]).
 /// - `hs_federation_pdu_wakes_total{outcome}`: wakes of the replica that sends for a
 ///   destination, for PDUs another replica queued ([`PduWakeLabels`]).
+/// - `hs_federation_key_fetch_total{source}`: key lookups answered, by where from: the cache,
+///   the origin server, or a notary ([`KeyFetchLabels`]).
 /// - `hs_federation_key_fetch_failures_total{reason}`: fetches of other servers' signing keys
-///   that failed, or were skipped under backoff ([`KeyFetchFailureLabels`]).
+///   that failed, or were skipped under backoff, or a notary that failed
+///   ([`KeyFetchFailureLabels`]).
 /// - `hs_federation_join_verify_seconds`: a histogram of how long each join through another
 ///   server spent verifying the `send_join` answer ([`record_join_verify_seconds`]).
 pub fn register_transport_metrics(registry: &mut Registry) {
@@ -594,10 +622,17 @@ pub fn register_transport_metrics(registry: &mut Registry) {
         PDU_WAKES.clone(),
     );
     registry.register(
+        "hs_federation_key_fetch",
+        "Key lookups answered, by source: the cache, the origin server's own key response, or \
+         a notary (a trusted key server) that held the key",
+        KEY_FETCHES.clone(),
+    );
+    registry.register(
         "hs_federation_key_fetch_failures",
         "Fetches of other servers' signing keys that failed, by reason (timeout, unreachable, \
-         invalid_response) or were not made because an earlier failure is still backed off \
-         from (backoff)",
+         invalid_response), were not made because an earlier failure is still backed off \
+         from (backoff), or a notary that could not be asked or answered an unsigned document \
+         (notary)",
         KEY_FETCH_FAILURES.clone(),
     );
     registry.register(

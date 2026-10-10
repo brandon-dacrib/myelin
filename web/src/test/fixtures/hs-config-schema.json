@@ -156,11 +156,20 @@
         "trust_os_root_store": false,
         "client_timeout": "30s",
         "max_retry_backoff": "1h",
+        "key_fetch_timeout": "10s",
         "max_queued_pdus_per_destination": 10000,
         "max_queued_durable_edus_per_destination": 10000,
         "forget_unused_destinations_after": "1w",
         "allow_public_rooms_over_federation": false,
-        "allow_device_name_lookup_over_federation": false
+        "allow_device_name_lookup_over_federation": false,
+        "trusted_key_servers": [
+          {
+            "server_name": "matrix.org",
+            "verify_keys": {
+              "ed25519:auto": "Noi6WqcDj0QmPxCNQqgezwTlBKrfqehY1u2FyWP9uYw"
+            }
+          }
+        ]
       }
     },
     "rate_limits": {
@@ -1513,6 +1522,12 @@
           "default": "1h",
           "x-applies": "restart"
         },
+        "key_fetch_timeout": {
+          "description": "How long one fetch of another server's signing keys (its `/_matrix/key/v2/server`, or\none query of a notary) may take, connecting and answering together, before it is given\nup and the server is left alone for a while (a minute, doubling to an hour while it\nkeeps failing). Shorter than `client_timeout` on purpose: a room's events cite many\nservers, some gone for good, and each gone server costs one of these while a join or a\nbackfill verifies them. Synapse asks with 10 s too. A change applies to the next fetch.",
+          "$ref": "#/$defs/Duration",
+          "default": "10s",
+          "x-applies": "hot"
+        },
         "max_queued_pdus_per_destination": {
           "description": "How many events the outbound queue holds for one destination before it is dropped and\nthe destination, once it answers again, is caught up with the latest event of each room\nit is behind in instead (it fetches the rest itself). Bounds what a server that is down\nfor days costs this one's database. Corresponds to Synapse's catch-up mode\n(`destination_rooms`), which Synapse enters on the first failure; Synapse has no\nsetting for it. At least 1.",
           "type": "integer",
@@ -1546,9 +1561,47 @@
           "type": "boolean",
           "default": false,
           "x-applies": "hot"
+        },
+        "trusted_key_servers": {
+          "description": "Notaries this server asks for another server's signing keys when that server does not\npublish them any more, or cannot be reached. A room that has existed for years has its\ncreation and early state signed with keys its server has since rotated out, and most\nservers do not publish their retired keys; without a notary, which keeps every key it\nhas ever fetched, such a room cannot be joined (the key the `m.room.create` event is\nsigned with cannot be found). Each notary's answer must be signed by one of the\n`verify_keys` named for it and by the server the keys belong to, the Matrix\nspecification's rule for notary answers.\n\nDefaults to matrix.org with its published notary key, as Synapse does. An empty list\nturns notary lookups off: a key the server itself does not publish is then not found.\nCorresponds to Synapse's `trusted_key_servers`. A change applies to the running server\nat once: the next key the server does not hold is asked of the new list.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TrustedKeyServer"
+          },
+          "default": [
+            {
+              "server_name": "matrix.org",
+              "verify_keys": {
+                "ed25519:auto": "Noi6WqcDj0QmPxCNQqgezwTlBKrfqehY1u2FyWP9uYw"
+              }
+            }
+          ],
+          "x-applies": "hot"
         }
       },
       "additionalProperties": false
+    },
+    "TrustedKeyServer": {
+      "description": "A notary (Synapse: \"trusted key server\", \"perspectives server\") this server asks for\nanother server's signing keys when that server no longer publishes them, and the keys the\nnotary's answers must be signed with. See [`FederationConfig::trusted_key_servers`].",
+      "type": "object",
+      "properties": {
+        "server_name": {
+          "description": "The notary's server name (`matrix.org`).",
+          "type": "string"
+        },
+        "verify_keys": {
+          "description": "The notary's own verify keys, `key_id` (`ed25519:auto`) to the base64 public key, as\n`GET /_matrix/key/v2/server` on the notary publishes them. An answer not signed by one\nof these is refused: without them a notary's answer is only as trustworthy as the\nconnection it came over. At least one.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "server_name",
+        "verify_keys"
+      ]
     },
     "RateLimitConfig": {
       "description": "Rate limits: how fast one user, address or server may do each costly thing before requests\nare refused with `429` and a time to wait. Defaults are Synapse's.",

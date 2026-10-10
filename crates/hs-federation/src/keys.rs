@@ -9,11 +9,11 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use ed25519_dalek::VerifyingKey;
+use futures::StreamExt as _;
 use hs_model::canonical::CanonicalJsonValue;
 use hs_model::signing::{self, ALGORITHM, SigningKeyPair};
 use serde::{Deserialize, Serialize};
@@ -44,6 +44,11 @@ pub const KEY_FETCH_BACKOFF_MIN: Duration = Duration::from_secs(60);
 
 /// The ceiling of the key-fetch backoff ([`KEY_FETCH_BACKOFF_MIN`]).
 pub const KEY_FETCH_BACKOFF_MAX: Duration = Duration::from_secs(60 * 60);
+
+/// `duration` in whole milliseconds, saturating (for the fetch budget's atomic).
+fn duration_to_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -188,6 +193,14 @@ impl OwnSigningKeys {
         &self.keys
     }
 
+    /// A second handle to the same keys, for tests that hand one to a fake and keep one.
+    #[cfg(test)]
+    pub(crate) fn clone_for_test(&self) -> Self {
+        Self {
+            keys: self.keys.clone(),
+        }
+    }
+
     /// The key used to sign new outbound material when exactly one is needed (the request-
     /// signing path signs with one key, per the spec's `X-Matrix` header carrying a single
     /// `key=`). Picks the lexicographically greatest version string, which is `a_<unix_ms>` for
@@ -305,6 +318,21 @@ pub fn wrap_for_notary(
 #[async_trait]
 pub trait KeyServerFetcher: Send + Sync {
     async fn fetch_server_key(&self, server_name: &str) -> Option<serde_json::Value>;
+
+    /// Asks the notary `notary` with `POST /_matrix/key/v2/query` and `body`
+    /// (`{"server_keys": {server: {key_id: {"minimum_valid_until_ts": n}}}}`), answering its
+    /// parsed `200` body, not yet verified: [`RemoteKeyCache`] checks that each document it
+    /// carries is signed by the notary's configured key and by the server it is about. `None`
+    /// when the notary could not be reached or did not answer `200` with JSON. The default asks
+    /// nobody, for fetchers (and test fakes) that have no notary to ask.
+    async fn query_notary(
+        &self,
+        notary: &str,
+        body: &serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        let _ = (notary, body);
+        None
+    }
 }
 
 #[async_trait]
@@ -312,12 +340,119 @@ impl KeyServerFetcher for Box<dyn KeyServerFetcher> {
     async fn fetch_server_key(&self, server_name: &str) -> Option<serde_json::Value> {
         (**self).fetch_server_key(server_name).await
     }
+
+    async fn query_notary(
+        &self,
+        notary: &str,
+        body: &serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        (**self).query_notary(notary, body).await
+    }
 }
 
 /// A [`RemoteKeyCache`] over a boxed, dynamically-dispatched fetcher — the concrete type used
 /// wherever the cache is stored alongside other crate-wide state (`crate::xmatrix`,
 /// `crate::client`) without infecting every consumer with `KeyServerFetcher`'s type parameter.
 pub type DynRemoteKeyCache = RemoteKeyCache<Box<dyn KeyServerFetcher>>;
+
+/// A notary (`federation.trusted_key_servers`; Synapse's "trusted key server" or "perspectives
+/// server") this cache asks for a key a server does not publish, with the keys the notary's
+/// answers must be signed by. A notary keeps every key response it has ever fetched, so it
+/// still has the key a server signed its rooms' creation with years ago and has since rotated
+/// out; the server itself usually does not publish it (`old_verify_keys` is rare in practice),
+/// and without the notary such a room cannot be joined.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustedKeyServer {
+    server_name: String,
+    verify_keys: HashMap<String, VerifyingKey>,
+}
+
+impl TrustedKeyServer {
+    /// A notary named `server_name` whose answers must be signed by one of `verify_keys`
+    /// (`key_id` to base64 public key, as its `/_matrix/key/v2/server` publishes them).
+    ///
+    /// # Errors
+    /// [`FederationError::Key`] when `verify_keys` is empty, or a key is not a base64 Ed25519
+    /// public key.
+    pub fn new(
+        server_name: &str,
+        verify_keys: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<Self, FederationError> {
+        let mut keys = HashMap::new();
+        for (key_id, key_b64) in verify_keys {
+            let key = signing::verifying_key_from_base64(&key_b64).map_err(|e| {
+                FederationError::Key(format!(
+                    "notary {server_name}: verify key {key_id} is not an Ed25519 public key: {e}"
+                ))
+            })?;
+            keys.insert(key_id, key);
+        }
+        if keys.is_empty() {
+            return Err(FederationError::Key(format!(
+                "notary {server_name}: no verify key configured"
+            )));
+        }
+        Ok(Self {
+            server_name: server_name.to_owned(),
+            verify_keys: keys,
+        })
+    }
+
+    /// From one entry of `federation.trusted_key_servers`.
+    ///
+    /// # Errors
+    /// As [`TrustedKeyServer::new`].
+    pub fn from_config(
+        configured: &hs_config::federation::TrustedKeyServer,
+    ) -> Result<Self, FederationError> {
+        Self::new(
+            &configured.server_name,
+            configured
+                .verify_keys
+                .iter()
+                .map(|(id, key)| (id.clone(), key.clone())),
+        )
+    }
+
+    /// Every entry of `federation.trusted_key_servers` that parses; one that does not is
+    /// logged and left out (configuration validation refuses the malformed shapes first, so
+    /// this is a key that is well-formed base64 of the wrong length, or the like).
+    #[must_use]
+    pub fn list_from_config(configured: &[hs_config::federation::TrustedKeyServer]) -> Vec<Self> {
+        configured
+            .iter()
+            .filter_map(|entry| match Self::from_config(entry) {
+                Ok(notary) => Some(notary),
+                Err(error) => {
+                    tracing::warn!(
+                        notary = %entry.server_name,
+                        %error,
+                        "a trusted key server in the configuration is unusable; not asking it"
+                    );
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// The notary's server name.
+    #[must_use]
+    pub fn server_name(&self) -> &str {
+        &self.server_name
+    }
+}
+
+/// A key a caller needs: `key_id` of `server_name`, valid when something was signed at
+/// `signed_at_ts` (ms since the epoch). [`RemoteKeyCache::ensure_keys`] takes a batch of them.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WantedKey {
+    /// The server whose key it is.
+    pub server_name: String,
+    /// `ed25519:<version>`.
+    pub key_id: String,
+    /// When the thing to verify was signed: `origin_server_ts` for an event, now for a request.
+    pub signed_at_ts: u64,
+}
 
 /// A cached, currently-trusted verify key, with the response's own claimed validity window.
 #[derive(Debug, Clone)]
@@ -335,15 +470,29 @@ struct CachedOld {
 }
 
 /// Why a verification lookup against the cache failed, distinguishing "never heard of this key"
-/// (worth a fetch) from "definitely expired" (fetching again will not help).
+/// (worth a fetch) from "definitely expired" (fetching again will not help). Every variant a
+/// fetch pass can end in says what the origin answered and what each notary answered, so the
+/// one line logged for a dropped event says where the key was looked for.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum KeyLookupError {
-    #[error("no verify key `{key_id}` known for server `{server_name}`")]
-    Unknown { server_name: String, key_id: String },
+    /// Neither the server (`detail` says whether it answered or could not be reached) nor any
+    /// notary has the key.
+    #[error("no verify key `{key_id}` known for server `{server_name}`: {detail}")]
+    Unknown {
+        server_name: String,
+        key_id: String,
+        /// What the server and each notary answered, for the log.
+        detail: String,
+    },
     #[error("verify key `{key_id}` for server `{server_name}` was not valid at the required time")]
     Expired { server_name: String, key_id: String },
-    #[error("could not fetch keys for server `{0}`")]
-    FetchFailed(String),
+    /// The server could not be reached (or answered nothing usable), and no notary had the key.
+    #[error("could not fetch keys for server `{server_name}`: {detail}")]
+    FetchFailed {
+        server_name: String,
+        /// Why the fetch failed, and what each notary answered.
+        detail: String,
+    },
     #[error("fetched key response for `{0}` failed self-signature verification")]
     InvalidResponse(String),
     /// Not asked: an earlier fetch failed and the server is being left alone for a while
@@ -351,7 +500,7 @@ pub enum KeyLookupError {
     /// so every event from a gone server after the first fails at once and says why.
     #[error(
         "not asking `{server_name}` for keys again for {retry_in_secs} s: its last fetch failed \
-         ({reason})"
+         ({reason}){notaries}"
     )]
     FetchBackoff {
         server_name: String,
@@ -359,11 +508,14 @@ pub enum KeyLookupError {
         reason: String,
         /// Seconds until the next fetch may be made (0 when it is due now).
         retry_in_secs: u64,
+        /// What each notary answered for the key (`; notary matrix.org had nothing for it`),
+        /// or empty when none is configured.
+        notaries: String,
     },
 }
 
 /// A server whose last key fetch failed, left alone until `retry_at`
-/// ([`RemoteKeyCache::fetch_failure`]).
+/// ([`RemoteKeyCache::fetch_failure`]). Also a notary whose last query failed.
 #[derive(Debug, Clone)]
 pub struct FetchFailure {
     /// What the fetch reported: timed out, unreachable, or an invalid response.
@@ -378,14 +530,61 @@ pub struct FetchFailure {
 
 impl FetchFailure {
     /// The error a lookup that is not made because of this failure answers.
-    fn error(&self, server_name: &str, now: tokio::time::Instant) -> KeyLookupError {
+    fn error(
+        &self,
+        server_name: &str,
+        now: tokio::time::Instant,
+        notaries: String,
+    ) -> KeyLookupError {
         KeyLookupError::FetchBackoff {
             server_name: server_name.to_owned(),
             reason: self.reason.clone(),
             retry_in_secs: self.retry_at.saturating_duration_since(now).as_secs(),
+            notaries,
         }
     }
 }
+
+/// Records a failure of `name` into `failures` at `now`: the wait before the next attempt
+/// doubles from the previous failure's ([`KEY_FETCH_BACKOFF_MIN`] for the first, at most
+/// [`KEY_FETCH_BACKOFF_MAX`]). Answers the wait set.
+fn record_failure(
+    failures: &mut HashMap<String, FetchFailure>,
+    name: &str,
+    reason: &str,
+    now: tokio::time::Instant,
+) -> Duration {
+    let backoff = failures
+        .get(name)
+        .map_or(KEY_FETCH_BACKOFF_MIN, |previous| {
+            previous
+                .backoff
+                .saturating_mul(2)
+                .min(KEY_FETCH_BACKOFF_MAX)
+        });
+    failures.insert(
+        name.to_owned(),
+        FetchFailure {
+            reason: reason.to_owned(),
+            failed_at: now,
+            retry_at: now + backoff,
+            backoff,
+        },
+    );
+    backoff
+}
+
+/// How long after a server answered its keys it is not asked again for a key it did not
+/// list: what it publishes is what it published a moment ago. Short, so a server that has
+/// just rotated to a new key and signs with it at once is asked again soon; long enough that
+/// the events of one `send_join` answer signed with a key the server does not publish cost
+/// one fetch, not one each ([`RemoteKeyCache::ensure_keys`] fetches ahead of them).
+pub const ORIGIN_RECHECK_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How long a key a notary had nothing for is not asked of that notary again. A notary that
+/// does not hold a key now will not hold it a moment later unless the server it belongs to
+/// publishes it again, which the server is asked about itself.
+pub const NOTARY_MISS_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Caches other servers' verify keys, fetched (and self-signature-checked) on demand, with
 /// per-origin in-flight de-duplication (threat model 2.3's confused-deputy defence: N concurrent
@@ -399,18 +598,35 @@ impl FetchFailure {
 /// from a gone server cost the client's full 30 s request timeout, one after another (the demo
 /// server joining `#matrix:matrix.org` on 2026-10-10). Keys already held are never affected by
 /// the backoff: it only decides whether a fetch is made.
+///
+/// A key the server does not publish, or that cannot be fetched because the server is gone or
+/// backed off from, is asked of the notaries ([`TrustedKeyServer`]; none by default here,
+/// matrix.org by default in the configuration), concurrently with the server itself and under
+/// the same budget. A notary's answer is accepted only when it is signed by the notary's
+/// configured key *and* by the server it is about, and a key it answers is cached like one
+/// fetched from the server, with the validity the server gave it: an event signed while the
+/// key was valid verifies against it however long ago that was. When the server and a notary
+/// both answer, the server's answer wins (it is the fresher document). A key no notary had is
+/// not asked of them again for [`NOTARY_MISS_INTERVAL`]. The demo could not join
+/// `#selfhosted:selfhosted.chat` on 2026-10-10: its `m.room.create` is signed with
+/// `ed25519:a_VOzg`, which selfhosted.chat no longer publishes; matrix.org's notary has it.
 pub struct RemoteKeyCache<F: KeyServerFetcher> {
     fetcher: F,
-    /// How long one fetch may take.
-    fetch_timeout: Duration,
+    /// How long one fetch may take, in milliseconds (`federation.key_fetch_timeout`; read per
+    /// fetch, so [`RemoteKeyCache::set_fetch_timeout`] applies to the next one).
+    fetch_timeout_ms: std::sync::atomic::AtomicU64,
+    /// The notaries asked for a key a server does not publish, in the order asked
+    /// (concurrently). Replaced whole by [`RemoteKeyCache::set_trusted_key_servers`].
+    notaries: std::sync::RwLock<Arc<Vec<TrustedKeyServer>>>,
     /// The servers whose last fetch failed, with when they may be asked again.
     failures: std::sync::Mutex<HashMap<String, FetchFailure>>,
-    /// Counts every fetch that finished (either way), and per server the count when its last
-    /// fetch finished: a caller that waited for the in-flight lock learns from it whether a
-    /// fetch for its server completed while it waited, and takes that outcome instead of
-    /// fetching again.
-    fetch_seq: AtomicU64,
-    last_fetch_seq: std::sync::Mutex<HashMap<String, u64>>,
+    /// When each server's own key response was last accepted ([`ORIGIN_RECHECK_INTERVAL`]).
+    origin_fetched: std::sync::Mutex<HashMap<String, tokio::time::Instant>>,
+    /// The notaries whose last query failed, with when they may be asked again.
+    notary_failures: std::sync::Mutex<HashMap<String, FetchFailure>>,
+    /// `(notary, server, key_id)` the notary was asked about and had nothing for, with until
+    /// when it is not asked again ([`NOTARY_MISS_INTERVAL`]).
+    notary_misses: std::sync::Mutex<HashMap<(String, String, String), tokio::time::Instant>>,
     current: std::sync::Mutex<HashMap<(String, String), CachedCurrent>>,
     old: std::sync::Mutex<HashMap<(String, String), CachedOld>>,
     in_flight: std::sync::Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
@@ -446,6 +662,8 @@ struct StoredResponse {
 /// The most servers one notary query (`POST /_matrix/key/v2/query`) may ask about. Each server
 /// not held fresh enough costs this server one outbound fetch, so a request naming thousands
 /// would turn the notary into an amplifier; Synapse's clients ask about one or a few at a time.
+/// This server's own queries of a notary name at most this many servers each too
+/// ([`RemoteKeyCache::ensure_keys`]).
 pub const MAX_NOTARY_SERVERS_PER_QUERY: usize = 100;
 
 /// One key [`RemoteKeyCache`] holds for a server, as the admin API shows it
@@ -473,15 +691,38 @@ pub struct CachedServerKeys {
     pub fetched_at_ms: Option<u64>,
 }
 
+/// Where a key response came from, for the log and the `source` of
+/// `hs_federation_key_fetch_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source<'a> {
+    /// The server's own `/_matrix/key/v2/server`.
+    Origin,
+    /// A notary's `/_matrix/key/v2/query`.
+    Notary(&'a str),
+}
+
+/// Why one notary query produced nothing for a key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NotaryOutcome {
+    /// The notary answered, and had nothing covering the key.
+    Nothing,
+    /// The query failed (timed out, unreachable, or every document it carried was refused).
+    Failed(String),
+}
+
 impl<F: KeyServerFetcher> RemoteKeyCache<F> {
     #[must_use]
     pub fn new(fetcher: F) -> Self {
         Self {
             fetcher,
-            fetch_timeout: DEFAULT_KEY_FETCH_TIMEOUT,
+            fetch_timeout_ms: std::sync::atomic::AtomicU64::new(duration_to_ms(
+                DEFAULT_KEY_FETCH_TIMEOUT,
+            )),
+            notaries: std::sync::RwLock::new(Arc::new(Vec::new())),
             failures: std::sync::Mutex::new(HashMap::new()),
-            fetch_seq: AtomicU64::new(0),
-            last_fetch_seq: std::sync::Mutex::new(HashMap::new()),
+            origin_fetched: std::sync::Mutex::new(HashMap::new()),
+            notary_failures: std::sync::Mutex::new(HashMap::new()),
+            notary_misses: std::sync::Mutex::new(HashMap::new()),
             current: std::sync::Mutex::new(HashMap::new()),
             old: std::sync::Mutex::new(HashMap::new()),
             in_flight: std::sync::Mutex::new(HashMap::new()),
@@ -493,23 +734,113 @@ impl<F: KeyServerFetcher> RemoteKeyCache<F> {
     }
 
     /// Changes how long one fetch of a server's keys may take, connect and answer together
-    /// (the default is [`DEFAULT_KEY_FETCH_TIMEOUT`]). A fetch over the budget counts as a
-    /// failure for the backoff.
+    /// (the default is [`DEFAULT_KEY_FETCH_TIMEOUT`]; `federation.key_fetch_timeout`). A fetch
+    /// over the budget counts as a failure for the backoff. A notary query has the same budget,
+    /// concurrently.
     #[must_use]
-    pub fn with_fetch_timeout(mut self, timeout: Duration) -> Self {
-        self.fetch_timeout = timeout;
+    pub fn with_fetch_timeout(self, timeout: Duration) -> Self {
+        self.fetch_timeout_ms.store(
+            duration_to_ms(timeout),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         self
+    }
+
+    /// [`RemoteKeyCache::with_fetch_timeout`] on a running cache (a change to
+    /// `federation.key_fetch_timeout`): the next fetch, and every one after it, has the new
+    /// budget; one under way keeps the budget it started with.
+    pub fn set_fetch_timeout(&self, timeout: Duration) {
+        let previous = self.fetch_timeout();
+        self.fetch_timeout_ms.store(
+            duration_to_ms(timeout),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        if previous != timeout {
+            tracing::info!(
+                key_fetch_timeout_ms = duration_to_ms(timeout),
+                "the key fetch budget is now in force"
+            );
+        }
+    }
+
+    /// How long one fetch of a server's keys (or one notary query) may take.
+    #[must_use]
+    pub fn fetch_timeout(&self) -> Duration {
+        Duration::from_millis(
+            self.fetch_timeout_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// The notaries to ask for a key a server does not publish (`federation.trusted_key_servers`).
+    #[must_use]
+    pub fn with_trusted_key_servers(self, notaries: Vec<TrustedKeyServer>) -> Self {
+        self.set_trusted_key_servers(notaries);
+        self
+    }
+
+    /// Replaces the notaries ([`RemoteKeyCache::with_trusted_key_servers`]) on a running cache:
+    /// the next key a server does not hold is asked of the new list. Cheap: the list is read
+    /// once per fetch pass, and nothing cached depends on who answered it.
+    pub fn set_trusted_key_servers(&self, notaries: Vec<TrustedKeyServer>) {
+        if *self.notaries_snapshot() == notaries {
+            return;
+        }
+        tracing::info!(
+            notaries = ?notaries.iter().map(TrustedKeyServer::server_name).collect::<Vec<_>>(),
+            "trusted key servers (notaries) in force"
+        );
+        *self
+            .notaries
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(notaries);
+    }
+
+    /// The names of the notaries asked ([`RemoteKeyCache::with_trusted_key_servers`]).
+    #[must_use]
+    pub fn trusted_key_servers(&self) -> Vec<String> {
+        self.notaries_snapshot()
+            .iter()
+            .map(|notary| notary.server_name.clone())
+            .collect()
+    }
+
+    fn notaries_snapshot(&self) -> Arc<Vec<TrustedKeyServer>> {
+        self.notaries
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// The failure `server_name` is being backed off from, if its last key fetch failed and the
     /// backoff has not ended (for the operator's view and for tests).
     #[must_use]
     pub fn fetch_failure(&self, server_name: &str) -> Option<FetchFailure> {
-        let now = tokio::time::Instant::now();
+        self.fetch_failure_at(server_name, tokio::time::Instant::now())
+    }
+
+    fn fetch_failure_at(
+        &self,
+        server_name: &str,
+        now: tokio::time::Instant,
+    ) -> Option<FetchFailure> {
         self.failures
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(server_name)
+            .filter(|failure| now < failure.retry_at)
+            .cloned()
+    }
+
+    /// The failure `notary` is being backed off from, if its last query failed and the backoff
+    /// has not ended.
+    #[must_use]
+    pub fn notary_failure(&self, notary: &str) -> Option<FetchFailure> {
+        let now = tokio::time::Instant::now();
+        self.notary_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(notary)
             .filter(|failure| now < failure.retry_at)
             .cloned()
     }
@@ -521,7 +852,10 @@ impl<F: KeyServerFetcher> RemoteKeyCache<F> {
     /// and each is trusted for a signature made at any time: whatever this server signed, it
     /// signed. Call once at startup, after the signing keys are loaded.
     pub fn seed_own_keys(&self, own_server_name: &str, own_keys: &OwnSigningKeys) {
-        let mut own = self.own.lock().unwrap();
+        let mut own = self
+            .own
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for key in own_keys.all() {
             own.insert(
                 (own_server_name.to_owned(), key.key_id()),
@@ -580,11 +914,12 @@ impl<F: KeyServerFetcher> RemoteKeyCache<F> {
     /// `key_ids` names the keys asked about (empty: all of them). A response is fresh enough
     /// when its `valid_until_ts` is at least `minimum_valid_until_ts`; when some key asked about
     /// has no fresh-enough response held (or, for an empty `key_ids`, none at all is), the server
-    /// is asked again first. Whatever the fetch's outcome, the answer is every response then held
-    /// for the keys asked about -- expired ones included, since the spec's notary returns the
-    /// last keys it has for a server that is offline -- and a response that lists another key
-    /// does not displace one held for a key it no longer lists (Synapse issue 5305, Sytest's
-    /// "must not overwrite a valid key with a spurious result from the origin server").
+    /// is asked again first (the server only: a notary does not consult other notaries).
+    /// Whatever the fetch's outcome, the answer is every response then held for the keys asked
+    /// about -- expired ones included, since the spec's notary returns the last keys it has for
+    /// a server that is offline -- and a response that lists another key does not displace one
+    /// held for a key it no longer lists (Synapse issue 5305, Sytest's "must not overwrite a
+    /// valid key with a spurious result from the origin server").
     pub async fn notary_responses(
         &self,
         server_name: &str,
@@ -592,7 +927,7 @@ impl<F: KeyServerFetcher> RemoteKeyCache<F> {
         minimum_valid_until_ts: u64,
     ) -> Vec<serde_json::Value> {
         if !self.held_fresh_enough(server_name, key_ids, minimum_valid_until_ts)
-            && let Err(error) = self.refresh(server_name).await
+            && let Err(error) = self.refresh_origin(server_name, Refresh::Fresher).await
         {
             tracing::debug!(
                 server = server_name,
@@ -765,10 +1100,16 @@ impl<F: KeyServerFetcher> RemoteKeyCache<F> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(server_name);
-        self.last_fetch_seq
+        // Nor is it remembered as asked a moment ago, or as a key the notaries lacked: the next
+        // signature of it asks the server and the notaries afresh.
+        self.origin_fetched
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(server_name);
+        self.notary_misses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(_, server, _), _| server != server_name);
         if let Some(store) = &self.store {
             key_ids.sort();
             key_ids.dedup();
@@ -781,14 +1122,14 @@ impl<F: KeyServerFetcher> RemoteKeyCache<F> {
 
     /// Fetches `server_name`'s keys again now, whatever is cached and whatever backoff an
     /// earlier failure set (an administrator's `federation.keys.refresh`), and answers what the
-    /// cache then holds for it.
+    /// cache then holds for it. The server itself is asked, not the notaries.
     ///
     /// # Errors
     /// [`KeyLookupError::FetchFailed`] when the server could not be reached, and
     /// [`KeyLookupError::InvalidResponse`] when what it answered was not a validly self-signed
     /// key response for it; the cache is unchanged either way.
     pub async fn refetch(&self, server_name: &str) -> Result<CachedServerKeys, KeyLookupError> {
-        self.refresh_inner(server_name, true).await?;
+        self.refresh_origin(server_name, Refresh::Force).await?;
         self.cached_keys(server_name)
             .ok_or_else(|| KeyLookupError::InvalidResponse(server_name.to_owned()))
     }
@@ -804,22 +1145,27 @@ impl<F: KeyServerFetcher> RemoteKeyCache<F> {
         key_id: &str,
     ) -> Result<VerifyingKey, KeyLookupError> {
         if let Some(key) = self.cached_current(server_name, key_id) {
+            crate::metrics::record_key_fetch("cache");
             return Ok(key.verifying_key);
         }
-        self.refresh(server_name).await?;
+        let wanted = WantedKey {
+            server_name: server_name.to_owned(),
+            key_id: key_id.to_owned(),
+            signed_at_ts: now_ms(),
+        };
+        self.refresh_for(&wanted).await?;
         self.cached_current(server_name, key_id)
             .map(|k| k.verifying_key)
-            .ok_or_else(|| KeyLookupError::Unknown {
-                server_name: server_name.to_string(),
-                key_id: key_id.to_string(),
-            })
+            .ok_or_else(|| self.unknown(server_name, key_id))
     }
 
     /// Returns a verifying key usable to verify something signed *at* `signed_at_ts`
     /// (milliseconds since the epoch) — accepts a key that was current at that time even if it
-    /// has since rotated out (checked against `old_verify_keys`' `expired_ts`), and rejects a key
-    /// that had already expired by then. Fetches (with de-duplication) if nothing cached covers
-    /// the requested timestamp.
+    /// has since rotated out (checked against `old_verify_keys`' `expired_ts`, or the
+    /// `valid_until_ts` of the last response that listed it), and rejects a key that had
+    /// already expired by then. Fetches (with de-duplication) if nothing cached covers the
+    /// requested timestamp: the server, and the notaries with `minimum_valid_until_ts` set to
+    /// `signed_at_ts`.
     ///
     /// # Errors
     /// See [`KeyLookupError`].
@@ -830,43 +1176,121 @@ impl<F: KeyServerFetcher> RemoteKeyCache<F> {
         signed_at_ts: u64,
     ) -> Result<VerifyingKey, KeyLookupError> {
         if let Some(key) = self.cached_valid_at(server_name, key_id, signed_at_ts) {
+            crate::metrics::record_key_fetch("cache");
             return Ok(key);
         }
-        self.refresh(server_name).await?;
+        let wanted = WantedKey {
+            server_name: server_name.to_owned(),
+            key_id: key_id.to_owned(),
+            signed_at_ts,
+        };
+        self.refresh_for(&wanted).await?;
         self.cached_valid_at(server_name, key_id, signed_at_ts)
             .ok_or_else(|| {
                 // Distinguish "we have never heard of this key" from "we have heard of it and it
                 // does not cover this timestamp" for a clearer error, matching the plan's
                 // "expired key rejected" test intent.
+                let key = (server_name.to_string(), key_id.to_string());
                 let known_but_wrong_time = self
                     .current
                     .lock()
-                    .unwrap()
-                    .contains_key(&(server_name.to_string(), key_id.to_string()))
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains_key(&key)
                     || self
                         .old
                         .lock()
-                        .unwrap()
-                        .contains_key(&(server_name.to_string(), key_id.to_string()));
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .contains_key(&key);
                 if known_but_wrong_time {
                     KeyLookupError::Expired {
                         server_name: server_name.to_string(),
                         key_id: key_id.to_string(),
                     }
                 } else {
-                    KeyLookupError::Unknown {
-                        server_name: server_name.to_string(),
-                        key_id: key_id.to_string(),
-                    }
+                    self.unknown(server_name, key_id)
                 }
             })
+    }
+
+    /// Fetches ahead of a batch of lookups: every key of `wanted` not already held is asked of
+    /// its server (the servers [`JOIN_PREFETCH_CONCURRENCY`] at a time, each with the usual
+    /// budget, de-duplication and backoff) and then, for the keys the servers did not provide,
+    /// of each notary in one query naming them all (chunked by
+    /// [`MAX_NOTARY_SERVERS_PER_QUERY`] servers). The
+    /// lookups that follow ([`RemoteKeyCache::get_valid_at`]) then find their key held, or are
+    /// refused at once: a server that did not answer is backed off from, one that answered
+    /// without the key is not asked again for [`ORIGIN_RECHECK_INTERVAL`], and a key no notary
+    /// had is not asked of them again for [`NOTARY_MISS_INTERVAL`]. A `send_join` answer's
+    /// events (`crate::outbound_join`) cost one notary query, not one per event.
+    pub async fn ensure_keys(&self, wanted: &[WantedKey]) {
+        let mut missing: Vec<WantedKey> = Vec::new();
+        for key in wanted {
+            if self
+                .cached_valid_at(&key.server_name, &key.key_id, key.signed_at_ts)
+                .is_none()
+                && !missing.contains(key)
+            {
+                missing.push(key.clone());
+            }
+        }
+        if missing.is_empty() {
+            return;
+        }
+        // Owned names: a closure over `&str` here is not general enough in its lifetime for
+        // the task a join runs in (`tokio::spawn` needs the whole future to be `Send` for any
+        // lifetime), and the compiler says so in `hs-cli`, not here.
+        let mut servers: Vec<String> = Vec::new();
+        for key in &missing {
+            if !servers.contains(&key.server_name) {
+                servers.push(key.server_name.clone());
+            }
+        }
+        futures::stream::iter(servers.into_iter().map(|server| async move {
+            if let Err(error) = self.refresh_origin(&server, Refresh::Lookup).await {
+                tracing::debug!(server, %error, "prefetch: a server's keys were not fetched");
+            }
+        }))
+        .buffer_unordered(JOIN_PREFETCH_CONCURRENCY)
+        .collect::<Vec<()>>()
+        .await;
+        // The notaries, for what the servers did not provide: the keys of servers that are
+        // gone or backed off from, and keys a server has rotated out. One query per notary
+        // names them all; a join whose servers all answer costs no notary query.
+        let still_missing: Vec<WantedKey> = missing
+            .into_iter()
+            .filter(|key| {
+                self.cached_valid_at(&key.server_name, &key.key_id, key.signed_at_ts)
+                    .is_none()
+            })
+            .collect();
+        if still_missing.is_empty() {
+            return;
+        }
+        let notaries = self.notaries_snapshot();
+        let notaries: Vec<&TrustedKeyServer> = notaries
+            .iter()
+            .filter(|notary| self.notary_failure(&notary.server_name).is_none())
+            .collect();
+        if !notaries.is_empty() {
+            tracing::info!(
+                keys = still_missing.len(),
+                servers = still_missing
+                    .iter()
+                    .map(|key| key.server_name.as_str())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len(),
+                notaries = ?notaries.iter().map(|n| n.server_name.as_str()).collect::<Vec<_>>(),
+                "asking the notaries for the keys their servers did not provide"
+            );
+        }
+        self.query_notaries(&notaries, &still_missing).await;
     }
 
     fn cached_current(&self, server_name: &str, key_id: &str) -> Option<CachedCurrent> {
         if let Some(verifying_key) = self
             .own
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&(server_name.to_string(), key_id.to_string()))
         {
             return Some(CachedCurrent {
@@ -875,7 +1299,10 @@ impl<F: KeyServerFetcher> RemoteKeyCache<F> {
             });
         }
         let now = now_ms();
-        let map = self.current.lock().unwrap();
+        let map = self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.get(&(server_name.to_string(), key_id.to_string()))
             .filter(|c| now < c.valid_until_ts)
             .cloned()
@@ -883,15 +1310,28 @@ impl<F: KeyServerFetcher> RemoteKeyCache<F> {
 
     fn cached_valid_at(&self, server_name: &str, key_id: &str, ts: u64) -> Option<VerifyingKey> {
         let key = (server_name.to_string(), key_id.to_string());
-        if let Some(verifying_key) = self.own.lock().unwrap().get(&key) {
+        if let Some(verifying_key) = self
+            .own
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+        {
             return Some(*verifying_key);
         }
-        if let Some(c) = self.current.lock().unwrap().get(&key)
+        if let Some(c) = self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
             && ts <= c.valid_until_ts
         {
             return Some(c.verifying_key);
         }
-        if let Some(c) = self.old.lock().unwrap().get(&key)
+        if let Some(c) = self
+            .old
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
             && ts <= c.expired_ts
         {
             return Some(c.verifying_key);
@@ -899,63 +1339,174 @@ impl<F: KeyServerFetcher> RemoteKeyCache<F> {
         None
     }
 
-    /// Fetches (de-duplicated per `server_name`) and ingests a fresh key response, unless the
-    /// server is being backed off from after an earlier failure.
-    async fn refresh(&self, server_name: &str) -> Result<(), KeyLookupError> {
-        self.refresh_inner(server_name, false).await
+    /// The in-flight lock of `server_name`: one fetch of a server's keys at a time.
+    fn in_flight_lock(&self, server_name: &str) -> Arc<AsyncMutex<()>> {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(server_name.to_string())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
     }
 
-    /// [`RemoteKeyCache::refresh`]; `force` fetches through the backoff, and through a fetch
-    /// another caller completed meanwhile.
-    async fn refresh_inner(&self, server_name: &str, force: bool) -> Result<(), KeyLookupError> {
-        let seq_before = self.fetch_seq.load(Ordering::SeqCst);
-        let lock = {
-            let mut in_flight = self.in_flight.lock().unwrap();
-            in_flight
-                .entry(server_name.to_string())
-                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-                .clone()
-        };
+    /// Whether `server_name`'s own keys were accepted within [`ORIGIN_RECHECK_INTERVAL`] of
+    /// `now`: what it publishes is known, and a key not among them is not there.
+    fn origin_fetched_recently(&self, server_name: &str, now: tokio::time::Instant) -> bool {
+        self.origin_fetched
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(server_name)
+            .is_some_and(|at| now.saturating_duration_since(*at) < ORIGIN_RECHECK_INTERVAL)
+    }
+
+    /// The notaries to ask about `server_name`'s keys: every configured one but the server
+    /// itself (its notary would answer its own current document, which is what asking it
+    /// directly gets).
+    fn notaries_for(&self, server_name: &str) -> Vec<TrustedKeyServer> {
+        self.notaries_snapshot()
+            .iter()
+            .filter(|notary| notary.server_name != server_name)
+            .cloned()
+            .collect()
+    }
+
+    /// Whether `notary` was asked about `key` within [`NOTARY_MISS_INTERVAL`] and had nothing.
+    fn notary_missed(&self, notary: &str, key: &WantedKey, now: tokio::time::Instant) -> bool {
+        self.notary_misses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(
+                notary.to_owned(),
+                key.server_name.clone(),
+                key.key_id.clone(),
+            ))
+            .is_some_and(|until| now < *until)
+    }
+
+    /// Fetches what is needed to answer one lookup of `wanted`, de-duplicated per server: the
+    /// server's own keys (unless fetched within [`ORIGIN_RECHECK_INTERVAL`], or backed off
+    /// from) and, concurrently, the notaries' answer for the key (unless each already had
+    /// nothing for it, or is backed off from). `Ok` when the key may now be held -- the caller
+    /// looks again -- and `Err` when the server could not be asked and no notary had it.
+    async fn refresh_for(&self, wanted: &WantedKey) -> Result<(), KeyLookupError> {
+        let server_name = wanted.server_name.as_str();
+        let lock = self.in_flight_lock(server_name);
         let _guard = lock.lock().await;
-        if !force {
-            // A fetch for this server finished while this caller waited for the lock: its
-            // outcome is this caller's too. Success: the public getters re-check the cache
-            // after `refresh`. Failure: the backoff it set says so.
-            let fetched_meanwhile = self
-                .last_fetch_seq
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(server_name)
-                .is_some_and(|seq| *seq > seq_before);
-            let now = tokio::time::Instant::now();
-            let backed_off = self
-                .failures
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(server_name)
-                .filter(|failure| now < failure.retry_at)
-                .map(|failure| failure.error(server_name, now));
-            match (fetched_meanwhile, backed_off) {
-                (true, None) => return Ok(()),
-                (true, Some(error)) => return Err(error),
-                (false, Some(error)) => {
+        // A fetch for this server finished while this caller waited for the lock, and brought
+        // the key: its outcome is this caller's too.
+        if self
+            .cached_valid_at(server_name, &wanted.key_id, wanted.signed_at_ts)
+            .is_some()
+        {
+            return Ok(());
+        }
+        let now = tokio::time::Instant::now();
+        let backed_off = self.fetch_failure_at(server_name, now);
+        let ask_origin = backed_off.is_none() && !self.origin_fetched_recently(server_name, now);
+        let notaries = self.notaries_for(server_name);
+        let notaries: Vec<&TrustedKeyServer> = notaries
+            .iter()
+            .filter(|notary| {
+                !self.notary_missed(&notary.server_name, wanted, now)
+                    && self.notary_failure(&notary.server_name).is_none()
+            })
+            .collect();
+        if !ask_origin && notaries.is_empty() {
+            return match backed_off {
+                Some(failure) => {
                     crate::metrics::record_key_fetch_failure("backoff");
-                    return Err(error);
+                    Err(failure.error(server_name, now, self.notary_summary(wanted)))
                 }
-                (false, None) => {}
+                // Fetched a moment ago, and the key was not among them: the caller answers
+                // `Unknown` with the detail.
+                None => Ok(()),
+            };
+        }
+        // The server and the notaries are asked concurrently, but the server's answer is
+        // waited for first: when it carries the key, the notaries' answer is not needed (the
+        // query is dropped, and with it the request), so a lookup the server answers in a
+        // moment does not wait on matrix.org as well. Only a server that is gone, backed off
+        // from, or does not publish the key waits for the notaries.
+        let origin = async {
+            if ask_origin {
+                Some(self.fetch_origin(server_name).await)
+            } else {
+                None
+            }
+        };
+        let notary_query = self.query_notaries(&notaries, std::slice::from_ref(wanted));
+        let mut origin = std::pin::pin!(origin);
+        let mut notary_query = std::pin::pin!(notary_query);
+        let mut notaries_done = notaries.is_empty();
+        let origin = loop {
+            tokio::select! {
+                // The notaries first, so their query is on its way before the server's answer
+                // can end the wait.
+                biased;
+                () = &mut notary_query, if !notaries_done => notaries_done = true,
+                outcome = &mut origin => break outcome,
+            }
+        };
+        if self
+            .cached_valid_at(server_name, &wanted.key_id, wanted.signed_at_ts)
+            .is_some()
+        {
+            return Ok(());
+        }
+        if !notaries_done {
+            notary_query.await;
+        }
+        match origin {
+            Some(Err(error))
+                if self
+                    .cached_valid_at(server_name, &wanted.key_id, wanted.signed_at_ts)
+                    .is_none() =>
+            {
+                Err(match error {
+                    KeyLookupError::FetchFailed {
+                        server_name,
+                        detail,
+                    } => KeyLookupError::FetchFailed {
+                        server_name,
+                        detail: format!("{detail}{}", self.notary_summary(wanted)),
+                    },
+                    other => other,
+                })
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Fetches `server_name`'s own keys under its in-flight lock, unless `how` says the server
+    /// is not to be asked now: backed off from (the backoff's error), or fetched within
+    /// [`ORIGIN_RECHECK_INTERVAL`] (`Ok`, nothing fetched). The notaries are not asked.
+    async fn refresh_origin(&self, server_name: &str, how: Refresh) -> Result<(), KeyLookupError> {
+        let lock = self.in_flight_lock(server_name);
+        let _guard = lock.lock().await;
+        if how != Refresh::Force {
+            let now = tokio::time::Instant::now();
+            if let Some(failure) = self.fetch_failure_at(server_name, now) {
+                crate::metrics::record_key_fetch_failure("backoff");
+                return Err(failure.error(server_name, now, String::new()));
+            }
+            if how == Refresh::Lookup && self.origin_fetched_recently(server_name, now) {
+                return Ok(());
             }
         }
+        self.fetch_origin(server_name).await
+    }
 
+    /// One fetch of `server_name`'s own `/_matrix/key/v2/server`, within the budget, ingested;
+    /// a failure is recorded for the backoff. The caller holds the server's in-flight lock.
+    async fn fetch_origin(&self, server_name: &str) -> Result<(), KeyLookupError> {
         let started = tokio::time::Instant::now();
-        let outcome = tokio::time::timeout(
-            self.fetch_timeout,
-            self.fetcher.fetch_server_key(server_name),
-        )
-        .await;
+        let fetch_timeout = self.fetch_timeout();
+        let outcome =
+            tokio::time::timeout(fetch_timeout, self.fetcher.fetch_server_key(server_name)).await;
         let result: Result<(), (&'static str, String)> = match outcome {
             Err(_elapsed) => Err((
                 "timeout",
-                format!("timed out after {} s", self.fetch_timeout.as_secs()),
+                format!("timed out after {} s", fetch_timeout.as_secs()),
             )),
             Ok(None) => Err((
                 "unreachable",
@@ -964,25 +1515,32 @@ impl<F: KeyServerFetcher> RemoteKeyCache<F> {
                     .to_owned(),
             )),
             Ok(Some(doc)) => self
-                .ingest_response(server_name, &doc)
+                .ingest(server_name, &doc, Ingest::Fetched(Source::Origin))
                 .map_err(|error| ("invalid_response", error.to_string())),
         };
-        let seq = self.fetch_seq.fetch_add(1, Ordering::SeqCst) + 1;
-        self.last_fetch_seq
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(server_name.to_owned(), seq);
         match result {
             Ok(()) => {
                 self.failures
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(server_name);
+                self.origin_fetched
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(server_name.to_owned(), tokio::time::Instant::now());
                 Ok(())
             }
             Err((label, reason)) => {
                 crate::metrics::record_key_fetch_failure(label);
-                let backoff = self.record_fetch_failure(server_name, &reason, started);
+                let backoff = record_failure(
+                    &mut self
+                        .failures
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    server_name,
+                    &reason,
+                    started,
+                );
                 tracing::info!(
                     server = server_name,
                     reason = %reason,
@@ -992,51 +1550,295 @@ impl<F: KeyServerFetcher> RemoteKeyCache<F> {
                 );
                 Err(match label {
                     "invalid_response" => KeyLookupError::InvalidResponse(server_name.to_owned()),
-                    _ => KeyLookupError::FetchFailed(server_name.to_owned()),
+                    _ => KeyLookupError::FetchFailed {
+                        server_name: server_name.to_owned(),
+                        detail: reason,
+                    },
                 })
             }
         }
     }
 
-    /// Records a failed fetch of `server_name`'s keys at `now`: the wait before the next
-    /// attempt doubles from the previous failure's ([`KEY_FETCH_BACKOFF_MIN`] for the first,
-    /// at most [`KEY_FETCH_BACKOFF_MAX`]). Answers the wait set.
-    fn record_fetch_failure(
+    /// Asks each of `notaries`, concurrently and each within the budget, for every key of
+    /// `wanted` (not those of the notary itself), in queries of at most
+    /// [`MAX_NOTARY_SERVERS_PER_QUERY`] servers; ingests what verifies; records a miss for
+    /// every key a notary answered nothing covering, and a failure for a notary that could not
+    /// be asked.
+    async fn query_notaries(&self, notaries: &[&TrustedKeyServer], wanted: &[WantedKey]) {
+        if notaries.is_empty() || wanted.is_empty() {
+            return;
+        }
+        let queries = notaries.iter().map(|notary| async move {
+            let keys: Vec<&WantedKey> = wanted
+                .iter()
+                .filter(|key| key.server_name != notary.server_name)
+                .collect();
+            let mut servers: Vec<&str> = Vec::new();
+            for key in &keys {
+                if !servers.contains(&key.server_name.as_str()) {
+                    servers.push(&key.server_name);
+                }
+            }
+            for chunk in servers.chunks(MAX_NOTARY_SERVERS_PER_QUERY) {
+                let batch: Vec<&WantedKey> = keys
+                    .iter()
+                    .copied()
+                    .filter(|key| chunk.contains(&key.server_name.as_str()))
+                    .collect();
+                let outcome = self.query_notary(notary, &batch).await;
+                if let Some(NotaryOutcome::Failed(reason)) = outcome {
+                    let now = tokio::time::Instant::now();
+                    let backoff = record_failure(
+                        &mut self
+                            .notary_failures
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                        &notary.server_name,
+                        &reason,
+                        now,
+                    );
+                    tracing::warn!(
+                        notary = %notary.server_name,
+                        reason = %reason,
+                        backoff_secs = backoff.as_secs(),
+                        "could not ask a notary for keys; not asking it again until the \
+                         backoff ends"
+                    );
+                    break;
+                }
+            }
+        });
+        futures::future::join_all(queries).await;
+    }
+
+    /// One `POST /_matrix/key/v2/query` to `notary` for `batch`: ingests the documents that
+    /// verify, records a miss for each key still not held. `None` when there was nothing to
+    /// ask; `Nothing` when the notary answered; `Failed` when it did not, or nothing it
+    /// answered verified.
+    async fn query_notary(
         &self,
-        server_name: &str,
-        reason: &str,
-        now: tokio::time::Instant,
-    ) -> Duration {
-        let mut failures = self
-            .failures
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let backoff = failures
-            .get(server_name)
-            .map_or(KEY_FETCH_BACKOFF_MIN, |previous| {
-                previous
-                    .backoff
-                    .saturating_mul(2)
-                    .min(KEY_FETCH_BACKOFF_MAX)
-            });
-        failures.insert(
-            server_name.to_owned(),
-            FetchFailure {
-                reason: reason.to_owned(),
-                failed_at: now,
-                retry_at: now + backoff,
-                backoff,
-            },
-        );
-        backoff
+        notary: &TrustedKeyServer,
+        batch: &[&WantedKey],
+    ) -> Option<NotaryOutcome> {
+        if batch.is_empty() {
+            return None;
+        }
+        let mut server_keys = serde_json::Map::new();
+        for key in batch {
+            server_keys
+                .entry(key.server_name.clone())
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                .as_object_mut()
+                .map(|criteria| {
+                    criteria.insert(
+                        key.key_id.clone(),
+                        serde_json::json!({ "minimum_valid_until_ts": key.signed_at_ts }),
+                    )
+                });
+        }
+        let body = serde_json::json!({ "server_keys": server_keys });
+        let started = tokio::time::Instant::now();
+        let fetch_timeout = self.fetch_timeout();
+        let answer = tokio::time::timeout(
+            fetch_timeout,
+            self.fetcher.query_notary(&notary.server_name, &body),
+        )
+        .await;
+        let outcome = match answer {
+            Err(_elapsed) => {
+                NotaryOutcome::Failed(format!("timed out after {} s", fetch_timeout.as_secs()))
+            }
+            Ok(None) => NotaryOutcome::Failed(
+                "the notary could not be reached, or did not answer 200 with JSON".to_owned(),
+            ),
+            Ok(Some(answer)) => self.ingest_notary_answer(notary, &answer, batch),
+        };
+        match &outcome {
+            NotaryOutcome::Failed(_) => {
+                crate::metrics::record_key_fetch_failure("notary");
+            }
+            NotaryOutcome::Nothing => {
+                let until = tokio::time::Instant::now() + NOTARY_MISS_INTERVAL;
+                let mut misses = self
+                    .notary_misses
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut missed = 0usize;
+                for key in batch {
+                    if self
+                        .cached_valid_at(&key.server_name, &key.key_id, key.signed_at_ts)
+                        .is_none()
+                    {
+                        misses.insert(
+                            (
+                                notary.server_name.clone(),
+                                key.server_name.clone(),
+                                key.key_id.clone(),
+                            ),
+                            until,
+                        );
+                        missed += 1;
+                    }
+                }
+                tracing::debug!(
+                    notary = %notary.server_name,
+                    asked = batch.len(),
+                    missed,
+                    took_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    "asked a notary for keys"
+                );
+            }
+        }
+        Some(outcome)
+    }
+
+    /// Takes a notary's answer: each document of `server_keys` that is about a server in
+    /// `batch`, is signed by one of the notary's configured keys, and (in [`Self::ingest`]) is
+    /// self-signed by that server, is cached as if fetched from the server. `Nothing` when the
+    /// answer parsed (whether or not anything in it was accepted; the caller checks what is
+    /// held), `Failed` when it did not, or every document in it was refused.
+    fn ingest_notary_answer(
+        &self,
+        notary: &TrustedKeyServer,
+        answer: &serde_json::Value,
+        batch: &[&WantedKey],
+    ) -> NotaryOutcome {
+        let Some(docs) = answer
+            .get("server_keys")
+            .and_then(serde_json::Value::as_array)
+        else {
+            return NotaryOutcome::Failed("the answer has no `server_keys` array".to_owned());
+        };
+        let (mut accepted, mut refused) = (0usize, 0usize);
+        for doc in docs {
+            let Some(server_name) = doc.get("server_name").and_then(serde_json::Value::as_str)
+            else {
+                refused += 1;
+                continue;
+            };
+            if !batch.iter().any(|key| key.server_name == server_name) {
+                // Not asked about: not taken, however well signed.
+                refused += 1;
+                continue;
+            }
+            let Ok(object) = signing::to_signable_object(doc) else {
+                refused += 1;
+                continue;
+            };
+            let signed_by_notary = object
+                .get("signatures")
+                .and_then(CanonicalJsonValue::as_object)
+                .and_then(|signatures| signatures.get(&notary.server_name))
+                .and_then(CanonicalJsonValue::as_object)
+                .is_some_and(|by_notary| {
+                    by_notary.keys().any(|key_id| {
+                        notary.verify_keys.get(key_id).is_some_and(|vk| {
+                            signing::verify_object(&object, &notary.server_name, key_id, vk).is_ok()
+                        })
+                    })
+                });
+            if !signed_by_notary {
+                tracing::warn!(
+                    notary = %notary.server_name,
+                    server = server_name,
+                    configured_key_ids = ?notary.verify_keys.keys().collect::<Vec<_>>(),
+                    "a notary's answer is not signed by any of its configured keys; refusing it \
+                     (if the notary rotated its key, update federation.trusted_key_servers)"
+                );
+                refused += 1;
+                continue;
+            }
+            match self.ingest(
+                server_name,
+                doc,
+                Ingest::Fetched(Source::Notary(&notary.server_name)),
+            ) {
+                Ok(()) => accepted += 1,
+                Err(error) => {
+                    tracing::warn!(
+                        notary = %notary.server_name,
+                        server = server_name,
+                        %error,
+                        "a document in a notary's answer is not signed by the server it is \
+                         about; refusing it"
+                    );
+                    refused += 1;
+                }
+            }
+        }
+        if accepted == 0 && refused > 0 {
+            return NotaryOutcome::Failed(format!(
+                "every document in the notary's answer was refused ({refused})"
+            ));
+        }
+        NotaryOutcome::Nothing
+    }
+
+    /// What each notary answered for `wanted`, for an error message: `; notary matrix.org had
+    /// nothing for it`, or empty when no notary applies.
+    fn notary_summary(&self, wanted: &WantedKey) -> String {
+        let notaries = self.notaries_for(&wanted.server_name);
+        if notaries.is_empty() {
+            return if self.notaries_snapshot().is_empty() {
+                "; no notary is configured (federation.trusted_key_servers)".to_owned()
+            } else {
+                String::new()
+            };
+        }
+        let now = tokio::time::Instant::now();
+        let parts: Vec<String> = notaries
+            .iter()
+            .map(|notary| {
+                if let Some(failure) = self.notary_failure(&notary.server_name) {
+                    format!(
+                        "notary {} could not be asked ({})",
+                        notary.server_name, failure.reason
+                    )
+                } else if self.notary_missed(&notary.server_name, wanted, now) {
+                    format!("notary {} had nothing for it", notary.server_name)
+                } else {
+                    format!("notary {} was not asked", notary.server_name)
+                }
+            })
+            .collect();
+        format!("; {}", parts.join("; "))
+    }
+
+    /// The error for a key that is not held after a fetch pass: what the server answered, and
+    /// what each notary answered.
+    fn unknown(&self, server_name: &str, key_id: &str) -> KeyLookupError {
+        let now = tokio::time::Instant::now();
+        let origin = if let Some(failure) = self.fetch_failure_at(server_name, now) {
+            format!("its last key fetch failed ({})", failure.reason)
+        } else if self.origin_fetched_recently(server_name, now)
+            || self
+                .fetched_at
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(server_name)
+        {
+            "the server does not publish it".to_owned()
+        } else {
+            "the server was not asked".to_owned()
+        };
+        let wanted = WantedKey {
+            server_name: server_name.to_owned(),
+            key_id: key_id.to_owned(),
+            signed_at_ts: 0,
+        };
+        KeyLookupError::Unknown {
+            server_name: server_name.to_owned(),
+            key_id: key_id.to_owned(),
+            detail: format!("{origin}{}", self.notary_summary(&wanted)),
+        }
     }
 
     /// Verifies a fetched key response is validly self-signed by a key it itself claims, then
     /// caches every key it lists — scoped strictly to `expected_server_name`, so a response
     /// cannot inject keys under any other server's name (the "no key substitution" defence).
     ///
-    /// `pub` (not just called internally from [`RemoteKeyCache::refresh`]) so it is directly
-    /// fuzzable against arbitrary, hostile JSON without needing a live fetcher to drive it — see
+    /// `pub` (not just called internally from the fetch paths) so it is directly fuzzable
+    /// against arbitrary, hostile JSON without needing a live fetcher to drive it — see
     /// `fuzz/fuzz_targets/key_server_response_parse.rs`.
     ///
     /// # Errors
@@ -1046,16 +1848,25 @@ impl<F: KeyServerFetcher> RemoteKeyCache<F> {
         expected_server_name: &str,
         doc: &serde_json::Value,
     ) -> Result<(), KeyLookupError> {
-        self.ingest(expected_server_name, doc, Ingest::Fetched)
+        self.ingest(expected_server_name, doc, Ingest::Fetched(Source::Origin))
     }
 
-    /// [`RemoteKeyCache::ingest_response`], for a response just fetched (kept in the store, its
-    /// fetch time recorded) or one restored from the store (neither).
+    /// [`RemoteKeyCache::ingest_response`], for a response just fetched from the server or a
+    /// notary (kept in the store, its fetch time recorded) or one restored from the store
+    /// (neither).
+    ///
+    /// What the response says never shortens what is held: a key already held with a later
+    /// `valid_until_ts` (or `expired_ts`) keeps it, so a notary's older copy of a document
+    /// cannot undo what the server itself answered a moment ago (the server's answer is
+    /// preferred when both arrive, whichever is ingested first), and a document whose
+    /// `valid_until_ts` has passed still records its keys as valid until then: an event
+    /// signed while the key was valid verifies against it (the point of asking a notary for
+    /// a key the server rotated out years ago).
     fn ingest(
         &self,
         expected_server_name: &str,
         doc: &serde_json::Value,
-        how: Ingest,
+        how: Ingest<'_>,
     ) -> Result<(), KeyLookupError> {
         let object = signing::to_signable_object(doc)
             .map_err(|_| KeyLookupError::InvalidResponse(expected_server_name.to_string()))?;
@@ -1112,19 +1923,45 @@ impl<F: KeyServerFetcher> RemoteKeyCache<F> {
             ));
         }
 
-        // Only cache as "current" if the response has not already expired; an expired response
-        // is not evidence of anything current, but see below — its keys are still recorded into
-        // the retrospective (`old`) cache so already-known validity windows are not lost.
+        // A key is cached as "current" only from a response that has not expired, and only
+        // when nothing held says it is valid for longer; an expired response's keys go to the
+        // retrospective (`old`) cache, valid until the response's `valid_until_ts`, so a
+        // notary's copy of a document the server published years ago still verifies what was
+        // signed while it was current.
         let now = now_ms();
         {
-            let mut current = self.current.lock().unwrap();
+            let mut current = self
+                .current
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut old = self
+                .old
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             for (key_id, vk) in &candidates {
+                let key = (expected_server_name.to_string(), key_id.clone());
                 if now < valid_until_ts {
-                    current.insert(
-                        (expected_server_name.to_string(), key_id.clone()),
-                        CachedCurrent {
+                    if current
+                        .get(&key)
+                        .is_none_or(|held| held.valid_until_ts <= valid_until_ts)
+                    {
+                        current.insert(
+                            key,
+                            CachedCurrent {
+                                verifying_key: *vk,
+                                valid_until_ts,
+                            },
+                        );
+                    }
+                } else if old
+                    .get(&key)
+                    .is_none_or(|held| held.expired_ts <= valid_until_ts)
+                {
+                    old.insert(
+                        key,
+                        CachedOld {
                             verifying_key: *vk,
-                            valid_until_ts,
+                            expired_ts: valid_until_ts,
                         },
                     );
                 }
@@ -1135,7 +1972,10 @@ impl<F: KeyServerFetcher> RemoteKeyCache<F> {
             .get("old_verify_keys")
             .and_then(CanonicalJsonValue::as_object)
         {
-            let mut old = self.old.lock().unwrap();
+            let mut old = self
+                .old
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             for (key_id, value) in old_verify_keys {
                 let Some(obj) = value.as_object() else {
                     continue;
@@ -1150,39 +1990,51 @@ impl<F: KeyServerFetcher> RemoteKeyCache<F> {
                     continue;
                 };
                 if let Ok(vk) = signing::verifying_key_from_base64(key_b64) {
-                    old.insert(
-                        (expected_server_name.to_string(), key_id.clone()),
-                        CachedOld {
-                            verifying_key: vk,
-                            expired_ts,
-                        },
-                    );
+                    let key = (expected_server_name.to_string(), key_id.clone());
+                    if old
+                        .get(&key)
+                        .is_none_or(|held| held.expired_ts <= expired_ts)
+                    {
+                        old.insert(
+                            key,
+                            CachedOld {
+                                verifying_key: vk,
+                                expired_ts,
+                            },
+                        );
+                    }
                 }
             }
         }
 
-        // The document itself, for the notary endpoints, under every key it vouches for.
+        // The document itself, for the notary endpoints, under every key it vouches for --
+        // unless a later document is already held for that key.
         let stored = StoredResponse {
             valid_until_ts,
             doc: Arc::new(doc.clone()),
         };
+        let mut newly_held: Vec<String> = Vec::new();
         {
             let mut responses = self
                 .responses
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             for key_id in candidates.keys() {
-                responses.insert(
-                    (expected_server_name.to_string(), key_id.clone()),
-                    stored.clone(),
-                );
+                let key = (expected_server_name.to_string(), key_id.clone());
+                if responses
+                    .get(&key)
+                    .is_none_or(|held| held.valid_until_ts <= valid_until_ts)
+                {
+                    responses.insert(key, stored.clone());
+                    newly_held.push(key_id.clone());
+                }
             }
         }
-        if how == Ingest::Restored {
+        let Ingest::Fetched(source) = how else {
             return Ok(());
-        }
+        };
         if let Some(store) = &self.store {
-            for key_id in candidates.keys() {
+            for key_id in &newly_held {
                 store.hold(&crate::key_store::HeldKeyResponse {
                     server_name: expected_server_name.to_owned(),
                     key_id: key_id.clone(),
@@ -1196,18 +2048,64 @@ impl<F: KeyServerFetcher> RemoteKeyCache<F> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(expected_server_name.to_string(), now);
+        let mut key_ids: Vec<&String> = candidates.keys().collect();
+        key_ids.sort();
+        match source {
+            Source::Origin => {
+                crate::metrics::record_key_fetch("origin");
+                tracing::debug!(
+                    server = expected_server_name,
+                    source = "origin",
+                    ?key_ids,
+                    valid_until_ts,
+                    expired = now >= valid_until_ts,
+                    "accepted a server's key response"
+                );
+            }
+            Source::Notary(notary) => {
+                crate::metrics::record_key_fetch("notary");
+                tracing::info!(
+                    server = expected_server_name,
+                    source = "notary",
+                    notary,
+                    ?key_ids,
+                    valid_until_ts,
+                    expired = now >= valid_until_ts,
+                    "accepted a server's key response from a notary"
+                );
+            }
+        }
         Ok(())
     }
 }
 
+/// When [`RemoteKeyCache::refresh_origin`] asks the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refresh {
+    /// For a key not held: not while backed off from, and not again within
+    /// [`ORIGIN_RECHECK_INTERVAL`] of its last answer, which did not list the key.
+    Lookup,
+    /// For a document fresher than the one held (the notary role, asked for a later
+    /// `minimum_valid_until_ts`): not while backed off from; the recheck interval does not
+    /// apply, since the last answer is exactly what is not fresh enough.
+    Fresher,
+    /// An administrator's refetch: now, whatever the backoff.
+    Force,
+}
+
 /// Where a response [`RemoteKeyCache::ingest`] takes came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Ingest {
-    /// Fetched (or handed in) now: kept in the store, its fetch time recorded.
-    Fetched,
+enum Ingest<'a> {
+    /// Fetched (or handed in) now, from the server or a notary: kept in the store, its fetch
+    /// time recorded.
+    Fetched(Source<'a>),
     /// Read back from the store at boot: already kept, and not fetched now.
     Restored,
 }
+
+/// How many servers [`RemoteKeyCache::ensure_keys`] fetches from at once: the same as
+/// `crate::outbound_join`'s verification concurrency, whose batch it fetches ahead of.
+pub const JOIN_PREFETCH_CONCURRENCY: usize = 64;
 
 #[cfg(test)]
 mod tests {
@@ -1401,10 +2299,10 @@ mod tests {
         cache.refetch("remote.example.org").await.unwrap();
         assert_eq!(fetcher.count_for("remote.example.org"), 2);
         // A server that cannot be reached is an error, and caches nothing.
-        assert_eq!(
+        assert!(matches!(
             cache.refetch("gone.example.org").await.unwrap_err(),
-            KeyLookupError::FetchFailed("gone.example.org".to_owned())
-        );
+            KeyLookupError::FetchFailed { ref server_name, .. } if server_name == "gone.example.org"
+        ));
         assert_eq!(cache.cached_keys("gone.example.org"), None);
     }
 
@@ -1534,7 +2432,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            KeyLookupError::FetchFailed(_) | KeyLookupError::Unknown { .. }
+            KeyLookupError::FetchFailed { .. } | KeyLookupError::Unknown { .. }
         ));
     }
 
@@ -1606,7 +2504,7 @@ mod tests {
             .get_current("nowhere.example.org", "ed25519:a_1")
             .await
             .unwrap_err();
-        assert!(matches!(err, KeyLookupError::FetchFailed(_)));
+        assert!(matches!(err, KeyLookupError::FetchFailed { .. }));
     }
 
     /// A fetcher that never answers for some servers (a server that is gone: the connection
@@ -1651,7 +2549,7 @@ mod tests {
 
         assert!(matches!(
             lookup(&cache).await,
-            KeyLookupError::FetchFailed(_)
+            KeyLookupError::FetchFailed { .. }
         ));
         assert_eq!(cache.fetcher.count_for(gone), 1);
         let failure = cache
@@ -1667,10 +2565,12 @@ mod tests {
                 server_name,
                 reason,
                 retry_in_secs,
+                notaries,
             } => {
                 assert_eq!(server_name, gone);
                 assert!(reason.contains("could not be reached"));
                 assert_eq!(*retry_in_secs, 60);
+                assert!(notaries.contains("no notary is configured"), "{notaries}");
             }
             other => panic!("expected a backoff, got {other:?}"),
         }
@@ -1687,7 +2587,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(1)).await;
         assert!(matches!(
             lookup(&cache).await,
-            KeyLookupError::FetchFailed(_)
+            KeyLookupError::FetchFailed { .. }
         ));
         assert_eq!(cache.fetcher.count_for(gone), 2);
         assert_eq!(
@@ -1740,7 +2640,7 @@ mod tests {
         let cache = RemoteKeyCache::new(fetcher);
         let before = tokio::time::Instant::now();
         let err = cache.get_current(gone, "ed25519:a_1").await.unwrap_err();
-        assert!(matches!(err, KeyLookupError::FetchFailed(_)), "{err}");
+        assert!(matches!(err, KeyLookupError::FetchFailed { .. }), "{err}");
         assert_eq!(before.elapsed(), DEFAULT_KEY_FETCH_TIMEOUT);
         let failure = cache.fetch_failure(gone).unwrap();
         assert!(
@@ -1787,7 +2687,7 @@ mod tests {
         let mut backed_off = 0;
         for handle in handles {
             match handle.await.unwrap() {
-                KeyLookupError::FetchFailed(_) => failed += 1,
+                KeyLookupError::FetchFailed { .. } => failed += 1,
                 KeyLookupError::FetchBackoff { .. } => backed_off += 1,
                 other => panic!("unexpected {other:?}"),
             }
@@ -1811,13 +2711,23 @@ mod tests {
         cache.get_current(server, &known).await.unwrap();
         assert_eq!(cache.fetcher.count_for(server), 1);
 
-        // The server goes away, and an unknown key id forces a fetch that fails.
+        // The server goes away, and an unknown key id forces a fetch that fails (once the
+        // last answer is older than the recheck interval; until then what it published is
+        // known not to include the key, without a fetch).
         cache.fetcher.responses.lock().unwrap().remove(server);
         let err = cache
             .get_current(server, "ed25519:never_published")
             .await
             .unwrap_err();
-        assert!(matches!(err, KeyLookupError::FetchFailed(_)), "{err}");
+        assert!(matches!(err, KeyLookupError::Unknown { .. }), "{err}");
+        assert!(err.to_string().contains("does not publish it"), "{err}");
+        assert_eq!(cache.fetcher.count_for(server), 1);
+        tokio::time::advance(ORIGIN_RECHECK_INTERVAL).await;
+        let err = cache
+            .get_current(server, "ed25519:never_published")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, KeyLookupError::FetchFailed { .. }), "{err}");
         assert!(cache.fetch_failure(server).is_some());
 
         // The held key still verifies, with no fetch.
@@ -1831,7 +2741,7 @@ mod tests {
 
         // The administrator's refetch goes through the backoff, and clears it on success.
         let err = cache.refetch(server).await.unwrap_err();
-        assert!(matches!(err, KeyLookupError::FetchFailed(_)), "{err}");
+        assert!(matches!(err, KeyLookupError::FetchFailed { .. }), "{err}");
         assert_eq!(cache.fetcher.count_for(server), 3);
         let (doc, _) = signed_response(server, 3600);
         cache.fetcher.set(server, doc);
@@ -1935,5 +2845,625 @@ mod tests {
                 .all(|held| held.server_name != "gone.example.org"),
             "a response expired over a year ago is forgotten"
         );
+    }
+
+    // --- Notaries ------------------------------------------------------------------------
+
+    /// A fetcher that plays the origin servers (`FixedFetcher`) and one or more notaries: each
+    /// notary answers every query with the documents scripted for it, co-signed with its key
+    /// ([`wrap_for_notary`]), or with nothing when it is scripted as down. Every query body is
+    /// kept, so a test can see what was asked.
+    struct NotaryFetcher {
+        origins: FixedFetcher,
+        /// Notary name to (its keys, the origin documents it holds); `None` keys: down.
+        notaries: StdMutex<HashMap<String, FakeNotary>>,
+        queries: StdMutex<Vec<(String, serde_json::Value)>>,
+        /// An answer that replaces the scripted one once (a tampered document, say).
+        canned: StdMutex<Option<serde_json::Value>>,
+    }
+
+    /// A fake notary's keys (`None`: the notary is down) and the origin documents it holds.
+    type FakeNotary = (Option<OwnSigningKeys>, Vec<serde_json::Value>);
+
+    impl NotaryFetcher {
+        fn new() -> Self {
+            Self {
+                origins: FixedFetcher::new(),
+                notaries: StdMutex::new(HashMap::new()),
+                queries: StdMutex::new(Vec::new()),
+                canned: StdMutex::new(None),
+            }
+        }
+        fn notary_holds(&self, notary: &str, keys: OwnSigningKeys, docs: Vec<serde_json::Value>) {
+            self.notaries
+                .lock()
+                .unwrap()
+                .insert(notary.to_owned(), (Some(keys), docs));
+        }
+        fn notary_down(&self, notary: &str) {
+            self.notaries
+                .lock()
+                .unwrap()
+                .insert(notary.to_owned(), (None, Vec::new()));
+        }
+        fn queries(&self) -> Vec<(String, serde_json::Value)> {
+            self.queries.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl KeyServerFetcher for NotaryFetcher {
+        async fn fetch_server_key(&self, server_name: &str) -> Option<serde_json::Value> {
+            self.origins.fetch_server_key(server_name).await
+        }
+        async fn query_notary(
+            &self,
+            notary: &str,
+            body: &serde_json::Value,
+        ) -> Option<serde_json::Value> {
+            self.queries
+                .lock()
+                .unwrap()
+                .push((notary.to_owned(), body.clone()));
+            if let Some(canned) = self.canned.lock().unwrap().take() {
+                return Some(canned);
+            }
+            let notaries = self.notaries.lock().unwrap();
+            let (keys, docs) = notaries.get(notary)?;
+            let keys = keys.as_ref()?;
+            let asked = body["server_keys"].as_object()?;
+            let server_keys: Vec<serde_json::Value> = docs
+                .iter()
+                .filter(|doc| asked.contains_key(doc["server_name"].as_str().unwrap_or("")))
+                .map(|doc| wrap_for_notary(doc, notary, keys).unwrap())
+                .collect();
+            Some(serde_json::json!({ "server_keys": server_keys }))
+        }
+    }
+
+    fn new_keys() -> OwnSigningKeys {
+        let dir = tempfile::tempdir().unwrap();
+        OwnSigningKeys::load_or_generate(dir.path()).unwrap()
+    }
+
+    /// `notary`'s configuration entry, naming its primary key.
+    fn trusted(notary: &str, keys: &OwnSigningKeys) -> TrustedKeyServer {
+        TrustedKeyServer::new(
+            notary,
+            [(
+                keys.primary().key_id(),
+                keys.primary().verifying_key_base64(),
+            )],
+        )
+        .unwrap()
+    }
+
+    /// A key response for `server` signed by `keys`, valid until `valid_until_ts` (a timestamp,
+    /// not a duration: the response may already be expired).
+    fn response_valid_until(
+        server: &str,
+        keys: &OwnSigningKeys,
+        valid_until_ts: u64,
+    ) -> serde_json::Value {
+        let body = serde_json::json!({
+            "server_name": server,
+            "verify_keys": keys.verify_keys_json(),
+            "old_verify_keys": {},
+            "valid_until_ts": valid_until_ts,
+        });
+        let mut object = signing::to_signable_object(&body).unwrap();
+        let name = ruma::ServerName::parse(server).unwrap();
+        for key in keys.all() {
+            signing::sign_object(&mut object, name.as_ref(), key).unwrap();
+        }
+        serde_json::from_slice(&CanonicalJsonValue::Object(object).to_canonical_bytes()).unwrap()
+    }
+
+    /// The scenario of 2026-10-10: `#selfhosted:selfhosted.chat`'s create event is signed with
+    /// a key the server rotated out and no longer publishes; matrix.org's notary still has the
+    /// document that listed it. The origin's `/key/v2/server` carries only the new key, and the
+    /// old one is found at the notary, co-signed by the notary and self-signed by the origin;
+    /// an event signed while it was valid verifies against it. Counted as a notary fetch.
+    #[tokio::test]
+    async fn a_rotated_out_key_found_only_at_the_notary_verifies_an_old_event() {
+        let fetcher = NotaryFetcher::new();
+        let origin = "selfhosted.example.org";
+        let old_keys = new_keys();
+        let current_keys = new_keys();
+        let old_doc = response_valid_until(origin, &old_keys, 2_000_000);
+        fetcher.origins.set(
+            origin,
+            build_server_key_response(origin, &current_keys, &[], 3600).unwrap(),
+        );
+        let notary_keys = new_keys();
+        fetcher.notary_holds(
+            "notary.example.org",
+            notary_keys.clone_for_test(),
+            vec![old_doc],
+        );
+        let cache = RemoteKeyCache::new(fetcher)
+            .with_trusted_key_servers(vec![trusted("notary.example.org", &notary_keys)]);
+
+        let before = crate::metrics::key_fetches("notary");
+        let key = cache
+            .get_valid_at(origin, &old_keys.primary().key_id(), 1_500_000)
+            .await
+            .expect("the notary had the rotated-out key");
+        assert_eq!(key, old_keys.primary().verifying_key());
+        assert!(
+            crate::metrics::key_fetches("notary") > before,
+            "counted (the counter is process-wide)"
+        );
+        // The origin was asked too (concurrently), and its current key is held as well.
+        assert_eq!(cache.fetcher.origins.count_for(origin), 1);
+        assert_eq!(
+            cache.fetcher.queries().len(),
+            1,
+            "{:?}",
+            cache.fetcher.queries()
+        );
+        cache
+            .get_current(origin, &current_keys.primary().key_id())
+            .await
+            .expect("the origin's current key, from the same pass");
+        // The rotated-out key is held as an old one: not usable for anything current.
+        let held = cache.cached_keys(origin).unwrap();
+        let old = held
+            .keys
+            .iter()
+            .find(|k| k.key_id == old_keys.primary().key_id())
+            .unwrap();
+        assert!(old.old);
+        assert_eq!(old.valid_until_ts, 2_000_000);
+    }
+
+    /// An answer the notary did not sign with a key this server was configured with is worth
+    /// nothing, however well the origin signed what is inside it: a notary is trusted by its
+    /// key, not by its name. The error says the notary had nothing usable.
+    #[tokio::test]
+    async fn a_notary_answer_with_a_bad_notary_signature_is_rejected() {
+        let fetcher = NotaryFetcher::new();
+        let origin = "origin.example.org";
+        let old_keys = new_keys();
+        let doc = response_valid_until(origin, &old_keys, 2_000_000);
+        let signing_with = new_keys();
+        fetcher.notary_holds("notary.example.org", signing_with, vec![doc]);
+        let configured = new_keys();
+        let cache = RemoteKeyCache::new(fetcher)
+            .with_trusted_key_servers(vec![trusted("notary.example.org", &configured)]);
+
+        let err = cache
+            .get_valid_at(origin, &old_keys.primary().key_id(), 1_500_000)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, KeyLookupError::FetchFailed { .. }),
+            "the origin is gone too: {err}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("notary notary.example.org could not be asked")
+                && message.contains("every document in the notary's answer was refused"),
+            "{message}"
+        );
+        assert_eq!(cache.cached_keys(origin), None);
+        assert!(cache.notary_failure("notary.example.org").is_some());
+    }
+
+    /// A document inside a well-signed notary answer that is not signed by the server it is
+    /// about (tampered after the origin signed it, or forged) is refused: the spec's rule is
+    /// both signatures, and a notary cannot mint keys for another server.
+    #[tokio::test]
+    async fn a_bad_origin_signature_inside_a_notary_answer_is_rejected() {
+        let fetcher = NotaryFetcher::new();
+        let origin = "origin.example.org";
+        let old_keys = new_keys();
+        let mut doc = response_valid_until(origin, &old_keys, 2_000_000);
+        // The notary (or someone between) swaps the key material after the origin signed.
+        let forged = new_keys();
+        doc["verify_keys"][old_keys.primary().key_id()]["key"] =
+            serde_json::Value::String(forged.primary().verifying_key_base64());
+        let notary_keys = new_keys();
+        fetcher.notary_holds(
+            "notary.example.org",
+            notary_keys.clone_for_test(),
+            vec![doc],
+        );
+        let cache = RemoteKeyCache::new(fetcher)
+            .with_trusted_key_servers(vec![trusted("notary.example.org", &notary_keys)]);
+
+        let err = cache
+            .get_valid_at(origin, &old_keys.primary().key_id(), 1_500_000)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("every document in the notary's answer was refused"),
+            "{err}"
+        );
+        assert_eq!(cache.cached_keys(origin), None);
+    }
+
+    /// A key from an expired document (the notary's copy of what the server published years
+    /// ago) verifies an event from before the document's `valid_until_ts`, and not one after:
+    /// that is what asking a notary is for, and the limit on it.
+    #[tokio::test]
+    async fn an_expired_key_from_a_notary_verifies_before_its_expiry_and_not_after() {
+        let fetcher = NotaryFetcher::new();
+        let origin = "origin.example.org";
+        let old_keys = new_keys();
+        let expired_ts = 2_000_000;
+        let doc = response_valid_until(origin, &old_keys, expired_ts);
+        let notary_keys = new_keys();
+        fetcher.notary_holds(
+            "notary.example.org",
+            notary_keys.clone_for_test(),
+            vec![doc],
+        );
+        let cache = RemoteKeyCache::new(fetcher)
+            .with_trusted_key_servers(vec![trusted("notary.example.org", &notary_keys)]);
+        let key_id = old_keys.primary().key_id();
+
+        cache
+            .get_valid_at(origin, &key_id, expired_ts - 1)
+            .await
+            .expect("signed while the key was valid");
+        cache
+            .get_valid_at(origin, &key_id, expired_ts)
+            .await
+            .expect("signed at the last valid moment");
+        let err = cache
+            .get_valid_at(origin, &key_id, expired_ts + 1)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, KeyLookupError::Expired { .. }), "{err}");
+        // Not current: the origin (gone) is backed off from, and the notary had nothing fresher.
+        let err = cache.get_current(origin, &key_id).await.unwrap_err();
+        assert!(
+            matches!(err, KeyLookupError::FetchBackoff { .. }),
+            "not current: {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("notary notary.example.org had nothing for it"),
+            "{err}"
+        );
+    }
+
+    /// `ensure_keys` asks each notary once for every key still missing, not once per key:
+    /// one query naming every server and key, each with the timestamp it must cover. Keys
+    /// already held are not asked about, and the notary is not asked about its own keys.
+    #[tokio::test]
+    async fn the_batch_query_carries_every_miss_in_one_request_per_notary() {
+        let fetcher = NotaryFetcher::new();
+        let held_keys = new_keys();
+        fetcher.origins.set(
+            "held.example.org",
+            build_server_key_response("held.example.org", &held_keys, &[], 3600).unwrap(),
+        );
+        let notary_keys = new_keys();
+        fetcher.notary_holds("notary.example.org", notary_keys.clone_for_test(), vec![]);
+        let cache = RemoteKeyCache::new(fetcher)
+            .with_trusted_key_servers(vec![trusted("notary.example.org", &notary_keys)]);
+        cache
+            .get_current("held.example.org", &held_keys.primary().key_id())
+            .await
+            .unwrap();
+        assert_eq!(
+            cache.fetcher.queries().len(),
+            1,
+            "one query for the held key's pass"
+        );
+
+        let wanted = vec![
+            WantedKey {
+                server_name: "held.example.org".to_owned(),
+                key_id: held_keys.primary().key_id(),
+                signed_at_ts: 5,
+            },
+            WantedKey {
+                server_name: "a.example.org".to_owned(),
+                key_id: "ed25519:a1".to_owned(),
+                signed_at_ts: 10,
+            },
+            WantedKey {
+                server_name: "a.example.org".to_owned(),
+                key_id: "ed25519:a2".to_owned(),
+                signed_at_ts: 20,
+            },
+            WantedKey {
+                server_name: "b.example.org".to_owned(),
+                key_id: "ed25519:b1".to_owned(),
+                signed_at_ts: 30,
+            },
+            WantedKey {
+                server_name: "notary.example.org".to_owned(),
+                key_id: "ed25519:n1".to_owned(),
+                signed_at_ts: 40,
+            },
+        ];
+        cache.ensure_keys(&wanted).await;
+        let queries = cache.fetcher.queries();
+        assert_eq!(queries.len(), 2, "{queries:?}");
+        let (notary, body) = &queries[1];
+        assert_eq!(notary, "notary.example.org");
+        assert_eq!(
+            body,
+            &serde_json::json!({"server_keys": {
+                "a.example.org": {
+                    "ed25519:a1": {"minimum_valid_until_ts": 10},
+                    "ed25519:a2": {"minimum_valid_until_ts": 20},
+                },
+                "b.example.org": {"ed25519:b1": {"minimum_valid_until_ts": 30}},
+            }})
+        );
+        // Each origin was asked too, once.
+        assert_eq!(cache.fetcher.origins.count_for("a.example.org"), 1);
+        assert_eq!(cache.fetcher.origins.count_for("b.example.org"), 1);
+        assert_eq!(cache.fetcher.origins.count_for("held.example.org"), 1);
+
+        // The lookups that follow are refused at once, naming what was asked, with no further
+        // query: the origins are backed off from and the notary had nothing.
+        let err = cache
+            .get_valid_at("a.example.org", "ed25519:a1", 10)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, KeyLookupError::FetchBackoff { .. }), "{err}");
+        assert!(
+            err.to_string()
+                .contains("notary notary.example.org had nothing for it"),
+            "{err}"
+        );
+        assert_eq!(cache.fetcher.queries().len(), 2);
+        assert_eq!(cache.fetcher.origins.count_for("a.example.org"), 1);
+    }
+
+    /// When the origin and the notary both answer, what the origin said wins: its document is
+    /// the fresher one, and a notary's older copy does not shorten the validity held.
+    #[tokio::test]
+    async fn the_origin_is_preferred_when_both_answer() {
+        let fetcher = NotaryFetcher::new();
+        let origin = "origin.example.org";
+        let keys = new_keys();
+        let fresh = now_ms() + 3_600_000;
+        fetcher
+            .origins
+            .set(origin, response_valid_until(origin, &keys, fresh));
+        let notary_keys = new_keys();
+        fetcher.notary_holds(
+            "notary.example.org",
+            notary_keys.clone_for_test(),
+            vec![response_valid_until(origin, &keys, fresh - 1_000_000)],
+        );
+        let cache = RemoteKeyCache::new(fetcher)
+            .with_trusted_key_servers(vec![trusted("notary.example.org", &notary_keys)]);
+        let before = crate::metrics::key_fetches("origin");
+        cache
+            .get_current(origin, &keys.primary().key_id())
+            .await
+            .unwrap();
+        assert_eq!(cache.fetcher.origins.count_for(origin), 1);
+        assert_eq!(cache.fetcher.queries().len(), 1, "both were asked");
+        assert!(
+            crate::metrics::key_fetches("origin") > before,
+            "counted (the counter is process-wide)"
+        );
+        let held = cache.cached_keys(origin).unwrap();
+        assert_eq!(held.keys.len(), 1);
+        assert_eq!(held.keys[0].valid_until_ts, fresh, "the origin's validity");
+        assert_eq!(
+            cache.notary_responses(origin, &[], 0).await[0]["valid_until_ts"],
+            fresh,
+            "and the origin's document is what this server's notary passes on"
+        );
+    }
+
+    /// A notary that cannot be reached is backed off from like a server, counted under the
+    /// `notary` failure reason, and the error for a key says so; the origin's answer is
+    /// unaffected.
+    #[tokio::test(start_paused = true)]
+    async fn a_notary_that_does_not_answer_is_backed_off_and_named() {
+        let fetcher = NotaryFetcher::new();
+        fetcher.notary_down("notary.example.org");
+        let notary_keys = new_keys();
+        let cache = RemoteKeyCache::new(fetcher)
+            .with_trusted_key_servers(vec![trusted("notary.example.org", &notary_keys)]);
+        let before = crate::metrics::key_fetch_failures("notary");
+        let err = cache
+            .get_valid_at("gone.example.org", "ed25519:x", 1)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, KeyLookupError::FetchFailed { .. }), "{err}");
+        assert!(
+            err.to_string().contains(
+                "notary notary.example.org could not be asked (the notary could not be reached"
+            ),
+            "{err}"
+        );
+        assert!(
+            crate::metrics::key_fetch_failures("notary") > before,
+            "counted (the counter is process-wide)"
+        );
+        assert_eq!(
+            cache.notary_failure("notary.example.org").unwrap().backoff,
+            KEY_FETCH_BACKOFF_MIN
+        );
+        // Not asked again while backed off: the next lookup makes no query.
+        let _ = cache
+            .get_valid_at("other.example.org", "ed25519:y", 1)
+            .await;
+        assert_eq!(cache.fetcher.queries().len(), 1);
+        tokio::time::advance(KEY_FETCH_BACKOFF_MIN).await;
+        let _ = cache
+            .get_valid_at("third.example.org", "ed25519:z", 1)
+            .await;
+        assert_eq!(cache.fetcher.queries().len(), 2);
+    }
+
+    /// Replacing the notaries on a running cache takes effect on the next pass: an empty list
+    /// turns notary lookups off, and the error says no notary is configured.
+    #[tokio::test]
+    async fn the_notaries_can_be_replaced_on_a_running_cache() {
+        let fetcher = NotaryFetcher::new();
+        let notary_keys = new_keys();
+        fetcher.notary_holds("notary.example.org", notary_keys.clone_for_test(), vec![]);
+        let cache = RemoteKeyCache::new(fetcher)
+            .with_trusted_key_servers(vec![trusted("notary.example.org", &notary_keys)]);
+        assert_eq!(cache.trusted_key_servers(), vec!["notary.example.org"]);
+        let _ = cache.get_valid_at("a.example.org", "ed25519:a", 1).await;
+        assert_eq!(cache.fetcher.queries().len(), 1);
+
+        cache.set_trusted_key_servers(Vec::new());
+        assert!(cache.trusted_key_servers().is_empty());
+        let err = cache
+            .get_valid_at("b.example.org", "ed25519:b", 1)
+            .await
+            .unwrap_err();
+        assert_eq!(cache.fetcher.queries().len(), 1, "nobody to ask");
+        assert!(err.to_string().contains("no notary is configured"), "{err}");
+    }
+
+    /// The join of 2026-10-10: a server that is gone (its key fetch fails) signed events the
+    /// notary still has the key for. The notary's answer is taken, the event verifies, and the
+    /// gone server is backed off from: the next key of the same server is not asked of it again
+    /// but is asked of the notary, which keeps a join's events from a gone server verifiable
+    /// instead of dropped.
+    #[tokio::test]
+    async fn a_gone_servers_key_is_found_at_the_notary_and_the_server_is_backed_off() {
+        let fetcher = NotaryFetcher::new();
+        let gone = "gone.example.org";
+        let gone_keys = new_keys();
+        let other_keys = new_keys();
+        let notary_keys = new_keys();
+        fetcher.notary_holds(
+            "notary.example.org",
+            notary_keys.clone_for_test(),
+            vec![
+                response_valid_until(gone, &gone_keys, 2_000_000),
+                response_valid_until(gone, &other_keys, 3_000_000),
+            ],
+        );
+        let cache = RemoteKeyCache::new(fetcher)
+            .with_trusted_key_servers(vec![trusted("notary.example.org", &notary_keys)]);
+
+        let key = cache
+            .get_valid_at(gone, &gone_keys.primary().key_id(), 1_500_000)
+            .await
+            .expect("the notary had the gone server's key");
+        assert_eq!(key, gone_keys.primary().verifying_key());
+        assert_eq!(
+            cache.fetcher.origins.count_for(gone),
+            1,
+            "the server was asked once"
+        );
+        assert!(
+            cache.fetch_failure(gone).is_some(),
+            "and is backed off from, having not answered"
+        );
+
+        // The negative cache is consulted before anything is fetched: the server is not asked
+        // again. The notary's one answer carried every document it held for the server, so the
+        // other key is held already and costs no query either.
+        cache
+            .get_valid_at(gone, &other_keys.primary().key_id(), 2_500_000)
+            .await
+            .expect("the notary's answer carried this key too");
+        assert_eq!(cache.fetcher.origins.count_for(gone), 1, "not asked again");
+        assert_eq!(cache.fetcher.queries().len(), 1);
+
+        // A key nobody has: the notary is asked once (the server is not), and the error names
+        // the backoff and the notary's answer; the lookup after that is refused at once, since
+        // the notary's miss is remembered too.
+        let err = cache
+            .get_valid_at(gone, "ed25519:nobody", 1)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, KeyLookupError::Unknown { .. }), "{err}");
+        let message = err.to_string();
+        assert!(
+            message.contains("its last key fetch failed")
+                && message.contains("notary notary.example.org had nothing for it"),
+            "{message}"
+        );
+        assert_eq!(cache.fetcher.origins.count_for(gone), 1);
+        assert_eq!(cache.fetcher.queries().len(), 2);
+        let err = cache
+            .get_valid_at(gone, "ed25519:nobody", 1)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, KeyLookupError::FetchBackoff { .. }), "{err}");
+        assert_eq!(cache.fetcher.queries().len(), 2, "nobody asked again");
+    }
+
+    /// With two notaries configured, one that is down does not cost the key: the other's
+    /// answer is taken. The one that is down is backed off from and named in the log and the
+    /// error; the next pass asks only the one that answers.
+    #[tokio::test]
+    async fn a_notary_that_is_down_falls_back_to_the_next() {
+        let fetcher = NotaryFetcher::new();
+        let origin = "origin.example.org";
+        let old_keys = new_keys();
+        fetcher.notary_down("down.example.org");
+        let up_keys = new_keys();
+        fetcher.notary_holds(
+            "up.example.org",
+            up_keys.clone_for_test(),
+            vec![response_valid_until(origin, &old_keys, 2_000_000)],
+        );
+        let down_keys = new_keys();
+        let cache = RemoteKeyCache::new(fetcher).with_trusted_key_servers(vec![
+            trusted("down.example.org", &down_keys),
+            trusted("up.example.org", &up_keys),
+        ]);
+
+        let key = cache
+            .get_valid_at(origin, &old_keys.primary().key_id(), 1_500_000)
+            .await
+            .expect("the second notary had it");
+        assert_eq!(key, old_keys.primary().verifying_key());
+        let asked: Vec<String> = cache
+            .fetcher
+            .queries()
+            .into_iter()
+            .map(|(notary, _)| notary)
+            .collect();
+        assert_eq!(asked.len(), 2, "both were asked, concurrently: {asked:?}");
+        assert!(asked.contains(&"down.example.org".to_owned()));
+        assert!(asked.contains(&"up.example.org".to_owned()));
+        assert!(cache.notary_failure("down.example.org").is_some());
+        assert!(cache.notary_failure("up.example.org").is_none());
+
+        // The next key: only the notary that answers is asked.
+        let _ = cache
+            .get_valid_at("other.example.org", "ed25519:o", 1)
+            .await;
+        let asked: Vec<String> = cache
+            .fetcher
+            .queries()
+            .into_iter()
+            .skip(2)
+            .map(|(notary, _)| notary)
+            .collect();
+        assert_eq!(asked, vec!["up.example.org".to_owned()]);
+    }
+
+    /// `federation.key_fetch_timeout` changed on the running server: the next fetch has the new
+    /// budget.
+    #[tokio::test(start_paused = true)]
+    async fn the_fetch_budget_can_be_changed_on_a_running_cache() {
+        let cache = RemoteKeyCache::new(StallingFetcher {
+            inner: FixedFetcher::new(),
+            stalls: vec!["slow.example.org".to_owned()],
+        });
+        assert_eq!(cache.fetch_timeout(), DEFAULT_KEY_FETCH_TIMEOUT);
+        cache.set_fetch_timeout(Duration::from_secs(2));
+        assert_eq!(cache.fetch_timeout(), Duration::from_secs(2));
+        let started = tokio::time::Instant::now();
+        let err = cache
+            .get_current("slow.example.org", "ed25519:x")
+            .await
+            .unwrap_err();
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+        assert!(err.to_string().contains("timed out after 2 s"), "{err}");
     }
 }

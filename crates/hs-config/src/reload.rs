@@ -254,6 +254,10 @@ pub const SETTINGS: &[Setting] = &[
         "/federation/max_retry_backoff",
         "built into the federation client's backoff",
     ),
+    hot(
+        "/federation/key_fetch_timeout",
+        "the key cache reads it for each fetch of another server's keys",
+    ),
     restart(
         "/federation/max_queued_pdus_per_destination",
         "built into the federation sender's queues",
@@ -273,6 +277,10 @@ pub const SETTINGS: &[Setting] = &[
     hot(
         "/federation/allow_device_name_lookup_over_federation",
         "the federation routes read it per request",
+    ),
+    hot(
+        "/federation/trusted_key_servers",
+        "the key cache reads it each time it asks a notary for a key a server does not publish",
     ),
     // rate_limits
     hot(

@@ -1587,6 +1587,28 @@ impl hs_federation::keys::KeyServerFetcher for ClientKeyFetcher {
             }
         }
     }
+
+    async fn query_notary(&self, notary: &str, body: &Value) -> Option<Value> {
+        match self
+            .client
+            .send(notary, "POST", "/_matrix/key/v2/query", Some(body))
+            .await
+        {
+            Ok(response) if response.status == 200 => Some(response.body),
+            Ok(response) => {
+                tracing::debug!(
+                    notary,
+                    status = response.status,
+                    "a notary returned a non-200 response to a key query"
+                );
+                None
+            }
+            Err(error) => {
+                tracing::debug!(notary, %error, "could not ask a notary for keys");
+                None
+            }
+        }
+    }
 }
 
 // ------------------------------------------------------------------------------------------
@@ -1687,12 +1709,21 @@ pub fn build_mount<B: KvBackend + 'static>(
         addr,
     ));
 
-    let key_cache: Arc<hs_federation::keys::DynRemoteKeyCache> =
-        Arc::new(hs_federation::keys::RemoteKeyCache::with_store(
+    // One fetch of another server's keys has `federation.key_fetch_timeout`; a key a server no
+    // longer publishes is asked of the notaries in `federation.trusted_key_servers` (matrix.org
+    // by default), whose answers must be signed with the keys configured for them. Both are
+    // hot (`crate::serve`'s `on_change("federation", ..)`).
+    let key_cache: Arc<hs_federation::keys::DynRemoteKeyCache> = Arc::new(
+        hs_federation::keys::RemoteKeyCache::with_store(
             Box::new(ClientKeyFetcher::new(client.clone()))
                 as Box<dyn hs_federation::keys::KeyServerFetcher>,
             held_keys,
-        ));
+        )
+        .with_fetch_timeout(config.federation.key_fetch_timeout.into())
+        .with_trusted_key_servers(hs_federation::keys::TrustedKeyServer::list_from_config(
+            &config.federation.trusted_key_servers,
+        )),
+    );
     // Our own verify keys, so an event this server signed itself -- its own user's membership
     // echoed back in a `send_join`, `invite` or `make_join` response -- verifies against the keys
     // in memory instead of being fetched over federation from this server, which cannot answer a
@@ -2009,7 +2040,11 @@ pub async fn run_join_room(args: &crate::cli::FederationJoinRoomArgs) -> i32 {
     ));
     let key_cache: hs_federation::keys::DynRemoteKeyCache =
         hs_federation::keys::RemoteKeyCache::new(Box::new(ClientKeyFetcher::new(client.clone()))
-            as Box<dyn hs_federation::keys::KeyServerFetcher>);
+            as Box<dyn hs_federation::keys::KeyServerFetcher>)
+        .with_fetch_timeout(config.federation.key_fetch_timeout.into())
+        .with_trusted_key_servers(hs_federation::keys::TrustedKeyServer::list_from_config(
+            &config.federation.trusted_key_servers,
+        ));
     // Our own event in the response verifies against the key in memory, not a fetch from us.
     let own_keys =
         hs_federation::keys::OwnSigningKeys::from_keys(vec![(*identity.signing_key).clone()]);

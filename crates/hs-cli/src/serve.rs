@@ -1917,6 +1917,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             let client = mount.client.clone();
             let sender = mount.sender.clone();
             let retention = forget_after.clone();
+            let key_cache = mount.x_matrix.key_cache.clone();
             live.on_change("federation", move |config| {
                 let federation = &config.federation;
                 // The destination sweep reads the retention at each run.
@@ -1928,6 +1929,14 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
                         "the retention of destinations sharing no room is now in force (0 turns the sweep off)"
                     );
                 }
+                // The key fetch budget is read per fetch, and the notaries per lookup of a key
+                // a server does not publish; both log when they change.
+                key_cache.set_fetch_timeout(federation.key_fetch_timeout.into());
+                key_cache.set_trusted_key_servers(
+                    hs_federation::keys::TrustedKeyServer::list_from_config(
+                        &federation.trusted_key_servers,
+                    ),
+                );
                 // The durable EDU bound is read for each one queued.
                 let durable_bound =
                     usize::try_from(federation.max_queued_durable_edus_per_destination)
