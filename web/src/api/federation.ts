@@ -3,7 +3,13 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, newIdempotencyKey } from "./client";
 import { unwrap } from "./problem";
 import { useConfigSection } from "./config";
-import { DEFAULT_MAX_QUEUED_PDUS, MAX_QUEUED_PDUS_SETTING } from "@/lib/federation";
+import {
+  DEFAULT_FORGET_AFTER,
+  DEFAULT_MAX_QUEUED_PDUS,
+  FORGET_AFTER_SETTING,
+  MAX_QUEUED_PDUS_SETTING,
+  formatSettingDuration,
+} from "@/lib/federation";
 import { rememberTask } from "./task-cache";
 import type { components } from "./schema";
 
@@ -38,6 +44,72 @@ export function useResetFederationDestination() {
     onSuccess: (_data, serverName) => {
       qc.invalidateQueries({ queryKey: ["federation-destinations"] });
       qc.invalidateQueries({ queryKey: ["federation-destination", serverName] });
+    },
+  });
+}
+
+export type DestinationForgotten = components["schemas"]["DestinationForgotten"];
+export type DestinationPruneReport = components["schemas"]["DestinationPruneReport"];
+export type DestinationPruneEntry = components["schemas"]["DestinationPruneEntry"];
+
+/**
+ * `DELETE /federation/destinations/{server_name}`: forgets the destination (its queue, backoff,
+ * catch-up mark and cached keys). The server answers `409 conflict` while it shares a room with
+ * this one unless `force` is given; the caller shows that refusal and offers the force.
+ */
+export function useForgetDestination() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async ({
+      serverName,
+      force,
+    }: {
+      serverName: string;
+      force?: boolean;
+    }): Promise<DestinationForgotten> => {
+      const result = await api.DELETE("/federation/destinations/{server_name}", {
+        params: {
+          path: { server_name: serverName },
+          query: force ? { force: true } : {},
+          header: { "Idempotency-Key": newIdempotencyKey() },
+        },
+      });
+      return unwrap(result);
+    },
+    onSuccess: (_data, { serverName }) => {
+      void qc.invalidateQueries({ queryKey: ["federation-destinations"] });
+      void qc.invalidateQueries({ queryKey: ["federation-destination", serverName] });
+      void qc.invalidateQueries({ queryKey: ["federation-remote-keys", serverName] });
+    },
+  });
+}
+
+/**
+ * `POST /federation/destinations/prune`: forgets every destination sharing no room with
+ * nothing queued and, with `failingFor` (`"7d"`), every one failing that long whose queue is
+ * only for rooms this server left. `dryRun` answers the same report and forgets nothing.
+ */
+export function usePruneDestinations() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async ({
+      dryRun,
+      failingFor,
+    }: {
+      dryRun: boolean;
+      failingFor?: string;
+    }): Promise<DestinationPruneReport> => {
+      const result = await api.POST("/federation/destinations/prune", {
+        params: {
+          query: dryRun ? { dry_run: true } : {},
+          header: { "Idempotency-Key": newIdempotencyKey() },
+        },
+        body: failingFor ? { failing_for: failingFor } : {},
+      });
+      return unwrap(result);
+    },
+    onSuccess: (_report, { dryRun }) => {
+      if (!dryRun) void qc.invalidateQueries({ queryKey: ["federation-destinations"] });
     },
   });
 }
@@ -123,4 +195,25 @@ export function useFederationQueueLimit(): { limit: number; configured: boolean 
   return typeof value === "number"
     ? { limit: value, configured: value !== DEFAULT_MAX_QUEUED_PDUS }
     : { limit: DEFAULT_MAX_QUEUED_PDUS, configured: false };
+}
+
+/**
+ * How long the hourly sweep keeps a destination this server shares no room with
+ * (`federation.forget_unused_destinations_after`): the configured value when the `federation`
+ * section can be read (`null` when it is `0`: the sweep is off), else the default, `"1w"`.
+ */
+export function useForgetAfterSetting(): {
+  /** The duration in words ("1 week"), or `null` when the sweep is off. */
+  after: string | null;
+  /** Whether this is the configured value rather than the default. */
+  configured: boolean;
+} {
+  const { data } = useConfigSection("federation");
+  const value = data?.section.values?.[FORGET_AFTER_SETTING];
+  const configured = formatSettingDuration(value);
+  if (configured !== undefined) return { after: configured, configured: true };
+  return {
+    after: formatSettingDuration(DEFAULT_FORGET_AFTER) ?? DEFAULT_FORGET_AFTER,
+    configured: false,
+  };
 }

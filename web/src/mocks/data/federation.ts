@@ -65,13 +65,50 @@ export function sortDestinations(
   return sorted.sort((a, b) => compare(a, b) || byName(a, b));
 }
 
-/** `failing=true` keeps the failing destinations, `failing=false` the rest, absent keeps all. */
+/**
+ * `failing=true` keeps the failing destinations, `failing=false` the rest; `shares_room=false`
+ * keeps those sharing no room, `shares_room=true` the rest; absent keeps all.
+ */
 export function filterDestinations(
   items: readonly Destination[],
   failing: string | null,
+  sharesRoom: string | null = null,
 ): Destination[] {
-  if (failing !== "true" && failing !== "false") return [...items];
-  return items.filter((d) => Boolean(d.failing_since) === (failing === "true"));
+  let out = [...items];
+  if (failing === "true" || failing === "false")
+    out = out.filter((d) => Boolean(d.failing_since) === (failing === "true"));
+  if (sharesRoom === "true" || sharesRoom === "false")
+    out = out.filter((d) => (d.shared_rooms_count ?? 0) > 0 === (sharesRoom === "true"));
+  return out;
+}
+
+/** A destination row with `shared_rooms_count`, read from the rooms shared with it below. */
+export function withSharedRooms(d: Destination): Destination {
+  return { ...d, shared_rooms_count: sharedRoomsCount(d.server_name ?? "") };
+}
+
+/**
+ * How many rooms this server shares with `server`: the rooms below. Every eighth quiet server
+ * (`srv-07`, `srv-14`, ...: eight of them) shares none, so the "No shared room" filter, a forget
+ * and a prune have something to show.
+ */
+export function sharedRoomsCount(server: string): number {
+  return (sharedRooms[server] ?? generalRoomFor(server)).length;
+}
+
+/** Whether a generated quiet server shares the General room: all but every seventh. */
+function generalRoomFor(server: string): DestinationRoom[] {
+  const match = /^srv-(\d+)\.example\.net$/.exec(server);
+  if (!match || Number(match[1]) % 7 === 0) return [];
+  return [
+    {
+      room_id: "!general:example.org",
+      name: "General",
+      canonical_alias: "#general:example.org",
+      joined_members_count: 214,
+      destination_members_count: 1,
+    },
+  ];
 }
 
 const DAY = 86_400_000;
@@ -105,7 +142,147 @@ const sharedRooms: Record<string, DestinationRoom[]> = {
       destination_members_count: 2,
     },
   ],
+  "mozilla.org": [
+    {
+      room_id: "!general:example.org",
+      name: "General",
+      canonical_alias: "#general:example.org",
+      joined_members_count: 214,
+      destination_members_count: 12,
+    },
+    {
+      room_id: "!spam-central:example.org",
+      name: "spam-central",
+      canonical_alias: null,
+      joined_members_count: 3,
+      destination_members_count: 1,
+    },
+  ],
+  "kde.org": [
+    {
+      room_id: "!general:example.org",
+      name: "General",
+      canonical_alias: "#general:example.org",
+      joined_members_count: 214,
+      destination_members_count: 4,
+    },
+  ],
 };
+
+type DestinationForgotten = components["schemas"]["DestinationForgotten"];
+type DestinationPruneReport = components["schemas"]["DestinationPruneReport"];
+type DestinationPruneEntry = components["schemas"]["DestinationPruneEntry"];
+
+/**
+ * `DELETE /federation/destinations/{server_name}` (`forget_destination` in
+ * `crates/hs-admin/src/federation.rs`): `"not-found"` for a server never tried, `"shares-rooms"`
+ * while a room is shared unless `force`, else the row is gone and what it held is reported.
+ */
+export function forgetDestination(
+  server: string,
+  force: boolean,
+): DestinationForgotten | "not-found" | { shares: number } {
+  const index = federationDestinations.findIndex((d) => d.server_name === server);
+  if (index < 0) return "not-found";
+  const d = federationDestinations[index];
+  const shares = sharedRoomsCount(server);
+  if (shares > 0 && !force) return { shares };
+  federationDestinations.splice(index, 1);
+  const keys = cachedKeys(server);
+  delete cache[server];
+  return {
+    server_name: server,
+    dropped_pdu_count: d.catch_up_since ? 0 : (d.pending_pdu_count ?? 0),
+    dropped_edu_count: d.pending_edu_count ?? 0,
+    dropped_key_count: keys?.keys.length ?? 0,
+    was_catching_up: Boolean(d.catch_up_since),
+    shared_rooms_count: shares,
+  };
+}
+
+/** `"7d"` → milliseconds, as `parse_failing_for` reads it; `undefined` for anything else. */
+export function parseFailingFor(text: string): number | undefined {
+  const units: Record<string, number> = {
+    ms: 1,
+    s: 1000,
+    m: 60_000,
+    h: 3_600_000,
+    d: 86_400_000,
+    w: 7 * 86_400_000,
+  };
+  const trimmed = text.trim();
+  if (/^\d+$/.test(trimmed)) return Number(trimmed);
+  let total = 0;
+  let consumed = 0;
+  for (const match of trimmed.matchAll(/(\d+)(ms|s|m|h|d|w)/gy)) {
+    total += Number(match[1]) * units[match[2]];
+    consumed = match.index + match[0].length;
+  }
+  return consumed === trimmed.length && trimmed.length > 0 ? total : undefined;
+}
+
+/**
+ * `POST /federation/destinations/prune` as `decide` in `crates/hs-admin/src/federation.rs`
+ * rules, with the administrator's zero idle time: a server sharing a room is kept
+ * (`shares_rooms`); one sharing none with nothing queued is forgotten (`unused`); one with a
+ * queue is kept unless `failingFor` is given and it has failed that long (`failing`), else
+ * `queued_not_failing` or `failing_recently`.
+ */
+export function pruneDestinations(dryRun: boolean, failingFor?: number): DestinationPruneReport {
+  const forgotten: DestinationPruneEntry[] = [];
+  const kept: DestinationPruneEntry[] = [];
+  const now = Date.now();
+  for (const d of federationDestinations) {
+    const name = d.server_name ?? "";
+    const shares = sharedRoomsCount(name);
+    const queued = (d.catch_up_since ? 0 : (d.pending_pdu_count ?? 0)) + (d.pending_edu_count ?? 0);
+    if (shares > 0) {
+      kept.push({
+        server_name: name,
+        reason: "shares_rooms",
+        detail: `shares ${shares} ${shares === 1 ? "room" : "rooms"} with this server`,
+      });
+    } else if (queued === 0) {
+      forgotten.push({
+        server_name: name,
+        reason: "unused",
+        detail: "shares no room and has nothing queued",
+      });
+    } else if (!d.failing_since) {
+      kept.push({
+        server_name: name,
+        reason: "queued_not_failing",
+        detail: `${queued} queued and not failing: they will be delivered`,
+      });
+    } else if (failingFor != null && now - Date.parse(d.failing_since) >= failingFor) {
+      forgotten.push({
+        server_name: name,
+        reason: "failing",
+        detail: `failing since ${d.failing_since}; its ${queued} queued are for rooms this server left`,
+      });
+    } else {
+      kept.push({
+        server_name: name,
+        reason: "failing_recently",
+        detail: `failing since ${d.failing_since}, not yet for long enough`,
+      });
+    }
+  }
+  if (!dryRun) {
+    const gone = new Set(forgotten.map((e) => e.server_name));
+    for (let i = federationDestinations.length - 1; i >= 0; i--) {
+      if (gone.has(federationDestinations[i].server_name ?? ""))
+        federationDestinations.splice(i, 1);
+    }
+    for (const name of gone) delete cache[name];
+  }
+  const group = (entries: DestinationPruneEntry[]) => {
+    const by_reason: Record<string, number> = {};
+    for (const e of entries) by_reason[e.reason] = (by_reason[e.reason] ?? 0) + 1;
+    return { count: entries.length, by_reason, servers: entries.slice(0, 50) };
+  };
+  return { dry_run: dryRun, forgotten: group(forgotten), kept: group(kept) };
+}
 
 export const ownKeys: SigningKey[] = [
   {
@@ -149,7 +326,9 @@ export function resetFederationKeys(): void {
 
 export function destinationRooms(server: string): DestinationRoom[] | undefined {
   if (sharedRooms[server]) return sharedRooms[server];
-  return federationDestinations.some((d) => d.server_name === server) ? [] : undefined;
+  return federationDestinations.some((d) => d.server_name === server)
+    ? generalRoomFor(server)
+    : undefined;
 }
 
 export function cachedKeys(server: string): RemoteServerKeys | undefined {

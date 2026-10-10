@@ -31,70 +31,79 @@ export const clusterStatus: ClusterStatus = clusterSummary();
  * the Federation page pages (fifty at a time) and the Overview's counts cannot come from one
  * page. Two of the quiet ones are backing off, so a sort by last attempt has something to show.
  */
-export const federationDestinations: Destination[] = [
-  {
-    server_name: "matrix.org",
-    last_successful_at: iso(30_000),
-    failing_since: null,
-    retry_last_at: null,
-    retry_interval_ms: null,
-    pending_pdu_count: 0,
-    pending_edu_count: 0,
-  },
-  {
-    server_name: "element.io",
-    last_successful_at: iso(60_000),
-    failing_since: null,
-    retry_last_at: null,
-    retry_interval_ms: null,
-    pending_pdu_count: 0,
-    pending_edu_count: 0,
-  },
-  {
-    server_name: "gnome.org",
-    last_successful_at: iso(20 * 60_000),
-    failing_since: null,
-    retry_last_at: iso(5 * 60_000),
-    retry_interval_ms: 60_000,
-    pending_pdu_count: 4,
-    pending_edu_count: 0,
-  },
-  {
-    server_name: "mozilla.org",
-    last_successful_at: iso(3 * 3_600_000),
-    failing_since: iso(2 * 3_600_000),
-    retry_last_at: iso(2 * 60_000),
-    retry_interval_ms: 300_000,
-    pending_pdu_count: 42,
-    pending_edu_count: 3,
-    catch_up_since: null,
-  },
-  {
-    // Down for two days: its queue overflowed, so nothing more is queued for it and it is
-    // caught up with each room's latest event when it answers (`catch_up_since`).
-    server_name: "kde.org",
-    last_successful_at: iso(2 * 86_400_000),
-    failing_since: iso(2 * 86_400_000 - 60_000),
-    retry_last_at: iso(40 * 60_000),
-    retry_interval_ms: 3_600_000,
-    pending_pdu_count: 0,
-    pending_edu_count: 0,
-    catch_up_since: iso(26 * 3_600_000),
-  },
-  ...Array.from({ length: 60 }, (_, i): Destination => {
-    const n = i + 1;
-    const backingOff = n === 5 || n === 17;
-    return {
-      server_name: `srv-${String(n).padStart(2, "0")}.example.net`,
-      last_successful_at: iso(n * 90_000),
+function seedDestinations(): Destination[] {
+  return [
+    {
+      server_name: "matrix.org",
+      last_successful_at: iso(30_000),
       failing_since: null,
-      retry_last_at: backingOff ? iso(n * 10_000) : null,
-      retry_interval_ms: backingOff ? 120_000 : null,
-      pending_pdu_count: backingOff ? n : 0,
+      retry_last_at: null,
+      retry_interval_ms: null,
+      pending_pdu_count: 0,
       pending_edu_count: 0,
-    };
-  }),
-];
+    },
+    {
+      server_name: "element.io",
+      last_successful_at: iso(60_000),
+      failing_since: null,
+      retry_last_at: null,
+      retry_interval_ms: null,
+      pending_pdu_count: 0,
+      pending_edu_count: 0,
+    },
+    {
+      server_name: "gnome.org",
+      last_successful_at: iso(20 * 60_000),
+      failing_since: null,
+      retry_last_at: iso(5 * 60_000),
+      retry_interval_ms: 60_000,
+      pending_pdu_count: 4,
+      pending_edu_count: 0,
+    },
+    {
+      server_name: "mozilla.org",
+      last_successful_at: iso(3 * 3_600_000),
+      failing_since: iso(2 * 3_600_000),
+      retry_last_at: iso(2 * 60_000),
+      retry_interval_ms: 300_000,
+      pending_pdu_count: 42,
+      pending_edu_count: 3,
+      catch_up_since: null,
+    },
+    {
+      // Down for two days: its queue overflowed, so nothing more is queued for it and it is
+      // caught up with each room's latest event when it answers (`catch_up_since`).
+      server_name: "kde.org",
+      last_successful_at: iso(2 * 86_400_000),
+      failing_since: iso(2 * 86_400_000 - 60_000),
+      retry_last_at: iso(40 * 60_000),
+      retry_interval_ms: 3_600_000,
+      pending_pdu_count: 0,
+      pending_edu_count: 0,
+      catch_up_since: iso(26 * 3_600_000),
+    },
+    ...Array.from({ length: 60 }, (_, i): Destination => {
+      const n = i + 1;
+      const backingOff = n === 5 || n === 17;
+      return {
+        server_name: `srv-${String(n).padStart(2, "0")}.example.net`,
+        last_successful_at: iso(n * 90_000),
+        failing_since: null,
+        retry_last_at: backingOff ? iso(n * 10_000) : null,
+        retry_interval_ms: backingOff ? 120_000 : null,
+        pending_pdu_count: backingOff ? n : 0,
+        pending_edu_count: 0,
+      };
+    }),
+  ];
+}
+
+export const federationDestinations: Destination[] = seedDestinations();
+
+/** Puts the destinations back as they were (a forget or a prune removes some; Vitest runs this after every test). */
+export function resetFederationDestinations(): void {
+  federationDestinations.splice(0, federationDestinations.length, ...seedDestinations());
+}
 
 /** How many destinations are failing: the Overview's `federation_destinations_failing_count`. */
 export function failingDestinationCount(): number {

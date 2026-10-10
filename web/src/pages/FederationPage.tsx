@@ -1,8 +1,11 @@
+import { useState } from "react";
 import { Link, useNavigate, useSearch } from "@tanstack/react-router";
 import { Globe } from "lucide-react";
 import { useFederationDestinations } from "@/api/dashboard";
 import type { Destination } from "@/api/federation";
 import { Badge } from "@/components/ui/badge/Badge";
+import { Button } from "@/components/ui/button/Button";
+import { toast } from "@/components/ui/toast/toast-store";
 import { DataTable, type Column } from "@/components/ui/table/DataTable";
 import { EmptyState } from "@/components/ui/empty-state/EmptyState";
 import { ForbiddenState } from "@/components/ui/error-state/ErrorState";
@@ -10,22 +13,26 @@ import { QueryProblemState } from "@/components/QueryProblemState";
 import { RelativeTime } from "@/components/RelativeTime";
 import { hasScope } from "@/lib/auth";
 import { cn } from "@/lib/cn";
-import { DESTINATION_PAGE_SIZE, destinationHealth } from "@/lib/federation";
+import { DESTINATION_PAGE_SIZE, destinationHealth, forgottenSummary } from "@/lib/federation";
 import { formatCount } from "@/lib/format";
 import { fromSortState, toSortState } from "@/lib/sort-param";
 import { useFederationQueueLimit } from "@/api/federation";
 import { CatchUpBadge } from "./federation/CatchUp";
 import {
   failingParam,
+  sharesRoomParam,
   type DestinationShow,
   type FederationSearch,
 } from "./federation/federation-search";
 import { OwnKeysPanel } from "./federation/FederationPanels";
+import { ForgetDestinationDialog } from "./federation/ForgetDestination";
+import { PrunePanel } from "./federation/PruneDestinations";
 
 const SHOW_OPTIONS: { value: DestinationShow | "all"; label: string }[] = [
   { value: "all", label: "Every server" },
   { value: "failing", label: "Failing" },
   { value: "not-failing", label: "Not failing" },
+  { value: "no-shared-room", label: "No shared room" },
 ];
 
 /**
@@ -37,6 +44,8 @@ export function FederationPage() {
   const search = useSearch({ from: "/federation" });
   const navigate = useNavigate({ from: "/federation" });
   const canRead = hasScope("admin:read");
+  const canWrite = hasScope("admin:write");
+  const [forgetting, setForgetting] = useState<Destination | null>(null);
   const update = (patch: Partial<FederationSearch>) =>
     navigate({ search: { ...search, ...patch } });
 
@@ -49,6 +58,7 @@ export function FederationPage() {
       cursor: search.cursor,
       sort,
       failing: failingParam(search.show),
+      shares_room: sharesRoomParam(search.show),
       include_total: true,
     },
   );
@@ -116,6 +126,42 @@ export function FederationPage() {
           (d.pending_pdu_count ?? 0) + (d.pending_edu_count ?? 0)
         ),
     },
+    {
+      // Not sortable: the server does not sort by it (it is read from the rooms, not stored).
+      key: "shared_rooms_count",
+      header: "Shared rooms",
+      priority: 2,
+      align: "end",
+      render: (d) =>
+        d.shared_rooms_count == null ? (
+          <span className="text-text-muted" title="This server cannot say right now">
+            unknown
+          </span>
+        ) : d.shared_rooms_count === 0 ? (
+          <span className="text-text-muted">none</span>
+        ) : (
+          d.shared_rooms_count
+        ),
+    },
+    {
+      key: "forget",
+      header: "Action",
+      priority: 2,
+      align: "end",
+      interactive: true,
+      render: (d) => (
+        <Button
+          variant="ghost"
+          size="sm"
+          disabled={!canWrite}
+          title={!canWrite ? "Needs admin:write" : `Forget ${d.server_name}`}
+          aria-label={`Forget ${d.server_name}`}
+          onClick={() => setForgetting(d)}
+        >
+          Forget
+        </Button>
+      ),
+    },
   ];
 
   if (!canRead) {
@@ -133,7 +179,13 @@ export function FederationPage() {
     total == null
       ? undefined
       : `${formatCount(total)} ${total === 1 ? "server" : "servers"}${
-          show === "failing" ? " failing" : show === "not-failing" ? " not failing" : ""
+          show === "failing"
+            ? " failing"
+            : show === "not-failing"
+              ? " not failing"
+              : show === "no-shared-room"
+                ? " sharing no room"
+                : ""
         }`;
 
   return (
@@ -223,7 +275,24 @@ export function FederationPage() {
         </div>
       )}
 
+      <PrunePanel />
       <OwnKeysPanel />
+
+      {forgetting && (
+        <ForgetDestinationDialog
+          destination={forgetting}
+          open
+          onOpenChange={(open) => {
+            if (!open) setForgetting(null);
+          }}
+          onForgotten={(result) =>
+            toast({
+              title: `Forgot ${result.server_name}`,
+              description: forgottenSummary(result),
+            })
+          }
+        />
+      )}
     </div>
   );
 }
@@ -245,6 +314,15 @@ function NoDestinations({ show }: { show: DestinationShow | "all" }) {
         icon={<Globe aria-hidden="true" />}
         title="Every known server is failing"
         description="No server this one sends to has answered its last request."
+      />
+    );
+  if (show === "no-shared-room")
+    return (
+      <EmptyState
+        variant="filtered"
+        icon={<Globe aria-hidden="true" />}
+        title="Every known server shares a room"
+        description="There is nothing to forget: each server this one knows has users in a room your users are in."
       />
     );
   return (
@@ -306,6 +384,15 @@ function StatusKey({ catchingUp, paged }: { catchingUp: number; paged: boolean }
           <dd>
             Events (PDUs) and other messages (EDUs: typing, read receipts, presence, device updates)
             queued for the server, sent as soon as it answers.
+          </dd>
+        </div>
+        <div className="contents">
+          <dt className="text-text">Shared rooms</dt>
+          <dd>
+            How many rooms have users from both servers. A server sharing none is only a record:
+            nothing is sent to it until a room brings the two together again, so it may be forgotten
+            (its row&apos;s Forget, or the prune below), and the hourly sweep forgets it in time.
+            &ldquo;No shared room&rdquo; above lists just those.
           </dd>
         </div>
         <div className="contents">

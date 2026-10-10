@@ -190,14 +190,19 @@ describe("ConfigSectionPage", () => {
     ).toBeInTheDocument();
   });
 
-  it("names the settings of a mostly-restart section that apply at once", async () => {
+  it("names the settings of a mixed section that apply at once", async () => {
     renderSection("federation");
+    // Seven of the federation section's fourteen settings are hot (the destination sweep's
+    // retention joined them on 2026-10-10), so the headline leads with the ones that apply on save.
     const legend = within(
       await screen.findByRole("region", {
-        name: "Most changes here take effect at the next restart; some apply on save",
+        name: "Most changes here apply on save; some wait for a restart",
       }),
     );
-    expect(legend.getByText("6 settings")).toBeInTheDocument();
+    // Seven apply on save, seven need a restart.
+    expect(legend.getAllByText("7 settings")).toHaveLength(2);
+    const forget = document.getElementById("setting-forget_unused_destinations_after")!;
+    expect(within(forget).getByText("Applies on save")).toBeInTheDocument();
     const allowlist = document.getElementById("setting-domain_allowlist")!;
     expect(within(allowlist).getByText("Applies on save")).toBeInTheDocument();
     // The bound on each server's waiting to-device and device-list updates is read per update.
