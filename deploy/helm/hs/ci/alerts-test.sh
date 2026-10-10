@@ -26,6 +26,10 @@ done
 command -v helm >/dev/null || { echo "helm is not installed" >&2; exit 2; }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/alerts-test.XXXXXX")"
+# mktemp makes it 0700, and the Prometheus image runs promtool as `nobody`, which then cannot
+# enter the mounted directory on a Linux host (CD run 38003318126: "stat rules.yaml: permission
+# denied"; on macOS the file-sharing layer hid it). World-readable, like the rules are.
+chmod 0755 "$WORK"
 trap 'rm -rf "$WORK"' EXIT
 
 echo "== Rendering the PrometheusRule (release myelin, namespace hs, cluster mode, PostgreSQL, media claim hs-media)"
@@ -58,6 +62,7 @@ else
   promtool() { docker run --rm -v "$WORK:/work:ro" -w /work --entrypoint promtool "$PROMETHEUS_IMAGE" "$@"; }
 fi
 
+chmod 0644 "$WORK"/*.yaml
 echo "== promtool check rules"
 promtool check rules rules.yaml
 echo "== promtool test rules"
