@@ -4,6 +4,23 @@ Written 2026-09-20 by the integration lead, last revised 2026-10-10, 18:20 EDT (
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
+## 2026-10-10 evening (branch `agent/fed-destinations`, pushed, not merged): a federation destination this server shares no room with can be forgotten
+
+Decision 0042. The Federation page lists thousands of "failing" servers after one visit to a
+large room, and nothing removed one. Now a destination sharing no room (no room with users from
+both) is state, not a relationship: `DELETE /federation/destinations/{server_name}` (409 while a
+room is shared unless `force=true`), `POST /federation/destinations/prune` (`dry_run`,
+`failing_for`), `Destination.shared_rooms_count` and a `shares_room` filter (OpenAPI 0.1.14); an
+hourly sweep in `hs serve` forgets them after `federation.forget_unused_destinations_after`
+(default `1w`, hot, `0` off); the web interface has the "No shared room" filter, Forget on each
+row and on the destination page (with the warning and the force when a room is shared), and a
+prune panel that previews before it forgets and states the sweep's setting with a link to it. One
+`INFO` line per destination forgotten with the reason and who decided; metric
+`hs_federation_destinations_forgotten_total{reason,by}`. Verified: the four crates' tests and
+clippy, `hs-cli/tests/federation_destinations.rs` against two real binaries, `npm run check` and
+`npm run test:e2e` (`e2e/federation-forget.spec.ts`). Details and what is left in
+`docs/status/06-federation.md` (top entry). To gate and merge.
+
 ## Resume here: 2026-10-10, 18:20 EDT -- the demo runs `2d11ea2e` and federates from the public internet; the first public join found two bugs, fixed and rolled
 
 **The afternoon.** Finding 3 of the 16:30 entry is closed (`deploy/demo/tailscale-funnel.md`):
