@@ -397,12 +397,10 @@ jobs:
         # volume and the signing-key Secret, dropped and restored the same way, the media
         # byte for byte. The chart's README has the procedure; this is it, run.
         #
-        # Reports, does not block, until it has been seen green on these runners: on run
-        # 38008712117 its first single-node install never went Ready in 5 min after the cluster
-        # smoke on the same two-CPU node, and the script printed no diagnostics (fixed since).
-        # Drop `continue-on-error` with the cluster smoke's.
+        # Blocks since run 38019011375, the first green one here: before it, a same-ID image the
+        # kubelet had pulled beside the imported `myelin:smoke` made every pod from the imported
+        # name ErrImageNeverPull (the cluster smoke's step says how that was settled).
         if: matrix.arch == 'amd64'
-        continue-on-error: true
         run: deploy/helm/hs/ci/backup-restore-smoke.sh myelin:smoke --kind smoke
 
       - name: Export the digest
