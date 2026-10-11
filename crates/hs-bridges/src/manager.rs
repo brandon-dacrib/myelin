@@ -689,6 +689,7 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             state: row.state.as_str().to_owned(),
             reason,
             appservice_id: row.appservice_id.clone(),
+            url: row.url.clone(),
             bot,
             deployment,
             health: health.as_ref().map(|h| h.status.clone()),
@@ -944,13 +945,18 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
                         Some("waiting for the pod".into()),
                     );
                 } else {
+                    let on_a_mac = bridge_types::get(&row.bridge_type, &self.server_name)
+                        .is_some_and(|k| k.runs_on == "mac");
                     self.set_state(
                         row,
                         InstanceState::Starting,
-                        Some(
+                        Some(if on_a_mac {
+                            "waiting for the bridge on the Mac to answer this server: set the Mac's address, download its files and run it there"
+                                .into()
+                        } else {
                             "waiting for someone to run it: its files are in the admin interface"
-                                .into(),
-                        ),
+                                .into()
+                        }),
                     );
                 }
                 self.wake();
@@ -1446,7 +1452,10 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
                     r.hs_token = Some(crate::random_hex(32));
                     r.provisioning_secret = Some(crate::random_hex(32));
                     r.pickle_key = Some(crate::random_hex(32));
-                    r.url = Some(url.clone());
+                    // An administrator may have said where it listens before it was named.
+                    if r.url.is_none() {
+                        r.url = Some(url.clone());
+                    }
                     true
                 })
                 .map_err(|e| e.to_string())?;
@@ -2377,6 +2386,55 @@ impl<B: KvBackend + 'static> BridgeOfferingSource for BridgeManager<B> {
         Ok(self.instance_view(&row).await)
     }
 
+    async fn set_instance_address(
+        &self,
+        bridge_type: &str,
+        user_id: &str,
+        address: &str,
+    ) -> Result<BridgeInstance, SourceError> {
+        let offering = self
+            .store
+            .offering(bridge_type)
+            .map_err(store_err)?
+            .ok_or(SourceError::NotFound)?;
+        if offering.runtime == "cluster" {
+            return Err(SourceError::Invalid(
+                "this server deploys that bridge itself and knows where it listens".into(),
+            ));
+        }
+        let kind =
+            bridge_types::get(bridge_type, &self.server_name).ok_or(SourceError::NotFound)?;
+        let url = hs_admin::bridge_offerings::instance_url(address, kind.port)
+            .map_err(SourceError::Invalid)?;
+        let row = self
+            .store
+            .update_instance(bridge_type, user_id, |r| {
+                if r.url.as_deref() == Some(url.as_str()) {
+                    return false;
+                }
+                r.url = Some(url.clone());
+                true
+            })
+            .map_err(store_err)?
+            .ok_or(SourceError::NotFound)?;
+        tracing::info!(bridge_type, owner = user_id, url = %url, "an administrator set where a bridge run elsewhere listens");
+        // The registry's copy follows at once: the fingerprint leaves `url` out, so the step
+        // that patches changed claims would not carry it.
+        if let Some(id) = &row.appservice_id {
+            match self
+                .directory
+                .update(id, serde_json::json!({"url": url}))
+                .await
+            {
+                Ok(_) | Err(SourceError::NotFound) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        self.clear_backoff(bridge_type, Some(user_id));
+        self.wake();
+        Ok(self.instance_view(&row).await)
+    }
+
     async fn delete_instance(&self, bridge_type: &str, user_id: &str) -> Result<(), SourceError> {
         tracing::debug!(
             bridge_type,
@@ -2422,6 +2480,7 @@ impl<B: KvBackend + 'static> BridgeOfferingSource for BridgeManager<B> {
             registration_yaml: render.registration_yaml.clone(),
             compose_yaml: render.compose_yaml.clone(),
             manifest_yaml: manifest_yaml(&spec, &namespace),
+            run_sh: render.run_sh.clone(),
         })
     }
 }
@@ -3409,6 +3468,127 @@ mod tests {
             .unwrap();
         assert_eq!(row.reason.as_deref(), Some(REREGISTERED_REASON));
         assert_eq!(row.state, InstanceState::Starting);
+    }
+
+    /// An iMessage bridge runs on the person's Mac: the administrator says where the Mac is,
+    /// before or after the instance is named, and the registration's `url` and the files
+    /// follow; the server's own deployment cannot be pointed elsewhere.
+    #[tokio::test]
+    async fn an_administrator_says_where_a_bridge_on_a_mac_listens() {
+        let directory =
+            Arc::new(InMemoryAppserviceDirectory::new().unreachable("imessage-brandon"));
+        let manager = BridgeManager::new(
+            MemoryBackend::new(),
+            directory.clone(),
+            None,
+            "example.org",
+            "https://example.org",
+        )
+        .unwrap();
+        manager.attach("http://127.0.0.1:9");
+        // iMessage cannot be offered in the cluster, even by a server that deploys.
+        let offering = manager
+            .put("mautrix-imessage", BridgeOfferingRequest::default())
+            .await
+            .unwrap();
+        assert_eq!(offering.runtime, "elsewhere");
+        manager
+            .put_instance("mautrix-imessage", "@brandon:example.org")
+            .await
+            .unwrap();
+
+        // Before the instance is named: the address is kept, and registration keeps it.
+        let view = manager
+            .set_instance_address(
+                "mautrix-imessage",
+                "@brandon:example.org",
+                "brandons-mac.local",
+            )
+            .await
+            .unwrap();
+        assert_eq!(view.url.as_deref(), Some("http://brandons-mac.local:29331"));
+        manager.tick().await; // registered
+        manager.tick().await; // starting
+        let row = manager
+            .store
+            .instance("mautrix-imessage", "@brandon:example.org")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, InstanceState::Starting);
+        assert!(
+            row.reason.as_deref().is_some_and(|r| r.contains("Mac")),
+            "{:?}",
+            row.reason
+        );
+        assert_eq!(row.url.as_deref(), Some("http://brandons-mac.local:29331"));
+        let registered = directory.get("imessage-brandon").await.unwrap().unwrap();
+        assert_eq!(
+            registered.url.as_deref(),
+            Some("http://brandons-mac.local:29331")
+        );
+
+        // After: the registry's copy is patched at once, and the files say the new address.
+        let view = manager
+            .set_instance_address("mautrix-imessage", "@brandon:example.org", "10.0.0.5:29400")
+            .await
+            .unwrap();
+        assert_eq!(view.url.as_deref(), Some("http://10.0.0.5:29400"));
+        let registered = directory.get("imessage-brandon").await.unwrap().unwrap();
+        assert_eq!(registered.url.as_deref(), Some("http://10.0.0.5:29400"));
+        let files = manager
+            .instance_files("mautrix-imessage", "@brandon:example.org")
+            .await
+            .unwrap();
+        assert!(
+            files
+                .config_yaml
+                .as_deref()
+                .unwrap()
+                .contains("address: http://10.0.0.5:29400")
+        );
+        assert!(
+            files
+                .run_sh
+                .as_deref()
+                .unwrap()
+                .contains("http://10.0.0.5:29400")
+        );
+        assert!(
+            files
+                .config_yaml
+                .as_deref()
+                .unwrap()
+                .contains("user: \"@brandon:example.org\"")
+        );
+
+        // A bad address is refused in words, and nothing changes.
+        let err = manager
+            .set_instance_address("mautrix-imessage", "@brandon:example.org", "mac/path")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SourceError::Invalid(_)), "{err:?}");
+        let row = manager
+            .store
+            .instance("mautrix-imessage", "@brandon:example.org")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.url.as_deref(), Some("http://10.0.0.5:29400"));
+
+        // An instance this server deploys knows where it listens.
+        let (cluster, _runtime) = cluster_manager();
+        cluster
+            .put("mautrix-whatsapp", BridgeOfferingRequest::default())
+            .await
+            .unwrap();
+        cluster
+            .put_instance("mautrix-whatsapp", "@brandon:example.org")
+            .await
+            .unwrap();
+        let err = cluster
+            .set_instance_address("mautrix-whatsapp", "@brandon:example.org", "somewhere")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SourceError::Invalid(_)), "{err:?}");
     }
 
     /// The deployment's declared offerings (`MYELIN_BRIDGES_OFFERINGS`) are created the first

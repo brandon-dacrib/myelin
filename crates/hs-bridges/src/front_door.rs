@@ -301,8 +301,14 @@ async fn request<B: KvBackend + 'static>(
         .request(bridge_type, user, room_id)
         .map_err(|_| "Something went wrong on my side; try again in a minute.".to_owned())?;
     let elsewhere = offering.runtime != "cluster";
+    let on_a_mac = hs_admin::bridge_types::get(bridge_type, &manager.server_name)
+        .is_some_and(|k| k.runs_on == "mac");
     if created {
-        return Ok(if elsewhere {
+        return Ok(if on_a_mac {
+            format!(
+                "A {name} bridge runs on your own Mac, beside Messages. I've asked for one for you: an administrator will give you its files and the steps to run it there, and I'll invite you to it as soon as it answers this server."
+            )
+        } else if elsewhere {
             format!(
                 "An administrator runs {name} bridges on this server by hand. I've asked for one for you, and I'll invite you to it as soon as it's running."
             )

@@ -8615,7 +8615,7 @@ components:
           type:
           - string
           - 'null'
-          description: For `runs_on: mac`, where to download the program (a pinned build, as `image` pins a tag).
+          description: 'For `runs_on: mac`, where to download the program (a pinned build, as `image` pins a tag).'
         download_note:
           type:
           - string
@@ -8908,7 +8908,7 @@ components:
           type:
           - string
           - 'null'
-          description: Where this server reaches the bridge (the registration's `url`): the cluster Service for an instance it deploys, else `http://<appservice id>:<port>` until an administrator sets the address (`PUT` with `address`).
+          description: 'Where this server reaches the bridge (the registration''s `url`): the cluster Service for an instance it deploys, else `http://<appservice id>:<port>` until an administrator sets the address (`PUT` with `address`).'
         bot:
           type:
           - string

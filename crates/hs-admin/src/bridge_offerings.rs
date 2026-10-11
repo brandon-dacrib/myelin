@@ -46,6 +46,15 @@ pub trait BridgeOfferingSource: Send + Sync + 'static {
         bridge_type: &str,
         user_id: &str,
     ) -> Result<BridgeInstance, SourceError>;
+    /// Tells this server where an instance run elsewhere listens (`host`, `host:port` or a
+    /// URL; a bare host takes the type's port): its registration's `url` and its files follow.
+    /// [`SourceError::Invalid`] for an instance this server deploys.
+    async fn set_instance_address(
+        &self,
+        bridge_type: &str,
+        user_id: &str,
+        address: &str,
+    ) -> Result<BridgeInstance, SourceError>;
     async fn delete_instance(&self, bridge_type: &str, user_id: &str) -> Result<(), SourceError>;
     /// The files to run an instance elsewhere, with its own tokens.
     async fn instance_files(
@@ -254,6 +263,30 @@ impl BridgeOfferingSource for InMemoryBridgeOfferings {
         Ok(instance.clone())
     }
 
+    async fn set_instance_address(
+        &self,
+        bridge_type: &str,
+        user_id: &str,
+        address: &str,
+    ) -> Result<BridgeInstance, SourceError> {
+        let offering = self.get(bridge_type).await?.ok_or(SourceError::NotFound)?;
+        if offering.runtime == "cluster" {
+            return Err(SourceError::Invalid(
+                "this server deploys that bridge itself and knows where it listens".into(),
+            ));
+        }
+        let port = crate::bridge_types::get(bridge_type, "example.org")
+            .map(|k| k.port)
+            .unwrap_or(29318);
+        let url = instance_url(address, port).map_err(SourceError::Invalid)?;
+        let mut instances = self.instances.write().expect("lock");
+        let instance = instances
+            .get_mut(&(bridge_type.to_owned(), user_id.to_owned()))
+            .ok_or(SourceError::NotFound)?;
+        instance.url = Some(url);
+        Ok(instance.clone())
+    }
+
     async fn delete_instance(&self, bridge_type: &str, user_id: &str) -> Result<(), SourceError> {
         self.instances
             .write()
@@ -276,6 +309,126 @@ impl BridgeOfferingSource for InMemoryBridgeOfferings {
             registration_yaml: format!("id: {bridge_type}\n"),
             compose_yaml: "services: {}\n".into(),
             manifest_yaml: "kind: Bridge\n".into(),
+            run_sh: (bridge_type == "mautrix-imessage").then(|| "#!/bin/sh\n".into()),
         })
+    }
+}
+
+/// The registration `url` an administrator's `address` means: a full `http(s)://` URL as given
+/// (its trailing slash dropped), else `host` or `host:port` over plain HTTP, a bare host taking
+/// `default_port`. Refused when empty, when it has a path or query, or when the host is not a
+/// hostname, an IPv4 address or a bracketed IPv6 address.
+///
+/// # Errors
+/// What is wrong with it, in words for the administrator.
+pub fn instance_url(address: &str, default_port: u16) -> Result<String, String> {
+    let address = address.trim();
+    if address.is_empty() {
+        return Err(
+            "address is empty: the Mac's hostname or IP address, with :port if not the default"
+                .into(),
+        );
+    }
+    let (scheme, rest) = match address.split_once("://") {
+        Some(("http", rest)) => ("http", rest),
+        Some(("https", rest)) => ("https", rest),
+        Some((other, _)) => {
+            return Err(format!("address: `{other}://` is not http or https"));
+        }
+        None => ("http", address),
+    };
+    let rest = rest.trim_end_matches('/');
+    if rest.is_empty() || rest.contains('/') || rest.contains('?') || rest.contains('#') {
+        return Err("address is a host or host:port (or an http(s):// URL with no path)".into());
+    }
+    let (host, port) = if let Some(end) = rest.strip_prefix('[') {
+        let Some((v6, after)) = end.split_once(']') else {
+            return Err("address: an IPv6 address is written in brackets, [::1]:29331".into());
+        };
+        if v6.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err(format!("address: `{v6}` is not an IPv6 address"));
+        }
+        let port = match after.strip_prefix(':') {
+            None if after.is_empty() => default_port,
+            Some(p) => parse_port(p)?,
+            None => return Err("address: after ] comes :port or nothing".into()),
+        };
+        (format!("[{v6}]"), port)
+    } else {
+        match rest.rsplit_once(':') {
+            Some((host, p)) if !host.contains(':') => (host.to_owned(), parse_port(p)?),
+            _ => (rest.to_owned(), default_port),
+        }
+    };
+    let host_ok = host.starts_with('[')
+        || (!host.is_empty()
+            && host.len() <= 253
+            && host.split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && label
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            }));
+    if !host_ok {
+        return Err(format!(
+            "address: `{host}` is not a hostname or an IP address"
+        ));
+    }
+    Ok(format!("{scheme}://{host}:{port}"))
+}
+
+fn parse_port(p: &str) -> Result<u16, String> {
+    p.parse::<u16>()
+        .ok()
+        .filter(|p| *p > 0)
+        .ok_or_else(|| format!("address: `{p}` is not a port"))
+}
+
+#[cfg(test)]
+mod address_tests {
+    use super::instance_url;
+
+    #[test]
+    fn an_address_becomes_the_registration_url() {
+        assert_eq!(
+            instance_url("brandons-mac.local", 29331).unwrap(),
+            "http://brandons-mac.local:29331"
+        );
+        assert_eq!(
+            instance_url(" 192.168.1.20:29400 ", 29331).unwrap(),
+            "http://192.168.1.20:29400"
+        );
+        assert_eq!(
+            instance_url("https://mac.example.net/", 29331).unwrap(),
+            "https://mac.example.net:29331"
+        );
+        assert_eq!(
+            instance_url("http://mac.example.net:8080", 29331).unwrap(),
+            "http://mac.example.net:8080"
+        );
+        assert_eq!(
+            instance_url("[fd00::2]", 29331).unwrap(),
+            "http://[fd00::2]:29331"
+        );
+        assert_eq!(
+            instance_url("[fd00::2]:29400", 29331).unwrap(),
+            "http://[fd00::2]:29400"
+        );
+        for bad in [
+            "",
+            "   ",
+            "ws://mac",
+            "mac/path",
+            "mac:notaport",
+            "mac:0",
+            "mac:70000",
+            "[fd00::2",
+            "[nope]",
+            "a b",
+            "mac?x=1",
+        ] {
+            assert!(instance_url(bad, 29331).is_err(), "{bad:?}");
+        }
     }
 }

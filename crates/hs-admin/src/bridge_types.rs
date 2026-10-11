@@ -98,14 +98,37 @@ struct Entry {
     sign_in: &'static [&'static str],
     /// A caveat worth knowing before signing in, or nothing.
     sign_in_notes: Option<&'static str>,
-    /// A mautrix bridge still on mautrix-go's older bridge framework (`bridge/`, not
-    /// `bridgev2/`), whose `config.yaml` has another layout: the database under `appservice`,
-    /// the ghost template, encryption, double puppeting, backfill and provisioning under
-    /// `bridge`. Such a bridge given the `bridgev2` layout exits at once with `Configuration
-    /// error: "appservice.database not configured"`, as the demo's Discord bridge did on
-    /// 2026-10-11. mautrix-discord is the one such bridge in the catalogue; the rest are
-    /// `v0.25xx`/`v0.26xx` builds, which are `bridgev2`.
-    legacy_config: bool,
+    /// Which `config.yaml` layout the bridge reads ([`ConfigLayout`]).
+    layout: ConfigLayout,
+    /// For a bridge that is a program for a Mac rather than a container image
+    /// (mautrix-imessage): where to download it. Such a type is never deployed by this server.
+    mac_download: Option<MacDownload>,
+}
+
+/// The layout of a mautrix bridge's `config.yaml`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigLayout {
+    /// `bridgev2` (every `v0.25xx`/`v0.26xx` mautrix build): a top-level `database`,
+    /// `encryption`, `double_puppet` and `provisioning`.
+    BridgeV2,
+    /// mautrix-go's older bridge framework (`bridge/`, not `bridgev2/`; mautrix-discord v0.7.x):
+    /// the database under `appservice`, the ghost template, encryption, double puppeting,
+    /// backfill and provisioning under `bridge`. Such a bridge given the `bridgev2` layout exits
+    /// at once with `Configuration error: "appservice.database not configured"`, as the demo's
+    /// Discord bridge did on 2026-10-11.
+    Legacy,
+    /// mautrix-imessage: the older framework's layout with its own sections (`imessage`, a
+    /// single `bridge.user`, `bridge.login_shared_secret`, `bridge.backfill.enable`) and a
+    /// websocket proxy to switch off, since this server pushes to the bridge's own listener.
+    IMessage,
+}
+
+/// Where a Mac program is downloaded from, pinned to one build the way an image pins a tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MacDownload {
+    url: &'static str,
+    /// What the download is and which build it is.
+    note: &'static str,
 }
 
 impl Entry {
@@ -138,6 +161,9 @@ const MSC3202: &str = "org.matrix.msc3202";
 const MSC4190: &str = "io.element.msc4190";
 
 const MAUTRIX_FEATURES: &[&str] = &[MSC2409, MSC3202, MSC4190];
+/// For a bridge on the older framework without MSC4190 (mautrix-imessage): its bot's device
+/// comes from `m.login.application_service`, which this server offers every appservice.
+const MAUTRIX_LEGACY_FEATURES: &[&str] = &[MSC2409, MSC3202];
 
 macro_rules! mautrix {
     (
@@ -156,7 +182,7 @@ macro_rules! mautrix {
             needs: [$(($k, $d, $r)),*],
             sign_in: [$($step),*],
             notes: $notes,
-            legacy_config: false,
+            layout: ConfigLayout::BridgeV2,
         )
     };
     (
@@ -167,7 +193,7 @@ macro_rules! mautrix {
         needs: [$(($k:literal, $d:literal, $r:literal)),* $(,)?],
         sign_in: [$($step:literal),* $(,)?],
         notes: $notes:expr,
-        legacy_config: $legacy:literal $(,)?
+        layout: $layout:expr $(,)?
     ) => {
         Entry {
             id: $id,
@@ -186,7 +212,8 @@ macro_rules! mautrix {
             runtime: Runtime::Mautrix,
             sign_in: &[$($step),*],
             sign_in_notes: $notes,
-            legacy_config: $legacy,
+            layout: $layout,
+            mac_download: None,
         }
     };
 }
@@ -284,7 +311,7 @@ const CATALOGUE: &[Entry] = &[
         notes: Some("Discord may flag accounts that look automated. A bot account carries none of that risk."),
         // v0.7.7 is on mautrix-go's older bridge framework (its go.mod wants `mautrix
         // v0.16.3-…`, and its example config keeps the database under `appservice`).
-        legacy_config: true,
+        layout: ConfigLayout::Legacy,
     ),
     mautrix!(
         "mautrix-slack", "Slack", "slack", "v0.2609.1", 29335, "slack_", "slackbot",
@@ -331,6 +358,45 @@ const CATALOGUE: &[Entry] = &[
         notes: None,
     ),
     Entry {
+        id: "mautrix-imessage",
+        name: "iMessage",
+        description: "Your Mac's Messages: iMessage and SMS chats, as yourself.",
+        category: Category::Messaging,
+        upstream_project: "mautrix/imessage",
+        docs_url: "https://docs.mau.fi/bridges/go/imessage/mac/setup.html",
+        // Not a container image: a label for the build `mac_download` pins (the tag is the
+        // commit), so that the offering's "image tag" names the same build.
+        image: "mautrix-imessage:300ba6d0",
+        port: 29331,
+        ghost_prefix: "imessage_",
+        bot: "imessagebot",
+        needs: &[(
+            "mac",
+            "A Mac signed in to Messages, kept on and awake, that this server can reach",
+            true,
+        )],
+        double_puppeting: true,
+        // The older framework without MSC4190: its bot logs in with the appservice flow.
+        features: MAUTRIX_LEGACY_FEATURES,
+        runtime: Runtime::Mautrix,
+        sign_in: &[
+            "Download the bridge for your Mac from your bridge's page and unzip it.",
+            "Put your bridge's config.yaml, registration.yaml and run.sh beside it, open Terminal there and run `./run.sh`. When macOS asks, give Terminal Full Disk Access (System Settings → Privacy & Security → Full Disk Access) and run it again.",
+            "Keep the Mac on and awake; the bridge carries the chats of the Apple account Messages is signed in to.",
+        ],
+        sign_in_notes: Some(
+            "The server has to reach the Mac on its port (29331 by default): the same network, or a Tailscale-style private network. A Mac behind NAT with no such path cannot be reached yet.",
+        ),
+        layout: ConfigLayout::IMessage,
+        mac_download: Some(MacDownload {
+            // mau.dev pipeline 20935, job "build universal" (commit 300ba6d0, 2026-05-14): a
+            // zip of `mautrix-imessage`, `libolm.3.dylib` and `example-config.yaml`. A job's
+            // artifact link is a permalink; the `master` one moves (decision 0037).
+            url: "https://mau.dev/mautrix/imessage/-/jobs/95972/artifacts/download",
+            note: "Universal macOS build (Apple silicon and Intel) of mautrix-imessage commit 300ba6d0, from the project's CI on 2026-05-14. The zip holds the program, libolm.3.dylib and an example config.",
+        }),
+    },
+    Entry {
         id: "heisenbridge",
         name: "IRC (heisenbridge)",
         description: "An IRC bouncer: one person's networks, channels and queries, in Matrix.",
@@ -357,7 +423,8 @@ const CATALOGUE: &[Entry] = &[
         sign_in_notes: Some(
             "One owner drives the bridge: the Matrix user named on its command line.",
         ),
-        legacy_config: false,
+        layout: ConfigLayout::BridgeV2,
+        mac_download: None,
     },
     Entry {
         id: "matrix-appservice-irc",
@@ -383,7 +450,8 @@ const CATALOGUE: &[Entry] = &[
             "Start a direct chat with {bot} and send `!nick <name>` to choose your IRC nick, or `!join #channel` to join one.",
         ],
         sign_in_notes: None,
-        legacy_config: false,
+        layout: ConfigLayout::BridgeV2,
+        mac_download: None,
     },
     Entry {
         id: "matrix-hookshot",
@@ -409,7 +477,8 @@ const CATALOGUE: &[Entry] = &[
             "`!hookshot webhook <name>` gives the room a webhook URL; GitHub, GitLab, Jira and RSS are connected per room the same way, or through the widget.",
         ],
         sign_in_notes: None,
-        legacy_config: false,
+        layout: ConfigLayout::BridgeV2,
+        mac_download: None,
     },
 ];
 
@@ -472,7 +541,7 @@ fn provisioning_of(entry: &Entry) -> (ProvisioningApi, &'static str) {
         // The older framework's provisioning API is v1 (`/_matrix/provision/v1/...`, per
         // bridge, with no `whoami`): there is nothing for this server to ask, and saying so is
         // better than a `refused` from a path that is not there.
-        Runtime::Mautrix if entry.legacy_config => (
+        Runtime::Mautrix if entry.layout != ConfigLayout::BridgeV2 => (
             ProvisioningApi::None,
             "This bridge is on mautrix-go's older framework, whose provisioning API has no whoami, so the bridge keeps who has signed in itself: ask its bot `ping`.",
         ),
@@ -529,6 +598,7 @@ fn command_prefix(entry: &Entry) -> Option<&'static str> {
         "mautrix-gvoice" => Some("!gv"),
         "mautrix-meta" => Some("!fb"),
         "mautrix-discord" => Some("!discord"),
+        "mautrix-imessage" => Some("!im"),
         "mautrix-bluesky" => Some("!bsky"),
         "mautrix-signal" => Some("!signal"),
         "mautrix-slack" => Some("!slack"),
@@ -683,6 +753,12 @@ fn deployable(entry: &Entry) -> bool {
 /// Why this server cannot deploy the type itself, in the words the interface shows; `None`
 /// when it can.
 fn not_deployable_reason(entry: &Entry) -> Option<String> {
+    if entry.mac_download.is_some() {
+        return Some(format!(
+            "{} bridges run on a Mac, beside the Messages app they read, so this server cannot deploy one: each person downloads the bridge and runs it on their Mac.",
+            entry.name
+        ));
+    }
     match entry.runtime {
         Runtime::AppserviceIrc | Runtime::Hookshot => Some(format!(
             "{}'s config names the networks or services it connects, which only an administrator can write, so it runs elsewhere.",
@@ -723,6 +799,16 @@ fn namespaces_for(entry: &Entry, server_name: &str) -> Value {
     })
 }
 
+/// `container` for an image this server deploys or someone runs from a compose file, `mac`
+/// for a program for a Mac ([`Entry::mac_download`]).
+fn runs_on(entry: &Entry) -> &'static str {
+    if entry.mac_download.is_some() {
+        "mac"
+    } else {
+        "container"
+    }
+}
+
 fn bridge_type(entry: &Entry, server_name: &str) -> BridgeType {
     BridgeType {
         id: entry.id.to_owned(),
@@ -752,6 +838,9 @@ fn bridge_type(entry: &Entry, server_name: &str) -> BridgeType {
         not_deployable_reason: not_deployable_reason(entry),
         provisioning_api: provisioning_of(entry).0.as_str().to_owned(),
         provisioning_note: Some(provisioning_of(entry).1.to_owned()),
+        runs_on: runs_on(entry).to_owned(),
+        download_url: entry.mac_download.map(|d| d.url.to_owned()),
+        download_note: entry.mac_download.map(|d| d.note.to_owned()),
         sign_in: BridgeTypeSignIn {
             steps: entry
                 .sign_in
@@ -965,7 +1054,8 @@ pub fn render(type_id: &str, server_name: &str, values: &Value) -> Option<Bridge
             pickle_key: None,
             // The wizard's bridge is one for the server, run by hand: the shared name.
             network: network_section(entry, &device_name_for(entry.name, server_name, None)),
-            legacy: entry.legacy_config,
+            layout: entry.layout,
+            owner: c.admin_user.as_deref(),
         })
     });
     let compose_yaml = compose(entry, &c, &image, server_name);
@@ -1008,9 +1098,11 @@ struct MautrixParams<'a> {
     /// The `network:` section naming the bridge on the network's side
     /// ([`network_section`]), when the connector has such a setting.
     network: Option<String>,
-    /// The older framework's layout ([`Entry::legacy_config`]): [`mautrix_legacy_config`]
-    /// instead of the `bridgev2` one.
-    legacy: bool,
+    /// Which layout to write ([`Entry::layout`]).
+    layout: ConfigLayout,
+    /// The one person the bridge is for, where the layout names one (`bridge.user` in
+    /// mautrix-imessage's); `None` for a shared render.
+    owner: Option<&'a str>,
 }
 
 /// The `config.yaml` a mautrix bridge reads, with everything that ties it to this server filled
@@ -1022,11 +1114,13 @@ struct MautrixParams<'a> {
 /// generator does with an empty one. The database is SQLite in the bridge's own volume, which
 /// is all one bridge process needs (RFC 0017 section 4.4).
 ///
-/// The layout is `bridgev2`'s, unless the entry is on the older framework
-/// ([`MautrixParams::legacy`]), whose file [`mautrix_legacy_config`] writes.
+/// The layout is `bridgev2`'s, unless the entry says otherwise ([`MautrixParams::layout`]):
+/// [`mautrix_legacy_config`] or [`mautrix_imessage_config`].
 fn mautrix_config(p: &MautrixParams<'_>) -> String {
-    if p.legacy {
-        return mautrix_legacy_config(p);
+    match p.layout {
+        ConfigLayout::Legacy => return mautrix_legacy_config(p),
+        ConfigLayout::IMessage => return mautrix_imessage_config(p),
+        ConfigLayout::BridgeV2 => {}
     }
     let mut out = String::new();
     out.push_str(&format!(
@@ -1240,6 +1334,151 @@ fn mautrix_legacy_config(p: &MautrixParams<'_>) -> String {
     out
 }
 
+/// The `config.yaml` of mautrix-imessage on a Mac: the older framework's layout
+/// ([`mautrix_legacy_config`]) with what that bridge has instead, read from its
+/// `example-config.yaml` (commit 300ba6d0) and `bridge/bridge.go` of its mautrix-go on
+/// 2026-10-11:
+///
+/// - `homeserver.websocket_proxy` is set to nothing: with it set (its example's default, which
+///   the bridge's config upgrader would otherwise fill in) the bridge connects out to a
+///   mautrix-wsproxy instead of listening, and this server pushes to the bridge's own listener
+///   at the address an administrator gave;
+/// - `appservice.database` is a SQLite file beside the config (the Mac has no `/data`);
+/// - `imessage.platform: mac`: the Mac's own Messages database;
+/// - the bridge is one person's: `bridge.user`, no `permissions`;
+/// - double puppeting is one `bridge.login_shared_secret`, not a map;
+/// - `bridge.backfill.enable` is a switch;
+/// - encryption has no `msc4190` (its framework predates it): the bot's device comes from the
+///   appservice login flow, which the registration's features match.
+fn mautrix_imessage_config(p: &MautrixParams<'_>) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# {} bridge configuration, written by Myelin for the registration it created.\n",
+        p.name
+    ));
+    out.push_str(
+        "# This bridge runs on a Mac, beside Messages, from the folder this file is in.\n",
+    );
+    out.push_str(&format!(
+        "# It reaches the server at {} and the server reaches it at {}.\n",
+        p.homeserver_address, p.url
+    ));
+    out.push_str("# Every setting not listed here keeps the bridge's own default; the bridge\n");
+    out.push_str("# fills the rest in and rewrites this file on its first start.\n");
+    out.push_str("homeserver:\n");
+    out.push_str(&format!("  address: {}\n", p.homeserver_address));
+    out.push_str(&format!("  domain: {}\n", p.server_name));
+    out.push_str("  # No websocket proxy: the server pushes to the listener below. With a\n");
+    out.push_str("  # proxy named here the bridge would connect out to it instead of listening.\n");
+    out.push_str("  websocket_proxy: null\n");
+    out.push_str("appservice:\n");
+    out.push_str(&format!("  address: {}\n", p.url));
+    out.push_str("  hostname: 0.0.0.0\n");
+    out.push_str(&format!("  port: {}\n", p.port));
+    out.push_str("  database:\n");
+    out.push_str("    # SQLite beside this file.\n");
+    out.push_str("    type: sqlite3-fk-wal\n");
+    out.push_str(&format!("    uri: file:{}.db?_txlock=immediate\n", p.id));
+    out.push_str(&format!("  id: {}\n", p.id));
+    out.push_str("  bot:\n");
+    out.push_str(&format!("    username: {}\n", p.bot));
+    out.push_str("  ephemeral_events: true\n");
+    out.push_str(&format!("  as_token: {}\n", p.as_token));
+    out.push_str(&format!("  hs_token: {}\n", p.hs_token));
+    out.push_str("imessage:\n");
+    out.push_str("  # The Mac's own Messages database, read directly (Full Disk Access).\n");
+    out.push_str("  platform: mac\n");
+    out.push_str("bridge:\n");
+    out.push_str("  # The one person this bridge is for: the Mac's Messages account is theirs.\n");
+    match p.owner {
+        Some(owner) => out.push_str(&format!("  user: \"{owner}\"\n")),
+        None => out.push_str(&format!("  user: \"@you:{}\"\n", p.server_name)),
+    }
+    out.push_str(&format!(
+        "  username_template: \"{}{{{{.}}}}\"\n",
+        p.ghost_prefix
+    ));
+    out.push_str("  backfill:\n");
+    out.push_str(&format!("    enable: {}\n", p.backfill));
+    if p.double_puppeting {
+        out.push_str(
+            "  # The bridge sends as its person through its own token: the registration's\n",
+        );
+        out.push_str("  # non-exclusive claim on them is what allows it.\n");
+        out.push_str(&format!(
+            "  login_shared_secret: \"as_token:{}\"\n",
+            p.as_token
+        ));
+    }
+    out.push_str("  encryption:\n");
+    if p.encryption {
+        out.push_str(
+            "    # End-to-bridge encryption, with the device lists and to-device messages\n",
+        );
+        out.push_str(
+            "    # arriving in appservice transactions (MSC3202, MSC4203), as the registration\n",
+        );
+        out.push_str("    # asks for. The bot's device comes from the appservice login flow.\n");
+        out.push_str("    allow: true\n");
+        out.push_str("    default: true\n");
+        out.push_str("    appservice: true\n");
+    } else {
+        out.push_str("    allow: false\n");
+    }
+    out
+}
+
+/// The script that runs a Mac program's instance beside its `config.yaml` and
+/// `registration.yaml`: downloads the pinned build if it is not there yet, clears macOS's
+/// quarantine flag (a downloaded program is refused until it is), checks the two files are
+/// there and starts the bridge in the foreground, so that `operation not permitted` (no Full
+/// Disk Access yet) is seen where it happens. POSIX `sh` and the tools every Mac has.
+fn mac_run_sh(entry: &Entry, download: MacDownload, owner: Option<&str>, url: &str) -> String {
+    let binary = entry
+        .upstream_project
+        .rsplit_once('/')
+        .map_or(entry.upstream_project, |(_, name)| name);
+    let binary = format!("mautrix-{binary}");
+    let whose = owner.map_or_else(|| "this server".to_owned(), str::to_owned);
+    let mut out = String::new();
+    out.push_str("#!/bin/sh\n");
+    out.push_str(&format!(
+        "# Runs the {} bridge for {whose} on this Mac. Written by Myelin.\n",
+        entry.name
+    ));
+    out.push_str("# Keep this file beside config.yaml and registration.yaml and run it from\n");
+    out.push_str("# Terminal: ./run.sh (chmod +x run.sh first). The server reaches the bridge\n");
+    out.push_str(&format!(
+        "# at {url}; if that is not this Mac, set the address on the bridge's page.\n"
+    ));
+    out.push_str(&format!("# Build: {}\n", download.note));
+    out.push_str("set -eu\n");
+    out.push_str("cd \"$(dirname \"$0\")\"\n");
+    out.push_str(&format!("BUILD_URL=\"{}\"\n", download.url));
+    out.push_str(&format!("if [ ! -x ./{binary} ]; then\n"));
+    out.push_str("  echo \"downloading the bridge...\"\n");
+    out.push_str("  curl -fsSL -o build.zip \"$BUILD_URL\"\n");
+    out.push_str(&format!("  unzip -o build.zip {binary} libolm.3.dylib\n"));
+    out.push_str("  rm -f build.zip\n");
+    out.push_str(&format!("  chmod +x ./{binary}\n"));
+    out.push_str("fi\n");
+    out.push_str("# macOS quarantines downloads and refuses to run them until the flag is gone.\n");
+    out.push_str("xattr -dr com.apple.quarantine . 2>/dev/null || true\n");
+    out.push_str("for f in config.yaml registration.yaml; do\n");
+    out.push_str("  [ -f \"$f\" ] || { echo \"$f is missing: download it from your bridge's page\"; exit 1; }\n");
+    out.push_str("done\n");
+    out.push_str(
+        "echo \"starting the bridge. If it stops with 'operation not permitted', give Terminal\"\n",
+    );
+    out.push_str(
+        "echo \"Full Disk Access (System Settings > Privacy & Security) and run this again.\"\n",
+    );
+    out.push_str(&format!(
+        "exec ./{binary} -c config.yaml -r registration.yaml\n"
+    ));
+    out
+}
+
 fn compose(entry: &Entry, c: &Choices, image: &str, server_name: &str) -> String {
     let mut out = String::new();
     out.push_str("# Run beside the server, on the same Compose network, so that `url` in the\n");
@@ -1400,6 +1639,9 @@ pub struct InstanceRender {
     /// What the network's own device list calls this bridge ([`device_name`]), written into the
     /// config; `None` for a type without such a setting.
     pub device_name: Option<String>,
+    /// For a type that runs on a Mac ([`BridgeType::runs_on`] `mac`): the script to run beside
+    /// `config.yaml` and `registration.yaml` there ([`mac_run_sh`]). `None` for a container.
+    pub run_sh: Option<String>,
 }
 
 impl std::fmt::Debug for InstanceRender {
@@ -1538,7 +1780,8 @@ pub fn render_instance(spec: &InstanceSpec<'_>) -> Option<InstanceRender> {
                 network: device_name
                     .as_deref()
                     .and_then(|name| network_section(entry, name)),
-                legacy: entry.legacy_config,
+                layout: entry.layout,
+                owner: spec.owner,
             });
             files.insert("config.yaml".to_owned(), config.clone());
             Some(config)
@@ -1571,7 +1814,39 @@ pub fn render_instance(spec: &InstanceSpec<'_>) -> Option<InstanceRender> {
         .map_or(entry.image, |(name, _)| name)
         .to_owned();
     let image_tag = resolve_image_tag(entry, Some(spec.image_tag));
+    let run_sh = entry
+        .mac_download
+        .map(|d| mac_run_sh(entry, d, spec.owner, spec.url));
+    if let Some(script) = &run_sh {
+        files.insert("run.sh".to_owned(), script.clone());
+    }
     let mut compose_yaml = String::new();
+    if entry.mac_download.is_some() {
+        compose_yaml.push_str(&format!(
+            "# {} bridges run on a Mac, not in a container: run.sh beside config.yaml and\n# registration.yaml starts one there.\n",
+            entry.name
+        ));
+        return Some(InstanceRender {
+            registration,
+            registration_yaml,
+            config_yaml,
+            files,
+            compose_yaml,
+            image_repository: repository,
+            image_tag,
+            port: entry.port,
+            args,
+            bot_localpart: bot,
+            ghost_prefix,
+            sign_in: entry
+                .sign_in
+                .iter()
+                .map(|s| s.replace("{server}", spec.server_name))
+                .collect(),
+            device_name,
+            run_sh,
+        });
+    }
     compose_yaml
         .push_str("# Save config.yaml and registration.yaml into the directory mounted at\n");
     compose_yaml
@@ -1615,6 +1890,7 @@ pub fn render_instance(spec: &InstanceSpec<'_>) -> Option<InstanceRender> {
             .map(|s| s.replace("{server}", spec.server_name))
             .collect(),
         device_name,
+        run_sh,
     })
 }
 
@@ -2281,7 +2557,7 @@ mod tests {
         // its own example-config.yaml: the database under appservice, the rest under bridge.
         let legacy: Vec<&str> = CATALOGUE
             .iter()
-            .filter(|e| e.legacy_config)
+            .filter(|e| e.layout == ConfigLayout::Legacy)
             .map(|e| e.id)
             .collect();
         assert_eq!(legacy, ["mautrix-discord"]);
@@ -2389,11 +2665,174 @@ mod tests {
     }
 
     #[test]
+    fn an_imessage_bridge_runs_on_a_mac_and_its_files_say_how() {
+        // The catalogue: one Mac program, never deployed, with a pinned download.
+        let macs: Vec<&str> = CATALOGUE
+            .iter()
+            .filter(|e| e.mac_download.is_some())
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(macs, ["mautrix-imessage"]);
+        let kind = get("mautrix-imessage", "chat.example.net").unwrap();
+        assert_eq!(kind.runs_on, "mac");
+        assert!(!kind.deployable);
+        assert!(
+            kind.not_deployable_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("Mac")),
+            "{:?}",
+            kind.not_deployable_reason
+        );
+        assert_eq!(
+            kind.download_url.as_deref(),
+            Some("https://mau.dev/mautrix/imessage/-/jobs/95972/artifacts/download")
+        );
+        assert!(kind.download_note.is_some_and(|n| n.contains("300ba6d0")));
+        assert_eq!(kind.port, 29331);
+        assert_eq!(kind.mode, "per_user");
+        assert_eq!(kind.command_prefix.as_deref(), Some("!im"));
+        assert_eq!(kind.provisioning_api, "none");
+        // No MSC4190: its framework predates it, and its bot logs in with the appservice flow.
+        assert_eq!(kind.required_features, [MSC2409, MSC3202]);
+        for other in list("chat.example.net") {
+            if other.id != "mautrix-imessage" {
+                assert_eq!(other.runs_on, "container", "{}", other.id);
+                assert!(other.download_url.is_none(), "{}", other.id);
+            }
+        }
+
+        // An instance's files: the older framework's layout with iMessage's own sections.
+        let r = render_instance(&InstanceSpec {
+            type_id: "mautrix-imessage",
+            server_name: "chat.example.net",
+            appservice_id: "imessage-brandon",
+            owner: Some("@brandon:chat.example.net"),
+            as_token: "a",
+            hs_token: "h",
+            url: "http://brandons-mac.local:29331",
+            homeserver_address: "https://chat.example.net",
+            image_tag: "",
+            encryption: None,
+            double_puppeting: None,
+            backfill: None,
+            provisioning_secret: Some("ignored"),
+            pickle_key: Some("ignored"),
+        })
+        .unwrap();
+        let text = r.config_yaml.as_deref().expect("a mautrix config");
+        let config: Value = serde_yaml_ng::from_str(text).expect("valid YAML");
+        assert_eq!(config["homeserver"]["address"], "https://chat.example.net");
+        assert!(
+            config["homeserver"]["websocket_proxy"].is_null()
+                && text.contains("websocket_proxy: null"),
+            "the proxy is switched off explicitly, or the upgrader fills the example's in"
+        );
+        assert_eq!(
+            config["appservice"]["address"],
+            "http://brandons-mac.local:29331"
+        );
+        assert_eq!(config["appservice"]["port"], 29331);
+        assert_eq!(config["appservice"]["database"]["type"], "sqlite3-fk-wal");
+        assert_eq!(
+            config["appservice"]["database"]["uri"],
+            "file:imessage-brandon.db?_txlock=immediate"
+        );
+        assert!(config.get("database").is_none());
+        assert_eq!(config["imessage"]["platform"], "mac");
+        assert_eq!(config["bridge"]["user"], "@brandon:chat.example.net");
+        assert!(config["bridge"].get("permissions").is_none());
+        assert_eq!(
+            config["bridge"]["username_template"],
+            "imessage_brandon_{{.}}"
+        );
+        assert_eq!(config["bridge"]["backfill"]["enable"], true);
+        assert_eq!(config["bridge"]["login_shared_secret"], "as_token:a");
+        assert!(config["bridge"].get("login_shared_secret_map").is_none());
+        assert_eq!(config["bridge"]["encryption"]["allow"], true);
+        assert_eq!(config["bridge"]["encryption"]["appservice"], true);
+        assert!(config["bridge"]["encryption"].get("msc4190").is_none());
+        assert!(!text.contains("pickle_key") && !text.contains("provisioning"));
+        assert!(r.registration.get(PROVISIONING_SECRET_KEY).is_none());
+        let features: Vec<&str> = r
+            .registration
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|k| {
+                k.starts_with("de.") || k.starts_with("org.") || k.starts_with("io.element")
+            })
+            .map(String::as_str)
+            .collect();
+        assert!(
+            features.contains(&MSC3202) && !features.contains(&MSC4190),
+            "{features:?}"
+        );
+
+        // The run script, beside the two files: the pinned download, the quarantine flag, the
+        // two files checked, the bridge started in the foreground.
+        let run = r.run_sh.as_deref().expect("a Mac gets run.sh");
+        assert_eq!(r.files.get("run.sh").map(String::as_str), Some(run));
+        assert!(run.starts_with(
+            "#!/bin/sh
+"
+        ));
+        assert!(run.contains("https://mau.dev/mautrix/imessage/-/jobs/95972/artifacts/download"));
+        assert!(run.contains("unzip -o build.zip mautrix-imessage libolm.3.dylib"));
+        assert!(run.contains("xattr -dr com.apple.quarantine"));
+        assert!(run.contains("for f in config.yaml registration.yaml"));
+        assert!(run.contains("exec ./mautrix-imessage -c config.yaml -r registration.yaml"));
+        assert!(run.contains("@brandon:chat.example.net"));
+        assert!(run.contains("http://brandons-mac.local:29331"));
+        // No container: the compose file says so and nothing else.
+        assert!(
+            r.compose_yaml.lines().all(|l| l.starts_with('#')),
+            "{}",
+            r.compose_yaml
+        );
+        let compose: Value = serde_yaml_ng::from_str(&r.compose_yaml).unwrap();
+        assert!(compose.is_null());
+
+        // A container type gets no script.
+        let wa = render_instance(&InstanceSpec {
+            type_id: "mautrix-whatsapp",
+            server_name: "chat.example.net",
+            appservice_id: "wa",
+            owner: Some("@brandon:chat.example.net"),
+            as_token: "a",
+            hs_token: "h",
+            url: "http://b:1",
+            homeserver_address: "http://hs:8008",
+            image_tag: "",
+            encryption: None,
+            double_puppeting: None,
+            backfill: None,
+            provisioning_secret: None,
+            pickle_key: None,
+        })
+        .unwrap();
+        assert!(wa.run_sh.is_none() && !wa.files.contains_key("run.sh"));
+
+        // Off switches and a shared render: backfill off, no double puppeting, the placeholder
+        // user the wizard's reader replaces.
+        let shared = render(
+            "mautrix-imessage",
+            "chat.example.net",
+            &json!({"backfill": false, "doublePuppeting": false, "encryption": false}),
+        )
+        .unwrap();
+        let config: Value =
+            serde_yaml_ng::from_str(shared.config_yaml.as_deref().unwrap()).unwrap();
+        assert_eq!(config["bridge"]["user"], "@you:chat.example.net");
+        assert_eq!(config["bridge"]["encryption"]["allow"], false);
+        assert!(config["bridge"].get("login_shared_secret").is_none());
+    }
+
+    #[test]
     fn every_type_says_what_provisioning_api_it_has_and_only_mautrix_reports_logins() {
         for t in list("x.org") {
             let expected = match t.id.as_str() {
                 // The older framework's provisioning API has no whoami.
-                "mautrix-discord" => "none",
+                "mautrix-discord" | "mautrix-imessage" => "none",
                 id if id.starts_with("mautrix-") => "mautrix_v3",
                 "heisenbridge" => "none",
                 "matrix-appservice-irc" => "irc_v1",

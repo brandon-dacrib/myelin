@@ -557,6 +557,33 @@ pub struct BridgeType {
     /// can be.
     #[serde(default)]
     pub provisioning_note: Option<String>,
+    /// Where the bridge runs: `container` (an image this server deploys, or someone runs from
+    /// a compose file) or `mac` (a program for a Mac, beside the Messages app it reads, which
+    /// this server never deploys: its offerings run `elsewhere`).
+    #[serde(default = "default_runs_on")]
+    pub runs_on: String,
+    /// For `runs_on: mac`, where to download the program: one pinned build, as `image` pins a
+    /// tag.
+    #[serde(default)]
+    pub download_url: Option<String>,
+    /// What that download is and which build it is, in words.
+    #[serde(default)]
+    pub download_note: Option<String>,
+}
+
+fn default_runs_on() -> String {
+    "container".to_owned()
+}
+
+/// The OpenAPI `BridgeInstanceRequest` schema: what `PUT /bridge-offerings/{type}/instances/{user_id}`
+/// may carry. Without a body the instance is created, or returned as it is.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BridgeInstanceRequest {
+    /// For an instance run elsewhere: where this server reaches the bridge, as `host`,
+    /// `host:port` or a full `http(s)://` URL (a bare host takes the type's port). `None`
+    /// leaves it as it is.
+    #[serde(default)]
+    pub address: Option<String>,
 }
 
 /// The OpenAPI `BridgeLogins` schema: `GET /appservices/{id}/logins`, who has signed in to a
@@ -779,6 +806,11 @@ pub struct BridgeInstance {
     pub state: String,
     pub reason: Option<String>,
     pub appservice_id: Option<String>,
+    /// Where this server reaches the bridge (the registration's `url`): the cluster Service
+    /// for an instance it deploys, else `http://<appservice id>:<port>` until an administrator
+    /// sets the address.
+    #[serde(default)]
+    pub url: Option<String>,
     /// The instance's own bot, which the user talks to.
     pub bot: Option<String>,
     pub deployment: Option<BridgeDeployment>,
@@ -861,6 +893,10 @@ pub struct BridgeInstanceFiles {
     pub registration_yaml: String,
     pub compose_yaml: String,
     pub manifest_yaml: String,
+    /// For a type that runs on a Mac: the script to run there beside the two files, which
+    /// downloads the pinned build, clears its quarantine flag and starts the bridge.
+    #[serde(default)]
+    pub run_sh: Option<String>,
 }
 
 impl std::fmt::Debug for BridgeInstanceFiles {

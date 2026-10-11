@@ -3263,8 +3263,23 @@ async fn bridge_instances_put(
     State(state): State<AdminState>,
     headers: HeaderMap,
     Path((t, user)): Path<(String, String)>,
+    body: axum::body::Bytes,
 ) -> Response {
     let instance = format!("/api/v1/bridge-offerings/{t}/instances/{user}");
+    let request: crate::model::BridgeInstanceRequest =
+        match parse_optional_json::<serde_json::Value>(&body) {
+            Ok(serde_json::Value::Null) => crate::model::BridgeInstanceRequest::default(),
+            Ok(v) => match serde_json::from_value(v) {
+                Ok(r) => r,
+                Err(e) => {
+                    return Problem::validation_failed()
+                        .with_detail(e.to_string())
+                        .with_instance(instance)
+                        .into_response();
+                }
+            },
+            Err(p) => return p.with_instance(instance).into_response(),
+        };
     let target = ResourceRef::new("bridge_instance", format!("{t}/{user}"));
     with_offerings(
         &state,
@@ -3273,7 +3288,15 @@ async fn bridge_instances_put(
         Scope::BridgesWrite,
         Some(("bridge_instances.put", "bridge_instance.requested", target)),
         StatusCode::OK,
-        |s| async move { Ok(Some(s.put_instance(&t, &user).await?)) },
+        |s| async move {
+            let created = s.put_instance(&t, &user).await?;
+            Ok(Some(match request.address.as_deref().map(str::trim) {
+                Some(address) if !address.is_empty() => {
+                    s.set_instance_address(&t, &user, address).await?
+                }
+                _ => created,
+            }))
+        },
     )
     .await
 }
