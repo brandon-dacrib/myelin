@@ -78,6 +78,12 @@ function provisioning(id: string): Pick<BridgeType, "provisioning_api" | "provis
       provisioning_note:
         "Hookshot's provisioning API manages each room's connections (webhooks, feeds, repositories); Myelin does not read accounts from it, so the bridge keeps that itself.",
     };
+  if (id === "mautrix-discord")
+    return {
+      provisioning_api: "none",
+      provisioning_note:
+        "This bridge is on mautrix-go's older framework, whose provisioning API has no whoami, so the bridge keeps who has signed in itself: ask its bot `ping`.",
+    };
   if (id.startsWith("mautrix-") && id !== "mautrix-imessage")
     return {
       provisioning_api: "mautrix_v3",

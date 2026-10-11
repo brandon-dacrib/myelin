@@ -14,6 +14,15 @@ owner also created a second bridge (`bridge-signal-brandon`, 22:59 UTC, mautrix-
 planned. The owner's `kubectl proxy` on 127.0.0.1:8001 was up all evening and is how every
 cluster number below was read.
 
+**2026-10-11, later (branch `agent/discord-legacy-config`, status 11): the demo's Discord
+bridge crash-looped** with `appservice.database not configured`. mautrix-discord v0.7.7 is on
+mautrix-go's older framework, whose config layout differs from `bridgev2`'s; the catalogue now
+marks it `legacy_config` and renders that layout, and its `provisioning_api` is `none` with why.
+After the next roll, `bridge-discord-brandon` should roll by itself (its rendered files changed)
+and reach Running: check it, and `help` to `@discordbot_brandon`. Next asked for by the owner: an
+iMessage offering, where the bridge runs on a Mac outside the cluster (the UI gives a download
+for the Mac binary, asks for the Mac's hostname or IP, and shows how to run it).
+
 **The evidence** (`container_memory_working_set_bytes` from the cluster's Prometheus, read
 23:17 UTC; the server exported no process memory metric of its own):
 

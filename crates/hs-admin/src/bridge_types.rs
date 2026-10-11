@@ -98,6 +98,14 @@ struct Entry {
     sign_in: &'static [&'static str],
     /// A caveat worth knowing before signing in, or nothing.
     sign_in_notes: Option<&'static str>,
+    /// A mautrix bridge still on mautrix-go's older bridge framework (`bridge/`, not
+    /// `bridgev2/`), whose `config.yaml` has another layout: the database under `appservice`,
+    /// the ghost template, encryption, double puppeting, backfill and provisioning under
+    /// `bridge`. Such a bridge given the `bridgev2` layout exits at once with `Configuration
+    /// error: "appservice.database not configured"`, as the demo's Discord bridge did on
+    /// 2026-10-11. mautrix-discord is the one such bridge in the catalogue; the rest are
+    /// `v0.25xx`/`v0.26xx` builds, which are `bridgev2`.
+    legacy_config: bool,
 }
 
 impl Entry {
@@ -141,6 +149,26 @@ macro_rules! mautrix {
         sign_in: [$($step:literal),* $(,)?],
         notes: $notes:expr $(,)?
     ) => {
+        mautrix!(
+            $id, $name, $net, $tag, $port, $prefix, $bot,
+            category: $category,
+            description: $description,
+            needs: [$(($k, $d, $r)),*],
+            sign_in: [$($step),*],
+            notes: $notes,
+            legacy_config: false,
+        )
+    };
+    (
+        $id:literal, $name:literal, $net:literal, $tag:literal, $port:literal, $prefix:literal,
+        $bot:literal,
+        category: $category:expr,
+        description: $description:literal,
+        needs: [$(($k:literal, $d:literal, $r:literal)),* $(,)?],
+        sign_in: [$($step:literal),* $(,)?],
+        notes: $notes:expr,
+        legacy_config: $legacy:literal $(,)?
+    ) => {
         Entry {
             id: $id,
             name: $name,
@@ -158,6 +186,7 @@ macro_rules! mautrix {
             runtime: Runtime::Mautrix,
             sign_in: &[$($step),*],
             sign_in_notes: $notes,
+            legacy_config: $legacy,
         }
     };
 }
@@ -253,6 +282,9 @@ const CATALOGUE: &[Entry] = &[
             "For a bot account instead: `login-token bot <token>`, with the members and message-content intents enabled on the application.",
         ],
         notes: Some("Discord may flag accounts that look automated. A bot account carries none of that risk."),
+        // v0.7.7 is on mautrix-go's older bridge framework (its go.mod wants `mautrix
+        // v0.16.3-…`, and its example config keeps the database under `appservice`).
+        legacy_config: true,
     ),
     mautrix!(
         "mautrix-slack", "Slack", "slack", "v0.2609.1", 29335, "slack_", "slackbot",
@@ -325,6 +357,7 @@ const CATALOGUE: &[Entry] = &[
         sign_in_notes: Some(
             "One owner drives the bridge: the Matrix user named on its command line.",
         ),
+        legacy_config: false,
     },
     Entry {
         id: "matrix-appservice-irc",
@@ -350,6 +383,7 @@ const CATALOGUE: &[Entry] = &[
             "Start a direct chat with {bot} and send `!nick <name>` to choose your IRC nick, or `!join #channel` to join one.",
         ],
         sign_in_notes: None,
+        legacy_config: false,
     },
     Entry {
         id: "matrix-hookshot",
@@ -375,6 +409,7 @@ const CATALOGUE: &[Entry] = &[
             "`!hookshot webhook <name>` gives the room a webhook URL; GitHub, GitLab, Jira and RSS are connected per room the same way, or through the widget.",
         ],
         sign_in_notes: None,
+        legacy_config: false,
     },
 ];
 
@@ -434,6 +469,13 @@ impl ProvisioningApi {
 
 fn provisioning_of(entry: &Entry) -> (ProvisioningApi, &'static str) {
     match entry.runtime {
+        // The older framework's provisioning API is v1 (`/_matrix/provision/v1/...`, per
+        // bridge, with no `whoami`): there is nothing for this server to ask, and saying so is
+        // better than a `refused` from a path that is not there.
+        Runtime::Mautrix if entry.legacy_config => (
+            ProvisioningApi::None,
+            "This bridge is on mautrix-go's older framework, whose provisioning API has no whoami, so the bridge keeps who has signed in itself: ask its bot `ping`.",
+        ),
         Runtime::Mautrix => (
             ProvisioningApi::MautrixV3,
             "The bridge's provisioning API (/_matrix/provision/v3/whoami) says who has signed in and as what, with the shared secret Myelin writes into its config.yaml.",
@@ -923,6 +965,7 @@ pub fn render(type_id: &str, server_name: &str, values: &Value) -> Option<Bridge
             pickle_key: None,
             // The wizard's bridge is one for the server, run by hand: the shared name.
             network: network_section(entry, &device_name_for(entry.name, server_name, None)),
+            legacy: entry.legacy_config,
         })
     });
     let compose_yaml = compose(entry, &c, &image, server_name);
@@ -965,17 +1008,26 @@ struct MautrixParams<'a> {
     /// The `network:` section naming the bridge on the network's side
     /// ([`network_section`]), when the connector has such a setting.
     network: Option<String>,
+    /// The older framework's layout ([`Entry::legacy_config`]): [`mautrix_legacy_config`]
+    /// instead of the `bridgev2` one.
+    legacy: bool,
 }
 
-/// The `config.yaml` a mautrix `bridgev2` bridge reads, with everything that ties it to this
-/// server filled in: where the server is, what it is called, the bridge's own address and
-/// port (the registration's `url`), the same two tokens, a database, who may use it, backfill,
-/// double puppeting through its own token, and encryption in the appservice mode the
-/// registration asked for. Every key not written here keeps the bridge's default: the bridge
-/// completes and rewrites this file on its first start (its config upgrader), which is also
-/// what its own `-e` generator does with an empty one. The database is SQLite in the bridge's
-/// own volume, which is all one bridge process needs (RFC 0017 section 4.4).
+/// The `config.yaml` a mautrix bridge reads, with everything that ties it to this server filled
+/// in: where the server is, what it is called, the bridge's own address and port (the
+/// registration's `url`), the same two tokens, a database, who may use it, backfill, double
+/// puppeting through its own token, and encryption in the appservice mode the registration
+/// asked for. Every key not written here keeps the bridge's default: the bridge completes and
+/// rewrites this file on its first start (its config upgrader), which is also what its own `-e`
+/// generator does with an empty one. The database is SQLite in the bridge's own volume, which
+/// is all one bridge process needs (RFC 0017 section 4.4).
+///
+/// The layout is `bridgev2`'s, unless the entry is on the older framework
+/// ([`MautrixParams::legacy`]), whose file [`mautrix_legacy_config`] writes.
 fn mautrix_config(p: &MautrixParams<'_>) -> String {
+    if p.legacy {
+        return mautrix_legacy_config(p);
+    }
     let mut out = String::new();
     out.push_str(&format!(
         "# {} bridge configuration, written by Myelin for the registration it created.\n",
@@ -1064,6 +1116,126 @@ fn mautrix_config(p: &MautrixParams<'_>) -> String {
         out.push_str("# administrators who has signed in to the bridge and as what.\n");
         out.push_str("provisioning:\n");
         out.push_str(&format!("  shared_secret: {secret}\n"));
+    }
+    out
+}
+
+/// How many messages a legacy bridge backfills when a portal is created, per kind of chat,
+/// and how many it catches up on at startup, when the offering has backfill on. The older
+/// framework has no `backfill.enabled`: `0` is off, and a limit is the only way on. mautrix's
+/// example sets every one to `0`; these are modest so that a new portal opens quickly.
+const LEGACY_BACKFILL_INITIAL: u32 = 50;
+const LEGACY_BACKFILL_MISSED: u32 = 500;
+
+/// The `config.yaml` of a mautrix bridge on the older framework (`bridge/`, before `bridgev2`;
+/// mautrix-discord v0.7.x). The same facts as [`mautrix_config`], in that framework's layout,
+/// read from mautrix-discord v0.7.7's `example-config.yaml` on 2026-10-11:
+///
+/// - the database is `appservice.database`, not `database`; without it the bridge exits with
+///   `Configuration error: "appservice.database not configured"`;
+/// - the ghost template, permissions, backfill limits, double puppeting
+///   (`login_shared_secret_map`, which takes an `as_token:` secret since mautrix-go v0.15),
+///   encryption and provisioning are all under `bridge`;
+/// - the crypto store's pickle key is a constant in the binary, not a setting, so
+///   [`MautrixParams::pickle_key`] is not written (and a roll cannot lose it);
+/// - `encryption.msc4190` exists there too, so the registration's MSC4190 ask is honoured.
+fn mautrix_legacy_config(p: &MautrixParams<'_>) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# {} bridge configuration, written by Myelin for the registration it created.\n",
+        p.name
+    ));
+    out.push_str(
+        "# This bridge is on mautrix-go's older framework, so the layout is that one's:\n",
+    );
+    out.push_str("# the database under appservice, the rest under bridge. Every setting not\n");
+    out.push_str(
+        "# listed here keeps the bridge's own default; the bridge fills the rest in and\n",
+    );
+    out.push_str("# rewrites this file on its first start.\n");
+    out.push_str("homeserver:\n");
+    out.push_str(&format!("  address: {}\n", p.homeserver_address));
+    out.push_str(&format!("  domain: {}\n", p.server_name));
+    out.push_str("appservice:\n");
+    out.push_str(&format!("  address: {}\n", p.url));
+    out.push_str("  hostname: 0.0.0.0\n");
+    out.push_str(&format!("  port: {}\n", p.port));
+    out.push_str("  database:\n");
+    out.push_str("    # SQLite in the bridge's own volume. For Postgres: type: postgres and a\n");
+    out.push_str("    # postgres:// URI to a database of its own.\n");
+    out.push_str("    type: sqlite3-fk-wal\n");
+    out.push_str(&format!(
+        "    uri: file:/data/{}.db?_txlock=immediate\n",
+        p.id
+    ));
+    out.push_str(&format!("  id: {}\n", p.id));
+    out.push_str("  bot:\n");
+    out.push_str(&format!("    username: {}\n", p.bot));
+    out.push_str("  ephemeral_events: true\n");
+    out.push_str(&format!("  as_token: {}\n", p.as_token));
+    out.push_str(&format!("  hs_token: {}\n", p.hs_token));
+    out.push_str("bridge:\n");
+    out.push_str(&format!(
+        "  username_template: \"{}{{{{.}}}}\"\n",
+        p.ghost_prefix
+    ));
+    out.push_str("  # Who may use the bridge: relay (only through someone else's login),\n");
+    out.push_str("  # user (sign in and chat), admin (bridge commands as well).\n");
+    out.push_str("  permissions:\n");
+    for (who, level) in &p.permissions {
+        out.push_str(&format!("    \"{who}\": {level}\n"));
+    }
+    out.push_str("  # This framework has no backfill switch: 0 is off, a limit is on.\n");
+    out.push_str("  backfill:\n");
+    out.push_str("    forward_limits:\n");
+    let (initial, missed) = if p.backfill {
+        (LEGACY_BACKFILL_INITIAL, LEGACY_BACKFILL_MISSED)
+    } else {
+        (0, 0)
+    };
+    out.push_str("      initial:\n");
+    for kind in ["dm", "channel", "thread"] {
+        out.push_str(&format!("        {kind}: {initial}\n"));
+    }
+    out.push_str("      missed:\n");
+    for kind in ["dm", "channel", "thread"] {
+        out.push_str(&format!("        {kind}: {missed}\n"));
+    }
+    if p.double_puppeting {
+        out.push_str(
+            "  # The bridge sends as your users through its own token: the registration's\n",
+        );
+        out.push_str("  # non-exclusive claim on them is what allows it.\n");
+        out.push_str("  login_shared_secret_map:\n");
+        out.push_str(&format!(
+            "    \"{}\": \"as_token:{}\"\n",
+            p.server_name, p.as_token
+        ));
+    }
+    out.push_str("  encryption:\n");
+    if p.encryption {
+        out.push_str(
+            "    # End-to-bridge encryption, with the device lists and to-device messages\n",
+        );
+        out.push_str(
+            "    # arriving in appservice transactions (MSC3202, MSC4203) and the bridge's\n",
+        );
+        out.push_str(
+            "    # device made without a login (MSC4190), as the registration asks for.\n",
+        );
+        out.push_str("    allow: true\n");
+        out.push_str("    default: true\n");
+        out.push_str("    appservice: true\n");
+        out.push_str("    msc4190: true\n");
+    } else {
+        out.push_str("    allow: false\n");
+    }
+    if let Some(secret) = p.provisioning_secret {
+        out.push_str("  provisioning:\n");
+        out.push_str(&format!("    shared_secret: {secret}\n"));
+    }
+    if let Some(network) = &p.network {
+        out.push_str(network);
     }
     out
 }
@@ -1366,6 +1538,7 @@ pub fn render_instance(spec: &InstanceSpec<'_>) -> Option<InstanceRender> {
                 network: device_name
                     .as_deref()
                     .and_then(|name| network_section(entry, name)),
+                legacy: entry.legacy_config,
             });
             files.insert("config.yaml".to_owned(), config.clone());
             Some(config)
@@ -2102,9 +2275,125 @@ mod tests {
     }
 
     #[test]
+    fn a_bridge_on_the_older_framework_gets_that_frameworks_config_layout() {
+        // mautrix-discord v0.7.7 read the bridgev2 layout on the demo on 2026-10-11 and exited
+        // with `Configuration error: "appservice.database not configured"`. Its file follows
+        // its own example-config.yaml: the database under appservice, the rest under bridge.
+        let legacy: Vec<&str> = CATALOGUE
+            .iter()
+            .filter(|e| e.legacy_config)
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(legacy, ["mautrix-discord"]);
+
+        let r = render_instance(&InstanceSpec {
+            type_id: "mautrix-discord",
+            server_name: "chat.example.net",
+            appservice_id: "discord-brandon",
+            owner: Some("@brandon:chat.example.net"),
+            as_token: "a",
+            hs_token: "h",
+            url: "http://bridge-discord-brandon:29334",
+            homeserver_address: "http://hs:8008",
+            image_tag: "",
+            encryption: None,
+            double_puppeting: None,
+            backfill: None,
+            provisioning_secret: Some("s"),
+            pickle_key: Some("k"),
+        })
+        .unwrap();
+        let text = r.config_yaml.as_deref().expect("a mautrix config");
+        let config: Value = serde_yaml_ng::from_str(text).expect("valid YAML");
+        assert!(config.get("database").is_none(), "no top-level database");
+        assert_eq!(config["appservice"]["database"]["type"], "sqlite3-fk-wal");
+        assert_eq!(
+            config["appservice"]["database"]["uri"],
+            "file:/data/discord-brandon.db?_txlock=immediate"
+        );
+        assert_eq!(config["appservice"]["id"], "discord-brandon");
+        assert_eq!(config["appservice"]["port"], 29334);
+        assert_eq!(
+            config["appservice"]["bot"]["username"],
+            "discordbot_brandon"
+        );
+        assert!(config["appservice"].get("username_template").is_none());
+        assert_eq!(
+            config["bridge"]["username_template"],
+            "discord_brandon_{{.}}"
+        );
+        assert_eq!(
+            config["bridge"]["permissions"]["@brandon:chat.example.net"],
+            "admin"
+        );
+        assert_eq!(
+            config["bridge"]["backfill"]["forward_limits"]["initial"]["dm"],
+            LEGACY_BACKFILL_INITIAL
+        );
+        assert_eq!(
+            config["bridge"]["backfill"]["forward_limits"]["missed"]["channel"],
+            LEGACY_BACKFILL_MISSED
+        );
+        assert_eq!(
+            config["bridge"]["login_shared_secret_map"]["chat.example.net"],
+            "as_token:a"
+        );
+        assert!(config.get("double_puppet").is_none());
+        assert_eq!(config["bridge"]["encryption"]["allow"], true);
+        assert_eq!(config["bridge"]["encryption"]["appservice"], true);
+        assert_eq!(config["bridge"]["encryption"]["msc4190"], true);
+        assert!(config.get("encryption").is_none());
+        // Its pickle key is a constant in the binary, not a setting.
+        assert!(!text.contains("pickle_key"));
+        // No whoami to ask, so no secret is written or carried in the registration.
+        assert!(config["bridge"].get("provisioning").is_none());
+        assert!(r.registration.get(PROVISIONING_SECRET_KEY).is_none());
+
+        // Backfill off: every limit is 0, which is this framework's "off".
+        let r = render_instance(&InstanceSpec {
+            type_id: "mautrix-discord",
+            server_name: "chat.example.net",
+            appservice_id: "d",
+            owner: Some("@brandon:chat.example.net"),
+            as_token: "a",
+            hs_token: "h",
+            url: "http://b:1",
+            homeserver_address: "http://hs:8008",
+            image_tag: "",
+            encryption: Some(false),
+            double_puppeting: Some(false),
+            backfill: Some(false),
+            provisioning_secret: None,
+            pickle_key: None,
+        })
+        .unwrap();
+        let config: Value = serde_yaml_ng::from_str(r.config_yaml.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            config["bridge"]["backfill"]["forward_limits"]["initial"]["thread"],
+            0
+        );
+        assert_eq!(config["bridge"]["encryption"]["allow"], false);
+        assert!(config["bridge"].get("login_shared_secret_map").is_none());
+
+        // The wizard's shared render takes the same layout.
+        let shared = render("mautrix-discord", "chat.example.net", &json!({})).unwrap();
+        let config: Value =
+            serde_yaml_ng::from_str(shared.config_yaml.as_deref().unwrap()).unwrap();
+        assert_eq!(config["appservice"]["database"]["type"], "sqlite3-fk-wal");
+        assert!(config.get("database").is_none());
+
+        // Every other mautrix type keeps bridgev2's layout.
+        let config = instance_config("mautrix-whatsapp", Some("@alice:chat.example.net"), None);
+        assert_eq!(config["database"]["type"], "sqlite3-fk-wal");
+        assert!(config["appservice"].get("database").is_none());
+    }
+
+    #[test]
     fn every_type_says_what_provisioning_api_it_has_and_only_mautrix_reports_logins() {
         for t in list("x.org") {
             let expected = match t.id.as_str() {
+                // The older framework's provisioning API has no whoami.
+                "mautrix-discord" => "none",
                 id if id.starts_with("mautrix-") => "mautrix_v3",
                 "heisenbridge" => "none",
                 "matrix-appservice-irc" => "irc_v1",

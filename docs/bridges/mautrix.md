@@ -322,6 +322,28 @@ two settings, and which one decides what to do:
 Running it: `cargo build -p hs-cli --bin hs`, then `cargo test -p hs-bridge-conformance --test
 real_mautrix_login -- --nocapture` with Docker reachable.
 
+## 2026-10-11: mautrix-discord is on the older framework, and its config said so by crashing
+
+The demo's `bridge-discord-brandon` would not start: `FTL Configuration error
+error="appservice.database not configured"`, in a `CrashLoopBackOff`. mautrix-discord v0.7.7
+is on mautrix-go's older bridge framework (`bridge/`), not `bridgev2`, and reads another
+`config.yaml` layout: the database under `appservice`, and `username_template`, `permissions`,
+`backfill`, `login_shared_secret_map`, `encryption` and `provisioning` under `bridge`. The server
+rendered every mautrix type in `bridgev2`'s layout. Since this session the catalogue marks
+Discord `legacy_config` and renders its file in its own layout (status 11, 2026-10-11, has the
+key-by-key table). A deployed Discord instance rolls by itself when the server runs with the
+change, since its rendered files changed.
+
+Two things this framework does differently, worth knowing when reading its page:
+
+- its crypto store's pickle key is a constant in the binary, not a setting, so the
+  2026-10-09 pickle-key story above cannot happen to it, and its config has no `pickle_key`;
+- its provisioning API is v1 and has no `whoami`, so the Sign in tab says the bridge keeps
+  who has signed in itself (`ping` to its bot answers), rather than asking.
+
+Not yet seen: the Discord bot answering on the demo after the roll (the check is `help` in
+the owner's chat with `@discordbot_brandon`), and a Discord sign-in (`login-qr`).
+
 ## 2026-10-09: offerings pin a release tag
 
 Every offering's image was `:latest`, and during the roll above the WhatsApp bridge pulled a

@@ -1,7 +1,9 @@
 # Status: track 11, appservices and bridges
 
-Last updated: 2026-10-10 (the manager removes a bot device the bridge left behind after a crypto
-reset, decision 0041; the OTK-count warning on the demo is Synapse's behaviour; below); before
+Last updated: 2026-10-11 (mautrix-discord is on mautrix-go's older framework and now gets that
+framework's `config.yaml` layout; below); before that 2026-10-10 (the manager removes a bot device
+the bridge left behind after a crypto reset, decision 0041; the OTK-count warning on the demo is
+Synapse's behaviour; below); before
 that 2026-10-09, later (the manager says, in its log, which bridge bot device it
 cross-signed, and bridge offerings pin a release tag, decision 0037; both below); before that
 2026-10-08 (one bridge's slowness never delays another's delivery: the "does this
@@ -24,6 +26,59 @@ manager) and an instance's Kubernetes objects say whose bridge they are; before 
 (who has signed in to a bridge; the `cluster` runtime run on kind); before that 2026-09-30
 (ephemeral, to-device and device-list delivery); before that 2026-09-27 (RFC 0017 run against
 the real binary), 2026-09-27 (the bridge manager) and 2026-09-25.
+
+## Session 2026-10-11 (branch `agent/discord-legacy-config`): mautrix-discord gets the older framework's config layout
+
+**What the owner saw.** `bridge-discord-brandon` on the demo in `CrashLoopBackOff`, its `Bridge`
+status carrying the container's last line: `FTL Configuration error error="appservice.database
+not configured"`. The pod, Service, Secret, PVC and registration were all right; the file was
+not.
+
+**Root cause.** mautrix-discord `v0.7.7` is still on mautrix-go's older bridge framework
+(`bridge/`, not `bridgev2/`; its `go.mod` wants `maunium.net/go/mautrix v0.16.3-…`). That
+framework's `config.yaml` keeps the database under `appservice.database`, and the ghost
+template, permissions, backfill limits, double puppeting (`login_shared_secret_map`), encryption
+and provisioning under `bridge`. `bridge_types.rs` rendered every `mautrix-*` entry in
+`bridgev2`'s layout (top-level `database:`, `encryption:`, `double_puppet:`, `provisioning:`),
+so Discord found no database and exited before it listened. Two earlier sessions had written
+"mautrix-discord was not checked to be on `bridgev2`"; it is not. Every other mautrix entry in
+the catalogue is a `v0.25xx`/`v0.26xx` build, which are all `bridgev2`.
+
+**The fix.** A catalogue entry says `legacy_config: true` (Discord alone), and
+`mautrix_legacy_config` writes that framework's file from the same facts, read against
+mautrix-discord v0.7.7's `example-config.yaml`:
+
+| Setting | `bridgev2` | older framework (Discord) |
+|---|---|---|
+| database | `database` | `appservice.database` |
+| ghost template | `appservice.username_template` | `bridge.username_template` |
+| permissions | `bridge.permissions` | `bridge.permissions` |
+| backfill | `backfill.enabled` | `bridge.backfill.forward_limits.{initial,missed}.{dm,channel,thread}` (0 is off; on is 50 initial, 500 missed) |
+| double puppeting | `double_puppet.secrets` | `bridge.login_shared_secret_map` (`as_token:` secrets since mautrix-go 0.15) |
+| encryption | `encryption` | `bridge.encryption` (`msc4190` exists there too) |
+| pickle key | `encryption.pickle_key` | none: a constant in the binary, so not written and never lost by a roll |
+| provisioning | `provisioning.shared_secret`, v3 `whoami` | v1, no `whoami`: `provisioning_api: none`, with why |
+
+The wizard's shared render and an offering's instance render both take the layout from the
+entry. Because the manager re-applies a deployment whose rendered files changed
+(`applied_fingerprint`), a deployed Discord instance rolls by itself once a server with this
+change runs: no pod work. `BridgeType.provisioning_api` for Discord is `none` with a note
+("…whose provisioning API has no whoami…: ask its bot `ping`"), so the Sign in tab says the
+bridge keeps that itself instead of a `refused`, and no secret is minted into its registration.
+
+**Tests.** `bridge_types::tests::a_bridge_on_the_older_framework_gets_that_frameworks_config_layout`
+parses Discord's instance file and the wizard's shared file (database under `appservice`, no
+top-level `database`/`encryption`/`double_puppet`, `login_shared_secret_map` with the
+`as_token:` secret, `bridge.encryption.msc4190`, backfill limits on and off, no `pickle_key`, no
+provisioning secret) and that WhatsApp keeps `bridgev2`'s; the catalogue has exactly one legacy
+entry. `every_type_says_what_provisioning_api_it_has…` expects `none` for Discord. The web mock
+(`bridge-types.ts`) says the same.
+
+**Left.** Not run against the real mautrix-discord image here (the Discord sign-in needs a
+Discord account); the demo's `bridge-discord-brandon` is the check, on the roll after this
+merges: its pod should reach Running and its bot answer `help`. The management-room rule of the
+older framework (bare commands only in the room the bot was invited to) is the same as
+`bridgev2`'s per its source, so the manager's chat repair applies unchanged.
 
 ## Session 2026-10-10 (branch `agent/bridge-stale-devices`): a bot device the bridge left behind is removed; the OTK-count warning is Synapse's behaviour
 
@@ -925,7 +980,8 @@ today. Nobody scanned the QR with a phone, so the bridge's `login` flow past its
 a WhatsApp message in either direction, remain unseen. The bridge's welcome ("Hello, I'm a
 WhatsApp bridge bot … This room has been marked as your management room") and the manager's
 steps both land in the chat, in either order. `mautrix-discord` was not checked to be on
-`bridgev2`; if it still uses the older framework its management-room rule may differ.
+`bridgev2`; if it still uses the older framework its management-room rule may differ. (Checked 2026-10-11: it is on the older framework, and its config layout
+was wrong; see the 2026-10-11 session above.)
 
 ## Session 2026-10-02 (branch `agent/bridge-names`): the pod says what bridge and whose it is
 
@@ -1070,7 +1126,7 @@ themselves. Now `GET /api/v1/appservices/{id}/logins?user_id=` (`appservices.log
 - `web`: `BridgeSignInState.test.tsx` (4); mock server answers the operation for every case.
 
 **Left.** Only mautrix `bridgev2` bridges answer. mautrix-discord was not checked to be on
-`bridgev2`; if it is not, its answer is an honest `refused` (404 or 401) rather than a list.
+`bridgev2`; if it is not, its answer is an honest `refused` (404 or 401) rather than a list. (2026-10-11: it is not; it now says `provisioning_api: none` with why, above.)
 hookshot's provisioning API may expose linked GitHub/GitLab accounts; not read. The cache is per
 replica. The offering page lists instances without their sign-in state (one request per
 instance; the instance's registration page has it).
