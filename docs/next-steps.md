@@ -1,10 +1,10 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-10-10, 20:45 EDT (the memory leak: two causes, six branches, one merged). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+Written 2026-09-20 by the integration lead, last revised 2026-10-10, 22:10 EDT (the memory leak: two causes, five branches merged, 0.2.0 in its gate). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
-## Resume here: 2026-10-10, 20:45 EDT -- the memory leak has two causes, both fixed on branches; one is on main, four are in the merge queue, the sixth needs its hs-room half
+## Resume here: 2026-10-10, 22:10 EDT -- the memory leak has two causes, both fixed and on main; 0.2.0 is in its gate; the state store's half needs its hs-room side
 
 **Read this first.** Nothing rolled to the demo tonight. It runs `sha-2d11ea2e` (revision 17) with
 the pod's memory limit raised by the owner from the chart's default to **2Gi at 22:45 UTC
@@ -111,17 +111,20 @@ RFC 0025 file will textually merge with what room-memory put on main.
   server's key response from a notary` lines after the roll. Left: a real three-server notary
   test; notaries and their backoff on the Federation page.
 
-**The merge queue when the session ended.** Serial, through `tools/merge-queue.sh`, PostgreSQL
-gate servers up (`.claude/gate-pg/env.sh`): `agent/room-memory` merged 20:29 EDT. The stack
-`agent/fed-destinations,agent/leak-hunt` entered its gate at 20:24 (the queue's `target/` hit
-102 GB and it pruned `incremental`), with `agent/notary-keys` and then `agent/fjall-write-buffer`
-queued behind it. **If a gate was cut off by the session's end, `.git/myelin-merge.lock` may be
-left behind: check `ps` for `merge-queue.sh`, then `rmdir` the lock and run
-`tools/merge-queue.sh agent/fed-destinations,agent/leak-hunt agent/notary-keys agent/fjall-write-buffer`**
-(notary-keys and fjall-write-buffer were each rebased onto the branch before them, so the order
-matters). Numbers are already disjoint: decisions 0042 fed-destinations, 0043 leak-hunt, 0044
-room-memory (merged), 0045 reserved for state-load; RFC 0024 is on both leak-hunt and
-fjall-write-buffer (the latter's copy, status implemented, wins), RFC 0025 room-memory's.
+**The merge queue, later that night.** Serial, through `tools/merge-queue.sh`, PostgreSQL gate
+servers up (`.claude/gate-pg/env.sh`). Merged in this order: `agent/room-memory` (20:29 EDT,
+`6133b31b`), the stack `agent/fed-destinations,agent/leak-hunt` (21:09, `36acda9a`; its first
+run failed on `cluster_rejoin.rs`'s "a room on B" wait, a load flake that passed alone in 14 s),
+`agent/notary-keys` (21:48, `b927c54b`, after a rebase over leak-hunt's metrics.rs),
+`agent/fjall-write-buffer` (22:07, `422e47f1`; its first run failed on hs-user's
+`a_second_wake_for_a_mirrored_room_reads_only_the_new_positions`, in-memory backend, passed 3/3
+alone: a timing flake). Two gates were lost to flakes under load; both tests want a look
+(track 14). **`agent/version-0.2`** (workspace, chart and web app at 0.2.0; CHANGELOG opens
+"0.2.0 (2026-10-10)") entered its gate at 22:07; when it merges, tag `v0.2.0` on that commit and
+CD publishes image `0.2.0`/`0.2`/`latest`, chart `0.2.0` and a GitHub release
+(`deploy/helm/hs/ci/chart-version.sh`). `agent/state-load` stays unmerged until its hs-room half
+is done (above). If a gate was cut off: check `ps` for `merge-queue.sh`, `rmdir
+.git/myelin-merge.lock`, rerun `tools/merge-queue.sh <branch>`.
 
 **Then, with the owner:** build and roll the image of the merged main to the demo (revision 18)
 and watch, over an hour, `process_resident_memory_bytes` (should saw-tooth under
