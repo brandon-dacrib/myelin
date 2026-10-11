@@ -1,15 +1,23 @@
-//! Process-wide metrics of this crate: what the PostgreSQL backend's commit flushes (RFC 0021).
+//! Process-wide metrics of this crate: what the PostgreSQL backend's commit flushes (RFC 0021)
+//! and the Fjall backend's write buffer against its cap (RFC 0024).
 //!
 //! Process-wide statics, like `hs_user::metrics` and `hs_room::metrics`: a backend is opened far
 //! from any registry, and a metric is only atomics. [`register_metrics`] puts them on
 //! `/metrics`; `hs-cli` calls it once at startup. The same counts are available per backend,
-//! without a registry, from `PostgresBackend::flush_stats`.
+//! without a registry, from `PostgresBackend::flush_stats` and
+//! [`FjallBackend::write_buffer_stats`](crate::fjall_backend::FjallBackend::write_buffer_stats).
+//! The Fjall gauges are read live at scrape time from every backend open in the process (a
+//! [`Collector`]), so they show a flush emptying the buffer, not the size at the last commit.
 
 use std::sync::LazyLock;
 use std::time::Duration;
 
+use prometheus_client::collector::Collector;
+use prometheus_client::encoding::DescriptorEncoder;
+use prometheus_client::metrics::MetricType;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::histogram::Histogram;
+use prometheus_client::registry::Unit;
 
 /// `hs_kv_postgres_flush_writes`: buffered writes (puts and deletes) one commit flushed. A
 /// room update's fan-out writes about three per member (decision 0026), so a batch of 100
@@ -41,9 +49,65 @@ pub(crate) fn observe_flush(writes: usize, statements: usize, elapsed: Duration)
     FLUSH_STATEMENTS.inc_by(statements as u64);
 }
 
+/// The Fjall write buffer, read live from every open [`crate::fjall_backend::FjallBackend`]:
+/// `hs_kv_fjall_write_buffer_bytes` (every memtable together, active and awaiting a flush),
+/// `hs_kv_fjall_write_buffer_cap_bytes` (the cap the backend enforces; absent when no open
+/// backend has one), `hs_kv_fjall_write_buffer_rotations_total` (memtable rotations the cap
+/// caused) and `hs_kv_fjall_sealed_memtables` (memtables waiting for Fjall's flush workers). A
+/// process normally has one backend; with more, the gauges are sums and the cap the smallest.
+#[derive(Debug)]
+struct FjallWriteBuffer;
+
+impl Collector for FjallWriteBuffer {
+    fn encode(&self, mut encoder: DescriptorEncoder<'_>) -> Result<(), std::fmt::Error> {
+        let stats = crate::fjall_backend::open_backend_stats();
+        let bytes: u64 = stats.iter().map(|s| s.bytes).sum();
+        let rotations: u64 = stats.iter().map(|s| s.rotations).sum();
+        let sealed: usize = stats.iter().map(|s| s.sealed_memtables).sum();
+        let cap = stats.iter().filter_map(|s| s.cap).min();
+
+        let mut e = encoder.encode_descriptor(
+            // The unit appends `_bytes`.
+            "hs_kv_fjall_write_buffer",
+            "Bytes in the Fjall database's memtables, active and awaiting a flush together",
+            Some(&Unit::Bytes),
+            MetricType::Gauge,
+        )?;
+        e.encode_gauge(&bytes)?;
+        if let Some(cap) = cap {
+            let mut e = encoder.encode_descriptor(
+                "hs_kv_fjall_write_buffer_cap",
+                "The write-buffer cap hs-kv enforces by rotating memtables (RFC 0024)",
+                Some(&Unit::Bytes),
+                MetricType::Gauge,
+            )?;
+            e.encode_gauge(&cap)?;
+        }
+        let mut e = encoder.encode_descriptor(
+            "hs_kv_fjall_write_buffer_rotations",
+            "Memtable rotations hs-kv requested because the Fjall write buffer passed its cap",
+            None,
+            MetricType::Counter,
+        )?;
+        e.encode_counter::<Vec<(String, String)>, u64, u64>(&rotations, None)?;
+        let mut e = encoder.encode_descriptor(
+            "hs_kv_fjall_sealed_memtables",
+            "Fjall memtables sealed and waiting for a flush worker",
+            None,
+            MetricType::Gauge,
+        )?;
+        e.encode_gauge(&sealed)?;
+        Ok(())
+    }
+}
+
 /// Registers this crate's metrics into `registry`: `hs_kv_postgres_flush_writes`,
-/// `hs_kv_postgres_flush_duration_seconds` and `hs_kv_postgres_flush_statements_total`.
+/// `hs_kv_postgres_flush_duration_seconds`, `hs_kv_postgres_flush_statements_total`, and the
+/// Fjall write-buffer gauges `hs_kv_fjall_write_buffer_bytes`,
+/// `hs_kv_fjall_write_buffer_cap_bytes`, `hs_kv_fjall_write_buffer_rotations_total` and
+/// `hs_kv_fjall_sealed_memtables`.
 pub fn register_metrics(registry: &mut prometheus_client::registry::Registry) {
+    registry.register_collector(Box::new(FjallWriteBuffer));
     registry.register(
         "hs_kv_postgres_flush_writes",
         "Buffered writes (puts and deletes) one PostgreSQL commit flushed in bulk",
@@ -82,5 +146,30 @@ mod tests {
             out.contains("hs_kv_postgres_flush_statements_total"),
             "{out}"
         );
+        // The Fjall collector encodes with no backend open: zero bytes, no cap.
+        assert!(out.contains("hs_kv_fjall_write_buffer_bytes 0"), "{out}");
+        assert!(!out.contains("hs_kv_fjall_write_buffer_cap_bytes"), "{out}");
+        assert!(
+            out.contains("hs_kv_fjall_write_buffer_rotations_total 0"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn the_fjall_gauges_read_an_open_backend_live() {
+        use crate::fjall_backend::{FJALL_WRITE_BUFFER_CAP, FjallBackend};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let backend = FjallBackend::open(dir.path()).expect("open");
+        let mut registry = prometheus_client::registry::Registry::default();
+        register_metrics(&mut registry);
+        let mut out = String::new();
+        prometheus_client::encoding::text::encode(&mut out, &registry).expect("encode");
+        assert!(
+            out.contains(&format!(
+                "hs_kv_fjall_write_buffer_cap_bytes {FJALL_WRITE_BUFFER_CAP}"
+            )),
+            "{out}"
+        );
+        drop(backend);
     }
 }

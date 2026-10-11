@@ -27,12 +27,31 @@
 //! A data directory written before this layout keeps working: a name that already exists as a
 //! Fjall keyspace of its own is opened as one, unprefixed, as before; only keyspaces that do not
 //! exist yet go into the shared one. Nothing is migrated.
+//!
+//! # The write buffer is capped (RFC 0024)
+//!
+//! Fjall keeps every write in its keyspace's memtable until that memtable reaches the keyspace's
+//! `max_memtable_size` (64 MiB by default), and a key written again is a new entry there, not a
+//! replacement, until the flush. A slow periodic writer, a presence update or a retry-state row
+//! every few seconds, therefore grows resident memory at its write rate for hours before anything
+//! is flushed; on a data directory in the per-table layout every one of its hundred-odd
+//! keyspaces can do so (the demo crept 13 MiB an hour while idle on 2026-10-10).
+//!
+//! Fjall 3.1's own database-wide cap (`Builder::max_write_buffer_size`) is stored but enforced
+//! nowhere (`#[deprecated = "todo"]` in 3.1.10), so this backend bounds the write buffer itself:
+//! after every commit it reads the database's write-buffer size (one atomic load) and, when it is
+//! over [`FjallOptions::write_buffer_cap`], asks every Fjall keyspace that has no flush pending to
+//! rotate its memtable. A keyspace whose memtable is already sealed is skipped, so one crossing
+//! triggers one flush round and not a storm. Independently, every Fjall keyspace this backend
+//! *creates* gets [`FjallOptions::max_memtable_size`], smaller than Fjall's default, so a fresh
+//! store flushes on its own well before the cap; a keyspace recovered from an older directory
+//! keeps the size it was created with (Fjall persists it), and the cap covers it.
 
 use std::collections::HashMap;
 use std::ops::Bound;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use bytes::Bytes;
 use fjall::{KeyspaceCreateOptions, KvSeparationOptions};
@@ -49,12 +68,64 @@ pub const SHARED_KEYSPACE: &str = "_hs_kv_shared";
 /// The longest key Fjall stores (`lsm-tree` encodes a key's length as a `u16`).
 const FJALL_MAX_KEY: usize = u16::MAX as usize;
 
-/// What the keyspace lock guards: the shared Fjall keyspace once opened, and every `hs-kv`
-/// keyspace handed out so far.
+/// The default cap on the Fjall database's whole write buffer, every memtable together (see the
+/// module docs): 32 MiB. Past it, the backend rotates memtables itself. Bounded resident memory
+/// for an idle server was the goal (RFC 0024); the price is a flush round once per 32 MiB
+/// written, which is small next to Fjall's compaction.
+pub const FJALL_WRITE_BUFFER_CAP: u64 = 32 * 1024 * 1024;
+
+/// The default `max_memtable_size` of every Fjall keyspace this backend creates: 16 MiB, in the
+/// 8 to 64 MiB range Fjall recommends and a quarter of its default. With every table behind a
+/// prefix in one shared keyspace this is the size the one memtable reaches before Fjall flushes
+/// it on its own, so it is also how far an idle server's resident memory creeps before it comes
+/// back.
+pub const FJALL_MEMTABLE_SIZE: u64 = 16 * 1024 * 1024;
+
+/// Tuning of a [`FjallBackend`]. [`FjallBackend::open`] uses [`FjallOptions::default`]; the
+/// fields exist for tests and benchmarks (a tiny cap makes a flush observable in milliseconds) and
+/// for an operator setting, should one ever be needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FjallOptions {
+    /// The cap on the database's whole write buffer, in bytes; `None` disables the backend's own
+    /// enforcement and leaves only Fjall's per-keyspace `max_memtable_size`.
+    pub write_buffer_cap: Option<u64>,
+    /// `max_memtable_size` for every Fjall keyspace this backend creates (not for keyspaces
+    /// recovered from an existing directory, whose size Fjall persisted at their creation).
+    pub max_memtable_size: u64,
+}
+
+impl Default for FjallOptions {
+    fn default() -> Self {
+        Self {
+            write_buffer_cap: Some(FJALL_WRITE_BUFFER_CAP),
+            max_memtable_size: FJALL_MEMTABLE_SIZE,
+        }
+    }
+}
+
+/// A reading of one backend's write buffer, from [`FjallBackend::write_buffer_stats`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteBufferStats {
+    /// Bytes in every memtable of the database, active and sealed-but-not-yet-flushed together
+    /// (Fjall's `write_buffer_size`).
+    pub bytes: u64,
+    /// The cap the backend enforces, if any.
+    pub cap: Option<u64>,
+    /// Memtable rotations this backend requested because the write buffer was over the cap. Fjall's
+    /// own size-triggered rotations are not counted; Fjall does not expose them.
+    pub rotations: u64,
+    /// Memtables sealed and waiting for Fjall's flush workers, over every Fjall keyspace open.
+    pub sealed_memtables: usize,
+}
+
+/// What the keyspace lock guards: the shared Fjall keyspace once opened, every `hs-kv` keyspace
+/// handed out so far, and every distinct Fjall keyspace behind them (the shared one and any in
+/// the per-table layout), for the write-buffer cap to rotate.
 #[derive(Default)]
 struct Keyspaces {
     shared: Option<fjall::OptimisticTxKeyspace>,
     opened: HashMap<String, FjallKeyspace>,
+    fjall: Vec<fjall::OptimisticTxKeyspace>,
 }
 
 struct Inner {
@@ -63,6 +134,23 @@ struct Inner {
     keyspaces: Mutex<Keyspaces>,
     fresh: bool,
     created: AtomicUsize,
+    options: FjallOptions,
+    rotations: AtomicU64,
+}
+
+/// Every backend open in this process, for the process-wide metrics ([`crate::metrics`]) to read
+/// live. Dropped backends are pruned on the next open and skipped on every read.
+static OPEN_BACKENDS: LazyLock<Mutex<Vec<Weak<Inner>>>> = LazyLock::new(Mutex::default);
+
+/// The write-buffer stats of every backend open in this process.
+pub(crate) fn open_backend_stats() -> Vec<WriteBufferStats> {
+    OPEN_BACKENDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter_map(Weak::upgrade)
+        .map(|inner| FjallBackend { inner }.write_buffer_stats())
+        .collect()
 }
 
 /// The Fjall [`KvBackend`]. Cloning shares the open database handle.
@@ -77,6 +165,17 @@ impl FjallBackend {
     /// # Errors
     /// Returns [`KvError::Backend`] if Fjall could not open or create the database at `path`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, KvError> {
+        Self::open_with_options(path, FjallOptions::default())
+    }
+
+    /// [`FjallBackend::open`] with explicit tuning (see [`FjallOptions`]).
+    ///
+    /// # Errors
+    /// Returns [`KvError::Backend`] if Fjall could not open or create the database at `path`.
+    pub fn open_with_options(
+        path: impl AsRef<Path>,
+        options: FjallOptions,
+    ) -> Result<Self, KvError> {
         let path = path.as_ref();
         // Fjall writes its version marker when it creates a database, and recovers one whenever
         // the marker is there (`fjall::Database::create_or_recover`).
@@ -84,18 +183,117 @@ impl FjallBackend {
             .join("version")
             .try_exists()
             .map_err(KvError::backend)?;
+        // Not `Builder::max_write_buffer_size`: in Fjall 3.1.10 it is stored and never read (see
+        // the module docs), so the cap is enforced in `enforce_write_buffer_cap` instead.
         let db = fjall::OptimisticTxDatabase::builder(path)
             .open()
             .map_err(KvError::from)?;
-        Ok(Self {
-            inner: Arc::new(Inner {
-                db,
-                hub: Hub::new(),
-                keyspaces: Mutex::new(Keyspaces::default()),
-                fresh,
-                created: AtomicUsize::new(0),
-            }),
-        })
+        let inner = Arc::new(Inner {
+            db,
+            hub: Hub::new(),
+            keyspaces: Mutex::new(Keyspaces::default()),
+            fresh,
+            created: AtomicUsize::new(0),
+            options,
+            rotations: AtomicU64::new(0),
+        });
+        {
+            let mut open = OPEN_BACKENDS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            open.retain(|weak| weak.strong_count() > 0);
+            open.push(Arc::downgrade(&inner));
+        }
+        tracing::info!(
+            path = %path.display(),
+            fresh,
+            write_buffer_cap_bytes = options.write_buffer_cap,
+            memtable_bytes = options.max_memtable_size,
+            "opened the Fjall database"
+        );
+        Ok(Self { inner })
+    }
+
+    /// The tuning this backend was opened with.
+    #[must_use]
+    pub fn options(&self) -> FjallOptions {
+        self.inner.options
+    }
+
+    /// A live reading of the write buffer: its size, the cap, how often the cap made this backend
+    /// rotate a memtable, and how many memtables await a flush.
+    #[must_use]
+    pub fn write_buffer_stats(&self) -> WriteBufferStats {
+        let sealed_memtables = self
+            .lock_keyspaces()
+            .fjall
+            .iter()
+            .map(|ks| ks.inner().sealed_memtable_count())
+            .sum();
+        WriteBufferStats {
+            bytes: self.inner.db.write_buffer_size(),
+            cap: self.inner.options.write_buffer_cap,
+            rotations: self.inner.rotations.load(Ordering::Relaxed),
+            sealed_memtables,
+        }
+    }
+
+    /// Rotates the memtable of every Fjall keyspace that has no flush pending, so Fjall's workers
+    /// write them to tables and free the write buffer. Returns how many it rotated.
+    ///
+    /// # Errors
+    /// Returns [`KvError::Backend`] if Fjall could not seal a memtable (the journal could not be
+    /// locked, say); the keyspaces before it are rotated.
+    pub fn flush_memtables(&self) -> Result<usize, KvError> {
+        let keyspaces = self.lock_keyspaces().fjall.clone();
+        let mut rotated = 0;
+        for keyspace in &keyspaces {
+            let keyspace = keyspace.inner();
+            if keyspace.sealed_memtable_count() > 0 {
+                continue;
+            }
+            if keyspace.rotate_memtable().map_err(KvError::from)? {
+                rotated += 1;
+            }
+        }
+        Ok(rotated)
+    }
+
+    /// The write-buffer cap of the module docs: after a commit, when the database's memtables
+    /// together are over the cap, rotate the ones not already waiting for a flush. One atomic
+    /// load on the path where nothing is over the cap.
+    fn enforce_write_buffer_cap(&self) {
+        let Some(cap) = self.inner.options.write_buffer_cap else {
+            return;
+        };
+        let bytes = self.inner.db.write_buffer_size();
+        if bytes <= cap {
+            return;
+        }
+        match self.flush_memtables() {
+            Ok(0) => {}
+            Ok(rotated) => {
+                self.inner
+                    .rotations
+                    .fetch_add(rotated as u64, Ordering::Relaxed);
+                tracing::debug!(
+                    write_buffer_bytes = bytes,
+                    cap,
+                    rotated,
+                    "the Fjall write buffer passed its cap; memtables rotated for flushing"
+                );
+            }
+            Err(err) => {
+                // Not fatal: the commit is durable in the journal, and Fjall's own
+                // `max_memtable_size` still bounds every memtable.
+                tracing::warn!(
+                    error = %err,
+                    write_buffer_bytes = bytes,
+                    cap,
+                    "the Fjall write buffer is over its cap and a memtable could not be rotated"
+                );
+            }
+        }
     }
 
     /// Whether [`FjallBackend::open`] created the database rather than recovering one: `true`
@@ -140,21 +338,33 @@ impl FjallBackend {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Opens a Fjall keyspace by name, counting it if this call created it.
-    fn fjall_keyspace(&self, name: &str) -> Result<fjall::OptimisticTxKeyspace, KvError> {
+    /// Opens a Fjall keyspace by name, counting it if this call created it and remembering it
+    /// in `keyspaces` (the caller's lock) for the write-buffer cap.
+    fn fjall_keyspace(
+        &self,
+        keyspaces: &mut Keyspaces,
+        name: &str,
+    ) -> Result<fjall::OptimisticTxKeyspace, KvError> {
         let existed = self.inner.db.keyspace_exists(name);
+        let max_memtable_size = self.inner.options.max_memtable_size;
         let keyspace = self
             .inner
             .db
             .keyspace(name, || {
                 KeyspaceCreateOptions::default()
+                    .max_memtable_size(max_memtable_size)
                     .with_kv_separation(Some(KvSeparationOptions::default()))
             })
             .map_err(KvError::from)?;
         if !existed {
             self.inner.created.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(keyspace = name, "created a Fjall keyspace");
+            tracing::debug!(
+                keyspace = name,
+                max_memtable_size,
+                "created a Fjall keyspace"
+            );
         }
+        keyspaces.fjall.push(keyspace.clone());
         Ok(keyspace)
     }
 }
@@ -355,7 +565,7 @@ impl KvBackend for FjallBackend {
             // Written before the shared layout: keep reading and writing it where it is.
             FjallKeyspace {
                 name: Arc::from(name),
-                inner: self.fjall_keyspace(name)?,
+                inner: self.fjall_keyspace(&mut keyspaces, name)?,
                 prefix: Bytes::new(),
             }
         } else {
@@ -363,7 +573,7 @@ impl KvBackend for FjallBackend {
             let shared = match &keyspaces.shared {
                 Some(shared) => shared.clone(),
                 None => {
-                    let shared = self.fjall_keyspace(SHARED_KEYSPACE)?;
+                    let shared = self.fjall_keyspace(&mut keyspaces, SHARED_KEYSPACE)?;
                     keyspaces.shared = Some(shared.clone());
                     shared
                 }
@@ -399,6 +609,7 @@ impl KvBackend for FjallBackend {
                 for (ks, key) in &txn.write_keys {
                     self.inner.hub.notify(ks, key);
                 }
+                self.enforce_write_buffer_cap();
                 Ok(Ok(()))
             }
             Err(fjall::Conflict) => Ok(Err(Conflict)),
