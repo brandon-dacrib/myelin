@@ -43,6 +43,34 @@ tag's run green. Then: the pods (`bridge-discord-brandon` is gone from the demo 
 Discord check is to request one again and see it reach Running), the Bridges page, the WARN
 rate, and iMessage on the owner's Mac.
 
+**Rolled by the owner as revision 20, `ghcr.io/brandon-dacrib/myelin:0.3.0`, 21:06 UTC
+2026-10-11.** Read through the owner's proxy 23 minutes in: server, operator, WhatsApp and
+Signal pods Running (the two bridges did not roll: their files did not change), 0 ERROR lines,
+the known `event failed the authentication check` WARN noise (above), and **one new finding**:
+
+- **The WhatsApp bot's device cannot be cross-signed since 17:00:40 UTC**, one WARN every 3 s
+  (`hs_bridges::manager`, `could not settle the bot's cross-signing identity`): the server
+  answers `/keys/signatures/upload` with `M_INVALID_SIGNATURE: no known key
+  ed25519:1MIe4im07QT/C0p6uh5z+F6cJNFQ0s/F5Mbtnq5bbhA for signer @whatsappbot_brandon`. Loki
+  says what led to it: at 17:00:04 the owner removed and re-created the WhatsApp instance
+  (requested → registered → deploying → starting → ready at 17:00:40); the new row minted new
+  seeds (`minted the cross-signing keys of a bridge instance's bot`), published them (master
+  `ed25519:1wFuyiIz…`, the server answered 200), and the very next call, signing device
+  `BQBMQVR81T` with the new self-signing key, was refused, and has been every tick since. The
+  master is published (otherwise the manager would publish again and log it; it logged once),
+  so the server holds the new master but not the new self-signing key, or holds another. Not
+  from the roll: it began 4 hours before it. Read so far: `post_device_signing_upload` stores
+  every key in the body after verifying the self-signing key against the request's master,
+  `has_different_keys` short-circuits only when nothing differs, the store has no cache, and
+  `resolve_signers_own_key` reads master, self-signing and user-signing then devices; no commit
+  since 2026-10-08 touched either path. **Next:** with an admin or bot token,
+  `GET /_matrix/client/v3/keys/query` for `@whatsappbot_brandon:myelin.dacrib.net` and compare
+  `master_keys` and `self_signing_keys` with the manager's (`1wFu…`/`1MIe…`); then either the
+  server dropped the self-signing key on this upload path (hs-e2e bug) or the manager signs with
+  a key it did not upload (hs-bridges bug). Two things to fix regardless: the manager should
+  check `self_signing_keys` as it checks the master and publish again when it differs, and a
+  refused signature should back off (it is retried every tick, 1,200 WARN lines an hour).
+
 **2026-10-11, later (branch `agent/imessage-web`, off `agent/imessage-offering`, status 16): the
 web half of the iMessage offering.** For a type with `runs_on: "mac"` the instance row's action is
 "Set up on a Mac": a dialog with the pinned download, a field for the Mac's hostname or IP (saved
