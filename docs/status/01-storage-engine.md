@@ -1247,6 +1247,11 @@ None.
 
 ## Decisions made
 
+- **The Fjall write buffer is bounded by `hs-kv`, not by Fjall's builder** (2026-10-10, RFC
+  0024). `Builder::max_write_buffer_size` is a deprecated no-op in Fjall 3.1.10, so the backend
+  rotates memtables itself after a commit that leaves the database over `FJALL_WRITE_BUFFER_CAP`
+  (32 MiB), and creates keyspaces with a 16 MiB `max_memtable_size`. Constants, with
+  `FjallOptions` for tests; no `hs-config` setting yet. See "The Fjall write buffer is capped".
 - **On Fjall, every `hs-kv` keyspace shares one Fjall keyspace behind a `[len][name]` prefix**
   (2026-10-01, decision 0024). Creating a Fjall keyspace is several fsyncs under a global lock,
   and a server opens over a hundred; sharing one made a first boot as quick as a later one.
@@ -1368,3 +1373,84 @@ Session 3 (execution-model fix): `tokio` added to `crates/hs-kv/[dev-dependencie
 `tests/postgres_conformance.rs` can hold an `#[tokio::test]` regression test to an ambient runtime.
 Already present in `[workspace.dependencies]` (with the `full` feature) — not new to the workspace,
 and not a dependency of `hs-kv`'s own library code, only its test target.
+
+## The Fjall write buffer is capped (2026-10-10, `agent/fjall-write-buffer`, RFC 0024)
+
+**Cause.** The demo's resident memory crept 13 MiB an hour while idle (Prometheus, 2026-10-10,
+15:18 to 18:33 UTC: 272 to 315 MiB) until the owner raised the pod's limit to 3 GiB. Track 06's
+leak hunt (RFC 0024) found the mechanism in this crate: Fjall keeps every write in its keyspace's
+memtable until the memtable reaches `max_memtable_size` (64 MiB by default), a rewritten key is a
+new entry there rather than a replacement, and nothing bounded the sum: `FjallBackend::open` set
+no database-wide cap, and a data directory in the per-table layout (written before decision 0024,
+2026-10-01) has a hundred-odd keyspaces that each creep at their writer's rate for hours.
+
+**What Fjall 3.1.10 actually offers, read from `~/.cargo/registry`.** The RFC's one-liner,
+`Builder::max_write_buffer_size`, **does nothing**: it is `#[deprecated = "todo"]` and
+`#[doc(hidden)]`, stores `db_config.max_write_buffer_size_in_bytes`, and no code reads the field.
+The flush triggers that exist are a keyspace's own `max_memtable_size` (checked on every insert,
+`keyspace/mod.rs:839`, persisted in the meta keyspace at creation and recovered from there, so a
+new value at open does not apply to an existing keyspace) and journal eviction at
+`max_journaling_size` (512 MiB). Public seams: `Database::write_buffer_size()` (the sum of every
+memtable, an atomic), `Keyspace::sealed_memtable_count()` and `Keyspace::rotate_memtable()`
+(`#[doc(hidden)]`, used by Fjall's tests; returns `false` for an empty memtable). `metrics()` is
+behind a feature and counts block I/O, not flushes.
+
+**Change** (`crates/hs-kv/src/fjall_backend.rs`, module docs "The write buffer is capped"):
+
+- `FJALL_WRITE_BUFFER_CAP` = 32 MiB, enforced by the backend after every commit: one atomic
+  load; when over the cap, rotate the memtable of every Fjall keyspace with no sealed memtable
+  pending (a keyspace already being flushed is skipped, so a crossing is one flush round). An
+  error rotating is a `warn`, never a failed commit.
+- `FJALL_MEMTABLE_SIZE` = 16 MiB as `max_memtable_size` for every Fjall keyspace the backend
+  creates (Fjall recommends 8 to 64). On the shared layout the database has one memtable, so this
+  is how far an idle fresh server creeps before Fjall itself flushes; a keyspace recovered from an
+  older directory keeps its persisted 64 MiB and the cap covers it. Per-table sizing is not
+  possible: every table is a prefix in one keyspace (decision 0024).
+- `FjallOptions { write_buffer_cap: Option<u64>, max_memtable_size: u64 }`,
+  `FjallBackend::open_with_options`, `options()`, `write_buffer_stats()` (bytes, cap, rotations,
+  sealed memtables) and `flush_memtables()` (rotate on demand). `open` uses the defaults. No
+  `hs-config` setting (the RFC asks for a constant first); adding `storage.embedded.write_buffer_bytes`
+  is a field in `EmbeddedStorageConfig`, one line in `hs-cli`'s bootstrap, and the docs and web
+  fixture regeneration.
+- Observability: a `prometheus_client::collector::Collector` registered by the existing
+  `hs_kv::metrics::register_metrics` (which `hs serve` already calls) reads every open backend
+  live at scrape: `hs_kv_fjall_write_buffer_bytes`, `hs_kv_fjall_write_buffer_cap_bytes`,
+  `hs_kv_fjall_write_buffer_rotations_total` (rotations the cap caused; Fjall's own are not
+  countable) and `hs_kv_fjall_sealed_memtables`. `opened the Fjall database` at `info` names
+  `write_buffer_cap_bytes` and `memtable_bytes`. No `hs-cli` change.
+
+**Measured** (`crates/hs-kv/tests/fjall_write_buffer_soak.rs`, ignored; a debug test binary,
+100 keyspaces, one key each rewritten round-robin at 25 writes/s, 8 KiB values so five minutes
+write 60 MiB and show what 25 small rewrites/s show in hours; RSS from `ps -o rss=` every ten
+seconds, the slope over the last 40% of the run, from the 180 s sample to the last at 290 s):
+
+| run | RSS at 180 s | RSS at 290 s | slope after warm-up | shape |
+|-----|-------------|------------------------|---------------------|-------|
+| capped (defaults: cap 32 MiB, memtable 16 MiB) | 45,088 KiB | 45,104 KiB | +524 KiB/h | climbs to 45,088 KiB by 170 s (two 16 MiB memtable flushes at 80 s and 160 s; the allocator keeps the first freed memtable), then flat to the end: 45,088 to 45,104 KiB over the last 130 s, with the write buffer saw-toothing between 1.5 and 16.4 MiB |
+| uncapped (as before: no cap, memtable 64 MiB) | 51,072 KiB | 76,624 KiB | +836,000 KiB/h (817 MiB/h, the write rate plus overhead) | a straight line from 8,912 KiB at 0 s to 76,624 KiB at 290 s, 2.3 MiB every ten seconds; the write buffer ends at 62.2 MiB and never flushed (Fjall's 64 MiB memtable is not reached in five minutes), which is the demo's creep at a rate that fits a test |
+
+In the capped run `rotations` stayed 0: with one shared keyspace Fjall's own 16 MiB memtable
+trigger fires first, as designed; the cap is what bounds a per-table-layout directory, which
+`tests/fjall_write_buffer.rs` exercises with a 256 KiB cap (`rotations >= 1`, reads right across
+the flushes and after a reopen).
+
+Commands:
+
+```text
+cargo test -p hs-kv                                   # 46 passed, 2 ignored (PostgreSQL tests SKIP without a DSN)
+cargo test -p hs-tables                               # 24 passed
+cargo test -p hs-cli --test e2e                       # 27 passed (the real binary on Fjall)
+cargo fmt --all --check
+cargo clippy -p hs-kv -p hs-tables -p hs-cli --all-targets -- -D warnings
+SOAK_MINUTES=5 cargo test -p hs-kv --test fjall_write_buffer_soak -- --ignored --nocapture
+SOAK_UNCAPPED=1 SOAK_MINUTES=5 cargo test -p hs-kv --test fjall_write_buffer_soak -- --ignored --nocapture
+```
+
+**Left.** Confirm on the demo: `process_resident_memory_bytes` flat or saw-toothing under
+`hs_kv_fjall_write_buffer_cap_bytes` after a roll (the demo's data directory layout decides which
+mechanism does the work; `hs_kv_fjall_write_buffer_rotations_total` says whether it is the cap).
+`storage.embedded.write_buffer_bytes` in `hs-config` if an operator ever needs it. Freed memtable
+memory is not returned to the OS by the allocator (the plateau above is baseline plus about two
+memtables); a `jemalloc`/`mimalloc` decision belongs to track 12 if the plateau itself matters.
+RFC 0024 asked for 128 MiB; 32 MiB was chosen because the number is a bound on idle creep, not a
+throughput knob, and a flush round per 32 MiB written is small next to compaction.

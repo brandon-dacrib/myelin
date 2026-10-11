@@ -14,8 +14,9 @@
 //!
 //! `SOAK_UNCAPPED=1` opens the backend as before RFC 0024 (no cap, Fjall's 64 MiB memtable);
 //! `SOAK_WRITES_PER_SEC` (25) and `SOAK_KEYSPACES` (100) set the writer. It prints one sample a
-//! ten seconds and a summary line, and with the cap asserts that RSS after the warm-up grew by
-//! less than the cap plus a margin.
+//! ten seconds and a summary line (the slope over the last 40% of the run, past the first two
+//! memtable flushes), and with the cap asserts that RSS after the warm-up grew by less than the
+//! cap plus a margin.
 
 use std::time::{Duration, Instant};
 
@@ -69,7 +70,10 @@ fn rss_stays_flat_under_the_write_buffer_cap() {
 
     let interval = Duration::from_secs_f64(1.0 / writes_per_sec as f64);
     let end = Instant::now() + Duration::from_secs(minutes * 60);
-    let warm_up = Duration::from_secs(60.min(minutes * 60 / 5));
+    // The slope is measured over the last 40% of the run: with the defaults the memtable flushes
+    // first at 80 s and the allocator keeps the first freed memtable, so the plateau starts at
+    // about three minutes.
+    let warm_up = Duration::from_secs(minutes * 60 * 3 / 5);
     let start = Instant::now();
     let mut next_write = start;
     let mut next_sample = start;

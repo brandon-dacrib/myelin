@@ -1,6 +1,7 @@
 # RFC 0024: a cap on Fjall's total write buffer
 
-- Status: proposed (track 06 asks track 01)
+- Status: accepted; implemented 2026-10-10 by track 01 (`agent/fjall-write-buffer`), with one
+  deviation from "What is asked", in "Outcome" at the end
 - Date: 2026-10-10
 - Owner of the change: track 01 (`crates/hs-kv/src/fjall_backend.rs`)
 - Asked by: track 06, from the 2026-10-10 leak hunt (`docs/status/06-federation.md`)
@@ -67,3 +68,37 @@ if an operator ever needs to tune it.
 
 `crates/hs-kv` is track 01's. The federation side has done what it can: fewer writes. The cap is
 one line in the backend's constructor and belongs with the backend's other defaults.
+
+## Outcome (track 01, 2026-10-10)
+
+Implemented in `crates/hs-kv/src/fjall_backend.rs` (module docs, "The write buffer is capped"),
+with one deviation: **`fjall::Builder::max_write_buffer_size` is not used, because in Fjall 3.1.10
+it does nothing.** The builder stores the value in `db_config.max_write_buffer_size_in_bytes`,
+the method is `#[deprecated = "todo"]` and `#[doc(hidden)]`, and nothing reads the field (the
+only flush triggers are a keyspace's own `max_memtable_size`, checked on insert, and journal
+eviction at `max_journaling_size`, 512 MiB). So the backend enforces the cap itself:
+
+- **A database-wide cap, enforced after every commit**: `FjallBackend` reads Fjall's
+  `write_buffer_size()` (one atomic load) and, when it is over the cap, rotates the memtable of
+  every Fjall keyspace that has no sealed memtable awaiting a flush (`Keyspace::rotate_memtable`,
+  `sealed_memtable_count`). A keyspace already being flushed is skipped, so a crossing is one
+  flush round, not a storm. The cap is `FJALL_WRITE_BUFFER_CAP` = **32 MiB**, not the 128 MiB
+  suggested: on the shared layout (decision 0024) the database has one memtable, so the number
+  that bounds an idle server's creep is the memtable size, and the cap exists for directories in
+  the per-table layout (the demo's, if its data directory predates 2026-10-01), where it bounds
+  the sum of a hundred-odd memtables.
+- **A smaller `max_memtable_size` for every Fjall keyspace the backend creates**:
+  `FJALL_MEMTABLE_SIZE` = **16 MiB** (Fjall's default is 64; it recommends 8 to 64). Fjall persists
+  the size at creation, so a keyspace recovered from an existing directory keeps its 64 MiB and is
+  covered by the cap. Per-table sizing is not possible: every table is a prefix in one keyspace.
+- Both are `FjallOptions` on `FjallBackend::open_with_options`; `open` uses the defaults. No
+  `hs-config` setting yet (a constant first, as asked); wiring one is a field in
+  `EmbeddedStorageConfig` and one line in `hs-cli`'s bootstrap.
+- Observability: `hs_kv_fjall_write_buffer_bytes`, `hs_kv_fjall_write_buffer_cap_bytes`,
+  `hs_kv_fjall_write_buffer_rotations_total` and `hs_kv_fjall_sealed_memtables`, read live at
+  scrape from every open backend by a collector that `hs_kv::metrics::register_metrics` registers
+  (already called by `hs serve`); an `info` line at open names the cap and memtable size.
+- Proof: `crates/hs-kv/tests/fjall_write_buffer.rs` (the cap rotates and flushes, reads stay
+  right across the flushes and a reopen; a small memtable size makes Fjall flush on its own) and
+  `tests/fjall_write_buffer_soak.rs` (ignored, five minutes, RSS from `ps`), whose numbers are in
+  `docs/status/01-storage-engine.md`, "The Fjall write buffer is capped (2026-10-10)".
