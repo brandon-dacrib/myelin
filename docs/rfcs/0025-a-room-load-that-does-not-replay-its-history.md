@@ -1,9 +1,46 @@
 # 0025. A room load that does not replay its history: the state store's per-event records must be durable
 
-Status: **proposed**, 2026-10-10 (branch `agent/room-memory`). Author: track 04 (room and
-events). Owner of the change: track 02 (state and model). Affects:
-`crates/hs-state/src/kv_store.rs` (`KvStateStore`, `CommonInner`), `crates/hs-state/src/api.rs`
-(`StateStore`), then `crates/hs-room/src/actor.rs` (`RoomActor::load`).
+Status: **implemented in `hs-state`** (branch `agent/state-load`, 2026-10-10; decision 0045 is
+left to write: a root per event over the frames' delta chains, not Synapse-style state groups).
+The room actor's half (its load reading only current state, and feeding the store inside its own
+transaction) is track 04's; the seams are in place. Originally proposed 2026-10-10 by track 04
+on branch `agent/room-memory`. Owner of the change: track 02 (state and model). Affects:
+`crates/hs-state/src/kv_store.rs` (`KvStateStore`), `crates/hs-state/src/durable.rs` (new),
+then `crates/hs-room/src/actor.rs` (`RoomActor::load`).
+
+## What landed (track 02, 2026-10-10, `agent/state-load`)
+
+Each numbered need below, as `crates/hs-state` now answers it:
+
+1. **`state_at` durable**: the `state_at` keyspace, `EventSn` to the frame root (16 bytes),
+   written by every ingestion and read through a bounded cache (`KvStateStore::state_at`).
+2. **Interning durable**: the `state_key_id_{fwd,rev,seq}` keyspaces in `hs-tables`'s own
+   layout, so `hs_tables::interning::state_key_id_table` reads the same rows; a bounded cache
+   each way instead of `InternTable`'s unbounded one. Rooms whose frames were written by the
+   per-process numbering are rebuilt once: `KvStateStore::needs_migration(room_id)` says so,
+   the actor's existing replay is the rebuild, `mark_migrated` ends it, `LAYOUT_VERSION` lets a
+   future change ask for it again; `mark_migrated_in(txn)` marks a room as it is created.
+3. **Records by short id, on demand**: the `state_event` keyspace holds a compact record per
+   event (`crate::record`); state resolution reads only the records it touches through
+   `state_res::EventFetch` (conflicted events, their auth chains, the state entries auth checks
+   ask for), kept for the resolution in an arena and across resolutions in an LRU of 1,024
+   (`hs_state_resolution_events_cached`).
+4. **The chain-cover index durable**: `state_chain_{pos,event,link,tip,seq}`, the same
+   algorithm as the in-memory `ChainCoverIndex` behind `chain_cover::{ChainReader,
+   ChainWriter}`, read lazily; it also answers the resolvers' auth chains.
+5. **Writes inside the caller's transaction**: `KvStateStore::ingest_in(txn, &NewEvent,
+   explicit_state)`; the frames stay content-addressed in their own idempotent writes.
+6. **`has_event(EventSn)`**: a cached or point read.
+
+Metrics `hs_state_open_seconds`, `hs_state_events_replayed_total`,
+`hs_state_resolution_events_cached`, `hs_state_migrations_total`,
+`hs_state_event_records_read_total` (`hs_state::metrics::register_metrics`, for `hs-cli` to
+call); `KvStateStore::log_open_summary(room_id)` logs replayed-versus-read counts for a room of
+more than 10,000 events. Measured (`crates/hs-state/tests/open_memory.rs`, release, 50,000
+events on Fjall): a replay of the room into the store 0.60 s and +55 MiB; an open that reads
+current state 0.00 s and +0 MiB, zero records read, zero events ingested.
+
+## The original proposal
 
 ## The problem
 
