@@ -66,6 +66,15 @@ pub trait StateRepr {
     /// Returns `Self::Error` if `root` is not known to this representation, `changes` is
     /// contradictory, or on a storage failure.
     fn apply(&self, root: Self::Root, changes: &StateDiff) -> Result<Self::Root, Self::Error>;
+
+    /// The durable encoding of a root: what [`crate::kv_store::KvStateStore`] writes in its
+    /// per-event `state_at` rows. Must round-trip through [`StateRepr::decode_root`],
+    /// including [`StateRepr::empty_root`].
+    fn encode_root(&self, root: Self::Root) -> Vec<u8>;
+
+    /// The inverse of [`StateRepr::encode_root`]; `None` if `bytes` is not a root this
+    /// representation wrote.
+    fn decode_root(&self, bytes: &[u8]) -> Option<Self::Root>;
 }
 
 /// Instrumentation a [`StateRepr`] exposes, beyond the storage operations that trait itself

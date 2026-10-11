@@ -33,6 +33,7 @@
 //! independently, matching the same idea Palpo's `chain_cover` also implements.
 
 use std::collections::BTreeMap;
+use std::convert::Infallible;
 
 use hs_model::ids::{EventSn, StateKeyId};
 
@@ -53,12 +54,324 @@ pub struct ChainPosition {
     pub sequence: u32,
 }
 
-/// The chain-cover index for one room.
+/// Read access to a chain-cover index, however it is stored: in memory ([`ChainCoverIndex`])
+/// or in durable keyspaces read on demand (`crate::durable`). The algorithms ([`coverage`],
+/// [`contains`], [`auth_chain_difference`], [`add_event`]) are written once against this trait
+/// so the durable index is the same index as the one the property tests check, not a second
+/// implementation of it.
+pub trait ChainReader {
+    /// The storage error, if any ([`Infallible`] for the in-memory index).
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// The position and interned `(type, state_key)` of `event`, if it has been indexed.
+    ///
+    /// # Errors
+    /// Returns `Self::Error` on a storage failure.
+    fn position_of(
+        &self,
+        event: EventSn,
+    ) -> Result<Option<(ChainPosition, StateKeyId)>, Self::Error>;
+
+    /// The highest `sequence` used so far on `chain` (`0` if the chain has no positions).
+    ///
+    /// # Errors
+    /// Returns `Self::Error` on a storage failure.
+    fn tip_of(&self, chain: ChainId) -> Result<u32, Self::Error>;
+
+    /// The links recorded exactly at `at`.
+    ///
+    /// # Errors
+    /// Returns `Self::Error` on a storage failure.
+    fn links_at(&self, at: ChainPosition) -> Result<Vec<ChainPosition>, Self::Error>;
+
+    /// Every link recorded on `chain` at a sequence `<= sequence`, in any order.
+    ///
+    /// # Errors
+    /// Returns `Self::Error` on a storage failure.
+    fn links_up_to(&self, chain: ChainId, sequence: u32)
+    -> Result<Vec<ChainPosition>, Self::Error>;
+
+    /// The events placed at `from..=to` on `chain`, ascending by sequence; a position with no
+    /// event is skipped.
+    ///
+    /// # Errors
+    /// Returns `Self::Error` on a storage failure.
+    fn events_between(
+        &self,
+        chain: ChainId,
+        from: u32,
+        to: u32,
+    ) -> Result<Vec<EventSn>, Self::Error>;
+}
+
+/// Write access to a chain-cover index; see [`ChainReader`].
+pub trait ChainWriter: ChainReader {
+    /// Allocates a fresh, never-used chain id.
+    ///
+    /// # Errors
+    /// Returns `Self::Error` on a storage failure.
+    fn allocate_chain(&mut self) -> Result<ChainId, Self::Error>;
+
+    /// Records `event` at `position`, with its interned key.
+    ///
+    /// # Errors
+    /// Returns `Self::Error` on a storage failure.
+    fn record_position(
+        &mut self,
+        event: EventSn,
+        position: ChainPosition,
+        key: StateKeyId,
+    ) -> Result<(), Self::Error>;
+
+    /// Records `sequence` as the tip of `chain`.
+    ///
+    /// # Errors
+    /// Returns `Self::Error` on a storage failure.
+    fn record_tip(&mut self, chain: ChainId, sequence: u32) -> Result<(), Self::Error>;
+
+    /// Records the links out of `at`. Never called with an empty `targets`.
+    ///
+    /// # Errors
+    /// Returns `Self::Error` on a storage failure.
+    fn record_links(
+        &mut self,
+        at: ChainPosition,
+        targets: Vec<ChainPosition>,
+    ) -> Result<(), Self::Error>;
+}
+
+/// Adds one event to the index behind `writer` and returns its assigned position.
+///
+/// `key` is the event's interned `(type, state_key)` (only used to prefer keeping a state key's
+/// version history on one chain; the algorithm is correct without this, but the resulting chains
+/// are shorter and less informative without it). `auth_events` is the event's `auth_events`,
+/// which must already have been added.
+///
+/// The chain to extend is chosen, in order of preference, among auth events that are currently
+/// the *tip* of their chain (nothing has extended past them yet -- an auth event that has already
+/// been superseded as someone else's predecessor cannot be extended again without colliding two
+/// different events onto the same position):
+/// 1. An auth event with the same `key` (successive versions of the same piece of state almost
+///    always cite their own predecessor).
+/// 2. Otherwise, the auth event whose existing position has the greatest `sequence` (a
+///    heavy-path heuristic: extending the already-longest chain keeps the chain count low).
+///
+/// If no known auth event is a usable tip (there are none, or every one of them has already been
+/// extended by an earlier fork of the same history), a new chain is started instead, and every
+/// known auth event becomes a link recorded at the new position. Otherwise, every known auth
+/// event *other than* the one chosen to extend becomes a link.
+///
+/// An `auth_events` entry that has not itself been added is silently ignored (treated as outside
+/// the indexed region, exactly like an event whose ancestor chain reaches further back than what
+/// the caller has loaded).
+///
+/// # Errors
+/// Returns the writer's error on a storage failure.
+pub fn add_event<W: ChainWriter>(
+    writer: &mut W,
+    event: EventSn,
+    key: StateKeyId,
+    auth_events: &[EventSn],
+) -> Result<ChainPosition, W::Error> {
+    let mut known: Vec<(EventSn, ChainPosition, StateKeyId)> =
+        Vec::with_capacity(auth_events.len());
+    for a in auth_events {
+        if let Some((p, k)) = writer.position_of(*a)? {
+            known.push((*a, p, k));
+        }
+    }
+    let mut tips: Vec<(EventSn, ChainPosition)> = Vec::with_capacity(known.len());
+    let mut same_key_tip: Option<(EventSn, ChainPosition)> = None;
+    for (id, p, k) in &known {
+        if writer.tip_of(p.chain)? == p.sequence {
+            tips.push((*id, *p));
+            if same_key_tip.is_none() && *k == key {
+                same_key_tip = Some((*id, *p));
+            }
+        }
+    }
+
+    let extend_from = same_key_tip.or_else(|| {
+        tips.iter()
+            .max_by_key(|(id, p)| (p.sequence, std::cmp::Reverse(*id)))
+            .copied()
+    });
+
+    let position = match extend_from {
+        Some((extend_id, extend_pos)) => {
+            let new_position = ChainPosition {
+                chain: extend_pos.chain,
+                sequence: extend_pos.sequence + 1,
+            };
+            writer.record_tip(new_position.chain, new_position.sequence)?;
+            record_links(
+                writer,
+                new_position,
+                known
+                    .iter()
+                    .filter(|(id, _, _)| *id != extend_id)
+                    .map(|(_, p, _)| *p),
+            )?;
+            new_position
+        }
+        None => {
+            let chain = writer.allocate_chain()?;
+            let new_position = ChainPosition { chain, sequence: 1 };
+            writer.record_tip(chain, 1)?;
+            record_links(writer, new_position, known.iter().map(|(_, p, _)| *p))?;
+            new_position
+        }
+    };
+
+    writer.record_position(event, position, key)?;
+    Ok(position)
+}
+
+/// Records links from `at` to `targets`, keeping only the furthest position per target chain (a
+/// link to `(C, s)` subsumes any link to `(C, s')` for `s' <= s`, since chain prefixes are
+/// already transitively covered).
+fn record_links<W: ChainWriter>(
+    writer: &mut W,
+    at: ChainPosition,
+    targets: impl Iterator<Item = ChainPosition>,
+) -> Result<(), W::Error> {
+    let mut link_targets: Vec<ChainPosition> = targets.collect();
+    link_targets.sort_by_key(|p| (p.chain, std::cmp::Reverse(p.sequence)));
+    link_targets.dedup_by_key(|p| p.chain);
+    if !link_targets.is_empty() {
+        writer.record_links(at, link_targets)?;
+    }
+    Ok(())
+}
+
+/// The chain coverage reachable from `roots`: for every chain the auth chains of `roots` touch,
+/// the furthest `sequence` reached on it.
+///
+/// This is the primitive both [`contains`] and [`auth_chain_difference`] are built from:
+/// computing "how far does this set of events' auth chains reach on each chain" costs one
+/// traversal over chains and their link tables, not over individual events.
+///
+/// # Errors
+/// Returns the reader's error on a storage failure.
+pub fn coverage<R: ChainReader + ?Sized>(
+    reader: &R,
+    roots: impl IntoIterator<Item = EventSn>,
+) -> Result<BTreeMap<ChainId, u32>, R::Error> {
+    let mut reach: BTreeMap<ChainId, u32> = BTreeMap::new();
+    let mut stack: Vec<ChainPosition> = Vec::new();
+
+    // A root's *auth chain* is its ancestors, not the root itself: seed the search with the
+    // chain prefix strictly before the root (sequence - 1) and the root's own links (recorded
+    // at its own sequence, for auth events other than the one that extends the chain).
+    for root in roots {
+        let Some((pos, _)) = reader.position_of(root)? else {
+            continue;
+        };
+        if pos.sequence > 1 {
+            stack.push(ChainPosition {
+                chain: pos.chain,
+                sequence: pos.sequence - 1,
+            });
+        }
+        stack.extend(reader.links_at(pos)?);
+    }
+
+    while let Some(pos) = stack.pop() {
+        let entry = reach.entry(pos.chain).or_insert(0);
+        if pos.sequence <= *entry {
+            // Already covered at least this far on this chain; its links were already
+            // followed when that coverage was recorded.
+            continue;
+        }
+        *entry = pos.sequence;
+        stack.extend(reader.links_up_to(pos.chain, pos.sequence)?);
+    }
+
+    Ok(reach)
+}
+
+/// Whether `ancestor` is in `event`'s auth chain. `event` is trivially in its own auth chain
+/// (`ancestor == event` is always `Some(true)` once `event` is indexed), matching how callers
+/// use this -- "has this event's causal history already accounted for `ancestor`" -- even though
+/// the spec's own auth-chain definition (walking `auth_events` edges) does not include an event in
+/// its own chain.
+///
+/// Returns `None` if either event has not been added to the index.
+///
+/// # Errors
+/// Returns the reader's error on a storage failure.
+pub fn contains<R: ChainReader + ?Sized>(
+    reader: &R,
+    event: EventSn,
+    ancestor: EventSn,
+) -> Result<Option<bool>, R::Error> {
+    let Some((ancestor_position, _)) = reader.position_of(ancestor)? else {
+        return Ok(None);
+    };
+    if reader.position_of(event)?.is_none() {
+        return Ok(None);
+    }
+    if event == ancestor {
+        return Ok(Some(true));
+    }
+    let reach = coverage(reader, [event])?;
+    Ok(Some(
+        reach
+            .get(&ancestor_position.chain)
+            .is_some_and(|&max| max >= ancestor_position.sequence),
+    ))
+}
+
+/// The [auth difference](https://spec.matrix.org/v1.19/rooms/v2/#definitions) of `sets`: every
+/// event that is in the union of `sets`' auth chains but not in their intersection.
+///
+/// This is the primitive state resolution v2/v2.1 spends most of its time on
+/// ([`crate::state_res::v2`], [`crate::state_res::oracle`]); with the chain-cover index it costs
+/// one [`coverage`] traversal per input set (each bounded by the number of chains touched, not
+/// the number of events) plus materializing the resulting chain ranges, rather than a full graph
+/// walk per set.
+///
+/// # Errors
+/// Returns the reader's error on a storage failure.
+pub fn auth_chain_difference<R: ChainReader + ?Sized>(
+    reader: &R,
+    sets: &[Vec<EventSn>],
+) -> Result<Vec<EventSn>, R::Error> {
+    let mut coverages: Vec<BTreeMap<ChainId, u32>> = Vec::with_capacity(sets.len());
+    for set in sets {
+        coverages.push(coverage(reader, set.iter().copied())?);
+    }
+
+    let mut all_chains: std::collections::BTreeSet<ChainId> = std::collections::BTreeSet::new();
+    for coverage in &coverages {
+        all_chains.extend(coverage.keys().copied());
+    }
+
+    let mut difference = Vec::new();
+    for chain in all_chains {
+        let maxima: Vec<u32> = coverages
+            .iter()
+            .map(|c| c.get(&chain).copied().unwrap_or(0))
+            .collect();
+        let min = maxima.iter().copied().min().unwrap_or(0);
+        let max = maxima.iter().copied().max().unwrap_or(0);
+        if max > min {
+            difference.extend(reader.events_between(chain, min + 1, max)?);
+        }
+    }
+    Ok(difference)
+}
+
+/// The chain-cover index for one room, in memory.
 ///
 /// Build by calling [`ChainCoverIndex::add_event`] once per event, in an order where every event's
 /// `auth_events` have already been added (any topological order of the auth-events DAG works;
 /// receipt order satisfies this for events accepted normally, since an event's auth events must
 /// already be known and accepted before the event itself is).
+///
+/// This is the reference implementation of [`ChainReader`]/[`ChainWriter`], what
+/// [`crate::store::InMemoryStateStore`] holds and what the property tests below check; the
+/// production store keeps the same index in durable keyspaces (`crate::durable`).
 #[derive(Debug, Clone, Default)]
 pub struct ChainCoverIndex {
     /// Every known event's position.
@@ -66,15 +379,15 @@ pub struct ChainCoverIndex {
     /// The inverse of `position`, for materializing concrete events out of a chain range.
     event_at: BTreeMap<ChainPosition, EventSn>,
     /// The interned `(type, state_key)` of every known event, used only to prefer extending a
-    /// chain along an auth event for the *same* key (see [`ChainCoverIndex::add_event`]).
+    /// chain along an auth event for the *same* key (see [`add_event`]).
     key_of: BTreeMap<EventSn, StateKeyId>,
     /// Links out of a chain: `chain -> sequence -> other positions the auth chain also depends on
     /// as of that sequence`. Recorded only for auth-event edges that were not chosen to extend the
     /// chain itself.
     links: BTreeMap<ChainId, BTreeMap<u32, Vec<ChainPosition>>>,
     /// The highest `sequence` used so far on each chain: only a position exactly at its chain's
-    /// current tip may be extended (see [`ChainCoverIndex::add_event`]), otherwise two events that
-    /// both cite the same ancestor as "the next version" would collide on one position.
+    /// current tip may be extended (see [`add_event`]), otherwise two events that both cite the
+    /// same ancestor as "the next version" would collide on one position.
     chain_tip: BTreeMap<ChainId, u32>,
     next_chain: u32,
 }
@@ -116,218 +429,130 @@ impl ChainCoverIndex {
         self.event_at.get(&position).copied()
     }
 
-    /// Adds one event to the index and returns its assigned position.
-    ///
-    /// `key` is the event's interned `(type, state_key)` (only used to prefer keeping a state
-    /// key's version history on one chain; the algorithm is correct without this, but the
-    /// resulting chains are shorter and less informative without it). `auth_events` is the
-    /// event's `auth_events`, which must already have been added.
-    ///
-    /// The chain to extend is chosen, in order of preference, among auth events that are
-    /// currently the *tip* of their chain (nothing has extended past them yet -- an auth event
-    /// that has already been superseded as someone else's predecessor cannot be extended again
-    /// without colliding two different events onto the same position):
-    /// 1. An auth event with the same `key` (successive versions of the same piece of state
-    ///    almost always cite their own predecessor).
-    /// 2. Otherwise, the auth event whose existing position has the greatest `sequence` (a
-    ///    heavy-path heuristic: extending the already-longest chain keeps the chain count low).
-    ///
-    /// If no known auth event is a usable tip (there are none, or every one of them has already
-    /// been extended by an earlier fork of the same history), a new chain is started instead, and
-    /// every known auth event becomes a link recorded at the new position. Otherwise, every known
-    /// auth event *other than* the one chosen to extend becomes a link.
-    ///
-    /// # Panics
-    /// Never panics; an `auth_events` entry that has not itself been added is silently ignored
-    /// (treated as outside the indexed region, exactly like an event whose ancestor chain reaches
-    /// further back than what the caller has loaded).
+    /// Adds one event to the index and returns its assigned position. See [`add_event`].
     pub fn add_event(
         &mut self,
         event: EventSn,
         key: StateKeyId,
         auth_events: &[EventSn],
     ) -> ChainPosition {
-        self.key_of.insert(event, key);
-
-        let known: Vec<(EventSn, ChainPosition)> = auth_events
-            .iter()
-            .filter_map(|a| self.position.get(a).map(|p| (*a, *p)))
-            .collect();
-        let is_tip =
-            |p: ChainPosition| self.chain_tip.get(&p.chain).copied().unwrap_or(0) == p.sequence;
-
-        let extend_from = known
-            .iter()
-            .filter(|(_, p)| is_tip(*p))
-            .find(|(id, _)| self.key_of.get(id) == Some(&key))
-            .copied()
-            .or_else(|| {
-                known
-                    .iter()
-                    .filter(|(_, p)| is_tip(*p))
-                    .max_by_key(|(id, p)| (p.sequence, std::cmp::Reverse(*id)))
-                    .copied()
-            });
-
-        let position = match extend_from {
-            Some((extend_id, extend_pos)) => {
-                let new_position = ChainPosition {
-                    chain: extend_pos.chain,
-                    sequence: extend_pos.sequence + 1,
-                };
-                self.chain_tip
-                    .insert(new_position.chain, new_position.sequence);
-                self.record_links(
-                    new_position,
-                    known
-                        .iter()
-                        .filter(|(id, _)| *id != extend_id)
-                        .map(|(_, p)| *p),
-                );
-                new_position
-            }
-            None => {
-                let chain = ChainId(self.next_chain);
-                self.next_chain += 1;
-                let new_position = ChainPosition { chain, sequence: 1 };
-                self.chain_tip.insert(chain, 1);
-                self.record_links(new_position, known.iter().map(|(_, p)| *p));
-                new_position
-            }
-        };
-
-        self.position.insert(event, position);
-        self.event_at.insert(position, event);
+        let Ok(position) = add_event(self, event, key, auth_events);
         position
     }
 
-    /// Records links from `at` to `targets`, keeping only the furthest position per target chain
-    /// (a link to `(C, s)` subsumes any link to `(C, s')` for `s' <= s`, since chain prefixes are
-    /// already transitively covered).
-    fn record_links(&mut self, at: ChainPosition, targets: impl Iterator<Item = ChainPosition>) {
-        let mut link_targets: Vec<ChainPosition> = targets.collect();
-        link_targets.sort_by_key(|p| (p.chain, std::cmp::Reverse(p.sequence)));
-        link_targets.dedup_by_key(|p| p.chain);
-        if !link_targets.is_empty() {
-            self.links
-                .entry(at.chain)
-                .or_default()
-                .insert(at.sequence, link_targets);
-        }
-    }
-
-    /// The chain coverage reachable from `roots`: for every chain the auth chains of `roots`
-    /// touch, the furthest `sequence` reached on it.
-    ///
-    /// This is the primitive both [`ChainCoverIndex::contains`] and
-    /// [`ChainCoverIndex::auth_chain_difference`] are built from: computing "how far does this set
-    /// of events' auth chains reach on each chain" costs one traversal over chains and their link
-    /// tables, not over individual events.
+    /// See [`coverage`].
     #[must_use]
     pub fn coverage(&self, roots: impl IntoIterator<Item = EventSn>) -> BTreeMap<ChainId, u32> {
-        let mut reach: BTreeMap<ChainId, u32> = BTreeMap::new();
-        let mut stack: Vec<ChainPosition> = Vec::new();
-
-        // A root's *auth chain* is its ancestors, not the root itself: seed the search with the
-        // chain prefix strictly before the root (sequence - 1) and the root's own links (recorded
-        // at its own sequence, for auth events other than the one that extends the chain).
-        for root in roots {
-            let Some(pos) = self.position.get(&root).copied() else {
-                continue;
-            };
-            if pos.sequence > 1 {
-                stack.push(ChainPosition {
-                    chain: pos.chain,
-                    sequence: pos.sequence - 1,
-                });
-            }
-            if let Some(targets) = self
-                .links
-                .get(&pos.chain)
-                .and_then(|by_seq| by_seq.get(&pos.sequence))
-            {
-                stack.extend(targets.iter().copied());
-            }
-        }
-
-        while let Some(pos) = stack.pop() {
-            let entry = reach.entry(pos.chain).or_insert(0);
-            if pos.sequence <= *entry {
-                // Already covered at least this far on this chain; its links were already
-                // followed when that coverage was recorded.
-                continue;
-            }
-            *entry = pos.sequence;
-
-            if let Some(by_sequence) = self.links.get(&pos.chain) {
-                for targets in by_sequence.range(..=pos.sequence).map(|(_, t)| t) {
-                    stack.extend(targets.iter().copied());
-                }
-            }
-        }
-
+        let Ok(reach) = coverage(self, roots);
         reach
     }
 
-    /// Whether `ancestor` is in `event`'s auth chain. `event` is trivially in its own auth chain
-    /// (`ancestor == event` is always `Some(true)` once `event` is indexed), matching how callers
-    /// use this -- "has this event's causal history already accounted for `ancestor`" -- even
-    /// though the spec's own auth-chain definition (walking `auth_events` edges) does not include
-    /// an event in its own chain.
-    ///
-    /// Returns `None` if either event has not been added to the index.
+    /// See [`contains`].
     #[must_use]
     pub fn contains(&self, event: EventSn, ancestor: EventSn) -> Option<bool> {
-        let ancestor_position = self.position(ancestor)?;
-        if !self.position.contains_key(&event) {
-            return None;
-        }
-        if event == ancestor {
-            return Some(true);
-        }
-        let reach = self.coverage([event]);
-        Some(
-            reach
-                .get(&ancestor_position.chain)
-                .is_some_and(|&max| max >= ancestor_position.sequence),
-        )
+        let Ok(answer) = contains(self, event, ancestor);
+        answer
     }
 
-    /// The [auth difference](https://spec.matrix.org/v1.19/rooms/v2/#definitions) of `sets`: every
-    /// event that is in the union of `sets`' auth chains but not in their intersection.
-    ///
-    /// This is the primitive state resolution v2/v2.1 spends most of its time on
-    /// ([`crate::state_res::v2`], [`crate::state_res::oracle`]); with the chain-cover index it
-    /// costs one [`coverage`](Self::coverage) traversal per input set (each bounded by the number
-    /// of chains touched, not the number of events) plus materializing the resulting chain
-    /// ranges, rather than a full graph walk per set.
+    /// See [`auth_chain_difference`].
     #[must_use]
     pub fn auth_chain_difference(&self, sets: &[Vec<EventSn>]) -> Vec<EventSn> {
-        let coverages: Vec<BTreeMap<ChainId, u32>> = sets
-            .iter()
-            .map(|set| self.coverage(set.iter().copied()))
-            .collect();
-
-        let mut all_chains: std::collections::BTreeSet<ChainId> = std::collections::BTreeSet::new();
-        for coverage in &coverages {
-            all_chains.extend(coverage.keys().copied());
-        }
-
-        let mut difference = Vec::new();
-        for chain in all_chains {
-            let maxima: Vec<u32> = coverages
-                .iter()
-                .map(|c| c.get(&chain).copied().unwrap_or(0))
-                .collect();
-            let min = maxima.iter().copied().min().unwrap_or(0);
-            let max = maxima.iter().copied().max().unwrap_or(0);
-            for sequence in (min + 1)..=max {
-                if let Some(event) = self.event_at(ChainPosition { chain, sequence }) {
-                    difference.push(event);
-                }
-            }
-        }
+        let Ok(difference) = auth_chain_difference(self, sets);
         difference
+    }
+}
+
+impl ChainReader for ChainCoverIndex {
+    type Error = Infallible;
+
+    fn position_of(
+        &self,
+        event: EventSn,
+    ) -> Result<Option<(ChainPosition, StateKeyId)>, Infallible> {
+        Ok(self
+            .position
+            .get(&event)
+            .and_then(|p| self.key_of.get(&event).map(|k| (*p, *k))))
+    }
+
+    fn tip_of(&self, chain: ChainId) -> Result<u32, Infallible> {
+        Ok(self.chain_tip.get(&chain).copied().unwrap_or(0))
+    }
+
+    fn links_at(&self, at: ChainPosition) -> Result<Vec<ChainPosition>, Infallible> {
+        Ok(self
+            .links
+            .get(&at.chain)
+            .and_then(|by_seq| by_seq.get(&at.sequence))
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    fn links_up_to(&self, chain: ChainId, sequence: u32) -> Result<Vec<ChainPosition>, Infallible> {
+        Ok(self
+            .links
+            .get(&chain)
+            .map(|by_seq| {
+                by_seq
+                    .range(..=sequence)
+                    .flat_map(|(_, targets)| targets.iter().copied())
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    fn events_between(
+        &self,
+        chain: ChainId,
+        from: u32,
+        to: u32,
+    ) -> Result<Vec<EventSn>, Infallible> {
+        let lo = ChainPosition {
+            chain,
+            sequence: from,
+        };
+        let hi = ChainPosition {
+            chain,
+            sequence: to,
+        };
+        Ok(self.event_at.range(lo..=hi).map(|(_, e)| *e).collect())
+    }
+}
+
+impl ChainWriter for ChainCoverIndex {
+    fn allocate_chain(&mut self) -> Result<ChainId, Infallible> {
+        let chain = ChainId(self.next_chain);
+        self.next_chain += 1;
+        Ok(chain)
+    }
+
+    fn record_position(
+        &mut self,
+        event: EventSn,
+        position: ChainPosition,
+        key: StateKeyId,
+    ) -> Result<(), Infallible> {
+        self.key_of.insert(event, key);
+        self.position.insert(event, position);
+        self.event_at.insert(position, event);
+        Ok(())
+    }
+
+    fn record_tip(&mut self, chain: ChainId, sequence: u32) -> Result<(), Infallible> {
+        self.chain_tip.insert(chain, sequence);
+        Ok(())
+    }
+
+    fn record_links(
+        &mut self,
+        at: ChainPosition,
+        targets: Vec<ChainPosition>,
+    ) -> Result<(), Infallible> {
+        self.links
+            .entry(at.chain)
+            .or_default()
+            .insert(at.sequence, targets);
+        Ok(())
     }
 }
 

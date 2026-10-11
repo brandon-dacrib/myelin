@@ -11,11 +11,13 @@
 //! [`hs_model::room_version::RoomVersionRules`].
 //!
 //! `ruma_state_res::resolve` also needs each input state map's *auth chain* (every event
-//! reachable by following `auth_events`) to compute the auth difference. This module computes
-//! that by walking `auth_events` in [`super::EventStore`] directly; the chain-cover index
-//! (`crate::chain_cover`) exists precisely to make that walk fast on a real room, but a resolver
-//! given a small `EventStore` (as every caller of this module is, today) does not need it.
+//! reachable by following `auth_events`) to compute the auth difference. This module asks the
+//! [`super::EventFetch`] for it ([`super::EventFetch::auth_chain`]): the in-memory
+//! [`super::EventStore`] walks `auth_events` directly, and the production store answers from
+//! its chain-cover index (`crate::chain_cover`), which exists precisely to make that walk fast
+//! on a real room. Events are fetched on demand, and only those the resolution touches.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use ruma::events::{StateEventType, TimelineEventType};
@@ -27,7 +29,7 @@ use ruma::{
 };
 use serde_json::value::RawValue as RawJsonValue;
 
-use super::{EventStore, ResolutionEvent, StateMap};
+use super::{EventFetch, ResolutionEvent, StateMap};
 use crate::error::StateResError;
 
 /// Resolves a set of state maps under state resolution v2 (room versions 2 to 11) or v2.1 (room
@@ -36,10 +38,10 @@ use crate::error::StateResError;
 /// # Errors
 /// Returns [`StateResError::UnsupportedInput`] if `room_version` does not use state resolution
 /// v2/v2.1, or if `ruma-state-res` itself reports an error (malformed events, a missing event).
-pub fn resolve(
+pub fn resolve<F: EventFetch + ?Sized>(
     room_version: &RoomVersionId,
     states: &[StateMap],
-    store: &EventStore,
+    store: &F,
 ) -> Result<StateMap, StateResError> {
     let rules = room_version.rules().ok_or_else(|| {
         StateResError::UnsupportedInput(format!("unknown room version {room_version}"))
@@ -50,15 +52,26 @@ pub fn resolve(
         ))
     })?;
 
-    let adapters: HashMap<OwnedEventId, Adapter> = store
-        .iter()
-        .map(|(id, event)| (id.clone(), Adapter::new(event)))
-        .collect();
+    // Adapted on first fetch and memoised: `ruma-state-res` asks for the same event many times
+    // (every auth check of every conflicted event re-reads its auth events), and adapting one
+    // re-serialises its content.
+    let adapters: RefCell<HashMap<OwnedEventId, Adapter>> = RefCell::new(HashMap::new());
+    let fetch_event = |id: &EventId| -> Option<Adapter> {
+        if let Some(adapter) = adapters.borrow().get(id) {
+            return Some(adapter.clone());
+        }
+        let adapter = Adapter::new(store.fetch(id)?);
+        adapters.borrow_mut().insert(id.to_owned(), adapter.clone());
+        Some(adapter)
+    };
 
     let auth_chains: Vec<EventIdSet<OwnedEventId>> = states
         .iter()
-        .map(|state| auth_chain_of(state.values(), store))
-        .collect::<Result<_, _>>()?;
+        .map(|state| {
+            let ids: Vec<OwnedEventId> = state.values().cloned().collect();
+            store.auth_chain(&ids)
+        })
+        .collect();
 
     let converted: Vec<ruma::state_res::StateMap<OwnedEventId>> = states
         .iter()
@@ -80,7 +93,7 @@ pub fn resolve(
         &state_res_rules,
         converted.iter(),
         auth_chains,
-        |id: &EventId| adapters.get(id).cloned(),
+        fetch_event,
         // The conflicted state subgraph (MSC4297, state resolution v2.1): the conflicted events
         // and every event on an `auth_events` path from one to another. `ruma-state-res` asks
         // for it only under v2.1. Until 2026-10-04 the conflicted events alone were answered,
@@ -102,13 +115,13 @@ pub fn resolve(
 /// The conflicted state subgraph of `conflicted` (MSC4297): those events, and every event that
 /// is an `auth_events` ancestor of one of them and has another of them among its own
 /// ancestors -- that is, lies on a path between two. Walked within `store`, each event once.
-fn conflicted_subgraph(
+fn conflicted_subgraph<F: EventFetch + ?Sized>(
     conflicted: &[OwnedEventId],
-    store: &EventStore,
+    store: &F,
 ) -> EventIdSet<OwnedEventId> {
     let targets: std::collections::HashSet<&OwnedEventId> = conflicted.iter().collect();
     // Every strict ancestor of a conflicted event.
-    let ancestors = auth_chain_of(conflicted.iter(), store).unwrap_or_default();
+    let ancestors = store.auth_chain(conflicted);
     // Whether an event is conflicted or reaches one through `auth_events`, memoised; the
     // walk is iterative so a long auth chain does not exhaust the stack.
     let mut reaches: HashMap<OwnedEventId, bool> = HashMap::new();
@@ -127,7 +140,7 @@ fn conflicted_subgraph(
                 continue;
             }
             let auth: Vec<OwnedEventId> = store
-                .get(&id)
+                .fetch(&id)
                 .map(|event| event.auth_events.clone())
                 .unwrap_or_default();
             if expanded {
@@ -149,30 +162,6 @@ fn conflicted_subgraph(
         }
     }
     set
-}
-
-/// Walks `auth_events` transitively from every event in `ids`, within `store`.
-fn auth_chain_of<'a>(
-    ids: impl Iterator<Item = &'a OwnedEventId>,
-    store: &EventStore,
-) -> Result<EventIdSet<OwnedEventId>, StateResError> {
-    let mut seen = EventIdSet::new();
-    let mut stack: Vec<OwnedEventId> = ids.cloned().collect();
-    while let Some(id) = stack.pop() {
-        let Some(event) = store.get(&id) else {
-            // An event outside the store (for example, a state event whose auth chain reaches
-            // further back than what the caller loaded) is not itself an error: callers are
-            // expected to load enough of the room's history for the room versions and scenarios
-            // they resolve. We simply stop walking past it.
-            continue;
-        };
-        for auth_id in &event.auth_events {
-            if seen.insert(auth_id.clone()) {
-                stack.push(auth_id.clone());
-            }
-        }
-    }
-    Ok(seen)
 }
 
 /// Adapts [`ResolutionEvent`] to `ruma_state_res::Event`.

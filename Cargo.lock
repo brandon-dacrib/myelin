@@ -1447,6 +1447,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
 
 [[package]]
+name = "elsa"
+version = "1.11.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9abf33c656a7256451ebb7d0082c5a471820c31269e49d807c538c252352186e"
+dependencies = [
+ "stable_deref_trait",
+]
+
+[[package]]
 name = "email-encoding"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2762,9 +2771,11 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "ed25519-dalek 2.2.0",
+ "elsa",
  "hs-kv",
  "hs-model",
  "hs-tables",
+ "prometheus-client",
  "proptest",
  "rand 0.9.5",
  "ruma 0.15.1",

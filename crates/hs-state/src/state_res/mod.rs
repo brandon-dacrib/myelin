@@ -32,6 +32,7 @@ pub(crate) mod test_support;
 use std::collections::BTreeMap;
 
 use hs_model::canonical::CanonicalJsonObject;
+use ruma::state_res::utils::event_id_set::EventIdSet;
 use ruma::{EventId, OwnedEventId, OwnedRoomId, OwnedUserId};
 
 use crate::state_fetch::{StateEntry, StateFetch};
@@ -76,22 +77,65 @@ pub struct ResolutionEvent {
 
 /// A lookup from event ID to [`ResolutionEvent`], shared by all events under resolution
 /// (typically: every event in the room, or at least everything reachable from the state maps
-/// being resolved and their auth chains).
+/// being resolved and their auth chains). The in-memory [`EventFetch`]; the production store
+/// reads records on demand instead (`crate::kv_store`).
 pub type EventStore = BTreeMap<OwnedEventId, ResolutionEvent>;
 
-/// A [`StateFetch`] backed by a [`StateMap`] plus an [`EventStore`]: resolves `(type, state_key)`
-/// to an ID via the map, then the ID to sender/content via the store.
-pub(crate) struct MapStateFetch<'a> {
-    pub map: &'a StateMap,
-    pub store: &'a EventStore,
+/// What the resolution algorithms read events through: by ID, on demand.
+///
+/// Until 2026-10-10 every resolver took an [`EventStore`] holding every event of the room; the
+/// production store now reads the records a resolution touches from durable keyspaces, which
+/// is what this trait abstracts over. A returned reference lives as long as the fetch does
+/// (an append-only arena behind the production implementation), so callers can hold several
+/// events at once without cloning them.
+pub trait EventFetch {
+    /// The event with this ID, if available.
+    fn fetch(&self, id: &EventId) -> Option<&ResolutionEvent>;
+
+    /// Every event reachable from `ids` by following `auth_events` transitively (the ids
+    /// themselves only if reachable from another). The default walks [`EventFetch::fetch`];
+    /// the production store answers from its chain-cover index instead.
+    ///
+    /// An event outside the fetch (for example, a state event whose auth chain reaches further
+    /// back than what the caller loaded) is not itself an error: callers are expected to load
+    /// enough of the room's history for the room versions and scenarios they resolve. The walk
+    /// simply stops past it.
+    fn auth_chain(&self, ids: &[OwnedEventId]) -> EventIdSet<OwnedEventId> {
+        let mut seen = EventIdSet::new();
+        let mut stack: Vec<OwnedEventId> = ids.to_vec();
+        while let Some(id) = stack.pop() {
+            let Some(event) = self.fetch(&id) else {
+                continue;
+            };
+            for auth_id in &event.auth_events {
+                if seen.insert(auth_id.clone()) {
+                    stack.push(auth_id.clone());
+                }
+            }
+        }
+        seen
+    }
 }
 
-impl StateFetch for MapStateFetch<'_> {
+impl EventFetch for EventStore {
+    fn fetch(&self, id: &EventId) -> Option<&ResolutionEvent> {
+        self.get(id)
+    }
+}
+
+/// A [`StateFetch`] backed by a [`StateMap`] plus an [`EventFetch`]: resolves `(type, state_key)`
+/// to an ID via the map, then the ID to sender/content via the fetch.
+pub(crate) struct MapStateFetch<'a, F: EventFetch + ?Sized> {
+    pub map: &'a StateMap,
+    pub store: &'a F,
+}
+
+impl<F: EventFetch + ?Sized> StateFetch for MapStateFetch<'_, F> {
     fn get(&self, event_type: &str, state_key: &str) -> Option<StateEntry<'_>> {
         let id = self
             .map
             .get(&(event_type.to_owned(), state_key.to_owned()))?;
-        let event = self.store.get(id)?;
+        let event = self.store.fetch(id)?;
         Some(StateEntry {
             sender: &event.sender,
             content: &event.content,

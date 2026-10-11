@@ -640,6 +640,14 @@ impl<KV: KvBackend> StateRepr for PersistentMapRepr<KV> {
         RootC(EMPTY)
     }
 
+    fn encode_root(&self, root: RootC) -> Vec<u8> {
+        root.0.to_vec()
+    }
+
+    fn decode_root(&self, bytes: &[u8]) -> Option<RootC> {
+        <[u8; 16]>::try_from(bytes).ok().map(RootC)
+    }
+
     fn get(&self, root: RootC, key: StateKeyId) -> Result<Option<EventSn>, Error> {
         self.get_rec(root.0, 0, key.get())
     }
