@@ -2167,7 +2167,7 @@ dependencies = [
 
 [[package]]
 name = "hs-admin"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2197,7 +2197,7 @@ dependencies = [
 
 [[package]]
 name = "hs-appservice"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -2228,7 +2228,7 @@ dependencies = [
 
 [[package]]
 name = "hs-auth"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "argon2",
  "async-trait",
@@ -2270,7 +2270,7 @@ dependencies = [
 
 [[package]]
 name = "hs-bridge-conformance"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2294,7 +2294,7 @@ dependencies = [
 
 [[package]]
 name = "hs-bridges"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -2323,7 +2323,7 @@ dependencies = [
 
 [[package]]
 name = "hs-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2384,7 +2384,7 @@ dependencies = [
 
 [[package]]
 name = "hs-cluster"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2417,7 +2417,7 @@ dependencies = [
 
 [[package]]
 name = "hs-compat"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -2443,7 +2443,7 @@ dependencies = [
 
 [[package]]
 name = "hs-config"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "hs-kv",
  "schemars 1.2.2",
@@ -2456,7 +2456,7 @@ dependencies = [
 
 [[package]]
 name = "hs-e2e"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -2485,7 +2485,7 @@ dependencies = [
 
 [[package]]
 name = "hs-federation"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -2530,7 +2530,7 @@ dependencies = [
 
 [[package]]
 name = "hs-http"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -2561,7 +2561,7 @@ dependencies = [
 
 [[package]]
 name = "hs-kv"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "criterion",
@@ -2583,7 +2583,7 @@ dependencies = [
 
 [[package]]
 name = "hs-loadgen"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "matrix-sdk",
@@ -2597,7 +2597,7 @@ dependencies = [
 
 [[package]]
 name = "hs-media"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -2637,7 +2637,7 @@ dependencies = [
 
 [[package]]
 name = "hs-model"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -2653,7 +2653,7 @@ dependencies = [
 
 [[package]]
 name = "hs-modules"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -2669,7 +2669,7 @@ dependencies = [
 
 [[package]]
 name = "hs-operator"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "axum",
  "futures",
@@ -2693,7 +2693,7 @@ dependencies = [
 
 [[package]]
 name = "hs-push"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -2722,7 +2722,7 @@ dependencies = [
 
 [[package]]
 name = "hs-room"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -2754,11 +2754,11 @@ dependencies = [
 
 [[package]]
 name = "hs-search"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "hs-spec-coverage"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2769,7 +2769,7 @@ dependencies = [
 
 [[package]]
 name = "hs-state"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -2790,7 +2790,7 @@ dependencies = [
 
 [[package]]
 name = "hs-tables"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "hs-kv",
@@ -2801,7 +2801,7 @@ dependencies = [
 
 [[package]]
 name = "hs-telemetry"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "hex",
  "http",
@@ -2827,7 +2827,7 @@ dependencies = [
 
 [[package]]
 name = "hs-testkit"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "axum",
  "bytes",
@@ -2845,7 +2845,7 @@ dependencies = [
 
 [[package]]
 name = "hs-user"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "axum",

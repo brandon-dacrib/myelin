@@ -12,6 +12,32 @@ everything before it shipped only as `main` images.
 
 ## Unreleased
 
+## 0.3.0 (2026-10-11)
+
+Two bridges the catalogue did not get right: one whose config layout was wrong, and one that
+does not run in a container at all.
+
+- **Discord bridges start.** mautrix-discord v0.7.7 is on mautrix-go's older bridge framework,
+  whose `config.yaml` keeps the database under `appservice` and the rest under `bridge`; the
+  server rendered every mautrix type in the `bridgev2` layout, and the demo's Discord bridge
+  exited at once with `appservice.database not configured`. The catalogue now knows which layout
+  each type reads and renders Discord's own; a deployed instance rolls by itself because its
+  files changed. Its sign-in query says `none` with why (that framework has no `whoami`) instead
+  of a refused call. Verified key by key against the bridge's example config in tests; the
+  demo's Discord pod reaching Running is the roll's first check.
+- **iMessage is offered.** mautrix-imessage is a program for the person's Mac, so the server
+  never deploys it: the catalogue says `runs_on: mac` with a pinned CI build (the project has no
+  release tags), the offering runs elsewhere, and the person's row has **Set up on a Mac**: the
+  download, a field for the Mac's hostname or IP (`PUT …/instances/{user}` with `address`; the
+  registration's `url`, the files and the server's pings follow it), the files with a `run.sh`
+  that fetches the build, clears quarantine and starts the bridge, and the steps (Full Disk
+  Access, keeping the Mac awake). The config switches the bridge's websocket proxy off so it
+  listens and the server pushes to the Mac, which the server must be able to reach. Verified
+  against the real server with a stand-in at the address, which took the instance to ready; not
+  yet run on a real Mac (`docs/bridges/imessage.md`).
+- **The admin API** (0.1.15) says where each bridge type runs, where to download a Mac program,
+  and where the server reaches each instance.
+
 ## 0.2.0 (2026-10-10)
 
 The first tagged release. Its theme is the first week on the public internet: the demo federated

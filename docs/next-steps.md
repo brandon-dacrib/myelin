@@ -31,6 +31,17 @@ Verified against the real binary with a stand-in at the address; **not yet run o
 that is the owner's step (`docs/bridges/imessage.md`, "What was verified"). The server must
 reach the Mac on 29331 (same network or Tailscale); a Mac behind NAT needs a websocket on the
 server's side, not done.
+All three branches are **merged** (`cf8566ee`, `ed280918`, `47238821`) and the owner called this
+**release 0.3.0**: the workspace, the chart and the web app say so and `v0.3.0` is tagged; CD
+builds the `0.3.0` image from the tag. **The roll is the owner's step** (the session's `helm
+upgrade` through the proxy is refused by the harness's classifier, as on 2026-10-10): from a
+plain shell, `helm --kube-context admin@dacrib0 get values myelin -n myelin -o yaml >
+/tmp/myelin-values.yaml && helm --kube-context admin@dacrib0 upgrade myelin deploy/helm/hs -n
+myelin -f /tmp/myelin-values.yaml -f deploy/demo/values-bridges.yaml --set image.tag=0.3.0
+--wait --timeout 10m` from the `v0.3.0` checkout, once `gh run list --workflow cd` shows the
+tag's run green. Then: the pods (`bridge-discord-brandon` is gone from the demo already, so the
+Discord check is to request one again and see it reach Running), the Bridges page, the WARN
+rate, and iMessage on the owner's Mac.
 
 **2026-10-11, later (branch `agent/imessage-web`, off `agent/imessage-offering`, status 16): the
 web half of the iMessage offering.** For a type with `runs_on: "mac"` the instance row's action is
