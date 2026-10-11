@@ -1,10 +1,10 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-10-10, 22:10 EDT (the memory leak: two causes, five branches merged, 0.2.0 in its gate). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+Written 2026-09-20 by the integration lead, last revised 2026-10-10, 23:15 EDT (0.2.0 tagged and published; the memory leak's two causes fixed). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
-## Resume here: 2026-10-10, 22:10 EDT -- the memory leak has two causes, both fixed and on main; 0.2.0 is in its gate; the state store's half needs its hs-room side
+## Resume here: 2026-10-10, 23:15 EDT -- 0.2.0 is tagged and published with both memory fixes; roll it to the demo; the state store's half needs its hs-room side
 
 **Read this first.** Nothing rolled to the demo tonight. It runs `sha-2d11ea2e` (revision 17) with
 the pod's memory limit raised by the owner from the chart's default to **2Gi at 22:45 UTC
@@ -120,14 +120,14 @@ run failed on `cluster_rejoin.rs`'s "a room on B" wait, a load flake that passed
 `a_second_wake_for_a_mirrored_room_reads_only_the_new_positions`, in-memory backend, passed 3/3
 alone: a timing flake). Two gates were lost to flakes under load; both tests want a look
 (track 14). **`agent/version-0.2`** (workspace, chart and web app at 0.2.0; CHANGELOG opens
-"0.2.0 (2026-10-10)") entered its gate at 22:07; when it merges, tag `v0.2.0` on that commit and
-CD publishes image `0.2.0`/`0.2`/`latest`, chart `0.2.0` and a GitHub release
-(`deploy/helm/hs/ci/chart-version.sh`). `agent/state-load` stays unmerged until its hs-room half
+"0.2.0 (2026-10-10)") merged at 22:26 as `0ee2c597`, **tagged `v0.2.0`**; CD run 38105196046 was green at 23:15
+(binaries, both image architectures, manifest list, chart 0.2.0, GitHub release): the image is
+`ghcr.io/brandon-dacrib/myelin:0.2.0`. The owner rolls it as revision 18 with the commands in
+the paragraph below. `agent/state-load` stays unmerged until its hs-room half
 is done (above). If a gate was cut off: check `ps` for `merge-queue.sh`, `rmdir
 .git/myelin-merge.lock`, rerun `tools/merge-queue.sh <branch>`.
 
-**Then, with the owner:** build and roll the image of the merged main to the demo (revision 18)
-and watch, over an hour, `process_resident_memory_bytes` (should saw-tooth under
+**Then, with the owner:** roll `0.2.0` to the demo (revision 18): `helm get values myelin -n myelin -o yaml > /tmp/myelin-values.yaml`, then `helm upgrade myelin deploy/helm/hs -n myelin -f /tmp/myelin-values.yaml -f deploy/demo/values-bridges.yaml --set image.tag=0.2.0 --wait --timeout 10m` from a `v0.2.0` checkout; and watch, over an hour, `process_resident_memory_bytes` (should saw-tooth under
 `hs_kv_fjall_write_buffer_cap_bytes`, no slope), `hs_room_events_cached` against resident rooms,
 `hs_federation_sender_destinations_backing_off`, and the WARN rate in the log (should fall from
 7/s to a handful a minute). The memory limit can go back toward the chart default once boot
