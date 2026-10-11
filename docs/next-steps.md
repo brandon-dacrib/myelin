@@ -1,10 +1,123 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-10-10, 18:20 EDT (public federation through a Funnel; the join fix rolled as 2d11ea2e). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+Written 2026-09-20 by the integration lead, last revised 2026-10-10, 20:45 EDT (the memory leak: two causes, five branches, one merged). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
-## Resume here: 2026-10-10, 18:20 EDT -- the demo runs `2d11ea2e` and federates from the public internet; the first public join found two bugs, fixed and rolled
+## Resume here: 2026-10-10, 20:45 EDT -- the memory leak has two causes, both fixed on branches; one is on main, four are in the merge queue, one is being written
+
+**Read this first.** Nothing rolled to the demo tonight. It runs `sha-2d11ea2e` (revision 17) with
+the pod's memory limit raised by the owner from the chart's default to **2Gi at 22:45 UTC
+(revision 16) and 3Gi at 23:11 UTC (revision 17)**, because the server was over its limit. The
+owner also created a second bridge (`bridge-signal-brandon`, 22:59 UTC, mautrix-signal
+`v0.2609.0`) by hand; the owner said work around multiple bridges is not needed, so none is
+planned. The owner's `kubectl proxy` on 127.0.0.1:8001 was up all evening and is how every
+cluster number below was read.
+
+**The evidence** (`container_memory_working_set_bytes` from the cluster's Prometheus, read
+23:17 UTC; the server exported no process memory metric of its own):
+
+| UTC | working set | what was happening |
+|---|---|---|
+| 15:18 -> 18:33 | 272 -> 315 MiB | idle on `87d57288`: a straight line, 13 MiB/h |
+| 19:00 -> 19:28, 21:08 -> 22:13 | 181 -> 187, 346 -> 362 MiB | the same slope on every build of the day |
+| 22:18 -> 23:08 | 162 -> 1318 MiB | revision 15 booted, then `/join #matrix:matrix.org` and others |
+| 23:13, 60 s after boot | 1225 MiB | revision 17: held at boot before any traffic |
+
+The log in a 400 s window: 2,790 WARN `federation transaction failed; will retry` (7/s), mostly
+destinations whose DNS is gone, 73 outbound queues resumed at boot, every `hs_federation_*`
+counter on `/metrics` reading zero because nothing had observed those labels yet.
+
+**Cause 1, the idle creep: Fjall's write buffer.** Fjall keeps every version of a rewritten key
+in the memtable until it flushes (64 MiB per keyspace by default), and `hs-kv` set no cap on the
+total. The federation sender wrote a destination's retry state on *every* failed attempt, and a
+destination that did not resolve was never backed off by the client, so hundreds of dead servers
+named by the big rooms fed the memtables. Proved in `crates/hs-federation/tests/sender_soak.rs`
+(ignored): the same sender at 25 attempts/s grows +8.2 MiB/h over Fjall and is flat over
+`MemoryBackend`. Two branches:
+
+- `agent/leak-hunt` (status 06, decision 0043, RFC 0024; `d458acc9`, `6999cd13`): the sender
+  writes once per backoff step; `FederationClient` records a `Discovery` failure so a server
+  that does not resolve is refused with `Backoff` for every caller (joins and key fetches too);
+  three WARNs per dead destination ever, the rest DEBUG; `process_resident_memory_bytes`,
+  `process_virtual_memory_bytes` (hs-cli `process_metrics.rs`), `hs_federation_transactions_total{outcome}`,
+  `hs_federation_pdus_sent_total`, `hs_federation_sender_{destinations,pdus_pending,edus_queued,destinations_backing_off,state_bytes}`,
+  every label pre-created so series render from the first scrape; `docs/ops/memory.md`;
+  `tools/rss-sample.sh`. Soak after the fix: flat over 15 minutes.
+- `agent/fjall-write-buffer` (status 01, RFC 0024 implemented; `663973d9`, `a0d9d8e0`, rebased
+  onto leak-hunt): **Fjall 3.1.10's `Builder::max_write_buffer_size` is a deprecated no-op**, so
+  hs-kv enforces the cap itself after every commit (32 MiB total; when over, `rotate_memtable`
+  on every keyspace not already flushing) and creates keyspaces with a 16 MiB memtable; live
+  gauges `hs_kv_fjall_write_buffer_bytes`, `_cap_bytes`, `_rotations_total`,
+  `hs_kv_fjall_sealed_memtables`. Soak (100 keyspaces, 25 rewrites/s, 8 KiB values, 5 min):
+  uncapped +817 MiB/h in a straight line, capped flat at 45 MiB. Note: since decision 0024 every
+  table is a prefix of one shared keyspace, so a fresh directory has one memtable; the demo's
+  directory predates that and has the per-table layout (`_rotations_total` > 0 after the roll
+  will confirm).
+
+**Cause 2, the 1.2 GiB at boot: the room actor held every event.** `agent/room-memory`
+**(merged, `6133b31b`, status 04, decision 0044)**: a per-room LRU window of event bodies
+(`server.rooms.event_cache_size`, default 1,000, hot), the rest read from the store, no
+whole-history id index, three O(history) scans replaced; `server.rooms.idle_unload_after`;
+`hs_room_events_cached`, `hs_room_resident_rooms`, `hs_room_actors_alive`, cache miss/eviction
+counters. A 50,000-event room: 386 MiB -> 114 MiB resident, load 1.28 s -> 0.75 s. **The 114 MiB
+that remain are `hs-state`'s in-memory per-event records (`KvStateStore::CommonInner`), rebuilt
+by replaying every event on every open**, so boot still reads the whole room. RFC 0025 asks
+track 02 to make them durable; `agent/state-load` (hs-02, worktree `.claude/worktrees/state-load`)
+was writing that when the session ended: durable `state_at` and `(type, state_key)` interning,
+`ResolutionEvent`s read by sn on demand, a lazy chain index, a one-time migration per room with a
+version marker, `hs_state_open_seconds`, `hs_state_events_replayed_total`. See its status 02
+entry (or a `WIP:` commit) for how far it got. Decision number 0045 is reserved for it.
+
+**Also finished tonight** (the branches the last session left mid-flight):
+
+- `agent/fed-destinations` (status 06, decision 0042, OpenAPI 0.1.14; tip `cbb3e26c`): a
+  destination this server shares no room with can be forgotten (`DELETE
+  /federation/destinations/{name}`, 409 naming shared rooms unless `force`), pruned
+  (`POST .../prune` with `dry_run` and `failing_for`), and is swept hourly
+  (`federation.forget_unused_destinations_after`, default 1w, hot); Federation page filter,
+  Forget button, Prune panel; `hs_federation_destinations_forgotten_total{reason,by}`. **Its first
+  gate failed** on `federation_restart.rs::an_event_queued_for_a_server_that_is_down...`, a race
+  that exists on main too: the room registry re-announces a room's head after a reload and
+  hs-cli's forwarder queued the same event again. Fixed in `cbb3e26c` (the forwarder keeps a
+  forwarded position per room in the sender's store; regression test in
+  `hs-cli/tests/federation_sender.rs`), and `pending_pdu_count` uses the store's count only
+  when this replica has no worker for the destination.
+- `agent/notary-keys` (status 06; tip `5426f543`, rebased onto fed-destinations): keys a server
+  no longer publishes come from `federation.trusted_key_servers` (default matrix.org, as
+  Synapse), notary and origin signatures both required, the origin preferred when both answer,
+  notaries asked once for the leftovers after the origins; `federation.key_fetch_timeout`
+  (default 10s, hot); `hs_federation_key_fetch_total{source}`; one in-flight join per (room,
+  user) (`InFlightJoins`, `hs_federation_join_requests_total{share}`). Expect `accepted a
+  server's key response from a notary` lines after the roll. Left: a real three-server notary
+  test; notaries and their backoff on the Federation page.
+
+**The merge queue when the session ended.** Serial, through `tools/merge-queue.sh`, PostgreSQL
+gate servers up (`.claude/gate-pg/env.sh`): `agent/room-memory` merged 20:29 EDT. The stack
+`agent/fed-destinations,agent/leak-hunt` entered its gate at 20:24 (the queue's `target/` hit
+102 GB and it pruned `incremental`), with `agent/notary-keys` and then `agent/fjall-write-buffer`
+queued behind it. **If a gate was cut off by the session's end, `.git/myelin-merge.lock` may be
+left behind: check `ps` for `merge-queue.sh`, then `rmdir` the lock and run
+`tools/merge-queue.sh agent/fed-destinations,agent/leak-hunt agent/notary-keys agent/fjall-write-buffer`**
+(notary-keys and fjall-write-buffer were each rebased onto the branch before them, so the order
+matters). Numbers are already disjoint: decisions 0042 fed-destinations, 0043 leak-hunt, 0044
+room-memory (merged), 0045 reserved for state-load; RFC 0024 is on both leak-hunt and
+fjall-write-buffer (the latter's copy, status implemented, wins), RFC 0025 room-memory's.
+
+**Then, with the owner:** build and roll the image of the merged main to the demo (revision 18)
+and watch, over an hour, `process_resident_memory_bytes` (should saw-tooth under
+`hs_kv_fjall_write_buffer_cap_bytes`, no slope), `hs_room_events_cached` against resident rooms,
+`hs_federation_sender_destinations_backing_off`, and the WARN rate in the log (should fall from
+7/s to a handful a minute). The memory limit can go back toward the chart default once boot
+memory is seen; it is still bounded by `hs-state` until `agent/state-load` lands. Then the owner
+retries `/join #matrix:matrix.org` and we time it. Grafana has no panel for the new series yet
+(track 12; `deploy/observability/grafana/hs-overview.json` federation panel is a TODO).
+
+**Worktrees left for the next session** (remove each once its branch is merged):
+`.claude/worktrees/{fed-destinations,notary-keys,leak-hunt,fjall-buffer,state-load}`, plus the
+queue's own `merge-queue` and `merge-queue-dry`.
+
+## Earlier: 2026-10-10, 18:20 EDT -- the demo runs `2d11ea2e` and federates from the public internet; the first public join found two bugs, fixed and rolled
 
 **The afternoon.** Finding 3 of the 16:30 entry is closed (`deploy/demo/tailscale-funnel.md`):
 a Tailscale Funnel at `myelin.longhair-tet.ts.net` through the operator the cluster already ran,
