@@ -1,10 +1,10 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-10-11, 12:45 EDT (0.2.0 running on the demo; its memory curve unchecked). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+Written 2026-09-20 by the integration lead, last revised 2026-10-11, 12:50 EDT (0.2.0 on the demo: 915 MiB flat at boot, sender quiet, notary in use). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
-## Resume here: 2026-10-11 -- 0.2.0 is tagged, published and running on the demo (revision 18); check its memory curve first; the state store's half needs its hs-room side
+## Resume here: 2026-10-11 -- 0.2.0 runs on the demo (revision 18), verified: memory flat at 915 MiB, sender quiet, notary in use; the state store's half needs its hs-room side
 
 **Read this first.** Nothing rolled to the demo tonight. It runs `sha-2d11ea2e` (revision 17) with
 the pod's memory limit raised by the owner from the chart's default to **2Gi at 22:45 UTC
@@ -122,20 +122,35 @@ alone: a timing flake). Two gates were lost to flakes under load; both tests wan
 (track 14). **`agent/version-0.2`** (workspace, chart and web app at 0.2.0; CHANGELOG opens
 "0.2.0 (2026-10-10)") merged at 22:26 as `0ee2c597`, **tagged `v0.2.0`**; CD run 38105196046 was green at 23:15
 (binaries, both image architectures, manifest list, chart 0.2.0, GitHub release): the image is
-`ghcr.io/brandon-dacrib/myelin:0.2.0`. **Rolled by the owner as revision 18 around 03:50 UTC 2026-10-11** (the harness's classifier
-refuses `helm upgrade` from a session as a production deploy; reads through the proxy work with
-`helm --kube-apiserver http://127.0.0.1:8001 --kube-context admin@dacrib0 ...`). Confirmed from
-outside at 16:44 UTC: `/_matrix/federation/v1/version` says `0.2.0`, `/_matrix/client/versions`,
-both well-known documents and `/admin/` answer 200. **Not yet checked, because the owner's
-`kubectl proxy` lost its route to the API server twice overnight (the process stays up and
-answers 500 "no route to host"; a fresh one from a plain SSH shell fixes it): the memory curve
-since 04:00 UTC and the new series.** First thing next session, with a proxy up: Prometheus
-`container_memory_working_set_bytes{namespace="myelin",container="hs"}` from 03:30 UTC on (expect
-a plateau, no 13 MiB/h slope), and from `myelin-hs-0:9090/proxy/metrics`: `process_resident_memory_bytes`,
-`hs_kv_fjall_write_buffer_bytes` under `_cap_bytes` (33554432), `_rotations_total` (> 0 means the
-demo's directory has the per-table layout), `hs_room_events_cached`, `hs_room_resident_rooms`,
-`hs_federation_sender_destinations_backing_off`, `hs_federation_transactions_total{outcome}`, and
-the WARN rate in the log; then the owner retries `/join #matrix:matrix.org`. `agent/state-load` stays unmerged until its hs-room half
+`ghcr.io/brandon-dacrib/myelin:0.2.0`. **Rolled by the owner as revision 18 at 16:37 UTC 2026-10-11** (the harness's classifier refuses
+`helm upgrade` from a session as a production deploy; reads and `helm get values` work through the
+proxy with `helm --kube-apiserver http://127.0.0.1:8001 --kube-context admin@dacrib0 ...`; the
+owner's `kubectl proxy` lost its route twice overnight and answered 500 until restarted from a
+plain SSH shell). **Verified at 16:47 UTC, ten minutes after boot:**
+
+| what | before (sha-2d11ea2e) | after (0.2.0) |
+|---|---|---|
+| working set (Prometheus) | 1,717 MiB at 12:47 -> 1,742 MiB at 16:36 (still +6 MiB/h) | 1,049 MiB at 16:38, **915 MiB flat from 16:43 to 16:47** |
+| `federation transaction failed; will retry` | 2,790 in 400 s (7/s) | 46 in 9 min |
+| server version at `/_matrix/federation/v1/version` | 0.0.1 | 0.2.0 |
+
+New series present from the first scrape: `process_resident_memory_bytes` 1,002,016,768;
+`hs_kv_fjall_write_buffer_bytes` 4,998,132 under `_cap_bytes` 33,554,432, `_rotations_total` 38
+(the demo's directory has the per-table layout, as expected); `hs_room_resident_rooms` 68,
+`hs_room_events_cached` 2,837, no evictions yet, 961,670 cache misses (the load replay);
+`hs_federation_sender_destinations` 638, `_pdus_pending` 239, `_destinations_backing_off` 66,
+`_state_bytes` 50,819; `hs_federation_transactions_total` accepted 597 / failed 167 / deferred 69 /
+rejected 9 / unresolvable 0; `hs_federation_key_fetch_total` cache 1,027 / origin 13 / **notary 12**
+(the notary path is in use). Both bridges untouched, 0 restarts everywhere.
+
+**Still to watch** (next session, proxy up): the working set over a day: 915 MiB at boot is
+hs-state's replay of 68 rooms (`agent/state-load`'s half), and the old build's remaining +6 MiB/h
+should be gone. **Found, pre-existing, not from this roll:** `ruma_state_res::state_res` logs
+`event failed the authentication check: ...` at WARN about 10,000 times per 9 minutes (Loki:
+~900,000/h on the previous image too, since the `#matrix:matrix.org` join); it is state
+resolution rejecting the room's many rejected memberships, normal for that room, and it should be
+`debug` in hs-cli's default log filter (track 02/14; one line). Then the owner retries
+`/join #matrix:matrix.org` and we time it. `agent/state-load` stays unmerged until its hs-room half
 is done (above). If a gate was cut off: check `ps` for `merge-queue.sh`, `rmdir
 .git/myelin-merge.lock`, rerun `tools/merge-queue.sh <branch>`.
 
