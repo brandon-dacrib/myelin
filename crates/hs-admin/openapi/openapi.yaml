@@ -10,7 +10,7 @@ openapi: 3.1.0
 info:
   title: hs-admin API
   summary: The native administration and moderation API for the homeserver.
-  version: 0.1.14
+  version: 0.1.15
   description: 'The only API the management interface (track 16) talks to. See docs/rfcs/0004-admin-api.md for the full design rationale: resource modeling, naming, pagination, filtering, errors, idempotency, scopes, versioning and the event stream. This document is the contract; the hs-admin router''s contract tests assert the router and this document agree on paths and methods (RFC 0004 section 1, decision D15.16).'
   contact:
     name: 'Track 15: Admin API and modules'
@@ -1021,7 +1021,7 @@ paths:
           $ref: '#/components/responses/Unavailable'
     put:
       summary: Create a user's bridge instance
-      description: 'Starts provisioning an instance for the user, exactly as their message to the front door would; the user is invited to their bridge when it is ready. Idempotent: an existing instance is returned as it is (a failed one is retried).'
+      description: 'Starts provisioning an instance for the user, exactly as their message to the front door would; the user is invited to their bridge when it is ready. Idempotent: an existing instance is returned as it is (a failed one is retried). With a body, `address` tells this server where an instance run elsewhere (a bridge on someone''s Mac) listens.'
       operationId: bridge_instances.put
       tags:
       - Bridges
@@ -1031,6 +1031,12 @@ paths:
       parameters:
       - $ref: '#/components/parameters/BridgeTypeId'
       - $ref: '#/components/parameters/BridgeInstanceUser'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BridgeInstanceRequest'
       responses:
         '200':
           description: The instance.
@@ -8599,6 +8605,31 @@ components:
               type:
               - string
               - 'null'
+        runs_on:
+          type: string
+          enum:
+          - container
+          - mac
+          description: 'Where the bridge runs: `container` (an image this server can deploy, or run by hand from a compose file), or `mac` (a program for a Mac, beside the Messages app it reads; never deployed by this server, so its offerings run `elsewhere`).'
+        download_url:
+          type:
+          - string
+          - 'null'
+          description: For `runs_on: mac`, where to download the program (a pinned build, as `image` pins a tag).
+        download_note:
+          type:
+          - string
+          - 'null'
+          description: What the download is (a universal macOS build from the project's CI, say) and which build is pinned.
+    BridgeInstanceRequest:
+      type: object
+      description: 'What `PUT /bridge-offerings/{type}/instances/{user_id}` may carry. Without a body the instance is created (or returned as it is) with nothing changed.'
+      properties:
+        address:
+          type:
+          - string
+          - 'null'
+          description: 'For an instance run elsewhere: where this server reaches the bridge, as `host`, `host:port` or a full `http(s)://` URL (a bare host takes the type''s port). The registration''s `url` and the files the bridge runs from are rewritten with it. `null` leaves it as it is. Refused for an instance this server deploys.'
     BridgeLogins:
       type: object
       description: Who has signed in to a bridge and as what, as the bridge's provisioning API says.
@@ -8873,6 +8904,11 @@ components:
           type:
           - string
           - 'null'
+        url:
+          type:
+          - string
+          - 'null'
+          description: Where this server reaches the bridge (the registration's `url`): the cluster Service for an instance it deploys, else `http://<appservice id>:<port>` until an administrator sets the address (`PUT` with `address`).
         bot:
           type:
           - string
@@ -9007,6 +9043,11 @@ components:
         manifest_yaml:
           type: string
           description: A Secret with the files and a `Bridge` resource, for a cluster running the Myelin operator.
+        run_sh:
+          type:
+          - string
+          - 'null'
+          description: For a type that runs on a Mac, a shell script to run beside `config.yaml` and `registration.yaml` there, which downloads the pinned build if it is not there yet, clears its quarantine flag and starts it. `null` for a container type.
     ClusterStatus:
       type: object
       properties:
