@@ -19,9 +19,18 @@ bridge crash-looped** with `appservice.database not configured`. mautrix-discord
 mautrix-go's older framework, whose config layout differs from `bridgev2`'s; the catalogue now
 marks it `legacy_config` and renders that layout, and its `provisioning_api` is `none` with why.
 After the next roll, `bridge-discord-brandon` should roll by itself (its rendered files changed)
-and reach Running: check it, and `help` to `@discordbot_brandon`. Next asked for by the owner: an
-iMessage offering, where the bridge runs on a Mac outside the cluster (the UI gives a download
-for the Mac binary, asks for the Mac's hostname or IP, and shows how to run it).
+and reach Running: check it, and `help` to `@discordbot_brandon`. **Merged** as `cf8566ee`.
+
+**2026-10-11, later (branches `agent/imessage-offering` and `agent/imessage-web`, status 11 and
+16): iMessage is offered.** mautrix-imessage is a program for the person's Mac, so its offering
+runs elsewhere; the catalogue pins a CI build (no release tags exist), the config is the older
+framework's layout with iMessage's sections and `websocket_proxy: null` so the bridge listens
+and the server pushes to the Mac; `PUT …/instances/{user}` takes `address`; files include
+`run.sh`; the offering page gets a "Set up on a Mac" dialog (download, address, files, steps).
+Verified against the real binary with a stand-in at the address; **not yet run on a real Mac**:
+that is the owner's step (`docs/bridges/imessage.md`, "What was verified"). The server must
+reach the Mac on 29331 (same network or Tailscale); a Mac behind NAT needs a websocket on the
+server's side, not done.
 
 **The evidence** (`container_memory_working_set_bytes` from the cluster's Prometheus, read
 23:17 UTC; the server exported no process memory metric of its own):

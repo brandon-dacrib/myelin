@@ -1318,3 +1318,164 @@ async fn a_shared_registration_beside_its_offering_is_named_and_a_changed_double
     assert_eq!(offering["overlapping_appservices"], json!([]), "{offering}");
     handle.shutdown().await;
 }
+
+/// An iMessage bridge is a program on the person's Mac: the server cannot deploy it, the
+/// offering runs elsewhere, the administrator says where the Mac is (before or after the
+/// instance is named), and the registration's `url`, the files and the server's pings follow
+/// it. The files are the older framework's layout with iMessage's own sections, and a run
+/// script for the Mac.
+#[tokio::test]
+async fn an_imessage_offering_runs_on_a_mac_whose_address_the_administrator_sets() {
+    let dir = tempfile::tempdir().unwrap();
+    let (handle, admin, _users) = boot(dir.path(), &["alice"]).await;
+    let alice_id = "@alice:example.org";
+
+    // The catalogue says where it runs and where to get it.
+    let kind = admin
+        .admin(GET, "/bridge-types/mautrix-imessage", None)
+        .await;
+    assert_eq!(kind["runs_on"], "mac", "{kind}");
+    assert_eq!(kind["deployable"], false);
+    assert!(
+        kind["not_deployable_reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("Mac")),
+        "{kind}"
+    );
+    assert_eq!(
+        kind["download_url"],
+        "https://mau.dev/mautrix/imessage/-/jobs/95972/artifacts/download"
+    );
+    assert!(
+        kind["download_note"]
+            .as_str()
+            .is_some_and(|n| n.contains("300ba6d0"))
+    );
+    let whatsapp = admin
+        .admin(GET, "/bridge-types/mautrix-whatsapp", None)
+        .await;
+    assert_eq!(whatsapp["runs_on"], "container", "{whatsapp}");
+    assert!(whatsapp["download_url"].is_null());
+
+    // Offered with no runtime named: elsewhere, the only one it can have.
+    let offering = admin
+        .admin(
+            PUT,
+            "/bridge-offerings/mautrix-imessage",
+            Some(json!({"access": {"all_local_users": true}})),
+        )
+        .await;
+    assert_eq!(offering["runtime"], "elsewhere", "{offering}");
+    assert_eq!(offering["front_door"], "@imessagebot:example.org");
+
+    // Alice's instance, with the Mac's address in the same request.
+    let path = format!(
+        "/bridge-offerings/mautrix-imessage/instances/{}",
+        escape(alice_id)
+    );
+    let instance = admin
+        .admin(PUT, &path, Some(json!({"address": "alices-mac.local"})))
+        .await;
+    assert_eq!(
+        instance["url"], "http://alices-mac.local:29331",
+        "{instance}"
+    );
+    let seen = until_state(&admin, &path, "starting").await;
+    assert_eq!(seen["appservice_id"], "imessage-alice", "{seen}");
+    assert_eq!(seen["bot"], "@imessagebot_alice:example.org");
+    assert_eq!(seen["url"], "http://alices-mac.local:29331");
+    assert!(
+        seen["reason"].as_str().is_some_and(|r| r.contains("Mac")),
+        "{seen}"
+    );
+    let registered = admin.admin(GET, "/appservices/imessage-alice", None).await;
+    assert_eq!(
+        registered["url"], "http://alices-mac.local:29331",
+        "{registered}"
+    );
+    let registration = admin
+        .admin(GET, "/appservices/imessage-alice/registration", None)
+        .await;
+    assert!(
+        registration.get("io.element.msc4190").is_none(),
+        "{registration}"
+    );
+    assert_eq!(registration["org.matrix.msc3202"], true);
+    let hs_token = registration["hs_token"].as_str().unwrap().to_owned();
+
+    // The files: the older framework's layout with iMessage's sections, and the run script.
+    let files = admin.admin(POST, &format!("{path}/files"), None).await;
+    let config = files["config_yaml"].as_str().unwrap();
+    for needle in [
+        "websocket_proxy: null",
+        "  database:\n",
+        "uri: file:imessage-alice.db?_txlock=immediate",
+        "platform: mac",
+        "user: \"@alice:example.org\"",
+        "address: http://alices-mac.local:29331",
+        &format!("address: {}", handle.base_url()),
+        &format!("hs_token: {hs_token}"),
+    ] {
+        assert!(
+            config.contains(needle),
+            "{needle:?} missing from:\n{config}"
+        );
+    }
+    assert!(!config.contains("\ndatabase:"), "{config}");
+    let run = files["run_sh"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{files}"));
+    assert!(run.starts_with("#!/bin/sh\n"), "{run}");
+    assert!(run.contains("https://mau.dev/mautrix/imessage/-/jobs/95972/artifacts/download"));
+    assert!(run.contains("exec ./mautrix-imessage -c config.yaml -r registration.yaml"));
+    // A bad address is refused in words; the address stays.
+    let refused = admin
+        .admin_expect(
+            PUT,
+            &path,
+            Some(json!({"address": "mac/path"})),
+            reqwest::StatusCode::BAD_REQUEST,
+        )
+        .await;
+    assert!(
+        refused["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("host")),
+        "{refused}"
+    );
+    let same = admin.admin(GET, &path, None).await;
+    assert_eq!(same["url"], "http://alices-mac.local:29331", "{same}");
+
+    // The Mac comes up where a stand-in listens: the administrator sets that address, the
+    // registry is patched at once, the next ping finds it, and the instance is ready.
+    let (url, _bridge) = stand_in(&hs_token).await;
+    let address = url.trim_start_matches("http://").to_owned();
+    let moved = admin
+        .admin(PUT, &path, Some(json!({"address": address})))
+        .await;
+    assert_eq!(moved["url"], url, "{moved}");
+    let registered = admin.admin(GET, "/appservices/imessage-alice", None).await;
+    assert_eq!(registered["url"], url, "{registered}");
+    let seen = until_state(&admin, &path, "ready").await;
+    assert_eq!(seen["health"], "healthy", "{seen}");
+    assert_eq!(seen["url"], url);
+
+    // Gone with the offering, registration and all.
+    admin
+        .admin_expect(
+            DELETE,
+            "/bridge-offerings/mautrix-imessage?remove_instances=true",
+            None,
+            reqwest::StatusCode::NO_CONTENT,
+        )
+        .await;
+    admin
+        .admin_expect(
+            GET,
+            "/appservices/imessage-alice",
+            None,
+            reqwest::StatusCode::NOT_FOUND,
+        )
+        .await;
+    handle.shutdown().await;
+}

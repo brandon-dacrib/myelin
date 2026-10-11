@@ -1,6 +1,8 @@
 # Status: track 11, appservices and bridges
 
-Last updated: 2026-10-11 (mautrix-discord is on mautrix-go's older framework and now gets that
+Last updated: 2026-10-11, later (iMessage is offered: a program for the person's Mac, with its
+own config layout, a run script and an address the administrator sets; below); before that
+2026-10-11 (mautrix-discord is on mautrix-go's older framework and now gets that
 framework's `config.yaml` layout; below); before that 2026-10-10 (the manager removes a bot device
 the bridge left behind after a crypto reset, decision 0041; the OTK-count warning on the demo is
 Synapse's behaviour; below); before
@@ -26,6 +28,43 @@ manager) and an instance's Kubernetes objects say whose bridge they are; before 
 (who has signed in to a bridge; the `cluster` runtime run on kind); before that 2026-09-30
 (ephemeral, to-device and device-list delivery); before that 2026-09-27 (RFC 0017 run against
 the real binary), 2026-09-27 (the bridge manager) and 2026-09-25.
+
+## Session 2026-10-11, later (branch `agent/imessage-offering`): iMessage is offered, as a program on the person's Mac
+
+**Asked for by the owner**: offer mautrix-imessage, which runs on a Mac outside the cluster; the
+interface gives a download link for the program, asks for the Mac's hostname or IP address,
+and shows how to run it. `docs/bridges/imessage.md` has the whole of it; in short:
+
+- **Catalogue** (`bridge_types.rs`): `mautrix-imessage`, port 29331, bot `imessagebot`, ghosts
+  `imessage_`, `!im`; `Entry::mac_download` pins one CI build (mau.dev job 95972, commit
+  `300ba6d0`, 2026-05-14; no release tags exist), surfaced as `BridgeType.runs_on: "mac"`,
+  `download_url`, `download_note`; `deployable: false` with a reason, so its offering can only
+  run `elsewhere`. `ConfigLayout::IMessage` (the Discord session's `legacy_config` became
+  `ConfigLayout {BridgeV2, Legacy, IMessage}`) writes the older framework's layout with
+  iMessage's sections and `websocket_proxy: null`, so the bridge listens and the server pushes
+  to the Mac. Features are MSC2409 and MSC3202 only: its framework has no MSC4190, and the bot
+  logs in with the appservice flow. `run.sh` is rendered beside the two files
+  (`InstanceRender::run_sh`, `BridgeInstanceFiles.run_sh`).
+- **Address** (`hs-bridges`, `hs-admin`): `PUT …/instances/{user}` takes
+  `BridgeInstanceRequest { address }` (`host`, `host:port` or URL; `instance_url` in
+  `bridge_offerings.rs` is the grammar); `BridgeOfferingSource::set_instance_address` keeps it
+  as the row's `url`, patches the registry's copy at once (the fingerprint leaves `url` out)
+  and wakes the manager; an address set before the instance is named survives naming
+  (`allocate_and_register` keeps a set `url`). `BridgeInstance.url` is new. Refused for an
+  instance the server deploys. The starting reason and the front-door bot say "on the Mac".
+- **OpenAPI 0.1.15**: the fields above and the request body.
+- **Web**: on branch `agent/imessage-web` (status 16), the "Set up on a Mac" dialog.
+
+**Tests.** `bridge_types::tests::an_imessage_bridge_runs_on_a_mac_and_its_files_say_how`;
+`bridge_offerings::address_tests`; `manager::tests::an_administrator_says_where_a_bridge_on_a_mac_listens`;
+real binary: `hs-cli/tests/bridge_offerings.rs::an_imessage_offering_runs_on_a_mac_whose_address_the_administrator_sets`
+(offer, instance with address, registry url, files, refused address, ready once the address
+points at a stand-in that answers pings, removed with the offering).
+
+**Left.** Not run on a real Mac: the owner's is the first (download, `./run.sh`, Full Disk
+Access, a message both ways). A Mac the server cannot reach (NAT) needs a websocket on the
+server's side (mautrix-wsproxy's protocol); not done. The owner cannot set the address from the
+bot's chat (only an administrator, in the interface or the API).
 
 ## Session 2026-10-11 (branch `agent/discord-legacy-config`): mautrix-discord gets the older framework's config layout
 

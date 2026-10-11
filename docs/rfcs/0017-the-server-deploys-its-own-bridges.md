@@ -143,6 +143,10 @@ A trait in `hs-bridges` with two implementations:
   and volume).
 - **Elsewhere**: nothing to run; the instance goes from `registered` to `starting` and waits for
   the ping, and the administrator downloads the files for it (and the iMessage user's Mac runs it).
+  Since 2026-10-11 the administrator also tells the server where such an instance listens
+  (`PUT …/instances/{user}` with `address`), which the registration's `url` and the files
+  follow; a type that is a program for a Mac (`BridgeType.runs_on: mac`, mautrix-imessage)
+  gets a `run.sh` with the files and can only run elsewhere (`docs/bridges/imessage.md`).
 
 An offering's runtime is `cluster` (only when the server can deploy) or `elsewhere`.
 
