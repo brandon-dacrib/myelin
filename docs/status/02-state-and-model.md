@@ -1,6 +1,72 @@
 # 02 State and model: status
 
-Updated: 2026-09-30 (a mainline tie-break bug, found by Complement; below). Before that 2026-09-18 (session 5).
+Updated: 2026-10-10 (the state store's per-event records are durable; below). Before that
+2026-09-30 (a mainline tie-break bug).
+
+## 2026-10-10: the store opens without replaying the room (RFC 0025), on `agent/state-load`
+
+**Done, tested, pushed** (commit "The state store keeps every per-event record durably and opens
+without replaying the room"). `KvStateStore` kept, in memory and rebuilt on every open, a
+`state_at` root per event, two event-id maps, a `ResolutionEvent` per event and the chain-cover
+index: the room actor replayed its whole history into it on every load, and the store held a
+record of every event for the actor's lifetime (the 1.2 GiB the demo held after joining
+`#matrix:matrix.org`). Now:
+
+- **Durable keyspaces** (`crates/hs-state/src/durable.rs`, table in its module docs): `state_at`
+  (EventSn to frame root), `state_event` (a compact record per event, `crates/hs-state/src/record.rs`),
+  `state_event_id`, the `hs-tables` `state_key_id_{fwd,rev,seq}` interning layout (same rows as
+  `hs_tables::interning::state_key_id_table`, with bounded caches), `state_chain_{pos,event,link,tip,seq}`
+  (the chain-cover index: `chain_cover.rs` is now one algorithm over `ChainReader`/`ChainWriter`,
+  implemented by the in-memory `ChainCoverIndex` and by the durable reader/writer; a 64-case
+  property test says they agree) and `state_layout` (the per-room migration marker).
+- **In memory**: bounded LRU caches only (`crates/hs-state/src/cache.rs`, `durable::CacheSizes`,
+  defaults 4,096 per kind and 1,024 event records). Nothing per event survives an open.
+- **State resolution reads on demand**: `state_res::EventFetch` (new trait; `EventStore` the
+  `BTreeMap` implements it) makes v1 and v2 generic; the production store fetches only the
+  records a resolution touches, into an `elsa::FrozenMap` arena, and answers the resolvers'
+  auth chains from the durable chain cover. ruma's adapters are built per fetched event, not
+  for the whole store as before.
+- **API**: `KvStateStore<R, KV>` (a second generic, the backend); `KvStateStore::new(room_version,
+  repr, backend)`; `ProductionStateStore::open` unchanged; `NewEvent` + `ingest(&event,
+  explicit_state)` / `ingest_in(txn, ..)` (writes inside the caller's transaction; frames stay
+  content-addressed in their own idempotent writes); `add_event`/`add_event_with_state` unchanged
+  as positional wrappers; `has_event`; `needs_migration(room_id)`, `mark_migrated(room_id,
+  events)`, `mark_migrated_in(txn, room_id)`, `LAYOUT_VERSION = 1`; `stats()`;
+  `log_open_summary(room_id)` (INFO over 10,000 events); `intern` now returns `Result`.
+- **Metrics** (`crates/hs-state/src/metrics.rs`, `hs_state::metrics::register_metrics` -- hs-cli
+  must call it, not done here): `hs_state_open_seconds`, `hs_state_events_replayed_total`,
+  `hs_state_resolution_events_cached`, `hs_state_migrations_total`,
+  `hs_state_event_records_read_total`.
+- **Migration**: an existing room (frames only, per-process key numbering) has `needs_migration`
+  true; the actor's existing replay rebuilds the records (new frames are written; old ones stay
+  unreferenced in the content-addressed keyspace), `mark_migrated` logs the room and count at
+  INFO and counts the metric; later opens read current state only. Tested old-layout to new with
+  identical state at every event (`tests/durable_store.rs`).
+- **Numbers** (`cargo test -p hs-state --release --test open_memory measure_open_of_a_large_room
+  -- --ignored --nocapture`, one process per leg via `HS_STATE_MEASURE_LEG`, 50,000 events on
+  Fjall): build 0.6 s; **replay leg** (what every load did until now) open + current state
+  0.60 s, RSS +55 MiB; **durable leg** 0.00 s, RSS +0 MiB, 0 records read, 0 events ingested.
+  (The before figure for the old in-memory store is track 04's: 114 MiB resident for the same
+  room after its own cache was bounded, most of it this store's.)
+
+**Checks run**: `cargo test -p hs-state` (81 lib + 7 `durable_store` + 1 `ruma_cross_check`, all
+green; the fork cross-checks against the oracle and ruma-state-res unchanged), `cargo test -p
+hs-room` (212 lib tests and every integration binary, unchanged, green), `cargo clippy -p
+hs-state --all-targets -- -D warnings` clean, `cargo fmt --all --check` clean, `cargo check -p
+hs-room --all-targets` clean. **Not run** (the session ended): `cargo clippy -p hs-room -p
+hs-cli`, the hs-cli real-binary tests (`in_process_restart`, `legacy_events`, `federation_reads`,
+`federation_writes`, `members_at`).
+
+**Left**: (1) the hs-room half, deliberately not done here (track 04's `load` on `agent/room-memory`
+has since merged): gate the replay on `store.needs_migration(room_id)`, call `mark_migrated` after
+it and `log_open_summary` at the end of `load`, `mark_migrated_in` in the transaction that creates a
+room, and move `feed_store` into `persist_with`'s transaction via `ingest_in`; until then every load
+still replays (now as idempotent durable re-ingestion, counted in `hs_state_events_replayed_total`),
+so memory is bounded but boot time is not yet. (2) `hs-cli` registering `hs_state::metrics`. (3)
+Decision 0045 (a root per event over the frames' delta chains rather than state groups: the frames
+already are the delta chain and the bake-off chose them) is described in RFC 0025's status but the
+file is not written. (4) `docs/next-steps.md` paragraph. **Shared dependency added**: `elsa = "1"`
+in `[workspace.dependencies]` (the same line `agent/room-memory` added; trivially mergeable).
 
 ## 2026-09-30: mainline ties were broken by event ID, not by time
 
