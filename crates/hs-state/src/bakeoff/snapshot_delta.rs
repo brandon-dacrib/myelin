@@ -304,6 +304,16 @@ impl<KV: KvBackend> StateRepr for SnapshotDeltaRepr<KV> {
         RootA(0)
     }
 
+    fn encode_root(&self, root: RootA) -> Vec<u8> {
+        root.0.to_be_bytes().to_vec()
+    }
+
+    fn decode_root(&self, bytes: &[u8]) -> Option<RootA> {
+        <[u8; 8]>::try_from(bytes)
+            .ok()
+            .map(|b| RootA(u64::from_be_bytes(b)))
+    }
+
     fn get(&self, root: RootA, key: StateKeyId) -> Result<Option<EventSn>, Error> {
         let mut cur = root.0;
         loop {

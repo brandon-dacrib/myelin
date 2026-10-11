@@ -38,6 +38,7 @@ hex = "0.4"
 proptest = "1"
 criterion = "0.5"
 prometheus-client = "0.25"
+elsa = "1"
 serde_yaml_ng = "0.10"
 schemars = { version = "1", features = ["preserve_order"] }
 hmac = "0.12"

@@ -32,7 +32,7 @@ use hs_model::room_version::RoomVersionRules;
 use ruma::OwnedEventId;
 
 use super::{
-    EventStore, MapStateFetch, StateMap, incoming_event, sha1_of_event_id, split_conflicted,
+    EventFetch, MapStateFetch, StateMap, incoming_event, sha1_of_event_id, split_conflicted,
 };
 use crate::auth;
 use crate::error::StateResError;
@@ -42,10 +42,10 @@ use crate::error::StateResError;
 /// # Errors
 /// Returns [`StateResError::MissingEvent`] if a candidate event referenced by one of `states` is
 /// not present in `store`.
-pub fn resolve(
+pub fn resolve<F: EventFetch + ?Sized>(
     rules: &RoomVersionRules,
     states: &[StateMap],
-    store: &EventStore,
+    store: &F,
 ) -> Result<StateMap, StateResError> {
     let (mut r, mut conflicted) = split_conflicted(states);
 
@@ -72,12 +72,12 @@ pub fn resolve(
     Ok(r)
 }
 
-fn resolve_power_affecting_type(
+fn resolve_power_affecting_type<F: EventFetch + ?Sized>(
     rules: &RoomVersionRules,
     event_type: &str,
     r: &mut StateMap,
     conflicted: &mut std::collections::BTreeMap<(String, String), Vec<OwnedEventId>>,
-    store: &EventStore,
+    store: &F,
 ) -> Result<(), StateResError> {
     let mut combined: Vec<OwnedEventId> = Vec::new();
     let mut keys_of_type: Vec<(String, String)> = Vec::new();
@@ -126,11 +126,11 @@ fn resolve_power_affecting_type(
 
 /// Picks the highest-depth, lowest-`sha1(event_id)` candidate that passes authorization against
 /// the given state, or `None` if no candidate passes.
-fn pick_best_passing(
+fn pick_best_passing<F: EventFetch + ?Sized>(
     rules: &RoomVersionRules,
     ids: &[OwnedEventId],
     r: &StateMap,
-    store: &EventStore,
+    store: &F,
 ) -> Result<Option<OwnedEventId>, StateResError> {
     let mut passing = Vec::new();
     for id in ids {
@@ -148,19 +148,19 @@ fn pick_best_passing(
     Ok(ordered.into_iter().next())
 }
 
-fn get<'a>(
-    store: &'a EventStore,
+fn get<'a, F: EventFetch + ?Sized>(
+    store: &'a F,
     id: &OwnedEventId,
 ) -> Result<&'a super::ResolutionEvent, StateResError> {
     store
-        .get(id)
+        .fetch(id)
         .ok_or_else(|| StateResError::MissingEvent(id.to_string()))
 }
 
 /// Ascending `depth`, ties broken by descending `sha1(event_id)`.
-fn sort_ascending_depth_descending_sha1(
+fn sort_ascending_depth_descending_sha1<F: EventFetch + ?Sized>(
     ids: &[OwnedEventId],
-    store: &EventStore,
+    store: &F,
 ) -> Result<Vec<OwnedEventId>, StateResError> {
     let mut v = ids.to_vec();
     let mut err = None;
@@ -185,16 +185,18 @@ fn sort_ascending_depth_descending_sha1(
 }
 
 /// Descending `depth`, ties broken by ascending `sha1(event_id)`.
-fn sort_descending_depth_ascending_sha1(
+fn sort_descending_depth_ascending_sha1<F: EventFetch + ?Sized>(
     ids: &[OwnedEventId],
-    store: &EventStore,
+    store: &F,
 ) -> Result<Vec<OwnedEventId>, StateResError> {
+    // Every id here passed `get` in `pick_best_passing` already; a missing one is unreachable.
     let mut v = ids.to_vec();
     v.sort_by(|a, b| {
-        let ea = &store[a];
-        let eb = &store[b];
-        eb.depth
-            .cmp(&ea.depth)
+        let (da, db) = match (store.fetch(a), store.fetch(b)) {
+            (Some(ea), Some(eb)) => (ea.depth, eb.depth),
+            _ => (0, 0),
+        };
+        db.cmp(&da)
             .then_with(|| sha1_of_event_id(a).cmp(&sha1_of_event_id(b)))
     });
     Ok(v)
@@ -204,7 +206,7 @@ fn sort_descending_depth_ascending_sha1(
 mod tests {
     use super::*;
     use crate::auth;
-    use crate::state_res::ResolutionEvent;
+    use crate::state_res::{EventStore, ResolutionEvent};
     use hs_model::canonical::to_canonical_object;
     use ruma::{OwnedRoomId, OwnedUserId, RoomId, UserId};
     use serde_json::json;

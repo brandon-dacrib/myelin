@@ -265,8 +265,9 @@ mod adapter_tests {
         let alice = UserId::parse("@alice:hs2").unwrap();
         let rules = hs_model::room_version::rules_for(&RoomVersionId::V11).unwrap();
 
-        let repr = FrameRepr::new(MemoryBackend::default()).unwrap();
-        let store = KvStateStore::new(RoomVersionId::V11, repr).unwrap();
+        let backend = MemoryBackend::default();
+        let repr = FrameRepr::new(backend.clone()).unwrap();
+        let store = KvStateStore::new(RoomVersionId::V11, repr, backend).unwrap();
         let mut bodies = EventBodies::new();
         let mut flat = FlatState::new();
 

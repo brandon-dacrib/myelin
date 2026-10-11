@@ -90,8 +90,8 @@ fn percentile_us(durations: &mut [Duration], p: f64) -> f64 {
 /// `(StateKeyId, EventSn)` worth, 12 bytes, per state event -- the write-amplification
 /// denominator).
 #[allow(clippy::too_many_lines)]
-fn replay<R: StateRepr>(
-    store: &GenericStore<R>,
+fn replay<R: StateRepr, KV: hs_kv::KvBackend>(
+    store: &GenericStore<R, KV>,
     scenario: &Scenario,
     sn_base: u64,
     room_index: usize,
@@ -158,8 +158,9 @@ fn replay<R: StateRepr>(
 
 /// Runs one candidate/backend/scenario combination end to end, returning the filled-in metrics
 /// except `gc_*` (candidate-specific, filled in by the caller for candidate C).
-fn run<R: StateRepr + BakeoffStats + Clone>(
+fn run<R: StateRepr + BakeoffStats + Clone, KV: hs_kv::KvBackend>(
     repr: R,
+    kv: KV,
     room_version: RoomVersionId,
     candidate: &str,
     backend: &str,
@@ -177,7 +178,7 @@ fn run<R: StateRepr + BakeoffStats + Clone>(
     let mut sample_keys: Vec<hs_model::ids::StateKeyId> = Vec::new();
 
     for (room_index, scenario) in scenarios.iter().enumerate() {
-        let store = GenericStore::new(room_version.clone(), repr.clone())?;
+        let store = GenericStore::new(room_version.clone(), repr.clone(), kv.clone())?;
         let (roots, resolution_times, ingest_dur, logical_bytes, state_events) =
             replay(&store, scenario, sn_base, room_index)?;
 
@@ -198,7 +199,7 @@ fn run<R: StateRepr + BakeoffStats + Clone>(
         // Collect a handful of sample keys (from this room's state events) for lookup timing.
         for e in scenario.events.iter().take(200) {
             if let Some(sk) = &e.state_key {
-                sample_keys.push(store.intern(&e.event_type, sk));
+                sample_keys.push(store.intern(&e.event_type, sk)?);
             }
         }
 
@@ -347,9 +348,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let metrics = match (candidate, backend_kind) {
         ("a", "memory") => {
-            let repr = SnapshotDeltaRepr::new(MemoryBackend::default())?;
+            let backend = MemoryBackend::default();
+            let repr = SnapshotDeltaRepr::new(backend.clone())?;
             let (m, _, _) = run(
                 repr,
+                backend,
                 room_version,
                 "a",
                 "memory",
@@ -359,9 +362,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             m
         }
         ("b", "memory") => {
-            let repr = FrameRepr::new(MemoryBackend::default())?;
+            let backend = MemoryBackend::default();
+            let repr = FrameRepr::new(backend.clone())?;
             let (m, _, _) = run(
                 repr,
+                backend,
                 room_version,
                 "b",
                 "memory",
@@ -371,9 +376,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             m
         }
         ("c", "memory") => {
-            let repr = PersistentMapRepr::new(MemoryBackend::default())?;
+            let backend = MemoryBackend::default();
+            let repr = PersistentMapRepr::new(backend.clone())?;
             let (mut m, repr, roots) = run(
                 repr,
+                backend,
                 room_version,
                 "c",
                 "memory",
@@ -393,13 +400,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ("a", "fjall") => {
             let dir = fjall_dir.expect("fjall_dir required for backend=fjall");
             let backend = FjallBackend::open(&dir)?;
-            let repr = SnapshotDeltaRepr::new(backend)?;
-            let (mut m, repr, roots) =
-                run(repr, room_version, "a", "fjall", &scenario_name, &scenarios)?;
+            let repr = SnapshotDeltaRepr::new(backend.clone())?;
+            let (mut m, repr, roots) = run(
+                repr,
+                backend.clone(),
+                room_version,
+                "a",
+                "fjall",
+                &scenario_name,
+                &scenarios,
+            )?;
             let last_root = roots.last().copied();
             // Fjall holds an exclusive lock on `dir` for as long as this handle is open; drop it
             // before reopening for the cold-lookup measurement below.
             drop(repr);
+            drop(backend);
             if let Some(root) = last_root {
                 let keys = sample_keys_for(&scenarios);
                 let (p50, p99) = measure_cold_fjall(&dir, root, &keys, |b| {
@@ -413,11 +428,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ("b", "fjall") => {
             let dir = fjall_dir.expect("fjall_dir required for backend=fjall");
             let backend = FjallBackend::open(&dir)?;
-            let repr = FrameRepr::new(backend)?;
-            let (mut m, repr, roots) =
-                run(repr, room_version, "b", "fjall", &scenario_name, &scenarios)?;
+            let repr = FrameRepr::new(backend.clone())?;
+            let (mut m, repr, roots) = run(
+                repr,
+                backend.clone(),
+                room_version,
+                "b",
+                "fjall",
+                &scenario_name,
+                &scenarios,
+            )?;
             let last_root = roots.last().copied();
             drop(repr);
+            drop(backend);
             if let Some(root) = last_root {
                 let keys = sample_keys_for(&scenarios);
                 let (p50, p99) = measure_cold_fjall(&dir, root, &keys, |b| {
@@ -431,9 +454,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ("c", "fjall") => {
             let dir = fjall_dir.expect("fjall_dir required for backend=fjall");
             let backend = FjallBackend::open(&dir)?;
-            let repr = PersistentMapRepr::new(backend)?;
-            let (mut m, repr, roots) =
-                run(repr, room_version, "c", "fjall", &scenario_name, &scenarios)?;
+            let repr = PersistentMapRepr::new(backend.clone())?;
+            let (mut m, repr, roots) = run(
+                repr,
+                backend.clone(),
+                room_version,
+                "c",
+                "fjall",
+                &scenario_name,
+                &scenarios,
+            )?;
             if !roots.is_empty() {
                 let t0 = Instant::now();
                 let stats = repr.gc(&roots)?;
@@ -444,6 +474,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let last_root = roots.last().copied();
             drop(repr);
+            drop(backend);
             if let Some(root) = last_root {
                 let keys = sample_keys_for(&scenarios);
                 let (p50, p99) = measure_cold_fjall(&dir, root, &keys, |b| {
@@ -476,10 +507,11 @@ fn sample_keys_for(scenarios: &[Scenario]) -> Vec<hs_model::ids::StateKeyId> {
     let Some(scenario) = scenarios.last() else {
         return Vec::new();
     };
-    let Ok(throwaway_repr) = SnapshotDeltaRepr::new(MemoryBackend::default()) else {
+    let throwaway = MemoryBackend::default();
+    let Ok(throwaway_repr) = SnapshotDeltaRepr::new(throwaway.clone()) else {
         return Vec::new();
     };
-    let Ok(store) = GenericStore::new(RoomVersionId::V11, throwaway_repr) else {
+    let Ok(store) = GenericStore::new(RoomVersionId::V11, throwaway_repr, throwaway) else {
         return Vec::new();
     };
     scenario
@@ -489,7 +521,7 @@ fn sample_keys_for(scenarios: &[Scenario]) -> Vec<hs_model::ids::StateKeyId> {
         .filter_map(|e| {
             e.state_key
                 .as_deref()
-                .map(|sk| store.intern(&e.event_type, sk))
+                .and_then(|sk| store.intern(&e.event_type, sk).ok())
         })
         .collect()
 }

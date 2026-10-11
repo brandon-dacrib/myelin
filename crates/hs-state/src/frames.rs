@@ -386,6 +386,14 @@ impl<KV: KvBackend> StateRepr for FrameRepr<KV> {
         self.materialize_full(root)
     }
 
+    fn encode_root(&self, root: RootB) -> Vec<u8> {
+        root.0.to_vec()
+    }
+
+    fn decode_root(&self, bytes: &[u8]) -> Option<RootB> {
+        <[u8; 16]>::try_from(bytes).ok().map(RootB)
+    }
+
     fn diff(&self, from: RootB, to: RootB) -> Result<StateDiff, Error> {
         if from == to {
             return Ok(StateDiff::default());

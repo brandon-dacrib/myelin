@@ -32,7 +32,7 @@ use crate::kv_store::KvStateStore;
 /// The store type + the event-id <-> `EventSn` mapping used to build it: what
 /// [`replay_into_production_store`] returns.
 type ReplayedStore = (
-    KvStateStore<FrameRepr<MemoryBackend>>,
+    KvStateStore<FrameRepr<MemoryBackend>, MemoryBackend>,
     BTreeMap<OwnedEventId, EventSn>,
     BTreeMap<EventSn, OwnedEventId>,
 );
@@ -46,9 +46,9 @@ fn replay_into_production_store(
     order: &[OwnedEventId],
     events: &EventStore,
 ) -> ReplayedStore {
-    let repr =
-        FrameRepr::new(MemoryBackend::default()).expect("in-memory backend never fails to open");
-    let store = KvStateStore::new(room_version.clone(), repr)
+    let backend = MemoryBackend::default();
+    let repr = FrameRepr::new(backend.clone()).expect("in-memory backend never fails to open");
+    let store = KvStateStore::new(room_version.clone(), repr, backend)
         .expect("RoomBuilder only ever builds rooms of a room version this crate supports");
 
     let mut sn_of: BTreeMap<OwnedEventId, EventSn> = BTreeMap::new();

@@ -19,12 +19,16 @@
 pub mod api;
 pub mod auth;
 pub mod bakeoff;
+pub mod cache;
 pub mod chain_cover;
 #[path = "../corpus/generators.rs"]
 pub mod corpus;
+pub mod durable;
 pub mod error;
 pub mod frames;
 pub mod kv_store;
+pub mod metrics;
+pub mod record;
 pub mod repr;
 pub mod state_fetch;
 pub mod state_res;
@@ -34,4 +38,4 @@ mod varint;
 pub use api::{StateDiff, StateStore};
 pub use error::{AuthError, AuthResult, StateResError};
 pub use frames::FrameRepr;
-pub use kv_store::{KvStateStore, KvStoreError, ProductionStateStore};
+pub use kv_store::{KvStateStore, KvStoreError, NewEvent, ProductionStateStore};
