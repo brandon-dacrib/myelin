@@ -1,6 +1,6 @@
 {
   "name": "hs-admin-web",
-  "version": "0.0.1",
+  "version": "0.2.0",
   "private": true,
   "description": "Management web interface for the hs Matrix homeserver (track 16). Built on the public admin API and served by the homeserver at /admin/.",
   "license": "Apache-2.0",

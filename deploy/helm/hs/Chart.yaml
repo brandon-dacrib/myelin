@@ -10,7 +10,7 @@ description: >-
   ServiceMonitor, and Ingress/Gateway API routing. docs/status/12-platform-and-kubernetes.md
   records what has been verified against a real cluster and what has only been rendered.
 type: application
-version: 0.1.0
+version: 0.2.0
 # The image tag the chart pulls when `image.tag` is unset. `main` is the continuously published
 # build, and is what a chart installed from a checkout pulls. CD's `helm package --app-version`
 # replaces it in every chart it publishes: with `sha-<commit>` on a push to `main`, so the
