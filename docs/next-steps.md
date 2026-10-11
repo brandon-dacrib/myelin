@@ -1,10 +1,10 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-10-10, 20:45 EDT (the memory leak: two causes, five branches, one merged). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+Written 2026-09-20 by the integration lead, last revised 2026-10-10, 20:45 EDT (the memory leak: two causes, six branches, one merged). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
-## Resume here: 2026-10-10, 20:45 EDT -- the memory leak has two causes, both fixed on branches; one is on main, four are in the merge queue, one is being written
+## Resume here: 2026-10-10, 20:45 EDT -- the memory leak has two causes, both fixed on branches; one is on main, four are in the merge queue, the sixth needs its hs-room half
 
 **Read this first.** Nothing rolled to the demo tonight. It runs `sha-2d11ea2e` (revision 17) with
 the pod's memory limit raised by the owner from the chart's default to **2Gi at 22:45 UTC
@@ -63,11 +63,30 @@ whole-history id index, three O(history) scans replaced; `server.rooms.idle_unlo
 counters. A 50,000-event room: 386 MiB -> 114 MiB resident, load 1.28 s -> 0.75 s. **The 114 MiB
 that remain are `hs-state`'s in-memory per-event records (`KvStateStore::CommonInner`), rebuilt
 by replaying every event on every open**, so boot still reads the whole room. RFC 0025 asks
-track 02 to make them durable; `agent/state-load` (hs-02, worktree `.claude/worktrees/state-load`)
-was writing that when the session ended: durable `state_at` and `(type, state_key)` interning,
-`ResolutionEvent`s read by sn on demand, a lazy chain index, a one-time migration per room with a
-version marker, `hs_state_open_seconds`, `hs_state_events_replayed_total`. See its status 02
-entry (or a `WIP:` commit) for how far it got. Decision number 0045 is reserved for it.
+track 02 to make them durable. **`agent/state-load` (hs-02, tip `4dd0b8e6`, pushed, not gated;
+status 02, RFC 0025 implemented) did the hs-state half:** `KvStateStore` holds nothing per event
+in memory any more. `state_at` (a 16-byte frame root per event over the frames' existing delta
+chains, not Synapse-style state groups), compact per-event records, event ids, `(type,
+state_key)` interning on the hs-tables layout, and the chain-cover index are durable keyspaces
+(`crates/hs-state/src/durable.rs`), with bounded LRUs in front; state resolution fetches only the
+records a resolution touches (`state_res::EventFetch`); a per-room layout marker
+(`needs_migration`/`mark_migrated`, `LAYOUT_VERSION = 1`); `ingest_in` writes inside the
+caller's transaction; metrics `hs_state_open_seconds`, `hs_state_events_replayed_total`,
+`hs_state_resolution_events_cached`, `hs_state_migrations_total`, `hs_state_event_records_read_total`.
+Measured (`crates/hs-state/tests/open_memory.rs`, release, 50,000 events): the replay leg opens
+in 0.60 s with +55 MiB; the durable leg in 0.00 s with +0 MiB, one state row read. Green:
+`cargo test -p hs-state` (89), `cargo test -p hs-room` (212 + 9 binaries), clippy on hs-state, fmt.
+**Left before its gate:** (1) the hs-room half, deliberately not edited because room-memory was
+merging: in `RoomActor::load` gate the replay (`feed_store*`) on `store.needs_migration(room_id)`,
+call `mark_migrated` after a migration replay and `log_open_summary` at the end, `mark_migrated_in`
+in the room-creating transaction, and move `feed_store` into `persist_with`'s `transact` via
+`ingest_in`; until then every load still replays (idempotently, visible in
+`hs_state_events_replayed_total`), so memory is bounded but boot time is not; (2) hs-cli:
+`metrics.with_registry(hs_state::metrics::register_metrics)` in `serve.rs`; (3) write decision
+0045 (its content is RFC 0025's status block) and this paragraph's one-liner; (4) `cargo clippy -p
+hs-room -p hs-cli`, and hs-cli's `in_process_restart`, `legacy_events`, `federation_reads`,
+`federation_writes`, `members_at` against the real binary. Its `elsa` workspace dependency and
+RFC 0025 file will textually merge with what room-memory put on main.
 
 **Also finished tonight** (the branches the last session left mid-flight):
 
