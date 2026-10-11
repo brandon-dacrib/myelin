@@ -1136,6 +1136,18 @@ impl FederationSender {
         self.shared.pending_total.load(Ordering::Acquire)
     }
 
+    /// Whether this replica has a worker sending for `destination` right now: it was queued for
+    /// here, or resumed from the store, and the gate lets this replica send for it. Without one,
+    /// [`FederationSender::pending_pdus_for`] is zero whatever the store holds (a queue another
+    /// replica sends for, or one left by a previous run that is not resumed yet).
+    #[must_use]
+    pub fn has_worker_for(&self, destination: &str) -> bool {
+        self.queues
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(destination)
+    }
+
     /// PDUs queued for one destination and not yet accepted or dropped. Zero for a destination
     /// nothing has been queued for.
     #[must_use]

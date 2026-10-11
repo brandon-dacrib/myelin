@@ -325,16 +325,17 @@ impl DestinationStoreSource {
         self
     }
 
-    /// PDUs waiting for `server_name`: this replica's worker's count when it has one, else
-    /// what the store holds (queued here for the replica that sends for it, or left by a
-    /// previous run and not resumed yet).
+    /// PDUs waiting for `server_name`: this replica's worker's count when it has a worker for
+    /// it (what the worker will send, counted as it was queued or resumed), else what the store
+    /// holds (queued here for the replica that sends for it, or left by a previous run and not
+    /// resumed yet). Never the store's count for a destination with a worker: the store may hold
+    /// rows the worker has already sent and not yet removed, or that were written around it.
     fn pending_for(&self, server_name: &str) -> u64 {
         let Some(sender) = &self.sender else {
             return 0;
         };
-        let in_worker = sender.pending_pdus_for(server_name);
-        if in_worker > 0 {
-            return in_worker as u64;
+        if sender.has_worker_for(server_name) {
+            return sender.pending_pdus_for(server_name) as u64;
         }
         sender.queued_pdus_in_store(server_name).unwrap_or(0) as u64
     }
@@ -703,6 +704,65 @@ mod tests {
             Arc::new(Nothing),
             Arc::new(Nothing),
         ))
+    }
+
+    /// A row's pending count is the worker's when this replica has a worker for the destination,
+    /// even when the store holds more rows for it (written around the worker, or not yet removed
+    /// after a send); the store's count is only for a destination without a worker here (left by
+    /// a previous run and not resumed, or queued for the replica that sends for it).
+    #[tokio::test]
+    async fn pending_is_the_workers_count_with_a_worker_and_the_stores_without_one() {
+        let client_store = Arc::new(InMemoryDestinationStore::new());
+        let outbound: Arc<dyn OutboundStore> = Arc::new(InMemoryOutboundStore::new());
+        let sender = Arc::new(FederationSender::with_store(
+            client(client_store.clone()),
+            "us.example",
+            SenderConfig::default(),
+            outbound.clone(),
+        ));
+        let source = DestinationStoreSource::new(client_store.clone()).with_sender(sender.clone());
+        let pdu = serde_json::json!({"type": "m.room.message", "room_id": "!r:us.example"});
+
+        // A worker for `worked` counts the one PDU queued through the sender; two more rows
+        // written straight to the store (another writer) are not its to count.
+        sender.enqueue_pdu(["worked.example".to_owned()], pdu.clone());
+        assert!(sender.has_worker_for("worked.example"));
+        assert_eq!(sender.pending_pdus_for("worked.example"), 1);
+        for _ in 0..2 {
+            outbound
+                .enqueue(
+                    &["worked.example".to_owned()],
+                    Some("!r:us.example"),
+                    &pdu,
+                    100,
+                )
+                .unwrap();
+        }
+        assert_eq!(sender.queued_pdus_in_store("worked.example").unwrap(), 3);
+        assert_eq!(source.pending_for("worked.example"), 1);
+
+        // No worker for `stored`: the store's rows are what waits.
+        outbound
+            .enqueue(
+                &["stored.example".to_owned()],
+                Some("!r:us.example"),
+                &pdu,
+                100,
+            )
+            .unwrap();
+        assert!(!sender.has_worker_for("stored.example"));
+        assert_eq!(source.pending_for("stored.example"), 1);
+
+        let rows = source.list_destinations().await.unwrap();
+        let pending = |name: &str| {
+            rows.iter()
+                .find(|r| r.server_name == name)
+                .unwrap_or_else(|| panic!("{name} missing from {rows:?}"))
+                .pending_pdu_count
+        };
+        assert_eq!(pending("worked.example"), 1);
+        assert_eq!(pending("stored.example"), 1);
+        sender.shutdown();
     }
 
     /// Forgetting and pruning over the real stores (decision 0042): a destination sharing a

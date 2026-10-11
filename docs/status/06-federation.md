@@ -69,6 +69,27 @@ run` at `WARN`. Metric `hs_federation_destinations_forgotten_total{reason,by}`, 
   setting's row on the Configuration page; a forced forget from the destination's page; axe at
   desktop and phone width). Results in the final report of the session.
 
+**The gate's failure, found and fixed (2026-10-10, late).** The full gate failed
+`hs-cli/tests/federation_restart.rs::an_event_queued_for_a_server_that_is_down_arrives_after_a_restart_of_the_sender`:
+after A's restart the row showed `pending_pdu_count: 3` for 30 s where 1 was expected. Not the
+branch's row logic: with the in-memory count alone (main's reading) the row still said 3, and a
+forced forget dropped 3 rows the store really held while `resume` had read one. A's log at
+`debug` named it: right after the restart the room registry loaded the room, then dropped and
+loaded it again when its shard's epoch arrived, and each load announced the room's head on the
+global stream (`RoomActor::head_update`), which `hs-cli`'s forwarder queued as a new local event
+-- the one event the store had resumed, twice more. A race main has too (whether the room loads
+before the epoch is known), so the test is flaky there; it failed 2 of 2 under load here and
+passed 5 of 5 idle. Fixed in `crates/hs-cli/src/federation_sender.rs`: the forwarder keeps each
+room's forwarded room-local position in the sender's store (`forwarded:{room_id}`, the existing
+cursor API), skips an announcement at or behind it at `debug`, and records above it after the
+queue rows are written (a stop in between costs one duplicate, never an event). Regression test
+`hs-cli/tests/federation_sender.rs::a_rooms_head_announced_again_on_a_reload_is_not_sent_again`
+(fails without the fix: the head goes out again). And, as the coordinator asked, the row's
+pending count is the worker's whenever this replica has a worker for the destination
+(`FederationSender::has_worker_for`), the store's only without one;
+`admin_source::tests::pending_is_the_workers_count_with_a_worker_and_the_stores_without_one`.
+The restart test then passed 2 of 2 under the same load.
+
 **Not done on this branch.** The sweep's result is not kept anywhere but the log (the
 decision says why; the page says so and offers the preview). No two-replica run of a forget
 (the source forgets through this replica's sender; a queue another replica is sending for is

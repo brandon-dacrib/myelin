@@ -280,17 +280,27 @@ async fn follow<B: KvBackend + 'static>(
     loop {
         match updates.recv().await {
             Ok(update) => {
-                if update.sender.server_name() == own_server_name
-                    && let Err(error) =
-                        forward_update(&rooms, &sender, &own_server_name, &update).await
-                {
-                    tracing::error!(
-                        room_id = %update.room_id,
-                        event_id = %update.event_id,
-                        %error,
-                        "could not hand a local event to the federation sender; remote servers \
-                         will not receive it"
-                    );
+                if update.sender.server_name() == own_server_name {
+                    if already_forwarded(&sender, &update) {
+                        tracing::debug!(
+                            room_id = %update.room_id,
+                            event_id = %update.event_id,
+                            room_pos = update.room_pos,
+                            "a local event announced again (the room was loaded again) was \
+                             already handed to the federation sender"
+                        );
+                    } else {
+                        match forward_update(&rooms, &sender, &own_server_name, &update).await {
+                            Ok(_) => remember_forwarded(&sender, &update),
+                            Err(error) => tracing::error!(
+                                room_id = %update.room_id,
+                                event_id = %update.event_id,
+                                %error,
+                                "could not hand a local event to the federation sender; remote \
+                                 servers will not receive it"
+                            ),
+                        }
+                    }
                 }
                 // Handed to the sender (queued, or nothing to queue, or failed and logged):
                 // either way this update is behind the forwarder now.
@@ -306,6 +316,46 @@ async fn follow<B: KvBackend + 'static>(
             }
             Err(RecvError::Closed) => return,
         }
+    }
+}
+
+/// The sender's stored position for a room (`forwarded:{room_id}`): the room-local timeline
+/// position of the newest local event the forwarder handed to the sender. A room announces its
+/// head on the global stream each time it is loaded (`RoomActor::head_update`: after a restart,
+/// after an idle eviction, when its shard changes hands), and that announcement is not news to
+/// the sender: the event was queued when it was made, and is in the sender's store still if it
+/// has not gone out. Kept in the store so a restart does not queue the head again on top of the
+/// queue it resumes. An announcement above the position (an event the forwarder never saw: a
+/// lagged stream, a stop between persisting and queueing) is forwarded like any other.
+fn forwarded_cursor(room_id: &ruma::RoomId) -> String {
+    format!("forwarded:{room_id}")
+}
+
+/// Whether `update`'s event is at or behind the room's forwarded position. A position the
+/// store cannot read is logged and counts as not forwarded: one duplicate (the receiver already
+/// has the event) over one event never sent.
+fn already_forwarded(sender: &FederationSender, update: &RoomUpdate) -> bool {
+    let Ok(position) = u64::try_from(update.room_pos) else {
+        return false;
+    };
+    match sender.stored_position(&forwarded_cursor(&update.room_id)) {
+        Ok(Some(forwarded)) => position <= forwarded,
+        Ok(None) => false,
+        Err(error) => {
+            tracing::error!(room_id = %update.room_id, %error, "cannot read how far the room was forwarded");
+            false
+        }
+    }
+}
+
+/// Moves the room's forwarded position to `update`'s event, once it has been handed to the
+/// sender (after the queue rows, so a stop in between costs a duplicate, never an event).
+fn remember_forwarded(sender: &FederationSender, update: &RoomUpdate) {
+    let Ok(position) = u64::try_from(update.room_pos) else {
+        return;
+    };
+    if let Err(error) = sender.store_position(&forwarded_cursor(&update.room_id), position) {
+        tracing::error!(room_id = %update.room_id, %error, "cannot record how far the room was forwarded");
     }
 }
 

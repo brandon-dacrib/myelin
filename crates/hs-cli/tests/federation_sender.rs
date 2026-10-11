@@ -698,3 +698,76 @@ async fn a_local_users_join_another_server_made_is_not_sent_again() {
         vec![h.remote.clone()]
     );
 }
+
+/// A room loaded again (after a restart, after an idle eviction, when its shard changes hands)
+/// announces its head on the global stream as if it were news. The forwarder remembers how far
+/// it has handed each room to the sender (`forwarded:{room_id}` in the sender's store) and does
+/// not queue the announced event again; a later event in the room still goes.
+#[tokio::test]
+async fn a_rooms_head_announced_again_on_a_reload_is_not_sent_again() {
+    let h = Harness::new().await;
+    let outbound = OutboundFederation::start(
+        h.rooms.clone(),
+        h.sender.clone(),
+        h.identity.server_name.clone(),
+        hs_cluster::ownership::SingleNode::new(hs_cluster::types::ReplicaId::new("only")),
+        hs_cluster::types::ShardLayout::default(),
+    );
+    let alice = Harness::alice();
+    let bob = h.bob();
+    let room = h.public_room().await;
+    room.membership(
+        bob.clone(),
+        Action::Join,
+        bob.clone(),
+        serde_json::json!({}),
+        2_000,
+    )
+    .await
+    .expect("bob joins");
+    room.send_event(
+        alice.clone(),
+        "m.room.message".to_owned(),
+        None,
+        serde_json::json!({ "msgtype": "m.text", "body": "hello bob" }),
+        None,
+        3_000,
+    )
+    .await
+    .expect("message to bob");
+    let requests = h.settled_transactions(1).await;
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    let room_id = room.query(|a| a.room_id().to_owned()).await;
+
+    // Evicted and read back: the reload announces the room's head (alice's message) again.
+    drop(room);
+    let evicted = h.rooms.evict_idle(Duration::ZERO).await;
+    assert_eq!(evicted, 1, "the room should have been evicted");
+    let room = h.rooms.get_or_load(&room_id).await.expect("reload");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        h.peer.request_count(),
+        1,
+        "the announced head was sent again: {:?}",
+        h.peer.requests()
+    );
+    assert_eq!(h.sender.pending_pdus(), 0);
+
+    room.send_event(
+        alice.clone(),
+        "m.room.message".to_owned(),
+        None,
+        serde_json::json!({ "msgtype": "m.text", "body": "after the reload" }),
+        None,
+        4_000,
+    )
+    .await
+    .expect("message after the reload");
+    let requests = h.settled_transactions(2).await;
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    assert_eq!(
+        pdus_of(&requests[1])[0]["content"]["body"],
+        "after the reload"
+    );
+    outbound.stop();
+}
