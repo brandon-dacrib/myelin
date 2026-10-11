@@ -1,10 +1,10 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-10-10, 23:15 EDT (0.2.0 tagged and published; the memory leak's two causes fixed). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+Written 2026-09-20 by the integration lead, last revised 2026-10-11, 12:45 EDT (0.2.0 running on the demo; its memory curve unchecked). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
-## Resume here: 2026-10-10, 23:15 EDT -- 0.2.0 is tagged and published with both memory fixes; roll it to the demo; the state store's half needs its hs-room side
+## Resume here: 2026-10-11 -- 0.2.0 is tagged, published and running on the demo (revision 18); check its memory curve first; the state store's half needs its hs-room side
 
 **Read this first.** Nothing rolled to the demo tonight. It runs `sha-2d11ea2e` (revision 17) with
 the pod's memory limit raised by the owner from the chart's default to **2Gi at 22:45 UTC
@@ -122,8 +122,20 @@ alone: a timing flake). Two gates were lost to flakes under load; both tests wan
 (track 14). **`agent/version-0.2`** (workspace, chart and web app at 0.2.0; CHANGELOG opens
 "0.2.0 (2026-10-10)") merged at 22:26 as `0ee2c597`, **tagged `v0.2.0`**; CD run 38105196046 was green at 23:15
 (binaries, both image architectures, manifest list, chart 0.2.0, GitHub release): the image is
-`ghcr.io/brandon-dacrib/myelin:0.2.0`. The owner rolls it as revision 18 with the commands in
-the paragraph below. `agent/state-load` stays unmerged until its hs-room half
+`ghcr.io/brandon-dacrib/myelin:0.2.0`. **Rolled by the owner as revision 18 around 03:50 UTC 2026-10-11** (the harness's classifier
+refuses `helm upgrade` from a session as a production deploy; reads through the proxy work with
+`helm --kube-apiserver http://127.0.0.1:8001 --kube-context admin@dacrib0 ...`). Confirmed from
+outside at 16:44 UTC: `/_matrix/federation/v1/version` says `0.2.0`, `/_matrix/client/versions`,
+both well-known documents and `/admin/` answer 200. **Not yet checked, because the owner's
+`kubectl proxy` lost its route to the API server twice overnight (the process stays up and
+answers 500 "no route to host"; a fresh one from a plain SSH shell fixes it): the memory curve
+since 04:00 UTC and the new series.** First thing next session, with a proxy up: Prometheus
+`container_memory_working_set_bytes{namespace="myelin",container="hs"}` from 03:30 UTC on (expect
+a plateau, no 13 MiB/h slope), and from `myelin-hs-0:9090/proxy/metrics`: `process_resident_memory_bytes`,
+`hs_kv_fjall_write_buffer_bytes` under `_cap_bytes` (33554432), `_rotations_total` (> 0 means the
+demo's directory has the per-table layout), `hs_room_events_cached`, `hs_room_resident_rooms`,
+`hs_federation_sender_destinations_backing_off`, `hs_federation_transactions_total{outcome}`, and
+the WARN rate in the log; then the owner retries `/join #matrix:matrix.org`. `agent/state-load` stays unmerged until its hs-room half
 is done (above). If a gate was cut off: check `ps` for `merge-queue.sh`, `rmdir
 .git/myelin-merge.lock`, rerun `tools/merge-queue.sh <branch>`.
 
