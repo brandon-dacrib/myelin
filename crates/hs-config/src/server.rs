@@ -73,6 +73,48 @@ pub struct ServerConfig {
     /// anything.
     #[serde(default)]
     pub sync: SyncConfig,
+
+    /// How much of each room this server keeps in memory while the room is in use: the recent
+    /// events it holds resident per room, and how long an unused room stays resident. A room's
+    /// memory is bounded by its state and this window, not by the length of its history; the
+    /// rest is read from the database as needed.
+    #[serde(default)]
+    pub rooms: RoomsConfig,
+}
+
+/// What a room costs in memory (`server.rooms`). Both settings take effect at once.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RoomsConfig {
+    /// How many of a room's events this server keeps in memory, per room, most recently used
+    /// first: the ones its members' clients read and its next events cite. An event not kept is
+    /// read from the database when a request needs it. A parsed event is a few kilobytes, so
+    /// this is at most a few megabytes for each room that has this much history. `0` keeps
+    /// none, which costs a database read per event served and gains nothing. Synapse has no
+    /// equivalent: it caches events across rooms (`event_cache_size`, 10K by default).
+    #[serde(default = "default_event_cache_size")]
+    pub event_cache_size: u32,
+
+    /// How long a room nobody has used stays in memory before it is unloaded, checked once a
+    /// minute. A room is loaded again, from the database, the next time it is used; the load
+    /// reads the room's history, so a large room takes seconds to come back. Unset (the
+    /// default), a room stays loaded for as long as the server runs. Synapse has no equivalent;
+    /// it holds no room in memory between requests.
+    #[serde(default)]
+    pub idle_unload_after: Option<crate::duration::Duration>,
+}
+
+fn default_event_cache_size() -> u32 {
+    1_000
+}
+
+impl Default for RoomsConfig {
+    fn default() -> Self {
+        Self {
+            event_cache_size: default_event_cache_size(),
+            idle_unload_after: None,
+        }
+    }
 }
 
 /// Retention of the sync feeds (`server.sync`). Both settings take effect at once.
@@ -130,6 +172,7 @@ impl Default for ServerConfig {
             admin_contact: None,
             unstable_features: BTreeMap::new(),
             sync: SyncConfig::default(),
+            rooms: RoomsConfig::default(),
         }
     }
 }

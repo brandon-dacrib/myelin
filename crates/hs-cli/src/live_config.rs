@@ -304,6 +304,23 @@ fn keep_running(running: &Value, next: &mut Value, section: &str) {
     }
 }
 
+/// `server.rooms`: installs the per-room event cache size and the idle unload threshold on
+/// the room registry, which every room reads from there, and says so.
+pub fn apply_rooms<B: hs_kv::KvBackend>(
+    rooms: &hs_room::registry::RoomRegistry<B>,
+    config: &hs_config::server::RoomsConfig,
+) {
+    rooms.set_event_cache_size(config.event_cache_size as usize);
+    let idle: Option<std::time::Duration> = config.idle_unload_after.map(Into::into);
+    rooms.set_idle_unload_after(idle);
+    tracing::info!(
+        event_cache_size = config.event_cache_size,
+        idle_unload_after = ?idle,
+        "each room keeps this many recent events in memory; the rest is read from the database \
+         (server.rooms)"
+    );
+}
+
 /// The server-wide send limit `rate_limits` says is in force: `rate_limits.message` while
 /// `rate_limits.enabled`, and nothing -- nobody without an override limited -- otherwise, or
 /// when its rate is `0`.

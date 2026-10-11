@@ -1603,6 +1603,11 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     rooms
         .send_limiter()
         .set_server_limit(crate::live_config::message_limit(&config.rate_limits));
+    // `server.rooms`: how many of a room's events stay in memory, and how long an unused room
+    // does. Read by every room on every event it caches and by the unloader on every sweep,
+    // so a change is in force at once (the `server` hook below sets them again).
+    crate::live_config::apply_rooms(&rooms, &config.server.rooms);
+    let _idle_unloader = rooms.spawn_idle_unloader();
     // An administrator's change to a user's display name or avatar (`users.update`) is carried
     // into the user's rooms the way their own `PUT /profile/...` is: the record changes in
     // `hs-auth`, and the room layer re-stamps their membership everywhere they are joined.
@@ -1639,6 +1644,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             crate::live_config::apply_network(config);
             Ok(())
         });
+        let rooms_for_server = rooms.clone();
         let rooms = rooms.clone();
         let limits = auth_state.limits.clone();
         live.on_change("rate_limits", move |config| {
@@ -1681,6 +1687,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
                 "sign-in and validation links now use the new public address"
             );
             auth.set_config(new);
+            crate::live_config::apply_rooms(&rooms_for_server, &config.server.rooms);
             Ok(())
         });
         let registry = appservices.registry.clone();

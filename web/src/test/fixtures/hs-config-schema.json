@@ -17,6 +17,10 @@
         "sync": {
           "feed_retention_entries": 10000,
           "hot_room_stream_retention_entries": 100000
+        },
+        "rooms": {
+          "event_cache_size": 1000,
+          "idle_unload_after": null
         }
       }
     },
@@ -402,6 +406,15 @@
             "hot_room_stream_retention_entries": 100000
           },
           "x-applies": "hot"
+        },
+        "rooms": {
+          "description": "How much of each room this server keeps in memory while the room is in use: the recent\nevents it holds resident per room, and how long an unused room stays resident. A room's\nmemory is bounded by its state and this window, not by the length of its history; the\nrest is read from the database as needed.",
+          "$ref": "#/$defs/RoomsConfig",
+          "default": {
+            "event_cache_size": 1000,
+            "idle_unload_after": null
+          },
+          "x-applies": "hot"
         }
       },
       "additionalProperties": false,
@@ -429,6 +442,40 @@
         }
       },
       "additionalProperties": false
+    },
+    "RoomsConfig": {
+      "description": "What a room costs in memory (`server.rooms`). Both settings take effect at once.",
+      "type": "object",
+      "properties": {
+        "event_cache_size": {
+          "description": "How many of a room's events this server keeps in memory, per room, most recently used\nfirst: the ones its members' clients read and its next events cite. An event not kept is\nread from the database when a request needs it. A parsed event is a few kilobytes, so\nthis is at most a few megabytes for each room that has this much history. `0` keeps\nnone, which costs a database read per event served and gains nothing. Synapse has no\nequivalent: it caches events across rooms (`event_cache_size`, 10K by default).",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "default": 1000
+        },
+        "idle_unload_after": {
+          "description": "How long a room nobody has used stays in memory before it is unloaded, checked once a\nminute. A room is loaded again, from the database, the next time it is used; the load\nreads the room's history, so a large room takes seconds to come back. Unset (the\ndefault), a room stays loaded for as long as the server runs. Synapse has no equivalent;\nit holds no room in memory between requests.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Duration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false
+    },
+    "Duration": {
+      "description": "A duration: a string of <number><unit> groups (ms, s, m, h, d, w, y), or an integer number of milliseconds.",
+      "type": [
+        "string",
+        "integer"
+      ],
+      "x-duration": true
     },
     "ListenersConfig": {
       "description": "All configured listeners. Restart required to change (see\n[`crate::reload`]): sockets are bound once at startup.",
@@ -730,14 +777,6 @@
           "const": "verify-full"
         }
       ]
-    },
-    "Duration": {
-      "description": "A duration: a string of <number><unit> groups (ms, s, m, h, d, w, y), or an integer number of milliseconds.",
-      "type": [
-        "string",
-        "integer"
-      ],
-      "x-duration": true
     },
     "MediaConfig": {
       "description": "Media repository settings.",

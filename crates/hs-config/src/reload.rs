@@ -140,6 +140,10 @@ pub const SETTINGS: &[Setting] = &[
         "/server/sync",
         "the session hub reads it on every room update",
     ),
+    hot(
+        "/server/rooms",
+        "the room registry reads it on every event it caches and every minute's idle sweep",
+    ),
     // listeners, storage
     bootstrap("/listeners", "sockets this process binds at startup"),
     bootstrap("/storage", "where the database is, read before it is open"),

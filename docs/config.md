@@ -15,7 +15,7 @@ Decision 0010: this server is administered through the admin API and the web int
 Every setting is one of three kinds (decision 0016; `hs_config::reload::SETTINGS` is the table, and the schema the admin API serves carries it as `x-applies` on each setting):
 
 - **bootstrap** (7): set at install, per process, never stored in the database;
-- **hot** (56): applies to the running server at once -- a save reports it as reloaded;
+- **hot** (57): applies to the running server at once -- a save reports it as reloaded;
 - **restart** (20): stored at once, read at the next start -- a save reports it as waiting for a restart.
 
 The **Applies** column below gives each setting's kind and what reads it. Sections in which every administered setting is hot: `server`, `rate_limits`, `appservices`, `migration`, `network`, `email`.
@@ -36,6 +36,7 @@ signing keys are, and what it advertises about itself.
 | `admin_contact` | string \| null | — | hot (GET /.well-known/matrix/support reads it per request) | How to reach this server's administrator: an email address (`mailto:abuse@example.org`) or a Matrix ID (`@admin:example.org`). It is published as the administrator contact in `/.well-known/matrix/support`, the document clients read to tell people who to ask for help or report abuse to; a `https://` address is published there as the support page instead. Unset, that document is not served. Corresponds to Synapse's `admin_contact`. |
 | `unstable_features` | object | `{}` | hot (GET /versions reads it per request) | Extra `unstable_features` flags advertised by `GET /_matrix/client/versions`, by MSC identifier (`org.matrix.msc3202: true`). Merged over the server's built-in set, which is empty: every flag gates a feature a client or bridge will then use, so advertise one only for a feature this server serves. `false` suppresses a built-in flag. |
 | `sync` | object | `{"feed_retention_entries":10000,"hot_room_stream_retention_entries":100000}` | hot (the session hub reads it on every room update) | How much of each user's sync history this server keeps: the per-user feed that tells `/sync` which rooms changed, and the server-wide stream that does the same for very large rooms. Older history is compacted to each room's last position. A client whose sync token is older than what is kept still learns of every room that changed, and is sent a room whole where its position as of the token is gone; it never misses anything. |
+| `rooms` | object | `{"event_cache_size":1000,"idle_unload_after":null}` | hot (the room registry reads it on every event it caches and every minute's idle sweep) | How much of each room this server keeps in memory while the room is in use: the recent events it holds resident per room, and how long an unused room stays resident. A room's memory is bounded by its state and this window, not by the length of its history; the rest is read from the database as needed. |
 
 
 ## `listeners`
