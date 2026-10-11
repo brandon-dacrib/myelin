@@ -34,6 +34,11 @@ use hs_tables::keyspace::TypedKeyspace;
 
 use super::*;
 
+/// How many events either side of where [`RoomActor::event_nearest`]'s bisection lands are
+/// read for the exact nearest timestamp: how far out of position order a sender's clock may
+/// put an event and still be found.
+const NEAREST_WINDOW: usize = 64;
+
 /// How many rows one purge or deletion transaction touches.
 const ADMIN_BATCH: usize = 512;
 
@@ -89,7 +94,7 @@ impl<B: KvBackend> RoomActor<B> {
             if Some(*pos) == newest || self.forward_extremities.contains(sn) {
                 continue;
             }
-            let Some(event) = self.events.get(sn) else {
+            let Some(event) = self.event_uncached(*sn) else {
                 continue;
             };
             let header = event.header();
@@ -125,7 +130,7 @@ impl<B: KvBackend> RoomActor<B> {
             let Some(sn) = self.timeline.get(pos).copied() else {
                 continue;
             };
-            let Some(event) = self.events.get(&sn) else {
+            let Some(event) = self.event_uncached(sn) else {
                 continue;
             };
             let redacted = hs_model::redaction::redact(event.json(), &self.rules.redaction)
@@ -177,7 +182,7 @@ impl<B: KvBackend> RoomActor<B> {
         for (pos, sn, skeleton, _) in rewrites {
             self.timeline.remove(&pos);
             self.purged.insert(sn);
-            self.events.insert(sn, skeleton);
+            self.hold(sn, skeleton, Some(pos));
             for children in self.relations_by_target.values_mut() {
                 children.retain(|child| *child != sn);
             }
@@ -194,15 +199,12 @@ impl<B: KvBackend> RoomActor<B> {
         room_pos: i64,
         explicit_state: Option<&[EventSn]>,
     ) -> Result<(), RoomError> {
-        self.event_id_index
-            .insert(event.event_id().to_owned(), event_sn);
         self.next_room_pos = self.next_room_pos.max(room_pos + 1);
         match explicit_state {
             Some(state) => self.feed_store_with_state(&event, event_sn, state)?,
             None => self.feed_store(&event, event_sn)?,
         };
         self.purged.insert(event_sn);
-        self.events.insert(event_sn, event);
         Ok(())
     }
 
@@ -213,7 +215,7 @@ impl<B: KvBackend> RoomActor<B> {
         let mut out: Vec<(&Event, i64)> = self
             .forward_extremities
             .iter()
-            .filter_map(|sn| self.events.get(sn))
+            .filter_map(|sn| self.event(*sn))
             .map(|e| (e, self.timeline_position(e.event_id()).unwrap_or(i64::MIN)))
             .collect();
         out.sort_by(|(a, a_pos), (b, b_pos)| {
@@ -245,7 +247,7 @@ impl<B: KvBackend> RoomActor<B> {
         }
         let dropped: Vec<(OwnedEventId, EventSn)> = ordered[1..]
             .iter()
-            .filter_map(|id| self.event_id_index.get(id).map(|sn| (id.clone(), *sn)))
+            .filter_map(|id| self.sn_of(id).map(|sn| (id.clone(), sn)))
             .collect();
         let room_sn = self.room_sn;
         transact(&self.backend, TransactConfig::default(), |txn| {
@@ -267,14 +269,40 @@ impl<B: KvBackend> RoomActor<B> {
     /// The timeline event nearest `ts` (milliseconds) in direction `direction`: forwards, the
     /// first sent at or after it; backwards, the last sent at or before it (MSC3030's
     /// `timestamp_to_event`, over what this server holds).
+    ///
+    /// Timestamps follow timeline positions closely but not exactly (each is the sender's
+    /// clock), so this bisects the timeline by position reading one event per probe, then
+    /// looks [`NEAREST_WINDOW`] events either side of where the bisection landed for the
+    /// exact answer -- about `2 log n + 2 * NEAREST_WINDOW` reads, not one per event of
+    /// history. An event further out of order than that window is missed.
     #[must_use]
     pub fn event_nearest(&self, ts: i64, direction: Direction) -> Option<&Event> {
-        let events = self.timeline.values().filter_map(|sn| self.events.get(sn));
+        let ts_of = |sn: EventSn| self.event_uncached(sn).map(|e| e.header().origin_server_ts);
+        let (&first, _) = self.timeline.iter().next()?;
+        let (&last, _) = self.timeline.iter().next_back()?;
+        // The first position whose event was sent at or after `ts`, by bisection.
+        let (mut lo, mut hi) = (first, last + 1);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let Some((&pos, &sn)) = self.timeline.range(mid..).next() else {
+                hi = mid;
+                continue;
+            };
+            match ts_of(sn) {
+                Some(t) if t < ts => lo = pos + 1,
+                _ => hi = pos,
+            }
+        }
+        let older = self.timeline.range(..lo).rev().take(NEAREST_WINDOW);
+        let newer = self.timeline.range(lo..).take(NEAREST_WINDOW);
+        let candidates = older
+            .chain(newer)
+            .filter_map(|(_, sn)| self.event_uncached(*sn));
         match direction {
-            Direction::Forward => events
+            Direction::Forward => candidates
                 .filter(|e| e.header().origin_server_ts >= ts)
                 .min_by_key(|e| e.header().origin_server_ts),
-            Direction::Backward => events
+            Direction::Backward => candidates
                 .filter(|e| e.header().origin_server_ts <= ts)
                 .max_by_key(|e| e.header().origin_server_ts),
         }
@@ -302,7 +330,7 @@ impl<B: KvBackend> RoomActor<B> {
             }
         };
         for sn in self.timeline.values() {
-            if let Some(event) = self.events.get(sn) {
+            if let Some(event) = self.event_uncached(*sn) {
                 visit(event);
             }
         }
@@ -400,7 +428,22 @@ impl<B: KvBackend> RoomActor<B> {
             .filter_map(|e| e.header().state_key.clone())
             .collect();
         let aliases = self.list_aliases().unwrap_or_default();
-        let event_sns: Vec<EventSn> = self.events.keys().copied().collect();
+        // Every event row of the room: the timeline's, the purged (out of the timeline, rows
+        // kept), the outliers (the rejected and the fetched-state outliers among them).
+        let mut event_sns: HashSet<EventSn> = self.timeline.values().copied().collect();
+        event_sns.extend(self.purged.iter().copied());
+        event_sns.extend(self.rejected.iter().copied());
+        event_sns.extend(self.fetched_state_outliers.iter().copied());
+        {
+            let snapshot = backend.snapshot();
+            let spec =
+                TypedKeyspace::<B::Keyspace, crate::persist::OutlierKey>::prefix(&(room_sn,));
+            for item in tables.outliers.range(&snapshot, spec) {
+                let ((_, sn), _) = item?;
+                event_sns.insert(sn);
+            }
+        }
+        let event_sns: Vec<EventSn> = event_sns.into_iter().collect();
 
         let mut removed = 0u64;
         for chunk in event_sns.chunks(ADMIN_BATCH) {
@@ -444,6 +487,8 @@ impl<B: KvBackend> RoomActor<B> {
         self.gaps.clear();
         self.forward_extremities.clear();
         self.relations_by_target.clear();
+        self.pins.as_mut().clear();
+        self.cache.borrow_mut().clear();
         Ok(removed)
     }
 }

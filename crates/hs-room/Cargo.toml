@@ -21,6 +21,9 @@ ruma.workspace = true
 rand.workspace = true
 # `crate::moderation::ModerationMetrics`: `hs_room_moderated_writes_total` on `/metrics`.
 prometheus-client.workspace = true
+# `crate::actor::RoomActor::pins`: the per-operation pin arena that lets a bounded event cache
+# hand out `&Event` (see `crate::actor::event_cache`'s module docs).
+elsa.workspace = true
 hs-model = { path = "../hs-model" }
 hs-state = { path = "../hs-state" }
 hs-kv = { path = "../hs-kv" }
@@ -36,6 +39,10 @@ hs-admin = { path = "../hs-admin" }
 # No cycle: `hs-cluster` depends only on `hs-kv`.
 hs-cluster = { path = "../hs-cluster" }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# `crate::metrics::process_memory`: `proc_pidinfo` for this process's resident size.
+libc.workspace = true
+
 [dev-dependencies]
 proptest.workspace = true
 # `crate::third_party_invite`'s tests sign an identity server's `signed` block.
@@ -43,6 +50,9 @@ ed25519-dalek.workspace = true
 base64.workspace = true
 tower = { workspace = true, features = ["util"] }
 hs-testkit = { path = "../hs-testkit" }
+# `tests/working_set.rs`'s measurement of a 50,000-event room on a Fjall store in a temporary
+# directory.
+tempfile.workspace = true
 # `hs-testkit`'s `FakeClock` calls `tokio::time::advance`, which needs tokio's `test-util`
 # feature; `hs-testkit`'s own Cargo.toml does not request it (see
 # `docs/status/04-room-and-events.md`), so this crate's tests request it here. Cargo unifies

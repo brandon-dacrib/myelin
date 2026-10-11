@@ -51,6 +51,10 @@ tokio-postgres = "0.7"
 deadpool-postgres = "0.14"
 tempfile = "3"
 libc = "0.2"
+# `hs-room`'s per-operation pin arena (`RoomActor::pins`): an append-only map that hands out
+# `&Event` through `&self`, so the actor's event cache can be bounded without changing the
+# `&Event`-returning read API. MIT OR Apache-2.0.
+elsa = "1"
 # Added by track 01 (storage), for the PostgreSQL `KvBackend`: `hs-kv`'s trait is synchronous
 # (mirrors the embedded Fjall backend, which is also blocking), so the backend uses the
 # synchronous `postgres` client (the same rust-postgres project as `tokio-postgres` above, with a

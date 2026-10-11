@@ -1,6 +1,7 @@
 //! [`RoomActor`]: the synchronous, single-room state machine. [`RoomActorHandle`]: the async,
 //! serialized mailbox wrapping it. See `crate::protocol` for the design rationale.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
@@ -31,6 +32,7 @@ use crate::timeline::{Direction, PaginationToken};
 
 pub mod admin_ops;
 pub mod catch_up;
+pub mod event_cache;
 mod fetched_state;
 pub mod gaps;
 mod history;
@@ -48,6 +50,9 @@ mod new_room_ids;
 pub mod redactions;
 mod rejected;
 mod soft_fail;
+mod working_set;
+
+use event_cache::EventCache;
 
 /// Timeline events with their room-local positions, as [`RoomActor::events_around`] answers.
 pub type PositionedEvents<'a> = Vec<(i64, &'a Event)>;
@@ -62,6 +67,10 @@ pub type PositionedEvents<'a> = Vec<(i64, &'a Event)>;
 /// already taken (a version-12 create identical to an earlier one). With no fencing installed
 /// (this crate's own tests; `hs serve` always installs it) the bound is this number itself.
 pub const MAX_ID_ATTEMPTS_PER_SHARD: u32 = 16;
+
+/// How many events [`RoomActor::load`] replays between two releases of what the replay
+/// pinned (`working_set`): the bound on a load's transient memory, in events.
+const LOAD_PIN_RELEASE_EVERY: usize = 256;
 
 fn to_kv(e: hs_tables::keyspace::TableError) -> hs_kv::KvError {
     match e {
@@ -372,12 +381,16 @@ pub struct RoomActor<B: KvBackend> {
     /// `backend` (content-addressed, so safe to share the physical keyspace across rooms -- see
     /// this crate's status file for why).
     store: ProductionStateStore<B>,
-    /// Every event body held in memory. Phase 0 scope: unbounded (the whole room's history stays
-    /// resident for the actor's lifetime); see `crate::registry` for room-granularity eviction and
-    /// this module's doc comment on `events` for the documented next step (a bounded recent-window
-    /// cache with KV fallback for older events).
-    events: HashMap<EventSn, Event>,
-    event_id_index: HashMap<OwnedEventId, EventSn>,
+    /// The event bodies held in memory: a bounded, least-recently-used working set
+    /// (`server.rooms.event_cache_size` events) over the store, which holds every event
+    /// (`event_cache`, `working_set`). Until 2026-10-10 this was every event of the room for
+    /// the actor's lifetime, so a room's memory grew with its history. Behind a `RefCell`
+    /// because a read through `&self` touches it (a hit is a use).
+    cache: RefCell<EventCache>,
+    /// The events the current operation has touched, pinned so that reads can hand out
+    /// `&Event` through `&self` while the cache behind them may evict; cleared by
+    /// [`RoomActor::begin_operation`] (`working_set`).
+    pins: elsa::FrozenMap<EventSn, Arc<Event>>,
     /// The room's forward extremities. Usually a single event: every ordinary local send
     /// (`RoomActor::send_event`) cites *every* current extremity as its `prev_events`, which
     /// converges them all back down to one. More than one is a genuine, representable fork --
@@ -459,6 +472,10 @@ pub struct RoomActor<B: KvBackend> {
     /// the join a `send_join` made, a leave or knock a resident took. In-memory only: it matters
     /// for the moment the event is published, which is when the federation sender reads it.
     not_proactively_sent: HashSet<EventSn>,
+    /// The short id of the room's `m.room.create`, once fed to the state store: what
+    /// [`RoomActor::only_prev_is_create`] compares against, so that neither a load nor a send
+    /// reads an event body to learn whether a prev event is the create.
+    create_sn: Option<EventSn>,
     /// Set once an administrator has deleted this room (`crate::actor::admin_ops`). A handle
     /// somebody still holds refuses every write from then on, so nothing can be written into a
     /// room whose records are being removed.
@@ -760,12 +777,15 @@ impl<B: KvBackend> RoomActor<B> {
             tables,
             identity,
             room_sn,
+            cache: RefCell::new(EventCache::new(
+                room_id.clone(),
+                event_cache::CacheCapacity::default(),
+            )),
+            pins: elsa::FrozenMap::new(),
             room_id,
             room_version,
             rules,
             store,
-            events: HashMap::new(),
-            event_id_index: HashMap::new(),
             forward_extremities: BTreeSet::new(),
             timeline: BTreeMap::new(),
             next_room_pos: 1,
@@ -789,6 +809,7 @@ impl<B: KvBackend> RoomActor<B> {
             fencing: None,
             quiet: false,
             rewrites_seen: 0,
+            create_sn: None,
             pending_redactions: HashMap::new(),
         }
     }
@@ -930,7 +951,10 @@ impl<B: KvBackend> RoomActor<B> {
             }
         }
         outliers.sort_by(|(_, a), (_, b)| topological_order(a, b));
-        for (sn, event) in outliers {
+        for (index, (sn, event)) in outliers.into_iter().enumerate() {
+            if index % LOAD_PIN_RELEASE_EVERY == 0 {
+                actor.begin_operation();
+            }
             // An event stored as rejected (`rejected`) shares the outliers' index and nothing
             // else: it is not fed to the state store.
             if event.header().flags.is_rejected() {
@@ -968,12 +992,17 @@ impl<B: KvBackend> RoomActor<B> {
         }
         entries.sort_by_key(|(pos, _)| *pos);
 
-        for (room_pos, event_sn) in entries {
+        for (index, (room_pos, event_sn)) in entries.into_iter().enumerate() {
+            // What the replay pinned so far is released every so often, so that a load's peak
+            // is bounded by this stretch of events, not by the room (`working_set`).
+            if index % LOAD_PIN_RELEASE_EVERY == 0 {
+                actor.begin_operation();
+            }
             // An outlier placed in the timeline by backfill
             // (`RoomActor::accept_backfilled_events`) was absorbed with the outliers above and
             // stays what it was; here it gets its position, and the state computed for it at
             // placement (its `state_snapshots` row) is what reads of the state after it see.
-            if actor.events.contains_key(&event_sn) {
+            if actor.known(event_sn) {
                 let state = match explicit_states.remove(&event_sn) {
                     Some(state) => state,
                     None => {
@@ -1002,7 +1031,7 @@ impl<B: KvBackend> RoomActor<B> {
         // An outlier held with a fetched state and no timeline position (`fetched_state`): the
         // state after it is the one it was held with, as at the time it was.
         for (sn, state) in explicit_states {
-            if !actor.events.contains_key(&sn) {
+            if !actor.known(sn) {
                 continue;
             }
             if actor.rejected.contains(&sn) {
@@ -1040,7 +1069,7 @@ impl<B: KvBackend> RoomActor<B> {
             gap_rows.push((top, record));
         }
         actor.restore_gaps(gap_rows);
-        actor.name_redactions_on_load();
+        actor.warm_cache();
         if !actor.repaired_outlier_states.is_empty() {
             let repaired = actor.repaired_outlier_states.len();
             crate::metrics::count_outlier_state_rows_repaired(repaired);
@@ -1078,12 +1107,12 @@ impl<B: KvBackend> RoomActor<B> {
                 .map_err(|e| RoomError::State(e.to_string()))?;
             return Ok(diff.added.values().copied().collect());
         }
-        let Some(event) = self.events.get(&outlier) else {
+        let Some(event) = self.event(outlier) else {
             return Ok(Vec::new());
         };
         Ok(pipeline::decode_event_ids(event.json().get("auth_events"))
             .iter()
-            .filter_map(|id| self.event_id_index.get(id).copied())
+            .filter_map(|id| self.sn_of(id))
             .collect())
     }
 
@@ -1142,6 +1171,7 @@ impl<B: KvBackend> RoomActor<B> {
     /// # Errors
     /// Returns [`RoomError::State`] if the state store fails.
     fn feed_store(&mut self, event: &Event, event_sn: EventSn) -> Result<Vec<EventSn>, RoomError> {
+        self.note_create(event, event_sn);
         let inputs = self.store_inputs(event);
         self.store
             .add_event(
@@ -1177,6 +1207,7 @@ impl<B: KvBackend> RoomActor<B> {
         event_sn: EventSn,
         state: &[EventSn],
     ) -> Result<Vec<EventSn>, RoomError> {
+        self.note_create(event, event_sn);
         let inputs = self.store_inputs(event);
         self.store
             .add_event_with_state(
@@ -1210,6 +1241,7 @@ impl<B: KvBackend> RoomActor<B> {
     /// # Errors
     /// Returns [`RoomError::State`] if the state store fails.
     fn feed_store_outlier(&mut self, event: &Event, event_sn: EventSn) -> Result<(), RoomError> {
+        self.note_create(event, event_sn);
         let inputs = self.store_inputs(event);
         self.store
             .add_event(
@@ -1230,21 +1262,32 @@ impl<B: KvBackend> RoomActor<B> {
         Ok(())
     }
 
+    /// Remembers the room's `m.room.create` as it is fed ([`RoomActor::create_sn`]).
+    fn note_create(&mut self, event: &Event, event_sn: EventSn) {
+        if event.header().event_type == "m.room.create" && self.create_sn.is_none() {
+            self.create_sn = Some(event_sn);
+        }
+    }
+
+    /// Whether `prev_sns` is exactly the room's `m.room.create` -- the auth rules' "the only
+    /// prev event is the create" case -- without reading any event body.
+    fn only_prev_is_create(&self, prev_sns: &[EventSn]) -> bool {
+        prev_sns.len() == 1 && self.create_sn == Some(prev_sns[0])
+    }
+
     /// What every `feed_store` variant hands the state store: the event's `prev_events` and
     /// `auth_events` decoded to the `EventSn`s this actor holds (entries it does not hold are
     /// skipped), its content, and whether its only prev event is the room's `m.room.create`.
     fn store_inputs(&self, event: &Event) -> StoreInputs {
         let prev_sns: Vec<EventSn> = pipeline::decode_event_ids(event.json().get("prev_events"))
             .iter()
-            .filter_map(|id| self.event_id_index.get(id))
-            .copied()
+            .filter_map(|id| self.sn_of(id))
             .collect();
         // A rejected prev event was never fed to the store; it stands for its own prev events.
         let prev_sns = self.effective_prev_sns(&prev_sns);
         let auth_sns: Vec<EventSn> = pipeline::decode_event_ids(event.json().get("auth_events"))
             .iter()
-            .filter_map(|id| self.event_id_index.get(id))
-            .copied()
+            .filter_map(|id| self.sn_of(id))
             .collect();
         let content = event
             .json()
@@ -1252,11 +1295,7 @@ impl<B: KvBackend> RoomActor<B> {
             .and_then(CanonicalJsonValue::as_object)
             .cloned()
             .unwrap_or_default();
-        let only_prev_is_create = prev_sns.len() == 1
-            && self
-                .events
-                .get(&prev_sns[0])
-                .is_some_and(|e| e.header().event_type == "m.room.create");
+        let only_prev_is_create = self.only_prev_is_create(&prev_sns);
         StoreInputs {
             prev_sns,
             auth_sns,
@@ -1300,16 +1339,13 @@ impl<B: KvBackend> RoomActor<B> {
         } else {
             self.index_relation(&event, event_sn);
         }
-        self.event_id_index
-            .insert(event.event_id().to_owned(), event_sn);
         self.timeline.insert(room_pos, event_sn);
         self.next_room_pos = self.next_room_pos.max(room_pos + 1);
         match explicit_state {
             Some(state) => self.feed_store_with_state(&event, event_sn, state)?,
             None => self.feed_store(&event, event_sn)?,
         };
-        self.events.insert(event_sn, event);
-        self.note_redaction_at(event_sn);
+        self.note_redaction(&event);
         Ok(())
     }
 
@@ -1319,10 +1355,7 @@ impl<B: KvBackend> RoomActor<B> {
     /// every outlier is a state event (a state snapshot and its auth chain contain nothing
     /// else), and `/relations` is a timeline read.
     fn absorb_loaded_outlier(&mut self, event_sn: EventSn, event: Event) -> Result<(), RoomError> {
-        self.event_id_index
-            .insert(event.event_id().to_owned(), event_sn);
         self.feed_store_outlier(&event, event_sn)?;
-        self.events.insert(event_sn, event);
         Ok(())
     }
 
@@ -1354,7 +1387,7 @@ impl<B: KvBackend> RoomActor<B> {
         Ok(RoomStateView {
             store: &self.store,
             root,
-            bodies: EventMap(&self.events),
+            bodies: EventMap(self),
         })
     }
 
@@ -1421,7 +1454,7 @@ impl<B: KvBackend> RoomActor<B> {
     ) -> Result<<ProductionStateStore<B> as StateStore>::Root, RoomError> {
         let mut diff = hs_state::api::StateDiff::default();
         for sn in state.iter().chain(plus.iter()) {
-            let Some(event) = self.events.get(sn) else {
+            let Some(event) = self.event_uncached(*sn) else {
                 continue;
             };
             let Some(state_key) = event.header().state_key.as_deref() else {
@@ -1481,7 +1514,7 @@ impl<B: KvBackend> RoomActor<B> {
         Ok(RoomStateView {
             store: &self.store,
             root,
-            bodies: EventMap(&self.events),
+            bodies: EventMap(self),
         })
     }
 
@@ -1489,8 +1522,7 @@ impl<B: KvBackend> RoomActor<B> {
         sns.iter()
             .map(|sn| {
                 let event = self
-                    .events
-                    .get(sn)
+                    .event(*sn)
                     .ok_or_else(|| RoomError::Internal("cited event not in hot cache".into()))?;
                 pipeline::event_ref(event, &self.rules)
             })
@@ -1876,7 +1908,7 @@ impl<B: KvBackend> RoomActor<B> {
     /// this actor; [`RoomError::Forbidden`] if authorization rejects the event; [`RoomError::State`]
     /// if the state store fails; [`RoomError::Store`] on a storage failure persisting the event.
     pub fn accept_remote_event(&mut self, event: Event) -> Result<RemoteEventOutcome, RoomError> {
-        if self.event_id_index.contains_key(event.event_id()) {
+        if self.sn_of(event.event_id()).is_some() {
             return Ok(RemoteEventOutcome::AlreadyKnown);
         }
 
@@ -1886,15 +1918,15 @@ impl<B: KvBackend> RoomActor<B> {
         let mut missing = Vec::new();
         let mut prev_sns = Vec::with_capacity(prev_ids.len());
         for id in &prev_ids {
-            match self.event_id_index.get(id) {
-                Some(&sn) => prev_sns.push(sn),
+            match self.sn_of(id) {
+                Some(sn) => prev_sns.push(sn),
                 None => missing.push(id.clone()),
             }
         }
         let mut auth_sns = Vec::with_capacity(auth_ids.len());
         for id in &auth_ids {
-            match self.event_id_index.get(id) {
-                Some(&sn) => auth_sns.push(sn),
+            match self.sn_of(id) {
+                Some(sn) => auth_sns.push(sn),
                 None => missing.push(id.clone()),
             }
         }
@@ -2032,8 +2064,7 @@ impl<B: KvBackend> RoomActor<B> {
         let mut auth_event_refs = Vec::with_capacity(auth_sns.len());
         for &sn in auth_sns {
             let e = self
-                .events
-                .get(&sn)
+                .event(sn)
                 .ok_or_else(|| RoomError::Internal("auth event not in hot cache".into()))?;
             let content = e
                 .json()
@@ -2079,11 +2110,7 @@ impl<B: KvBackend> RoomActor<B> {
             .cloned()
             .unwrap_or_default();
         let redacts_owned = extract_redacts(event);
-        let only_prev_is_create = prev_sns.len() == 1
-            && self
-                .events
-                .get(&prev_sns[0])
-                .is_some_and(|e| e.header().event_type == "m.room.create");
+        let only_prev_is_create = self.only_prev_is_create(prev_sns);
 
         // From room version 12 the create event carries no `room_id` (its id is the room's),
         // and `check_room_create` refuses one that does: an imported or received create event
@@ -2322,8 +2349,7 @@ impl<B: KvBackend> RoomActor<B> {
         // `send_event_citing` -- an explicit subset of events this actor already holds).
         let prev_sns: Vec<EventSn> = pipeline::decode_event_ids(event.json().get("prev_events"))
             .iter()
-            .filter_map(|id| self.event_id_index.get(id))
-            .copied()
+            .filter_map(|id| self.sn_of(id))
             .collect();
         let old_extremities: Vec<EventSn> = match &kind {
             _ if soft_failed => Vec::new(),
@@ -2533,8 +2559,6 @@ impl<B: KvBackend> RoomActor<B> {
         }
         self.timeline.insert(room_pos, event_sn);
         self.next_room_pos = room_pos + 1;
-        self.event_id_index
-            .insert(event.event_id().to_owned(), event_sn);
         if let Some(below) = gap_below {
             self.open_gap(room_pos, below, &event);
         }
@@ -2553,8 +2577,8 @@ impl<B: KvBackend> RoomActor<B> {
             push_evaluation_inputs: Vec::new(),
             global_seq: 0,
         };
-        self.events.insert(event_sn, event);
-        self.note_redaction_at(event_sn);
+        self.note_redaction(&event);
+        self.hold(event_sn, event, Some(room_pos));
         if self.quiet {
             return Ok(event_sn);
         }
@@ -2674,9 +2698,7 @@ impl<B: KvBackend> RoomActor<B> {
         let mut pending: Vec<Event> = Vec::with_capacity(outliers.len());
         let mut seen: HashSet<OwnedEventId> = HashSet::new();
         for mut event in outliers {
-            if self.event_id_index.contains_key(event.event_id())
-                || !seen.insert(event.event_id().to_owned())
-            {
+            if self.sn_of(event.event_id()).is_some() || !seen.insert(event.event_id().to_owned()) {
                 continue;
             }
             event.flags_mut().set_outlier(true);
@@ -2881,7 +2903,7 @@ impl<B: KvBackend> RoomActor<B> {
                 // event carries the none it was parsed with.
                 let flags = p
                     .held_as
-                    .and_then(|sn| self.events.get(&sn))
+                    .and_then(|sn| self.event(sn))
                     .map_or_else(|| p.event.header().flags, |held| held.header().flags);
                 let persisted = PersistedEvent {
                     room_id: self.room_id.to_string(),
@@ -2924,12 +2946,7 @@ impl<B: KvBackend> RoomActor<B> {
                     let state_sns: Vec<EventSn> = p
                         .state_before
                         .iter()
-                        .filter_map(|id| {
-                            local
-                                .get(id)
-                                .copied()
-                                .or_else(|| self.event_id_index.get(id).copied())
-                        })
+                        .filter_map(|id| local.get(id).copied().or_else(|| self.sn_of(id)))
                         .collect();
                     self.tables
                         .state_snapshots
@@ -2962,24 +2979,24 @@ impl<B: KvBackend> RoomActor<B> {
                 let state_sns: Vec<EventSn> = p
                     .state_before
                     .iter()
-                    .filter_map(|id| self.event_id_index.get(id).copied())
+                    .filter_map(|id| self.sn_of(id))
                     .collect();
                 if p.held_as.is_some() {
                     self.timeline.insert(p.room_pos, sn);
+                    // The row was just rewritten with its position; the cached copy learns it.
+                    self.set_cached_room_pos(sn, Some(p.room_pos));
                     self.record_placed_outlier_state(sn, &state_sns)?;
                     added += 1;
                     continue;
                 }
-                self.event_id_index
-                    .insert(p.event.event_id().to_owned(), sn);
                 self.timeline.insert(p.room_pos, sn);
                 if relation.is_some() {
                     self.index_relation(&p.event, sn);
                 }
                 self.feed_store_with_state(&p.event, sn, &state_sns)?;
                 placed.push(p.event.event_id().to_owned());
-                self.events.insert(sn, p.event);
-                self.note_redaction_at(sn);
+                self.note_redaction(&p.event);
+                self.hold(sn, p.event, Some(p.room_pos));
                 added += 1;
             }
         }
@@ -3026,7 +3043,7 @@ impl<B: KvBackend> RoomActor<B> {
         };
         let mut before = BTreeMap::new();
         for s in sns {
-            if let Some(event) = self.events.get(&s)
+            if let Some(event) = self.event_uncached(s)
                 && let Some(state_key) = event.header().state_key.clone()
             {
                 before.insert(
@@ -3308,7 +3325,7 @@ impl<B: KvBackend> RoomActor<B> {
         auth_chain: Vec<Event>,
         join_event: Event,
     ) -> Result<RemoteEventOutcome, RoomError> {
-        if self.event_id_index.contains_key(join_event.event_id()) {
+        if self.sn_of(join_event.event_id()).is_some() {
             return Ok(RemoteEventOutcome::AlreadyKnown);
         }
         self.validate_remote_join(&state, &auth_chain, &join_event)?;
@@ -3320,7 +3337,7 @@ impl<B: KvBackend> RoomActor<B> {
 
         let mut snapshot = Vec::with_capacity(state_ids.len());
         for id in &state_ids {
-            let sn = *self.event_id_index.get(id).ok_or_else(|| {
+            let sn = self.sn_of(id).ok_or_else(|| {
                 RoomError::Internal(format!(
                     "snapshot event {id} was not indexed after persisting"
                 ))
@@ -3367,7 +3384,7 @@ impl<B: KvBackend> RoomActor<B> {
         &mut self,
         event: Event,
     ) -> Result<RemoteEventOutcome, RoomError> {
-        if self.event_id_index.contains_key(event.event_id()) {
+        if self.sn_of(event.event_id()).is_some() {
             return Ok(RemoteEventOutcome::AlreadyKnown);
         }
         let shape = |msg: String| RoomError::InvalidEvent(hs_model::EventError::Format(msg));
@@ -3428,7 +3445,7 @@ impl<B: KvBackend> RoomActor<B> {
         let snapshot: Vec<EventSn> = self
             .full_state()?
             .iter()
-            .filter_map(|held| self.event_id_index.get(held.event_id()).copied())
+            .filter_map(|held| self.sn_of(held.event_id()))
             .collect();
         let event_sn = self.persist_with(event, PersistKind::RemoteJoin { snapshot })?;
         Ok(RemoteEventOutcome::Stored(event_sn))
@@ -4435,7 +4452,7 @@ impl<B: KvBackend> RoomActor<B> {
             .iter()
             .rev()
             .find(|(_, sn)| !self.hidden_from_clients(**sn))?;
-        let event = self.events.get(&event_sn)?;
+        let event = self.event(event_sn)?;
         Some(RoomUpdate {
             room_sn: self.room_sn,
             room_id: self.room_id.clone(),
@@ -4822,7 +4839,7 @@ impl<B: KvBackend> RoomActor<B> {
         Ok(diff
             .added
             .values()
-            .filter_map(|sn| self.events.get(sn))
+            .filter_map(|sn| self.event_uncached(*sn))
             .collect())
     }
 
@@ -4892,12 +4909,9 @@ impl<B: KvBackend> RoomActor<B> {
                 self.room_id
             )));
         }
-        let sn = *self
-            .event_id_index
-            .get(membership_event.event_id())
-            .ok_or_else(|| {
-                RoomError::Internal("current-state event missing from event-ID index".into())
-            })?;
+        let sn = self.sn_of(membership_event.event_id()).ok_or_else(|| {
+            RoomError::Internal("current-state event missing from event-ID index".into())
+        })?;
         Ok(Some(self.state_view_at_sn(sn)?))
     }
 
@@ -4997,7 +5011,7 @@ impl<B: KvBackend> RoomActor<B> {
     /// # Errors
     /// Returns [`RoomError::State`] if the state store fails.
     pub fn state_at_event(&self, event_id: &EventId) -> Result<Option<StateAtEvent>, RoomError> {
-        let Some(&sn) = self.event_id_index.get(event_id) else {
+        let Some(sn) = self.sn_of(event_id) else {
             return Ok(None);
         };
         let root = self.root_after(sn)?;
@@ -5019,10 +5033,10 @@ impl<B: KvBackend> RoomActor<B> {
         &self,
         event_id: &EventId,
     ) -> Result<Option<StateAtEvent>, RoomError> {
-        let Some(&sn) = self.event_id_index.get(event_id) else {
+        let Some(sn) = self.sn_of(event_id) else {
             return Ok(None);
         };
-        let Some(event) = self.events.get(&sn) else {
+        let Some(event) = self.event(sn) else {
             return Ok(None);
         };
         let explicit = self
@@ -5045,7 +5059,7 @@ impl<B: KvBackend> RoomActor<B> {
                 let prev_sns: Vec<EventSn> =
                     pipeline::decode_event_ids(event.json().get("prev_events"))
                         .iter()
-                        .filter_map(|id| self.event_id_index.get(id).copied())
+                        .filter_map(|id| self.sn_of(id))
                         .collect();
                 // A rejected prev event stands for its own prev events (`rejected`).
                 self.state_view(&self.effective_prev_sns(&prev_sns))?.root
@@ -5066,7 +5080,7 @@ impl<B: KvBackend> RoomActor<B> {
         let state_sns: Vec<EventSn> = diff.added.values().copied().collect();
         let state: Vec<Event> = state_sns
             .iter()
-            .filter_map(|s| self.events.get(s).cloned())
+            .filter_map(|s| self.event_uncached(*s).cloned())
             .collect();
 
         let auth_chain_sns = self
@@ -5075,7 +5089,7 @@ impl<B: KvBackend> RoomActor<B> {
             .map_err(|e| RoomError::State(e.to_string()))?;
         let auth_chain: Vec<Event> = auth_chain_sns
             .iter()
-            .filter_map(|s| self.events.get(s).cloned())
+            .filter_map(|s| self.event_uncached(*s).cloned())
             .collect();
 
         Ok(StateAtEvent { state, auth_chain })
@@ -5085,7 +5099,7 @@ impl<B: KvBackend> RoomActor<B> {
     /// [`RoomActor::send_event_citing`] takes as `prev_events`.
     #[must_use]
     pub fn event_sn_of(&self, event_id: &EventId) -> Option<EventSn> {
-        self.event_id_index.get(event_id).copied()
+        self.sn_of(event_id)
     }
 
     /// Whether this server sends `event_id` to the room's other servers itself: every event of
@@ -5095,9 +5109,8 @@ impl<B: KvBackend> RoomActor<B> {
     /// before queueing a local user's event.
     #[must_use]
     pub fn is_proactively_sent(&self, event_id: &EventId) -> bool {
-        self.event_id_index
-            .get(event_id)
-            .is_none_or(|sn| !self.not_proactively_sent.contains(sn))
+        self.sn_of(event_id)
+            .is_none_or(|sn| !self.not_proactively_sent.contains(&sn))
     }
 
     /// One event by ID, if this actor holds it (its own room's events only) in a form a
@@ -5105,11 +5118,14 @@ impl<B: KvBackend> RoomActor<B> {
     /// use [`RoomActor::held_event`], which includes soft-failed events.
     #[must_use]
     pub fn event_by_id(&self, event_id: &EventId) -> Option<&Event> {
-        let sn = self.event_id_index.get(event_id)?;
-        if self.purged.contains(sn) || self.rejected.contains(sn) || self.soft_failed.contains(sn) {
+        let sn = self.sn_of(event_id)?;
+        if self.purged.contains(&sn)
+            || self.rejected.contains(&sn)
+            || self.soft_failed.contains(&sn)
+        {
             return None;
         }
-        self.events.get(sn)
+        self.event(sn)
     }
 
     /// Every current `m.room.member` event.
@@ -5307,6 +5323,54 @@ impl<B: KvBackend> RoomActor<B> {
             == Some("join"))
     }
 
+    /// Whether `user` joined the room at some point after timeline position `pos`: whether
+    /// any of their membership events placed after `pos` is a join. Walks their membership
+    /// history backwards from the room's current state -- each membership event's state before
+    /// it names the one before -- and stops at the first one at or before `pos`, so it costs as
+    /// many reads as the user had membership changes since then, not a scan of every later
+    /// event (which, now that the actor reads older events from the store, would be a read
+    /// per event of history behind `pos`). A membership on a branch the current state does not
+    /// descend from is not seen; neither is one with no position (an outlier).
+    ///
+    /// # Errors
+    /// [`RoomError::State`] if the state store fails.
+    fn joined_after(&self, user: &UserId, pos: i64) -> Result<bool, RoomError> {
+        /// More membership changes than any user has: a guard against a membership whose
+        /// state before it names itself through some corruption.
+        const MAX_MEMBERSHIP_WALK: usize = 10_000;
+        let mut view = self.current_view()?;
+        for _ in 0..MAX_MEMBERSHIP_WALK {
+            let Some(member) = view
+                .event_for("m.room.member", user.as_str())
+                .map_err(|e| RoomError::State(e.to_string()))?
+            else {
+                return Ok(false);
+            };
+            let Some(member_sn) = self.sn_of(member.event_id()) else {
+                return Ok(false);
+            };
+            let Some(member_pos) = self.room_pos_of(member_sn) else {
+                return Ok(false);
+            };
+            if member_pos <= pos {
+                return Ok(false);
+            }
+            if content_str(member, "membership") == Some("join") {
+                return Ok(true);
+            }
+            let prev_sns: Vec<EventSn> =
+                pipeline::decode_event_ids(member.json().get("prev_events"))
+                    .iter()
+                    .filter_map(|id| self.sn_of(id))
+                    .collect();
+            if prev_sns.is_empty() {
+                return Ok(false);
+            }
+            view = self.state_view(&self.effective_prev_sns(&prev_sns))?;
+        }
+        Ok(false)
+    }
+
     /// `user`'s `m.room.member` event in the room's state as of immediately after `event`, if
     /// they have one there. An outlier, which has no state of its own, is answered from the
     /// room's current state. What a lazy-loading `/messages` or `/context` sends for each sender
@@ -5323,9 +5387,8 @@ impl<B: KvBackend> RoomActor<B> {
         if event.header().flags.is_outlier() {
             return self.state_event("m.room.member", user.as_str());
         }
-        let sn = *self
-            .event_id_index
-            .get(event.event_id())
+        let sn = self
+            .sn_of(event.event_id())
             .ok_or_else(|| RoomError::EventNotFound(event.event_id().to_string()))?;
         self.state_view_at_sn(sn)?
             .event_for("m.room.member", user.as_str())
@@ -5378,7 +5441,7 @@ impl<B: KvBackend> RoomActor<B> {
             if self.hidden_from_clients(*sn) {
                 continue;
             }
-            if let Some(event) = self.events.get(sn) {
+            if let Some(event) = self.event_uncached(*sn) {
                 out.push((pos, event));
             }
         }
@@ -5393,7 +5456,7 @@ impl<B: KvBackend> RoomActor<B> {
         if self.purged.contains(sn) || self.hidden_from_clients(*sn) {
             return None;
         }
-        self.events.get(sn)
+        self.event(*sn)
     }
 
     /// Up to `before` timeline events older than position `pos` (nearest first) and up to
@@ -5411,14 +5474,14 @@ impl<B: KvBackend> RoomActor<B> {
             .range(..pos)
             .rev()
             .filter(|(_, sn)| !self.purged.contains(*sn) && !self.hidden_from_clients(**sn))
-            .filter_map(|(p, sn)| Some((*p, self.events.get(sn)?)))
+            .filter_map(|(p, sn)| Some((*p, self.event_uncached(*sn)?)))
             .take(before)
             .collect();
         let newer = self
             .timeline
             .range((std::ops::Bound::Excluded(pos), std::ops::Bound::Unbounded))
             .filter(|(_, sn)| !self.purged.contains(*sn) && !self.hidden_from_clients(**sn))
-            .filter_map(|(p, sn)| Some((*p, self.events.get(sn)?)))
+            .filter_map(|(p, sn)| Some((*p, self.event_uncached(*sn)?)))
             .take(after)
             .collect();
         (older, newer)
@@ -5435,9 +5498,8 @@ impl<B: KvBackend> RoomActor<B> {
     /// Returns [`RoomError::EventNotFound`] if this actor does not hold `event`, or
     /// [`RoomError::State`] if the state store fails.
     pub fn joined_members_after(&self, event: &Event) -> Result<Vec<String>, RoomError> {
-        let sn = *self
-            .event_id_index
-            .get(event.event_id())
+        let sn = self
+            .sn_of(event.event_id())
             .ok_or_else(|| RoomError::EventNotFound(event.event_id().to_string()))?;
         let view = self.state_view_at_sn(sn)?;
         Ok(self
@@ -5449,18 +5511,6 @@ impl<B: KvBackend> RoomActor<B> {
             })
             .filter_map(|e| e.header().state_key.clone())
             .collect())
-    }
-
-    /// The room-local send position (`room_pos`) of a known [`EventSn`], by linear scan of
-    /// `self.timeline`. Phase 0 scope, same tradeoff as `RoomActor::get_context`'s full scan for
-    /// an event's position: this crate holds a room's whole timeline resident in memory already
-    /// (see `events`'s doc comment), so a scan costs a `Vec`-sized comparison loop, not a store
-    /// round trip -- a `HashMap<EventSn, i64>` reverse index is the obvious speed-up if profiling
-    /// ever shows this mattering.
-    fn room_pos_of(&self, sn: EventSn) -> Option<i64> {
-        self.timeline
-            .iter()
-            .find_map(|(pos, s)| (*s == sn).then_some(*pos))
     }
 
     /// Whether `requester` may see `event`, per the `m.room.history_visibility` read-side
@@ -5497,9 +5547,8 @@ impl<B: KvBackend> RoomActor<B> {
         if event.header().flags.is_outlier() {
             return self.can_see_current_membership(requester);
         }
-        let sn = *self
-            .event_id_index
-            .get(event.event_id())
+        let sn = self
+            .sn_of(event.event_id())
             .ok_or_else(|| RoomError::EventNotFound(event.event_id().to_string()))?;
         let pos = self
             .room_pos_of(sn)
@@ -5517,20 +5566,12 @@ impl<B: KvBackend> RoomActor<B> {
         // event alone, Complement's `TestNetworkPartitionOrdering` -- a message from a
         // partitioned server, made before that server had received bob's join -- was hidden
         // from bob or not depending on which of two servers' events arrived first.
-        let joined_later = self
-            .timeline
-            .range((std::ops::Bound::Excluded(pos), std::ops::Bound::Unbounded))
-            .filter_map(|(_, s)| self.events.get(s))
-            .any(|e| {
-                e.header().event_type == "m.room.member"
-                    && e.header().state_key.as_deref() == Some(requester.as_str())
-                    && content_str(e, "membership") == Some("join")
-            })
-            || self.was_joined_at(requester, pos - 1)?;
+        let joined_later =
+            self.joined_after(requester, pos)? || self.was_joined_at(requester, pos - 1)?;
 
         let prev_sns: Vec<EventSn> = pipeline::decode_event_ids(event.json().get("prev_events"))
             .iter()
-            .filter_map(|id| self.event_id_index.get(id).copied())
+            .filter_map(|id| self.sn_of(id))
             .collect();
         let before = self.state_view(&self.effective_prev_sns(&prev_sns))?;
         let after = self.state_view_at_sn(sn)?;
@@ -5583,9 +5624,8 @@ impl<B: KvBackend> RoomActor<B> {
         if event.header().flags.is_outlier() {
             return Ok(true);
         }
-        let sn = *self
-            .event_id_index
-            .get(event.event_id())
+        let sn = self
+            .sn_of(event.event_id())
             .ok_or_else(|| RoomError::EventNotFound(event.event_id().to_string()))?;
         let after = self.state_view_at_sn(sn)?;
         let visibility = history_visibility::HistoryVisibility::parse(
@@ -5643,7 +5683,7 @@ impl<B: KvBackend> RoomActor<B> {
         };
         let prev_sns: Vec<EventSn> = pipeline::decode_event_ids(event.json().get("prev_events"))
             .iter()
-            .filter_map(|id| self.event_id_index.get(id).copied())
+            .filter_map(|id| self.sn_of(id))
             .collect();
         if prev_sns.is_empty() {
             return Ok(None);
@@ -5786,7 +5826,7 @@ impl<B: KvBackend> RoomActor<B> {
         let events: Vec<&Event> = positions
             .iter()
             .filter_map(|pos| self.timeline.get(pos))
-            .filter_map(|sn| self.events.get(sn))
+            .filter_map(|sn| self.event_uncached(*sn))
             .collect();
 
         // The continuation token is the *last* position returned (oldest of the page for
@@ -5837,7 +5877,7 @@ impl<B: KvBackend> RoomActor<B> {
         self.timeline
             .values()
             .next()
-            .and_then(|sn| self.events.get(sn))
+            .and_then(|sn| self.event(*sn))
             .is_some_and(|e| e.header().event_type != "m.room.create")
     }
 
@@ -5851,7 +5891,7 @@ impl<B: KvBackend> RoomActor<B> {
             return None;
         }
         let (_, sn) = self.timeline.iter().next()?;
-        let event_id = self.events.get(sn)?.event_id().to_owned();
+        let event_id = self.event(*sn)?.event_id().to_owned();
         let servers = self.servers_to_ask_for_history();
         Some(crate::backfill::BackfillAnchor { event_id, servers })
     }
@@ -5968,7 +6008,7 @@ impl<B: KvBackend> RoomActor<B> {
     pub fn forward_extremity_ids(&self) -> Vec<(OwnedEventId, i64)> {
         self.forward_extremities
             .iter()
-            .filter_map(|sn| self.events.get(sn))
+            .filter_map(|sn| self.event_uncached(*sn))
             .map(|e| (e.event_id().to_owned(), e.header().depth))
             .collect()
     }
@@ -5979,7 +6019,7 @@ impl<B: KvBackend> RoomActor<B> {
     /// placed and for an event not held at all.
     #[must_use]
     pub fn timeline_position(&self, event_id: &EventId) -> Option<i64> {
-        let sn = *self.event_id_index.get(event_id)?;
+        let sn = self.sn_of(event_id)?;
         self.room_pos_of(sn)
     }
 
@@ -5992,7 +6032,7 @@ impl<B: KvBackend> RoomActor<B> {
         };
         children
             .iter()
-            .filter_map(|sn| self.events.get(sn))
+            .filter_map(|sn| self.event(*sn))
             .filter(|e| {
                 rel_type.is_none_or(|want| {
                     e.json()
@@ -6058,8 +6098,6 @@ impl<B: KvBackend> RoomActor<B> {
         // tie-break is then an event ID, which is a hash. Complement's `TestThreadsEndpoint`
         // passed in two runs out of four on exactly that coin. Position is a total order, is this
         // server's own, and is what "most recently active" means.
-        let position_of: HashMap<EventSn, i64> =
-            self.timeline.iter().map(|(pos, sn)| (*sn, *pos)).collect();
         let mut roots: Vec<(&Event, i64)> = self
             .relations_by_target
             .keys()
@@ -6082,10 +6120,9 @@ impl<B: KvBackend> RoomActor<B> {
                 // nothing about recency; a thread with only those sorts last.
                 let latest = thread_children
                     .iter()
-                    .filter_map(|c| self.event_id_index.get(c.event_id()))
-                    .filter_map(|sn| position_of.get(sn))
+                    .filter_map(|c| self.sn_of(c.event_id()))
+                    .filter_map(|sn| self.room_pos_of(sn))
                     .max()
-                    .copied()
                     .unwrap_or(i64::MIN);
                 Some((root, latest))
             })
@@ -6708,6 +6745,8 @@ impl<B: KvBackend> RoomActorHandle<B> {
         // inside the blocking closure, never across an `.await`.
         tokio::task::spawn_blocking(move || {
             let mut guard = inner.blocking_lock();
+            // Release what the previous operation's reads pinned (`working_set`).
+            guard.begin_operation();
             f(&mut guard)
         })
         .await
@@ -7879,7 +7918,7 @@ mod tests {
         // After the merge, the room has exactly one forward extremity again (the fork converged).
         assert_eq!(
             actor.forward_extremities_vec(),
-            vec![*actor.event_id_index.get(merge.event_id()).unwrap()]
+            vec![actor.sn_of(merge.event_id()).unwrap()]
         );
 
         // The resolved power-levels state is exactly one of the two branches' content (state

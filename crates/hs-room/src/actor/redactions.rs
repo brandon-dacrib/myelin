@@ -28,7 +28,6 @@
 use hs_kv::{KvBackend, TransactConfig, transact};
 use hs_model::Event;
 use hs_model::canonical::{CanonicalJsonObject, CanonicalJsonValue};
-use hs_model::ids::EventSn;
 use ruma::{EventId, OwnedEventId, UserId};
 
 use super::{RoomActor, extract_redacts, to_kv};
@@ -42,11 +41,8 @@ pub const REDACTED_BY: &str = "redacted_by";
 pub const REDACTED_BECAUSE: &str = "redacted_because";
 
 impl<B: KvBackend> RoomActor<B> {
-    /// Indexes the event stored under `event_sn` by the event it redacts, if it is a redaction.
-    pub(super) fn note_redaction_at(&mut self, event_sn: EventSn) {
-        let Some(event) = self.events.get(&event_sn) else {
-            return;
-        };
+    /// Indexes `event` by the event it redacts, if it is a redaction.
+    pub(super) fn note_redaction(&mut self, event: &Event) {
         if event.header().event_type != "m.room.redaction" {
             return;
         }
@@ -126,7 +122,7 @@ impl<B: KvBackend> RoomActor<B> {
         let Some(target) = extract_redacts(event) else {
             return Ok(None);
         };
-        if self.event_id_index.contains_key(&target) {
+        if self.sn_of(&target).is_some() {
             return Ok(None);
         }
         Ok(self
@@ -264,24 +260,24 @@ impl<B: KvBackend> RoomActor<B> {
         target: &EventId,
         rewritten: Option<(Event, serde_json::Value)>,
     ) -> Result<(), RoomError> {
-        let sn = *self
-            .event_id_index
-            .get(target)
+        let sn = self
+            .sn_of(target)
             .ok_or_else(|| RoomError::EventNotFound(target.to_string()))?;
         let mut flags = self
-            .events
-            .get(&sn)
+            .event(sn)
             .ok_or_else(|| RoomError::EventNotFound(target.to_string()))?
             .header()
             .flags;
         flags.set_redacted(true);
         let new_json = rewritten.as_ref().map(|(_, json)| json);
+        let stored_pos: std::cell::Cell<Option<i64>> = std::cell::Cell::new(None);
         transact(&self.backend, TransactConfig::default(), |txn| {
             let Some(bytes) = self.tables.events.get(txn, &(sn,)).map_err(to_kv)? else {
                 return Ok(());
             };
             let mut persisted: PersistedEvent =
                 serde_json::from_slice(&bytes).map_err(hs_kv::KvError::backend)?;
+            stored_pos.set(persisted.room_pos);
             persisted.flags = flags.to_byte();
             if let Some(json) = new_json {
                 persisted.json = json.clone();
@@ -294,44 +290,11 @@ impl<B: KvBackend> RoomActor<B> {
         match rewritten {
             Some((mut event, _)) => {
                 *event.flags_mut() = flags;
-                self.events.insert(sn, event);
+                self.hold(sn, event, stored_pos.get());
             }
-            None => {
-                if let Some(event) = self.events.get_mut(&sn) {
-                    *event.flags_mut() = flags;
-                }
-            }
+            None => self.update_cached(sn, |event| *event.flags_mut() = flags),
         }
         Ok(())
-    }
-
-    /// On load: an event redacted before redactions were kept in it (2026-10-01) is given, in
-    /// memory, the first redaction held for it, so it renders `redacted_because` like any other.
-    /// Nothing is written: a load may run on a replica that does not own the room.
-    pub(super) fn name_redactions_on_load(&mut self) {
-        let targets: Vec<(OwnedEventId, OwnedEventId)> = self
-            .redactions_by_target
-            .iter()
-            .filter_map(|(target, redactions)| Some((target.clone(), redactions.first()?.clone())))
-            .collect();
-        for (target, redaction_id) in targets {
-            let Some(&sn) = self.event_id_index.get(&target) else {
-                continue;
-            };
-            let Some(event) = self.events.get(&sn) else {
-                continue;
-            };
-            if !event.header().flags.is_redacted() || redacted_by(event).is_some() {
-                continue;
-            }
-            let Some(redaction) = self.event_by_id(&redaction_id) else {
-                continue;
-            };
-            if let Ok((mut named, _)) = with_redaction(event, redaction) {
-                *named.flags_mut() = event.header().flags;
-                self.events.insert(sn, named);
-            }
-        }
     }
 }
 
@@ -349,7 +312,7 @@ pub fn redacted_by(event: &Event) -> Option<&str> {
 /// `target` with `redaction` named in its `unsigned`: `redacted_by` its ID, `redacted_because`
 /// its PDU (without the redaction's own `unsigned`). Parsed again, and checked to be the same
 /// event.
-fn with_redaction(
+pub(super) fn with_redaction(
     target: &Event,
     redaction: &Event,
 ) -> Result<(Event, serde_json::Value), RoomError> {

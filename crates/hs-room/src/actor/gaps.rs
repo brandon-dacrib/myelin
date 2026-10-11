@@ -47,7 +47,7 @@
 //!
 //! [`Page::gap`]: super::Page::gap
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use hs_kv::{KvBackend, TransactConfig, transact};
 use hs_model::Event;
@@ -98,25 +98,15 @@ pub struct TimelineGap {
 }
 
 impl<B: KvBackend> RoomActor<B> {
-    /// Every `EventSn` placed in the timeline.
-    fn timeline_sns(&self) -> HashSet<EventSn> {
-        self.timeline.values().copied().collect()
-    }
-
     /// The `prev_events` of `event` that are not in the timeline (held as outliers, or not held
     /// at all).
-    fn prevs_not_in_timeline(
-        &self,
-        event: &Event,
-        in_timeline: &HashSet<EventSn>,
-    ) -> Vec<OwnedEventId> {
+    fn prevs_not_in_timeline(&self, event: &Event) -> Vec<OwnedEventId> {
         pipeline::decode_event_ids(event.json().get("prev_events"))
             .into_iter()
             .filter(|id| {
                 !self
-                    .event_id_index
-                    .get(id)
-                    .is_some_and(|sn| in_timeline.contains(sn))
+                    .sn_of(id)
+                    .is_some_and(|sn| self.room_pos_of(sn).is_some())
             })
             .collect()
     }
@@ -127,17 +117,13 @@ impl<B: KvBackend> RoomActor<B> {
     /// below the timeline instead; or an event whose ancestors are all here).
     pub(super) fn gap_below_for(&self, event: &Event) -> Option<i64> {
         let newest = *self.timeline.keys().next_back()?;
-        let in_timeline = self.timeline_sns();
-        (!self.prevs_not_in_timeline(event, &in_timeline).is_empty()).then_some(newest)
+        (!self.prevs_not_in_timeline(event).is_empty()).then_some(newest)
     }
 
     /// Records the gap `RoomActor::persist_with` just opened below the event at `top`.
     pub(super) fn open_gap(&mut self, top: i64, below: i64, event: &Event) {
-        let in_timeline = self.timeline_sns();
-        let missing: BTreeSet<OwnedEventId> = self
-            .prevs_not_in_timeline(event, &in_timeline)
-            .into_iter()
-            .collect();
+        let missing: BTreeSet<OwnedEventId> =
+            self.prevs_not_in_timeline(event).into_iter().collect();
         tracing::info!(
             room_id = %self.room_id,
             event_id = %event.event_id(),
@@ -159,7 +145,6 @@ impl<B: KvBackend> RoomActor<B> {
 
     /// Rebuilds the in-memory gaps on load from their rows and the timeline just replayed.
     pub(super) fn restore_gaps(&mut self, rows: Vec<(i64, TimelineGapRecord)>) {
-        let in_timeline = self.timeline_sns();
         for (top, record) in rows {
             let filled_to = self
                 .timeline
@@ -171,8 +156,8 @@ impl<B: KvBackend> RoomActor<B> {
             } else {
                 self.timeline
                     .range(filled_to..=top)
-                    .filter_map(|(_, sn)| self.events.get(sn))
-                    .flat_map(|event| self.prevs_not_in_timeline(event, &in_timeline))
+                    .filter_map(|(_, sn)| self.event_uncached(*sn))
+                    .flat_map(|event| self.prevs_not_in_timeline(event))
                     .collect()
             };
             let closed = record.closed || missing.is_empty();
@@ -307,15 +292,13 @@ impl<B: KvBackend> RoomActor<B> {
             older_than_gap,
         } = selection;
         cited.extend(gap.missing.iter().cloned());
-        let in_timeline = self.timeline_sns();
         let missing: BTreeSet<OwnedEventId> = cited
             .into_iter()
             .filter(|id| !older_than_gap.contains(id) && !self.rejected_history.contains(id))
             .filter(|id| {
                 !self
-                    .event_id_index
-                    .get(id)
-                    .is_some_and(|sn| in_timeline.contains(sn))
+                    .sn_of(id)
+                    .is_some_and(|sn| self.room_pos_of(sn).is_some())
             })
             .collect();
         // An event of another room is never part of this room's history, however its events
@@ -399,7 +382,7 @@ impl<B: KvBackend> RoomActor<B> {
             .map_err(|e| RoomError::State(e.to_string()))?;
         let mut after = BTreeMap::new();
         for s in diff.added.values() {
-            if let Some(event) = self.events.get(s)
+            if let Some(event) = self.event_uncached(*s)
                 && let Some(state_key) = event.header().state_key.clone()
             {
                 after.insert(

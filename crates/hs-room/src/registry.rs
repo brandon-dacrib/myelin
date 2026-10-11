@@ -10,6 +10,7 @@ use ruma::{OwnedRoomId, RoomId, UserId};
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 
+use crate::actor::event_cache::CacheCapacity;
 use crate::actor::{RoomActor, RoomActorHandle};
 use crate::error::RoomError;
 use crate::identity::HomeserverIdentity;
@@ -154,7 +155,20 @@ pub struct RoomRegistry<B: KvBackend> {
     /// The rooms a user of this server is joining through another server right now, with how
     /// many such joins are under way ([`RoomRegistry::remote_join_started`]).
     joining: Arc<std::sync::Mutex<HashMap<OwnedRoomId, usize>>>,
+    /// How many event bodies each resident room keeps in memory
+    /// (`server.rooms.event_cache_size`): installed on every actor this registry constructs or
+    /// loads, and read by each on every insert, so [`RoomRegistry::set_event_cache_size`]
+    /// applies at once. See `crate::actor::event_cache`.
+    event_cache_capacity: CacheCapacity,
+    /// How long an unused room stays resident, in seconds; `0` for ever
+    /// (`server.rooms.idle_unload_after`). Read by [`RoomRegistry::spawn_idle_unloader`]'s task
+    /// on every sweep.
+    idle_unload_after_secs: Arc<std::sync::atomic::AtomicU64>,
 }
+
+/// How often [`RoomRegistry::spawn_idle_unloader`] looks for rooms idle longer than
+/// `server.rooms.idle_unload_after`.
+pub const IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// A join through another server under way, from [`RoomRegistry::remote_join_started`] until
 /// this is dropped.
@@ -217,7 +231,77 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
             send_limiter: crate::moderation::SendLimiter::new(),
             search,
             joining: Arc::default(),
+            event_cache_capacity: CacheCapacity::default(),
+            idle_unload_after_secs: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
+    }
+
+    /// Sets how many event bodies each resident room keeps in memory
+    /// (`server.rooms.event_cache_size`). Applies to every room already resident on its next
+    /// cached event, and to every room loaded from now on.
+    pub fn set_event_cache_size(&self, events: usize) {
+        self.event_cache_capacity.set(events);
+    }
+
+    /// The per-room event cache capacity as it stands.
+    #[must_use]
+    pub fn event_cache_size(&self) -> usize {
+        self.event_cache_capacity.get()
+    }
+
+    /// Sets how long an unused room stays resident before
+    /// [`RoomRegistry::spawn_idle_unloader`]'s task unloads it; `None` keeps every room for as
+    /// long as the process runs (`server.rooms.idle_unload_after`). Read on the next sweep.
+    pub fn set_idle_unload_after(&self, after: Option<Duration>) {
+        self.idle_unload_after_secs.store(
+            after.map_or(0, |d| d.as_secs().max(1)),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// How long an unused room stays resident, as it stands; `None` for ever.
+    #[must_use]
+    pub fn idle_unload_after(&self) -> Option<Duration> {
+        match self
+            .idle_unload_after_secs
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            0 => None,
+            secs => Some(Duration::from_secs(secs)),
+        }
+    }
+
+    /// Spawns the task that unloads rooms idle longer than
+    /// [`RoomRegistry::idle_unload_after`], every [`IDLE_SWEEP_INTERVAL`]; a sweep with the
+    /// setting unset does nothing, so the task is spawned once whatever the setting and follows
+    /// it as it changes. What `hs serve` installs; [`RoomRegistry::spawn_eviction_sweeper`] is
+    /// the fixed-threshold variant for a caller with its own schedule.
+    pub fn spawn_idle_unloader(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let registry = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(IDLE_SWEEP_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                let Some(max_idle) = registry.idle_unload_after() else {
+                    continue;
+                };
+                let unloaded = registry.evict_idle(max_idle).await;
+                if unloaded > 0 {
+                    tracing::info!(
+                        unloaded,
+                        idle_for = ?max_idle,
+                        "unloaded rooms nobody had used for a while; each is loaded again on its next use"
+                    );
+                }
+            }
+        })
+    }
+
+    /// Records how many rooms are resident (`hs_room_resident_rooms`); called under the map
+    /// lock after every change to it.
+    fn note_residents(rooms: &HashMap<OwnedRoomId, Entry<B>>) {
+        crate::metrics::set_resident_rooms(rooms.len());
     }
 
     /// Marks a join of `room_id` through another server as under way, until the returned guard
@@ -500,6 +584,7 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
                     );
                     crate::metrics::count_stale_copy_reloaded();
                     rooms.remove(room_id);
+                    Self::note_residents(&rooms);
                 } else {
                     entry.last_used = Instant::now();
                     return Ok(entry.handle.clone());
@@ -520,6 +605,7 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
         let Some(mut actor) = loaded else {
             return Err(RoomError::RoomNotFound(room_id.to_string()));
         };
+        actor.set_cache_capacity(self.event_cache_capacity.clone());
         actor.set_fencing(self.fencing.get().cloned());
         match actor.persist_repaired_outlier_states() {
             Ok(0) => {}
@@ -556,7 +642,9 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
             }
         };
         entry.last_used = Instant::now();
-        Ok(entry.handle.clone())
+        let handle = entry.handle.clone();
+        Self::note_residents(&rooms);
+        Ok(handle)
     }
 
     /// Creates a new room (`crate::actor::RoomActor::create_room`) and registers it.
@@ -613,7 +701,8 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
 
     /// The map half of [`RoomRegistry::insert`], for an actor already fenced and on the global
     /// stream.
-    async fn register(&self, actor: RoomActor<B>) -> RoomActorHandle<B> {
+    async fn register(&self, mut actor: RoomActor<B>) -> RoomActorHandle<B> {
+        actor.set_cache_capacity(self.event_cache_capacity.clone());
         let room_id = actor.room_id().to_owned();
         let fence = self.current_fence(&room_id);
         let handle = RoomActorHandle::new(actor);
@@ -626,6 +715,7 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
                 fence,
             },
         );
+        Self::note_residents(&rooms);
         handle
     }
 
@@ -636,6 +726,7 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
     /// fencing and joins the global stream under the map lock, so the announcement and the
     /// entry are one step for anyone racing to load the same room, as `get_or_load` does.
     async fn insert_if_absent(&self, mut actor: RoomActor<B>) -> RoomActorHandle<B> {
+        actor.set_cache_capacity(self.event_cache_capacity.clone());
         actor.set_fencing(self.fencing.get().cloned());
         let room_id = actor.room_id().to_owned();
         let fence = self.current_fence(&room_id);
@@ -652,7 +743,9 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
             }
         };
         entry.last_used = Instant::now();
-        entry.handle.clone()
+        let handle = entry.handle.clone();
+        Self::note_residents(&rooms);
+        handle
     }
 
     /// The room to import `room_id`'s history into (the Synapse importer): its handle if the room
@@ -709,6 +802,7 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
             .is_some_and(|entry| entry.handle.ptr_eq(handle))
         {
             rooms.remove(room_id);
+            Self::note_residents(&rooms);
         }
     }
 
@@ -956,6 +1050,7 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
         let before = rooms.len();
         let now = Instant::now();
         rooms.retain(|_, entry| now.duration_since(entry.last_used) < max_idle);
+        Self::note_residents(&rooms);
         before - rooms.len()
     }
 
@@ -981,7 +1076,9 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
     /// Drops `room_id`'s resident actor, if there is one, whatever its idle time: what a room
     /// deletion does once the room's records are gone, so the next access finds it missing.
     pub async fn forget_resident(&self, room_id: &ruma::RoomId) {
-        self.rooms.lock().await.remove(room_id);
+        let mut rooms = self.rooms.lock().await;
+        rooms.remove(room_id);
+        Self::note_residents(&rooms);
     }
 
     /// How many rooms are currently resident. For tests and diagnostics.

@@ -122,9 +122,8 @@ struct Lookup<'a, B: KvBackend> {
 impl<'a, B: KvBackend> Lookup<'a, B> {
     fn event(&self, id: &EventId) -> Option<&'a Event> {
         self.actor
-            .event_id_index
-            .get(id)
-            .and_then(|sn| self.actor.events.get(sn))
+            .sn_of(id)
+            .and_then(|sn| self.actor.event(sn))
             .or_else(|| self.local.get(id))
     }
 }
@@ -170,8 +169,7 @@ impl<B: KvBackend> RoomActor<B> {
                     ));
                 };
                 let depth = self
-                    .events
-                    .get(&sn)
+                    .event(sn)
                     .ok_or_else(|| {
                         RoomError::Internal("oldest timeline event not in hot cache".into())
                     })?
@@ -192,7 +190,7 @@ impl<B: KvBackend> RoomActor<B> {
                 let depth_at = |pos: i64| -> Option<i64> {
                     self.timeline
                         .get(&pos)
-                        .and_then(|sn| self.events.get(sn))
+                        .and_then(|sn| self.event(*sn))
                         .map(|e| e.header().depth)
                 };
                 let top_depth = depth_at(top).ok_or_else(|| {
@@ -212,7 +210,6 @@ impl<B: KvBackend> RoomActor<B> {
             }
         };
 
-        let in_timeline: HashSet<EventSn> = self.timeline.values().copied().collect();
         let mut seen: HashSet<OwnedEventId> = HashSet::new();
         let mut older_than_gap: HashSet<OwnedEventId> = HashSet::new();
         let mut batch: Vec<Event> = Vec::with_capacity(events.len());
@@ -235,9 +232,8 @@ impl<B: KvBackend> RoomActor<B> {
                 continue;
             }
             if self
-                .event_id_index
-                .get(event.event_id())
-                .is_some_and(|sn| in_timeline.contains(sn))
+                .sn_of(event.event_id())
+                .is_some_and(|sn| self.room_pos_of(sn).is_some())
             {
                 continue;
             }
@@ -315,7 +311,7 @@ impl<B: KvBackend> RoomActor<B> {
         let mut missing_auth: BTreeSet<OwnedEventId> = BTreeSet::new();
         for event in &selected.batch {
             for id in pipeline::decode_event_ids(event.json().get("auth_events")) {
-                if !self.event_id_index.contains_key(&id) && !in_batch.contains(&*id) {
+                if !self.sn_of(&id).is_some() && !in_batch.contains(&*id) {
                     missing_auth.insert(id);
                 }
             }
@@ -332,7 +328,7 @@ impl<B: KvBackend> RoomActor<B> {
     pub fn events_not_held(&self, ids: &[OwnedEventId]) -> Vec<OwnedEventId> {
         let mut seen = HashSet::new();
         ids.iter()
-            .filter(|id| !self.event_id_index.contains_key(*id) && seen.insert(*id))
+            .filter(|id| self.sn_of(id).is_none() && seen.insert(*id))
             .cloned()
             .collect()
     }
@@ -509,7 +505,7 @@ impl<B: KvBackend> RoomActor<B> {
             };
             cited.extend(pipeline::decode_event_ids(event.json().get("prev_events")));
             planned.push(PlannedHistory {
-                held_as: self.event_id_index.get(event.event_id()).copied(),
+                held_as: self.sn_of(event.event_id()),
                 event,
                 room_pos: newest_pos - i,
                 state_before: state_before.into_values().collect(),
@@ -635,9 +631,7 @@ impl<B: KvBackend> RoomActor<B> {
         let mut pending: Vec<Event> = Vec::with_capacity(events.len());
         let mut seen: HashSet<OwnedEventId> = HashSet::new();
         for event in events {
-            if self.event_id_index.contains_key(event.event_id())
-                || !seen.insert(event.event_id().to_owned())
-            {
+            if self.sn_of(event.event_id()).is_some() || !seen.insert(event.event_id().to_owned()) {
                 continue;
             }
             let room_id = event
@@ -695,9 +689,8 @@ impl<B: KvBackend> RoomActor<B> {
         let mut absent = 0usize;
         for id in ids {
             match self
-                .event_id_index
-                .get(id)
-                .and_then(|sn| self.events.get(sn))
+                .sn_of(id)
+                .and_then(|sn| self.event_uncached(sn))
                 .and_then(|event| state_key_of(event).map(|key| (key, event)))
             {
                 Some((key, event)) => {

@@ -59,14 +59,42 @@ use crate::error::RoomError;
 /// [`hs_state::state_fetch::EventBody`], the narrow "dereference an `EventSn` back into a sender
 /// and content" interface [`StoreStateFetch`] needs. Per
 /// `docs/status/02-state-and-model.md`'s "exactly what track 04 calls to delete `CurrentState`":
-/// the room actor reads through its own cache directly rather than copying bodies into
+/// the room actor reads through its own bounded cache and the store behind it
+/// (`crate::actor::working_set`) rather than copying bodies into
 /// `hs_state::state_fetch::EventBodies` (a test fixture type).
-#[derive(Debug, Clone, Copy)]
-pub struct EventMap<'a>(pub &'a HashMap<EventSn, Event>);
+#[derive(Clone, Copy)]
+pub struct EventMap<'a>(pub &'a dyn EventLookup);
+
+impl std::fmt::Debug for EventMap<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("EventMap(..)")
+    }
+}
+
+/// Where [`EventMap`] finds an event body by short ID: the room actor's bounded cache over the
+/// store in production (`crate::actor::working_set`), a plain map in this module's tests.
+pub trait EventLookup {
+    /// The event `sn`, if this source holds it.
+    fn event(&self, sn: EventSn) -> Option<&Event>;
+
+    /// The event with `event_id`, if this source holds it, whatever its standing (a rejected
+    /// event included: an `auth_events` entry is checked for exactly that).
+    fn event_with_id(&self, event_id: &ruma::EventId) -> Option<&Event>;
+}
+
+impl EventLookup for HashMap<EventSn, Event> {
+    fn event(&self, sn: EventSn) -> Option<&Event> {
+        self.get(&sn)
+    }
+
+    fn event_with_id(&self, event_id: &ruma::EventId) -> Option<&Event> {
+        self.values().find(|e| e.event_id() == event_id)
+    }
+}
 
 impl<'a> EventBody for EventMap<'a> {
     fn body(&self, event: EventSn) -> Option<(&UserId, &CanonicalJsonObject)> {
-        let e = self.0.get(&event)?;
+        let e = self.0.event(event)?;
         let content = e.json().get("content")?.as_object()?;
         Some((AsRef::<UserId>::as_ref(&e.header().sender), content))
     }
@@ -103,7 +131,7 @@ impl<'a, S: StateStore> RoomStateView<'a, S> {
     ) -> Result<Option<&'a Event>, S::Error> {
         let key = self.store.intern_state_key(event_type, state_key)?;
         let sn = self.store.get(self.root, key)?;
-        Ok(sn.and_then(|sn| self.bodies.0.get(&sn)))
+        Ok(sn.and_then(|sn| self.bodies.0.event(sn)))
     }
 
     /// Adapts this view into [`StateFetch`], the narrow interface event authorization reads
@@ -471,8 +499,7 @@ pub fn build_and_authorize<S: StateStore>(
             state
                 .bodies
                 .0
-                .values()
-                .find(|e| e.event_id() == r.event_id)
+                .event_with_id(&r.event_id)
                 .map(|e| AuthEventRef {
                     event_type: &e.header().event_type,
                     state_key: e.header().state_key.as_deref().unwrap_or(""),

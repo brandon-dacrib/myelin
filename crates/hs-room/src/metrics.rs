@@ -1,6 +1,7 @@
 //! Process-wide metrics of this crate that are not about moderation (`crate::moderation` has
 //! its own): how many attempts placing a new room's ID took and how many IDs were found taken,
-//! room upgrades, and the room-event search index.
+//! room upgrades, the room-event search index, the room actors' event caches and this
+//! process's memory (`process_resident_memory_bytes`, `process_virtual_memory_bytes`).
 //!
 //! Process-wide statics, like `crate::moderation`'s: the code that observes them runs inside a
 //! room actor's blocking construction or a background task with no registry at hand, and a
@@ -47,6 +48,216 @@ static SEARCH_INDEXED_EVENTS: LazyLock<Counter> = LazyLock::new(Counter::default
 /// rules at the state before them and failed them at the room's current state
 /// (`crate::actor::soft_fail`): held, kept from clients.
 static SOFT_FAILED_EVENTS: LazyLock<Counter> = LazyLock::new(Counter::default);
+
+/// `hs_room_events_cached`: event bodies resident across every room actor alive in this
+/// process (`crate::actor::event_cache`), each at most `server.rooms.event_cache_size`. The
+/// figure an operator watches to see that a room's memory no longer follows its history.
+static EVENTS_CACHED: LazyLock<Gauge<i64, AtomicI64>> = LazyLock::new(Gauge::default);
+
+/// `hs_room_actors_alive`: room actors alive in this process -- the registry's resident rooms,
+/// plus the short-lived copies a read on a replica that does not own the room loads.
+static ACTORS_ALIVE: LazyLock<Gauge<i64, AtomicI64>> = LazyLock::new(Gauge::default);
+
+/// `hs_room_resident_rooms`: rooms the registry holds loaded right now
+/// (`crate::registry::RoomRegistry`), each with its own event cache; unloaded after
+/// `server.rooms.idle_unload_after` unused, when that is set.
+static RESIDENT_ROOMS: LazyLock<Gauge<i64, AtomicI64>> = LazyLock::new(Gauge::default);
+
+/// Sets `hs_room_resident_rooms`.
+pub(crate) fn set_resident_rooms(n: usize) {
+    RESIDENT_ROOMS.set(i64::try_from(n).unwrap_or(i64::MAX));
+}
+
+/// `hs_room_resident_rooms` as it stands.
+#[must_use]
+pub fn resident_rooms() -> i64 {
+    RESIDENT_ROOMS.get()
+}
+
+/// `hs_room_event_cache_misses_total`: event bodies read from the store because the room's
+/// cache did not hold them (`RoomActor::event`), bulk reads that go around the cache included.
+static EVENT_CACHE_MISSES: LazyLock<Counter> = LazyLock::new(Counter::default);
+
+/// `hs_room_event_cache_evictions_total`: event bodies dropped from a room's cache to stay
+/// within `server.rooms.event_cache_size`.
+static EVENT_CACHE_EVICTIONS: LazyLock<Counter> = LazyLock::new(Counter::default);
+
+/// `hs_room_event_id_lookups_total`: event IDs resolved to a short ID through the interning
+/// table because no cached event carried the ID (`RoomActor::sn_of`).
+static EVENT_ID_LOOKUPS: LazyLock<Counter> = LazyLock::new(Counter::default);
+
+/// Adjusts `hs_room_events_cached` by `delta` (an insert is `+1`, an eviction `-1`).
+pub(crate) fn events_cached_delta(delta: i64) {
+    if delta >= 0 {
+        EVENTS_CACHED.inc_by(delta);
+    } else {
+        EVENTS_CACHED.dec_by(-delta);
+    }
+}
+
+/// `hs_room_events_cached` as it stands.
+#[must_use]
+pub fn events_cached() -> i64 {
+    EVENTS_CACHED.get()
+}
+
+/// One room actor more is alive.
+pub(crate) fn actor_constructed() {
+    ACTORS_ALIVE.inc();
+}
+
+/// One room actor fewer is alive.
+pub(crate) fn actor_dropped() {
+    ACTORS_ALIVE.dec();
+}
+
+/// `hs_room_actors_alive` as it stands.
+#[must_use]
+pub fn actors_alive() -> i64 {
+    ACTORS_ALIVE.get()
+}
+
+/// Counts one event body read from the store.
+pub(crate) fn count_event_cache_miss() {
+    EVENT_CACHE_MISSES.inc();
+}
+
+/// `hs_room_event_cache_misses_total` as it stands.
+#[must_use]
+pub fn event_cache_misses() -> u64 {
+    EVENT_CACHE_MISSES.get()
+}
+
+/// Counts `n` event bodies evicted from a room's cache.
+pub(crate) fn count_event_cache_evictions(n: u64) {
+    EVENT_CACHE_EVICTIONS.inc_by(n);
+}
+
+/// `hs_room_event_cache_evictions_total` as it stands.
+#[must_use]
+pub fn event_cache_evictions() -> u64 {
+    EVENT_CACHE_EVICTIONS.get()
+}
+
+/// Counts one event ID resolved through the interning table.
+pub(crate) fn count_event_id_lookup() {
+    EVENT_ID_LOOKUPS.inc();
+}
+
+/// `hs_room_event_id_lookups_total` as it stands.
+#[must_use]
+pub fn event_id_lookups() -> u64 {
+    EVENT_ID_LOOKUPS.get()
+}
+
+/// This process's memory as the operating system accounts it, in bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessMemory {
+    /// Resident set size: the physical memory the process holds right now.
+    pub resident_bytes: u64,
+    /// Virtual size: everything mapped, resident or not.
+    pub virtual_bytes: u64,
+}
+
+/// This process's resident and virtual size, read from `/proc/self/status` on Linux and
+/// `proc_pidinfo` on macOS; `None` on another platform or when the read fails. What
+/// `process_resident_memory_bytes` and `process_virtual_memory_bytes` on `/metrics` report
+/// ([`register_metrics`]); until 2026-10-10 the server exported no memory figure at all, and
+/// the demo's growth to 1.3 GiB was read off the cluster's metrics-server instead.
+#[must_use]
+pub fn process_memory() -> Option<ProcessMemory> {
+    process_memory_impl()
+}
+
+#[cfg(target_os = "linux")]
+fn process_memory_impl() -> Option<ProcessMemory> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let kib = |key: &str| -> Option<u64> {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(key))
+            .and_then(|rest| {
+                rest.trim()
+                    .trim_end_matches("kB")
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+            })
+    };
+    Some(ProcessMemory {
+        resident_bytes: kib("VmRSS:")? * 1024,
+        virtual_bytes: kib("VmSize:")? * 1024,
+    })
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn process_memory_impl() -> Option<ProcessMemory> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_taskinfo>::uninit();
+    let size = i32::try_from(std::mem::size_of::<libc::proc_taskinfo>()).ok()?;
+    // SAFETY: `proc_pidinfo` with `PROC_PIDTASKINFO` writes at most `size` bytes of a
+    // `proc_taskinfo` into the buffer given, which is exactly one `proc_taskinfo` here, and
+    // reports how many it wrote; `info` is read only when it wrote the whole struct. `getpid`
+    // has no preconditions. This is the documented libproc call `ps` and `top` make, and the
+    // `process_memory_is_known_on_this_platform` test runs it.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            libc::getpid(),
+            libc::PROC_PIDTASKINFO,
+            0,
+            info.as_mut_ptr().cast::<libc::c_void>(),
+            size,
+        )
+    };
+    if written != size {
+        return None;
+    }
+    // SAFETY: the call above wrote the whole struct.
+    let info = unsafe { info.assume_init() };
+    Some(ProcessMemory {
+        resident_bytes: info.pti_resident_size,
+        virtual_bytes: info.pti_virtual_size,
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_memory_impl() -> Option<ProcessMemory> {
+    None
+}
+
+/// The collector behind `process_resident_memory_bytes` and `process_virtual_memory_bytes`:
+/// reads [`process_memory`] on every scrape, and reports nothing where it is unknown.
+#[derive(Debug)]
+struct ProcessMemoryCollector;
+
+impl prometheus_client::collector::Collector for ProcessMemoryCollector {
+    fn encode(
+        &self,
+        mut encoder: prometheus_client::encoding::DescriptorEncoder,
+    ) -> Result<(), std::fmt::Error> {
+        use prometheus_client::encoding::EncodeMetric;
+        use prometheus_client::metrics::MetricType;
+        use prometheus_client::metrics::gauge::ConstGauge;
+        let Some(memory) = process_memory() else {
+            return Ok(());
+        };
+        let resident = ConstGauge::new(i64::try_from(memory.resident_bytes).unwrap_or(i64::MAX));
+        resident.encode(encoder.encode_descriptor(
+            "process_resident_memory_bytes",
+            "Resident memory size in bytes",
+            None,
+            MetricType::Gauge,
+        )?)?;
+        let virtual_size = ConstGauge::new(i64::try_from(memory.virtual_bytes).unwrap_or(i64::MAX));
+        virtual_size.encode(encoder.encode_descriptor(
+            "process_virtual_memory_bytes",
+            "Virtual memory size in bytes",
+            None,
+            MetricType::Gauge,
+        )?)?;
+        Ok(())
+    }
+}
 
 /// Counts one soft-failed event.
 pub(crate) fn record_soft_failed_event() {
@@ -278,6 +489,42 @@ pub fn register_metrics(registry: &mut prometheus_client::registry::Registry) {
         "Time taken to answer POST /search",
         SEARCH_DURATION.clone(),
     );
+    registry.register(
+        "hs_room_events_cached",
+        "Event bodies resident across every room actor alive, each room holding at most \
+         server.rooms.event_cache_size",
+        EVENTS_CACHED.clone(),
+    );
+    registry.register(
+        "hs_room_resident_rooms",
+        "Rooms the registry holds loaded right now, each with its own event cache",
+        RESIDENT_ROOMS.clone(),
+    );
+    registry.register(
+        "hs_room_actors_alive",
+        "Room actors alive: the registry's resident rooms plus short-lived copies loaded for \
+         a read on a replica that does not own the room",
+        ACTORS_ALIVE.clone(),
+    );
+    // Registered without `_total`: the text encoder appends it.
+    registry.register(
+        "hs_room_event_cache_misses",
+        "Event bodies read from the store because the room's event cache did not hold them",
+        EVENT_CACHE_MISSES.clone(),
+    );
+    // Registered without `_total`: the text encoder appends it.
+    registry.register(
+        "hs_room_event_cache_evictions",
+        "Event bodies dropped from a room's event cache to stay within its capacity",
+        EVENT_CACHE_EVICTIONS.clone(),
+    );
+    // Registered without `_total`: the text encoder appends it.
+    registry.register(
+        "hs_room_event_id_lookups",
+        "Event IDs resolved through the interning table because no cached event carried them",
+        EVENT_ID_LOOKUPS.clone(),
+    );
+    registry.register_collector(Box::new(ProcessMemoryCollector));
 }
 
 #[cfg(test)]
@@ -291,6 +538,30 @@ mod tests {
         assert_eq!(gauge_value(0, true), Some(0));
         assert_eq!(gauge_value(7, true), Some(7));
         assert_eq!(gauge_value(-1, true), Some(0));
+    }
+
+    #[test]
+    fn process_memory_is_known_on_this_platform() {
+        if !cfg!(any(target_os = "linux", target_os = "macos")) {
+            return;
+        }
+        let memory = process_memory().expect("Linux and macOS report process memory");
+        assert!(memory.resident_bytes > 0);
+        assert!(memory.virtual_bytes >= memory.resident_bytes);
+    }
+
+    #[test]
+    fn process_memory_is_on_the_metrics_page() {
+        let mut registry = prometheus_client::registry::Registry::default();
+        register_metrics(&mut registry);
+        let mut text = String::new();
+        prometheus_client::encoding::text::encode(&mut text, &registry).unwrap();
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
+            assert!(text.contains("process_resident_memory_bytes "), "{text}");
+            assert!(text.contains("process_virtual_memory_bytes "), "{text}");
+        }
+        assert!(text.contains("hs_room_events_cached "), "{text}");
+        assert!(text.contains("hs_room_event_cache_misses_total "), "{text}");
     }
 
     #[test]

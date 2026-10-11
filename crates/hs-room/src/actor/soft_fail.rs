@@ -92,11 +92,7 @@ impl<B: KvBackend> RoomActor<B> {
             .cloned()
             .unwrap_or_default();
         let redacts = extract_redacts(event);
-        let only_prev_is_create = prev_sns.len() == 1
-            && self
-                .events
-                .get(&prev_sns[0])
-                .is_some_and(|e| e.header().event_type == "m.room.create");
+        let only_prev_is_create = self.only_prev_is_create(prev_sns);
         let incoming = IncomingEvent {
             event_type: &event.header().event_type,
             sender: AsRef::<UserId>::as_ref(&event.header().sender),
@@ -144,12 +140,12 @@ impl<B: KvBackend> RoomActor<B> {
                 );
                 break;
             }
-            if let Some(event) = self.events.get(&sn) {
+            if let Some(event) = self.event(sn) {
                 for id in pipeline::decode_event_ids(event.json().get("prev_events"))
                     .iter()
                     .rev()
                 {
-                    if let Some(&prev) = self.event_id_index.get(id) {
+                    if let Some(prev) = self.sn_of(id) {
                         stack.push(prev);
                     }
                 }
@@ -161,9 +157,8 @@ impl<B: KvBackend> RoomActor<B> {
     /// Whether `event_id` is held here soft failed.
     #[must_use]
     pub fn is_soft_failed_event(&self, event_id: &EventId) -> bool {
-        self.event_id_index
-            .get(event_id)
-            .is_some_and(|sn| self.soft_failed.contains(sn))
+        self.sn_of(event_id)
+            .is_some_and(|sn| self.soft_failed.contains(&sn))
     }
 
     /// The event `event_id`, if this actor holds it in a form another *server* may be given: as
@@ -172,11 +167,11 @@ impl<B: KvBackend> RoomActor<B> {
     /// still hidden. What federation's `/event`, `/state` and `/state_ids` read.
     #[must_use]
     pub fn held_event(&self, event_id: &EventId) -> Option<&Event> {
-        let sn = self.event_id_index.get(event_id)?;
-        if self.purged.contains(sn) || self.rejected.contains(sn) {
+        let sn = self.sn_of(event_id)?;
+        if self.purged.contains(&sn) || self.rejected.contains(&sn) {
             return None;
         }
-        self.events.get(sn)
+        self.event(sn)
     }
 
     /// Whether the event at `sn` is kept out of client reads: soft failed.

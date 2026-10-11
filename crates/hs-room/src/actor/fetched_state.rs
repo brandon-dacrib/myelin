@@ -70,7 +70,7 @@ impl<B: KvBackend> RoomActor<B> {
         state_before: &[OwnedEventId],
         fetched: Vec<Event>,
     ) -> Result<RemoteEventOutcome, RoomError> {
-        if let Some(&sn) = self.event_id_index.get(prev.event_id())
+        if let Some(sn) = self.sn_of(prev.event_id())
             && (self.fetched_state_outliers.contains(&sn) || self.timeline_contains(sn))
         {
             return Ok(RemoteEventOutcome::AlreadyKnown);
@@ -80,8 +80,7 @@ impl<B: KvBackend> RoomActor<B> {
         let mut pending: Vec<Event> = fetched
             .into_iter()
             .filter(|event| {
-                event.event_id() != prev.event_id()
-                    && !self.event_id_index.contains_key(event.event_id())
+                event.event_id() != prev.event_id() && !self.sn_of(event.event_id()).is_some()
             })
             .collect();
         pending.sort_by(topological_order);
@@ -120,7 +119,7 @@ impl<B: KvBackend> RoomActor<B> {
         // 2. The state before `prev`: what is held and not rejected.
         let state_sns: Vec<EventSn> = state_before
             .iter()
-            .filter_map(|id| self.event_id_index.get(id).copied())
+            .filter_map(|id| self.sn_of(id))
             .filter(|sn| !self.rejected.contains(sn))
             .collect();
 
@@ -145,7 +144,7 @@ impl<B: KvBackend> RoomActor<B> {
             }
             Err(error) => return Err(error),
         };
-        let sn = *self.event_id_index.get(&prev_id).ok_or_else(|| {
+        let sn = self.sn_of(&prev_id).ok_or_else(|| {
             RoomError::Internal(format!("{prev_id} was not indexed after persisting"))
         })?;
 
@@ -204,15 +203,13 @@ impl<B: KvBackend> RoomActor<B> {
     pub fn accept_auth_outliers(&mut self, events: Vec<Event>) -> Result<usize, RoomError> {
         let mut pending: Vec<Event> = events
             .into_iter()
-            .filter(|event| !self.event_id_index.contains_key(event.event_id()))
+            .filter(|event| !self.sn_of(event.event_id()).is_some())
             .collect();
         pending.sort_by(topological_order);
         let mut seen: HashSet<OwnedEventId> = HashSet::new();
         let (mut held, mut rejected, mut unjudged) = (0usize, 0usize, 0usize);
         for event in pending {
-            if !seen.insert(event.event_id().to_owned())
-                || self.event_id_index.contains_key(event.event_id())
-            {
+            if !seen.insert(event.event_id().to_owned()) || self.sn_of(event.event_id()).is_some() {
                 continue;
             }
             match self.authorize_outlier(&event) {
@@ -240,7 +237,7 @@ impl<B: KvBackend> RoomActor<B> {
 
     /// Whether `sn` has a timeline position.
     fn timeline_contains(&self, sn: EventSn) -> bool {
-        self.timeline.values().any(|held| *held == sn)
+        self.room_pos_of(sn).is_some()
     }
 
     /// An outlier fetched for a state is judged by its own `auth_events` only (as the events of
@@ -257,8 +254,8 @@ impl<B: KvBackend> RoomActor<B> {
         let mut auth_sns: Vec<EventSn> = Vec::with_capacity(ids.len());
         let mut missing = Vec::new();
         for id in ids {
-            match self.event_id_index.get(&id) {
-                Some(sn) => auth_sns.push(*sn),
+            match self.sn_of(&id) {
+                Some(sn) => auth_sns.push(sn),
                 None => missing.push(id),
             }
         }
@@ -461,7 +458,7 @@ mod tests {
         for old in &old_extremities {
             assert!(extremities.contains(old), "the old extremity stays");
         }
-        assert!(extremities.contains(&actor.event_id_index[s.event_id()]));
+        assert!(extremities.contains(&actor.sn_of(s.event_id()).unwrap()));
         let (timeline, _) = actor.paginate(None, Direction::Backward, 10);
         assert_eq!(timeline[0].event_id(), s.event_id());
         assert_eq!(timeline[1].event_id(), r.event_id());

@@ -29,7 +29,10 @@
 //! - [`fencing`]: [`fencing::RoomFencing`], the optional cluster-fencing hook
 //!   [`actor::RoomActor::persist`] checks before committing.
 
-#![forbid(unsafe_code)]
+// `deny`, not `forbid`, since 2026-10-10: `crate::metrics::process_memory` makes the one
+// `proc_pidinfo` call that reads this process's resident size on macOS, allowed there alone
+// with its safety argument and a test (`docs/decisions/0002-workspace-conventions.md`).
+#![deny(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod actor;

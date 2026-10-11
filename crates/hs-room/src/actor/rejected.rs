@@ -47,7 +47,7 @@ impl<B: KvBackend> RoomActor<B> {
         mut event: Event,
         reason: &str,
     ) -> Result<(), RoomError> {
-        if self.event_id_index.contains_key(event.event_id()) {
+        if self.sn_of(event.event_id()).is_some() {
             return Ok(());
         }
         event.flags_mut().set_rejected(true);
@@ -96,9 +96,8 @@ impl<B: KvBackend> RoomActor<B> {
     /// wrote it): indexed by ID so a later reference finds it, hidden from every read, and
     /// nowhere else.
     pub(super) fn absorb_rejected(&mut self, sn: EventSn, event: Event) {
-        self.event_id_index.insert(event.event_id().to_owned(), sn);
         self.rejected.insert(sn);
-        self.events.insert(sn, event);
+        self.hold(sn, event, None);
     }
 
     /// The first of `ids` this server holds in a room other than this one, with that room's ID.
@@ -130,9 +129,8 @@ impl<B: KvBackend> RoomActor<B> {
     /// Whether `event_id` is held here as an event authorization rejected.
     #[must_use]
     pub fn is_rejected_event(&self, event_id: &EventId) -> bool {
-        self.event_id_index
-            .get(event_id)
-            .is_some_and(|sn| self.rejected.contains(sn))
+        self.sn_of(event_id)
+            .is_some_and(|sn| self.rejected.contains(&sn))
     }
 
     /// `prev_sns` with every rejected event replaced by its own `prev_events` (recursively, up
@@ -167,10 +165,10 @@ impl<B: KvBackend> RoomActor<B> {
                 );
                 break;
             }
-            if let Some(rejected) = self.events.get(&sn) {
+            if let Some(rejected) = self.event(sn) {
                 let prevs = pipeline::decode_event_ids(rejected.json().get("prev_events"));
                 for id in prevs.iter().rev() {
-                    if let Some(&prev) = self.event_id_index.get(id) {
+                    if let Some(prev) = self.sn_of(id) {
                         stack.push(prev);
                     }
                 }

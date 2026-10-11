@@ -216,7 +216,7 @@ impl<B: KvBackend> RoomActor<B> {
                     found: room_pos,
                 }));
             }
-            if self.events.contains_key(&event_sn) {
+            if self.known(event_sn) {
                 return Ok(CatchUp::Reload(CatchUpReload::UnexpectedRow { room_pos }));
             }
             if self
@@ -272,7 +272,7 @@ impl<B: KvBackend> RoomActor<B> {
             self.absorb_loaded_event(event_sn, event, room_pos, None)?;
         }
         for target in redaction_targets {
-            let Some(target_sn) = self.event_id_index.get(&target).copied() else {
+            let Some(target_sn) = self.sn_of(&target) else {
                 continue;
             };
             if !self.take_stored_redaction(&snapshot, target_sn)? {
@@ -304,10 +304,17 @@ impl<B: KvBackend> RoomActor<B> {
         snapshot: &B::Snapshot,
         sn: EventSn,
     ) -> Result<bool, RoomError> {
-        match self.events.get(&sn) {
-            None => return Ok(true),
-            Some(event) if event.header().flags.is_redacted() => return Ok(true),
-            Some(_) => {}
+        if !self.known(sn) {
+            return Ok(true);
+        }
+        // A copy not resident needs no marking: its next read brings the row as it is.
+        let cached_redacted = self
+            .cache
+            .borrow()
+            .peek(sn)
+            .is_some_and(|event| event.header().flags.is_redacted());
+        if cached_redacted {
+            return Ok(true);
         }
         let Some(bytes) = self.tables.events.get(snapshot, &(sn,))? else {
             return Ok(true);
@@ -317,9 +324,7 @@ impl<B: KvBackend> RoomActor<B> {
         if !EventFlags::from_byte(persisted.flags).is_redacted() {
             return Ok(false);
         }
-        if let Some(event) = self.events.get_mut(&sn) {
-            event.flags_mut().set_redacted(true);
-        }
+        self.update_cached(sn, |event| event.flags_mut().set_redacted(true));
         Ok(true)
     }
 }
