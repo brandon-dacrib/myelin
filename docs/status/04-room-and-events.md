@@ -2,6 +2,113 @@
 
 Track brief: `docs/workstreams/04-room-and-events.md`. Owner crate: `hs-room`.
 
+## 2026-10-10 (branch `agent/room-memory`): a room actor holds a bounded window of its events, and says how much it holds
+
+**The evidence** (the owner's "memory leak problem"; the demo `myelin-hs-0`, image `sha-2d11ea2e`,
+read through the cluster's Prometheus and metrics-server at 23:17 UTC): before any big room the
+pod sat at 272-315 MiB (15:18-18:33 UTC), 180-360 MiB idling after each roll. Revision 15
+rolled at 22:16; the owner joined `#matrix:matrix.org` and others. Working set 162 MiB at 22:18
+(boot), 641 at 22:23, 795 at 22:43, 834 at 22:53, 1,318 MiB at 23:08. The chart's limit went to
+2Gi at 22:45 (revision 16) and 3Gi at 23:11 (revision 17); the pod restarted for 17 and was
+back at 1,225 MiB within 60 s of boot, 1,250 at 23:17: about 1.2 GiB held at boot, before any
+traffic, with no memory figure on `/metrics` at all. The known-gaps row said it since 2026-10-01:
+"the room actor still holds every event of a room in memory (`RoomActor::events`)".
+
+**What was built** (decision 0042; `crates/hs-room/src/actor/event_cache.rs` and
+`actor/working_set.rs`, new):
+
+- `RoomActor::events: HashMap<EventSn, Event>` and `event_id_index: HashMap<OwnedEventId,
+  EventSn>` are gone. In their place a per-room least-recently-used cache of `Arc<Event>`
+  bodies, `server.rooms.event_cache_size` of them (default 1,000; hs-config, hot), behind a
+  `RefCell`, and a per-operation pin arena (`elsa::FrozenMap<EventSn, Arc<Event>>`) that
+  `RoomActorHandle` clears before every closure. Reads go pins -> cache -> `Tables::events`
+  (`RoomActor::event`), and the many `&Event`-returning methods other crates call (`event_by_id`,
+  `members`, `events_around`, `held_event`, ...) kept their signatures. Bulk reads (the whole
+  state, a page of old timeline, `/members`) use `event_uncached`, which pins but does not cache,
+  so a 50,000-member `/members` does not evict the working set.
+- An event id resolves through the cached events, then the `event_sn` interning table, accepted
+  only when the room's state store knows the event or holds it rejected (`sn_of`, `known`).
+- Positions come from the rows: `room_pos_of` reads `PersistedEvent::room_pos` (kept beside the
+  cached copy) instead of walking the timeline; the "joined later" test in `event_visible_to`
+  walks the requester's membership chain back from the current state (`joined_after`) instead of
+  scanning every later event; `event_nearest` (`timestamp_to_event`) bisects the timeline and
+  reads 64 events either side instead of every event; `only_prev_is_create` compares against the
+  create's short id instead of reading the prev event's body. Each was O(history) in memory and
+  would have become O(history) store reads.
+- The pipeline's auth-event check used to find each `auth_events` entry by scanning every
+  event body (`pipeline.rs`, `bodies.values().find(...)`, on every send); it asks by id now
+  (`EventLookup::event_with_id`).
+- `store_inputs` hands `hs-state` an empty `content` and no `auth_events` for events that are
+  not state events: state resolution reads neither of a message, and the store keeps a record
+  of every event it is given.
+- Every path that rewrites a stored row tells the cache: `hold` (persist, placed history, a
+  rewritten redaction target, a purge skeleton, a rejected event), `update_cached` (a redaction
+  flag found on catch-up), `set_cached_room_pos` (an outlier backfill placed). The legacy
+  naming of pre-2026-10-01 redactions (`name_redactions_on_load`) is applied on every read from
+  the store instead (`decorate_from_store`), so an evicted event comes back the same.
+- `RoomActor::load` still replays every event into the state store (below), but no longer holds
+  any of them: it releases what the replay pinned every 256 events and warms the cache with the
+  newest window at the end (`warm_cache`, public).
+- Registry: `RoomRegistry::set_event_cache_size`/`event_cache_size` (one `CacheCapacity` shared
+  by every actor it constructs or loads; `RoomActor::set_cache_capacity`), and
+  `set_idle_unload_after`/`spawn_idle_unloader`: a sweep every minute unloads rooms idle longer
+  than `server.rooms.idle_unload_after` (unset by default: a reload replays history, and the
+  in-memory-only transaction-id dedup and `/forget` state is lost with it, as recorded since
+  session 5). `hs serve` installs both and re-applies them on a `server` reload
+  (`hs-cli/src/live_config.rs::apply_rooms`).
+- Metrics (`metrics.rs`): `hs_room_events_cached`, `hs_room_resident_rooms`,
+  `hs_room_actors_alive`, `hs_room_event_cache_misses_total`,
+  `hs_room_event_cache_evictions_total`, `hs_room_event_id_lookups_total`, and the server's
+  first memory figures, `process_resident_memory_bytes` and `process_virtual_memory_bytes`
+  (`/proc/self/status` on Linux; `proc_pidinfo` on macOS, the crate's one `unsafe` call, so
+  `lib.rs` is `deny(unsafe_code)` with an allow there and a test). An `info` line the first
+  time a room evicts, naming the room and the capacity.
+- Config: `server.rooms.event_cache_size` and `server.rooms.idle_unload_after` (hot, both),
+  `docs/config.md` and `web/src/test/fixtures/hs-config-schema.json` regenerated.
+
+**Measured** (`crates/hs-room/tests/working_set.rs::measure_resident_memory_of_a_large_room`,
+release, one process per leg because a process keeps what a dropped actor freed; a room of
+50,000 messages on a Fjall store in a temporary directory, this desktop, 2026-10-10 evening):
+
+| window | load | cached events | RSS before -> after | delta |
+|---|---|---|---|---|
+| 51,000 (every event resident, as every room was held until today) | 1.28 s | 50,006 | 118 -> 504 MiB | **386 MiB** |
+| 1,000 (the default) | 0.75 s | 1,000 | 118 -> 232 MiB | **114 MiB** |
+| 0 (nothing cached) | 0.78 s | 0 | 118 -> 232 MiB | 114 MiB |
+
+So the bodies cost about 5.6 KB an event (272 MiB over 49,000) and the actor no longer pays it:
+3.4 times less per room, and a faster load. The 114 MiB that remain are **not this crate's**:
+`hs-state`'s `KvStateStore` keeps an in-memory record of every event it is fed (`state_at`,
+two id maps, a `ResolutionEvent` with the event's ids and strings, the chain index; RFC 0024
+has the table) and rebuilds them by replay on every open, which is also why `load` still reads
+every event. On the demo that is the part of the 1.2 GiB this branch does not remove; the part
+it removes is the larger. Before this branch, the first in-process attempt at this measurement
+showed window 1,000 at 380 MiB: `store_inputs` read each prev event through `event()` during the
+replay and pinned every event until the load ended, so a load *peaked* at O(history) too. That
+is the `only_prev_is_create` and 256-event release changes above.
+
+**Verified**: `cargo test -p hs-room` (218 unit, every integration target including the new
+`tests/working_set.rs`: pages, `/context`, state at an old event, relations, a redaction, members,
+beyond a 50-event window, with a zero window, and after a drop and `load`); `cargo test -p
+hs-config` (the fixture test regenerated); `cargo test -p hs-cli --test members_at --test
+in_process_restart --test legacy_events --test federation_writes --test federation_reads --test
+peeking --test admin_rooms` (real binary); `cargo clippy -p hs-room -p hs-config -p hs-cli
+--all-targets -- -D warnings`; `cargo fmt --all --check`; `cargo check --workspace
+--all-targets`. A real `hs serve` booted with `server.rooms: {event_cache_size: 250,
+idle_unload_after: 2h}` logs the setting and serves every series above on `/metrics`
+(`process_resident_memory_bytes 81215488` at idle, debug build).
+
+**Left**: (1) RFC 0024 for track 02: make `KvStateStore`'s per-event records durable so a load
+reads state, extremities and the window, not the history -- the second half of the brief
+("loading a room must not read every event") and the remaining 114 MiB per 50,000 events; the
+actor's `load` is written so the replay is one removable block. (2) `timeline: BTreeMap<i64,
+EventSn>` (about 30 B an event), `relations_by_target` (per relation) and
+`redactions_by_target` (per redaction) still grow, slowly; each has a keyspace to move onto.
+(3) `hs-user`'s cluster mirror and `hs-cli`'s push delivery load copies with the default window
+(1,000), not the configured one: `RoomActor::load`'s signature is theirs too. (4) Measure on the
+demo after the roll: `hs_room_events_cached` against `process_resident_memory_bytes`, and the
+time to the first `/sync` of `#matrix:matrix.org`.
+
 ## 2026-10-09 (branch `agent/scale-sync-bug`): a resident copy is only as current as the ownership it was loaded under
 
 The cluster smoke's scale 3 -> 1 -> 2 (status 12 of this date) broke rooms for good:
@@ -2910,6 +3017,11 @@ None. Everything this pass needed from other tracks (`hs-kv`, `hs-tables`, `hs-m
 
 ## Interfaces needed
 
+- **02 (state and model), 2026-10-10**: RFC 0024 -- durable `state_at`, durable
+  `(type, state_key)` interning, `ResolutionEvent`s by short id read on demand, a durable or
+  lazily rebuilt chain-cover index, a write inside the caller's transaction, and a cheap
+  `has_event`, so `RoomActor::load` can stop replaying a room's history and `hs-state` stops
+  holding a record of every event. The remaining O(history) memory and boot time per room.
 - **06 (federation) / `hs-cli`, session 8**: call `RoomRegistry::bootstrap_from_remote_join` with
   `hs_federation::outbound_join::RemoteJoinOutcome`'s fields after a successful `join_room`; and
   backfill, so a bootstrapped room has history before the join. Details in session 8's
@@ -2939,6 +3051,11 @@ None. Everything this pass needed from other tracks (`hs-kv`, `hs-tables`, `hs-m
 
 ## Decisions made
 
+- **2026-10-10 (`agent/room-memory`)**: decision 0042 -- a room actor holds a bounded,
+  least-recently-used window of its events (`server.rooms.event_cache_size`), reads the rest
+  from the store, resolves ids through the interning table, and tells `hs-state` nothing about
+  a message's content or auth events; the state store's own per-event copy is RFC 0024, track
+  02's. `hs-room`'s `#![forbid(unsafe_code)]` became `deny` for the one `proc_pidinfo` call.
 - **Session 8**: a remote join supersedes every forward extremity held; outliers are fed to the
   state store with no prev events (their `state_at` is meaningless by design); `room_meta` is
   written with the first *timeline* event only; `load` restores persisted flags. Full list in
@@ -2984,6 +3101,12 @@ None. Everything this pass needed from other tracks (`hs-kv`, `hs-tables`, `hs-m
   if the same `txnId` was already used. Noted at each call site and in "Next".
 
 ## Shared dependencies added
+
+2026-10-10 (`agent/room-memory`): `elsa = "1"` added to `[workspace.dependencies]` (MIT OR
+Apache-2.0; one dependency, `stable_deref_trait`, already in the lock file): the per-operation
+pin arena that lets the bounded event cache hand out `&Event`. `hs-room` also takes `libc` on
+macOS only (already a workspace dependency) for `proc_pidinfo`, and `tempfile` as a
+dev-dependency for the measurement test.
 
 Session 8: none (no `Cargo.toml` changed).
 
