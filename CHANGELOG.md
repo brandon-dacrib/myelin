@@ -7,9 +7,39 @@ server, a real client, or a conformance suite, because this project has repeated
 "implemented and tested" and "works" are different claims. Where something is built but not
 reachable, or reachable but unproven, it says so.
 
-Versions follow [semantic versioning](https://semver.org). Nothing is released yet.
+Versions follow [semantic versioning](https://semver.org). 0.2.0 is the first tagged release;
+everything before it shipped only as `main` images.
 
 ## Unreleased
+
+## 0.2.0 (2026-10-10)
+
+The first tagged release. Its theme is the first week on the public internet: the demo federated
+with matrix.org, joined `#matrix:matrix.org`, and what that did to memory was found and fixed.
+
+- **Memory no longer follows history.** A room actor keeps a window of recent events
+  (`server.rooms.event_cache_size`, 1,000 by default) and reads the rest from the database (a
+  50,000-event room: 386 MiB to 114 MiB resident). The embedded database caps its total write
+  buffer at 32 MiB and flushes when it is passed, which ends the 13 MiB/h idle creep (Fjall's own
+  cap is a no-op in 3.1; measured 817 MiB/h uncapped against flat capped). The federation sender
+  writes a destination's retry state once per backoff step instead of once per attempt, and a
+  server whose name does not resolve is backed off for every caller. `/metrics` carries
+  `process_resident_memory_bytes`, `hs_kv_fjall_write_buffer_*`, `hs_room_events_cached` and the
+  sender's gauges, every series present from the first scrape. (decisions 0043 and 0044, RFC 0024)
+- **Joins through other servers finish.** A `send_join` answer is verified 64 servers at a time
+  with a negative cache for servers whose keys cannot be fetched; keys a server no longer
+  publishes come from a notary (`federation.trusted_key_servers`, matrix.org by default);
+  `federation.key_fetch_timeout`; a repeated `/join` for the same room and user attaches to the
+  one under way; a join outlives the client's connection.
+- **Federation destinations are managed.** A destination this server shares no room with can be
+  forgotten, one at a time or by a previewed prune, from the Federation page or the API, and an
+  hourly sweep forgets them after `federation.forget_unused_destinations_after` (decision 0042).
+- **The demo is public.** A Tailscale Funnel, both well-known documents derived from the public
+  base URL (decision 0040), and `FederationOK: true` from the federation tester.
+- **Bridges after a crypto reset.** The manager removes a bot's device the bridge left behind,
+  and a bridge is sent its owner's key counts as Synapse sends them (decision 0041).
+
+Everything in "Unreleased" below this heading on `main` after 2026-10-10 is for the next version.
 
 - A room's memory no longer follows its history: a room actor keeps `server.rooms.event_cache_size` recent events in memory (1,000 by default, hot) and reads the rest from the database, an unused room can be unloaded after `server.rooms.idle_unload_after`, and `/metrics` reports `hs_room_events_cached`, `hs_room_resident_rooms` and the cache's misses and evictions. A 50,000-event room went from 386 MiB to 114 MiB resident; what remains is the state store's copy of every event, still rebuilt on load (RFC 0025). (2026-10-10, `agent/room-memory`, decision 0044.)
 - Every setting does something: `server.admin_contact` is published as `/.well-known/matrix/support`, `auth.password.enabled: false` stops password login (a password still confirms a sensitive change), `media.remote_media_retention` deletes cached remote media nobody asked for in that long, hourly; `server.report_stats`, `auth.enable_legacy_login`, `auth.session_secret(_file)` and `appservices.enabled` are gone, and a configuration that still has them starts with a warning (decision 0034). The web interface shows a user's server-wide message limit beside their override, and an offering's settings say what saving does to bridges people already have (2026-10-08, `agent/web-items`).
@@ -18,8 +48,7 @@ Versions follow [semantic versioning](https://semver.org). Nothing is released y
 - Backfill from events of another room answers nothing; `/state` and `/state_ids` at a rejected event are `404`; an event citing a rejected event is readable and reaches `/sync`.
 - `tests/federation-synapse/run.sh`: a repeatable Myelin<->Synapse interop run (real Synapse in Docker, private CA, nginx terminating TLS for Myelin), one PASS/FAIL line per step of the basic federation story; clean-skips without Docker. Status 06 records the 2026-10-02 attempt.
 
-Everything below exists on `main` and has never been tagged. The container image is published
-continuously to `ghcr.io/brandon-dacrib/myelin` as `main` and `sha-<commit>`, and the Helm chart
+The container image is published as `0.2.0`, `0.2` and `latest` for the tag, and continuously to `ghcr.io/brandon-dacrib/myelin` as `main` and `sha-<commit>`, and the Helm chart
 to `oci://ghcr.io/brandon-dacrib/charts/hs` as a pre-release, `0.1.0-main.<run>.g<commit>`, that
 pulls the `sha-<commit>` image from the same commit (`helm install --devel`).
 
