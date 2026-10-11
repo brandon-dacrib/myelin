@@ -118,6 +118,57 @@ test.describe("Offer a bridge", () => {
     domGuard.assertClean();
   });
 
+  test("an iMessage bridge is set up on the person's Mac: download, address, files, run", async ({
+    page,
+  }) => {
+    const domGuard = installDomNestingGuard(page);
+    await signInAsOperator(page);
+    await page.goto("/admin/bridges/offerings/mautrix-imessage");
+    await expect(page.getByRole("heading", { name: "iMessage" })).toBeVisible();
+    // Not a container: the settings name the pinned build, and the row has no address yet.
+    await expect(page.getByText("Build", { exact: true })).toBeVisible();
+    await expect(page.getByText("Image", { exact: true })).toHaveCount(0);
+    const row = page.getByRole("table").getByRole("row", { name: /@alice:example\.org/ });
+    await expect(row).toContainText("Address not set");
+    await expect(row.getByRole("button", { name: /Files for/ })).toHaveCount(0);
+    await expectNoAxeViolations(page, "iMessage offering");
+
+    await row.getByRole("button", { name: "Set up on a Mac for @alice:example.org" }).click();
+    const dialog = page.getByRole("dialog", {
+      name: "Set up @alice:example.org's iMessage bridge on their Mac",
+    });
+    await expect(
+      dialog.getByRole("link", { name: /Download iMessage for the Mac/ }),
+    ).toHaveAttribute("href", "https://mau.dev/mautrix/imessage/-/jobs/95972/artifacts/download");
+    await expect(dialog.getByRole("region", { name: "run.sh" })).toBeVisible();
+    await expect(dialog.getByRole("region", { name: "config.yaml" })).toBeVisible();
+    await expect(dialog.getByRole("region", { name: "registration.yaml" })).toContainText(
+      "url: http://imessage-alice:29331",
+    );
+    await expect(dialog.getByRole("region", { name: "docker-compose.yaml" })).toHaveCount(0);
+    await expect(dialog.getByText(/Full Disk Access/)).toBeVisible();
+    await expectNoAxeViolations(page, "iMessage: set up on a Mac");
+
+    await dialog.getByLabel(/hostname or IP address/).fill("alices-mac.local");
+    await dialog.getByRole("button", { name: "Save address" }).click();
+    await expect(dialog.getByTestId("address-current")).toContainText(
+      "http://alices-mac.local:29331",
+    );
+    // The files are rendered again with the address in them.
+    await expect(dialog.getByRole("region", { name: "registration.yaml" })).toContainText(
+      "url: http://alices-mac.local:29331",
+    );
+    await dialog.getByRole("button", { name: "Done" }).click();
+    await expect(dialog).toBeHidden();
+
+    await expect(row).toContainText("alices-mac.local:29331");
+    await expect(row).not.toContainText("Address not set");
+    await expect(
+      page.locator("summary").filter({ hasText: "Next steps for @alice:example.org" }),
+    ).toContainText("Waiting to be run");
+    domGuard.assertClean();
+  });
+
   test("the settings dialog says what saving does to bridges people already have", async ({
     page,
   }) => {

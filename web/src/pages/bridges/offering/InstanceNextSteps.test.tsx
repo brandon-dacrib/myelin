@@ -42,14 +42,23 @@ function instance(userId: string, fields: Partial<BridgeInstance> = {}): BridgeI
   };
 }
 
-function renderSteps(i: BridgeInstance, offering = whatsapp) {
+function renderSteps(i: BridgeInstance, offering = whatsapp, type = catalogue) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={client}>
-      <InstanceNextSteps instance={i} offering={offering} type={catalogue} />
+      <InstanceNextSteps instance={i} offering={offering} type={type} />
     </QueryClientProvider>,
   );
 }
+
+const imessage: BridgeOffering = {
+  ...whatsapp,
+  type: "mautrix-imessage",
+  name: "iMessage",
+  runtime: "elsewhere",
+  front_door: "@imessagebot:example.org",
+};
+const imessageType = bridgeTypes.find((t) => t.id === "mautrix-imessage");
 
 beforeEach(async () => {
   await signIn();
@@ -296,6 +305,37 @@ describe("InstanceNextSteps", () => {
       "@whatsappbot_carol:example.org",
     );
     expect(screen.queryByRole("list")).toBeNull();
+  });
+
+  it("tells the operator to set the Mac's address first, with the Mac steps, for a bridge on a Mac", () => {
+    renderSteps(
+      instance("@alice:example.org", {
+        state: "starting",
+        appservice_id: "imessage-alice",
+        url: "http://imessage-alice:29331",
+        bot: "@imessagebot_alice:example.org",
+      }),
+      imessage,
+      imessageType,
+    );
+    expect(screen.getByText(/does not know the Mac's address yet/)).toBeInTheDocument();
+    expect(screen.getByTestId("mac-steps")).toHaveTextContent("run ./run.sh");
+    expect(screen.getByText(/29331 by default/)).toBeInTheDocument();
+    expect(screen.queryByText(/use Files in the table/)).toBeNull();
+  });
+
+  it("once the Mac's address is set, waits for the bridge on the Mac rather than for Files", () => {
+    renderSteps(
+      instance("@alice:example.org", {
+        state: "starting",
+        appservice_id: "imessage-alice",
+        url: "http://alices-mac.local:29331",
+      }),
+      imessage,
+      imessageType,
+    );
+    expect(screen.getByText(/waiting for the bridge on the Mac/)).toBeInTheDocument();
+    expect(screen.queryByText(/use Files in the table/)).toBeNull();
   });
 
   it("tells the operator to run a bridge that runs elsewhere", () => {

@@ -32,6 +32,18 @@ that is the owner's step (`docs/bridges/imessage.md`, "What was verified"). The 
 reach the Mac on 29331 (same network or Tailscale); a Mac behind NAT needs a websocket on the
 server's side, not done.
 
+**2026-10-11, later (branch `agent/imessage-web`, off `agent/imessage-offering`, status 16): the
+web half of the iMessage offering.** For a type with `runs_on: "mac"` the instance row's action is
+"Set up on a Mac": a dialog with the pinned download, a field for the Mac's hostname or IP (saved
+with `PUT .../instances/{user_id}` `{address}`), config.yaml, registration.yaml and run.sh, how to
+run it (Full Disk Access, `caffeinate`), and the live state; the Runs column shows the Mac's host
+or "Address not set"; the wizard, settings and offering page say "Build" with the download note,
+never an image; next steps start with "Set the Mac's address and run it there". Mocks, unit tests
+and a Playwright flow cover it; `npm run check` and `npm run test:e2e` green in the worktree. The
+branch also quotes two descriptions in `crates/hs-admin/openapi/openapi.yaml` (`download_url`,
+`BridgeInstance.url`) that were invalid YAML and broke `npm run generate:client`; the coordinator
+merges it after `agent/imessage-offering`. Not yet run against the real binary.
+
 **The evidence** (`container_memory_working_set_bytes` from the cluster's Prometheus, read
 23:17 UTC; the server exported no process memory metric of its own):
 

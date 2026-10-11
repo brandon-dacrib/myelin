@@ -432,6 +432,7 @@ export type BridgeOfferingRuntime = BridgeOffering["runtime"];
 export type BridgeInstance = components["schemas"]["BridgeInstance"];
 export type BridgeInstanceState = BridgeInstance["state"];
 export type BridgeInstanceFiles = components["schemas"]["BridgeInstanceFiles"];
+export type BridgeInstanceRequest = components["schemas"]["BridgeInstanceRequest"];
 export type BridgeMode = BridgeOffering["mode"];
 
 /** Every instance state, in the order an instance moves through them. */
@@ -574,14 +575,26 @@ export function useBridgeInstance(type: string | undefined, userId: string | und
 /**
  * Creates a user's instance, exactly as their message to the front door would. Idempotent: an
  * existing instance comes back as it is, and a failed one is retried, so this is also Retry.
+ * With an `address` (a host, `host:port` or URL where this server reaches a bridge run
+ * elsewhere, such as someone's Mac), the server rewrites the instance's registration url and
+ * its files with it; the server refuses that for a bridge it deploys itself.
  */
 export function usePutBridgeInstance() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: async ({ type, userId }: { type: string; userId: string }) =>
+    mutationFn: async ({
+      type,
+      userId,
+      address,
+    }: {
+      type: string;
+      userId: string;
+      address?: string;
+    }) =>
       unwrap(
         await api.PUT("/bridge-offerings/{type}/instances/{user_id}", {
           params: { path: { type, user_id: userId } },
+          ...(address !== undefined ? { body: { address } } : {}),
         }),
       ),
     onSuccess: (_instance, { type, userId }) => {

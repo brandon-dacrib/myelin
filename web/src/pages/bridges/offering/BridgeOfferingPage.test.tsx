@@ -76,12 +76,15 @@ describe("Bridge offering page", () => {
     expect(alice.getByText("Healthy")).toBeInTheDocument();
   });
 
-  it("hands over an instance's files", async () => {
-    renderOffering("mautrix-imessage");
-    await screen.findByText(/an administrator runs iMessage for them/);
+  it("hands over an instance's files for a bridge that runs in a container", async () => {
+    renderOffering("mautrix-whatsapp");
+    // A container type keeps Files; nothing about a Mac.
+    const table = await screen.findByRole("table");
+    await within(table).findByRole("button", { name: "Files for @alice:example.org" });
+    expect(within(table).queryByRole("button", { name: /Set up on a Mac/ })).toBeNull();
     await userEvent.click(await tableButton("Files for @alice:example.org"));
     const dialog = await screen.findByRole("dialog");
-    expect(within(dialog).getByText(/their Mac, signed in to Messages/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/This server already runs it/)).toBeInTheDocument();
     for (const label of [
       "config.yaml",
       "registration.yaml",
@@ -90,9 +93,147 @@ describe("Bridge offering page", () => {
     ]) {
       expect(await within(dialog).findByRole("region", { name: label })).toBeInTheDocument();
     }
+    expect(within(dialog).queryByRole("region", { name: "run.sh" })).toBeNull();
     expect(within(dialog).getByRole("region", { name: "registration.yaml" })).toHaveTextContent(
       "io.myelin.bridge_instance: @alice:example.org",
     );
+  });
+
+  describe("a bridge that runs on a Mac (iMessage)", () => {
+    it("walks through the download, the address, the files and running it", async () => {
+      renderOffering("mautrix-imessage");
+      await screen.findByText(/Set up on a Mac on its row has the download/);
+      // The row says the address is not set, and the settings name the build, not an image.
+      const alice = await rowFor("@alice:example.org");
+      expect(alice.getByText("Address not set")).toBeInTheDocument();
+      expect(screen.getByText("Build")).toBeInTheDocument();
+      expect(screen.queryByText("Image")).toBeNull();
+      expect(screen.getByText(/Universal macOS build/)).toBeInTheDocument();
+      expect(screen.queryByText("mautrix-imessage:300ba6d0")).toBeNull();
+
+      await userEvent.click(await tableButton("Set up on a Mac for @alice:example.org"));
+      const dialog = await screen.findByRole("dialog", {
+        name: "Set up @alice:example.org's iMessage bridge on their Mac",
+      });
+
+      // 1. The pinned build to download, with what it is.
+      const download = within(dialog).getByRole("link", { name: /Download iMessage for the Mac/ });
+      expect(download).toHaveAttribute(
+        "href",
+        "https://mau.dev/mautrix/imessage/-/jobs/95972/artifacts/download",
+      );
+      expect(within(dialog).getByText(/commit 300ba6d0/)).toBeInTheDocument();
+
+      // 2. The address: a placeholder until saved.
+      expect(within(dialog).getByTestId("address-current")).toHaveTextContent("Not set yet");
+      expect(within(dialog).getByLabelText(/hostname or IP address/)).toHaveValue("");
+
+      // 3. The three files, none of them for a container.
+      for (const label of ["config.yaml", "registration.yaml", "run.sh"]) {
+        expect(await within(dialog).findByRole("region", { name: label })).toBeInTheDocument();
+      }
+      expect(within(dialog).queryByRole("region", { name: "docker-compose.yaml" })).toBeNull();
+      expect(
+        within(dialog).queryByRole("region", { name: "Kubernetes manifest (Secret and Bridge)" }),
+      ).toBeNull();
+      expect(within(dialog).getByRole("region", { name: "run.sh" })).toHaveTextContent(
+        "xattr -d com.apple.quarantine",
+      );
+      // Until the address is saved the files carry the placeholder.
+      expect(within(dialog).getByRole("region", { name: "registration.yaml" })).toHaveTextContent(
+        "url: http://imessage-alice:29331",
+      );
+
+      // 4. How to run it, and 5. where it has got to.
+      expect(within(dialog).getByRole("region", { name: "In Terminal" })).toHaveTextContent(
+        "chmod +x run.sh",
+      );
+      expect(within(dialog).getByText(/Full Disk Access/)).toBeInTheDocument();
+      expect(within(dialog).getByText(/caffeinate -i/)).toBeInTheDocument();
+      expect(within(dialog).getByText(/pings the bridge every 30 seconds/)).toBeInTheDocument();
+      expect(within(dialog).getByText(/Waiting for the bridge on the Mac/)).toBeInTheDocument();
+    });
+
+    it("saves the Mac's address with the PUT body, and the row and the files take it", async () => {
+      const bodies: unknown[] = [];
+      const record = async ({ request }: { request: Request }) => {
+        if (request.method === "PUT" && request.url.includes("/instances/")) {
+          const text = await request.clone().text();
+          bodies.push(text ? JSON.parse(text) : null);
+        }
+      };
+      server.events.on("request:start", record);
+      renderOffering("mautrix-imessage");
+      await userEvent.click(await tableButton("Set up on a Mac for @alice:example.org"));
+      const dialog = await screen.findByRole("dialog");
+      await within(dialog).findByRole("region", { name: "registration.yaml" });
+
+      const field = within(dialog).getByLabelText(/hostname or IP address/);
+      await userEvent.click(within(dialog).getByRole("button", { name: "Save address" }));
+      expect(await within(dialog).findByText(/Type the Mac's hostname/)).toBeInTheDocument();
+      expect(bodies).toHaveLength(0);
+
+      await userEvent.type(field, "alices-mac.local");
+      await userEvent.click(within(dialog).getByRole("button", { name: "Save address" }));
+      await waitFor(() => expect(bodies).toEqual([{ address: "alices-mac.local" }]));
+      // The server adds the type's port; the field and the row show what it kept.
+      await waitFor(() =>
+        expect(within(dialog).getByTestId("address-current")).toHaveTextContent(
+          "http://alices-mac.local:29331",
+        ),
+      );
+      expect(field).toHaveValue("alices-mac.local:29331");
+      await waitFor(() =>
+        expect(within(dialog).getByRole("region", { name: "registration.yaml" })).toHaveTextContent(
+          "url: http://alices-mac.local:29331",
+        ),
+      );
+      // The dialog is modal, so the row behind it is checked once it is closed.
+      await userEvent.click(within(dialog).getByRole("button", { name: "Done" }));
+      const alice = await rowFor("@alice:example.org");
+      await waitFor(() => expect(alice.getByText("alices-mac.local:29331")).toBeInTheDocument());
+      expect(alice.queryByText("Address not set")).toBeNull();
+
+      // The next steps move on from "set the address" once it is set.
+      const summary = await screen.findByText(/Next steps for/);
+      expect(summary.closest("summary")).toHaveTextContent("Waiting to be run");
+      server.events.removeListener("request:start", record);
+    });
+
+    it("says why the server refused an address", async () => {
+      server.use(
+        http.put("/api/v1/bridge-offerings/mautrix-imessage/instances/:user", () =>
+          HttpResponse.json(
+            {
+              type: "https://myelin.dev/problems/validation",
+              title: "Validation failed",
+              status: 400,
+              detail: "address names no host.",
+            },
+            { status: 400 },
+          ),
+        ),
+      );
+      renderOffering("mautrix-imessage");
+      await userEvent.click(await tableButton("Set up on a Mac for @alice:example.org"));
+      const dialog = await screen.findByRole("dialog");
+      await userEvent.type(within(dialog).getByLabelText(/hostname or IP address/), "mac.local");
+      await userEvent.click(within(dialog).getByRole("button", { name: "Save address" }));
+      expect(await within(dialog).findByText("address names no host.")).toBeInTheDocument();
+    });
+
+    it("tells the operator to set the address first, with the Mac steps to relay", async () => {
+      renderOffering("mautrix-imessage");
+      const summary = await screen.findByText(/Next steps for/);
+      expect(summary.closest("summary")).toHaveTextContent(
+        "Set the Mac's address and run it there",
+      );
+      const details = summary.closest("details") as HTMLElement;
+      expect(within(details).getByTestId("mac-steps")).toHaveTextContent(
+        "Download the bridge for your Mac from your bridge's page and unzip it.",
+      );
+      expect(within(details).getByText(/Tailscale-style private network/)).toBeInTheDocument();
+    });
   });
 
   it("adds a bridge for someone, and it appears on its way", async () => {

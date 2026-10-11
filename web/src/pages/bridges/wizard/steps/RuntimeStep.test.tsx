@@ -61,9 +61,21 @@ describe("Offer a bridge: Runtime", () => {
   it("keeps a type that cannot run from its config out of the cluster, and says why", async () => {
     renderStep("mautrix-imessage");
     const cluster = await screen.findByRole("radio", { name: /Runs in this cluster/ });
-    await vi.waitFor(() => expect(cluster).toHaveTextContent(/has to run on a Mac/));
+    // The catalogue's own reason, not the interface's fallback wording.
+    await vi.waitFor(() =>
+      expect(cluster).toHaveTextContent(/run on a Mac, beside the Messages app they read/),
+    );
     expect(cluster).toBeDisabled();
     expect(screen.queryByText(/Why this server can't run bridges itself/)).toBeNull();
+  });
+
+  it("shows the pinned build, not an image tag, for a bridge that runs on a Mac", async () => {
+    renderStep("mautrix-imessage");
+    expect(await screen.findByRole("radio", { name: /Runs on each person's Mac/ })).toBeVisible();
+    expect(screen.queryByLabelText("Image tag")).toBeNull();
+    expect(screen.getByTestId("mac-build")).toHaveTextContent(
+      "Universal macOS build (Apple silicon and Intel) of mautrix-imessage commit 300ba6d0",
+    );
   });
 
   it("edits the image tag", async () => {

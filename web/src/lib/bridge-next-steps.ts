@@ -1,5 +1,6 @@
 import type { BridgeInstance, BridgeLogins, BridgeOffering, BridgeType } from "@/api/bridges";
 import { signInSteps } from "./bridge-catalogue";
+import { instanceAddress, runsOnMac } from "./bridge-offerings";
 
 /**
  * What an operator tells a person whose bridge the server set up for them (RFC 0017 sections 4.1
@@ -52,6 +53,8 @@ export interface LoginsState {
  * Where a person's bridge is, as it decides what the operator sees.
  *
  * - `setting-up`: this server is running it up; the steps come when it is ready.
+ * - `set-address`: it runs on the person's Mac and this server has only its placeholder
+ *   address: an administrator sets the Mac's address and runs the bridge there first.
  * - `waiting-elsewhere`: it runs elsewhere and waits for an administrator to start it.
  * - `failed`, `removing`: nothing to tell the person.
  * - `asking`: ready, and the bridge is being asked whether they have signed in.
@@ -62,6 +65,7 @@ export interface LoginsState {
  */
 export type NextStepsPhase =
   | { kind: "setting-up" }
+  | { kind: "set-address" }
   | { kind: "waiting-elsewhere" }
   | { kind: "failed" }
   | { kind: "removing" }
@@ -70,9 +74,10 @@ export type NextStepsPhase =
   | { kind: "signed-in"; as: string };
 
 export function nextStepsPhase(
-  instance: Pick<BridgeInstance, "state" | "appservice_id">,
+  instance: Pick<BridgeInstance, "state" | "appservice_id" | "url">,
   runtime: BridgeOffering["runtime"],
   logins: LoginsState,
+  type?: Pick<BridgeType, "runs_on">,
 ): NextStepsPhase {
   switch (instance.state) {
     case "removing":
@@ -82,6 +87,9 @@ export function nextStepsPhase(
     case "ready":
       break;
     default:
+      if (runsOnMac(type) && instanceAddress(instance)?.set === false) {
+        return { kind: "set-address" };
+      }
       return runtime === "elsewhere" ? { kind: "waiting-elsewhere" } : { kind: "setting-up" };
   }
   if (!instance.appservice_id) {
@@ -112,6 +120,8 @@ export function phaseLabel(phase: NextStepsPhase, isSelf: boolean): string {
   switch (phase.kind) {
     case "setting-up":
       return "Setting up";
+    case "set-address":
+      return "Set the Mac's address and run it there";
     case "waiting-elsewhere":
       return "Waiting to be run";
     case "failed":

@@ -11,6 +11,7 @@ import {
 } from "./data/appservices";
 import { bridgeTypes } from "./data/bridge-types";
 import {
+  addressRefusal,
   deleteInstance,
   deleteOffering,
   deploymentTarget,
@@ -150,7 +151,7 @@ import {
 } from "./data/media";
 import type { MediaItem } from "@/api/media";
 import { ALL_SCOPES, type Scope } from "@/lib/auth";
-import type { AppService, BridgeOfferingRequest } from "@/api/bridges";
+import type { AppService, BridgeInstanceRequest, BridgeOfferingRequest } from "@/api/bridges";
 import type { JsonValue } from "@/api/config-schema";
 import type { components } from "@/api/schema";
 
@@ -806,7 +807,7 @@ export const handlers = [
       : problem(404, "not-found", "Bridge instance not found");
   }),
 
-  http.put(`${API}/bridge-offerings/:type/instances/:user_id`, ({ params }) => {
+  http.put(`${API}/bridge-offerings/:type/instances/:user_id`, async ({ params, request }) => {
     const type = String(params.type);
     const user = decodeURIComponent(String(params.user_id));
     if (!findOffering(type)) return problem(404, "not-found", "Bridge offering not found");
@@ -816,7 +817,19 @@ export const handlers = [
         errors: [{ pointer: "/user_id", detail: "not a local user" }],
       });
     }
-    return HttpResponse.json(putInstance(type, user));
+    // The body is optional: without one the instance is created or returned as it is.
+    const text = await request.text();
+    const body = text ? (JSON.parse(text) as BridgeInstanceRequest) : {};
+    if (body.address != null) {
+      const refusal = addressRefusal(type, body.address);
+      if (refusal) {
+        return problem(400, "validation", "Validation failed", {
+          detail: refusal,
+          errors: [{ pointer: "/address", detail: refusal }],
+        });
+      }
+    }
+    return HttpResponse.json(putInstance(type, user, body.address));
   }),
 
   http.delete(`${API}/bridge-offerings/:type/instances/:user_id`, ({ params }) =>

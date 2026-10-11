@@ -18,7 +18,7 @@ import {
   nextStepsPhase,
   type NextStepsPhase,
 } from "@/lib/bridge-next-steps";
-import { instanceStateBadge, instanceStateLabel } from "@/lib/bridge-offerings";
+import { instanceStateBadge, instanceStateLabel, runsOnMac } from "@/lib/bridge-offerings";
 import { withInlineCode } from "@/lib/inline-code";
 
 /**
@@ -60,7 +60,7 @@ export function InstanceNextSteps({
     ready ? (instance.appservice_id ?? undefined) : undefined,
     undefined,
   );
-  const phase = nextStepsPhase(instance, offering.runtime, logins);
+  const phase = nextStepsPhase(instance, offering.runtime, logins, type);
   return (
     <InstanceNextStepsBody
       instance={instance}
@@ -115,13 +115,39 @@ export function InstanceNextStepsBody({
           </p>
         </div>
       );
+    case "set-address":
+      return (
+        <div className="flex flex-col gap-3 text-sm text-text">
+          <StateLine instance={instance} />
+          <p>
+            It is registered, and runs on {isSelf ? "your" : `${owner}'s`} Mac rather than here.
+            This server does not know the Mac&apos;s address yet: Set up on a Mac in the table has
+            the download, the address to save, and the files to run there.
+          </p>
+          {detail && <p className="text-text-muted">{detail}</p>}
+          <p className="text-text-muted">
+            What {isSelf ? "you do" : `${owner} does`} on the Mac, in the catalogue&apos;s words:
+          </p>
+          <MacSteps type={type} bot={bot} />
+          <p className="text-text-muted">
+            Once the bridge on the Mac answers this server, its bot
+            {bot && (
+              <>
+                , <CopyableId value={bot} />,
+              </>
+            )}{" "}
+            invites {them} to a direct chat, and {isSelf ? "your" : "their"} chats arrive as rooms.
+          </p>
+        </div>
+      );
     case "waiting-elsewhere":
       return (
         <div className="flex flex-col gap-2 text-sm text-text">
           <StateLine instance={instance} />
           <p>
-            It is registered and waiting for its first ping. It runs elsewhere: use Files in the
-            table to download its files and run it where it can run.
+            {runsOnMac(type)
+              ? "It is registered and waiting for the bridge on the Mac to answer this server. Set up on a Mac in the table has the download, the files and how to run it."
+              : "It is registered and waiting for its first ping. It runs elsewhere: use Files in the table to download its files and run it where it can run."}
           </p>
           <p className="text-text-muted">
             Once it answers this server, the sign-in steps appear here. Nothing to{" "}
@@ -226,6 +252,31 @@ function BotDeviceNotes({ instance }: { instance: BridgeInstance }) {
           </span>
           ), so chat apps no longer encrypt messages&apos; keys to{" "}
           {removedDevices.length === 1 ? "it" : "them"}.
+        </p>
+      )}
+    </>
+  );
+}
+
+/** The catalogue's steps for a bridge run on a Mac, which are about the Mac rather than a chat. */
+function MacSteps({ type, bot }: { type: BridgeType | undefined; bot: string | undefined }) {
+  const steps = signInSteps(type, bot ?? "its bot");
+  if (steps.length === 0) return null;
+  return (
+    <>
+      <ol className="flex flex-col gap-2" data-testid="mac-steps">
+        {steps.map((step, i) => (
+          <li key={i} className="flex gap-3">
+            <span className="flex size-6 shrink-0 items-center justify-center rounded-full bg-accent-muted text-xs font-medium text-accent">
+              {i + 1}
+            </span>
+            <span className="pt-0.5">{withInlineCode(step)}</span>
+          </li>
+        ))}
+      </ol>
+      {type?.sign_in?.notes && (
+        <p className="rounded-md border border-info-border bg-info-bg px-3 py-2 text-info">
+          {type.sign_in.notes}
         </p>
       )}
     </>

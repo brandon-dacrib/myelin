@@ -386,7 +386,7 @@ export interface paths {
         get: operations["bridge_instances.get"];
         /**
          * Create a user's bridge instance
-         * @description Starts provisioning an instance for the user, exactly as their message to the front door would; the user is invited to their bridge when it is ready. Idempotent: an existing instance is returned as it is (a failed one is retried).
+         * @description Starts provisioning an instance for the user, exactly as their message to the front door would; the user is invited to their bridge when it is ready. Idempotent: an existing instance is returned as it is (a failed one is retried). With a body, `address` tells this server where an instance run elsewhere (a bridge on someone's Mac) listens.
          */
         put: operations["bridge_instances.put"];
         post?: never;
@@ -2767,6 +2767,8 @@ export interface components {
             /** @enum {string} */
             state: "requested" | "registered" | "deploying" | "starting" | "ready" | "failed" | "removing";
             type: string;
+            /** @description Where this server reaches the bridge (the registration's `url`): the cluster Service for an instance it deploys, else `http://<appservice id>:<port>` until an administrator sets the address (`PUT` with `address`). */
+            url?: string | null;
             /** @description The owner; null for a shared type's instance. */
             user_id: string | null;
         };
@@ -2776,9 +2778,16 @@ export interface components {
             /** @description A Secret with the files and a `Bridge` resource, for a cluster running the Myelin operator. */
             manifest_yaml?: string;
             registration_yaml?: string;
+            /** @description For a type that runs on a Mac, a shell script to run beside `config.yaml` and `registration.yaml` there, which downloads the pinned build if it is not there yet, clears its quarantine flag and starts it. `null` for a container type. */
+            run_sh?: string | null;
         };
         BridgeInstancePage: components["schemas"]["PageEnvelope"] & {
             items: components["schemas"]["BridgeInstance"][];
+        };
+        /** @description What `PUT /bridge-offerings/{type}/instances/{user_id}` may carry. Without a body the instance is created (or returned as it is) with nothing changed. */
+        BridgeInstanceRequest: {
+            /** @description For an instance run elsewhere: where this server reaches the bridge, as `host`, `host:port` or a full `http(s)://` URL (a bare host takes the type's port). The registration's `url` and the files the bridge runs from are rewritten with it. `null` leaves it as it is. Refused for an instance this server deploys. */
+            address?: string | null;
         };
         BridgeLogin: {
             /** @description The remote network's id for the login. */
@@ -2903,6 +2912,10 @@ export interface components {
              * @description The bridge project's own documentation.
              */
             docs_url?: string;
+            /** @description What the download is (a universal macOS build from the project's CI, say) and which build is pinned. */
+            download_note?: string | null;
+            /** @description For `runs_on: mac`, where to download the program (a pinned build, as `image` pins a tag). */
+            download_url?: string | null;
             id?: string;
             image?: string;
             /**
@@ -2925,6 +2938,11 @@ export interface components {
             /** @description Whether a render of this type produces a `config_yaml` the bridge reads as it is (mautrix bridges), or only the registration and the notes to run it. */
             renders_config?: boolean;
             required_features?: string[];
+            /**
+             * @description Where the bridge runs: `container` (an image this server can deploy, or run by hand from a compose file), or `mac` (a program for a Mac, beside the Messages app it reads; never deployed by this server, so its offerings run `elsewhere`).
+             * @enum {string}
+             */
+            runs_on?: "container" | "mac";
             /** @description The bridge's own documented login flow. `{bot}` in a step stands for the bridge bot's Matrix ID, which the interface substitutes. */
             sign_in?: {
                 notes?: string | null;
@@ -5076,7 +5094,11 @@ export interface operations {
             };
             cookie?: never;
         };
-        requestBody?: never;
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["BridgeInstanceRequest"];
+            };
+        };
         responses: {
             /** @description The instance. */
             200: {

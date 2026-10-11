@@ -211,8 +211,19 @@ export function OfferBridgeWizardPage() {
                 </ReviewGroup>
                 <ReviewGroup title="Runtime" onEdit={() => goTo("runtime")}>
                   <dl className="grid grid-cols-2 gap-2 text-sm">
-                    <Row label="Runs" value={runtimeMeta[runtime].label} />
-                    <Row label="Image tag" value={state.imageTag || "latest"} />
+                    <Row
+                      label="Runs"
+                      value={
+                        type?.runs_on === "mac"
+                          ? "On each person's Mac"
+                          : runtimeMeta[runtime].label
+                      }
+                    />
+                    {type?.runs_on === "mac" ? (
+                      <Row label="Build" value={type.download_note ?? "The catalogue's pin"} />
+                    ) : (
+                      <Row label="Image tag" value={state.imageTag || "latest"} />
+                    )}
                   </dl>
                 </ReviewGroup>
                 <ReviewGroup title="Options" onEdit={() => goTo("options")}>

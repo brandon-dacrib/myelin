@@ -31,6 +31,66 @@ function logins(overrides: Partial<BridgeLogins>): BridgeLogins {
   };
 }
 
+const imessageType = { runs_on: "mac" } as BridgeType;
+
+describe("nextStepsPhase for a bridge on a Mac", () => {
+  const pending = { status: "pending" } as const;
+  it("asks for the Mac's address while the server has only its placeholder", () => {
+    const instance = {
+      state: "starting",
+      appservice_id: "imessage-alice",
+      url: "http://imessage-alice:29331",
+    } as const;
+    expect(nextStepsPhase(instance, "elsewhere", pending, imessageType)).toEqual({
+      kind: "set-address",
+    });
+    expect(phaseLabel({ kind: "set-address" }, false)).toBe(
+      "Set the Mac's address and run it there",
+    );
+    // The same instance of a container type is simply waiting to be run.
+    expect(nextStepsPhase(instance, "elsewhere", pending, { runs_on: "container" })).toEqual({
+      kind: "waiting-elsewhere",
+    });
+    expect(nextStepsPhase(instance, "elsewhere", pending)).toEqual({ kind: "waiting-elsewhere" });
+  });
+
+  it("moves on once the address is set, and never asks for it after ready or failed", () => {
+    expect(
+      nextStepsPhase(
+        { state: "starting", appservice_id: "imessage-alice", url: "http://mac.local:29331" },
+        "elsewhere",
+        pending,
+        imessageType,
+      ),
+    ).toEqual({ kind: "waiting-elsewhere" });
+    expect(
+      nextStepsPhase(
+        { state: "failed", appservice_id: "imessage-alice", url: "http://imessage-alice:29331" },
+        "elsewhere",
+        pending,
+        imessageType,
+      ),
+    ).toEqual({ kind: "failed" });
+    expect(
+      nextStepsPhase(
+        { state: "ready", appservice_id: "imessage-alice", url: "http://imessage-alice:29331" },
+        "elsewhere",
+        pending,
+        imessageType,
+      ),
+    ).toEqual({ kind: "asking" });
+    // A server that sends no url cannot say the address is unset.
+    expect(
+      nextStepsPhase(
+        { state: "starting", appservice_id: "imessage-alice", url: null },
+        "elsewhere",
+        pending,
+        imessageType,
+      ),
+    ).toEqual({ kind: "waiting-elsewhere" });
+  });
+});
+
 describe("encodeLocalpart", () => {
   it("keeps what the catalogue allows and hex-escapes the rest, RFC 0017 section 3", () => {
     expect(encodeLocalpart("alice")).toBe("alice");

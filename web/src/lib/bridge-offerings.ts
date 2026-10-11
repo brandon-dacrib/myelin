@@ -278,3 +278,53 @@ export function cannotRunBridgesWhy(reason: string | null | undefined): string {
     ? sentence
     : `${sentence} Each bridge offered here runs elsewhere, from the files on its page.`;
 }
+
+/** Whether a catalogue type is a program for a Mac rather than a container image. */
+export function runsOnMac(type: Pick<BridgeType, "runs_on"> | undefined): boolean {
+  return type?.runs_on === "mac";
+}
+
+/**
+ * Where this server reaches an instance run elsewhere, read from `BridgeInstance.url`. Until an
+ * administrator sets the Mac's address the server keeps the placeholder `http://<appservice
+ * id>:<port>`, whose host is the appservice id itself, so `set` is false exactly then. `host`
+ * is what to show and to prefill the address field with (`mac.local:29331`; the port is left
+ * out when it is the scheme's default). Null when the instance has no URL or it does not parse.
+ */
+export function instanceAddress(
+  instance: Pick<BridgeInstance, "url" | "appservice_id">,
+): { host: string; hostname: string; set: boolean } | null {
+  if (!instance.url) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(instance.url);
+  } catch {
+    return null;
+  }
+  if (!parsed.hostname) return null;
+  const set = !instance.appservice_id || parsed.hostname !== instance.appservice_id;
+  return { host: parsed.host, hostname: parsed.hostname, set };
+}
+
+/**
+ * What an administrator typed as a Mac's address, checked before it is sent: a hostname or IP,
+ * `host:port`, or a full `http(s)://` URL (`BridgeInstanceRequest.address`). Returns the
+ * address to send, trimmed, or the reason it cannot be sent.
+ */
+export function checkMacAddress(raw: string): { address: string } | { error: string } {
+  const value = raw.trim();
+  if (!value) return { error: "Type the Mac's hostname or IP address." };
+  if (/\s/.test(value)) return { error: "An address has no spaces in it." };
+  const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(value) ? value : `http://${value}`;
+  if (!/^https?:\/\//i.test(withScheme)) {
+    return { error: "Only http:// and https:// addresses can be used." };
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(withScheme);
+  } catch {
+    return { error: "That is not a hostname, an IP address or a URL." };
+  }
+  if (!parsed.hostname) return { error: "That is not a hostname, an IP address or a URL." };
+  return { address: value };
+}

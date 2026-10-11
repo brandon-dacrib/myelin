@@ -72,6 +72,21 @@ function short(type: string): string {
   return type.replace(/^mautrix-/, "").replace(/^matrix-/, "");
 }
 
+/** The entry's port, as the real server takes it from the catalogue. */
+function portOf(type: string): number {
+  return catalogueEntry(type)?.port ?? 29999;
+}
+
+/**
+ * What the instance's `reason` says while it waits to be run: for a program on a Mac, that the
+ * Mac's address has to be set and the files run there; for anything else run elsewhere, the files.
+ */
+function waitingReason(type: string): string {
+  return catalogueEntry(type)?.runs_on === "mac"
+    ? "Waiting for the bridge on the Mac to answer this server. Set the Mac's address, download its files, and run it there."
+    : "Waiting for its first ping. It runs elsewhere: download its files and start it there.";
+}
+
 function imageOf(offering: MockOffering): string {
   const repository = (catalogueEntry(offering.type)?.image ?? `${offering.type}:latest`).split(
     ":",
@@ -115,6 +130,12 @@ function makeInstance(
     state: "requested",
     reason: null,
     appservice_id: appserviceId,
+    // The registration's url: the cluster Service, or the placeholder named after the
+    // appservice until an administrator says where the bridge really listens.
+    url:
+      offering.runtime === "cluster"
+        ? `http://${resourceName(appserviceId)}.${NAMESPACE}.svc:${portOf(offering.type)}`
+        : `http://${appserviceId}:${portOf(offering.type)}`,
     bot: localpart ? `@${s}bot_${encodeLocalpart(localpart)}:${SERVER}` : `@${s}bot:${SERVER}`,
     deployment: null,
     health: null,
@@ -158,7 +179,8 @@ function seed() {
     type: "mautrix-imessage",
     enabled: true,
     runtime: "elsewhere",
-    imageTag: "latest",
+    // The catalogue's pinned build of the program, not a container tag.
+    imageTag: "300ba6d0",
     access: { all_local_users: false, users: ["@alice:example.org"] },
     options: { encryption: true, double_puppeting: true, backfill: false },
     created_at: iso(3 * DAY),
@@ -201,7 +223,7 @@ function seed() {
 
   const aliceMac = makeInstance(imessage, "@alice:example.org", {
     state: "starting",
-    reason: "Waiting for its first ping. It runs elsewhere: download its files and start it there.",
+    reason: waitingReason(imessage.type),
     health: "unknown",
     created_at: iso(2 * DAY),
   });
@@ -242,8 +264,7 @@ function advance(offering: MockOffering, instance: MockInstance): MockInstance {
     return {
       ...base,
       state: "starting",
-      reason:
-        "Waiting for its first ping. It runs elsewhere: download its files and start it there.",
+      reason: waitingReason(offering.type),
       health: "unknown",
     };
   }
@@ -414,15 +435,64 @@ export function deleteOffering(type: string): void {
   delete state.instances[type];
 }
 
-/** Creates (or, for a failed one, retries) a user's instance; idempotent otherwise. */
-export function putInstance(type: string, userSegment: string): BridgeInstance | undefined {
+/**
+ * `BridgeInstanceRequest.address` as the real server reads it: a bare host takes the type's
+ * port, `host:port` is used as given, and a full `http(s)://` URL is kept whole. Returns the
+ * registration url to store, or why the address is refused (a 400 to the caller).
+ */
+export function instanceUrlFor(
+  type: string,
+  address: string,
+): { url: string } | { refusal: string } {
+  const value = address.trim();
+  if (!value) return { refusal: "address names no host." };
+  const hasScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(value);
+  if (hasScheme && !/^https?:\/\//i.test(value)) {
+    return { refusal: `address must be http:// or https://, not ${value.split(":")[0]}://.` };
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(hasScheme ? value : `http://${value}`);
+  } catch {
+    return { refusal: `address "${value}" is not a host, host:port or URL.` };
+  }
+  if (!parsed.hostname) return { refusal: `address "${value}" names no host.` };
+  if (hasScheme) return { url: value };
+  const port = parsed.port || String(portOf(type));
+  return { url: `http://${parsed.hostname}:${port}` };
+}
+
+/**
+ * Why a `PUT` with an address would be refused, or `null`: the real server rewrites the
+ * registration only for an instance it does not deploy itself.
+ */
+export function addressRefusal(type: string, address: string): string | null {
+  const offering = findOffering(type);
+  if (!offering) return null;
+  if (offering.runtime === "cluster") {
+    return `${catalogueEntry(type)?.name ?? type} runs in this cluster, where this server sets each bridge's address itself; an address can only be set for a bridge run elsewhere.`;
+  }
+  const checked = instanceUrlFor(type, address);
+  return "refusal" in checked ? checked.refusal : null;
+}
+
+/**
+ * Creates (or, for a failed one, retries) a user's instance; idempotent otherwise. With an
+ * `address` (checked with `addressRefusal` first), the instance's url is rewritten with it, as
+ * are the files `instanceFiles` renders.
+ */
+export function putInstance(
+  type: string,
+  userSegment: string,
+  address?: string | null,
+): BridgeInstance | undefined {
   const offering = findOffering(type);
   if (!offering) return undefined;
-  const existing = findInstance(type, userSegment);
-  if (existing) {
-    const current = advance(offering, existing);
+  let instance = findInstance(type, userSegment);
+  if (instance) {
+    const current = advance(offering, instance);
     if (current.state === "failed") {
-      Object.assign(existing, {
+      Object.assign(instance, {
         state: "requested",
         reason: null,
         deployment: null,
@@ -430,12 +500,16 @@ export function putInstance(type: string, userSegment: string): BridgeInstance |
         startedAt: Date.now(),
       });
     }
-    return publicInstance(advance(offering, existing));
+  } else {
+    instance = makeInstance(offering, userSegment === "_" ? null : userSegment, {
+      startedAt: Date.now(),
+    });
+    state.instances[type] = [...(state.instances[type] ?? []), instance];
   }
-  const instance = makeInstance(offering, userSegment === "_" ? null : userSegment, {
-    startedAt: Date.now(),
-  });
-  state.instances[type] = [...(state.instances[type] ?? []), instance];
+  if (address != null && offering.runtime !== "cluster") {
+    const checked = instanceUrlFor(type, address);
+    if ("url" in checked) instance.url = checked.url;
+  }
   return publicInstance(advance(offering, instance));
 }
 
@@ -457,10 +531,13 @@ export function instanceFiles(type: string, userSegment: string): BridgeInstance
   const botLocalpart = (instance.bot ?? "").slice(1).split(":")[0];
   const ghostPrefix = botLocalpart.replace(/bot_/, "_");
   const name = resourceName(id);
+  // The registration's url, as the instance carries it (the Mac's address once it is set).
   const url =
-    offering.runtime === "cluster"
+    instance.url ??
+    (offering.runtime === "cluster"
       ? `http://${name}.${NAMESPACE}.svc:${port}`
-      : `http://${id}:${port}`;
+      : `http://${id}:${port}`);
+  const mac = entry?.runs_on === "mac";
   const registration_yaml = [
     `id: ${id}`,
     `url: ${url}`,
@@ -498,7 +575,7 @@ export function instanceFiles(type: string, userSegment: string): BridgeInstance
         `  hs_token: ${instance.tokens.hs}`,
         "database:",
         "  type: sqlite3-fk-wal",
-        `  uri: file:/data/${id}.db?_txlock=immediate`,
+        `  uri: file:${mac ? "" : "/data/"}${id}.db?_txlock=immediate`,
         "bridge:",
         "  permissions:",
         ...(instance.user_id ? [`    "${instance.user_id}": admin`] : [`    "${SERVER}": user`]),
@@ -539,5 +616,25 @@ export function instanceFiles(type: string, userSegment: string): BridgeInstance
     `  filesSecret: ${name}-files`,
     "  storage: { size: 1Gi }",
   ].join("\n");
-  return { config_yaml, registration_yaml, compose_yaml, manifest_yaml };
+  // For a program on a Mac: what the real server renders beside the two YAML files, which
+  // fetches the pinned build when it is not there yet, clears its quarantine flag and starts it.
+  const run_sh = mac
+    ? [
+        "#!/bin/sh",
+        `# Runs ${entry?.name ?? type} for ${instance.user_id ?? "everyone"} on this Mac, beside config.yaml and registration.yaml.`,
+        "set -eu",
+        'cd "$(dirname "$0")"',
+        `BUILD="${entry?.download_url ?? ""}"`,
+        "if [ ! -x ./mautrix-imessage ]; then",
+        `  echo "Downloading ${entry?.name ?? type} (${imageOf(offering)})..."`,
+        '  curl -fsSL -o bridge.zip "$BUILD"',
+        "  unzip -o bridge.zip mautrix-imessage libolm.3.dylib",
+        "  rm -f bridge.zip",
+        "  chmod +x ./mautrix-imessage",
+        "fi",
+        "xattr -d com.apple.quarantine ./mautrix-imessage ./libolm.3.dylib 2>/dev/null || true",
+        "exec ./mautrix-imessage -c config.yaml -r registration.yaml",
+      ].join("\n")
+    : null;
+  return { config_yaml, registration_yaml, compose_yaml, manifest_yaml, run_sh };
 }

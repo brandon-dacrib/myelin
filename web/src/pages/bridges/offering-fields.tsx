@@ -4,7 +4,12 @@ import type { BridgeDeploymentTarget, BridgeOfferingRuntime, BridgeType } from "
 import { Button } from "@/components/ui/button/Button";
 import { Field, Input } from "@/components/ui/input/Input";
 import { Switch } from "@/components/ui/switch/Switch";
-import { looksLikeUserId, notDeployableReason, parseUserList } from "@/lib/bridge-offerings";
+import {
+  looksLikeUserId,
+  notDeployableReason,
+  parseUserList,
+  runsOnMac,
+} from "@/lib/bridge-offerings";
 import { cn } from "@/lib/cn";
 
 /**
@@ -225,7 +230,12 @@ export function RuntimeFields({
   clusterAvailable: boolean;
   unavailableBecause: "no-target" | "not-deployable" | "loading" | null;
   target: BridgeDeploymentTarget | undefined;
-  type: Pick<BridgeType, "name" | "id" | "image" | "not_deployable_reason"> | undefined;
+  type:
+    | Pick<
+        BridgeType,
+        "name" | "id" | "image" | "not_deployable_reason" | "runs_on" | "download_note"
+      >
+    | undefined;
   imageTag: string;
   onImageTag: (tag: string) => void;
 }) {
@@ -258,8 +268,12 @@ export function RuntimeFields({
           selected={runtime === "elsewhere" || !clusterAvailable}
           onSelect={() => onRuntime("elsewhere")}
           icon={<Laptop size={18} aria-hidden="true" />}
-          title="Runs elsewhere"
-          description="Someone runs each bridge from its files on a machine that can, like the Mac an iMessage bridge needs. You download the files from the offering's page."
+          title={runsOnMac(type) ? "Runs on each person's Mac" : "Runs elsewhere"}
+          description={
+            runsOnMac(type)
+              ? `Each person downloads ${type?.name ?? "the bridge"} and runs it on their own Mac, beside the Messages app it reads. You set the Mac's address and download the files from the offering's page.`
+              : "Someone runs each bridge from its files on a machine that can, like the Mac an iMessage bridge needs. You download the files from the offering's page."
+          }
         />
       </div>
 
@@ -280,25 +294,37 @@ export function RuntimeFields({
         </div>
       )}
 
-      <div className="mt-6 max-w-sm">
-        <Field
-          label="Image tag"
-          hint={
-            repository
-              ? `Of ${repository}. Every bridge of this kind runs it; pin a version to upgrade deliberately.`
-              : "Every bridge of this kind runs it; pin a version to upgrade deliberately."
-          }
-        >
-          {(f) => (
-            <Input
-              {...f}
-              value={imageTag}
-              onChange={(e) => onImageTag(e.target.value)}
-              className="font-identifier"
-            />
-          )}
-        </Field>
-      </div>
+      {runsOnMac(type) ? (
+        // Not a container image: the catalogue pins a build of the program for the Mac, and the
+        // run.sh this server renders downloads that one.
+        <div className="mt-6" data-testid="mac-build">
+          <p className="text-sm font-medium text-text">Build</p>
+          <p className="mt-1 text-sm text-text-muted">
+            {type?.download_note ??
+              `The catalogue's pinned build of ${type?.name ?? "the bridge"}, which run.sh downloads.`}
+          </p>
+        </div>
+      ) : (
+        <div className="mt-6 max-w-sm">
+          <Field
+            label="Image tag"
+            hint={
+              repository
+                ? `Of ${repository}. Every bridge of this kind runs it; pin a version to upgrade deliberately.`
+                : "Every bridge of this kind runs it; pin a version to upgrade deliberately."
+            }
+          >
+            {(f) => (
+              <Input
+                {...f}
+                value={imageTag}
+                onChange={(e) => onImageTag(e.target.value)}
+                className="font-identifier"
+              />
+            )}
+          </Field>
+        </div>
+      )}
     </div>
   );
 }

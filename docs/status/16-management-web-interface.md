@@ -1,8 +1,73 @@
 # 16. Management web interface: status
 
-Last updated: 2026-10-09 (the Migration page explains the five streams track 13's
-`agent/migration-95` added, and what no longer or newly does not move; branch
-`agent/web-migration-streams`).
+Last updated: 2026-10-11 (an iMessage bridge is set up on the person's Mac from its row:
+download, address, files, how to run it; branch `agent/imessage-web`).
+
+## 2026-10-11: a bridge that runs on a Mac is set up from its row (branch `agent/imessage-web`, on `agent/imessage-offering`)
+
+OpenAPI 0.1.15 (track 15, on `agent/imessage-offering`) says where a type runs
+(`BridgeType.runs_on`, `download_url`, `download_note`), where this server reaches an instance
+(`BridgeInstance.url`, the placeholder `http://<appservice id>:<port>` until set), takes an address
+on `PUT .../instances/{user_id}` (`BridgeInstanceRequest.address`: host, `host:port` or URL) and
+renders `BridgeInstanceFiles.run_sh` for a Mac type. `src/api/schema.d.ts` regenerated.
+**The branch's `openapi.yaml` would not parse** (two new descriptions were unquoted plain scalars
+containing `: `, at `download_url` and `BridgeInstance.url`); this branch quotes those two lines
+and nothing else in it, so `npm run generate:client` and `npm run build` work.
+
+What was added, all under `web/`:
+
+- **Mocks.** `mocks/data/bridge-types.ts`: mautrix-imessage is the contract's entry (port 29331,
+  `!im`, `runs_on: "mac"`, the pinned CI download and its note, `not_deployable_reason`, MSC2409
+  and MSC3202 only, the three Mac steps and the reachability note); every other type says
+  `runs_on: "container"` with null download fields. `mocks/data/bridge-offerings.ts`: every
+  instance carries `url` (the cluster Service, or the placeholder), `putInstance` takes an
+  address (`instanceUrlFor`: a bare host takes the type's port, `host:port` as given, a URL
+  kept whole; `addressRefusal` refuses it for a cluster-runtime offering), and `instanceFiles`
+  renders the url into both YAML files and a `run_sh` for a Mac type (null otherwise). The PUT
+  handler reads the optional body and answers 400 with the refusal. The iMessage instance's
+  reason is the contract's "Waiting for the bridge on the Mac to answer this server...".
+- **`lib/bridge-offerings.ts`**: `runsOnMac`, `instanceAddress` (host, and whether it is set: the
+  placeholder's host equals the appservice id) and `checkMacAddress` (what the field accepts
+  before it is sent). `api/bridges.ts`: `usePutBridgeInstance` takes an optional `address` and
+  sends it as the body.
+- **`pages/bridges/offering/MacSetupDialog.tsx`** (new): for a type that runs on a Mac the row's
+  action is **Set up on a Mac** instead of Files, and the dialog walks the five steps in order:
+  the download link with its note; the Mac's hostname or IP (prefilled when set, Save PUTs
+  `{address}`, the server's 400 detail shows under the field, the files are rendered again after
+  a save because they carry the address); config.yaml, registration.yaml and run.sh as
+  `CopyBlock`s (no compose file, no manifest); how to run it (`cd`, `chmod +x run.sh`,
+  `./run.sh`, the Full Disk Access prompt, `caffeinate -i`, one sentence about launchd); and the
+  live state with its reason and `last_error` and that the server pings every 30 s. The dialog
+  follows the page's polled row, so it moves while open.
+- **`BridgeOfferingPage.tsx`**: the Runs column shows the Mac's host or "Address not set"
+  ("On @alice's Mac" under it); Settings say "Runs: On each person's Mac" and "Build: <download
+  note>" instead of an image; the front door and the table's intro say the bridge runs on the
+  person's Mac. **Offer wizard and settings** (`offering-fields.tsx`, `OfferBridgeWizardPage.tsx`):
+  for a Mac type the Runtime step's second card is "Runs on each person's Mac", the Image tag
+  field is replaced by the Build note, and Review shows Build instead of Image tag.
+- **Next steps** (`lib/bridge-next-steps.ts`, `InstanceNextSteps.tsx`): the phase `set-address`
+  ("Set the Mac's address and run it there") comes before starting/ready for a Mac instance whose
+  url is still the placeholder; its body points at Set up on a Mac and lists the type's
+  `sign_in.steps` (the Mac steps) and its note. A Mac instance whose address is set reads
+  "waiting for the bridge on the Mac" rather than "use Files".
+
+Verified 2026-10-11 in the worktree: `npm run check` green (lint with the four pre-existing
+fast-refresh warnings, typecheck, 677 unit tests in 88 files, build); `npm run test:e2e`: see the
+line below this one for the count. New tests: `BridgeOfferingPage.test.tsx` (the Mac dialog's
+download link, files without compose/manifest and with run.sh, the PUT body and the row and files
+taking the address, the server's refusal, the set-address next steps; the container type keeps
+Files), `InstanceNextSteps.test.tsx` (two Mac phases), `bridge-next-steps.test.ts` (the phase),
+`bridge-offerings.test.ts` (`instanceAddress`, `checkMacAddress`), `mocks/data/bridge-offerings.test.ts`
+(the address PUT, the refusal, run.sh), `RuntimeStep.test.tsx` (the Build note), and the iMessage
+flow in `e2e/offer-bridge.spec.ts` (open the dialog, save an address, see it in the row and the
+files, axe clean). Not verified against the real `hs` binary: the backend half is on
+`agent/imessage-offering`, being built in parallel; `e2e-real/` has no iMessage case yet.
+
+Decisions: the address field accepts what the server accepts (host, `host:port`, `http(s)://`
+URL) and refuses the rest client-side with one sentence, the server's detail winning when it
+answers 400; the dialog keys on the owner segment so it reads the live row; the files are
+rendered when it opens and again after a save, never cached (they carry tokens); `run.sh`'s
+absence (an older server) shows the bare command instead of an empty block.
 
 ## 2026-10-10: the bridge pages name a bot's devices (branch `agent/bridge-stale-devices`, track 11)
 

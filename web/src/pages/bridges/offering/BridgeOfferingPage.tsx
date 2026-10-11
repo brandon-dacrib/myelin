@@ -34,15 +34,18 @@ import { nextStepsPhase, phaseLabel } from "@/lib/bridge-next-steps";
 import {
   frontDoorSentence,
   imageTag,
+  instanceAddress,
   instanceOwnerLabel,
   instanceStateBadge,
   instanceStateLabel,
+  runsOnMac,
   runtimeMeta,
   deploymentPhaseMeta,
 } from "@/lib/bridge-offerings";
 import { AddInstanceDialog } from "./AddInstanceDialog";
 import { InstanceFilesDialog } from "./InstanceFilesDialog";
 import { InstanceNextSteps } from "./InstanceNextSteps";
+import { MacSetupDialog } from "./MacSetupDialog";
 import { OfferingSettingsDialog } from "./OfferingSettingsDialog";
 import { RemoveOfferingDialog } from "./RemoveOfferingDialog";
 
@@ -82,6 +85,8 @@ export function BridgeOfferingPage() {
   const files = useBridgeInstanceFiles();
 
   const [filesFor, setFilesFor] = useState<BridgeInstance | null>(null);
+  // The owner segment, not the instance: the dialog follows the live row as the page polls.
+  const [macSetupFor, setMacSetupFor] = useState<string | null>(null);
   const [removing, setRemoving] = useState<BridgeInstance | null>(null);
   const [adding, setAdding] = useState(false);
   const [editing, setEditing] = useState(false);
@@ -107,6 +112,11 @@ export function BridgeOfferingPage() {
 
   const offering = offeringQuery.data;
   const catalogueType = types?.find((t) => t.id === type);
+  const mac = runsOnMac(catalogueType);
+  const macSetupInstance =
+    macSetupFor === null
+      ? null
+      : (instances.find((i) => instanceUserSegment(i) === macSetupFor) ?? null);
 
   if (offeringQuery.isError) {
     return (
@@ -143,6 +153,12 @@ export function BridgeOfferingPage() {
     files.mutate({ type, userId: instanceUserSegment(instance) });
   }
 
+  function openMacSetup(instance: BridgeInstance) {
+    setMacSetupFor(instanceUserSegment(instance));
+    files.reset();
+    files.mutate({ type, userId: instanceUserSegment(instance) });
+  }
+
   function retry(instance: BridgeInstance) {
     const owner = instanceOwnerLabel(instance);
     putInstance.mutate(
@@ -171,16 +187,29 @@ export function BridgeOfferingPage() {
             Retry
           </Button>
         )}
-        <Button
-          variant="ghost"
-          size="sm"
-          aria-label={`Files for ${owner}`}
-          disabled={!canWrite}
-          title={noWrite ?? "Download the files to run it elsewhere"}
-          onClick={() => openFiles(instance)}
-        >
-          Files
-        </Button>
+        {mac ? (
+          <Button
+            variant="secondary"
+            size="sm"
+            aria-label={`Set up on a Mac for ${owner}`}
+            disabled={!canWrite}
+            title={noWrite ?? "Download the bridge, set the Mac's address and get its files"}
+            onClick={() => openMacSetup(instance)}
+          >
+            Set up on a Mac
+          </Button>
+        ) : (
+          <Button
+            variant="ghost"
+            size="sm"
+            aria-label={`Files for ${owner}`}
+            disabled={!canWrite}
+            title={noWrite ?? "Download the files to run it elsewhere"}
+            onClick={() => openFiles(instance)}
+          >
+            Files
+          </Button>
+        )}
         {instance.user_id && (
           <Button
             variant="ghost"
@@ -232,7 +261,7 @@ export function BridgeOfferingPage() {
       key: "deployment",
       header: offering.runtime === "cluster" ? "Deployment" : "Runs",
       priority: 3,
-      render: (i) => <DeploymentCell instance={i} runtime={offering.runtime} />,
+      render: (i) => <DeploymentCell instance={i} runtime={offering.runtime} mac={mac} />,
     },
     {
       key: "times",
@@ -307,7 +336,7 @@ export function BridgeOfferingPage() {
         </div>
       </div>
 
-      <FrontDoor offering={offering} />
+      <FrontDoor offering={offering} mac={mac} />
 
       <OverlappingRegistrations offering={offering} />
 
@@ -332,6 +361,7 @@ export function BridgeOfferingPage() {
               <SharedInstancePanel
                 instance={instances[0]}
                 runtime={offering.runtime}
+                mac={mac}
                 actions={actions(instances[0])}
               />
             ) : (
@@ -349,9 +379,10 @@ export function BridgeOfferingPage() {
                 People&apos;s bridges
               </h2>
               <p className="mt-0.5 text-sm text-text-muted">
-                Each has its own registration, bot and{" "}
-                {offering.runtime === "cluster" ? "pod" : "process"}. Removing one deletes that
-                person&apos;s sign-ins and nothing else.
+                {mac
+                  ? "Each has its own registration and bot, and runs on that person's own Mac. "
+                  : `Each has its own registration, bot and ${offering.runtime === "cluster" ? "pod" : "process"}. `}
+                Removing one deletes that person&apos;s sign-ins and nothing else.
               </p>
             </div>
             <Button
@@ -408,6 +439,20 @@ export function BridgeOfferingPage() {
           }
         }}
         onRetry={() => filesFor && files.mutate({ type, userId: instanceUserSegment(filesFor) })}
+      />
+
+      <MacSetupDialog
+        offering={offering}
+        type={catalogueType}
+        instance={macSetupInstance}
+        files={files}
+        onOpenChange={(open) => {
+          if (!open) {
+            setMacSetupFor(null);
+            files.reset();
+          }
+        }}
+        onRenderFiles={() => macSetupFor !== null && files.mutate({ type, userId: macSetupFor })}
       />
 
       <Dialog open={removing !== null} onOpenChange={(open) => !open && setRemoving(null)}>
@@ -477,7 +522,7 @@ function BackLink() {
 }
 
 /** The one line an administrator tells people, with the address to copy. */
-function FrontDoor({ offering }: { offering: BridgeOffering }) {
+function FrontDoor({ offering, mac }: { offering: BridgeOffering; mac: boolean }) {
   const sentence = frontDoorSentence(offering);
   const name = offering.name ?? offering.type;
   return (
@@ -497,7 +542,9 @@ function FrontDoor({ offering }: { offering: BridgeOffering }) {
           <p className="mt-2 text-sm text-text-muted">
             {offering.runtime === "cluster"
               ? `It sets up their bridge, and invites them to it a minute or two later.`
-              : `It tells them an administrator runs ${name} for them. Their bridge appears below, waiting for its first ping: download its files and run it where it can run.`}
+              : mac
+                ? `It tells them an administrator runs ${name} for them. Their bridge appears below, waiting for the bridge on their Mac: Set up on a Mac on its row has the download, the Mac's address and the files to run there.`
+                : `It tells them an administrator runs ${name} for them. Their bridge appears below, waiting for its first ping: download its files and run it where it can run.`}
           </p>
         </>
       ) : (
@@ -568,12 +615,24 @@ function SettingsSummary({
         Settings
       </h2>
       <dl className="mt-3 grid grid-cols-1 gap-x-8 gap-y-3 text-sm sm:grid-cols-2 xl:grid-cols-4">
-        <Detail label="Runs">{runtimeMeta[offering.runtime].label}</Detail>
-        <Detail label="Image">
-          <span className="font-identifier [overflow-wrap:anywhere]">
-            {offering.image ?? `tag ${imageTag(offering.image)}`}
-          </span>
+        <Detail label="Runs">
+          {runsOnMac(type) ? "On each person's Mac" : runtimeMeta[offering.runtime].label}
         </Detail>
+        {runsOnMac(type) ? (
+          <Detail label="Build">
+            {type?.download_note ?? (
+              <span className="font-identifier [overflow-wrap:anywhere]">
+                {imageTag(offering.image)}
+              </span>
+            )}
+          </Detail>
+        ) : (
+          <Detail label="Image">
+            <span className="font-identifier [overflow-wrap:anywhere]">
+              {offering.image ?? `tag ${imageTag(offering.image)}`}
+            </span>
+          </Detail>
+        )}
         <Detail label="Who can have one">
           {offering.access?.all_local_users === false
             ? users.length > 0
@@ -634,7 +693,7 @@ function NextStepsSection({
   const pending = owned
     .map((instance, idx) => ({
       instance,
-      phase: nextStepsPhase(instance, offering.runtime, logins[idx]),
+      phase: nextStepsPhase(instance, offering.runtime, logins[idx], type),
     }))
     .filter(({ phase }) => phase.kind !== "signed-in");
   if (owned.length === 0) return null;
@@ -713,11 +772,28 @@ function HealthCell({ health }: { health: string | null | undefined }) {
 function DeploymentCell({
   instance,
   runtime,
+  mac,
 }: {
   instance: BridgeInstance;
   runtime: BridgeOffering["runtime"];
+  mac: boolean;
 }) {
   const d = instance.deployment;
+  if (!d && mac) {
+    const address = instanceAddress(instance);
+    return (
+      <div className="flex flex-col gap-0.5">
+        {address?.set ? (
+          <span className="font-identifier text-text [overflow-wrap:anywhere]">{address.host}</span>
+        ) : (
+          <span className="text-text-muted">Address not set</span>
+        )}
+        <span className="text-xs text-text-muted">
+          On {instance.user_id ? `${instance.user_id}'s` : "a"} Mac
+        </span>
+      </div>
+    );
+  }
   if (!d) {
     return (
       <span className="text-text-muted">{runtime === "elsewhere" ? "Elsewhere" : "Not yet"}</span>
@@ -742,10 +818,12 @@ function DeploymentCell({
 function SharedInstancePanel({
   instance,
   runtime,
+  mac,
   actions,
 }: {
   instance: BridgeInstance;
   runtime: BridgeOffering["runtime"];
+  mac: boolean;
   actions: ReactNode;
 }) {
   return (
@@ -759,7 +837,7 @@ function SharedInstancePanel({
           <HealthCell health={instance.health} />
         </Detail>
         <Detail label={runtime === "cluster" ? "Deployment" : "Runs"}>
-          <DeploymentCell instance={instance} runtime={runtime} />
+          <DeploymentCell instance={instance} runtime={runtime} mac={mac} />
         </Detail>
         <Detail label="Bot">
           {instance.bot ? <CopyableId value={instance.bot} /> : <span>—</span>}

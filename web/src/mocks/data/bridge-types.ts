@@ -19,6 +19,14 @@ interface Spec {
   mode?: "per_user" | "shared";
   /** RFC 0017: whether the server can run it from a rendered config alone. */
   deployable?: boolean;
+  /** Why the server cannot deploy it, when it cannot (`not_deployable_reason`). */
+  notDeployableReason?: string;
+  /** A program for a Mac rather than a container image: never deployed by this server. */
+  runsOn?: "container" | "mac";
+  /** For `runsOn: "mac"`, the pinned build to download and what it is. */
+  download?: { url: string; note: string };
+  /** The MSCs the bridge needs; mautrix's three unless the type says otherwise. */
+  requiredFeatures?: string[];
 }
 
 const PORTS: Record<string, number> = {
@@ -36,7 +44,7 @@ const PORTS: Record<string, number> = {
   heisenbridge: 9898,
   "matrix-appservice-irc": 9999,
   "matrix-hookshot": 9993,
-  "mautrix-imessage": 29337,
+  "mautrix-imessage": 29331,
 };
 
 /**
@@ -51,6 +59,7 @@ const COMMAND_PREFIXES: Record<string, string> = {
   "mautrix-meta": "!fb",
   "mautrix-discord": "!discord",
   "mautrix-bluesky": "!bsky",
+  "mautrix-imessage": "!im",
   // No `DefaultCommandPrefix` in their connectors: mautrix-go falls back to `!` + NetworkID.
   "mautrix-signal": "!signal",
   "mautrix-slack": "!slack",
@@ -147,12 +156,18 @@ function type(spec: Spec): BridgeType {
     config_keys: [{ key: spec.needs[0], description: spec.needs[1], required: true }],
     supports_double_puppeting: mautrix,
     command_prefix: COMMAND_PREFIXES[spec.id] ?? null,
-    required_features: mautrix
-      ? ["de.sorunome.msc2409.push_ephemeral", "org.matrix.msc3202", "io.element.msc4190"]
-      : [],
+    required_features:
+      spec.requiredFeatures ??
+      (mautrix
+        ? ["de.sorunome.msc2409.push_ephemeral", "org.matrix.msc3202", "io.element.msc4190"]
+        : []),
     renders_config: mautrix,
     mode: spec.mode ?? "per_user",
     deployable: spec.deployable ?? mautrix,
+    not_deployable_reason: spec.notDeployableReason ?? null,
+    runs_on: spec.runsOn ?? "container",
+    download_url: spec.download?.url ?? null,
+    download_note: spec.download?.note ?? null,
     ...provisioning(spec.id),
     sign_in: { steps: spec.steps, notes: spec.notes ?? null },
   };
@@ -222,15 +237,29 @@ export const bridgeTypes: BridgeType[] = [
     id: "mautrix-imessage",
     name: "iMessage",
     category: "messaging",
-    description: "iMessage and SMS, through a Mac signed in to Messages.",
+    description: "Your Mac's Messages: iMessage and SMS chats, as yourself.",
     needs: ["mac", "A Mac signed in to iMessage, which runs the bridge"],
+    docs: "https://docs.mau.fi/bridges/go/imessage/mac/setup.html",
+    // Not a container image: the pinned build of the program for a Mac, named like a tag.
+    image: "mautrix-imessage:300ba6d0",
     // It runs beside Messages on the person's own Mac; no cluster can run it for them.
     deployable: false,
+    notDeployableReason:
+      "iMessage bridges run on a Mac, beside the Messages app they read, so this server cannot deploy one: each person downloads the bridge and runs it on their Mac.",
+    runsOn: "mac",
+    download: {
+      url: "https://mau.dev/mautrix/imessage/-/jobs/95972/artifacts/download",
+      note: "Universal macOS build (Apple silicon and Intel) of mautrix-imessage commit 300ba6d0, from the project's CI on 2026-05-14. The zip holds the program, libolm.3.dylib and an example config.",
+    },
+    // No MSC4190: the bridge's bot has an ordinary device.
+    requiredFeatures: ["de.sorunome.msc2409.push_ephemeral", "org.matrix.msc3202"],
     steps: [
-      "Start the bridge on the Mac with the files an administrator gave you; it signs in with the Mac's own Messages account.",
-      "Start a direct chat with {bot} and send `help`. Your iMessage chats appear as rooms as messages arrive.",
+      "Download the bridge for your Mac from your bridge's page and unzip it.",
+      "Put your bridge's config.yaml, registration.yaml and run.sh beside it, open Terminal there and run `./run.sh`. When macOS asks, give Terminal Full Disk Access (System Settings → Privacy & Security → Full Disk Access) and run it again.",
+      "Keep the Mac on and awake; the bridge carries the chats of the Apple account Messages is signed in to.",
     ],
-    notes: "The Mac has to stay on and signed in to Messages for the bridge to work.",
+    notes:
+      "The server has to reach the Mac on its port (29331 by default): the same network, or a Tailscale-style private network. A Mac behind NAT with no such path cannot be reached yet.",
   }),
   type({
     id: "mautrix-meta",

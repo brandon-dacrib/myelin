@@ -10,6 +10,8 @@ import {
   requestFromOffering,
   settingsEffects,
   totalInstances,
+  checkMacAddress,
+  instanceAddress,
 } from "./bridge-offerings";
 
 describe("imageTag", () => {
@@ -146,5 +148,40 @@ describe("settingsEffects", () => {
     expect(settingsEffects("cluster", "elsewhere", 1).runtimeChange).toMatch(
       /^Saving does not move the 1 bridge people already have: the ones in the cluster keep running there/,
     );
+  });
+});
+
+describe("instanceAddress", () => {
+  it("reads the host from the url and knows the placeholder named after the appservice", () => {
+    expect(
+      instanceAddress({ url: "http://imessage-alice:29331", appservice_id: "imessage-alice" }),
+    ).toEqual({ host: "imessage-alice:29331", hostname: "imessage-alice", set: false });
+    expect(
+      instanceAddress({ url: "http://alices-mac.local:29331", appservice_id: "imessage-alice" }),
+    ).toEqual({ host: "alices-mac.local:29331", hostname: "alices-mac.local", set: true });
+    // The scheme's default port is left out of the host, as a browser would.
+    expect(instanceAddress({ url: "https://mac.example.net/", appservice_id: "x" })).toEqual({
+      host: "mac.example.net",
+      hostname: "mac.example.net",
+      set: true,
+    });
+    expect(instanceAddress({ url: null, appservice_id: "x" })).toBeNull();
+    expect(instanceAddress({ url: "not a url", appservice_id: "x" })).toBeNull();
+  });
+});
+
+describe("checkMacAddress", () => {
+  it("takes a host, host:port or http(s) URL and refuses what the server would", () => {
+    expect(checkMacAddress("  alices-mac.local ")).toEqual({ address: "alices-mac.local" });
+    expect(checkMacAddress("100.64.0.7:29331")).toEqual({ address: "100.64.0.7:29331" });
+    expect(checkMacAddress("https://mac.example.net:8443")).toEqual({
+      address: "https://mac.example.net:8443",
+    });
+    expect(checkMacAddress("")).toEqual({ error: "Type the Mac's hostname or IP address." });
+    expect(checkMacAddress("my mac")).toEqual({ error: "An address has no spaces in it." });
+    expect(checkMacAddress("ssh://mac.local")).toEqual({
+      error: "Only http:// and https:// addresses can be used.",
+    });
+    expect(checkMacAddress("http://")).toMatchObject({ error: expect.any(String) });
   });
 });
