@@ -31,6 +31,15 @@ hs-config, one in-flight join per (room, user).
 bot's device left behind after a crypto reset; a bridge is sent its owner's key counts as
 Synapse does; bridge page changes), not gated yet.
 
+**The idle memory creep is bounded in `hs-kv`** (`agent/fjall-write-buffer`, RFC 0024, status
+01 "The Fjall write buffer is capped"): Fjall's own database-wide cap is a deprecated no-op in
+3.1.10, so the backend rotates memtables itself once the write buffer passes 32 MiB and creates
+keyspaces with a 16 MiB memtable; `hs_kv_fjall_write_buffer_bytes` and `_cap_bytes` are on
+`/metrics`. The five-minute soak at 25 rewrites/s of 8 KiB is flat after the plateau with the
+cap (+0.5 MiB/h over the last two minutes) and climbs at the write rate, 817 MiB/h, without it. After the next roll, check `process_resident_memory_bytes`
+on the demo saw-tooths instead of creeping; an `hs-config` setting is left for when an operator
+needs one.
+
 ## Earlier: 2026-10-10, 16:30 EDT -- the demo runs `87d57288`; three findings from the roll
 
 **The roll** (through the owner's `kubectl proxy` on 127.0.0.1:8001, 19:26 UTC): `helm upgrade`
