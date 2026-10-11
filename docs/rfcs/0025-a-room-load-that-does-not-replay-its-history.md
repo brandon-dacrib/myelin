@@ -1,4 +1,4 @@
-# 0024. A room load that does not replay its history: the state store's per-event records must be durable
+# 0025. A room load that does not replay its history: the state store's per-event records must be durable
 
 Status: **proposed**, 2026-10-10 (branch `agent/room-memory`). Author: track 04 (room and
 events). Owner of the change: track 02 (state and model). Affects:
@@ -9,7 +9,7 @@ events). Owner of the change: track 02 (state and model). Affects:
 
 On 2026-10-10 the demo joined `#matrix:matrix.org` and held about 1.2 GiB within a minute of
 boot, before any traffic. Track 04 has since bounded what the room actor itself keeps
-(`crates/hs-room/src/actor/event_cache.rs`, decision 0042): the actor no longer holds every
+(`crates/hs-room/src/actor/event_cache.rs`, decision 0044): the actor no longer holds every
 event body of a room, nor an index of every event ID. What it cannot bound from its side is the
 state store it feeds.
 

@@ -7,7 +7,7 @@
 //! The ignored `measure_*` test is the before/after figure for status 04: a room of 50,000
 //! events on a Fjall store, loaded with a window as large as the room (how every room was held
 //! until 2026-10-10) and with the default window, with this process's resident size read each
-//! time (`hs_room::metrics::process_memory`). Run it alone, release, with `--nocapture`.
+//! time (`ps -o rss=`). Run it alone, release, with `--nocapture`.
 
 use std::collections::HashSet;
 
@@ -355,10 +355,16 @@ fn measure_resident_memory_of_a_large_room() {
     let backend = FjallBackend::open(&kv).expect("open fjall");
     let tables = Tables::open(&backend).expect("open tables");
     let identity = HomeserverIdentity::for_tests("hs1");
-    let rss = || {
-        hs_room::metrics::process_memory()
-            .map(|m| m.resident_bytes)
-            .unwrap_or(0)
+    // This process's resident size as `ps` reports it (KiB), on Linux and macOS alike; the
+    // server's own figure is `hs-cli`'s `process_resident_memory_bytes`.
+    let rss = || -> u64 {
+        std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+            .output()
+            .ok()
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+            .and_then(|text| text.trim().parse::<u64>().ok())
+            .map_or(0, |kib| kib * 1024)
     };
     let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
     let room_id_file = dir.join("room_id");

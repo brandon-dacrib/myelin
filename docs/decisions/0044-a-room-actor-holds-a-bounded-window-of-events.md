@@ -1,4 +1,4 @@
-# 0042: 2026-10-10: a room actor holds a bounded window of its events, least recently used
+# 0044: 2026-10-10: a room actor holds a bounded window of its events, least recently used
 
 Status: accepted (track 04; a setting in 13's `hs-config`, metrics 12 scrapes).
 
@@ -35,21 +35,20 @@ event ID. A room's memory followed its history, and the demo, having joined
 5. **The state store is told less about messages.** `RoomActor::store_inputs` hands `hs-state`
    an empty `content` and no `auth_events` for an event that is not a state event: state
    resolution reads neither of a message, and the store keeps a record of every event it is
-   given (RFC 0024).
+   given (RFC 0025).
 6. **What is still O(history) is named, not hidden.** `hs-state`'s in-memory per-event records
-   and the replay on load that fills them (RFC 0024, track 02); the actor's `timeline` map
+   and the replay on load that fills them (RFC 0025, track 02); the actor's `timeline` map
    (about 30 bytes per event); `relations_by_target` (per relation) and `redactions_by_target`
    (per redaction).
 7. **Operators can see it.** `hs_room_events_cached`, `hs_room_resident_rooms`,
    `hs_room_actors_alive`, `hs_room_event_cache_misses_total`,
-   `hs_room_event_cache_evictions_total`, `hs_room_event_id_lookups_total`, and, new to the
-   server, `process_resident_memory_bytes` and `process_virtual_memory_bytes`
-   (`/proc/self/status` on Linux, `proc_pidinfo` on macOS -- the one `unsafe` call in
-   `hs-room`, so the crate's `forbid(unsafe_code)` became `deny` with an allow on that
-   function). An INFO line the first time a room evicts.
+   `hs_room_event_cache_evictions_total`, `hs_room_event_id_lookups_total`; beside them the
+   server's `process_resident_memory_bytes` and `process_virtual_memory_bytes`, exported by
+   `hs-cli`'s `process_metrics` (`agent/leak-hunt`, the same day). An INFO line the first time
+   a room evicts.
 8. **An idle room can be unloaded.** `server.rooms.idle_unload_after` (unset by default): the
    registry's sweeper unloads rooms nobody used for that long, every minute. Off by default
-   because a reload still replays history (RFC 0024) and the actor's in-memory-only state (the
+   because a reload still replays history (RFC 0025) and the actor's in-memory-only state (the
    transaction-id dedup, `/forget`) is lost with it, as the status file has long recorded.
 
 ## Consequences

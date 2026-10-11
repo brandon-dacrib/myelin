@@ -39,10 +39,6 @@ hs-admin = { path = "../hs-admin" }
 # No cycle: `hs-cluster` depends only on `hs-kv`.
 hs-cluster = { path = "../hs-cluster" }
 
-[target.'cfg(target_os = "macos")'.dependencies]
-# `crate::metrics::process_memory`: `proc_pidinfo` for this process's resident size.
-libc.workspace = true
-
 [dev-dependencies]
 proptest.workspace = true
 # `crate::third_party_invite`'s tests sign an identity server's `signed` block.

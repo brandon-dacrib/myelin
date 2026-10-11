@@ -2738,7 +2738,6 @@ dependencies = [
  "hs-state",
  "hs-tables",
  "hs-testkit",
- "libc",
  "prometheus-client",
  "proptest",
  "rand 0.9.5",
