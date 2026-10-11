@@ -3339,3 +3339,13 @@ Refreshed 2026-09-28 against the code: closed rows are struck through with the c
   interface and `docs/config.md` are built from it); its first sentence is the inline hint, so
   make it say what the setting does for an operator, not restate its name. An operator should
   never need a config file, the CLI, the raw API or these docs to run the server.
+- **A steady memory creep is usually write buffering, and the sender should not be a fast
+  writer** (branch `agent/leak-hunt`, 2026-10-10). The demo's 13 MiB/h idle creep was Fjall
+  keeping every version of a rewritten key in a 64 MiB-per-keyspace memtable with no cap on the
+  total (RFC 0024, for track 01), fed by the federation sender writing a retry-state row on every
+  attempt at a destination whose DNS is gone, retried from one second because the client never
+  backed such a destination off (decision 0043). `/metrics` now has `process_resident_memory_bytes`,
+  `hs_federation_transactions_total{outcome}` and the `hs_federation_sender_*` gauges, every
+  label at zero from the first scrape; `docs/ops/memory.md` says how to read them;
+  `tools/rss-sample.sh` and `cargo test -p hs-federation --test sender_soak -- --ignored` reproduce
+  the measurement. Left: RFC 0024 in `hs-kv`, and a Grafana panel for the new series.

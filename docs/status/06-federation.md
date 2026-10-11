@@ -4419,3 +4419,112 @@ The workspace-level entries (`hickory-resolver`, `ipnet`) are noted with "Added 
 attribution comments in the root `Cargo.toml`; `hs-state` needed no root `Cargo.toml` change since
 internal crate-to-crate path dependencies are declared directly in each crate's own manifest (the
 same way this crate already depends on `hs-model`/`hs-kv`/etc.).
+
+## 2026-10-10 (branch `agent/leak-hunt`): the leak hunt -- where the demo's memory creep came from, and what `/metrics` now says about it
+
+**Evidence (the owner, 23:17 UTC, from the cluster's Prometheus and the pod's log).** The demo
+pod (image `sha-2d11ea2e`, one replica) had its memory limit raised from the chart default to
+2 GiB at 22:45 and 3 GiB at 23:11. `container_memory_working_set_bytes` crept linearly while
+idle on every build of the day: 272 to 315 MiB over 15:18-18:33 (13 MiB/h), 181 to 187 MiB over
+19:00-19:28, 346 to 362 MiB over 21:08-22:13. The log had, in a 400 s window, 2,790 `WARN
+federation transaction failed; will retry` (about 7 a second), mostly `could not resolve
+destination X: X did not resolve to any address` for the dead servers that
+`!aJfJRJuTsMXWPBU6qF9AK5AwfJ1XL5tPdRsWW6_kQzQ` and `#matrix:matrix.org` name, with `retry_in_ms`
+doubling 1000, 2000, 4000 per destination; 73 `resuming an outbound federation queue left by a
+previous run`, 39 `destination was failing before this start`, 45 `federation transaction
+rejected`, 35 `destination rejected a PDU`, 54 `could not fetch a server's keys`. Every
+`hs_federation_*` series on `/metrics` except `join_verify` read zero, and there was no process
+memory metric at all. (The 1.2 GiB held at boot after joining the big rooms is the room actor's
+event cache, bounded on `agent/room-memory`; not this branch.)
+
+**What was found.**
+
+1. *The creep is write buffering in Fjall, fed by the sender's retry storm.* Every failed attempt
+   at a transaction writes the destination's retry state (`KvOutboundStore::record_failure`, one
+   `hs-kv` transaction). Fjall keeps every version of a rewritten key in its keyspace's memtable
+   until that memtable reaches 64 MiB (`KeyspaceCreateOptions::default()` in Fjall 3.1), and
+   `hs-kv` sets no database-wide `max_write_buffer_size`, so the sum over 139 keyspaces is
+   unbounded until each flushes on its own. The soak below shows it: the same sender code and
+   the same 25 attempts a second grow RSS at 8 MiB/h over Fjall and not at all over `hs-kv`'s
+   memory backend. Nothing in the sender itself accumulates per attempt: the transaction body is
+   built once per transaction, timers and spans are freed, the per-destination maps (semaphores,
+   pinned HTTP clients, well-known and key caches) are bounded by the number of destinations, and
+   the channel entries by `max_queued_pdus_per_destination`.
+2. *A destination that does not resolve was never backed off by the client.* `FederationClient::send`
+   recorded a destination failure only for `ClientError::Request` and `ResponseTooLarge`;
+   `ClientError::Discovery` recorded nothing, so the sender's own loop was the only brake, and
+   every other caller (a join verifying a `send_join` answer, a key fetch) asked the dead server
+   as often as its own loop allowed. The sender's loop does persist and double its wait, so the
+   `1000, 2000, 4000` runs were destinations being tried for the first time (hundreds at once,
+   after the join named them), not a reset at boot; but each attempt was a `warn` and a store
+   write.
+3. *Zero meant absent.* A `prometheus_client` `Family` with no observed label set renders no
+   series, so the demo's zeros for `hs_federation_key_fetch_failures_total` and the rest were
+   "never observed here", not mis-wiring: `register_transport_metrics` was and is called by
+   `hs serve`. There was no counter for transaction attempts at all, and no process memory.
+
+**What changed.**
+
+- `crates/hs-cli/src/process_metrics.rs` (new): `process_resident_memory_bytes` and
+  `process_virtual_memory_bytes`, read at scrape time from `/proc/self/statm` on Linux and
+  `task_info` on macOS, absent (not zero) elsewhere; registered in `serve.rs` beside the other
+  families. `libc` added to `hs-cli`'s dependencies (already a workspace dependency).
+- `crates/hs-federation/src/metrics.rs`: `hs_federation_transactions_total{outcome}` (`accepted`,
+  `rejected`, `unresolvable`, `failed`, `deferred`, `dropped`), `hs_federation_pdus_sent_total`,
+  and the `hs_federation_sender_*` gauges (`destinations`, `pdus_pending`, `edus_queued`,
+  `destinations_backing_off`, `state_bytes`) as a `Collector` over
+  `FederationSender::snapshot()`, registered by `serve.rs` once the sender exists. Every label of
+  the transactions and key-fetch-failure families is created at registration, so each series is
+  on `/metrics` at zero from the first scrape.
+- `crates/hs-federation/src/sender.rs`: `SenderSnapshot` and `snapshot()`; a count of workers
+  waiting out a retry (`BackingOff` guard around every wait); a running byte estimate on each
+  `EduQueue` (`approx_json_bytes`); `deliver` counts each attempt's outcome, names a
+  `Discovery` error `unresolvable` with its own message, and logs a failed attempt at `warn` only
+  on the first failure of a run and when the wait reaches a new level (a minute, the ceiling) --
+  three warnings per dead destination ever, the run being persisted -- and at `debug` otherwise;
+  `destination was failing before this start` is `debug`, and `resume` logs one summary line
+  with how many resumed destinations are still waiting out a backoff.
+- `crates/hs-federation/src/client.rs`: `send` and `get_media` record `ClientError::Discovery` in
+  the destination store like a `Request` failure (decision 0043), so a dead server is refused
+  with `Backoff` for every caller until its jittered, doubling backoff (capped at
+  `federation.max_retry_backoff`) ends.
+- `crates/hs-federation/tests/sender_soak.rs` (new, ignored): the sender as `hs serve` builds it
+  (Fjall under a tempdir, the system resolver, the HTTP well-known fetcher) against
+  `SOAK_DESTINATIONS` unresolvable servers, sampling RSS with `ps` every 30 s for `SOAK_MINUTES`;
+  `SOAK_BACKEND=memory` swaps in the memory backend. `tools/rss-sample.sh` (new) samples any
+  process's RSS the same way.
+- Docs: `docs/ops/memory.md` (new; what the metrics mean and what to expect from a large room),
+  `docs/rfcs/0024-fjall-write-buffer-cap.md` (the storage-side fix, for track 01),
+  `docs/decisions/0043-...`, one paragraph in `docs/next-steps.md`.
+
+**Measurements (debug build, macOS desktop, 2026-10-10 evening; RSS from `ps`, KiB).**
+
+| run | configuration | start | after 2 min | end | slope after warm-up |
+|-----|---------------|-------|-------------|-----|---------------------|
+| idle `hs serve` | single node, embedded storage, no rooms, no traffic, 21.5 min (`tools/rss-sample.sh`) | 79,200 | 79,248 | 56,912 | flat (the drop at 7 min is the OS paging an idle process) |
+| soak, before, Fjall | unmodified sender, 50 `*.invalid` destinations, 2 s backoff cap, 25 attempts/s, 15 min | 27,600 | 35,824 | 37,600 | +8.2 MiB/h |
+| soak, before, memory backend | the same, both stores on `MemoryBackend` | 25,616 | 27,776 | 25,728 | flat |
+| soak, after, Fjall | fixed sender and client, the real 1 h backoff cap, 15 min | 26,336 | 31,280 | 24,224 | flat (-32 MiB/h: the allocator giving pages back) |
+
+In the after run the unresolvable attempts stop within minutes (500 across 50 destinations by
+15 min: 10 per destination at 1, 2, 4, ..., 512 s, then nothing until the next doubling) while
+`deferred` grows at about four a second: those are the sender's polls of the
+destination store between client backoffs (a read, no network, no write). The demo's idle creep
+did not reproduce on an idle local server with nothing configured; its 13 MiB/h is the same
+mechanism as the soak's 8 MiB/h with other periodic writers (bridges, presence, leases) in place
+of the storm, which is what RFC 0024 is for.
+
+**Commands run (all green).** `cargo test -p hs-federation` (247 lib tests, doc tests; the soak
+is ignored); `cargo test -p hs-cli --lib process_metrics`; `cargo test -p hs-cli --test e2e
+metrics_carry` (boots the real server in-process and reads `/metrics`); `cargo test -p hs-cli
+--test federation_sender --test federation_restart`; `cargo clippy -p hs-federation -p hs-cli
+--all-targets -- -D warnings`; `cargo fmt --all --check`; the three soaks and the idle sample
+above. Not run here: the whole-workspace gate (the coordinator's, under the merge lock).
+
+**Left.** RFC 0024 (one line in `hs-kv`'s `FjallBackend::open`, track 01). A Grafana panel for
+`process_resident_memory_bytes` and the `hs_federation_sender_*` gauges (track 12;
+`deploy/observability/grafana/hs-overview.json` still has the federation panel as a TODO). Watch
+the demo's `process_resident_memory_bytes` after the next roll: if it still creeps at 13 MiB/h
+with the sender quiet, the writer is elsewhere and the metric now says so. Decision 0043 is new
+behaviour for every client caller; a Complement or Sytest run that resolves a destination to
+nothing twice in one test would now see `Backoff` the second time.
