@@ -70,10 +70,15 @@ export function AddBridgeWizardPage() {
   const [furthest, setFurthest] = useState<WizardStep>("kind");
   const [conflict, setConflict] = useState<IdentityConflict | null>(null);
   const [idempotencyKey] = useState(() => newIdempotencyKey());
+  const [doublePuppetIdempotencyKey] = useState(() => newIdempotencyKey());
   const [renderResult, setRenderResult] = useState<BridgeTypeRenderResult | null>(null);
 
   const render = useRenderBridgeType();
   const create = useCreateAppservice();
+  // A bridge that double puppets does so with a registration of its own (decision 0045), made
+  // right after the bridge's: a non-exclusive claim on the people it acts as, and no URL, so the
+  // server never sends it anything (the bridge's own registration claims only its ghosts and bot).
+  const createDoublePuppet = useCreateAppservice();
 
   function goTo(next: WizardStep) {
     navigate({ search: { step: next } });
@@ -116,12 +121,27 @@ export function AddBridgeWizardPage() {
           // A bridge registered here is one the operator runs themselves, so the files are
           // its config, its registration and a Compose service. A bridge this server runs is
           // an offering (RFC 0017), not this path.
-          stashCreatedArtifacts(createdId, {
-            registrationYaml,
-            configYaml: renderResult.config_yaml ?? undefined,
-            composeYaml: renderResult.compose_yaml,
-          });
-          navigate({ to: "/bridges/$bridgeId/created", params: { bridgeId: createdId } });
+          const finish = () => {
+            stashCreatedArtifacts(createdId, {
+              registrationYaml,
+              configYaml: renderResult.config_yaml ?? undefined,
+              composeYaml: renderResult.compose_yaml,
+            });
+            navigate({ to: "/bridges/$bridgeId/created", params: { bridgeId: createdId } });
+          };
+          const doublePuppet = renderResult.double_puppet_registration;
+          if (!doublePuppet) {
+            finish();
+            return;
+          }
+          createDoublePuppet.mutate(
+            {
+              idempotencyKey: doublePuppetIdempotencyKey,
+              registration: doublePuppet,
+              registrationYaml: renderResult.double_puppet_registration_yaml ?? "",
+            },
+            { onSuccess: finish },
+          );
         },
         onError: (err: unknown) => {
           const { problem } = classifyError(err);
@@ -144,7 +164,12 @@ export function AddBridgeWizardPage() {
 
   const createErrorMessage = create.isError
     ? wizardErrorMessage(create.error, "The server did not accept this bridge.")
-    : undefined;
+    : createDoublePuppet.isError
+      ? `The bridge is registered, but its double puppeting is not: ${wizardErrorMessage(
+          createDoublePuppet.error,
+          "the server did not accept it.",
+        )} Try again to register it.`
+      : undefined;
   const renderErrorMessage = render.isError
     ? wizardErrorMessage(render.error, "Couldn't render the registration preview.")
     : undefined;
@@ -210,7 +235,7 @@ export function AddBridgeWizardPage() {
               state={state}
               onEdit={goTo}
               onCreate={handleCreate}
-              isPending={create.isPending}
+              isPending={create.isPending || createDoublePuppet.isPending}
               isRendering={render.isPending}
               renderResult={renderResult}
               renderError={renderErrorMessage}

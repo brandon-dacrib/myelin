@@ -90,6 +90,22 @@ export function ReviewStep({
               content={renderResult.registration_yaml ?? ""}
               filename={`${state.id || "bridge"}-registration.yaml`}
             />
+            {renderResult.double_puppet_registration_yaml && (
+              <>
+                <p className="text-sm text-text-muted">
+                  Double puppeting is a second registration, created with the first: it lets the
+                  bridge post as the people it bridges for, and has no URL, so the server never
+                  sends it anything. The bridge&apos;s own registration claims only its ghosts and
+                  its bot, so it is not sent the rooms they are not in. Its token is already in
+                  config.yaml.
+                </p>
+                <CopyBlock
+                  label="Double puppeting registration (preview)"
+                  content={renderResult.double_puppet_registration_yaml}
+                  filename={`${state.id || "bridge"}-doublepuppet-registration.yaml`}
+                />
+              </>
+            )}
             {renderResult.config_yaml && (
               <CopyBlock
                 label="config.yaml (preview)"

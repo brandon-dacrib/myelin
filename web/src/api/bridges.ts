@@ -53,16 +53,45 @@ export type Task = components["schemas"]["Task"];
  */
 export const BUILT_IN_APPSERVICE_ID = "myelin-bridges";
 
-/** Whether `appservice` is the server's own built-in registration, not a bridge somebody added. */
-export function isBuiltInAppservice(appservice: Pick<AppService, "id">): boolean {
-  return appservice.id === BUILT_IN_APPSERVICE_ID;
+/**
+ * What a bridge's double-puppeting registration's id ends with (`whatsapp-brandon-doublepuppet`,
+ * `hs_admin::bridge_types::DOUBLE_PUPPET_ID_SUFFIX`). Decision 0045: a bridge acts as people with
+ * a registration of its own that has no `url`, so the server never sends it anything.
+ */
+export const DOUBLE_PUPPET_ID_SUFFIX = "-doublepuppet";
+
+/**
+ * Whether `appservice` is a registration with no `url`: the server never sends it anything (a
+ * bridge's double puppeting, which only lends the bridge a token), so it has no delivery to be
+ * healthy or degraded about.
+ */
+export function isSendsNothingAppservice(appservice: Pick<AppService, "url">): boolean {
+  return appservice.url === null;
 }
 
-/** `id` humanised for display: real appservices have no display-name field. */
-export function deriveDisplayName(appservice: Pick<AppService, "id">): string {
-  const id = appservice.id ?? "";
-  if (!id) return "(unknown)";
-  if (isBuiltInAppservice(appservice)) return "This server's bridge manager";
+/** Whether `appservice` is a bridge's double-puppeting registration (decision 0045). */
+export function isDoublePuppetAppservice(appservice: Pick<AppService, "id" | "url">): boolean {
+  return (
+    isSendsNothingAppservice(appservice) && (appservice.id ?? "").endsWith(DOUBLE_PUPPET_ID_SUFFIX)
+  );
+}
+
+/**
+ * Whether `appservice` is the server's own built-in registration, not a bridge somebody added:
+ * the bridge manager, or a double-puppeting registration the manager (or the wizard) made beside
+ * a bridge. Neither is probed or delivered to the way a bridge is.
+ */
+export function isBuiltInAppservice(
+  appservice: Pick<AppService, "id"> & Partial<Pick<AppService, "url">>,
+): boolean {
+  return (
+    appservice.id === BUILT_IN_APPSERVICE_ID ||
+    (appservice.url !== undefined &&
+      isDoublePuppetAppservice({ id: appservice.id, url: appservice.url }))
+  );
+}
+
+function humanise(id: string): string {
   return id
     .split(/[-_]/)
     .filter(Boolean)
@@ -70,12 +99,29 @@ export function deriveDisplayName(appservice: Pick<AppService, "id">): string {
     .join(" ");
 }
 
+/** `id` humanised for display: real appservices have no display-name field. */
+export function deriveDisplayName(
+  appservice: Pick<AppService, "id"> & Partial<Pick<AppService, "url">>,
+): string {
+  const id = appservice.id ?? "";
+  if (!id) return "(unknown)";
+  if (id === BUILT_IN_APPSERVICE_ID) return "This server's bridge manager";
+  if (appservice.url !== undefined && isDoublePuppetAppservice({ id, url: appservice.url }))
+    return `Double puppeting for ${humanise(id.slice(0, -DOUBLE_PUPPET_ID_SUFFIX.length))}`;
+  return humanise(id);
+}
+
 /** `protocols` read as the bridge "kind": real appservices carry no bridge-type reference. */
 export function deriveKindLabel(
-  appservice: Pick<AppService, "protocols"> & Partial<Pick<AppService, "id">>,
+  appservice: Pick<AppService, "protocols"> & Partial<Pick<AppService, "id" | "url">>,
 ): string {
-  if (appservice.id && isBuiltInAppservice({ id: appservice.id }))
-    return "Built in: runs the bridges offered here";
+  if (appservice.id === BUILT_IN_APPSERVICE_ID) return "Built in: runs the bridges offered here";
+  if (
+    appservice.url !== undefined &&
+    isDoublePuppetAppservice({ id: appservice.id, url: appservice.url })
+  )
+    return "Built in: lets the bridge post as its owner; the server sends it nothing";
+  if (appservice.url === null) return "No URL: the server sends it nothing";
   return appservice.protocols && appservice.protocols.length > 0
     ? appservice.protocols.join(", ")
     : "Custom appservice";

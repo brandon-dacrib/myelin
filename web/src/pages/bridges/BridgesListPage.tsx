@@ -3,6 +3,7 @@ import { useNavigate, useSearch, Link } from "@tanstack/react-router";
 import { Cable, Play, Pause } from "lucide-react";
 import {
   isBuiltInAppservice,
+  isSendsNothingAppservice,
   useAppservices,
   useBridgeTypes,
   usePauseAppservice,
@@ -63,7 +64,12 @@ export function BridgesListPage() {
   const resume = useResumeAppservice();
 
   const all = useMemo(() => data?.items ?? [], [data]);
-  const counts = useMemo(() => healthCounts(all), [all]);
+  // The health chips count bridges: the server's own registrations and ones with no URL have no
+  // delivery to be healthy or not about.
+  const counts = useMemo(
+    () => healthCounts(all.filter((b) => !isBuiltInAppservice(b) && !isSendsNothingAppservice(b))),
+    [all],
+  );
 
   const rows = useMemo(() => {
     let items = all;
@@ -118,7 +124,8 @@ export function BridgesListPage() {
       header: "State",
       priority: 1,
       render: (b) => {
-        // The server's own bridge manager is not probed, so "Unknown" would read as a fault.
+        // The server's own registrations (the bridge manager, a bridge's double puppeting) are
+        // not probed, and one with no URL is never sent anything: "Unknown" would read as a fault.
         if (isBuiltInAppservice(b)) {
           return (
             <span title="The server's own registration; it is not probed.">
@@ -126,11 +133,22 @@ export function BridgesListPage() {
             </span>
           );
         }
+        if (isSendsNothingAppservice(b)) {
+          return (
+            <span title="It has no URL: the server sends it nothing, so there is no delivery to judge.">
+              <Badge status="muted">Sends nothing</Badge>
+            </span>
+          );
+        }
         const meta = bridgeHealthMeta[healthKeyOf(b)];
         return <Badge status={meta.status}>{meta.label}</Badge>;
       },
       renderCompact: (b) =>
-        isBuiltInAppservice(b) ? "Built in" : bridgeHealthMeta[healthKeyOf(b)].label,
+        isBuiltInAppservice(b)
+          ? "Built in"
+          : isSendsNothingAppservice(b)
+            ? "Sends nothing"
+            : bridgeHealthMeta[healthKeyOf(b)].label,
     },
     {
       key: "queue",

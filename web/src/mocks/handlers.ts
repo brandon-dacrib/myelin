@@ -739,12 +739,57 @@ export const handlers = [
       `  image: dock.mau.dev/mautrix/${typeId.replace(/^mautrix-/, "")}:${imageTag}`,
     ].join("\n");
 
+    // Double puppeting, as the real render does it (decision 0045): a registration of its own
+    // with no URL, claiming everyone here non-exclusively; the bridge's own claims only its
+    // ghosts. Only for a type that supports it, when the wizard asked for it.
+    const supportsDoublePuppeting = bridgeTypes.find(
+      (t) => t.id === typeId,
+    )?.supports_double_puppeting;
+    const doublePuppetId = `${id}-doublepuppet`;
+    const double_puppet_registration =
+      values.doublePuppeting && supportsDoublePuppeting
+        ? {
+            id: doublePuppetId,
+            url: null,
+            as_token: `as_token_${doublePuppetId}_${crypto.randomUUID().slice(0, 8)}`,
+            hs_token: `hs_token_${doublePuppetId}_${crypto.randomUUID().slice(0, 8)}`,
+            sender_localpart: doublePuppetId,
+            rate_limited: false,
+            namespaces: {
+              users: [{ regex: "@.*:example\\.org", exclusive: false }],
+              aliases: [],
+              rooms: [],
+            },
+            "io.myelin.double_puppet_for": id,
+          }
+        : undefined;
+    const double_puppet_registration_yaml = double_puppet_registration
+      ? [
+          `id: ${doublePuppetId}`,
+          "url: null",
+          `as_token: ${double_puppet_registration.as_token}`,
+          `hs_token: ${double_puppet_registration.hs_token}`,
+          `sender_localpart: ${doublePuppetId}`,
+          "rate_limited: false",
+          "namespaces:",
+          "  users:",
+          "    - exclusive: false",
+          "      regex: '@.*:example\\.org'",
+          "  aliases: []",
+          "  rooms: []",
+          `io.myelin.double_puppet_for: ${id}`,
+        ].join("\n")
+      : undefined;
+
     return HttpResponse.json({
       registration,
       registration_yaml,
       config_yaml,
       compose_yaml,
       bridge_resource_yaml,
+      ...(double_puppet_registration
+        ? { double_puppet_registration, double_puppet_registration_yaml }
+        : {}),
     });
   }),
 

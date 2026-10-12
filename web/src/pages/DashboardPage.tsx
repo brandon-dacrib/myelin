@@ -24,6 +24,7 @@ import {
   useBridgeOfferings,
   deriveDisplayName,
   isBuiltInAppservice,
+  isSendsNothingAppservice,
 } from "@/api/bridges";
 import { useMigration } from "@/api/migration";
 import { useTasks } from "@/api/tasks";
@@ -112,9 +113,13 @@ export function DashboardPage() {
   if (health.isError) unchecked.push("server health");
 
   // The server's own bridge manager is a registration too, and its health is "unknown" because
-  // nothing probes it: that is not a bridge in trouble, so it is not under Attention.
+  // nothing probes it: that is not a bridge in trouble, so it is not under Attention. Nor is a
+  // registration with no URL (a bridge's double puppeting): it is never sent anything.
   const bridges = useMemo(
-    () => (appservices.data?.items ?? []).filter((b) => !isBuiltInAppservice(b)),
+    () =>
+      (appservices.data?.items ?? []).filter(
+        (b) => !isBuiltInAppservice(b) && !isSendsNothingAppservice(b),
+      ),
     [appservices.data],
   );
   const unhealthyBridges = useMemo(

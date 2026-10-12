@@ -84,7 +84,7 @@ export function shortTypeId(typeId: string): string {
  * `work-whatsapp`) with the kind shown beside it.
  */
 export function bridgeTitle(
-  appservice: Pick<AppService, "id" | "bridge_type">,
+  appservice: Pick<AppService, "id" | "bridge_type"> & Partial<Pick<AppService, "url">>,
   type: Pick<BridgeType, "id" | "name"> | undefined,
 ): string {
   const id = appservice.id ?? "";
@@ -94,7 +94,8 @@ export function bridgeTitle(
 
 /** The kind column: the catalogue's name, or what the registration's `protocols` say. */
 export function bridgeKind(
-  appservice: Pick<AppService, "protocols" | "bridge_type"> & Partial<Pick<AppService, "id">>,
+  appservice: Pick<AppService, "protocols" | "bridge_type"> &
+    Partial<Pick<AppService, "id" | "url">>,
   type: Pick<BridgeType, "name"> | undefined,
 ): string {
   return type?.name ?? deriveKindLabel(appservice);

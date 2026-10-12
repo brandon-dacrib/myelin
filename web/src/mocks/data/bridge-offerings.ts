@@ -551,9 +551,7 @@ export function instanceFiles(type: string, userSegment: string): BridgeInstance
     "      exclusive: true",
     `    - regex: '@${botLocalpart}:example\\.org'`,
     "      exclusive: true",
-    ...(instance.user_id && offering.options.double_puppeting
-      ? [`    - regex: '${instance.user_id.replaceAll(".", "\\.")}'`, "      exclusive: false"]
-      : []),
+    // Not its owner: double puppeting is a registration of its own with no URL (decision 0045).
     "de.sorunome.msc2409.push_ephemeral: true",
     `org.matrix.msc3202: ${offering.options.encryption}`,
     `io.myelin.bridge_type: ${type}`,

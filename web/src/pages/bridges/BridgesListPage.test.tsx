@@ -48,4 +48,39 @@ describe("Bridges list", () => {
     expect(within(row).getByText("Built in")).toBeInTheDocument();
     expect(within(row).queryByText("Unknown")).not.toBeInTheDocument();
   });
+
+  it("names a bridge's double-puppeting registration as built in, and one with no URL as sending nothing", async () => {
+    server.use(
+      http.get("/api/v1/appservices", () =>
+        HttpResponse.json({
+          items: [
+            {
+              id: "signal-brandon-doublepuppet",
+              sender_localpart: "signal-brandon-doublepuppet",
+              url: null,
+              health: "unknown",
+            },
+            { id: "my-puppets", sender_localpart: "puppets", url: null, health: "unknown" },
+          ],
+          next_cursor: null,
+          prev_cursor: null,
+        }),
+      ),
+    );
+    renderBridgesRoute("/bridges/registrations", BridgesListPage, "/bridges/registrations");
+    expect(
+      await screen.findByRole("link", { name: "Double puppeting for Signal Brandon" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Built in: lets the bridge post as its owner; the server sends it nothing"),
+    ).toBeInTheDocument();
+    const dp = screen.getByRole("row", { name: /Double puppeting for Signal Brandon/ });
+    expect(within(dp).getByText("Built in")).toBeInTheDocument();
+    expect(within(dp).queryByText("Unknown")).not.toBeInTheDocument();
+    const plain = screen.getByRole("row", { name: /My Puppets/ });
+    expect(within(plain).getByText("Sends nothing")).toBeInTheDocument();
+    expect(within(plain).queryByText("Unknown")).not.toBeInTheDocument();
+    // Neither is counted as a bridge of unknown health.
+    expect(screen.queryByRole("button", { name: /Unknown/ })).not.toBeInTheDocument();
+  });
 });

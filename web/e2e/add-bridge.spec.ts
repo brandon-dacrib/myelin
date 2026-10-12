@@ -69,6 +69,12 @@ test.describe("Register a bridge you run yourself", () => {
     const configPreview = page.getByRole("region", { name: "config.yaml (preview)" });
     await expect(configPreview).toContainText("address: http://myelin:8008");
     await expect(configPreview).toContainText('"@ops:example.org": admin');
+    // Double puppeting is a second registration with no URL (decision 0045), created with it.
+    const doublePuppetPreview = page.getByRole("region", {
+      name: "Double puppeting registration (preview)",
+    });
+    await expect(doublePuppetPreview).toContainText("url: null");
+    await expect(doublePuppetPreview).toContainText("id: bluesky-doublepuppet");
 
     await page.getByRole("button", { name: "Register bridge" }).click();
 
@@ -101,6 +107,12 @@ test.describe("Register a bridge you run yourself", () => {
     await page.getByRole("button", { name: "Check" }).click();
     await expect(page.getByText("@bob:example.org is not signed in.")).toBeVisible();
     await expectNoAxeViolations(page, "bridge detail: sign in");
+
+    // Its double puppeting is listed as the server's own, not as a bridge of unknown health.
+    await openRegistrations(page);
+    const doublePuppetRow = page.getByRole("row", { name: /Double puppeting for Bluesky/ });
+    await expect(doublePuppetRow).toBeVisible();
+    await expect(doublePuppetRow.getByText("Built in", { exact: true })).toBeVisible();
     domGuard.assertClean();
   });
 

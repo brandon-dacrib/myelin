@@ -2963,6 +2963,10 @@ export interface components {
             compose_yaml?: string;
             /** @description The bridge's own `config.yaml` with everything that ties it to this server filled in (mautrix bridges); null when the render writes no config for this type. */
             config_yaml?: string | null;
+            /** @description The bridge's double-puppeting registration (decision 0045), present when double puppeting was chosen: a non-exclusive claim on the people the bridge may act as and `url: null`, so the server never sends it anything. The bridge's config acts as people with its `as_token`. Create it with `POST /appservices` beside `registration`; the bridge's own registration claims only its ghosts and its bot. */
+            double_puppet_registration?: Record<string, never>;
+            /** @description `double_puppet_registration` as YAML. */
+            double_puppet_registration_yaml?: string;
             registration?: Record<string, never>;
             registration_yaml?: string;
         };
