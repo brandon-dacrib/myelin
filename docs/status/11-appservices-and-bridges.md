@@ -1,6 +1,7 @@
 # Status: track 11, appservices and bridges
 
-Last updated: 2026-10-12, late night (double puppeting is a registration of its own with no url,
+Last updated: 2026-10-12, latest (the iMessage bridge double puppets again, through its
+double-puppeting registration; below); before that 2026-10-12, late night (double puppeting is a registration of its own with no url,
 so a bridge is no longer sent every room its owner is in; decision 0046; mautrix-imessage stops
 double puppeting; below); before that 2026-10-12, night (the iMessage bridge starts on the
 owner's Mac: `GET /login` lists the appservice login, the config's double puppeting says
@@ -146,6 +147,27 @@ DOUBLE_PUPPET_FOR_KEY, DOUBLE_PUPPET_ID_SUFFIX}`, `InstanceSpec::double_puppet`,
 `hs_appservice::error::error_chain`, `HttpTransactionSender::with_timeout`.
 
 **Shared dependencies added.** None.
+## Session 2026-10-12, latest (branch `agent/imessage-double-puppet`): the iMessage bridge double puppets again
+
+Decision 0046 (`agent/double-puppet-registration`) stopped a bridge's own registration from
+claiming its person, and so took iMessage's double puppeting out: this build knows only
+`login_shared_secret: appservice`, an appservice login with its own token. The owner wants it
+back. `hs-auth`'s appservice login now allows a user the appservice's own registration does not
+claim when its double-puppeting registration does
+(`AppserviceRegistry::double_puppet_record_for`, which `hs-appservice`'s adapter answers from
+the row whose `io.myelin.double_puppet_for` names it). It logs one INFO line per such login.
+The iMessage config says `appservice` again when the instance double puppets. Masquerading and
+transaction delivery are unchanged, so the bridge is still not sent the person's every room.
+
+**Verified** with the real `mautrix-imessage` build against a local `hs` from the branch, on
+port 29399 with fresh tokens, the instance's registration without the person, and a
+`-doublepuppet` registration claiming them: `Successfully automatically enabled custom puppet`
+and the server's INFO line. Without the double-puppeting registration it is `403 Application
+service cannot masquerade`. Unit test:
+`routes::login::tests::an_appservice_logs_in_as_a_user_its_double_puppeting_registration_claims`
+(allowed for the claimed user, refused for another, refused with no double-puppeting
+registration). `bridge_offerings.rs` passes.
+
 ## Session 2026-10-12, late night (branch `agent/imessage-launchagent`): a Mac bridge starts at login
 
 The owner wants the iMessage bridge to start without Terminal once it works. The generated

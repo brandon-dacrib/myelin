@@ -15,6 +15,12 @@ carries the generated notes for that merge.
 
 ## Unreleased
 
+- **The iMessage bridge double puppets again.** Decision 0046 stopped a bridge's own
+  registration from claiming its person, and the iMessage build can double puppet only by
+  logging in with its own token. The server now allows that login for whoever the bridge's
+  double-puppeting registration claims, so what you send from your own Apple devices shows up as
+  you, and the bridge is still not sent every room you are in. Verified with the real build.
+
 - **The server's log is readable again.** State resolution's own lines (its steps at INFO,
   and every conflicted event that loses on auth at WARN, ~10,000 lines in 9 minutes on the
   demo) are no longer in the default log; its errors still are. `debug`, `trace` and

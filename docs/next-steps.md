@@ -72,9 +72,9 @@ server's log has one `moved the bridge instance's double puppeting` line per ins
    undecryptable, run `/discardsession` in that room and try again.
 4. **iMessage on the owner's Mac**: the bridge starts with the server of `agent/as-login-flow`
    (status 11, 2026-10-12, night). After the roll that also carries
-   `agent/double-puppet-registration`: download the files again (they have no
-   `login_shared_secret` any more: that bridge cannot double puppet without the claim that
-   floods it, decision 0046), `./run.sh`, Full Disk Access, a message both ways; then
+   `agent/double-puppet-registration` and `agent/imessage-double-puppet`: download the files
+   again (`login_shared_secret: appservice`, allowed through the instance's double-puppeting
+   registration, 0046 amended), `./run.sh`, Full Disk Access, a message both ways; then
    `./run.sh install` to start it at login (`c59c6da9`, `docs/bridges/imessage.md`, "Starting it
    at login"; Full Disk Access then goes to `mautrix-imessage` itself); then an `e2e-real` case.
    **Never test a bridge on this Mac with the instance's port (29331) or tokens**: the demo
