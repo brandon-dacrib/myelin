@@ -92,6 +92,27 @@ pub struct RemovedBotDevice {
     pub kept_device: String,
 }
 
+/// An instance's double-puppeting registration ([`InstanceRow::double_puppet`]).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DoublePuppetRow {
+    /// Its appservice id: `<instance's>-doublepuppet`, or with `-2` and on if that was taken.
+    pub appservice_id: String,
+    pub as_token: String,
+    pub hs_token: String,
+    /// A fingerprint of the registration last written to the registry
+    /// (`manager::registration_fingerprint`); `None` until it is written.
+    #[serde(default)]
+    pub registered_fingerprint: Option<String>,
+}
+
+impl std::fmt::Debug for DoublePuppetRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DoublePuppetRow")
+            .field("appservice_id", &self.appservice_id)
+            .finish_non_exhaustive()
+    }
+}
+
 /// An instance as stored. Holds its tokens: the manager renders its files from them, and its bot
 /// speaks with them.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -175,6 +196,14 @@ pub struct InstanceRow {
     /// row from before this was recorded: that one is applied again once.
     #[serde(default)]
     pub applied_fingerprint: Option<String>,
+    /// Its double-puppeting registration (decision 0045): the separate, `url`-less registration
+    /// whose token the bridge acts as its owner with, so that its own registration claims only
+    /// its ghosts and its bot. Minted on the step that first finds the instance double puppets
+    /// without one (a new instance, or one registered before 2026-10-12, whose own registration
+    /// claimed the owner), and dropped, with the registration, when double puppeting is
+    /// switched off.
+    #[serde(default)]
+    pub double_puppet: Option<DoublePuppetRow>,
     pub created_at_ms: u64,
     /// When it entered its current state.
     pub state_since_ms: u64,
@@ -219,6 +248,7 @@ impl InstanceRow {
             dm_started_by: None,
             registered_fingerprint: None,
             applied_fingerprint: None,
+            double_puppet: None,
             created_at_ms: now_ms,
             state_since_ms: now_ms,
             ready_at_ms: None,

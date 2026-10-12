@@ -680,6 +680,15 @@ pub struct BridgeTypeRenderResult {
     pub config_yaml: Option<String>,
     pub compose_yaml: String,
     pub bridge_resource_yaml: String,
+    /// The bridge's double-puppeting registration (decision 0045): a non-exclusive claim on the
+    /// people it may act as, `url: null` so that nothing is ever sent to it, and the token the
+    /// bridge's config acts as them with. Created beside `registration`; `None` without double
+    /// puppeting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub double_puppet_registration: Option<serde_json::Value>,
+    /// The same, as YAML.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub double_puppet_registration_yaml: Option<String>,
 }
 
 impl std::fmt::Debug for BridgeTypeRenderResult {

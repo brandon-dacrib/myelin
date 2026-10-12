@@ -988,18 +988,28 @@ pub fn render(type_id: &str, server_name: &str, values: &Value) -> Option<Bridge
     registration.insert("hs_token".into(), json!(hs_token));
     registration.insert("sender_localpart".into(), json!(c.sender_localpart));
     registration.insert("rate_limited".into(), json!(!c.rate_limit_exempt));
-    let mut users = vec![
+    // The bridge's own registration claims its ghosts and its bot, and nothing else: a claim on
+    // anyone else, even a non-exclusive one, makes every room that person is in the bridge's
+    // business (the spec's interest rules), and the server pushes the bridge all of it.
+    let users = vec![
         json!({"regex": c.user_namespace, "exclusive": true}),
         json!({"regex": format!("@{}:{server}", c.sender_localpart), "exclusive": true}),
     ];
     let double_puppeting = c.double_puppeting && entry.double_puppeting;
-    if double_puppeting {
-        // Double puppeting is the bridge sending as real users; that needs a non-exclusive
-        // claim on everyone, which reserves nothing. The bridge's own token then signs in as
-        // any local user (`m.login.application_service`), which is what the rendered config
-        // tells it to do.
-        users.push(json!({"regex": format!("@.*:{server}"), "exclusive": false}));
-    }
+    // Double puppeting is the bridge sending as real users. That is a registration of its own
+    // (decision 0045): a non-exclusive claim on everyone here, which reserves nothing, and no
+    // `url`, so the server never sends it anything. Its token goes into the bridge's config.
+    let double_puppet = double_puppeting.then(|| {
+        let dp_as_token = token();
+        let registration = double_puppet_registration(&DoublePuppetRegistration {
+            id: &double_puppet_id(&c.id),
+            for_appservice: &c.id,
+            users_regex: &format!("@.*:{server}"),
+            as_token: &dp_as_token,
+            hs_token: &token(),
+        });
+        (dp_as_token, registration)
+    });
     let mut rooms = Vec::new();
     if let Some(room) = &c.room_namespace {
         rooms.push(json!({"regex": room, "exclusive": true}));
@@ -1029,6 +1039,7 @@ pub fn render(type_id: &str, server_name: &str, values: &Value) -> Option<Bridge
     }
     let registration = Value::Object(registration);
     let registration_yaml = serde_yaml_ng::to_string(&registration).unwrap_or_default();
+    let double_puppet_secret = double_puppet.as_ref().map(|(t, _)| t.as_str());
 
     let config_yaml = (entry.runtime == Runtime::Mautrix).then(|| {
         let mut permissions = vec![("*".to_owned(), "relay"), (server_name.to_owned(), "user")];
@@ -1048,7 +1059,7 @@ pub fn render(type_id: &str, server_name: &str, values: &Value) -> Option<Bridge
             hs_token: &hs_token,
             permissions,
             backfill: true,
-            double_puppeting,
+            double_puppet_secret,
             encryption: c.encryption,
             provisioning_secret: provisioning_secret.as_deref(),
             pickle_key: None,
@@ -1061,13 +1072,100 @@ pub fn render(type_id: &str, server_name: &str, values: &Value) -> Option<Bridge
     let compose_yaml = compose(entry, &c, &image, server_name);
     let bridge_resource_yaml = bridge_resource(entry, &c, &image);
 
+    let (double_puppet_registration, double_puppet_registration_yaml) = match double_puppet {
+        Some((_, dp)) => {
+            let yaml = serde_yaml_ng::to_string(&dp).unwrap_or_default();
+            (Some(dp), Some(yaml))
+        }
+        None => (None, None),
+    };
+
     Some(BridgeTypeRenderResult {
         registration,
         registration_yaml,
         config_yaml,
         compose_yaml,
         bridge_resource_yaml,
+        double_puppet_registration,
+        double_puppet_registration_yaml,
     })
+}
+
+/// The registration key a double-puppeting registration carries: the id of the appservice
+/// whose bridge it lets act as people. Kept by the registry with the other unrecognised keys.
+pub const DOUBLE_PUPPET_FOR_KEY: &str = "io.myelin.double_puppet_for";
+
+/// What a double-puppeting registration's id ends with: `whatsapp-alice-doublepuppet` is the one
+/// `whatsapp-alice`'s bridge sends as its owner with.
+pub const DOUBLE_PUPPET_ID_SUFFIX: &str = "-doublepuppet";
+
+/// The id of the double-puppeting registration of the appservice `appservice_id`.
+#[must_use]
+pub fn double_puppet_id(appservice_id: &str) -> String {
+    format!("{appservice_id}{DOUBLE_PUPPET_ID_SUFFIX}")
+}
+
+/// What a double-puppeting registration is made of ([`double_puppet_registration`]).
+#[derive(Debug, Clone, Copy)]
+pub struct DoublePuppetRegistration<'a> {
+    /// Its own appservice id ([`double_puppet_id`]).
+    pub id: &'a str,
+    /// The appservice whose bridge holds its token ([`DOUBLE_PUPPET_FOR_KEY`]).
+    pub for_appservice: &'a str,
+    /// The one users pattern it claims, non-exclusively: an instance's owner, escaped, or
+    /// `@.*:server` for a bridge that serves everyone here.
+    pub users_regex: &'a str,
+    /// The token the bridge acts as people with.
+    pub as_token: &'a str,
+    /// Required of every registration and never used: nothing is ever sent to this one.
+    pub hs_token: &'a str,
+}
+
+/// A double-puppeting registration, mautrix's "double puppeting via appservice"
+/// (<https://docs.mau.fi/bridges/general/double-puppeting.html>): a non-exclusive claim on the
+/// people the bridge may act as and `url: null`, so that this server never sends it a
+/// transaction. The bridge's config carries its `as_token` as `as_token:<token>`, and the
+/// bridge acts as a person with it and `?user_id=`.
+///
+/// It is a registration apart from the bridge's own because a claim on a person in the bridge's
+/// own registration makes every room that person is in the bridge's business under the spec's
+/// interest rules: the bridge is then pushed every event of every such room, encrypted rooms
+/// its bot is not in among them, and a mautrix bridge waits on keys for each one. On the demo on
+/// 2026-10-12 that stalled five of its six bridges (decision 0045).
+#[must_use]
+pub fn double_puppet_registration(r: &DoublePuppetRegistration<'_>) -> Value {
+    json!({
+        "id": r.id,
+        "url": null,
+        "as_token": r.as_token,
+        "hs_token": r.hs_token,
+        "sender_localpart": localpart_safe(r.id),
+        "rate_limited": false,
+        "namespaces": {
+            "users": [{"regex": r.users_regex, "exclusive": false}],
+            "aliases": [],
+            "rooms": [],
+        },
+        DOUBLE_PUPPET_FOR_KEY: r.for_appservice,
+    })
+}
+
+/// `s` as a Matrix localpart: lowercase, and every character a localpart may not have
+/// (anything but `a-z`, `0-9`, `.`, `_`, `=`, `-` and `/`) as `-`.
+fn localpart_safe(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            let c = c.to_ascii_lowercase();
+            if c.is_ascii_lowercase()
+                || c.is_ascii_digit()
+                || matches!(c, '.' | '_' | '=' | '-' | '/')
+            {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 /// What a mautrix `config.yaml` says, for either a render or an instance.
@@ -1086,7 +1184,10 @@ struct MautrixParams<'a> {
     /// `(who, level)`, in order.
     permissions: Vec<(String, &'static str)>,
     backfill: bool,
-    double_puppeting: bool,
+    /// The `as_token` of the bridge's double-puppeting registration
+    /// ([`double_puppet_registration`]), written as its double-puppeting secret; `None` writes
+    /// no double puppeting.
+    double_puppet_secret: Option<&'a str>,
     encryption: bool,
     /// `provisioning.shared_secret`, when this server is to read the bridge's sign-ins.
     provisioning_secret: Option<&'a str>,
@@ -1166,16 +1267,16 @@ fn mautrix_config(p: &MautrixParams<'_>) -> String {
     if let Some(network) = &p.network {
         out.push_str(network);
     }
-    if p.double_puppeting {
+    if let Some(secret) = p.double_puppet_secret {
         out.push_str(
-            "# The bridge sends as your users through its own token: the registration's\n",
+            "# The bridge sends as your users with the token of a registration of their own,\n",
         );
-        out.push_str("# non-exclusive claim on them is what allows it.\n");
+        out.push_str("# which claims them and which the server never sends anything to.\n");
         out.push_str("double_puppet:\n");
         out.push_str("  secrets:\n");
         out.push_str(&format!(
-            "    \"{}\": \"as_token:{}\"\n",
-            p.server_name, p.as_token
+            "    \"{}\": \"as_token:{secret}\"\n",
+            p.server_name
         ));
     }
     out.push_str("encryption:\n");
@@ -1295,15 +1396,15 @@ fn mautrix_legacy_config(p: &MautrixParams<'_>) -> String {
     for kind in ["dm", "channel", "thread"] {
         out.push_str(&format!("        {kind}: {missed}\n"));
     }
-    if p.double_puppeting {
+    if let Some(secret) = p.double_puppet_secret {
         out.push_str(
-            "  # The bridge sends as your users through its own token: the registration's\n",
+            "  # The bridge sends as your users with the token of a registration of their own,\n",
         );
-        out.push_str("  # non-exclusive claim on them is what allows it.\n");
+        out.push_str("  # which claims them and which the server never sends anything to.\n");
         out.push_str("  login_shared_secret_map:\n");
         out.push_str(&format!(
-            "    \"{}\": \"as_token:{}\"\n",
-            p.server_name, p.as_token
+            "    \"{}\": \"as_token:{secret}\"\n",
+            p.server_name
         ));
     }
     out.push_str("  encryption:\n");
@@ -1400,18 +1501,14 @@ fn mautrix_imessage_config(p: &MautrixParams<'_>) -> String {
     ));
     out.push_str("  backfill:\n");
     out.push_str(&format!("    enable: {}\n", p.backfill));
-    if p.double_puppeting {
-        // `appservice`, not the newer frameworks' `as_token:<token>`: this build's
-        // `loginWithSharedSecret` knows only the literal `appservice` (an appservice login
-        // with the registration's own token) and takes anything else as an HMAC secret for a
-        // password login, which this server refuses ("Invalid username or password"). Both
-        // seen with the real build on 2026-10-12.
-        out.push_str(
-            "  # The bridge sends as its person through its own token (an appservice login):\n",
-        );
-        out.push_str("  # the registration's non-exclusive claim on them is what allows it.\n");
-        out.push_str("  login_shared_secret: appservice\n");
-    }
+    // No double puppeting from the bridge itself. This build's `loginWithSharedSecret` knows
+    // only the literal `appservice` (an appservice login with the registration's own token) and
+    // takes anything else, `as_token:<token>` included, as an HMAC secret for a password login,
+    // which this server refuses (both seen with the real build on 2026-10-12). An appservice
+    // login as the person needs the bridge's own registration to claim them, and that claim makes
+    // every room they are in the bridge's business (decision 0045: it stalled five of the demo's
+    // bridges). So the bridge does not act as its person; the manager still does, with the
+    // instance's double-puppeting registration, to start the person's chat with the bot.
     out.push_str("  encryption:\n");
     if p.encryption {
         out.push_str(
@@ -1620,6 +1717,21 @@ pub struct InstanceSpec<'a> {
     /// kept by whoever keeps the instance so that its config can be rendered again, complete;
     /// `None` for an instance made before the manager minted one, or a type without one.
     pub pickle_key: Option<&'a str>,
+    /// The instance's double-puppeting registration's id and tokens, minted and kept by
+    /// whoever keeps the instance; `None` until they are (the render then writes no double
+    /// puppeting into the config, and [`InstanceRender::double_puppets`] says one is wanted).
+    pub double_puppet: Option<DoublePuppetTokens<'a>>,
+}
+
+/// An instance's double-puppeting registration's id and tokens ([`double_puppet_registration`]).
+#[derive(Debug, Clone, Copy)]
+pub struct DoublePuppetTokens<'a> {
+    /// Its appservice id, [`double_puppet_id`] of the instance's unless that was taken.
+    pub appservice_id: &'a str,
+    /// The token the bridge acts as its owner with.
+    pub as_token: &'a str,
+    /// Required of a registration, never used.
+    pub hs_token: &'a str,
 }
 
 /// An instance, rendered: its registration, the files its process reads from `/data`, and how
@@ -1649,6 +1761,13 @@ pub struct InstanceRender {
     /// For a type that runs on a Mac ([`BridgeType::runs_on`] `mac`): the script to run beside
     /// `config.yaml` and `registration.yaml` there ([`mac_run_sh`]). `None` for a container.
     pub run_sh: Option<String>,
+    /// Whether the instance double puppets as its owner: the type can, it has an owner, and
+    /// the offering has not switched it off. It then needs a double-puppeting registration
+    /// ([`InstanceSpec::double_puppet`]).
+    pub double_puppets: bool,
+    /// That registration, when the instance double puppets and its tokens were given: claims
+    /// the owner alone, non-exclusively, and has no `url`. `None` otherwise.
+    pub double_puppet_registration: Option<Value>,
 }
 
 impl std::fmt::Debug for InstanceRender {
@@ -1712,15 +1831,32 @@ pub fn render_instance(spec: &InstanceSpec<'_>) -> Option<InstanceRender> {
     registration.insert("hs_token".into(), json!(spec.hs_token));
     registration.insert("sender_localpart".into(), json!(bot));
     registration.insert("rate_limited".into(), json!(false));
-    let mut users = vec![
+    // Its ghosts and its bot, nothing else. The owner is claimed by the instance's
+    // double-puppeting registration instead: a claim on them here would make every room they
+    // are in the bridge's business, and the server would push the bridge all of it (decision
+    // 0045; it stalled five of the demo's six bridges on 2026-10-12).
+    let users = vec![
         json!({"regex": format!("@{}.*:{server}", regex_escape(&ghost_prefix)), "exclusive": true}),
         json!({"regex": format!("@{}:{server}", regex_escape(&bot)), "exclusive": true}),
     ];
-    if double_puppeting && let Some(owner) = spec.owner {
-        // Double puppeting as the owner, and only the owner: a compromised instance can act as
-        // one person, not as everyone on the server.
-        users.push(json!({"regex": regex_escape(owner), "exclusive": false}));
-    }
+    // Double puppeting as the owner, and only the owner: a compromised instance can act as one
+    // person, not as everyone on the server.
+    let double_puppet_registration = match (double_puppeting, spec.owner, spec.double_puppet) {
+        (true, Some(owner), Some(dp)) => {
+            Some(double_puppet_registration(&DoublePuppetRegistration {
+                id: dp.appservice_id,
+                for_appservice: spec.appservice_id,
+                users_regex: &regex_escape(owner),
+                as_token: dp.as_token,
+                hs_token: dp.hs_token,
+            }))
+        }
+        _ => None,
+    };
+    let double_puppet_secret = double_puppet_registration
+        .as_ref()
+        .and(spec.double_puppet)
+        .map(|dp| dp.as_token);
     registration.insert(
         "namespaces".into(),
         json!({
@@ -1780,7 +1916,7 @@ pub fn render_instance(spec: &InstanceSpec<'_>) -> Option<InstanceRender> {
                 hs_token: spec.hs_token,
                 permissions,
                 backfill,
-                double_puppeting,
+                double_puppet_secret,
                 encryption,
                 provisioning_secret,
                 pickle_key: spec.pickle_key.filter(|k| !k.trim().is_empty()),
@@ -1852,6 +1988,8 @@ pub fn render_instance(spec: &InstanceSpec<'_>) -> Option<InstanceRender> {
                 .collect(),
             device_name,
             run_sh,
+            double_puppets: double_puppeting,
+            double_puppet_registration,
         });
     }
     compose_yaml
@@ -1898,7 +2036,17 @@ pub fn render_instance(spec: &InstanceSpec<'_>) -> Option<InstanceRender> {
             .collect(),
         device_name,
         run_sh,
+        double_puppets: double_puppeting,
+        double_puppet_registration,
     })
+}
+
+/// The namespace pattern that matches exactly `user_id`: what an instance's double-puppeting
+/// registration claims its owner with (and what its own registration claimed them with before
+/// decision 0045).
+#[must_use]
+pub fn user_regex(user_id: &str) -> String {
+    regex_escape(user_id)
 }
 
 /// Escapes the regex metacharacters that can appear in a Matrix ID.
@@ -2101,12 +2249,34 @@ mod tests {
             r["namespaces"]["users"][1]["regex"],
             "@tgbot:chat\\.example\\.net"
         );
-        // Double puppeting: everyone, non-exclusively.
+        // Its ghosts and its bot, and nobody else: a claim on anyone else would have the
+        // server push it every room they are in (decision 0045).
+        assert_eq!(r["namespaces"]["users"].as_array().unwrap().len(), 2, "{r}");
+        // Double puppeting is a registration of its own: everyone, non-exclusively, with no
+        // url, so it is never sent anything.
+        let dp = result
+            .double_puppet_registration
+            .as_ref()
+            .expect("double puppeting was chosen");
+        assert_eq!(dp["id"], "tg-doublepuppet");
+        assert_eq!(dp["url"], Value::Null);
+        assert_eq!(dp["sender_localpart"], "tg-doublepuppet");
+        assert_eq!(dp["rate_limited"], false);
         assert_eq!(
-            r["namespaces"]["users"][2]["regex"],
-            "@.*:chat\\.example\\.net"
+            dp["namespaces"]["users"],
+            json!([{"regex": "@.*:chat\\.example\\.net", "exclusive": false}])
         );
-        assert_eq!(r["namespaces"]["users"][2]["exclusive"], false);
+        assert_eq!(dp[DOUBLE_PUPPET_FOR_KEY], "tg");
+        assert_eq!(dp["as_token"].as_str().unwrap().len(), 64);
+        assert_ne!(dp["as_token"], r["as_token"]);
+        assert_ne!(dp["hs_token"], r["hs_token"]);
+        assert!(dp.get(BRIDGE_TYPE_KEY).is_none(), "not a bridge of its own");
+        assert!(
+            result
+                .double_puppet_registration_yaml
+                .as_deref()
+                .is_some_and(|y| y.contains("url: null") && y.contains("id: tg-doublepuppet"))
+        );
         assert_eq!(r[MSC2409], true);
         assert_eq!(r[MSC3202], true);
         assert_eq!(r[MSC4190], true);
@@ -2178,9 +2348,11 @@ mod tests {
             config["bridge"]["permissions"]["@ops:chat.example.net"],
             "admin"
         );
+        // The double-puppeting registration's token, not the bridge's own.
+        let dp = result.double_puppet_registration.as_ref().unwrap();
         assert_eq!(
             config["double_puppet"]["secrets"]["chat.example.net"],
-            format!("as_token:{}", r["as_token"].as_str().unwrap())
+            format!("as_token:{}", dp["as_token"].as_str().unwrap())
         );
         assert_eq!(config["encryption"]["allow"], true);
         assert_eq!(config["encryption"]["appservice"], true);
@@ -2228,6 +2400,8 @@ mod tests {
         assert!(config["bridge"]["permissions"].as_object().unwrap().len() == 2);
         assert_eq!(config["encryption"]["allow"], false);
         assert!(config.get("double_puppet").is_none());
+        assert!(plain.double_puppet_registration.is_none());
+        assert!(plain.double_puppet_registration_yaml.is_none());
         assert_eq!(config["homeserver"]["address"], "http://myelin:8008");
     }
 
@@ -2319,6 +2493,11 @@ mod tests {
             backfill: None,
             provisioning_secret: Some("p".repeat(64).as_str()),
             pickle_key: Some("k".repeat(64).as_str()),
+            double_puppet: Some(DoublePuppetTokens {
+                appservice_id: "whatsapp-alice-doublepuppet",
+                as_token: "d".repeat(64).as_str(),
+                hs_token: "e".repeat(64).as_str(),
+            }),
         })
         .unwrap();
         let reg = &r.registration;
@@ -2327,9 +2506,28 @@ mod tests {
         let users = reg["namespaces"]["users"].as_array().unwrap();
         assert_eq!(users[0]["regex"], "@whatsapp_alice_.*:chat\\.example\\.net");
         assert_eq!(users[1]["regex"], "@whatsappbot_alice:chat\\.example\\.net");
-        assert_eq!(users[2]["regex"], "@alice:chat\\.example\\.net");
-        assert_eq!(users[2]["exclusive"], false);
-        assert_eq!(users.len(), 3, "no claim on anyone else");
+        // Not even its owner (decision 0045): a claim on alice here would have the server push
+        // the bridge every room she is in.
+        assert_eq!(users.len(), 2, "no claim on anyone else: {users:?}");
+        // Its owner is its double-puppeting registration's, alone, with no url.
+        assert!(r.double_puppets);
+        let dp = r
+            .double_puppet_registration
+            .as_ref()
+            .expect("its tokens were given");
+        assert_eq!(dp["id"], "whatsapp-alice-doublepuppet");
+        assert_eq!(dp["url"], Value::Null);
+        assert_eq!(dp["as_token"], "d".repeat(64));
+        assert_eq!(dp["hs_token"], "e".repeat(64));
+        assert_eq!(dp["sender_localpart"], "whatsapp-alice-doublepuppet");
+        assert_eq!(
+            dp["namespaces"]["users"],
+            json!([{"regex": "@alice:chat\\.example\\.net", "exclusive": false}])
+        );
+        assert_eq!(dp["namespaces"]["aliases"], json!([]));
+        assert_eq!(dp["namespaces"]["rooms"], json!([]));
+        assert_eq!(dp[DOUBLE_PUPPET_FOR_KEY], "whatsapp-alice");
+        assert!(dp.get(BRIDGE_INSTANCE_KEY).is_none() && dp.get(BRIDGE_TYPE_KEY).is_none());
         assert_eq!(reg[BRIDGE_INSTANCE_KEY], "@alice:chat.example.net");
         assert_eq!(reg[MSC4190], true);
         let config: Value = serde_yaml_ng::from_str(r.config_yaml.as_deref().unwrap()).unwrap();
@@ -2345,6 +2543,11 @@ mod tests {
         assert_eq!(
             config["homeserver"]["address"],
             "http://myelin-hs.myelin.svc:8008"
+        );
+        // It double puppets with that registration's token.
+        assert_eq!(
+            config["double_puppet"]["secrets"]["chat.example.net"],
+            format!("as_token:{}", "d".repeat(64))
         );
         // The provisioning API's secret is the same in the config the bridge reads and the
         // registration the server keeps, which is how the server asks who has signed in.
@@ -2390,6 +2593,7 @@ mod tests {
                 backfill: None,
                 provisioning_secret: Some("ignored"),
                 pickle_key: None,
+                double_puppet: None,
             }
         })
         .unwrap();
@@ -2410,6 +2614,62 @@ mod tests {
         assert_eq!(heisen.image_tag, "1.15.4");
     }
 
+    /// Before its double-puppeting registration's tokens exist (an instance from before
+    /// decision 0045, on the step that mints them), the render says one is wanted and writes no
+    /// double puppeting at all: never the bridge's own token, which no registration lets act as
+    /// the owner any more. Off, or shared, wants none.
+    #[test]
+    fn an_instance_without_its_double_puppeting_tokens_writes_no_double_puppeting() {
+        let spec = InstanceSpec {
+            type_id: "mautrix-signal",
+            server_name: "chat.example.net",
+            appservice_id: "signal-alice",
+            owner: Some("@alice:chat.example.net"),
+            as_token: "own",
+            hs_token: "h",
+            url: "http://b:1",
+            homeserver_address: "http://hs:8008",
+            image_tag: "",
+            encryption: None,
+            double_puppeting: None,
+            backfill: None,
+            provisioning_secret: None,
+            pickle_key: None,
+            double_puppet: None,
+        };
+        let r = render_instance(&spec).unwrap();
+        assert!(r.double_puppets);
+        assert!(r.double_puppet_registration.is_none());
+        let text = r.config_yaml.unwrap();
+        assert!(
+            !text.contains("double_puppet") && !text.contains("\"as_token:"),
+            "{text}"
+        );
+
+        let tokens = DoublePuppetTokens {
+            appservice_id: "signal-alice-doublepuppet",
+            as_token: "dp",
+            hs_token: "dph",
+        };
+        let off = render_instance(&InstanceSpec {
+            double_puppeting: Some(false),
+            double_puppet: Some(tokens),
+            ..spec
+        })
+        .unwrap();
+        assert!(!off.double_puppets);
+        assert!(off.double_puppet_registration.is_none());
+        assert!(!off.config_yaml.unwrap().contains("double_puppet"));
+        let shared = render_instance(&InstanceSpec {
+            owner: None,
+            double_puppet: Some(tokens),
+            ..spec
+        })
+        .unwrap();
+        assert!(!shared.double_puppets);
+        assert!(shared.double_puppet_registration.is_none());
+    }
+
     fn instance_config(type_id: &str, owner: Option<&str>, pickle_key: Option<&str>) -> Value {
         let r = render_instance(&InstanceSpec {
             type_id,
@@ -2426,6 +2686,7 @@ mod tests {
             backfill: None,
             provisioning_secret: None,
             pickle_key,
+            double_puppet: None,
         })
         .unwrap();
         serde_yaml_ng::from_str(r.config_yaml.as_deref().expect("a mautrix config")).unwrap()
@@ -2471,6 +2732,7 @@ mod tests {
             backfill: None,
             provisioning_secret: None,
             pickle_key: None,
+            double_puppet: None,
         })
         .unwrap();
         assert_eq!(
@@ -2584,6 +2846,11 @@ mod tests {
             backfill: None,
             provisioning_secret: Some("s"),
             pickle_key: Some("k"),
+            double_puppet: Some(DoublePuppetTokens {
+                appservice_id: "discord-brandon-doublepuppet",
+                as_token: "dp",
+                hs_token: "dph",
+            }),
         })
         .unwrap();
         let text = r.config_yaml.as_deref().expect("a mautrix config");
@@ -2619,7 +2886,7 @@ mod tests {
         );
         assert_eq!(
             config["bridge"]["login_shared_secret_map"]["chat.example.net"],
-            "as_token:a"
+            "as_token:dp"
         );
         assert!(config.get("double_puppet").is_none());
         assert_eq!(config["bridge"]["encryption"]["allow"], true);
@@ -2648,6 +2915,7 @@ mod tests {
             backfill: Some(false),
             provisioning_secret: None,
             pickle_key: None,
+            double_puppet: None,
         })
         .unwrap();
         let config: Value = serde_yaml_ng::from_str(r.config_yaml.as_deref().unwrap()).unwrap();
@@ -2724,6 +2992,11 @@ mod tests {
             backfill: None,
             provisioning_secret: Some("ignored"),
             pickle_key: Some("ignored"),
+            double_puppet: Some(DoublePuppetTokens {
+                appservice_id: "imessage-brandon-doublepuppet",
+                as_token: "dp",
+                hs_token: "dph",
+            }),
         })
         .unwrap();
         let text = r.config_yaml.as_deref().expect("a mautrix config");
@@ -2753,8 +3026,12 @@ mod tests {
             "imessage_brandon_{{.}}"
         );
         assert_eq!(config["bridge"]["backfill"]["enable"], true);
-        // The literal this build knows; `as_token:<token>` would be taken as an HMAC secret.
-        assert_eq!(config["bridge"]["login_shared_secret"], "appservice");
+        // No double puppeting from the bridge: `appservice` would need its own registration to
+        // claim the person, and `as_token:<token>` is taken as an HMAC secret (decision 0045).
+        assert!(
+            config["bridge"].get("login_shared_secret").is_none(),
+            "{text}"
+        );
         assert!(config["bridge"].get("login_shared_secret_map").is_none());
         assert_eq!(config["bridge"]["encryption"]["allow"], true);
         assert_eq!(config["bridge"]["encryption"]["appservice"], true);
@@ -2818,6 +3095,7 @@ mod tests {
             backfill: None,
             provisioning_secret: None,
             pickle_key: None,
+            double_puppet: None,
         })
         .unwrap();
         assert!(wa.run_sh.is_none() && !wa.files.contains_key("run.sh"));

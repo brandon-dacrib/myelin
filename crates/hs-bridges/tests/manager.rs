@@ -228,17 +228,30 @@ async fn an_instance_is_registered_then_waits_for_its_bridge_then_is_ready() {
     assert_eq!(registration["io.myelin.bridge_type"], "mautrix-whatsapp");
     assert_eq!(registration["sender_localpart"], "whatsappbot_alice");
     assert_eq!(registration["url"], "http://whatsapp-alice:29318");
+    // Its ghosts and its bot, and not alice: a claim on her would have the server send the
+    // bridge every room she is in (decision 0045).
     assert_eq!(
         namespaces_of(&registration["namespaces"]),
         vec![
             "@whatsapp_alice_.*:example\\.org",
             "@whatsappbot_alice:example\\.org",
-            "@alice:example\\.org"
         ]
     );
 
-    // The next: with nothing to deploy, it waits for whoever runs it, and says so.
+    // The next: its double puppeting is registered apart, claiming alice alone with no url;
+    // then, with nothing to deploy, it waits for whoever runs it, and says so.
     manager.tick().await;
+    let double_puppet = directory
+        .registration("whatsapp-alice-doublepuppet")
+        .await
+        .unwrap()
+        .json;
+    assert_eq!(double_puppet["url"], serde_json::Value::Null);
+    assert_eq!(
+        namespaces_of(&double_puppet["namespaces"]),
+        vec!["@alice:example\\.org"]
+    );
+    assert_eq!(double_puppet["namespaces"]["users"][0]["exclusive"], false);
     let instance = manager
         .instance("mautrix-whatsapp", "@alice:example.org")
         .await
@@ -259,6 +272,14 @@ async fn an_instance_is_registered_then_waits_for_its_bridge_then_is_ready() {
     let config = files.config_yaml.unwrap();
     assert!(config.contains(registration["as_token"].as_str().unwrap()));
     assert!(config.contains("address: https://example.org"), "{config}");
+    // It double puppets with that registration's token, not its own.
+    assert!(
+        config.contains(&format!(
+            "\"example.org\": \"as_token:{}\"",
+            double_puppet["as_token"].as_str().unwrap()
+        )),
+        "{config}"
+    );
     // The instance's own provisioning secret, in the config it runs with and the registration
     // the server keeps, so that the admin API can ask it who has signed in; and the admin API
     // asks about its owner without being told whom.

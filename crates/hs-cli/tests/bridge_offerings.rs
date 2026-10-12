@@ -572,13 +572,35 @@ async fn an_offering_takes_an_instance_from_requested_to_ready_and_removes_it_ag
         .unwrap_or_else(|| panic!("{listed}"));
     assert_eq!(mine["bridge_type"], "mautrix-whatsapp", "{mine}");
     assert_eq!(mine["sender_localpart"], "whatsappbot_alice");
+    // Its ghosts and its bot, and not alice (decision 0045): her double puppeting is a
+    // registration of its own, with no url, claiming her alone.
     assert_eq!(
         user_namespaces(mine),
         vec![
             "@whatsapp_alice_.*:example\\.org",
             "@whatsappbot_alice:example\\.org",
-            "@alice:example\\.org"
         ]
+    );
+    let dp = listed["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == "whatsapp-alice-doublepuppet")
+        .unwrap_or_else(|| panic!("{listed}"));
+    assert_eq!(user_namespaces(dp), vec!["@alice:example\\.org"]);
+    assert!(dp["url"].is_null(), "{dp}");
+    assert!(dp["bridge_type"].is_null(), "not a bridge of its own: {dp}");
+    let dp_registration = admin
+        .admin(
+            GET,
+            "/appservices/whatsapp-alice-doublepuppet/registration",
+            None,
+        )
+        .await;
+    let dp_token = dp_registration["as_token"].as_str().unwrap().to_owned();
+    assert_eq!(
+        dp_registration["io.myelin.double_puppet_for"],
+        "whatsapp-alice"
     );
     let registration = admin
         .admin(GET, "/appservices/whatsapp-alice/registration", None)
@@ -606,6 +628,11 @@ async fn an_offering_takes_an_instance_from_requested_to_ready_and_removes_it_ag
     let config = files["config_yaml"].as_str().unwrap();
     assert!(config.contains(&as_token), "{config}");
     assert!(config.contains(&hs_token));
+    // It double puppets as alice with her double-puppeting registration's token.
+    assert!(
+        config.contains(&format!("\"example.org\": \"as_token:{dp_token}\"")),
+        "{config}"
+    );
     assert!(
         config.contains(&format!("address: {}", handle.base_url())),
         "{config}"
@@ -740,14 +767,16 @@ async fn an_offering_takes_an_instance_from_requested_to_ready_and_removes_it_ag
     admin
         .admin_expect(GET, &path, None, reqwest::StatusCode::NOT_FOUND)
         .await;
-    admin
-        .admin_expect(
-            GET,
-            "/appservices/whatsapp-alice",
-            None,
-            reqwest::StatusCode::NOT_FOUND,
-        )
-        .await;
+    for gone in ["whatsapp-alice", "whatsapp-alice-doublepuppet"] {
+        admin
+            .admin_expect(
+                GET,
+                &format!("/appservices/{gone}"),
+                None,
+                reqwest::StatusCode::NOT_FOUND,
+            )
+            .await;
+    }
     let counted = admin
         .admin(GET, "/bridge-offerings/mautrix-whatsapp", None)
         .await;
@@ -812,6 +841,199 @@ async fn an_offering_takes_an_instance_from_requested_to_ready_and_removes_it_ag
             "@whatsappbot_alice:example.org=whatsapp-alice",
         ]
     );
+
+    handle.shutdown().await;
+}
+
+/// Decision 0045, the demo's stalled bridges of 2026-10-12, against the real server: alice's
+/// bridge is sent what happens in the rooms its bot and ghosts are in, and nothing of her
+/// encrypted chat with bob, which none of them is in. (Before, her instance's own registration
+/// claimed her, the server pushed it every room she was in, and a mautrix bridge waited 25
+/// seconds on keys for each event it could not decrypt.) Its double puppeting is a registration
+/// of its own: `url: null`, so it is never sent anything and its health is not a fault, and its
+/// token, and only its token, acts as alice.
+#[tokio::test]
+async fn a_bridge_is_sent_nothing_of_a_room_none_of_its_users_is_in_and_double_puppets_apart() {
+    let dir = tempfile::tempdir().unwrap();
+    let (handle, admin, users) = boot(dir.path(), &["alice", "bob"]).await;
+    let (alice, bob) = (&users[0], &users[1]);
+    let alice_id = "@alice:example.org";
+    let bot = "@whatsappbot_alice:example.org";
+
+    admin
+        .admin(
+            PUT,
+            "/bridge-offerings/mautrix-whatsapp",
+            Some(json!({"runtime": "elsewhere"})),
+        )
+        .await;
+    let path = format!(
+        "/bridge-offerings/mautrix-whatsapp/instances/{}",
+        escape(alice_id)
+    );
+    admin.admin(PUT, &path, None).await;
+    until_state(&admin, &path, "starting").await;
+    let registration = admin
+        .admin(GET, "/appservices/whatsapp-alice/registration", None)
+        .await;
+    let as_token = registration["as_token"].as_str().unwrap().to_owned();
+    let hs_token = registration["hs_token"].as_str().unwrap().to_owned();
+    let dp_token = admin
+        .admin(
+            GET,
+            "/appservices/whatsapp-alice-doublepuppet/registration",
+            None,
+        )
+        .await["as_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (url, bridge) = stand_in(&hs_token).await;
+    admin
+        .admin(
+            PATCH,
+            "/appservices/whatsapp-alice",
+            Some(json!({"url": url})),
+        )
+        .await;
+    until_state(&admin, &path, "ready").await;
+
+    // Delivery works: the bot's invitation to alice's chat with it reaches the bridge. The
+    // manager started that chat as alice, with the double-puppeting registration's token.
+    until("the bridge is sent its chat", || async {
+        bridge
+            .transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|t| t["events"].as_array().cloned().unwrap_or_default())
+            .any(|e| e["type"] == "m.room.member" && e["state_key"] == bot)
+    })
+    .await;
+    let seen = admin.admin(GET, &path, None).await;
+    assert_eq!(seen["chat_started_by"], "owner", "{seen}");
+    let chat = seen["chat_room"].as_str().unwrap().to_owned();
+
+    // Alice's encrypted chat with bob: no bot, no ghost.
+    let private = alice
+        .matrix(
+            POST,
+            "/createRoom",
+            Some(json!({
+                "preset": "private_chat",
+                "invite": ["@bob:example.org"],
+                "initial_state": [{
+                    "type": "m.room.encryption",
+                    "state_key": "",
+                    "content": {"algorithm": "m.megolm.v1.aes-sha2"},
+                }],
+            })),
+        )
+        .await["room_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    bob.matrix(POST, &format!("/rooms/{}/join", escape(&private)), None)
+        .await;
+    for (who, n) in [(alice, 1), (bob, 2), (alice, 3)] {
+        who.matrix(
+            PUT,
+            &format!(
+                "/rooms/{}/send/m.room.encrypted/e{n}{}",
+                escape(&private),
+                rand_suffix()
+            ),
+            Some(json!({
+                "algorithm": "m.megolm.v1.aes-sha2",
+                "ciphertext": format!("AwgAEn{n}"),
+                "device_id": "DEVICE",
+                "sender_key": "c2VuZGVyIGtleQ",
+                "session_id": "c2Vzc2lvbg",
+            })),
+        )
+        .await;
+    }
+    // Then a line in her chat with the bot, which the bridge must hear: everything said
+    // before it has had its chance to be sent.
+    alice.say(&chat, "after the private chat").await;
+    until("the bridge is sent alice's line", || async {
+        bridge
+            .transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|t| t["events"].as_array().cloned().unwrap_or_default())
+            .any(|e| e["content"]["body"] == "after the private chat")
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let leaked: Vec<Value> = bridge
+        .transactions
+        .lock()
+        .unwrap()
+        .iter()
+        .flat_map(|t| t["events"].as_array().cloned().unwrap_or_default())
+        .filter(|e| e["room_id"] == private.as_str())
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "the bridge was sent alice's private chat, which none of its users is in: {leaked:?}"
+    );
+
+    // The double-puppeting registration is sent nothing and is not counted as a fault.
+    let dp = admin
+        .admin(GET, "/appservices/whatsapp-alice-doublepuppet", None)
+        .await;
+    assert!(dp["url"].is_null(), "{dp}");
+    assert_eq!(dp["health"], "unknown", "{dp}");
+    assert_eq!(dp["queue"]["pending"], 0, "{dp}");
+    let pinged = admin
+        .call(
+            POST,
+            "/api/v1/appservices/whatsapp-alice-doublepuppet/ping",
+            None,
+        )
+        .await;
+    let dp = admin
+        .admin(GET, "/appservices/whatsapp-alice-doublepuppet", None)
+        .await;
+    assert_eq!(
+        dp["health"], "unknown",
+        "a ping does not make it degraded: {pinged:?} {dp}"
+    );
+
+    // Its token acts as alice, and nobody else; the bridge's own token no longer acts as her.
+    let whoami = |token: &str, user: &str| {
+        let caller = Caller {
+            token: token.to_owned(),
+            ..alice.clone()
+        };
+        let user = user.to_owned();
+        async move {
+            caller
+                .call(
+                    GET,
+                    &format!(
+                        "/_matrix/client/v3/account/whoami?user_id={}",
+                        escape(&user)
+                    ),
+                    None,
+                )
+                .await
+        }
+    };
+    let (status, body) = whoami(&dp_token, alice_id).await;
+    assert!(status.is_success(), "{status} {body}");
+    assert_eq!(body["user_id"], alice_id);
+    let (status, body) = whoami(&dp_token, "@bob:example.org").await;
+    assert!(status.is_client_error(), "not bob: {status} {body}");
+    let (status, body) = whoami(&as_token, alice_id).await;
+    assert!(
+        status.is_client_error(),
+        "the bridge's own token no longer acts as alice: {status} {body}"
+    );
+    let (status, body) = whoami(&as_token, bot).await;
+    assert!(status.is_success(), "its bot, still: {status} {body}");
 
     handle.shutdown().await;
 }
@@ -1271,15 +1493,22 @@ async fn a_shared_registration_beside_its_offering_is_named_and_a_changed_double
         .await;
     assert!(theirs["overlaps_offering"].is_null(), "{theirs}");
 
-    // Double puppeting off: alice's registration loses its claim on her, and her files the
-    // secret, once; the reason says to fetch them again.
+    // Her double puppeting is a registration of its own (decision 0045), and it is not
+    // mistaken for a hand-registered bridge either (the count above). Off: that registration
+    // goes, and her files the secret, once; the reason says to fetch them again. Her own
+    // registration never claimed her.
     let claims_alice = |appservice: &Value| {
         user_namespaces(appservice)
             .iter()
             .any(|r| r == "@alice:example\\.org")
     };
     let mine = admin.admin(GET, "/appservices/whatsapp-alice", None).await;
-    assert!(claims_alice(&mine), "{mine}");
+    assert!(!claims_alice(&mine), "{mine}");
+    let dp = admin
+        .admin(GET, "/appservices/whatsapp-alice-doublepuppet", None)
+        .await;
+    assert!(claims_alice(&dp), "{dp}");
+    assert!(dp["url"].is_null(), "{dp}");
     admin
         .admin(
             PUT,
@@ -1287,8 +1516,18 @@ async fn a_shared_registration_beside_its_offering_is_named_and_a_changed_double
             Some(json!({"options": {"double_puppeting": false}})),
         )
         .await;
-    until("alice's registration loses its claim on her", || async {
-        !claims_alice(&admin.admin(GET, "/appservices/whatsapp-alice", None).await)
+    until("alice's double-puppeting registration goes", || async {
+        admin
+            .call(GET, "/api/v1/appservices/whatsapp-alice-doublepuppet", None)
+            .await
+            .0
+            == reqwest::StatusCode::NOT_FOUND
+    })
+    .await;
+    until("alice's instance says to fetch its files again", || async {
+        admin.admin(GET, &path, None).await["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("download its files again"))
     })
     .await;
     let seen = admin.admin(GET, &path, None).await;

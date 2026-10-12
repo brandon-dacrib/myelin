@@ -45,8 +45,8 @@ use crate::matrix::MatrixClient;
 use crate::overlap::{self, Overlap};
 use crate::runtime::{DeploySpec, Runtime, manifest_yaml};
 use crate::store::{
-    BridgeStore, CHAT_BY_BOT, CHAT_BY_OWNER, InstanceRow, InstanceState, ManagerRow, OfferingRow,
-    StoreError,
+    BridgeStore, CHAT_BY_BOT, CHAT_BY_OWNER, DoublePuppetRow, InstanceRow, InstanceState,
+    ManagerRow, OfferingRow, StoreError,
 };
 
 /// The manager's own appservice id.
@@ -776,6 +776,14 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             backfill: offering.options.backfill,
             provisioning_secret: row.provisioning_secret.as_deref(),
             pickle_key: row.pickle_key.as_deref(),
+            double_puppet: row
+                .double_puppet
+                .as_ref()
+                .map(|dp| bridge_types::DoublePuppetTokens {
+                    appservice_id: &dp.appservice_id,
+                    as_token: &dp.as_token,
+                    hs_token: &dp.hs_token,
+                }),
         })
     }
 
@@ -943,6 +951,10 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             }
             return self.remove(row).await;
         };
+        // Its double-puppeting registration before its own is patched and before its files are
+        // rendered for a deployment: the files carry that registration's token, and the bridge
+        // must find it registered when it starts.
+        let row = &self.settle_double_puppet(row, &offering).await?;
         let row = &self.settle_registration(row, &offering).await?;
         let now = now_ms();
         match row.state {
@@ -1654,6 +1666,224 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
         Ok(updated.unwrap_or_else(|| row.clone()))
     }
 
+    /// The row with its double-puppeting registration settled (decision 0045). An instance
+    /// that double puppets ([`InstanceRender::double_puppets`]) has one: minted here the first
+    /// time (a new instance, or one registered before the bridge's own registration stopped
+    /// claiming its owner) and written to the registry once per change of what it claims,
+    /// `url: null`, claiming the owner alone. One that does not (double puppeting switched off)
+    /// has its registration removed. The bridge's files carry the registration's token, so a
+    /// deployed instance's pod rolls once through the deployment fingerprint, as for any other
+    /// change of its files; its other secrets, the pickle key among them, are the row's and are
+    /// not touched.
+    async fn settle_double_puppet(
+        &self,
+        row: &InstanceRow,
+        offering: &OfferingRow,
+    ) -> Result<InstanceRow, String> {
+        if !matches!(
+            row.state,
+            InstanceState::Registered
+                | InstanceState::Deploying
+                | InstanceState::Starting
+                | InstanceState::Ready
+        ) {
+            return Ok(row.clone());
+        }
+        let (Some(appservice_id), Some(render)) =
+            (row.appservice_id.clone(), self.render(row, offering))
+        else {
+            return Ok(row.clone());
+        };
+        if !render.double_puppets {
+            let Some(dp) = &row.double_puppet else {
+                return Ok(row.clone());
+            };
+            match self.directory.delete(&dp.appservice_id).await {
+                Ok(()) | Err(SourceError::NotFound) => {}
+                Err(e) => {
+                    return Err(format!(
+                        "could not remove its double-puppeting registration: {e}"
+                    ));
+                }
+            }
+            tracing::info!(
+                bridge_type = %row.bridge_type,
+                owner = %row.owner,
+                appservice = %appservice_id,
+                double_puppet_appservice = %dp.appservice_id,
+                "double puppeting is off for the bridge instance: removed its double-puppeting registration"
+            );
+            let elsewhere = offering.runtime != "cluster";
+            let updated = self
+                .store
+                .update_instance(&row.bridge_type, &row.owner, |r| {
+                    // Its files no longer double puppet: one run elsewhere has nobody to roll it.
+                    if elsewhere && r.state != InstanceState::Registered {
+                        r.reason = Some(REREGISTERED_REASON.to_owned());
+                    }
+                    r.double_puppet.take().is_some()
+                })
+                .map_err(|e| e.to_string())?;
+            return Ok(updated.unwrap_or_else(|| row.clone()));
+        }
+        let row = if row.double_puppet.is_some() {
+            row.clone()
+        } else {
+            let id = self.free_double_puppet_id(&appservice_id).await?;
+            let minted = DoublePuppetRow {
+                appservice_id: id,
+                as_token: crate::random_hex(32),
+                hs_token: crate::random_hex(32),
+                registered_fingerprint: None,
+            };
+            self.store
+                .update_instance(&row.bridge_type, &row.owner, |r| {
+                    if r.double_puppet.is_some() {
+                        return false;
+                    }
+                    r.double_puppet = Some(minted.clone());
+                    true
+                })
+                .map_err(|e| e.to_string())?;
+            self.store
+                .instance(&row.bridge_type, &row.owner)
+                .map_err(|e| e.to_string())?
+                .ok_or("the instance was removed")?
+        };
+        let Some(dp) = row.double_puppet.clone() else {
+            return Ok(row);
+        };
+        let Some(registration) = self
+            .render(&row, offering)
+            .and_then(|r| r.double_puppet_registration)
+        else {
+            return Ok(row);
+        };
+        let fingerprint = registration_fingerprint(&registration);
+        if dp.registered_fingerprint.as_deref() == Some(fingerprint.as_str()) {
+            return Ok(row);
+        }
+        // Whether this is an instance from before: its own registration, as the registry has
+        // it, still claims its owner. Said once, when its double puppeting moves.
+        let owner_claim = owner_of(&row).map(bridge_types::user_regex);
+        let migrating = match (&owner_claim, self.directory.get(&appservice_id).await) {
+            (Some(claim), Ok(Some(own))) => own.namespaces["users"]
+                .as_array()
+                .is_some_and(|users| users.iter().any(|u| u["regex"] == claim.as_str())),
+            _ => false,
+        };
+        match self
+            .directory
+            .create(AdminAppserviceCreate {
+                registration: Some(registration.clone()),
+                registration_yaml: None,
+            })
+            .await
+        {
+            Ok(_) => {}
+            Err(SourceError::Conflict(detail)) => {
+                let ours = self
+                    .directory
+                    .registration(&dp.appservice_id)
+                    .await
+                    .map(|r| r.json["as_token"] == registration["as_token"])
+                    .unwrap_or(false);
+                if !ours {
+                    // Taken since it was chosen: forget it, and the next step picks another.
+                    let _ = self
+                        .store
+                        .update_instance(&row.bridge_type, &row.owner, |r| {
+                            r.double_puppet.take().is_some()
+                        });
+                    return Err(format!(
+                        "could not register its double puppeting as {}: {detail}",
+                        dp.appservice_id
+                    ));
+                }
+                let mut patch = serde_json::Map::new();
+                patch.insert("namespaces".to_owned(), registration["namespaces"].clone());
+                self.directory
+                    .update(&dp.appservice_id, Value::Object(patch))
+                    .await
+                    .map_err(|e| format!("could not update its double puppeting: {e}"))?;
+            }
+            Err(e) => return Err(format!("could not register its double puppeting: {e}")),
+        }
+        if migrating {
+            tracing::info!(
+                bridge_type = %row.bridge_type,
+                owner = %row.owner,
+                appservice = %appservice_id,
+                double_puppet_appservice = %dp.appservice_id,
+                deploy_name = row.deploy_name.as_deref().unwrap_or_default(),
+                "moved the bridge instance's double puppeting to a registration of its own: its own registration stops claiming the owner, and its pod restarts once with the new token (its other secrets are kept)"
+            );
+        } else {
+            tracing::info!(
+                bridge_type = %row.bridge_type,
+                owner = %row.owner,
+                appservice = %appservice_id,
+                double_puppet_appservice = %dp.appservice_id,
+                "registered the bridge instance's double puppeting"
+            );
+        }
+        // Its files carry the new token: a deployed instance rolls through its deployment
+        // fingerprint, and one run elsewhere, past being registered, is told to fetch them.
+        let elsewhere = offering.runtime != "cluster";
+        let updated = self
+            .store
+            .update_instance(&row.bridge_type, &row.owner, |r| {
+                if elsewhere && r.state != InstanceState::Registered {
+                    r.reason = Some(REREGISTERED_REASON.to_owned());
+                }
+                match &mut r.double_puppet {
+                    Some(d) if d.appservice_id == dp.appservice_id => {
+                        d.registered_fingerprint = Some(fingerprint.clone());
+                        true
+                    }
+                    _ => false,
+                }
+            })
+            .map_err(|e| e.to_string())?;
+        Ok(updated.unwrap_or(row))
+    }
+
+    /// `whatsapp-alice-doublepuppet`, or `-doublepuppet-2` and on if that is something else's.
+    /// One left behind for the same instance (tagged with its id, its tokens lost with a row
+    /// write that never happened) is removed and its id reused.
+    async fn free_double_puppet_id(&self, appservice_id: &str) -> Result<String, String> {
+        let stem = bridge_types::double_puppet_id(appservice_id);
+        for n in 1..100 {
+            let candidate = if n == 1 {
+                stem.clone()
+            } else {
+                format!("{stem}-{n}")
+            };
+            match self.directory.get(&candidate).await {
+                Ok(None) => return Ok(candidate),
+                Ok(Some(_)) => {
+                    let for_us = self
+                        .directory
+                        .registration(&candidate)
+                        .await
+                        .ok()
+                        .is_some_and(|r| {
+                            r.json[bridge_types::DOUBLE_PUPPET_FOR_KEY].as_str()
+                                == Some(appservice_id)
+                        });
+                    if for_us {
+                        match self.directory.delete(&candidate).await {
+                            Ok(()) | Err(SourceError::NotFound) => return Ok(candidate),
+                            Err(e) => return Err(e.to_string()),
+                        }
+                    }
+                }
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        Err("no free appservice id for its double puppeting".into())
+    }
+
     /// `whatsapp-alice`, or `whatsapp-alice-2` if that is somebody else's.
     async fn free_appservice_id(&self, row: &InstanceRow) -> Result<String, String> {
         let stem = match owner_of(row) {
@@ -1722,8 +1952,9 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
         // started by the bot, and the steps say to start one.
         let as_owner = may_act_as_owner(kind.as_ref(), offering);
         let room = if as_owner {
+            let owner_token = owner_token(row)?;
             let room = client
-                .create_dm(&token, owner, &bot, encrypted)
+                .create_dm(&owner_token, owner, &bot, encrypted)
                 .await
                 .map_err(|e| format!("could not start the chat as its owner: {e}"))?;
             client
@@ -1909,13 +2140,14 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             return Ok(());
         }
         // Case 3: the repair.
+        let owner_token = owner_token(row)?;
         client
             .leave(&token, &bot, &room)
             .await
             .map_err(|e| format!("the bot could not leave the chat it started: {e}"))?;
         let back = async {
             client
-                .invite(&token, owner, &room, &bot)
+                .invite(&owner_token, owner, &room, &bot)
                 .await
                 .map_err(|e| format!("the owner could not invite the bot back: {e}"))?;
             client
@@ -1985,7 +2217,8 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
         if let (Some(runtime), Some(name)) = (&self.runtime, &row.deploy_name) {
             runtime.delete(name).await?;
         }
-        if let Some(id) = &row.appservice_id {
+        let double_puppet = row.double_puppet.as_ref().map(|dp| &dp.appservice_id);
+        for id in row.appservice_id.iter().chain(double_puppet) {
             match self.directory.delete(id).await {
                 Ok(()) | Err(SourceError::NotFound) => {}
                 Err(e) => return Err(e.to_string()),
@@ -2557,11 +2790,21 @@ impl<B: KvBackend + 'static> BridgeOfferingSource for BridgeManager<B> {
 }
 
 /// Whether an instance of `offering` may act as its owner: the type supports double puppeting
-/// and the offering has it on (its default), which is the registration's non-exclusive claim on
-/// the owner.
+/// and the offering has it on (its default), which is its double-puppeting registration's
+/// non-exclusive claim on the owner.
 fn may_act_as_owner(kind: Option<&hs_admin::model::BridgeType>, offering: &OfferingRow) -> bool {
     kind.is_some_and(|k| k.supports_double_puppeting)
         && offering.options.double_puppeting.unwrap_or(true)
+}
+
+/// The token the manager acts as `row`'s owner with: its double-puppeting registration's, once
+/// that is registered (decision 0045; the instance's own registration does not claim the owner).
+fn owner_token(row: &InstanceRow) -> Result<String, String> {
+    row.double_puppet
+        .as_ref()
+        .filter(|dp| dp.registered_fingerprint.is_some())
+        .map(|dp| dp.as_token.clone())
+        .ok_or_else(|| "its double-puppeting registration is not registered yet".to_owned())
 }
 
 /// The catalogue's sign-in steps as the bot says them in its own chat: `{bot}` is "me", and
@@ -3348,27 +3591,64 @@ mod tests {
             .any(|u| u["regex"] == "@brandon:example\\.org" && u["exclusive"] == false)
     }
 
-    /// Double puppeting is the owner's non-exclusive claim in the instance's registration.
-    /// Switching it off on the offering patches the registry's copy once, and the changed
-    /// files roll the pod, as any other change does; switching it back on does the same.
+    const DP_ID: &str = "whatsapp-brandon-doublepuppet";
+
+    /// The config the runtime was last asked to run for `name`.
+    fn applied_config(runtime: &FakeRuntime, name: &str) -> String {
+        runtime
+            .spec(name)
+            .expect("applied")
+            .files
+            .get("config.yaml")
+            .cloned()
+            .expect("a config")
+    }
+
+    /// Double puppeting is a registration of its own (decision 0045): `url: null`, a
+    /// non-exclusive claim on the owner alone, and its token in the bridge's config. The
+    /// instance's own registration never claims the owner. Switching it off on the offering
+    /// removes that registration and the changed files roll the pod, as any other change does;
+    /// switching it back on registers a new one and rolls the pod again.
     #[tokio::test]
-    async fn a_changed_double_puppeting_updates_the_instances_claim_once_and_rolls_it() {
-        let (manager, _runtime, directory) = cluster_manager_with_directory();
+    async fn a_changed_double_puppeting_adds_or_removes_its_registration_once_and_rolls_it() {
+        let (manager, runtime, directory) = cluster_manager_with_directory();
         manager.put("mautrix-whatsapp", cluster()).await.unwrap();
         manager
             .put_instance("mautrix-whatsapp", "@brandon:example.org")
             .await
             .unwrap();
-        manager.tick().await; // registered: the claim is on the server
+        manager.tick().await; // registered
+        manager.tick().await; // its double puppeting registered, then deploying
         let users = users_claimed(&directory, "whatsapp-brandon").await;
-        assert!(claims_owner(&users), "{users:?}");
+        assert!(!claims_owner(&users), "{users:?}");
+        assert_eq!(users.len(), 2, "its ghosts and its bot: {users:?}");
+        let dp = directory.get(DP_ID).await.unwrap().expect("registered");
+        assert!(dp.url.is_none(), "never sent anything");
+        assert!(claims_owner(&users_claimed(&directory, DP_ID).await));
+        assert_eq!(users_claimed(&directory, DP_ID).await.len(), 1);
         let row = manager
             .store
             .instance("mautrix-whatsapp", "@brandon:example.org")
             .unwrap()
             .unwrap();
+        assert_eq!(row.state, InstanceState::Deploying);
+        let first = row.double_puppet.clone().expect("minted");
+        assert_eq!(first.appservice_id, DP_ID);
+        let registration = directory.registration(DP_ID).await.unwrap().json;
+        assert_eq!(registration["as_token"], first.as_token.as_str());
+        assert_eq!(
+            registration[bridge_types::DOUBLE_PUPPET_FOR_KEY],
+            "whatsapp-brandon"
+        );
+        let name = row.deploy_name.clone().unwrap();
+        let config = applied_config(&runtime, &name);
+        assert!(
+            config.contains(&format!("\"example.org\": \"as_token:{}\"", first.as_token)),
+            "{config}"
+        );
+        let own = row.as_token.clone().unwrap();
+        assert!(!config.contains(&format!("as_token:{own}")), "{config}");
         let registered = row.registered_fingerprint.clone().unwrap();
-        manager.tick().await; // deploying
         manager
             .store
             .update_instance("mautrix-whatsapp", "@brandon:example.org", |r| {
@@ -3381,7 +3661,8 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        // Off: the registry no longer lets the bridge act as brandon, and the pod rolls.
+        // Off: the registration goes, the bridge's config says nothing of double puppeting,
+        // and the pod rolls. The instance's own registration is as it was.
         manager
             .put(
                 "mautrix-whatsapp",
@@ -3396,14 +3677,14 @@ mod tests {
             .await
             .unwrap();
         manager.tick().await;
-        let users = users_claimed(&directory, "whatsapp-brandon").await;
-        assert!(!claims_owner(&users), "{users:?}");
+        assert!(directory.get(DP_ID).await.unwrap().is_none());
         let row = manager
             .store
             .instance("mautrix-whatsapp", "@brandon:example.org")
             .unwrap()
             .unwrap();
-        assert_ne!(
+        assert!(row.double_puppet.is_none());
+        assert_eq!(
             row.registered_fingerprint.as_deref(),
             Some(registered.as_str())
         );
@@ -3412,8 +3693,8 @@ mod tests {
             row.reason.as_deref(),
             Some("its configuration changed: restarting the pod with it")
         );
-        let after_off = row.registered_fingerprint.clone().unwrap();
-        // Once: the next step finds nothing to patch and the instance moves on.
+        assert!(!applied_config(&runtime, &name).contains("double_puppet"));
+        // Once: the next step finds nothing to change and the instance moves on.
         manager.tick().await;
         let row = manager
             .store
@@ -3421,12 +3702,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(row.state, InstanceState::Starting);
-        assert_eq!(
-            row.registered_fingerprint.as_deref(),
-            Some(after_off.as_str())
-        );
 
-        // On again: the claim is back.
+        // On again: a new registration, new tokens, and the pod rolls with them.
         manager
             .put(
                 "mautrix-whatsapp",
@@ -3441,23 +3718,177 @@ mod tests {
             .await
             .unwrap();
         manager.tick().await;
-        let users = users_claimed(&directory, "whatsapp-brandon").await;
-        assert!(claims_owner(&users), "{users:?}");
+        assert!(claims_owner(&users_claimed(&directory, DP_ID).await));
+        assert!(!claims_owner(
+            &users_claimed(&directory, "whatsapp-brandon").await
+        ));
         let row = manager
             .store
             .instance("mautrix-whatsapp", "@brandon:example.org")
             .unwrap()
             .unwrap();
-        assert_eq!(
-            row.registered_fingerprint.as_deref(),
-            Some(registered.as_str())
-        );
+        let second = row.double_puppet.clone().expect("minted again");
+        assert_ne!(second.as_token, first.as_token);
         assert_eq!(row.state, InstanceState::Deploying);
+        assert!(applied_config(&runtime, &name).contains(&second.as_token));
     }
 
-    /// An instance run elsewhere has nobody to roll it: its registration is patched the same
-    /// way and its reason says to fetch the files again. A row from before the fingerprint
-    /// was kept is patched once with what it already claims, and nothing is said.
+    /// The demo's six bridges on 2026-10-12 (decision 0045): an instance registered before,
+    /// whose own registration claims its owner and whose config double puppets with its own
+    /// token. The next step registers its double puppeting apart, patches its own registration
+    /// in place (same id, same tokens) to stop claiming the owner, and rolls its pod once with
+    /// a config that carries the new token and every secret it had: the pickle key, the
+    /// provisioning secret, its own tokens. Said once, at INFO. Nothing changes after.
+    #[tokio::test]
+    async fn an_instance_from_before_moves_its_double_puppeting_once_and_keeps_its_secrets() {
+        let (manager, runtime, directory) = cluster_manager_with_directory();
+        manager.put("mautrix-whatsapp", cluster()).await.unwrap();
+        manager
+            .put_instance("mautrix-whatsapp", "@brandon:example.org")
+            .await
+            .unwrap();
+        manager.tick().await; // registered
+        manager.tick().await; // deploying
+        let row = row_of_owner(&manager, "@brandon:example.org");
+        let name = row.deploy_name.clone().unwrap();
+        let (own_as, own_hs) = (row.as_token.clone().unwrap(), row.hs_token.clone().unwrap());
+        let pickle_key = row.pickle_key.clone().expect("minted with its tokens");
+        let provisioning = row.provisioning_secret.clone().unwrap();
+
+        // Make it what an instance from before looks like: its registration claims brandon,
+        // there is no double-puppeting registration, and it runs, ready, with the old config.
+        directory.delete(DP_ID).await.unwrap();
+        let mut users = users_claimed(&directory, "whatsapp-brandon").await;
+        users.push(json!({"regex": "@brandon:example\\.org", "exclusive": false}));
+        directory
+            .update(
+                "whatsapp-brandon",
+                json!({"namespaces": {"users": users, "aliases": [], "rooms": []}}),
+            )
+            .await
+            .unwrap();
+        let old_registration = directory
+            .registration("whatsapp-brandon")
+            .await
+            .unwrap()
+            .json;
+        manager
+            .store
+            .update_instance("mautrix-whatsapp", "@brandon:example.org", |r| {
+                r.double_puppet = None;
+                r.registered_fingerprint = Some(registration_fingerprint(&old_registration));
+                r.applied_fingerprint = Some("from-before".into());
+                r.enter(InstanceState::Ready, 5);
+                r.reason = None;
+                r.dm_room = Some("!chat:example.org".into());
+                r.dm_started_by = Some(CHAT_BY_OWNER.into());
+                true
+            })
+            .unwrap();
+        let applies_before = *runtime.applies.lock().unwrap();
+        let log = LogSink::capture();
+
+        manager.tick().await;
+
+        // Its double puppeting is a registration of its own, claiming brandon, with no url.
+        let dp = directory.get(DP_ID).await.unwrap().expect("registered");
+        assert!(dp.url.is_none());
+        assert!(claims_owner(&users_claimed(&directory, DP_ID).await));
+        // Its own registration: the same one, patched in place, claiming brandon no more.
+        let users = users_claimed(&directory, "whatsapp-brandon").await;
+        assert!(!claims_owner(&users), "{users:?}");
+        let now = directory
+            .registration("whatsapp-brandon")
+            .await
+            .unwrap()
+            .json;
+        assert_eq!(now["as_token"], own_as.as_str());
+        assert_eq!(now["hs_token"], own_hs.as_str());
+        // Its secrets are the ones it had.
+        let row = row_of_owner(&manager, "@brandon:example.org");
+        assert_eq!(row.as_token.as_deref(), Some(own_as.as_str()));
+        assert_eq!(row.hs_token.as_deref(), Some(own_hs.as_str()));
+        assert_eq!(row.pickle_key.as_deref(), Some(pickle_key.as_str()));
+        assert_eq!(
+            row.provisioning_secret.as_deref(),
+            Some(provisioning.as_str())
+        );
+        // Its pod rolls once, with all of them and the new token.
+        assert_eq!(row.state, InstanceState::Deploying);
+        assert_eq!(*runtime.applies.lock().unwrap(), applies_before + 1);
+        let config = applied_config(&runtime, &name);
+        let dp_token = row.double_puppet.clone().unwrap().as_token;
+        for expected in [
+            format!("  pickle_key: {pickle_key}\n"),
+            format!("  as_token: {own_as}\n"),
+            format!("  hs_token: {own_hs}\n"),
+            format!("  shared_secret: {provisioning}\n"),
+            format!("\"example.org\": \"as_token:{dp_token}\""),
+        ] {
+            assert!(config.contains(&expected), "{expected} in {config}");
+        }
+        let said = log.lines_with("moved the bridge instance's double puppeting");
+        assert_eq!(said.len(), 1, "{said:?}");
+        for expected in [
+            "appservice=whatsapp-brandon",
+            "double_puppet_appservice=whatsapp-brandon-doublepuppet",
+            "owner=@brandon:example.org",
+        ] {
+            assert!(said[0].contains(expected), "{expected} in {}", said[0]);
+        }
+        assert!(said[0].contains("INFO"), "{}", said[0]);
+
+        // Once: the next steps change nothing more and say nothing more.
+        manager.tick().await;
+        manager.tick().await;
+        assert_eq!(*runtime.applies.lock().unwrap(), applies_before + 1);
+        assert_eq!(
+            log.lines_with("moved the bridge instance's double puppeting")
+                .len(),
+            1
+        );
+        assert_eq!(
+            row_of_owner(&manager, "@brandon:example.org")
+                .double_puppet
+                .unwrap()
+                .as_token,
+            dp_token
+        );
+    }
+
+    fn row_of_owner(manager: &BridgeManager<MemoryBackend>, owner: &str) -> InstanceRow {
+        manager
+            .store
+            .instance("mautrix-whatsapp", owner)
+            .unwrap()
+            .unwrap()
+    }
+
+    /// Removing an instance removes its double-puppeting registration with its own.
+    #[tokio::test]
+    async fn removing_an_instance_removes_its_double_puppeting_too() {
+        let (manager, _runtime, directory) = cluster_manager_with_directory();
+        manager.put("mautrix-whatsapp", cluster()).await.unwrap();
+        manager
+            .put_instance("mautrix-whatsapp", "@brandon:example.org")
+            .await
+            .unwrap();
+        manager.tick().await;
+        manager.tick().await;
+        assert!(directory.get(DP_ID).await.unwrap().is_some());
+        manager
+            .delete_instance("mautrix-whatsapp", "@brandon:example.org")
+            .await
+            .unwrap();
+        manager.tick().await;
+        assert!(directory.get("whatsapp-brandon").await.unwrap().is_none());
+        assert!(directory.get(DP_ID).await.unwrap().is_none());
+    }
+
+    /// An instance run elsewhere has nobody to roll it: when its files change (its double
+    /// puppeting switched off, here) its reason says to fetch them again. A row from before
+    /// the fingerprint was kept is patched once with what it already claims, and nothing is
+    /// said.
     #[tokio::test]
     async fn an_instance_run_elsewhere_is_told_to_fetch_its_files_when_its_claim_changes() {
         // Nobody has run the bridge yet: its pings fail and it waits in `starting`.
@@ -3529,9 +3960,10 @@ mod tests {
             )
             .await
             .unwrap();
+        assert!(directory.get(DP_ID).await.unwrap().is_some());
         manager.tick().await;
-        let users = users_claimed(&directory, "whatsapp-brandon").await;
-        assert!(!claims_owner(&users), "{users:?}");
+        // Its double-puppeting registration is gone and its files no longer double puppet.
+        assert!(directory.get(DP_ID).await.unwrap().is_none());
         let row = manager
             .store
             .instance("mautrix-whatsapp", "@brandon:example.org")

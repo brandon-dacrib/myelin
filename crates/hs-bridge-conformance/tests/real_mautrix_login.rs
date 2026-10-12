@@ -992,7 +992,7 @@ async fn bot_is_cross_signed(scene: &Scene) -> Result<String> {
 /// A chat the bot started, repaired in place. Without double puppeting the manager cannot act
 /// as alice, so the bot starts the chat and invites her: the shape of every chat from before
 /// 2026-10-02, and the bridge drops what she types there. Then the instance is allowed to act
-/// as her (the registration's claim on her, and the offering's option), and the manager's next
+/// as her (the offering's option, which registers its double puppeting), and the manager's next
 /// step has the bot leave and alice re-invite it; the bridge accepts, marks the room as her
 /// management room and says so; the bot says why it had been silent; and `login qr` is answered.
 async fn repaired_chat() -> Result<()> {
@@ -1014,22 +1014,9 @@ async fn repaired_chat() -> Result<()> {
     let alice_id = scene.alice_id.clone();
     let appservice_id = scene.appservice_id.clone();
 
-    // What the registration would carry had double puppeting been on from the start: the
-    // non-exclusive claim on alice (`bridge_types::render_instance`). Arrays replace under a
-    // merge patch, so the whole list is sent.
-    let escaped = SERVER_NAME.replace('.', "\\.");
-    scene
-        .admin
-        .ok(
-            reqwest::Method::PATCH,
-            &format!("/appservices/{appservice_id}"),
-            Some(json!({"namespaces": {"users": [
-                {"regex": format!("@whatsapp_alice_.*:{escaped}"), "exclusive": true},
-                {"regex": format!("@whatsappbot_alice:{escaped}"), "exclusive": true},
-                {"regex": format!("@alice:{escaped}"), "exclusive": false},
-            ]}})),
-        )
-        .await?;
+    // Double puppeting on: the manager registers the instance's double-puppeting registration
+    // (decision 0045: `url: null`, a non-exclusive claim on alice alone), acts as alice with its
+    // token, and the bridge's own registration goes on claiming only its ghosts and its bot.
     scene
         .admin
         .ok(
@@ -1038,6 +1025,18 @@ async fn repaired_chat() -> Result<()> {
             Some(json!({"options": {"double_puppeting": true}})),
         )
         .await?;
+    let own = scene
+        .admin
+        .ok(
+            reqwest::Method::GET,
+            &format!("/appservices/{appservice_id}"),
+            None,
+        )
+        .await?;
+    let alice_claimed = own["namespaces"]["users"]
+        .as_array()
+        .is_some_and(|users| users.iter().any(|u| u["exclusive"] == false));
+    assert!(!alice_claimed, "the bridge's own registration: {own}");
 
     // The bridge: "This room has been marked as your management room" (encrypted, since the
     // room is). The bot, through the manager: why it had been silent (plain).

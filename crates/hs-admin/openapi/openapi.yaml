@@ -10,7 +10,7 @@ openapi: 3.1.0
 info:
   title: hs-admin API
   summary: The native administration and moderation API for the homeserver.
-  version: 0.1.15
+  version: 0.1.16
   description: 'The only API the management interface (track 16) talks to. See docs/rfcs/0004-admin-api.md for the full design rationale: resource modeling, naming, pagination, filtering, errors, idempotency, scopes, versioning and the event stream. This document is the contract; the hs-admin router''s contract tests assert the router and this document agree on paths and methods (RFC 0004 section 1, decision D15.16).'
   contact:
     name: 'Track 15: Admin API and modules'
@@ -8759,6 +8759,12 @@ components:
           type: string
         bridge_resource_yaml:
           type: string
+        double_puppet_registration:
+          type: object
+          description: 'The bridge''s double-puppeting registration (decision 0045), present when double puppeting was chosen: a non-exclusive claim on the people the bridge may act as and `url: null`, so the server never sends it anything. The bridge''s config acts as people with its `as_token`. Create it with `POST /appservices` beside `registration`; the bridge''s own registration claims only its ghosts and its bot.'
+        double_puppet_registration_yaml:
+          type: string
+          description: '`double_puppet_registration` as YAML.'
     BridgeDeploymentTarget:
       type: object
       required:
