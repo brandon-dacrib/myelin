@@ -1,6 +1,8 @@
 # Status: track 11, appservices and bridges
 
-Last updated: 2026-10-12, evening (a device signed by a replaced self-signing key can be signed
+Last updated: 2026-10-12, night (the iMessage bridge starts on the owner's Mac: `GET /login`
+lists the appservice login, the config's double puppeting says `appservice`, and `run.sh` fetches
+a missing `libolm`; below); before that 2026-10-12, evening (a device signed by a replaced self-signing key can be signed
 by the new one, so the re-created WhatsApp bot's devices are signed; below); before that 2026-10-12, later (a bridge device made without keys is told it has none, so
 mautrix-discord uploads its keys and can decrypt; below); before that 2026-10-12 (the manager publishes the bot's self-signing key again when the server
 does not hold it, and a refused signature backs off; below); before that 2026-10-11, later (iMessage is offered: a program for the person's Mac, with its
@@ -31,6 +33,34 @@ manager) and an instance's Kubernetes objects say whose bridge they are; before 
 (who has signed in to a bridge; the `cluster` runtime run on kind); before that 2026-09-30
 (ephemeral, to-device and device-list delivery); before that 2026-09-27 (RFC 0017 run against
 the real binary), 2026-09-27 (the bridge manager) and 2026-09-25.
+
+## Session 2026-10-12, night (branch `agent/as-login-flow`): the iMessage bridge starts on the owner's Mac
+
+The owner ran `run.sh` on their Mac, which is also the machine this session runs on. It hit
+three problems; `docs/bridges/imessage.md` ("What was verified") has the details:
+
+1. `run.sh` fetched the build only when the program was missing, so a missing
+   `libolm.3.dylib` crashed the program at launch. It now fetches when either is missing.
+2. **`GET /login` did not list `m.login.application_service`.** The doc comment said Synapse
+   omits it, but Synapse's `LoginRestServlet.on_GET` appends it. mautrix-go's older framework
+   checks for it before logging its bot in for encryption and stops with `homeserver does not
+   support appservice login`. `hs-auth` now lists it.
+3. This build's double puppeting takes `login_shared_secret: appservice`, not `as_token:`. The
+   catalogue's iMessage config now says `appservice`.
+
+**Verified** with the real `mautrix-imessage` build against a local `hs` built from the branch:
+`Logged in as bridge bot`, keys uploaded, `Successfully automatically enabled custom puppet`,
+`Bridge started!`. The unit tests and `bridge_offerings.rs`'s iMessage case pass.
+
+**An incident during the check.** The first run reused the instance's port (29331) and
+`hs_token`. The demo's registration sends to this Mac's address, so the test instance received
+31 of the demo's real transactions (41 events, 11 to-device, 19:59:07–19:59:47 UTC) until it
+was stopped. It could not decrypt them, its only server was the local one, and it had no
+Contacts access, so nothing was sent anywhere. But the real bridge will not get those events.
+The second run used its own port and tokens.
+
+**Next on the Mac**, after the roll that carries fix 2: set `login_shared_secret: appservice`
+in the Mac's `config.yaml` (or download the files again), then `./run.sh`.
 
 ## Session 2026-10-12, evening (branch `agent/stale-signatures`): the re-created WhatsApp bot's devices can be signed: the refused key was the old identity's
 

@@ -19,6 +19,12 @@ carries the generated notes for that merge.
   and every conflicted event that loses on auth at WARN, ~10,000 lines in 9 minutes on the
   demo) are no longer in the default log; its errors still are. `debug`, `trace` and
   `RUST_LOG` still show everything.
+- **The iMessage bridge starts.** On the owner's Mac it stopped at once with "homeserver does not
+  support appservice login": `GET /login` did not list `m.login.application_service`, which
+  Synapse lists and the bridge's framework checks for before it logs its bot in. It is listed
+  now. The iMessage config's double puppeting says `appservice`, the only form this build
+  knows, and `run.sh` downloads the build again when `libolm.3.dylib` is missing. Verified with
+  the real bridge build against the server.
 
 - **A re-created bridge's bot can cross-sign its devices again.** The server checked every
   signature on a device being signed, including one by a self-signing key the bot no longer

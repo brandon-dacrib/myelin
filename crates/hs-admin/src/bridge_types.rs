@@ -1401,14 +1401,16 @@ fn mautrix_imessage_config(p: &MautrixParams<'_>) -> String {
     out.push_str("  backfill:\n");
     out.push_str(&format!("    enable: {}\n", p.backfill));
     if p.double_puppeting {
+        // `appservice`, not the newer frameworks' `as_token:<token>`: this build's
+        // `loginWithSharedSecret` knows only the literal `appservice` (an appservice login
+        // with the registration's own token) and takes anything else as an HMAC secret for a
+        // password login, which this server refuses ("Invalid username or password"). Both
+        // seen with the real build on 2026-10-12.
         out.push_str(
-            "  # The bridge sends as its person through its own token: the registration's\n",
+            "  # The bridge sends as its person through its own token (an appservice login):\n",
         );
-        out.push_str("  # non-exclusive claim on them is what allows it.\n");
-        out.push_str(&format!(
-            "  login_shared_secret: \"as_token:{}\"\n",
-            p.as_token
-        ));
+        out.push_str("  # the registration's non-exclusive claim on them is what allows it.\n");
+        out.push_str("  login_shared_secret: appservice\n");
     }
     out.push_str("  encryption:\n");
     if p.encryption {
@@ -1455,7 +1457,12 @@ fn mac_run_sh(entry: &Entry, download: MacDownload, owner: Option<&str>, url: &s
     out.push_str("set -eu\n");
     out.push_str("cd \"$(dirname \"$0\")\"\n");
     out.push_str(&format!("BUILD_URL=\"{}\"\n", download.url));
-    out.push_str(&format!("if [ ! -x ./{binary} ]; then\n"));
+    // Both files, not just the program: without `libolm.3.dylib` beside it the program aborts
+    // at launch ("Library not loaded: @rpath/libolm.3.dylib"), as it did on the owner's Mac on
+    // 2026-10-12 with the program there and the library not.
+    out.push_str(&format!(
+        "if [ ! -x ./{binary} ] || [ ! -f ./libolm.3.dylib ]; then\n"
+    ));
     out.push_str("  echo \"downloading the bridge...\"\n");
     out.push_str("  curl -fsSL -o build.zip \"$BUILD_URL\"\n");
     out.push_str(&format!("  unzip -o build.zip {binary} libolm.3.dylib\n"));
@@ -2746,7 +2753,8 @@ mod tests {
             "imessage_brandon_{{.}}"
         );
         assert_eq!(config["bridge"]["backfill"]["enable"], true);
-        assert_eq!(config["bridge"]["login_shared_secret"], "as_token:a");
+        // The literal this build knows; `as_token:<token>` would be taken as an HMAC secret.
+        assert_eq!(config["bridge"]["login_shared_secret"], "appservice");
         assert!(config["bridge"].get("login_shared_secret_map").is_none());
         assert_eq!(config["bridge"]["encryption"]["allow"], true);
         assert_eq!(config["bridge"]["encryption"]["appservice"], true);
@@ -2778,6 +2786,8 @@ mod tests {
         ));
         assert!(run.contains("https://mau.dev/mautrix/imessage/-/jobs/95972/artifacts/download"));
         assert!(run.contains("unzip -o build.zip mautrix-imessage libolm.3.dylib"));
+        // A missing library is downloaded again too, not only a missing program.
+        assert!(run.contains("if [ ! -x ./mautrix-imessage ] || [ ! -f ./libolm.3.dylib ]; then"));
         assert!(run.contains("xattr -dr com.apple.quarantine"));
         assert!(run.contains("for f in config.yaml registration.yaml"));
         assert!(run.contains("exec ./mautrix-imessage -c config.yaml -r registration.yaml"));

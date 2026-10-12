@@ -54,7 +54,9 @@ The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/
    `agent/discord-otk-counts` (status 11, 2026-10-12, later). After the roll that carries it,
    `login qr` in the Discord management room should get a QR code. If the old messages stay
    undecryptable, run `/discardsession` in that room and try again.
-4. **iMessage on the owner's Mac**: download, address, `./run.sh`, Full Disk Access, a message
+4. **iMessage on the owner's Mac**: the bridge starts with the server of `agent/as-login-flow`
+   (status 11, 2026-10-12, night). After that roll: `login_shared_secret: appservice` in the
+   Mac's `config.yaml` (or download the files again), `./run.sh`, Full Disk Access, a message
    both ways; then an `e2e-real` case.
 5. **The WARN noise of `event failed the authentication check`: fixed**
    (`agent/state-res-log-noise`, status 12, 2026-10-12, evening). The default filter holds

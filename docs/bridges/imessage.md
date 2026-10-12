@@ -33,7 +33,8 @@ the table) with iMessage's own sections, read from its `example-config.yaml` at 
   has no `/data`;
 - `imessage.platform: mac`;
 - `bridge.user`: the one person the bridge is for (no `permissions`);
-- `bridge.login_shared_secret: as_token:<token>` for double puppeting (one value, not a map);
+- `bridge.login_shared_secret: appservice` for double puppeting (one value, not a map, and the
+  literal `appservice`: this build takes anything else as an HMAC secret);
 - `bridge.backfill.enable`;
 - `bridge.encryption` with `allow`, `default`, `appservice`, and **no `msc4190`**: its
   framework predates MSC4190, so the registration asks for MSC2409 and MSC3202 only and the
@@ -79,9 +80,22 @@ until the address is set it is the placeholder `http://<appservice id>:29331`.
 - Unit tests in `bridge_types.rs` (the config and the script, key by key), `bridge_offerings.rs`
   (the address grammar) and `manager.rs` (address before and after naming; refused for a
   deployed instance).
-- **Not run on a real Mac yet.** The owner's Mac is the first: download, `./run.sh`, Full Disk
-  Access, and a message both ways. Until then the config is written from the bridge's example
-  and source, not from a bridge that started. Things most likely to need a look then: whether
-  the bridge's config upgrader keeps `websocket_proxy: null` (it copies the key when present),
-  whether `bridge.login_shared_secret` with an `as_token:` secret works on its framework (it
-  does on discord's, `bridge/doublepuppet.go`), and the bot's appservice login for encryption.
+- **Run on the owner's Mac, 2026-10-12** (the pinned build `300ba6d0`, macOS 26.6). Three
+  findings, all fixed:
+  1. `run.sh` downloaded the build only when the program was missing. With the program there
+     and `libolm.3.dylib` not, the bridge aborted at launch (`Library not loaded:
+     @rpath/libolm.3.dylib`, five crash reports). It now downloads when either is missing,
+     checked by running the script with the program present and the library absent.
+  2. Encryption: this framework logs its bot in with `m.login.application_service` and first
+     checks that `GET /login` lists it. The server did not, so the bridge stopped with
+     `homeserver does not support appservice login`. The server now lists it, as Synapse
+     does. Checked with the real build against a local `hs` with the fix: `Logged in as bridge
+     bot`, its keys uploaded, `Bridge started!`.
+  3. Double puppeting: this build's `login_shared_secret` knows the literal `appservice`, not
+     `as_token:<token>`, which it took as an HMAC secret for a password login (`403 Invalid
+     username or password`). The config now says `appservice`. Checked the same way:
+     `Successfully automatically enabled custom puppet`.
+
+  Still to see on the demo: a message both ways, which needs Full Disk Access for the
+  terminal that runs `run.sh` and the server with fix 2. Whether the config upgrader keeps
+  `websocket_proxy: null` is also unconfirmed.

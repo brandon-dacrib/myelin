@@ -31,12 +31,17 @@ use hs_http::body::PermissiveJson;
 /// so a failed login never tells an attacker which half was wrong.
 const INVALID_USERNAME_OR_PASSWORD: &str = "Invalid username or password";
 
+/// The spec's login type for an appservice logging in as one of its users, with its own token.
+const APPSERVICE_LOGIN_TYPE: &str = "m.login.application_service";
+
 /// The wire login type for `crate::shared_secret_auth` (legacy mautrix bridge double puppeting).
 const SHARED_SECRET_AUTH_LOGIN_TYPE: &str = "com.devture.shared_secret_auth";
 
-/// `GET /login`: the login flows this server offers. `m.login.application_service` is
-/// deliberately not advertised here — appservices know to use it implicitly from their
-/// registration, the same way Synapse omits it from `get_login_types`.
+/// `GET /login`: the login flows this server offers. `m.login.application_service` is always
+/// listed, as Synapse lists it (`LoginRestServlet.on_GET` appends `APPSERVICE_TYPE`):
+/// mautrix-go's older bridge framework looks for it before it logs its bot's device in for
+/// end-to-bridge encryption, and refuses to start without it ("homeserver does not support
+/// appservice login", mautrix-imessage on 2026-10-12). Only an appservice's token can use it.
 /// `com.devture.shared_secret_auth` is advertised only when a secret is configured for it
 /// (`crate::shared_secret_auth`), matching how mautrix bridges probe for it
 /// (`refs/mautrix-python/mautrix/bridge/custom_puppet.py`'s
@@ -62,6 +67,7 @@ pub async fn get_login_types(State(state): State<AuthState>) -> Json<Value> {
         }));
         flows.push(json!({"type": "m.login.cas"}));
     }
+    flows.push(json!({"type": APPSERVICE_LOGIN_TYPE}));
     Json(json!({ "flows": flows }))
 }
 
@@ -711,6 +717,8 @@ mod tests {
             .collect();
         assert!(types.contains(&"m.login.password".to_string()));
         assert!(types.contains(&"m.login.token".to_string()));
+        // As Synapse lists it: a bridge on mautrix-go's older framework will not start without.
+        assert!(types.contains(&APPSERVICE_LOGIN_TYPE.to_string()));
     }
 
     #[tokio::test]
