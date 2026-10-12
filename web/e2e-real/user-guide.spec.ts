@@ -425,7 +425,7 @@ test.describe("user guide screenshots", () => {
     await page.getByRole("radio", { name: /Deactivated the user/ }).check();
     await page
       .getByRole("textbox", { name: "Note" })
-      .fill("Spam account. Deactivated from his user page.");
+      .fill("Spam account. Deactivated from their user page.");
     await shot(page, "report-decide");
     await page.getByRole("button", { name: "Resolve report" }).click();
     await expect(page.getByText("Resolved").first()).toBeVisible();

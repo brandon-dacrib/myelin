@@ -499,6 +499,14 @@ HS_USER_GUIDE_SCREENSHOTS=1 \
   npx playwright test --config playwright.real.config.ts user-guide
 ```
 
+Then compress them, from the repository root (`brew install pngquant oxipng`):
+
+```sh
+cd docs/user-guide
+pngquant --quality=70-90 --skip-if-larger --force --ext .png *.png
+oxipng -o 4 --strip safe *.png
+```
+
 Without `HS_USER_GUIDE_SCREENSHOTS=1` the images go to `web/test-results/user-guide/` and the
 committed ones are left alone. The spec changes the server it runs against, so each run needs a
 fresh data directory.

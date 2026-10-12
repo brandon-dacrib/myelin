@@ -16,9 +16,8 @@ changing a setting, review, save, history), then Media, Reports (and deciding on
 Statistics, Audit log, API tokens, Server notices, Cluster and Migration, and where to go next.
 README and `docs/install-and-upgrade.md` link to it.
 
-**How the screenshots were made.** All 39 PNGs in `docs/user-guide/` (1280x800, light theme,
-4 MB together; neither `pngquant` nor `oxipng` is installed here, so they are not compressed)
-come from `web/e2e-real/user-guide.spec.ts` against a real `hs serve` on an empty data
+**How the screenshots were made.** All 39 PNGs in `docs/user-guide/` (1280x800, light theme;
+4.16 MB as taken, 1.15 MB after `pngquant` and `oxipng`) come from `web/e2e-real/user-guide.spec.ts` against a real `hs serve` on an empty data
 directory, server name `example.org`. The spec makes the first administrator through the setup
 page, seeds alice, bob, carol and dave and the rooms General, Random and Old project through the
 admin and client-server APIs (a report from carol about dave's message, a picture from alice, a
@@ -44,6 +43,17 @@ HS_USER_GUIDE_RECOVER_CMD="../target/debug/hs recover --data-dir <dir>" \
 HS_USER_GUIDE_SCREENSHOTS=1 \
   npx playwright test --config playwright.real.config.ts user-guide
 ```
+
+Then compress them (from the repository root):
+
+```sh
+cd docs/user-guide
+pngquant --quality=70-90 --skip-if-larger --force --ext .png *.png
+oxipng -o 4 --strip safe *.png
+```
+
+Text stays crisp; pngquant dithers a little where a dialog's dimmed backdrop covers the red
+Reports badge and in the media page's gradient thumbnail, which is acceptable at this size.
 
 Without `HS_USER_GUIDE_SCREENSHOTS=1` they go to `test-results/user-guide/`. Run on 2026-10-12
 against `hs` built from this branch: 1 passed (1.5 min).
