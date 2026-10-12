@@ -43,11 +43,22 @@ impl Level {
     /// At `info` the embedded storage engine is held to `warn`. `lsm_tree` logs every flush and
     /// ingestion at `info`, which on a first boot was 67 of the 72 lines an operator saw -- the
     /// other five being the ones that mattered: where the signing key went and what address is
-    /// listening. Asking for `debug` or `trace` is asking for everything, so those are left
-    /// alone, and `RUST_LOG` overrides all of it.
+    /// listening.
+    ///
+    /// At `info` and `warn` the state-resolution library is held to `error`. `ruma_state_res`
+    /// logs every resolution's steps at `info` ("state resolution starting", "unconflicted
+    /// events", ...) and, at `warn`, every conflicted event that loses on auth ("event failed
+    /// the authentication check: cannot join restricted room without
+    /// `join_authorised_via_users_server` ..."). In a federated room that is resolution
+    /// working as designed, not something to act on, and on the demo it was ~10,000 lines in
+    /// 9 minutes, enough to rotate the pod's log down to a few minutes of history.
+    ///
+    /// Asking for `debug` or `trace` is asking for everything, so those are left alone, and
+    /// `RUST_LOG` overrides all of it.
     fn default_directives(self) -> String {
         match self {
-            Level::Info => "info,lsm_tree=warn,fjall=warn".to_owned(),
+            Level::Info => "info,lsm_tree=warn,fjall=warn,ruma_state_res=error".to_owned(),
+            Level::Warn => "warn,ruma_state_res=error".to_owned(),
             other => other.as_str().to_owned(),
         }
     }
@@ -354,6 +365,13 @@ mod tests {
                 tracing::info!(target: "lsm_tree::tree::ingest", "Finished ingestion writer");
                 tracing::warn!(target: "lsm_tree::tree", "a storage warning");
                 tracing::info!(target: "hs_cli::cli", "listening");
+                tracing::info!(target: "ruma_state_res::state_res", "state resolution starting");
+                tracing::warn!(
+                    target: "ruma_state_res::state_res",
+                    "event failed the authentication check"
+                );
+                tracing::error!(target: "ruma_state_res::state_res", "a resolution error");
+                tracing::warn!(target: "hs_room::actor", "a room warning");
             });
             String::from_utf8(capture.0.lock().unwrap().clone()).unwrap()
         };
@@ -362,10 +380,23 @@ mod tests {
         assert!(!info.contains("Finished ingestion writer"), "{info}");
         assert!(info.contains("a storage warning"), "{info}");
         assert!(info.contains("listening"), "{info}");
+        // State resolution's steps and the events that lose on auth are not an operator's
+        // business; its errors are.
+        assert!(!info.contains("state resolution starting"), "{info}");
+        assert!(!info.contains("failed the authentication check"), "{info}");
+        assert!(info.contains("a resolution error"), "{info}");
+        assert!(info.contains("a room warning"), "{info}");
+
+        let warn = lines_at(Level::Warn);
+        assert!(!warn.contains("failed the authentication check"), "{warn}");
+        assert!(warn.contains("a resolution error"), "{warn}");
+        assert!(warn.contains("a room warning"), "{warn}");
+        assert!(!warn.contains("listening"), "{warn}");
 
         // Asking for more is asking for everything.
         let debug = lines_at(Level::Debug);
         assert!(debug.contains("Finished ingestion writer"), "{debug}");
+        assert!(debug.contains("failed the authentication check"), "{debug}");
     }
 
     /// The same composition `init` builds -- the filter behind a reload layer, first on the

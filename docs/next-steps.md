@@ -56,8 +56,10 @@ The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/
    undecryptable, run `/discardsession` in that room and try again.
 4. **iMessage on the owner's Mac**: download, address, `./run.sh`, Full Disk Access, a message
    both ways; then an `e2e-real` case.
-5. The WARN noise of `event failed the authentication check` (track 02/14, one line in the log
-   filter; still ~10,000 per 9 minutes).
+5. **The WARN noise of `event failed the authentication check`: fixed**
+   (`agent/state-res-log-noise`, status 12, 2026-10-12, evening). The default filter holds
+   `ruma_state_res` to `error`. After the roll, the demo's log should have no `ruma_state_res`
+   lines.
 6. `agent/state-load` (hs-02, tip `4dd0b8e6`, pushed, not gated): the one unmerged branch, its
    hs-room half still to do (below).
 

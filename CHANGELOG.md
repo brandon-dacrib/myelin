@@ -15,6 +15,11 @@ carries the generated notes for that merge.
 
 ## Unreleased
 
+- **The server's log is readable again.** State resolution's own lines (its steps at INFO,
+  and every conflicted event that loses on auth at WARN, ~10,000 lines in 9 minutes on the
+  demo) are no longer in the default log; its errors still are. `debug`, `trace` and
+  `RUST_LOG` still show everything.
+
 - **A re-created bridge's bot can cross-sign its devices again.** The server checked every
   signature on a device being signed, including one by a self-signing key the bot no longer
   had, and refused the new signature with "no known key". On the demo, the re-created WhatsApp

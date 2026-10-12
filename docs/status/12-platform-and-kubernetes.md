@@ -1,5 +1,23 @@
 # 12. Platform and Kubernetes
 
+## 2026-10-12, evening (branch `agent/state-res-log-noise`): state resolution's steps are out of the default log
+
+On the demo, `ruma_state_res` was most of the server's log: `state resolution starting`,
+`unconflicted events` and the like at INFO, and `event failed the authentication check: cannot
+join restricted room without join_authorised_via_users_server …` at WARN, ~10,000 lines in 9
+minutes. That rotated the pod's log down to a few minutes of history and buried real WARNs. A
+conflicted event losing on auth is resolution working, not something for an operator to act on.
+`hs-telemetry`'s default filter now holds `ruma_state_res` to `error` at `info` (with
+`lsm_tree` and `fjall` at `warn`, as before) and at `warn`. At `debug` and `trace`, and with
+`RUST_LOG`, nothing is filtered.
+
+**Verified** at the filter: `init::tests` builds the same `EnvFilter` from the level's
+directives and checks that state resolution's INFO and WARN are dropped at `info` and `warn`,
+that its ERROR and other crates' WARNs are kept, and that `debug` shows everything. **Not seen
+on a real binary**: only conflicting state from another server runs `ruma_state_res`, and
+neither a local room nor `admin_rooms.rs`'s forked room does (0 lines with `RUST_LOG=info`). The
+demo's log after the roll that carries this is the check: no `ruma_state_res` lines.
+
 ## 2026-10-12: one document for install and upgrade (`docs/install-and-upgrade.md`)
 
 The Helm commands were spread across the chart README, the top-level README, decision 0036 and
