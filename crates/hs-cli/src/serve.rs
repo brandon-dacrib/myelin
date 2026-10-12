@@ -1543,6 +1543,9 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     // How many room ids a creation built before one hashed to a shard this replica owns
     // (decision 0020), and the room-event search index.
     metrics.with_registry(hs_room::metrics::register_metrics);
+    // How long a room's state store takes to open, how many events a load still replays into it,
+    // and the records state resolution reads on demand (RFC 0025).
+    metrics.with_registry(hs_state::metrics::register_metrics);
     // The copies a replica keeps of rooms it does not own, to answer /sync (decision 0022).
     metrics.with_registry(hs_user::metrics::register_metrics);
     // What the PostgreSQL backend's commits flush in bulk (RFC 0021).

@@ -38,7 +38,6 @@ hex = "0.4"
 proptest = "1"
 criterion = "0.5"
 prometheus-client = "0.25"
-elsa = "1"
 serde_yaml_ng = "0.10"
 schemars = { version = "1", features = ["preserve_order"] }
 hmac = "0.12"
@@ -54,7 +53,7 @@ tempfile = "3"
 libc = "0.2"
 # `hs-room`'s per-operation pin arena (`RoomActor::pins`): an append-only map that hands out
 # `&Event` through `&self`, so the actor's event cache can be bounded without changing the
-# `&Event`-returning read API. MIT OR Apache-2.0.
+# `&Event`-returning read API; also `hs-state`'s per-resolution event arena. MIT OR Apache-2.0.
 elsa = "1"
 # Added by track 01 (storage), for the PostgreSQL `KvBackend`: `hs-kv`'s trait is synchronous
 # (mirrors the embedded Fjall backend, which is also blocking), so the backend uses the

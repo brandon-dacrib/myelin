@@ -2349,6 +2349,7 @@ dependencies = [
  "hs-operator",
  "hs-push",
  "hs-room",
+ "hs-state",
  "hs-tables",
  "hs-telemetry",
  "hs-testkit",

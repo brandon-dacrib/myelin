@@ -30,6 +30,7 @@ hs-telemetry = { path = "../hs-telemetry" }
 prometheus-client = { workspace = true }
 hs-http = { path = "../hs-http" }
 hs-room = { path = "../hs-room" }
+hs-state = { path = "../hs-state" }
 hs-federation = { path = "../hs-federation" }
 hs-user = { path = "../hs-user" }
 hs-e2e = { path = "../hs-e2e" }
