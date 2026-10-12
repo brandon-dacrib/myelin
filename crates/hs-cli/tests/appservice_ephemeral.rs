@@ -1021,13 +1021,9 @@ async fn a_bridge_device_made_without_keys_is_told_it_has_none() {
     .await;
     alice.say(&room_id, "login-qr").await;
     let count_of = |bridge: &StandIn| {
-        bridge
-            .transactions()
-            .iter()
-            .rev()
-            .find_map(|txn| {
-                txn["device_one_time_keys_count"][bot_id][device]["signed_curve25519"].as_u64()
-            })
+        bridge.transactions().iter().rev().find_map(|txn| {
+            txn["device_one_time_keys_count"][bot_id][device]["signed_curve25519"].as_u64()
+        })
     };
     until("the bridge was told its new device has no keys", || async {
         count_of(&bridge) == Some(0)
@@ -1049,7 +1045,10 @@ async fn a_bridge_device_made_without_keys_is_told_it_has_none() {
         )
         .await;
     assert!(status.is_success(), "{status} {body}");
-    assert_eq!(body["one_time_key_counts"]["signed_curve25519"], 2, "{body}");
+    assert_eq!(
+        body["one_time_key_counts"]["signed_curve25519"], 2,
+        "{body}"
+    );
     alice.say(&room_id, "login-qr again").await;
     until("the bridge was told its device's keys", || async {
         count_of(&bridge) == Some(2)
