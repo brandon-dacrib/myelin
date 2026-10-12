@@ -80,6 +80,10 @@ server's log has one `moved the bridge instance's double puppeting` line per ins
    (`agent/state-res-log-noise`, status 12, 2026-10-12, evening). The default filter holds
    `ruma_state_res` to `error`. After the roll, the demo's log should have no `ruma_state_res`
    lines.
+   both ways; then `./run.sh install` (start at login, `agent/imessage-launchagent`) and Full
+   Disk Access for the program itself; then an `e2e-real` case.
+5. The WARN noise of `event failed the authentication check` (track 02/14, one line in the log
+   filter; still ~10,000 per 9 minutes).
 6. `agent/state-load` (hs-02, tip `4dd0b8e6`, pushed, not gated): the one unmerged branch, its
    hs-room half still to do (below).
 

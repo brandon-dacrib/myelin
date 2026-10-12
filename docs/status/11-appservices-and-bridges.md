@@ -6,6 +6,10 @@ double puppeting; below); before that 2026-10-12, night (the iMessage bridge sta
 owner's Mac: `GET /login` lists the appservice login, the config's double puppeting says
 `appservice`, and `run.sh` fetches a missing `libolm`; below); before that 2026-10-12, evening
 (a device signed by a replaced self-signing key can be signed
+Last updated: 2026-10-12, late night (`./run.sh install` makes a Mac bridge a LaunchAgent that
+starts at login; below); before that 2026-10-12, night (the iMessage bridge starts on the owner's Mac: `GET /login`
+lists the appservice login, the config's double puppeting says `appservice`, and `run.sh` fetches
+a missing `libolm`; below); before that 2026-10-12, evening (a device signed by a replaced self-signing key can be signed
 by the new one, so the re-created WhatsApp bot's devices are signed; below); before that 2026-10-12, later (a bridge device made without keys is told it has none, so
 mautrix-discord uploads its keys and can decrypt; below); before that 2026-10-12 (the manager publishes the bot's self-signing key again when the server
 does not hold it, and a refused signature backs off; below); before that 2026-10-11, later (iMessage is offered: a program for the person's Mac, with its
@@ -142,6 +146,18 @@ DOUBLE_PUPPET_FOR_KEY, DOUBLE_PUPPET_ID_SUFFIX}`, `InstanceSpec::double_puppet`,
 `hs_appservice::error::error_chain`, `HttpTransactionSender::with_timeout`.
 
 **Shared dependencies added.** None.
+## Session 2026-10-12, late night (branch `agent/imessage-launchagent`): a Mac bridge starts at login
+
+The owner wants the iMessage bridge to start without Terminal once it works. The generated
+`run.sh` now takes `install` and `uninstall`. `install` writes a per-user LaunchAgent
+(`dev.myelin.bridge.<appservice id>`, `RunAtLoad`, `KeepAlive`, 30 s throttle, stderr to
+`logs/launchd-stderr.log`) and bootstraps it in `gui/<uid>`. `uninstall` boots it out and
+removes the plist. A plain run refuses beside an installed agent. It is a LaunchAgent, not a
+LaunchDaemon, because Messages and Contacts are only readable in the person's session, and
+Full Disk Access goes to the program, not Terminal. `docs/bridges/imessage.md` ("Starting it at
+login") has the details. **Verified** with launchd on this Mac, using a stand-in program and a
+test label: running, refusal, restart after a kill, and clean uninstall. **Not yet** with the
+real bridge, which needs the roll that carries `agent/as-login-flow`.
 
 ## Session 2026-10-12, night (branch `agent/as-login-flow`): the iMessage bridge starts on the owner's Mac
 

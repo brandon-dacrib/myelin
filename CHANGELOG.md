@@ -19,6 +19,10 @@ carries the generated notes for that merge.
   and every conflicted event that loses on auth at WARN, ~10,000 lines in 9 minutes on the
   demo) are no longer in the default log; its errors still are. `debug`, `trace` and
   `RUST_LOG` still show everything.
+- **A Mac bridge starts at login.** `./run.sh install` makes the iMessage bridge a LaunchAgent
+  that runs now and at every login and is restarted if it stops. `./run.sh uninstall` removes
+  it. Checked with launchd.
+
 - **The iMessage bridge starts.** On the owner's Mac it stopped at once with "homeserver does not
   support appservice login": `GET /login` did not list `m.login.application_service`, which
   Synapse lists and the bridge's framework checks for before it logs its bot in. It is listed

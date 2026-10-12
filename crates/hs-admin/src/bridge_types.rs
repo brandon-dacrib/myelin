@@ -1532,56 +1532,142 @@ fn mautrix_imessage_config(p: &MautrixParams<'_>) -> String {
 /// quarantine flag (a downloaded program is refused until it is), checks the two files are
 /// there and starts the bridge in the foreground, so that `operation not permitted` (no Full
 /// Disk Access yet) is seen where it happens. POSIX `sh` and the tools every Mac has.
-fn mac_run_sh(entry: &Entry, download: MacDownload, owner: Option<&str>, url: &str) -> String {
+///
+/// `./run.sh install` makes it a per-user LaunchAgent instead ([`mac_launch_agent_label`]):
+/// running now, at every login, and again after a crash. A LaunchAgent and not a system
+/// LaunchDaemon, because the bridge reads the person's Messages database and Contacts, which
+/// macOS allows only inside their logged-in session; starting it at boot is automatic login.
+/// The agent runs the program itself, not Terminal, so Full Disk Access is granted to the
+/// program, which `install` says. `./run.sh uninstall` removes it, and a plain `./run.sh`
+/// refuses to start a second copy beside an installed one.
+fn mac_run_sh(
+    entry: &Entry,
+    download: MacDownload,
+    owner: Option<&str>,
+    url: &str,
+    appservice_id: &str,
+) -> String {
     let binary = entry
         .upstream_project
         .rsplit_once('/')
         .map_or(entry.upstream_project, |(_, name)| name);
     let binary = format!("mautrix-{binary}");
     let whose = owner.map_or_else(|| "this server".to_owned(), str::to_owned);
-    let mut out = String::new();
-    out.push_str("#!/bin/sh\n");
-    out.push_str(&format!(
-        "# Runs the {} bridge for {whose} on this Mac. Written by Myelin.\n",
-        entry.name
-    ));
-    out.push_str("# Keep this file beside config.yaml and registration.yaml and run it from\n");
-    out.push_str("# Terminal: ./run.sh (chmod +x run.sh first). The server reaches the bridge\n");
-    out.push_str(&format!(
-        "# at {url}; if that is not this Mac, set the address on the bridge's page.\n"
-    ));
-    out.push_str(&format!("# Build: {}\n", download.note));
-    out.push_str("set -eu\n");
-    out.push_str("cd \"$(dirname \"$0\")\"\n");
-    out.push_str(&format!("BUILD_URL=\"{}\"\n", download.url));
-    // Both files, not just the program: without `libolm.3.dylib` beside it the program aborts
-    // at launch ("Library not loaded: @rpath/libolm.3.dylib"), as it did on the owner's Mac on
-    // 2026-10-12 with the program there and the library not.
-    out.push_str(&format!(
-        "if [ ! -x ./{binary} ] || [ ! -f ./libolm.3.dylib ]; then\n"
-    ));
-    out.push_str("  echo \"downloading the bridge...\"\n");
-    out.push_str("  curl -fsSL -o build.zip \"$BUILD_URL\"\n");
-    out.push_str(&format!("  unzip -o build.zip {binary} libolm.3.dylib\n"));
-    out.push_str("  rm -f build.zip\n");
-    out.push_str(&format!("  chmod +x ./{binary}\n"));
-    out.push_str("fi\n");
-    out.push_str("# macOS quarantines downloads and refuses to run them until the flag is gone.\n");
-    out.push_str("xattr -dr com.apple.quarantine . 2>/dev/null || true\n");
-    out.push_str("for f in config.yaml registration.yaml; do\n");
-    out.push_str("  [ -f \"$f\" ] || { echo \"$f is missing: download it from your bridge's page\"; exit 1; }\n");
-    out.push_str("done\n");
-    out.push_str(
-        "echo \"starting the bridge. If it stops with 'operation not permitted', give Terminal\"\n",
-    );
-    out.push_str(
-        "echo \"Full Disk Access (System Settings > Privacy & Security) and run this again.\"\n",
-    );
-    out.push_str(&format!(
-        "exec ./{binary} -c config.yaml -r registration.yaml\n"
-    ));
-    out
+    let label = mac_launch_agent_label(appservice_id);
+    MAC_RUN_SH
+        .replace("{name}", entry.name)
+        .replace("{whose}", &whose)
+        .replace("{url}", url)
+        .replace("{note}", download.note)
+        .replace("{build_url}", download.url)
+        .replace("{label}", &label)
+        .replace("{binary}", &binary)
 }
+
+/// The LaunchAgent label of a Mac instance, `dev.myelin.bridge.<appservice id>`: one per
+/// instance, so two bridges on one Mac (or two servers' bridges) do not replace each other.
+/// Characters a label or a file name should not carry are dropped.
+#[must_use]
+fn mac_launch_agent_label(appservice_id: &str) -> String {
+    let id: String = appservice_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        .collect();
+    format!("dev.myelin.bridge.{id}")
+}
+
+/// [`mac_run_sh`]'s text, with `{name}`, `{whose}`, `{url}`, `{note}`, `{build_url}`,
+/// `{label}` and `{binary}` filled in.
+const MAC_RUN_SH: &str = r#"#!/bin/sh
+# Runs the {name} bridge for {whose} on this Mac. Written by Myelin.
+# Keep this file beside config.yaml and registration.yaml (chmod +x run.sh first):
+#   ./run.sh            runs the bridge in this Terminal window (Ctrl-C stops it)
+#   ./run.sh install    runs it in the background, now and at every login, restarted if it stops
+#   ./run.sh uninstall  stops that and removes it
+# The server reaches the bridge at {url}; if that is not this Mac, set the address on the
+# bridge's page.
+# Build: {note}
+set -eu
+cd "$(dirname "$0")"
+DIR="$(pwd -P)"
+LABEL="{label}"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+DOMAIN="gui/$(id -u)"
+BUILD_URL="{build_url}"
+case "${1:-run}" in
+  run|install) ;;
+  uninstall)
+    launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+    rm -f "$PLIST"
+    echo "the bridge is stopped and no longer starts at login."
+    exit 0
+    ;;
+  *)
+    echo "usage: ./run.sh [install|uninstall]"
+    exit 2
+    ;;
+esac
+# Both files, not just the program: without libolm.3.dylib beside it the program stops at
+# launch ("Library not loaded: @rpath/libolm.3.dylib").
+if [ ! -x ./{binary} ] || [ ! -f ./libolm.3.dylib ]; then
+  echo "downloading the bridge..."
+  curl -fsSL -o build.zip "$BUILD_URL"
+  unzip -o build.zip {binary} libolm.3.dylib
+  rm -f build.zip
+  chmod +x ./{binary}
+fi
+# macOS quarantines downloads and refuses to run them until the flag is gone.
+xattr -dr com.apple.quarantine . 2>/dev/null || true
+for f in config.yaml registration.yaml; do
+  [ -f "$f" ] || { echo "$f is missing: download it from your bridge's page"; exit 1; }
+done
+if [ "${1:-run}" = install ]; then
+  mkdir -p "$HOME/Library/LaunchAgents" logs
+  xml() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+  D="$(xml "$DIR")"
+  # The bridge keeps its own rotating log in logs/; launchd keeps only what it writes to
+  # stderr, which is where a failure before its logging starts goes.
+  cat > "$PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$D/{binary}</string>
+    <string>-c</string><string>config.yaml</string>
+    <string>-r</string><string>registration.yaml</string>
+  </array>
+  <key>WorkingDirectory</key><string>$D</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>StandardOutPath</key><string>/dev/null</string>
+  <key>StandardErrorPath</key><string>$D/logs/launchd-stderr.log</string>
+</dict>
+</plist>
+PLIST
+  plutil -lint -s "$PLIST"
+  launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+  launchctl bootstrap "$DOMAIN" "$PLIST"
+  echo "installed: the bridge runs in the background now and starts at every login."
+  echo "Its log: $DIR/logs. It needs Full Disk Access itself, not Terminal's:"
+  echo "  System Settings > Privacy & Security > Full Disk Access, +, choose $DIR/{binary}"
+  echo "then restart it: launchctl kickstart -k $DOMAIN/$LABEL"
+  echo "To start it after a restart without anyone logging in, turn on automatic login."
+  exit 0
+fi
+if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+  echo "the bridge already runs in the background (./run.sh install); ./run.sh uninstall first"
+  echo "to run it in this window instead."
+  exit 1
+fi
+echo "starting the bridge. If it stops with 'operation not permitted', give Terminal"
+echo "Full Disk Access (System Settings > Privacy & Security) and run this again."
+exec ./{binary} -c config.yaml -r registration.yaml
+"#;
 
 fn compose(entry: &Entry, c: &Choices, image: &str, server_name: &str) -> String {
     let mut out = String::new();
@@ -1959,7 +2045,7 @@ pub fn render_instance(spec: &InstanceSpec<'_>) -> Option<InstanceRender> {
     let image_tag = resolve_image_tag(entry, Some(spec.image_tag));
     let run_sh = entry
         .mac_download
-        .map(|d| mac_run_sh(entry, d, spec.owner, spec.url));
+        .map(|d| mac_run_sh(entry, d, spec.owner, spec.url, spec.appservice_id));
     if let Some(script) = &run_sh {
         files.insert("run.sh".to_owned(), script.clone());
     }
@@ -3057,6 +3143,15 @@ mod tests {
         // two files checked, the bridge started in the foreground.
         let run = r.run_sh.as_deref().expect("a Mac gets run.sh");
         assert_eq!(r.files.get("run.sh").map(String::as_str), Some(run));
+        // Started at login as a LaunchAgent of its own, and removed again; never two copies.
+        assert!(run.contains("LABEL=\"dev.myelin.bridge.imessage-brandon\""));
+        assert!(run.contains("PLIST=\"$HOME/Library/LaunchAgents/$LABEL.plist\""));
+        assert!(run.contains("launchctl bootstrap \"$DOMAIN\" \"$PLIST\""));
+        assert!(run.contains("<string>$D/mautrix-imessage</string>"));
+        assert!(run.contains("<key>KeepAlive</key><true/>"));
+        assert!(run.contains("launchctl bootout \"$DOMAIN/$LABEL\""));
+        assert!(run.contains("Full Disk Access itself, not Terminal's"));
+        assert!(run.contains("if launchctl print \"$DOMAIN/$LABEL\" >/dev/null 2>&1; then"));
         assert!(run.starts_with(
             "#!/bin/sh
 "

@@ -74,6 +74,33 @@ the files render with it. Set before the instance is named, it survives naming. 
 instance the server deploys. `BridgeInstance.url` says where the server reaches the bridge;
 until the address is set it is the placeholder `http://<appservice id>:29331`.
 
+## Starting it at login
+
+Once `./run.sh` works in Terminal, `./run.sh install` keeps it running without Terminal. It
+installs a per-user LaunchAgent, `~/Library/LaunchAgents/dev.myelin.bridge.<appservice
+id>.plist`, which runs the bridge now and at every login, and launchd restarts it 30 seconds
+after it stops. `./run.sh uninstall` stops it and removes the agent. While the agent is
+installed, a plain `./run.sh` refuses to start a second copy, since two would fight over the
+port.
+
+- **At login, not at boot.** The bridge reads the person's Messages database and Contacts, and
+  macOS allows that only inside their logged-in session. So it is a LaunchAgent, not a system
+  LaunchDaemon. To have it running after a restart with nobody at the Mac, turn on automatic
+  login for the account (System Settings > Users & Groups).
+- **Full Disk Access for the program.** The agent runs `mautrix-imessage` itself, not
+  Terminal, so Terminal's Full Disk Access does not carry over. Add the program in System
+  Settings > Privacy & Security > Full Disk Access with +, then `launchctl kickstart -k
+  gui/$(id -u)/dev.myelin.bridge.<appservice id>`. `install` prints both. A new build of the
+  program needs the grant again.
+- **Logs.** The bridge's own rotating log stays in `logs/`. launchd keeps only stderr, in
+  `logs/launchd-stderr.log`, which is where a failure before logging starts goes (a missing
+  `libolm.3.dylib`, say).
+
+Checked on macOS 26.6 with launchd: the agent ran the program from a path containing a space
+and an `&`, a second `./run.sh` was refused, a killed program was restarted, and `uninstall`
+left no agent, plist or process. A stand-in program was used, so this check did not cover the
+bridge's own Full Disk Access.
+
 ## What was verified, and what was not
 
 - `crates/hs-cli/tests/bridge_offerings.rs::an_imessage_offering_runs_on_a_mac_whose_address_the_administrator_sets`,
