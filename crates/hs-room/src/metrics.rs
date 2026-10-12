@@ -34,6 +34,29 @@ static CREATE_ROOM_ID_TAKEN: LazyLock<Counter> = LazyLock::new(Counter::default)
 /// row"). Counts once per room load that found some, so a non-owner's copies count too.
 static OUTLIER_STATE_ROWS_REPAIRED: LazyLock<Counter> = LazyLock::new(Counter::default);
 
+/// `hs_room_state_records_repaired_total`: events a room load (of a room whose state records
+/// are complete, so not replayed) or a read copy's catch-up found held with no record in the
+/// durable state store, and fed to it (`RoomActor::load`). Expected to stay 0: an event's state
+/// record is written in the transaction that writes its row; what is left are the few paths
+/// that still feed the store just after their own commit (outliers, placed history) and a crash
+/// between the two, or a writer from before 2026-10-12.
+static STATE_RECORDS_REPAIRED: LazyLock<Counter> = LazyLock::new(Counter::default);
+
+/// Histograms by a set of labels, each made with its own buckets.
+type LabelledHistograms = Family<Vec<(String, String)>, Histogram, fn() -> Histogram>;
+
+/// `hs_room_load_seconds{state}`: how long `RoomActor::load` took, by what it did with the
+/// room's state records -- `read` (complete, so the load fed the state store nothing but what
+/// it lacked) or `replayed` (a room from before the records were durable, fed its whole
+/// history once and marked; RFC 0025). The boot-time figure a room's history no longer drives.
+static ROOM_LOADS: LazyLock<LabelledHistograms> = LazyLock::new(|| {
+    Family::new_with_constructor(|| {
+        Histogram::new([
+            0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 120.0,
+        ])
+    })
+});
+
 /// `hs_room_stale_copies_reloaded_total`: resident copies of a room `RoomRegistry::get_or_load`
 /// dropped because the room's shard changed hands since the copy was loaded (the fencing epoch
 /// moved: this replica lost the shard and got it back), each followed by a load from the store.
@@ -243,6 +266,21 @@ pub(crate) fn count_outlier_state_rows_repaired(repaired: usize) {
     OUTLIER_STATE_ROWS_REPAIRED.inc_by(repaired as u64);
 }
 
+/// Observes one room load's duration in `hs_room_load_seconds`, labelled by whether it
+/// replayed the room's history into the state store.
+pub(crate) fn observe_room_load(elapsed: std::time::Duration, replayed: bool) {
+    let state = if replayed { "replayed" } else { "read" };
+    ROOM_LOADS
+        .get_or_create(&vec![("state".to_owned(), state.to_owned())])
+        .observe(elapsed.as_secs_f64());
+}
+
+/// Counts `repaired` events fed to the state store because it had no record of them
+/// (`hs_room_state_records_repaired_total`).
+pub(crate) fn count_state_records_repaired(repaired: u64) {
+    STATE_RECORDS_REPAIRED.inc_by(repaired);
+}
+
 /// `hs_room_create_room_id_taken_total` as it stands, for tests.
 #[cfg(test)]
 pub(crate) fn create_room_id_taken() -> u64 {
@@ -339,6 +377,19 @@ pub fn register_metrics(registry: &mut prometheus_client::registry::Registry) {
         "Placed outliers found on a room load with no state row (placed before the state at \
          backfilled history was recorded) and given one",
         OUTLIER_STATE_ROWS_REPAIRED.clone(),
+    );
+    registry.register(
+        "hs_room_load_seconds",
+        "Time taken to load a room into its actor, by whether its state records were read \
+         (complete) or its history replayed into them (a room from before they were durable)",
+        ROOM_LOADS.clone(),
+    );
+    // Registered without `_total`: the text encoder appends it.
+    registry.register(
+        "hs_room_state_records_repaired",
+        "Events a room load or catch-up found held with no record in the durable state store, \
+         and fed to it",
+        STATE_RECORDS_REPAIRED.clone(),
     );
     // Registered without `_total`: the text encoder appends it.
     registry.register(

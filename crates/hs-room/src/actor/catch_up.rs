@@ -257,11 +257,15 @@ impl<B: KvBackend> RoomActor<B> {
             }
         }
 
+        // The owner fed the state store each of these in the transaction that wrote its row, and
+        // the store is the same durable one: the copy feeds it only one it has no record of (a
+        // row from an owner older than that), and counts it.
         let events = batch.len();
+        let ingested_before = self.store.stats().events_ingested;
         let mut redaction_targets: Vec<OwnedEventId> = Vec::new();
         for (room_pos, event_sn, event, purged) in batch {
             if purged {
-                self.absorb_purged_event(event_sn, event, room_pos, None)?;
+                self.absorb_purged_event(event_sn, event, room_pos, None, Feed::IfMissing)?;
                 continue;
             }
             if event.header().event_type == "m.room.redaction"
@@ -269,7 +273,17 @@ impl<B: KvBackend> RoomActor<B> {
             {
                 redaction_targets.push(target);
             }
-            self.absorb_loaded_event(event_sn, event, room_pos, None)?;
+            self.absorb_loaded_event(event_sn, event, room_pos, None, Feed::IfMissing)?;
+        }
+        let fed = self.store.stats().events_ingested - ingested_before;
+        if fed > 0 {
+            crate::metrics::count_state_records_repaired(fed);
+            tracing::info!(
+                room_id = %self.room_id,
+                events = fed,
+                "a read copy fed the state store events its owner's rows named and the store \
+                 had no record of"
+            );
         }
         for target in redaction_targets {
             let Some(target_sn) = self.sn_of(&target) else {

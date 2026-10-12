@@ -1,6 +1,7 @@
 # 02 State and model: status
 
-Updated: 2026-10-10 (the state store's per-event records are durable; below). Before that
+Updated: 2026-10-12 (the room actor's half landed: a room loads without replaying its history;
+decision 0045). Before that 2026-10-10 (the state store's per-event records are durable; below). Before that
 2026-09-30 (a mainline tie-break bug).
 
 ## 2026-10-10: the store opens without replaying the room (RFC 0025), on `agent/state-load`
@@ -57,7 +58,18 @@ hs-room --all-targets` clean. **Not run** (the session ended): `cargo clippy -p 
 hs-cli`, the hs-cli real-binary tests (`in_process_restart`, `legacy_events`, `federation_reads`,
 `federation_writes`, `members_at`).
 
-**Left**: (1) the hs-room half, deliberately not done here (track 04's `load` on `agent/room-memory`
+**2026-10-12, the rest landed on the same branch** (track 04's status has the detail): the room
+actor gates its replay on `needs_migration`, marks a replayed room (`mark_migrated`) and a new
+one in its creating transaction (`mark_migrated_in`), logs `log_open_summary`, and feeds the
+store inside `persist_with`'s transaction (`ingest_in`); a load of a room whose records are
+complete feeds the store nothing (50,000 messages on Fjall: 0.16-0.20 s against 3.0-3.5 s for
+the replay every load did). `hs-cli` registers `hs_state::metrics` (the coordinator, `23149dc8`).
+Decision 0045 is written. One change here: `frames.rs`'s frame write is a retried transaction
+that skips a frame already present, so two writers re-ingesting one room at once (an owner and a
+copy migrating it together) agree instead of one failing on a conflict (tested on PostgreSQL by
+`crates/hs-room/tests/durable_state.rs`).
+
+**Left as of 2026-10-10 (all done 2026-10-12, above)**: (1) the hs-room half, deliberately not done here (track 04's `load` on `agent/room-memory`
 has since merged): gate the replay on `store.needs_migration(room_id)`, call `mark_migrated` after
 it and `log_open_summary` at the end of `load`, `mark_migrated_in` in the transaction that creates a
 room, and move `feed_store` into `persist_with`'s transaction via `ingest_in`; until then every load

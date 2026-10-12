@@ -198,12 +198,16 @@ impl<B: KvBackend> RoomActor<B> {
         event: Event,
         room_pos: i64,
         explicit_state: Option<&[EventSn]>,
+        feed: Feed,
     ) -> Result<(), RoomError> {
         self.next_room_pos = self.next_room_pos.max(room_pos + 1);
-        match explicit_state {
-            Some(state) => self.feed_store_with_state(&event, event_sn, state)?,
-            None => self.feed_store(&event, event_sn)?,
-        };
+        self.note_create(&event, event_sn);
+        if self.must_feed(event_sn, feed)? {
+            match explicit_state {
+                Some(state) => self.feed_store_with_state(&event, event_sn, state)?,
+                None => self.feed_store(&event, event_sn)?,
+            };
+        }
         self.purged.insert(event_sn);
         Ok(())
     }

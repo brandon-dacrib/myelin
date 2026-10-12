@@ -256,17 +256,18 @@ impl<KV: KvBackend> FrameRepr<KV> {
         let encoded = encode_frame(rec);
         self.bytes_written
             .fetch_add(encoded.len() as u64 + 16, Ordering::Relaxed);
-        let mut txn = self.backend.begin()?;
-        txn.put(&self.frames, &hash, &encoded)?;
-        self.backend.commit(txn)?.map_err(|_conflict| {
-            // Two writers racing to create the exact same content-addressed frame: the losing
-            // side's content already exists under `hash` (that is what content-addressing
-            // guarantees), so this is not actually a correctness problem, just treated as an
-            // error here because the bake-off harness is single-threaded and should never hit
-            // this branch.
-            Error::Kv(KvError::backend(std::io::Error::other(
-                "unexpected write conflict on a content-addressed frame",
-            )))
+        // Two writers can race to create the exact same frame: since the store's records are
+        // durable and shared (RFC 0025), two actors replaying the same room at once (a room's
+        // owner and a read copy on another replica migrating it together) ingest the same
+        // events. The loser's frame is already there under `hash` -- that is what content
+        // addressing guarantees -- so a conflict (which PostgreSQL's serializable isolation can
+        // raise for two upserts of one row) is retried, and the retry finds the frame and
+        // writes nothing. Until 2026-10-12 a conflict here was an error.
+        hs_kv::transact(&self.backend, hs_kv::TransactConfig::default(), |txn| {
+            if txn.get(&self.frames, &hash)?.is_none() {
+                txn.put(&self.frames, &hash, &encoded)?;
+            }
+            Ok(())
         })?;
         Ok(hash)
     }

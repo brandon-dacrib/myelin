@@ -162,6 +162,22 @@ pub struct PersistedEvent {
     pub written_by: Option<String>,
 }
 
+/// The bookkeeping fields of a [`PersistedEvent`] row without its event: what deciding whether a
+/// room holds an event needs (`RoomActor::known`), decoded from the same bytes without building
+/// the event's JSON tree (serde skips the `json` field it does not name).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct PersistedEventHead {
+    /// The room this event belongs to.
+    pub room_id: String,
+    /// As [`PersistedEvent::flags`].
+    pub flags: u8,
+    /// As [`PersistedEvent::room_pos`].
+    pub room_pos: Option<i64>,
+    /// As [`PersistedEvent::purged`].
+    #[serde(default)]
+    pub purged: bool,
+}
+
 /// A room's fixed metadata.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RoomMeta {

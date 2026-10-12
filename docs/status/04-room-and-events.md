@@ -2,6 +2,111 @@
 
 Track brief: `docs/workstreams/04-room-and-events.md`. Owner crate: `hs-room`.
 
+## 2026-10-12 (branch `agent/state-load`): a room loads from its durable state records without replaying its history
+
+The room actor's half of RFC 0025 (track 02 made `hs-state`'s records durable on this branch;
+decision 0045). Until now every `RoomActor::load` replayed the whole room into the state store,
+and with the store's records now durable and shared by every actor on the backend, 16 of this
+crate's tests failed: the actor used "the state store knows it" as "this actor holds it".
+
+**Done**:
+
+- **"Held" is the room's own rows** (`crates/hs-room/src/actor/working_set.rs`, `RoomActor::known`).
+  The store now knows every room's events (and a read copy's owner's newer ones), so it can no
+  longer answer what this copy holds. `known(sn)` is: rejected or purged here (in-memory sets,
+  both few), resident (pinned or cached), or a stored row of this room, not rejected, that this
+  actor has taken in -- an outlier, or a timeline event at the position its row names in this
+  actor's `timeline` (`row_is_held`). The last is a point read of the row's bookkeeping fields
+  (`persist::PersistedEventHead`, serde skips the event JSON); a yes is remembered in a bounded
+  LRU (`HELD_VERDICTS` = 4,096 short ids per actor). Chosen over `store.has_event` (not
+  room-scoped, not per-copy) and over a per-room set of held events (O(history) again); the
+  timeline map it consults was already resident. `fetch_from_store` reads the row once for both
+  the verdict and the event.
+- **The load reads, and replays once** (`RoomActor::load`): `store.needs_migration(room_id)`
+  decides. A room whose records are complete is loaded with `Feed::IfMissing`: nothing is fed
+  to the store but an event it has no record of (a crash between a post-commit feed and its
+  row, a writer from before; counted in `hs_room_state_records_repaired_total`, logged at
+  `warn`). A room from before is replayed (`Feed::Always`) and marked with `mark_migrated`,
+  which logs it and counts `hs_state_migrations_total`. `log_open_summary` at the end. Ordinary
+  timeline rows are not decoded into events at all: position, soft-failed/purged flags, the
+  relation and the create come from the row's fields (`LoadRow`); an event is decoded only to be
+  fed, or for a redaction (its id is a reference hash). Outlier rows are read for their flags
+  only; a rejected one is decoded and held. A placed outlier is recognised by its row's outlier
+  flag (it was `known()`). `create_sn` falls back to the current state's create (a joined room's
+  create is an outlier no longer decoded).
+- **The store is fed inside `persist_with`'s transaction** (`KvStateStore::ingest_in`), and a
+  room's first timeline event marks it migrated in the same transaction (`mark_migrated_in`;
+  that covers a created room and one joined over federation). A state-store failure inside the
+  transaction is parked and returned as `RoomError::State`; a storage conflict is retried with
+  the rest. The old comment recording the torn-write gap is gone with the gap.
+- **Read copies** (`catch_up`, decision 0022) absorb the owner's rows with `Feed::IfMissing`:
+  the owner already fed the shared store in the row's transaction, so a copy feeds nothing
+  (asserted), and does not hold the owner's newer events before it has read their rows.
+- **Idempotent re-ingestion by two writers**: two actors replaying one room at once (an owner
+  and a copy migrating together) agree, on the in-memory backend and on PostgreSQL. One fix in
+  `hs-state` for it (`crates/hs-state/src/frames.rs`, track 02's file on track 02's branch): a
+  frame write that conflicts is retried and skips a frame already there, where it used to be an
+  error.
+- **Observability**: `hs_room_load_seconds{state="read"|"replayed"}` (new),
+  `hs_room_state_records_repaired_total` (new), a `debug` line per load (timeline length,
+  replayed, records fed, elapsed), beside track 02's `hs_state_*` series (now on `/metrics`).
+  `RoomActor::state_store_stats()` (new, public) for tests and diagnosis.
+
+**Numbers** (`cargo test -p hs-room --release --test durable_state measure -- --ignored
+--nocapture`, 50,000 messages on Fjall): load with complete records **0.16-0.20 s**, 0 events
+fed; replay over the records (every load until now) 3.0-3.5 s; one-time migration into an empty
+store 2.8-3.2 s. (An intermediate version that still decoded every row took 0.65 s.)
+
+**Real binary** (`target/debug/hs`, a fresh data dir, one room of 200 messages and 5 state
+changes, `SIGTERM`, restart): state and `/messages` identical after the restart,
+`hs_state_events_replayed_total 0`, `hs_state_migrations_total 0`,
+`hs_room_state_records_repaired_total 0` on the second start. A data dir written by `main`
+(`d4a69b5b`, before this branch) opened by this branch: identical answers,
+`hs_state_migrations_total 1` and "built the room's durable state records from its events ...
+events=211 elapsed_ms=36" on the first start; 0 migrations and 0 replays on the next.
+(Details in the 2026-10-12 report to the coordinator; reproduce with any data dir, reading
+`/metrics`.)
+
+**Tests**: the 16 that failed after the merge of `main` all pass unchanged
+(`actor::catch_up::tests::{a_copy_reads_only_the_new_rows_and_ends_up_as_a_fresh_load_would,
+a_redaction_marks_its_target_now_or_on_a_later_catch_up, a_target_never_flagged_stops_being_checked,
+visibility_and_membership_changes_in_one_batch_are_applied_in_order,
+a_purge_a_deletion_and_a_missing_position_each_ask_for_a_reload}`,
+`actor::rejected::tests::{an_event_citing_an_event_of_another_room_is_rejected_not_fetched_for,
+a_redaction_of_an_event_of_another_room_is_withheld,
+a_fetched_prev_event_citing_another_rooms_event_is_rejected_and_what_follows_judged}`,
+`actor::soft_fail::tests::soft_failed_events_are_held_hidden_and_never_extremities`,
+`actor::tests::{a_redaction_that_arrives_before_its_event_takes_effect_when_the_event_comes,
+a_rejected_event_is_stored_as_rejected_and_later_references_to_it_are_consistent}`,
+`admin::content::tests::{a_fork_is_reported_and_pruned_to_the_newest_extremity,
+a_purge_removes_old_remote_messages_keeps_state_and_local_and_survives_a_reload}`,
+`fencing::tests::a_copy_behind_the_store_is_refused_rather_than_writing_over_a_row`,
+`registry::tests::{a_copy_is_loaded_again_once_its_shard_changed_hands,
+a_room_loaded_from_disk_reports_its_events_on_the_global_stream}`). New,
+`crates/hs-room/tests/durable_state.rs`: a load of complete records equals a replay (state at
+every event, current state, timeline, extremities, relations; a fork, a redaction, a reaction)
+and feeds nothing; a pre-migration room migrates once and later loads feed and replay nothing;
+two writers replaying at once agree; the same on PostgreSQL (`HS_KV_TEST_POSTGRES_DSN`, `SKIP`
+without); a read copy catches up without feeding the store; another room's events are not
+held; the ignored measurement above.
+
+**Left**:
+
+- Still O(history) on a load: a read of every timeline row's fields, the `timeline` map, a read
+  of every outlier row's flags. Next would be a rejected-events index (so outliers need no
+  scan) and range reads of `Tables::timeline` in place of the map (RFC 0025, "What stays with
+  track 04").
+- `persist_outliers` and `place_history` still feed the store just after their own commit (the
+  RFC asked for `persist`); the next load repairs a crash between (`Feed::IfMissing`). Moving
+  them in needs the batch's ids resolved inside the transaction.
+- On PostgreSQL an ingestion holds its transaction's connection while the frames write in their
+  own (track 02's design; `ingest` did the same before this change): two connections per write
+  under a pool of 16.
+
+**Decisions made**: decision 0045 (with track 02). "Held" is the room's rows, not the store
+(above). A load trusts complete records and repairs, rather than verifying, what it finds
+missing.
+
 ## 2026-10-10 (branch `agent/room-memory`): a room actor holds a bounded window of its events, and says how much it holds
 
 **The evidence** (the owner's "memory leak problem"; the demo `myelin-hs-0`, image `sha-2d11ea2e`,

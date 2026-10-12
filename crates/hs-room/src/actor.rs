@@ -14,7 +14,7 @@ use hs_model::room_version::{self, RoomIdFormat, RoomVersionRules};
 use hs_state::api::StateStore;
 use hs_state::auth::{self, AuthEventRef, IncomingEvent};
 use hs_state::error::AuthError;
-use hs_state::kv_store::ProductionStateStore;
+use hs_state::kv_store::{NewEvent as StoreEvent, ProductionStateStore, StoreStats};
 use hs_state::state_fetch::FlatState;
 use ruma::{
     EventId, OwnedEventId, OwnedRoomId, OwnedUserId, RoomAliasId, RoomId, RoomVersionId, UserId,
@@ -71,6 +71,24 @@ pub const MAX_ID_ATTEMPTS_PER_SHARD: u32 = 16;
 /// How many events [`RoomActor::load`] replays between two releases of what the replay
 /// pinned (`working_set`): the bound on a load's transient memory, in events.
 const LOAD_PIN_RELEASE_EVERY: usize = 256;
+
+/// A state-store error met inside one of this actor's transactions, as the `hs_kv::KvError`
+/// the transaction must carry: a storage error as itself (so a conflict is retried), anything
+/// else parked in `parked` for the caller to report as [`RoomError::State`].
+fn park_state_error<E: std::error::Error + Send + Sync + 'static>(
+    e: hs_state::KvStoreError<E>,
+    parked: &std::cell::Cell<Option<String>>,
+) -> hs_kv::KvError {
+    match e {
+        hs_state::KvStoreError::Durable(hs_state::durable::DurableError::Kv(kv)) => kv,
+        other => {
+            parked.set(Some(other.to_string()));
+            hs_kv::KvError::Aborted(Box::new(std::io::Error::other(
+                "the state store refused the event",
+            )))
+        }
+    }
+}
 
 fn to_kv(e: hs_tables::keyspace::TableError) -> hs_kv::KvError {
     match e {
@@ -273,6 +291,46 @@ enum PowerLevelsAt<'a> {
     Unknown,
 }
 
+/// What [`RoomActor::load`] reads of a stored row ([`PersistedEvent`]) to take an ordinary
+/// timeline event in without decoding it: its flags, whether it was purged, and of its JSON
+/// only the type and `content["m.relates_to"]`. Everything else in the row is skipped by the
+/// parser, not built.
+#[derive(serde::Deserialize)]
+struct LoadRow {
+    flags: u8,
+    #[serde(default)]
+    purged: bool,
+    json: LoadRowJson,
+}
+
+/// The part of an event's JSON [`LoadRow`] reads.
+#[derive(serde::Deserialize)]
+struct LoadRowJson {
+    #[serde(rename = "type")]
+    event_type: String,
+    #[serde(default)]
+    content: LoadRowContent,
+}
+
+/// The part of an event's `content` [`LoadRow`] reads.
+#[derive(serde::Deserialize, Default)]
+struct LoadRowContent {
+    #[serde(rename = "m.relates_to", default)]
+    relates_to: Option<serde_json::Value>,
+}
+
+/// Whether a path absorbing stored events into an actor feeds them to the state store
+/// ([`RoomActor::must_feed`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Feed {
+    /// Every event: what a write does with the event it just stored, and what a load does for
+    /// a room whose state records are not yet complete (a replay; `needs_migration`).
+    Always,
+    /// Only an event the store has no record of: a load of a room whose records are complete,
+    /// and a read copy catching up with rows its owner wrote (and fed) already.
+    IfMissing,
+}
+
 struct StoreInputs {
     prev_sns: Vec<EventSn>,
     auth_sns: Vec<EventSn>,
@@ -387,6 +445,10 @@ pub struct RoomActor<B: KvBackend> {
     /// the actor's lifetime, so a room's memory grew with its history. Behind a `RefCell`
     /// because a read through `&self` touches it (a hit is a use).
     cache: RefCell<EventCache>,
+    /// Events [`RoomActor::known`] found this actor holds by reading their rows, remembered
+    /// (bounded, [`working_set::HELD_VERDICTS`]) so the events a room keeps naming are not read
+    /// again for it. Only yes is remembered: what an actor holds it holds for its lifetime.
+    held_verdicts: RefCell<hs_state::cache::LruCache<EventSn, ()>>,
     /// The events the current operation has touched, pinned so that reads can hand out
     /// `&Event` through `&self` while the cache behind them may evict; cleared by
     /// [`RoomActor::begin_operation`] (`working_set`).
@@ -782,6 +844,7 @@ impl<B: KvBackend> RoomActor<B> {
                 event_cache::CacheCapacity::default(),
             )),
             pins: elsa::FrozenMap::new(),
+            held_verdicts: RefCell::new(hs_state::cache::LruCache::new(working_set::HELD_VERDICTS)),
             room_id,
             room_version,
             rules,
@@ -849,11 +912,20 @@ impl<B: KvBackend> RoomActor<B> {
         ))
     }
 
-    /// Reconstructs a room actor by replaying its full persisted timeline. `Ok(None)` if the room
-    /// is not known to this store (was never created, or `room_id` is misspelled).
+    /// Reconstructs a room actor from the store. `Ok(None)` if the room is not known to this
+    /// store (was never created, or `room_id` is misspelled).
     ///
     /// This is `crate::registry::RoomRegistry`'s cold-load path: everything a `RoomActor` holds is
     /// derivable from the store (`PLAN.md` section 5.3), and this is the function that derives it.
+    ///
+    /// # The state store
+    /// Its records of the room are durable (`docs/rfcs/0025-a-room-load-that-does-not-replay-its-history.md`,
+    /// decision 0045). For a room whose records are complete -- created or migrated since
+    /// 2026-10-12, `KvStateStore::needs_migration` false -- the load reads the room's rows and
+    /// feeds the store nothing but an event it has no record of (`hs_room_state_records_repaired_total`);
+    /// ordinary timeline rows are not even decoded into events (`LoadRow`). A room from before
+    /// is replayed into the store once, as every load did until then, and marked
+    /// (`KvStateStore::mark_migrated`). `hs_room_load_seconds{state}` times both.
     ///
     /// # Outliers and explicit state
     /// A room this server's own user joined over federation
@@ -888,6 +960,7 @@ impl<B: KvBackend> RoomActor<B> {
         identity: HomeserverIdentity,
         room_id: &RoomId,
     ) -> Result<Option<Self>, RoomError> {
+        let started = std::time::Instant::now();
         let snapshot = backend.snapshot();
         let Some(room_sn) = tables.room_sn.lookup(&snapshot, room_id.as_bytes())? else {
             return Ok(None);
@@ -917,6 +990,21 @@ impl<B: KvBackend> RoomActor<B> {
         );
         actor.rewrites_seen = catch_up::read_rewrites(&actor.tables, &snapshot, room_sn)?;
 
+        // The state store's records of the room are durable (RFC 0025): complete for a room
+        // created or migrated since 2026-10-12, so the load feeds it only an event it has no
+        // record of (`Feed::IfMissing`, expected never). A room from before is replayed into it
+        // once, as every load did until then, and marked so that no later load does.
+        let replay = actor
+            .store
+            .needs_migration(room_id)
+            .map_err(|e| RoomError::State(e.to_string()))?;
+        let feed = if replay {
+            Feed::Always
+        } else {
+            Feed::IfMissing
+        };
+        let ingested_before = actor.store.stats().events_ingested;
+
         // Decodes one persisted row back into an `Event`, with the processing flags it was
         // stored with (`redacted`, `outlier`, ...) restored -- `Event::parse` starts every event
         // with no flags, and a flag is exactly the part of the record the JSON does not carry.
@@ -943,9 +1031,19 @@ impl<B: KvBackend> RoomActor<B> {
             B::Keyspace,
             crate::persist::OutlierKey,
         >::prefix(&(room_sn,));
+        // Only the rejected, and the outliers the store must be fed, are decoded: a room whose
+        // records are complete reads each outlier's bookkeeping fields and one state-store row.
         let mut outliers: Vec<(EventSn, Event)> = Vec::new();
         for item in actor.tables.outliers.range(&snapshot, outlier_spec) {
             let ((_, sn), _) = item?;
+            let Some(bytes) = events_table.get(&snapshot, &(sn,))? else {
+                continue;
+            };
+            let head: crate::persist::PersistedEventHead =
+                serde_json::from_slice(&bytes).map_err(|e| RoomError::Internal(e.to_string()))?;
+            if !EventFlags::from_byte(head.flags).is_rejected() && !actor.must_feed(sn, feed)? {
+                continue;
+            }
             if let Some(event) = read_event(sn)? {
                 outliers.push((sn, event));
             }
@@ -961,7 +1059,7 @@ impl<B: KvBackend> RoomActor<B> {
                 actor.absorb_rejected(sn, event);
                 continue;
             }
-            actor.absorb_loaded_outlier(sn, event)?;
+            actor.absorb_loaded_outlier(sn, event, feed)?;
         }
 
         // The explicit states timeline events were fed to the store with, if any.
@@ -998,11 +1096,23 @@ impl<B: KvBackend> RoomActor<B> {
             if index % LOAD_PIN_RELEASE_EVERY == 0 {
                 actor.begin_operation();
             }
+            // Most rows are not decoded into an `Event` at all: what the actor keeps of an
+            // ordinary event (its position, a soft-failed or purged flag, a relation, whether
+            // it is the create) is read from the row's fields ([`LoadRow`]). An event is decoded
+            // whole only to be fed to the state store, or for a redaction, whose own ID (a
+            // reference hash, in most room versions) the redactions index records.
+            let Some(bytes) = events_table.get(&snapshot, &(event_sn,))? else {
+                continue;
+            };
+            let row: LoadRow =
+                serde_json::from_slice(&bytes).map_err(|e| RoomError::Internal(e.to_string()))?;
+            let flags = EventFlags::from_byte(row.flags);
             // An outlier placed in the timeline by backfill
             // (`RoomActor::accept_backfilled_events`) was absorbed with the outliers above and
             // stays what it was; here it gets its position, and the state computed for it at
             // placement (its `state_snapshots` row) is what reads of the state after it see.
-            if actor.known(event_sn) {
+            // (Its row says so: a placed outlier keeps its outlier flag.)
+            if flags.is_outlier() || actor.rejected.contains(&event_sn) {
                 let state = match explicit_states.remove(&event_sn) {
                     Some(state) => state,
                     None => {
@@ -1017,15 +1127,31 @@ impl<B: KvBackend> RoomActor<B> {
                 actor.record_placed_outlier_state(event_sn, &state)?;
                 continue;
             }
+            let explicit_state = explicit_states.remove(&event_sn);
+            if row.json.event_type != "m.room.redaction" && !actor.must_feed(event_sn, feed)? {
+                actor.absorb_loaded_row(event_sn, room_pos, flags, &row);
+                continue;
+            }
             let Some((event, purged)) = read_event_row(event_sn)? else {
                 continue;
             };
-            let explicit_state = explicit_states.remove(&event_sn);
             if purged {
-                actor.absorb_purged_event(event_sn, event, room_pos, explicit_state.as_deref())?;
+                actor.absorb_purged_event(
+                    event_sn,
+                    event,
+                    room_pos,
+                    explicit_state.as_deref(),
+                    feed,
+                )?;
                 continue;
             }
-            actor.absorb_loaded_event(event_sn, event, room_pos, explicit_state.as_deref())?;
+            actor.absorb_loaded_event(
+                event_sn,
+                event,
+                room_pos,
+                explicit_state.as_deref(),
+                feed,
+            )?;
         }
 
         // An outlier held with a fetched state and no timeline position (`fetched_state`): the
@@ -1069,7 +1195,37 @@ impl<B: KvBackend> RoomActor<B> {
             gap_rows.push((top, record));
         }
         actor.restore_gaps(gap_rows);
+        if actor.create_sn.is_none() {
+            actor.create_sn = actor.current_create_sn()?;
+        }
+
+        let fed = actor.store.stats().events_ingested - ingested_before;
+        if replay {
+            actor
+                .store
+                .mark_migrated(room_id, fed)
+                .map_err(|e| RoomError::State(e.to_string()))?;
+        } else if fed > 0 {
+            crate::metrics::count_state_records_repaired(fed);
+            tracing::warn!(
+                room_id = %room_id,
+                events = fed,
+                "the state store had no record of events this room holds, and was fed them: a \
+                 write that stopped between an event's row and its state, or a writer from \
+                 before the records were written with the row"
+            );
+        }
+        actor.store.log_open_summary(room_id);
         actor.warm_cache();
+        crate::metrics::observe_room_load(started.elapsed(), replay);
+        tracing::debug!(
+            room_id = %room_id,
+            timeline = actor.timeline.len(),
+            replayed = replay,
+            state_records_fed = fed,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "loaded a room"
+        );
         if !actor.repaired_outlier_states.is_empty() {
             let repaired = actor.repaired_outlier_states.len();
             crate::metrics::count_outlier_state_rows_repaired(repaired);
@@ -1161,8 +1317,10 @@ impl<B: KvBackend> RoomActor<B> {
     }
 
     /// Ingests `event` (already durably persisted under `event_sn`) into the room's production
-    /// state store, decoding its own `auth_events`/`prev_events` fields back into `EventSn`s via
-    /// `self.event_id_index` (`crate::pipeline::decode_event_ids`) -- every ancestor an event
+    /// state store in a transaction of its own, decoding its own `auth_events`/`prev_events`
+    /// fields back into `EventSn`s via [`RoomActor::sn_of`] (`crate::pipeline::decode_event_ids`)
+    /// -- for the paths that feed it after their own commit (a load, a catch-up, placed
+    /// history; [`RoomActor::persist`] feeds it inside its transaction) -- every ancestor an event
     /// cites is already known to this actor by the time it is persisted or replayed, whether
     /// locally originated or loaded from the store, so this never needs a network round trip.
     /// Returns the decoded `prev_events` `EventSn`s, which `RoomActor::persist` also needs for
@@ -1333,6 +1491,7 @@ impl<B: KvBackend> RoomActor<B> {
         event: Event,
         room_pos: i64,
         explicit_state: Option<&[EventSn]>,
+        feed: Feed,
     ) -> Result<(), RoomError> {
         if event.header().flags.is_soft_failed() {
             self.soft_failed.insert(event_sn);
@@ -1341,12 +1500,91 @@ impl<B: KvBackend> RoomActor<B> {
         }
         self.timeline.insert(room_pos, event_sn);
         self.next_room_pos = self.next_room_pos.max(room_pos + 1);
-        match explicit_state {
-            Some(state) => self.feed_store_with_state(&event, event_sn, state)?,
-            None => self.feed_store(&event, event_sn)?,
-        };
+        self.note_create(&event, event_sn);
+        if self.must_feed(event_sn, feed)? {
+            match explicit_state {
+                Some(state) => self.feed_store_with_state(&event, event_sn, state)?,
+                None => self.feed_store(&event, event_sn)?,
+            };
+        }
         self.note_redaction(&event);
         Ok(())
+    }
+
+    /// [`RoomActor::absorb_loaded_event`] (or [`RoomActor::absorb_purged_event`]) for a row the
+    /// state store already has a record of and that is not a redaction: the same bookkeeping,
+    /// from the row's fields, with no `Event` decoded.
+    fn absorb_loaded_row(
+        &mut self,
+        event_sn: EventSn,
+        room_pos: i64,
+        flags: EventFlags,
+        row: &LoadRow,
+    ) {
+        self.next_room_pos = self.next_room_pos.max(room_pos + 1);
+        if row.json.event_type == "m.room.create" && self.create_sn.is_none() {
+            self.create_sn = Some(event_sn);
+        }
+        if row.purged {
+            self.purged.insert(event_sn);
+            return;
+        }
+        if flags.is_soft_failed() {
+            self.soft_failed.insert(event_sn);
+        } else if let Some(relates_to) = &row.json.content.relates_to {
+            let content = serde_json::json!({ "m.relates_to": relates_to });
+            if let Some(rel) = relations::relation_of(&content) {
+                self.relations_by_target
+                    .entry(rel.target)
+                    .or_default()
+                    .push(event_sn);
+            }
+        }
+        self.timeline.insert(room_pos, event_sn);
+    }
+
+    /// Whether an event being absorbed under `feed` is to be fed to the state store: always
+    /// in a replay, otherwise only when the store has no record of it.
+    ///
+    /// # Errors
+    /// [`RoomError::State`] if the store cannot be read.
+    fn must_feed(&self, sn: EventSn, feed: Feed) -> Result<bool, RoomError> {
+        match feed {
+            Feed::Always => Ok(true),
+            Feed::IfMissing => self
+                .store
+                .has_event(sn)
+                .map(|has| !has)
+                .map_err(|e| RoomError::State(e.to_string())),
+        }
+    }
+
+    /// The room's `m.room.create` in its current state, for [`RoomActor::create_sn`] when a
+    /// load fed the store nothing that named it (a room joined over federation holds its
+    /// create as an outlier, and a load whose records are complete decodes no outlier).
+    ///
+    /// # Errors
+    /// [`RoomError::State`] if the state store fails.
+    fn current_create_sn(&self) -> Result<Option<EventSn>, RoomError> {
+        if self.forward_extremities.is_empty() {
+            return Ok(None);
+        }
+        let view = self.current_view()?;
+        let key = self
+            .store
+            .intern_state_key("m.room.create", "")
+            .map_err(|e| RoomError::State(e.to_string()))?;
+        self.store
+            .get(view.root, key)
+            .map_err(|e| RoomError::State(e.to_string()))
+    }
+
+    /// What this actor's state store has read and written since it was opened: on a room just
+    /// loaded, `events_ingested` is what the load fed it (0 for a room whose records are
+    /// complete) and `events_replayed` what it fed again.
+    #[must_use]
+    pub fn state_store_stats(&self) -> StoreStats {
+        self.store.stats()
     }
 
     /// Absorbs one persisted outlier on load (or right after [`RoomActor::persist_outliers`]
@@ -1354,8 +1592,16 @@ impl<B: KvBackend> RoomActor<B> {
     /// a forward extremity, never published. Relations are not indexed for outliers either:
     /// every outlier is a state event (a state snapshot and its auth chain contain nothing
     /// else), and `/relations` is a timeline read.
-    fn absorb_loaded_outlier(&mut self, event_sn: EventSn, event: Event) -> Result<(), RoomError> {
-        self.feed_store_outlier(&event, event_sn)?;
+    fn absorb_loaded_outlier(
+        &mut self,
+        event_sn: EventSn,
+        event: Event,
+        feed: Feed,
+    ) -> Result<(), RoomError> {
+        self.note_create(&event, event_sn);
+        if self.must_feed(event_sn, feed)? {
+            self.feed_store_outlier(&event, event_sn)?;
+        }
         Ok(())
     }
 
@@ -2364,6 +2610,17 @@ impl<B: KvBackend> RoomActor<B> {
                 Some(encode_event_sns(snapshot))
             }
         };
+        // What the state store is fed, inside the transaction below: the event's own record and
+        // the state after it commit with its row, or neither does (RFC 0025 item 5; until
+        // 2026-10-12 the store was fed after the commit, and a crash between left a row whose
+        // state was never recorded).
+        let inputs = self.store_inputs(&event);
+        let explicit_state: Option<&[EventSn]> = match &kind {
+            PersistKind::Ordinary | PersistKind::NewRoom => None,
+            PersistKind::RemoteJoin { snapshot } | PersistKind::AfterFetchedState { snapshot } => {
+                Some(snapshot.as_slice())
+            }
+        };
         let must_be_new = matches!(kind, PersistKind::NewRoom);
         // A membership another server made the handshake for (`send_join`, `send_leave`,
         // `send_knock`) is that server's to send on, as Synapse's `proactively_send = False`
@@ -2384,6 +2641,9 @@ impl<B: KvBackend> RoomActor<B> {
         // already taken: the copy is behind the store (see the check below).
         let stale_copy: std::cell::Cell<Option<(i64, Option<EventSn>)>> =
             std::cell::Cell::new(None);
+        // Set from inside the closure when the state store refuses the event (an explicit
+        // state naming an event it does not hold, a representation failure).
+        let state_failure: std::cell::Cell<Option<String>> = std::cell::Cell::new(None);
         let event_sn = transact(&self.backend, TransactConfig::default(), |txn| {
             if must_be_new
                 && self
@@ -2484,6 +2744,31 @@ impl<B: KvBackend> RoomActor<B> {
                         .map_err(to_kv)?;
                 }
             }
+            // The state store's records of the event, in this same transaction.
+            let store_event = StoreEvent {
+                event: event_sn,
+                event_id: event.event_id().to_owned(),
+                room_id: self.room_id.clone(),
+                event_type: &event.header().event_type,
+                state_key: event.header().state_key.as_deref(),
+                sender: event.header().sender.clone(),
+                content: inputs.content.clone(),
+                depth: event.header().depth,
+                origin_server_ts: event.header().origin_server_ts,
+                auth_events: &inputs.auth_sns,
+                prev_events: &inputs.prev_sns,
+                only_prev_event_is_room_create: inputs.only_prev_is_create,
+            };
+            self.store
+                .ingest_in(txn, &store_event, explicit_state)
+                .map_err(|e| park_state_error(e, &state_failure))?;
+            // A room's first timeline event creates it (here, or by a join over federation):
+            // its state records are complete from the start, and no load replays it.
+            if room_meta_bytes.is_some() {
+                self.store
+                    .mark_migrated_in(txn, &self.room_id)
+                    .map_err(|e| park_state_error(e, &state_failure))?;
+            }
             // The belt-and-braces cluster-fencing check (`docs/status/03-cluster.md` item 4), as
             // the last read before this closure returns `Ok`: see `crate::fencing`'s module docs
             // for why this must run *inside* this same transaction rather than before it. A no-op
@@ -2495,28 +2780,13 @@ impl<B: KvBackend> RoomActor<B> {
         .map_err(|e| match fence_failure.take() {
             Some(msg) => RoomError::Fenced(msg),
             None if id_taken.get() => RoomError::RoomAlreadyExists(self.room_id.to_string()),
-            None => match stale_copy.take() {
-                Some((room_pos, held)) => self.stale_copy_error(room_pos, held),
-                None => RoomError::from(e),
+            None => match (stale_copy.take(), state_failure.take()) {
+                (Some((room_pos, held)), _) => self.stale_copy_error(room_pos, held),
+                (None, Some(msg)) => RoomError::State(msg),
+                (None, None) => RoomError::from(e),
             },
         })?;
-
-        // Feed the production state store. This runs as its own write after the room's own KV
-        // transaction above commits, not inside it: `hs_state::api::StateStore`'s methods take
-        // `&self` with no externally-supplied transaction handle, so this crate cannot thread the
-        // two into one atomic commit with the interface as given. A crash strictly between the two
-        // could leave a persisted event whose state-store ingestion did not happen -- a real,
-        // narrow gap this pass's wiring introduces (there was nothing to compare against before:
-        // the flat map it replaces had no separate store to fall out of sync with). Recorded in
-        // this crate's status file rather than silently accepted.
-        match &kind {
-            PersistKind::Ordinary | PersistKind::NewRoom => {
-                self.feed_store(&event, event_sn)?;
-            }
-            PersistKind::RemoteJoin { snapshot } | PersistKind::AfterFetchedState { snapshot } => {
-                self.feed_store_with_state(&event, event_sn, snapshot)?;
-            }
-        }
+        self.note_create(&event, event_sn);
 
         let mut changed_state_keys = Vec::new();
         let mut membership_deltas = Vec::new();
@@ -2752,7 +3022,7 @@ impl<B: KvBackend> RoomActor<B> {
             })?;
 
             for (event, sn) in chunk.iter().zip(sns) {
-                self.absorb_loaded_outlier(sn, event.clone())?;
+                self.absorb_loaded_outlier(sn, event.clone(), Feed::Always)?;
             }
         }
         Ok(total)

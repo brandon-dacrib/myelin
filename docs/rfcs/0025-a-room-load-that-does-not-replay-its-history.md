@@ -1,12 +1,12 @@
 # 0025. A room load that does not replay its history: the state store's per-event records must be durable
 
-Status: **implemented in `hs-state`** (branch `agent/state-load`, 2026-10-10; decision 0045 is
-left to write: a root per event over the frames' delta chains, not Synapse-style state groups).
-The room actor's half (its load reading only current state, and feeding the store inside its own
-transaction) is track 04's; the seams are in place. Originally proposed 2026-10-10 by track 04
-on branch `agent/room-memory`. Owner of the change: track 02 (state and model). Affects:
-`crates/hs-state/src/kv_store.rs` (`KvStateStore`), `crates/hs-state/src/durable.rs` (new),
-then `crates/hs-room/src/actor.rs` (`RoomActor::load`).
+Status: **implemented** (branch `agent/state-load`: `hs-state` 2026-10-10, the room actor's
+half 2026-10-12; decision 0045: a root per event over the frames' delta chains, not
+Synapse-style state groups). Originally proposed 2026-10-10 by track 04 on branch
+`agent/room-memory`. Owner of the change: track 02 (state and model), with track 04 for
+`hs-room`. Affects: `crates/hs-state/src/kv_store.rs` (`KvStateStore`),
+`crates/hs-state/src/durable.rs` (new), `crates/hs-room/src/actor.rs` (`RoomActor::load`,
+`persist_with`), `crates/hs-room/src/actor/working_set.rs` (`RoomActor::known`).
 
 ## What landed (track 02, 2026-10-10, `agent/state-load`)
 
@@ -39,6 +39,24 @@ call); `KvStateStore::log_open_summary(room_id)` logs replayed-versus-read count
 more than 10,000 events. Measured (`crates/hs-state/tests/open_memory.rs`, release, 50,000
 events on Fjall): a replay of the room into the store 0.60 s and +55 MiB; an open that reads
 current state 0.00 s and +0 MiB, zero records read, zero events ingested.
+
+## What landed (track 04, 2026-10-12, `agent/state-load`)
+
+- `RoomActor::load` asks `needs_migration`: a room whose records are complete feeds the store
+  only an event it has no record of (expected never; `hs_room_state_records_repaired_total`); a
+  room from before is replayed once and `mark_migrated`. `log_open_summary` ends the load.
+  Ordinary timeline rows are read for their fields, not decoded into events.
+- `RoomActor::persist_with` feeds the store with `ingest_in` inside its own transaction, and a
+  room's first timeline event marks it with `mark_migrated_in` there (item 5).
+- "This actor holds it" (item 6) is not `has_event`: the store is shared by every actor and
+  replica, so it says what some writer ingested. `RoomActor::known` reads the room's own row
+  (its room, flags and position against the actor's timeline), with a bounded cache of yes
+  verdicts.
+- A read copy's catch-up feeds the store nothing: the owner did, in the row's transaction.
+- Measured: 50,000 messages on Fjall load in 0.16-0.20 s against 3.0-3.5 s for the replay;
+  `hs_room_load_seconds{state}` shows it in production.
+- Still to do from "What stays with track 04": the `timeline` map and a read of each timeline
+  and outlier row on load; `persist_outliers` and `place_history` feeding after their commit.
 
 ## The original proposal
 

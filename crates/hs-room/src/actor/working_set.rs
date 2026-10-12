@@ -18,9 +18,13 @@
 //!    stored with, and decorated the way a load used to decorate it
 //!    ([`RoomActor::decorate_from_store`]).
 //!
-//! An event is "held" by the room when the state store knows it or it is held as rejected
-//! ([`RoomActor::known`]); a short ID the interning table answers for some other room's event
-//! is not served. The whole-history `event_id_index` the actor used to carry is gone: an ID is
+//! An event is "held" by this actor when its stored row says it is this room's and this actor
+//! has taken it in: at the timeline position the row names, as an outlier, purged, or rejected
+//! ([`RoomActor::known`]). Not "the state store knows it": since 2026-10-12 the state store's
+//! records are durable and shared by every actor and replica on the backend
+//! (`docs/rfcs/0025-a-room-load-that-does-not-replay-its-history.md`), so they say what some
+//! writer ingested, in whichever room, not what this copy has absorbed. A short ID the
+//! interning table answers for some other room's event is not served. The whole-history `event_id_index` the actor used to carry is gone: an ID is
 //! resolved through the cached events first and the interning table otherwise
 //! ([`RoomActor::sn_of`], `hs_room_event_id_lookups_total`).
 
@@ -30,14 +34,19 @@ use hs_kv::KvBackend;
 use hs_model::Event;
 use hs_model::event::EventFlags;
 use hs_model::ids::EventSn;
-use hs_state::api::StateStore;
 use ruma::EventId;
 
 use super::RoomActor;
 use super::event_cache::CacheCapacity;
 use super::redactions::{redacted_by, with_redaction};
 use crate::error::RoomError;
-use crate::persist::PersistedEvent;
+use crate::persist::{PersistedEvent, PersistedEventHead};
+
+/// How many "this actor holds it" verdicts [`RoomActor::known`] remembers per actor (an
+/// `EventSn` each, so about 100 KiB at most): the events a room's sends and reads keep naming --
+/// its extremities, its state, the recent timeline -- are answered without a read of their
+/// rows.
+pub(crate) const HELD_VERDICTS: usize = 4096;
 use crate::pipeline::EventLookup;
 
 impl<B: KvBackend> RoomActor<B> {
@@ -105,10 +114,66 @@ impl<B: KvBackend> RoomActor<B> {
         Some(self.pins.insert(sn, event))
     }
 
-    /// Whether this room holds the event `sn`: fed to its state store, or held as rejected.
-    /// What used to be "is in `events`".
+    /// Whether this actor holds the event `sn`. What used to be "is in `events`", and until
+    /// 2026-10-12 "its state store knows it" -- true then because each actor fed a store of its
+    /// own; now the store is durable and shared, and knows every room's events and a read
+    /// copy's owner's newer ones.
+    ///
+    /// Held is: rejected or purged here (both in memory, both few), resident (pinned or
+    /// cached: only held events are), or a stored row of this room that this actor has taken
+    /// in -- an outlier, or a timeline event at the position its row names
+    /// ([`RoomActor::row_is_held`]). The last costs a point read of the row (its bookkeeping
+    /// fields only, [`PersistedEventHead`]); a yes is remembered in a bounded cache
+    /// ([`HELD_VERDICTS`]), since an event this actor holds stays held for its lifetime.
     pub(crate) fn known(&self, sn: EventSn) -> bool {
-        self.rejected.contains(&sn) || self.store.state_at(sn).is_ok()
+        if self.rejected.contains(&sn)
+            || self.purged.contains(&sn)
+            || self.pins.get(&sn).is_some()
+            || self.cache.borrow().contains(sn)
+            || self.held_verdicts.borrow_mut().get(&sn).is_some()
+        {
+            return true;
+        }
+        let snapshot = self.backend.snapshot();
+        let head = match self.tables.events.get(&snapshot, &(sn,)) {
+            Ok(Some(bytes)) => serde_json::from_slice::<PersistedEventHead>(&bytes),
+            Ok(None) => return false,
+            Err(error) => {
+                tracing::warn!(room_id = %self.room_id, event_sn = %sn, %error, "could not read an event row");
+                return false;
+            }
+        };
+        match head {
+            Ok(head) => {
+                let held = self.row_is_held(sn, &head.room_id, head.flags, head.room_pos);
+                if held {
+                    self.held_verdicts.borrow_mut().insert(sn, ());
+                }
+                held
+            }
+            Err(error) => {
+                tracing::warn!(room_id = %self.room_id, event_sn = %sn, %error, "corrupt event row");
+                false
+            }
+        }
+    }
+
+    /// Whether a stored row of `sn` -- of `room_id`, with `flags` and `room_pos` -- is one this
+    /// actor holds, beyond the in-memory sets [`RoomActor::known`] checks first: this room's,
+    /// not rejected (a rejected event is held only once absorbed, `RoomActor::rejected`), and
+    /// either an outlier (absorbed with the room's outliers by the load; an outlier the owner
+    /// wrote since bumps the room's rewrite counter, and a copy reloads on its next catch-up)
+    /// or at its position in this actor's timeline (so a copy does not hold the owner's rows
+    /// past its head, nor a row another writer put at a position this copy holds otherwise).
+    fn row_is_held(&self, sn: EventSn, room_id: &str, flags: u8, room_pos: Option<i64>) -> bool {
+        if room_id != self.room_id.as_str() {
+            return false;
+        }
+        let flags = EventFlags::from_byte(flags);
+        if flags.is_rejected() {
+            return false;
+        }
+        flags.is_outlier() || room_pos.is_some_and(|pos| self.timeline.get(&pos) == Some(&sn))
     }
 
     /// The short ID of `event_id`, if this room holds the event: from a cached event's ID, or
@@ -209,25 +274,47 @@ impl<B: KvBackend> RoomActor<B> {
         &self,
         sn: EventSn,
     ) -> Result<Option<(Event, Option<i64>)>, RoomError> {
+        Ok(self
+            .read_stored_row(sn)?
+            .map(|(event, persisted)| (event, persisted.room_pos)))
+    }
+
+    /// [`RoomActor::read_stored_event`] with the whole row (its `json` left in place of the
+    /// event's, which is moved into the [`Event`]).
+    fn read_stored_row(&self, sn: EventSn) -> Result<Option<(Event, PersistedEvent)>, RoomError> {
         let snapshot = self.backend.snapshot();
         let Some(bytes) = self.tables.events.get(&snapshot, &(sn,))? else {
             return Ok(None);
         };
-        let persisted: PersistedEvent =
+        let mut persisted: PersistedEvent =
             serde_json::from_slice(&bytes).map_err(|e| RoomError::Internal(e.to_string()))?;
-        let mut event = Event::parse(&persisted.json, self.room_version.clone())?;
+        let json = std::mem::take(&mut persisted.json);
+        let mut event = Event::parse(&json, self.room_version.clone())?;
         *event.flags_mut() = EventFlags::from_byte(persisted.flags);
-        Ok(Some((event, persisted.room_pos)))
+        Ok(Some((event, persisted)))
     }
 
     fn fetch_from_store(&self, sn: EventSn) -> Option<(Arc<Event>, Option<i64>)> {
-        if !self.known(sn) {
-            return None;
-        }
         crate::metrics::count_event_cache_miss();
-        match self.read_stored_event(sn) {
-            Ok(Some((event, room_pos))) => {
-                Some((Arc::new(self.decorate_from_store(event)), room_pos))
+        match self.read_stored_row(sn) {
+            Ok(Some((event, persisted))) => {
+                // One read answers both whether the room holds the event and what it is.
+                let held = self.rejected.contains(&sn)
+                    || self.purged.contains(&sn)
+                    || self.row_is_held(
+                        sn,
+                        &persisted.room_id,
+                        persisted.flags,
+                        persisted.room_pos,
+                    );
+                if !held {
+                    return None;
+                }
+                self.held_verdicts.borrow_mut().insert(sn, ());
+                Some((
+                    Arc::new(self.decorate_from_store(event)),
+                    persisted.room_pos,
+                ))
             }
             Ok(None) => None,
             Err(error) => {
