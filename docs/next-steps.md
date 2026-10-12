@@ -74,9 +74,17 @@ server's log has one `moved the bridge instance's double puppeting` line per ins
    (status 11, 2026-10-12, night). After the roll that also carries
    `agent/double-puppet-registration`: download the files again (they have no
    `login_shared_secret` any more: that bridge cannot double puppet without the claim that
-   floods it, decision 0046), `./run.sh`, Full Disk Access, a message both ways; then an
-   `e2e-real` case.
-5. **The WARN noise of `event failed the authentication check`: fixed**
+   floods it, decision 0046), `./run.sh`, Full Disk Access, a message both ways; then
+   `./run.sh install` to start it at login (`c59c6da9`, `docs/bridges/imessage.md`, "Starting it
+   at login"; Full Disk Access then goes to `mautrix-imessage` itself); then an `e2e-real` case.
+   **Never test a bridge on this Mac with the instance's port (29331) or tokens**: the demo
+   delivers to this Mac, and a test copy takes its real transactions (status 11, 2026-10-12,
+   night).
+5. **A flaky cluster test**: `hs-cli/tests/cluster_rejoin.rs::a_replica_that_gets_a_room_back_writes_from_the_store_not_its_old_copy`
+   failed the merge queue's full gate once on 2026-10-12 (`agent/imessage-launchagent`, which
+   touches only `hs-admin`'s `run.sh`). It passed 3 of 3 runs alone (16–30 s) and the re-gate
+   passed. Look at it if it fails again: it may be timing under full-workspace load.
+6. **The WARN noise of `event failed the authentication check`: fixed**
    (`agent/state-res-log-noise`, status 12, 2026-10-12, evening). The default filter holds
    `ruma_state_res` to `error`. After the roll, the demo's log should have no `ruma_state_res`
    lines.
