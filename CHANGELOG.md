@@ -25,6 +25,18 @@ carries the generated notes for that merge.
   now. The iMessage config's double puppeting says `appservice`, the only form this build
   knows, and `run.sh` downloads the build again when `libolm.3.dylib` is missing. Verified with
   the real bridge build against the server.
+- **Bridges are no longer flooded with rooms they are not in.** A bridge that double puppets
+  claimed its owner in its own registration, so the server sent it every event of every room the
+  owner was in, encrypted chats its bot was never in among them; a mautrix bridge waited 25
+  seconds on keys for each, one at a time, and five of the demo's six bridges stopped taking
+  transactions. Double puppeting is now a registration of its own with no URL, one per bridge
+  (claiming its owner alone), whose token is in the bridge's config; the bridge's own
+  registration claims only its ghosts and bot. Existing bridges move by themselves on upgrade:
+  their registration is patched in place and their pod restarts once, with every secret it had.
+  Delivery errors now say why (`operation timed out`, `connection refused`). The iMessage
+  bridge no longer double puppets: its build only knows the form that needs the flooding claim.
+  Verified with the real binary, a stand-in bridge and the real WhatsApp and Signal bridges
+  (decision 0045).
 
 - **A re-created bridge's bot can cross-sign its devices again.** The server checked every
   signature on a device being signed, including one by a self-signing key the bot no longer

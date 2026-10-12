@@ -1,8 +1,11 @@
 # Status: track 11, appservices and bridges
 
-Last updated: 2026-10-12, night (the iMessage bridge starts on the owner's Mac: `GET /login`
-lists the appservice login, the config's double puppeting says `appservice`, and `run.sh` fetches
-a missing `libolm`; below); before that 2026-10-12, evening (a device signed by a replaced self-signing key can be signed
+Last updated: 2026-10-12, late night (double puppeting is a registration of its own with no url,
+so a bridge is no longer sent every room its owner is in; decision 0045; mautrix-imessage stops
+double puppeting; below); before that 2026-10-12, night (the iMessage bridge starts on the
+owner's Mac: `GET /login` lists the appservice login, the config's double puppeting says
+`appservice`, and `run.sh` fetches a missing `libolm`; below); before that 2026-10-12, evening
+(a device signed by a replaced self-signing key can be signed
 by the new one, so the re-created WhatsApp bot's devices are signed; below); before that 2026-10-12, later (a bridge device made without keys is told it has none, so
 mautrix-discord uploads its keys and can decrypt; below); before that 2026-10-12 (the manager publishes the bot's self-signing key again when the server
 does not hold it, and a refused signature backs off; below); before that 2026-10-11, later (iMessage is offered: a program for the person's Mac, with its
@@ -34,6 +37,112 @@ manager) and an instance's Kubernetes objects say whose bridge they are; before 
 (ephemeral, to-device and device-list delivery); before that 2026-09-27 (RFC 0017 run against
 the real binary), 2026-09-27 (the bridge manager) and 2026-09-25.
 
+## Session 2026-10-12, late night (branch `agent/double-puppet-registration`): double puppeting is a registration of its own, and the bridges are not flooded
+
+**What was wrong** (diagnosed on the demo the same day). Five of six bridges (signal, whatsapp,
+meta, linkedin, discord) took no transactions and were "Degraded"; their pods were fine. Each
+instance's own registration claimed its owner non-exclusively (the wizard's server-wide render
+claimed `@.*`) so that it could double puppet with its own token. Under the spec's interest rules
+that made every room the owner is in the bridge's business: each was sent every event of every
+such room, encrypted chats its bot is not in among them, and mautrix waited 25 s on keys for each
+one, serially, until its transaction handler blocked and the server's 30 s timeout fired. The
+server's log said only `error sending request for url (...)`. Decision 0045 has the numbers.
+
+**Done.**
+
+- `hs-admin::bridge_types`: an instance's registration (`render_instance`) and the wizard's
+  (`render`) claim the bridge's ghosts and bot only. `double_puppet_registration` /
+  `DoublePuppetRegistration` build the separate registration: `url: null`, one non-exclusive
+  users rule, tokens of its own, `io.myelin.double_puppet_for` (`DOUBLE_PUPPET_FOR_KEY`), id
+  `<appservice>-doublepuppet` (`double_puppet_id`). `InstanceSpec::double_puppet`
+  (`DoublePuppetTokens`) gives an instance's tokens; `InstanceRender::double_puppets` says one is
+  wanted and `double_puppet_registration` is it (claiming the owner alone). The config's secret
+  is that registration's token as `as_token:<token>` in `double_puppet.secrets` (bridgev2) and
+  `bridge.login_shared_secret_map` (mautrix-discord); without tokens, no double puppeting is
+  written at all. **mautrix-imessage no longer double puppets**: its build knows only
+  `login_shared_secret: appservice` (`b26fce40`, the same day), an appservice login with its own
+  token, which needs its own registration to claim the owner, the very claim that floods; it
+  takes `as_token:` as an HMAC secret. Its config has no `login_shared_secret`; the manager
+  still starts its owner's chat as the owner with the double-puppeting registration. The cost:
+  what the owner sends from their own Apple devices is not sent as them in Matrix. It comes back
+  when that bridge takes an `as_token:` secret. `user_regex` is the exact-match pattern for a user.
+  `BridgeTypeRenderResult.double_puppet_registration{,_yaml}` (OpenAPI 0.1.16) for the wizard,
+  with `@.*:<server>`.
+- `hs-bridges::manager`: `InstanceRow::double_puppet` (`DoublePuppetRow`: id, tokens,
+  `registered_fingerprint`). `settle_double_puppet`, run on every step before
+  `settle_registration`: mints and registers the registration once per change of what it
+  claims (a free id: `-doublepuppet`, `-doublepuppet-2`, ..., reusing one left behind for the
+  same instance), removes it when double puppeting is switched off, tells an instance run
+  elsewhere to fetch its files. The owner's chat is started, and a repaired chat's re-invite
+  sent, with that token (`owner_token`). Removing an instance removes both registrations.
+- **Migration**: an existing instance's next step registers its double puppeting, patches its
+  own registration in place (same id and tokens; the existing fingerprint mechanism) to stop
+  claiming the owner, and rolls its pod once through the deployment fingerprint with the new
+  token and every secret it had (pickle key, provisioning secret, tokens: decision 0036). One INFO
+  line per instance: `moved the bridge instance's double puppeting to a registration of its own`
+  (`appservice`, `double_puppet_appservice`, `owner`, `deploy_name`).
+- `hs-appservice`: `error::error_chain` (the error and every cause, each once). The transaction
+  sender, ping, user/alias queries and the provisioning call use it, so the delivery log and
+  `last_error` say `error sending request for url (...): operation timed out` (or `connection
+  refused`, `dns error: ...`). `HttpTransactionSender::with_timeout`. A ping of a url-less
+  registration answers `M_URL_NOT_SET` and records nothing; `Registry::health` of a url-less,
+  unpaused registration is `unknown` whatever was recorded.
+- Web: a `-doublepuppet` registration with no url is "Built in" ("Double puppeting for Signal
+  Brandon", "Built in: lets the bridge post as its owner; the server sends it nothing"); any other
+  url-less registration is "Sends nothing"; neither is under Attention or counted in the health
+  chips. The wizard previews and creates the double-puppeting registration after the bridge's own
+  (its own idempotency key; a failure says the bridge is registered and its double puppeting is
+  not). Mocks follow.
+- Docs: decision 0045, `docs/bridges/mautrix.md` ("2026-10-12": how it works, what the roll does,
+  the post-roll checks), CHANGELOG, `docs/next-steps.md`.
+
+**Verified.**
+
+- `cargo test -p hs-appservice`: `pump::tests::a_bridge_is_not_sent_a_room_none_of_its_users_is_in_whoever_double_puppets`
+  (the old shape hears the owner's private chat, the new one and its url-less registration do
+  not), `scheduler::tests::a_bridge_that_never_answers_is_reported_as_timed_out` (a real listener
+  that accepts and never answers: the drain's error and `last_error` say `timed out`),
+  `error::tests::*` (a refused connection says `refused`), `ping::tests::null_url_ping_is_a_distinct_failure`.
+- `cargo test -p hs-admin --lib bridge_types`: the registrations and configs of all three layouts,
+  and `an_instance_without_its_double_puppeting_tokens_writes_no_double_puppeting`.
+- `cargo test -p hs-bridges`: `a_changed_double_puppeting_adds_or_removes_its_registration_once_and_rolls_it`,
+  `an_instance_from_before_moves_its_double_puppeting_once_and_keeps_its_secrets` (the demo's
+  case: same id and tokens, same pickle key and provisioning secret in the rolled config, one
+  apply, one INFO line), `removing_an_instance_removes_its_double_puppeting_too`.
+- Real binary (`cargo test -p hs-cli --test bridge_offerings`, six tests):
+  `a_bridge_is_sent_nothing_of_a_room_none_of_its_users_is_in_and_double_puppets_apart`: alice's
+  instance, a stand-in bridge; alice and bob exchange `m.room.encrypted` events in a room of
+  their own, then alice writes in her chat with the bot; the bridge is sent her line and nothing
+  of the private room; the `-doublepuppet` registration has no url, health `unknown` even after a
+  ping, nothing queued; its token is `alice` on `whoami?user_id=` and refused for bob; the
+  bridge's own token is refused as alice and accepted as its bot. The other five tests were
+  updated for the new shape (no owner claim, the registration listed, removed with the instance,
+  switched off with the option).
+- Real mautrix: `cargo test -p hs-bridge-conformance --test real_mautrix_login` (Docker,
+  `dock.mau.dev/mautrix/{whatsapp,signal}:v0.2609.0`, the real `hs` binary): 5 passed in 93 s.
+  The bridges start with the new config, the manager starts the owner's chat as them with the
+  double-puppeting token and repairs a bot-started chat with it (the `repaired` case no longer
+  patches a claim on alice into the bridge's registration; it asserts there is none), and
+  `login qr` gets a QR code in WhatsApp and Signal. The bridge's own use of the secret (after a
+  network sign-in) needs a phone and is not covered.
+- Web: `npm run check` and `npm run test:e2e` (73 flows) pass; `add-bridge.spec.ts` sees the
+  double-puppeting preview on Review and the "Built in" row after creating.
+
+**Next.** Roll the demo (the coordinator; the post-roll checks are in `docs/bridges/mautrix.md`
+and `docs/next-steps.md`).
+
+**Decisions made.** Decision 0045: one double-puppeting registration per instance (claiming its
+owner alone), not one shared `@.*` registration; a url-less registration is never a fault.
+
+**Interfaces provided.** `hs_admin::bridge_types::{double_puppet_registration,
+DoublePuppetRegistration, DoublePuppetTokens, double_puppet_id, user_regex,
+DOUBLE_PUPPET_FOR_KEY, DOUBLE_PUPPET_ID_SUFFIX}`, `InstanceSpec::double_puppet`,
+`InstanceRender::{double_puppets, double_puppet_registration}`,
+`BridgeTypeRenderResult::double_puppet_registration{,_yaml}` (OpenAPI 0.1.16),
+`hs_appservice::error::error_chain`, `HttpTransactionSender::with_timeout`.
+
+**Shared dependencies added.** None.
+
 ## Session 2026-10-12, night (branch `agent/as-login-flow`): the iMessage bridge starts on the owner's Mac
 
 The owner ran `run.sh` on their Mac, which is also the machine this session runs on. It hit
@@ -60,7 +169,10 @@ Contacts access, so nothing was sent anywhere. But the real bridge will not get 
 The second run used its own port and tokens.
 
 **Next on the Mac**, after the roll that carries fix 2: set `login_shared_secret: appservice`
-in the Mac's `config.yaml` (or download the files again), then `./run.sh`.
+in the Mac's `config.yaml` (or download the files again), then `./run.sh`. **Superseded** by
+`agent/double-puppet-registration` (above): after the roll that carries it, download the files
+again; they have no `login_shared_secret`, and the instance's own registration no longer claims
+the owner.
 
 ## Session 2026-10-12, evening (branch `agent/stale-signatures`): the re-created WhatsApp bot's devices can be signed: the refused key was the old identity's
 

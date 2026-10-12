@@ -10,6 +10,22 @@ The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/
 
 **Install and upgrade** (2026-10-12): `docs/install-and-upgrade.md` is the operator's page of Helm commands, verified on kind 0.2.0 → 0.3.0 → rollback (status 12). Keep it current when a release needs a one-time step.
 
+**The roll candidate that un-sticks the demo's bridges** (2026-10-12, night;
+`agent/double-puppet-registration`, decision 0045, status 11): five of six bridges (signal,
+whatsapp, meta, linkedin, discord) were "Degraded" and took no transactions because each one's
+own registration claimed brandon, so the server sent it every room he is in and mautrix waited
+25 s on keys per encrypted event. Double puppeting is now a registration of its own,
+`<instance>-doublepuppet`, `url: null`, claiming the owner alone. The release that carries it
+moves every instance by itself on its first step: registers that registration, patches the
+instance's own in place (same id, same tokens), and rolls each bridge pod once with every secret
+it had (pickle keys kept). **After the roll, check**: each `bridge-*-brandon` pod rolled once and
+is Running (`kubectl -n myelin get pods -l app.kubernetes.io/name=myelin-bridge`: a new age,
+restarts 0); `hs_appservice_transactions_total{outcome="delivered"}` rising for every bridge;
+the admin Registrations tab: each bridge Healthy and each `-doublepuppet` "Built in"; the
+server's log has one `moved the bridge instance's double puppeting` line per instance; no
+`Event channel is full` in any bridge's log; brandon's own messages are still double-puppeted
+(something he sends on WhatsApp appears in its portal as him, not as a ghost).
+
 **Read this first.** The 2026-10-11 session (two owner asks, both merged and released as
 **0.3.0**, tag `v0.3.0`, image `ghcr.io/brandon-dacrib/myelin:0.3.0`):
 
@@ -55,9 +71,11 @@ The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/
    `login qr` in the Discord management room should get a QR code. If the old messages stay
    undecryptable, run `/discardsession` in that room and try again.
 4. **iMessage on the owner's Mac**: the bridge starts with the server of `agent/as-login-flow`
-   (status 11, 2026-10-12, night). After that roll: `login_shared_secret: appservice` in the
-   Mac's `config.yaml` (or download the files again), `./run.sh`, Full Disk Access, a message
-   both ways; then an `e2e-real` case.
+   (status 11, 2026-10-12, night). After the roll that also carries
+   `agent/double-puppet-registration`: download the files again (they have no
+   `login_shared_secret` any more: that bridge cannot double puppet without the claim that
+   floods it, decision 0045), `./run.sh`, Full Disk Access, a message both ways; then an
+   `e2e-real` case.
 5. **The WARN noise of `event failed the authentication check`: fixed**
    (`agent/state-res-log-noise`, status 12, 2026-10-12, evening). The default filter holds
    `ruma_state_res` to `error`. After the roll, the demo's log should have no `ruma_state_res`

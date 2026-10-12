@@ -322,6 +322,65 @@ two settings, and which one decides what to do:
 Running it: `cargo build -p hs-cli --bin hs`, then `cargo test -p hs-bridge-conformance --test
 real_mautrix_login -- --nocapture` with Docker reachable.
 
+## 2026-10-12: double puppeting is a registration of its own, and the bridges are not flooded
+
+Five of the demo's six bridges stalled: "Degraded", no transactions taken, pods Running and
+Ready. Each instance's own registration claimed its owner (non-exclusively) so that it could
+double puppet with its own token, and the spec makes every room a namespace user is in the
+registration's business. So each bridge was sent every event of every room brandon was in,
+encrypted chats its bot is not in among them; mautrix waited 25 s on keys for each event it could
+not decrypt, one event at a time, its event channel filled ("Event channel is full"), its
+transaction handler blocked, and the server's 30 s timeout fired. Decision 0045 has the numbers.
+
+**How double puppeting works now** (mautrix's "double puppeting via appservice"):
+
+- The bridge's own registration claims its ghosts and its bot, nothing else.
+- Beside it is `<instance>-doublepuppet` (`whatsapp-brandon-doublepuppet`): `url: null`, a
+  non-exclusive claim on the owner alone, tokens of its own, `io.myelin.double_puppet_for:
+  whatsapp-brandon`. The server never sends it anything.
+- The bridge's config carries that registration's token: `double_puppet.secrets:
+  {"<server>": "as_token:<token>"}` for a `bridgev2` bridge, `bridge.login_shared_secret_map` for
+  mautrix-discord (older framework, `as_token:` supported since mautrix-go v0.15).
+  mautrix-imessage knows only `login_shared_secret: appservice` (its own token, which needs the
+  flooding claim) and gets none: it does not double puppet (`docs/bridges/imessage.md`).
+- One per instance, so a leaked token acts as one person (decision 0045 says why not the shared
+  `@.*` registration the mautrix docs show). A bridge registered through the wizard, which serves
+  everyone, gets one `<id>-doublepuppet` claiming `@.*:<server>`, created with it; its preview
+  is on the wizard's Review step.
+- The Registrations tab lists it as **Built in** ("Double puppeting for WhatsApp Brandon"). Its
+  health is `unknown` and it is never under Attention; pinging it answers `M_URL_NOT_SET` and
+  records nothing.
+
+**What the roll does to an existing instance.** Nothing to do by hand: on the server's first step
+after the upgrade, for each instance that double puppets, the manager
+
+1. mints and registers `<instance>-doublepuppet`;
+2. patches the instance's own registration in place (same id, same `as_token` and `hs_token`)
+   so that it stops claiming the owner;
+3. re-renders its files with the new token and every secret it had (the pickle key, the
+   provisioning secret, its own tokens: decision 0036, never a new pickle key), which rolls its
+   pod once;
+4. logs once, at INFO: `moved the bridge instance's double puppeting to a registration of its
+   own` with `appservice`, `double_puppet_appservice`, `owner` and `deploy_name`.
+
+An instance run elsewhere gets the reason "its registration changed: download its files again
+and restart it with them"; until it does, it is not flooded, but it cannot double puppet.
+
+**After the roll, check:**
+
+- each bridge pod rolled once and is Running (`kubectl -n myelin get pods -l
+  app.kubernetes.io/name=myelin-bridge`: a new age, restarts 0);
+- `hs_appservice_transactions_total{outcome="delivered"}` rising for every bridge;
+- the Registrations tab: each bridge Healthy, each `-doublepuppet` Built in;
+- no `Event channel is full` in any bridge's log;
+- the owner's own messages still double-puppeted: something brandon sends on the network appears
+  in its portal as him, not as a ghost.
+
+**Delivery errors say why.** A failed transaction's log line and the appservice's `last_error`
+carry the error's causes: `error sending request for url (http://...): operation timed out`, or
+`... connection refused`, or `... dns error: ...`, where before they said only `error sending
+request for url (...)`.
+
 ## 2026-10-11: mautrix-discord is on the older framework, and its config said so by crashing
 
 The demo's `bridge-discord-brandon` would not start: `FTL Configuration error
@@ -648,14 +707,12 @@ on, and the wizard now does or says it.
   (`*: relay`, the server's domain as `user`, the administrator as `admin`);
   `backfill.enabled`; `double_puppet.secrets`; `encryption.allow/default/appservice/msc4190`.
   Everything else keeps the bridge's default and the bridge writes it in.
-- **Double puppeting through the bridge's own token.** The documentation's shape is a separate
-  `doublepuppet.yaml` registration with `url: null` and a non-exclusive `@.*:domain` claim,
-  its `as_token` placed in every bridge's `double_puppet.secrets`. The wizard does the same
-  with one registration instead of two: the bridge's own registration gets the non-exclusive
-  claim, and its own `as_token` goes into its `double_puppet.secrets`. The server allows
-  `m.login.application_service` as any user a non-exclusive namespace covers, which is all the
-  shared registration provided. One fewer secret to rotate; the Options step says exactly this
-  rather than promising a shared registration nothing creates.
+- **Double puppeting through a registration of its own.** The documentation's shape is a
+  separate `doublepuppet.yaml` registration with `url: null` and a non-exclusive `@.*:domain`
+  claim, its `as_token` placed in every bridge's `double_puppet.secrets`. Until 2026-10-12 the
+  wizard folded that claim into the bridge's own registration, which made the server push the
+  bridge every room anyone was in (see "2026-10-12" above). It now renders the separate
+  registration, one per bridge (decision 0045), and creates it with the bridge's.
 - **Encryption in appservice mode.** With `encryption.appservice: true` and `msc4190: true`
   the bridge expects device lists and to-device messages inside its transactions (MSC3202,
   MSC4203) and creates its device with a `PUT` instead of a login (MSC4190); that is what the
