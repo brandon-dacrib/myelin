@@ -12,7 +12,10 @@ charts: install 0.2.0 (Ready in 31 s), upgrade to 0.3.0 with the commands in
 [Upgrade](#upgrade) (signing key unchanged, `/_matrix/federation/v1/version` 0.2.0 then 0.3.0,
 no `ERROR` lines), `helm rollback` to 0.2.0 (key unchanged again), `helm uninstall` (the data
 volume and the `Bridge` CRD left in place). The standing demo is upgraded the same way (its values
-from `helm get values`, passed with `-f`).
+from `helm get values`, passed with `-f`). Also 2026-10-12: the published `hs-0.3.0` chart has
+`appVersion: 0.3.0` and renders `ghcr.io/brandon-dacrib/myelin:0.3.0` with no `image.tag` set,
+and `helm template` reads its `-f` from
+`https://raw.githubusercontent.com/brandon-dacrib/myelin/v0.3.0/deploy/demo/values-bridges.yaml`.
 
 ## What you need
 
