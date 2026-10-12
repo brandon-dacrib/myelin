@@ -168,6 +168,13 @@ service cannot masquerade`. Unit test:
 (allowed for the claimed user, refused for another, refused with no double-puppeting
 registration). `bridge_offerings.rs` passes.
 
+**CI on arm64** failed on four of the last five commits in
+`bridge_offerings.rs::a_bridge_is_sent_nothing_of_a_room_none_of_its_users_is_in_and_double_puppets_apart`
+(line 914, `chat_started_by` null), which kept `d1ddf6bd` from being released. The manager
+records who started the chat after it has created it and the bot has joined, and the test read
+the record once, as soon as the bridge saw the invitation. The test now waits for the record
+(`agent/bridge-offerings-race`).
+
 ## Session 2026-10-12, late night (branch `agent/imessage-launchagent`): a Mac bridge starts at login
 
 The owner wants the iMessage bridge to start without Terminal once it works. The generated

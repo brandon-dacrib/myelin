@@ -910,7 +910,17 @@ async fn a_bridge_is_sent_nothing_of_a_room_none_of_its_users_is_in_and_double_p
             .any(|e| e["type"] == "m.room.member" && e["state_key"] == bot)
     })
     .await;
-    let seen = admin.admin(GET, &path, None).await;
+    // The manager records who started the chat after it has created it and the bot has joined,
+    // so the bridge can see the invitation first: wait for the record, do not read it once (the
+    // single read failed on arm64 runners, 2026-10-12).
+    let mut seen = Value::Null;
+    for _ in 0..240 {
+        seen = admin.admin(GET, &path, None).await;
+        if !seen["chat_started_by"].is_null() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
     assert_eq!(seen["chat_started_by"], "owner", "{seen}");
     let chat = seen["chat_room"].as_str().unwrap().to_owned();
 
