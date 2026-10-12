@@ -57,7 +57,9 @@ Two ways to make the state at each event durable were on the table:
    create at once is written once: the frame write is a retried transaction that skips a frame
    already there (PostgreSQL's serializable isolation can refuse the second writer; until this
    change that was an error). Tested with two writers migrating one room at once, on the
-   in-memory backend and on PostgreSQL.
+   in-memory backend and on PostgreSQL. The one event whose rows legitimately change is an
+   outlier later taken into the timeline (it gains a real state and prev events): ingesting
+   drops what the store cached of that event, so its next read takes the new rows.
 
 ## Consequences
 

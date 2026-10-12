@@ -47,6 +47,15 @@ crate's tests failed: the actor used "the state store knows it" as "this actor h
   `hs-state` for it (`crates/hs-state/src/frames.rs`, track 02's file on track 02's branch): a
   frame write that conflicts is retried and skips a frame already there, where it used to be an
   error.
+- **An event ingested twice gets its second rows** (found by the merge gate, in `hs-user`'s
+  `sync::membership_cases`): a remote join whose `state` names the join itself stores the join
+  first as an outlier (its state its own entry, cached by the store) and then takes it into the
+  timeline with the snapshot as its state. `ingest_in` wrote the right rows, but the store's
+  cache still answered the outlier's root, so the room's state after the join was the join
+  alone and the next event was refused for "no m.room.create event". `hs-state`'s ingestion now
+  drops what it cached of the event's state root and record (`kv_store.rs`, `ingest_locked`).
+  Test: `durable_state::a_remote_join_whose_snapshot_names_the_join_has_the_snapshots_state`
+  (fails without the fix).
 - **Observability**: `hs_room_load_seconds{state="read"|"replayed"}` (new),
   `hs_room_state_records_repaired_total` (new), a `debug` line per load (timeline length,
   replayed, records fed, elapsed), beside track 02's `hs_state_*` series (now on `/metrics`).

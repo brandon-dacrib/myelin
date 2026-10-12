@@ -560,6 +560,17 @@ impl<R: StateRepr, KV: KvBackend> KvStateStore<R, KV> {
         event: &NewEvent<'_>,
         explicit_state: Option<&[EventSn]>,
     ) -> Result<Ingested<R::Root>, KvStoreError<R::Error>> {
+        // An event ingested again may not get the rows it had: an outlier (recorded with no
+        // prev events, its state its own entry) that is later taken into the timeline -- a
+        // remote join whose snapshot names the join itself, history placed over a held
+        // outlier -- gets a real state and record. What this store cached of the old rows is
+        // dropped here, so the next read takes the new ones once they commit (a read before
+        // then sees the old, committed rows, as any reader of the store would).
+        {
+            let mut caches = self.caches.borrow_mut();
+            caches.state_at.remove(&event.event);
+            caches.records.remove(&event.event);
+        }
         let mut writer = Writer::new(&self.tables, txn, &self.caches);
 
         // The state before the event, computed before anything is written so an unknown

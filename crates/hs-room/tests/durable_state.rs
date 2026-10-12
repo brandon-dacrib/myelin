@@ -544,3 +544,78 @@ fn measure_load_of_a_large_room() {
     let after = timed("records complete again");
     assert_eq!(after.events_ingested, 0);
 }
+
+/// A remote join whose `state` names the join itself (the resident's state *at* the join, as
+/// `/state_ids` answers it): the join is first stored as one of the snapshot's outliers, its
+/// state its own entry, then taken into the timeline with the snapshot as the state before
+/// it. The state store must answer the second, not what it cached of the first (until
+/// 2026-10-12's fix in `hs-state`, the room's state after the join was the join alone, and
+/// the next event from the room was refused for "no m.room.create event").
+#[tokio::test]
+async fn a_remote_join_whose_snapshot_names_the_join_has_the_snapshots_state() {
+    use hs_room::membership::Action;
+    use hs_room::registry::RoomRegistry;
+    let alice = user_id!("@alice:a.example").to_owned();
+    let bob = user_id!("@bob:b.example").to_owned();
+    let resident_backend = MemoryBackend::new();
+    let mut resident = RoomActor::create_room(
+        resident_backend.clone(),
+        Tables::open(&resident_backend).unwrap(),
+        HomeserverIdentity::for_tests("b.example"),
+        bob.clone(),
+        CreateRoomRequest {
+            preset: Some("public_chat".to_owned()),
+            room_version: Some(RoomVersionId::V11),
+            ..Default::default()
+        },
+        1,
+    )
+    .unwrap();
+    let room_id = resident.room_id().to_owned();
+    let join = resident
+        .membership_action(alice.clone(), Action::Join, alice.clone(), json!({}), 2)
+        .unwrap();
+    let at_join = resident.state_at_event(join.event_id()).unwrap().unwrap();
+    assert!(
+        at_join
+            .state
+            .iter()
+            .any(|e| e.event_id() == join.event_id()),
+        "the snapshot names the join"
+    );
+    let expected = at_join.state.len();
+
+    let backend = MemoryBackend::new();
+    let registry =
+        RoomRegistry::open(backend.clone(), HomeserverIdentity::for_tests("a.example")).unwrap();
+    registry
+        .bootstrap_from_remote_join(
+            &room_id,
+            RoomVersionId::V11,
+            at_join.state,
+            at_join.auth_chain,
+            join,
+        )
+        .await
+        .unwrap();
+    let handle = registry.get_or_load(&room_id).await.unwrap();
+    let held = handle
+        .query(|actor: &RoomActor<MemoryBackend>| actor.full_state().map(|s| s.len()))
+        .await
+        .unwrap();
+    assert_eq!(held, expected);
+
+    let ban = resident
+        .membership_action(bob, Action::Ban, alice, json!({}), 3)
+        .unwrap();
+    handle
+        .accept_remote_event(ban)
+        .await
+        .expect("the room's next event is accepted");
+
+    // And after a load, from the durable records.
+    let tables = Tables::open(&backend).unwrap();
+    let loaded = load(&backend, &tables, &room_id);
+    assert_eq!(loaded.state_store_stats().events_ingested, 0);
+    assert_eq!(loaded.full_state().unwrap().len(), expected);
+}

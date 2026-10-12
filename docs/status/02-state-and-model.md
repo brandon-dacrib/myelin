@@ -67,7 +67,11 @@ the replay every load did). `hs-cli` registers `hs_state::metrics` (the coordina
 Decision 0045 is written. One change here: `frames.rs`'s frame write is a retried transaction
 that skips a frame already present, so two writers re-ingesting one room at once (an owner and a
 copy migrating it together) agree instead of one failing on a conflict (tested on PostgreSQL by
-`crates/hs-room/tests/durable_state.rs`).
+`crates/hs-room/tests/durable_state.rs`). And a second: `ingest_locked` drops the cached state
+root and record of the event it ingests, because an event can be ingested again with different
+rows (an outlier later taken into the timeline with an explicit state, as a remote join whose
+snapshot names the join is); the cache's "rows are immutable once written" did not hold for
+those, and the merge gate's `hs-user` tests caught the stale root.
 
 **Left as of 2026-10-10 (all done 2026-10-12, above)**: (1) the hs-room half, deliberately not done here (track 04's `load` on `agent/room-memory`
 has since merged): gate the replay on `store.needs_migration(room_id)`, call `mark_migrated` after
