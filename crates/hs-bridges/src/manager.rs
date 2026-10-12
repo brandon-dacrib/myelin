@@ -1666,7 +1666,7 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
         Ok(updated.unwrap_or_else(|| row.clone()))
     }
 
-    /// The row with its double-puppeting registration settled (decision 0045). An instance
+    /// The row with its double-puppeting registration settled (decision 0046). An instance
     /// that double puppets ([`InstanceRender::double_puppets`]) has one: minted here the first
     /// time (a new instance, or one registered before the bridge's own registration stopped
     /// claiming its owner) and written to the registry once per change of what it claims,
@@ -2798,7 +2798,7 @@ fn may_act_as_owner(kind: Option<&hs_admin::model::BridgeType>, offering: &Offer
 }
 
 /// The token the manager acts as `row`'s owner with: its double-puppeting registration's, once
-/// that is registered (decision 0045; the instance's own registration does not claim the owner).
+/// that is registered (decision 0046; the instance's own registration does not claim the owner).
 fn owner_token(row: &InstanceRow) -> Result<String, String> {
     row.double_puppet
         .as_ref()
@@ -3604,7 +3604,7 @@ mod tests {
             .expect("a config")
     }
 
-    /// Double puppeting is a registration of its own (decision 0045): `url: null`, a
+    /// Double puppeting is a registration of its own (decision 0046): `url: null`, a
     /// non-exclusive claim on the owner alone, and its token in the bridge's config. The
     /// instance's own registration never claims the owner. Switching it off on the offering
     /// removes that registration and the changed files roll the pod, as any other change does;
@@ -3733,7 +3733,7 @@ mod tests {
         assert!(applied_config(&runtime, &name).contains(&second.as_token));
     }
 
-    /// The demo's six bridges on 2026-10-12 (decision 0045): an instance registered before,
+    /// The demo's six bridges on 2026-10-12 (decision 0046): an instance registered before,
     /// whose own registration claims its owner and whose config double puppets with its own
     /// token. The next step registers its double puppeting apart, patches its own registration
     /// in place (same id, same tokens) to stop claiming the owner, and rolls its pod once with

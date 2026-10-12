@@ -1,7 +1,7 @@
 # Status: track 11, appservices and bridges
 
 Last updated: 2026-10-12, late night (double puppeting is a registration of its own with no url,
-so a bridge is no longer sent every room its owner is in; decision 0045; mautrix-imessage stops
+so a bridge is no longer sent every room its owner is in; decision 0046; mautrix-imessage stops
 double puppeting; below); before that 2026-10-12, night (the iMessage bridge starts on the
 owner's Mac: `GET /login` lists the appservice login, the config's double puppeting says
 `appservice`, and `run.sh` fetches a missing `libolm`; below); before that 2026-10-12, evening
@@ -46,7 +46,7 @@ claimed `@.*`) so that it could double puppet with its own token. Under the spec
 that made every room the owner is in the bridge's business: each was sent every event of every
 such room, encrypted chats its bot is not in among them, and mautrix waited 25 s on keys for each
 one, serially, until its transaction handler blocked and the server's 30 s timeout fired. The
-server's log said only `error sending request for url (...)`. Decision 0045 has the numbers.
+server's log said only `error sending request for url (...)`. Decision 0046 has the numbers.
 
 **Done.**
 
@@ -93,7 +93,7 @@ server's log said only `error sending request for url (...)`. Decision 0045 has 
   chips. The wizard previews and creates the double-puppeting registration after the bridge's own
   (its own idempotency key; a failure says the bridge is registered and its double puppeting is
   not). Mocks follow.
-- Docs: decision 0045, `docs/bridges/mautrix.md` ("2026-10-12": how it works, what the roll does,
+- Docs: decision 0046, `docs/bridges/mautrix.md` ("2026-10-12": how it works, what the roll does,
   the post-roll checks), CHANGELOG, `docs/next-steps.md`.
 
 **Verified.**
@@ -131,7 +131,7 @@ server's log said only `error sending request for url (...)`. Decision 0045 has 
 **Next.** Roll the demo (the coordinator; the post-roll checks are in `docs/bridges/mautrix.md`
 and `docs/next-steps.md`).
 
-**Decisions made.** Decision 0045: one double-puppeting registration per instance (claiming its
+**Decisions made.** Decision 0046: one double-puppeting registration per instance (claiming its
 owner alone), not one shared `@.*` registration; a url-less registration is never a fault.
 
 **Interfaces provided.** `hs_admin::bridge_types::{double_puppet_registration,

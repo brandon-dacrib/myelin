@@ -1015,7 +1015,7 @@ async fn repaired_chat() -> Result<()> {
     let appservice_id = scene.appservice_id.clone();
 
     // Double puppeting on: the manager registers the instance's double-puppeting registration
-    // (decision 0045: `url: null`, a non-exclusive claim on alice alone), acts as alice with its
+    // (decision 0046: `url: null`, a non-exclusive claim on alice alone), acts as alice with its
     // token, and the bridge's own registration goes on claiming only its ghosts and its bot.
     scene
         .admin

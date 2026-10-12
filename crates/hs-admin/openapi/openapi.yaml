@@ -8761,7 +8761,7 @@ components:
           type: string
         double_puppet_registration:
           type: object
-          description: 'The bridge''s double-puppeting registration (decision 0045), present when double puppeting was chosen: a non-exclusive claim on the people the bridge may act as and `url: null`, so the server never sends it anything. The bridge''s config acts as people with its `as_token`. Create it with `POST /appservices` beside `registration`; the bridge''s own registration claims only its ghosts and its bot.'
+          description: 'The bridge''s double-puppeting registration (decision 0046), present when double puppeting was chosen: a non-exclusive claim on the people the bridge may act as and `url: null`, so the server never sends it anything. The bridge''s config acts as people with its `as_token`. Create it with `POST /appservices` beside `registration`; the bridge''s own registration claims only its ghosts and its bot.'
         double_puppet_registration_yaml:
           type: string
           description: '`double_puppet_registration` as YAML.'

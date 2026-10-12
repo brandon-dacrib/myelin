@@ -1,4 +1,4 @@
-# 0045: 2026-10-12: double puppeting is a registration of its own, with no url, one per instance
+# 0046: 2026-10-12: double puppeting is a registration of its own, with no url, one per instance
 
 Status: accepted (track 11; touches 15's admin API (OpenAPI 0.1.16) and 16's bridge pages).
 

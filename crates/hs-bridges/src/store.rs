@@ -196,7 +196,7 @@ pub struct InstanceRow {
     /// row from before this was recorded: that one is applied again once.
     #[serde(default)]
     pub applied_fingerprint: Option<String>,
-    /// Its double-puppeting registration (decision 0045): the separate, `url`-less registration
+    /// Its double-puppeting registration (decision 0046): the separate, `url`-less registration
     /// whose token the bridge acts as its owner with, so that its own registration claims only
     /// its ghosts and its bot. Minted on the step that first finds the instance double puppets
     /// without one (a new instance, or one registered before 2026-10-12, whose own registration

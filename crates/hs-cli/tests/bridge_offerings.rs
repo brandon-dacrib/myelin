@@ -572,7 +572,7 @@ async fn an_offering_takes_an_instance_from_requested_to_ready_and_removes_it_ag
         .unwrap_or_else(|| panic!("{listed}"));
     assert_eq!(mine["bridge_type"], "mautrix-whatsapp", "{mine}");
     assert_eq!(mine["sender_localpart"], "whatsappbot_alice");
-    // Its ghosts and its bot, and not alice (decision 0045): her double puppeting is a
+    // Its ghosts and its bot, and not alice (decision 0046): her double puppeting is a
     // registration of its own, with no url, claiming her alone.
     assert_eq!(
         user_namespaces(mine),
@@ -845,7 +845,7 @@ async fn an_offering_takes_an_instance_from_requested_to_ready_and_removes_it_ag
     handle.shutdown().await;
 }
 
-/// Decision 0045, the demo's stalled bridges of 2026-10-12, against the real server: alice's
+/// Decision 0046, the demo's stalled bridges of 2026-10-12, against the real server: alice's
 /// bridge is sent what happens in the rooms its bot and ghosts are in, and nothing of her
 /// encrypted chat with bob, which none of them is in. (Before, her instance's own registration
 /// claimed her, the server pushed it every room she was in, and a mautrix bridge waited 25
@@ -1493,7 +1493,7 @@ async fn a_shared_registration_beside_its_offering_is_named_and_a_changed_double
         .await;
     assert!(theirs["overlaps_offering"].is_null(), "{theirs}");
 
-    // Her double puppeting is a registration of its own (decision 0045), and it is not
+    // Her double puppeting is a registration of its own (decision 0046), and it is not
     // mistaken for a hand-registered bridge either (the count above). Off: that registration
     // goes, and her files the secret, once; the reason says to fetch them again. Her own
     // registration never claimed her.

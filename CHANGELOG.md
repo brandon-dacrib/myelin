@@ -36,7 +36,7 @@ carries the generated notes for that merge.
   Delivery errors now say why (`operation timed out`, `connection refused`). The iMessage
   bridge no longer double puppets: its build only knows the form that needs the flooding claim.
   Verified with the real binary, a stand-in bridge and the real WhatsApp and Signal bridges
-  (decision 0045).
+  (decision 0046).
 
 - **A re-created bridge's bot can cross-sign its devices again.** The server checked every
   signature on a device being signed, including one by a self-signing key the bot no longer

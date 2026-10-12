@@ -75,7 +75,7 @@ export function AddBridgeWizardPage() {
 
   const render = useRenderBridgeType();
   const create = useCreateAppservice();
-  // A bridge that double puppets does so with a registration of its own (decision 0045), made
+  // A bridge that double puppets does so with a registration of its own (decision 0046), made
   // right after the bridge's: a non-exclusive claim on the people it acts as, and no URL, so the
   // server never sends it anything (the bridge's own registration claims only its ghosts and bot).
   const createDoublePuppet = useCreateAppservice();

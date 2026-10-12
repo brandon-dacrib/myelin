@@ -787,7 +787,7 @@ mod tests {
         );
     }
 
-    /// The demo on 2026-10-12 (decision 0045). A bridge whose own registration claimed its
+    /// The demo on 2026-10-12 (decision 0046). A bridge whose own registration claimed its
     /// owner, even non-exclusively, was sent every event of every room the owner was in: their
     /// encrypted chats with other people among them, which its bot was never in. A mautrix
     /// bridge waits 25 seconds on keys for each such event, one at a time, and five bridges

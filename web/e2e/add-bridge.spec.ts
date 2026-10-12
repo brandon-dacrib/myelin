@@ -69,7 +69,7 @@ test.describe("Register a bridge you run yourself", () => {
     const configPreview = page.getByRole("region", { name: "config.yaml (preview)" });
     await expect(configPreview).toContainText("address: http://myelin:8008");
     await expect(configPreview).toContainText('"@ops:example.org": admin');
-    // Double puppeting is a second registration with no URL (decision 0045), created with it.
+    // Double puppeting is a second registration with no URL (decision 0046), created with it.
     const doublePuppetPreview = page.getByRole("region", {
       name: "Double puppeting registration (preview)",
     });

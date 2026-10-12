@@ -11,7 +11,7 @@ The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/
 **Install and upgrade** (2026-10-12): `docs/install-and-upgrade.md` is the operator's page of Helm commands, verified on kind 0.2.0 → 0.3.0 → rollback (status 12). Keep it current when a release needs a one-time step.
 
 **The roll candidate that un-sticks the demo's bridges** (2026-10-12, night;
-`agent/double-puppet-registration`, decision 0045, status 11): five of six bridges (signal,
+`agent/double-puppet-registration`, decision 0046, status 11): five of six bridges (signal,
 whatsapp, meta, linkedin, discord) were "Degraded" and took no transactions because each one's
 own registration claimed brandon, so the server sent it every room he is in and mautrix waited
 25 s on keys per encrypted event. Double puppeting is now a registration of its own,
@@ -74,7 +74,7 @@ server's log has one `moved the bridge instance's double puppeting` line per ins
    (status 11, 2026-10-12, night). After the roll that also carries
    `agent/double-puppet-registration`: download the files again (they have no
    `login_shared_secret` any more: that bridge cannot double puppet without the claim that
-   floods it, decision 0045), `./run.sh`, Full Disk Access, a message both ways; then an
+   floods it, decision 0046), `./run.sh`, Full Disk Access, a message both ways; then an
    `e2e-real` case.
 5. **The WARN noise of `event failed the authentication check`: fixed**
    (`agent/state-res-log-noise`, status 12, 2026-10-12, evening). The default filter holds

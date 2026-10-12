@@ -739,7 +739,7 @@ export const handlers = [
       `  image: dock.mau.dev/mautrix/${typeId.replace(/^mautrix-/, "")}:${imageTag}`,
     ].join("\n");
 
-    // Double puppeting, as the real render does it (decision 0045): a registration of its own
+    // Double puppeting, as the real render does it (decision 0046): a registration of its own
     // with no URL, claiming everyone here non-exclusively; the bridge's own claims only its
     // ghosts. Only for a type that supports it, when the wizard asked for it.
     const supportsDoublePuppeting = bridgeTypes.find(

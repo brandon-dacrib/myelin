@@ -997,7 +997,7 @@ pub fn render(type_id: &str, server_name: &str, values: &Value) -> Option<Bridge
     ];
     let double_puppeting = c.double_puppeting && entry.double_puppeting;
     // Double puppeting is the bridge sending as real users. That is a registration of its own
-    // (decision 0045): a non-exclusive claim on everyone here, which reserves nothing, and no
+    // (decision 0046): a non-exclusive claim on everyone here, which reserves nothing, and no
     // `url`, so the server never sends it anything. Its token goes into the bridge's config.
     let double_puppet = double_puppeting.then(|| {
         let dp_as_token = token();
@@ -1131,7 +1131,7 @@ pub struct DoublePuppetRegistration<'a> {
 /// own registration makes every room that person is in the bridge's business under the spec's
 /// interest rules: the bridge is then pushed every event of every such room, encrypted rooms
 /// its bot is not in among them, and a mautrix bridge waits on keys for each one. On the demo on
-/// 2026-10-12 that stalled five of its six bridges (decision 0045).
+/// 2026-10-12 that stalled five of its six bridges (decision 0046).
 #[must_use]
 pub fn double_puppet_registration(r: &DoublePuppetRegistration<'_>) -> Value {
     json!({
@@ -1506,7 +1506,7 @@ fn mautrix_imessage_config(p: &MautrixParams<'_>) -> String {
     // takes anything else, `as_token:<token>` included, as an HMAC secret for a password login,
     // which this server refuses (both seen with the real build on 2026-10-12). An appservice
     // login as the person needs the bridge's own registration to claim them, and that claim makes
-    // every room they are in the bridge's business (decision 0045: it stalled five of the demo's
+    // every room they are in the bridge's business (decision 0046: it stalled five of the demo's
     // bridges). So the bridge does not act as its person; the manager still does, with the
     // instance's double-puppeting registration, to start the person's chat with the bot.
     out.push_str("  encryption:\n");
@@ -1834,7 +1834,7 @@ pub fn render_instance(spec: &InstanceSpec<'_>) -> Option<InstanceRender> {
     // Its ghosts and its bot, nothing else. The owner is claimed by the instance's
     // double-puppeting registration instead: a claim on them here would make every room they
     // are in the bridge's business, and the server would push the bridge all of it (decision
-    // 0045; it stalled five of the demo's six bridges on 2026-10-12).
+    // 0046; it stalled five of the demo's six bridges on 2026-10-12).
     let users = vec![
         json!({"regex": format!("@{}.*:{server}", regex_escape(&ghost_prefix)), "exclusive": true}),
         json!({"regex": format!("@{}:{server}", regex_escape(&bot)), "exclusive": true}),
@@ -2043,7 +2043,7 @@ pub fn render_instance(spec: &InstanceSpec<'_>) -> Option<InstanceRender> {
 
 /// The namespace pattern that matches exactly `user_id`: what an instance's double-puppeting
 /// registration claims its owner with (and what its own registration claimed them with before
-/// decision 0045).
+/// decision 0046).
 #[must_use]
 pub fn user_regex(user_id: &str) -> String {
     regex_escape(user_id)
@@ -2250,7 +2250,7 @@ mod tests {
             "@tgbot:chat\\.example\\.net"
         );
         // Its ghosts and its bot, and nobody else: a claim on anyone else would have the
-        // server push it every room they are in (decision 0045).
+        // server push it every room they are in (decision 0046).
         assert_eq!(r["namespaces"]["users"].as_array().unwrap().len(), 2, "{r}");
         // Double puppeting is a registration of its own: everyone, non-exclusively, with no
         // url, so it is never sent anything.
@@ -2506,7 +2506,7 @@ mod tests {
         let users = reg["namespaces"]["users"].as_array().unwrap();
         assert_eq!(users[0]["regex"], "@whatsapp_alice_.*:chat\\.example\\.net");
         assert_eq!(users[1]["regex"], "@whatsappbot_alice:chat\\.example\\.net");
-        // Not even its owner (decision 0045): a claim on alice here would have the server push
+        // Not even its owner (decision 0046): a claim on alice here would have the server push
         // the bridge every room she is in.
         assert_eq!(users.len(), 2, "no claim on anyone else: {users:?}");
         // Its owner is its double-puppeting registration's, alone, with no url.
@@ -2615,7 +2615,7 @@ mod tests {
     }
 
     /// Before its double-puppeting registration's tokens exist (an instance from before
-    /// decision 0045, on the step that mints them), the render says one is wanted and writes no
+    /// decision 0046, on the step that mints them), the render says one is wanted and writes no
     /// double puppeting at all: never the bridge's own token, which no registration lets act as
     /// the owner any more. Off, or shared, wants none.
     #[test]
@@ -3027,7 +3027,7 @@ mod tests {
         );
         assert_eq!(config["bridge"]["backfill"]["enable"], true);
         // No double puppeting from the bridge: `appservice` would need its own registration to
-        // claim the person, and `as_token:<token>` is taken as an HMAC secret (decision 0045).
+        // claim the person, and `as_token:<token>` is taken as an HMAC secret (decision 0046).
         assert!(
             config["bridge"].get("login_shared_secret").is_none(),
             "{text}"

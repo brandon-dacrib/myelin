@@ -55,7 +55,7 @@ export const BUILT_IN_APPSERVICE_ID = "myelin-bridges";
 
 /**
  * What a bridge's double-puppeting registration's id ends with (`whatsapp-brandon-doublepuppet`,
- * `hs_admin::bridge_types::DOUBLE_PUPPET_ID_SUFFIX`). Decision 0045: a bridge acts as people with
+ * `hs_admin::bridge_types::DOUBLE_PUPPET_ID_SUFFIX`). Decision 0046: a bridge acts as people with
  * a registration of its own that has no `url`, so the server never sends it anything.
  */
 export const DOUBLE_PUPPET_ID_SUFFIX = "-doublepuppet";
@@ -69,7 +69,7 @@ export function isSendsNothingAppservice(appservice: Pick<AppService, "url">): b
   return appservice.url === null;
 }
 
-/** Whether `appservice` is a bridge's double-puppeting registration (decision 0045). */
+/** Whether `appservice` is a bridge's double-puppeting registration (decision 0046). */
 export function isDoublePuppetAppservice(appservice: Pick<AppService, "id" | "url">): boolean {
   return (
     isSendsNothingAppservice(appservice) && (appservice.id ?? "").endsWith(DOUBLE_PUPPET_ID_SUFFIX)

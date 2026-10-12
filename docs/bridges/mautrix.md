@@ -330,7 +330,7 @@ double puppet with its own token, and the spec makes every room a namespace user
 registration's business. So each bridge was sent every event of every room brandon was in,
 encrypted chats its bot is not in among them; mautrix waited 25 s on keys for each event it could
 not decrypt, one event at a time, its event channel filled ("Event channel is full"), its
-transaction handler blocked, and the server's 30 s timeout fired. Decision 0045 has the numbers.
+transaction handler blocked, and the server's 30 s timeout fired. Decision 0046 has the numbers.
 
 **How double puppeting works now** (mautrix's "double puppeting via appservice"):
 
@@ -343,7 +343,7 @@ transaction handler blocked, and the server's 30 s timeout fired. Decision 0045 
   mautrix-discord (older framework, `as_token:` supported since mautrix-go v0.15).
   mautrix-imessage knows only `login_shared_secret: appservice` (its own token, which needs the
   flooding claim) and gets none: it does not double puppet (`docs/bridges/imessage.md`).
-- One per instance, so a leaked token acts as one person (decision 0045 says why not the shared
+- One per instance, so a leaked token acts as one person (decision 0046 says why not the shared
   `@.*` registration the mautrix docs show). A bridge registered through the wizard, which serves
   everyone, gets one `<id>-doublepuppet` claiming `@.*:<server>`, created with it; its preview
   is on the wizard's Review step.
@@ -712,7 +712,7 @@ on, and the wizard now does or says it.
   claim, its `as_token` placed in every bridge's `double_puppet.secrets`. Until 2026-10-12 the
   wizard folded that claim into the bridge's own registration, which made the server push the
   bridge every room anyone was in (see "2026-10-12" above). It now renders the separate
-  registration, one per bridge (decision 0045), and creates it with the bridge's.
+  registration, one per bridge (decision 0046), and creates it with the bridge's.
 - **Encryption in appservice mode.** With `encryption.appservice: true` and `msc4190: true`
   the bridge expects device lists and to-device messages inside its transactions (MSC3202,
   MSC4203) and creates its device with a `PUT` instead of a login (MSC4190); that is what the

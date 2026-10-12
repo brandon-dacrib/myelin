@@ -34,7 +34,7 @@ the table) with iMessage's own sections, read from its `example-config.yaml` at 
 - `imessage.platform: mac`;
 - `bridge.user`: the one person the bridge is for (no `permissions`);
 - no `bridge.login_shared_secret`, so the bridge does not double puppet (since 2026-10-12,
-  decision 0045). This build knows only the literal `appservice` there, an appservice login with
+  decision 0046). This build knows only the literal `appservice` there, an appservice login with
   the bridge's own token, which needs the bridge's own registration to claim its person; that
   claim made the server send the bridge every room the person is in, and stalled five of the
   demo's bridges. It takes anything else, `as_token:<token>` included, as an HMAC secret. The
@@ -100,7 +100,7 @@ until the address is set it is the placeholder `http://<appservice id>:29331`.
      `as_token:<token>`, which it took as an HMAC secret for a password login (`403 Invalid
      username or password`). The config said `appservice`, checked the same way:
      `Successfully automatically enabled custom puppet`. **Taken out the same night** (decision
-     0045): `appservice` needs the bridge's own registration to claim the person, which floods
+     0046): `appservice` needs the bridge's own registration to claim the person, which floods
      the bridge with every room they are in. The config now has no `login_shared_secret`, so
      what the person sends from their own Apple devices is not shown as them. It can come back
      when the bridge takes an `as_token:` secret (mautrix-go's newer frameworks do).

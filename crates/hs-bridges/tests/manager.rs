@@ -229,7 +229,7 @@ async fn an_instance_is_registered_then_waits_for_its_bridge_then_is_ready() {
     assert_eq!(registration["sender_localpart"], "whatsappbot_alice");
     assert_eq!(registration["url"], "http://whatsapp-alice:29318");
     // Its ghosts and its bot, and not alice: a claim on her would have the server send the
-    // bridge every room she is in (decision 0045).
+    // bridge every room she is in (decision 0046).
     assert_eq!(
         namespaces_of(&registration["namespaces"]),
         vec![
