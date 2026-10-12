@@ -1,6 +1,7 @@
 # Status: track 11, appservices and bridges
 
-Last updated: 2026-10-11, later (iMessage is offered: a program for the person's Mac, with its
+Last updated: 2026-10-12 (the manager publishes the bot's self-signing key again when the server
+does not hold it, and a refused signature backs off; below); before that 2026-10-11, later (iMessage is offered: a program for the person's Mac, with its
 own config layout, a run script and an address the administrator sets; below); before that
 2026-10-11 (mautrix-discord is on mautrix-go's older framework and now gets that
 framework's `config.yaml` layout; below); before that 2026-10-10 (the manager removes a bot device
@@ -28,6 +29,41 @@ manager) and an instance's Kubernetes objects say whose bridge they are; before 
 (who has signed in to a bridge; the `cluster` runtime run on kind); before that 2026-09-30
 (ephemeral, to-device and device-list delivery); before that 2026-09-27 (RFC 0017 run against
 the real binary), 2026-09-27 (the bridge manager) and 2026-09-25.
+
+## Session 2026-10-12 (branch `agent/bot-identity-selfsigning`): the self-signing key is checked like the master, and a refused signature backs off
+
+**What the demo showed** (0.3.0, read through the owner's proxy and Loki on 2026-10-11): at
+17:00:04Z the owner removed and re-created their WhatsApp instance; the new row minted new
+seeds, `published the bot's cross-signing keys` (the server answered 200), and from 17:00:40Z
+every signing of device `BQBMQVR81T` was refused, `M_INVALID_SIGNATURE: no known key
+ed25519:1MIe… for signer @whatsappbot_brandon`, once per tick, 1,200 WARN lines an hour. The
+master was published (the manager would otherwise have published again and logged it), so the
+server held the manager's master and not its self-signing key. Why the upload left the server
+without it is **not yet known** (`post_device_signing_upload` stores every key it is given; the
+owner's `/keys/query` of the bot settles which side; `docs/next-steps.md`).
+
+**What changed, regardless of which side.**
+
+- `BotIdentity::is_published_self_signing` mirrors `is_published_master`;
+  `settle_bot_identity` looks at `self_signing_keys.<bot>` as it looks at `master_keys.<bot>`
+  and publishes both again when either is not this identity's. The `published the bot's
+  cross-signing keys` line now carries both key ids and which of the two was already there.
+- A failed settle is kept per instance (`identity_failures`: count, when to try again, the
+  error) and tried again after [`step_backoff`] (3 s, 3 s, 6 s, … 5 min), not every tick;
+  logged at WARN once per distinct error and at DEBUG (`the bot's cross-signing identity still
+  cannot be settled`, with `failures` and `retry_in_s`) while it repeats. The row's reason
+  stays what it was. A success clears it. In memory: a restart tries once more straight away.
+- The fake Matrix server in the manager's tests can refuse signatures the way the demo did.
+
+**Tests.** `manager::tests::a_self_signing_key_the_server_does_not_hold_is_published_again`
+(master held, another self-signing key held: both published again, the device signed, the
+row clean) and `a_refused_signature_is_retried_with_backoff` (one upload per due look, nothing
+asked within the wait, the reason kept, the count doubling the wait, a success clearing it).
+
+**Left.** Which side lost the self-signing key on 2026-10-11 (the owner's `/keys/query` of the
+bot says; then an hs-e2e or hs-bridges fix with a real-binary test). On the demo, once this
+rolls, the manager publishes both keys again on its next look and signs the device; the log
+says `published the bot's cross-signing keys … self_signing_was_published=false`.
 
 ## Session 2026-10-11, later (branch `agent/imessage-offering`): iMessage is offered, as a program on the person's Mac
 

@@ -141,6 +141,19 @@ impl BotIdentity {
             == Some(self.master_public_key().as_str())
     }
 
+    /// Whether `/keys/query`'s `self_signing_keys.<bot>` entry is this identity's self-signing
+    /// key: the one every device signature is made with, so a server that holds this master
+    /// and another self-signing key (or none) refuses every signature with "no known key", as
+    /// the demo did on 2026-10-11 after an instance was re-created for the same bot.
+    #[must_use]
+    pub fn is_published_self_signing(&self, self_signing_keys_entry: Option<&Value>) -> bool {
+        self_signing_keys_entry
+            .and_then(|m| m.get("keys"))
+            .and_then(|k| k.get(self.self_signing_key_id()))
+            .and_then(Value::as_str)
+            == Some(self.self_signing.verifying_key_base64().as_str())
+    }
+
     /// Whether a device-keys object (`/keys/query`'s `device_keys.<bot>.<device>`) carries this
     /// identity's self-signing signature.
     #[must_use]
