@@ -2185,6 +2185,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
             rooms: rooms.clone(),
             hub: user_state.hub.clone(),
             e2e: e2e_state.store.clone(),
+            accounts: auth_state.store.clone(),
             ownership: cluster_handles.cluster.ownership().clone(),
             layout: cluster_handles.layout,
             metrics: Some(appservice_metrics.clone()),

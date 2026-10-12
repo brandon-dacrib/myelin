@@ -939,3 +939,121 @@ async fn a_bridge_is_sent_ephemeral_data_once_across_a_restart_and_not_while_pau
     assert_eq!(health["status"], "healthy", "{health}");
     let _ = server.stop();
 }
+
+/// mautrix-discord (mautrix-go's older framework) in appservice mode creates its bot's device
+/// with MSC4190 (`PUT /devices/{id}`, no login) and uploads that device's keys only when a
+/// transaction says its one-time-key count is low. A device with no keys yet is therefore
+/// counted, at zero, as Synapse counts it; leaving it out meant the bridge never uploaded, and
+/// no client could share a room key with it (the demo's Discord bridge, 2026-10-12).
+#[tokio::test]
+async fn a_bridge_device_made_without_keys_is_told_it_has_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let (bridge_url, bridge) = stand_in().await;
+    let registration_path = dir.path().join("registration.yaml");
+    std::fs::write(
+        &registration_path,
+        format!(
+            "{}io.element.msc4190: true\n",
+            registration_yaml(&bridge_url)
+        ),
+    )
+    .unwrap();
+    let port = reserve_port();
+    let data_dir = dir.path().join("data");
+    let config_path = dir.path().join("hs.yaml");
+    std::fs::write(
+        &config_path,
+        config_yaml(port, &data_dir, &registration_path),
+    )
+    .unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let mut server = HsProcess::serve(&config_path);
+    let _ = admin_token_of(&mut server, &client, &base).await;
+
+    let alice = register(&client, &base, "alice").await;
+    // The bot's account, without a session: MSC4190 bridges register with `inhibit_login`.
+    let registered: Value = client
+        .post(format!("{base}/_matrix/client/v3/register"))
+        .bearer_auth(AS_TOKEN)
+        .json(&json!({
+            "type": "m.login.application_service",
+            "username": "bridgebot",
+            "inhibit_login": true,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let bot_id = "@bridgebot:example.org";
+    assert_eq!(registered["user_id"], bot_id, "{registered}");
+    let bot = Caller {
+        client: client.clone(),
+        base: base.clone(),
+        token: AS_TOKEN.to_owned(),
+        masquerade: Some(bot_id.to_owned()),
+    };
+    // The device, as mautrix-go makes it: a display name and nothing else.
+    let device = "BOTDEVICE";
+    bot.matrix(
+        reqwest::Method::PUT,
+        &format!("/devices/{device}"),
+        Some(json!({"display_name": "Discord bridge"})),
+    )
+    .await;
+
+    // A room with the bot in it, and a message: a transaction, with the bot's key counts.
+    let created = alice
+        .matrix(
+            reqwest::Method::POST,
+            "/createRoom",
+            Some(json!({"preset": "private_chat", "invite": [bot_id]})),
+        )
+        .await;
+    let room_id = created["room_id"].as_str().unwrap().to_owned();
+    bot.matrix(
+        reqwest::Method::POST,
+        &format!("/join/{}", escape(&room_id)),
+        None,
+    )
+    .await;
+    alice.say(&room_id, "login-qr").await;
+    let count_of = |bridge: &StandIn| {
+        bridge
+            .transactions()
+            .iter()
+            .rev()
+            .find_map(|txn| {
+                txn["device_one_time_keys_count"][bot_id][device]["signed_curve25519"].as_u64()
+            })
+    };
+    until("the bridge was told its new device has no keys", || async {
+        count_of(&bridge) == Some(0)
+    })
+    .await;
+
+    // The bridge uploads, as told; the next transaction counts what it uploaded.
+    let (status, body) = bot
+        .call(
+            reqwest::Method::POST,
+            &format!("/_matrix/client/v3/keys/upload?device_id={device}"),
+            Some(json!({
+                "device_keys": device_keys(bot_id, device),
+                "one_time_keys": {
+                    "signed_curve25519:AAAAAA": {"key": "k1", "signatures": {}},
+                    "signed_curve25519:AAAAAB": {"key": "k2", "signatures": {}},
+                },
+            })),
+        )
+        .await;
+    assert!(status.is_success(), "{status} {body}");
+    assert_eq!(body["one_time_key_counts"]["signed_curve25519"], 2, "{body}");
+    alice.say(&room_id, "login-qr again").await;
+    until("the bridge was told its device's keys", || async {
+        count_of(&bridge) == Some(2)
+    })
+    .await;
+    let _ = server.stop();
+}

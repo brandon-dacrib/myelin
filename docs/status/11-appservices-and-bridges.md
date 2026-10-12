@@ -1,6 +1,7 @@
 # Status: track 11, appservices and bridges
 
-Last updated: 2026-10-12 (the manager publishes the bot's self-signing key again when the server
+Last updated: 2026-10-12, later (a bridge device made without keys is told it has none, so
+mautrix-discord uploads its keys and can decrypt; below); before that 2026-10-12 (the manager publishes the bot's self-signing key again when the server
 does not hold it, and a refused signature backs off; below); before that 2026-10-11, later (iMessage is offered: a program for the person's Mac, with its
 own config layout, a run script and an address the administrator sets; below); before that
 2026-10-11 (mautrix-discord is on mautrix-go's older framework and now gets that
@@ -29,6 +30,44 @@ manager) and an instance's Kubernetes objects say whose bridge they are; before 
 (who has signed in to a bridge; the `cluster` runtime run on kind); before that 2026-09-30
 (ephemeral, to-device and device-list delivery); before that 2026-09-27 (RFC 0017 run against
 the real binary), 2026-09-27 (the bridge manager) and 2026-09-25.
+
+## Session 2026-10-12, later (branch `agent/discord-otk-counts`): a bridge device made without keys is told it has none
+
+**What the owner saw.** On the demo, the new `bridge-discord-brandon` answered `login qr` in its
+management room with "⚠ Your message was not bridged: the bridge hasn't received the decryption
+keys", every time.
+
+**Root cause.** mautrix-discord v0.7.7 (mautrix-go's older framework) in appservice mode makes
+its bot's device with MSC4190 (`PUT /devices/7YmXUAYXKj`, no login) and does not upload keys at
+start. It uploads when a transaction's MSC3202 `device_one_time_keys_count` says its device is
+low. The server built those counts from `list_device_keys`, the devices that already have keys,
+so a device with none was never mentioned. The bridge never uploaded, `/keys/query` showed the bot
+with no device keys, and Element shared the room key with every device but the bot's. Element
+did nothing wrong, and nothing was withheld. The bridge's log showed it: no `keys/upload` among
+its requests, and every discord-brandon transaction had `one_time_key_counts: 0` (no device),
+while the `bridgev2` bridges, which upload at start, had their bot's. Synapse counts every device
+of the user, at `signed_curve25519: 0` when it has none (`count_bulk_e2e_one_time_keys_for_as`).
+
+**The fix.** `hs-cli`'s `KeyCountSource` lists the user's devices from the accounts
+(`DeliveryDeps::accounts`, `hs-auth`'s `list_devices`), adds any device with keys the accounts do
+not list, and always reports `signed_curve25519`, at zero when none are left. The
+`KeyCountSource` and `DeviceKeyCounts` docs in `hs-appservice` say so.
+
+**Verified.** `appservice_ephemeral.rs::a_bridge_device_made_without_keys_is_told_it_has_none`
+runs the real `hs`: an `inhibit_login` registration, an MSC4190 device, a room and a message, and
+the transaction says `signed_curve25519: 0` for the device. After the stand-in uploads two keys,
+the next transaction says 2. Without the fix it fails, "never happened: the bridge was told its
+new device has no keys", which is the demo's symptom. The unit test
+`a_device_with_no_keys_yet_is_counted_at_zero` covers the source.
+
+**Observable.** The scheduler's `delivered a transaction to an appservice` line counts the
+devices with key counts (`one_time_key_counts`). After the roll, discord-brandon's should be at
+least 1, and the bridge logs `Request completed … url=…/keys/upload`.
+
+**Left.** The demo roll, and then `login qr` in the Discord management room. A management room
+whose Megolm session was shared before the bot had keys stays undecryptable for those messages.
+Element starts a new session for the bot once it sees the bot's device: if it does not, the
+owner can run `/discardsession` in that room, or ask for a new management room.
 
 ## Session 2026-10-12 (branch `agent/bot-identity-selfsigning`): the self-signing key is checked like the master, and a refused signature backs off
 

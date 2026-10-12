@@ -54,6 +54,10 @@ use hs_user::hub::{EphemeralObserver, SessionHub};
 /// and device-list changes), and the backstop for the ones that do.
 const EPHEMERAL_POLL: Duration = Duration::from_millis(250);
 
+/// The one-time-key algorithm every device's count names, at zero when none are left: what
+/// Synapse reports and what a client compares against to decide to upload more.
+const SIGNED_CURVE25519: &str = "signed_curve25519";
+
 /// The session hub as `hs serve` builds it.
 type Hub<B> = SessionHub<B, Arc<RoomRegistry<B>>>;
 
@@ -139,11 +143,13 @@ impl<B: KvBackend + 'static> RoomSource for Rooms<B> {
 
 /// The ephemeral pump's sources over the real server: the session hub (typing, presence),
 /// its store (the receipt and presence streams, memberships), the room registry (members and
-/// aliases) and the E2EE store (to-device messages, device lists, key counts).
+/// aliases), the E2EE store (to-device messages, device lists, key counts) and the accounts
+/// (which devices a user has, keys or not).
 struct Sources<B: KvBackend + 'static> {
     hub: Arc<Hub<B>>,
     rooms: Arc<RoomRegistry<B>>,
     e2e: Arc<dyn hs_e2e::store::E2eStore>,
+    accounts: Arc<dyn hs_auth::store::AuthStore>,
 }
 
 fn user(id: &str) -> Result<ruma::OwnedUserId, String> {
@@ -291,22 +297,43 @@ impl<B: KvBackend + 'static> EphemeralSource for Sources<B> {
 
 #[async_trait]
 impl<B: KvBackend + 'static> KeyCountSource for Sources<B> {
+    /// Every device the user has, keys or not, as Synapse counts them
+    /// (`count_bulk_e2e_one_time_keys_for_as`): a device with no keys yet is reported with
+    /// `signed_curve25519: 0`. An appservice-mode bridge that creates its device without
+    /// uploading keys (mautrix-go's legacy bridges, MSC4190) uploads them only when told its
+    /// count is low; leaving its device out meant it never did, and no client could share a
+    /// room key with it ("the bridge hasn't received the decryption keys").
     async fn key_counts(&self, user_id: &str) -> Result<Vec<DeviceKeyCounts>, String> {
         let user_id = user(user_id)?;
-        let mut out = Vec::new();
-        for (device_id, _) in self
-            .e2e
-            .list_device_keys(&user_id)
+        let mut devices: BTreeSet<ruma::OwnedDeviceId> = self
+            .accounts
+            .list_devices(&user_id)
             .await
             .map_err(|e| e.to_string())?
-        {
-            let one_time_keys: BTreeMap<String, u64> = self
+            .into_iter()
+            .map(|device| device.device_id)
+            .collect();
+        // Keys of a device the accounts do not list are still counted, as they were.
+        devices.extend(
+            self.e2e
+                .list_device_keys(&user_id)
+                .await
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(|(device_id, _)| device_id),
+        );
+        let mut out = Vec::with_capacity(devices.len());
+        for device_id in devices {
+            let mut one_time_keys: BTreeMap<String, u64> = self
                 .e2e
                 .count_one_time_keys(&user_id, &device_id)
                 .await
                 .map_err(|e| e.to_string())?
                 .into_iter()
                 .collect();
+            one_time_keys
+                .entry(SIGNED_CURVE25519.to_owned())
+                .or_insert(0);
             let unused_fallback_key_types = self
                 .e2e
                 .unused_fallback_key_algorithms(&user_id, &device_id)
@@ -496,6 +523,9 @@ pub struct DeliveryDeps<B: KvBackend + 'static> {
     pub hub: Arc<Hub<B>>,
     /// The E2EE store: to-device messages, device lists and key counts.
     pub e2e: Arc<dyn hs_e2e::store::E2eStore>,
+    /// The accounts: which devices a user has, so a device with no keys yet still gets a key
+    /// count (zero) and its bridge uploads keys.
+    pub accounts: Arc<dyn hs_auth::store::AuthStore>,
     /// Which shards are this replica's.
     pub ownership: Arc<dyn Ownership>,
     /// Which shard an appservice belongs to.
@@ -565,6 +595,7 @@ impl<B: KvBackend + 'static> AppserviceDelivery<B> {
             rooms,
             hub,
             e2e,
+            accounts,
             ownership,
             layout,
             metrics,
@@ -613,6 +644,7 @@ impl<B: KvBackend + 'static> AppserviceDelivery<B> {
             hub: hub.clone(),
             rooms: rooms.clone(),
             e2e,
+            accounts,
         });
         let pump = Arc::new(
             Pump::new(
@@ -882,6 +914,77 @@ mod tests {
         (hub, e2e)
     }
 
+    /// A bridge in appservice mode that creates its device without keys (mautrix-discord,
+    /// MSC4190) uploads them only when a transaction says its device has none left. So a
+    /// device with no keys is counted, at zero, next to one that has some.
+    #[tokio::test]
+    async fn a_device_with_no_keys_yet_is_counted_at_zero() {
+        use hs_auth::store::DeviceStore as _;
+
+        let rooms = Arc::new(
+            RoomRegistry::open(
+                MemoryBackend::new(),
+                hs_room::identity::HomeserverIdentity::for_tests("example.org"),
+            )
+            .unwrap(),
+        );
+        let (hub, e2e) = hub_and_e2e(&rooms);
+        let accounts = Arc::new(hs_auth::store::memory::InMemoryAuthStore::new());
+        let bot = ruma::user_id!("@discordbot:example.org");
+        for device in ["NEWDEVICE", "KEYED"] {
+            accounts
+                .upsert_device(hs_auth::store::DeviceRecord {
+                    user_id: bot.to_owned(),
+                    device_id: device.into(),
+                    display_name: None,
+                    last_seen_ms: None,
+                    last_seen_ip: None,
+                })
+                .await
+                .unwrap();
+        }
+        let keyed: &ruma::DeviceId = "KEYED".into();
+        e2e.upload_device_keys(bot, keyed, serde_json::json!({"device_id": "KEYED"}))
+            .await
+            .unwrap();
+        e2e.upload_one_time_keys(
+            bot,
+            keyed,
+            BTreeMap::from([(
+                "signed_curve25519:AAAA".to_owned(),
+                serde_json::json!({"key": "k"}),
+            )]),
+        )
+        .await
+        .unwrap();
+        let sources = Sources {
+            hub,
+            rooms,
+            e2e,
+            accounts,
+        };
+
+        let counts = sources.key_counts(bot.as_str()).await.unwrap();
+
+        let by_device: BTreeMap<_, _> = counts
+            .iter()
+            .map(|c| (c.device_id.as_str(), &c.one_time_keys))
+            .collect();
+        assert_eq!(
+            by_device,
+            BTreeMap::from([
+                (
+                    "KEYED",
+                    &BTreeMap::from([(SIGNED_CURVE25519.to_owned(), 1)])
+                ),
+                (
+                    "NEWDEVICE",
+                    &BTreeMap::from([(SIGNED_CURVE25519.to_owned(), 0)])
+                ),
+            ])
+        );
+    }
+
     /// Two replicas would each queue every event and each send every transaction. So a replica
     /// does the pump's work only while it owns the global shard, and an appservice's delivery
     /// only while it owns that appservice's shard -- and picks each up, from shared storage,
@@ -921,6 +1024,7 @@ mod tests {
             rooms: rooms.clone(),
             hub,
             e2e,
+            accounts: Arc::new(hs_auth::store::memory::InMemoryAuthStore::new()),
             ownership: ownership.clone(),
             layout,
             metrics: None,

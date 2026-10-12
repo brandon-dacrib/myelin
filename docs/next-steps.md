@@ -46,7 +46,11 @@ The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/
    `self_signing_keys` (`1MIe…`) with the manager's. Server dropped it: hs-e2e; manager signed
    with a key it did not upload: hs-bridges. Then a real-binary test of the re-create flow
    (`hs-cli/tests/bridge_offerings.rs`).
-3. **Discord**: request one again (`start discord` to `@discordbot`), see Running.
+3. **Discord**: its pod is Running (seen 2026-10-12), but it could not decrypt anything:
+   the server never told its keyless MSC4190 device to upload keys. Fixed on
+   `agent/discord-otk-counts` (status 11, 2026-10-12, later). After the roll that carries it,
+   `login qr` in the Discord management room should get a QR code. If the old messages stay
+   undecryptable, run `/discardsession` in that room and try again.
 4. **iMessage on the owner's Mac**: download, address, `./run.sh`, Full Disk Access, a message
    both ways; then an `e2e-real` case.
 5. The WARN noise of `event failed the authentication check` (track 02/14, one line in the log

@@ -15,6 +15,13 @@ carries the generated notes for that merge.
 
 ## Unreleased
 
+- **The Discord bridge can decrypt.** mautrix-discord makes its bot's device without keys
+  (MSC4190) and uploads them when a transaction says that device has none. The server only
+  counted devices that already had keys, so the bridge never uploaded, and every encrypted
+  message, `login qr` included, came back as "the bridge hasn't received the decryption keys".
+  Every device is now counted, at zero when it has no keys, as Synapse does. Verified with the
+  real binary and a stand-in bridge.
+
 ## 0.3.0 (2026-10-11)
 
 Two bridges the catalogue did not get right: one whose config layout was wrong, and one that

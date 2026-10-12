@@ -162,7 +162,8 @@ pub struct RoomFacts {
 pub struct DeviceKeyCounts {
     /// The device.
     pub device_id: String,
-    /// Remaining one-time keys by algorithm (only algorithms with at least one).
+    /// Remaining one-time keys by algorithm: `signed_curve25519` always (zero when none are
+    /// left, or none were ever uploaded), any other algorithm only with at least one.
     pub one_time_keys: BTreeMap<String, u64>,
     /// Algorithms with an unused fallback key.
     pub unused_fallback_key_types: Vec<String>,
@@ -201,11 +202,12 @@ pub trait EphemeralSource: Send + Sync {
 }
 
 /// Where MSC3202's key counts come from: one-time-key counts and unused fallback key types
-/// for every device of a user that has uploaded keys. Split from [`DeviceSource`] because the
+/// for every device of a user, including one that has not uploaded keys yet (a bridge in
+/// appservice mode uploads its first keys when told its count is zero). Split from [`DeviceSource`] because the
 /// event pump ([`crate::pump`]) needs only this.
 #[async_trait]
 pub trait KeyCountSource: Send + Sync {
-    /// Key counts for each of `user_id`'s devices with uploaded keys.
+    /// Key counts for each of `user_id`'s devices, keys uploaded or not.
     async fn key_counts(&self, user_id: &str) -> Result<Vec<DeviceKeyCounts>, String>;
 }
 
@@ -825,7 +827,7 @@ async fn room_facts<'c>(
 }
 
 /// MSC3202's `device_one_time_keys_count` and `device_unused_fallback_key_types` for `users`:
-/// every device of theirs with uploaded keys, from `source`. Used by this pump and by
+/// every device of theirs, from `source`. Used by this pump and by
 /// [`crate::pump`] alike.
 ///
 /// # Errors
