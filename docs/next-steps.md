@@ -70,6 +70,14 @@ the known `event failed the authentication check` WARN noise (above), and **one 
   a key it did not upload (hs-bridges bug). Two things to fix regardless: the manager should
   check `self_signing_keys` as it checks the master and publish again when it differs, and a
   refused signature should back off (it is retried every tick, 1,200 WARN lines an hour).
+  **Both done** (branch `agent/bot-identity-selfsigning`, 2026-10-12, status 11): the manager
+  checks `self_signing_keys` as it checks the master and publishes both again when either is
+  not its own; a failed settle backs off (3 s doubling to 5 min) and is logged once per distinct
+  error. After the next roll the demo's WhatsApp bot gets its device signed on the manager's
+  first look; the `/keys/query` above still says which side dropped the key on 2026-10-11.
+  (Also: `git checkout v0.3.0` in the main checkout left it detached; a handover commit made
+  there was re-applied to `main` on 2026-10-12. Roll from a worktree, or `git checkout main`
+  after.)
 
 **2026-10-11, later (branch `agent/imessage-web`, off `agent/imessage-offering`, status 16): the
 web half of the iMessage offering.** For a type with `runs_on: "mac"` the instance row's action is
