@@ -295,7 +295,6 @@ impl<B: KvBackend> RoomActor<B> {
     }
 
     fn fetch_from_store(&self, sn: EventSn) -> Option<(Arc<Event>, Option<i64>)> {
-        crate::metrics::count_event_cache_miss();
         match self.read_stored_row(sn) {
             Ok(Some((event, persisted))) => {
                 // One read answers both whether the room holds the event and what it is.
@@ -310,6 +309,7 @@ impl<B: KvBackend> RoomActor<B> {
                 if !held {
                     return None;
                 }
+                crate::metrics::count_event_cache_miss();
                 self.held_verdicts.borrow_mut().insert(sn, ());
                 Some((
                     Arc::new(self.decorate_from_store(event)),
