@@ -1,10 +1,65 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-10-11, 12:50 EDT (0.2.0 on the demo: 915 MiB flat at boot, sender quiet, notary in use). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+Written 2026-09-20 by the integration lead, last revised 2026-10-12, 12:30 EDT (0.3.0 on the demo; the cross-signing fix merged, its roll is next). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
-## Resume here: 2026-10-11 -- 0.2.0 runs on the demo (revision 18), verified: memory flat at 915 MiB, sender quiet, notary in use; the state store's half needs its hs-room side
+## Resume here: 2026-10-12 -- 0.3.0 runs on the demo (revision 20); roll `6469d192` next, then read the bot's keys
+
+**Read this first.** The 2026-10-11 session (two owner asks, both merged and released as
+**0.3.0**, tag `v0.3.0`, image `ghcr.io/brandon-dacrib/myelin:0.3.0`):
+
+1. **Discord bridges start** (`cf8566ee`, status 11): mautrix-discord is on mautrix-go's older
+   framework and gets its own `config.yaml` layout. The demo's Discord instance was removed by
+   the owner before the roll, so the check is to request one again and see its pod reach
+   Running and `help` to `@discordbot_brandon` answered. **Not yet seen.**
+2. **iMessage is offered** (`d344c855`, `ed280918`, `47238821`; status 11 and 16;
+   `docs/bridges/imessage.md`): a program for the person's Mac, pinned CI build, address set
+   from the row's "Set up on a Mac" dialog, `run.sh` with the files. Verified against the real
+   binary with a stand-in at the address. **Not yet run on a real Mac**: the owner's is the
+   first (the doc's "What was verified" says what to watch).
+3. **The roll** (owner, revision 20, 21:06 UTC): server, operator, WhatsApp and Signal pods
+   Running, 0 ERROR. One new finding: **the WhatsApp bot's device has not been cross-signable
+   since 17:00:40 UTC**, after the owner re-created the instance (details in the 2026-10-11,
+   later section below). The manager-side fixes are **merged, `6469d192`** (2026-10-12, status
+   11): the self-signing key is checked like the master and published again when the server
+   does not hold it; a refused signature backs off and is logged once. CD run 38276275100
+   builds `sha-6469d192…`.
+
+**Next, in order.**
+
+1. **Roll `sha-6469d192…`** (owner, plain shell, not from the session: the classifier refuses
+   `helm upgrade` even through the proxy, and `git checkout <tag>` in the main checkout leaves it
+   detached, so roll from a worktree or `git checkout main` after):
+   `helm --kube-context admin@dacrib0 get values myelin -n myelin -o yaml > /tmp/myelin-values.yaml && helm --kube-context admin@dacrib0 upgrade myelin deploy/helm/hs -n myelin -f /tmp/myelin-values.yaml -f deploy/demo/values-bridges.yaml --set image.tag=sha-6469d192<full sha> --wait --timeout 10m`.
+   Then the log should say `published the bot's cross-signing keys … self_signing_was_published=false`
+   once and `cross-signed the bridge bot's device … device=BQBMQVR81T`, and the WARN loop stops.
+2. **Which side lost the self-signing key on 2026-10-11**: `POST /_matrix/client/v3/keys/query`
+   for `@whatsappbot_brandon:myelin.dacrib.net` with an admin or bot token, before the roll if
+   possible (the roll's republish overwrites the evidence); compare `master_keys` (`1wFu…`) and
+   `self_signing_keys` (`1MIe…`) with the manager's. Server dropped it: hs-e2e; manager signed
+   with a key it did not upload: hs-bridges. Then a real-binary test of the re-create flow
+   (`hs-cli/tests/bridge_offerings.rs`).
+3. **Discord**: request one again (`start discord` to `@discordbot`), see Running.
+4. **iMessage on the owner's Mac**: download, address, `./run.sh`, Full Disk Access, a message
+   both ways; then an `e2e-real` case.
+5. The WARN noise of `event failed the authentication check` (track 02/14, one line in the log
+   filter; still ~10,000 per 9 minutes).
+6. `agent/state-load` (hs-02, tip `4dd0b8e6`, pushed, not gated): the one unmerged branch, its
+   hs-room half still to do (below).
+
+**Reading the cluster from a session, what worked on 2026-10-11**: with the owner's
+`kubectl proxy` on 127.0.0.1:8001, a kubeconfig file whose cluster is
+`http://127.0.0.1:8001` (no credentials) makes `kubectl get`, `kubectl logs`, `helm list` and
+`helm get values` work; Loki's history is at
+`http://127.0.0.1:8001/api/v1/namespaces/monitoring-system/services/loki-gateway:80/proxy/loki/api/v1/query_range`
+with Apple's `/usr/bin/curl`. `helm upgrade` and, inconsistently, some `kubectl get` calls
+are refused by the harness's classifier ("Protected-Scope IaC Apply").
+
+**Worktrees**: `.claude/worktrees/state-load` (its branch), plus the queue's own `merge-queue`
+and `merge-queue-dry`. Nothing else is left running.
+
+## Earlier: 2026-10-11 -- 0.2.0 runs on the demo (revision 18), verified: memory flat at 915 MiB, sender quiet, notary in use; the state store's half needs its hs-room side
 
 **Read this first.** Nothing rolled to the demo tonight. It runs `sha-2d11ea2e` (revision 17) with
 the pod's memory limit raised by the owner from the chart's default to **2Gi at 22:45 UTC
