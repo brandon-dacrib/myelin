@@ -94,6 +94,20 @@ server's log has one `moved the bridge instance's double puppeting` line per ins
    filter; still ~10,000 per 9 minutes).
 6. `agent/state-load` (hs-02, tip `4dd0b8e6`, pushed, not gated): the one unmerged branch, its
    hs-room half still to do (below).
+6. **A room loads without replaying its history** (`agent/state-load`, hs-02 and hs-04,
+   rebased linear on `main` 2026-10-12, pushed, waiting for the merge queue; RFC 0025,
+   decision 0045, status 02 and 04). `hs-state`'s per-event records are durable, and the room
+   actor no longer feeds the store its whole history on every load: a room whose records are
+   complete loads from its rows (50,000 messages on Fjall: 0.16-0.20 s, against 3.0-3.5 s for
+   the replay every load did), the store is fed inside the event's own transaction, and "this
+   actor holds the event" is read from the room's row, not the shared store. **On the first
+   roll that carries it, every room is replayed once on its first load** and marked; watch
+   `hs_state_migrations_total` climb to the number of rooms and stop,
+   `hs_room_load_seconds{state="replayed"}` stop growing after it, and
+   `hs_room_state_records_repaired_total` stay 0. Verified on the real binary, including a
+   data dir written by `main` before it. Left (status 04): a load still reads every timeline
+   row's fields and keeps the `timeline` map; outliers and placed history are fed just after
+   their commit.
 
 **Reading the cluster from a session, what worked on 2026-10-11**: with the owner's
 `kubectl proxy` on 127.0.0.1:8001, a kubeconfig file whose cluster is
@@ -103,8 +117,8 @@ server's log has one `moved the bridge instance's double puppeting` line per ins
 with Apple's `/usr/bin/curl`. `helm upgrade` and, inconsistently, some `kubectl get` calls
 are refused by the harness's classifier ("Protected-Scope IaC Apply").
 
-**Worktrees**: `.claude/worktrees/state-load` (its branch), plus the queue's own `merge-queue`
-and `merge-queue-dry`. Nothing else is left running.
+**Worktrees**: `.claude/worktrees/state-load` (its branch; remove once merged), plus the
+queue's own `merge-queue` and `merge-queue-dry`. Nothing else is left running.
 
 ## Earlier: 2026-10-11 -- 0.2.0 runs on the demo (revision 18), verified: memory flat at 915 MiB, sender quiet, notary in use; the state store's half needs its hs-room side
 

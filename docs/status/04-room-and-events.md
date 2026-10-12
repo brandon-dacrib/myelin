@@ -57,15 +57,15 @@ crate's tests failed: the actor used "the state store knows it" as "this actor h
 fed; replay over the records (every load until now) 3.0-3.5 s; one-time migration into an empty
 store 2.8-3.2 s. (An intermediate version that still decoded every row took 0.65 s.)
 
-**Real binary** (`target/debug/hs`, a fresh data dir, one room of 200 messages and 5 state
-changes, `SIGTERM`, restart): state and `/messages` identical after the restart,
-`hs_state_events_replayed_total 0`, `hs_state_migrations_total 0`,
-`hs_room_state_records_repaired_total 0` on the second start. A data dir written by `main`
-(`d4a69b5b`, before this branch) opened by this branch: identical answers,
-`hs_state_migrations_total 1` and "built the room's durable state records from its events ...
-events=211 elapsed_ms=36" on the first start; 0 migrations and 0 replays on the next.
-(Details in the 2026-10-12 report to the coordinator; reproduce with any data dir, reading
-`/metrics`.)
+**Real binary** (debug `target/debug/hs`, embedded store, one room of 2,000 messages and 4
+topic changes, `SIGTERM`, restart; a script reading `/rooms/{id}/state`, `/messages` and
+`/metrics`): on a fresh data dir, state and the newest 1,000 timeline events identical after the
+restart, `hs_room_load_seconds{state="read"}` 0.114 s, `hs_state_events_replayed_total 0`,
+`hs_state_migrations_total 0`, `hs_room_state_records_repaired_total 0`. A data dir written by
+`main` before this branch (`d4a69b5b`) opened by this branch: identical answers; first start
+`hs_room_load_seconds{state="replayed"}` 0.487 s, `hs_state_migrations_total 1` and "built the
+room's durable state records from its events ... events=2011 elapsed_ms=409"; second start
+`{state="read"}` 0.114 s, 0 migrations, 0 replays, 0 repairs.
 
 **Tests**: the 16 that failed after the merge of `main` all pass unchanged
 (`actor::catch_up::tests::{a_copy_reads_only_the_new_rows_and_ends_up_as_a_fresh_load_would,
