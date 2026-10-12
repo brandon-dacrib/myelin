@@ -115,6 +115,11 @@ again after; only someone who can read the server's log can use it. Behind a rev
 the link names the address the server listens on, and the line after it says so: open it with
 the host replaced by wherever you reach the server, since the token is what matters.
 
+**[docs/user-guide.md](docs/user-guide.md) is the guide to the admin interface from there**,
+with screenshots from the real server: the first sign-in, users and invite links, rooms,
+bridges, federation, configuration and the other pages, and a short section to send the people
+who use the server.
+
 Locked out later, with nobody able to sign in as an administrator? `docker exec myelin hs
 recover` prints a one-time link that resets an administrator's password and signs you in. It
 works because the command runs where the server keeps its signing key and signs its request
@@ -214,6 +219,7 @@ each with its evidence in `docs/status/06-federation.md`.
 
 ## Where things are
 
+- `docs/user-guide.md`: using the admin interface day to day, with screenshots.
 - `PLAN.md`: the plan, design decisions, architecture, roadmap.
 - `docs/landscape.md`: the other homeservers as they are today, and where this one stands.
 - `docs/scaling.md`: what a replica adds, what it does not, and what is built versus designed.

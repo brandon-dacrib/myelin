@@ -1,7 +1,70 @@
 # 16. Management web interface: status
 
-Last updated: 2026-10-11 (an iMessage bridge is set up on the person's Mac from its row:
-download, address, files, how to run it; branch `agent/imessage-web`).
+Last updated: 2026-10-12 (a user guide for administrators, with screenshots from the real
+server; branch `agent/user-guide`).
+
+## 2026-10-12: a user guide, with screenshots from the real server (branch `agent/user-guide`)
+
+The owner asked for a user guide with screenshots. `docs/user-guide.md` is written for the
+server's administrator, in task order: a short section to send the people who use the server
+(connect with Element, an invite link, getting a bridge by messaging its bot), then first
+sign-in (the setup link, signing in, `hs recover`), the Overview, Users (add, a user's page,
+reset a password, deactivate, invite links, open sign-up), Rooms (the list, a room's page and
+its tabs, each action, deleting), Bridges (offering WhatsApp step by step, the offering's
+page, registrations), Federation (the list and a destination's page), Configuration (badges,
+changing a setting, review, save, history), then Media, Reports (and deciding one), Tasks,
+Statistics, Audit log, API tokens, Server notices, Cluster and Migration, and where to go next.
+README and `docs/install-and-upgrade.md` link to it.
+
+**How the screenshots were made.** All 39 PNGs in `docs/user-guide/` (1280x800, light theme,
+4 MB together; neither `pngquant` nor `oxipng` is installed here, so they are not compressed)
+come from `web/e2e-real/user-guide.spec.ts` against a real `hs serve` on an empty data
+directory, server name `example.org`. The spec makes the first administrator through the setup
+page, seeds alice, bob, carol and dave and the rooms General, Random and Old project through the
+admin and client-server APIs (a report from carol about dave's message, a picture from alice, a
+failed invitation to `@frank:example.invalid` so Federation has a destination), and then does
+every task the guide describes through the interface: adds erin, deactivates dave, makes an
+invite link, opens it in a second browser, saves a configuration change, deletes Old project,
+offers WhatsApp and adds one for alice, resolves the report, sends a server notice, opens a
+recovery link from `hs recover`. Nothing secret is readable: password fields are masked, the
+setup and recovery tokens are in the address's fragment, which a page screenshot does not show,
+and the one visible token is the invite link's made-up `welcome-to-example-org`. It waits a
+minute before the Overview so its counts (cached for a minute by `hs-cli`'s overview source)
+include the seeded data. Like every `e2e-real/` spec it skips when `HS_REAL_SERVER_URL` is
+unset, so `npm run test:e2e` and CI are unaffected; it needs a fresh server each run (it skips,
+saying so, on a server that already has an administrator).
+
+To take them again (from `web/`, with `hs serve --data-dir <dir> --server-name example.org`
+running and its setup link's token at hand):
+
+```sh
+HS_REAL_SERVER_URL=http://127.0.0.1:8008 \
+HS_USER_GUIDE_SETUP_TOKEN=<the part after #token=> \
+HS_USER_GUIDE_RECOVER_CMD="../target/debug/hs recover --data-dir <dir>" \
+HS_USER_GUIDE_SCREENSHOTS=1 \
+  npx playwright test --config playwright.real.config.ts user-guide
+```
+
+Without `HS_USER_GUIDE_SCREENSHOTS=1` they go to `test-results/user-guide/`. Run on 2026-10-12
+against `hs` built from this branch: 1 passed (1.5 min).
+
+**Found while taking them** (not fixed here; none is in `web/`):
+
+- A user's page says **Rooms 0** and **Media 0** for alice, who is in two rooms and uploaded a
+  file: `GET /api/v1/users/{id}` answers `room_count: 0, media_count: 0` (track 15's user
+  source does not fill them).
+- The Overview's **Users** and the Statistics page's **New accounts** count the bridge bots and
+  `@_server` (9 new accounts for 5 people and an administrator), and **Daily active users**
+  on Statistics says 0 next to a "Now" of 5 until the next 15-minute sample.
+- The sidebar shows **Migration** only while the Overview counts one user or fewer, and that
+  count is cached for a minute, so for the first minute after people are added the item is
+  still there; the guide explains where to find the page when it is hidden.
+- An offered bridge that runs elsewhere shows **Degraded** (Overview "Attention", the
+  Registrations tab, its ping) before anybody has run it, which reads as a fault rather than
+  "waiting for someone to run it".
+- A configuration section's header badge says **Restart required** when 33 of its 37 settings
+  apply on save (Sign-in and registration); the box under it is right, the badge reads wrong.
+- A report's heading names the room by ID (`Message in !4MKn…:example.org`), not by its name.
 
 ## 2026-10-11: a bridge that runs on a Mac is set up from its row (branch `agent/imessage-web`, on `agent/imessage-offering`)
 

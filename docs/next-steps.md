@@ -6,6 +6,8 @@ The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/
 
 ## Resume here: 2026-10-12 -- 0.3.0 runs on the demo (revision 20); roll `6469d192` next, then read the bot's keys
 
+**User guide** (2026-10-12): `docs/user-guide.md` is the administrator's guide to the interface, with 39 screenshots from the real binary in `docs/user-guide/`, made by `web/e2e-real/user-guide.spec.ts` (status 16 says how to take them again). Retake them when a page it shows changes.
+
 **Install and upgrade** (2026-10-12): `docs/install-and-upgrade.md` is the operator's page of Helm commands, verified on kind 0.2.0 → 0.3.0 → rollback (status 12). Keep it current when a release needs a one-time step.
 
 **Read this first.** The 2026-10-11 session (two owner asks, both merged and released as

@@ -83,6 +83,8 @@ kubectl -n myelin port-forward svc/myelin-hs 8008:8008   # without publicBaseUrl
 ```
 
 Open the link, choose a username and password, and you are in the admin interface at `/admin/`.
+The [user guide](user-guide.md#1-first-sign-in) starts here and goes through the interface
+from the first sign-in on.
 
 ### A server on the internet
 
