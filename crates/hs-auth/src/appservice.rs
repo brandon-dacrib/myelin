@@ -130,6 +130,17 @@ pub trait AppserviceRegistry: Send + Sync {
     async fn network_room_ids(&self, _instance_id: Option<&str>) -> Vec<String> {
         Vec::new()
     }
+
+    /// The double-puppeting registration that belongs to the appservice `appservice_id`, if
+    /// any: a registration of its own, with no `url`, whose claim on real users is what lets a
+    /// bridge act as them (decision 0046). An appservice login by `appservice_id` as a user its
+    /// own registration does not claim is allowed when this one does
+    /// (`routes::login`): a bridge that knows only the appservice login form
+    /// (mautrix-imessage) double puppets with its own token, and its own registration still does
+    /// not claim its person, so it is not sent every room they are in. The default has none.
+    async fn double_puppet_record_for(&self, _appservice_id: &str) -> Option<AppserviceRecord> {
+        None
+    }
 }
 
 /// An in-memory registry for tests and for running this crate standalone before track 11's real
@@ -137,6 +148,8 @@ pub trait AppserviceRegistry: Send + Sync {
 #[derive(Default)]
 pub struct InMemoryAppserviceRegistry {
     by_token: std::sync::Mutex<std::collections::HashMap<String, AppserviceRecord>>,
+    /// Double-puppeting registrations by the appservice they belong to.
+    double_puppets: std::sync::Mutex<std::collections::HashMap<String, AppserviceRecord>>,
 }
 
 impl InMemoryAppserviceRegistry {
@@ -152,6 +165,18 @@ impl InMemoryAppserviceRegistry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(token.into(), record);
+    }
+
+    /// Registers `record` as the double-puppeting registration of `for_appservice`.
+    pub fn insert_double_puppet(
+        &self,
+        for_appservice: impl Into<String>,
+        record: AppserviceRecord,
+    ) {
+        self.double_puppets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(for_appservice.into(), record);
     }
 }
 
@@ -177,6 +202,14 @@ impl AppserviceRegistry for InMemoryAppserviceRegistry {
                     .any(|ns| ns.exclusive && ns.regex.is_match(user_id.as_str()))
             })
             .map(|record| record.appservice_id.clone())
+    }
+
+    async fn double_puppet_record_for(&self, appservice_id: &str) -> Option<AppserviceRecord> {
+        self.double_puppets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(appservice_id)
+            .cloned()
     }
 }
 

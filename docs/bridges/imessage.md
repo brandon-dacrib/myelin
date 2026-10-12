@@ -33,13 +33,13 @@ the table) with iMessage's own sections, read from its `example-config.yaml` at 
   has no `/data`;
 - `imessage.platform: mac`;
 - `bridge.user`: the one person the bridge is for (no `permissions`);
-- no `bridge.login_shared_secret`, so the bridge does not double puppet (since 2026-10-12,
-  decision 0046). This build knows only the literal `appservice` there, an appservice login with
-  the bridge's own token, which needs the bridge's own registration to claim its person; that
-  claim made the server send the bridge every room the person is in, and stalled five of the
-  demo's bridges. It takes anything else, `as_token:<token>` included, as an HMAC secret. The
-  manager still starts the person's chat with the bot as them, with the instance's
-  double-puppeting registration (`<instance>-doublepuppet`, no url);
+- `bridge.login_shared_secret: appservice`, for double puppeting. This build knows only that
+  literal, an appservice login with the bridge's own token, and takes anything else,
+  `as_token:<token>` included, as an HMAC secret. The bridge's own registration does not claim
+  its person (decision 0046: that claim made the server send the bridge every room the person
+  is in, and stalled five of the demo's bridges). The server allows the login because the
+  instance's double-puppeting registration (`<instance>-doublepuppet`, no url) claims them
+  (decision 0046, amended);
 - `bridge.backfill.enable`;
 - `bridge.encryption` with `allow`, `default`, `appservice`, and **no `msc4190`**: its
   framework predates MSC4190, so the registration asks for MSC2409 and MSC3202 only and the
@@ -126,11 +126,12 @@ bridge's own Full Disk Access.
   3. Double puppeting: this build's `login_shared_secret` knows the literal `appservice`, not
      `as_token:<token>`, which it took as an HMAC secret for a password login (`403 Invalid
      username or password`). The config said `appservice`, checked the same way:
-     `Successfully automatically enabled custom puppet`. **Taken out the same night** (decision
-     0046): `appservice` needs the bridge's own registration to claim the person, which floods
-     the bridge with every room they are in. The config now has no `login_shared_secret`, so
-     what the person sends from their own Apple devices is not shown as them. It can come back
-     when the bridge takes an `as_token:` secret (mautrix-go's newer frameworks do).
+     `Successfully automatically enabled custom puppet`. Taken out the same night by decision
+     0046, because `appservice` needed the bridge's own registration to claim the person, and
+     **back the same night** (0046 amended): the server allows the login through the instance's
+     double-puppeting registration instead. Checked with the real build and registrations laid
+     out as 0046 has them: `Successfully automatically enabled custom puppet` with the
+     double-puppeting registration, `403 Application service cannot masquerade` without it.
 
   Still to see on the demo: a message both ways, which needs Full Disk Access for the
   terminal that runs `run.sh` and the server with fix 2. Whether the config upgrader keeps

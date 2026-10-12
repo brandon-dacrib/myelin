@@ -373,9 +373,25 @@ async fn resolve_appservice_login(
     let user_id = UserId::parse_with_server_name(m.user.as_str(), state.server_name())
         .map_err(|_| MatrixError::invalid_param("invalid user identifier"))?;
     if !record.can_control(&user_id) {
-        return Err(MatrixError::forbidden(
-            "Application service cannot masquerade as this user",
-        ));
+        // Its double-puppeting registration may claim them: a bridge that knows only this login
+        // form (mautrix-imessage) double puppets with its own token, while its own registration
+        // does not claim its person (decision 0046).
+        let through_double_puppet = state
+            .appservices
+            .double_puppet_record_for(&record.appservice_id)
+            .await
+            .filter(|dp| dp.can_control(&user_id));
+        let Some(double_puppet) = through_double_puppet else {
+            return Err(MatrixError::forbidden(
+                "Application service cannot masquerade as this user",
+            ));
+        };
+        tracing::info!(
+            appservice = %record.appservice_id,
+            double_puppet = %double_puppet.appservice_id,
+            user_id = %user_id,
+            "an appservice logged in as a user its double-puppeting registration claims"
+        );
     }
     // Appservice-driven logins auto-provision the user if it does not exist yet, matching
     // Synapse's behavior for `m.login.application_service` (the AS namespace already proved the
@@ -430,6 +446,82 @@ mod tests {
         record.password_hash = Some(hash_password(password).unwrap());
         state.store.create_user(record).await.unwrap();
         state
+    }
+
+    /// mautrix-imessage double puppets only through an appservice login with its own token.
+    /// Its own registration does not claim its person (decision 0046), so the login is allowed
+    /// for whoever its double-puppeting registration claims, and nobody else.
+    #[tokio::test]
+    async fn an_appservice_logs_in_as_a_user_its_double_puppeting_registration_claims() {
+        use crate::appservice::{AppserviceRecord, InMemoryAppserviceRegistry, NamespaceRule};
+        let rule = |pattern: &str, exclusive| NamespaceRule {
+            regex: regex::Regex::new(pattern).unwrap(),
+            exclusive,
+        };
+        let registry = InMemoryAppserviceRegistry::new();
+        registry.insert(
+            "imessage_token",
+            AppserviceRecord::new(
+                "imessage-brandon",
+                user_id!("@imessagebot_brandon:example.org").to_owned(),
+                vec![rule(r"@imessage_brandon_.*:example\.org", true)],
+            ),
+        );
+        let state = AuthState::in_memory().with_appservices(std::sync::Arc::new(registry));
+        let login_as = |state: AuthState, user: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(AUTHORIZATION, "Bearer imessage_token".parse().unwrap());
+            let body = json!({
+                "type": "m.login.application_service",
+                "identifier": {"type": "m.id.user", "user": user},
+            });
+            async move {
+                post_login(
+                    State(state),
+                    headers,
+                    Query(HashMap::new()),
+                    hs_http::buckets::ClientIp(None),
+                    PermissiveJson(body),
+                )
+                .await
+                .map(|r| r.status())
+                .map_err(|e| e.status())
+            }
+        };
+
+        // No double-puppeting registration: its person is not its own registration's to claim.
+        assert_eq!(
+            login_as(state.clone(), "@brandon:example.org").await,
+            Err(StatusCode::FORBIDDEN)
+        );
+
+        let registry = InMemoryAppserviceRegistry::new();
+        registry.insert(
+            "imessage_token",
+            AppserviceRecord::new(
+                "imessage-brandon",
+                user_id!("@imessagebot_brandon:example.org").to_owned(),
+                vec![rule(r"@imessage_brandon_.*:example\.org", true)],
+            ),
+        );
+        registry.insert_double_puppet(
+            "imessage-brandon",
+            AppserviceRecord::new(
+                "imessage-brandon-doublepuppet",
+                user_id!("@imessage-brandon-doublepuppet:example.org").to_owned(),
+                vec![rule(r"@brandon:example\.org", false)],
+            ),
+        );
+        let state = AuthState::in_memory().with_appservices(std::sync::Arc::new(registry));
+        assert_eq!(
+            login_as(state.clone(), "@brandon:example.org").await,
+            Ok(StatusCode::OK)
+        );
+        // Only whom the double-puppeting registration claims.
+        assert_eq!(
+            login_as(state, "@alice:example.org").await,
+            Err(StatusCode::FORBIDDEN)
+        );
     }
 
     #[tokio::test]

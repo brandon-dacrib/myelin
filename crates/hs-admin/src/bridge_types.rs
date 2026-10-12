@@ -1501,14 +1501,23 @@ fn mautrix_imessage_config(p: &MautrixParams<'_>) -> String {
     ));
     out.push_str("  backfill:\n");
     out.push_str(&format!("    enable: {}\n", p.backfill));
-    // No double puppeting from the bridge itself. This build's `loginWithSharedSecret` knows
-    // only the literal `appservice` (an appservice login with the registration's own token) and
-    // takes anything else, `as_token:<token>` included, as an HMAC secret for a password login,
-    // which this server refuses (both seen with the real build on 2026-10-12). An appservice
-    // login as the person needs the bridge's own registration to claim them, and that claim makes
-    // every room they are in the bridge's business (decision 0046: it stalled five of the demo's
-    // bridges). So the bridge does not act as its person; the manager still does, with the
-    // instance's double-puppeting registration, to start the person's chat with the bot.
+    // Double puppeting with this build's only form: `loginWithSharedSecret` knows the literal
+    // `appservice` (an appservice login with the registration's own token) and takes anything
+    // else, `as_token:<token>` included, as an HMAC secret for a password login, which this
+    // server refuses (both seen with the real build on 2026-10-12). Its own registration does
+    // not claim its person (decision 0046: that claim made every room they are in the bridge's
+    // business and stalled five of the demo's bridges). The server lets it log in as anyone its
+    // double-puppeting registration claims instead (`hs_auth::appservice::AppserviceRegistry::
+    // double_puppet_record_for`).
+    if p.double_puppet_secret.is_some() {
+        out.push_str(
+            "  # The bridge sends as its person through an appservice login with its own token,\n",
+        );
+        out.push_str(
+            "  # which the server allows for whoever its double-puppeting registration claims.\n",
+        );
+        out.push_str("  login_shared_secret: appservice\n");
+    }
     out.push_str("  encryption:\n");
     if p.encryption {
         out.push_str(
@@ -3112,10 +3121,11 @@ mod tests {
             "imessage_brandon_{{.}}"
         );
         assert_eq!(config["bridge"]["backfill"]["enable"], true);
-        // No double puppeting from the bridge: `appservice` would need its own registration to
-        // claim the person, and `as_token:<token>` is taken as an HMAC secret (decision 0046).
-        assert!(
-            config["bridge"].get("login_shared_secret").is_none(),
+        // Double puppeting in the one form this build knows: an appservice login with its own
+        // token, which the server allows for whoever its double-puppeting registration claims
+        // (`as_token:<token>` would be taken as an HMAC secret).
+        assert_eq!(
+            config["bridge"]["login_shared_secret"], "appservice",
             "{text}"
         );
         assert!(config["bridge"].get("login_shared_secret_map").is_none());

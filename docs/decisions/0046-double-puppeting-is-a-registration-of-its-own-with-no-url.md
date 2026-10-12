@@ -39,10 +39,16 @@ request for url (...)`: reqwest's top line, without the timeout under it.
    since mautrix-go v0.15). The bridge acts as the person with it and `?user_id=`, which the
    server's masquerading allows for any user a registration's namespace covers.
    mautrix-imessage's build knows only `login_shared_secret: appservice`, an appservice login
-   with its own token, which needs the claim this decision removes; it takes `as_token:` as an
-   HMAC secret. So it gets no double puppeting in its config: what its person sends from their
-   own Apple devices is not sent as them. Until that bridge takes `as_token:`, that is the price
-   of not flooding it.
+   with its own token, and takes `as_token:` as an HMAC secret. **Amended 2026-10-12, late (the
+   owner wants iMessage to double puppet):** the server allows an appservice login by an
+   appservice as a user its own registration does not claim when that appservice's
+   double-puppeting registration (`io.myelin.double_puppet_for` naming it) does
+   (`AppserviceRegistry::double_puppet_record_for`, `hs-auth`'s `routes::login`). The bridge's
+   own registration still claims only its ghosts and bot, so it is not flooded, and its config
+   says `appservice` again. This widens only the login: masquerading with `?user_id=` and
+   transaction delivery still follow the bridge's own registration. Checked with the real
+   build: `Successfully automatically enabled custom puppet` with the double-puppeting
+   registration, and `403` without it.
 3. **One per instance, not one shared.** The manager mints `<instance id>-doublepuppet` for each
    instance that double puppets, claiming that instance's owner alone (`@brandon:server`), and
    keeps its tokens on the instance's row (`InstanceRow::double_puppet`). The wizard's

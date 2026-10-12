@@ -55,15 +55,10 @@ impl<B: KvBackend> RegistryAppserviceAdapter<B> {
     }
 }
 
-#[async_trait]
-impl<B: KvBackend> AppserviceRegistry for RegistryAppserviceAdapter<B> {
-    async fn lookup_by_token(&self, token: &str) -> Option<AppserviceRecord> {
-        let row = self
-            .registry
-            .store()
-            .get_by_as_token(token)
-            .ok()
-            .flatten()?;
+impl<B: KvBackend> RegistryAppserviceAdapter<B> {
+    /// `row` as `hs-auth` sees an appservice: its sender and its user namespaces, projected
+    /// onto the `regex` crate (see the module docs), and its capability flags.
+    fn record_of(&self, row: crate::store::AppserviceRow) -> Option<AppserviceRecord> {
         let sender_str = format!("@{}:{}", row.sender_localpart, self.registry.server_name());
         let sender = UserId::parse(&sender_str).ok()?;
 
@@ -101,6 +96,29 @@ impl<B: KvBackend> AppserviceRegistry for RegistryAppserviceAdapter<B> {
             rate_limited: row.rate_limited,
             msc4190_enabled: row.msc4190,
         })
+    }
+}
+
+#[async_trait]
+impl<B: KvBackend> AppserviceRegistry for RegistryAppserviceAdapter<B> {
+    async fn lookup_by_token(&self, token: &str) -> Option<AppserviceRecord> {
+        let row = self
+            .registry
+            .store()
+            .get_by_as_token(token)
+            .ok()
+            .flatten()?;
+        self.record_of(row)
+    }
+
+    async fn double_puppet_record_for(&self, appservice_id: &str) -> Option<AppserviceRecord> {
+        let row = self.registry.store().list().ok()?.into_iter().find(|row| {
+            row.extra
+                .get(hs_admin::bridge_types::DOUBLE_PUPPET_FOR_KEY)
+                .and_then(serde_json::Value::as_str)
+                == Some(appservice_id)
+        })?;
+        self.record_of(row)
     }
 
     async fn exclusive_user_owner(&self, user_id: &UserId) -> Option<String> {
