@@ -15,6 +15,13 @@ carries the generated notes for that merge.
 
 ## Unreleased
 
+- **A re-created bridge's bot can cross-sign its devices again.** The server checked every
+  signature on a device being signed, including one by a self-signing key the bot no longer
+  had, and refused the new signature with "no known key". On the demo, the re-created WhatsApp
+  bot could sign none of its devices, and the server logged a WARN every 3 seconds. A signature
+  already stored on a key is no longer checked again, as in Synapse, and the bridge manager no
+  longer sends one. Verified with the real binary.
+
 - **The Discord bridge can decrypt.** mautrix-discord makes its bot's device without keys
   (MSC4190) and uploads them when a transaction says that device has none. The server only
   counted devices that already had keys, so the bridge never uploaded, and every encrypted

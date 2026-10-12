@@ -1,6 +1,7 @@
 # Status: track 11, appservices and bridges
 
-Last updated: 2026-10-12, later (a bridge device made without keys is told it has none, so
+Last updated: 2026-10-12, evening (a device signed by a replaced self-signing key can be signed
+by the new one, so the re-created WhatsApp bot's devices are signed; below); before that 2026-10-12, later (a bridge device made without keys is told it has none, so
 mautrix-discord uploads its keys and can decrypt; below); before that 2026-10-12 (the manager publishes the bot's self-signing key again when the server
 does not hold it, and a refused signature backs off; below); before that 2026-10-11, later (iMessage is offered: a program for the person's Mac, with its
 own config layout, a run script and an address the administrator sets; below); before that
@@ -30,6 +31,50 @@ manager) and an instance's Kubernetes objects say whose bridge they are; before 
 (who has signed in to a bridge; the `cluster` runtime run on kind); before that 2026-09-30
 (ephemeral, to-device and device-list delivery); before that 2026-09-27 (RFC 0017 run against
 the real binary), 2026-09-27 (the bridge manager) and 2026-09-25.
+
+## Session 2026-10-12, evening (branch `agent/stale-signatures`): the re-created WhatsApp bot's devices can be signed: the refused key was the old identity's
+
+**What was wrong.** The 2026-10-12 section below assumed the server had lost the manager's new
+self-signing key (`1MIe…`). It had not. `1MIe…` was the **previous instance's** self-signing
+key. The manager signs each bot device lacking its signature, starting from the object
+`/keys/query` returns. That object for `BQBMQVR81T`, the device the first instance used and
+cross-signed on 2026-10-10 at 22:44, still carried the old key's signature. The server's
+`/keys/signatures/upload` checked **every** entry under the signer's name
+(`verify_submitted_entries_by_signer`), found no key `1MIe…` after the new identity replaced it,
+and refused the whole upload. The new keys had been stored (Loki: minted 17:00:40.492,
+published .497, refused .499). The manager signs devices in ID order and stops at the first
+failure, so `BQBMQVR81T` < `TRV2160MAI` meant the bridge's **current** device was never signed
+either. A client that excludes insecure devices withholds keys from it. The 0.3.1 fix (republish
+when the self-signing key differs, back off) does not cover this: after it, the server holds the
+manager's keys, nothing is republished, and every signing still fails, only less often.
+
+**The fix, both sides.**
+
+- **Server (`hs-e2e`):** an entry already stored on the target, unchanged
+  (`signatures.<signer>.<key id>` with the same value), is not a new claim and is not checked
+  again (`already_stored`). This applies to devices and to cross-signing keys, including the
+  user-signing case. Synapse checks only the new signing key's signature and ignores the rest. A
+  new entry is still checked: one by an unknown key, or a stored key id with a different
+  signature, is still `M_INVALID_SIGNATURE`.
+- **Manager (`hs-bridges`):** `BotIdentity::sign_device` sends only the device's own
+  signature and the new one, as clients do, so it works on a server with the strict check too.
+
+**Verified.**
+- `hs-e2e/tests/cross_signing.rs::signatures_upload_accepts_a_device_still_carrying_a_replaced_keys_signature`
+  (in-process router): sign with key A, replace the identity, re-sign the queried object with B.
+  The forged and tampered entries are refused.
+- `hs-cli/tests/appservice_ephemeral.rs::a_bot_device_signed_by_a_replaced_identity_is_signed_by_the_new_one`
+  (real `hs`, as the appservice, with the manager's `BotIdentity`): identity one signs the device,
+  identities two and three replace it, and the device is signed with the stale entry left in and
+  with the manager's body. Without the server fix it fails with the demo's exact error,
+  `no known key ed25519:… for signer`.
+- `cross_signing::tests::a_device_is_signed_by_the_self_signing_key_and_keeps_its_own_signature`
+  checks that a replaced key's entry is not sent.
+
+**After the roll.** The manager logs `cross-signed the bridge bot's device …` for `BQBMQVR81T`
+and for `TRV2160MAI`, and the `could not settle the bot's cross-signing identity` WARN stops.
+`BQBMQVR81T` is the stale device; the device cleanup (decision 0041) removes it once it is
+older than its threshold.
 
 ## Session 2026-10-12, later (branch `agent/discord-otk-counts`): a bridge device made without keys is told it has none
 
@@ -77,7 +122,8 @@ seeds, `published the bot's cross-signing keys` (the server answered 200), and f
 every signing of device `BQBMQVR81T` was refused, `M_INVALID_SIGNATURE: no known key
 ed25519:1MIe… for signer @whatsappbot_brandon`, once per tick, 1,200 WARN lines an hour. The
 master was published (the manager would otherwise have published again and logged it), so the
-server held the manager's master and not its self-signing key. Why the upload left the server
+server held the manager's master and not its self-signing key. (**Wrong, see 2026-10-12,
+evening, above:** `1MIe…` was the old identity's key, still signed onto the device.) Why the upload left the server
 without it is **not yet known** (`post_device_signing_upload` stores every key it is given; the
 owner's `/keys/query` of the bot settles which side; `docs/next-steps.md`).
 

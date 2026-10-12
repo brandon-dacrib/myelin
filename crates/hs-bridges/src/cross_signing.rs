@@ -167,7 +167,11 @@ impl BotIdentity {
 
     /// The body of `POST /keys/signatures/upload` that signs `device_keys` (a device-keys
     /// object from `/keys/query`, for `device_id`) with the self-signing key:
-    /// `{<bot>: {<device>: <device keys with the signature added>}}`.
+    /// `{<bot>: {<device>: <device keys with the signature added>}}`. Of the bot's signatures
+    /// already on the device, only the device's own is sent along: one by a self-signing key
+    /// since replaced (an instance re-created for the same bot) names a key the server no
+    /// longer has, which a server that checks every entry refuses, as this one did until
+    /// 2026-10-12 ("no known key", every signature of the re-created WhatsApp bot's devices).
     ///
     /// # Errors
     /// `device_keys` is not an object, or does not canonicalise.
@@ -190,6 +194,8 @@ impl BotIdentity {
                     .as_object_mut()
             })
             .ok_or("device keys' signatures are not an object")?;
+        let device_own = format!("ed25519:{device_id}");
+        own.retain(|key_id, _| *key_id == device_own);
         own.insert(self.self_signing_key_id(), Value::String(signature));
         Ok(json!({ self.user_id.clone(): { device_id: signed } }))
     }
@@ -258,7 +264,10 @@ mod tests {
             "device_id": "IEXNEKZESJ",
             "algorithms": ["m.olm.v1.curve25519-aes-sha2", "m.megolm.v1.aes-sha2"],
             "keys": {"curve25519:IEXNEKZESJ": "c", "ed25519:IEXNEKZESJ": "e"},
-            "signatures": {BOT: {"ed25519:IEXNEKZESJ": "the device's own"}},
+            "signatures": {BOT: {
+                "ed25519:IEXNEKZESJ": "the device's own",
+                "ed25519:areplacedselfsigningkey": "a previous instance's",
+            }},
             "unsigned": {"device_display_name": "WhatsApp bridge"},
         });
         assert!(!identity.has_signed_device(&device));
@@ -267,6 +276,13 @@ mod tests {
         assert_eq!(
             signed["signatures"][BOT]["ed25519:IEXNEKZESJ"],
             "the device's own"
+        );
+        // A replaced self-signing key's signature is not sent: the server no longer has its key.
+        assert!(
+            signed["signatures"][BOT]
+                .get("ed25519:areplacedselfsigningkey")
+                .is_none(),
+            "{signed}"
         );
         assert!(identity.has_signed_device(signed));
         let ssk_public = identity

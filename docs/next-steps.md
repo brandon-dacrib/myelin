@@ -42,12 +42,11 @@ The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/
    `0.3.2`, `0.3.3`, … and the demo is rolled with `--set image.tag=<that>`.
    Then the log should say `published the bot's cross-signing keys … self_signing_was_published=false`
    once and `cross-signed the bridge bot's device … device=BQBMQVR81T`, and the WARN loop stops.
-2. **Which side lost the self-signing key on 2026-10-11**: `POST /_matrix/client/v3/keys/query`
-   for `@whatsappbot_brandon:myelin.dacrib.net` with an admin or bot token, before the roll if
-   possible (the roll's republish overwrites the evidence); compare `master_keys` (`1wFu…`) and
-   `self_signing_keys` (`1MIe…`) with the manager's. Server dropped it: hs-e2e; manager signed
-   with a key it did not upload: hs-bridges. Then a real-binary test of the re-create flow
-   (`hs-cli/tests/bridge_offerings.rs`).
+2. **The WhatsApp cross-signing loop: answered and fixed** (`agent/stale-signatures`, status
+   11 and 08, 2026-10-12, evening). Neither side lost a key. `1MIe…` was the old identity's
+   self-signing key, still signed onto device `BQBMQVR81T`, and the server checked every
+   signature in the object the manager sent back. After the roll that carries it, the manager
+   signs `BQBMQVR81T` and `TRV2160MAI` and the WARN stops.
 3. **Discord**: its pod is Running (seen 2026-10-12), but it could not decrypt anything:
    the server never told its keyless MSC4190 device to upload keys. Fixed on
    `agent/discord-otk-counts` (status 11, 2026-10-12, later). After the roll that carries it,

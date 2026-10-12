@@ -548,3 +548,152 @@ async fn signatures_upload_rejects_another_users_master_key_signed_by_the_wrong_
         }
     }
 }
+
+/// `user_id`'s `device` as `/keys/query` returns it to `alice`.
+async fn query_device(scenario: &mut Scenario, user_id: &str, device: &str) -> Value {
+    scenario
+        .send(
+            Some("alice"),
+            Method::POST,
+            "/keys/query",
+            Some(json!({"device_keys": {user_id: []}})),
+        )
+        .await
+        .json["device_keys"][user_id][device]
+        .clone()
+}
+
+/// `/keys/signatures/upload`: a device signed by a self-signing key that has since been replaced
+/// can be signed by the new one, with the object `/keys/query` returns. That object still carries
+/// the old key's signature; checking it against keys the user no longer has refused every new
+/// signature ("no known key <the old key>"), which on the demo on 2026-10-11 left a re-created
+/// bridge's bot unable to cross-sign any device. Synapse checks only the new signing key's
+/// signature; an entry already stored on the device, unchanged, is not a new claim.
+#[tokio::test]
+async fn signatures_upload_accepts_a_device_still_carrying_a_replaced_keys_signature() {
+    let mut scenario = Scenario::new(app());
+    let (alice_id, old_master, old_ssk) = bootstrap_cross_signing(&mut scenario, "alice").await;
+    let device = scenario
+        .session("alice")
+        .unwrap()
+        .device_id
+        .clone()
+        .unwrap();
+    let device_key = SigningKeyPair::generate(&device);
+    let device_key_id = format!("ed25519:{device}");
+    let unsigned_device = json!({
+        "user_id": alice_id,
+        "device_id": device,
+        "algorithms": ["m.olm.v1.curve25519-aes-sha2"],
+        "keys": { device_key_id.clone(): device_key.verifying_key_base64() },
+    });
+    let device_keys = signed_by(
+        unsigned_device.clone(),
+        &alice_id,
+        &device_key_id,
+        &device_key,
+    );
+    scenario
+        .send(
+            Some("alice"),
+            Method::POST,
+            "/keys/upload",
+            Some(obj1("device_keys", device_keys.clone())),
+        )
+        .await
+        .assert_ok();
+    let sign_as = |mut device_keys: Value, ssk: &CrossSigningFixture| {
+        let signature = sign_canonical(&device_keys, &ssk.keypair);
+        device_keys["signatures"][&alice_id][&ssk.key_id] = json!(signature);
+        obj1(alice_id.clone(), obj1(device.clone(), device_keys))
+    };
+
+    // Signed by the first self-signing key.
+    let stored = query_device(&mut scenario, &alice_id, &device).await;
+    let signed = scenario
+        .send(
+            Some("alice"),
+            Method::POST,
+            "/keys/signatures/upload",
+            Some(sign_as(stored, &old_ssk)),
+        )
+        .await;
+    signed.assert_ok();
+    assert_eq!(signed.json["failures"], json!({}), "{}", signed.json);
+
+    // A new identity, and the device signed again with what `/keys/query` returns.
+    let new_master = make_cross_signing_key(&alice_id, "master", "new-master");
+    let new_ssk = make_cross_signing_key(&alice_id, "self_signing", "new-ssk");
+    scenario
+        .send(
+            Some("alice"),
+            Method::POST,
+            "/keys/device_signing/upload",
+            Some(json!({
+                "master_key": new_master.json,
+                "self_signing_key": signed_by(new_ssk.json.clone(), &alice_id, &new_master.key_id, &new_master.keypair),
+                "auth": password_auth(&alice_id, "correct horse battery staple 42"),
+            })),
+        )
+        .await
+        .assert_ok();
+    let stored = query_device(&mut scenario, &alice_id, &device).await;
+    assert!(
+        stored["signatures"][&alice_id][&old_ssk.key_id].is_string(),
+        "the old signature is still on the device: {stored}"
+    );
+    let resigned = scenario
+        .send(
+            Some("alice"),
+            Method::POST,
+            "/keys/signatures/upload",
+            Some(sign_as(stored, &new_ssk)),
+        )
+        .await;
+    resigned.assert_ok();
+    assert_eq!(resigned.json["failures"], json!({}), "{}", resigned.json);
+    let stored = query_device(&mut scenario, &alice_id, &device).await;
+    assert!(
+        stored["signatures"][&alice_id][&new_ssk.key_id].is_string(),
+        "the new signature is stored: {stored}"
+    );
+
+    // A new entry is still checked: one by a key alice never had is refused, unchanged entries
+    // or not.
+    let stranger = make_cross_signing_key(&alice_id, "self_signing", "stranger");
+    let forged = scenario
+        .send(
+            Some("alice"),
+            Method::POST,
+            "/keys/signatures/upload",
+            Some(sign_as(stored.clone(), &stranger)),
+        )
+        .await;
+    forged.assert_ok();
+    assert_eq!(
+        forged.json["failures"][&alice_id][&device]["errcode"], "M_INVALID_SIGNATURE",
+        "{}",
+        forged.json
+    );
+    // So is an entry that names a stored key but carries a different signature.
+    let mut tampered = stored.clone();
+    tampered["signatures"][&alice_id][&new_ssk.key_id] = json!(sign_canonical(
+        &json!({"something": "else"}),
+        &new_ssk.keypair
+    ));
+    let tampered = scenario
+        .send(
+            Some("alice"),
+            Method::POST,
+            "/keys/signatures/upload",
+            Some(obj1(alice_id.clone(), obj1(device.clone(), tampered))),
+        )
+        .await;
+    tampered.assert_ok();
+    assert_eq!(
+        tampered.json["failures"][&alice_id][&device]["errcode"], "M_INVALID_SIGNATURE",
+        "{}",
+        tampered.json
+    );
+    let _ = (old_master, unsigned_device);
+}

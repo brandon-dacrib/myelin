@@ -425,21 +425,39 @@ fn submitted_entries_and_canonical<'v>(
     Ok(Some((entries, canonical)))
 }
 
-/// Verifies every signature entry `submitted.signatures.<signer>.*` against one of `signer`'s own
-/// known keys (any of their three cross-signing keys, or one of their devices), resolved per entry
-/// by its key ID. Used for the general case: signing your own device, or signing your own
-/// master/self-signing/user-signing key with another key of your own. An entry whose key ID cannot
-/// be resolved to any key of the signer's is a failure, not skipped -- a signature naming an
-/// unknown key can never be a legitimate claim.
+/// Whether `stored` already carries exactly `signature` under `signatures.<signer>.<key_id>`:
+/// an entry a client sent back as `/keys/query` gave it, which claims nothing new. Synapse
+/// checks only the new signing key's signature and ignores the rest; checking a stored entry
+/// again fails once its key is replaced ("no known key"), and refused every new signature of a
+/// device signed by a self-signing key since replaced (the demo, 2026-10-11).
+fn already_stored(stored: &Value, signer: &UserId, key_id: &str, signature: &Value) -> bool {
+    stored
+        .get("signatures")
+        .and_then(|s| s.get(signer.as_str()))
+        .and_then(|s| s.get(key_id))
+        == Some(signature)
+}
+
+/// Verifies every new signature entry `submitted.signatures.<signer>.*` against one of
+/// `signer`'s own known keys (any of their three cross-signing keys, or one of their devices),
+/// resolved per entry by its key ID. Used for the general case: signing your own device, or
+/// signing your own master/self-signing/user-signing key with another key of your own. An entry
+/// already on `stored`, unchanged, is not checked again ([`already_stored`]). A new entry whose
+/// key ID cannot be resolved to any key of the signer's is a failure, not skipped -- a signature
+/// naming an unknown key can never be a legitimate claim.
 async fn verify_submitted_entries_by_signer<B: KvBackend + 'static>(
     state: &E2eState<B>,
     submitted: &Value,
+    stored: &Value,
     signer: &UserId,
 ) -> Result<(), String> {
     let Some((entries, canonical)) = submitted_entries_and_canonical(submitted, signer)? else {
         return Ok(());
     };
-    for key_id in entries.keys() {
+    for (key_id, signature) in entries {
+        if already_stored(stored, signer, key_id, signature) {
+            continue;
+        }
         let verifying_key = resolve_signers_own_key(state, signer, key_id)
             .await
             .map_err(|e| format!("looking up signing key {key_id}: {e}"))?
@@ -450,11 +468,14 @@ async fn verify_submitted_entries_by_signer<B: KvBackend + 'static>(
     Ok(())
 }
 
-/// Verifies every signature entry `submitted.signatures.<signer>.*` against exactly one expected
-/// key (key ID and verifying key) -- used for the one case where a specific key, and no other, is
-/// allowed to make the claim: another user's user-signing key vouching for this user's master key.
+/// Verifies every new signature entry `submitted.signatures.<signer>.*` against exactly one
+/// expected key (key ID and verifying key) -- used for the one case where a specific key, and no
+/// other, is allowed to make the claim: another user's user-signing key vouching for this user's
+/// master key. An entry already on `stored`, unchanged, is not checked again: the signer's
+/// previous user-signing key's signature stays on the key they signed.
 fn verify_submitted_entries_as(
     submitted: &Value,
+    stored: &Value,
     signer: &UserId,
     expected_key_id: &str,
     verifying_key: &VerifyingKey,
@@ -462,7 +483,10 @@ fn verify_submitted_entries_as(
     let Some((entries, canonical)) = submitted_entries_and_canonical(submitted, signer)? else {
         return Ok(());
     };
-    for key_id in entries.keys() {
+    for (key_id, signature) in entries {
+        if already_stored(stored, signer, key_id, signature) {
+            continue;
+        }
         if key_id != expected_key_id {
             return Err(format!(
                 "signature under key {key_id} does not match {signer}'s user-signing key \
@@ -494,7 +518,7 @@ async fn apply_one_signature<B: KvBackend + 'static>(
                 "a device key can only be signed by its own user".to_string(),
             ));
         }
-        let verify = verify_submitted_entries_by_signer(state, submitted, signer).await;
+        let verify = verify_submitted_entries_by_signer(state, submitted, &row.keys, signer).await;
         return Ok(match verify {
             Ok(()) => {
                 let merged = merge_signatures(row.keys, submitted, signer);
@@ -541,7 +565,13 @@ async fn apply_one_signature<B: KvBackend + 'static>(
                     "signer's user-signing key is malformed".to_string(),
                 ));
             };
-            verify_submitted_entries_as(submitted, signer, &usk_key_id, &usk_verifying_key)
+            verify_submitted_entries_as(
+                submitted,
+                &existing,
+                signer,
+                &usk_key_id,
+                &usk_verifying_key,
+            )
         } else {
             if signer != target_user {
                 return Ok(SignatureOutcome::Invalid(
@@ -549,7 +579,7 @@ async fn apply_one_signature<B: KvBackend + 'static>(
                         .to_string(),
                 ));
             }
-            verify_submitted_entries_by_signer(state, submitted, signer).await
+            verify_submitted_entries_by_signer(state, submitted, &existing, signer).await
         };
 
         return Ok(match verify {

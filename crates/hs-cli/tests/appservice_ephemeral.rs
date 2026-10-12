@@ -1056,3 +1056,193 @@ async fn a_bridge_device_made_without_keys_is_told_it_has_none() {
     .await;
     let _ = server.stop();
 }
+
+/// `user`'s `device` as `/keys/query` lists it, asked as `caller`.
+async fn queried_device(caller: &Caller, user: &str, device: &str) -> Value {
+    caller
+        .matrix(
+            reqwest::Method::POST,
+            "/keys/query",
+            Some(json!({"device_keys": {user: []}})),
+        )
+        .await["device_keys"][user][device]
+        .clone()
+}
+
+/// Publishes `identity` as the bridge manager does, as the appservice.
+async fn publish(
+    caller: &Caller,
+    identity: hs_bridges::cross_signing::BotIdentity,
+) -> hs_bridges::cross_signing::BotIdentity {
+    caller
+        .matrix(
+            reqwest::Method::POST,
+            "/keys/device_signing/upload",
+            Some(identity.upload_body().unwrap()),
+        )
+        .await;
+    identity
+}
+
+/// Uploads `body` to `/keys/signatures/upload` and asserts nothing was refused.
+async fn sign(caller: &Caller, body: Value) {
+    let answer = caller
+        .matrix(reqwest::Method::POST, "/keys/signatures/upload", Some(body))
+        .await;
+    assert_eq!(answer["failures"], json!({}), "{answer}");
+}
+
+/// A bridge instance re-created for the same bot publishes a new cross-signing identity
+/// (`hs_bridges::cross_signing`), and the bot's devices still carry the old self-signing key's
+/// signature. Signing them with the new key must work both ways a signer sends the device: with
+/// that stale entry left in (as `/keys/query` returned it; the server checks only new entries)
+/// and without it (as the manager now sends it). Before 2026-10-12 the server refused the first
+/// with "no known key <the old key>", and the demo's re-created WhatsApp bot could sign no device.
+#[tokio::test]
+async fn a_bot_device_signed_by_a_replaced_identity_is_signed_by_the_new_one() {
+    use hs_bridges::cross_signing::{BotIdentity, Seeds};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (bridge_url, _bridge) = stand_in().await;
+    let registration_path = dir.path().join("registration.yaml");
+    std::fs::write(
+        &registration_path,
+        format!(
+            "{}io.element.msc4190: true\n",
+            registration_yaml(&bridge_url)
+        ),
+    )
+    .unwrap();
+    let port = reserve_port();
+    let data_dir = dir.path().join("data");
+    let config_path = dir.path().join("hs.yaml");
+    std::fs::write(
+        &config_path,
+        config_yaml(port, &data_dir, &registration_path),
+    )
+    .unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let mut server = HsProcess::serve(&config_path);
+    let _ = admin_token_of(&mut server, &client, &base).await;
+
+    let registered: Value = client
+        .post(format!("{base}/_matrix/client/v3/register"))
+        .bearer_auth(AS_TOKEN)
+        .json(&json!({
+            "type": "m.login.application_service",
+            "username": "bridgebot",
+            "inhibit_login": true,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let bot_id = "@bridgebot:example.org";
+    assert_eq!(registered["user_id"], bot_id, "{registered}");
+    let bot = Caller {
+        client: client.clone(),
+        base: base.clone(),
+        token: AS_TOKEN.to_owned(),
+        masquerade: Some(bot_id.to_owned()),
+    };
+    let device = "BQBMQVR81T";
+    bot.matrix(
+        reqwest::Method::PUT,
+        &format!("/devices/{device}"),
+        Some(json!({"display_name": "WhatsApp bridge"})),
+    )
+    .await;
+    // The device's keys, self-signed by its own ed25519 key as a bridge uploads them.
+    let device_key = hs_model::signing::SigningKeyPair::generate(device);
+    let mut device_keys = json!({
+        "user_id": bot_id,
+        "device_id": device,
+        "algorithms": ["m.olm.v1.curve25519-aes-sha2", "m.megolm.v1.aes-sha2"],
+        "keys": {
+            format!("curve25519:{device}"): "3C5BFWi2Y8MaVvjM8M22DBmh24PmgR0nPvJOIArzgyI",
+            format!("ed25519:{device}"): device_key.verifying_key_base64(),
+        },
+    });
+    let canonical = hs_model::canonical::CanonicalJsonValue::Object(
+        hs_model::signing::to_signable_object(&device_keys).unwrap(),
+    )
+    .to_canonical_bytes();
+    device_keys["signatures"] = json!({bot_id: {format!("ed25519:{device}"): base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD_NO_PAD,
+        hs_model::signing::sign_bytes(&canonical, &device_key).to_bytes(),
+    )}});
+    let (status, body) = bot
+        .call(
+            reqwest::Method::POST,
+            &format!("/_matrix/client/v3/keys/upload?device_id={device}"),
+            Some(json!({"device_keys": device_keys})),
+        )
+        .await;
+    assert!(status.is_success(), "{status} {body}");
+
+    // The first instance's identity signs the device.
+    let first = publish(
+        &bot,
+        BotIdentity::from_seeds(bot_id, &Seeds::generate()).unwrap(),
+    )
+    .await;
+    sign(
+        &bot,
+        first
+            .sign_device(device, &queried_device(&bot, bot_id, device).await)
+            .unwrap(),
+    )
+    .await;
+    assert!(first.has_signed_device(&queried_device(&bot, bot_id, device).await));
+
+    // The instance is re-created: a new identity, published by the appservice without
+    // user-interactive auth. The device still carries the first identity's signature.
+    let second = publish(
+        &bot,
+        BotIdentity::from_seeds(bot_id, &Seeds::generate()).unwrap(),
+    )
+    .await;
+    let stale = queried_device(&bot, bot_id, device).await;
+    assert!(first.has_signed_device(&stale), "{stale}");
+    // Sent back with the stale entry left in, plus the new signature: the server checks only
+    // what is new.
+    let mut with_stale = stale.clone();
+    let mut signed = second.sign_device(device, &stale).unwrap();
+    with_stale["signatures"][bot_id][second.self_signing_key_id()] =
+        signed[bot_id][device]["signatures"][bot_id][second.self_signing_key_id()].take();
+    sign(&bot, json!({bot_id: {device: with_stale}})).await;
+    assert!(second.has_signed_device(&queried_device(&bot, bot_id, device).await));
+
+    // Once more, as the manager sends it now: the device's own signature and the new one only.
+    let third = publish(
+        &bot,
+        BotIdentity::from_seeds(bot_id, &Seeds::generate()).unwrap(),
+    )
+    .await;
+    let body = third
+        .sign_device(device, &queried_device(&bot, bot_id, device).await)
+        .unwrap();
+    let sent = body[bot_id][device]["signatures"][bot_id]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        sent,
+        [format!("ed25519:{device}"), third.self_signing_key_id()]
+            .into_iter()
+            .collect(),
+    );
+    sign(&bot, body).await;
+    let after = queried_device(&bot, bot_id, device).await;
+    assert!(third.has_signed_device(&after), "{after}");
+    assert!(
+        after["signatures"][bot_id][format!("ed25519:{device}")].is_string(),
+        "the device's own signature is kept: {after}"
+    );
+    let _ = server.stop();
+}
