@@ -12,9 +12,21 @@ name: cd
 #
 # | trigger | images | binaries | chart | published |
 # |---|---|---|---|---|
-# | push to `main` | yes, tagged `main` and the commit sha | no | yes, a pre-release pinned to that image | yes |
-# | tag `v*` | yes, tagged with the version and `latest` | yes, attached to the release | yes | yes |
+# | push to `main` | yes, tagged with the version, `main`, `latest` and the commit sha | yes, attached to the release | yes, the version | yes, and the run tags the commit `vX.Y.Z` and makes the GitHub release at its end |
+# | tag `v*` pushed by hand | yes, tagged with the version and `latest` | yes, attached to the release | yes | yes |
 # | manual dispatch | unless `images` is off | if asked | no | only if asked |
+#
+# # Every merge is a release (2026-10-12)
+#
+# The owner rolls the demo with `helm upgrade --set image.tag=<version>` and wants every merge
+# to be such a version, so a push to `main` releases: the `version` job derives the next patch
+# of the line Chart.yaml names (deploy/helm/hs/ci/chart-version.sh has the rule and its
+# self-test), every artifact of the run carries it, and the `release` job, last, creates the
+# tag on the commit and the GitHub release. The tag is made with the workflow's token, which
+# starts no second run. A hand-pushed `v*` tag still releases its own version (a release
+# candidate, say). Runs on `main` are serialized by the concurrency group below, so each run
+# sees the tag the previous one made. The repository's version files name the line (`0.3.0`);
+# raising them to `0.4.0` makes the next merge `0.4.0`.
 #
 # A manual dispatch with `binaries` on and `images` off is the release binaries' dry run: the
 # same matrix a `v*` tag runs -- the management interface built with Node, embedded, the binary
@@ -132,6 +144,38 @@ jobs:
   # One image per architecture, built natively, pushed by digest only. The manifest list that
   # gives them a human-readable tag is assembled afterwards.
   # ---------------------------------------------------------------------------------------------
+  # The release version of this run: see "Every merge is a release" above. Skipped on a manual
+  # dispatch (a branch has no release); the jobs below that need it allow for that.
+  version:
+    name: release version
+    needs: gate
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      app_version: ${{ steps.version.outputs.app_version }}
+      line: ${{ steps.version.outputs.line }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - name: Work out the version this run releases
+        id: version
+        run: |
+          set -euo pipefail
+          deploy/helm/hs/ci/chart-version.sh --self-test
+          git fetch --tags --force --quiet origin
+          chart="$(helm show chart deploy/helm/hs | sed -n 's/^version: *//p')"
+          # shellcheck disable=SC2046
+          deploy/helm/hs/ci/chart-version.sh "$GITHUB_REF" "$GITHUB_RUN_NUMBER" "$GITHUB_SHA" \
+            "$chart" $(git tag -l 'v*') | tee -a "$GITHUB_OUTPUT"
+          version="$(sed -n 's/^version=//p' "$GITHUB_OUTPUT" | tail -1)"
+          if [ "$GITHUB_REF" = refs/heads/main ] && git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+            echo "v$version exists already; the rule should have moved past it" >&2
+            exit 1
+          fi
+          echo "this run releases $version"
+
   image:
     name: image (${{ matrix.arch }})
     needs: gate
@@ -413,8 +457,9 @@ jobs:
   # ---------------------------------------------------------------------------------------------
   manifest:
     name: manifest list
-    needs: image
-    if: github.event_name != 'workflow_dispatch' || inputs.publish
+    needs: [image, version]
+    # `version` is skipped on a dispatch; the image is what matters here.
+    if: ${{ !cancelled() && needs.image.result == 'success' && (github.event_name != 'workflow_dispatch' || inputs.publish) }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -442,9 +487,9 @@ jobs:
           tags: |
             type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
             type=sha,format=long
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=${{ needs.version.outputs.version }},enable=${{ needs.version.outputs.version != '' }}
+            type=raw,value=${{ needs.version.outputs.line }},enable=${{ needs.version.outputs.line != '' && !contains(needs.version.outputs.version, '-') }}
+            type=raw,value=latest,enable=${{ needs.version.outputs.version != '' && !contains(needs.version.outputs.version, '-') }}
 
       - name: Create and push the manifest list
         run: |
@@ -471,8 +516,8 @@ jobs:
   # ---------------------------------------------------------------------------------------------
   binaries:
     name: binary (${{ matrix.target }})
-    needs: gate
-    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.binaries)
+    needs: [gate, version]
+    if: ${{ !cancelled() && needs.gate.result == 'success' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.binaries)) }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -551,12 +596,14 @@ jobs:
           wait "$pid" 2>/dev/null || true
 
       - name: Package
+        env:
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
         run: |
           set -euo pipefail
-          # The tag on a release; on a manual dry run the ref is a branch, which may hold a `/`
+          # The release's tag; on a manual dry run the ref is a branch, which may hold a `/`
           # (agent/x), so the archive is named for the commit instead.
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            label="$GITHUB_REF_NAME"
+          if [ -n "${RELEASE_TAG:-}" ]; then
+            label="$RELEASE_TAG"
           else
             label="manual-${GITHUB_SHA::12}"
           fi
@@ -580,14 +627,11 @@ jobs:
   # from the same place -- on every push to `main` as well as on a tag, because "install is one
   # value" is only true when there is something to install from.
   #
-  # A push to `main` publishes a pre-release of the version in Chart.yaml,
-  # `<version>-main.<run number>.g<short sha>`, whose appVersion is the `sha-<commit>` image tag
-  # this same workflow run has just published, so a chart and the image it pulls always come
-  # from one commit. `helm install --devel` picks the newest of them. A plain `helm install`
-  # picks releases only, so the day `v0.1.0` is tagged the pre-releases stop being what an
-  # operator gets by default. `--devel` keeps seeing `main` after that without a Chart.yaml
-  # bump: once a tag has released Chart.yaml's version, `<version>` is the patch after the
-  # newest tag (`0.1.1-main.N` sorts above `0.1.0`; deploy/helm/hs/ci/chart-version.sh).
+  # Every push to `main` publishes the chart as the release version the `version` job derived,
+  # with that same version as its appVersion: the image tag this run has just published, so a
+  # chart and the image it pulls always come from one commit (before 2026-10-12 `main` published
+  # `<base>-main.<run>.g<sha>` pre-releases for `helm install --devel`; now a plain
+  # `helm install` sees every merge).
   #
   # It waits for the manifest list rather than the gate so the image it points at exists before
   # anything can pull the chart that names it. That the chart *installs* was already proven by
@@ -596,7 +640,7 @@ jobs:
   # ---------------------------------------------------------------------------------------------
   chart:
     name: helm chart
-    needs: manifest
+    needs: [manifest, version]
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     permissions:
@@ -640,26 +684,12 @@ jobs:
         # silent. promtool runs from the Prometheus image.
         run: deploy/helm/hs/ci/alerts-test.sh
 
-      - name: Work out the chart version and the image it pulls
-        # deploy/helm/hs/ci/chart-version.sh has the rule and why: a tag publishes its version;
-        # `main` publishes `<base>-main.<run>.g<sha>`, where `<base>` moves past the newest `v*`
-        # tag by itself, so `--devel` keeps picking `main` after a release without anybody
-        # having to bump Chart.yaml. Its self-test runs first, so a broken rule fails here
-        # before anything is pushed.
-        id: version
-        run: |
-          set -euo pipefail
-          deploy/helm/hs/ci/chart-version.sh --self-test
-          git fetch --tags --force --quiet origin
-          chart="$(helm show chart deploy/helm/hs | sed -n 's/^version: *//p')"
-          # shellcheck disable=SC2046
-          deploy/helm/hs/ci/chart-version.sh "$GITHUB_REF" "$GITHUB_RUN_NUMBER" "$GITHUB_SHA" \
-            "$chart" $(git tag -l 'v*') | tee -a "$GITHUB_OUTPUT"
-
       - name: Package and push
+        # The version the `version` job derived (deploy/helm/hs/ci/chart-version.sh), which is
+        # also the image tag `manifest` has just published.
         env:
-          VERSION: ${{ steps.version.outputs.version }}
-          APP_VERSION: ${{ steps.version.outputs.app_version }}
+          VERSION: ${{ needs.version.outputs.version }}
+          APP_VERSION: ${{ needs.version.outputs.app_version }}
         run: |
           set -euo pipefail
           helm package deploy/helm/hs --version "$VERSION" --app-version "$APP_VERSION"
@@ -671,8 +701,8 @@ jobs:
         # from the registry by the version just published, render it, and check that the image
         # it would run is in the registry too -- the whole point of publishing them together.
         env:
-          VERSION: ${{ steps.version.outputs.version }}
-          APP_VERSION: ${{ steps.version.outputs.app_version }}
+          VERSION: ${{ needs.version.outputs.version }}
+          APP_VERSION: ${{ needs.version.outputs.app_version }}
         run: |
           set -euo pipefail
           mkdir pulled
@@ -691,12 +721,14 @@ jobs:
           echo "and that image is in the registry"
 
   # ---------------------------------------------------------------------------------------------
-  # The release itself, only once everything that feeds it has succeeded.
+  # The release itself, only once everything that feeds it has succeeded. On a push to `main`
+  # this is where the commit gets its `vX.Y.Z` tag (made with the workflow's token, so it starts
+  # no second run); on a hand-pushed tag the tag exists and the release is attached to it.
   # ---------------------------------------------------------------------------------------------
   release:
     name: github release
-    needs: [manifest, binaries, chart]
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [manifest, binaries, chart, version]
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -708,6 +740,10 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ needs.version.outputs.version }}
+          prerelease: ${{ contains(needs.version.outputs.version, '-') }}
           files: |
             myelin-*.tar.gz
             myelin-*.tar.gz.sha256
@@ -716,8 +752,11 @@ jobs:
             ## Container image
 
             ```
-            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.version }}
             ```
+
+            Roll a Helm release of the chart to it with
+            `helm upgrade <release> <chart> -f <your values> --set image.tag=${{ needs.version.outputs.version }}`.
 
             Multi-architecture (`linux/amd64`, `linux/arm64`), with an SBOM and build provenance
             attached, smoke-tested on both architectures before publication, and installed with
@@ -727,6 +766,6 @@ jobs:
 
             ```
             helm install myelin oci://${{ env.REGISTRY }}/${{ github.repository_owner }}/charts/hs \
-              --version ${GITHUB_REF_NAME#v} \
+              --version ${{ needs.version.outputs.version }} \
               --set serverName=example.org
             ```

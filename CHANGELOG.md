@@ -8,7 +8,10 @@ server, a real client, or a conformance suite, because this project has repeated
 reachable, or reachable but unproven, it says so.
 
 Versions follow [semantic versioning](https://semver.org). 0.2.0 is the first tagged release;
-everything before it shipped only as `main` images.
+everything before it shipped only as `main` images. Since 2026-10-12 every merge to `main` is a
+release, `X.Y.Z` with the patch derived by CD (`deploy/helm/hs/ci/chart-version.sh`); this file
+describes each line (`0.3`, `0.4`, …) under its `.0` heading, and each merge's GitHub release
+carries the generated notes for that merge.
 
 ## Unreleased
 

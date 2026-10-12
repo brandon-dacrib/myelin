@@ -32,6 +32,8 @@ Work does not stay in branches. When a piece of work is done, it is merged into 
 
 Before merging, rebase onto (or merge) the latest `origin/main` and run the checks again. When several agents work in parallel they merge one at a time. Work that is not done is reported as not done, with what is left, and is never left quietly in a branch.
 
+**Every merge to `main` is a release** (since 2026-10-12). CD derives the version from the tags at the start of each run on `main`: the next patch of the line the repository names (`version` in `Cargo.toml`, `deploy/helm/hs/Chart.yaml` and `web/package.json`, kept at `X.Y.0`), or that line's `.0` when it is ahead of every tag. The run publishes the image as `ghcr.io/brandon-dacrib/myelin:X.Y.Z` (and `X.Y`, `latest`, `main`, `sha-<commit>`), the chart as `X.Y.Z`, the binaries, and at its end tags the commit `vX.Y.Z` and makes the GitHub release, so the demo is rolled with `--set image.tag=X.Y.Z`. Consequences: do not push a `vX.Y.Z` tag by hand for a merge (CD does; a hand-pushed tag is for a release candidate or a version the rule would not pick); to start a new line, raise the three version files to `X.Y+1.0` in the branch that opens it (the next merge is `X.Y+1.0`); the changelog's `Unreleased` section is written as the line's entry and each merge's GitHub release carries generated notes; runs on `main` are serialized, and a merge made while a run is queued is folded into the next run (GitHub keeps one queued run), so not every commit gets its own number but every release names a commit on `main`. The rule and its self-test: `deploy/helm/hs/ci/chart-version.sh`.
+
 ## Working in Parallel
 
 These rules come from runs of nine agents at once (2026-09-28), where finished work sat unmerged for hours:

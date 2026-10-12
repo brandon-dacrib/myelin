@@ -1,28 +1,27 @@
 #!/usr/bin/env bash
 #
-# The version CD publishes the chart under, and the image tag it pulls (its appVersion). Run by
-# the `chart` job in .github/workflows/cd.yml; a script so the rule is in one place and can be
-# checked without a workflow run (`--self-test`).
+# The version CD releases: the image tag, the chart version and its appVersion, and the `v*`
+# tag the run creates at its end. Run by the `version` job in .github/workflows/cd.yml; a script
+# so the rule is in one place and can be checked without a workflow run (`--self-test`).
 #
-# The rule:
+# The rule (since 2026-10-12, every merge to `main` is a release; before, `main` published
+# `<base>-main.<run>.g<sha>` pre-releases and only a hand-pushed tag released):
 #
-# - A `v*` tag publishes the tag's version (`v0.2.0` -> chart 0.2.0, appVersion 0.2.0).
-# - A push to `main` publishes a pre-release, `<base>-main.<run number>.g<short sha>`, pulling the
-#   image `sha-<commit>`. `<base>` is Chart.yaml's `version` -- unless a `v*` tag already
-#   released that version or a later one, in which case it is the patch after the newest tag.
+# - A `v*` tag releases the tag's version (`v0.2.0` -> 0.2.0).
+# - A push to `main` releases the next patch of the line Chart.yaml names: Chart.yaml's
+#   `version` itself when it is ahead of every `v*` tag (somebody raised it: a new line starts at
+#   `.0`), else the patch after the newest tag. So with Chart.yaml at 0.3.0 and v0.3.0 tagged,
+#   merges release 0.3.1, 0.3.2, ...; raising Chart.yaml (and Cargo.toml and web/package.json,
+#   which name the same line) to 0.4.0 makes the next merge 0.4.0.
 #
-# Why the second clause: SemVer sorts a pre-release below the release it precedes, so once
-# `v0.1.0` is tagged, `0.1.0-main.N` sorts below it and `helm install --devel` stops picking up
-# `main` until somebody remembers to raise Chart.yaml's version. The base moving past the newest
-# tag by itself makes that reminder unnecessary: `main` after `v0.1.0` publishes
-# `0.1.1-main.N`, which sorts above `0.1.0`. Raising Chart.yaml's version (to 0.2.0, say) still
-# works and wins whenever it is ahead of every tag. The alternative, the release workflow
-# committing a Chart.yaml bump to `main` itself, was not taken: `main` is written by the serial
-# merge queue (tools/merge-queue.sh) under its lock, a workflow's push would race it, and a push
-# made with the workflow's token starts no CI or CD run of its own.
-#
-# A chart from `main` still needs `--devel`: that is what a pre-release is for, so a plain
-# `helm install` takes releases only.
+# The repository's own version files therefore name the *line* (`X.Y.0`), and CD derives the
+# patch. The alternative, the release workflow committing a bump to `main` itself, was not
+# taken: `main` is written by the serial merge queue (tools/merge-queue.sh) under its lock, a
+# workflow's push would race it, and a push made with the workflow's token starts no CI or CD
+# run of its own. The tag the run pushes at its end is made with that token too, so it starts
+# no second run; the run that built the release is the run that tags it, once everything in
+# it has succeeded. Runs on `main` are serialized (the workflow's concurrency group), so each
+# run sees the tag the previous one made.
 #
 # Usage:
 #
@@ -30,13 +29,13 @@
 #   deploy/helm/hs/ci/chart-version.sh --self-test
 #
 #   REF            `refs/tags/v1.2.3` or `refs/heads/main` (GITHUB_REF).
-#   RUN_NUMBER     GITHUB_RUN_NUMBER.
-#   SHA            The full commit (GITHUB_SHA).
+#   RUN_NUMBER     GITHUB_RUN_NUMBER (kept for the call site; unused by the rule now).
+#   SHA            The full commit (GITHUB_SHA; unused by the rule now).
 #   CHART_VERSION  Chart.yaml's `version`, X.Y.Z.
 #   TAG...         Every `v*` tag in the repository (`git tag -l 'v*'`); others are ignored.
 #
-# Prints two lines, `version=...` and `app_version=...`, for "$GITHUB_OUTPUT". Exits non-zero,
-# with the reason on stderr, for a version that is not SemVer.
+# Prints `version=X.Y.Z`, `app_version=X.Y.Z`, `line=X.Y` and `tag=vX.Y.Z` for "$GITHUB_OUTPUT".
+# Exits non-zero, with the reason on stderr, for a version that is not SemVer.
 
 set -euo pipefail
 
@@ -57,8 +56,7 @@ compute() {
       echo "the tag $tag is not v<SemVer>; helm cannot publish it as a chart version" >&2
       return 1
     fi
-    echo "version=${tag#v}"
-    echo "app_version=${tag#v}"
+    emit "${tag#v}"
     return 0
   fi
   if ! [[ "$chart" =~ $semver_core ]]; then
@@ -76,10 +74,19 @@ compute() {
     local major minor patch
     IFS=. read -r major minor patch <<<"$newest"
     base="$major.$minor.$((patch + 1))"
-    echo "note: v$newest is tagged and Chart.yaml says $chart, so main publishes $base pre-releases (raise Chart.yaml's version to choose another)" >&2
+    echo "note: v$newest is tagged and Chart.yaml says $chart, so this merge releases $base (raise Chart.yaml's version to start a new line)" >&2
   fi
-  echo "version=${base}-main.${run}.g${sha:0:7}"
-  echo "app_version=sha-${sha}"
+  emit "$base"
+}
+
+# The four output lines for a release version (X.Y.Z, or X.Y.Z-pre from a hand-pushed tag).
+emit() {
+  local v="$1" major minor rest
+  IFS=. read -r major minor rest <<<"$v"
+  echo "version=$v"
+  echo "app_version=$v"
+  echo "line=$major.$minor"
+  echo "tag=v$v"
 }
 
 self_test() {
@@ -95,30 +102,35 @@ self_test() {
       failed=1
     fi
   }
-  # No tags yet: Chart.yaml's version, as before.
-  check "0.1.0-main.7.g0123456" refs/heads/main 7 "$sha" 0.1.0
-  # The first release: v0.1.0 publishes 0.1.0 ...
+  # No tags yet: Chart.yaml's version is the first release.
+  check "0.1.0" refs/heads/main 7 "$sha" 0.1.0
+  # A hand-pushed tag releases its version ...
   check "0.1.0" refs/tags/v0.1.0 8 "$sha" 0.1.0 v0.1.0
-  # ... and main after it moves past it by itself, so `--devel` still picks main.
-  check "0.1.1-main.9.g0123456" refs/heads/main 9 "$sha" 0.1.0 v0.1.0
-  # Somebody raised Chart.yaml ahead of every tag: that wins.
-  check "0.2.0-main.10.g0123456" refs/heads/main 10 "$sha" 0.2.0 v0.1.0
+  # ... and the next merge is the patch after it.
+  check "0.1.1" refs/heads/main 9 "$sha" 0.1.0 v0.1.0
+  check "0.1.3" refs/heads/main 9 "$sha" 0.1.0 v0.1.0 v0.1.1 v0.1.2
+  # Somebody raised Chart.yaml ahead of every tag: a new line starts at its .0.
+  check "0.2.0" refs/heads/main 10 "$sha" 0.2.0 v0.1.0 v0.1.9
   # A tag later than Chart.yaml (Chart.yaml forgotten for two releases).
-  check "0.3.1-main.11.g0123456" refs/heads/main 11 "$sha" 0.1.0 v0.1.0 v0.3.0 v0.2.0
+  check "0.3.1" refs/heads/main 11 "$sha" 0.1.0 v0.1.0 v0.3.0 v0.2.0
   # Numeric, not lexical: v0.10.0 is newer than v0.9.0.
-  check "0.10.1-main.12.g0123456" refs/heads/main 12 "$sha" 0.1.0 v0.9.0 v0.10.0
-  # A release candidate counts by its core: main sorts above 0.2.0-rc.1 too.
-  check "0.2.1-main.13.g0123456" refs/heads/main 13 "$sha" 0.2.0 v0.1.0 v0.2.0-rc.1
+  check "0.10.1" refs/heads/main 12 "$sha" 0.1.0 v0.9.0 v0.10.0
+  # A release candidate counts by its core.
+  check "0.2.1" refs/heads/main 13 "$sha" 0.2.0 v0.1.0 v0.2.0-rc.1
   check "0.2.0-rc.1" refs/tags/v0.2.0-rc.1 14 "$sha" 0.2.0 v0.2.0-rc.1
   # Tags that are not v<SemVer> are not releases.
-  check "0.1.0-main.15.g0123456" refs/heads/main 15 "$sha" 0.1.0 vnext v1 release-1
+  check "0.1.0" refs/heads/main 15 "$sha" 0.1.0 vnext v1 release-1
   # A tag helm could not publish fails rather than producing a broken chart.
   check "(error)" refs/tags/vnext 16 "$sha" 0.1.0
   check "(error)" refs/heads/main 17 "$sha" 0.1
-  # The appVersion of a main build is the image tag CD pushed for that commit.
-  local app
-  app="$(compute refs/heads/main 18 "$sha" 0.1.0 | sed -n 's/^app_version=//p')"
-  if [ "$app" = "sha-$sha" ]; then echo "ok    app_version=sha-<commit> on main"; else echo "FAIL  app_version $app"; failed=1; fi
+  # The image the chart pulls is the release itself, and the tag names it.
+  local out
+  out="$(compute refs/heads/main 18 "$sha" 0.3.0 v0.3.0 2>/dev/null)"
+  if [ "$out" = $'version=0.3.1\napp_version=0.3.1\nline=0.3\ntag=v0.3.1' ]; then
+    echo "ok    app_version, line and tag follow the version"
+  else
+    echo "FAIL  outputs: $out"; failed=1
+  fi
   if [ "$failed" -eq 0 ]; then echo "self-test passed"; else echo "self-test FAILED"; fi
   return "$failed"
 }

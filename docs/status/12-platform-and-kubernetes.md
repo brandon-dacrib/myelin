@@ -1,5 +1,39 @@
 # 12. Platform and Kubernetes
 
+## 2026-10-12 (branch `agent/release-per-merge`): every merge to `main` is a release
+
+Asked for by the owner: "a new release will be pushed on every commit so that I can helm
+upgrade those tagged releases". Before, a push to `main` published `main`, `sha-<commit>` and a
+chart pre-release, and only a hand-pushed `v*` tag released (0.2.0 and 0.3.0 were cut that way).
+
+**What CD does now** (`.github/workflows/cd.yml`, "Every merge is a release"):
+
+- a `version` job after the CI gate runs `deploy/helm/hs/ci/chart-version.sh`: on `main`, the
+  next patch of the line Chart.yaml names (`0.3.0` tagged, Chart.yaml `0.3.0` → `0.3.1`,
+  `0.3.2`, …; Chart.yaml raised to `0.4.0` → `0.4.0`); on a hand-pushed tag, the tag's version.
+  The script's self-test covers the cases and runs first. The job refuses to go on if the tag
+  it would make exists already;
+- `manifest` tags the image `X.Y.Z`, `X.Y`, `latest` (not for a pre-release version), `main`
+  and `sha-<commit>`; `binaries` builds the three targets on every merge, named for the tag;
+  `chart` publishes `X.Y.Z` with appVersion `X.Y.Z` (no more `-main.N` pre-releases, so
+  `helm install` without `--devel` sees every merge);
+- `release`, last, after everything succeeded, creates the tag `vX.Y.Z` on the commit and the
+  GitHub release with the generated notes, the binaries, and the roll line. The tag is made
+  with the workflow's token, which starts no second run. Runs on `main` are serialized by the
+  concurrency group, so each run sees the previous run's tag; a merge made while a run is
+  queued is folded into the next run (GitHub keeps one queued run).
+
+**Not changed:** the repository's version files name the line (`0.3.0`) and are raised by hand
+to open a new one; the merge queue is still what writes `main`.
+
+**Verified:** `chart-version.sh --self-test` (13 cases) and `actionlint` on the workflow. The
+first real run is this branch's own merge, which should release **0.3.1** (the image
+`ghcr.io/brandon-dacrib/myelin:0.3.1`, tag `v0.3.1`, a GitHub release): check `gh run list
+--workflow cd` and `gh release list` after the merge; that is the roll candidate for the demo.
+
+**Left.** A release's notes are GitHub's generated ones; the changelog is per line. A merge
+folded into the next queued run gets no release of its own.
+
 ## 2026-10-10 (branch `agent/well-known-default`): the server `.well-known` document is published by default
 
 Decision 0040, from finding 3 of the roll: a server with an `https://` `server.public_baseurl`

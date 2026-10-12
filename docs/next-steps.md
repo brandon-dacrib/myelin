@@ -28,10 +28,14 @@ The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/
 
 **Next, in order.**
 
-1. **Roll `sha-6469d192…`** (owner, plain shell, not from the session: the classifier refuses
+1. **Roll the first per-merge release** (owner, plain shell, not from the session: the classifier refuses
    `helm upgrade` even through the proxy, and `git checkout <tag>` in the main checkout leaves it
    detached, so roll from a worktree or `git checkout main` after):
-   `helm --kube-context admin@dacrib0 get values myelin -n myelin -o yaml > /tmp/myelin-values.yaml && helm --kube-context admin@dacrib0 upgrade myelin deploy/helm/hs -n myelin -f /tmp/myelin-values.yaml -f deploy/demo/values-bridges.yaml --set image.tag=sha-6469d192<full sha> --wait --timeout 10m`.
+   `helm --kube-context admin@dacrib0 get values myelin -n myelin -o yaml > /tmp/myelin-values.yaml && helm --kube-context admin@dacrib0 upgrade myelin deploy/helm/hs -n myelin -f /tmp/myelin-values.yaml -f deploy/demo/values-bridges.yaml --set image.tag=0.3.1 --wait --timeout 10m`.
+   **Since 2026-10-12 every merge to `main` is a release** (`agent/release-per-merge`, status
+   12): the merge of that branch itself is the first, `0.3.1` (`gh release list` shows it once
+   its CD run is done); it carries the cross-signing fix of `6469d192` too. Later merges are
+   `0.3.2`, `0.3.3`, … and the demo is rolled with `--set image.tag=<that>`.
    Then the log should say `published the bot's cross-signing keys … self_signing_was_published=false`
    once and `cross-signed the bridge bot's device … device=BQBMQVR81T`, and the WARN loop stops.
 2. **Which side lost the self-signing key on 2026-10-11**: `POST /_matrix/client/v3/keys/query`

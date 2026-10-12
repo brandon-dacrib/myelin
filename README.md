@@ -143,12 +143,12 @@ addresses that failed, the IPv6 addresses it did not try, and the setting.
 On Kubernetes it is one value:
 
 ```sh
-helm install myelin oci://ghcr.io/brandon-dacrib/charts/hs --devel --set serverName=example.org
+helm install myelin oci://ghcr.io/brandon-dacrib/charts/hs --set serverName=example.org
 ```
 
-`--devel` because nothing is tagged yet: every push to `main` publishes the chart as a
-pre-release (`0.1.0-main.<run>.g<commit>`) whose default image is the one built from that same
-commit, and a plain `helm install` takes releases only. From a checkout,
+Every merge to `main` is a release (since 2026-10-12): the chart is published as `X.Y.Z` with
+the image built from that same commit as its default, the commit is tagged `vX.Y.Z` with a
+GitHub release, and an operator rolls to one with `--set image.tag=X.Y.Z`. From a checkout,
 `helm install myelin deploy/helm/hs --set serverName=example.org` is the same chart with the
 `main` image.
 
