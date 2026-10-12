@@ -1,5 +1,22 @@
 # 12. Platform and Kubernetes
 
+## 2026-10-12: one document for install and upgrade (`docs/install-and-upgrade.md`)
+
+The Helm commands were spread across the chart README, the top-level README, decision 0036 and
+this file. `docs/install-and-upgrade.md` now has them in order: install (single node, on the
+internet, cluster mode), upgrade (`helm get values` then `-f`, not `--reuse-values`), the two
+one-time steps for installs from charts before 2026-09-26 and 2026-10-09, rollback, uninstall,
+and the errors each step can give.
+
+**Verified** on kind (Kubernetes 1.33.1, Helm 4.3.0) with the published charts, fetched from
+ghcr.io: `helm install` of 0.2.0 Ready in 31 s; `helm upgrade` to 0.3.0 with the doc's two
+commands, both pods on `ghcr.io/brandon-dacrib/myelin:0.3.0`, `/_matrix/federation/v1/version`
+0.2.0 then 0.3.0, the signing key `ed25519:a_KounQ7` unchanged, no `ERROR` line; `helm rollback
+myelin 1` back to 0.2.0 with the same key; `helm uninstall` left `data-myelin-hs-0` and
+`bridges.hs.matrix.org`. The doc's internet and cluster-mode values files render with chart
+0.3.0 (`helm template`). Not run here: the cluster-mode install itself (the cluster smoke in CD
+covers it) and an upgrade with the one-time steps (`ci/crd-upgrade-smoke.sh` covers the CRD one).
+
 ## 2026-10-12 (branch `agent/release-per-merge`): every merge to `main` is a release
 
 Asked for by the owner: "a new release will be pushed on every commit so that I can helm
@@ -33,7 +50,6 @@ first real run is this branch's own merge, which should release **0.3.1** (the i
 
 **Left.** A release's notes are GitHub's generated ones; the changelog is per line. A merge
 folded into the next queued run gets no release of its own.
-
 ## 2026-10-10 (branch `agent/well-known-default`): the server `.well-known` document is published by default
 
 Decision 0040, from finding 3 of the roll: a server with an `https://` `server.public_baseurl`

@@ -6,6 +6,8 @@ The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/
 
 ## Resume here: 2026-10-12 -- 0.3.0 runs on the demo (revision 20); roll `6469d192` next, then read the bot's keys
 
+**Install and upgrade** (2026-10-12): `docs/install-and-upgrade.md` is the operator's page of Helm commands, verified on kind 0.2.0 → 0.3.0 → rollback (status 12). Keep it current when a release needs a one-time step.
+
 **Read this first.** The 2026-10-11 session (two owner asks, both merged and released as
 **0.3.0**, tag `v0.3.0`, image `ghcr.io/brandon-dacrib/myelin:0.3.0`):
 

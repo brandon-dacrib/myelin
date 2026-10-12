@@ -148,7 +148,10 @@ helm install myelin oci://ghcr.io/brandon-dacrib/charts/hs --set serverName=exam
 
 Every merge to `main` is a release (since 2026-10-12): the chart is published as `X.Y.Z` with
 the image built from that same commit as its default, the commit is tagged `vX.Y.Z` with a
-GitHub release, and an operator rolls to one with `--set image.tag=X.Y.Z`. From a checkout,
+GitHub release, and an operator rolls to one with `--set image.tag=X.Y.Z`.
+**[docs/install-and-upgrade.md](docs/install-and-upgrade.md) has every Helm command, in order:
+install (single node, on the internet, cluster mode), upgrade, the one-time steps for old
+installs, rollback and uninstall.** From a checkout,
 `helm install myelin deploy/helm/hs --set serverName=example.org` is the same chart with the
 `main` image.
 

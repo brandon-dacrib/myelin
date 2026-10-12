@@ -4,7 +4,9 @@
 helm install myelin oci://ghcr.io/brandon-dacrib/charts/hs --set serverName=example.org
 ```
 
-One value installs a running server; `values.yaml` documents every other one. What has been
+One value installs a running server; `values.yaml` documents every other one.
+`docs/install-and-upgrade.md` has the Helm commands for each step: install, upgrade, rollback,
+uninstall. What has been
 verified against a real cluster is recorded in `docs/status/12-platform-and-kubernetes.md`.
 
 ## The Bridge CRD
