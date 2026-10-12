@@ -26,19 +26,32 @@ from `helm get values`, passed with `-f`).
 
 Since 2026-10-12 every merge to `main` is a release `X.Y.Z`: the chart, the image
 `ghcr.io/brandon-dacrib/myelin:X.Y.Z` (the chart's default), the tag `vX.Y.Z` and a GitHub
-release all come from that one commit. The examples below say `0.3.0`; use the newest release
-(`gh release list`, or `https://github.com/brandon-dacrib/myelin/releases`).
+release all come from that one commit. A release is ready once its tag and GitHub release
+exist (`gh release view vX.Y.Z`; CD makes both last, after the chart and image are published).
 
-| You want | Chart reference | Flags |
-|---|---|---|
-| A release, pinned (recommended) | `oci://ghcr.io/brandon-dacrib/charts/hs` | `--version X.Y.Z` |
-| The newest release | `oci://ghcr.io/brandon-dacrib/charts/hs` | none |
-| The chart from a checkout of `vX.Y.Z` | `deploy/helm/hs` | `--set image.tag=X.Y.Z` |
+**Install and upgrade from a tagged release, always.** Every command below sets the version
+once and uses it for everything:
 
-Upgrade the chart and the image together (`--version X.Y.Z`). `--set image.tag=X.Y.Z` on its
-own runs the new server with the old chart's templates; do that only with a checkout of the same
-tag. A chart from a checkout runs the mutable `main` image unless you pin `image.tag`: always pin
-it, because an upgrade that changes nothing but what `main` points at does not restart the pod.
+```sh
+V=0.3.0        # the release: gh release list, or https://github.com/brandon-dacrib/myelin/releases
+```
+
+| What | From the release `$V` |
+|---|---|
+| The chart | `oci://ghcr.io/brandon-dacrib/charts/hs --version "$V"` |
+| The image | `ghcr.io/brandon-dacrib/myelin:$V`, the chart's default (its `appVersion`) |
+| A values file shipped in the repository (`deploy/demo/values-bridges.yaml`, …) | `-f "https://raw.githubusercontent.com/brandon-dacrib/myelin/v$V/<path>"` |
+
+Not the chart from a checkout (`deploy/helm/hs`): its `appVersion` is `main`, a moving image, so
+an upgrade that changes nothing but what `main` points at does not restart the pod, and a
+checkout that is not the tag runs templates the release did not test. A checkout's chart is for
+working on the chart. Without `--version`, Helm takes the newest release, which is not the same
+twice.
+
+**If your values pin `image.tag`**, which installs from a checkout did, that pin outlives every
+upgrade: the new chart runs the old image. Check with
+`helm -n myelin get values myelin -o yaml | grep -A3 '^image:'`. If `tag:` is there, pass
+`--set image.tag="$V"` on every upgrade, as below, or drop the pin from your values file once.
 
 `CHANGELOG.md` says what each line changes; a release's own notes are on its GitHub release.
 
@@ -47,7 +60,8 @@ it, because an upgrade that changes nothing but what `main` points at does not r
 ### The smallest install
 
 ```sh
-helm install myelin oci://ghcr.io/brandon-dacrib/charts/hs --version 0.3.0 \
+V=0.3.0
+helm install myelin oci://ghcr.io/brandon-dacrib/charts/hs --version "$V" \
   -n myelin --create-namespace \
   --set serverName=example.org \
   --wait --timeout 10m
@@ -89,7 +103,8 @@ prometheusRule:
 ```
 
 ```sh
-helm install myelin oci://ghcr.io/brandon-dacrib/charts/hs --version 0.3.0 \
+V=0.3.0
+helm install myelin oci://ghcr.io/brandon-dacrib/charts/hs --version "$V" \
   -n myelin --create-namespace -f myelin-values.yaml --wait --timeout 10m
 ```
 
@@ -173,13 +188,30 @@ The `Bridge` CRD is cluster-wide and belongs to one release. Every other release
 ### The upgrade
 
 ```sh
+V=0.3.1        # the release you are going to
 helm -n myelin get values myelin -o yaml > myelin-values.yaml
-helm upgrade myelin oci://ghcr.io/brandon-dacrib/charts/hs --version 0.3.0 \
-  -n myelin -f myelin-values.yaml --wait --timeout 10m
+helm upgrade myelin oci://ghcr.io/brandon-dacrib/charts/hs --version "$V" \
+  -n myelin -f myelin-values.yaml \
+  --set image.tag="$V" \
+  --wait --timeout 10m
 ```
 
-If you keep your values file in git (you should), use it instead of `helm get values`, and diff
-the two first.
+`--set image.tag="$V"` matters only if your values pin the tag ([Which chart](#which-chart)).
+It is harmless otherwise, since it names the image the chart would pick anyway. If you keep your
+values file in git (you should), use it instead of `helm get values`, and diff the two first.
+
+A values file from the repository goes in after yours, read from the same tag. The standing
+demo's upgrade, for example:
+
+```sh
+V=0.3.1
+helm --kube-context admin@dacrib0 -n myelin get values myelin -o yaml > /tmp/myelin-values.yaml
+helm --kube-context admin@dacrib0 upgrade myelin oci://ghcr.io/brandon-dacrib/charts/hs --version "$V" \
+  -n myelin -f /tmp/myelin-values.yaml \
+  -f "https://raw.githubusercontent.com/brandon-dacrib/myelin/v$V/deploy/demo/values-bridges.yaml" \
+  --set image.tag="$V" \
+  --wait --timeout 10m
+```
 
 **Do not use `--reuse-values`.** It reuses the old release's merged values in place of the new
 chart's defaults, so a value a new chart added has no default: the 2026-09-30 upgrade of the
@@ -195,7 +227,9 @@ Bridge pods roll by themselves when the new server renders their files different
 
 ```sh
 kubectl -n myelin rollout status statefulset/myelin-hs
-kubectl -n myelin get pods,bridges                                       # all Running, image the new tag
+helm -n myelin list                                                      # CHART hs-$V, APP VERSION $V
+kubectl -n myelin get pods,bridges                                       # all Running
+kubectl -n myelin get pod myelin-hs-0 -o jsonpath='{.spec.containers[0].image}'   # ghcr.io/brandon-dacrib/myelin:$V
 kubectl -n myelin logs statefulset/myelin-hs | grep -E 'WARN|ERROR'
 curl https://matrix.example.org/_matrix/federation/v1/version             # the new version
 curl https://matrix.example.org/_matrix/key/v2/server                     # the same ed25519 key as before
@@ -251,6 +285,6 @@ kubectl delete crd bridges.hs.matrix.org      # deletes every Bridge in the clus
 | You see | It means | Do this |
 |---|---|---|
 | A bridge's page, or the log: "the Bridge CRD in the cluster is older than this server" | The CRD was not upgraded with the chart (`crds.enabled=false` here, or the one-time step above was skipped) | Upgrade the release that owns the CRD, or `kubectl apply --server-side --force-conflicts -f deploy/crds/bridge.yaml` from the matching tag |
-| The pod still runs the old image after an upgrade | The tag did not change (a checkout chart on `main`) | Pin `--set image.tag=<tag>`; or `kubectl -n myelin rollout restart statefulset/myelin-hs` |
+| The pod still runs the old image after an upgrade | Your values pin `image.tag` (an install from a checkout), or the chart came from a checkout, whose image is `main` | Upgrade from the release with `--set image.tag="$V"` ([Which chart](#which-chart)) |
 | Locked out of the admin interface | | `kubectl -n myelin exec myelin-hs-0 -- hs recover`, and open the link it prints |
 | `401 Failed to find any key` from other servers | They cannot fetch this server's key | `/.well-known/matrix/server` at the `serverName` host (see [A server on the internet](#a-server-on-the-internet)) |
