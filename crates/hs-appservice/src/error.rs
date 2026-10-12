@@ -84,3 +84,87 @@ impl From<hs_tables::IndexError> for AppserviceError {
         }
     }
 }
+
+/// `error` with every cause in its source chain, `outer: inner: innermost`, each said once.
+///
+/// An HTTP client's error says what it was doing and keeps why in its sources: reqwest's
+/// `Display` for a request that timed out is `error sending request for url (...)`, and the
+/// `operation timed out` (or `connection refused`, or `dns error: ...`) is a source or two down.
+/// That top line alone was all the delivery log and an appservice's `last_error` said on the
+/// demo on 2026-10-12, when five bridges stopped taking transactions and nothing said why. A
+/// cause whose text is already in what has been said (hyper and reqwest sometimes repeat one)
+/// is left out.
+#[must_use]
+pub fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = error.to_string();
+    let mut current = error.source();
+    while let Some(cause) = current {
+        let text = cause.to_string();
+        if !text.is_empty() && !out.contains(&text) {
+            out.push_str(": ");
+            out.push_str(&text);
+        }
+        current = cause.source();
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::error_chain;
+
+    #[derive(Debug)]
+    struct Layer(&'static str, Option<Box<Layer>>);
+
+    impl std::fmt::Display for Layer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for Layer {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1
+                .as_deref()
+                .map(|l| l as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    #[test]
+    fn every_cause_is_said_once_outermost_first() {
+        let error = Layer(
+            "error sending request for url (http://bridge:29318/)",
+            Some(Box::new(Layer(
+                "client error (SendRequest)",
+                Some(Box::new(Layer(
+                    "operation timed out",
+                    Some(Box::new(Layer("operation timed out", None))),
+                ))),
+            ))),
+        );
+        assert_eq!(
+            error_chain(&error),
+            "error sending request for url (http://bridge:29318/): client error (SendRequest): operation timed out"
+        );
+        assert_eq!(error_chain(&Layer("alone", None)), "alone");
+    }
+
+    #[tokio::test]
+    async fn a_refused_connection_says_it_was_refused() {
+        // A port that was bound and let go: nothing listens there now.
+        let addr = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap()
+        };
+        let error = reqwest::Client::new()
+            .put(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap_err();
+        let chained = error_chain(&error);
+        assert!(
+            chained.to_lowercase().contains("refused"),
+            "{chained} (plain: {error})"
+        );
+    }
+}

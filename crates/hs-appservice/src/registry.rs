@@ -506,8 +506,15 @@ impl<B: KvBackend> Registry<B> {
             .get(id)?
             .ok_or_else(|| AppserviceError::NotFound(id.to_string()))?;
         let health_row = self.store.health(id)?;
+        let status = if row.url.is_none() && !row.paused {
+            // Never sent anything (a bridge's double-puppeting registration, say): there is no
+            // delivery to judge, whatever was recorded while it had a url.
+            HealthStatus::Unknown
+        } else {
+            compute_status(row.paused, &health_row, self.failure_threshold())
+        };
         Ok(Health {
-            status: compute_status(row.paused, &health_row, self.failure_threshold()),
+            status,
             last_ping_at_ms: health_row.last_ping_at_ms,
             last_error: health_row.last_error,
             consecutive_failures: health_row.consecutive_failures,

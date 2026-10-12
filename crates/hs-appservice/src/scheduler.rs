@@ -112,9 +112,15 @@ impl HttpTransactionSender {
     /// A sender with a 30-second request timeout.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_timeout(std::time::Duration::from_secs(30))
+    }
+
+    /// A sender whose requests give up after `timeout`.
+    #[must_use]
+    pub fn with_timeout(timeout: std::time::Duration) -> Self {
         Self {
             client: hs_http::client::builder()
-                .timeout(std::time::Duration::from_secs(30))
+                .timeout(timeout)
                 .build()
                 .unwrap_or_default(),
         }
@@ -140,7 +146,9 @@ impl TransactionSender for HttpTransactionSender {
             .json(body)
             .send()
             .await
-            .map_err(|e| e.to_string())?;
+            // The cause, not just "error sending request for url (...)": that is what the
+            // delivery log and the appservice's `last_error` say.
+            .map_err(|e| crate::error::error_chain(&e))?;
         if response.status().is_success() {
             Ok(())
         } else {
@@ -886,6 +894,45 @@ mod tests {
         assert_eq!(merged["events"], json!([1, 2, 3]));
         assert_eq!(merged["device_lists"]["changed"], json!(["x", "y"]));
         assert_eq!(merged["device_lists"]["left"], json!(["z"]));
+    }
+
+    /// The demo on 2026-10-12: a bridge whose transaction handler is stuck accepts the
+    /// connection and never answers. The request times out, and both the failure the drain
+    /// reports (which the delivery worker logs) and the appservice's `last_error` say that it
+    /// timed out, not only reqwest's "error sending request for url (...)".
+    #[tokio::test]
+    async fn a_bridge_that_never_answers_is_reported_as_timed_out() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let held = tokio::spawn(async move {
+            let mut open = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                open.push(socket);
+            }
+        });
+        let (registry, clock) = registry_with("stuck", Some(&url));
+        let sender = HttpTransactionSender::with_timeout(std::time::Duration::from_millis(300));
+        let scheduler = Scheduler::new(registry.clone(), clock, Arc::new(sender));
+        scheduler.enqueue("stuck", &event_txn("hello?")).unwrap();
+        let outcome = scheduler.drain("stuck").await.unwrap();
+        held.abort();
+        let DrainOutcome::Failed { error, .. } = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert!(
+            error.starts_with("error sending request for url"),
+            "{error}"
+        );
+        assert!(error.contains("timed out"), "{error}");
+        let health = registry.health("stuck").unwrap();
+        assert!(
+            health
+                .last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("timed out")),
+            "{:?}",
+            health.last_error
+        );
     }
 
     #[test]

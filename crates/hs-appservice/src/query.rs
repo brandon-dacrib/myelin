@@ -142,7 +142,7 @@ impl AppserviceQueryTransport for HttpQueryTransport {
             .bearer_auth(hs_token)
             .send()
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| crate::error::error_chain(&e))?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }

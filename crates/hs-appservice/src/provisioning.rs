@@ -207,17 +207,18 @@ impl BridgeLogins {
 }
 
 fn transport_error(error: &reqwest::Error) -> AdminBridgeLoginsError {
+    let cause = crate::error::error_chain(error);
     if error.is_timeout() {
         AdminBridgeLoginsError {
             status: 504,
             reason: "timeout".to_owned(),
-            detail: format!("the bridge did not answer in time: {error}"),
+            detail: format!("the bridge did not answer in time: {cause}"),
         }
     } else {
         AdminBridgeLoginsError {
             status: 502,
             reason: "unreachable".to_owned(),
-            detail: format!("the server could not reach the bridge: {error}"),
+            detail: format!("the server could not reach the bridge: {cause}"),
         }
     }
 }

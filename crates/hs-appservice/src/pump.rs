@@ -787,6 +787,72 @@ mod tests {
         );
     }
 
+    /// The demo on 2026-10-12 (decision 0045). A bridge whose own registration claimed its
+    /// owner, even non-exclusively, was sent every event of every room the owner was in: their
+    /// encrypted chats with other people among them, which its bot was never in. A mautrix
+    /// bridge waits 25 seconds on keys for each such event, one at a time, and five bridges
+    /// stopped taking transactions. With double puppeting in a registration of its own (no
+    /// `url`), the bridge hears only the rooms its bot or ghosts are in, and the double-puppeting
+    /// registration hears nothing at all.
+    #[tokio::test]
+    async fn a_bridge_is_not_sent_a_room_none_of_its_users_is_in_whoever_double_puppets() {
+        let bridge = "id: whatsapp-alice\nurl: 'http://localhost:1'\nas_token: wa_as\n\
+            hs_token: wa_hs\nsender_localpart: whatsappbot_alice\nnamespaces:\n  users:\n    \
+            - regex: '@whatsapp_alice_.*:example\\.org'\n      exclusive: true\n    \
+            - regex: '@whatsappbot_alice:example\\.org'\n      exclusive: true\n";
+        let double_puppet = "id: whatsapp-alice-doublepuppet\nurl: null\nas_token: dp_as\n\
+            hs_token: dp_hs\nsender_localpart: whatsapp-alice-doublepuppet\nnamespaces:\n  \
+            users:\n    - regex: '@alice:example\\.org'\n      exclusive: false\n";
+        // What the instance's own registration was before: the owner claimed beside its ghosts.
+        let before = "id: signal-alice\nurl: 'http://localhost:2'\nas_token: sg_as\n\
+            hs_token: sg_hs\nsender_localpart: signalbot_alice\nnamespaces:\n  users:\n    \
+            - regex: '@signal_alice_.*:example\\.org'\n      exclusive: true\n    \
+            - regex: '@signalbot_alice:example\\.org'\n      exclusive: true\n    \
+            - regex: '@alice:example\\.org'\n      exclusive: false\n";
+        let (registry, rooms, pump) = setup(&[bridge, double_puppet, before]);
+        pump.start().await.unwrap();
+
+        // Alice's encrypted chat with bob: no bot, no ghost.
+        let private = "!private:example.org";
+        rooms.join(private, "@alice:example.org");
+        rooms.join(private, "@bob:example.org");
+        rooms.say(private, "@bob:example.org", "an encrypted hello");
+        // Her portal: the bridge's bot and one of its ghosts are in it.
+        let portal = "!portal:example.org";
+        rooms.join(portal, "@alice:example.org");
+        rooms.join(portal, "@whatsappbot_alice:example.org");
+        rooms.join(portal, "@whatsapp_alice_123:example.org");
+        rooms.say(portal, "@alice:example.org", "to whatsapp");
+
+        let touched = pump.pump_room(private).await.unwrap();
+        assert_eq!(
+            touched,
+            vec!["signal-alice".to_owned()],
+            "only the old shape"
+        );
+        pump.pump_room(portal).await.unwrap();
+
+        let heard = queued(&registry, "whatsapp-alice");
+        assert!(
+            !heard.iter().any(|e| e == "an encrypted hello"),
+            "the bridge was sent a room none of its users is in: {heard:?}"
+        );
+        assert!(heard.iter().any(|e| e == "to whatsapp"), "{heard:?}");
+        assert!(
+            registry
+                .store()
+                .queue_for("whatsapp-alice-doublepuppet")
+                .unwrap()
+                .is_empty()
+        );
+        // The shape that stalled the demo hears her private chat.
+        assert!(
+            queued(&registry, "signal-alice")
+                .iter()
+                .any(|e| e == "an encrypted hello")
+        );
+    }
+
     #[tokio::test]
     async fn an_appservice_with_no_url_is_queued_nothing_and_does_not_hold_the_cursor_back() {
         let puppet = "id: puppet\nurl: null\nas_token: puppet_as\nhs_token: puppet_hs\n\

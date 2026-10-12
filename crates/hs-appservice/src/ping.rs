@@ -109,7 +109,7 @@ impl PingTransport for HttpPingTransport {
                 if e.is_timeout() {
                     PingTransportError::Timeout
                 } else {
-                    PingTransportError::ConnectionFailed(e.to_string())
+                    PingTransportError::ConnectionFailed(crate::error::error_chain(&e))
                 }
             })?;
         if response.status().is_success() {
@@ -203,7 +203,8 @@ impl<B: KvBackend> PingService<B> {
     }
 
     /// Pings `appservice_id`'s registered `url`, recording the result in its health row
-    /// regardless of outcome. This is the single entry point both the inbound client route and
+    /// regardless of outcome (a registration with no `url` is answered `M_URL_NOT_SET` and
+    /// nothing is recorded). This is the single entry point both the inbound client route and
     /// the admin API's `POST /appservices/{id}/ping` call.
     ///
     /// # Errors
@@ -223,7 +224,8 @@ impl<B: KvBackend> PingService<B> {
 
         let now = self.registry.now_ms();
         let Some(url) = row.url else {
-            self.record(appservice_id, now, Err(&PingFailure::NoUrlSet))?;
+            // Not recorded: a registration with no url (a bridge's double puppeting, say) is
+            // never sent anything, and that is what it is for, not a fault in its health.
             return Ok(Err(PingFailure::NoUrlSet));
         };
 
@@ -372,11 +374,17 @@ mod tests {
     async fn null_url_ping_is_a_distinct_failure() {
         let registry = registry_with("dp", None);
         let transport = Arc::new(MockTransport::ok());
-        let service = PingService::new(registry, transport.clone());
+        let service = PingService::new(registry.clone(), transport.clone());
 
         let outcome = service.ping("dp", None).await.unwrap();
         assert_eq!(outcome, Err(PingFailure::NoUrlSet));
         assert!(transport.calls.lock().unwrap().is_empty());
+        // And it is not held against the registration: one with no url is never sent
+        // anything, so its health is not degraded by being asked.
+        let health = registry.health("dp").unwrap();
+        assert_eq!(health.status, crate::registry::HealthStatus::Unknown);
+        assert!(health.last_error.is_none());
+        assert!(health.last_ping_at_ms.is_none());
     }
 
     #[tokio::test]
