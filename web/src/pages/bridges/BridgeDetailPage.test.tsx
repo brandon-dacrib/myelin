@@ -57,7 +57,8 @@ describe("Bridge page", () => {
     expect(await screen.findByText(/Off: it posts as its own ghosts only/)).toBeInTheDocument();
   });
 
-  it("links a double-puppeting registration back to its bridge", async () => {
+  it("shows a double-puppeting registration as its bridge's key, not as a bridge", async () => {
+    let healthAsked = false;
     server.use(
       http.get("/api/v1/appservices/telegram-doublepuppet", () =>
         HttpResponse.json({
@@ -65,12 +66,29 @@ describe("Bridge page", () => {
           sender_localpart: "telegram-doublepuppet",
           url: null,
           health: "unknown",
+          namespaces: { users: [{ regex: "@brandon:example\\.org", exclusive: false }] },
         }),
       ),
+      http.get("/api/v1/appservices/telegram-doublepuppet/health", () => {
+        healthAsked = true;
+        return HttpResponse.json({ status: "unknown" });
+      }),
     );
     renderBridge("telegram-doublepuppet");
-    const link = await screen.findByRole("link", { name: "telegram" });
-    expect(link).toHaveAttribute("href", "/bridges/telegram");
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "Double puppeting for Telegram" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/This is not a bridge/)).toBeInTheDocument();
+    expect(screen.getByText("Built in")).toBeInTheDocument();
+    expect(screen.getByText("@brandon:example\\.org")).toBeInTheDocument();
+    // Its bridge is linked, by the bridge's name, once its record is read.
+    const links = await screen.findAllByRole("link", { name: /^Telegram$/ });
+    for (const link of links) expect(link).toHaveAttribute("href", "/bridges/telegram");
+    // Nothing that belongs to a bridge the server delivers to.
+    expect(screen.queryByText("Unknown")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Test connection" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("tab")).not.toBeInTheDocument();
     expect(screen.queryByText(/^Off:/)).not.toBeInTheDocument();
+    expect(healthAsked).toBe(false);
   });
 });

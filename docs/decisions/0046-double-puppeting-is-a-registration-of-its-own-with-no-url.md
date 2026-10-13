@@ -72,7 +72,8 @@ request for url (...)`: reqwest's top line, without the timeout under it.
    **Amended 2026-10-13:** listing it as a row of its own doubled the Registrations tab (the owner
    read "Slack Brandon" beside "Double puppeting for Slack Brandon" as a duplicate). The tab now
    folds it into its bridge's row ("Double puppeting on"); the bridge's page names and links it.
-   It keeps a row of its own only when its bridge is not on the loaded page.
+   It keeps a row of its own only when its bridge is not on the loaded page. Its own page says it
+   is the bridge's key and shows whom it covers, with none of a bridge's health or actions.
 7. **Delivery errors say why.** The transaction sender, the ping, the user and alias queries and
    the provisioning call report the error's whole source chain (`hs_appservice::error::error_chain`):
    `error sending request for url (...): operation timed out`, not the top line alone.

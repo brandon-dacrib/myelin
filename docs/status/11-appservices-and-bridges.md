@@ -140,7 +140,9 @@ server's log said only `error sending request for url (...)`. Decision 0046 has 
   into its bridge's row ("… · Double puppeting on"; `foldDoublePuppets` in `web/src/api/bridges.ts`),
   so the list has one row per bridge and "All" counts bridges. One whose bridge is not on the
   loaded page stays a row of its own. The bridge's page says "Double puppeting: On" with a link to
-  `<id>-doublepuppet` (or "Off"), and that registration's page links back ("Double puppeting for").
+  `<id>-doublepuppet` (or "Off"). That registration's own page is not a bridge's page: it says it
+  is the bridge's key, links the bridge, lists whom it covers, and has no health, connection test,
+  tabs or actions (its health and backlog are not fetched).
 - Docs: decision 0046, `docs/bridges/mautrix.md` ("2026-10-12": how it works, what the roll does,
   the post-roll checks), CHANGELOG, `docs/next-steps.md`.
 

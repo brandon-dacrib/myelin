@@ -3,6 +3,8 @@ import { useParams, useNavigate, useRouterState, Link } from "@tanstack/react-ro
 import { Root, List, Trigger, Content } from "radix-ui/tabs";
 import { ExternalLink, Eye, EyeOff, ChevronLeft } from "lucide-react";
 import {
+  DOUBLE_PUPPET_ID_SUFFIX,
+  deriveDisplayName,
   doublePuppetBridgeId,
   isBuiltInAppservice,
   isSendsNothingAppservice,
@@ -69,7 +71,12 @@ export function BridgeDetailPage() {
     (TABS as readonly string[]).includes(hash) ? (hash as (typeof TABS)[number]) : "overview",
   );
   const { data: bridge, isLoading, isError, error, refetch } = useAppservice(bridgeId);
-  const { data: health } = useAppserviceHealth(bridgeId);
+  // A double-puppeting registration has no delivery, so its health and backlog are not asked for.
+  const deliveredTo =
+    bridge === undefined
+      ? !bridgeId.endsWith(DOUBLE_PUPPET_ID_SUFFIX)
+      : doublePuppetBridgeId(bridge) === undefined;
+  const { data: health } = useAppserviceHealth(deliveredTo ? bridgeId : undefined);
   // A bridge that is pushed to may have a double-puppeting registration beside it (decision 0046);
   // the registrations list folds that into the bridge's row, so this page says what it is.
   const { data: doublePuppet } = useDoublePuppetRegistration(
@@ -82,7 +89,7 @@ export function BridgeDetailPage() {
     data: backlog,
     isError: backlogIsError,
     error: backlogError,
-  } = useAppserviceBacklog(bridgeId);
+  } = useAppserviceBacklog(deliveredTo ? bridgeId : undefined);
   const canWrite = hasScope("bridges:write");
   const {
     data: registration,
@@ -121,6 +128,11 @@ export function BridgeDetailPage() {
     );
   }
 
+  const doublePuppetFor = doublePuppetBridgeId(bridge);
+  if (doublePuppetFor !== undefined) {
+    return <DoublePuppetRegistration registration={bridge} bridgeId={doublePuppetFor} />;
+  }
+
   // AppService.id is optional on the schema (no `required` list); this page
   // only ever has one fetched by its route param, so that param is the
   // reliable fallback if the resource ever omitted its own id.
@@ -129,7 +141,6 @@ export function BridgeDetailPage() {
   const name = bridgeTitle(bridge, type);
   const botId = botMatrixId(bridge.sender_localpart, server?.name);
   const meta = bridgeHealthMeta[healthKeyOf(bridge)];
-  const doublePuppetFor = doublePuppetBridgeId(bridge);
   const pendingBacklog = (backlog?.items ?? []).filter((e) => !e.dead_lettered);
   const deadLettered = (backlog?.items ?? []).filter((e) => e.dead_lettered);
 
@@ -416,20 +427,6 @@ export function BridgeDetailPage() {
                 }
               />
             )}
-            {doublePuppetFor && (
-              <Fact
-                label="Double puppeting for"
-                value={
-                  <Link
-                    to="/bridges/$bridgeId"
-                    params={{ bridgeId: doublePuppetFor }}
-                    className="font-identifier text-accent hover:underline"
-                  >
-                    {doublePuppetFor}
-                  </Link>
-                }
-              />
-            )}
           </dl>
           <h2 className="mt-6 text-sm font-medium text-text">Namespaces</h2>
           <p className="mt-1 text-sm text-text-muted">
@@ -594,6 +591,69 @@ export function BridgeDetailPage() {
           </div>
         </Content>
       </Root>
+    </div>
+  );
+}
+
+/**
+ * A bridge's double-puppeting registration (decision 0046), which is not a bridge: it has no URL,
+ * the server sends it nothing, and the bridge only borrows its token to post as its owner. So it
+ * has no health, queue, connection test, sign-in or transactions, and this page says what it is
+ * for, whom it lets the bridge act as, and which bridge uses it.
+ */
+function DoublePuppetRegistration({
+  registration,
+  bridgeId,
+}: {
+  registration: AppService;
+  bridgeId: string;
+}) {
+  const { data: bridge } = useAppservice(bridgeId);
+  const { data: types } = useBridgeTypes();
+  const bridgeName = bridge ? bridgeTitle(bridge, bridgeTypeOf(bridge, types)) : bridgeId;
+  const id = registration.id ?? `${bridgeId}${DOUBLE_PUPPET_ID_SUFFIX}`;
+  const bridgeLink = (
+    <Link to="/bridges/$bridgeId" params={{ bridgeId }} className="text-accent hover:underline">
+      {bridgeName}
+    </Link>
+  );
+
+  return (
+    <div className="mx-auto max-w-[90rem] p-6">
+      <Link
+        to="/bridges/$bridgeId"
+        params={{ bridgeId }}
+        className="inline-flex items-center gap-1 text-sm text-text-muted hover:text-text"
+      >
+        <ChevronLeft size={14} aria-hidden="true" />
+        {bridgeName}
+      </Link>
+      <div className="mt-2 flex items-center gap-3">
+        <h1 className="text-xl text-text">{deriveDisplayName(registration)}</h1>
+        <span title="The server's own registration; it is not probed.">
+          <Badge status="muted">Built in</Badge>
+        </span>
+      </div>
+      <p className="mt-1 text-sm text-text-muted">
+        <CopyableId value={id} />
+      </p>
+      <p className="mt-4 max-w-3xl text-sm text-text">
+        This is not a bridge. It is the key {bridgeLink} uses to post as its owner, so that what
+        they send from the other network&apos;s own app shows up in Matrix from their own account
+        rather than from a ghost. It has no URL, so the server never sends it anything: there is no
+        connection, queue or health to look at here. Everything about the bridge itself is on{" "}
+        {bridgeLink}&apos;s page.
+      </p>
+      <dl className="mt-6 grid grid-cols-1 gap-x-8 gap-y-4 sm:grid-cols-2 xl:grid-cols-3">
+        <Fact label="Double puppeting for" value={bridgeLink} />
+        <Fact label="Added" value={<RelativeTime at={registration.created_at} />} />
+      </dl>
+      <h2 className="mt-6 text-sm font-medium text-text">Who the bridge may post as</h2>
+      <p className="mt-1 text-sm text-text-muted">
+        The users this key covers. The claim is shared, not exclusive, and the key has no URL: it
+        lets the bridge act as them, and nothing of theirs is sent to it.
+      </p>
+      <NamespaceList namespaces={registration.namespaces} />
     </div>
   );
 }
