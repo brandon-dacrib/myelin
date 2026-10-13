@@ -3,7 +3,11 @@ import { useParams, useNavigate, useRouterState, Link } from "@tanstack/react-ro
 import { Root, List, Trigger, Content } from "radix-ui/tabs";
 import { ExternalLink, Eye, EyeOff, ChevronLeft } from "lucide-react";
 import {
+  doublePuppetBridgeId,
+  isBuiltInAppservice,
+  isSendsNothingAppservice,
   useAppservice,
+  useDoublePuppetRegistration,
   useAppserviceHealth,
   useAppserviceBacklog,
   useAppserviceRegistration,
@@ -66,6 +70,12 @@ export function BridgeDetailPage() {
   );
   const { data: bridge, isLoading, isError, error, refetch } = useAppservice(bridgeId);
   const { data: health } = useAppserviceHealth(bridgeId);
+  // A bridge that is pushed to may have a double-puppeting registration beside it (decision 0046);
+  // the registrations list folds that into the bridge's row, so this page says what it is.
+  const { data: doublePuppet } = useDoublePuppetRegistration(
+    bridgeId,
+    bridge !== undefined && !isSendsNothingAppservice(bridge) && !isBuiltInAppservice(bridge),
+  );
   const { data: types } = useBridgeTypes();
   const { data: server } = useServerInfo();
   const {
@@ -119,6 +129,7 @@ export function BridgeDetailPage() {
   const name = bridgeTitle(bridge, type);
   const botId = botMatrixId(bridge.sender_localpart, server?.name);
   const meta = bridgeHealthMeta[healthKeyOf(bridge)];
+  const doublePuppetFor = doublePuppetBridgeId(bridge);
   const pendingBacklog = (backlog?.items ?? []).filter((e) => !e.dead_lettered);
   const deadLettered = (backlog?.items ?? []).filter((e) => e.dead_lettered);
 
@@ -383,6 +394,42 @@ export function BridgeDetailPage() {
             />
             <Fact label="Rate limited" value={bridge.rate_limited ? "Yes" : "No, exempt"} />
             <Fact label="Added" value={<RelativeTime at={bridge.created_at} />} />
+            {doublePuppet !== undefined && (
+              <Fact
+                label="Double puppeting"
+                value={
+                  doublePuppet === null ? (
+                    "Off: it posts as its own ghosts only"
+                  ) : (
+                    <>
+                      On: it posts as its owner with{" "}
+                      <Link
+                        to="/bridges/$bridgeId"
+                        params={{ bridgeId: doublePuppet.id ?? "" }}
+                        className="font-identifier text-accent hover:underline"
+                      >
+                        {doublePuppet.id}
+                      </Link>
+                      , a registration the server sends nothing
+                    </>
+                  )
+                }
+              />
+            )}
+            {doublePuppetFor && (
+              <Fact
+                label="Double puppeting for"
+                value={
+                  <Link
+                    to="/bridges/$bridgeId"
+                    params={{ bridgeId: doublePuppetFor }}
+                    className="font-identifier text-accent hover:underline"
+                  >
+                    {doublePuppetFor}
+                  </Link>
+                }
+              />
+            )}
           </dl>
           <h2 className="mt-6 text-sm font-medium text-text">Namespaces</h2>
           <p className="mt-1 text-sm text-text-muted">

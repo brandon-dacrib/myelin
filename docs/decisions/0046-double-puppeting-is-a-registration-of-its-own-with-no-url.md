@@ -69,6 +69,10 @@ request for url (...)`: reqwest's top line, without the timeout under it.
    (`Registry::health`), and a ping of one answers `M_URL_NOT_SET` without recording a failure.
    The admin interface lists a double-puppeting registration as "Built in" ("Double puppeting for
    Signal Brandon"), any other url-less one as "Sends nothing", and neither under Attention.
+   **Amended 2026-10-13:** listing it as a row of its own doubled the Registrations tab (the owner
+   read "Slack Brandon" beside "Double puppeting for Slack Brandon" as a duplicate). The tab now
+   folds it into its bridge's row ("Double puppeting on"); the bridge's page names and links it.
+   It keeps a row of its own only when its bridge is not on the loaded page.
 7. **Delivery errors say why.** The transaction sender, the ping, the user and alias queries and
    the provisioning call report the error's whole source chain (`hs_appservice::error::error_chain`):
    `error sending request for url (...): operation timed out`, not the top line alone.

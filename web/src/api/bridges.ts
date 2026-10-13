@@ -77,6 +77,38 @@ export function isDoublePuppetAppservice(appservice: Pick<AppService, "id" | "ur
 }
 
 /**
+ * The id of the bridge a double-puppeting registration lends its token to
+ * (`whatsapp-brandon-doublepuppet` → `whatsapp-brandon`), or undefined for any other registration.
+ */
+export function doublePuppetBridgeId(
+  appservice: Pick<AppService, "id" | "url">,
+): string | undefined {
+  if (!isDoublePuppetAppservice(appservice)) return undefined;
+  return (appservice.id ?? "").slice(0, -DOUBLE_PUPPET_ID_SUFFIX.length) || undefined;
+}
+
+/**
+ * The registrations list as people think of it: one row per bridge. Each double-puppeting
+ * registration whose bridge is in `items` leaves the list and is returned in `doublePuppets`, keyed
+ * by that bridge's id, so the bridge's row can say it double puppets. One whose bridge is not in
+ * `items` (on another page, or left behind) stays a row of its own, so nothing is hidden.
+ */
+export function foldDoublePuppets(items: AppService[]): {
+  rows: AppService[];
+  doublePuppets: Map<string, AppService>;
+} {
+  const ids = new Set(items.map((a) => a.id));
+  const doublePuppets = new Map<string, AppService>();
+  const rows: AppService[] = [];
+  for (const item of items) {
+    const bridgeId = doublePuppetBridgeId(item);
+    if (bridgeId !== undefined && ids.has(bridgeId)) doublePuppets.set(bridgeId, item);
+    else rows.push(item);
+  }
+  return { rows, doublePuppets };
+}
+
+/**
  * Whether `appservice` is the server's own built-in registration, not a bridge somebody added:
  * the bridge manager, or a double-puppeting registration the manager (or the wizard) made beside
  * a bridge. Neither is probed or delivered to the way a bridge is.
@@ -157,6 +189,24 @@ export function useAppservice(id: string | undefined, options: { refetchInterval
       return unwrap(result);
     },
     refetchInterval: options.refetchInterval ?? 15_000,
+  });
+}
+
+/**
+ * The double-puppeting registration of bridge `id` (`<id>-doublepuppet`, decision 0046), or null
+ * when it has none. Not polled: it changes only when the bridge's double puppeting is switched.
+ */
+export function useDoublePuppetRegistration(id: string | undefined, enabled = true) {
+  const dpId = id ? `${id}${DOUBLE_PUPPET_ID_SUFFIX}` : undefined;
+  return useQuery({
+    queryKey: ["appservice", dpId, "double-puppet"],
+    enabled: Boolean(dpId) && enabled,
+    queryFn: async () => {
+      const result = await api.GET("/appservices/{id}", { params: { path: { id: dpId! } } });
+      if (result.response.status === 404) return null;
+      const appservice = unwrap(result);
+      return isDoublePuppetAppservice(appservice) ? appservice : null;
+    },
   });
 }
 

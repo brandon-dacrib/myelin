@@ -49,7 +49,48 @@ describe("Bridges list", () => {
     expect(within(row).queryByText("Unknown")).not.toBeInTheDocument();
   });
 
-  it("names a bridge's double-puppeting registration as built in, and one with no URL as sending nothing", async () => {
+  it("folds a bridge's double-puppeting registration into the bridge's row", async () => {
+    server.use(
+      http.get("/api/v1/appservices", () =>
+        HttpResponse.json({
+          items: [
+            {
+              id: "signal-brandon",
+              sender_localpart: "signal-brandon",
+              url: "http://signal-brandon.bridges.svc:29328",
+              health: "healthy",
+            },
+            {
+              id: "signal-brandon-doublepuppet",
+              sender_localpart: "signal-brandon-doublepuppet",
+              url: null,
+              health: "unknown",
+            },
+            {
+              id: "slack-brandon",
+              sender_localpart: "slack-brandon",
+              url: "http://slack-brandon.bridges.svc:29335",
+              health: "healthy",
+            },
+          ],
+          next_cursor: null,
+          prev_cursor: null,
+        }),
+      ),
+    );
+    renderBridgesRoute("/bridges/registrations", BridgesListPage, "/bridges/registrations");
+    const signal = await screen.findByRole("row", { name: /Signal Brandon/ });
+    expect(within(signal).getByText(/Double puppeting on/)).toBeInTheDocument();
+    // One row per bridge: the double-puppeting registration has none of its own.
+    expect(screen.queryByText(/Double puppeting for/)).not.toBeInTheDocument();
+    expect(screen.getAllByRole("row")).toHaveLength(3); // the header and two bridges
+    const slack = screen.getByRole("row", { name: /Slack Brandon/ });
+    expect(within(slack).queryByText(/Double puppeting on/)).not.toBeInTheDocument();
+    // "All" counts bridges, not registrations.
+    expect(screen.getByRole("button", { name: /All/ })).toHaveTextContent("2");
+  });
+
+  it("keeps a double-puppeting registration whose bridge is not listed, and one with no URL, as rows", async () => {
     server.use(
       http.get("/api/v1/appservices", () =>
         HttpResponse.json({
@@ -70,9 +111,6 @@ describe("Bridges list", () => {
     renderBridgesRoute("/bridges/registrations", BridgesListPage, "/bridges/registrations");
     expect(
       await screen.findByRole("link", { name: "Double puppeting for Signal Brandon" }),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByText("Built in: lets the bridge post as its owner; the server sends it nothing"),
     ).toBeInTheDocument();
     const dp = screen.getByRole("row", { name: /Double puppeting for Signal Brandon/ });
     expect(within(dp).getByText("Built in")).toBeInTheDocument();

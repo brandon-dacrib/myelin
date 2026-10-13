@@ -15,6 +15,9 @@ carries the generated notes for that merge.
 
 ## Unreleased
 
+- **One row per bridge on the Registrations tab.** A bridge's double-puppeting registration is
+  shown on the bridge's own row ("Double puppeting on") instead of as a second row, which read as
+  a duplicate. The bridge's page links it.
 - **A bridge that is switched off no longer takes the server down.** Its queue can hold tens of
   thousands of transactions; delivery retries and the queue metrics now read a small row per
   entry instead of every body. On the demo the old reads froze the server for seconds at a

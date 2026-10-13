@@ -108,11 +108,12 @@ test.describe("Register a bridge you run yourself", () => {
     await expect(page.getByText("@bob:example.org is not signed in.")).toBeVisible();
     await expectNoAxeViolations(page, "bridge detail: sign in");
 
-    // Its double puppeting is listed as the server's own, not as a bridge of unknown health.
+    // Its double puppeting is folded into its row, not listed as a registration of its own.
     await openRegistrations(page);
-    const doublePuppetRow = page.getByRole("row", { name: /Double puppeting for Bluesky/ });
-    await expect(doublePuppetRow).toBeVisible();
-    await expect(doublePuppetRow.getByText("Built in", { exact: true })).toBeVisible();
+    const blueskyRow = page.getByRole("row", { name: /Bluesky/ });
+    await expect(blueskyRow).toHaveCount(1);
+    await expect(blueskyRow.getByText(/Double puppeting on/)).toBeVisible();
+    await expect(page.getByRole("row", { name: /Double puppeting for Bluesky/ })).toHaveCount(0);
     domGuard.assertClean();
   });
 

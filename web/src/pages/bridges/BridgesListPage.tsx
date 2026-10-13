@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { useNavigate, useSearch, Link } from "@tanstack/react-router";
 import { Cable, Play, Pause } from "lucide-react";
 import {
+  foldDoublePuppets,
   isBuiltInAppservice,
   isSendsNothingAppservice,
   useAppservices,
@@ -63,7 +64,9 @@ export function BridgesListPage() {
   const pause = usePauseAppservice();
   const resume = useResumeAppservice();
 
-  const all = useMemo(() => data?.items ?? [], [data]);
+  // A bridge's double-puppeting registration (decision 0046) is part of that bridge, not a bridge
+  // of its own: it is folded into the bridge's row, which says the bridge double puppets.
+  const { rows: all, doublePuppets } = useMemo(() => foldDoublePuppets(data?.items ?? []), [data]);
   // The health chips count bridges: the server's own registrations and ones with no URL have no
   // delivery to be healthy or not about.
   const counts = useMemo(
@@ -112,7 +115,14 @@ export function BridgesListPage() {
               >
                 {bridgeTitle(b, type)}
               </Link>
-              <span className="truncate text-xs text-text-muted">{bridgeKind(b, type)}</span>
+              <span className="truncate text-xs text-text-muted">
+                {bridgeKind(b, type)}
+                {doublePuppets.has(b.id ?? "") && (
+                  <span title="It posts as its owner with a registration of its own, which the server sends nothing; see the bridge's page.">
+                    {" · "}Double puppeting on
+                  </span>
+                )}
+              </span>
             </span>
           </span>
         );

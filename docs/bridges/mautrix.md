@@ -347,9 +347,10 @@ transaction handler blocked, and the server's 30 s timeout fired. Decision 0046 
   `@.*` registration the mautrix docs show). A bridge registered through the wizard, which serves
   everyone, gets one `<id>-doublepuppet` claiming `@.*:<server>`, created with it; its preview
   is on the wizard's Review step.
-- The Registrations tab lists it as **Built in** ("Double puppeting for WhatsApp Brandon"). Its
-  health is `unknown` and it is never under Attention; pinging it answers `M_URL_NOT_SET` and
-  records nothing.
+- The Registrations tab shows it on its bridge's row ("WhatsApp Brandon … · Double puppeting on"),
+  not as a row of its own; the bridge's page links it under "Double puppeting". Its health is
+  `unknown` and it is never under Attention; pinging it answers `M_URL_NOT_SET` and records
+  nothing.
 
 **What the roll does to an existing instance.** Nothing to do by hand: on the server's first step
 after the upgrade, for each instance that double puppets, the manager
