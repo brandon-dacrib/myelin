@@ -1,10 +1,24 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-10-13, noon EDT (0.3.9 on the demo, freezing under the iMessage queue; the fix is `agent/queue-heads`). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+Written 2026-09-20 by the integration lead, last revised 2026-10-13, 13:50 EDT (0.3.10 on the demo, checked). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
-## Resume here: 2026-10-13, noon EDT -- the demo's server restarted 92 times on 0.3.8; the fix is `agent/queue-heads`
+## Resume here: 2026-10-13, 13:50 EDT -- 0.3.10 runs on the demo, checked; it no longer freezes under the iMessage queue
+
+Rolled 17:32 UTC (revision 23). **Checked through the owner's proxy**: `myelin-hs-0` on
+`ghcr.io/brandon-dacrib/myelin:0.3.10`, 0 restarts after 16 minutes (0.3.9 had restarted 15
+times in 90 minutes); `gave each queued appservice transaction its head row, once
+entries=39537` at 17:32:47, listening 7.1 s after start; 40 `/health/live` probes over a minute,
+none failed, slowest 0.24 s; `scrape_duration_seconds{job="myelin-hs"}` 10 s (timing out) at
+16:28, 0.19 s at 17:48. **Not yet better**: the process still uses ~3.4 cores and 1-1.5 GiB (0.3.0
+used 5+ cores on 2026-10-12, so this predates the queue); a scrape still takes 0.2-0.6 s, not the
+0.02 s of a day ago. Discord's count check (0.3.9's `null` fix) has not run since the roll: its
+bot has had no reason to upload keys; the next `Failed to share keys` or its absence after an
+upload settles it. The iMessage queue (39,537) waits for the Mac bridge or the owner's choice to
+drop or replay it.
+
+## Earlier: 2026-10-13, noon EDT -- the demo's server restarted 92 times on 0.3.8; the fix is `agent/queue-heads`
 
 **What happened** (status 11, 2026-10-13): the iMessage bridge on the owner's Mac has been off
 since 2026-10-12 ~19:20 UTC, its queue reached ~36,000 transactions, and the scheduler read the
