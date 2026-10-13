@@ -15,6 +15,9 @@ carries the generated notes for that merge.
 
 ## Unreleased
 
+- **Bridges on mautrix-go's older framework read their key count without an error.** Their
+  `/keys/upload` with `"one_time_keys": null` was refused; `null` now means absent, as in
+  Synapse.
 - **The iMessage bridge double puppets again.** Decision 0046 stopped a bridge's own
   registration from claiming its person, and the iMessage build can double puppet only by
   logging in with its own token. The server now allows that login for whoever the bridge's

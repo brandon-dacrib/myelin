@@ -13,7 +13,7 @@ use crate::state::{E2eRequester, E2eState};
 
 fn as_object_map(value: Option<&Value>) -> Result<BTreeMap<String, Value>, E2eError> {
     match value {
-        None => Ok(BTreeMap::new()),
+        None | Some(Value::Null) => Ok(BTreeMap::new()),
         Some(Value::Object(map)) => Ok(map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
         Some(_) => Err(E2eError::BadRequest(
             "expected a JSON object of keys".to_string(),
@@ -35,7 +35,9 @@ pub async fn post_keys_upload<B: KvBackend + 'static>(
         ));
     };
 
-    if let Some(device_keys) = body.get("device_keys") {
+    // A `null` field is an absent one, as in Synapse: mautrix-go asks for its count with
+    // `{"one_time_keys": null}` and logged "Failed to share keys" on a 400 here.
+    if let Some(device_keys) = body.get("device_keys").filter(|v| !v.is_null()) {
         let Some(device_keys_obj) = device_keys.as_object() else {
             return Err(E2eError::BadRequest(
                 "device_keys must be an object".to_string(),
@@ -217,6 +219,38 @@ mod tests {
         .await
         .unwrap();
 
+        assert_eq!(store.current_stream_pos().await.unwrap(), 0);
+    }
+
+    /// mautrix-go reads its count with `{"one_time_keys": null}` (the Discord bridge's "Failed
+    /// to share keys" on the demo, 2026-10-13): every key field may be `null`, read as absent,
+    /// and the answer is the device's count.
+    #[tokio::test]
+    async fn null_key_fields_are_read_as_absent_and_the_count_is_returned() {
+        let backend = MemoryBackend::new();
+        let store = Arc::new(TablesE2eStore::open(backend).unwrap());
+        let state: E2eState<MemoryBackend> = E2eState::new(AuthState::in_memory(), store.clone());
+        let Json(_) = post_keys_upload::<MemoryBackend>(
+            State(state.clone()),
+            E2eRequester(device_bound_requester()),
+            PermissiveJson(json!({"one_time_keys": {"signed_curve25519:AAAA": {"key": "k"}}})),
+        )
+        .await
+        .unwrap();
+
+        let Json(answer) = post_keys_upload::<MemoryBackend>(
+            State(state),
+            E2eRequester(device_bound_requester()),
+            PermissiveJson(json!({
+                "device_keys": null,
+                "one_time_keys": null,
+                "fallback_keys": null,
+            })),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(answer["one_time_key_counts"]["signed_curve25519"], 1);
         assert_eq!(store.current_stream_pos().await.unwrap(), 0);
     }
 }

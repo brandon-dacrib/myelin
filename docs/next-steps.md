@@ -1,10 +1,40 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-10-12, 12:30 EDT (0.3.0 on the demo; the cross-signing fix merged, its roll is next). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+Written 2026-09-20 by the integration lead, last revised 2026-10-13, 00:00 EDT (0.3.8 on the demo, checked). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
-## Resume here: 2026-10-12 -- 0.3.0 runs on the demo (revision 20); roll `6469d192` next, then read the bot's keys
+## Resume here: 2026-10-13 -- 0.3.8 runs on the demo (revision 21), checked; two findings
+
+Rolled 03:41 UTC from the tagged chart (`docs/install-and-upgrade.md`). **Checked through the
+owner's proxy**: every pod on `ghcr.io/brandon-dacrib/myelin:0.3.8`, every Bridge `Ready`, each
+bridge rolled once with 0 restarts. In the 150 s before the roll the server logged 2,145 WARN and
+ERROR lines (state resolution's auth-check lines, WhatsApp's `could not settle the bot's
+cross-signing identity` every 3 s); in the 150 s after, 13, and none of either kind.
+`cross-signed the bridge bot's device` for WhatsApp at 03:42:44. Discord's bot device
+`shIJmjnXFs` uploaded its device keys and 50 one-time keys at 03:45:47 ("Successfully shared
+keys"), the `login qr` fix seen working on the demo.
+
+**Findings:**
+
+1. **mautrix-go's count check was refused** (fixed, branch `agent/otk-null`, status 08): right
+   after sharing keys mautrix asks for its count with `{"one_time_keys": null}`, and
+   `/keys/upload` answered 400 `expected a JSON object of keys` (Discord logged "Failed to share
+   keys"). A `null` key field is now read as absent, as in Synapse.
+2. **A bridge's start-up burst exhausts the KV retry budget** (open, not new: the same 500s at
+   19:33 on 0.3.0). Slack resyncs dozens of chats at once; for ~35 s, room creation and state
+   sends got HTTP 500 `transaction retry budget (10 attempts) exhausted, last conflict was on
+   commit` (10 on 2026-10-13, 03:43:05), so those portals were not created until their next
+   activity, and the ephemeral pump's tick failed the same way 4 times (`appservice ephemeral
+   delivery could not read a stream`, 03:42:49-03:43:40; the next tick recovers). The server logs
+   no line for those 500s. Next: find which keys the concurrent creates share, log a 500's cause
+   at WARN.
+
+The iMessage registration's transactions are refused (`connection refused` at
+`192.168.115.157:29331`) until the owner runs the Mac bridge; one batch of 20 was dead-lettered
+on the first attempt after the roll (replayable from the Registrations tab).
+
+## Earlier: 2026-10-12 -- 0.3.0 runs on the demo (revision 20); roll `6469d192` next, then read the bot's keys
 
 **User guide** (2026-10-12): `docs/user-guide.md` is the administrator's guide to the interface, with 39 screenshots from the real binary in `docs/user-guide/`, made by `web/e2e-real/user-guide.spec.ts` (status 16 says how to take them again). Retake them when a page it shows changes.
 
