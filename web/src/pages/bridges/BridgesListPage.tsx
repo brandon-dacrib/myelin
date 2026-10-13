@@ -2,7 +2,6 @@ import { useMemo, useState } from "react";
 import { useNavigate, useSearch, Link } from "@tanstack/react-router";
 import { Cable, Play, Pause } from "lucide-react";
 import {
-  foldDoublePuppets,
   isBuiltInAppservice,
   isSendsNothingAppservice,
   useAppservices,
@@ -42,7 +41,10 @@ const HEALTH_ORDER: AppServiceHealthStatus[] = ["down", "degraded", "unknown", "
  * does, and the table reads attention-first. `GET /appservices` has no `state`/`kind` filter
  * parameter (only free-text `q`), so the health filter applies client-side to the loaded page
  * only; see the reconciliation note in api/bridges.ts and
- * docs/status/16-management-web-interface.md.
+ * docs/status/16-management-web-interface.md. A bridge's double-puppeting registration (decision
+ * 0046) is part of that bridge, not a bridge of its own: the server leaves it out of the pages
+ * (`fold_double_puppets`) and names it in the bridge's `double_puppet`, so a page of 20 is 20
+ * bridges and never splits one from its double puppeting.
  */
 export function BridgesListPage() {
   const search = useSearch({ from: "/bridges/registrations" });
@@ -57,6 +59,7 @@ export function BridgesListPage() {
   const { data, isLoading, isError, error, refetch } = useAppservices({
     cursor: search.cursor,
     limit: 20,
+    fold_double_puppets: true,
   });
   const { data: types } = useBridgeTypes();
   const { data: server } = useServerInfo();
@@ -64,9 +67,7 @@ export function BridgesListPage() {
   const pause = usePauseAppservice();
   const resume = useResumeAppservice();
 
-  // A bridge's double-puppeting registration (decision 0046) is part of that bridge, not a bridge
-  // of its own: it is folded into the bridge's row, which says the bridge double puppets.
-  const { rows: all, doublePuppets } = useMemo(() => foldDoublePuppets(data?.items ?? []), [data]);
+  const all = useMemo(() => data?.items ?? [], [data]);
   // The health chips count bridges: the server's own registrations and ones with no URL have no
   // delivery to be healthy or not about.
   const counts = useMemo(
@@ -117,7 +118,7 @@ export function BridgesListPage() {
               </Link>
               <span className="truncate text-xs text-text-muted">
                 {bridgeKind(b, type)}
-                {doublePuppets.has(b.id ?? "") && (
+                {b.double_puppet && (
                   <span title="It posts as its owner with a registration of its own, which the server sends nothing; see the bridge's page.">
                     {" · "}Double puppeting on
                   </span>

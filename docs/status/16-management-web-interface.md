@@ -1,7 +1,32 @@
 # 16. Management web interface: status
 
-Last updated: 2026-10-12 (a user guide for administrators, with screenshots from the real
-server; branch `agent/user-guide`).
+Last updated: 2026-10-13 (the Registrations tab pages by bridge: the server folds each
+double-puppeting registration; branch `agent/fold-doublepuppet-server`).
+
+## 2026-10-13: the Registrations tab pages by bridge (branch `agent/fold-doublepuppet-server`)
+
+The tab folded a bridge's double-puppeting registration into the bridge's row over the loaded
+page, so a bridge and its registration on different pages were not folded and a page of 20 held
+about ten bridges. OpenAPI 0.1.17 (status 15) folds on the server; `schema.d.ts` regenerated.
+`useAppservices` takes `fold_double_puppets`, which the Registrations tab, the Overview, the
+sidebar and the command palette pass; the row says "Double puppeting on" from the bridge's
+`double_puppet`. `foldDoublePuppets` and `useDoublePuppetRegistration` (the 404-probing
+`GET /appservices/<id>-doublepuppet`) are gone: the bridge's page reads `bridge.double_puppet`,
+and `doublePuppetBridgeId` reads `double_puppet_for`, falling back to the id suffix only when
+the field is absent (an older server). The registration's own page waits for its record before
+deciding whether to ask for health, and when its bridge is gone (`404`) it says so, links back to
+Registrations, and offers "Remove registration". The mock server follows the real one (a
+`slack-doublepuppet` fixture, `linkedAppservice`, `isFoldedDoublePuppet`). Tests:
+`BridgesListPage.test.tsx` (the page asks the server to fold; 21 bridges with 21 registrations
+are 20 rows then 1, each "Double puppeting on"; an orphan stays a row), `BridgeDetailPage.test.tsx`
+(the link comes from `double_puppet` with no probe; a registration found by `double_puppet_for`
+under any id; an orphan's page and its removal), `e2e/bridges-list.spec.ts` and
+`e2e/add-bridge.spec.ts`. `npm run check` (685 unit tests) and `npm run test:e2e` (73) pass.
+Against `hs serve` with Vite proxying (25 bridges, 20 registrations, one orphan): page 1 is 20
+bridges with 16 "Double puppeting on", page 2 the last five, the orphan ("Double puppeting for
+Gone", Built in) and the bridge manager; bridge01's page says "On" and links
+`bridge01-doublepuppet`; the orphan's page says its bridge is gone.
+
 
 ## 2026-10-12: a user guide, with screenshots from the real server (branch `agent/user-guide`)
 

@@ -22,6 +22,7 @@ export const appservices: AppService[] = [
     paused: false,
     health: "healthy",
     created_at: iso(30 * 24 * 3_600_000),
+    double_puppet_for: null,
     links: { login_url: null },
     queue: { pending: 0, dead_lettered: 0, oldest_pending_age_ms: null },
   },
@@ -36,6 +37,7 @@ export const appservices: AppService[] = [
     paused: false,
     health: "degraded",
     created_at: iso(20 * 24 * 3_600_000),
+    double_puppet_for: null,
     links: { login_url: null },
     queue: { pending: 1, dead_lettered: 0, oldest_pending_age_ms: 6 * 60_000 },
   },
@@ -50,6 +52,7 @@ export const appservices: AppService[] = [
     paused: false,
     health: "down",
     created_at: iso(10 * 24 * 3_600_000),
+    double_puppet_for: null,
     links: { login_url: null },
     queue: { pending: 0, dead_lettered: 2, oldest_pending_age_ms: null },
   },
@@ -64,6 +67,7 @@ export const appservices: AppService[] = [
     paused: true,
     health: "paused",
     created_at: iso(60 * 24 * 3_600_000),
+    double_puppet_for: null,
     links: { login_url: null },
     queue: { pending: 0, dead_lettered: 0, oldest_pending_age_ms: null },
   },
@@ -78,10 +82,59 @@ export const appservices: AppService[] = [
     paused: false,
     health: "unknown",
     created_at: iso(2 * 3_600_000),
+    double_puppet_for: null,
+    links: { login_url: null },
+    queue: { pending: 0, dead_lettered: 0, oldest_pending_age_ms: null },
+  },
+  {
+    // Slack's double puppeting (decision 0046): no url, a shared claim on its owner, and
+    // `io.myelin.double_puppet_for`. `GET /appservices?fold_double_puppets=true` leaves it out and
+    // Slack's row names it in `double_puppet`.
+    id: "slack-doublepuppet",
+    sender_localpart: "slack-doublepuppet",
+    url: null,
+    namespaces: {
+      users: [{ regex: "@alice:example\\.org", exclusive: false }],
+    } as unknown as AppService["namespaces"],
+    rate_limited: false,
+    protocols: [],
+    bridge_type: null,
+    paused: false,
+    health: "unknown",
+    created_at: iso(2 * 3_600_000),
+    double_puppet_for: "slack",
     links: { login_url: null },
     queue: { pending: 0, dead_lettered: 0, oldest_pending_age_ms: null },
   },
 ];
+
+/** The registration key a double-puppeting registration names its bridge under (decision 0046). */
+export const DOUBLE_PUPPET_FOR_KEY = "io.myelin.double_puppet_for";
+
+/**
+ * `appservice` as the server answers it: `double_puppet` is the registration whose
+ * `double_puppet_for` names it (the first by id, should two), read from the whole registry
+ * (`AdminAppservice::link_double_puppets`).
+ */
+export function linkedAppservice(appservice: AppService): AppService {
+  const named = appservices
+    .filter((o) => o.id !== appservice.id && o.double_puppet_for === appservice.id)
+    .map((o) => o.id ?? "")
+    .sort();
+  return { ...appservice, double_puppet: named[0] ?? null };
+}
+
+/**
+ * Whether `GET /appservices?fold_double_puppets=true` leaves `appservice` out: it is a
+ * double-puppeting registration whose bridge is registered and names it. One whose bridge is gone
+ * is listed (`AdminAppservice::folded_double_puppets`).
+ */
+export function isFoldedDoublePuppet(appservice: AppService): boolean {
+  const bridgeId = appservice.double_puppet_for;
+  if (!bridgeId || bridgeId === appservice.id) return false;
+  const bridge = findAppservice(bridgeId);
+  return bridge !== undefined && linkedAppservice(bridge).double_puppet === appservice.id;
+}
 
 export const appserviceHealth: Record<string, AppServiceHealth> = {
   whatsapp: { status: "healthy", last_ping_at: iso(60_000), last_error: null },
@@ -97,6 +150,7 @@ export const appserviceHealth: Record<string, AppServiceHealth> = {
   },
   discord: { status: "paused", last_ping_at: iso(20 * 3_600_000), last_error: null },
   slack: { status: "unknown", last_ping_at: null, last_error: null },
+  "slack-doublepuppet": { status: "unknown", last_ping_at: null, last_error: null },
 };
 
 export const appserviceBacklog: Record<string, AppServiceBacklogEntry[]> = {
@@ -128,6 +182,7 @@ export const appserviceBacklog: Record<string, AppServiceBacklogEntry[]> = {
   ],
   discord: [],
   slack: [],
+  "slack-doublepuppet": [],
 };
 
 export const appserviceRegistration: Record<string, Record<string, unknown>> = Object.fromEntries(
@@ -141,6 +196,7 @@ export const appserviceRegistration: Record<string, Record<string, unknown>> = O
       sender_localpart: a.sender_localpart,
       namespaces: a.namespaces,
       rate_limited: a.rate_limited,
+      ...(a.double_puppet_for ? { [DOUBLE_PUPPET_FOR_KEY]: a.double_puppet_for } : {}),
     },
   ]),
 );

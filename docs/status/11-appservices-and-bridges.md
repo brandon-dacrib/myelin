@@ -143,6 +143,16 @@ server's log said only `error sending request for url (...)`. Decision 0046 has 
   `<id>-doublepuppet` (or "Off"). That registration's own page is not a bridge's page: it says it
   is the bridge's key, links the bridge, lists whom it covers, and has no health, connection test,
   tabs or actions (its health and backlog are not fetched).
+- **2026-10-13, the server folds** (branch `agent/fold-doublepuppet-server`, OpenAPI 0.1.17,
+  decision 0046 amended): `hs_appservice::admin_directory` fills `AppService.double_puppet_for`
+  from the row's `io.myelin.double_puppet_for` and `AppService.double_puppet` from the whole
+  registry (the first registration by id that names the bridge), on `list`, `get`, `create`,
+  `update`, `pause` and `resume`. `GET /appservices?fold_double_puppets=true` (hs-admin's router)
+  leaves out each double-puppeting registration its bridge names, before paging; an orphan stays.
+  The web's client-side `foldDoublePuppets` and its `GET /appservices/<id>-doublepuppet` probe
+  are gone. Checked against `hs serve`: 25 bridges, 20 double-puppeting registrations and one
+  orphan give page 1 = bridge00..bridge19 with `double_puppet` set where one exists, page 2 =
+  bridge20..24, the orphan and `myelin-bridges`; total 27 folded, 47 not.
 - Docs: decision 0046, `docs/bridges/mautrix.md` ("2026-10-12": how it works, what the roll does,
   the post-roll checks), CHANGELOG, `docs/next-steps.md`.
 

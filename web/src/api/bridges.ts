@@ -22,8 +22,9 @@
  *   client-side; `pages/bridges/wizard/artifacts.ts`'s hand-rolled YAML
  *   builder is gone.
  * - There is no `state`/`kind` filter query parameter on `GET /appservices`,
- *   only `q` (free text), `limit`, `cursor`, `include_total`; the bridges
- *   list filters by health client-side over the loaded page.
+ *   only `q` (free text), `limit`, `cursor`, `include_total` and
+ *   `fold_double_puppets` (OpenAPI 0.1.17); the bridges list filters by health
+ *   client-side over the loaded page.
  */
 import { queryOptions, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, newIdempotencyKey } from "./client";
@@ -56,9 +57,15 @@ export const BUILT_IN_APPSERVICE_ID = "myelin-bridges";
 /**
  * What a bridge's double-puppeting registration's id ends with (`whatsapp-brandon-doublepuppet`,
  * `hs_admin::bridge_types::DOUBLE_PUPPET_ID_SUFFIX`). Decision 0046: a bridge acts as people with
- * a registration of its own that has no `url`, so the server never sends it anything.
+ * a registration of its own that has no `url`, so the server never sends it anything. Only a
+ * fallback: the server says which registration is whose in `double_puppet_for` and
+ * `double_puppet` (OpenAPI 0.1.17).
  */
 export const DOUBLE_PUPPET_ID_SUFFIX = "-doublepuppet";
+
+/** What the double-puppeting helpers below read of an appservice. */
+type DoublePuppetFields = Pick<AppService, "id" | "url"> &
+  Partial<Pick<AppService, "double_puppet_for">>;
 
 /**
  * Whether `appservice` is a registration with no `url`: the server never sends it anything (a
@@ -69,43 +76,23 @@ export function isSendsNothingAppservice(appservice: Pick<AppService, "url">): b
   return appservice.url === null;
 }
 
+/**
+ * The id of the bridge a double-puppeting registration lends its token to, or undefined for any
+ * other registration. The server's `double_puppet_for` (read from the registration's
+ * `io.myelin.double_puppet_for`) says; only an answer without that field (an older server) falls
+ * back to the id (`whatsapp-brandon-doublepuppet` with no `url` → `whatsapp-brandon`).
+ */
+export function doublePuppetBridgeId(appservice: DoublePuppetFields): string | undefined {
+  if (appservice.double_puppet_for !== undefined) return appservice.double_puppet_for ?? undefined;
+  if (!isSendsNothingAppservice(appservice)) return undefined;
+  const id = appservice.id ?? "";
+  if (!id.endsWith(DOUBLE_PUPPET_ID_SUFFIX)) return undefined;
+  return id.slice(0, -DOUBLE_PUPPET_ID_SUFFIX.length) || undefined;
+}
+
 /** Whether `appservice` is a bridge's double-puppeting registration (decision 0046). */
-export function isDoublePuppetAppservice(appservice: Pick<AppService, "id" | "url">): boolean {
-  return (
-    isSendsNothingAppservice(appservice) && (appservice.id ?? "").endsWith(DOUBLE_PUPPET_ID_SUFFIX)
-  );
-}
-
-/**
- * The id of the bridge a double-puppeting registration lends its token to
- * (`whatsapp-brandon-doublepuppet` → `whatsapp-brandon`), or undefined for any other registration.
- */
-export function doublePuppetBridgeId(
-  appservice: Pick<AppService, "id" | "url">,
-): string | undefined {
-  if (!isDoublePuppetAppservice(appservice)) return undefined;
-  return (appservice.id ?? "").slice(0, -DOUBLE_PUPPET_ID_SUFFIX.length) || undefined;
-}
-
-/**
- * The registrations list as people think of it: one row per bridge. Each double-puppeting
- * registration whose bridge is in `items` leaves the list and is returned in `doublePuppets`, keyed
- * by that bridge's id, so the bridge's row can say it double puppets. One whose bridge is not in
- * `items` (on another page, or left behind) stays a row of its own, so nothing is hidden.
- */
-export function foldDoublePuppets(items: AppService[]): {
-  rows: AppService[];
-  doublePuppets: Map<string, AppService>;
-} {
-  const ids = new Set(items.map((a) => a.id));
-  const doublePuppets = new Map<string, AppService>();
-  const rows: AppService[] = [];
-  for (const item of items) {
-    const bridgeId = doublePuppetBridgeId(item);
-    if (bridgeId !== undefined && ids.has(bridgeId)) doublePuppets.set(bridgeId, item);
-    else rows.push(item);
-  }
-  return { rows, doublePuppets };
+export function isDoublePuppetAppservice(appservice: DoublePuppetFields): boolean {
+  return doublePuppetBridgeId(appservice) !== undefined;
 }
 
 /**
@@ -114,12 +101,12 @@ export function foldDoublePuppets(items: AppService[]): {
  * a bridge. Neither is probed or delivered to the way a bridge is.
  */
 export function isBuiltInAppservice(
-  appservice: Pick<AppService, "id"> & Partial<Pick<AppService, "url">>,
+  appservice: Pick<AppService, "id"> & Partial<Pick<AppService, "url" | "double_puppet_for">>,
 ): boolean {
   return (
     appservice.id === BUILT_IN_APPSERVICE_ID ||
     (appservice.url !== undefined &&
-      isDoublePuppetAppservice({ id: appservice.id, url: appservice.url }))
+      isDoublePuppetAppservice({ ...appservice, url: appservice.url }))
   );
 }
 
@@ -133,24 +120,28 @@ function humanise(id: string): string {
 
 /** `id` humanised for display: real appservices have no display-name field. */
 export function deriveDisplayName(
-  appservice: Pick<AppService, "id"> & Partial<Pick<AppService, "url">>,
+  appservice: Pick<AppService, "id"> & Partial<Pick<AppService, "url" | "double_puppet_for">>,
 ): string {
   const id = appservice.id ?? "";
   if (!id) return "(unknown)";
   if (id === BUILT_IN_APPSERVICE_ID) return "This server's bridge manager";
-  if (appservice.url !== undefined && isDoublePuppetAppservice({ id, url: appservice.url }))
-    return `Double puppeting for ${humanise(id.slice(0, -DOUBLE_PUPPET_ID_SUFFIX.length))}`;
+  const bridgeId =
+    appservice.url !== undefined
+      ? doublePuppetBridgeId({ ...appservice, url: appservice.url })
+      : undefined;
+  if (bridgeId !== undefined) return `Double puppeting for ${humanise(bridgeId)}`;
   return humanise(id);
 }
 
 /** `protocols` read as the bridge "kind": real appservices carry no bridge-type reference. */
 export function deriveKindLabel(
-  appservice: Pick<AppService, "protocols"> & Partial<Pick<AppService, "id" | "url">>,
+  appservice: Pick<AppService, "protocols"> &
+    Partial<Pick<AppService, "id" | "url" | "double_puppet_for">>,
 ): string {
   if (appservice.id === BUILT_IN_APPSERVICE_ID) return "Built in: runs the bridges offered here";
   if (
     appservice.url !== undefined &&
-    isDoublePuppetAppservice({ id: appservice.id, url: appservice.url })
+    isDoublePuppetAppservice({ ...appservice, url: appservice.url })
   )
     return "Built in: lets the bridge post as its owner; the server sends it nothing";
   if (appservice.url === null) return "No URL: the server sends it nothing";
@@ -163,6 +154,12 @@ export interface AppserviceListFilters {
   q?: string;
   cursor?: string;
   limit?: number;
+  /**
+   * Leave out each double-puppeting registration whose bridge is registered (decision 0046,
+   * OpenAPI 0.1.17): the bridge's row names it in `double_puppet`, so a page counts bridges and
+   * never splits a bridge from its double puppeting. One whose bridge is gone is still listed.
+   */
+  fold_double_puppets?: boolean;
 }
 
 export function useAppservices(filters: AppserviceListFilters) {
@@ -189,24 +186,6 @@ export function useAppservice(id: string | undefined, options: { refetchInterval
       return unwrap(result);
     },
     refetchInterval: options.refetchInterval ?? 15_000,
-  });
-}
-
-/**
- * The double-puppeting registration of bridge `id` (`<id>-doublepuppet`, decision 0046), or null
- * when it has none. Not polled: it changes only when the bridge's double puppeting is switched.
- */
-export function useDoublePuppetRegistration(id: string | undefined, enabled = true) {
-  const dpId = id ? `${id}${DOUBLE_PUPPET_ID_SUFFIX}` : undefined;
-  return useQuery({
-    queryKey: ["appservice", dpId, "double-puppet"],
-    enabled: Boolean(dpId) && enabled,
-    queryFn: async () => {
-      const result = await api.GET("/appservices/{id}", { params: { path: { id: dpId! } } });
-      if (result.response.status === 404) return null;
-      const appservice = unwrap(result);
-      return isDoublePuppetAppservice(appservice) ? appservice : null;
-    },
   });
 }
 

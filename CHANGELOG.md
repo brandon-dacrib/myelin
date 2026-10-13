@@ -18,7 +18,9 @@ carries the generated notes for that merge.
 - **One row per bridge on the Registrations tab.** A bridge's double-puppeting registration is
   shown on the bridge's own row ("Double puppeting on") instead of as a second row, which read as
   a duplicate. The bridge's page links it, and its own page now says what it is (the bridge's key
-  for posting as its owner) instead of looking like a bridge of unknown health.
+  for posting as its owner) instead of looking like a bridge of unknown health. The server does
+  the folding (`GET /appservices?fold_double_puppets=true`, `AppService.double_puppet`), so a
+  page of the tab is 20 bridges and never splits a bridge from its double puppeting.
 - **A bridge that is switched off no longer takes the server down.** Its queue can hold tens of
   thousands of transactions; delivery retries and the queue metrics now read a small row per
   entry instead of every body. On the demo the old reads froze the server for seconds at a

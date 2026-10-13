@@ -1,6 +1,6 @@
 # 0046: 2026-10-12: double puppeting is a registration of its own, with no url, one per instance
 
-Status: accepted (track 11; touches 15's admin API (OpenAPI 0.1.16) and 16's bridge pages).
+Status: accepted (track 11; touches 15's admin API (OpenAPI 0.1.16, 0.1.17) and 16's bridge pages).
 
 ## The problem
 
@@ -74,6 +74,18 @@ request for url (...)`: reqwest's top line, without the timeout under it.
    folds it into its bridge's row ("Double puppeting on"); the bridge's page names and links it.
    It keeps a row of its own only when its bridge is not on the loaded page. Its own page says it
    is the bridge's key and shows whom it covers, with none of a bridge's health or actions.
+   **Amended again 2026-10-13 (OpenAPI 0.1.17):** folding a loaded page split a bridge from its
+   registration when the two fell on different pages, and a page of 20 held about ten bridges.
+   The server folds now. `AppService.double_puppet_for` is the bridge a registration lends its
+   token to (read from `io.myelin.double_puppet_for`, not from the id), and
+   `AppService.double_puppet` names a bridge's double-puppeting registration, from the whole
+   registry (`AdminAppservice::link_double_puppets`). `GET /appservices?fold_double_puppets=true`
+   leaves out, before paging, each double-puppeting registration whose bridge is registered and
+   names it, so a page, its cursor and `include_total` count bridges. One whose bridge is gone
+   is listed (the interface labels it as before, and its page says the bridge is gone and offers
+   to remove it), so folding hides nothing. Without the parameter every registration is listed,
+   as before. The interface asks for it on the Registrations tab, the Overview, the sidebar and
+   the command palette, and no longer probes `GET /appservices/<id>-doublepuppet`.
 7. **Delivery errors say why.** The transaction sender, the ping, the user and alias queries and
    the provisioning call report the error's whole source chain (`hs_appservice::error::error_chain`):
    `error sending request for url (...): operation timed out`, not the top line alone.

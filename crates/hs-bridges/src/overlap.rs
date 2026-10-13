@@ -153,6 +153,8 @@ mod tests {
             health: "healthy".to_owned(),
             created_at: "2026-09-25T00:00:00.000Z".to_owned(),
             bridge_type: bridge_type.map(str::to_owned),
+            double_puppet_for: None,
+            double_puppet: None,
             links: Default::default(),
             queue: Default::default(),
         }

@@ -2572,6 +2572,9 @@ impl FederationSource for InMemoryFederationSource {
 /// registered. `create` answers [`SourceError::Conflict`] for an id, a token or an exclusive
 /// namespace already taken, and [`SourceError::Invalid`] for a registration that does not
 /// parse -- with a [`SourceError::InvalidField`] pointer when it can say which field.
+///
+/// Every [`AdminAppservice`] it answers carries `double_puppet_for` (from the registration) and
+/// `double_puppet` (from the whole registry, [`AdminAppservice::link_double_puppets`]).
 #[async_trait]
 pub trait AppserviceDirectory: Send + Sync + 'static {
     async fn list(&self) -> Result<Vec<AdminAppservice>, SourceError>;
@@ -2743,9 +2746,36 @@ impl InMemoryAppserviceDirectory {
                 .get(crate::bridge_types::BRIDGE_TYPE_KEY)
                 .and_then(Value::as_str)
                 .map(str::to_owned),
+            double_puppet_for: r
+                .as_object()
+                .and_then(AdminAppservice::double_puppet_for_of),
+            // Filled from the whole registry by `linked`.
+            double_puppet: None,
             links: AdminAppserviceLinks::default(),
             queue: crate::model::AdminAppserviceQueue::default(),
         }
+    }
+
+    /// `view` with its `double_puppet` read from every row.
+    fn linked(&self, mut view: AdminAppservice) -> AdminAppservice {
+        let rows = self
+            .rows
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        view.double_puppet = rows
+            .iter()
+            .filter(|(id, row)| {
+                **id != view.id
+                    && row
+                        .registration
+                        .as_object()
+                        .and_then(AdminAppservice::double_puppet_for_of)
+                        .as_deref()
+                        == Some(view.id.as_str())
+            })
+            .map(|(id, _)| id.clone())
+            .next();
+        view
     }
 
     fn with_row<T>(
@@ -2764,22 +2794,25 @@ impl InMemoryAppserviceDirectory {
 #[async_trait]
 impl AppserviceDirectory for InMemoryAppserviceDirectory {
     async fn list(&self) -> Result<Vec<AdminAppservice>, SourceError> {
-        Ok(self
+        let mut items: Vec<AdminAppservice> = self
             .rows
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .values()
             .map(Self::view)
-            .collect())
+            .collect();
+        AdminAppservice::link_double_puppets(&mut items);
+        Ok(items)
     }
 
     async fn get(&self, id: &str) -> Result<Option<AdminAppservice>, SourceError> {
-        Ok(self
+        let view = self
             .rows
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(id)
-            .map(Self::view))
+            .map(Self::view);
+        Ok(view.map(|v| self.linked(v)))
     }
 
     async fn create(&self, request: AdminAppserviceCreate) -> Result<AdminAppservice, SourceError> {
@@ -2825,14 +2858,16 @@ impl AppserviceDirectory for InMemoryAppserviceDirectory {
         };
         let view = Self::view(&row);
         rows.insert(id, row);
-        Ok(view)
+        drop(rows);
+        Ok(self.linked(view))
     }
 
     async fn update(&self, id: &str, patch: Value) -> Result<AdminAppservice, SourceError> {
-        self.with_row(id, |row| {
+        let view = self.with_row(id, |row| {
             hs_config::merge_patch(&mut row.registration, &patch);
             Self::view(row)
-        })
+        })?;
+        Ok(self.linked(view))
     }
 
     async fn delete(&self, id: &str) -> Result<(), SourceError> {
@@ -2858,17 +2893,19 @@ impl AppserviceDirectory for InMemoryAppserviceDirectory {
     }
 
     async fn pause(&self, id: &str) -> Result<AdminAppservice, SourceError> {
-        self.with_row(id, |row| {
+        let view = self.with_row(id, |row| {
             row.paused = true;
             Self::view(row)
-        })
+        })?;
+        Ok(self.linked(view))
     }
 
     async fn resume(&self, id: &str) -> Result<AdminAppservice, SourceError> {
-        self.with_row(id, |row| {
+        let view = self.with_row(id, |row| {
             row.paused = false;
             Self::view(row)
-        })
+        })?;
+        Ok(self.linked(view))
     }
 
     async fn rotate_tokens(&self, id: &str) -> Result<AdminAppserviceTokens, SourceError> {

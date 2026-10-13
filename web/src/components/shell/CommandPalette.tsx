@@ -25,7 +25,7 @@ export function CommandPalette({ open, onOpenChange }: CommandPaletteProps) {
   const [query, setQuery] = useState("");
   const [activeIndex, setActiveIndex] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
-  const { data: bridgePage } = useAppservices({ limit: 50 });
+  const { data: bridgePage } = useAppservices({ limit: 50, fold_double_puppets: true });
 
   // Focus only (no setState): reset of query/activeIndex on open happens in
   // handleOpenChange below, not here, so state resets stay an event

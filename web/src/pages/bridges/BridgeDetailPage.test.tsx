@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { screen, waitFor, within } from "@testing-library/react";
 import { http, HttpResponse } from "msw";
 import { signIn, signOut } from "@/lib/auth";
 import { server } from "@/mocks/node";
@@ -39,17 +40,38 @@ describe("Bridge page", () => {
   });
 
   it("says a bridge double puppets, and links its double-puppeting registration", async () => {
-    const dp = {
-      id: "whatsapp-doublepuppet",
-      sender_localpart: "whatsapp-doublepuppet",
-      url: null,
-      health: "unknown",
-    };
-    server.use(http.get("/api/v1/appservices/whatsapp-doublepuppet", () => HttpResponse.json(dp)));
-    renderBridge("whatsapp");
-    const link = await screen.findByRole("link", { name: "whatsapp-doublepuppet" });
-    expect(link).toHaveAttribute("href", "/bridges/whatsapp-doublepuppet");
+    // The mock server's Slack bridge has `slack-doublepuppet`, which it names in `double_puppet`;
+    // nothing is probed by id.
+    let probed = false;
+    server.use(
+      http.get("/api/v1/appservices/slack-doublepuppet", () => {
+        probed = true;
+        return HttpResponse.json({});
+      }),
+    );
+    renderBridge("slack");
+    const link = await screen.findByRole("link", { name: "slack-doublepuppet" });
+    expect(link).toHaveAttribute("href", "/bridges/slack-doublepuppet");
     expect(screen.getByText(/On: it posts as its owner with/)).toBeInTheDocument();
+    expect(probed).toBe(false);
+  });
+
+  it("reads the double-puppeting registration's name from the server, not from its id", async () => {
+    server.use(
+      http.get("/api/v1/appservices/telegram", () =>
+        HttpResponse.json({
+          id: "telegram",
+          sender_localpart: "telegrambot",
+          url: "http://mautrix-telegram.bridges.svc:29317",
+          health: "healthy",
+          double_puppet: "telegram-puppets",
+          double_puppet_for: null,
+        }),
+      ),
+    );
+    renderBridge("telegram");
+    const link = await screen.findByRole("link", { name: "telegram-puppets" });
+    expect(link).toHaveAttribute("href", "/bridges/telegram-puppets");
   });
 
   it("says double puppeting is off when the bridge has no such registration", async () => {
@@ -60,21 +82,24 @@ describe("Bridge page", () => {
   it("shows a double-puppeting registration as its bridge's key, not as a bridge", async () => {
     let healthAsked = false;
     server.use(
-      http.get("/api/v1/appservices/telegram-doublepuppet", () =>
+      // Named for its bridge by `double_puppet_for`, whatever its id.
+      http.get("/api/v1/appservices/tg-key", () =>
         HttpResponse.json({
-          id: "telegram-doublepuppet",
-          sender_localpart: "telegram-doublepuppet",
+          id: "tg-key",
+          sender_localpart: "tg-key",
           url: null,
           health: "unknown",
+          double_puppet_for: "telegram",
+          double_puppet: null,
           namespaces: { users: [{ regex: "@brandon:example\\.org", exclusive: false }] },
         }),
       ),
-      http.get("/api/v1/appservices/telegram-doublepuppet/health", () => {
+      http.get("/api/v1/appservices/tg-key/health", () => {
         healthAsked = true;
         return HttpResponse.json({ status: "unknown" });
       }),
     );
-    renderBridge("telegram-doublepuppet");
+    renderBridge("tg-key");
     expect(
       await screen.findByRole("heading", { level: 1, name: "Double puppeting for Telegram" }),
     ).toBeInTheDocument();
@@ -90,5 +115,40 @@ describe("Bridge page", () => {
     expect(screen.queryByRole("tab")).not.toBeInTheDocument();
     expect(screen.queryByText(/^Off:/)).not.toBeInTheDocument();
     expect(healthAsked).toBe(false);
+  });
+
+  it("says a double-puppeting registration's bridge is gone, and offers to remove it", async () => {
+    let deleted = false;
+    server.use(
+      http.get("/api/v1/appservices/gone-doublepuppet", () =>
+        HttpResponse.json({
+          id: "gone-doublepuppet",
+          sender_localpart: "gone-doublepuppet",
+          url: null,
+          health: "unknown",
+          double_puppet_for: "gone",
+          double_puppet: null,
+        }),
+      ),
+      http.get("/api/v1/appservices/gone", () =>
+        HttpResponse.json(
+          { type: "urn:hs:problem:not-found", title: "Not found", status: 404 },
+          { status: 404 },
+        ),
+      ),
+      http.delete("/api/v1/appservices/gone-doublepuppet", () => {
+        deleted = true;
+        return new HttpResponse(null, { status: 204 });
+      }),
+    );
+    renderBridge("gone-doublepuppet");
+    expect(
+      await screen.findByText(/Its bridge has been removed, so nothing uses it any more/),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: /^Gone$/ })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Remove registration" }));
+    const dialog = await screen.findByRole("dialog");
+    await userEvent.click(within(dialog).getByRole("button", { name: "Remove registration" }));
+    await waitFor(() => expect(deleted).toBe(true));
   });
 });

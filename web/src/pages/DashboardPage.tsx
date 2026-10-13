@@ -67,7 +67,7 @@ export function DashboardPage() {
   const stats = useStatisticsOverview();
   const server = useServerInfo();
   const cluster = useClusterStatus();
-  const appservices = useAppservices({ limit: 50 });
+  const appservices = useAppservices({ limit: 50, fold_double_puppets: true });
   // The failing destinations, longest failing first, for the attention rows, with how many
   // there are in all; and how many are not failing. The counts shown are the server's totals
   // (`include_total`), never the length of a page.

@@ -2604,6 +2604,10 @@ export interface components {
             bridge_type?: string | null;
             /** Format: date-time */
             created_at?: string;
+            /** @description The id of this appservice's double-puppeting registration, the one whose double_puppet_for names it; null when it has none. */
+            double_puppet?: string | null;
+            /** @description Set on a double-puppeting registration (decision 0046), one with no url whose token a bridge holds to act as the people it claims; the id of that bridge's appservice, read from the registration's `io.myelin.double_puppet_for` key. Null for any other registration. */
+            double_puppet_for?: string | null;
             /** @enum {string} */
             health?: "healthy" | "degraded" | "down" | "paused" | "unknown";
             id?: string;
@@ -4313,6 +4317,8 @@ export interface operations {
             query?: {
                 /** @description Opaque keyset cursor from a previous page's next_cursor or prev_cursor. */
                 cursor?: components["parameters"]["Cursor"];
+                /** @description Leave out each double-puppeting registration (one whose double_puppet_for names an appservice) whose bridge is registered, so that a page, its cursor and include_total count bridges; the bridge's own row names it in double_puppet. A double-puppeting registration whose bridge is not registered is listed, so nothing is hidden. Without it every registration is listed. */
+                fold_double_puppets?: boolean;
                 /** @description Ask for the total count. Only honoured where a count is cheap; otherwise total is omitted. */
                 include_total?: components["parameters"]["IncludeTotal"];
                 /** @description Page size. Values above the resource's max are clamped, not rejected. */

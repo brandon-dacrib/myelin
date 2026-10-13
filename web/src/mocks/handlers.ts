@@ -6,6 +6,8 @@ import {
   appserviceRegistration,
   appserviceLogins,
   findAppservice,
+  isFoldedDoublePuppet,
+  linkedAppservice,
   patchAppservice,
   pingAppservice,
 } from "./data/appservices";
@@ -895,6 +897,10 @@ export const handlers = [
     const url = new URL(request.url);
     const q = url.searchParams.get("q");
     let filtered = appservices;
+    // As the server does, before paging: a bridge's double-puppeting registration is left out
+    // when its bridge is registered and names it in `double_puppet` (decision 0046).
+    if (url.searchParams.get("fold_double_puppets") === "true")
+      filtered = filtered.filter((a) => !isFoldedDoublePuppet(a));
     if (q) filtered = filtered.filter((a) => (a.id ?? "").includes(q));
     // attention-first default order (information-architecture.md: "Sort:
     // attention first by default")
@@ -902,7 +908,7 @@ export const handlers = [
     const sorted = [...filtered].sort(
       (a, b) => (severity[a.health ?? "unknown"] ?? 9) - (severity[b.health ?? "unknown"] ?? 9),
     );
-    const { items, next_cursor, prev_cursor } = paginate(sorted, url);
+    const { items, next_cursor, prev_cursor } = paginate(sorted.map(linkedAppservice), url);
     return HttpResponse.json({ items, next_cursor, prev_cursor });
   }),
 
@@ -913,6 +919,7 @@ export const handlers = [
         sender_localpart?: string;
         url?: string;
         "io.myelin.bridge_type"?: string;
+        "io.myelin.double_puppet_for"?: string;
       };
     };
     const id = body.registration?.id;
@@ -950,6 +957,7 @@ export const handlers = [
       health: "unknown",
       created_at: new Date().toISOString(),
       bridge_type: body.registration?.["io.myelin.bridge_type"] ?? null,
+      double_puppet_for: body.registration?.["io.myelin.double_puppet_for"] || null,
       links: { login_url: null },
     };
     appservices.unshift(created);
@@ -957,7 +965,7 @@ export const handlers = [
     appserviceHealth[id] = { status: "unknown", last_ping_at: null, last_error: null };
     appserviceBacklog[id] = [];
     appserviceRegistration[id] = body.registration ?? { id };
-    return HttpResponse.json(created, { status: 201 });
+    return HttpResponse.json(linkedAppservice(created), { status: 201 });
   }),
 
   http.get(`${API}/appservices/:id`, ({ params }) => {
@@ -967,7 +975,7 @@ export const handlers = [
         { type: "urn:hs:problem:not-found", title: "Appservice not found", status: 404 },
         { status: 404 },
       );
-    return HttpResponse.json(appservice);
+    return HttpResponse.json(linkedAppservice(appservice));
   }),
 
   http.patch(`${API}/appservices/:id`, async ({ params, request }) => {
@@ -997,7 +1005,7 @@ export const handlers = [
         { type: "urn:hs:problem:not-found", title: "Appservice not found", status: 404 },
         { status: 404 },
       );
-    return HttpResponse.json(appservice);
+    return HttpResponse.json(linkedAppservice(appservice));
   }),
 
   http.delete(`${API}/appservices/:id`, ({ params }) => {
@@ -1076,7 +1084,7 @@ export const handlers = [
         { status: 404 },
       );
     appservice.paused = true;
-    return HttpResponse.json(appservice);
+    return HttpResponse.json(linkedAppservice(appservice));
   }),
 
   http.post(`${API}/appservices/:id/resume`, ({ params }) => {
@@ -1087,7 +1095,7 @@ export const handlers = [
         { status: 404 },
       );
     appservice.paused = false;
-    return HttpResponse.json(appservice);
+    return HttpResponse.json(linkedAppservice(appservice));
   }),
 
   http.post(`${API}/appservices/:id/ping`, ({ params }) => {

@@ -974,12 +974,84 @@ pub struct AdminAppservice {
     /// the registration's `io.myelin.bridge_type` key; `None` for a registration that did not
     /// come through the catalogue.
     pub bridge_type: Option<String>,
+    /// Set on a double-puppeting registration (decision 0046): the id of the appservice whose
+    /// bridge holds its token, read from the registration's
+    /// [`crate::bridge_types::DOUBLE_PUPPET_FOR_KEY`]. `None` for any other registration.
+    #[serde(default)]
+    pub double_puppet_for: Option<String>,
+    /// The id of this appservice's double-puppeting registration, the one whose
+    /// `double_puppet_for` names it; `None` when it has none. Filled by the directory from the
+    /// whole registry ([`AdminAppservice::link_double_puppets`]).
+    #[serde(default)]
+    pub double_puppet: Option<String>,
     /// Where an operator can go from here. `login_url` is where a bridge with its own login
     /// flow puts it; nothing sets it yet.
     pub links: AdminAppserviceLinks,
     /// What waits to be sent to it (`AppService.queue`), read when the row is answered.
     #[serde(default)]
     pub queue: AdminAppserviceQueue,
+}
+
+impl AdminAppservice {
+    /// The `double_puppet_for` a registration's top-level keys (the JSON object, or the
+    /// registry's unrecognised keys) carry: its [`crate::bridge_types::DOUBLE_PUPPET_FOR_KEY`]
+    /// when that is a non-empty string.
+    #[must_use]
+    pub fn double_puppet_for_of(
+        registration: &serde_json::Map<String, serde_json::Value>,
+    ) -> Option<String> {
+        registration
+            .get(crate::bridge_types::DOUBLE_PUPPET_FOR_KEY)
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    }
+
+    /// Sets each appservice's `double_puppet` to the id of the one in `items` whose
+    /// `double_puppet_for` names it (the first by id, should two claim the same bridge), and
+    /// clears it on one no registration names. A registration naming itself is ignored.
+    /// `items` is the whole registry.
+    pub fn link_double_puppets(items: &mut [Self]) {
+        let mut by_bridge: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for item in items.iter() {
+            if let Some(bridge) = item.double_puppet_for.as_ref().filter(|b| **b != item.id) {
+                by_bridge
+                    .entry(bridge.clone())
+                    .and_modify(|id| {
+                        if item.id < *id {
+                            id.clone_from(&item.id);
+                        }
+                    })
+                    .or_insert_with(|| item.id.clone());
+            }
+        }
+        for item in items.iter_mut() {
+            item.double_puppet = by_bridge.get(&item.id).cloned();
+        }
+    }
+
+    /// Of `items` (the whole registry, linked by [`Self::link_double_puppets`]), the
+    /// double-puppeting registrations whose bridge is in `items` and names them in its
+    /// `double_puppet`: what `GET /appservices?fold_double_puppets=true` leaves out, since that
+    /// row stands for them. One whose bridge is gone (or names another) is not among them, so
+    /// folding hides nothing.
+    #[must_use]
+    pub fn folded_double_puppets(items: &[Self]) -> std::collections::BTreeSet<String> {
+        let named: std::collections::BTreeMap<&str, &str> = items
+            .iter()
+            .filter_map(|a| a.double_puppet.as_deref().map(|dp| (a.id.as_str(), dp)))
+            .collect();
+        items
+            .iter()
+            .filter(|a| {
+                a.double_puppet_for.as_deref().is_some_and(|bridge| {
+                    bridge != a.id && named.get(bridge).copied() == Some(a.id.as_str())
+                })
+            })
+            .map(|a| a.id.clone())
+            .collect()
+    }
 }
 
 /// The OpenAPI `AppServiceQueue` schema: what waits to be sent to one appservice.

@@ -13,7 +13,7 @@ export interface SidebarProps {
 }
 
 export function Sidebar({ variant, onNavigate }: SidebarProps) {
-  const { data: appservicePage } = useAppservices({ limit: 50 });
+  const { data: appservicePage } = useAppservices({ limit: 50, fold_double_puppets: true });
   const { data: cluster } = useClusterStatus();
   // Open reports, from the Overview's own counts (information-architecture.md #6: the sidebar
   // counts what needs attention). Only asked for by someone who could read them.

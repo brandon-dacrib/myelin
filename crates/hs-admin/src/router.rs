@@ -30,10 +30,10 @@ use crate::auth::{ScopeDecision, TokenVerifier, require_scope};
 use crate::events::{EventBus, ReplayOutcome};
 use crate::idempotency::{IdempotencyStore, Replay, StoredResponse};
 use crate::model::{
-    Actor, ActorKind, AdminAppserviceCreate, AdminAppserviceReplay, AuditChange, AuditEntry,
-    AuditOutcome, ConfigChange, ConfigSchema, ConfigSection, ConfigSectionInfo, ConfigSettingInfo,
-    Event, Page, Principal, RecoveryInspectRequest, RecoveryLinkRequest, RecoveryResetRequest,
-    ResourceRef, Scope, ServerHealth, ServerInfo, SetupRequest, SetupStatus,
+    Actor, ActorKind, AdminAppservice, AdminAppserviceCreate, AdminAppserviceReplay, AuditChange,
+    AuditEntry, AuditOutcome, ConfigChange, ConfigSchema, ConfigSection, ConfigSectionInfo,
+    ConfigSettingInfo, Event, Page, Principal, RecoveryInspectRequest, RecoveryLinkRequest,
+    RecoveryResetRequest, ResourceRef, Scope, ServerHealth, ServerInfo, SetupRequest, SetupStatus,
 };
 use crate::operations::{OperationDef, load as load_operations};
 use crate::sources::{
@@ -3363,9 +3363,14 @@ struct AppservicesListQuery {
     cursor: Option<String>,
     include_total: Option<bool>,
     q: Option<String>,
+    /// Leave out each double-puppeting registration its bridge's row names
+    /// ([`AdminAppservice::folded_double_puppets`]), so a page counts bridges.
+    fold_double_puppets: Option<bool>,
 }
 
-/// `GET /api/v1/appservices`.
+/// `GET /api/v1/appservices`. With `fold_double_puppets=true`, a double-puppeting registration
+/// whose bridge is registered is left out before paging (its bridge's `double_puppet` names it),
+/// so the cursor and `include_total` count bridges; one whose bridge is gone is listed.
 async fn appservices_list(
     State(state): State<AdminState>,
     headers: HeaderMap,
@@ -3385,6 +3390,10 @@ async fn appservices_list(
             };
             match appservices.list().await {
                 Ok(mut items) => {
+                    if query.fold_double_puppets.unwrap_or(false) {
+                        let folded = AdminAppservice::folded_double_puppets(&items);
+                        items.retain(|a| !folded.contains(&a.id));
+                    }
                     if let Some(q) = query.q.as_deref().map(str::to_lowercase)
                         && !q.is_empty()
                     {
@@ -9915,6 +9924,221 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// A bridge registration `id` with a url, as the wizard or the manager writes one.
+    fn bridge_registration(id: &str) -> serde_json::Value {
+        json!({
+            "id": id,
+            "url": format!("http://{id}.local:29318"),
+            "as_token": format!("as_{id}"),
+            "hs_token": format!("hs_{id}"),
+            "sender_localpart": format!("{id}bot"),
+            "namespaces": {"users": [{"regex": format!("@{id}_.*:example\\.org"), "exclusive": true}]}
+        })
+    }
+
+    /// The double-puppeting registration of `bridge` (decision 0046): no url, a non-exclusive
+    /// claim on its owner, and `io.myelin.double_puppet_for`.
+    fn double_puppet_registration(id: &str, bridge: &str) -> serde_json::Value {
+        json!({
+            "id": id,
+            "url": null,
+            "as_token": format!("as_{id}"),
+            "hs_token": format!("hs_{id}"),
+            "sender_localpart": format!("{id}bot"),
+            "namespaces": {"users": [{"regex": "@alice:example\\.org", "exclusive": false}]},
+            crate::bridge_types::DOUBLE_PUPPET_FOR_KEY: bridge,
+        })
+    }
+
+    /// Twenty-five bridges `b00`..`b24`, all but every fifth with a `-doublepuppet`, and one
+    /// double-puppeting registration whose bridge (`gone`) is not registered.
+    fn state_with_double_puppets() -> AdminState {
+        let mut directory = crate::sources::InMemoryAppserviceDirectory::new();
+        for n in 0u32..25 {
+            let id = format!("b{n:02}");
+            directory = directory.with_registration(bridge_registration(&id));
+            if !n.is_multiple_of(5) {
+                directory = directory.with_registration(double_puppet_registration(
+                    &format!("{id}-doublepuppet"),
+                    &id,
+                ));
+            }
+        }
+        directory =
+            directory.with_registration(double_puppet_registration("gone-doublepuppet", "gone"));
+        test_state().with_appservices(Arc::new(directory))
+    }
+
+    async fn appservice_json(router: &axum::Router, uri: &str) -> serde_json::Value {
+        let (status, body, _) = call(router, "GET", uri, None, None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    fn page_ids(page: &serde_json::Value) -> Vec<String> {
+        page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["id"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_appservice_names_its_double_puppet_and_the_double_puppet_its_bridge() {
+        let (router, _manifest) = build_router(state_with_double_puppets());
+
+        let bridge = appservice_json(&router, "/api/v1/appservices/b01").await;
+        assert_eq!(bridge["double_puppet"], "b01-doublepuppet", "{bridge}");
+        assert_eq!(bridge["double_puppet_for"], serde_json::Value::Null);
+
+        let dp = appservice_json(&router, "/api/v1/appservices/b01-doublepuppet").await;
+        assert_eq!(dp["double_puppet_for"], "b01", "{dp}");
+        assert_eq!(dp["double_puppet"], serde_json::Value::Null);
+
+        // Every fifth bridge has none.
+        let lone = appservice_json(&router, "/api/v1/appservices/b05").await;
+        assert_eq!(lone["double_puppet"], serde_json::Value::Null, "{lone}");
+
+        // The orphan says whose it was, though that bridge is gone.
+        let orphan = appservice_json(&router, "/api/v1/appservices/gone-doublepuppet").await;
+        assert_eq!(orphan["double_puppet_for"], "gone", "{orphan}");
+
+        // A list answers both fields too, unfolded by default.
+        let page =
+            appservice_json(&router, "/api/v1/appservices?limit=500&include_total=true").await;
+        assert_eq!(page["total"], 46, "{page}");
+        let b02 = page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == "b02")
+            .unwrap();
+        assert_eq!(b02["double_puppet"], "b02-doublepuppet");
+
+        // The field comes from the registration, not the id: a double-puppeting registration
+        // under any name is found, and a `-doublepuppet` id without the key is a bridge.
+        let (status, _, _) = call(
+            &router,
+            "POST",
+            "/api/v1/appservices",
+            Some(json!({"registration": double_puppet_registration("b05-dp", "b05")})),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let lone = appservice_json(&router, "/api/v1/appservices/b05").await;
+        assert_eq!(lone["double_puppet"], "b05-dp", "{lone}");
+        let (status, _, _) = call(
+            &router,
+            "POST",
+            "/api/v1/appservices",
+            Some(json!({"registration": bridge_registration("x-doublepuppet")})),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let x = appservice_json(&router, "/api/v1/appservices/x-doublepuppet").await;
+        assert_eq!(x["double_puppet_for"], serde_json::Value::Null, "{x}");
+    }
+
+    #[tokio::test]
+    async fn folding_double_puppets_pages_by_bridge_and_keeps_an_orphan() {
+        let (router, _manifest) = build_router(state_with_double_puppets());
+
+        // Unfolded, a page of 20 holds about ten bridges and splits some from their double
+        // puppets: b11 is on page 1, b11-doublepuppet on page 2.
+        let page = appservice_json(&router, "/api/v1/appservices?limit=20").await;
+        let unfolded = page_ids(&page);
+        assert!(unfolded.contains(&"b11".to_owned()), "{unfolded:?}");
+        assert!(
+            !unfolded.contains(&"b11-doublepuppet".to_owned()),
+            "{unfolded:?}"
+        );
+
+        // Folded, page 1 is twenty bridges, each naming its double puppet where it has one.
+        let page = appservice_json(
+            &router,
+            "/api/v1/appservices?limit=20&include_total=true&fold_double_puppets=true",
+        )
+        .await;
+        assert_eq!(page["total"], 26, "25 bridges and the orphan: {page}");
+        let first = page_ids(&page);
+        let expected: Vec<String> = (0..20).map(|n| format!("b{n:02}")).collect();
+        assert_eq!(first, expected);
+        for item in page["items"].as_array().unwrap() {
+            let id = item["id"].as_str().unwrap();
+            let n: u32 = id[1..].parse().unwrap();
+            if n.is_multiple_of(5) {
+                assert_eq!(item["double_puppet"], serde_json::Value::Null, "{item}");
+            } else {
+                assert_eq!(
+                    item["double_puppet"],
+                    format!("{id}-doublepuppet"),
+                    "{item}"
+                );
+            }
+        }
+        assert_eq!(page["next_cursor"], "20", "{page}");
+
+        // Page 2: the last five bridges and the orphan, whose bridge is gone, so it is listed.
+        let page = appservice_json(
+            &router,
+            "/api/v1/appservices?limit=20&cursor=20&fold_double_puppets=true",
+        )
+        .await;
+        assert_eq!(
+            page_ids(&page),
+            ["b20", "b21", "b22", "b23", "b24", "gone-doublepuppet"]
+        );
+        assert_eq!(page["next_cursor"], serde_json::Value::Null, "{page}");
+        let orphan = &page["items"][5];
+        assert_eq!(orphan["double_puppet_for"], "gone", "{orphan}");
+
+        // `fold_double_puppets=false` is the default.
+        let page = appservice_json(
+            &router,
+            "/api/v1/appservices?limit=500&include_total=true&fold_double_puppets=false",
+        )
+        .await;
+        assert_eq!(page["total"], 46, "{page}");
+
+        // Folding happens before the search: a search for a double puppet's id finds nothing
+        // when its bridge is listed in its place; the orphan is found.
+        let page = appservice_json(
+            &router,
+            "/api/v1/appservices?q=doublepuppet&fold_double_puppets=true",
+        )
+        .await;
+        assert_eq!(page_ids(&page), ["gone-doublepuppet"]);
+    }
+
+    #[test]
+    fn folding_hides_only_a_double_puppet_its_bridge_names() {
+        use crate::model::AdminAppservice;
+        let row = |id: &str, dp_for: Option<&str>| AdminAppservice {
+            id: id.into(),
+            double_puppet_for: dp_for.map(str::to_owned),
+            ..AdminAppservice::default()
+        };
+        let mut items = vec![
+            row("a", None),
+            row("a-dp1", Some("a")),
+            row("a-dp2", Some("a")),
+            row("self", Some("self")),
+            row("orphan", Some("missing")),
+        ];
+        AdminAppservice::link_double_puppets(&mut items);
+        assert_eq!(items[0].double_puppet.as_deref(), Some("a-dp1"));
+        assert_eq!(
+            items[3].double_puppet, None,
+            "a registration naming itself is ignored"
+        );
+        let folded = AdminAppservice::folded_double_puppets(&items);
+        // a-dp2 claims `a` too but `a` names a-dp1, so it stays listed: nothing is hidden.
+        assert_eq!(folded.into_iter().collect::<Vec<_>>(), ["a-dp1"]);
     }
 
     #[tokio::test]

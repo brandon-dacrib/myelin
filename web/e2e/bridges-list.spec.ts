@@ -41,6 +41,12 @@ test.describe("Bridges list", () => {
     await expect(names).toHaveCount(1);
     await page.getByRole("button", { name: /^All 5$/ }).click();
     await expect(names).toHaveCount(5);
+    // Slack's double puppeting is a registration of its own (decision 0046) that the server folds
+    // into Slack's row: five bridges, not six registrations.
+    await expect(
+      page.getByRole("row", { name: /Slack/ }).getByText(/Double puppeting on/),
+    ).toBeVisible();
+    await expect(page.getByRole("row", { name: /Double puppeting for/ })).toHaveCount(0);
     await expectNoAxeViolations(page, "bridges list");
     domGuard.assertClean();
   });

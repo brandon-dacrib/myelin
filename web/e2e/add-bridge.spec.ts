@@ -95,6 +95,9 @@ test.describe("Register a bridge you run yourself", () => {
     await expect(page).toHaveURL(/\/bridges\/bluesky$/);
     await expect(page.getByRole("heading", { name: "Bluesky" })).toBeVisible();
     await expect(page.getByText("Unknown").first()).toBeVisible();
+    // The server names its double-puppeting registration (`double_puppet`), and the page links it.
+    await expect(page.getByText(/On: it posts as its owner with/)).toBeVisible();
+    await expect(page.getByRole("link", { name: "bluesky-doublepuppet" })).toBeVisible();
     await expectNoAxeViolations(page, "bridge detail");
 
     // The detail page knows what it is and how to sign in to it.

@@ -10,7 +10,7 @@ openapi: 3.1.0
 info:
   title: hs-admin API
   summary: The native administration and moderation API for the homeserver.
-  version: 0.1.16
+  version: 0.1.17
   description: 'The only API the management interface (track 16) talks to. See docs/rfcs/0004-admin-api.md for the full design rationale: resource modeling, naming, pagination, filtering, errors, idempotency, scopes, versioning and the event stream. This document is the contract; the hs-admin router''s contract tests assert the router and this document agree on paths and methods (RFC 0004 section 1, decision D15.16).'
   contact:
     name: 'Track 15: Admin API and modules'
@@ -174,6 +174,12 @@ paths:
       - $ref: '#/components/parameters/Cursor'
       - $ref: '#/components/parameters/IncludeTotal'
       - $ref: '#/components/parameters/Q'
+      - name: fold_double_puppets
+        in: query
+        schema:
+          type: boolean
+          default: false
+        description: Leave out each double-puppeting registration (one whose double_puppet_for names an appservice) whose bridge is registered, so that a page, its cursor and include_total count bridges; the bridge's own row names it in double_puppet. A double-puppeting registration whose bridge is not registered is listed, so nothing is hidden. Without it every registration is listed.
       responses:
         '200':
           description: A page of appservices, with health summaries inline.
@@ -8336,6 +8342,16 @@ components:
           - string
           - 'null'
           description: The bridge-type catalogue entry this appservice was created from, read from the registration's `io.myelin.bridge_type` key. Null for a registration that did not come through the catalogue.
+        double_puppet_for:
+          type:
+          - string
+          - 'null'
+          description: Set on a double-puppeting registration (decision 0046), one with no url whose token a bridge holds to act as the people it claims; the id of that bridge's appservice, read from the registration's `io.myelin.double_puppet_for` key. Null for any other registration.
+        double_puppet:
+          type:
+          - string
+          - 'null'
+          description: The id of this appservice's double-puppeting registration, the one whose double_puppet_for names it; null when it has none.
         links:
           type: object
           properties:

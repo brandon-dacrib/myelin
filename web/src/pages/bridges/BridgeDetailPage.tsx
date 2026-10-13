@@ -9,7 +9,6 @@ import {
   isBuiltInAppservice,
   isSendsNothingAppservice,
   useAppservice,
-  useDoublePuppetRegistration,
   useAppserviceHealth,
   useAppserviceBacklog,
   useAppserviceRegistration,
@@ -24,6 +23,7 @@ import {
   type AppserviceNamespaces,
 } from "@/api/bridges";
 import { useServerInfo } from "@/api/dashboard";
+import { ApiProblemError } from "@/api/problem";
 import { BridgeGlyph } from "@/components/BridgeGlyph";
 import { BridgeSignInGuide } from "@/components/BridgeSignInGuide";
 import { BridgeSignInState } from "@/components/BridgeSignInState";
@@ -72,17 +72,16 @@ export function BridgeDetailPage() {
   );
   const { data: bridge, isLoading, isError, error, refetch } = useAppservice(bridgeId);
   // A double-puppeting registration has no delivery, so its health and backlog are not asked for.
-  const deliveredTo =
-    bridge === undefined
-      ? !bridgeId.endsWith(DOUBLE_PUPPET_ID_SUFFIX)
-      : doublePuppetBridgeId(bridge) === undefined;
+  // Which it is comes from the record (`double_puppet_for`), so they wait for it.
+  const deliveredTo = bridge !== undefined && doublePuppetBridgeId(bridge) === undefined;
   const { data: health } = useAppserviceHealth(deliveredTo ? bridgeId : undefined);
   // A bridge that is pushed to may have a double-puppeting registration beside it (decision 0046);
-  // the registrations list folds that into the bridge's row, so this page says what it is.
-  const { data: doublePuppet } = useDoublePuppetRegistration(
-    bridgeId,
-    bridge !== undefined && !isSendsNothingAppservice(bridge) && !isBuiltInAppservice(bridge),
-  );
+  // the registrations list folds that into the bridge's row, so this page says what it is. The
+  // server names it in `double_puppet` (null when there is none; absent from an older server).
+  const doublePuppet =
+    bridge !== undefined && !isSendsNothingAppservice(bridge) && !isBuiltInAppservice(bridge)
+      ? bridge.double_puppet
+      : undefined;
   const { data: types } = useBridgeTypes();
   const { data: server } = useServerInfo();
   const {
@@ -416,10 +415,10 @@ export function BridgeDetailPage() {
                       On: it posts as its owner with{" "}
                       <Link
                         to="/bridges/$bridgeId"
-                        params={{ bridgeId: doublePuppet.id ?? "" }}
+                        params={{ bridgeId: doublePuppet }}
                         className="font-identifier text-accent hover:underline"
                       >
-                        {doublePuppet.id}
+                        {doublePuppet}
                       </Link>
                       , a registration the server sends nothing
                     </>
@@ -608,11 +607,21 @@ function DoublePuppetRegistration({
   registration: AppService;
   bridgeId: string;
 }) {
-  const { data: bridge } = useAppservice(bridgeId);
+  const { data: bridge, error: bridgeError } = useAppservice(bridgeId);
   const { data: types } = useBridgeTypes();
+  const navigate = useNavigate();
+  const del = useDeleteAppservice();
+  const canWrite = hasScope("bridges:write");
+  // Left behind: its bridge was removed and it was not (the list still shows it as a row of its
+  // own for that reason), so there is no bridge page to link to.
+  const bridgeGone = bridgeError instanceof ApiProblemError && bridgeError.problem.status === 404;
   const bridgeName = bridge ? bridgeTitle(bridge, bridgeTypeOf(bridge, types)) : bridgeId;
   const id = registration.id ?? `${bridgeId}${DOUBLE_PUPPET_ID_SUFFIX}`;
-  const bridgeLink = (
+  const bridgeLink = bridgeGone ? (
+    <span>
+      <span className="font-identifier">{bridgeId}</span>, a bridge no longer registered here
+    </span>
+  ) : (
     <Link to="/bridges/$bridgeId" params={{ bridgeId }} className="text-accent hover:underline">
       {bridgeName}
     </Link>
@@ -620,14 +629,24 @@ function DoublePuppetRegistration({
 
   return (
     <div className="mx-auto max-w-[90rem] p-6">
-      <Link
-        to="/bridges/$bridgeId"
-        params={{ bridgeId }}
-        className="inline-flex items-center gap-1 text-sm text-text-muted hover:text-text"
-      >
-        <ChevronLeft size={14} aria-hidden="true" />
-        {bridgeName}
-      </Link>
+      {bridgeGone ? (
+        <Link
+          to="/bridges/registrations"
+          className="inline-flex items-center gap-1 text-sm text-text-muted hover:text-text"
+        >
+          <ChevronLeft size={14} aria-hidden="true" />
+          Registrations
+        </Link>
+      ) : (
+        <Link
+          to="/bridges/$bridgeId"
+          params={{ bridgeId }}
+          className="inline-flex items-center gap-1 text-sm text-text-muted hover:text-text"
+        >
+          <ChevronLeft size={14} aria-hidden="true" />
+          {bridgeName}
+        </Link>
+      )}
       <div className="mt-2 flex items-center gap-3">
         <h1 className="text-xl text-text">{deriveDisplayName(registration)}</h1>
         <span title="The server's own registration; it is not probed.">
@@ -641,8 +660,15 @@ function DoublePuppetRegistration({
         This is not a bridge. It is the key {bridgeLink} uses to post as its owner, so that what
         they send from the other network&apos;s own app shows up in Matrix from their own account
         rather than from a ghost. It has no URL, so the server never sends it anything: there is no
-        connection, queue or health to look at here. Everything about the bridge itself is on{" "}
-        {bridgeLink}&apos;s page.
+        connection, queue or health to look at here.{" "}
+        {bridgeGone ? (
+          <>
+            Its bridge has been removed, so nothing uses it any more. Remove it below unless you
+            mean to register that bridge again.
+          </>
+        ) : (
+          <>Everything about the bridge itself is on {bridgeLink}&apos;s page.</>
+        )}
       </p>
       <dl className="mt-6 grid grid-cols-1 gap-x-8 gap-y-4 sm:grid-cols-2 xl:grid-cols-3">
         <Fact label="Double puppeting for" value={bridgeLink} />
@@ -654,6 +680,51 @@ function DoublePuppetRegistration({
         lets the bridge act as them, and nothing of theirs is sent to it.
       </p>
       <NamespaceList namespaces={registration.namespaces} />
+      {bridgeGone && (
+        <div className="mt-6 rounded-md border border-danger-border bg-danger-bg p-4">
+          <h3 className="text-md font-medium text-text">Remove this registration</h3>
+          <p className="mt-1 text-sm text-text-muted">
+            Its token stops working at once, so nothing can post as these users with it any more.
+          </p>
+          <Dialog>
+            <DialogTrigger asChild>
+              <Button
+                variant="danger"
+                className="mt-3"
+                disabled={!canWrite}
+                title={!canWrite ? "Needs bridges:write" : undefined}
+              >
+                Remove registration
+              </Button>
+            </DialogTrigger>
+            <DialogContent
+              title={`Remove ${id}?`}
+              description="The registration is removed and its token revoked. This cannot be undone from here."
+              footer={
+                <>
+                  <DialogClose asChild>
+                    <Button variant="secondary">Cancel</Button>
+                  </DialogClose>
+                  <Button
+                    variant="danger"
+                    onClick={() =>
+                      del.mutate(id, {
+                        onSuccess: () => {
+                          toast({ title: `Registration ${id} removed` });
+                          navigate({ to: "/bridges/registrations" });
+                        },
+                        onError: () => toast({ title: `Couldn't remove ${id}`, variant: "danger" }),
+                      })
+                    }
+                  >
+                    Remove registration
+                  </Button>
+                </>
+              }
+            />
+          </Dialog>
+        </div>
+      )}
     </div>
   );
 }

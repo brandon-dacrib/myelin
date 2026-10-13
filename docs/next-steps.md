@@ -18,6 +18,13 @@ bot has had no reason to upload keys; the next `Failed to share keys` or its abs
 upload settles it. The iMessage queue (39,537) waits for the Mac bridge or the owner's choice to
 drop or replay it.
 
+**Registrations tab pages by bridge** (2026-10-13, `agent/fold-doublepuppet-server`, OpenAPI
+0.1.17, decision 0046 amended, status 15/16/11): the server folds each bridge's
+`-doublepuppet` registration into the bridge's row (`GET /appservices?fold_double_puppets=true`,
+`AppService.double_puppet` / `double_puppet_for`), so a page is 20 bridges and a bridge is never
+split from its double puppeting. On the demo after the next roll: the Registrations tab shows one
+row per bridge, each managed instance "Double puppeting on", no "Double puppeting for" rows.
+
 ## Earlier: 2026-10-13, noon EDT -- the demo's server restarted 92 times on 0.3.8; the fix is `agent/queue-heads`
 
 **What happened** (status 11, 2026-10-13): the iMessage bridge on the owner's Mac has been off
@@ -80,7 +87,8 @@ instance's own in place (same id, same tokens), and rolls each bridge pod once w
 it had (pickle keys kept). **After the roll, check**: each `bridge-*-brandon` pod rolled once and
 is Running (`kubectl -n myelin get pods -l app.kubernetes.io/name=myelin-bridge`: a new age,
 restarts 0); `hs_appservice_transactions_total{outcome="delivered"}` rising for every bridge;
-the admin Registrations tab: each bridge Healthy and each `-doublepuppet` "Built in"; the
+the admin Registrations tab: each bridge Healthy and "Double puppeting on" (since 2026-10-13
+the `-doublepuppet` registrations are folded into their bridges' rows); the
 server's log has one `moved the bridge instance's double puppeting` line per instance; no
 `Event channel is full` in any bridge's log; brandon's own messages are still double-puppeted
 (something he sends on WhatsApp appears in its portal as him, not as a ghost).

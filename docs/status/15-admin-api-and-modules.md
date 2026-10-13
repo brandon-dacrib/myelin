@@ -2,6 +2,26 @@
 
 Track brief: `docs/workstreams/15-admin-api-and-modules.md`. Owner crates: `hs-admin`, `hs-modules`, `hs-identity`, `hs-http` (shared with 07 and 14).
 
+## 2026-10-13: the server folds a bridge's double-puppeting registration into its row
+
+Branch `agent/fold-doublepuppet-server` (tracks 15, 11, 16; decision 0046 amended).
+**Contract** (`openapi.yaml` **0.1.17**): `AppService.double_puppet_for` (string or null: the
+bridge a double-puppeting registration lends its token to, read from the registration's
+`io.myelin.double_puppet_for`) and `AppService.double_puppet` (string or null: the id of the
+registration whose `double_puppet_for` names this one, from the whole registry). `appservices.list`
+takes `fold_double_puppets` (boolean, default false): before `q` and paging it leaves out each
+double-puppeting registration whose bridge is registered and names it, so `limit`, the cursor and
+`include_total` count bridges; one whose bridge is gone (or that its bridge does not name) is
+listed. In `hs-admin`: `AdminAppservice::{double_puppet_for_of, link_double_puppets,
+folded_double_puppets}` (`model.rs`), `AppserviceDirectory`'s doc says every answer carries both
+fields, and `InMemoryAppserviceDirectory` fills them. `hs-appservice`'s directory and a test
+struct in `hs-bridges` (`overlap.rs`) were changed to match. Tests:
+`router::tests::{an_appservice_names_its_double_puppet_and_the_double_puppet_its_bridge,
+folding_double_puppets_pages_by_bridge_and_keeps_an_orphan,
+folding_hides_only_a_double_puppet_its_bridge_names}`,
+`hs_appservice::admin_directory::tests::a_bridge_and_its_double_puppeting_registration_name_each_other`.
+Verified against `hs serve` (status 11).
+
 ## 2026-10-08: a user's rate limit carries the server-wide limits; removed settings are refused
 
 Branch `agent/web-items` (tracks 16, 15). **Contract** (`openapi.yaml` **0.1.12**):

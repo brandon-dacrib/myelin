@@ -68,6 +68,27 @@ impl<B: KvBackend + 'static> RegistryAppserviceDirectory<B> {
         self
     }
 
+    /// [`Self::view`] with its `double_puppet` read from the whole registry: the registration
+    /// whose `io.myelin.double_puppet_for` names `row` (the first by id, should two).
+    fn linked_view(&self, row: &AppserviceRow) -> Result<AdminAppservice, SourceError> {
+        let mut view = self.view(row)?;
+        view.double_puppet = self
+            .registry
+            .list()
+            .map_err(to_source)?
+            .into_iter()
+            .filter(|other| {
+                other.id != row.id
+                    && AdminAppservice::double_puppet_for_of(&other.extra).as_deref()
+                        == Some(row.id.as_str())
+            })
+            .map(|other| other.id)
+            .min();
+        Ok(view)
+    }
+
+    /// One row as the admin API's `AppService`, `double_puppet` aside (the caller links it:
+    /// [`Self::linked_view`], or [`AdminAppservice::link_double_puppets`] over a list).
     fn view(&self, row: &AppserviceRow) -> Result<AdminAppservice, SourceError> {
         let health = self.registry.health(&row.id).map_err(to_source)?;
         Ok(AdminAppservice {
@@ -87,6 +108,8 @@ impl<B: KvBackend + 'static> RegistryAppserviceDirectory<B> {
                 .get(hs_admin::bridge_types::BRIDGE_TYPE_KEY)
                 .and_then(Value::as_str)
                 .map(str::to_owned),
+            double_puppet_for: AdminAppservice::double_puppet_for_of(&row.extra),
+            double_puppet: None,
             links: AdminAppserviceLinks::default(),
             queue: self.queue(&row.id)?,
         })
@@ -163,17 +186,20 @@ fn to_source(error: AppserviceError) -> SourceError {
 #[async_trait]
 impl<B: KvBackend + 'static> AppserviceDirectory for RegistryAppserviceDirectory<B> {
     async fn list(&self) -> Result<Vec<AdminAppservice>, SourceError> {
-        self.registry
+        let mut items = self
+            .registry
             .list()
             .map_err(to_source)?
             .iter()
             .map(|row| self.view(row))
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        AdminAppservice::link_double_puppets(&mut items);
+        Ok(items)
     }
 
     async fn get(&self, id: &str) -> Result<Option<AdminAppservice>, SourceError> {
         match self.registry.get(id).map_err(to_source)? {
-            Some(row) => self.view(&row).map(Some),
+            Some(row) => self.linked_view(&row).map(Some),
             None => Ok(None),
         }
     }
@@ -200,12 +226,12 @@ impl<B: KvBackend + 'static> AppserviceDirectory for RegistryAppserviceDirectory
             }
         };
         let row = self.registry.add(&registration).map_err(to_source)?;
-        self.view(&row)
+        self.linked_view(&row)
     }
 
     async fn update(&self, id: &str, patch: Value) -> Result<AdminAppservice, SourceError> {
         let row = self.registry.update(id, &patch).map_err(to_source)?;
-        self.view(&row)
+        self.linked_view(&row)
     }
 
     async fn delete(&self, id: &str) -> Result<(), SourceError> {
@@ -234,14 +260,14 @@ impl<B: KvBackend + 'static> AppserviceDirectory for RegistryAppserviceDirectory
 
     async fn pause(&self, id: &str) -> Result<AdminAppservice, SourceError> {
         let row = self.registry.pause(id).map_err(to_source)?;
-        self.view(&row)
+        self.linked_view(&row)
     }
 
     async fn resume(&self, id: &str) -> Result<AdminAppservice, SourceError> {
         let row = self.registry.resume(id).map_err(to_source)?;
         // Delivery may have been waiting on this.
         (self.nudge)(id);
-        self.view(&row)
+        self.linked_view(&row)
     }
 
     async fn rotate_tokens(&self, id: &str) -> Result<AdminAppserviceTokens, SourceError> {
@@ -395,6 +421,47 @@ mod tests {
             "protocols": ["irc"],
             "namespaces": {"users": [{"regex": "@irc_.*:example\\.org", "exclusive": true}]}
         })
+    }
+
+    /// A bridge and its double-puppeting registration (decision 0046) name each other, read
+    /// from `io.myelin.double_puppet_for` and not from the id; the list says so for every row,
+    /// and once the bridge is removed the orphan still names it.
+    #[tokio::test]
+    async fn a_bridge_and_its_double_puppeting_registration_name_each_other() {
+        let Fixture { directory, .. } = directory();
+        let create = |registration: Value| AdminAppserviceCreate {
+            registration: Some(registration),
+            registration_yaml: None,
+        };
+        directory.create(create(irc())).await.unwrap();
+        let dp = directory
+            .create(create(json!({
+                "id": "irc-puppets",
+                "url": null,
+                "as_token": "as_dp",
+                "hs_token": "hs_dp",
+                "sender_localpart": "ircdp",
+                "namespaces": {"users": [{"regex": "@alice:example\\.org", "exclusive": false}]},
+                hs_admin::bridge_types::DOUBLE_PUPPET_FOR_KEY: "irc",
+            })))
+            .await
+            .unwrap();
+        assert_eq!(dp.double_puppet_for.as_deref(), Some("irc"));
+        assert_eq!(dp.double_puppet, None);
+
+        let bridge = directory.get("irc").await.unwrap().unwrap();
+        assert_eq!(bridge.double_puppet.as_deref(), Some("irc-puppets"));
+        assert_eq!(bridge.double_puppet_for, None);
+        let paused = directory.pause("irc").await.unwrap();
+        assert_eq!(paused.double_puppet.as_deref(), Some("irc-puppets"));
+
+        let list = directory.list().await.unwrap();
+        let bridge = list.iter().find(|a| a.id == "irc").unwrap();
+        assert_eq!(bridge.double_puppet.as_deref(), Some("irc-puppets"));
+
+        directory.delete("irc").await.unwrap();
+        let orphan = directory.get("irc-puppets").await.unwrap().unwrap();
+        assert_eq!(orphan.double_puppet_for.as_deref(), Some("irc"));
     }
 
     #[tokio::test]
