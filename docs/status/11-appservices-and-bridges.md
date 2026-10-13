@@ -1,6 +1,8 @@
 # Status: track 11, appservices and bridges
 
-Last updated: 2026-10-13 (a bridge that is off no longer takes the server down: the scheduler and the
+Last updated: 2026-10-13, afternoon (a drain starts where the waiting entries start, the backlog
+list and replays read a page at a time, and queue work runs off the async workers; the drain is
+not what freezes the demo; below); before that 2026-10-13 (a bridge that is off no longer takes the server down: the scheduler and the
 queue gauges read small head rows, not every queued body; below); before that 2026-10-12, latest (the iMessage bridge double puppets again, through its
 double-puppeting registration; below); before that 2026-10-12, late night (double puppeting is a registration of its own with no url,
 so a bridge is no longer sent every room its owner is in; decision 0046; mautrix-imessage stops
@@ -43,6 +45,75 @@ manager) and an instance's Kubernetes objects say whose bridge they are; before 
 (ephemeral, to-device and device-list delivery); before that 2026-09-27 (RFC 0017 run against
 the real binary), 2026-09-27 (the bridge manager) and 2026-09-25.
 
+## Session 2026-10-13, afternoon (branch `agent/backlog-heads`): bounded drains, a paged backlog, and the drain is not the freeze
+
+**Why.** 0.3.10 on the demo was killed by its liveness probe every 3-6 minutes from 17:59 UTC,
+when the iMessage bridge came back to a queue of ~34,700 (3,441 dead-lettered at the front). The
+suspects in this crate were the backlog list (whole bodies on every 15 s poll; the demo's logs
+show no backlog requests, so not it) and the drain: `pending_batch` scanned heads from the front
+of the queue on every drain, past every dead-lettered head and every delivered entry's
+tombstone, and deleted a delivered batch one transaction per entry, all on an async worker.
+
+**What changed.**
+
+- `AppserviceStore::pending_batch` starts at the queue's floor (`hs_appservice.queue_floor`,
+  `(appservice id) -> seq`: nothing below it waits) and raises it to the first waiting entry it
+  finds, compare-and-set, so a replay that lowers it meanwhile wins. Whatever makes an older
+  entry wait again lowers it in its own transaction (`requeue_dead_lettered`,
+  `put_queue_entries` with a pending entry). Floors are forgotten when the store opens (a hint
+  only; a downgrade could have made entries wait without lowering one). Heads are read 512 per
+  range (`QUEUE_HEADS_PER_READ`; the PostgreSQL backend answers a range with every row at once)
+  and the batch's bodies in one `multi_get`.
+- A delivered batch is deleted in one transaction (`delete_queue_entries`), a failed batch's
+  attempts written in one (`put_queue_entries`). `Scheduler::drain` runs its queue reads and
+  writes on tokio's blocking pool (`off_the_runtime`), and `Delivery`'s worker yields between
+  back-to-back drains.
+- `Scheduler::replay` is `AppserviceStore::requeue_dead_lettered`: heads 512 at a time, 64
+  bodies per transaction, the request matched on the head (`ReplayRequest::matches_head`).
+  `purge_queue` deletes by heads, 512 per transaction.
+- The backlog list reads a page: `AppserviceStore::backlog_page` / `Registry::backlog_page`
+  (heads in order, delivered skipped, bodies of the page alone), `Registry::backlog_len` counts
+  heads. `hs-admin`'s `AppserviceDirectory::backlog` takes a `BacklogPageRequest` and returns an
+  `AdminAppserviceBacklogPage` (`hs-bridges`' wrapper forwards it); the router's cursor is
+  `t<transaction id>` (keyset, opaque in the OpenAPI as before; a cursor it did not hand out is a
+  `400 invalid_cursor`), `prev_cursor` is now always null, `include_total` counts heads. The
+  directory reads on the blocking pool. No OpenAPI change.
+- `AppserviceStore::queue_reads` counts the heads and bodies the paged reads fetched (tests and
+  diagnostics). `examples/seed_queue.rs` fills a stopped server's Fjall queue (total, how many
+  dead-lettered at the front) for reproducing this.
+
+**Verified** against the real release binary on Fjall (35,000 queued, 3,500 dead-lettered at the
+front, a stand-in bridge started 10 s after the server, `/health/live` every 3 s with a 5 s
+timeout, `/metrics` every 15 s):
+
+| binary | drain of 1,575 transactions | slowest `/health/live` | slowest `/metrics` |
+| --- | --- | --- | --- |
+| origin/main (0.3.10 + 2) | 8.2 s at ~95% of one core | 7 ms | 16 ms |
+| this branch | 2.8 s at ~60% of one core | 1.8 ms | 17 ms |
+
+With the stand-in bridge also sending three messages back per transaction (4,725 sends while
+draining, as a bridge catching up does), both binaries stayed under 10 ms per probe and Fjall
+reported no sealed memtables. **So the drain does not reproduce the demo's freeze**, before or
+after this change; whatever stalls the demo's runtime for 30-50 s is elsewhere (things to read
+from its Prometheus before the scrapes timed out: `hs_kv_fjall_sealed_memtables` and the rate of
+`hs_kv_fjall_write_buffer_rotations_total` (Fjall halts every writer, in a sleep loop on whatever
+thread commits, at 4 sealed memtables or 30 L0 runs, and all `hs-kv` keyspaces share one tree);
+the container's working set against its 3 GiB limit and its system CPU (reclaim); and the
+constant ~3.4 cores, which predates the bridge's return). Tests:
+`store::tests::a_drain_walks_past_the_dead_lettered_front_of_a_long_queue_once` (each drain after
+the first reads at most 512 heads and exactly its 20 bodies; a replay and an overwrite below the
+floor are found; a reopened store reads from the front),
+`store::tests::the_backlog_is_read_a_page_at_a_time` (3,000 entries, dead-lettered, delivered and
+deleted ones mixed: pages in order, cursors continue, each page reads its own bodies),
+`store::tests::requeue_and_purge_walk_the_queue_by_heads`,
+`hs-admin` `router::tests::the_backlog_is_paged_by_its_own_cursor`.
+
+**Left.** The backlog endpoint was checked through `hs-admin`'s router and the store, not
+against the running binary (it needs an admin token). The queue gauges and the admin API's
+`AppService.queue` still count every head of a queue on each scrape and each bridges-list read
+(small rows, ~12 ms for 35,000 here). A queue for a bridge that never comes back still grows
+without bound. The freeze itself is open (above).
+
 ## Session 2026-10-13 (branch `agent/queue-heads`): a bridge that is off no longer takes the server down
 
 **What happened on the demo.** The iMessage bridge on the owner's Mac has not answered since
@@ -75,7 +146,8 @@ dead-lettered and deleted ones skipped) and
 `store::tests::opening_a_store_builds_heads_for_a_queue_written_without_them`.
 
 **Left.** `Registry::backlog` (the admin API's backlog list) and `Scheduler::replay` still read
-whole bodies; both run only when an operator asks. A queue for a bridge that never comes back
+whole bodies; both run only when an operator asks (both read a page or a bounded batch since the
+afternoon session, above). A queue for a bridge that never comes back
 grows without bound (every entry is kept until delivered or replayed); a cap or an expiry for
 dead-lettered entries is the next step. A downgrade to a release before this one, then an
 upgrade again, leaves entries queued in between without heads (the marker is already set):

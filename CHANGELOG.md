@@ -15,6 +15,10 @@ carries the generated notes for that merge.
 
 ## Unreleased
 
+- **A bridge catching up on a long queue is delivered to in bounded steps.** Each delivery
+  starts where the waiting transactions start instead of walking past every one that ran out of
+  retries, a delivered batch is removed in one write, and the bridge's backlog list and replay
+  read a page at a time. A 35,000-transaction queue drains about three times faster.
 - **One row per bridge on the Registrations tab.** A bridge's double-puppeting registration is
   shown on the bridge's own row ("Double puppeting on") instead of as a second row, which read as
   a duplicate. The bridge's page links it, and its own page now says what it is (the bridge's key

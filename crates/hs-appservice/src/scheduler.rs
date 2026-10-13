@@ -243,12 +243,11 @@ pub struct ReplayRequest {
 }
 
 impl ReplayRequest {
-    fn matches(&self, entry: &QueuedTransaction) -> bool {
-        let id_ok = self.transaction_ids.is_empty()
-            || self.transaction_ids.contains(&entry.seq.to_string());
-        let since_ok = self
-            .since_ms
-            .is_none_or(|since| entry.enqueued_at_ms >= since);
+    /// Whether the entry `seq`, queued at `enqueued_at_ms`, is one this request asks for.
+    fn matches_head(&self, seq: u64, enqueued_at_ms: u64) -> bool {
+        let id_ok =
+            self.transaction_ids.is_empty() || self.transaction_ids.contains(&seq.to_string());
+        let since_ok = self.since_ms.is_none_or(|since| enqueued_at_ms >= since);
         id_ok && since_ok
     }
 }
@@ -330,6 +329,22 @@ impl<B: KvBackend> Scheduler<B> {
         self.clock.now_ms()
     }
 
+    /// Runs `work` against the registry on tokio's blocking pool rather than on an async worker
+    /// thread: a store read or write can take a while (an LSM store halts writers while it
+    /// compacts), and an async worker held that long is one fewer to answer `/health/live`.
+    async fn off_the_runtime<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&Registry<B>) -> Result<T, AppserviceError> + Send + 'static,
+    ) -> Result<T, AppserviceError>
+    where
+        B: 'static,
+    {
+        let registry = self.registry.clone();
+        tokio::task::spawn_blocking(move || work(&registry))
+            .await
+            .map_err(|e| AppserviceError::Store(format!("queue work did not finish: {e}")))?
+    }
+
     /// Enqueues a transaction for `appservice_id`, gating its wire spelling on that appservice's
     /// registration flags (`crate::transaction::Transaction::to_wire_json`).
     ///
@@ -375,7 +390,10 @@ impl<B: KvBackend> Scheduler<B> {
     /// error — it is reported as `Ok(`[`DrainOutcome::Failed`]`)`, since "the appservice was
     /// unreachable" is an expected, routine outcome the caller is meant to handle by trying again
     /// later, not an operational failure of the scheduler itself.
-    pub async fn drain(&self, appservice_id: &str) -> Result<DrainOutcome, AppserviceError> {
+    pub async fn drain(&self, appservice_id: &str) -> Result<DrainOutcome, AppserviceError>
+    where
+        B: 'static,
+    {
         let row = self
             .registry
             .get(appservice_id)?
@@ -387,11 +405,13 @@ impl<B: KvBackend> Scheduler<B> {
             return Ok(DrainOutcome::NoUrl);
         };
 
-        // Only the next batch is read, never the whole queue (`pending_batch`).
+        // Only the next batch is read, never the whole queue (`pending_batch`), and off the
+        // async worker threads.
+        let max_batch = self.config.max_batch.max(1);
+        let id = appservice_id.to_owned();
         let pending: Vec<QueuedTransaction> = self
-            .registry
-            .store()
-            .pending_batch(appservice_id, self.config.max_batch.max(1))?;
+            .off_the_runtime(move |registry| registry.store().pending_batch(&id, max_batch))
+            .await?;
 
         if pending.is_empty() {
             return Ok(DrainOutcome::Empty);
@@ -431,11 +451,12 @@ impl<B: KvBackend> Scheduler<B> {
 
         match outcome {
             Ok(()) => {
-                for entry in &batch {
-                    self.registry
-                        .store()
-                        .delete_queue_entry(appservice_id, entry.seq)?;
-                }
+                let seqs: Vec<u64> = batch.iter().map(|e| e.seq).collect();
+                let id = appservice_id.to_owned();
+                self.off_the_runtime(move |registry| {
+                    registry.store().delete_queue_entries(&id, &seqs)
+                })
+                .await?;
                 let counts = body_counts(&merged);
                 tracing::info!(
                     appservice = %appservice_id,
@@ -497,19 +518,27 @@ impl<B: KvBackend> Scheduler<B> {
                     metrics.record_failed(appservice_id);
                 }
                 let mut dead_lettered = 0usize;
-                for mut entry in batch.clone() {
-                    entry.attempts += 1;
-                    entry.last_error = Some(err.clone());
-                    if entry.attempts >= self.config.max_attempts {
-                        entry.status = QueueStatus::DeadLettered;
-                        dead_lettered += 1;
-                    } else {
-                        entry.next_attempt_at_ms = now + backoff_ms(&self.config, entry.attempts);
-                    }
-                    self.registry
-                        .store()
-                        .put_queue_entry(appservice_id, &entry)?;
-                }
+                let attempted: Vec<QueuedTransaction> = batch
+                    .iter()
+                    .cloned()
+                    .map(|mut entry| {
+                        entry.attempts += 1;
+                        entry.last_error = Some(err.clone());
+                        if entry.attempts >= self.config.max_attempts {
+                            entry.status = QueueStatus::DeadLettered;
+                            dead_lettered += 1;
+                        } else {
+                            entry.next_attempt_at_ms =
+                                now + backoff_ms(&self.config, entry.attempts);
+                        }
+                        entry
+                    })
+                    .collect();
+                let id = appservice_id.to_owned();
+                self.off_the_runtime(move |registry| {
+                    registry.store().put_queue_entries(&id, &attempted)
+                })
+                .await?;
                 let mut health = self.registry.store().health(appservice_id)?;
                 health.consecutive_failures = health.consecutive_failures.saturating_add(1);
                 health.last_error = Some(err.clone());
@@ -538,21 +567,13 @@ impl<B: KvBackend> Scheduler<B> {
         if self.registry.get(appservice_id)?.is_none() {
             return Err(AppserviceError::NotFound(appservice_id.to_string()));
         }
-        let now = self.now_ms();
-        let mut replayed = 0usize;
-        for mut entry in self.registry.store().queue_for(appservice_id)? {
-            if entry.status != QueueStatus::DeadLettered || !request.matches(&entry) {
-                continue;
-            }
-            entry.status = QueueStatus::Pending;
-            entry.next_attempt_at_ms = now;
-            entry.last_error = None;
-            self.registry
-                .store()
-                .put_queue_entry(appservice_id, &entry)?;
-            replayed += 1;
-        }
-        Ok(replayed)
+        // By heads, a bounded batch of bodies at a time: a bridge that has been off for a day
+        // can have tens of thousands dead-lettered.
+        self.registry.store().requeue_dead_lettered(
+            appservice_id,
+            |seq, enqueued_at_ms| request.matches_head(seq, enqueued_at_ms),
+            self.now_ms(),
+        )
     }
 }
 

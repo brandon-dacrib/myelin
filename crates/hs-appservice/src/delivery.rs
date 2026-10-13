@@ -111,8 +111,12 @@ impl<B: KvBackend + 'static> Delivery<B> {
     async fn work(scheduler: Arc<Scheduler<B>>, appservice_id: String, wake: Arc<Notify>) {
         loop {
             let pause = match scheduler.drain(&appservice_id).await {
-                // There may be more behind it.
-                Ok(DrainOutcome::Delivered { .. }) => continue,
+                // There may be more behind it; let everything else run first, so that a long
+                // queue being drained is one task among many, not the runtime's only one.
+                Ok(DrainOutcome::Delivered { .. }) => {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
                 Ok(DrainOutcome::Empty | DrainOutcome::Paused | DrainOutcome::NoUrl) => IDLE_CHECK,
                 Ok(DrainOutcome::Waiting) => RETRY_CHECK,
                 Ok(DrainOutcome::Failed {

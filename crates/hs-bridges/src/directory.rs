@@ -7,10 +7,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use hs_admin::model::{
-    AdminAppservice, AdminAppserviceBacklogEntry, AdminAppserviceCreate, AdminAppserviceHealth,
-    AdminAppserviceReplay, AdminAppserviceTokens, AdminBridgeLogins,
+    AdminAppservice, AdminAppserviceCreate, AdminAppserviceHealth, AdminAppserviceReplay,
+    AdminAppserviceTokens, AdminBridgeLogins,
 };
-use hs_admin::sources::{AdminAppserviceRegistration, AppserviceDirectory, SourceError};
+use hs_admin::sources::{
+    AdminAppserviceBacklogPage, AdminAppserviceRegistration, AppserviceDirectory,
+    BacklogPageRequest, SourceError,
+};
 use hs_kv::KvBackend;
 use serde_json::Value;
 
@@ -73,8 +76,12 @@ impl<B: KvBackend + 'static> AppserviceDirectory for OfferingAwareDirectory<B> {
         self.with_overlap(id, health).await
     }
 
-    async fn backlog(&self, id: &str) -> Result<Vec<AdminAppserviceBacklogEntry>, SourceError> {
-        self.inner.backlog(id).await
+    async fn backlog(
+        &self,
+        id: &str,
+        page: BacklogPageRequest,
+    ) -> Result<AdminAppserviceBacklogPage, SourceError> {
+        self.inner.backlog(id, page).await
     }
 
     async fn pause(&self, id: &str) -> Result<AdminAppservice, SourceError> {

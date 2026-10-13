@@ -8,8 +8,12 @@
 //! profiling says otherwise (no different code path is available yet; see that file's docs for the
 //! `spawn_blocking` escape hatch this crate would reach for first).
 
-use hs_kv::{KvBackend, KvWrite, RangeSpec, TransactConfig, transact};
+use std::ops::Bound;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use hs_kv::{KvBackend, KvRead, KvWrite, RangeSpec, TransactConfig, transact};
 use hs_tables::index::{IndexDef, lookup, maintain_index};
+use hs_tables::key::TupleKey;
 use hs_tables::keyspace::TypedKeyspace;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -210,6 +214,25 @@ const QUEUE_HEADS_BUILT: &str = "queue_heads";
 /// How many heads [`AppserviceStore::open`] writes per transaction when it builds them.
 const QUEUE_HEADS_PER_TXN: usize = 512;
 
+/// How many heads one range read takes when a queue is walked a piece at a time: the PostgreSQL
+/// backend answers a range with every row at once, so an unbounded read of a queue of 40,000
+/// is 40,000 rows in one reply.
+const QUEUE_HEADS_PER_READ: usize = 512;
+
+/// How many entries [`AppserviceStore::requeue_dead_lettered`] rewrites per transaction: each
+/// rewrite carries its body, and a transaction is limited to [`hs_kv::MAX_TXN_BYTES`].
+const REQUEUES_PER_TXN: usize = 64;
+
+/// [`AppserviceStore::backlog_page`]: one page of an appservice's backlog, oldest first.
+#[derive(Debug, Clone, Default)]
+pub struct QueuePage {
+    /// The page's entries, with their bodies, in sequence order.
+    pub entries: Vec<QueuedTransaction>,
+    /// The last sequence number on this page when there is more backlog after it: what the next
+    /// page starts after. `None` on the last page.
+    pub next_after: Option<u64>,
+}
+
 /// A queue entry's bookkeeping without its body: what the scheduler picks the next batch by
 /// and what the queue gauges count. Kept beside each [`QueuedTransaction`] (`txn_queue_head`),
 /// written in the same transaction, so that neither has to read every body. On 2026-10-13 the
@@ -258,6 +281,26 @@ pub struct AppserviceStore<B: KvBackend> {
     /// /_matrix/client/v3/directory/list/appservice/{networkId}/{roomId}`). See
     /// [`AppserviceStore::set_network_room`].
     network_rooms: TypedKeyspace<B::Keyspace, (String, String, String)>,
+    /// `(appservice id) -> seq`: no entry of that appservice's queue below `seq` is waiting to
+    /// be sent, so [`AppserviceStore::pending_batch`] starts there instead of at the front of
+    /// the queue. Raised by `pending_batch` past the dead-lettered and delivered entries it
+    /// walked; lowered, in the same transaction, by whatever makes an older entry wait again
+    /// ([`AppserviceStore::requeue_dead_lettered`], [`AppserviceStore::put_queue_entry`]).
+    queue_floor: TypedKeyspace<B::Keyspace, (String,)>,
+    /// How many queue bodies the paged reads ([`AppserviceStore::backlog_page`],
+    /// [`AppserviceStore::pending_batch`], [`AppserviceStore::requeue_dead_lettered`]) and how
+    /// many heads they have fetched: see [`AppserviceStore::queue_reads`].
+    bodies_read: AtomicU64,
+    heads_read: AtomicU64,
+}
+
+/// [`AppserviceStore::queue_reads`]: how much of the queue the paged reads have read.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueueReads {
+    /// Queue entries read with their bodies.
+    pub bodies: u64,
+    /// Head rows read.
+    pub heads: u64,
 }
 
 /// What [`AppserviceStore::enqueue_ephemeral`] queues for one appservice: a transaction body,
@@ -314,6 +357,7 @@ impl<B: KvBackend> AppserviceStore<B> {
         let pump_meta = TypedKeyspace::new(backend.keyspace("hs_appservice.pump_meta")?);
         let ephemeral_pos = TypedKeyspace::new(backend.keyspace("hs_appservice.ephemeral_pos")?);
         let network_rooms = TypedKeyspace::new(backend.keyspace("hs_appservice.network_rooms")?);
+        let queue_floor = TypedKeyspace::new(backend.keyspace("hs_appservice.queue_floor")?);
         let store = Self {
             backend,
             registry,
@@ -327,9 +371,37 @@ impl<B: KvBackend> AppserviceStore<B> {
             pump_meta,
             ephemeral_pos,
             network_rooms,
+            queue_floor,
+            bodies_read: AtomicU64::new(0),
+            heads_read: AtomicU64::new(0),
         };
         store.build_queue_heads()?;
+        store.forget_queue_floors()?;
         Ok(store)
+    }
+
+    /// Forgets every queue floor, so that the first [`AppserviceStore::pending_batch`] for each
+    /// appservice after a start reads its queue from the front once. A floor is only a hint, and
+    /// a release without floors (a downgrade, then an upgrade again) can have made an older
+    /// entry wait again without lowering one.
+    fn forget_queue_floors(&self) -> Result<(), AppserviceError> {
+        let floors: Vec<(String,)> = {
+            let snap = self.backend.snapshot();
+            self.queue_floor
+                .range(&snap, RangeSpec::full())
+                .map(|item| Ok(item?.0))
+                .collect::<Result<_, AppserviceError>>()?
+        };
+        if floors.is_empty() {
+            return Ok(());
+        }
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            for key in &floors {
+                self.queue_floor.delete(txn, key).map_err(to_kv)?;
+            }
+            Ok(())
+        })
+        .map_err(|e| AppserviceError::Store(e.to_string()))
     }
 
     /// Gives every queue entry written before heads existed its [`QueueHead`], once: a store
@@ -829,9 +901,13 @@ impl<B: KvBackend> AppserviceStore<B> {
     }
 
     /// The first `max` entries of `id`'s queue still waiting to be sent, in sequence order, with
-    /// their bodies: what [`crate::scheduler::Scheduler::drain`] sends next. Reads the heads up
-    /// to the `max`th waiting entry and the bodies of those alone, however long the queue (a
-    /// bridge that has been off for hours has tens of thousands queued).
+    /// their bodies: what [`crate::scheduler::Scheduler::drain`] sends next. Reads the heads
+    /// from the queue's floor (`queue_floor`) up to the `max`th waiting entry,
+    /// [`QUEUE_HEADS_PER_READ`] at a time, and the bodies of those alone, then raises the floor
+    /// to the first waiting entry. So the dead-lettered entries at the front of a long queue,
+    /// and the delivered ones deleted behind it (which an LSM store keeps as tombstones for a
+    /// while), are walked once, not on every drain: on 2026-10-13 the demo's iMessage queue had
+    /// 3,441 dead-lettered entries in front of ~31,000 waiting ones.
     ///
     /// # Errors
     /// Returns [`AppserviceError::Store`]/[`AppserviceError::Decode`] on failure.
@@ -840,27 +916,314 @@ impl<B: KvBackend> AppserviceStore<B> {
         id: &str,
         max: usize,
     ) -> Result<Vec<QueuedTransaction>, AppserviceError> {
+        let floor_key = (id.to_string(),);
+        let (batch, floor, new_floor) = {
+            let snap = self.backend.snapshot();
+            let floor: Option<u64> = self
+                .queue_floor
+                .get(&snap, &floor_key)?
+                .map(|v| decode(&v))
+                .transpose()?;
+            let after = floor.and_then(|f| f.checked_sub(1));
+            let mut first_pending = None;
+            let mut last_seen = None;
+            let mut found = Vec::new();
+            let mut cursor = after;
+            'scan: loop {
+                let chunk = self.heads_after(&snap, id, cursor, QUEUE_HEADS_PER_READ)?;
+                let Some((last, _)) = chunk.last() else {
+                    break;
+                };
+                cursor = Some(*last);
+                let full = chunk.len() == QUEUE_HEADS_PER_READ;
+                for (seq, head) in chunk {
+                    if found.len() >= max.max(1) {
+                        break 'scan;
+                    }
+                    last_seen = Some(seq);
+                    if head.status == QueueStatus::Pending {
+                        first_pending.get_or_insert(seq);
+                        found.push(seq);
+                    }
+                }
+                if !full {
+                    break;
+                }
+            }
+            if max == 0 {
+                found.clear();
+            }
+            let batch = self.bodies(&snap, id, &found)?;
+            // Nothing below the first waiting entry waits; with none, nothing up to the last
+            // entry seen does (a later entry has a larger sequence number).
+            let new_floor = first_pending.or_else(|| last_seen.map(|s| s.saturating_add(1)));
+            (batch, floor, new_floor)
+        };
+        if let Some(new_floor) = new_floor
+            && floor.is_none_or(|f| new_floor > f)
+        {
+            self.raise_queue_floor(id, floor, new_floor)?;
+        }
+        Ok(batch)
+    }
+
+    /// Sets `id`'s queue floor to `to` if it is still `from`: an entry made to wait again since
+    /// `from` was read lowered it, and that lower floor stands.
+    fn raise_queue_floor(
+        &self,
+        id: &str,
+        from: Option<u64>,
+        to: u64,
+    ) -> Result<(), AppserviceError> {
+        let key = (id.to_string(),);
+        let value = encode(&to)?;
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            let current: Option<u64> = match self.queue_floor.get(txn, &key).map_err(to_kv)? {
+                Some(v) => Some(
+                    serde_json::from_slice(&v)
+                        .map_err(|e| hs_kv::KvError::backend(EncodeFail(e.to_string())))?,
+                ),
+                None => None,
+            };
+            if current == from {
+                self.queue_floor.put(txn, &key, &value).map_err(to_kv)?;
+            }
+            Ok(())
+        })
+        .map_err(|e| AppserviceError::Store(e.to_string()))
+    }
+
+    /// Within `txn`, lowers `id`'s queue floor to `seq` if it is above it: entry `seq` waits
+    /// again.
+    fn lower_queue_floor_in<T: KvWrite<Keyspace = B::Keyspace>>(
+        &self,
+        txn: &mut T,
+        id: &str,
+        seq: u64,
+    ) -> Result<(), hs_kv::KvError> {
+        let key = (id.to_string(),);
+        let Some(current) = self.queue_floor.get(txn, &key).map_err(to_kv)? else {
+            return Ok(());
+        };
+        let current: u64 = serde_json::from_slice(&current)
+            .map_err(|e| hs_kv::KvError::backend(EncodeFail(e.to_string())))?;
+        if seq < current {
+            let value = serde_json::to_vec(&seq)
+                .map_err(|e| hs_kv::KvError::backend(EncodeFail(e.to_string())))?;
+            self.queue_floor.put(txn, &key, &value).map_err(to_kv)?;
+        }
+        Ok(())
+    }
+
+    /// One page of `id`'s backlog -- its waiting and dead-lettered entries, not the delivered
+    /// ones -- in sequence order, starting after sequence number `after` (from the front with
+    /// `None`), at most `limit` (at least one) long. Walks the heads and reads the bodies of the
+    /// page's entries alone: the admin API's backlog list, which the interface polls every
+    /// fifteen seconds while a bridge's page is open, read every body of the queue each time.
+    ///
+    /// # Errors
+    /// Returns [`AppserviceError::Store`]/[`AppserviceError::Decode`] on failure.
+    pub fn backlog_page(
+        &self,
+        id: &str,
+        after: Option<u64>,
+        limit: usize,
+    ) -> Result<QueuePage, AppserviceError> {
+        let limit = limit.max(1);
         let snap = self.backend.snapshot();
-        let prefix = TypedKeyspace::<B::Keyspace, (String, u64)>::prefix(&(id.to_string(),));
-        let mut keys = Vec::new();
-        for item in self.txn_queue_head.range(&snap, prefix) {
-            if keys.len() >= max {
+        // One more than the page, to know whether there is a next one.
+        let heads = self.find_heads(&snap, id, after, limit.saturating_add(1), |head| {
+            head.status != QueueStatus::Delivered
+        })?;
+        let more = heads.len() > limit;
+        let seqs: Vec<u64> = heads.iter().take(limit).map(|(seq, _)| *seq).collect();
+        let entries = self.bodies(&snap, id, &seqs)?;
+        Ok(QueuePage {
+            next_after: if more { seqs.last().copied() } else { None },
+            entries,
+        })
+    }
+
+    /// Puts `id`'s dead-lettered entries that `matches(seq, enqueued_at_ms)` back in the queue
+    /// for immediate retry: status pending, next attempt at `now_ms`, error cleared, attempt
+    /// count kept. Walks the heads [`QUEUE_HEADS_PER_READ`] at a time and rewrites the matching
+    /// entries [`REQUEUES_PER_TXN`] per transaction, so a replay of tens of thousands neither
+    /// holds them in memory nor writes them in one transaction. Returns how many it put back;
+    /// an entry delivered or put back by someone else meanwhile is left alone.
+    ///
+    /// # Errors
+    /// Returns [`AppserviceError::Store`]/[`AppserviceError::Decode`] on failure; entries
+    /// already put back stay put back.
+    pub fn requeue_dead_lettered(
+        &self,
+        id: &str,
+        matches: impl Fn(u64, u64) -> bool,
+        now_ms: u64,
+    ) -> Result<usize, AppserviceError> {
+        let mut requeued = 0usize;
+        let mut after = None;
+        loop {
+            let chunk = {
+                let snap = self.backend.snapshot();
+                self.heads_after(&snap, id, after, QUEUE_HEADS_PER_READ)?
+            };
+            let Some((last, _)) = chunk.last() else {
+                break;
+            };
+            after = Some(*last);
+            let keys: Vec<(String, u64)> = chunk
+                .iter()
+                .filter(|(seq, head)| {
+                    head.status == QueueStatus::DeadLettered && matches(*seq, head.enqueued_at_ms)
+                })
+                .map(|(seq, _)| (id.to_string(), *seq))
+                .collect();
+            for keys in keys.chunks(REQUEUES_PER_TXN) {
+                requeued += self.requeue_in_one_transaction(id, keys, now_ms)?;
+            }
+            if chunk.len() < QUEUE_HEADS_PER_READ {
                 break;
             }
-            let (key, v) = item?;
-            let head: QueueHead = decode(&v)?;
-            if head.status == QueueStatus::Pending {
-                keys.push(key);
+        }
+        Ok(requeued)
+    }
+
+    /// [`AppserviceStore::requeue_dead_lettered`]'s writes for `keys`, in one transaction.
+    fn requeue_in_one_transaction(
+        &self,
+        id: &str,
+        keys: &[(String, u64)],
+        now_ms: u64,
+    ) -> Result<usize, AppserviceError> {
+        let requeued = transact(&self.backend, TransactConfig::default(), |txn| {
+            let values = self.txn_queue.multi_get(txn, keys).map_err(to_kv)?;
+            let mut requeued = 0usize;
+            let mut lowest = None;
+            for (key, value) in keys.iter().zip(values) {
+                let Some(value) = value else { continue };
+                let mut entry: QueuedTransaction = serde_json::from_slice(&value)
+                    .map_err(|e| hs_kv::KvError::backend(EncodeFail(e.to_string())))?;
+                if entry.status != QueueStatus::DeadLettered {
+                    continue;
+                }
+                entry.status = QueueStatus::Pending;
+                entry.next_attempt_at_ms = now_ms;
+                entry.last_error = None;
+                let body = serde_json::to_vec(&entry)
+                    .map_err(|e| hs_kv::KvError::backend(EncodeFail(e.to_string())))?;
+                let head = serde_json::to_vec(&QueueHead::of(&entry))
+                    .map_err(|e| hs_kv::KvError::backend(EncodeFail(e.to_string())))?;
+                self.txn_queue.put(txn, key, &body).map_err(to_kv)?;
+                self.txn_queue_head.put(txn, key, &head).map_err(to_kv)?;
+                // `keys` are in sequence order: the first put back is the lowest.
+                lowest.get_or_insert(entry.seq);
+                requeued += 1;
+            }
+            if let Some(lowest) = lowest {
+                self.lower_queue_floor_in(txn, id, lowest)?;
+            }
+            Ok(requeued)
+        })
+        .map_err(|e| AppserviceError::Store(e.to_string()))?;
+        self.count_reads(keys.len(), 0);
+        Ok(requeued)
+    }
+
+    /// How much of the queues this store's paged reads ([`AppserviceStore::pending_batch`],
+    /// [`AppserviceStore::backlog_page`], [`AppserviceStore::requeue_dead_lettered`]) have read
+    /// since it was opened: a diagnostic, and how the tests show that a drain or a page of the
+    /// backlog reads its own entries and not the whole queue. [`AppserviceStore::queue_for`] and
+    /// [`AppserviceStore::queue_summary`] are not counted.
+    #[must_use]
+    pub fn queue_reads(&self) -> QueueReads {
+        QueueReads {
+            bodies: self.bodies_read.load(Ordering::Relaxed),
+            heads: self.heads_read.load(Ordering::Relaxed),
+        }
+    }
+
+    fn count_reads(&self, bodies: usize, heads: usize) {
+        let n = |x: usize| u64::try_from(x).unwrap_or(u64::MAX);
+        self.bodies_read.fetch_add(n(bodies), Ordering::Relaxed);
+        self.heads_read.fetch_add(n(heads), Ordering::Relaxed);
+    }
+
+    /// Up to `n` of `id`'s heads after sequence number `after` (from the front with `None`), in
+    /// sequence order: one bounded range read.
+    fn heads_after<R: KvRead<Keyspace = B::Keyspace>>(
+        &self,
+        read: &R,
+        id: &str,
+        after: Option<u64>,
+        n: usize,
+    ) -> Result<Vec<(u64, QueueHead)>, AppserviceError> {
+        let mut spec = TypedKeyspace::<B::Keyspace, (String, u64)>::prefix(&(id.to_string(),));
+        if let Some(seq) = after {
+            spec.start = Bound::Excluded((id.to_string(), seq).encode().into());
+        }
+        spec.limit = Some(n);
+        let heads = self
+            .txn_queue_head
+            .range(read, spec)
+            .map(|item| {
+                let ((_, seq), value) = item?;
+                Ok((seq, decode::<QueueHead>(&value)?))
+            })
+            .collect::<Result<Vec<_>, AppserviceError>>()?;
+        self.count_reads(0, heads.len());
+        Ok(heads)
+    }
+
+    /// The first `want` of `id`'s heads after `after` that `keep`, in sequence order, read
+    /// [`QUEUE_HEADS_PER_READ`] at a time until there are `want` or the queue ends.
+    fn find_heads<R: KvRead<Keyspace = B::Keyspace>>(
+        &self,
+        read: &R,
+        id: &str,
+        mut after: Option<u64>,
+        want: usize,
+        keep: impl Fn(&QueueHead) -> bool,
+    ) -> Result<Vec<(u64, QueueHead)>, AppserviceError> {
+        let mut found = Vec::new();
+        while found.len() < want {
+            let chunk = self.heads_after(read, id, after, QUEUE_HEADS_PER_READ)?;
+            let Some((last, _)) = chunk.last() else {
+                break;
+            };
+            after = Some(*last);
+            let full = chunk.len() == QUEUE_HEADS_PER_READ;
+            found.extend(
+                chunk
+                    .into_iter()
+                    .filter(|(_, head)| keep(head))
+                    .take(want - found.len()),
+            );
+            if !full {
+                break;
             }
         }
-        let mut batch = Vec::with_capacity(keys.len());
-        for key in keys {
-            if let Some(bytes) = self.txn_queue.get(&snap, &key)? {
-                batch.push(decode::<QueuedTransaction>(&bytes)?);
-            }
+        Ok(found)
+    }
+
+    /// The bodies of `id`'s entries `seqs`, in one read, in the order given; an entry gone since
+    /// its head was read is skipped.
+    fn bodies<R: KvRead<Keyspace = B::Keyspace>>(
+        &self,
+        read: &R,
+        id: &str,
+        seqs: &[u64],
+    ) -> Result<Vec<QueuedTransaction>, AppserviceError> {
+        if seqs.is_empty() {
+            return Ok(Vec::new());
         }
-        batch.sort_by_key(|e| e.seq);
-        Ok(batch)
+        let keys: Vec<(String, u64)> = seqs.iter().map(|seq| (id.to_string(), *seq)).collect();
+        let values = self.txn_queue.multi_get(read, &keys)?;
+        self.count_reads(keys.len(), 0);
+        values
+            .into_iter()
+            .flatten()
+            .map(|bytes| decode::<QueuedTransaction>(&bytes))
+            .collect()
     }
 
     /// Overwrites one queue entry (used by the scheduler to record an attempt's outcome).
@@ -872,12 +1235,43 @@ impl<B: KvBackend> AppserviceStore<B> {
         id: &str,
         entry: &QueuedTransaction,
     ) -> Result<(), AppserviceError> {
-        let value = encode(entry)?;
-        let head = encode(&QueueHead::of(entry))?;
-        let key = (id.to_string(), entry.seq);
+        self.put_queue_entries(id, std::slice::from_ref(entry))
+    }
+
+    /// Overwrites several queue entries in one transaction: a failed batch's attempts. One
+    /// made to wait lowers the queue's floor if it is below it.
+    ///
+    /// # Errors
+    /// Returns [`AppserviceError::Store`] on failure.
+    pub fn put_queue_entries(
+        &self,
+        id: &str,
+        entries: &[QueuedTransaction],
+    ) -> Result<(), AppserviceError> {
+        let rows = entries
+            .iter()
+            .map(|entry| {
+                Ok((
+                    (id.to_string(), entry.seq),
+                    encode(entry)?,
+                    encode(&QueueHead::of(entry))?,
+                ))
+            })
+            .collect::<Result<Vec<_>, AppserviceError>>()?;
+        let lowest_pending = entries
+            .iter()
+            .filter(|e| e.status == QueueStatus::Pending)
+            .map(|e| e.seq)
+            .min();
         transact(&self.backend, TransactConfig::default(), |txn| {
-            self.txn_queue.put(txn, &key, &value).map_err(to_kv)?;
-            self.txn_queue_head.put(txn, &key, &head).map_err(to_kv)
+            for (key, value, head) in &rows {
+                self.txn_queue.put(txn, key, value).map_err(to_kv)?;
+                self.txn_queue_head.put(txn, key, head).map_err(to_kv)?;
+            }
+            if let Some(seq) = lowest_pending {
+                self.lower_queue_floor_in(txn, id, seq)?;
+            }
+            Ok(())
         })
         .map_err(|e| AppserviceError::Store(e.to_string()))
     }
@@ -887,24 +1281,50 @@ impl<B: KvBackend> AppserviceStore<B> {
     /// # Errors
     /// Returns [`AppserviceError::Store`] on failure.
     pub fn delete_queue_entry(&self, id: &str, seq: u64) -> Result<(), AppserviceError> {
-        let key = (id.to_string(), seq);
+        self.delete_queue_entries(id, &[seq])
+    }
+
+    /// Deletes several queue entries in one transaction: a delivered batch.
+    ///
+    /// # Errors
+    /// Returns [`AppserviceError::Store`] on failure.
+    pub fn delete_queue_entries(&self, id: &str, seqs: &[u64]) -> Result<(), AppserviceError> {
         transact(&self.backend, TransactConfig::default(), |txn| {
-            self.txn_queue.delete(txn, &key).map_err(to_kv)?;
-            self.txn_queue_head.delete(txn, &key).map_err(to_kv)
+            for seq in seqs {
+                let key = (id.to_string(), *seq);
+                self.txn_queue.delete(txn, &key).map_err(to_kv)?;
+                self.txn_queue_head.delete(txn, &key).map_err(to_kv)?;
+            }
+            Ok(())
         })
         .map_err(|e| AppserviceError::Store(e.to_string()))
     }
 
     /// Deletes every queue entry for `id` (used when an appservice is removed and the caller
-    /// wants no residue).
+    /// wants no residue). By heads, [`QUEUE_HEADS_PER_READ`] per transaction: never every body,
+    /// and not one transaction per entry (a bridge removed while it was off can have tens of
+    /// thousands queued).
     ///
     /// # Errors
     /// Returns [`AppserviceError::Store`]/[`AppserviceError::Decode`] on failure.
     pub fn purge_queue(&self, id: &str) -> Result<(), AppserviceError> {
-        for entry in self.queue_for(id)? {
-            self.delete_queue_entry(id, entry.seq)?;
+        loop {
+            let chunk = {
+                let snap = self.backend.snapshot();
+                self.heads_after(&snap, id, None, QUEUE_HEADS_PER_READ)?
+            };
+            if chunk.is_empty() {
+                break;
+            }
+            let seqs: Vec<u64> = chunk.iter().map(|(seq, _)| *seq).collect();
+            self.delete_queue_entries(id, &seqs)?;
         }
-        Ok(())
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            self.queue_floor
+                .delete(txn, &(id.to_string(),))
+                .map_err(to_kv)
+        })
+        .map_err(|e| AppserviceError::Store(e.to_string()))
     }
 
     // ---- appservice room directories ----
@@ -1214,5 +1634,193 @@ mod tests {
             .map(|e| e.seq)
             .collect();
         assert_eq!(seqs, vec![1, 2, 3]);
+    }
+
+    /// `n` entries for `id`, the first `dead` of them dead-lettered.
+    fn long_queue(s: &AppserviceStore<MemoryBackend>, id: &str, n: u64, dead: u64) {
+        for i in 0..n {
+            s.enqueue(id, serde_json::json!({ "n": i }), 1_000 + i)
+                .unwrap();
+        }
+        let front: Vec<QueuedTransaction> = s
+            .queue_for(id)
+            .unwrap()
+            .into_iter()
+            .take(usize::try_from(dead).unwrap())
+            .map(|mut e| {
+                e.status = QueueStatus::DeadLettered;
+                e.attempts = 10;
+                e
+            })
+            .collect();
+        for chunk in front.chunks(100) {
+            s.put_queue_entries(id, chunk).unwrap();
+        }
+    }
+
+    fn seqs_of(batch: &[QueuedTransaction]) -> Vec<u64> {
+        batch.iter().map(|e| e.seq).collect()
+    }
+
+    /// The demo's iMessage queue (2026-10-13): thousands dead-lettered at the front of a long
+    /// queue being drained. The first drain walks past them and remembers where the waiting
+    /// entries start; each drain after it reads one bounded piece of the heads and its own
+    /// bodies, however many were dead-lettered or delivered before them. An entry made to wait
+    /// again below that point (a replay, an overwrite) is found by the next drain, and a store
+    /// opened again starts from the front.
+    #[test]
+    fn a_drain_walks_past_the_dead_lettered_front_of_a_long_queue_once() {
+        let backend = MemoryBackend::new();
+        let s = AppserviceStore::open(backend.clone()).unwrap();
+        long_queue(&s, "a", 3_000, 1_000);
+
+        let batch = s.pending_batch("a", 20).unwrap();
+        assert_eq!(seqs_of(&batch), (1_001..=1_020).collect::<Vec<u64>>());
+        assert_eq!(batch[0].body["n"], 1_000);
+        s.delete_queue_entries("a", &seqs_of(&batch)).unwrap();
+
+        for _ in 0..10 {
+            let before = s.queue_reads();
+            let batch = s.pending_batch("a", 20).unwrap();
+            let read = s.queue_reads();
+            assert_eq!(batch.len(), 20);
+            assert_eq!(read.bodies - before.bodies, 20, "only the batch's bodies");
+            assert!(
+                read.heads - before.heads <= QUEUE_HEADS_PER_READ as u64,
+                "one piece of the heads, not the dead-lettered front: {}",
+                read.heads - before.heads
+            );
+            s.delete_queue_entries("a", &seqs_of(&batch)).unwrap();
+        }
+        // 1,001 to 1,220 are delivered.
+        assert_eq!(s.pending_batch("a", 1).unwrap()[0].seq, 1_221);
+
+        // A replay of one dead-lettered entry puts it first again.
+        let replayed = s
+            .requeue_dead_lettered("a", |seq, _| seq == 500, 7)
+            .unwrap();
+        assert_eq!(replayed, 1);
+        assert_eq!(
+            seqs_of(&s.pending_batch("a", 3).unwrap()),
+            vec![500, 1_221, 1_222]
+        );
+        s.delete_queue_entries("a", &[500]).unwrap();
+        assert_eq!(s.pending_batch("a", 1).unwrap()[0].seq, 1_221);
+
+        // So does an entry overwritten as waiting.
+        let mut entry = s
+            .queue_for("a")
+            .unwrap()
+            .into_iter()
+            .find(|e| e.seq == 600)
+            .unwrap();
+        entry.status = QueueStatus::Pending;
+        s.put_queue_entry("a", &entry).unwrap();
+        assert_eq!(seqs_of(&s.pending_batch("a", 2).unwrap()), vec![600, 1_221]);
+
+        // A store opened again reads from the front once.
+        let reopened = AppserviceStore::open(backend).unwrap();
+        assert_eq!(
+            seqs_of(&reopened.pending_batch("a", 2).unwrap()),
+            vec![600, 1_221]
+        );
+
+        // An emptied queue, then a new entry: found.
+        let all: Vec<u64> = seqs_of(&reopened.queue_for("a").unwrap());
+        reopened.delete_queue_entries("a", &all).unwrap();
+        assert!(reopened.pending_batch("a", 20).unwrap().is_empty());
+        let seq = reopened.enqueue("a", serde_json::json!({}), 1).unwrap();
+        assert_eq!(
+            seqs_of(&reopened.pending_batch("a", 20).unwrap()),
+            vec![seq]
+        );
+    }
+
+    /// The admin API's backlog is read a page at a time: waiting and dead-lettered entries in
+    /// order, delivered and deleted ones left out, each page continuing where the last stopped,
+    /// and each reading its own entries' bodies and no others.
+    #[test]
+    fn the_backlog_is_read_a_page_at_a_time() {
+        let s = store();
+        long_queue(&s, "a", 3_000, 400);
+        s.enqueue("b", serde_json::json!({}), 1).unwrap();
+        let delivered: Vec<QueuedTransaction> = s
+            .queue_for("a")
+            .unwrap()
+            .into_iter()
+            .filter(|e| (1_100..1_110).contains(&e.seq))
+            .map(|mut e| {
+                e.status = QueueStatus::Delivered;
+                e
+            })
+            .collect();
+        s.put_queue_entries("a", &delivered).unwrap();
+        let gone: Vec<u64> = (2_000..2_600).collect();
+        s.delete_queue_entries("a", &gone).unwrap();
+        let expected: Vec<u64> = (1..=3_000)
+            .filter(|seq| !(1_100..1_110).contains(seq) && !gone.contains(seq))
+            .collect();
+
+        let mut seen = Vec::new();
+        let mut after = None;
+        let mut pages = 0;
+        loop {
+            let before = s.queue_reads();
+            let page = s.backlog_page("a", after, 50).unwrap();
+            let read = s.queue_reads();
+            assert_eq!(read.bodies - before.bodies, page.entries.len() as u64);
+            assert!(page.entries.len() <= 50);
+            for entry in &page.entries {
+                assert_eq!(entry.status == QueueStatus::DeadLettered, entry.seq <= 400);
+            }
+            seen.extend(seqs_of(&page.entries));
+            pages += 1;
+            match page.next_after {
+                Some(next) => {
+                    assert_eq!(Some(&next), seen.last());
+                    after = Some(next);
+                }
+                None => break,
+            }
+        }
+        assert_eq!(seen, expected);
+        assert_eq!(pages, expected.len().div_ceil(50));
+        let summary = s.queue_summary("a").unwrap();
+        assert_eq!(
+            summary.pending + summary.dead_lettered,
+            expected.len() as u64
+        );
+        assert!(
+            s.backlog_page("a", Some(3_000), 50)
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+    }
+
+    /// A replay walks the queue by heads and puts back only the dead-lettered entries asked
+    /// for, keeping their attempt counts; removing an appservice takes its whole queue.
+    #[test]
+    fn requeue_and_purge_walk_the_queue_by_heads() {
+        let s = store();
+        long_queue(&s, "a", 1_500, 1_200);
+        let replayed = s
+            .requeue_dead_lettered("a", |seq, _| seq % 2 == 0, 42)
+            .unwrap();
+        assert_eq!(replayed, 600);
+        let summary = s.queue_summary("a").unwrap();
+        assert_eq!(summary.dead_lettered, 600);
+        assert_eq!(summary.pending, 900);
+        let first = &s.pending_batch("a", 1).unwrap()[0];
+        assert_eq!(first.seq, 2);
+        assert_eq!(first.attempts, 10);
+        assert_eq!(first.next_attempt_at_ms, 42);
+        assert!(first.last_error.is_none());
+
+        s.enqueue("b", serde_json::json!({}), 1).unwrap();
+        s.purge_queue("a").unwrap();
+        assert!(s.queue_for("a").unwrap().is_empty());
+        assert_eq!(s.queue_summary("a").unwrap(), QueueSummary::default());
+        assert_eq!(s.queue_for("b").unwrap().len(), 1);
     }
 }

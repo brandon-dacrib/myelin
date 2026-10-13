@@ -16,7 +16,7 @@ use serde_json::Value;
 use crate::error::AppserviceError;
 use crate::namespace::NamespaceKind;
 use crate::registration::Registration;
-use crate::store::{AppserviceRow, AppserviceStore, HealthRow, QueueStatus, QueuedTransaction};
+use crate::store::{AppserviceRow, AppserviceStore, HealthRow, QueueStatus};
 
 /// The third-party instance ID of appservice `appservice_id`'s network `network_id`:
 /// `{appservice id}|{network id}`, as Synapse spells it (`ThirdPartyInstanceID.to_string`), which
@@ -523,22 +523,44 @@ impl<B: KvBackend> Registry<B> {
         })
     }
 
-    /// The pending and dead-lettered backlog for one appservice, oldest first — the admin API's
-    /// `GET /appservices/{id}/backlog`. Delivered entries (kept briefly for backlog-age
-    /// reporting by the scheduler) are excluded, since they are not backlog.
+    /// The whole pending and dead-lettered backlog for one appservice, oldest first, read a page
+    /// at a time ([`Registry::backlog_page`]). Every entry's body is read, so this is for tests
+    /// and small queues; the admin API pages.
     ///
     /// # Errors
     /// Returns [`AppserviceError::Store`] on backend failure.
     pub fn backlog(&self, id: &str) -> Result<Vec<BacklogEntry>, AppserviceError> {
+        let mut all = Vec::new();
+        let mut after = None;
+        loop {
+            let (page, next) = self.backlog_page(id, after, 500)?;
+            all.extend(page);
+            match next {
+                Some(next) => after = Some(next),
+                None => return Ok(all),
+            }
+        }
+    }
+
+    /// One page of the pending and dead-lettered backlog for one appservice, oldest first,
+    /// after transaction (sequence number) `after`, at most `limit` long — the admin API's
+    /// `GET /appservices/{id}/backlog`. Delivered entries (kept briefly for backlog-age
+    /// reporting by the scheduler) are excluded, since they are not backlog. Returns the page
+    /// and, when there is more, the sequence number the next page starts after. Reads the
+    /// page's bodies alone ([`AppserviceStore::backlog_page`]).
+    ///
+    /// # Errors
+    /// Returns [`AppserviceError::Store`] on backend failure.
+    pub fn backlog_page(
+        &self,
+        id: &str,
+        after: Option<u64>,
+        limit: usize,
+    ) -> Result<(Vec<BacklogEntry>, Option<u64>), AppserviceError> {
         let now = self.now_ms();
-        let mut entries: Vec<QueuedTransaction> = self
-            .store
-            .queue_for(id)?
-            .into_iter()
-            .filter(|e| e.status != QueueStatus::Delivered)
-            .collect();
-        entries.sort_by_key(|e| e.seq);
-        Ok(entries
+        let page = self.store.backlog_page(id, after, limit)?;
+        let entries = page
+            .entries
             .into_iter()
             .map(|e| BacklogEntry {
                 transaction_id: e.seq.to_string(),
@@ -547,7 +569,18 @@ impl<B: KvBackend> Registry<B> {
                 last_error: e.last_error,
                 dead_lettered: e.status == QueueStatus::DeadLettered,
             })
-            .collect())
+            .collect();
+        Ok((entries, page.next_after))
+    }
+
+    /// How many entries of one appservice's backlog there are (waiting and dead-lettered),
+    /// counted from the heads.
+    ///
+    /// # Errors
+    /// Returns [`AppserviceError::Store`] on backend failure.
+    pub fn backlog_len(&self, id: &str) -> Result<u64, AppserviceError> {
+        let summary = self.store.queue_summary(id)?;
+        Ok(summary.pending + summary.dead_lettered)
     }
 
     /// Namespace conflict detection (`PLAN.md` section 8.2's "namespace conflict checks against

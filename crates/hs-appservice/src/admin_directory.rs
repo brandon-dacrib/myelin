@@ -18,7 +18,10 @@ use hs_admin::model::{
     AdminAppserviceLinks, AdminAppserviceQueue, AdminAppserviceReplay, AdminAppserviceTokens,
     AdminBridgeLogins, AdminKeyWithheld,
 };
-use hs_admin::sources::{AdminAppserviceRegistration, AppserviceDirectory, SourceError};
+use hs_admin::sources::{
+    AdminAppserviceBacklogPage, AdminAppserviceRegistration, AppserviceDirectory,
+    BacklogPageRequest, SourceError,
+};
 use hs_kv::KvBackend;
 use serde_json::Value;
 
@@ -245,17 +248,34 @@ impl<B: KvBackend + 'static> AppserviceDirectory for RegistryAppserviceDirectory
             .map_err(to_source)
     }
 
-    async fn backlog(&self, id: &str) -> Result<Vec<AdminAppserviceBacklogEntry>, SourceError> {
-        if self.registry.get(id).map_err(to_source)?.is_none() {
-            return Err(SourceError::NotFound);
-        }
-        Ok(self
-            .registry
-            .backlog(id)
-            .map_err(to_source)?
-            .into_iter()
-            .map(admin_backlog)
-            .collect())
+    async fn backlog(
+        &self,
+        id: &str,
+        page: BacklogPageRequest,
+    ) -> Result<AdminAppserviceBacklogPage, SourceError> {
+        let registry = self.registry.clone();
+        let id = id.to_owned();
+        // On the blocking pool: a page is small, but the store under it may be slow to answer.
+        tokio::task::spawn_blocking(move || {
+            if registry.get(&id).map_err(to_source)?.is_none() {
+                return Err(SourceError::NotFound);
+            }
+            let (entries, next_after) = registry
+                .backlog_page(&id, page.after, page.limit)
+                .map_err(to_source)?;
+            let total = if page.include_total {
+                Some(registry.backlog_len(&id).map_err(to_source)?)
+            } else {
+                None
+            };
+            Ok(AdminAppserviceBacklogPage {
+                entries: entries.into_iter().map(admin_backlog).collect(),
+                next_after,
+                total,
+            })
+        })
+        .await
+        .map_err(|e| SourceError::Unavailable(format!("reading the backlog did not finish: {e}")))?
     }
 
     async fn pause(&self, id: &str) -> Result<AdminAppservice, SourceError> {
@@ -349,6 +369,12 @@ mod tests {
     use crate::ping::PingTransport;
     use crate::scheduler::MockSender;
     use crate::transaction::Transaction;
+
+    const FIRST_PAGE: BacklogPageRequest = BacklogPageRequest {
+        after: None,
+        limit: 50,
+        include_total: false,
+    };
     use hs_auth::clock::FixedClock;
     use hs_kv::memory::MemoryBackend;
     use serde_json::json;
@@ -567,7 +593,7 @@ mod tests {
             SourceError::NotFound
         ));
         assert!(matches!(
-            directory.backlog("nope").await.unwrap_err(),
+            directory.backlog("nope", FIRST_PAGE).await.unwrap_err(),
             SourceError::NotFound
         ));
     }
@@ -686,7 +712,7 @@ mod tests {
             "{outcome:?}"
         );
 
-        let backlog = directory.backlog("irc").await.unwrap();
+        let backlog = directory.backlog("irc", FIRST_PAGE).await.unwrap().entries;
         assert_eq!(backlog.len(), 1);
         assert!(backlog[0].dead_lettered);
         assert_eq!(backlog[0].attempts, 1);
@@ -697,7 +723,7 @@ mod tests {
             .unwrap();
         assert_eq!(replayed, 1);
         assert_eq!(nudged.lock().unwrap().as_slice(), ["irc"]);
-        let backlog = directory.backlog("irc").await.unwrap();
+        let backlog = directory.backlog("irc", FIRST_PAGE).await.unwrap().entries;
         assert!(!backlog[0].dead_lettered);
 
         let bad_since = directory

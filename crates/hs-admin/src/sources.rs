@@ -2587,8 +2587,15 @@ pub trait AppserviceDirectory: Send + Sync + 'static {
     async fn update(&self, id: &str, patch: Value) -> Result<AdminAppservice, SourceError>;
     async fn delete(&self, id: &str) -> Result<(), SourceError>;
     async fn health(&self, id: &str) -> Result<AdminAppserviceHealth, SourceError>;
-    /// Pending and dead-lettered transactions, oldest first.
-    async fn backlog(&self, id: &str) -> Result<Vec<AdminAppserviceBacklogEntry>, SourceError>;
+    /// One page of the pending and dead-lettered transactions, oldest first: those after
+    /// `page.after`, at most `page.limit`, and the whole backlog's size when
+    /// `page.include_total` asks for it. A directory reads that page and no more: a bridge that
+    /// has been off for a day has tens of thousands queued.
+    async fn backlog(
+        &self,
+        id: &str,
+        page: BacklogPageRequest,
+    ) -> Result<AdminAppserviceBacklogPage, SourceError>;
     /// Stops delivery; the queue keeps growing and nothing is lost.
     async fn pause(&self, id: &str) -> Result<AdminAppservice, SourceError>;
     async fn resume(&self, id: &str) -> Result<AdminAppservice, SourceError>;
@@ -2619,6 +2626,29 @@ pub trait AppserviceDirectory: Send + Sync + 'static {
             "this appservice directory cannot ask bridges who has signed in".to_owned(),
         ))
     }
+}
+
+/// What [`AppserviceDirectory::backlog`] is asked for: one page of an appservice's backlog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BacklogPageRequest {
+    /// Start after this transaction (its sequence number, the `transaction_id`); `None` starts
+    /// at the oldest.
+    pub after: Option<u64>,
+    /// At most this many entries (the router has already clamped it).
+    pub limit: usize,
+    /// Whether to count the whole backlog as well.
+    pub include_total: bool,
+}
+
+/// One page of an appservice's backlog, oldest first: [`AppserviceDirectory::backlog`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AdminAppserviceBacklogPage {
+    /// The page's entries.
+    pub entries: Vec<AdminAppserviceBacklogEntry>,
+    /// When there is more: the transaction the next page starts after.
+    pub next_after: Option<u64>,
+    /// The whole backlog's size, when it was asked for.
+    pub total: Option<u64>,
 }
 
 /// A registration in both notations, for `GET /appservices/{id}/registration` to answer in
@@ -2888,8 +2918,35 @@ impl AppserviceDirectory for InMemoryAppserviceDirectory {
         })
     }
 
-    async fn backlog(&self, id: &str) -> Result<Vec<AdminAppserviceBacklogEntry>, SourceError> {
-        self.with_row(id, |row| row.backlog.clone())
+    async fn backlog(
+        &self,
+        id: &str,
+        page: BacklogPageRequest,
+    ) -> Result<AdminAppserviceBacklogPage, SourceError> {
+        self.with_row(id, |row| {
+            let after: Vec<&AdminAppserviceBacklogEntry> = row
+                .backlog
+                .iter()
+                .filter(|e| {
+                    page.after.is_none_or(|after| {
+                        e.transaction_id.parse::<u64>().is_ok_and(|seq| seq > after)
+                    })
+                })
+                .collect();
+            let limit = page.limit.max(1);
+            let entries: Vec<AdminAppserviceBacklogEntry> =
+                after.iter().take(limit).map(|e| (*e).clone()).collect();
+            let next_after = if after.len() > limit {
+                entries.last().and_then(|e| e.transaction_id.parse().ok())
+            } else {
+                None
+            };
+            AdminAppserviceBacklogPage {
+                entries,
+                next_after,
+                total: page.include_total.then_some(row.backlog.len() as u64),
+            }
+        })
     }
 
     async fn pause(&self, id: &str) -> Result<AdminAppservice, SourceError> {

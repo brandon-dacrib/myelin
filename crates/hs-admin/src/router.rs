@@ -3548,13 +3548,38 @@ async fn appservices_backlog(
             let Some(appservices) = &state.appservices else {
                 return source_unavailable("appservice registry", &instance);
             };
-            match appservices.backlog(&id).await {
-                Ok(items) => axum::Json(Page::paginate(
-                    items,
-                    query.cursor.as_deref(),
-                    query.limit,
-                    query.include_total.unwrap_or(false),
-                ))
+            // A keyset cursor: `t<transaction id>`, the last one on the page before. The
+            // backlog is read a page at a time, never whole (a bridge that has been off for a
+            // day has tens of thousands queued).
+            let after = match query.cursor.as_deref().filter(|c| !c.is_empty()) {
+                None => None,
+                Some(cursor) => {
+                    match cursor.strip_prefix('t').and_then(|t| t.parse::<u64>().ok()) {
+                        Some(after) => Some(after),
+                        None => {
+                            let detail =
+                                format!("{cursor:?} is not a cursor this listing handed out");
+                            return Problem::invalid_cursor()
+                                .with_detail(detail.clone())
+                                .with_errors(vec![ValidationError::new("/cursor", detail)])
+                                .with_instance(instance)
+                                .into_response();
+                        }
+                    }
+                }
+            };
+            let request = crate::sources::BacklogPageRequest {
+                after,
+                limit: query.limit.unwrap_or(50).clamp(1, 500),
+                include_total: query.include_total.unwrap_or(false),
+            };
+            match appservices.backlog(&id, request).await {
+                Ok(page) => axum::Json(Page {
+                    items: page.entries,
+                    next_cursor: page.next_after.map(|t| format!("t{t}")),
+                    prev_cursor: None,
+                    total: page.total,
+                })
                 .into_response(),
                 Err(SourceError::NotFound) => no_such_appservice(&id, &instance),
                 Err(e) => e.to_problem().with_instance(instance).into_response(),
@@ -9838,6 +9863,42 @@ mod tests {
             .unwrap_or_default()
             .to_owned();
         (status, body_bytes(response).await, content_type)
+    }
+
+    /// The backlog is paged by a keyset cursor the server hands out, with a total only when
+    /// asked for; a cursor it did not hand out (an offset from before) is a 400, not page one.
+    #[tokio::test]
+    async fn the_backlog_is_paged_by_its_own_cursor() {
+        let (router, _manifest) = build_router(state_with_appservices());
+        let get = |uri: &'static str| {
+            let router = router.clone();
+            async move {
+                let (status, body, _) = call(&router, "GET", uri, None, None).await;
+                (
+                    status,
+                    serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                )
+            }
+        };
+
+        let (status, page) = get("/api/v1/appservices/irc/backlog?limit=1").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page["items"].as_array().unwrap().len(), 1, "{page}");
+        assert_eq!(page["items"][0]["transaction_id"], "7");
+        assert_eq!(page["next_cursor"], "t7");
+        assert!(page.get("total").is_none(), "{page}");
+
+        let (status, page) =
+            get("/api/v1/appservices/irc/backlog?limit=1&cursor=t7&include_total=true").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page["items"][0]["transaction_id"], "8", "{page}");
+        assert_eq!(page["next_cursor"], serde_json::Value::Null);
+        assert_eq!(page["total"], 2);
+
+        let (status, page) = get("/api/v1/appservices/irc/backlog?cursor=1").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{page}");
+        let (status, _) = get("/api/v1/appservices/nope/backlog").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
