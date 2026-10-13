@@ -1,10 +1,25 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-10-13, 00:00 EDT (0.3.8 on the demo, checked). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+Written 2026-09-20 by the integration lead, last revised 2026-10-13, noon EDT (0.3.9 on the demo, freezing under the iMessage queue; the fix is `agent/queue-heads`). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
-## Resume here: 2026-10-13 -- 0.3.8 runs on the demo (revision 21), checked; two findings
+## Resume here: 2026-10-13, noon EDT -- the demo's server restarted 92 times on 0.3.8; the fix is `agent/queue-heads`
+
+**What happened** (status 11, 2026-10-13): the iMessage bridge on the owner's Mac has been off
+since 2026-10-12 ~19:20 UTC, its queue reached ~36,000 transactions, and the scheduler read the
+whole queue with bodies on every retry and the gauges on every scrape. From 06:34 UTC
+`myelin-hs-0` froze for 12-20 s at a time and the kubelet restarted it 92 times; the 0.3.9 roll
+(revision 22) failed on that pod, then the StatefulSet replaced it and 0.3.9 runs, still
+freezing. **The fix**: head rows beside the queue, so retries and scrapes read only those (built
+once on open for an existing queue). **Roll it as soon as it is released**; check
+`gave each queued appservice transaction its head row, once entries=~36000` in the log, no
+restarts, `scrape_duration_seconds{job="myelin-hs"}` back near 0.02 s. Until then, pausing
+`imessage-brandon` in Registrations stops the retries' reads (not the scrape's). The 36,000
+queued transactions are a day of messages the bridge never saw: replaying them into the Mac
+bridge when it is back is the owner's choice.
+
+## Earlier: 2026-10-13 -- 0.3.8 runs on the demo (revision 21), checked; two findings
 
 Rolled 03:41 UTC from the tagged chart (`docs/install-and-upgrade.md`). **Checked through the
 owner's proxy**: every pod on `ghcr.io/brandon-dacrib/myelin:0.3.8`, every Bridge `Ready`, each

@@ -15,6 +15,10 @@ carries the generated notes for that merge.
 
 ## Unreleased
 
+- **A bridge that is switched off no longer takes the server down.** Its queue can hold tens of
+  thousands of transactions; delivery retries and the queue metrics now read a small row per
+  entry instead of every body. On the demo the old reads froze the server for seconds at a
+  time until it was restarted, over and over.
 - **Bridges on mautrix-go's older framework read their key count without an error.** Their
   `/keys/upload` with `"one_time_keys": null` was refused; `null` now means absent, as in
   Synapse.

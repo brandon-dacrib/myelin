@@ -203,6 +203,35 @@ pub struct QueueSummary {
 /// The [`AppserviceStore`] `pump_meta` row whose presence means the pump has started before.
 const PUMP_STARTED: &str = "started";
 
+/// The [`AppserviceStore`] `pump_meta` row whose presence means every queue entry has its
+/// [`QueueHead`] (written by [`AppserviceStore::open`] the first time it finds it missing).
+const QUEUE_HEADS_BUILT: &str = "queue_heads";
+
+/// How many heads [`AppserviceStore::open`] writes per transaction when it builds them.
+const QUEUE_HEADS_PER_TXN: usize = 512;
+
+/// A queue entry's bookkeeping without its body: what the scheduler picks the next batch by
+/// and what the queue gauges count. Kept beside each [`QueuedTransaction`] (`txn_queue_head`),
+/// written in the same transaction, so that neither has to read every body. On 2026-10-13 the
+/// demo's iMessage queue held ~36,000 transactions while its bridge was off; every retry and
+/// every scrape read them all, and the server stopped answering its liveness probe.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct QueueHead {
+    enqueued_at_ms: u64,
+    next_attempt_at_ms: u64,
+    status: QueueStatus,
+}
+
+impl QueueHead {
+    fn of(entry: &QueuedTransaction) -> Self {
+        Self {
+            enqueued_at_ms: entry.enqueued_at_ms,
+            next_attempt_at_ms: entry.next_attempt_at_ms,
+            status: entry.status,
+        }
+    }
+}
+
 /// The keyspace handles and typed accessors for one appservice registry, wired to a `B: KvBackend`.
 pub struct AppserviceStore<B: KvBackend> {
     backend: B,
@@ -211,6 +240,9 @@ pub struct AppserviceStore<B: KvBackend> {
     by_hs_token: IndexDef<B::Keyspace, (String,), (String,)>,
     health: TypedKeyspace<B::Keyspace, (String,)>,
     txn_queue: TypedKeyspace<B::Keyspace, (String, u64)>,
+    /// `(appservice id, seq) -> QueueHead`: each `txn_queue` entry's status and times, without
+    /// its body.
+    txn_queue_head: TypedKeyspace<B::Keyspace, (String, u64)>,
     txn_seq: TypedKeyspace<B::Keyspace, (String,)>,
     /// `room_id -> position`: how far into each room's timeline [`crate::pump`] has read. See
     /// [`AppserviceStore::enqueue_for_room`].
@@ -276,24 +308,75 @@ impl<B: KvBackend> AppserviceStore<B> {
         );
         let health = TypedKeyspace::new(backend.keyspace("hs_appservice.health")?);
         let txn_queue = TypedKeyspace::new(backend.keyspace("hs_appservice.txn_queue")?);
+        let txn_queue_head = TypedKeyspace::new(backend.keyspace("hs_appservice.txn_queue_head")?);
         let txn_seq = TypedKeyspace::new(backend.keyspace("hs_appservice.txn_seq")?);
         let room_cursor = TypedKeyspace::new(backend.keyspace("hs_appservice.room_cursor")?);
         let pump_meta = TypedKeyspace::new(backend.keyspace("hs_appservice.pump_meta")?);
         let ephemeral_pos = TypedKeyspace::new(backend.keyspace("hs_appservice.ephemeral_pos")?);
         let network_rooms = TypedKeyspace::new(backend.keyspace("hs_appservice.network_rooms")?);
-        Ok(Self {
+        let store = Self {
             backend,
             registry,
             by_as_token,
             by_hs_token,
             health,
             txn_queue,
+            txn_queue_head,
             txn_seq,
             room_cursor,
             pump_meta,
             ephemeral_pos,
             network_rooms,
+        };
+        store.build_queue_heads()?;
+        Ok(store)
+    }
+
+    /// Gives every queue entry written before heads existed its [`QueueHead`], once: a store
+    /// whose `pump_meta` says so is left alone. Each head is written only if its entry is still
+    /// there, in the transaction that checks, so an entry another replica delivers meanwhile
+    /// leaves nothing behind.
+    fn build_queue_heads(&self) -> Result<(), AppserviceError> {
+        let snap = self.backend.snapshot();
+        if self
+            .pump_meta
+            .get(&snap, &(QUEUE_HEADS_BUILT.to_string(),))?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let mut heads: Vec<((String, u64), Vec<u8>)> = Vec::new();
+        for item in self.txn_queue.range(&snap, RangeSpec::full()) {
+            let (key, value) = item?;
+            let entry: QueueHead = decode(&value)?;
+            heads.push((key, encode(&entry)?));
+        }
+        drop(snap);
+        let total = heads.len();
+        for chunk in heads.chunks(QUEUE_HEADS_PER_TXN) {
+            transact(&self.backend, TransactConfig::default(), |txn| {
+                for (key, head) in chunk {
+                    if self.txn_queue.get(txn, key).map_err(to_kv)?.is_some() {
+                        self.txn_queue_head.put(txn, key, head).map_err(to_kv)?;
+                    }
+                }
+                Ok(())
+            })
+            .map_err(|e| AppserviceError::Store(e.to_string()))?;
+        }
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            self.pump_meta
+                .put(txn, &(QUEUE_HEADS_BUILT.to_string(),), b"1")
+                .map_err(to_kv)
         })
+        .map_err(|e| AppserviceError::Store(e.to_string()))?;
+        if total > 0 {
+            tracing::info!(
+                entries = total,
+                "gave each queued appservice transaction its head row, once"
+            );
+        }
+        Ok(())
     }
 
     /// The underlying backend, for callers (the scheduler) that need their own transactions
@@ -548,9 +631,11 @@ impl<B: KvBackend> AppserviceStore<B> {
         };
         let value = serde_json::to_vec(&entry)
             .map_err(|e| hs_kv::KvError::backend(EncodeFail(e.to_string())))?;
-        self.txn_queue
-            .put(txn, &(id.to_string(), seq), &value)
-            .map_err(to_kv)?;
+        let head = serde_json::to_vec(&QueueHead::of(&entry))
+            .map_err(|e| hs_kv::KvError::backend(EncodeFail(e.to_string())))?;
+        let key = (id.to_string(), seq);
+        self.txn_queue.put(txn, &key, &value).map_err(to_kv)?;
+        self.txn_queue_head.put(txn, &key, &head).map_err(to_kv)?;
         Ok(seq)
     }
 
@@ -721,18 +806,12 @@ impl<B: KvBackend> AppserviceStore<B> {
     /// # Errors
     /// Returns [`AppserviceError::Store`]/[`AppserviceError::Decode`] on failure.
     pub fn queue_summary(&self, id: &str) -> Result<QueueSummary, AppserviceError> {
-        /// A queue row without its body.
-        #[derive(Deserialize)]
-        struct Head {
-            enqueued_at_ms: u64,
-            status: QueueStatus,
-        }
         let snap = self.backend.snapshot();
         let prefix = TypedKeyspace::<B::Keyspace, (String, u64)>::prefix(&(id.to_string(),));
         let mut summary = QueueSummary::default();
-        for item in self.txn_queue.range(&snap, prefix) {
+        for item in self.txn_queue_head.range(&snap, prefix) {
             let (_k, v) = item?;
-            let head: Head = decode(&v)?;
+            let head: QueueHead = decode(&v)?;
             match head.status {
                 QueueStatus::Pending => {
                     summary.pending += 1;
@@ -749,6 +828,41 @@ impl<B: KvBackend> AppserviceStore<B> {
         Ok(summary)
     }
 
+    /// The first `max` entries of `id`'s queue still waiting to be sent, in sequence order, with
+    /// their bodies: what [`crate::scheduler::Scheduler::drain`] sends next. Reads the heads up
+    /// to the `max`th waiting entry and the bodies of those alone, however long the queue (a
+    /// bridge that has been off for hours has tens of thousands queued).
+    ///
+    /// # Errors
+    /// Returns [`AppserviceError::Store`]/[`AppserviceError::Decode`] on failure.
+    pub fn pending_batch(
+        &self,
+        id: &str,
+        max: usize,
+    ) -> Result<Vec<QueuedTransaction>, AppserviceError> {
+        let snap = self.backend.snapshot();
+        let prefix = TypedKeyspace::<B::Keyspace, (String, u64)>::prefix(&(id.to_string(),));
+        let mut keys = Vec::new();
+        for item in self.txn_queue_head.range(&snap, prefix) {
+            if keys.len() >= max {
+                break;
+            }
+            let (key, v) = item?;
+            let head: QueueHead = decode(&v)?;
+            if head.status == QueueStatus::Pending {
+                keys.push(key);
+            }
+        }
+        let mut batch = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(bytes) = self.txn_queue.get(&snap, &key)? {
+                batch.push(decode::<QueuedTransaction>(&bytes)?);
+            }
+        }
+        batch.sort_by_key(|e| e.seq);
+        Ok(batch)
+    }
+
     /// Overwrites one queue entry (used by the scheduler to record an attempt's outcome).
     ///
     /// # Errors
@@ -759,10 +873,11 @@ impl<B: KvBackend> AppserviceStore<B> {
         entry: &QueuedTransaction,
     ) -> Result<(), AppserviceError> {
         let value = encode(entry)?;
+        let head = encode(&QueueHead::of(entry))?;
+        let key = (id.to_string(), entry.seq);
         transact(&self.backend, TransactConfig::default(), |txn| {
-            self.txn_queue
-                .put(txn, &(id.to_string(), entry.seq), &value)
-                .map_err(to_kv)
+            self.txn_queue.put(txn, &key, &value).map_err(to_kv)?;
+            self.txn_queue_head.put(txn, &key, &head).map_err(to_kv)
         })
         .map_err(|e| AppserviceError::Store(e.to_string()))
     }
@@ -772,10 +887,10 @@ impl<B: KvBackend> AppserviceStore<B> {
     /// # Errors
     /// Returns [`AppserviceError::Store`] on failure.
     pub fn delete_queue_entry(&self, id: &str, seq: u64) -> Result<(), AppserviceError> {
+        let key = (id.to_string(), seq);
         transact(&self.backend, TransactConfig::default(), |txn| {
-            self.txn_queue
-                .delete(txn, &(id.to_string(), seq))
-                .map_err(to_kv)
+            self.txn_queue.delete(txn, &key).map_err(to_kv)?;
+            self.txn_queue_head.delete(txn, &key).map_err(to_kv)
         })
         .map_err(|e| AppserviceError::Store(e.to_string()))
     }
@@ -1030,5 +1145,74 @@ mod tests {
         let h = s.health("a").unwrap();
         assert_eq!(h.consecutive_failures, 0);
         assert!(h.last_ping_at_ms.is_none());
+    }
+
+    /// The scheduler's next batch comes from the heads: the lowest waiting sequence numbers
+    /// (past 256, where a little-endian key would sort wrong), dead-lettered ones skipped, at
+    /// most `max`, with their bodies; the gauges count the same heads.
+    #[test]
+    fn pending_batch_reads_the_next_waiting_entries_from_their_heads() {
+        let s = store();
+        for n in 0..300u64 {
+            s.enqueue("a", serde_json::json!({ "n": n }), 1_000 + n)
+                .unwrap();
+        }
+        s.enqueue("b", serde_json::json!({ "n": "other" }), 5)
+            .unwrap();
+        for seq in 1..=3u64 {
+            let mut entry = s
+                .queue_for("a")
+                .unwrap()
+                .remove(usize::try_from(seq - 1).unwrap());
+            entry.status = QueueStatus::DeadLettered;
+            s.put_queue_entry("a", &entry).unwrap();
+        }
+        s.delete_queue_entry("a", 4).unwrap();
+
+        let batch = s.pending_batch("a", 20).unwrap();
+        let seqs: Vec<u64> = batch.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, (5..25).collect::<Vec<u64>>());
+        assert_eq!(batch[0].body["n"], 4);
+
+        let summary = s.queue_summary("a").unwrap();
+        assert_eq!(summary.pending, 296);
+        assert_eq!(summary.dead_lettered, 3);
+        assert_eq!(summary.oldest_pending_at_ms, Some(1_004));
+        assert_eq!(s.pending_batch("b", 20).unwrap().len(), 1);
+    }
+
+    /// A queue written before heads existed (the demo's, 2026-10-13) gets them once, when the
+    /// store opens: the scheduler and the gauges see every entry.
+    #[test]
+    fn opening_a_store_builds_heads_for_a_queue_written_without_them() {
+        let backend = MemoryBackend::new();
+        let s = AppserviceStore::open(backend.clone()).unwrap();
+        for n in 0..3u64 {
+            s.enqueue("a", serde_json::json!({ "n": n }), 10 + n)
+                .unwrap();
+        }
+        // As an older server left it: entries, no heads, no marker.
+        transact(&backend, TransactConfig::default(), |txn| {
+            for seq in 1..=3u64 {
+                s.txn_queue_head
+                    .delete(txn, &("a".to_string(), seq))
+                    .map_err(to_kv)?;
+            }
+            s.pump_meta
+                .delete(txn, &(QUEUE_HEADS_BUILT.to_string(),))
+                .map_err(to_kv)
+        })
+        .unwrap();
+        assert_eq!(s.queue_summary("a").unwrap().pending, 0);
+
+        let reopened = AppserviceStore::open(backend).unwrap();
+        assert_eq!(reopened.queue_summary("a").unwrap().pending, 3);
+        let seqs: Vec<u64> = reopened
+            .pending_batch("a", 10)
+            .unwrap()
+            .iter()
+            .map(|e| e.seq)
+            .collect();
+        assert_eq!(seqs, vec![1, 2, 3]);
     }
 }

@@ -387,14 +387,11 @@ impl<B: KvBackend> Scheduler<B> {
             return Ok(DrainOutcome::NoUrl);
         };
 
-        let mut pending: Vec<QueuedTransaction> = self
+        // Only the next batch is read, never the whole queue (`pending_batch`).
+        let pending: Vec<QueuedTransaction> = self
             .registry
             .store()
-            .queue_for(appservice_id)?
-            .into_iter()
-            .filter(|e| e.status == QueueStatus::Pending)
-            .collect();
-        pending.sort_by_key(|e| e.seq);
+            .pending_batch(appservice_id, self.config.max_batch.max(1))?;
 
         if pending.is_empty() {
             return Ok(DrainOutcome::Empty);

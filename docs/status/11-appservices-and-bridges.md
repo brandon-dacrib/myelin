@@ -1,6 +1,7 @@
 # Status: track 11, appservices and bridges
 
-Last updated: 2026-10-12, latest (the iMessage bridge double puppets again, through its
+Last updated: 2026-10-13 (a bridge that is off no longer takes the server down: the scheduler and the
+queue gauges read small head rows, not every queued body; below); before that 2026-10-12, latest (the iMessage bridge double puppets again, through its
 double-puppeting registration; below); before that 2026-10-12, late night (double puppeting is a registration of its own with no url,
 so a bridge is no longer sent every room its owner is in; decision 0046; mautrix-imessage stops
 double puppeting; below); before that 2026-10-12, night (the iMessage bridge starts on the
@@ -41,6 +42,44 @@ manager) and an instance's Kubernetes objects say whose bridge they are; before 
 (who has signed in to a bridge; the `cluster` runtime run on kind); before that 2026-09-30
 (ephemeral, to-device and device-list delivery); before that 2026-09-27 (RFC 0017 run against
 the real binary), 2026-09-27 (the bridge manager) and 2026-09-25.
+
+## Session 2026-10-13 (branch `agent/queue-heads`): a bridge that is off no longer takes the server down
+
+**What happened on the demo.** The iMessage bridge on the owner's Mac has not answered since
+2026-10-12, ~19:20 UTC. Its queue grew to ~36,000 transactions (Prometheus
+`hs_appservice_queue_depth{appservice="imessage-brandon"}`), each a batch of events.
+`Scheduler::drain` read the whole queue, bodies included, on every retry (`queue_for`, every
+few seconds), and the queue gauges read every entry on every scrape (`queue_summary`), both on
+async worker threads. The scrape went from 0.02 s to 0.4-3 s as the queue grew, and hit
+Prometheus's 10 s timeout from 06:23 on 2026-10-13; from 06:34 the server stopped answering
+`/health/live` for 12-20 s at a time while its resident memory swung by ~1 GB, and the kubelet
+restarted it 92 times in 9 hours (0.3.8). The 0.3.9 roll failed on that pod.
+
+**What changed.** Each queue entry has a head row beside it (`hs_appservice.txn_queue_head`,
+`(appservice id, seq) -> {enqueued_at_ms, next_attempt_at_ms, status}`), written in the same
+transaction as the entry by every write (`enqueue_in`, `put_queue_entry`,
+`delete_queue_entry`). `AppserviceStore::pending_batch` reads heads in order up to the batch's
+last waiting entry and fetches only those bodies; `drain` uses it. `queue_summary` (the gauges
+and the admin API's `AppService.queue`) counts heads. A store from before gets its heads once,
+when it opens, each written only if its entry is still there (`pump_meta` row `queue_heads`;
+logged at INFO: `gave each queued appservice transaction its head row, once`).
+
+**Verified** against the real binary on one data directory: 0.3.9's binary queued 4,901
+transactions (10,000 8 KB messages) for an appservice at a closed port. The scrape took
+0.28 s and the process 30-50% CPU while retrying. The new binary built 4,901 heads on start;
+the scrape then took 0.013 s, the process 4-8% CPU, `/health/live` 1.5 ms. With a fresh queue of
+645 entries for a receiver that was down and then started, all 1,500 messages arrived in 33
+transactions with increasing ids, none dead-lettered. Tests:
+`store::tests::pending_batch_reads_the_next_waiting_entries_from_their_heads` (300 entries,
+dead-lettered and deleted ones skipped) and
+`store::tests::opening_a_store_builds_heads_for_a_queue_written_without_them`.
+
+**Left.** `Registry::backlog` (the admin API's backlog list) and `Scheduler::replay` still read
+whole bodies; both run only when an operator asks. A queue for a bridge that never comes back
+grows without bound (every entry is kept until delivered or replayed); a cap or an expiry for
+dead-lettered entries is the next step. A downgrade to a release before this one, then an
+upgrade again, leaves entries queued in between without heads (the marker is already set):
+delete the `queue_heads` row in `hs_appservice.pump_meta` to have them built again.
 
 ## Session 2026-10-12, late night (branch `agent/double-puppet-registration`): double puppeting is a registration of its own, and the bridges are not flooded
 
