@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use axum::Router;
 use axum::extract::Extension;
 use axum::middleware;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use http::StatusCode;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -1087,15 +1087,61 @@ async fn health_ready(
     }
 }
 
-async fn metrics_handler(Extension(metrics): Extension<Arc<Metrics>>) -> impl IntoResponse {
-    match metrics.encode_to_string() {
-        Ok(text) => (
+/// How long a scrape waits, for a rendering already in flight and then for its own, before it
+/// is answered 503 (a rendering carries on to its end on its blocking thread either way). Under
+/// Prometheus's default 10 s scrape timeout, so the scraper hears why.
+const METRICS_RENDER_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// `GET /metrics`: the registry rendered on a blocking thread, one rendering at a time
+/// ([`Metrics::begin_encode`] has why). Until 2026-10-13 it rendered on the async worker that
+/// took the request: the demo's renderings took over a minute, each Prometheus scrape held one
+/// more worker, and within minutes nothing answered `/health/live`.
+async fn metrics_handler(Extension(metrics): Extension<Arc<Metrics>>) -> Response {
+    render_metrics(metrics, METRICS_RENDER_WAIT).await
+}
+
+/// [`metrics_handler`]'s body, with the wait as a parameter for tests.
+async fn render_metrics(metrics: Arc<Metrics>, wait: std::time::Duration) -> Response {
+    let deadline = tokio::time::Instant::now() + wait;
+    let Some(in_flight) = metrics.begin_encode(wait).await else {
+        tracing::warn!(
+            waited_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
+            "a /metrics scrape waited for the previous rendering to finish and gave up; \
+             answered 503"
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the previous metrics rendering is still running",
+        )
+            .into_response();
+    };
+    let rendering = tokio::task::spawn_blocking(move || {
+        let _in_flight = in_flight;
+        metrics.encode_to_string()
+    });
+    match tokio::time::timeout_at(deadline, rendering).await {
+        Ok(Ok(Ok(text))) => (
             StatusCode::OK,
             [(http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
             text,
         )
             .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Ok(Ok(Err(e))) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Ok(Err(join_error)) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, join_error.to_string()).into_response()
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                waited_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
+                "rendering the metrics is taking longer than a scrape waits; answered 503 and \
+                 left it to finish on its blocking thread"
+            );
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "rendering the metrics is taking too long",
+            )
+                .into_response()
+        }
     }
 }
 
@@ -2148,7 +2194,12 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     // scrape.
     if let Some(cluster_metrics) = &cluster_handles.metrics {
         let collector = hs_cluster::metrics::ClusterCollector::new(cluster_metrics.clone());
-        metrics.with_registry(|registry| registry.register_collector(Box::new(collector)));
+        metrics.with_registry(|registry| {
+            registry.register_collector(Box::new(hs_telemetry::TimedCollector::new(
+                "hs_cluster gauges",
+                collector,
+            )));
+        });
     }
     // `/sync` across replicas (`hs_user::cluster`): room owners wake this replica's long-polls
     // over the mesh, this replica reads rooms it does not own through a store-checked mirror,
@@ -2204,7 +2255,14 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     .map_err(|e| ServeError::Sessions(Box::new(e)))?;
     // How much waits for each bridge (`hs_appservice_queue_*`), read from the queue per scrape.
     let queue_collector = appservice_delivery.queue_collector();
-    metrics.with_registry(|registry| registry.register_collector(Box::new(queue_collector)));
+    // Timed: it reads every queue's heads from the store at each scrape, so it is the first
+    // suspect when `/metrics` is slow, and the warning names it if it is.
+    metrics.with_registry(|registry| {
+        registry.register_collector(Box::new(hs_telemetry::TimedCollector::new(
+            "hs_appservice queue gauges",
+            queue_collector,
+        )));
+    });
     // This server's own events reach remote servers from here, from the replica that owns each
     // destination's federation shard. Subscribes to the room stream inside, so it is started
     // before any listener is bound: an event sent before the subscription existed would never
@@ -2820,6 +2878,77 @@ fn normalize_bind_address(bind_address: &str, port: u16) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A collector as slow as the demo's were on 2026-10-13 (scaled down).
+    #[derive(Debug)]
+    struct SlowCollector(std::time::Duration);
+
+    impl prometheus_client::collector::Collector for SlowCollector {
+        fn encode(
+            &self,
+            _encoder: prometheus_client::encoding::DescriptorEncoder,
+        ) -> Result<(), std::fmt::Error> {
+            std::thread::sleep(self.0);
+            Ok(())
+        }
+    }
+
+    /// The 2026-10-13 crash loop in miniature: a rendering slower than the scrape interval, and
+    /// more scrapes than the runtime has workers. Before, each scrape held a worker for the
+    /// whole rendering (or blocked one on the registry lock behind it) and a two-worker runtime
+    /// answered nothing else until they were done; now one rendering runs on a blocking thread,
+    /// the scrapes that cannot wait for it are answered 503, and the runtime stays free.
+    #[test]
+    fn slow_metrics_renderings_never_hold_the_runtime_workers() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let metrics = Arc::new(Metrics::new());
+            metrics.with_registry(|registry| {
+                registry.register_collector(Box::new(hs_telemetry::TimedCollector::new(
+                    "slow test collector",
+                    SlowCollector(std::time::Duration::from_millis(1500)),
+                )));
+            });
+            let started = std::time::Instant::now();
+            let scrapes: Vec<_> = (0..6)
+                .map(|_| {
+                    let metrics = metrics.clone();
+                    tokio::spawn(render_metrics(
+                        metrics,
+                        std::time::Duration::from_millis(300),
+                    ))
+                })
+                .collect();
+            // While they are all in flight, the runtime still runs other work (what
+            // `/health/live` needs) and its timers fire: measured from before the scrapes, since
+            // a held runtime delays the start of a measurement as much as its end.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tokio::spawn(async {}).await.unwrap();
+            assert!(
+                started.elapsed() < std::time::Duration::from_millis(1000),
+                "the runtime was held for {:?} by renderings of 1.5 s",
+                started.elapsed()
+            );
+            for scrape in scrapes {
+                let response = scrape.await.unwrap();
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            }
+            // Once the rendering has finished, the next scrapes render again, one after the
+            // other: the second waits for the first without holding a thread.
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            let second = tokio::spawn(render_metrics(
+                metrics.clone(),
+                std::time::Duration::from_secs(10),
+            ));
+            let response = render_metrics(metrics, std::time::Duration::from_secs(10)).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(second.await.unwrap().status(), StatusCode::OK);
+        });
+    }
 
     /// `hs-config` itself rejects `port: 0` (`ListenersConfig::validate`: "0 is not a bindable
     /// port; choose an explicit port") since it is meaningful for a real deployment to reject —

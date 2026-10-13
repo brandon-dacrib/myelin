@@ -36,7 +36,7 @@ mod sentry_integration;
 
 pub use error::TelemetryError;
 pub use init::{Guard, Level, LogFormat, LogLevelHandle, Options, init};
-pub use metrics::{HttpLabels, Metrics};
+pub use metrics::{EncodeInFlight, HttpLabels, Metrics, TimedCollector};
 pub use request_id::{
     REQUEST_ID_HEADER, RequestIdLayer, RequestIdService, request_id_from_headers,
 };

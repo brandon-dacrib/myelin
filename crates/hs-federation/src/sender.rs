@@ -1281,6 +1281,24 @@ impl FederationSender {
     #[must_use]
     pub fn snapshot(&self) -> SenderSnapshot {
         let queues = self.queues.lock().unwrap_or_else(PoisonError::into_inner);
+        self.snapshot_of(&queues)
+    }
+
+    /// [`FederationSender::snapshot`], or `None` instead of waiting when the queue map is held
+    /// right now (an enqueue for many destinations writes the store under it). What the
+    /// gauges read: a scrape must never wait on the sender.
+    #[must_use]
+    pub fn try_snapshot(&self) -> Option<SenderSnapshot> {
+        match self.queues.try_lock() {
+            Ok(queues) => Some(self.snapshot_of(&queues)),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                Some(self.snapshot_of(&poisoned.into_inner()))
+            }
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
+
+    fn snapshot_of(&self, queues: &HashMap<String, DestinationQueue>) -> SenderSnapshot {
         let mut edus_queued = 0usize;
         let mut state_bytes = 0usize;
         for (name, queue) in queues.iter() {
@@ -1862,7 +1880,15 @@ impl Shared {
             if remaining <= slice {
                 return !self.shut_down.load(Ordering::Acquire);
             }
-            if self.state_of(destination).is_ready(now_ms()) {
+            // A slice that overslept past the end of the wait is the wait ending, not an
+            // administrator's reset: under a lagging runtime a 30 s sleep can wake late, and
+            // before 2026-10-13 every such worker logged a reset that nobody had made (bursts
+            // of them in the demo's crash loop).
+            let now = now_ms();
+            if now >= until_ms {
+                return !self.shut_down.load(Ordering::Acquire);
+            }
+            if self.state_of(destination).is_ready(now) {
                 tracing::info!(
                     destination,
                     "outbound backoff was reset while waiting; trying now"

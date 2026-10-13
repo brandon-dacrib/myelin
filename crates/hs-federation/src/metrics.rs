@@ -795,7 +795,8 @@ pub fn pdus_sent() -> u64 {
 }
 
 /// The `hs_federation_sender_*` gauges, read from a [`crate::sender::FederationSender`] at every
-/// scrape ([`crate::sender::FederationSender::snapshot`]):
+/// scrape without waiting on it ([`crate::sender::FederationSender::try_snapshot`]; the previous
+/// scrape's values when its queue map is busy):
 ///
 /// - `hs_federation_sender_destinations`: destinations this process has a worker for.
 /// - `hs_federation_sender_pdus_pending`: PDUs queued for them and not yet accepted or dropped.
@@ -808,6 +809,9 @@ pub fn pdus_sent() -> u64 {
 /// lacked: whether the sender's own state was what grew.
 pub struct SenderGauges {
     sender: std::sync::Arc<crate::sender::FederationSender>,
+    /// The last snapshot taken, reported again when the sender's queue map is busy at a scrape
+    /// ([`crate::sender::FederationSender::try_snapshot`]) rather than waiting for it.
+    last: std::sync::Mutex<crate::sender::SenderSnapshot>,
 }
 
 impl std::fmt::Debug for SenderGauges {
@@ -821,7 +825,16 @@ impl prometheus_client::collector::Collector for SenderGauges {
         &self,
         mut encoder: prometheus_client::encoding::DescriptorEncoder,
     ) -> Result<(), std::fmt::Error> {
-        let snapshot = self.sender.snapshot();
+        let snapshot = {
+            let mut last = self
+                .last
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(fresh) = self.sender.try_snapshot() {
+                *last = fresh;
+            }
+            *last
+        };
         let gauges: [(&str, &str, usize); 5] = [
             (
                 "hs_federation_sender_destinations",
@@ -871,7 +884,10 @@ pub fn register_sender_gauges(
     registry: &mut Registry,
     sender: std::sync::Arc<crate::sender::FederationSender>,
 ) {
-    registry.register_collector(Box::new(SenderGauges { sender }));
+    registry.register_collector(Box::new(SenderGauges {
+        sender,
+        last: std::sync::Mutex::default(),
+    }));
 }
 
 /// `edu_type` if it is one of [`KNOWN_EDU_TYPES`], `other` if not.

@@ -1,5 +1,50 @@
 # 06 Federation: status
 
+## 2026-10-13 (branch `agent/federation-boot-storm`): the demo's crash loop was `/metrics`, not the federation sender
+
+**Asked**: the demo's `myelin-hs-0` (0.3.10) was killed by its liveness probe every 2-6 minutes;
+each boot resumed ~420 outbound queues of mostly dead servers at once. Was that boot storm what
+blocked the runtime?
+
+**No.** Reproduced locally on the real release binary over Fjall (`examples/seed_outbound.rs`:
+420 destinations, 13 durable EDUs each, a PDU for every fifth; 150 `.invalid`, 150 `nip.io`
+names of blackholed `10.255.x.x`, 80 refused `127.0.0.1` ports, 40 policy-forbidden
+`192.0.2.x`): the resume storm (420 resumed, 310 failed, 300 unresolvable, 40 dropped) left
+`/health/live` at worst 21 ms over 80 probes, CPU ~2 % at steady state, and the persisted backoff
+survived a restart (`failures=7`, 240 of 380 waiting out their backoff). The demo's failures at
+`failures=1` were live servers whose requests timed out while the demo's runtime was stalled.
+
+**What it was** (evidence: Prometheus and Loki on the demo, and a read-only scrape through the
+owner's proxy): `GET /metrics` rendered the registry synchronously on the async worker that took
+the request, under a `std::sync::Mutex`. `scrape_duration_seconds{job="myelin-hs"}` grew from
+0.05 s (2026-10-12 18:00) to 2-4 s overnight and 5-8 s by 06:30 on 2026-10-13, and hit
+Prometheus's 10 s timeout from 07:00, the hour the kills began (first at 06:34; 6, 11, 13 an
+hour from 07:00). Server-side, `/metrics` took 1-30 s while `/health/live` took under 32 ms
+whenever it ran; a scrape at 19:33:40, three seconds after a boot, did not answer in 60 s. A
+rendering cannot be cancelled, so each scrape held a worker until it finished, and each scrape
+behind it blocked another on the lock: Prometheus every 30 s against 8 workers is a stall within
+about four minutes, then the probe's three failures. The kill cadence matches.
+
+**Fixed** (`hs-telemetry`, `hs-cli`, small changes outside this track, said here):
+`Metrics::begin_encode` hands out one rendering at a time and a scrape waits for it
+asynchronously; `hs-cli`'s handler renders on a blocking thread and answers 503 after 8 s
+(the rendering finishes on its own thread). `hs_process_metrics_encode_seconds` exports the last
+rendering's time, a rendering over 1 s is logged at `warn`, and `TimedCollector` names a slow
+collector (the appservice queue gauges and the cluster gauges are wrapped). Here: the sender's
+gauges no longer wait on its queue map (`FederationSender::try_snapshot`, previous values when it
+is busy), and a backoff slice that overslept past its end is no longer logged as `outbound backoff
+was reset while waiting` (bursts of those on the demo were lag, not resets).
+
+**Verified**: `serve::tests::slow_metrics_renderings_never_hold_the_runtime_workers` (two
+workers, six scrapes of a 1.5 s rendering) holds the runtime 7.5 s with the old handler and under
+1 s with the new; the real binary over the seeded data dir answers every probe in under 5 ms and
+`/metrics` in 1-2 ms.
+
+**Left**: which collector is slow on the demo (the first `a metrics collector took long to render`
+warning after the roll names it; the appservice queue gauges are the suspect, the only collector
+that reads the store); the ~3.4 cores the process uses at rest, which predates this and was not
+found here; the resume still starts every worker at once (harmless locally, not changed).
+
 ## 2026-10-10 (branch `agent/fed-destinations`): a destination this server shares no room with can be forgotten, by hand, by a prune, or by the hourly sweep (decision 0042)
 
 **Why.** After one join-and-leave of `#matrix:matrix.org` the Federation page listed thousands

@@ -1,10 +1,25 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-10-13, 13:50 EDT (0.3.10 on the demo, checked). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+Written 2026-09-20 by the integration lead, last revised 2026-10-13, evening (the crash loop is `/metrics`; fix on `agent/federation-boot-storm`). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
-## Resume here: 2026-10-13, 13:50 EDT -- 0.3.10 runs on the demo, checked; it no longer freezes under the iMessage queue
+## Resume here: 2026-10-13, evening -- the demo's crash loop is the `/metrics` handler; the fix is `agent/federation-boot-storm`
+
+0.3.10 was still killed by its liveness probe every 2-6 minutes (24 restarts by 19:45 UTC).
+**Cause**: `/metrics` rendered on the async worker that took the request; renderings grew to
+over a minute (`scrape_duration_seconds` 0.05 s on 2026-10-12, 10 s timeouts from 07:00 on
+2026-10-13, the hour the kills began), each Prometheus scrape held one more worker, and the
+runtime stalled (status 06, 2026-10-13). The federation boot storm was tested on the real
+binary with 420 dead destinations and is not the cause. **The fix**: rendering on a blocking
+thread, one at a time, 503 after 8 s. **Roll it as soon as it is released**; check no restarts,
+`/health/live` fast, and read the first `a metrics collector took long to render` warning: it
+names the slow collector (the appservice queue gauges are the suspect), which is the next fix.
+Until then the server stays up but `/metrics` may answer 503. The ~3.4 cores at rest are still
+unexplained. Note: two read-only scrapes through the proxy at 19:33-19:37 UTC shortened two
+uptimes (each held a worker too).
+
+## Earlier: 2026-10-13, 13:50 EDT -- 0.3.10 runs on the demo, checked; it no longer freezes under the iMessage queue
 
 Rolled 17:32 UTC (revision 23). **Checked through the owner's proxy**: `myelin-hs-0` on
 `ghcr.io/brandon-dacrib/myelin:0.3.10`, 0 restarts after 16 minutes (0.3.9 had restarted 15

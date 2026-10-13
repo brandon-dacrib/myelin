@@ -19,6 +19,10 @@ carries the generated notes for that merge.
   starts where the waiting transactions start instead of walking past every one that ran out of
   retries, a delivered batch is removed in one write, and the bridge's backlog list and replay
   read a page at a time. A 35,000-transaction queue drains about three times faster.
+- **A slow metrics scrape no longer takes the server down.** `/metrics` is rendered off the
+  request threads, one rendering at a time; a scrape that would wait past 8 s is answered 503.
+  On the demo every scrape held a thread until the slow rendering finished, and within minutes
+  nothing answered the liveness probe, so the server was restarted every few minutes all day.
 - **One row per bridge on the Registrations tab.** A bridge's double-puppeting registration is
   shown on the bridge's own row ("Double puppeting on") instead of as a second row, which read as
   a duplicate. The bridge's page links it, and its own page now says what it is (the bridge's key
