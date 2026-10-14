@@ -118,6 +118,19 @@ with `{"device_ids": ["yLLbqe7oX4"]}`). Never `h7ijM5DMbF`.
 **Next.** Compute a transaction's MSC3202 counts when it is sent, not when it is queued (Synapse's
 `_compute_msc3202_otk_counts_and_fallback_keys` runs in the sender), so a bridge draining a
 backlog is told its devices' counts as they are, not as they were hours before.
+## 2026-10-14 (track 06's branch `agent/federation-boot-freeze`): the queue gauges read from the floor
+
+`AppserviceStore::queue_summary` -- what `hs_appservice_queue_*` and the admin API's
+`AppService.queue` read, at every scrape -- walked each queue's heads from the first entry,
+the delivered entries' tombstones included: 1 to 5.7 s per scrape on the demo, whose iMessage
+queue had ~31,000 delivered behind its floor (`hs_appservice queue gauges` in the
+`TimedCollector` warning). It now reads from `queue_floor`, as `pending_batch` does: nothing
+below the floor waits, so below it only the dead-lettered entries are counted, once, and
+remembered per queue (`QueueFront`), each later summary counting only those the floor has passed
+since. A replay or a purge (`requeue_dead_lettered`, `purge_queue`) has the fronts counted
+again, and every remembered front is recounted from the start after ten minutes. Test:
+`a_queue_summary_reads_from_the_floor_and_remembers_the_front` (counts unchanged; the second
+summary reads no head below the floor).
 
 ## Session 2026-10-14 (branch `agent/ephemeral-prune`): the ephemeral pump's prune no longer spins on a refused transaction
 

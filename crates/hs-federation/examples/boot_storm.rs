@@ -4,16 +4,19 @@
 //! server it shares a room with, and the live ones answer the way Synapse does -- with a
 //! `GET /user/devices/{userId}` resync for each user, and their own traffic on top.
 //!
-//! One program, four commands:
+//! One program, five commands:
 //!
 //! ```text
 //! boot_storm peers   --count N --base-port P --hs http://127.0.0.1:18408 --hs-name NAME
-//!                    [--rooms FILE] [--join] [--pdus-per-sec R] [--edus-per-sec E]
-//!                    [--resync-delay-ms D] [--stats-every S]
+//!                    [--rooms FILE] [--join] [--state FILE] [--pdus-per-sec R]
+//!                    [--edus-per-sec E] [--resync-delay-ms D] [--stats-every S]
 //! boot_storm setup   --hs URL --hs-name NAME --users U --devices D --rooms R --out FILE
+//!                    [--first-user K] [--join-rooms FILE]
+//! boot_storm local-chatter --hs URL --user NAME --rooms FILE [--per-sec R] [--typing-per-sec T]
 //! boot_storm reset-announcer <data-dir>/db [position]
 //! boot_storm probe   --url URL [--interval-ms 250] [--timeout-ms 5000] [--duration-s 300]
-//!                    [--pid PID --sample-dir DIR --sample-over-ms 1000]
+//!                    [--pid PID --sample-dir DIR --sample-over-ms 1000 --max-samples 3]
+//!                    [--metrics URL --metrics-grep NAME,NAME]
 //! ```
 //!
 //! - `peers` runs `N` federation peers, `127.0.0.1:P` to `127.0.0.1:P+N-1`, each with its own
@@ -22,17 +25,26 @@
 //!   leaves `127.0.0.0/8` alone). Each serves its key, accepts `/send` (answering every PDU),
 //!   and answers a device-list or signing-key update for a user it has not resynced in the last
 //!   30 s with a signed `GET /user/devices/{userId}` after a random delay of up to
-//!   `--resync-delay-ms`. With `--join` each peer first joins every room in `--rooms` over
-//!   `make_join`/`send_join`. `--pdus-per-sec` and `--edus-per-sec` add each peer's own
-//!   traffic: messages into the rooms, typing, receipts and presence.
+//!   `--resync-delay-ms`, counting the updates that came with no `prev_id`. With `--join` each
+//!   peer first joins every room in `--rooms` over `make_join`/`send_join`, and with `--state`
+//!   writes what it learned there (and reads it back on a later run without `--join`). Fewer
+//!   peers than joined leaves the rest dead. `--pdus-per-sec` and `--edus-per-sec` add the peers'
+//!   own traffic: messages into the rooms, typing, receipts and presence.
 //! - `setup` registers `U` users with `D` devices each (keys uploaded), creates `R` public rooms
-//!   (room version 10) and joins every user to each, writing the room IDs to `--out`.
+//!   (room version 10) and joins every user to each, writing the room IDs to `--out`; with
+//!   `--join-rooms` the users (named from `--first-user` on) join those rooms instead.
+//! - `local-chatter` logs in as a local user and talks in the rooms: `--per-sec` messages and
+//!   `--typing-per-sec` typing notices, each one for every server in the room.
 //! - `reset-announcer` moves every federation shard's device-list announcer place in a stopped
-//!   server's store back to `position` (0 by default): the next boot re-announces every local
-//!   user as whole lists, as each of the demo's boots did.
+//!   server's store back to `position` (0 by default): the next boot announces every local user
+//!   again from there, as each of the demo's boots did.
 //! - `probe` asks `/health/live` every `--interval-ms` and prints each second's slowest answer;
-//!   with `--pid`, the first answer slower than `--sample-over-ms` runs `/usr/bin/sample` on the
-//!   server (macOS) for 10 s into `--sample-dir`.
+//!   with `--pid`, an answer slower than `--sample-over-ms` runs `/usr/bin/sample` on the server
+//!   (macOS) for 10 s into `--sample-dir`; with `--metrics`, the named metric lines are printed
+//!   every two seconds.
+//!
+//! On 2026-10-14, with 700 live peers, 720 dead destinations and 35 users, 0.3.17 froze for 70 s
+//! of 90 and the fixed server answered every probe within 29 ms (status 06 has the numbers).
 
 use std::collections::HashMap;
 use std::convert::Infallible;

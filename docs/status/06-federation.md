@@ -1,5 +1,144 @@
 # 06 Federation: status
 
+## 2026-10-14 (branch `agent/federation-boot-freeze`): the boot freeze with federation on -- store work on the runtime's threads, a resync storm the announcer provoked, and duplicate room loads
+
+**Asked**: the demo (0.3.17, embedded Fjall on a Longhorn volume, one pod, eight cores) froze
+about a minute into every boot with federation on: `/health/live` stopped answering, the
+liveness probe killed the pod, and it crash-looped until federation was turned off at 17:48 UTC.
+Find the cause and fix it, so federation can be turned back on. (The investigation's working
+notes, `docs/notes/federation-boot-freeze-wip.md` on `agent/federation-boot-freeze-wip`, are
+folded in here; that branch can go.)
+
+**What the demo showed** (Loki and Prometheus through the owner's proxy):
+- Every boot logged `announcing the device-list changes ... from=1314`: the announcer's stored
+  place never moved, so each boot announced the same changes again, as whole device lists with
+  an empty `prev_id`, to some 1,000-1,400 servers. A boot that lived four minutes still had not
+  finished it.
+- Inbound `GET /user/devices/{userId}`: 947 an hour at 3.2 s each (0.45 s on 2026-10-12), 472 in
+  one minute; `/send` about 5 s each. That is every live server resyncing every announced user:
+  Synapse resyncs on any update with no `prev_id`.
+- `hs_federation_sender_destinations` read **0 at every scrape** of every boot, with 265-1,400
+  workers running: `FederationSender::try_snapshot` found the sender's queue map held each time.
+- CPU 2-3.8 cores of eight while frozen: the runtime's threads were waiting, not computing.
+- Room loads of 2-120 s, and some 400 s each with federation off (track 04's finding).
+
+**What it was** -- reproduced locally and sampled. `examples/boot_storm.rs` (new) runs signing,
+TLS-serving federation peers that join a server's rooms over `make_join`/`send_join` and, like
+Synapse, answer a device-list update by asking for `GET /user/devices/{userId}`; it can also
+reset a stopped server's announcer place and probe `/health/live`, running `/usr/bin/sample` on a
+slow answer. Against 0.3.17 with 700 live peers, 720 dead destinations, three rooms of ~1,000
+servers and 35 users with 4-5 devices each, booting from announcer place 0 (as the demo did), the
+runtime froze within seconds: `/health/live` timed out for 70 s of 90, the sender gauge read 0
+like the demo's, peers' resyncs failed 6,399 of 11,033 (10.9 s average) and their sends 13,508 of
+13,603, and 5,360 transactions went out in five minutes. The samples, of the frozen binary:
+1. **Synchronous store work on the async workers** -- 86 % of their busy time in Fjall calls:
+   answering `/user/devices` (44 %: the auth store's devices and the e2e store's keys, every
+   block a cache miss read from disk), the sender's per-destination bookkeeping (`settle_edus` ->
+   `ack_durable_edus`, `settle`, `gather_edus`, the client's destination-store write on every
+   request), and the announcer's `enqueue_edu_local`: one transaction of ~8,400 mutations per EDU,
+   under the sender's `queues` mutex, which is why the gauge read 0.
+2. **The resync storm the announcer provoked**: whole lists with no `prev_id`, again at every boot,
+   because the place was stored only after everything was announced and what was announced lived
+   in memory. 24,500 resyncs in the repro; ~1,000 a minute on the demo.
+3. **Duplicate room loads**: `RoomRegistry::get_or_load` shared nothing, so every request for a
+   room still loading started its own full load. 114 threads were loading the three rooms at once
+   in the frozen sample, 465 after the first fixes. Off the async workers (they run in
+   `spawn_blocking`), but they took every core and the blocking pool, and every caller waited.
+Not the cause: dead destinations and resuming 1,580 workers (2026-10-13 and 2026-10-14, under 2 ms
+probes), and room work on the async workers (none: actors run in `spawn_blocking`).
+
+**Fixed**:
+- `hs-federation` sender: every write and every read of queued rows runs on a blocking thread
+  (`Shared::on_store`), at most `STORE_CONCURRENCY` (16) at once; the bookkeeping point reads stay
+  in place (a hop each cost more, in the blocking pool's own lock, than the read). `enqueue_pdu`
+  and the durable-EDU path write `ENQUEUE_BATCH` (100) destinations per transaction, without the
+  queue map held (PDU order is kept by a separate `pdu_order` lock). A success on a destination
+  already healthy and recorded under a minute ago writes nothing (`is_settled_success`, both
+  stores). Slow store operations are counted and warned about once per 10 s.
+- `hs-federation` destination store: writes on blocking threads; settled successes write nothing.
+- `hs-federation` inbound: at most `INBOUND_CONCURRENCY` (64) federation requests at once, X-Matrix
+  checks included; the rest wait up to 30 s holding no thread, then `429 M_LIMIT_EXCEEDED` with
+  `Retry-After`. `/health/live` and the client API never wait there. Liveness still fails if the
+  runtime is truly wedged: nothing answers it from outside the runtime.
+- `hs-federation` outbound store: `announced`/`set_announced`, the announcer's records per (user,
+  federation shard), in the new keyspace `hs_federation.outbound_announced`.
+- `hs-cli` device-list announcer: reads the stream `ANNOUNCE_STEP` (50) positions at a time and
+  stores each shard's place after every step; keeps what each shard's destinations were told per
+  user and sends the difference with `prev_id` (a user with no record is still announced whole);
+  writes on blocking threads. Shards taken on read their records, not whole lists.
+- `hs-cli` `/user/devices`: answered on a blocking thread, from `DeviceListAnswers`, a cache
+  keyed by the user's device-list stream position (kept only when the position was the same
+  before and after the read).
+- `hs-cli` feeder: `enqueue_pdu` and the forwarded-position read and write on blocking threads.
+- `hs-room` (track 04's crate, said here): `get_or_load` loads a room once however many ask
+  (single flight; a failed load is made again by the next waiter), at most
+  `MAX_CONCURRENT_LOADS` (4) at once; `RoomRegistry::loads_started` counts them.
+- `hs-auth` (track 07's crate, said here): a device's last-seen and a token's last-used are written
+  once a minute (`LAST_USE_PRECISION_MS`), not on every authenticated request.
+- `hs-appservice` (track 11's crate, said here): `queue_summary` reads from the queue floor and
+  remembers the dead letters below it, so the queue gauges no longer walk the delivered entries'
+  tombstones at every scrape.
+
+**Observability** (new): `hs_runtime_heartbeat_lateness_seconds` and
+`hs_runtime_heartbeat_lateness_max_seconds` (a 250 ms heartbeat's lateness), and a watchdog OS
+thread that logs `the async runtime has not run its heartbeat for over three seconds` *while* a
+stall lasts and `... is running again after a stall` with its length; a late beat is a `warn`.
+`hs_federation_device_list_announce_seconds` (per step), `..._announcer_behind` (positions behind
+the stream) and `..._announced_users_total`; slow steps logged at `info` with where they got to.
+`hs_federation_user_devices_seconds`, `hs_federation_sender_store_seconds{op}`,
+`hs_federation_inbound_in_flight`, `..._inbound_slot_wait_seconds`, `..._inbound_refused_total`.
+
+**Verified**, same data and load, eight runtime threads (`TOKIO_WORKER_THREADS=8`):
+
+| | 0.3.17 | all fixes but single-flight loads | this branch |
+|---|---|---|---|
+| `/health/live` worst | 5 s timeouts, 70 s of 90 frozen | 1.2 s | 29 ms (14 ms, 62 ms with two threads) |
+| peers' resyncs ok / failed | 4,634 / 6,399 (10.9 s avg) | 1,877 / 2,210 | 24,500 / 0 (73 ms avg) |
+| peers' sends ok / failed | 95 / 13,508 (49 s avg) | 25 / 5,361 | 6,959 / 242* (66 ms avg) |
+| transactions delivered | 5,360 in 330 s | 1,394 in 120 s | 921,137 in 120 s |
+| async workers' time in the store | 86 % of busy | -- | 3 % (point reads) |
+
+\* before the server was listening. Announcer: steps of 1.2-4.6 s, place stored after each, done
+by 16 s. A second boot from announcer place 0 with the records kept sent 700 device-list updates
+(the one device the test client's login added), **none without `prev_id`**, against 133,000 whole
+lists on the first. Tests: `cargo test -p hs-federation`, `-p hs-room`, `-p hs-appservice`,
+`-p hs-auth`, `-p hs-cli --lib`, and `-p hs-cli --test federation_edus --test federation_sender
+--test federation_reads --test federation_writes --test auth_sessions --test appservice_isolation`
+all pass; new tests name each fix (`an_enqueue_for_more_destinations_than_a_batch_reaches_every_one`,
+`a_success_on_a_healthy_destination_writes_nothing`, `announcement_records_are_kept_by_user_and_shard`,
+`kv_store_writes_a_success_only_when_it_changes_something`,
+`an_inbound_request_holds_a_slot_while_it_is_worked_on`,
+`shards_at_one_place_are_read_together_a_step_at_a_time`,
+`a_shard_taken_on_starts_at_its_stored_place_or_the_old_one_or_now`,
+`an_announcement_record_reads_back_as_it_was_written`,
+`a_device_list_answer_is_given_again_only_at_its_position`,
+`a_blocked_runtime_is_noticed_while_it_lasts_and_measured_after`,
+`many_asking_at_once_for_a_room_share_one_load`,
+`a_queue_summary_reads_from_the_floor_and_remembers_the_front`).
+
+**Reproduce**: `cargo build --release -p hs-cli --bin hs -p hs-federation --example boot_storm`;
+`boot_storm setup`, `boot_storm peers --join --state ...`, `seed_outbound`, `boot_storm
+reset-announcer`, then boot with `boot_storm peers --state ... --pdus-per-sec 10 --edus-per-sec
+50`, `boot_storm local-chatter --typing-per-sec 10` and `boot_storm probe --pid ... --metrics
+...` (the example's docs have every flag).
+
+**Left**:
+- On the demo after the roll: watch `hs_runtime_heartbeat_lateness_max_seconds`, the watchdog's
+  `warn`, `hs_federation_device_list_announcer_behind` (should reach 0 within a minute of boot and
+  stay), `hs_room_load_seconds` and `hs_federation_inbound_refused_total`. The first boot still
+  announces whole lists (no records exist yet); from the second on, differences.
+- Fjall's block cache is the default 32 MiB (`hs-kv` sets none): most reads in the samples were
+  block misses (`pread`, checksum, decompress). Raising it is track 01's call; it would cut the
+  CPU of every room load and device-list read.
+- A room load holds one Fjall snapshot for its whole length (400 s on the demo), which keeps every
+  commit since in Fjall's conflict list (`committed_txns`), walked on every commit under its
+  global lock. Track 04/01.
+- Other synchronous store work on the async workers remains outside federation: the session
+  hub's EDU and room-update writes (`hs-user`, being reworked on `agent/hub-wedge`), push
+  evaluation, sync. The federation paths are off them now.
+- The demo's notary waits (`matrix.org`, 8 slots, 10 s timeouts) were not reproduced (the peers
+  serve their own keys); they cost latency, not threads.
+
 ## 2026-10-13 (branch `agent/federation-boot-storm`): the demo's crash loop was `/metrics`, not the federation sender
 
 **Asked**: the demo's `myelin-hs-0` (0.3.10) was killed by its liveness probe every 2-6 minutes;
@@ -4090,6 +4229,16 @@ this track can fix (`crates/hs-http/**` is out of this session's ownership).
 
 ## Interfaces provided
 
+- **Boot-freeze fixes** (2026-10-14): `OutboundStore::{announced, set_announced}` (defaults keep
+  nothing; both stores implement them) and `FederationSender::{announced, set_announced}`;
+  `OutboundStoreError::Interrupted`; `OutboundDestinationState::is_settled_success`,
+  `SUCCESS_REFRESH_MS`; `DestinationState::is_settled_success`; `sender::{STORE_CONCURRENCY,
+  ENQUEUE_BATCH}`; `transport::{INBOUND_CONCURRENCY, INBOUND_SLOT_WAIT, inbound_in_flight}`;
+  `metrics::{record_sender_store_seconds, record_device_list_announce_step,
+  set_device_list_announcer_behind, record_user_devices_seconds, record_inbound_refused,
+  record_inbound_slot_wait, InboundInFlight}` and their readers. `enqueue_pdu` and the durable
+  EDU path now block for their batched writes without the queue map held: callers on the runtime
+  run them on a blocking thread (`hs-cli`'s feeder and announcer do).
 - **Catch-up** (2026-09-30, fifteenth session): `crate::sender::CatchUpSource`
   (`async fn latest_pdu(&self, room_id, destination) -> Result<Option<Value>, String>`; `hs-cli`'s
   `federation_sender::RoomCatchUp` implements it), `FederationSender::{install_catch_up_source,
@@ -4241,6 +4390,20 @@ this track can fix (`crates/hs-http/**` is out of this session's ownership).
 
 ## Decisions made
 
+- **Store work leaves the runtime's threads; bookkeeping point reads stay** (2026-10-14). Every
+  write and every read of queued rows the sender, the destination store, the announcer and the
+  `/user/devices` answer make runs on a blocking thread (`spawn_blocking`), bounded where it is
+  per destination (16 sender slots). A point read of one small bookkeeping row stays in place:
+  in the repro a hop per read cost more, in the blocking pool's lock, than the read.
+- **The announcer keeps what it told each shard, per user, in the sender's store** (2026-10-14).
+  Per (user, federation shard), so in a cluster each replica diffs against what its own
+  destinations were told; in single-node mode the 64 records of a user are written in one
+  transaction. A restart then sends differences with `prev_id`; only a user with no record is
+  announced whole.
+- **Inbound federation is bounded at 64 requests, then 429 after 30 s** (2026-10-14). A process
+  -wide semaphore, outermost on the signed federation routes (media's are not under it). Synapse
+  answers overload the same way; a sending server retries a transaction, and a resyncing one asks
+  again later.
 - **Catch-up follows Synapse, with a durable queue in front of it** (2026-09-30). Synapse
   drops its in-memory queue and enters catch-up on the first failure; this server keeps its
   durable queue up to a bound (`federation.max_queued_pdus_per_destination`, 10,000) and only

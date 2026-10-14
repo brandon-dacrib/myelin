@@ -36,6 +36,31 @@ on a room update` with the room, update and step after 30 s; gauges `hs_user_hub
 not tied to it (one replica: it would take the only endpoint away). **After the roll**: watch
 `hs_user_hub_lag_updates` stay near 0, and if the stuck warning appears, its room and step are
 the next fix (likely an `hs-room` read under the room's lock).
+Written 2026-09-20 by the integration lead, last revised 2026-10-14 (the federation boot freeze; fix on `agent/federation-boot-freeze`). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+
+The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
+
+## Resume here: 2026-10-14, evening -- the federation boot freeze; the fix is `agent/federation-boot-freeze`
+
+0.3.17 froze a minute into every boot with federation on and crash-looped; federation has been
+off on the demo since 17:48 UTC. **Cause** (status 06, 2026-10-14; reproduced with
+`examples/boot_storm.rs` and sampled): the device-list announcer stored its place only once it
+had announced everything, so each killed boot announced the same users again as whole lists with
+no `prev_id`; every live server asked for each list back (`GET /user/devices`); those answers,
+the sender's per-destination bookkeeping and the announcer's 8,400-mutation transactions ran as
+synchronous store work on the runtime's eight threads, and `get_or_load` started a full room load
+for every request that touched a room still loading (114-465 at once). **The fix**: store work
+on blocking threads, batched enqueues without the sender's queue map held, settled successes
+and last-seen times not rewritten, the announcer in 50-position steps with per-user records (a
+restart sends differences with `prev_id`), `/user/devices` cached by stream position, one room
+load per room (at most four at once), inbound federation bounded at 64 then 429, the appservice
+queue gauges reading from the floor, and a runtime heartbeat with a watchdog thread that logs a
+stall while it lasts. Repro on the same data: `/health/live` worst 5 s timeouts (70 s frozen) ->
+29 ms; 921,137 transactions out in 120 s instead of 5,360 in 330 s. **After the roll, turn
+federation back on** and watch `hs_runtime_heartbeat_lateness_max_seconds`, the watchdog's
+`warn`, `hs_federation_device_list_announcer_behind` (0 within a minute), `hs_room_load_seconds`
+and `hs_federation_inbound_refused_total`. Left: Fjall's 32 MiB default block cache (track 01),
+a room load's long-held snapshot (tracks 04/01), the hub's synchronous writes (`agent/hub-wedge`).
 
 ## Earlier: 2026-10-14 -- the overnight liveness kills; a refused prune spun the ephemeral pump; the fix is `agent/ephemeral-prune`
 

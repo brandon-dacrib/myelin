@@ -18,6 +18,17 @@ unfixed (held by another track this session), checked for Element-Web findings i
 `docs/status/16-management-web-interface.md` (none landed as of this write-up), and designed
 (without implementing) a UIA session-correlation scheme left open at the end of session 5).
 
+## 2026-10-14 (track 06's branch `agent/federation-boot-freeze`): last-seen and last-used are written once a minute
+
+Every authenticated request wrote twice, on its own runtime thread: the device's last-seen
+time and address (`record_seen`) and the token's last-used time (`mark_access_token_used`). Under
+the federation boot storm (status 06, 2026-10-14) those writes waited for the store's commit
+lock with the rest, and in the reproduction they were the last store work left on the runtime's
+threads. `TablesAuthStore` now reads the record first, outside any transaction, and writes only
+when the recorded time is a minute old or more, or the address changed
+(`LAST_USE_PRECISION_MS`), as Synapse batches its `client_ips`. Everything that reads them (the
+device list, the admin API, token expiry) works in minutes or days.
+
 ## 2026-10-09: self-service deactivation leaves rooms, the rest of CAS and SSO, pending registrations across replicas, bind/unbind against the real binary (branch `agent/auth-leftovers`)
 
 The 2026-10-05 "Left" list, less what needs another track. The four items `docs/next-steps.md`

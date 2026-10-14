@@ -3892,7 +3892,11 @@ mod tests {
         );
         sender.enqueue_pdu(destinations.clone(), pdu(1));
         for destination in &destinations {
-            assert_eq!(store.durable_edu_len(destination).unwrap(), 1, "{destination}");
+            assert_eq!(
+                store.durable_edu_len(destination).unwrap(),
+                1,
+                "{destination}"
+            );
             assert_eq!(store.queue_len(destination).unwrap(), 1, "{destination}");
         }
         assert_eq!(sender.pending_pdus(), destinations.len());
@@ -3943,11 +3947,7 @@ mod tests {
             let records = store.announced("@a:us.example.org").unwrap();
             assert_eq!(
                 records,
-                std::collections::BTreeMap::from([
-                    (0, first.clone()),
-                    (1, second),
-                    (2, first)
-                ])
+                std::collections::BTreeMap::from([(0, first.clone()), (1, second), (2, first)])
             );
             assert!(store.announced("@b:us.example.org").unwrap().is_empty());
         }

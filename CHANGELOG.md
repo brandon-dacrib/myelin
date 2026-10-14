@@ -30,6 +30,20 @@ carries the generated notes for that merge.
   (`the session hub is stuck on a room update`), and new gauges show whether the hub keeps up
   (`hs_user_hub_lag_updates`, `hs_user_hub_oldest_pending_seconds`,
   `hs_user_hub_stuck_updates`).
+- **A server with federation on no longer freezes at boot.** A minute into every boot the demo
+  stopped answering, its liveness probe killed it, and it went round again. Each boot told every
+  server sharing a room with its users all of their devices again, with nothing to say what came
+  before, and each live server asked for every list back; those answers, the outbound sender's
+  bookkeeping and the announcement itself ran as store work on the request threads, and every
+  request that touched a room still loading started its own load of it. Now the store work runs
+  off the request threads, a room loads once however many ask (at most four at once), the
+  device-list announcer keeps its place as it goes and remembers what it told each server, so a
+  restart sends only what changed and nobody asks back, device-list answers are kept until the
+  list changes, a device's last-seen time is written once a minute, and at most 64 federation
+  requests are worked on at once (the rest wait, then are told to retry). Two new gauges say
+  how late the runtime runs (`hs_runtime_heartbeat_lateness_seconds`,
+  `hs_runtime_heartbeat_lateness_max_seconds`), and a watchdog thread logs a stall while it
+  lasts. The bridges' queue gauges no longer walk every delivered transaction at each scrape.
 - **The bridge pump no longer spins on a stream it cannot prune.** Once more than 10,000
   receipts, presence changes or to-device messages waited to be pruned, the store refused the
   single delete every time and the appservice ephemeral pump retried it four times a second,
