@@ -107,7 +107,7 @@ lists on the first. Tests: `cargo test -p hs-federation`, `-p hs-room`, `-p hs-a
 all pass; new tests name each fix (`an_enqueue_for_more_destinations_than_a_batch_reaches_every_one`,
 `a_success_on_a_healthy_destination_writes_nothing`, `announcement_records_are_kept_by_user_and_shard`,
 `kv_store_writes_a_success_only_when_it_changes_something`,
-`an_inbound_request_holds_a_slot_while_it_is_worked_on`,
+`a_request_waits_for_a_slot_and_is_told_to_retry_when_none_comes_free`,
 `shards_at_one_place_are_read_together_a_step_at_a_time`,
 `a_shard_taken_on_starts_at_its_stored_place_or_the_old_one_or_now`,
 `an_announcement_record_reads_back_as_it_was_written`,

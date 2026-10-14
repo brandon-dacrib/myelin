@@ -84,6 +84,9 @@ pub fn lateness_max_seconds() -> f64 {
 struct Pulse {
     /// When the heartbeat last beat, in microseconds since `origin`.
     last_beat_us: AtomicU64,
+    /// The latest beat this heartbeat ever had, in microseconds (the gauge is the process's,
+    /// shared by every heartbeat in it; this is this one's).
+    worst_late_us: AtomicU64,
     origin: Instant,
     stop: AtomicBool,
 }
@@ -112,6 +115,7 @@ impl RuntimeHeartbeat {
     fn start_with(interval: Duration, stall_after: Duration, watch_every: Duration) -> Self {
         let pulse = Arc::new(Pulse {
             last_beat_us: AtomicU64::new(0),
+            worst_late_us: AtomicU64::new(0),
             origin: Instant::now(),
             stop: AtomicBool::new(false),
         });
@@ -127,6 +131,10 @@ impl RuntimeHeartbeat {
                 beating
                     .last_beat_us
                     .store(beating.now_us(), Ordering::Release);
+                beating.worst_late_us.fetch_max(
+                    u64::try_from(lateness.as_micros()).unwrap_or(u64::MAX),
+                    Ordering::AcqRel,
+                );
                 let seconds = lateness.as_secs_f64();
                 LATENESS.observe(seconds);
                 if window_start.elapsed() >= MAX_WINDOW {
@@ -241,11 +249,8 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         let after = heartbeat.pulse.last_beat_us.load(Ordering::Acquire);
         assert!(after > before, "the heartbeat beat again after the block");
-        assert!(
-            lateness_max_seconds() >= 0.4,
-            "the late beat was measured: {}",
-            lateness_max_seconds()
-        );
+        let worst = heartbeat.pulse.worst_late_us.load(Ordering::Acquire);
+        assert!(worst >= 400_000, "the late beat was measured: {worst} us");
         drop(heartbeat);
         runtime.shutdown_timeout(Duration::from_secs(1));
     }

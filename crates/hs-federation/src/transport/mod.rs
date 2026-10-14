@@ -266,8 +266,18 @@ async fn bound_inbound(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    hold_a_slot(&INBOUND_SLOTS, INBOUND_SLOT_WAIT, request, next).await
+}
+
+/// [`bound_inbound`]'s body, over any `slots` and `wait` (tests use their own).
+async fn hold_a_slot(
+    slots: &Arc<tokio::sync::Semaphore>,
+    wait: std::time::Duration,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
     let waited_from = std::time::Instant::now();
-    let slot = tokio::time::timeout(INBOUND_SLOT_WAIT, INBOUND_SLOTS.clone().acquire_owned()).await;
+    let slot = tokio::time::timeout(wait, slots.clone().acquire_owned()).await;
     let Ok(Ok(_slot)) = slot else {
         crate::metrics::record_inbound_refused();
         tracing::warn!(
@@ -279,7 +289,7 @@ async fn bound_inbound(
         );
         return axum::response::IntoResponse::into_response(
             hs_http::error::MatrixError::rate_limited(
-                u64::try_from(INBOUND_SLOT_WAIT.as_millis()).unwrap_or(u64::MAX),
+                u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
             ),
         );
     };
@@ -301,13 +311,17 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
-    /// Each inbound federation request holds one of the slots while it is worked on, and gives
-    /// it back when answered: requests in flight are counted, and the count comes back down.
+    /// Each inbound federation request holds one of the slots while it is worked on: with every
+    /// slot held, the next waits, holding no thread, and is answered `429 M_LIMIT_EXCEEDED` with
+    /// a `Retry-After` when none comes free in time; those holding slots are answered as usual
+    /// once they finish, and give their slots back.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_inbound_request_holds_a_slot_while_it_is_worked_on() {
-        // Closed until the three are counted; a semaphore keeps every release however early.
+    async fn a_request_waits_for_a_slot_and_is_told_to_retry_when_none_comes_free() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(2));
+        // Closed until released; a semaphore keeps every release however early.
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
         let held = gate.clone();
+        let layer_slots = slots.clone();
         let app = axum::Router::new()
             .route(
                 "/slow",
@@ -321,32 +335,36 @@ mod tests {
                     }
                 }),
             )
-            .layer(axum::middleware::from_fn(bound_inbound));
-        let before = inbound_in_flight();
-        let requests: Vec<_> = (0..3)
-            .map(|_| {
-                let app = app.clone();
-                tokio::spawn(async move {
-                    app.oneshot(Request::get("/slow").body(Body::empty()).unwrap())
-                        .await
-                        .unwrap()
-                        .status()
-                })
+            .layer(axum::middleware::from_fn(move |request, next| {
+                let slots = layer_slots.clone();
+                async move {
+                    hold_a_slot(&slots, std::time::Duration::from_millis(200), request, next).await
+                }
+            }));
+        let call = |app: axum::Router| {
+            tokio::spawn(async move {
+                app.oneshot(Request::get("/slow").body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
             })
-            .collect();
+        };
+        let first = call(app.clone());
+        let second = call(app.clone());
         let started = std::time::Instant::now();
-        while inbound_in_flight() < before + 3 {
+        while slots.available_permits() > 0 {
             assert!(
                 started.elapsed() < std::time::Duration::from_secs(10),
-                "three requests held slots"
+                "both slots taken"
             );
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        gate.add_permits(3);
-        for request in requests {
-            assert_eq!(request.await.unwrap(), StatusCode::OK);
-        }
-        assert!(inbound_in_flight() <= before, "the slots came back");
+        let refused = call(app.clone()).await.unwrap();
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(refused.headers().contains_key("retry-after"));
+        gate.add_permits(2);
+        assert_eq!(first.await.unwrap().status(), StatusCode::OK);
+        assert_eq!(second.await.unwrap().status(), StatusCode::OK);
+        assert_eq!(slots.available_permits(), 2, "the slots came back");
     }
 
     struct EmptyFetcher;
