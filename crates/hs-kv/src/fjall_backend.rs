@@ -546,6 +546,14 @@ impl KvWrite for FjallTxn {
             .push((keyspace.name.to_string(), key.to_vec()));
         Ok(())
     }
+
+    fn mutations(&self) -> usize {
+        self.budget.mutations()
+    }
+
+    fn written_keyspaces(&self) -> Vec<String> {
+        crate::traits::distinct_keyspaces(&self.write_keys)
+    }
 }
 
 impl KvBackend for FjallBackend {

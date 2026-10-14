@@ -18,6 +18,9 @@ otlp = [
     "dep:opentelemetry-otlp",
     "dep:tracing-opentelemetry",
 ]
+# `hs_telemetry::testing`: run code in a trace of its own and read back the spans it exported, for
+# other crates' tests of their spans (a dev-dependency feature).
+testing = ["otlp"]
 # Sentry error and panic reporting fed from `tracing` events.
 sentry = ["dep:sentry"]
 

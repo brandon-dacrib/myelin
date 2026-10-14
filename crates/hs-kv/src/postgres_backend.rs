@@ -1249,6 +1249,14 @@ impl KvWrite for PgTxn {
             .push((keyspace.name.to_string(), key.to_vec()));
         Ok(())
     }
+
+    fn mutations(&self) -> usize {
+        self.budget.mutations()
+    }
+
+    fn written_keyspaces(&self) -> Vec<String> {
+        crate::traits::distinct_keyspaces(&self.write_keys)
+    }
 }
 
 /// What one flush sent: the counts behind the `debug` line, [`FlushStats`] and the

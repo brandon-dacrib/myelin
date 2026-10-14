@@ -82,7 +82,10 @@ pub fn build_provider(
         ));
     }
 
-    let processor = BatchSpanProcessor::builder(Watched::new(exporter, endpoint))
+    let queue = crate::export_stats::Queue::default();
+    let mut watched = Watched::new(exporter, endpoint);
+    watched.queue = Some(queue.clone());
+    let processor = BatchSpanProcessor::builder(watched)
         .with_batch_config(
             BatchConfigBuilder::default()
                 .with_max_queue_size(MAX_QUEUE_SIZE)
@@ -93,7 +96,10 @@ pub fn build_provider(
         .build();
 
     let provider = SdkTracerProvider::builder()
-        .with_span_processor(processor)
+        .with_span_processor(Counted {
+            inner: processor,
+            queue,
+        })
         .with_sampler(sampler(options.otlp_sample_ratio))
         .with_resource(resource.build())
         .build();
@@ -116,6 +122,44 @@ struct Watched<E> {
     inner: E,
     endpoint: String,
     state: std::sync::Mutex<WatchState>,
+    /// The pipeline's queue, given back each export's places and counted on `/metrics`.
+    queue: Option<crate::export_stats::Queue>,
+}
+
+/// The span processor in front of the batch processor: counts each finished span into the
+/// queue ([`crate::export_stats`]), and drops it (counted) rather than hand it on when the
+/// queue is full. So `/metrics` says how many spans were dropped, which the batch processor
+/// keeps to itself.
+#[derive(Debug)]
+struct Counted<P> {
+    inner: P,
+    queue: crate::export_stats::Queue,
+}
+
+impl<P: opentelemetry_sdk::trace::SpanProcessor> opentelemetry_sdk::trace::SpanProcessor
+    for Counted<P>
+{
+    fn on_start(&self, span: &mut opentelemetry_sdk::trace::Span, cx: &opentelemetry::Context) {
+        self.inner.on_start(span, cx);
+    }
+
+    fn on_end(&self, span: opentelemetry_sdk::trace::SpanData) {
+        if self.queue.try_enqueue() {
+            self.inner.on_end(span);
+        }
+    }
+
+    fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult {
+        self.inner.force_flush()
+    }
+
+    fn shutdown_with_timeout(&self, timeout: Duration) -> opentelemetry_sdk::error::OTelSdkResult {
+        self.inner.shutdown_with_timeout(timeout)
+    }
+
+    fn set_resource(&mut self, resource: &Resource) {
+        self.inner.set_resource(resource);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -131,6 +175,7 @@ impl<E> Watched<E> {
             inner,
             endpoint: endpoint.to_owned(),
             state: std::sync::Mutex::new(WatchState::default()),
+            queue: None,
         }
     }
 
@@ -186,6 +231,9 @@ impl<E: opentelemetry_sdk::trace::SpanExporter> opentelemetry_sdk::trace::SpanEx
         let spans = batch.len();
         let result = self.inner.export(batch).await;
         self.observe(spans, &result);
+        if let Some(queue) = &self.queue {
+            queue.exported(spans, result.is_ok());
+        }
         result
     }
 
@@ -247,6 +295,74 @@ pub(crate) fn continue_remote_trace(headers: &http::HeaderMap, span: &tracing::S
         // Fails only when the span is already started or not an OpenTelemetry span (no OTLP
         // layer installed); either way the request is simply its own trace's root.
         let _ = span.set_parent(cx);
+    }
+}
+
+/// The OpenTelemetry span context of `span`: invalid when no OTLP layer is installed, when the
+/// span is disabled, or when its target is not exported. Starts the span if it had not started.
+pub(crate) fn span_context(span: &tracing::Span) -> opentelemetry::trace::SpanContext {
+    use opentelemetry::trace::TraceContextExt as _;
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+
+    if span.is_none() {
+        return opentelemetry::trace::SpanContext::empty_context();
+    }
+    span.context().span().span_context().clone()
+}
+
+/// A W3C `traceparent` for `cx`, sampled flag included.
+pub(crate) fn traceparent(cx: &opentelemetry::trace::SpanContext) -> Option<String> {
+    cx.is_valid().then(|| {
+        format!(
+            "00-{}-{}-{:02x}",
+            cx.trace_id(),
+            cx.span_id(),
+            cx.trace_flags().to_u8()
+        )
+    })
+}
+
+/// Parses a W3C `traceparent` into the remote span context it names; invalid when it is not one.
+pub(crate) fn parse_traceparent(value: &str) -> opentelemetry::trace::SpanContext {
+    use opentelemetry::propagation::TextMapPropagator as _;
+    use opentelemetry::trace::TraceContextExt as _;
+
+    let propagator = opentelemetry_sdk::propagation::TraceContextPropagator::new();
+    let cx = propagator.extract(&OneHeader(value));
+    cx.span().span_context().clone()
+}
+
+/// Makes `span`, which must not have started, a child of the remote span `remote`.
+pub(crate) fn set_remote_parent(span: &tracing::Span, remote: opentelemetry::trace::SpanContext) {
+    use opentelemetry::trace::TraceContextExt as _;
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+
+    if remote.is_valid() && !span.is_none() {
+        // Fails only when the span already started or has no OpenTelemetry data; it is then
+        // its own trace's root, which is what it would have been anyway.
+        let _ = span.set_parent(opentelemetry::Context::new().with_remote_span_context(remote));
+    }
+}
+
+/// Links `span` to `cx` (a span that caused it, in another trace).
+pub(crate) fn add_link(span: &tracing::Span, cx: opentelemetry::trace::SpanContext) {
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+
+    if cx.is_valid() && !span.is_none() {
+        span.add_link(cx);
+    }
+}
+
+/// [`opentelemetry::propagation::Extractor`] over a lone `traceparent` value.
+struct OneHeader<'a>(&'a str);
+
+impl opentelemetry::propagation::Extractor for OneHeader<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        (key == "traceparent").then_some(self.0)
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        vec!["traceparent"]
     }
 }
 
@@ -466,6 +582,216 @@ mod tests {
                 .await
                 .is_empty()
         );
+    }
+
+    /// Runs `f` under a subscriber exporting to a [`Capture`] at `ratio`; returns what it
+    /// returned and what was exported.
+    fn under<T>(ratio: f64, f: impl FnOnce() -> T) -> (T, Vec<SpanData>) {
+        let capture = Capture::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(capture.clone())
+            .with_sampler(sampler(ratio))
+            .build();
+        let subscriber = tracing_subscriber::registry().with(layer_from_provider(&provider));
+        let out = tracing::subscriber::with_default(subscriber, f);
+        provider.force_flush().unwrap();
+        let spans = capture.0.lock().unwrap().clone();
+        (out, spans)
+    }
+
+    #[test]
+    fn sampled_is_true_only_inside_a_sampled_trace() {
+        let ((outside, inside), _) = under(1.0, || {
+            let outside = crate::current_is_sampled();
+            let _span = tracing::info_span!(target: "hs_test", "pass").entered();
+            (outside, crate::current_is_sampled())
+        });
+        assert!(!outside, "no current span");
+        assert!(inside);
+        let (unsampled, spans) = under(0.0, || {
+            let _span = tracing::info_span!(target: "hs_test", "pass").entered();
+            crate::current_is_sampled()
+        });
+        assert!(!unsampled);
+        assert!(spans.is_empty());
+        // No OpenTelemetry layer at all: a span, but nothing records it.
+        let subscriber = tracing_subscriber::registry();
+        tracing::subscriber::with_default(subscriber, || {
+            let _span = tracing::info_span!(target: "hs_test", "pass").entered();
+            assert!(!crate::current_is_sampled());
+            assert!(crate::current_traceparent().is_none());
+        });
+    }
+
+    #[test]
+    fn a_traceparent_passed_on_continues_the_trace_on_the_other_side() {
+        let ((), spans) = under(1.0, || {
+            let traceparent = {
+                let _forwarding = tracing::info_span!(target: "hs_test", "forwarding").entered();
+                crate::current_traceparent().expect("a traceparent")
+            };
+            assert!(traceparent.starts_with("00-") && traceparent.ends_with("-01"));
+            let handling = tracing::info_span!(target: "hs_test", parent: None, "handling");
+            crate::continue_trace(&handling, &traceparent);
+            drop(handling.entered());
+        });
+        let forwarding = spans.iter().find(|s| s.name == "forwarding").unwrap();
+        let handling = spans.iter().find(|s| s.name == "handling").unwrap();
+        assert_eq!(
+            handling.span_context.trace_id(),
+            forwarding.span_context.trace_id()
+        );
+        assert_eq!(handling.parent_span_id, forwarding.span_context.span_id());
+
+        // An unsampled trace is passed on unsampled, and the other side keeps it so.
+        let ((), spans) = under(0.0, || {
+            let traceparent = {
+                let _forwarding = tracing::info_span!(target: "hs_test", "forwarding").entered();
+                crate::current_traceparent().expect("a traceparent")
+            };
+            assert!(traceparent.ends_with("-00"), "{traceparent}");
+            let handling = tracing::info_span!(target: "hs_test", parent: None, "handling");
+            crate::continue_trace(&handling, &traceparent);
+            drop(handling.entered());
+        });
+        assert!(spans.is_empty(), "{spans:?}");
+    }
+
+    #[test]
+    fn a_pass_links_to_the_requests_that_caused_it() {
+        let ((), spans) = under(1.0, || {
+            let links: Vec<crate::TraceLink> = (0..40)
+                .map(|_| {
+                    let _request = tracing::info_span!(target: "hs_test", "request").entered();
+                    crate::TraceLink::current()
+                })
+                .collect();
+            assert!(crate::TraceLink::current().is_empty(), "outside a span");
+            let pass = tracing::info_span!(
+                target: "hs_test",
+                parent: None,
+                "pass",
+                links_dropped = tracing::field::Empty
+            );
+            crate::add_links(&pass, &links);
+            drop(pass.entered());
+        });
+        let pass = spans.iter().find(|s| s.name == "pass").unwrap();
+        assert_eq!(pass.links.links.len(), crate::spans::MAX_LINKS_PER_SPAN);
+        let request = spans.iter().find(|s| s.name == "request").unwrap();
+        assert!(
+            pass.links
+                .links
+                .iter()
+                .any(|l| l.span_context.trace_id() == request.span_context.trace_id())
+        );
+        assert_ne!(
+            pass.span_context.trace_id(),
+            request.span_context.trace_id()
+        );
+        assert_eq!(
+            attr(pass, "links_dropped")
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("8")
+        );
+        let link = crate::TraceLink::from_traceparent(TRACEPARENT);
+        assert_eq!(link.traceparent().as_deref(), Some(TRACEPARENT));
+        assert!(crate::TraceLink::from_traceparent("nonsense").is_empty());
+    }
+
+    #[test]
+    fn a_full_queue_drops_spans_in_front_of_the_batch_processor() {
+        let capture = Capture::default();
+        let queue = crate::export_stats::Queue::default();
+        let provider = SdkTracerProvider::builder()
+            .with_span_processor(Counted {
+                inner: opentelemetry_sdk::trace::SimpleSpanProcessor::new(capture.clone()),
+                queue: queue.clone(),
+            })
+            .with_sampler(sampler(1.0))
+            .build();
+        // Fill the queue: nothing is exported through `Watched`, so no place is given back.
+        for _ in 0..crate::export_stats::MAX_QUEUED - 1 {
+            assert!(queue.try_enqueue());
+        }
+        let dropped = crate::export_stats::spans_dropped();
+        let subscriber = tracing_subscriber::registry().with(layer_from_provider(&provider));
+        tracing::subscriber::with_default(subscriber, || {
+            drop(tracing::info_span!(target: "hs_test", "kept").entered());
+            drop(tracing::info_span!(target: "hs_test", "dropped").entered());
+        });
+        provider.force_flush().unwrap();
+        let names: Vec<_> = capture
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.name.to_string())
+            .collect();
+        assert_eq!(names, vec!["kept"]);
+        assert!(crate::export_stats::spans_dropped() > dropped);
+    }
+
+    /// What guarding a small span with [`crate::current_is_sampled`] costs, against opening the
+    /// span unguarded, under the subscriber `hs` runs (level filter, JSON log layer, OTLP
+    /// layer) inside a request span that is sampled or not. Run by hand:
+    /// `cargo test -p hs-telemetry --features otlp --release --lib -- --ignored --nocapture
+    /// cost_of`.
+    #[test]
+    #[ignore = "a measurement, run by hand"]
+    fn cost_of_a_guarded_span() {
+        const N: u32 = 200_000;
+        for ratio in [0.0, 1.0] {
+            let provider = SdkTracerProvider::builder()
+                .with_span_processor(Counted {
+                    inner: opentelemetry_sdk::trace::SimpleSpanProcessor::new(Capture::default()),
+                    queue: crate::export_stats::Queue::default(),
+                })
+                .with_sampler(sampler(ratio))
+                .build();
+            let subscriber = tracing_subscriber::registry()
+                .with(tracing_subscriber::EnvFilter::new("info"))
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .json()
+                        .with_current_span(true)
+                        .with_span_list(true)
+                        .with_writer(std::io::sink),
+                )
+                .with(layer_from_provider(&provider));
+            tracing::subscriber::with_default(subscriber, || {
+                let _request = tracing::info_span!(target: "hs_test", "request").entered();
+                let time = |label: &str, f: &dyn Fn()| {
+                    let started = std::time::Instant::now();
+                    for _ in 0..N {
+                        f();
+                    }
+                    let ns = started.elapsed().as_nanos() / u128::from(N);
+                    println!("ratio {ratio}: {label}: {ns} ns");
+                };
+                time("nothing", &|| {
+                    std::hint::black_box(());
+                });
+                time("current_is_sampled()", &|| {
+                    std::hint::black_box(crate::current_is_sampled());
+                });
+                time("a span, unguarded", &|| {
+                    let span = tracing::info_span!(target: "hs_test", "kv.transaction", writes = 3);
+                    drop(std::hint::black_box(span.entered()));
+                });
+                time("a span, guarded", &|| {
+                    let span = if crate::current_is_sampled() {
+                        tracing::info_span!(target: "hs_test", "kv.transaction", writes = 3)
+                    } else {
+                        tracing::Span::none()
+                    };
+                    drop(std::hint::black_box(span.entered()));
+                });
+            });
+            // The Capture held every sampled span; drop them before the next round.
+            drop(provider);
+        }
     }
 
     #[test]

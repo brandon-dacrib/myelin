@@ -220,9 +220,11 @@ impl<B: KvBackend> KvDestinationStore<B> {
         work: impl FnOnce(&B, &TypedKeyspace<B::Keyspace, (String,)>) -> T + Send + 'static,
     ) -> Option<T> {
         let (backend, table) = (self.backend.clone(), self.table.clone());
-        tokio::task::spawn_blocking(move || work(&backend, &table))
-            .await
-            .ok()
+        hs_telemetry::spans::spawn_blocking("federation.destination_store", move || {
+            work(&backend, &table)
+        })
+        .await
+        .ok()
     }
 }
 

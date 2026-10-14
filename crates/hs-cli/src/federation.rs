@@ -1575,9 +1575,10 @@ impl<B: KvBackend + 'static> FederationQuerySource for ServerQuerySource<B> {
             // Answered again from `device_lists` while the user's list has not moved.
             let answers = self.device_lists.clone();
             let runtime = tokio::runtime::Handle::current();
-            return tokio::task::spawn_blocking(move || {
-                runtime.block_on(device_list_answer(&e2e, &parsed, &answers))
-            })
+            return hs_telemetry::spans::spawn_blocking(
+                "federation.device_list_answer",
+                move || runtime.block_on(device_list_answer(&e2e, &parsed, &answers)),
+            )
             .await
             .ok()
             .flatten();

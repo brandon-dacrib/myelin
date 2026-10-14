@@ -484,7 +484,7 @@ async fn off_runtime<T: Send + 'static>(
     work: impl FnOnce(&FederationSender) -> T + Send + 'static,
 ) -> Option<T> {
     let sender = sender.clone();
-    tokio::task::spawn_blocking(move || work(&sender))
+    hs_telemetry::spans::spawn_blocking("federation.edu_store", move || work(&sender))
         .await
         .ok()
 }

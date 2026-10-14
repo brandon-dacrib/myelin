@@ -417,7 +417,10 @@ pub async fn forward_update<B: KvBackend + 'static>(
         // other's: the feeder is one task) are queued in the order they were made.
         let (sender, queued_for) = (sender.clone(), destinations.clone());
         if let Err(error) =
-            tokio::task::spawn_blocking(move || sender.enqueue_pdu(queued_for, pdu)).await
+            hs_telemetry::spans::spawn_blocking("federation.enqueue_pdu", move || {
+                sender.enqueue_pdu(queued_for, pdu)
+            })
+            .await
         {
             return Err(RoomError::Internal(format!(
                 "queueing an event for federation did not finish: {error}"

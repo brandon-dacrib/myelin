@@ -216,6 +216,14 @@ impl KvWrite for MemoryTxn {
             .insert(key.to_vec(), None);
         Ok(())
     }
+
+    fn mutations(&self) -> usize {
+        self.budget.mutations()
+    }
+
+    fn written_keyspaces(&self) -> Vec<String> {
+        self.write_buffer.keys().cloned().collect()
+    }
 }
 
 impl KvBackend for MemoryBackend {

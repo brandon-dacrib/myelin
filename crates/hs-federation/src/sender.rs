@@ -1872,7 +1872,13 @@ impl Shared {
         // The semaphore is never closed; were it, the operation would run unbounded.
         let _slot = self.store_slots.acquire().await.ok();
         let store = self.store.clone();
-        let outcome = tokio::task::spawn_blocking(move || work(store.as_ref())).await;
+        // Made in a statement of its own: the name's `format_args!` must not live across the
+        // `.await` (it is not `Send`).
+        let task =
+            hs_telemetry::spans::spawn_blocking(format_args!("federation.store {op}"), move || {
+                work(store.as_ref())
+            });
+        let outcome = task.await;
         let took = started.elapsed();
         crate::metrics::record_sender_store_seconds(op, took.as_secs_f64());
         if took >= SLOW_STORE_OPERATION {

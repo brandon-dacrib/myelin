@@ -38,6 +38,11 @@ pub(crate) struct TxnBudget {
 }
 
 impl TxnBudget {
+    /// The mutations recorded so far.
+    pub(crate) fn mutations(&self) -> usize {
+        self.mutations
+    }
+
     pub(crate) fn record(&mut self, mutation_bytes: usize) -> Result<(), KvError> {
         self.mutations += 1;
         self.bytes += mutation_bytes;

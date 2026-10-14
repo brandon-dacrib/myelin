@@ -136,6 +136,8 @@ impl Metrics {
             http_request_duration_seconds.clone(),
         );
 
+        crate::export_stats::register(&mut registry);
+
         let encode_seconds = Gauge::<f64, std::sync::atomic::AtomicU64>::default();
         registry.register(
             "hs_process_metrics_encode_seconds",

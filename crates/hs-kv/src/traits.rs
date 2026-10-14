@@ -184,6 +184,30 @@ pub trait KvWrite: KvRead {
         self.put(keyspace, key, &next.to_be_bytes())?;
         Ok(next)
     }
+
+    /// The puts and deletes this transaction has made so far, for its trace span
+    /// ([`crate::transact`]). `0` from a backend that does not count them.
+    fn mutations(&self) -> usize {
+        0
+    }
+
+    /// The names of the keyspaces this transaction has written so far, each once, for its trace
+    /// span ([`crate::transact`]). Empty from a backend that does not keep them. Called only
+    /// when the transaction is traced.
+    fn written_keyspaces(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+/// The distinct keyspace names in `write_keys`, in the order first written.
+pub(crate) fn distinct_keyspaces(write_keys: &[(String, Vec<u8>)]) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for (name, _) in write_keys {
+        if !names.iter().any(|n| n == name) {
+            names.push(name.clone());
+        }
+    }
+    names
 }
 
 #[derive(Debug, thiserror::Error)]

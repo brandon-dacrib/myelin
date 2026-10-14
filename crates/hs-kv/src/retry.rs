@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use crate::error::KvError;
-use crate::traits::KvBackend;
+use crate::traits::{KvBackend, KvWrite as _};
 
 /// Tuning for [`transact`]. The defaults are conservative for interactive request paths; a
 /// background job doing bulk work may want a larger [`TransactConfig::max_attempts`].
@@ -54,16 +54,71 @@ where
         "TransactConfig::max_attempts must be at least 1"
     );
 
+    // A span only inside a recorded trace: transactions are the most frequent thing the server
+    // does, and an unsampled request's would cost a microsecond each for nothing (decision
+    // 0048). Named after the code that asked (`kv AuthTables::get_device`).
+    let span = if hs_telemetry::current_is_sampled() {
+        tracing::info_span!(
+            "kv.transaction",
+            "otel.name" = format!("kv {}", hs_telemetry::spans::caller_of_value(&f)).as_str(),
+            attempts = tracing::field::Empty,
+            mutations = tracing::field::Empty,
+            keyspaces = tracing::field::Empty,
+            "otel.status_code" = tracing::field::Empty,
+            "error.message" = tracing::field::Empty,
+        )
+    } else {
+        tracing::Span::none()
+    };
+    let _in_span = span.enter();
+    let result = attempts(backend, config, &mut f, &span);
+    if let Err(error) = &result
+        && !span.is_none()
+    {
+        span.record("otel.status_code", "error");
+        span.record("error.message", tracing::field::display(error));
+    }
+    result
+}
+
+/// [`transact`]'s attempts, recorded on its `span` (none when it is not traced).
+fn attempts<B, T>(
+    backend: &B,
+    config: TransactConfig,
+    f: &mut impl FnMut(&mut B::Txn) -> Result<T, KvError>,
+    span: &tracing::Span,
+) -> Result<T, KvError>
+where
+    B: KvBackend,
+{
+    let traced = !span.is_none();
     let mut attempt = 0u32;
     let mut jitter = Jitter::new();
     loop {
         attempt += 1;
+        if traced {
+            span.record("attempts", attempt);
+        }
         let mut txn = backend.begin()?;
         let conflicted = match f(&mut txn) {
-            Ok(value) => match backend.commit(txn)? {
-                Ok(()) => return Ok(value),
-                Err(crate::error::Conflict) => true,
-            },
+            Ok(value) => {
+                let committed = if traced {
+                    span.record("mutations", txn.mutations());
+                    let keyspaces = txn.written_keyspaces();
+                    if !keyspaces.is_empty() {
+                        span.record("keyspaces", keyspaces.join(",").as_str());
+                    }
+                    // The commit is a span of its own: on PostgreSQL it sends the writes.
+                    let _commit = tracing::info_span!("kv.commit").entered();
+                    backend.commit(txn)?
+                } else {
+                    backend.commit(txn)?
+                };
+                match committed {
+                    Ok(()) => return Ok(value),
+                    Err(crate::error::Conflict) => true,
+                }
+            }
             // Some backends (PostgreSQL's SSI) can detect a conflict on any statement, not only
             // at commit; see `KvError::MidTransactionConflict`. Treat it identically to a
             // commit-time `Conflict`: the transaction (already discarded by the backend) is

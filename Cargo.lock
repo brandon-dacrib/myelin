@@ -2572,6 +2572,7 @@ dependencies = [
  "bytes",
  "criterion",
  "fjall",
+ "hs-telemetry",
  "postgres",
  "prometheus-client",
  "r2d2",

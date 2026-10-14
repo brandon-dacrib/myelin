@@ -25,10 +25,13 @@
 #![warn(missing_docs)]
 
 pub mod error;
+pub mod export_stats;
 pub mod init;
 pub mod metrics;
 pub mod request_id;
 pub mod spans;
+#[cfg(feature = "testing")]
+pub mod testing;
 
 #[cfg(feature = "otlp")]
 mod otlp;
@@ -41,4 +44,6 @@ pub use metrics::{EncodeInFlight, HttpLabels, Metrics, TimedCollector};
 pub use request_id::{
     REQUEST_ID_HEADER, RequestIdLayer, RequestIdService, record_route, request_id_from_headers,
 };
-pub use spans::outside_spans;
+pub use spans::{
+    TraceLink, add_links, continue_trace, current_is_sampled, current_traceparent, outside_spans,
+};

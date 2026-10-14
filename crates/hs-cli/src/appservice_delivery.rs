@@ -184,7 +184,7 @@ async fn off_the_runtime<T: Send + 'static>(
     work: impl std::future::Future<Output = Result<T, String>> + Send + 'static,
 ) -> Result<T, String> {
     let runtime = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || runtime.block_on(work))
+    hs_telemetry::spans::spawn_blocking("appservice.store", move || runtime.block_on(work))
         .await
         .map_err(|e| format!("store work did not finish: {e}"))?
 }

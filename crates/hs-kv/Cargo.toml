@@ -16,6 +16,8 @@ bytes = { workspace = true }
 thiserror = { workspace = true }
 fjall = { workspace = true }
 tracing = { workspace = true }
+# `crate::transact`'s span, made only inside a recorded trace (`hs_telemetry::current_is_sampled`).
+hs-telemetry = { path = "../hs-telemetry" }
 # `src/metrics.rs`: the PostgreSQL backend's flush metrics (RFC 0021), registered by `hs-cli`.
 prometheus-client = { workspace = true }
 postgres = { workspace = true }
@@ -33,5 +35,6 @@ rustls-pemfile = { workspace = true }
 rustls-native-certs = { workspace = true }
 
 [dev-dependencies]
+hs-telemetry = { path = "../hs-telemetry", features = ["testing"] }
 tempfile = { workspace = true }
 criterion = { workspace = true }

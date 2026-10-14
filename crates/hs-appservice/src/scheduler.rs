@@ -351,7 +351,7 @@ impl<B: KvBackend> Scheduler<B> {
         B: 'static,
     {
         let registry = self.registry.clone();
-        tokio::task::spawn_blocking(move || work(&registry))
+        hs_telemetry::spans::spawn_blocking("appservice.store", move || work(&registry))
             .await
             .map_err(|e| AppserviceError::Store(format!("queue work did not finish: {e}")))?
     }
