@@ -1,5 +1,133 @@
 # 12. Platform and Kubernetes
 
+## 2026-10-14, night (branch `agent/otlp-traces`): the binary exports traces, instrumented for today's outages (stage 1)
+
+The owner asked for the demo to send traces to the cluster's collector, then widened it: "traces
+should be properly instrumented into the app so that we can tell what is going wrong". This is
+the first stage: the exporter, the chart, the demo, and the spans that would have explained
+2026-10-13/14 (the `/metrics` starvation, the hub wedge, the federation boot freeze). The rest
+is listed under "Next".
+
+### Done
+
+- **Built in.** `hs-cli` has a default feature `otlp` (`hs-telemetry/otlp`): `deploy/Dockerfile`
+  (cook and build both `-p hs-cli`, default features, so the cooked layer still matches), CD's
+  binaries (`cargo build --release -p hs-cli`) and releases all get it with no workflow change.
+  `--no-default-features` builds without it. `hs-telemetry`'s OpenTelemetry crates are now
+  traces only (no metrics, no logs; `opentelemetry-appender-tracing`, unused, dropped).
+  **Deltas** (release, aarch64-apple-darwin, this desktop): the binary 100,316,416 bytes
+  without, 102,367,552 with (+2.0 MB, +2.0%); 13 more crates to compile once (`tonic`,
+  `tonic-prost`, `tonic-types`, `prost`, `prost-derive`, `prost-types`, the four
+  `opentelemetry*`, `tracing-opentelemetry`, `tokio-stream`, `itertools` 0.10), which in the
+  image land in the cargo-chef cooked layer and are cached from the second CD build on; a
+  release rebuild of the workspace's own crates took 4 m 58 s with and 4 m 36 s without.
+- **Exporter** (`crates/hs-telemetry/src/otlp.rs`). OTLP/gRPC (tonic), sampler parent-based
+  over a trace-id ratio (the configured `sample_ratio`, which was ignored before: every trace
+  would have been kept), batch processor on its own thread with a 4,096-span queue, 512-span
+  batches every 2 s, a 5 s export deadline; a full queue drops spans, never blocks. Resource:
+  `service.name=myelin`, `service.version`, `service.instance.id` (`HOSTNAME`, the pod).
+  Export failures log once at `warn` and then at most every 5 minutes with counts, and "trace
+  export works again" when it recovers (the SDK's own internal logs are compiled out; they would
+  log every failed batch). Only `hs_*` spans are exported (a library's are traces with nothing
+  around them); Ruma's push-rule `flatten_value` spans (a dozen `info` spans per event per
+  evaluation) are held to `warn` in the default filter.
+- **Request root span** (`request_id.rs`). Root (or the caller's W3C `traceparent`), kind
+  `server`, named `METHOD route` by `hs-cli`'s metrics middleware (`record_route`, which also
+  renames the already-started OTel span), with method, route, status, request id, `url.path`
+  (exported only, not in log lines), `matrix.user_id` (`hs-auth`) or `matrix.origin` (the
+  `X-Matrix` layer); a `5xx` is a failed span.
+- **Spans** (catalogue in `docs/ops/tracing.md`): `auth.authenticate`;
+  `federation.authenticate` / `federation.origin_key`; `federation.inbound_slot_wait`;
+  `federation.pdu` per inbound PDU and `federation.edu` per EDU; `sync.settle`,
+  `sync.wait_for_news`, `sync.build_batch`; `room <op>` for every room actor operation with
+  `room.actor.blocking_wait` and `room.actor.lock_wait` (only inside something traced);
+  `room.load` with `slot_wait`, `blocking_wait`, `from_store` (timeline length, replayed, state
+  records fed) and `room.load.wait` for another caller's load; `hub.room_update` per update
+  (root) with each `InHand::step` as a child span named by the step; `federation.transaction`
+  per outbound attempt (root) and `federation.request` (kind `client`, named by endpoint) with
+  `slot_wait`, `resolve` and `http`.
+- **Found while verifying, fixed**: `kube-client` turns on `hyper-util`'s `tracing` feature for
+  the whole binary, and that spawns each new HTTP connection's task `in_current_span()`, so the
+  span that opened a connection, and every span above it, stayed open for the connection's
+  life: an inbound `/send` whose key lookup asked the matrix.org notary was never exported.
+  `hs_telemetry::outside_spans` runs a future in a root span of its own that is never exported
+  (`hs_telemetry::detached`), so the connection task holds that one; federation's HTTP
+  exchange, media fetch and well-known fetch use it. A first version polled with no subscriber
+  at all and lost the resolver's own warnings inside the exchange
+  (`tests/outbound_ipv6_only_peer.rs` caught it). Decision 0048 makes it the rule.
+- **Chart.** `telemetry.tracing.{enabled,otlpEndpoint,sampleRatio}` existed but only reached the
+  ConfigMap, which seeds the database once; on an installed release the database outranks it,
+  so turning tracing on in values did nothing. With `enabled: true` the StatefulSet now pins the
+  three as `HS__TELEMETRY__TRACING__*` (the idiom the chart already uses for the server name);
+  `otlpEndpoint` is `required` then. Not `extraEnv` (the roll lines replace it). README section
+  "Tracing".
+- **Demo** (`deploy/demo/values-bridges.yaml`): on, `http://otel-gateway-collector.monitoring-system.svc:4317`,
+  ratio `1.0`: a handful of people and bridges, a few requests a second at most, and the point is
+  to catch the one slow `/sync` or stuck load, which 10% would usually miss.
+
+### Verified
+
+- `cargo test -p hs-telemetry --features otlp` (21): a request is a server span named by its
+  route, continues a `traceparent` (trace id and parent span id checked), carries status, user,
+  path and request id, a 500 fails it and a 404 does not, a child lands under it; ratio 0
+  exports nothing unless the caller sampled, an unsampled `traceparent` is not exported at
+  ratio 1; a library's span is not exported and its event lands on ours; the watched exporter
+  counts and clears; `outside_spans` lets the caller's span close where a bare
+  `in_current_span` spawn holds it (both shown). `hs-room` (the op-name parser), `hs-federation`
+  (endpoint names), and the crates' suites: `cargo test -p hs-federation -p hs-room -p hs-user
+  -p hs-auth`, and `hs-cli`'s lib tests with `federation_two_servers`, `federation_sender`,
+  `federation_writes`, `federation_reads`, `federation_keys`, `outbound_ipv6_only_peer`,
+  `config_reload` and `e2e`.
+- **Real binary, Jaeger 1.62 in Docker** (`mirror.gcr.io/jaegertracing/all-in-one`), debug
+  `hs`, a database seeded with `tracing.enabled: false` and the three `HS__` variables set (the
+  chart's route): service `myelin` with `service.version` and `service.instance.id`. Traces
+  seen: `PUT .../send/{eventType}/{txnId}` → `auth.authenticate`, `room send_event_txn` (thread
+  and lock waits); a long-poll `GET /sync` 1,034 ms of which `sync.wait_for_news` 1,025 ms,
+  then `sync.build_batch` (`joined_rooms`) → `room build_batch`; `GET .../messages` after a
+  restart → `room.load` 3.6 ms (`from_store` 3.4 ms, `timeline_events=22`, `replayed=false`);
+  `hub.room_update` per send with its 13 steps; `POST .../invite` to an unresolvable server
+  failed `502` with `PUT /_matrix/federation/v2/invite` → `federation.resolve` 200 ms as the
+  cause; an inbound `/send` with a bad signature: `matrix.origin`, `federation.authenticate` →
+  `federation.origin_key` 595 ms → the notary `POST /_matrix/key/v2/query` to matrix.org
+  (resolve 184 ms, http 407 ms) and the origin's failed `GET /_matrix/key/v2/server`. No
+  `flatten_value` and no one-span `room index_room` traces after the filter and the rule.
+- **A collector that is down does not slow requests** (10,000 sequential authenticated
+  `whoami`, debug build, one desktop): tracing off p50 0.33 ms / p99 0.44 ms; ratio 0 0.36 /
+  0.46; ratio 1.0 with the collector refused (`127.0.0.1:1`) 0.39 / 0.48, and black-holed
+  (`10.255.255.1:4317`, connect hangs) 0.38 / 0.47, with spans dropped at the full queue and one
+  `warn` line naming the endpoint and the error. The difference between off and on is the cost
+  of building two spans per request in an unoptimized build.
+- `helm lint` clean; `helm template` with the demo values renders the three variables, with
+  `enabled: false` none, with `enabled: true` and no endpoint fails with the message.
+- **Not seen on a real binary**: an outbound transaction trace (`federation.transaction`; no
+  remote room member locally; the code path is the sender's own tests'); the cluster's Tempo
+  (after the roll, by the coordinator).
+
+### Next (stage 2)
+
+`outside_spans` on the other outbound HTTP call sites (appservice transactions and queries, push
+gateways, URL previews, media scanning, identity server, modules); KV transactions and
+`spawn_blocking` hops in `hs-kv`/`hs-tables`; state resolution, event auth and persistence in
+the room actor; `/user/devices` and the device-list announcer; appservice scheduler
+transactions, the ephemeral pump and queue drain; a root span per pass of every background loop
+with a link to the request that caused it; the admin API's principal on the request span; an
+exporter metric on `/metrics`; outbound `traceparent` between replicas.
+
+### Decisions made
+
+- 0048 (traces are exported; how a span is written): the rules above, for every track.
+- `service.name` is `myelin`, not `hs`: the product's name is what an operator looks for in a
+  trace store holding many services.
+- The chart pins tracing through the environment when on, and leaves it to the database when
+  off.
+- The demo traces every request (ratio 1.0).
+
+### Interfaces provided / needed
+
+Provided: `hs_telemetry::record_route`, `hs_telemetry::outside_spans`,
+`hs_telemetry::request_id::fields`, the `otlp` feature of `hs-cli`. Needed: none. Shared
+dependencies added: none to the workspace; `hs-federation` now depends on `hs-telemetry`.
+
 ## 2026-10-12, evening (branch `agent/state-res-log-noise`): state resolution's steps are out of the default log
 
 On the demo, `ruma_state_res` was most of the server's log: `state resolution starting`,

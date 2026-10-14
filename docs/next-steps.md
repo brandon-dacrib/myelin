@@ -4,6 +4,31 @@ Written 2026-09-20 by the integration lead, last revised 2026-10-14 (the session
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
+## 2026-10-14, night -- traces: the binary exports them, the demo sends them to Tempo; the branch is `agent/otlp-traces`
+
+`hs` was built without the OTLP exporter, so `telemetry.tracing` did nothing. Now on by
+default in `hs-cli` (image, CD binaries, release), and instrumented for today's outages: every
+HTTP request is a root span named by route (status, request id, user or origin, W3C
+`traceparent`), with room loads and load waits, each room operation's thread and lock waits,
+`/sync`'s settle / wait-for-news / build, inbound PDUs and EDUs, the inbound slot wait; a trace
+per session hub update with its steps as child spans, and per outbound transaction attempt with
+the federation request's slot wait, resolution and HTTP exchange. The chart's
+`telemetry.tracing.*` values are pinned through the environment (the database outranked the
+ConfigMap, so turning them on in values did nothing), and `deploy/demo/values-bridges.yaml`
+turns them on at ratio 1.0 to `otel-gateway-collector.monitoring-system.svc:4317`. **After the
+roll**: Tempo's `service.name` values include `myelin`, and
+`/api/search?tags=service.name%3Dmyelin` lists traces (`docs/ops/tracing.md`). **Found on the
+way** (decision 0048): `kube-client` turns on `hyper-util`'s `tracing` feature, which spawns
+every new HTTP connection's task `in_current_span()`, so a request that opened a connection was
+never exported while the connection lived; federation's HTTP now runs outside spans
+(`hs_telemetry::outside_spans`). **Left (stage 2)**: the same wrapper on the other outbound
+HTTP call sites (appservice transactions and queries, push, URL previews, media scanning,
+identity server, modules); KV transaction spans and `spawn_blocking` hops in `hs-kv`/`hs-tables`; state resolution,
+event auth and persistence inside the room actor; `/user/devices` and the device-list
+announcer; appservice scheduler transactions and pumps; a root span per pass of every
+background loop; links from a background pass to the request that caused it; the admin API's
+principal on the request span; an exporter metric (`dropped spans`) on `/metrics`.
+
 ## 2026-10-14, later -- the iMessage bridge's "Dropping OTK counts targeted to someone else" is a left-behind bot device the manager could not remove; the fix is `agent/otk-counts-device`
 
 The bridge's crypto device is `h7ijM5DMbF` and it is told its counts (it uploaded 50 keys on

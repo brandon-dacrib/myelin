@@ -38,6 +38,24 @@ page; it is a hot setting); the empty string publishes no server document, for a
 whose reverse proxy serves its own. `ci/install-smoke.sh` checks the derived document on
 every image CD builds.
 
+## Tracing
+
+The image exports OpenTelemetry traces over OTLP/gRPC once `telemetry.tracing` is on:
+
+```yaml
+telemetry:
+  tracing:
+    enabled: true
+    otlpEndpoint: http://otel-collector.monitoring.svc:4317
+    sampleRatio: 0.1
+```
+
+With `enabled: true` the chart passes all three as `HS__TELEMETRY__TRACING__*` environment
+variables, which outrank the database, so turning it on in an installed release takes effect on
+its next rollout (the ConfigMap's copy only seeds the database on the first start). A collector
+that is down costs dropped spans, never a slower request. What the traces contain and how to
+search them: `docs/ops/tracing.md`.
+
 ## Upgrading
 
 ### From a chart before 2026-10-09: adopt the CRD once

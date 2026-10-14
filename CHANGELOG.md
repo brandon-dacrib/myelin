@@ -15,6 +15,18 @@ carries the generated notes for that merge.
 
 ## Unreleased
 
+- **Traces show where a slow or failing request spent its time.** The shipped binary now exports
+  OpenTelemetry traces over OTLP/gRPC (it was compiled without the exporter, so
+  `telemetry.tracing` did nothing). Every HTTP request is a trace named by its route, with its
+  status, request id and user or origin server, and continues a caller's W3C `traceparent`;
+  inside it, room loads (and waits for another caller's load), each room operation's wait for a
+  thread and for the room's lock, `/sync`'s three phases, each inbound PDU and EDU, and each
+  outbound federation request with its resolution and HTTP exchange. Each session hub update
+  and each outbound transaction attempt is a trace of its own, the hub's steps as child spans.
+  The chart's `telemetry.tracing.{enabled,otlpEndpoint,sampleRatio}` now takes effect on an
+  installed release; the demo sends every trace to the cluster's collector. A collector that is
+  down costs dropped spans and one log line, never a slower request. Verified against the real
+  binary with Jaeger; `docs/ops/tracing.md`.
 - **A legacy bridge's left-behind bot device is removed.** An appservice now removes its users'
   devices (`DELETE /devices/{id}`, `POST /delete_devices`) without user-interactive auth whether
   or not it sets MSC4190, as Synapse allows. The bridge manager's cleanup of a bot device a
