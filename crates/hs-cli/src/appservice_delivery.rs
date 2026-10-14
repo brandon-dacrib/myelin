@@ -54,6 +54,17 @@ use hs_user::hub::{EphemeralObserver, SessionHub};
 /// and device-list changes), and the backstop for the ones that do.
 const EPHEMERAL_POLL: Duration = Duration::from_millis(250);
 
+/// The longest pause after a failed ephemeral tick ([`ephemeral_backoff`]).
+const EPHEMERAL_MAX_BACKOFF: Duration = Duration::from_secs(10);
+
+/// How long the ephemeral pump waits after its `failures`th failed tick in a row before the
+/// next: [`EPHEMERAL_POLL`], doubling with each failure, at most [`EPHEMERAL_MAX_BACKOFF`].
+fn ephemeral_backoff(failures: u32) -> Duration {
+    EPHEMERAL_POLL
+        .saturating_mul(1 << failures.saturating_sub(1).min(8))
+        .min(EPHEMERAL_MAX_BACKOFF)
+}
+
 /// The one-time-key algorithm every device's count names, at zero when none are left: what
 /// Synapse reports and what a client compares against to decide to upload more.
 const SIGNED_CURVE25519: &str = "signed_curve25519";
@@ -164,6 +175,20 @@ fn room(id: &str) -> Result<ruma::OwnedRoomId, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Runs a store call on the blocking pool. The stores' prunes are `async fn`s that do their KV
+/// work synchronously: up to `hs_user::store::STREAM_PRUNE_MAX_PER_CALL` deletes, several
+/// transactions, and an LSM store may stall a writer while it compacts. Held on an async
+/// worker, that is one fewer worker to answer `/health/live` (the demo's liveness kills,
+/// 2026-10-14). The future does no I/O of its own, so blocking on it there is all it needs.
+async fn off_the_runtime<T: Send + 'static>(
+    work: impl std::future::Future<Output = Result<T, String>> + Send + 'static,
+) -> Result<T, String> {
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || runtime.block_on(work))
+        .await
+        .map_err(|e| format!("store work did not finish: {e}"))?
+}
+
 #[async_trait]
 impl<B: KvBackend + 'static> EphemeralSource for Sources<B> {
     async fn typing_in(&self, room_id: &str) -> Result<Vec<String>, String> {
@@ -198,13 +223,15 @@ impl<B: KvBackend + 'static> EphemeralSource for Sources<B> {
             .map_err(|e| e.to_string())
     }
 
-    async fn prune_receipts_below(&self, below: u64) -> Result<(), String> {
-        self.hub
-            .store()
-            .prune_receipt_stream(below)
-            .await
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+    async fn prune_receipts_below(&self, below: u64) -> Result<usize, String> {
+        let store = self.hub.store().clone();
+        off_the_runtime(async move {
+            store
+                .prune_receipt_stream(below)
+                .await
+                .map_err(|e| e.to_string())
+        })
+        .await
     }
 
     async fn presence_since(
@@ -234,13 +261,15 @@ impl<B: KvBackend + 'static> EphemeralSource for Sources<B> {
             .map_err(|e| e.to_string())
     }
 
-    async fn prune_presence_below(&self, below: u64) -> Result<(), String> {
-        self.hub
-            .store()
-            .prune_presence_stream(below)
-            .await
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+    async fn prune_presence_below(&self, below: u64) -> Result<usize, String> {
+        let store = self.hub.store().clone();
+        off_the_runtime(async move {
+            store
+                .prune_presence_stream(below)
+                .await
+                .map_err(|e| e.to_string())
+        })
+        .await
     }
 
     async fn presence_content(&self, user_id: &str) -> Result<Option<serde_json::Value>, String> {
@@ -378,12 +407,14 @@ impl<B: KvBackend + 'static> DeviceSource for Sources<B> {
             .map_err(|e| e.to_string())
     }
 
-    async fn prune_to_device_below(&self, below: u64) -> Result<(), String> {
-        self.e2e
-            .prune_to_device_stream(below)
-            .await
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+    async fn prune_to_device_below(&self, below: u64) -> Result<usize, String> {
+        let e2e = self.e2e.clone();
+        off_the_runtime(async move {
+            e2e.prune_to_device_stream(below)
+                .await
+                .map_err(|e| e.to_string())
+        })
+        .await
     }
 
     async fn to_device_message(
@@ -610,6 +641,7 @@ impl<B: KvBackend + 'static> AppserviceDelivery<B> {
         // The admin API's `appservices.logins` asks bridges through this, counted with the
         // other appservice series (`hs_admin_bridge_login_queries_total`).
         let mut bridge_logins = hs_appservice::provisioning::BridgeLogins::new();
+        let ephemeral_metrics = metrics.clone();
         if let Some(metrics) = metrics {
             bridge_logins = bridge_logins.with_metrics(metrics.clone());
             scheduler = scheduler.with_metrics(metrics);
@@ -659,7 +691,11 @@ impl<B: KvBackend + 'static> AppserviceDelivery<B> {
             let gate = gate.clone();
             Arc::new(move |id: &str| gate.delivers_here(id))
         });
-        let ephemeral = Arc::new(EphemeralPump::new(appservices, sources.clone(), sources));
+        let mut ephemeral = EphemeralPump::new(appservices, sources.clone(), sources);
+        if let Some(metrics) = ephemeral_metrics {
+            ephemeral = ephemeral.with_metrics(metrics);
+        }
+        let ephemeral = Arc::new(ephemeral);
         // Installed before the first tick, so that a change in between rings a bell the tick
         // answers, rather than waiting for the timer.
         hub.install_ephemeral_observer(Arc::new(Doorbell {
@@ -692,20 +728,35 @@ impl<B: KvBackend + 'static> AppserviceDelivery<B> {
     /// The ephemeral pump's task: a tick on every doorbell and every [`EPHEMERAL_POLL`], on the
     /// replica that owns the global shard. Another replica drops the typing rooms it was told
     /// of; the owner was told of the same ones.
+    ///
+    /// A tick that fails is retried after [`ephemeral_backoff`], doorbells or not: a store
+    /// that keeps refusing the same work is not asked again four times a second.
     async fn follow_ephemeral(pump: Arc<EphemeralPump<B>>, gate: Arc<Gate<B>>) {
+        let mut failures: u32 = 0;
         loop {
             if gate.pumps_here() {
                 match pump.tick().await {
                     Ok(ids) => {
+                        failures = 0;
                         for id in ids {
                             gate.nudge(&id);
                         }
                     }
                     Err(error) => {
-                        tracing::error!(%error, "appservice ephemeral delivery could not read a stream; the next tick will try again");
+                        failures = failures.saturating_add(1);
+                        let retry_in = ephemeral_backoff(failures);
+                        tracing::error!(
+                            %error,
+                            consecutive_failures = failures,
+                            retry_in_ms = u64::try_from(retry_in.as_millis()).unwrap_or(u64::MAX),
+                            "appservice ephemeral delivery could not read a stream; it tries again after a pause"
+                        );
+                        tokio::time::sleep(retry_in).await;
+                        continue;
                     }
                 }
             } else {
+                failures = 0;
                 pump.discard_typing();
             }
             let _ = tokio::time::timeout(EPHEMERAL_POLL, pump.wait()).await;
@@ -819,6 +870,29 @@ mod tests {
     use hs_room::membership::Action;
     use std::collections::HashSet;
     use std::sync::Mutex;
+
+    /// A failing ephemeral tick is retried after a pause that doubles from the poll interval
+    /// up to a cap, so a store that keeps refusing is not asked four times a second.
+    #[test]
+    fn a_failing_ephemeral_tick_backs_off_to_a_cap() {
+        assert_eq!(ephemeral_backoff(1), EPHEMERAL_POLL);
+        assert_eq!(ephemeral_backoff(2), EPHEMERAL_POLL * 2);
+        assert_eq!(ephemeral_backoff(3), EPHEMERAL_POLL * 4);
+        assert_eq!(ephemeral_backoff(6), EPHEMERAL_POLL * 32);
+        assert_eq!(ephemeral_backoff(7), EPHEMERAL_MAX_BACKOFF);
+        assert_eq!(ephemeral_backoff(u32::MAX), EPHEMERAL_MAX_BACKOFF);
+    }
+
+    /// Store work handed to the blocking pool comes back with its answer, and a failure as the
+    /// error it was.
+    #[tokio::test]
+    async fn store_work_off_the_runtime_returns_its_result() {
+        assert_eq!(off_the_runtime(async { Ok(7_usize) }).await, Ok(7));
+        assert_eq!(
+            off_the_runtime(async { Err::<usize, _>("refused".to_owned()) }).await,
+            Err("refused".to_owned())
+        );
+    }
 
     /// An ownership whose answers a test scripts: which shards are mine, changed at will, with
     /// the event a real acquisition or release would publish.

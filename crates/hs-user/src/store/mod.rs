@@ -520,7 +520,9 @@ pub trait UserStore: Send + Sync {
     /// room that changed after it (the kept entry is at or after any deleted one), but may
     /// have lost the room's position as of itself, in which case `crate::sync` sends the room
     /// whole. Returns how many entries were deleted; `0` when the feed is within `keep` of its
-    /// floor already. A store with no feed retention does nothing.
+    /// floor already. A store with no feed retention does nothing. A store may delete in
+    /// several transactions and stop at a bound per call: entries it leaves below the floor
+    /// only make an old token repeat more, and the next compaction deletes them.
     ///
     /// # Errors
     /// Returns [`StoreError`] on a storage failure.
@@ -800,7 +802,9 @@ pub trait UserStore: Send + Sync {
     async fn receipt_stream_head(&self) -> Result<u64, StoreError>;
 
     /// Deletes receipt stream entries below `below` and returns how many. The receipts
-    /// themselves are untouched.
+    /// themselves are untouched. Deletes at most [`STREAM_PRUNE_MAX_PER_CALL`] entries,
+    /// [`STREAM_PRUNE_BATCH`] to a transaction: a call that returns that many may have left some
+    /// below `below` for the next call.
     ///
     /// # Errors
     /// Returns [`StoreError`] on a storage failure.
@@ -825,7 +829,8 @@ pub trait UserStore: Send + Sync {
     /// Returns [`StoreError`] on a storage failure.
     async fn presence_stream_head(&self) -> Result<u64, StoreError>;
 
-    /// Deletes presence stream entries below `below` and returns how many.
+    /// Deletes presence stream entries below `below` and returns how many, bounded as
+    /// [`UserStore::prune_receipt_stream`] is.
     ///
     /// # Errors
     /// Returns [`StoreError`] on a storage failure.
@@ -853,6 +858,18 @@ pub struct PresenceStreamEntry {
     /// current one is what a reader wants, not the one that was current at this position.
     pub user_id: String,
 }
+
+/// How many stream entries one prune transaction deletes at most
+/// ([`UserStore::prune_receipt_stream`], [`UserStore::prune_presence_stream`]): well under the
+/// store's 10,000-mutation transaction limit (`hs_kv::MAX_TXN_MUTATIONS`), which one
+/// transaction for the whole range exceeded once a backlog built up, so the prune was refused
+/// on every try and the stream was never pruned again.
+pub const STREAM_PRUNE_BATCH: usize = 1_000;
+
+/// How many stream entries one prune call deletes at most, [`STREAM_PRUNE_BATCH`] at a time.
+/// Bounds how long one call holds its caller (the appservice ephemeral pump, every tick); what
+/// is left is deleted by the next call.
+pub const STREAM_PRUNE_MAX_PER_CALL: usize = 10 * STREAM_PRUNE_BATCH;
 
 /// Shorthand for the trait-object form every consumer (`crate::hub::SessionHub`,
 /// `crate::state::UserState`) actually holds.

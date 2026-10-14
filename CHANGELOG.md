@@ -15,6 +15,15 @@ carries the generated notes for that merge.
 
 ## Unreleased
 
+- **The bridge pump no longer spins on a stream it cannot prune.** Once more than 10,000
+  receipts, presence changes or to-device messages waited to be pruned, the store refused the
+  single delete every time and the appservice ephemeral pump retried it four times a second,
+  logging an error each time (about 3,300 every 15 minutes on the demo, which its liveness probe
+  then killed). Streams are now pruned 1,000 entries to a transaction, off the async workers; a
+  prune that fails is logged once a minute and retried on the next tick without holding up
+  delivery, and two counters (`hs_appservice_ephemeral_pruned_total`,
+  `hs_appservice_ephemeral_prune_failures_total`) show it. A sync feed's and the hot-room
+  stream's compaction, which had the same single-transaction limit, are batched the same way.
 - **A bridge catching up on a long queue is delivered to in bounded steps.** Each delivery
   starts where the waiting transactions start instead of walking past every one that ran out of
   retries, a delivered batch is removed in one write, and the bridge's backlog list and replay

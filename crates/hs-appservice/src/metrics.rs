@@ -36,6 +36,12 @@
 //!   is that bridge falling behind. Reported by the replica that delivers to the appservice
 //!   (the owner of its shard), so a cluster's series never count one queue twice.
 //!
+//! - `hs_appservice_ephemeral_pruned_total{stream}` and
+//!   `hs_appservice_ephemeral_prune_failures_total{stream}`: entries the ephemeral pump
+//!   ([`crate::ephemeral`]) deleted from the `receipts`, `presence` and `to_device` streams once
+//!   every appservice had been sent them, and prunes of a stream that failed (each is retried on
+//!   the next tick). Failures that keep climbing mean a stream is growing without bound.
+//!
 //! `appservice` is the registration id: bounded by how many bridges an operator runs, and what
 //! the operator looks at the numbers by.
 
@@ -97,6 +103,14 @@ pub struct QueryLabels {
     pub outcome: String,
 }
 
+/// Labels of `hs_appservice_ephemeral_pruned_total` and
+/// `hs_appservice_ephemeral_prune_failures_total`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, prometheus_client::encoding::EncodeLabelSet)]
+pub struct EphemeralStreamLabels {
+    /// `receipts`, `presence` or `to_device`.
+    pub stream: String,
+}
+
 /// The delivery metric families. Cheap to clone; every clone counts into the same families.
 #[derive(Clone, Default)]
 pub struct AppserviceMetrics {
@@ -110,6 +124,10 @@ pub struct AppserviceMetrics {
     pub key_withheld_total: Family<KeyWithheldLabels, Counter>,
     /// `hs_appservice_queries_total{appservice,kind,outcome}`.
     pub queries_total: Family<QueryLabels, Counter>,
+    /// `hs_appservice_ephemeral_pruned_total{stream}`.
+    pub ephemeral_pruned_total: Family<EphemeralStreamLabels, Counter>,
+    /// `hs_appservice_ephemeral_prune_failures_total{stream}`.
+    pub ephemeral_prune_failures_total: Family<EphemeralStreamLabels, Counter>,
 }
 
 impl AppserviceMetrics {
@@ -151,7 +169,37 @@ impl AppserviceMetrics {
              error, cached)",
             metrics.queries_total.clone(),
         );
+        registry.register(
+            "hs_appservice_ephemeral_pruned",
+            "Entries the appservice ephemeral pump deleted from a stream (receipts, presence, \
+             to_device) once every appservice had been sent them",
+            metrics.ephemeral_pruned_total.clone(),
+        );
+        registry.register(
+            "hs_appservice_ephemeral_prune_failures",
+            "Prunes of an appservice ephemeral stream (receipts, presence, to_device) that \
+             failed; the next tick tries again",
+            metrics.ephemeral_prune_failures_total.clone(),
+        );
         metrics
+    }
+
+    /// Counts `pruned` entries deleted from `stream`.
+    pub fn record_ephemeral_pruned(&self, stream: &str, pruned: usize) {
+        self.ephemeral_pruned_total
+            .get_or_create(&EphemeralStreamLabels {
+                stream: stream.to_owned(),
+            })
+            .inc_by(u64::try_from(pruned).unwrap_or(u64::MAX));
+    }
+
+    /// Counts one failed prune of `stream`.
+    pub fn record_ephemeral_prune_failed(&self, stream: &str) {
+        self.ephemeral_prune_failures_total
+            .get_or_create(&EphemeralStreamLabels {
+                stream: stream.to_owned(),
+            })
+            .inc();
     }
 
     /// Counts one question to `appservice`.

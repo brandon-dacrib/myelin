@@ -1171,24 +1171,38 @@ impl<B: KvBackend> ToDeviceStore for TablesE2eStore<B> {
     }
 
     async fn prune_to_device_stream(&self, below: u64) -> Result<usize, StoreError> {
-        transact(&self.backend, TransactConfig::default(), |txn| {
-            let end = Bound::Excluded(Bytes::from((below,).encode()));
-            let spec = RangeSpec::new(Bound::Unbounded, end);
-            let to_delete: Vec<ToDeviceStreamKey> = {
-                let mut keys = Vec::new();
+        use super::{TO_DEVICE_PRUNE_BATCH, TO_DEVICE_PRUNE_MAX_PER_CALL};
+        // Bounded batches, each starting after the last key the one before deleted: one
+        // transaction for a long backlog is refused by the store (10,000 mutations at most).
+        let end = Bound::Excluded(Bytes::from((below,).encode()));
+        let mut start = Bound::Unbounded;
+        let mut total = 0;
+        while total < TO_DEVICE_PRUNE_MAX_PER_CALL {
+            let batch = TO_DEVICE_PRUNE_BATCH.min(TO_DEVICE_PRUNE_MAX_PER_CALL - total);
+            let (deleted, last) = transact(&self.backend, TransactConfig::default(), |txn| {
+                let spec = RangeSpec::new(start.clone(), end.clone()).limit(batch);
+                let mut keys: Vec<ToDeviceStreamKey> = Vec::with_capacity(batch);
                 for item in self.to_device_stream.range(&*txn, spec) {
                     let (k, _v) = item.map_err(to_kv)?;
                     keys.push(k);
                 }
-                keys
-            };
-            let count = to_delete.len();
-            for k in to_delete {
-                self.to_device_stream.delete(txn, &k).map_err(to_kv)?;
+                let last = keys.last().cloned();
+                let count = keys.len();
+                for k in keys {
+                    self.to_device_stream.delete(txn, &k).map_err(to_kv)?;
+                }
+                Ok((count, last))
+            })
+            .map_err(store_err)?;
+            total += deleted;
+            match last {
+                Some(last) if deleted == batch => {
+                    start = Bound::Excluded(Bytes::from(last.encode()));
+                }
+                _ => break,
             }
-            Ok(count)
-        })
-        .map_err(store_err)
+        }
+        Ok(total)
     }
 
     async fn poll_since(
@@ -1771,6 +1785,52 @@ mod tests {
         // The messages are where they were.
         let (msgs, _) = s.poll_since(&ghost, &did("GGGG"), 0, 10).await.unwrap();
         assert_eq!(msgs.len(), 2);
+    }
+
+    /// More to-device stream entries below the floor than one transaction may delete are
+    /// pruned across transactions, at most `TO_DEVICE_PRUNE_MAX_PER_CALL` a call, until none is
+    /// left; nothing at or above the floor is touched. One transaction for the whole range was
+    /// refused on every try (the demo, 2026-10-14).
+    #[tokio::test]
+    async fn a_to_device_backlog_over_the_transaction_limit_is_pruned_in_batches() {
+        use crate::store::{TO_DEVICE_PRUNE_BATCH, TO_DEVICE_PRUNE_MAX_PER_CALL};
+        const SEEDED: u64 = 12_345;
+        const BELOW: u64 = 12_001;
+        const { assert!(BELOW as usize - 1 > hs_kv::MAX_TXN_MUTATIONS) };
+        const { assert!(TO_DEVICE_PRUNE_BATCH < hs_kv::MAX_TXN_MUTATIONS) };
+        let s = store();
+        let row = encode(&ToDeviceStreamRow {
+            user_id: "@bob:example.org".to_owned(),
+            device_id: "BBBB".to_owned(),
+            stream_id: 1,
+        })
+        .unwrap();
+        let mut pos = 1;
+        while pos <= SEEDED {
+            let upto = (pos + 4_999).min(SEEDED);
+            transact(&s.backend, TransactConfig::default(), |txn| {
+                for p in pos..=upto {
+                    s.to_device_stream.put(txn, &(p,), &row).map_err(to_kv)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+            pos = upto + 1;
+        }
+
+        assert_eq!(
+            s.prune_to_device_stream(BELOW).await.unwrap(),
+            TO_DEVICE_PRUNE_MAX_PER_CALL,
+            "the first call stops at its cap"
+        );
+        assert_eq!(
+            s.prune_to_device_stream(BELOW).await.unwrap(),
+            12_000 - TO_DEVICE_PRUNE_MAX_PER_CALL
+        );
+        assert_eq!(s.prune_to_device_stream(BELOW).await.unwrap(), 0);
+        let left = s.to_device_stream_since(0, 1_000).await.unwrap();
+        assert_eq!(left.len() as u64, SEEDED - BELOW + 1);
+        assert_eq!(left[0].pos, BELOW);
     }
 
     #[tokio::test]

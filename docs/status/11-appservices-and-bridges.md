@@ -1,6 +1,8 @@
 # Status: track 11, appservices and bridges
 
-Last updated: 2026-10-13, afternoon (a drain starts where the waiting entries start, the backlog
+Last updated: 2026-10-14 (the ephemeral pump's stream prunes, and the sync feed and hot-room
+stream compactions, delete in bounded batches; a failed prune no longer fails the tick; below);
+before that 2026-10-13, afternoon (a drain starts where the waiting entries start, the backlog
 list and replays read a page at a time, and queue work runs off the async workers; the drain is
 not what freezes the demo; below); before that 2026-10-13 (a bridge that is off no longer takes the server down: the scheduler and the
 queue gauges read small head rows, not every queued body; below); before that 2026-10-12, latest (the iMessage bridge double puppets again, through its
@@ -44,6 +46,91 @@ manager) and an instance's Kubernetes objects say whose bridge they are; before 
 (who has signed in to a bridge; the `cluster` runtime run on kind); before that 2026-09-30
 (ephemeral, to-device and device-list delivery); before that 2026-09-27 (RFC 0017 run against
 the real binary), 2026-09-27 (the bridge manager) and 2026-09-25.
+
+## Session 2026-10-14 (branch `agent/ephemeral-prune`): the ephemeral pump's prune no longer spins on a refused transaction
+
+**Why.** 0.3.10 on the demo (embedded Fjall, federation off, no scraping) was killed by its
+liveness probe four times overnight (2026-10-14 04:46-04:52 and 10:46 UTC). Loki had about 3,300
+of `appservice ephemeral delivery could not read a stream` every 15 minutes since 03:00 UTC (and
+20:15-20:45 the evening before), each `transaction too large: 10001 mutations exceeds the
+10000-mutation limit`. `EphemeralPump::tick` prunes the receipt, presence and to-device streams
+after queueing, and each store prune (`hs-user`'s `prune_stream`, `hs-e2e`'s
+`prune_to_device_stream`) deleted everything below the floor in one transaction. Once more than
+10,000 entries sat below the floor the store refused it every time, the error failed the tick,
+and the next tick (a doorbell or the 250 ms timer) read the same 10,000-key range and was refused
+again: a permanent busy loop of synchronous KV work on async workers (0.4-1 core) and an ERROR
+flood, a likely contributor to the liveness kills.
+
+**What changed.**
+
+- The stores prune in bounded batches: at most 1,000 entries a transaction, at most 10,000 a
+  call, each batch starting after the last key the one before deleted
+  (`hs_user::store::{STREAM_PRUNE_BATCH, STREAM_PRUNE_MAX_PER_CALL}`,
+  `hs_e2e::store::{TO_DEVICE_PRUNE_BATCH, TO_DEVICE_PRUNE_MAX_PER_CALL}`). The count is still
+  returned.
+- `EphemeralSource::prune_receipts_below`, `prune_presence_below` and
+  `DeviceSource::prune_to_device_below` return how many they deleted (`usize`, was `()`).
+- A failed prune does not fail the tick: what was queued stays queued, the failure is counted
+  and logged at WARN at most once a minute (with how many went unlogged), and the next tick
+  prunes again. A stream whose last prune found nothing below the same bound is not asked again
+  until the bound moves (entries are only appended above the head), so an idle pump no longer
+  range-scans three streams four times a second. The bound is now the lowest position as just
+  stored, not as read at the start of the tick, so a stream is pruned one tick sooner.
+- `hs-cli` runs the three prunes on the blocking pool (`off_the_runtime`, the idiom of
+  78ef1f19), and a failing tick backs off (250 ms doubling to 10 s, `ephemeral_backoff`) instead
+  of retrying on every doorbell.
+- New counters: `hs_appservice_ephemeral_pruned_total{stream}` and
+  `hs_appservice_ephemeral_prune_failures_total{stream}` (`stream` is `receipts`, `presence` or
+  `to_device`).
+- The same bug class on the sync side, fixed the same way in `hs-user` (track 05's crate, at the
+  coordinator's request): `compact_feed` (run after every fan-out to a feed past twice its
+  retention, retried on every fan-out once refused) and `compact_hot_stream` (every 200,000
+  hot-room updates at the default retention, whose first run would delete ~100,000 rows in one
+  transaction) deleted up to 50,000 rows in one transaction. Both now scan and delete at most
+  1,000 rows a transaction (`COMPACTION_BATCH`), within the old 50,000-row bound per call. The
+  feed is walked newest first so the first transaction moves the floor (no kept entry is
+  coalesced into while the rest go); the hot-room stream decides each row against the next and
+  moves its floor when the scan reaches the end, as before.
+
+**Verified.** `cargo test -p hs-user -p hs-e2e -p hs-appservice` and `cargo test -p hs-cli`
+green; clippy clean on the four crates. New tests: 12,345 receipt, presence and to-device entries
+(more than one transaction may delete) are pruned across calls, at most 10,000 a call, nothing
+at or above the bound touched (`a_backlog_over_the_transaction_limit_is_pruned_in_batches`,
+`a_to_device_backlog_over_the_transaction_limit_is_pruned_in_batches`, on the in-memory backend,
+which enforces the same limit as Fjall and PostgreSQL); a 25,000-entry feed and a 12,000-row
+hot-room stream are compacted across transactions with each room's newest kept
+(`a_feed_compaction_over_the_transaction_limit_is_done_in_batches`,
+`a_hot_stream_compaction_over_the_transaction_limit_is_done_in_batches`); a prune the store
+refuses does not fail the tick, nothing is queued twice, the failures are counted, the streams
+are pruned once the store accepts, and an unchanged bound is not asked again
+(`a_failing_prune_does_not_fail_the_tick_and_the_streams_are_pruned_later`). Not yet verified on
+the demo: roll the release and check the ERROR is gone, `hs_appservice_ephemeral_pruned_total`
+climbs once (the backlog going) and then follows traffic, and the idle CPU drops.
+
+**Other unbounded deletes found (not fixed here; none runs per tick).** One transaction each, no
+batch cap; each can exceed 10,000 mutations:
+
+- `hs-federation` `outbound_store::forget_destination`: a full PDU queue (10,000 by default) plus
+  EDUs and indexes. Reached hourly by `hs-cli`'s `DestinationSweep` and by the admin forget/prune;
+  a refused one is retried, and refused, every hour.
+- `hs-push` `counts::tables::delete_where` (`mark_read`, `reset`, `reset_room`): every unread row
+  a receipt covers; per read receipt, so a user more than 10,000 notifying events behind in a
+  room can never clear it.
+- `hs-e2e` key backup `delete_version`, `delete_room_sessions`, `delete_all_sessions`: per client
+  request; users with more than 10,000 megolm sessions are common.
+- `hs-auth` `delete_all_access_tokens_for_user`, `delete_other_access_tokens_for_user`,
+  `delete_all_refresh_tokens_for_user`: two mutations a token, so more than 5,000 tokens.
+- `hs-user` `forget_room_members` and `reconcile_room_members` (room-update path, large rooms),
+  and `index_room_members_if_absent` (writes, rooms over ~10,000 members).
+- `hs-room` `admin_ops::delete_everything`: its last transaction (aliases and a `joined_rooms`
+  row per member); admin room delete of a room over ~10,000 members.
+- `hs-e2e` `replace_remote_device_list` / `forget_remote_user`: bounded by a remote server's
+  device count for a user.
+- `hs-appservice` `store::purge_network_rooms` (on removing an appservice; one-off; this track's,
+  next).
+- `hs-media` `scanning::cache::VerdictCache::put`: `overflow` deletes, normally one.
+- `hs-federation` `enqueue` / `enqueue_durable_edu`: writes, 2-4 per destination, past ~2,500
+  destinations.
 
 ## Session 2026-10-13, afternoon (branch `agent/backlog-heads`): bounded drains, a paged backlog, and the drain is not the freeze
 

@@ -1,10 +1,27 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-10-13, evening (the crash loop is `/metrics`; fix on `agent/federation-boot-storm`). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+Written 2026-09-20 by the integration lead, last revised 2026-10-14 (the ephemeral pump's prune busy loop; fix on `agent/ephemeral-prune`). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
-## Resume here: 2026-10-13, evening -- the demo's crash loop is the `/metrics` handler; the fix is `agent/federation-boot-storm`
+## Resume here: 2026-10-14 -- the overnight liveness kills; a refused prune spun the ephemeral pump; the fix is `agent/ephemeral-prune`
+
+0.3.10 was liveness-killed four times overnight (04:46-04:52 and 10:46 UTC) with federation off
+and no scraping, while Loki logged ~3,300 `appservice ephemeral delivery could not read a
+stream ... transaction too large: 10001 mutations` every 15 minutes. **Cause**: the ephemeral
+pump's stream prunes deleted everything below the floor in one transaction; past 10,000 entries
+the store refused it on every tick, failing the tick, which re-read the same range four times a
+second on async workers. **The fix** (status 11, 2026-10-14): prunes in 1,000-entry
+transactions (10,000 a call) on the blocking pool; a failed prune is counted and logged once a
+minute and does not fail the tick; a failing tick backs off to 10 s; the sync feed and hot-room
+stream compactions, which had the same single-transaction limit, are batched too. **After the
+roll**: the ERROR line gone, `hs_appservice_ephemeral_pruned_total` jumping once (the backlog)
+and then following traffic, `hs_appservice_ephemeral_prune_failures_total` flat, idle CPU down,
+no restarts. Status 11 lists ten other unbounded single-transaction deletes, none per tick; the
+next ones to batch are `hs-federation`'s `forget_destination` (hourly sweep) and `hs-push`'s
+`delete_where` (every read receipt).
+
+## Earlier: 2026-10-13, evening -- the demo's crash loop is the `/metrics` handler; the fix is `agent/federation-boot-storm`
 
 0.3.10 was still killed by its liveness probe every 2-6 minutes (24 restarts by 19:45 UTC).
 **Cause**: `/metrics` rendered on the async worker that took the request; renderings grew to

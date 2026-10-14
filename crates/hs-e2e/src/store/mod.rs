@@ -487,8 +487,10 @@ pub trait ToDeviceStore: Send + Sync {
     /// been queued.
     async fn to_device_stream_head(&self) -> Result<u64, StoreError>;
 
-    /// Deletes every entry of the server-wide stream with a position below `below`, and
-    /// returns how many. The messages themselves are not touched.
+    /// Deletes the entries of the server-wide stream with a position below `below`, and
+    /// returns how many. The messages themselves are not touched. Deletes at most
+    /// [`TO_DEVICE_PRUNE_MAX_PER_CALL`] entries, [`TO_DEVICE_PRUNE_BATCH`] to a transaction: a
+    /// call that returns that many may have left some below `below` for the next call.
     async fn prune_to_device_stream(&self, below: u64) -> Result<usize, StoreError>;
 
     /// Enqueues one message for a local recipient device, returning its assigned per-device
@@ -615,6 +617,17 @@ pub trait RemoteDeviceListStore: Send + Sync {
     /// Drops everything held about `user_id`.
     async fn forget_remote_user(&self, user_id: &UserId) -> Result<(), StoreError>;
 }
+
+/// How many to-device stream entries one prune transaction deletes at most
+/// (`prune_to_device_stream`): well under the store's 10,000-mutation transaction limit
+/// (`hs_kv::MAX_TXN_MUTATIONS`), which one transaction for the whole range exceeded once a
+/// backlog built up, so the prune was refused on every try and the stream never shrank again.
+pub const TO_DEVICE_PRUNE_BATCH: usize = 1_000;
+
+/// How many to-device stream entries one prune call deletes at most, [`TO_DEVICE_PRUNE_BATCH`]
+/// at a time. Bounds how long one call holds its caller (the appservice ephemeral pump, every
+/// tick); what is left is deleted by the next call.
+pub const TO_DEVICE_PRUNE_MAX_PER_CALL: usize = 10 * TO_DEVICE_PRUNE_BATCH;
 
 /// The union of every storage trait this crate needs, for callers that want "the e2e store"
 /// without naming each capability individually — mirrors `hs_auth::store::AuthStore`.

@@ -59,6 +59,21 @@
 //!   and the recipients of its to-device messages -- Synapse's `interesting users` rule,
 //!   computed when the transaction is queued rather than sent.
 //!
+//! # Pruning
+//!
+//! After queueing, a tick deletes what every listener has been sent from the receipt, presence
+//! and to-device streams. The stores delete a bounded number of entries per call, a bounded
+//! number per transaction (`hs_user::store::STREAM_PRUNE_BATCH`,
+//! `hs_e2e::store::TO_DEVICE_PRUNE_BATCH`), so a backlog is worked off over a few ticks rather
+//! than in one transaction the store refuses. A prune that fails does not fail the tick: what
+//! was queued stays queued, the failure is counted
+//! (`hs_appservice_ephemeral_prune_failures_total`) and logged at most once a minute, and the
+//! next tick prunes again. Until 2026-10-14 the whole range went in one transaction and its
+//! error failed the tick; once more than 10,000 entries sat below the floor every tick was
+//! refused, the next one (a quarter of a second later) read the same range again, and the pump
+//! spun on it for hours. A stream whose last prune found nothing below the same bound is not
+//! asked again until the bound moves.
+//!
 //! # What runs where
 //!
 //! One task, on the replica that owns the global shard, like the event pump (`hs-cli`'s
@@ -67,6 +82,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use hs_kv::KvBackend;
@@ -74,6 +90,7 @@ use serde_json::Value;
 use tokio::sync::Notify;
 
 use crate::error::AppserviceError;
+use crate::metrics::AppserviceMetrics;
 use crate::namespace::{NamespaceKind, Namespaces};
 use crate::pump::{Listener, listeners};
 use crate::registry::Registry;
@@ -181,16 +198,18 @@ pub trait EphemeralSource: Send + Sync {
     async fn receipts_since(&self, since: u64, limit: usize) -> Result<Vec<ReceiptChange>, String>;
     /// The receipt stream's newest position (`0` if empty).
     async fn receipts_head(&self) -> Result<u64, String>;
-    /// Deletes receipt stream entries below `below`.
-    async fn prune_receipts_below(&self, below: u64) -> Result<(), String>;
+    /// Deletes receipt stream entries below `below`, and returns how many. May delete only
+    /// some of them, a bounded number per call; the pump calls again on its next tick.
+    async fn prune_receipts_below(&self, below: u64) -> Result<usize, String>;
 
     /// Presence stream entries after `since`, oldest first, at most `limit`.
     async fn presence_since(&self, since: u64, limit: usize)
     -> Result<Vec<PresenceChange>, String>;
     /// The presence stream's newest position (`0` if empty).
     async fn presence_head(&self) -> Result<u64, String>;
-    /// Deletes presence stream entries below `below`.
-    async fn prune_presence_below(&self, below: u64) -> Result<(), String>;
+    /// Deletes presence stream entries below `below`, and returns how many, bounded as
+    /// [`EphemeralSource::prune_receipts_below`] is.
+    async fn prune_presence_below(&self, below: u64) -> Result<usize, String>;
     /// `user_id`'s current presence as `m.presence` content (`presence`, `last_active_ago`,
     /// `currently_active`, `status_msg`), or `None` if they have none.
     async fn presence_content(&self, user_id: &str) -> Result<Option<Value>, String>;
@@ -223,8 +242,9 @@ pub trait DeviceSource: KeyCountSource {
     ) -> Result<Vec<ToDeviceChange>, String>;
     /// The to-device stream's newest position (`0` if empty).
     async fn to_device_head(&self) -> Result<u64, String>;
-    /// Deletes to-device stream entries below `below`.
-    async fn prune_to_device_below(&self, below: u64) -> Result<(), String>;
+    /// Deletes to-device stream entries below `below`, and returns how many, bounded as
+    /// [`EphemeralSource::prune_receipts_below`] is.
+    async fn prune_to_device_below(&self, below: u64) -> Result<usize, String>;
     /// The message at `stream_id` in `(user_id, device_id)`'s queue, or `None` if that device's
     /// `/sync` has taken it since.
     async fn to_device_message(
@@ -285,6 +305,31 @@ pub struct EphemeralPump<B: KvBackend> {
     /// Rooms whose typing changed since the last tick.
     typing_rooms: Mutex<BTreeSet<String>>,
     wake: Notify,
+    /// What the last prunes found, and when a failed one was last logged.
+    prune: Mutex<PruneState>,
+    /// The `hs_appservice_ephemeral_*` counters, if registered.
+    metrics: Option<AppserviceMetrics>,
+}
+
+/// How often a failing prune is logged at most. The pump ticks several times a second; one line
+/// a minute says as much as one a tick did (3,300 every 15 minutes on the demo, 2026-10-14), and
+/// `hs_appservice_ephemeral_prune_failures_total` counts every one.
+const PRUNE_WARN_EVERY: Duration = Duration::from_secs(60);
+
+/// The streams a tick prunes, in [`PruneState::clean_below`]'s order.
+const PRUNED_STREAMS: [&str; 3] = [RECEIPTS, PRESENCE, TO_DEVICE];
+
+/// What the pump remembers between prunes.
+#[derive(Debug, Default)]
+struct PruneState {
+    /// Per stream ([`PRUNED_STREAMS`]): the bound below which the last prune found nothing to
+    /// delete. Entries are appended above the head, so nothing appears below that bound later,
+    /// and a tick with the same bound need not look again.
+    clean_below: [Option<u64>; 3],
+    /// When a failed prune was last logged.
+    last_warned: Option<Instant>,
+    /// Failed prunes since the last one logged.
+    unlogged_failures: u64,
 }
 
 /// Typing, receipt or presence: which of the hub's changes [`EphemeralPump::note`] is told of.
@@ -332,7 +377,18 @@ impl<B: KvBackend> EphemeralPump<B> {
             devices,
             typing_rooms: Mutex::new(BTreeSet::new()),
             wake: Notify::new(),
+            prune: Mutex::new(PruneState::default()),
+            metrics: None,
         }
+    }
+
+    /// Counts what the pump prunes from the streams, and the prunes that failed, into
+    /// `metrics` (`hs_appservice_ephemeral_pruned_total`,
+    /// `hs_appservice_ephemeral_prune_failures_total`).
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: AppserviceMetrics) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// The doorbell: notes a typing change's room, and wakes whoever is waiting in
@@ -389,9 +445,14 @@ impl<B: KvBackend> EphemeralPump<B> {
     /// the appservices that now have something queued. Must not run concurrently with itself
     /// (one task calls it; see `hs-cli`).
     ///
+    /// Once the transactions are queued it prunes the streams below the lowest position (the
+    /// module docs' "Pruning"); a prune that fails is counted and logged, and does not fail the
+    /// tick.
+    ///
     /// # Errors
-    /// Returns [`AppserviceError::Store`] if the store or a source fails; the tick is then
-    /// abandoned before anything is queued, and the next one reads the same positions again.
+    /// Returns [`AppserviceError::Store`] if the store or a source fails while reading or
+    /// queueing; the tick is then abandoned before anything is queued, and the next one reads the
+    /// same positions again.
     pub async fn tick(&self) -> Result<Vec<String>, AppserviceError> {
         let all = listeners(&self.registry)?;
         let ephemeral: Vec<&Listener> = all
@@ -564,21 +625,84 @@ impl<B: KvBackend> EphemeralPump<B> {
         }
 
         // Nobody needs what every listener has been sent (a position is the last entry dealt
-        // with, so everything at or below the lowest one). With nobody listening, nothing is
-        // kept.
-        source
-            .prune_receipts_below(receipt_positions.floor.saturating_add(1))
-            .await
-            .map_err(AppserviceError::Store)?;
-        source
-            .prune_presence_below(presence_positions.floor.saturating_add(1))
-            .await
-            .map_err(AppserviceError::Store)?;
-        self.devices
-            .prune_to_device_below(to_device_positions.floor.saturating_add(1))
-            .await
-            .map_err(AppserviceError::Store)?;
+        // with, so everything at or below the lowest one, as just stored). With nobody
+        // listening, nothing is kept. Never above the head read at the start: an entry appended
+        // since may not have been read by anyone.
+        let bound = |positions: &Positions, head: u64| {
+            let sent = positions
+                .per_listener
+                .iter()
+                .copied()
+                .min()
+                .unwrap_or(u64::MAX);
+            sent.min(head).saturating_add(1)
+        };
+        self.prune_streams([
+            bound(&receipt_positions, receipts_head),
+            bound(&presence_positions, presence_head),
+            bound(&to_device_positions, to_device_head),
+        ])
+        .await;
         Ok(touched)
+    }
+
+    fn prune_state(&self) -> std::sync::MutexGuard<'_, PruneState> {
+        self.prune
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Prunes each of [`PRUNED_STREAMS`] below its bound in `bounds`. A failure is counted and
+    /// logged (at most once per [`PRUNE_WARN_EVERY`]) and the next stream is pruned anyway: the
+    /// next tick tries again.
+    async fn prune_streams(&self, bounds: [u64; 3]) {
+        for (index, (stream, below)) in PRUNED_STREAMS.into_iter().zip(bounds).enumerate() {
+            if self.prune_state().clean_below[index] == Some(below) {
+                continue;
+            }
+            let result = match stream {
+                RECEIPTS => self.source.prune_receipts_below(below).await,
+                PRESENCE => self.source.prune_presence_below(below).await,
+                _ => self.devices.prune_to_device_below(below).await,
+            };
+            match result {
+                Ok(pruned) => {
+                    self.prune_state().clean_below[index] = (pruned == 0).then_some(below);
+                    if pruned > 0 {
+                        if let Some(metrics) = &self.metrics {
+                            metrics.record_ephemeral_pruned(stream, pruned);
+                        }
+                        tracing::debug!(stream, below, pruned, "pruned an ephemeral stream");
+                    }
+                }
+                Err(error) => {
+                    if let Some(metrics) = &self.metrics {
+                        metrics.record_ephemeral_prune_failed(stream);
+                    }
+                    let mut state = self.prune_state();
+                    state.clean_below[index] = None;
+                    let now = Instant::now();
+                    if state
+                        .last_warned
+                        .is_some_and(|at| now.duration_since(at) < PRUNE_WARN_EVERY)
+                    {
+                        state.unlogged_failures += 1;
+                    } else {
+                        let since_last_logged = std::mem::take(&mut state.unlogged_failures);
+                        state.last_warned = Some(now);
+                        drop(state);
+                        tracing::warn!(
+                            stream,
+                            below,
+                            %error,
+                            since_last_logged,
+                            "appservice ephemeral delivery could not prune a stream; what was \
+                             queued stays queued, and the next tick prunes again"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     async fn pump_receipts(
@@ -881,6 +1005,10 @@ mod tests {
         device_lists: Mutex<Vec<(u64, String)>>,
         keys: Mutex<HashMap<String, Vec<DeviceKeyCounts>>>,
         heads: Mutex<HashMap<&'static str, u64>>,
+        /// While set, every prune fails as the store did on the demo.
+        failing_prunes: std::sync::atomic::AtomicBool,
+        /// How many prunes were asked for.
+        prune_calls: std::sync::atomic::AtomicUsize,
     }
 
     impl Fake {
@@ -889,6 +1017,18 @@ mod tests {
             let head = heads.entry(stream).or_insert(0);
             *head += 1;
             *head
+        }
+
+        /// Counts a prune, and fails it while [`Fake::failing_prunes`] is set.
+        fn prune_call(&self) -> Result<(), String> {
+            use std::sync::atomic::Ordering;
+            self.prune_calls.fetch_add(1, Ordering::SeqCst);
+            if self.failing_prunes.load(Ordering::SeqCst) {
+                return Err("store error: backend error: transaction too large: 10001 \
+                     mutations exceeds the 10000-mutation limit"
+                    .to_owned());
+            }
+            Ok(())
         }
 
         fn head(&self, stream: &'static str) -> u64 {
@@ -1016,9 +1156,12 @@ mod tests {
         async fn receipts_head(&self) -> Result<u64, String> {
             Ok(self.head("receipts"))
         }
-        async fn prune_receipts_below(&self, below: u64) -> Result<(), String> {
-            self.receipts.lock().unwrap().retain(|r| r.pos >= below);
-            Ok(())
+        async fn prune_receipts_below(&self, below: u64) -> Result<usize, String> {
+            self.prune_call()?;
+            let mut receipts = self.receipts.lock().unwrap();
+            let before = receipts.len();
+            receipts.retain(|r| r.pos >= below);
+            Ok(before - receipts.len())
         }
         async fn presence_since(
             &self,
@@ -1035,9 +1178,12 @@ mod tests {
         async fn presence_head(&self) -> Result<u64, String> {
             Ok(self.head("presence"))
         }
-        async fn prune_presence_below(&self, below: u64) -> Result<(), String> {
-            self.presence.lock().unwrap().retain(|p| p.pos >= below);
-            Ok(())
+        async fn prune_presence_below(&self, below: u64) -> Result<usize, String> {
+            self.prune_call()?;
+            let mut presence = self.presence.lock().unwrap();
+            let before = presence.len();
+            presence.retain(|p| p.pos >= below);
+            Ok(before - presence.len())
         }
         async fn presence_content(&self, user_id: &str) -> Result<Option<Value>, String> {
             Ok(self.presence_content.lock().unwrap().get(user_id).cloned())
@@ -1087,9 +1233,12 @@ mod tests {
         async fn to_device_head(&self) -> Result<u64, String> {
             Ok(self.head("to_device"))
         }
-        async fn prune_to_device_below(&self, below: u64) -> Result<(), String> {
-            self.to_device.lock().unwrap().retain(|t| t.pos >= below);
-            Ok(())
+        async fn prune_to_device_below(&self, below: u64) -> Result<usize, String> {
+            self.prune_call()?;
+            let mut to_device = self.to_device.lock().unwrap();
+            let before = to_device.len();
+            to_device.retain(|t| t.pos >= below);
+            Ok(before - to_device.len())
         }
         async fn to_device_message(
             &self,
@@ -1267,6 +1416,96 @@ mod tests {
         // ...and the streams were pruned below them.
         assert!(fake.receipts_since(0, 10).await.unwrap().is_empty());
         assert!(fake.presence_since(0, 10).await.unwrap().is_empty());
+    }
+
+    /// A prune the store refuses (the demo, 2026-10-14: more than 10,000 entries below the
+    /// floor in one transaction) does not fail the tick: the transaction is queued, the
+    /// positions move, the failure is counted, and a later tick prunes the streams. A stream
+    /// already pruned to its bound is not asked again until the bound moves.
+    #[tokio::test]
+    async fn a_failing_prune_does_not_fail_the_tick_and_the_streams_are_pruned_later() {
+        use std::sync::atomic::Ordering;
+        let registry = Arc::new(
+            Registry::open(MemoryBackend::new(), ruma::server_name!("example.org")).unwrap(),
+        );
+        registry
+            .add(&Registration::parse_yaml(BRIDGE).unwrap())
+            .unwrap();
+        let fake = Arc::new(Fake::default());
+        let metrics = AppserviceMetrics::default();
+        let pump = EphemeralPump::new(registry.clone(), fake.clone(), fake.clone())
+            .with_metrics(metrics.clone());
+        fake.room(
+            "!bridged:example.org",
+            &["@alice:example.org", "@irc_bob:example.org"],
+        );
+        assert!(pump.tick().await.unwrap().is_empty());
+
+        fake.failing_prunes.store(true, Ordering::SeqCst);
+        fake.receipt(
+            "!bridged:example.org",
+            "@alice:example.org",
+            "m.read",
+            "$one",
+        );
+        fake.presence("@alice:example.org", "online");
+        fake.send_to_device("@irc_bob:example.org", "GHOSTDEV", "m.room_key");
+        assert_eq!(pump.tick().await.unwrap(), vec!["irc".to_owned()]);
+        assert_eq!(queued(&registry, "irc").len(), 1);
+        assert_eq!(
+            registry.store().ephemeral_pos("irc", RECEIPTS).unwrap(),
+            Some(1)
+        );
+        // Nothing was pruned, and every failure was counted.
+        assert_eq!(fake.receipts_since(0, 10).await.unwrap().len(), 1);
+        assert_eq!(fake.presence_since(0, 10).await.unwrap().len(), 1);
+        assert_eq!(fake.to_device_since(0, 10).await.unwrap().len(), 1);
+        for stream in PRUNED_STREAMS {
+            assert_eq!(
+                metrics
+                    .ephemeral_prune_failures_total
+                    .get_or_create(&crate::metrics::EphemeralStreamLabels {
+                        stream: stream.to_owned(),
+                    })
+                    .get(),
+                1,
+                "{stream}"
+            );
+        }
+        // Still failing: still not an error, and nothing queued twice.
+        assert!(pump.tick().await.unwrap().is_empty());
+        assert_eq!(queued(&registry, "irc").len(), 1);
+
+        // Once the store accepts it, the next tick prunes everything every listener has had.
+        fake.failing_prunes.store(false, Ordering::SeqCst);
+        assert!(pump.tick().await.unwrap().is_empty());
+        assert!(fake.receipts_since(0, 10).await.unwrap().is_empty());
+        assert!(fake.presence_since(0, 10).await.unwrap().is_empty());
+        assert!(fake.to_device_since(0, 10).await.unwrap().is_empty());
+        for stream in PRUNED_STREAMS {
+            assert_eq!(
+                metrics
+                    .ephemeral_pruned_total
+                    .get_or_create(&crate::metrics::EphemeralStreamLabels {
+                        stream: stream.to_owned(),
+                    })
+                    .get(),
+                1,
+                "{stream}"
+            );
+        }
+
+        // One more tick finds nothing below the same bounds; after that they are not asked.
+        assert!(pump.tick().await.unwrap().is_empty());
+        let calls = fake.prune_calls.load(Ordering::SeqCst);
+        assert!(pump.tick().await.unwrap().is_empty());
+        assert_eq!(fake.prune_calls.load(Ordering::SeqCst), calls);
+        // A new entry moves the bound, and its stream is pruned again.
+        fake.presence("@alice:example.org", "offline");
+        assert_eq!(pump.tick().await.unwrap(), vec!["irc".to_owned()]);
+        assert!(pump.tick().await.unwrap().is_empty());
+        assert!(fake.presence_since(0, 10).await.unwrap().is_empty());
+        assert!(fake.prune_calls.load(Ordering::SeqCst) > calls);
     }
 
     #[tokio::test]

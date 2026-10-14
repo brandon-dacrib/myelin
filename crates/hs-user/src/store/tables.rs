@@ -139,9 +139,16 @@ struct CoalesceBound {
 /// member by member, so a bound keeps that fallback small too.
 const FAN_OUT_BATCH: usize = 100;
 
-/// How many feed or stream rows one compaction transaction scans at most: a feed that grew for
-/// months before retention existed is compacted in pieces, not in one transaction.
+/// How many feed or stream rows one compaction call scans at most: a feed that grew for months
+/// before retention existed is compacted in pieces, over several calls.
 const COMPACTION_SCAN_LIMIT: usize = 50_000;
+
+/// How many feed or stream rows one compaction transaction scans, and so deletes, at most: well
+/// under the store's 10,000-mutation transaction limit (`hs_kv::MAX_TXN_MUTATIONS`). Until
+/// 2026-10-14 a compaction was one transaction of up to [`COMPACTION_SCAN_LIMIT`] deletes,
+/// which the store refused once a window held more than 10,000 rows to delete: the floor never
+/// moved, and a feed's compaction was tried again, and refused again, on every fan-out to it.
+const COMPACTION_BATCH: usize = 1_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AccountDataValue {
@@ -494,6 +501,55 @@ impl<B: KvBackend> TablesUserStore<B> {
             report.feed_entries += entries;
             report.transactions += 1;
             report.feeds_to_compact.extend(to_compact);
+        })
+    }
+}
+
+/// What one batch of [`TablesUserStore::compact_feed_batch`] did.
+struct FeedCompactionBatch {
+    /// Entries deleted.
+    deleted: usize,
+    /// Entries read.
+    scanned: usize,
+    /// The lowest `feed_seq` read, where the next batch continues below.
+    lowest: Option<u64>,
+}
+
+impl<B: KvBackend> TablesUserStore<B> {
+    /// One batch of [`UserStore::compact_feed`]: up to [`COMPACTION_BATCH`] of `uid`'s feed
+    /// entries below `upper`, newest first, deleting each whose room is already in `seen` (a
+    /// newer entry of the room stays) and adding the others' rooms to it.
+    fn compact_feed_batch(
+        &self,
+        txn: &mut B::Txn,
+        uid: &str,
+        upper: std::ops::Bound<Bytes>,
+        seen: &mut std::collections::HashSet<String>,
+    ) -> Result<FeedCompactionBatch, hs_kv::KvError> {
+        let lower =
+            std::ops::Bound::Included(Bytes::from(hs_tables::key::encode(&(uid.to_owned(), 0u64))));
+        let spec = RangeSpec::new(lower, upper)
+            .reverse()
+            .limit(COMPACTION_BATCH);
+        let mut rows: Vec<(u64, String)> = Vec::with_capacity(COMPACTION_BATCH);
+        for item in self.feed.range(&*txn, spec) {
+            let ((_, seq), value) = item.map_err(to_kv)?;
+            let decoded: FeedValue = json_decode(&value).map_err(to_kv)?;
+            rows.push((seq, decoded.room_id));
+        }
+        let mut deleted = 0;
+        for (seq, room) in &rows {
+            if !seen.insert(room.clone()) {
+                self.feed
+                    .delete(txn, &(uid.to_owned(), *seq))
+                    .map_err(to_kv)?;
+                deleted += 1;
+            }
+        }
+        Ok(FeedCompactionBatch {
+            deleted,
+            scanned: rows.len(),
+            lowest: rows.last().map(|(seq, _)| *seq),
         })
     }
 }
@@ -1023,54 +1079,54 @@ impl<B: KvBackend> UserStore for TablesUserStore<B> {
             return Ok(0);
         }
         let uid = user_id.to_string();
-        transact(&self.backend, TransactConfig::default(), |txn| {
+        // Newest first, from the target down, a batch to a transaction: the first entry met of
+        // each room is its newest at or below the target and stays, every later one goes. The
+        // first transaction moves the floor with its batch, so no entry at or below the target
+        // is coalesced into while the rest are deleted (the module docs, "Retention"); entries
+        // left below the floor by a call that stopped at its scan bound only make a token below
+        // the floor repeat more, and the next compaction deletes them.
+        let first = transact(&self.backend, TransactConfig::default(), |txn| {
             let mut head = self.feed_head_txn(txn, &uid).map_err(to_kv)?;
             let target = head.latest.saturating_sub(keep);
             if target <= head.floor {
-                return Ok(0);
+                return Ok(None);
             }
-            // Everything at or below the target, oldest first: the entries kept by earlier
-            // compactions (one per room) and everything since the old floor. Bounded: a feed
-            // that outgrew the bound is compacted up to where the scan stopped, and the next
-            // fan-out past twice the retention brings it here again.
-            let lower = Bytes::from(hs_tables::key::encode(&(uid.clone(), 0u64)));
-            let upper = Bytes::from(hs_tables::key::encode(&(uid.clone(), target)));
-            let spec = RangeSpec::new(
-                std::ops::Bound::Included(lower),
-                std::ops::Bound::Included(upper),
-            )
-            .limit(COMPACTION_SCAN_LIMIT);
-            let mut newest_per_room: std::collections::HashMap<String, u64> =
-                std::collections::HashMap::new();
-            let mut seen: Vec<(u64, String)> = Vec::new();
-            for item in self.feed.range(&*txn, spec) {
-                let ((_, seq), value) = item.map_err(to_kv)?;
-                let decoded: FeedValue = json_decode(&value).map_err(to_kv)?;
-                newest_per_room.insert(decoded.room_id.clone(), seq);
-                seen.push((seq, decoded.room_id));
-            }
-            let Some(&(last_seen, _)) = seen.last() else {
-                return Ok(0);
-            };
-            let new_floor = if seen.len() >= COMPACTION_SCAN_LIMIT {
-                last_seen
-            } else {
-                target
-            };
-            let mut pruned = 0usize;
-            for (seq, room) in &seen {
-                if newest_per_room.get(room) != Some(seq) {
-                    self.feed.delete(txn, &(uid.clone(), *seq)).map_err(to_kv)?;
-                    pruned += 1;
-                }
-            }
-            head.floor = new_floor;
+            let upper = std::ops::Bound::Included(Bytes::from(hs_tables::key::encode(&(
+                uid.clone(),
+                target,
+            ))));
+            let mut seen = std::collections::HashSet::new();
+            let batch = self.compact_feed_batch(txn, &uid, upper, &mut seen)?;
+            head.floor = target;
             self.feed_heads
                 .put(txn, &(uid.clone(),), &json_encode(&head).map_err(to_kv)?)
                 .map_err(to_kv)?;
-            Ok(pruned)
+            Ok(Some((batch, seen)))
         })
-        .map_err(StoreError::Kv)
+        .map_err(StoreError::Kv)?;
+        let Some((mut batch, mut seen)) = first else {
+            return Ok(0);
+        };
+        let mut pruned = batch.deleted;
+        let mut scanned = batch.scanned;
+        while batch.scanned == COMPACTION_BATCH && scanned < COMPACTION_SCAN_LIMIT {
+            let Some(lowest) = batch.lowest else {
+                break;
+            };
+            let upper = std::ops::Bound::Excluded(Bytes::from(hs_tables::key::encode(&(
+                uid.clone(),
+                lowest,
+            ))));
+            (batch, seen) = transact(&self.backend, TransactConfig::default(), |txn| {
+                let mut next_seen = seen.clone();
+                let batch = self.compact_feed_batch(txn, &uid, upper.clone(), &mut next_seen)?;
+                Ok((batch, next_seen))
+            })
+            .map_err(StoreError::Kv)?;
+            pruned += batch.deleted;
+            scanned += batch.scanned;
+        }
+        Ok(pruned)
     }
 
     async fn feed_floor(&self, user_id: &UserId) -> Result<u64, StoreError> {
@@ -1082,73 +1138,71 @@ impl<B: KvBackend> UserStore for TablesUserStore<B> {
         if keep == 0 {
             return Ok(0);
         }
-        transact(&self.backend, TransactConfig::default(), |txn| {
-            let head = read_counter(&*txn, &self.ephemeral_counters, HOT_POSITIONS_COUNTER)
-                .map_err(to_kv)?;
-            let floor = match txn
-                .get(&self.ephemeral_counters, HOT_POSITIONS_FLOOR)
-                .map_err(to_kv)?
-            {
-                Some(bytes) => decode_u64(&bytes).map_err(to_kv)?,
-                None => 0,
-            };
-            let target = head.saturating_sub(keep);
-            if target <= floor {
-                return Ok(0);
-            }
-            // The stream is keyed by room then position, so "everything at or below the
-            // target" is the whole keyspace read room by room, bounded by the scan limit. A
-            // room's rows are contiguous: within a complete room, every row at or below the
-            // target but its newest is deleted. A room cut off by the limit is left alone,
-            // and the floor moves only when the scan reached the end.
-            let spec = RangeSpec::full().limit(COMPACTION_SCAN_LIMIT);
-            let mut rows: Vec<(String, u64)> = Vec::new();
-            for item in self.hot_positions.range(&*txn, spec) {
-                let ((room, seq), _) = item.map_err(to_kv)?;
-                rows.push((room, seq));
-            }
-            let complete = rows.len() < COMPACTION_SCAN_LIMIT;
-            let cut_off_room = if complete {
-                None
-            } else {
-                rows.last().map(|(room, _)| room.clone())
-            };
-            let mut pruned = 0usize;
-            let mut i = 0;
-            while i < rows.len() {
-                let room = rows[i].0.clone();
-                let mut j = i;
-                while j < rows.len() && rows[j].0 == room {
-                    j += 1;
+        let snap = self.backend.snapshot();
+        let head = read_counter(&snap, &self.ephemeral_counters, HOT_POSITIONS_COUNTER)?;
+        let floor = match snap
+            .get(&self.ephemeral_counters, HOT_POSITIONS_FLOOR)
+            .map_err(StoreError::Kv)?
+        {
+            Some(bytes) => decode_u64(&bytes)?,
+            None => 0,
+        };
+        drop(snap);
+        let target = head.saturating_sub(keep);
+        if target <= floor {
+            return Ok(0);
+        }
+        // The stream is keyed by room then position, so "everything at or below the target" is
+        // the whole keyspace read room by room, a batch to a transaction. A room's rows are
+        // contiguous and oldest first: a row at or below the target goes when the row after it
+        // is the same room's and at or below the target too. The last row of a batch has no
+        // row after it yet, so the next batch starts at it. Entries appended meanwhile are
+        // above the head, so above the target. The floor moves only when the scan reached the
+        // end, within [`COMPACTION_SCAN_LIMIT`] rows.
+        let mut start = std::ops::Bound::Unbounded;
+        let mut pruned = 0usize;
+        let mut scanned = 0usize;
+        loop {
+            let (deleted, rows, last) = transact(&self.backend, TransactConfig::default(), |txn| {
+                let spec = RangeSpec::new(start.clone(), std::ops::Bound::Unbounded)
+                    .limit(COMPACTION_BATCH);
+                let mut rows: Vec<(String, u64)> = Vec::with_capacity(COMPACTION_BATCH);
+                for item in self.hot_positions.range(&*txn, spec) {
+                    let ((room, seq), _) = item.map_err(to_kv)?;
+                    rows.push((room, seq));
                 }
-                if cut_off_room.as_deref() != Some(room.as_str()) {
-                    let newest_below = rows[i..j]
-                        .iter()
-                        .filter(|(_, seq)| *seq <= target)
-                        .map(|(_, seq)| *seq)
-                        .max();
-                    for (_, seq) in &rows[i..j] {
-                        if *seq <= target && Some(*seq) != newest_below {
-                            self.hot_positions
-                                .delete(txn, &(room.clone(), *seq))
-                                .map_err(to_kv)?;
-                            pruned += 1;
-                        }
+                let mut deleted = 0usize;
+                for pair in rows.windows(2) {
+                    let ((room, seq), (next_room, next_seq)) = (&pair[0], &pair[1]);
+                    if room == next_room && *seq <= target && *next_seq <= target {
+                        self.hot_positions
+                            .delete(txn, &(room.clone(), *seq))
+                            .map_err(to_kv)?;
+                        deleted += 1;
                     }
                 }
-                i = j;
+                let complete = rows.len() < COMPACTION_BATCH;
+                if complete {
+                    txn.put(
+                        &self.ephemeral_counters,
+                        HOT_POSITIONS_FLOOR,
+                        &target.to_be_bytes(),
+                    )
+                    .map_err(to_kv)?;
+                }
+                Ok((deleted, rows.len(), rows.pop()))
+            })
+            .map_err(StoreError::Kv)?;
+            pruned += deleted;
+            scanned += rows;
+            match last {
+                Some(last) if rows == COMPACTION_BATCH && scanned < COMPACTION_SCAN_LIMIT => {
+                    start = std::ops::Bound::Included(Bytes::from(hs_tables::key::encode(&last)));
+                }
+                _ => break,
             }
-            if complete {
-                txn.put(
-                    &self.ephemeral_counters,
-                    HOT_POSITIONS_FLOOR,
-                    &target.to_be_bytes(),
-                )
-                .map_err(to_kv)?;
-            }
-            Ok(pruned)
-        })
-        .map_err(StoreError::Kv)
+        }
+        Ok(pruned)
     }
 
     async fn put_global_account_data(
@@ -1626,27 +1680,45 @@ impl<B: KvBackend> UserStore for TablesUserStore<B> {
     }
 }
 
-/// Deletes every entry of a `(pos,)`-keyed stream below `below`, returning how many.
+/// Deletes the entries of a `(pos,)`-keyed stream below `below`, returning how many: at most
+/// [`super::STREAM_PRUNE_MAX_PER_CALL`], in transactions of at most
+/// [`super::STREAM_PRUNE_BATCH`] deletes each, so a long backlog never makes one transaction
+/// the store refuses. Each batch starts after the last key the previous one deleted, so it does
+/// not walk back over what was just deleted.
 fn prune_stream<B: KvBackend>(
     backend: &B,
     stream: &TypedKeyspace<B::Keyspace, (u64,)>,
     below: u64,
 ) -> Result<usize, StoreError> {
-    transact(backend, TransactConfig::default(), |txn| {
-        let end = std::ops::Bound::Excluded(Bytes::from(hs_tables::key::encode(&(below,))));
-        let spec = RangeSpec::new(std::ops::Bound::Unbounded, end);
-        let mut keys = Vec::new();
-        for item in stream.range(&*txn, spec) {
-            let (k, _v) = item.map_err(to_kv)?;
-            keys.push(k);
+    let end = std::ops::Bound::Excluded(Bytes::from(hs_tables::key::encode(&(below,))));
+    let mut start = std::ops::Bound::Unbounded;
+    let mut total = 0;
+    while total < super::STREAM_PRUNE_MAX_PER_CALL {
+        let batch = super::STREAM_PRUNE_BATCH.min(super::STREAM_PRUNE_MAX_PER_CALL - total);
+        let (deleted, last) = transact(backend, TransactConfig::default(), |txn| {
+            let spec = RangeSpec::new(start.clone(), end.clone()).limit(batch);
+            let mut keys = Vec::with_capacity(batch);
+            for item in stream.range(&*txn, spec) {
+                let (k, _v) = item.map_err(to_kv)?;
+                keys.push(k);
+            }
+            let last = keys.last().copied();
+            let count = keys.len();
+            for k in keys {
+                stream.delete(txn, &k).map_err(to_kv)?;
+            }
+            Ok((count, last))
+        })
+        .map_err(StoreError::Kv)?;
+        total += deleted;
+        match last {
+            Some(last) if deleted == batch => {
+                start = std::ops::Bound::Excluded(Bytes::from(hs_tables::key::encode(&last)));
+            }
+            _ => break,
         }
-        let count = keys.len();
-        for k in keys {
-            stream.delete(txn, &k).map_err(to_kv)?;
-        }
-        Ok(count)
-    })
-    .map_err(StoreError::Kv)
+    }
+    Ok(total)
 }
 
 #[cfg(test)]
@@ -1657,6 +1729,81 @@ mod tests {
 
     fn store() -> TablesUserStore<MemoryBackend> {
         TablesUserStore::open(MemoryBackend::new()).unwrap()
+    }
+
+    /// Writes stream entries `1..=n` straight into `stream`, in transactions the store accepts.
+    fn seed_stream(
+        s: &TablesUserStore<MemoryBackend>,
+        stream: &TypedKeyspace<<MemoryBackend as KvBackend>::Keyspace, (u64,)>,
+        n: u64,
+    ) {
+        let mut pos = 1;
+        while pos <= n {
+            let upto = (pos + 4_999).min(n);
+            transact(&s.backend, TransactConfig::default(), |txn| {
+                for p in pos..=upto {
+                    stream.put(txn, &(p,), b"x").map_err(to_kv)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+            pos = upto + 1;
+        }
+    }
+
+    /// The positions left in `stream`, oldest first.
+    fn stream_positions(
+        s: &TablesUserStore<MemoryBackend>,
+        stream: &TypedKeyspace<<MemoryBackend as KvBackend>::Keyspace, (u64,)>,
+    ) -> Vec<u64> {
+        let snap = s.backend.snapshot();
+        let spec = RangeSpec::new(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded);
+        stream
+            .range(&snap, spec)
+            .map(|item| item.unwrap().0.0)
+            .collect()
+    }
+
+    /// More entries below the floor than one transaction may delete (the demo's receipt and
+    /// presence streams, 2026-10-14) are pruned across transactions, at most
+    /// `STREAM_PRUNE_MAX_PER_CALL` a call, until none is left; nothing at or above the floor is
+    /// touched. One transaction for the whole range was refused on every try.
+    #[tokio::test]
+    async fn a_backlog_over_the_transaction_limit_is_pruned_in_batches() {
+        use crate::store::{STREAM_PRUNE_BATCH, STREAM_PRUNE_MAX_PER_CALL};
+        const SEEDED: u64 = 12_345;
+        const BELOW: u64 = 12_001;
+        const { assert!(BELOW as usize - 1 > hs_kv::MAX_TXN_MUTATIONS) };
+        const { assert!(STREAM_PRUNE_BATCH < hs_kv::MAX_TXN_MUTATIONS) };
+        let s = store();
+
+        seed_stream(&s, &s.receipt_stream, SEEDED);
+        assert_eq!(
+            s.prune_receipt_stream(BELOW).await.unwrap(),
+            STREAM_PRUNE_MAX_PER_CALL,
+            "the first call stops at its cap"
+        );
+        assert_eq!(
+            s.prune_receipt_stream(BELOW).await.unwrap(),
+            12_000 - STREAM_PRUNE_MAX_PER_CALL
+        );
+        assert_eq!(s.prune_receipt_stream(BELOW).await.unwrap(), 0);
+        let left = stream_positions(&s, &s.receipt_stream);
+        assert_eq!(left.len() as u64, SEEDED - BELOW + 1);
+        assert_eq!(left.first(), Some(&BELOW));
+
+        seed_stream(&s, &s.presence_stream, SEEDED);
+        let mut pruned = 0;
+        loop {
+            let n = s.prune_presence_stream(u64::MAX).await.unwrap();
+            assert!(n <= STREAM_PRUNE_MAX_PER_CALL);
+            if n == 0 {
+                break;
+            }
+            pruned += n;
+        }
+        assert_eq!(pruned as u64, SEEDED);
+        assert!(stream_positions(&s, &s.presence_stream).is_empty());
     }
 
     /// Every receipt written is one entry of the receipt stream, carrying the receipt; a
@@ -2275,6 +2422,112 @@ mod tests {
         assert_eq!(s.compact_hot_stream(2).await.unwrap(), 2, "x@4 and y@2 go");
         assert_eq!(s.hot_room_pos_as_of(x, 8).await.unwrap(), Some(13));
         assert_eq!(s.hot_room_pos_as_of(y, 6).await.unwrap(), Some(21));
+    }
+
+    /// A feed with more entries to delete than one transaction may hold (a single room, a
+    /// device that synced after every event) is compacted across transactions: the newest
+    /// entry per room at or below the floor stays, everything else there goes, and the floor
+    /// moves. One transaction for the window was refused on every fan-out.
+    #[tokio::test]
+    async fn a_feed_compaction_over_the_transaction_limit_is_done_in_batches() {
+        const LATEST: u64 = 25_000;
+        const KEEP: u64 = 1_000;
+        let s = store();
+        let uid = user_id!("@alice:example.org");
+        let rooms = ["!a:example.org", "!b:example.org", "!c:example.org"];
+        let mut seq = 1;
+        while seq <= LATEST {
+            let upto = (seq + 4_999).min(LATEST);
+            transact(&s.backend, TransactConfig::default(), |txn| {
+                for n in seq..=upto {
+                    let value = json_encode(&FeedValue {
+                        room_id: rooms[(n % 3) as usize].to_owned(),
+                        room_pos: i64::try_from(n).unwrap(),
+                    })
+                    .map_err(to_kv)?;
+                    s.feed
+                        .put(txn, &(uid.to_string(), n), &value)
+                        .map_err(to_kv)?;
+                }
+                let head = FeedHead {
+                    latest: upto,
+                    floor: 0,
+                };
+                s.feed_heads
+                    .put(
+                        txn,
+                        &(uid.to_string(),),
+                        &json_encode(&head).map_err(to_kv)?,
+                    )
+                    .map_err(to_kv)?;
+                Ok(())
+            })
+            .unwrap();
+            seq = upto + 1;
+        }
+
+        let target = LATEST - KEEP;
+        assert_eq!(
+            s.compact_feed(uid, KEEP).await.unwrap() as u64,
+            target - 3,
+            "all but each room's newest at or below the floor"
+        );
+        assert_eq!(s.feed_floor(uid).await.unwrap(), target);
+        let seqs: Vec<u64> = s
+            .feed_since(uid, 0)
+            .await
+            .unwrap()
+            .iter()
+            .map(|e| e.feed_seq)
+            .collect();
+        assert_eq!(seqs.len() as u64, 3 + KEEP);
+        assert_eq!(&seqs[..4], &[target - 2, target - 1, target, target + 1]);
+        for room in rooms {
+            let room = RoomId::parse(room).unwrap();
+            assert!(
+                s.room_pos_as_of(uid, &room, target)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert_eq!(s.compact_feed(uid, KEEP).await.unwrap(), 0, "nothing more");
+    }
+
+    /// The hot-room stream likewise: more rows to delete than one transaction may hold are
+    /// deleted across transactions, rooms that straddle a batch included, and the floor moves.
+    #[tokio::test]
+    async fn a_hot_stream_compaction_over_the_transaction_limit_is_done_in_batches() {
+        const ROWS: u64 = 12_000;
+        const KEEP: u64 = 500;
+        let s = store();
+        let rooms = [
+            room_id!("!x:example.org"),
+            room_id!("!y:example.org"),
+            room_id!("!z:example.org"),
+        ];
+        for n in 1..=ROWS {
+            s.append_hot_position(rooms[(n % 3) as usize], i64::try_from(n).unwrap())
+                .await
+                .unwrap();
+        }
+        let target = ROWS - KEEP;
+        assert_eq!(
+            s.compact_hot_stream(KEEP).await.unwrap() as u64,
+            target - 3,
+            "all but each room's newest at or below the floor"
+        );
+        for (offset, room) in [
+            (0u64, rooms[target as usize % 3]),
+            (1, rooms[(target as usize - 1) % 3]),
+        ] {
+            assert_eq!(
+                s.hot_room_pos_as_of(room, target).await.unwrap(),
+                Some(i64::try_from(target - offset).unwrap())
+            );
+        }
+        assert_eq!(s.latest_hot_seq().await.unwrap(), ROWS);
+        assert_eq!(s.compact_hot_stream(KEEP).await.unwrap(), 0, "nothing more");
     }
 
     /// The feed head and the cursor maximum are kept beside the rows; a store written before
