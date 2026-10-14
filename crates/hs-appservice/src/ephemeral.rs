@@ -538,7 +538,7 @@ impl<B: KvBackend> EphemeralPump<B> {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
-        let mut has_work = !typing_rooms.is_empty()
+        let mut has_work = (!typing_rooms.is_empty() && !ephemeral.is_empty())
             || receipt_positions.floor < receipts_head
             || presence_positions.floor < presence_head
             || to_device_positions.floor < to_device_head;

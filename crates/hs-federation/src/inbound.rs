@@ -598,9 +598,15 @@ pub async fn process_transaction(
         // it, placing it in its room, and fetching what it stands on are its children.
         let pdu_span = tracing::info_span!(
             "federation.pdu",
-            event_id = %fallback_id,
+            event_id = tracing::field::Empty,
             room_id = pdu.get("room_id").and_then(serde_json::Value::as_str),
         );
+        // A PDU of room version 3 or later carries no `event_id`; its id is recorded once it
+        // is verified and computed (an attribute recorded twice is exported twice).
+        let id_given = pdu.get("event_id").and_then(Value::as_str).is_some();
+        if id_given {
+            pdu_span.record("event_id", fallback_id.as_str());
+        }
         let step = tracing::Instrument::instrument(
             async {
 
@@ -661,6 +667,9 @@ pub async fn process_transaction(
                 }
             };
             let event_id = event.event_id().to_string();
+            if !id_given {
+                tracing::Span::current().record("event_id", event_id.as_str());
+            }
             let logged_id = event_id.clone();
             let value = event_json(&event);
             match sink.accept_pushed_event(room_id, &event_id, &value).await {
