@@ -180,7 +180,7 @@ pub struct RoomRegistry<B: KvBackend> {
 /// the federation boot-freeze reproduction had 465 loads of its three rooms running at once,
 /// taking every core and the whole blocking pool, and the demo spent some 400 seconds on each
 /// load with federation off (`docs/status/06-federation.md`, "The boot freeze").
-pub const MAX_CONCURRENT_LOADS: usize = 4;
+pub const MAX_CONCURRENT_LOADS: usize = 8;
 
 /// How often [`RoomRegistry::spawn_idle_unloader`] looks for rooms idle longer than
 /// `server.rooms.idle_unload_after`.

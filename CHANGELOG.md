@@ -36,7 +36,7 @@ carries the generated notes for that merge.
   before, and each live server asked for every list back; those answers, the outbound sender's
   bookkeeping and the announcement itself ran as store work on the request threads, and every
   request that touched a room still loading started its own load of it. Now the store work runs
-  off the request threads, a room loads once however many ask (at most four at once), the
+  off the request threads, a room loads once however many ask (at most eight at once), the
   device-list announcer keeps its place as it goes and remembers what it told each server, so a
   restart sends only what changed and nobody asks back, device-list answers are kept until the
   list changes, a device's last-seen time is written once a minute, and at most 64 federation

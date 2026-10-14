@@ -53,7 +53,7 @@ for every request that touched a room still loading (114-465 at once). **The fix
 on blocking threads, batched enqueues without the sender's queue map held, settled successes
 and last-seen times not rewritten, the announcer in 50-position steps with per-user records (a
 restart sends differences with `prev_id`), `/user/devices` cached by stream position, one room
-load per room (at most four at once), inbound federation bounded at 64 then 429, the appservice
+load per room (at most eight at once), inbound federation bounded at 64 then 429, the appservice
 queue gauges reading from the floor, and a runtime heartbeat with a watchdog thread that logs a
 stall while it lasts. Repro on the same data: `/health/live` worst 5 s timeouts (70 s frozen) ->
 29 ms; 921,137 transactions out in 120 s instead of 5,360 in 330 s. **After the roll, turn

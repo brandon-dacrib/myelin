@@ -72,7 +72,7 @@ probes), and room work on the async workers (none: actors run in `spawn_blocking
 - `hs-cli` feeder: `enqueue_pdu` and the forwarded-position read and write on blocking threads.
 - `hs-room` (track 04's crate, said here): `get_or_load` loads a room once however many ask
   (single flight; a failed load is made again by the next waiter), at most
-  `MAX_CONCURRENT_LOADS` (4) at once; `RoomRegistry::loads_started` counts them.
+  `MAX_CONCURRENT_LOADS` (8) at once; `RoomRegistry::loads_started` counts them.
 - `hs-auth` (track 07's crate, said here): a device's last-seen and a token's last-used are written
   once a minute (`LAST_USE_PRECISION_MS`), not on every authenticated request.
 - `hs-appservice` (track 11's crate, said here): `queue_summary` reads from the queue floor and

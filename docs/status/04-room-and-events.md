@@ -2,7 +2,7 @@
 
 Track brief: `docs/workstreams/04-room-and-events.md`. Owner crate: `hs-room`.
 
-## 2026-10-14 (track 06's branch `agent/federation-boot-freeze`): a room loads once however many ask, four at a time
+## 2026-10-14 (track 06's branch `agent/federation-boot-freeze`): a room loads once however many ask, eight at a time
 
 `RoomRegistry::get_or_load` shared nothing: every caller asking for a room that was not
 resident started its own full `RoomActor::load`. At the boot of a server whose rooms are big and
@@ -11,7 +11,7 @@ had 114 threads loading its three rooms in one sample and 465 in another, taking
 the blocking pool, and with everything else fixed but this the server still delivered 1,394
 transactions in two minutes instead of 921,137. Now a load is single-flight per room (a
 `tokio::sync::OnceCell` per room in `loading`; a failed load is made again by the next caller
-waiting), at most `MAX_CONCURRENT_LOADS` (4) run at once (the rest wait holding no thread), and
+waiting), at most `MAX_CONCURRENT_LOADS` (8) run at once (the rest wait holding no thread: eight, not fewer, so that a few rooms taking minutes do not hold every small room up), and
 `RoomRegistry::loads_started` counts them. Test: `many_asking_at_once_for_a_room_share_one_load`
 (24 callers, one load, one actor; a missing room is still not found by every caller). Left for
 this track: a load holds one Fjall snapshot for its whole length (some 400 s on the demo), which
