@@ -281,7 +281,15 @@ async fn follow<B: KvBackend + 'static>(
         match updates.recv().await {
             Ok(update) => {
                 if update.sender.server_name() == own_server_name {
-                    if already_forwarded(&sender, &update) {
+                    // The sender's store is read and written on blocking threads: a store call
+                    // waits on the backend, and this task runs on the runtime's own threads.
+                    let (owned_sender, owned_update) = (sender.clone(), update.clone());
+                    let forwarded = tokio::task::spawn_blocking(move || {
+                        already_forwarded(&owned_sender, &owned_update)
+                    })
+                    .await
+                    .unwrap_or(false);
+                    if forwarded {
                         tracing::debug!(
                             room_id = %update.room_id,
                             event_id = %update.event_id,
@@ -291,7 +299,13 @@ async fn follow<B: KvBackend + 'static>(
                         );
                     } else {
                         match forward_update(&rooms, &sender, &own_server_name, &update).await {
-                            Ok(_) => remember_forwarded(&sender, &update),
+                            Ok(_) => {
+                                let (owned_sender, owned_update) = (sender.clone(), update.clone());
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    remember_forwarded(&owned_sender, &owned_update);
+                                })
+                                .await;
+                            }
                             Err(error) => tracing::error!(
                                 room_id = %update.room_id,
                                 event_id = %update.event_id,
@@ -368,7 +382,7 @@ fn remember_forwarded(sender: &FederationSender, update: &RoomUpdate) {
 /// the membership at the event cannot be read.
 pub async fn forward_update<B: KvBackend + 'static>(
     rooms: &RoomRegistry<B>,
-    sender: &FederationSender,
+    sender: &Arc<FederationSender>,
     own_server_name: &ServerName,
     update: &RoomUpdate,
 ) -> Result<Vec<String>, RoomError> {
@@ -398,7 +412,17 @@ pub async fn forward_update<B: KvBackend + 'static>(
             servers = destinations.len(),
             "queueing a local event for federation"
         );
-        sender.enqueue_pdu(destinations.clone(), pdu);
+        // Written to the sender's store a batch of destinations at a time, on a blocking
+        // thread: the writes wait on the backend. Awaited, so this room's events (and every
+        // other's: the feeder is one task) are queued in the order they were made.
+        let (sender, queued_for) = (sender.clone(), destinations.clone());
+        if let Err(error) =
+            tokio::task::spawn_blocking(move || sender.enqueue_pdu(queued_for, pdu)).await
+        {
+            return Err(RoomError::Internal(format!(
+                "queueing an event for federation did not finish: {error}"
+            )));
+        }
     }
     Ok(destinations)
 }

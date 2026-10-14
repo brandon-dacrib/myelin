@@ -875,6 +875,18 @@ impl<B: KvBackend> DeviceStore for TablesAuthStore<B> {
         ip: Option<String>,
     ) -> Result<(), StoreError> {
         let key = (user_id.to_string(), device_id.to_string());
+        // Read first, outside any transaction: a device seen from the same address less than
+        // `LAST_USE_PRECISION_MS` ago needs no write, and every authenticated request asks.
+        if let Some(bytes) = self
+            .devices
+            .get(&self.backend.snapshot(), &key)
+            .map_err(|e| StoreError::Backend(e.to_string()))?
+            && let Ok(record) = serde_json::from_slice::<DeviceRecord>(&bytes)
+            && recently(record.last_seen_ms, seen_at_ms)
+            && (ip.is_none() || record.last_seen_ip == ip)
+        {
+            return Ok(());
+        }
         transact(&self.backend, TransactConfig::default(), |txn| {
             let Some(bytes) = self.devices.get(txn, &key).map_err(to_kv)? else {
                 return Ok(());
@@ -1018,6 +1030,17 @@ impl<B: KvBackend> TokenStore for TablesAuthStore<B> {
         used_at_ms: u64,
     ) -> Result<(), StoreError> {
         let key = (hash.to_hex(),);
+        // As for `record_seen`: a token used less than `LAST_USE_PRECISION_MS` ago is not
+        // written again.
+        if let Some(bytes) = self
+            .access_tokens
+            .get(&self.backend.snapshot(), &key)
+            .map_err(|e| StoreError::Backend(e.to_string()))?
+            && let Ok(record) = serde_json::from_slice::<AccessTokenRecord>(&bytes)
+            && recently(record.last_used_ms, used_at_ms)
+        {
+            return Ok(());
+        }
         transact(&self.backend, TransactConfig::default(), |txn| {
             let Some(bytes) = self.access_tokens.get(txn, &key).map_err(to_kv)? else {
                 return Ok(());
@@ -1228,6 +1251,20 @@ impl<B: KvBackend> TokenStore for TablesAuthStore<B> {
 }
 
 /// How many `hs_auth.openid_tokens` rows one insert reads looking for expired ones to delete.
+/// How fresh a device's last-seen time and a token's last-used time are kept: a request less
+/// than this long after the recorded one writes nothing. Every authenticated request records
+/// both, and each record was a write transaction on the request's own thread, waiting for the
+/// store's commit lock -- which, on 2026-10-14, the federation boot storm kept busy enough that
+/// the runtime's threads were all waiting (`docs/status/06-federation.md`, "The boot freeze").
+/// Synapse batches the same records too (`client_ips`). A minute is the precision every reader
+/// of them (the device list, the admin API, token expiry) works in.
+pub const LAST_USE_PRECISION_MS: u64 = 60_000;
+
+/// Whether `recorded` is less than [`LAST_USE_PRECISION_MS`] before `now` (and not after it).
+fn recently(recorded: Option<u64>, now: u64) -> bool {
+    recorded.is_some_and(|at| at <= now && now - at < LAST_USE_PRECISION_MS)
+}
+
 const OPENID_SWEEP_LIMIT: usize = 256;
 
 /// How many `hs_auth.pending_registrations` rows one insert reads looking for expired ones.

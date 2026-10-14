@@ -204,7 +204,13 @@ async fn user_devices(
     // `allow_device_name_lookup_over_federation` governs the display names, not the answer:
     // a server that shares a room with this user needs their device list to encrypt to them,
     // and Synapse answers with the names left out when the option is off, as this does.
-    match state.queries.devices(&user_id).await {
+    // Timed (`hs_federation_user_devices_seconds`): every server told of a device-list change
+    // it cannot place asks for the whole list here, and on 2026-10-14 the demo was asked
+    // 472 times in one minute.
+    let started = std::time::Instant::now();
+    let answer = state.queries.devices(&user_id).await;
+    crate::metrics::record_user_devices_seconds(started.elapsed().as_secs_f64());
+    match answer {
         Some(mut v) => {
             if !state.policy.allow_device_names()
                 && let Some(devices) = v.get_mut("devices").and_then(|d| d.as_array_mut())

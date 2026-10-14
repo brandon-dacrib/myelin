@@ -1386,6 +1386,82 @@ pub struct ServerQuerySource<B: KvBackend> {
     /// Who is asked about a local alias the directory does not hold
     /// ([`ServerQuerySource::with_appservices`]); `None` asks nobody.
     appservices: Option<Arc<dyn hs_auth::appservice::AppserviceRegistry>>,
+    /// The device lists other servers asked for, by user, with the user's device-list stream
+    /// position they were read at ([`DeviceListAnswers`]).
+    device_lists: Arc<DeviceListAnswers>,
+}
+
+/// The answers to other servers' `GET /user/devices/{userId}` this server gave, each kept with
+/// the user's device-list stream position it was read at, and given again while that position
+/// is where the user still is: every change that answer shows -- a device, its keys or name,
+/// the cross-signing keys -- moves the position.
+///
+/// A server told of a device-list change it cannot place asks for the whole list; a server
+/// that told every server sharing a room with its users about all of them at once (as the demo
+/// did at each boot on 2026-10-14, a thousand-odd servers for each user) is asked for each list
+/// by each of them within a minute. On 2026-10-14 the local reproduction spent most of its
+/// runtime threads' time answering those, reading the same few lists from the store again and
+/// again (`docs/status/06-federation.md`, "The boot freeze").
+#[derive(Default)]
+pub struct DeviceListAnswers {
+    answers: std::sync::Mutex<HashMap<String, (u64, Value)>>,
+}
+
+impl DeviceListAnswers {
+    /// At most this many users' answers are kept; past it the oldest are forgotten all at once.
+    const MAX_USERS: usize = 4096;
+
+    fn get(&self, user_id: &str, position: u64) -> Option<Value> {
+        self.answers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(user_id)
+            .filter(|(at, _)| *at == position)
+            .map(|(_, answer)| answer.clone())
+    }
+
+    fn put(&self, user_id: &str, position: u64, answer: Value) {
+        let mut answers = self
+            .answers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if answers.len() >= Self::MAX_USERS && !answers.contains_key(user_id) {
+            answers.clear();
+        }
+        answers.insert(user_id.to_owned(), (position, answer));
+    }
+}
+
+/// `user_id`'s device list as another server asks for it, from `answers` when the user's
+/// device-list stream position is the one it was read at, and read (and kept) otherwise. Kept
+/// only when the position was the same before and after the read, so an answer that straddles
+/// a change is given once and not kept.
+async fn device_list_answer<B: KvBackend + 'static>(
+    e2e: &hs_e2e::state::E2eState<B>,
+    user_id: &ruma::UserId,
+    answers: &DeviceListAnswers,
+) -> Option<Value> {
+    let before = e2e.store.user_stream_pos(user_id).await.ok();
+    if let Some(position) = before
+        && let Some(answer) = answers.get(user_id.as_str(), position)
+    {
+        return Some(answer);
+    }
+    let answer = match hs_e2e::federation::federation_user_devices(e2e, user_id).await {
+        Ok(answer) => answer?,
+        Err(error) => {
+            tracing::info!(%user_id, %error, "could not answer a remote device-list query");
+            return None;
+        }
+    };
+    let after = e2e.store.user_stream_pos(user_id).await.ok();
+    if let (Some(before), Some(after)) = (before, after)
+        && before == after
+        && answer.get("stream_id").and_then(Value::as_u64) == Some(after)
+    {
+        answers.put(user_id.as_str(), after, answer.clone());
+    }
+    Some(answer)
 }
 
 impl<B: KvBackend + 'static> ServerQuerySource<B> {
@@ -1404,6 +1480,7 @@ impl<B: KvBackend + 'static> ServerQuerySource<B> {
             own_server_name: own_server_name.into(),
             keys: None,
             appservices: None,
+            device_lists: Arc::new(DeviceListAnswers::default()),
         }
     }
 
@@ -1492,14 +1569,18 @@ impl<B: KvBackend + 'static> FederationQuerySource for ServerQuerySource<B> {
         let parsed = ruma::UserId::parse(user_id).ok()?;
         // The whole list -- every device, named, with the cross-signing keys -- needs the
         // e2e state ([`ServerQuerySource::with_keys`]); without it, the devices with keys.
-        if let Some(e2e) = self.keys.as_ref() {
-            return match hs_e2e::federation::federation_user_devices(e2e, &parsed).await {
-                Ok(answer) => answer,
-                Err(error) => {
-                    tracing::info!(user_id, %error, "could not answer a remote device-list query");
-                    None
-                }
-            };
+        if let Some(e2e) = self.keys.clone() {
+            // On a blocking thread: the reads go to the store, and a storm of these (every
+            // server told of a change at once asks back) must not take the runtime's threads.
+            // Answered again from `device_lists` while the user's list has not moved.
+            let answers = self.device_lists.clone();
+            let runtime = tokio::runtime::Handle::current();
+            return tokio::task::spawn_blocking(move || {
+                runtime.block_on(device_list_answer(&e2e, &parsed, &answers))
+            })
+            .await
+            .ok()
+            .flatten();
         }
         self.auth.get_user(&parsed).await.ok().flatten()?;
         let keys = self.e2e.list_device_keys(&parsed).await.ok()?;

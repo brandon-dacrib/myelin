@@ -519,6 +519,151 @@ pub fn device_list_catch_ups() -> u64 {
     DEVICE_LIST_CATCH_UPS.get()
 }
 
+/// The buckets of this module's store and work timers, in seconds: a millisecond to a minute,
+/// since what they time is a store call that is fast on a local disk and was tens of seconds
+/// on the demo's network-replicated one.
+const WORK_SECONDS_BUCKETS: [f64; 12] = [
+    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0, 15.0, 60.0,
+];
+
+fn work_seconds_histogram() -> Histogram {
+    Histogram::new(WORK_SECONDS_BUCKETS)
+}
+
+/// Labels of `hs_federation_sender_store_seconds`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, prometheus_client::encoding::EncodeLabelSet)]
+pub struct SenderStoreLabels {
+    /// One of [`SENDER_STORE_OPS`].
+    pub op: &'static str,
+}
+
+/// The store operations of the outbound sender timed in `hs_federation_sender_store_seconds`:
+/// `read` (a destination worker reading its queue, durable EDUs, retry state or catch-up
+/// mark), `ack` (delivered rows taken out of the store), `state` (a success or failure
+/// recorded), `catch_up` (catch-up's bookkeeping), and `enqueue` (PDUs and durable EDUs written
+/// for their destinations, a batch of destinations at a time).
+pub const SENDER_STORE_OPS: [&str; 5] = ["read", "ack", "state", "catch_up", "enqueue"];
+
+static SENDER_STORE_SECONDS: std::sync::LazyLock<Family<SenderStoreLabels, Histogram>> =
+    std::sync::LazyLock::new(|| Family::new_with_constructor(work_seconds_histogram));
+
+/// Records one store operation of the outbound sender, `op` ([`SENDER_STORE_OPS`]), that took
+/// `seconds`, including the wait for the store's commit lock and for a free store slot.
+pub fn record_sender_store_seconds(op: &'static str, seconds: f64) {
+    SENDER_STORE_SECONDS
+        .get_or_create(&SenderStoreLabels { op })
+        .observe(seconds);
+}
+
+/// How many sender store operations of `op` were timed in this process (for tests).
+#[must_use]
+pub fn sender_store_operations(op: &'static str) -> u64 {
+    // `Histogram::count` is test-only in `prometheus-client`; the text encoding says it too.
+    let mut registry = Registry::default();
+    registry.register("probe", "probe", SENDER_STORE_SECONDS.clone());
+    let mut text = String::new();
+    if prometheus_client::encoding::text::encode(&mut text, &registry).is_err() {
+        return 0;
+    }
+    let prefix = format!("probe_count{{op=\"{op}\"}} ");
+    text.lines()
+        .find_map(|line| line.strip_prefix(prefix.as_str()))
+        .and_then(|count| count.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+static DEVICE_LIST_ANNOUNCE_SECONDS: std::sync::LazyLock<Histogram> =
+    std::sync::LazyLock::new(work_seconds_histogram);
+static DEVICE_LIST_ANNOUNCER_BEHIND: std::sync::LazyLock<prometheus_client::metrics::gauge::Gauge> =
+    std::sync::LazyLock::new(Default::default);
+static DEVICE_LIST_ANNOUNCED_USERS: std::sync::LazyLock<Counter> =
+    std::sync::LazyLock::new(Counter::default);
+
+/// Records one step of the device-list announcer (`hs-cli`'s `edus::DeviceListAnnouncer`): a
+/// stretch of the device-list stream read, its users' changes handed to the sender and the
+/// place stored, which took `seconds` and announced `users` local users
+/// (`hs_federation_device_list_announce_seconds`, `hs_federation_device_list_announced_users_total`).
+pub fn record_device_list_announce_step(seconds: f64, users: u64) {
+    DEVICE_LIST_ANNOUNCE_SECONDS.observe(seconds);
+    DEVICE_LIST_ANNOUNCED_USERS.inc_by(users);
+}
+
+/// Sets how far the device-list announcer's oldest stored place is behind the stream, in
+/// stream positions (`hs_federation_device_list_announcer_behind`): zero once every change
+/// is handed to the sender. A number that does not come down is an announcer that cannot
+/// finish -- what the demo's crash loop of 2026-10-14 was, every boot starting again at 1314.
+pub fn set_device_list_announcer_behind(positions: u64) {
+    DEVICE_LIST_ANNOUNCER_BEHIND.set(i64::try_from(positions).unwrap_or(i64::MAX));
+}
+
+/// The value of `hs_federation_device_list_announcer_behind` (for tests).
+#[must_use]
+pub fn device_list_announcer_behind() -> i64 {
+    DEVICE_LIST_ANNOUNCER_BEHIND.get()
+}
+
+/// How many local users' device-list changes the announcer handed to the sender in this
+/// process ([`record_device_list_announce_step`]).
+#[must_use]
+pub fn device_list_announced_users() -> u64 {
+    DEVICE_LIST_ANNOUNCED_USERS.get()
+}
+
+static INBOUND_REFUSED: std::sync::LazyLock<Counter> = std::sync::LazyLock::new(Counter::default);
+static INBOUND_SLOT_WAIT_SECONDS: std::sync::LazyLock<Histogram> =
+    std::sync::LazyLock::new(work_seconds_histogram);
+static INBOUND_IN_FLIGHT: std::sync::LazyLock<prometheus_client::metrics::gauge::Gauge> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Counts one inbound federation request refused because no slot came free in time
+/// (`hs_federation_inbound_refused_total`; `crate::transport::INBOUND_CONCURRENCY`).
+pub fn record_inbound_refused() {
+    INBOUND_REFUSED.inc();
+}
+
+/// How many inbound federation requests were refused for want of a slot, in this process.
+#[must_use]
+pub fn inbound_refused() -> u64 {
+    INBOUND_REFUSED.get()
+}
+
+/// Records how long an inbound federation request waited for its slot
+/// (`hs_federation_inbound_slot_wait_seconds`).
+pub fn record_inbound_slot_wait(seconds: f64) {
+    INBOUND_SLOT_WAIT_SECONDS.observe(seconds);
+}
+
+/// An inbound federation request holding a slot, counted in `hs_federation_inbound_in_flight`
+/// from [`InboundInFlight::enter`] until it is dropped (answered, or abandoned by its client).
+#[derive(Debug)]
+pub struct InboundInFlight(());
+
+impl InboundInFlight {
+    /// Counts one more request in flight until the returned guard is dropped.
+    #[must_use]
+    pub fn enter() -> Self {
+        INBOUND_IN_FLIGHT.inc();
+        Self(())
+    }
+}
+
+impl Drop for InboundInFlight {
+    fn drop(&mut self) {
+        INBOUND_IN_FLIGHT.dec();
+    }
+}
+
+static USER_DEVICES_SECONDS: std::sync::LazyLock<Histogram> =
+    std::sync::LazyLock::new(work_seconds_histogram);
+
+/// Records one answer to another server's `GET /_matrix/federation/v1/user/devices/{userId}`,
+/// from its arrival at the handler (the `X-Matrix` check already done) to the answer, in
+/// `hs_federation_user_devices_seconds`. The route's whole time, key fetches included, is
+/// `hs_http_request_duration_seconds`.
+pub fn record_user_devices_seconds(seconds: f64) {
+    USER_DEVICES_SECONDS.observe(seconds);
+}
+
 /// How many pushed PDUs were dropped for `reason`, in this process.
 #[must_use]
 pub fn pdus_dropped(reason: &'static str) -> u64 {
@@ -619,6 +764,18 @@ pub fn record_notary_answer(answered: bool) {
 ///   ones carried ([`record_transaction`], [`record_pdus_sent`]).
 /// - `hs_federation_join_requests_total{share}`: joins through another server, by whether the
 ///   request started one or attached to one under way ([`JoinRequestLabels`]).
+/// - `hs_federation_sender_store_seconds{op}`: a histogram of the outbound sender's store
+///   operations, which run off the request threads ([`record_sender_store_seconds`]).
+/// - `hs_federation_device_list_announce_seconds`, `hs_federation_device_list_announcer_behind`
+///   and `hs_federation_device_list_announced_users_total`: the device-list announcer's steps,
+///   how far it is behind the stream, and the users it announced
+///   ([`record_device_list_announce_step`], [`set_device_list_announcer_behind`]).
+/// - `hs_federation_user_devices_seconds`: a histogram of this server's answers to
+///   `GET /user/devices/{userId}` ([`record_user_devices_seconds`]).
+/// - `hs_federation_inbound_in_flight`, `hs_federation_inbound_slot_wait_seconds` and
+///   `hs_federation_inbound_refused_total`: inbound federation requests holding one of the
+///   slots `crate::transport::INBOUND_CONCURRENCY` allows, how long each waited for it, and
+///   those refused for want of one.
 pub fn register_transport_metrics(registry: &mut Registry) {
     // Registered without `_total`: the text encoder appends it.
     registry.register(
@@ -705,6 +862,55 @@ pub fn register_transport_metrics(registry: &mut Registry) {
         "PDUs carried by outbound transactions their destination accepted",
         PDUS_SENT.clone(),
     );
+    registry.register(
+        "hs_federation_sender_store_seconds",
+        "Seconds each store operation of the outbound sender took, waits for the store's \
+         commit lock and for a free store slot included, by op (read, ack, state, catch_up, \
+         enqueue); run off the request threads",
+        SENDER_STORE_SECONDS.clone(),
+    );
+    registry.register(
+        "hs_federation_device_list_announce_seconds",
+        "Seconds each step of the device-list announcer took: a stretch of the device-list \
+         stream read, its local users' changes handed to the outbound sender, its place stored",
+        DEVICE_LIST_ANNOUNCE_SECONDS.clone(),
+    );
+    registry.register(
+        "hs_federation_device_list_announcer_behind",
+        "Device-list stream positions the announcer's oldest stored place is behind: zero \
+         once every change is handed to the outbound sender",
+        DEVICE_LIST_ANNOUNCER_BEHIND.clone(),
+    );
+    registry.register(
+        "hs_federation_device_list_announced_users",
+        "Local users whose device-list changes the announcer handed to the outbound sender",
+        DEVICE_LIST_ANNOUNCED_USERS.clone(),
+    );
+    registry.register(
+        "hs_federation_inbound_refused",
+        "Inbound federation requests answered 429 because none of the slots for inbound \
+         requests came free in time",
+        INBOUND_REFUSED.clone(),
+    );
+    registry.register(
+        "hs_federation_inbound_slot_wait_seconds",
+        "Seconds each inbound federation request waited for a slot before its X-Matrix check",
+        INBOUND_SLOT_WAIT_SECONDS.clone(),
+    );
+    registry.register(
+        "hs_federation_inbound_in_flight",
+        "Inbound federation requests being worked on right now (each holds a slot)",
+        INBOUND_IN_FLIGHT.clone(),
+    );
+    registry.register(
+        "hs_federation_user_devices_seconds",
+        "Seconds this server took to answer another server's GET /user/devices/{userId}, \
+         after its X-Matrix check (the route's whole time is hs_http_request_duration_seconds)",
+        USER_DEVICES_SECONDS.clone(),
+    );
+    for op in SENDER_STORE_OPS {
+        let _ = SENDER_STORE_SECONDS.get_or_create(&SenderStoreLabels { op });
+    }
     // A labelled family with nothing observed renders nothing at all: every known label is
     // created now, so each series is on /metrics at zero from the first scrape.
     for outcome in TRANSACTION_OUTCOMES {

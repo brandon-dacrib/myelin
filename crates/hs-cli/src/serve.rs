@@ -1608,6 +1608,9 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     // Outbound connections made and addresses that did not connect, by address family
     // (`hs_http::outbound`): every outbound client of this server is counted.
     metrics.with_registry(hs_http::outbound::register_metrics);
+    // How late the runtime's heartbeat wakes (`crate::runtime_heartbeat`): a runtime whose
+    // threads are all busy or blocked answers nothing, `/health/live` included.
+    metrics.with_registry(crate::runtime_heartbeat::register_metrics);
 
     // The first HTTP client is built in here (the ping transport); the roots are ready by now
     // on any machine that is not very slow, and on one that is, waiting beats blocking.
@@ -1935,6 +1938,9 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     // What the server's running parts own on behalf of a hook that holds it weakly (to break a
     // reference cycle), dropped at shutdown.
     let mut keep_alive: Vec<Arc<dyn std::any::Any + Send + Sync>> = Vec::new();
+    // The runtime's heartbeat, and the watchdog thread that says when it stops beating
+    // (`crate::runtime_heartbeat`): stopped when the server's parts are dropped at shutdown.
+    keep_alive.push(Arc::new(crate::runtime_heartbeat::RuntimeHeartbeat::start()));
     // How `POST /join` reaches a room hosted elsewhere (`crate::remote_join`): over the
     // federation mount's own client, so only when federation is on.
     let remote_join: Option<Arc<dyn hs_room::remote_join::RemoteJoin>>;

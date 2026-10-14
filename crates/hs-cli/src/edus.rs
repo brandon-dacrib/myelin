@@ -49,15 +49,15 @@
 //! owner died, or was down while others read on, is caught up from its own place by whoever
 //! takes it next (counted in `hs_federation_device_list_catch_ups_total`).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use hs_cluster::{Ownership, ShardId, ShardKind, ShardLayout};
 use hs_e2e::federation::{
-    Announced, DIRECT_TO_DEVICE_EDU, InboundDeviceList, InboundToDevice, device_list_update_edus,
-    local_device_list,
+    Announced, AnnouncedDevice, DIRECT_TO_DEVICE_EDU, InboundDeviceList, InboundToDevice,
+    device_list_update_edus, local_device_list,
 };
 use hs_e2e::state::E2eState;
 use hs_federation::edu::{Edu, InboundEduSink};
@@ -66,7 +66,7 @@ use hs_federation::sender::FederationSender;
 use hs_kv::KvBackend;
 use hs_room::registry::RoomRegistry;
 use hs_user::hub::SessionHub;
-use ruma::{OwnedServerName, OwnedUserId, UserId};
+use ruma::{OwnedServerName, UserId};
 use serde_json::{Value, json};
 
 /// The session hub as `hs serve` builds it.
@@ -254,10 +254,12 @@ pub const DEVICE_LIST_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// missed it (Sytest's "If remote user leaves room we no longer receive device updates"). It
 /// still polls every [`DEVICE_LIST_POLL_INTERVAL`] for the writes another replica commits, and
 /// for federation shards it takes on. The stream names the user, not what changed, so the
-/// announcer remembers what it last announced for each user (`hs_e2e::federation::Announced`)
-/// and sends only the difference (`hs_e2e::federation::device_list_update_edus`). The first
-/// change it sees for a user announces every device and any cross-signing keys, since it cannot
-/// tell what changed.
+/// announcer keeps what it last announced for each user to each federation shard's
+/// destinations (`hs_e2e::federation::Announced`, in the sender's store:
+/// `FederationSender::announced`) and sends only the difference
+/// (`hs_e2e::federation::device_list_update_edus`), its `prev_id` the stream position the last
+/// announcement carried. Only a user it has no record of is announced whole, with an empty
+/// `prev_id`, which makes every server that receives it ask for the list back.
 ///
 /// # Where it is in the stream
 ///
@@ -266,15 +268,38 @@ pub const DEVICE_LIST_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// destination accepts it). Every replica follows the same stream, and each announces only to
 /// the destinations of the shards it owns ([`AnnouncerShards`]), so every destination is told
 /// once. A shard this replica takes on -- at start, or from a replica that left or died -- is
-/// read from its own place: whatever the stream gained since its previous owner last read is
-/// announced to its destinations, as whole device lists (this replica cannot know what they were
-/// told), logged at `info` and counted (`hs_federation_device_list_catch_ups_total`). A shard
-/// with no place yet starts where the place for the whole server stood before places were kept
-/// per shard ([`ANNOUNCER_POSITION`]), or from now. In single-node mode every shard is this
+/// read from its own place, and what its destinations were told is read from the records:
+/// whatever the stream gained since its previous owner last read is announced to them as
+/// differences, logged at `info` and counted (`hs_federation_device_list_catch_ups_total`). A
+/// shard with no place yet starts where the place for the whole server stood before places were
+/// kept per shard ([`ANNOUNCER_POSITION`]), or from now. In single-node mode every shard is this
 /// process's, so all of them move together.
+///
+/// # In bounded steps, off the request threads
+///
+/// The stream is read [`ANNOUNCE_STEP`] positions at a time, and each shard's place is stored
+/// after every step, so a process killed part-way does not start again from where it began;
+/// each user's record is stored as soon as their EDUs are queued, so a step that is repeated
+/// sends nothing twice. The EDUs and records are written on blocking threads: one EDU for every
+/// server a user shares a room with is many store writes. Before 2026-10-14 the place moved only
+/// after everything since it was announced, the records lived in memory, and the writes ran on
+/// the runtime's threads: the demo, killed by its liveness probe a minute into every boot,
+/// started from position 1314 every time and told some 1,400 servers every device again with no
+/// `prev_id`, and each live server asked for every list back (`docs/status/06-federation.md`,
+/// "The boot freeze"). Each step is timed (`hs_federation_device_list_announce_seconds`), and
+/// how far the announcer is behind the stream is a gauge
+/// (`hs_federation_device_list_announcer_behind`).
 pub struct DeviceListAnnouncer {
     task: tokio::task::JoinHandle<()>,
 }
+
+/// How many device-list stream positions [`DeviceListAnnouncer`] reads in one step before it
+/// stores its place (see "In bounded steps").
+pub const ANNOUNCE_STEP: u64 = 50;
+
+/// A step of [`DeviceListAnnouncer`] that takes this long is logged at `info`, with where it
+/// got to: a slow announcer is one an operator wants to see moving.
+const SLOW_ANNOUNCE_STEP: Duration = Duration::from_secs(1);
 
 /// The name the device-list announcer stored its one stream position under in the federation
 /// sender's store (`FederationSender::store_position`) before positions were kept per federation
@@ -320,15 +345,6 @@ impl AnnouncerShards {
     }
 }
 
-/// The places of one look at the stream, worked out from what this replica owns now.
-struct Look {
-    /// The shards owned at the previous look too, all at one place, and so told the changes
-    /// since as differences from what was last announced.
-    steady: Option<(u64, BTreeSet<u32>)>,
-    /// Shards newly taken on, by their stored place: told the changes since as whole lists.
-    taken: BTreeMap<u64, BTreeSet<u32>>,
-}
-
 impl DeviceListAnnouncer {
     /// Starts following `e2e`'s stream, announcing through `sender` to the servers `hub` says
     /// share a room with each changed user of `own_server`, for the federation shards `shards`
@@ -343,18 +359,26 @@ impl DeviceListAnnouncer {
     ) -> Self {
         let task = tokio::spawn(async move {
             // The place for the whole server, from before places were kept per shard.
-            let legacy = sender.stored_position(ANNOUNCER_POSITION).ok().flatten();
-            // Owned at the previous look: each shard's place.
+            let legacy = off_runtime(&sender, |sender| {
+                sender.stored_position(ANNOUNCER_POSITION).ok().flatten()
+            })
+            .await
+            .flatten();
+            // Each owned shard's place, as far as this replica has read.
             let mut places: BTreeMap<u32, u64> = BTreeMap::new();
-            let mut announced: HashMap<OwnedUserId, Announced> = HashMap::new();
             let mut interval = tokio::time::interval(DEVICE_LIST_POLL_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             // Woken by this process's own writes as they commit; the poll stays for the writes
             // of other replicas on a shared backend, for shards taken on, and for a store that
             // cannot say.
             let mut woken = e2e.store.subscribe_device_list_stream();
+            let mut behind = false;
             loop {
-                next_look(&mut interval, &mut woken).await;
+                // A step that left the stream unread goes on at once.
+                if !behind {
+                    next_look(&mut interval, &mut woken).await;
+                }
+                behind = false;
                 let now = match e2e.store.current_stream_pos().await {
                     Ok(pos) => pos,
                     Err(error) => {
@@ -364,80 +388,77 @@ impl DeviceListAnnouncer {
                 };
                 let owned = shards.owned();
                 places.retain(|shard, _| owned.contains(shard));
-                let look = plan_look(&places, &owned, now, |shard| {
-                    match sender.stored_position(&announcer_position(shard)) {
-                        Ok(stored) => stored,
-                        Err(error) => {
-                            tracing::warn!(shard, %error, "cannot read where the device-list announcer got to for a federation shard");
-                            None
-                        }
-                    }
-                    .or(legacy)
-                });
-                let mut read_all = true;
-                if let Some((from, steady)) = &look.steady
-                    && *from < now
-                {
-                    read_all &= announce_since(
+                take_on(&sender, &owned, &mut places, legacy, now).await;
+                for (from, group) in group_by_place(&places) {
+                    let Some(to) = step_end(from, now) else {
+                        continue;
+                    };
+                    let started = std::time::Instant::now();
+                    let Some(users) = announce_step(
                         &hub,
                         &e2e,
                         &sender,
                         &shards,
                         &own_server,
-                        (*from, now),
-                        steady,
-                        Some(&mut announced),
+                        (from, to),
+                        &group,
                     )
-                    .await;
-                }
-                for (from, taken) in &look.taken {
-                    if *from >= now {
+                    .await
+                    else {
+                        // Not read (logged): the same step again at the next look; the users'
+                        // records keep what was already sent from being sent again.
                         continue;
+                    };
+                    // Handed over (the EDUs are durable in the sender's store): each shard still
+                    // owned begins here next time, on this replica or the next owner.
+                    let still = shards.owned();
+                    let moved: Vec<u32> = group
+                        .iter()
+                        .copied()
+                        .filter(|shard| still.contains(shard))
+                        .collect();
+                    for shard in &moved {
+                        places.insert(*shard, to);
                     }
-                    hs_federation::metrics::record_device_list_catch_up();
-                    tracing::info!(
-                        from,
-                        to = now,
-                        shards = ?taken,
-                        "announcing the device-list changes federation shards taken on were not told"
+                    let writes: Vec<(String, u64)> = moved
+                        .iter()
+                        .map(|shard| (announcer_position(*shard), to))
+                        .collect();
+                    match off_runtime(&sender, move |sender| sender.store_positions(&writes)).await
+                    {
+                        Some(Ok(())) => {}
+                        Some(Err(error)) => tracing::warn!(
+                            %error,
+                            "cannot store where the device-list announcer got to"
+                        ),
+                        None => tracing::warn!(
+                            "the device-list announcer's place was not stored (its thread did not finish)"
+                        ),
+                    }
+                    let took = started.elapsed();
+                    hs_federation::metrics::record_device_list_announce_step(
+                        took.as_secs_f64(),
+                        users,
                     );
-                    read_all &= announce_since(
-                        &hub,
-                        &e2e,
-                        &sender,
-                        &shards,
-                        &own_server,
-                        (*from, now),
-                        taken,
-                        None,
-                    )
-                    .await;
-                }
-                if !read_all {
-                    // Read again at the next look, from the same places.
-                    for (from, taken) in look.taken {
-                        for shard in taken {
-                            places.insert(shard, from);
-                        }
+                    if took >= SLOW_ANNOUNCE_STEP {
+                        tracing::info!(
+                            from,
+                            to,
+                            stream = now,
+                            users,
+                            shards = moved.len(),
+                            took_ms = u64::try_from(took.as_millis()).unwrap_or(u64::MAX),
+                            "the device-list announcer stored its place after a slow step"
+                        );
                     }
-                    continue;
-                }
-                // Handed over (the EDUs are durable in the sender's store): each shard still
-                // owned begins here next time, on this replica or the next owner.
-                let still = shards.owned();
-                let mut writes = Vec::new();
-                for shard in owned {
-                    if !still.contains(&shard) {
-                        places.remove(&shard);
-                        continue;
-                    }
-                    if places.insert(shard, now) != Some(now) {
-                        writes.push((announcer_position(shard), now));
+                    if to < now {
+                        behind = true;
                     }
                 }
-                if let Err(error) = sender.store_positions(&writes) {
-                    tracing::warn!(%error, "cannot store where the device-list announcer got to");
-                }
+                let oldest = places.values().copied().min().unwrap_or(now);
+                hs_federation::metrics::set_device_list_announcer_behind(
+                    now.saturating_sub(oldest),
+                );
             }
         });
         Self { task }
@@ -455,63 +476,121 @@ impl Drop for DeviceListAnnouncer {
     }
 }
 
-/// Works out one look's places: the shards in `places` (owned at the previous look, and still)
-/// are steady at their common place; every other shard in `owned` is taken on, at what `stored`
-/// says (its stored place, or the old whole-server one), or at `now` with nothing stored, and
-/// never past `now` (a store reset under it).
-fn plan_look(
-    places: &BTreeMap<u32, u64>,
+/// Runs `work` with `sender` on a blocking thread: the sender's store calls wait for the
+/// backend, and the announcer's are many. `None` when the thread did not finish it (a panic,
+/// or the runtime shutting down).
+async fn off_runtime<T: Send + 'static>(
+    sender: &Arc<FederationSender>,
+    work: impl FnOnce(&FederationSender) -> T + Send + 'static,
+) -> Option<T> {
+    let sender = sender.clone();
+    tokio::task::spawn_blocking(move || work(&sender))
+        .await
+        .ok()
+}
+
+/// Gives every shard in `owned` that has no place in `places` yet (taken on at start, or from a
+/// replica that left or died) its stored place -- or the old whole-server one, `legacy`, or
+/// `now` with neither, never past `now` (a store reset under it) -- and logs and counts those
+/// whose place is behind: their destinations are told what they missed, from the records.
+async fn take_on(
+    sender: &Arc<FederationSender>,
     owned: &BTreeSet<u32>,
+    places: &mut BTreeMap<u32, u64>,
+    legacy: Option<u64>,
     now: u64,
-    mut stored: impl FnMut(u32) -> Option<u64>,
-) -> Look {
-    let steady = places.values().copied().min().map(|from| {
-        let shards: BTreeSet<u32> = places.keys().copied().collect();
-        (from, shards)
-    });
-    let mut taken: BTreeMap<u64, BTreeSet<u32>> = BTreeMap::new();
-    for shard in owned.iter().copied().filter(|s| !places.contains_key(s)) {
-        let from = stored(shard).unwrap_or(now).min(now);
-        taken.entry(from).or_default().insert(shard);
+) {
+    let taken: Vec<u32> = owned
+        .iter()
+        .copied()
+        .filter(|shard| !places.contains_key(shard))
+        .collect();
+    if taken.is_empty() {
+        return;
     }
-    Look { steady, taken }
+    let names = taken.clone();
+    let stored = off_runtime(sender, move |sender| {
+        names
+            .into_iter()
+            .map(|shard| {
+                let place = match sender.stored_position(&announcer_position(shard)) {
+                    Ok(stored) => stored,
+                    Err(error) => {
+                        tracing::warn!(shard, %error, "cannot read where the device-list announcer got to for a federation shard");
+                        None
+                    }
+                };
+                (shard, place)
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_else(|| taken.iter().map(|shard| (*shard, None)).collect());
+    let mut behind: BTreeMap<u64, BTreeSet<u32>> = BTreeMap::new();
+    for (shard, place) in stored {
+        let from = place.or(legacy).unwrap_or(now).min(now);
+        places.insert(shard, from);
+        if from < now {
+            behind.entry(from).or_default().insert(shard);
+        }
+    }
+    for (from, shards) in behind {
+        hs_federation::metrics::record_device_list_catch_up();
+        tracing::info!(
+            from,
+            to = now,
+            shards = ?shards,
+            "announcing the device-list changes federation shards taken on were not told"
+        );
+    }
+}
+
+/// The shards of `places` grouped by their place, so each group reads one stretch of the
+/// stream once.
+fn group_by_place(places: &BTreeMap<u32, u64>) -> BTreeMap<u64, BTreeSet<u32>> {
+    let mut groups: BTreeMap<u64, BTreeSet<u32>> = BTreeMap::new();
+    for (shard, place) in places {
+        groups.entry(*place).or_default().insert(*shard);
+    }
+    groups
+}
+
+/// Where a step from `from` ends when the stream is at `now`: at most [`ANNOUNCE_STEP`]
+/// positions on, never past `now`; `None` when there is nothing to read.
+fn step_end(from: u64, now: u64) -> Option<u64> {
+    (from < now).then(|| from.saturating_add(ANNOUNCE_STEP).min(now))
 }
 
 /// Announces the changes of `(from, to]` of every local user to the destinations of `group`'s
-/// federation shards: as differences from what was last announced with `announced` (which is
-/// updated), or as whole lists without. Whether the stream could be read; nothing is announced
-/// when it could not.
+/// federation shards, each as the difference from what those shards were last told (the
+/// records). The number of local users announced, or `None` when the stream or a user's
+/// devices could not be read (logged): the step is then made again.
 #[allow(clippy::too_many_arguments)]
-async fn announce_since<B: KvBackend + 'static>(
+async fn announce_step<B: KvBackend + 'static>(
     hub: &Hub<B>,
     e2e: &E2eState<B>,
-    sender: &FederationSender,
+    sender: &Arc<FederationSender>,
     shards: &AnnouncerShards,
     own_server: &OwnedServerName,
     (from, to): (u64, u64),
     group: &BTreeSet<u32>,
-    mut announced: Option<&mut HashMap<OwnedUserId, Announced>>,
-) -> bool {
+) -> Option<u64> {
     let changed = match e2e.store.changed_users_since(from, Some(to)).await {
         Ok(users) => users,
         Err(error) => {
             tracing::warn!(%error, "cannot read the device-list changes");
-            return false;
+            return None;
         }
     };
-    let sends_to = |destination: &str| group.contains(&shards.shard_of(destination));
+    let mut announced = 0u64;
     for user_id in changed {
         if user_id.server_name() != own_server {
             continue;
         }
-        let before = announced.as_deref().and_then(|map| map.get(&user_id));
-        if let Some(after) = announce(hub, e2e, sender, &user_id, before, &sends_to).await
-            && let Some(map) = announced.as_deref_mut()
-        {
-            map.insert(user_id, after);
-        }
+        announce(hub, e2e, sender, shards, &user_id, group).await?;
+        announced += 1;
     }
-    true
+    Some(announced)
 }
 
 /// Waits for the announcer's next look at the stream: a write committed in this process
@@ -536,17 +615,66 @@ async fn next_look(
     }
 }
 
-/// Sends what changed for `user_id` since `before` to the servers of everyone they share a
-/// joined room with, and returns what is announced now (`None`: nothing could be read, so
-/// nothing changes).
+/// `announced` as the sender's store keeps it (`FederationSender::set_announced`).
+fn announced_to_json(announced: &Announced) -> Value {
+    let devices: serde_json::Map<String, Value> = announced
+        .devices
+        .iter()
+        .map(|(device_id, device)| {
+            (
+                device_id.clone(),
+                json!({"keys": device.keys, "display_name": device.display_name}),
+            )
+        })
+        .collect();
+    json!({
+        "stream_id": announced.stream_id,
+        "devices": devices,
+        "master": announced.master,
+        "self_signing": announced.self_signing,
+    })
+}
+
+/// [`announced_to_json`] read back; `None` for a record that is not one.
+fn announced_from_json(record: &Value) -> Option<Announced> {
+    let devices = record
+        .get("devices")?
+        .as_object()?
+        .iter()
+        .map(|(device_id, device)| {
+            (
+                device_id.clone(),
+                AnnouncedDevice {
+                    keys: device.get("keys").filter(|keys| !keys.is_null()).cloned(),
+                    display_name: device
+                        .get("display_name")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                },
+            )
+        })
+        .collect();
+    let field = |name: &str| record.get(name).filter(|value| !value.is_null()).cloned();
+    Some(Announced {
+        stream_id: record.get("stream_id").and_then(Value::as_u64),
+        devices,
+        master: field("master"),
+        self_signing: field("self_signing"),
+    })
+}
+
+/// Sends what changed for `user_id` to the destinations of `group`'s shards that share a joined
+/// room with them -- to each set of shards the difference from what it was last told (its
+/// record in the sender's store) -- and then records what they were all told now. `None`
+/// when something could not be read or recorded (logged); nothing is recorded then.
 async fn announce<B: KvBackend + 'static>(
     hub: &Hub<B>,
     e2e: &E2eState<B>,
-    sender: &FederationSender,
+    sender: &Arc<FederationSender>,
+    shards: &AnnouncerShards,
     user_id: &UserId,
-    before: Option<&Announced>,
-    sends_to: &(dyn Fn(&str) -> bool + Sync),
-) -> Option<Announced> {
+    group: &BTreeSet<u32>,
+) -> Option<()> {
     let now = match local_device_list(e2e, user_id).await {
         Ok(now) => now,
         Err(error) => {
@@ -554,57 +682,114 @@ async fn announce<B: KvBackend + 'static>(
             return None;
         }
     };
-    let (edus, after) = device_list_update_edus(user_id, before, now);
-    if edus.is_empty() {
-        tracing::debug!(%user_id, "a device-list change with nothing another server is told about");
-        return Some(after);
-    }
-    let audience = match hub.users_sharing_room_with(user_id).await {
-        Ok(users) => users,
-        Err(error) => {
-            tracing::warn!(%user_id, %error, "cannot work out who to tell about a device-list change");
+    let user = user_id.to_string();
+    let records = match off_runtime(sender, move |sender| sender.announced(&user)).await {
+        Some(Ok(records)) => records,
+        Some(Err(error)) => {
+            tracing::warn!(%user_id, %error, "cannot read what was announced of a user's devices");
             return None;
         }
+        None => return None,
     };
-    let destinations: BTreeSet<String> = audience
-        .iter()
-        .map(|u| u.server_name().to_string())
-        .filter(|server| server != user_id.server_name().as_str() && sends_to(server))
-        .collect();
-    if destinations.is_empty() {
-        // Said, because a server that should have been told and was not is otherwise silent.
-        tracing::debug!(
-            %user_id,
-            audience = audience.len(),
-            "a device-list change with no other server sharing a room with the user"
-        );
-        return Some(after);
+    // The shards by what they were told: in single-node mode, all of them at once.
+    let mut told: BTreeMap<String, (Option<Announced>, BTreeSet<u32>)> = BTreeMap::new();
+    for shard in group {
+        let record = records.get(shard);
+        let key = record.map(Value::to_string).unwrap_or_default();
+        told.entry(key)
+            .or_insert_with(|| (record.and_then(announced_from_json), BTreeSet::new()))
+            .1
+            .insert(*shard);
     }
-    for (edu_type, content) in edus {
-        let coalesce_key = match edu_type {
-            "m.signing_key_update" => format!("signing {user_id}"),
-            _ => format!(
-                "device {user_id} {}",
-                content["device_id"].as_str().unwrap_or_default()
-            ),
+    let mut audience: Option<BTreeSet<String>> = None;
+    let mut after = None;
+    for (before, partition) in told.into_values() {
+        let (edus, announced) = device_list_update_edus(user_id, before.as_ref(), now.clone());
+        after.get_or_insert(announced);
+        if edus.is_empty() {
+            tracing::debug!(%user_id, "a device-list change with nothing another server is told about");
+            continue;
+        }
+        let servers = match &audience {
+            Some(servers) => servers,
+            None => audience.insert(servers_sharing_a_room(hub, user_id).await?),
         };
-        tracing::debug!(
-            %user_id,
-            edu_type,
-            destinations = destinations.len(),
-            "announcing a key change to other servers"
-        );
-        // Local only: every replica follows this stream, so the owner of each destination
-        // announces to it already (`crate::edu_forward`). Durable, as a device-list or
-        // signing-key update is (`hs_federation::sender::DURABLE_EDU_TYPES`).
-        sender.enqueue_edu_local(
-            destinations.iter().cloned(),
-            edu_type,
-            content,
-            Some(coalesce_key),
-        );
+        let destinations: Vec<String> = servers
+            .iter()
+            .filter(|server| partition.contains(&shards.shard_of(server)))
+            .cloned()
+            .collect();
+        if destinations.is_empty() {
+            // Said, because a server that should have been told and was not is otherwise silent.
+            tracing::debug!(
+                %user_id,
+                servers = servers.len(),
+                "a device-list change with no other server sharing a room with the user"
+            );
+            continue;
+        }
+        for (edu_type, content) in edus {
+            let coalesce_key = match edu_type {
+                "m.signing_key_update" => format!("signing {user_id}"),
+                _ => format!(
+                    "device {user_id} {}",
+                    content["device_id"].as_str().unwrap_or_default()
+                ),
+            };
+            tracing::debug!(
+                %user_id,
+                edu_type,
+                destinations = destinations.len(),
+                "announcing a key change to other servers"
+            );
+            // Local only: every replica follows this stream, so the owner of each destination
+            // announces to it already (`crate::edu_forward`). Durable, as a device-list or
+            // signing-key update is (`hs_federation::sender::DURABLE_EDU_TYPES`); written on a
+            // blocking thread, a batch of destinations at a time.
+            let destinations = destinations.clone();
+            off_runtime(sender, move |sender| {
+                sender.enqueue_edu_local(destinations, edu_type, content, Some(coalesce_key));
+            })
+            .await?;
+        }
     }
-    Some(after)
+    let after = after?;
+    let record = announced_to_json(&after);
+    let shards: Vec<u32> = group.iter().copied().collect();
+    let user = user_id.to_string();
+    match off_runtime(sender, move |sender| {
+        sender.set_announced(&user, &shards, &record)
+    })
+    .await
+    {
+        Some(Ok(())) => Some(()),
+        Some(Err(error)) => {
+            // The EDUs are queued; without the record the next look tells the same again.
+            tracing::warn!(%user_id, %error, "cannot record what was announced of a user's devices");
+            None
+        }
+        None => None,
+    }
+}
+
+/// The servers, other than the user's own, of everyone `user_id` shares a joined room with.
+async fn servers_sharing_a_room<B: KvBackend + 'static>(
+    hub: &Hub<B>,
+    user_id: &UserId,
+) -> Option<BTreeSet<String>> {
+    match hub.users_sharing_room_with(user_id).await {
+        Ok(users) => Some(
+            users
+                .iter()
+                .map(|u| u.server_name().to_string())
+                .filter(|server| server != user_id.server_name().as_str())
+                .collect(),
+        ),
+        Err(error) => {
+            tracing::warn!(%user_id, %error, "cannot work out who to tell about a device-list change");
+            None
+        }
+    }
 }
 
 /// `hs_e2e::federation::RemoteKeys` over the federation client. See the module docs.
@@ -691,35 +876,111 @@ impl<B: KvBackend + 'static> hs_e2e::federation::RoomSharing for HubRoomSharing<
 mod tests {
     use super::*;
 
-    /// A look's places: shards owned before are steady at their place; a shard taken on starts
-    /// at its stored place (or the old whole-server one the closure falls back to), at now with
-    /// none, never past now; shards taken on at one place are read together.
+    /// Shards at one place are read together; a step reads at most `ANNOUNCE_STEP` positions
+    /// and never past the stream, and there is no step when the place is the stream's end.
     #[test]
-    fn a_look_reads_steady_shards_from_their_place_and_taken_ones_from_theirs() {
-        let first = plan_look(
-            &BTreeMap::new(),
-            &BTreeSet::from([0, 1, 2]),
-            10,
-            |shard| match shard {
-                0 => Some(5),
-                2 => Some(50),
-                _ => None,
-            },
-        );
-        assert!(first.steady.is_none());
+    fn shards_at_one_place_are_read_together_a_step_at_a_time() {
+        let groups = group_by_place(&BTreeMap::from([(0, 5), (1, 10), (2, 5), (3, 10)]));
         assert_eq!(
-            first.taken,
-            BTreeMap::from([(5, BTreeSet::from([0])), (10, BTreeSet::from([1, 2]))])
+            groups,
+            BTreeMap::from([(5, BTreeSet::from([0, 2])), (10, BTreeSet::from([1, 3]))])
+        );
+        assert_eq!(step_end(1314, 1386), Some(1314 + ANNOUNCE_STEP));
+        assert_eq!(step_end(1380, 1386), Some(1386));
+        assert_eq!(step_end(1386, 1386), None);
+        assert_eq!(step_end(1400, 1386), None);
+    }
+
+    /// A shard taken on starts at its stored place, at the old whole-server one without, at
+    /// now with neither, never past now; and only one behind is a catch-up.
+    #[tokio::test]
+    async fn a_shard_taken_on_starts_at_its_stored_place_or_the_old_one_or_now() {
+        use hs_federation::discovery::{
+            AddrResolver, SrvResolver, WellKnownFetcher, WellKnownOutcome,
+        };
+        /// Resolves nothing: this sender never sends.
+        struct Nowhere;
+        #[async_trait]
+        impl WellKnownFetcher for Nowhere {
+            async fn fetch(&self, _hostname: &str) -> WellKnownOutcome {
+                WellKnownOutcome::Absent {
+                    cache_for: Duration::from_secs(60),
+                }
+            }
+        }
+        #[async_trait]
+        impl SrvResolver for Nowhere {
+            async fn lookup_srv(&self, _service: &str, _hostname: &str) -> Vec<(String, u16)> {
+                Vec::new()
+            }
+        }
+        #[async_trait]
+        impl AddrResolver for Nowhere {
+            async fn resolve_addr(&self, _hostname: &str) -> Vec<std::net::IpAddr> {
+                Vec::new()
+            }
+        }
+        let client = Arc::new(hs_federation::client::FederationClient::new(
+            "a.example",
+            hs_model::signing::SigningKeyPair::generate("t"),
+            hs_federation::client::ClientConfig::default(),
+            Arc::new(hs_federation::destination_store::InMemoryDestinationStore::new()),
+            Arc::new(Nowhere),
+            Arc::new(Nowhere),
+            Arc::new(Nowhere),
+        ));
+        let sender = Arc::new(FederationSender::new(client, "a.example"));
+        sender.store_position(&announcer_position(0), 5).unwrap();
+        sender.store_position(&announcer_position(2), 50).unwrap();
+        let catch_ups = hs_federation::metrics::device_list_catch_ups();
+
+        let mut places = BTreeMap::new();
+        take_on(&sender, &BTreeSet::from([0, 1, 2]), &mut places, None, 10).await;
+        assert_eq!(places, BTreeMap::from([(0, 5), (1, 10), (2, 10)]));
+        assert_eq!(
+            hs_federation::metrics::device_list_catch_ups(),
+            catch_ups + 1,
+            "shard 0 alone was behind"
         );
 
-        let later = plan_look(
-            &BTreeMap::from([(0, 8), (1, 8)]),
-            &BTreeSet::from([0, 1, 3]),
-            12,
-            |_| Some(2),
+        let mut places = BTreeMap::from([(0, 8)]);
+        take_on(&sender, &BTreeSet::from([0, 3]), &mut places, Some(2), 12).await;
+        assert_eq!(
+            places,
+            BTreeMap::from([(0, 8), (3, 2)]),
+            "shard 0 kept its place"
         );
-        assert_eq!(later.steady, Some((8, BTreeSet::from([0, 1]))));
-        assert_eq!(later.taken, BTreeMap::from([(2, BTreeSet::from([3]))]));
+    }
+
+    /// What was announced is kept as JSON in the sender's store and read back the same, devices,
+    /// names, cross-signing keys and stream position alike; and a record that is not one is
+    /// none, so the user is announced whole.
+    #[test]
+    fn an_announcement_record_reads_back_as_it_was_written() {
+        let announced = Announced {
+            stream_id: Some(42),
+            devices: BTreeMap::from([
+                (
+                    "D1".to_owned(),
+                    AnnouncedDevice {
+                        keys: Some(json!({"k": 1})),
+                        display_name: Some("phone".to_owned()),
+                    },
+                ),
+                (
+                    "D2".to_owned(),
+                    AnnouncedDevice {
+                        keys: None,
+                        display_name: None,
+                    },
+                ),
+            ]),
+            master: Some(json!({"m": 1})),
+            self_signing: None,
+        };
+        let record = announced_to_json(&announced);
+        assert_eq!(announced_from_json(&record), Some(announced));
+        assert_eq!(announced_from_json(&json!("not a record")), None);
     }
 
     /// Each federation shard's place has its own name, beside the old whole-server one.
@@ -728,7 +989,7 @@ mod tests {
         assert_eq!(announcer_position(7), "device_list_announcer/federation/7");
         assert_ne!(announcer_position(0), ANNOUNCER_POSITION);
     }
-    use hs_e2e::federation::{AnnouncedDevice, LocalDeviceList};
+    use hs_e2e::federation::LocalDeviceList;
 
     fn list(devices: &[(&str, Value)], master: Option<Value>, stream_id: u64) -> LocalDeviceList {
         LocalDeviceList {

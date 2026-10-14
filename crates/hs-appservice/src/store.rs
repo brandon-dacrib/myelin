@@ -8,8 +8,11 @@
 //! profiling says otherwise (no different code path is available yet; see that file's docs for the
 //! `spawn_blocking` escape hatch this crate would reach for first).
 
+use std::collections::HashMap;
 use std::ops::Bound;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use hs_kv::{KvBackend, KvRead, KvWrite, RangeSpec, TransactConfig, transact};
 use hs_tables::index::{IndexDef, lookup, maintain_index};
@@ -292,7 +295,34 @@ pub struct AppserviceStore<B: KvBackend> {
     /// many heads they have fetched: see [`AppserviceStore::queue_reads`].
     bodies_read: AtomicU64,
     heads_read: AtomicU64,
+    /// What [`AppserviceStore::queue_summary`] counted below each queue's floor, so the next
+    /// summary reads only what is new there ([`QueueFront`]).
+    fronts: Mutex<HashMap<String, QueueFront>>,
+    /// Moved on by whatever can take an entry from below a queue's floor without lowering the
+    /// floor ([`AppserviceStore::purge_queue`], [`AppserviceStore::requeue_dead_lettered`]):
+    /// every remembered [`QueueFront`] is counted again after it.
+    front_generation: AtomicU64,
 }
+
+/// What [`AppserviceStore::queue_summary`] remembers of one queue's front: below `floor`
+/// nothing waits (the floor's own invariant), so what is there are the dead-lettered entries,
+/// `dead_lettered` of them, and the delivered ones, deleted -- which an LSM store keeps as
+/// tombstones for a while, and which the gauges walked at every scrape, one to six seconds a
+/// time on the demo on 2026-10-14 (the iMessage queue had about 31,000 behind its floor).
+#[derive(Debug, Clone, Copy)]
+struct QueueFront {
+    floor: u64,
+    dead_lettered: u64,
+    /// When the front was last counted from the queue's first entry; it is counted so again
+    /// after [`FRONT_RECOUNT`].
+    counted: Instant,
+    generation: u64,
+}
+
+/// How long a remembered [`QueueFront`] is topped up before it is counted from the front again:
+/// a bound on how long a count gone wrong behind the store's back (another replica's purge)
+/// lasts.
+const FRONT_RECOUNT: Duration = Duration::from_secs(600);
 
 /// [`AppserviceStore::queue_reads`]: how much of the queue the paged reads have read.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -374,6 +404,8 @@ impl<B: KvBackend> AppserviceStore<B> {
             queue_floor,
             bodies_read: AtomicU64::new(0),
             heads_read: AtomicU64::new(0),
+            fronts: Mutex::new(HashMap::new()),
+            front_generation: AtomicU64::new(0),
         };
         store.build_queue_heads()?;
         store.forget_queue_floors()?;
@@ -875,13 +907,40 @@ impl<B: KvBackend> AppserviceStore<B> {
     /// ([`crate::metrics::QueueCollector`]) and the admin API's `AppService.queue`. Reads each
     /// entry's status without building its body.
     ///
+    /// Reads from the queue's floor (`queue_floor`), as [`AppserviceStore::pending_batch`]
+    /// does: nothing below it waits, and its dead-lettered entries are counted once and
+    /// remembered ([`QueueFront`]), each later summary counting only those the floor has
+    /// passed since. Before 2026-10-14 every summary walked the whole queue from its first
+    /// entry, the delivered ones' tombstones included.
+    ///
     /// # Errors
     /// Returns [`AppserviceError::Store`]/[`AppserviceError::Decode`] on failure.
     pub fn queue_summary(&self, id: &str) -> Result<QueueSummary, AppserviceError> {
         let snap = self.backend.snapshot();
-        let prefix = TypedKeyspace::<B::Keyspace, (String, u64)>::prefix(&(id.to_string(),));
+        let floor: Option<u64> = self
+            .queue_floor
+            .get(&snap, &(id.to_string(),))?
+            .map(|v| decode(&v))
+            .transpose()?;
         let mut summary = QueueSummary::default();
-        for item in self.txn_queue_head.range(&snap, prefix) {
+        let start = match floor {
+            Some(floor) => {
+                summary.dead_lettered = self.dead_lettered_below(&snap, id, floor)?;
+                floor.checked_sub(1)
+            }
+            None => {
+                self.fronts
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(id);
+                None
+            }
+        };
+        let mut spec = TypedKeyspace::<B::Keyspace, (String, u64)>::prefix(&(id.to_string(),));
+        if let Some(seq) = start {
+            spec.start = Bound::Excluded((id.to_string(), seq).encode().into());
+        }
+        for item in self.txn_queue_head.range(&snap, spec) {
             let (_k, v) = item?;
             let head: QueueHead = decode(&v)?;
             match head.status {
@@ -898,6 +957,74 @@ impl<B: KvBackend> AppserviceStore<B> {
             }
         }
         Ok(summary)
+    }
+
+    /// How many of `id`'s entries below `floor` are dead-lettered: what is remembered of the
+    /// queue's front ([`QueueFront`]), topped up with the entries the floor has passed since,
+    /// or counted from the queue's first entry when nothing usable is remembered.
+    fn dead_lettered_below<R: KvRead<Keyspace = B::Keyspace>>(
+        &self,
+        read: &R,
+        id: &str,
+        floor: u64,
+    ) -> Result<u64, AppserviceError> {
+        let generation = self.front_generation.load(Ordering::Acquire);
+        let remembered = self
+            .fronts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(id)
+            .copied()
+            .filter(|front| {
+                front.generation == generation
+                    && front.floor <= floor
+                    && front.counted.elapsed() < FRONT_RECOUNT
+            });
+        if let Some(front) = remembered
+            && front.floor == floor
+        {
+            return Ok(front.dead_lettered);
+        }
+        let (mut cursor, mut dead_lettered, counted) = match remembered {
+            Some(front) => (
+                front.floor.checked_sub(1),
+                front.dead_lettered,
+                front.counted,
+            ),
+            None => (None, 0, Instant::now()),
+        };
+        'front: loop {
+            let chunk = self.heads_after(read, id, cursor, QUEUE_HEADS_PER_READ)?;
+            let Some((last, _)) = chunk.last() else {
+                break;
+            };
+            cursor = Some(*last);
+            let full = chunk.len() == QUEUE_HEADS_PER_READ;
+            for (seq, head) in chunk {
+                if seq >= floor {
+                    break 'front;
+                }
+                if head.status == QueueStatus::DeadLettered {
+                    dead_lettered += 1;
+                }
+            }
+            if !full {
+                break;
+            }
+        }
+        self.fronts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                id.to_owned(),
+                QueueFront {
+                    floor,
+                    dead_lettered,
+                    counted,
+                    generation,
+                },
+            );
+        Ok(dead_lettered)
     }
 
     /// The first `max` entries of `id`'s queue still waiting to be sent, in sequence order, with
@@ -1060,6 +1187,9 @@ impl<B: KvBackend> AppserviceStore<B> {
         matches: impl Fn(u64, u64) -> bool,
         now_ms: u64,
     ) -> Result<usize, AppserviceError> {
+        // Entries leave the dead letters below the floor: what the summaries remember of the
+        // queues' fronts is counted again.
+        self.front_generation.fetch_add(1, Ordering::AcqRel);
         let mut requeued = 0usize;
         let mut after = None;
         loop {
@@ -1308,6 +1438,8 @@ impl<B: KvBackend> AppserviceStore<B> {
     /// # Errors
     /// Returns [`AppserviceError::Store`]/[`AppserviceError::Decode`] on failure.
     pub fn purge_queue(&self, id: &str) -> Result<(), AppserviceError> {
+        // Entries leave from below the floor too: what the summaries remember is counted again.
+        self.front_generation.fetch_add(1, Ordering::AcqRel);
         loop {
             let chunk = {
                 let snap = self.backend.snapshot();
@@ -1796,6 +1928,54 @@ mod tests {
                 .entries
                 .is_empty()
         );
+    }
+
+    /// The queue gauges read from the queue's floor: the dead-lettered entries in front are
+    /// counted once and remembered, so the next summary reads none of them, and gives the same
+    /// answer; entries the floor passes are counted as it passes them; a replay has the front
+    /// counted again. Before 2026-10-14 every scrape walked the whole queue, delivered entries'
+    /// tombstones included.
+    #[test]
+    fn a_queue_summary_reads_from_the_floor_and_remembers_the_front() {
+        let s = store();
+        long_queue(&s, "a", 3_000, 1_000);
+        let full = s.queue_summary("a").unwrap();
+        assert_eq!((full.pending, full.dead_lettered), (2_000, 1_000));
+
+        // A drain raises the floor past the dead letters.
+        assert_eq!(s.pending_batch("a", 10).unwrap()[0].seq, 1_001);
+        let before = s.queue_reads().heads;
+        assert_eq!(s.queue_summary("a").unwrap(), full);
+        let first = s.queue_reads().heads - before;
+        assert!(first >= 1_000, "the front is counted once: {first} heads");
+        let before = s.queue_reads().heads;
+        assert_eq!(s.queue_summary("a").unwrap(), full);
+        assert_eq!(s.queue_reads().heads, before, "and remembered");
+
+        // The floor moves on past entries made dead-lettered and delivered ones deleted.
+        let passed: Vec<QueuedTransaction> = s
+            .pending_batch("a", 20)
+            .unwrap()
+            .into_iter()
+            .map(|mut e| {
+                e.status = QueueStatus::DeadLettered;
+                e
+            })
+            .collect();
+        s.put_queue_entries("a", &passed[..10]).unwrap();
+        let delivered: Vec<u64> = passed[10..].iter().map(|e| e.seq).collect();
+        s.delete_queue_entries("a", &delivered).unwrap();
+        assert_eq!(s.pending_batch("a", 1).unwrap()[0].seq, 1_021);
+        let moved = s.queue_summary("a").unwrap();
+        assert_eq!((moved.pending, moved.dead_lettered), (1_980, 1_010));
+
+        // A replay puts dead letters back: the front is counted again.
+        assert_eq!(
+            s.requeue_dead_lettered("a", |seq, _| seq <= 5, 0).unwrap(),
+            5
+        );
+        let replayed = s.queue_summary("a").unwrap();
+        assert_eq!((replayed.pending, replayed.dead_lettered), (1_985, 1_005));
     }
 
     /// A replay walks the queue by heads and puts back only the dead-lettered entries asked

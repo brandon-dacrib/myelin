@@ -192,6 +192,23 @@ pub const DEFAULT_MAX_QUEUED_PDUS_PER_DESTINATION: usize = 10_000;
 /// catch-up mode: well inside `hs-kv`'s per-transaction mutation limit.
 const PURGE_BATCH: usize = 500;
 
+/// How many store operations the destination workers run at once. Each is a synchronous
+/// `hs-kv` call -- a read, or a write transaction that waits for the backend's commit lock --
+/// and runs on a blocking thread ([`Shared::on_store`]), never on the runtime's async worker
+/// threads: on 2026-10-14 the demo's 1,400 workers ran their bookkeeping writes on those
+/// threads, every one of the eight ended up parked in Fjall's commit lock, nothing answered
+/// `/health/live`, and the pod was killed at every boot (`docs/status/06-federation.md`, "The
+/// boot freeze"). Bounded, so a thousand workers do not take the whole blocking pool from the
+/// rooms: the rest wait for a slot asynchronously, holding no thread.
+pub const STORE_CONCURRENCY: usize = 16;
+
+/// How many destinations one store transaction of [`FederationSender::enqueue_pdu`] or of a
+/// durable EDU covers. An event in a room with servers from 1,400 destinations used to be
+/// one transaction of four thousand-odd mutations that read every destination's queue length,
+/// conflicting with each destination's acknowledgements as they landed; in batches each one is
+/// short, and a conflict repeats only its batch.
+pub const ENQUEUE_BATCH: usize = 100;
+
 /// Where catch-up gets the event to send for a room (see the module docs' "Catch-up").
 /// `hs-cli` implements it over the room registry; tests script one.
 #[async_trait::async_trait]
@@ -358,7 +375,15 @@ pub struct SenderSnapshot {
 /// `&self`.
 pub struct FederationSender {
     shared: Arc<Shared>,
+    /// Every destination this process has a worker for. Held only to look up, add or remove
+    /// workers and to hand them what was queued -- never across a store write, which can wait
+    /// on the backend for seconds (`enqueue_edu_with`, `enqueue_pdu`).
     queues: Mutex<HashMap<String, DestinationQueue>>,
+    /// Serializes [`FederationSender::enqueue_pdu`] calls with each other, and with nothing
+    /// else: each destination's PDUs must reach its channel in the order the store numbered
+    /// them, so one enqueue's store writes and channel sends finish before the next one's
+    /// start.
+    pdu_order: Mutex<()>,
 }
 
 /// What every destination worker holds on to: everything but the queue map, so that dropping the
@@ -394,7 +419,21 @@ struct Shared {
     /// Workers waiting out a retry backoff right now ([`BackingOff`] guards it), for
     /// `hs_federation_sender_destinations_backing_off`.
     backing_off: AtomicUsize,
+    /// The workers' store slots ([`STORE_CONCURRENCY`], [`Shared::on_store`]).
+    store_slots: tokio::sync::Semaphore,
+    /// Store operations slower than [`SLOW_STORE_OPERATION`] since the last warning about them,
+    /// and when that warning was ([`Shared::note_slow_store`]): one line per
+    /// [`SLOW_STORE_WARNING_INTERVAL`] at most, however many workers are waiting.
+    slow_store_ops: AtomicU64,
+    slow_store_warned_ms: AtomicU64,
 }
+
+/// A store operation of the sender's this slow is counted for the next warning
+/// ([`Shared::note_slow_store`]).
+const SLOW_STORE_OPERATION: Duration = Duration::from_secs(1);
+
+/// At most one warning about slow store operations this often.
+const SLOW_STORE_WARNING_INTERVAL: Duration = Duration::from_secs(10);
 
 struct DestinationQueue {
     tx: mpsc::UnboundedSender<Queued>,
@@ -577,8 +616,12 @@ impl FederationSender {
                     config.max_queued_durable_edus_per_destination.max(1),
                 ),
                 backing_off: AtomicUsize::new(0),
+                store_slots: tokio::sync::Semaphore::new(STORE_CONCURRENCY),
+                slow_store_ops: AtomicU64::new(0),
+                slow_store_warned_ms: AtomicU64::new(0),
             }),
             queues: Mutex::new(HashMap::new()),
+            pdu_order: Mutex::new(()),
         }
     }
 
@@ -847,6 +890,12 @@ impl FederationSender {
     /// gate allows the destination here; otherwise the PDU is only written to the store, for
     /// the replica that sends for it. The PDU is in the store before this returns.
     ///
+    /// The store is written [`ENQUEUE_BATCH`] destinations to a transaction, and without the
+    /// map of workers held: a store write can wait on the backend for a long time, and every
+    /// typing notice, receipt and to-device message waits for that map. This call blocks for
+    /// as long as its writes take, so a caller on the runtime runs it on a blocking thread
+    /// (`hs-cli`'s feeder does).
+    ///
     /// Must be called from within a Tokio runtime, since a new destination's worker is spawned on
     /// the current one; outside a runtime the PDU is logged and dropped rather than panicking.
     /// After [`FederationSender::shutdown`] every call is a logged no-op, as is a store that
@@ -868,46 +917,73 @@ impl FederationSender {
         if destinations.is_empty() {
             return;
         }
-        let mut queues = self.queues.lock().unwrap_or_else(PoisonError::into_inner);
+        // One enqueue at a time, so each destination's channel sees its PDUs in store order.
+        let _order = self
+            .pdu_order
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         // Workers first, counting whatever the store already holds for a destination that has
-        // none yet (a queue `resume` was not asked about), and only then the write: under the
-        // one lock, so a PDU is counted exactly once, either as backlog or as this enqueue.
+        // none yet (a queue `resume` was not asked about), and only then the write, so a PDU
+        // is counted once: as that backlog, or as this enqueue.
         let mut targets = Vec::with_capacity(destinations.len());
-        for destination in destinations {
-            if !queues.contains_key(&destination) && self.shared.sends_here(&destination) {
-                let backlog = match self.shared.store.queue_len(&destination) {
-                    Ok(count) => count,
-                    Err(error) => {
-                        tracing::error!(destination, %error, "cannot read the outbound queue");
-                        0
+        {
+            let mut queues = self.queues.lock().unwrap_or_else(PoisonError::into_inner);
+            for destination in destinations {
+                if !queues.contains_key(&destination) && self.shared.sends_here(&destination) {
+                    let backlog = match self.shared.store.queue_len(&destination) {
+                        Ok(count) => count,
+                        Err(error) => {
+                            tracing::error!(destination, %error, "cannot read the outbound queue");
+                            0
+                        }
+                    };
+                    match spawn_worker(&self.shared, &destination, backlog) {
+                        Some(queue) => {
+                            queues.insert(destination.clone(), queue);
+                        }
+                        None => continue,
                     }
-                };
-                match spawn_worker(&self.shared, &destination, backlog) {
-                    Some(queue) => {
-                        queues.insert(destination.clone(), queue);
-                    }
-                    None => continue,
                 }
+                targets.push(destination);
             }
-            targets.push(destination);
         }
         if targets.is_empty() {
             return;
         }
+        let pdu = Arc::new(pdu);
         let room_id = pdu.get("room_id").and_then(Value::as_str);
         let max = self.shared.config.max_queued_pdus_per_destination.max(1);
-        let enqueued = match self.shared.store.enqueue(&targets, room_id, &pdu, max) {
-            Ok(enqueued) => enqueued,
-            Err(error) => {
-                tracing::error!(
-                    destinations = ?targets,
-                    %error,
-                    "could not persist an outbound PDU; it will not be sent"
-                );
-                return;
-            }
-        };
+        for batch in targets.chunks(ENQUEUE_BATCH) {
+            let started = std::time::Instant::now();
+            let outcome = self.shared.store.enqueue(batch, room_id, &pdu, max);
+            crate::metrics::record_sender_store_seconds("enqueue", started.elapsed().as_secs_f64());
+            let enqueued = match outcome {
+                Ok(enqueued) => enqueued,
+                Err(error) => {
+                    tracing::error!(
+                        destinations = ?batch,
+                        %error,
+                        "could not persist an outbound PDU; it will not be sent"
+                    );
+                    continue;
+                }
+            };
+            self.hand_over_pdu(&pdu, room_id, max, enqueued);
+        }
+    }
+
+    /// Hands one batch of [`FederationSender::enqueue_pdu`]'s store write to the workers: wakes
+    /// those that just entered catch-up mode, and puts the PDU on the channel of each that
+    /// queued it.
+    fn hand_over_pdu(
+        &self,
+        pdu: &Arc<Value>,
+        room_id: Option<&str>,
+        max: usize,
+        enqueued: crate::outbound_store::Enqueued,
+    ) {
         let seq = enqueued.seq;
+        let queues = self.queues.lock().unwrap_or_else(PoisonError::into_inner);
         for destination in &enqueued.newly_catching_up {
             tracing::info!(
                 destination,
@@ -930,7 +1006,6 @@ impl FederationSender {
                 "destinations in catch-up mode: only the room's position moved"
             );
         }
-        let pdu = Arc::new(pdu);
         for destination in enqueued.queued {
             let Some(queue) = queues.get(&destination) else {
                 tracing::debug!(
@@ -1008,6 +1083,11 @@ impl FederationSender {
     /// destination another replica sends for goes to the [`EduForwarder`], as with
     /// [`FederationSender::enqueue_edu`] (the receiving replica queues it durably in turn).
     /// [`DURABLE_EDU_TYPES`] take this path from `enqueue_edu` and `enqueue_edu_local` too.
+    ///
+    /// The store is written [`ENQUEUE_BATCH`] destinations to a transaction, with the map of
+    /// workers released, and the call blocks for as long as the writes take: one EDU for every
+    /// server a user shares a room with is many writes, which a caller on the runtime makes on
+    /// a blocking thread (`hs-cli`'s device-list announcer does).
     pub fn enqueue_durable_edu(
         &self,
         destinations: impl IntoIterator<Item = String>,
@@ -1140,45 +1220,53 @@ impl FederationSender {
                 );
             }
         }
+        // The workers exist (or were refused) and the in-memory EDUs are handed over; the
+        // store writes below must not hold up everyone else who queues something meanwhile.
+        drop(queues);
         if durable_targets.is_empty() {
             return;
         }
         let max = self.shared.max_durable_edus.load(Ordering::Acquire);
-        match self.shared.store.enqueue_durable_edu(
-            &durable_targets,
-            &edu,
-            coalesce_key.as_deref(),
-            max,
-        ) {
-            Ok(dropped) => {
-                if dropped > 0 {
-                    tracing::warn!(
-                        destinations = ?durable_targets,
+        for batch in durable_targets.chunks(ENQUEUE_BATCH) {
+            let started = std::time::Instant::now();
+            let outcome =
+                self.shared
+                    .store
+                    .enqueue_durable_edu(batch, &edu, coalesce_key.as_deref(), max);
+            crate::metrics::record_sender_store_seconds("enqueue", started.elapsed().as_secs_f64());
+            match outcome {
+                Ok(dropped) => {
+                    if dropped > 0 {
+                        tracing::warn!(
+                            destinations = ?batch,
+                            edu_type,
+                            dropped,
+                            bound = max,
+                            "a destination's durable EDU queue is full; dropped the oldest"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(
+                        destinations = ?batch,
                         edu_type,
-                        dropped,
-                        bound = max,
-                        "a destination's durable EDU queue is full; dropped the oldest"
+                        %error,
+                        "could not persist an outbound EDU; it will not be sent"
                     );
+                    continue;
                 }
             }
-            Err(error) => {
-                tracing::error!(
-                    destinations = ?durable_targets,
-                    edu_type,
-                    %error,
-                    "could not persist an outbound EDU; it will not be sent"
-                );
-                return;
-            }
-        }
-        for destination in &durable_targets {
-            if let Some(queue) = queues.get(destination)
-                && queue.tx.send(Queued::Edus).is_err()
-            {
-                tracing::debug!(
-                    destination,
-                    "outbound federation worker is gone; the EDU waits in the store"
-                );
+            // The doorbells, now that the rows are there to be read.
+            let queues = self.queues.lock().unwrap_or_else(PoisonError::into_inner);
+            for destination in batch {
+                if let Some(queue) = queues.get(destination)
+                    && queue.tx.send(Queued::Edus).is_err()
+                {
+                    tracing::debug!(
+                        destination,
+                        "outbound federation worker is gone; the EDU waits in the store"
+                    );
+                }
             }
         }
     }
@@ -1193,7 +1281,7 @@ impl FederationSender {
             .unwrap_or_else(PoisonError::into_inner)
             .get(destination)
             .map_or(0, |queue| queue.edus.len());
-        in_memory + self.shared.durable_edus_waiting(destination)
+        in_memory + self.shared.durable_edus_waiting_now(destination)
     }
 
     /// PDUs queued and not yet accepted by (or dropped for) their destination, summed over every
@@ -1381,6 +1469,34 @@ impl FederationSender {
     /// Returns the store's error.
     pub fn store_positions(&self, positions: &[(String, u64)]) -> Result<(), OutboundStoreError> {
         self.shared.store.set_cursors(positions)
+    }
+
+    /// What `hs-cli`'s device-list announcer last told each federation shard's destinations
+    /// about `user`, by shard ([`OutboundStore::announced`]): kept in this sender's store beside
+    /// the EDUs that told them. Empty for a store that keeps none (an in-memory one after a
+    /// restart).
+    ///
+    /// # Errors
+    /// Returns the store's error.
+    pub fn announced(
+        &self,
+        user: &str,
+    ) -> Result<std::collections::BTreeMap<u32, Value>, OutboundStoreError> {
+        self.shared.store.announced(user)
+    }
+
+    /// Records what the destinations of `shards` were last told about `user`
+    /// ([`FederationSender::announced`]).
+    ///
+    /// # Errors
+    /// Returns the store's error.
+    pub fn set_announced(
+        &self,
+        user: &str,
+        shards: &[u32],
+        record: &Value,
+    ) -> Result<(), OutboundStoreError> {
+        self.shared.store.set_announced(user, shards, record)
     }
 
     /// Forgets `destination`'s persisted backoff, so its worker -- which re-reads the store
@@ -1594,7 +1710,7 @@ async fn run_worker(
     'outer: loop {
         // Catch-up mode, if the destination is in it: the queue is dropped and each room the
         // destination is behind in gets its latest event.
-        match shared.store.catch_up_mark(&destination) {
+        match shared.catch_up_mark_of(&destination).await {
             Ok(Some(mark)) => {
                 if !shared.catch_up(&destination, &mark, &pending).await {
                     return;
@@ -1610,7 +1726,10 @@ async fn run_worker(
         }
         // What the store holds, oldest first, until it holds nothing.
         loop {
-            let batch = match shared.store.peek(&destination, MAX_PDUS_PER_TRANSACTION) {
+            let batch = match shared
+                .peek_queue(&destination, MAX_PDUS_PER_TRANSACTION)
+                .await
+            {
                 Ok(batch) => batch,
                 Err(error) => {
                     tracing::error!(
@@ -1630,7 +1749,7 @@ async fn run_worker(
                 .map(|row| (row.seq, Arc::new(row.pdu)))
                 .collect();
             let pdus: Vec<Arc<Value>> = rows.iter().map(|(_, pdu)| pdu.clone()).collect();
-            let edu_batch = shared.gather_edus(&destination, &edus);
+            let edu_batch = shared.gather_edus(&destination, &edus).await;
             match shared
                 .send_batch(&destination, &pdus, &edu_batch.edus, Mode::Queue)
                 .await
@@ -1640,15 +1759,15 @@ async fn run_worker(
                 Delivery::Delivered | Delivery::Dropped | Delivery::Failed => {}
             }
             shared.settle_edus(&destination, &edu_batch.durable).await;
-            shared.settle(&destination, through, &rows, &pending);
+            shared.settle(&destination, through, &rows, &pending).await;
             acked_through = through;
         }
         // Then the channel, until it closes or has been quiet for a rescan interval.
         loop {
             // EDUs left over from a full transaction, or queued while one was being sent (their
             // doorbells may already have been consumed), go out before waiting for anything.
-            if edus.len() > 0 || shared.durable_edus_waiting(&destination) > 0 {
-                let edu_batch = shared.gather_edus(&destination, &edus);
+            if edus.len() > 0 || shared.durable_edus_waiting(&destination).await > 0 {
+                let edu_batch = shared.gather_edus(&destination, &edus).await;
                 if edu_batch.edus.is_empty() {
                     // Waiting, but none could be read (logged): wait for the next doorbell.
                 } else {
@@ -1690,7 +1809,7 @@ async fn run_worker(
                 }
                 next = rx.try_recv().ok();
             }
-            let edu_batch = shared.gather_edus(&destination, &edus);
+            let edu_batch = shared.gather_edus(&destination, &edus).await;
             if !batch.is_empty() || !edu_batch.edus.is_empty() {
                 let through = batch.last().map_or(acked_through, |(seq, _)| *seq);
                 let pdus: Vec<Arc<Value>> = batch.iter().map(|(_, pdu)| pdu.clone()).collect();
@@ -1704,7 +1823,7 @@ async fn run_worker(
                 }
                 shared.settle_edus(&destination, &edu_batch.durable).await;
                 if !pdus.is_empty() {
-                    shared.settle(&destination, through, &batch, &pending);
+                    shared.settle(&destination, through, &batch, &pending).await;
                     acked_through = through;
                 }
             }
@@ -1734,6 +1853,85 @@ impl Shared {
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .sends_here(destination)
+    }
+
+    /// Runs `op` against the store on a blocking thread, holding one of the workers' store
+    /// slots ([`STORE_CONCURRENCY`]) meanwhile, and times it in
+    /// `hs_federation_sender_store_seconds{op}`. Every write a destination worker makes goes
+    /// through here, and every read of queued rows: a write waits for the backend's commit lock
+    /// (Fjall has one for the whole database) and a read of rows can wait for the disk, and a
+    /// runtime thread that waits is one fewer for every request the server is answering. The
+    /// point reads of one small bookkeeping row (a retry state, a catch-up mark, a count) are
+    /// made in place: a hop each cost more, in the blocking pool's own lock, than the read.
+    async fn on_store<T, F>(&self, op: &'static str, work: F) -> Result<T, OutboundStoreError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&dyn OutboundStore) -> Result<T, OutboundStoreError> + Send + 'static,
+    {
+        let started = std::time::Instant::now();
+        // The semaphore is never closed; were it, the operation would run unbounded.
+        let _slot = self.store_slots.acquire().await.ok();
+        let store = self.store.clone();
+        let outcome = tokio::task::spawn_blocking(move || work(store.as_ref())).await;
+        let took = started.elapsed();
+        crate::metrics::record_sender_store_seconds(op, took.as_secs_f64());
+        if took >= SLOW_STORE_OPERATION {
+            self.note_slow_store(op, took);
+        }
+        match outcome {
+            Ok(result) => result,
+            Err(error) => Err(OutboundStoreError::Interrupted(error.to_string())),
+        }
+    }
+
+    /// Counts a store operation slower than [`SLOW_STORE_OPERATION`], and warns about the ones
+    /// counted so far at most once per [`SLOW_STORE_WARNING_INTERVAL`]: a slow store is what
+    /// the demo's boot freeze looked like from the inside, and a warning per worker per attempt
+    /// would bury it.
+    fn note_slow_store(&self, op: &'static str, took: Duration) {
+        self.slow_store_ops.fetch_add(1, Ordering::AcqRel);
+        let now = now_ms();
+        let last = self.slow_store_warned_ms.load(Ordering::Acquire);
+        let interval = u64::try_from(SLOW_STORE_WARNING_INTERVAL.as_millis()).unwrap_or(u64::MAX);
+        if now.saturating_sub(last) < interval
+            || self
+                .slow_store_warned_ms
+                .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return;
+        }
+        let slow = self.slow_store_ops.swap(0, Ordering::AcqRel);
+        tracing::warn!(
+            op,
+            took_ms = u64::try_from(took.as_millis()).unwrap_or(u64::MAX),
+            slow_operations = slow,
+            "outbound federation store operations are slow (over a second each, waiting for \
+             the store's commit lock); the destination workers wait for them off the request \
+             threads"
+        );
+    }
+
+    /// `destination`'s catch-up mark. A point read of one small row, made where the worker
+    /// runs: what goes to a blocking thread ([`Shared::on_store`]) is every write and every read
+    /// of queued rows; a hop there for each bookkeeping read cost more, in the blocking pool's
+    /// own lock, than the read (2026-10-14).
+    async fn catch_up_mark_of(
+        &self,
+        destination: &str,
+    ) -> Result<Option<crate::outbound_store::CatchUpMark>, OutboundStoreError> {
+        self.store.catch_up_mark(destination)
+    }
+
+    /// The oldest `limit` PDUs queued for `destination`, read off the request threads.
+    async fn peek_queue(
+        &self,
+        destination: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::outbound_store::QueuedPdu>, OutboundStoreError> {
+        let destination = destination.to_owned();
+        self.on_store("read", move |store| store.peek(&destination, limit))
+            .await
     }
 
     fn next_txn_id(&self) -> String {
@@ -1766,12 +1964,19 @@ impl Shared {
     /// A transaction's EDUs: the destination's oldest durable ones from the store, then
     /// in-memory ones up to [`MAX_EDUS_PER_TRANSACTION`] in all. A store that cannot be read is
     /// logged and its EDUs wait.
-    fn gather_edus(&self, destination: &str, memory: &EduQueue) -> EduBatch {
+    async fn gather_edus(&self, destination: &str, memory: &EduQueue) -> EduBatch {
         let mut batch = EduBatch::default();
-        match self
-            .store
-            .peek_durable_edus(destination, MAX_EDUS_PER_TRANSACTION)
-        {
+        let owned = destination.to_owned();
+        // The rows themselves are read on a blocking thread, and only when there are any.
+        let durable = if self.durable_edus_waiting_now(destination) == 0 {
+            Ok(Vec::new())
+        } else {
+            self.on_store("read", move |store| {
+                store.peek_durable_edus(&owned, MAX_EDUS_PER_TRANSACTION)
+            })
+            .await
+        };
+        match durable {
             Ok(rows) => {
                 for row in rows {
                     batch.durable.push(row.seq);
@@ -1790,13 +1995,19 @@ impl Shared {
     }
 
     /// How many durable EDUs wait in the store for `destination` (0 when it cannot be read).
-    fn durable_edus_waiting(&self, destination: &str) -> usize {
+    fn durable_edus_waiting_now(&self, destination: &str) -> usize {
         self.store
             .durable_edu_len(destination)
             .unwrap_or_else(|error| {
                 tracing::error!(destination, %error, "cannot read the durable EDU queue");
                 0
             })
+    }
+
+    /// [`Shared::durable_edus_waiting_now`], as a worker asks it: a point read of one counter
+    /// (see [`Shared::catch_up_mark_of`]).
+    async fn durable_edus_waiting(&self, destination: &str) -> usize {
+        self.durable_edus_waiting_now(destination)
     }
 
     /// Deletes the durable EDUs a delivered (or policy-dropped) transaction carried. A store
@@ -1807,7 +2018,11 @@ impl Shared {
         if durable.is_empty() {
             return;
         }
-        if let Err(error) = self.store.ack_durable_edus(destination, durable) {
+        let (owned, seqs) = (destination.to_owned(), durable.to_vec());
+        if let Err(error) = self
+            .on_store("ack", move |store| store.ack_durable_edus(&owned, &seqs))
+            .await
+        {
             tracing::error!(
                 destination,
                 %error,
@@ -1819,7 +2034,7 @@ impl Shared {
 
     /// Takes a delivered (or dropped) batch out of the store and the pending counts, and moves
     /// its rooms' sent positions to it.
-    fn settle(
+    async fn settle(
         &self,
         destination: &str,
         through: u64,
@@ -1828,7 +2043,11 @@ impl Shared {
     ) {
         let count = rows.len();
         let sent = room_positions(rows);
-        let removed = match self.store.ack(destination, through, &sent) {
+        let owned = destination.to_owned();
+        let removed = match self
+            .on_store("ack", move |store| store.ack(&owned, through, &sent))
+            .await
+        {
             Ok(removed) => removed,
             Err(error) => {
                 tracing::error!(
@@ -1851,7 +2070,8 @@ impl Shared {
 
     /// The persisted retry state for `destination`, or the default; a store that cannot be read
     /// is logged and treated as empty.
-    fn state_of(&self, destination: &str) -> OutboundDestinationState {
+    async fn state_of(&self, destination: &str) -> OutboundDestinationState {
+        // A point read of one small row (see `Shared::catch_up_mark_of`).
         match self.store.state(destination) {
             Ok(state) => state.unwrap_or_default(),
             Err(error) => {
@@ -1888,7 +2108,7 @@ impl Shared {
             if now >= until_ms {
                 return !self.shut_down.load(Ordering::Acquire);
             }
-            if self.state_of(destination).is_ready(now) {
+            if self.state_of(destination).await.is_ready(now) {
                 tracing::info!(
                     destination,
                     "outbound backoff was reset while waiting; trying now"
@@ -1898,19 +2118,45 @@ impl Shared {
         }
     }
 
-    fn record_failure(&self, destination: &str, error: &str, next_attempt_ms: u64) {
+    async fn record_failure(&self, destination: &str, error: &str, next_attempt_ms: u64) {
+        let (owned, error) = (destination.to_owned(), error.to_owned());
         if let Err(store_error) = self
-            .store
-            .record_failure(destination, error, next_attempt_ms)
+            .on_store("state", move |store| {
+                store.record_failure(&owned, &error, next_attempt_ms)
+            })
+            .await
         {
             tracing::error!(destination, error = %store_error, "cannot record an outbound failure");
         }
     }
 
+    /// Records an accepted transaction for `destination` (a store that refuses is logged): on a
+    /// blocking thread, and only when there is something to write -- most successes find the
+    /// destination healthy and recorded so a moment ago
+    /// ([`OutboundDestinationState::is_settled_success`]).
+    async fn record_success(&self, destination: &str) {
+        if self
+            .store
+            .state(destination)
+            .ok()
+            .flatten()
+            .is_some_and(|state| state.is_settled_success(now_ms()))
+        {
+            return;
+        }
+        let owned = destination.to_owned();
+        if let Err(error) = self
+            .on_store("state", move |store| store.record_success(&owned))
+            .await
+        {
+            tracing::error!(destination, %error, "cannot record an outbound success");
+        }
+    }
+
     /// Whether `destination` is in catch-up mode; a store that cannot be read says no (and is
     /// logged), so the queue carries on as it was.
-    fn catching_up(&self, destination: &str) -> bool {
-        match self.store.catch_up_mark(destination) {
+    async fn catching_up(&self, destination: &str) -> bool {
+        match self.catch_up_mark_of(destination).await {
             Ok(mark) => mark.is_some(),
             Err(error) => {
                 tracing::error!(destination, %error, "cannot read the catch-up mark");
@@ -1947,13 +2193,20 @@ impl Shared {
             }
             // First wait out the destination's backoff, then decide what to send: what is
             // latest in each room is what is latest when the attempt is made.
-            let next_attempt = self.state_of(destination).next_attempt_ms.unwrap_or(0);
+            let next_attempt = self
+                .state_of(destination)
+                .await
+                .next_attempt_ms
+                .unwrap_or(0);
             if !self.wait_until(destination, next_attempt).await {
                 return false;
             }
+            let owned = destination.to_owned();
             let behind = match self
-                .store
-                .rooms_behind(destination, MAX_PDUS_PER_TRANSACTION)
+                .on_store("catch_up", move |store| {
+                    store.rooms_behind(&owned, MAX_PDUS_PER_TRANSACTION)
+                })
+                .await
             {
                 Ok(behind) => behind,
                 Err(error) => {
@@ -1963,7 +2216,11 @@ impl Shared {
                 }
             };
             if behind.is_empty() {
-                match self.store.finish_catch_up(destination) {
+                let owned = destination.to_owned();
+                match self
+                    .on_store("catch_up", move |store| store.finish_catch_up(&owned))
+                    .await
+                {
                     Ok(true) => break,
                     // A room fell behind between the two reads: go round again.
                     Ok(false) => continue,
@@ -2015,7 +2272,13 @@ impl Shared {
                     Delivery::Delivered | Delivery::Dropped => {}
                 }
             }
-            if let Err(error) = self.store.record_sent(destination, &covered) {
+            let (owned, recorded) = (destination.to_owned(), covered.clone());
+            if let Err(error) = self
+                .on_store("catch_up", move |store| {
+                    store.record_sent(&owned, &recorded)
+                })
+                .await
+            {
                 tracing::error!(destination, %error, "cannot record what catch-up sent; retrying");
                 tokio::time::sleep(self.config.reset_poll_interval).await;
                 continue;
@@ -2049,7 +2312,7 @@ impl Shared {
             if self.shut_down.load(Ordering::Acquire) {
                 return false;
             }
-            let rows = match self.store.peek(destination, PURGE_BATCH) {
+            let rows = match self.peek_queue(destination, PURGE_BATCH).await {
                 Ok(rows) => rows,
                 Err(error) => {
                     tracing::error!(destination, %error, "cannot read the queue to drop it");
@@ -2065,10 +2328,14 @@ impl Shared {
                 .into_iter()
                 .map(|row| (row.seq, Arc::new(row.pdu)))
                 .collect();
+            let (owned, behind) = (destination.to_owned(), room_positions(&rows));
             let removed = self
-                .store
-                .note_queued(destination, &room_positions(&rows))
-                .and_then(|()| self.store.ack(destination, through, &[]));
+                .on_store("catch_up", move |store| {
+                    store
+                        .note_queued(&owned, &behind)
+                        .and_then(|()| store.ack(&owned, through, &[]))
+                })
+                .await;
             match removed {
                 Ok(removed) => {
                     let settled = removed.max(rows.len());
@@ -2116,7 +2383,7 @@ impl Shared {
         });
         // Where a previous run left this destination: its run of failures carries on from
         // there, and what is left of its wait is waited out first.
-        let persisted = self.state_of(destination);
+        let persisted = self.state_of(destination).await;
         let mut failures: u32 = persisted.failures;
         if let Some(next_attempt) = persisted.next_attempt_ms
             && next_attempt > now_ms()
@@ -2131,7 +2398,7 @@ impl Shared {
             if !self.wait_until(destination, next_attempt).await {
                 return Delivery::ShutDown;
             }
-            if mode == Mode::Queue && self.catching_up(destination) {
+            if mode == Mode::Queue && self.catching_up(destination).await {
                 return Delivery::Superseded;
             }
         }
@@ -2156,9 +2423,7 @@ impl Shared {
                         "federation transaction accepted"
                     );
                     self.record_edus_sent(destination, txn_id, edus);
-                    if let Err(error) = self.store.record_success(destination) {
-                        tracing::error!(destination, %error, "cannot record an outbound success");
-                    }
+                    self.record_success(destination).await;
                     return Delivery::Delivered;
                 }
                 Ok(response) => {
@@ -2175,7 +2440,7 @@ impl Shared {
                     );
                     let until = now_ms().saturating_add(delay.as_millis() as u64);
                     let error = format!("HTTP {}: {}", response.status, response.body);
-                    self.record_failure(destination, &error, until);
+                    self.record_failure(destination, &error, until).await;
                     Wait::Until(until)
                 }
                 Err(ClientError::Backoff { retry_at_ms, .. }) => {
@@ -2232,7 +2497,7 @@ impl Shared {
                     let error = error.to_string();
                     self.log_retry(destination, txn_id, failures, delay, &error, message);
                     let until = now_ms().saturating_add(delay.as_millis() as u64);
-                    self.record_failure(destination, &error, until);
+                    self.record_failure(destination, &error, until).await;
                     Wait::Until(until)
                 }
             };
@@ -2252,7 +2517,7 @@ impl Shared {
             }
             match mode {
                 Mode::CatchUp => return Delivery::Failed,
-                Mode::Queue if self.catching_up(destination) => {
+                Mode::Queue if self.catching_up(destination).await => {
                     tracing::info!(
                         destination,
                         txn_id,
@@ -2885,6 +3150,9 @@ mod tests {
             catch_up_metrics: std::sync::OnceLock::new(),
             max_durable_edus: AtomicUsize::new(1),
             backing_off: AtomicUsize::new(0),
+            store_slots: tokio::sync::Semaphore::new(STORE_CONCURRENCY),
+            slow_store_ops: AtomicU64::new(0),
+            slow_store_warned_ms: AtomicU64::new(0),
         };
         assert_eq!(shared.backoff(1), Duration::from_millis(100));
         assert_eq!(shared.backoff(2), Duration::from_millis(200));

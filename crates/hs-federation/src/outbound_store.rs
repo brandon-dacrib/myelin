@@ -118,6 +118,13 @@ pub struct ForgottenQueue {
     pub had_state: bool,
 }
 
+/// How old a healthy destination's recorded last success may grow before a success is written
+/// again ([`OutboundDestinationState::is_settled_success`]): a minute. Before 2026-10-14 every
+/// accepted transaction wrote the destination's state, a write transaction per transaction --
+/// one of the three bookkeeping writes per delivery that kept the demo's store commit lock busy
+/// at boot (`docs/status/06-federation.md`, "The boot freeze").
+pub const SUCCESS_REFRESH_MS: u64 = 60_000;
+
 /// How the sender's retrying of one destination's head transaction is going. Persisted, so a
 /// restart resumes the backoff where it was rather than hammering a destination that was failing
 /// a moment ago.
@@ -182,6 +189,19 @@ impl OutboundDestinationState {
     #[must_use]
     pub fn is_ready(&self, now_ms: u64) -> bool {
         self.next_attempt_ms.is_none_or(|at| now_ms >= at)
+    }
+
+    /// Whether a success at `now_ms` would change nothing worth writing: no failures, no wait,
+    /// and the last success at most [`SUCCESS_REFRESH_MS`] old. The success times are for an
+    /// operator and for forgetting unused destinations, both measured in minutes and days.
+    #[must_use]
+    pub fn is_settled_success(&self, now_ms: u64) -> bool {
+        self.failures == 0
+            && self.next_attempt_ms.is_none()
+            && self.failing_since_ms.is_none()
+            && self
+                .last_success_ms
+                .is_some_and(|at| now_ms.saturating_sub(at) < SUCCESS_REFRESH_MS)
     }
 
     /// The interval the current wait spans, in milliseconds, if there is one.
@@ -266,6 +286,10 @@ pub enum OutboundStoreError {
     /// A stored row could not be encoded or decoded.
     #[error("outbound queue row could not be encoded or decoded: {0}")]
     Codec(String),
+    /// The blocking thread a store operation ran on did not finish it: it panicked, or the
+    /// runtime is shutting down (`crate::sender` runs its store work off the request threads).
+    #[error("outbound store operation did not finish: {0}")]
+    Interrupted(String),
 }
 
 impl From<TableError> for OutboundStoreError {
@@ -523,6 +547,34 @@ pub trait OutboundStore: Send + Sync {
             .iter()
             .try_for_each(|(name, position)| self.set_cursor(name, *position))
     }
+
+    /// What `hs-cli`'s device-list announcer last told the destinations of each federation
+    /// shard about `user`: an opaque record it writes with [`OutboundStore::set_announced`], by
+    /// shard. Kept with the queue it describes, so a restart picks up where the announcements
+    /// stood and does not tell every server the whole list again, with no `prev_id`, which
+    /// makes each live one ask for it back (2026-10-14). The default keeps nothing.
+    ///
+    /// # Errors
+    /// Returns the backend's error.
+    fn announced(&self, user: &str) -> Result<BTreeMap<u32, Value>, OutboundStoreError> {
+        let _ = user;
+        Ok(BTreeMap::new())
+    }
+
+    /// Records `record` as what the destinations of each of `shards` were last told about
+    /// `user` ([`OutboundStore::announced`]), in one write. The default keeps nothing.
+    ///
+    /// # Errors
+    /// Returns the backend's error; nothing was written then.
+    fn set_announced(
+        &self,
+        user: &str,
+        shards: &[u32],
+        record: &Value,
+    ) -> Result<(), OutboundStoreError> {
+        let _ = (user, shards, record);
+        Ok(())
+    }
 }
 
 /// An [`OutboundStore`] that lives and dies with the process. What a sender built without a
@@ -544,6 +596,8 @@ struct InMemoryInner {
     /// Durable EDUs: `destination -> seq -> (key, edu)`.
     edus: HashMap<String, BTreeMap<u64, (Option<String>, Value)>>,
     cursors: HashMap<String, u64>,
+    /// The device-list announcer's records: `user -> shard -> record`.
+    announced: HashMap<String, BTreeMap<u32, Value>>,
 }
 
 impl InMemoryInner {
@@ -927,6 +981,24 @@ impl OutboundStore for InMemoryOutboundStore {
         self.lock().cursors.insert(name.to_owned(), position);
         Ok(())
     }
+
+    fn announced(&self, user: &str) -> Result<BTreeMap<u32, Value>, OutboundStoreError> {
+        Ok(self.lock().announced.get(user).cloned().unwrap_or_default())
+    }
+
+    fn set_announced(
+        &self,
+        user: &str,
+        shards: &[u32],
+        record: &Value,
+    ) -> Result<(), OutboundStoreError> {
+        let mut inner = self.lock();
+        let entry = inner.announced.entry(user.to_owned()).or_default();
+        for shard in shards {
+            entry.insert(*shard, record.clone());
+        }
+        Ok(())
+    }
 }
 
 /// The `hs-kv`-backed [`OutboundStore`]: see the module docs for the layout. What `hs serve`
@@ -944,6 +1016,9 @@ pub struct KvOutboundStore<B: KvBackend> {
     edus: TypedKeyspace<B::Keyspace, (String, u64)>,
     edu_keys: TypedKeyspace<B::Keyspace, (String, String)>,
     edu_lengths: B::Keyspace,
+    /// `(user, shard) -> record`: what the device-list announcer last told each federation
+    /// shard's destinations about a local user ([`OutboundStore::announced`]).
+    announced: TypedKeyspace<B::Keyspace, (String, u64)>,
 }
 
 /// A durable EDU row of `hs_federation.outbound_edus`.
@@ -990,6 +1065,7 @@ impl<B: KvBackend> KvOutboundStore<B> {
         let edus = TypedKeyspace::new(backend.keyspace("hs_federation.outbound_edus")?);
         let edu_keys = TypedKeyspace::new(backend.keyspace("hs_federation.outbound_edu_keys")?);
         let edu_lengths = backend.keyspace("hs_federation.outbound_edu_lengths")?;
+        let announced = TypedKeyspace::new(backend.keyspace("hs_federation.outbound_announced")?);
         let store = Self {
             backend,
             queue,
@@ -1002,6 +1078,7 @@ impl<B: KvBackend> KvOutboundStore<B> {
             edus,
             edu_keys,
             edu_lengths,
+            announced,
         };
         store.count_lengths_once()?;
         Ok(store)
@@ -1523,6 +1600,16 @@ impl<B: KvBackend> OutboundStore for KvOutboundStore<B> {
 
     fn record_success(&self, destination: &str) -> Result<(), OutboundStoreError> {
         let now = now_ms();
+        // Most successes find the destination healthy and its last success recent: nothing to
+        // write, and no write transaction opened -- which in Fjall waits for the database-wide
+        // commit lock, once per accepted transaction of every destination before this.
+        let key = (destination.to_owned(),);
+        if self
+            .read_state(&self.backend.snapshot(), &key)?
+            .is_some_and(|current| current.is_settled_success(now))
+        {
+            return Ok(());
+        }
         self.update_state(destination, |current| {
             Some(current.unwrap_or_default().on_success(now))
         })
@@ -1756,6 +1843,52 @@ impl<B: KvBackend> OutboundStore for KvOutboundStore<B> {
         transact(&self.backend, TransactConfig::default(), |txn| {
             cursors.iter().try_for_each(|(name, position)| {
                 txn.put(&self.meta, &cursor_key(name), &position.to_be_bytes())
+            })
+        })?;
+        Ok(())
+    }
+
+    fn announced(&self, user: &str) -> Result<BTreeMap<u32, Value>, OutboundStoreError> {
+        let snapshot = self.backend.snapshot();
+        let spec = TypedKeyspace::<B::Keyspace, (String, u64)>::prefix(&(user.to_owned(),));
+        let mut out = BTreeMap::new();
+        for item in self.announced.range(&snapshot, spec) {
+            let ((_, shard), bytes) = item?;
+            let Ok(shard) = u32::try_from(shard) else {
+                continue;
+            };
+            match serde_json::from_slice(&bytes) {
+                Ok(record) => {
+                    out.insert(shard, record);
+                }
+                // An unreadable record is a record of nothing: the user is announced in full
+                // to that shard's destinations, as after a restart before records were kept.
+                Err(error) => tracing::warn!(
+                    user,
+                    shard,
+                    %error,
+                    "a device-list announcement record no longer decodes; ignoring it"
+                ),
+            }
+        }
+        Ok(out)
+    }
+
+    fn set_announced(
+        &self,
+        user: &str,
+        shards: &[u32],
+        record: &Value,
+    ) -> Result<(), OutboundStoreError> {
+        if shards.is_empty() {
+            return Ok(());
+        }
+        let bytes = serde_json::to_vec(record)?;
+        transact(&self.backend, TransactConfig::default(), |txn| {
+            shards.iter().try_for_each(|shard| {
+                self.announced
+                    .put(txn, &(user.to_owned(), u64::from(*shard)), &bytes)
+                    .map_err(|e| into_kv(e.into()))
             })
         })?;
         Ok(())

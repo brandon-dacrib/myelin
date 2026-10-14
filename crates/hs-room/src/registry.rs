@@ -164,7 +164,23 @@ pub struct RoomRegistry<B: KvBackend> {
     /// (`server.rooms.idle_unload_after`). Read by [`RoomRegistry::spawn_idle_unloader`]'s task
     /// on every sweep.
     idle_unload_after_secs: Arc<std::sync::atomic::AtomicU64>,
+    /// The loads under way, by room ([`RoomRegistry::get_or_load`]): everyone who asks for a
+    /// room that is loading waits for that load instead of starting one of their own.
+    loading: std::sync::Mutex<HashMap<OwnedRoomId, Arc<tokio::sync::OnceCell<RoomActorHandle<B>>>>>,
+    /// How many room loads run at once ([`MAX_CONCURRENT_LOADS`]).
+    load_slots: tokio::sync::Semaphore,
+    /// How many loads this registry has started ([`RoomRegistry::loads_started`]).
+    loads_started: std::sync::atomic::AtomicU64,
 }
+
+/// How many rooms [`RoomRegistry::get_or_load`] loads at once; the rest wait their turn,
+/// holding no thread. A load reads the room's whole timeline and state rows: before
+/// 2026-10-14 nothing shared or bounded them, and at the boot of a server whose rooms are big
+/// and busy every request that touched a room not yet resident started its own load of it --
+/// the federation boot-freeze reproduction had 465 loads of its three rooms running at once,
+/// taking every core and the whole blocking pool, and the demo spent some 400 seconds on each
+/// load with federation off (`docs/status/06-federation.md`, "The boot freeze").
+pub const MAX_CONCURRENT_LOADS: usize = 4;
 
 /// How often [`RoomRegistry::spawn_idle_unloader`] looks for rooms idle longer than
 /// `server.rooms.idle_unload_after`.
@@ -233,6 +249,9 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
             joining: Arc::default(),
             event_cache_capacity: CacheCapacity::default(),
             idle_unload_after_secs: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            loading: std::sync::Mutex::new(HashMap::new()),
+            load_slots: tokio::sync::Semaphore::new(MAX_CONCURRENT_LOADS),
+            loads_started: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -555,6 +574,10 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
     /// loaded the room from the store found a forward extremity its timeline no longer held
     /// (`/sync` `500 unknown event EventSn#...`, sends `500 cited event not in history`).
     ///
+    /// One load per room at a time: whoever asks for a room another caller is loading waits for
+    /// that load and gets its handle; a load that fails is made again by the next one waiting.
+    /// At most [`MAX_CONCURRENT_LOADS`] rooms load at once, each on a blocking thread.
+    ///
     /// # Errors
     /// Returns [`RoomError::RoomNotFound`] if the room does not exist, or any error
     /// [`RoomActor::load`] can return.
@@ -592,10 +615,57 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
             }
         }
 
+        let load = {
+            let mut loading = self
+                .loading
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            loading.entry(room_id.to_owned()).or_default().clone()
+        };
+        let outcome = load
+            .get_or_try_init(|| self.load_and_register(room_id, fence))
+            .await
+            .cloned();
+        // Over, one way or the other: the next miss (after an unload, or after this failed for
+        // everyone waiting) loads afresh.
+        {
+            let mut loading = self
+                .loading
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if loading
+                .get(room_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &load))
+            {
+                loading.remove(room_id);
+            }
+        }
+        outcome
+    }
+
+    /// How many room loads from the store this registry has started: one per room that was not
+    /// resident when asked for, however many asked for it at once.
+    #[must_use]
+    pub fn loads_started(&self) -> u64 {
+        self.loads_started
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// [`RoomRegistry::get_or_load`]'s load of a room that is not resident: from the store, on a
+    /// blocking thread and in one of the [`MAX_CONCURRENT_LOADS`] slots, then registered.
+    async fn load_and_register(
+        &self,
+        room_id: &ruma::RoomId,
+        fence: Option<hs_cluster::Fence>,
+    ) -> Result<RoomActorHandle<B>, RoomError> {
         let backend = self.backend.clone();
         let tables = self.tables.clone();
         let identity = self.identity.clone();
         let owned_room_id = room_id.to_owned();
+        // The semaphore is never closed; were it, the load would run unbounded.
+        let _slot = self.load_slots.acquire().await.ok();
+        self.loads_started
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let loaded = tokio::task::spawn_blocking(move || {
             RoomActor::load(backend, tables, identity, &owned_room_id)
         })
@@ -1104,6 +1174,57 @@ mod tests {
     use crate::actor::CreateRoomRequest;
     use hs_kv::memory::MemoryBackend;
     use ruma::user_id;
+
+    /// Everyone asking at once for a room that is not resident waits for one load of it, and
+    /// gets the one actor it loaded; a room that is not there is still not found, by everyone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn many_asking_at_once_for_a_room_share_one_load() {
+        let backend = MemoryBackend::new();
+        let first = Arc::new(
+            RoomRegistry::open(
+                backend.clone(),
+                HomeserverIdentity::for_tests("registry.test"),
+            )
+            .unwrap(),
+        );
+        let creator = ruma::user_id!("@alice:registry.test").to_owned();
+        let room_id = first
+            .create_room(creator, crate::actor::CreateRoomRequest::default(), 1_000)
+            .await
+            .unwrap()
+            .query(|actor| actor.room_id().to_owned())
+            .await;
+        // The same store, nothing resident: what a restarted server sees.
+        let restarted = Arc::new(
+            RoomRegistry::open(backend, HomeserverIdentity::for_tests("registry.test")).unwrap(),
+        );
+        let askers: Vec<_> = (0..24)
+            .map(|_| {
+                let (registry, room_id) = (restarted.clone(), room_id.clone());
+                tokio::spawn(async move { registry.get_or_load(&room_id).await.unwrap() })
+            })
+            .collect();
+        let mut handles = Vec::new();
+        for asker in askers {
+            handles.push(asker.await.unwrap());
+        }
+        assert_eq!(restarted.loads_started(), 1, "one load for all of them");
+        assert!(handles.iter().all(|h| h.same_actor(&handles[0])));
+
+        let missing = ruma::room_id!("!missing:registry.test").to_owned();
+        let askers: Vec<_> = (0..4)
+            .map(|_| {
+                let (registry, room_id) = (restarted.clone(), missing.clone());
+                tokio::spawn(async move { registry.get_or_load(&room_id).await })
+            })
+            .collect();
+        for asker in askers {
+            assert!(matches!(
+                asker.await.unwrap(),
+                Err(RoomError::RoomNotFound(_))
+            ));
+        }
+    }
 
     fn registry() -> Arc<RoomRegistry<MemoryBackend>> {
         Arc::new(

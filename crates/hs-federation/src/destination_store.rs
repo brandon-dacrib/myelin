@@ -167,9 +167,37 @@ impl DestinationStore for InMemoryDestinationStore {
     }
 }
 
+/// How old a healthy destination's recorded last success may grow before a success is written
+/// again: a minute ([`DestinationState::is_settled_success`]).
+const SUCCESS_REFRESH_MS: u64 = 60_000;
+
+impl DestinationState {
+    /// Whether a success at `now_ms` would change nothing worth writing: no failures, no wait,
+    /// and the last success at most a minute old. Before 2026-10-14 every successful request
+    /// wrote the destination's record -- a write transaction per outbound request, each
+    /// waiting for the store's commit lock (`docs/status/06-federation.md`, "The boot
+    /// freeze").
+    #[must_use]
+    pub fn is_settled_success(&self, now_ms: u64) -> bool {
+        self.failure_count == 0
+            && self.retry_at_ms.is_none()
+            && self.failing_since_ms.is_none()
+            && self
+                .last_success_ms
+                .is_some_and(|at| now_ms.saturating_sub(at) < SUCCESS_REFRESH_MS)
+    }
+}
+
 /// A `hs-kv`/`hs-tables`-backed [`DestinationStore`]: a `destinations` typed keyspace keyed by
 /// destination server name, so backoff state survives a restart (the plan's explicit
 /// requirement).
+///
+/// Every write runs on a blocking thread (`tokio::task::spawn_blocking`), not on the runtime
+/// thread of the request it serves: the client records each outbound request's outcome here,
+/// and a store write waits for the backend's commit lock, which on the demo of 2026-10-14 kept
+/// every runtime thread waiting at once. A success on a destination already healthy writes
+/// nothing ([`DestinationState::is_settled_success`]); the point reads of one destination's row
+/// are made in place.
 pub struct KvDestinationStore<B: KvBackend> {
     backend: B,
     table: TypedKeyspace<B::Keyspace, (String,)>,
@@ -184,99 +212,148 @@ impl<B: KvBackend> KvDestinationStore<B> {
         let table = TypedKeyspace::new(backend.keyspace("hs_federation.destinations")?);
         Ok(Self { backend, table })
     }
+
+    /// Runs `work` against the store on a blocking thread. `None` if the thread did not finish
+    /// it (a panic, or the runtime shutting down); every caller treats that as "no record".
+    async fn off_runtime<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&B, &TypedKeyspace<B::Keyspace, (String,)>) -> T + Send + 'static,
+    ) -> Option<T> {
+        let (backend, table) = (self.backend.clone(), self.table.clone());
+        tokio::task::spawn_blocking(move || work(&backend, &table))
+            .await
+            .ok()
+    }
+}
+
+/// `destination`'s record as `reader` sees it; the default when there is none or it does not
+/// decode.
+fn read_state<R: hs_kv::KvRead<Keyspace = K>, K: hs_kv::KeyspaceHandle>(
+    table: &TypedKeyspace<K, (String,)>,
+    reader: &R,
+    key: &(String,),
+) -> Result<Option<DestinationState>, hs_kv::KvError> {
+    Ok(table
+        .get(reader, key)
+        .map_err(to_kv_err)?
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok()))
+}
+
+/// Writes `destination`'s record through `update`, in one transaction: `update` gets the
+/// current record (the default when there is none) and returns the new one, or `None` to leave
+/// it as it is.
+fn update_state<B: KvBackend>(
+    backend: &B,
+    table: &TypedKeyspace<B::Keyspace, (String,)>,
+    destination: &str,
+    update: impl Fn(Option<DestinationState>) -> Option<DestinationState>,
+) {
+    let key = (destination.to_string(),);
+    let outcome = transact(backend, TransactConfig::default(), |txn| {
+        let Some(updated) = update(read_state(table, txn, &key)?) else {
+            return Ok(());
+        };
+        let bytes = serde_json::to_vec(&updated)
+            .map_err(|e| hs_kv::KvError::backend(DecodeError(e.to_string())))?;
+        table.put(txn, &key, &bytes).map_err(to_kv_err)
+    });
+    if let Err(error) = outcome {
+        tracing::warn!(destination, %error, "could not record a federation destination's state");
+    }
 }
 
 #[async_trait]
 impl<B: KvBackend> DestinationStore for KvDestinationStore<B> {
     async fn get(&self, destination: &str) -> DestinationState {
-        let snapshot = self.backend.snapshot();
+        // A point read of one small row, made where the caller runs: a hop to a blocking thread
+        // for each request's check cost more, in the blocking pool's own lock, than the read.
         let key = (destination.to_string(),);
-        match self.table.get(&snapshot, &key) {
-            Ok(Some(bytes)) => serde_json::from_slice(&bytes).unwrap_or_default(),
-            _ => DestinationState::default(),
-        }
+        read_state(&self.table, &self.backend.snapshot(), &key)
+            .ok()
+            .flatten()
+            .unwrap_or_default()
     }
 
     async fn record_failure(&self, destination: &str, max_backoff_ms: u64) {
-        let key = (destination.to_string(),);
-        let _ = transact(&self.backend, TransactConfig::default(), |txn| {
-            let current: DestinationState = self
-                .table
-                .get(txn, &key)
-                .map_err(to_kv_err)?
-                .and_then(|b| serde_json::from_slice(&b).ok())
-                .unwrap_or_default();
-            let updated = current.on_failure(now_ms(), max_backoff_ms, |cap| {
-                if cap == 0 {
-                    0
-                } else {
-                    rand::random::<u64>() % (cap + 1)
-                }
+        let destination = destination.to_owned();
+        self.off_runtime(move |backend, table| {
+            update_state(backend, table, &destination, |current| {
+                Some(
+                    current
+                        .unwrap_or_default()
+                        .on_failure(now_ms(), max_backoff_ms, |cap| {
+                            if cap == 0 {
+                                0
+                            } else {
+                                rand::random::<u64>() % (cap + 1)
+                            }
+                        }),
+                )
             });
-            let bytes = serde_json::to_vec(&updated)
-                .map_err(|e| hs_kv::KvError::backend(DecodeError(e.to_string())))?;
-            self.table.put(txn, &key, &bytes).map_err(to_kv_err)
-        });
+        })
+        .await;
     }
 
     async fn record_success(&self, destination: &str) {
+        // Read first, where the caller runs and outside any transaction: a destination that is
+        // healthy and was recorded so a moment ago needs no write at all, and no hop.
+        let now = now_ms();
         let key = (destination.to_string(),);
-        let _ = transact(&self.backend, TransactConfig::default(), |txn| {
-            let current: DestinationState = self
-                .table
-                .get(txn, &key)
-                .map_err(to_kv_err)?
-                .and_then(|b| serde_json::from_slice(&b).ok())
-                .unwrap_or_default();
-            let updated = current.on_success(now_ms());
-            let bytes = serde_json::to_vec(&updated)
-                .map_err(|e| hs_kv::KvError::backend(DecodeError(e.to_string())))?;
-            self.table.put(txn, &key, &bytes).map_err(to_kv_err)
-        });
+        if let Ok(Some(current)) = read_state(&self.table, &self.backend.snapshot(), &key)
+            && current.is_settled_success(now)
+        {
+            return;
+        }
+        let destination = destination.to_owned();
+        self.off_runtime(move |backend, table| {
+            update_state(backend, table, &destination, |current| {
+                Some(current.unwrap_or_default().on_success(now))
+            });
+        })
+        .await;
     }
 
     async fn list(&self) -> Vec<(String, DestinationState)> {
-        let snapshot = self.backend.snapshot();
-        let mut all = Vec::new();
-        for item in self.table.range(&snapshot, hs_kv::RangeSpec::full()) {
-            let Ok(((destination,), bytes)) = item else {
-                continue;
-            };
-            if let Ok(state) = serde_json::from_slice::<DestinationState>(&bytes) {
-                all.push((destination, state));
+        self.off_runtime(|backend, table| {
+            let snapshot = backend.snapshot();
+            let mut all = Vec::new();
+            for item in table.range(&snapshot, hs_kv::RangeSpec::full()) {
+                let Ok(((destination,), bytes)) = item else {
+                    continue;
+                };
+                if let Ok(state) = serde_json::from_slice::<DestinationState>(&bytes) {
+                    all.push((destination, state));
+                }
             }
-        }
-        all
+            all
+        })
+        .await
+        .unwrap_or_default()
     }
 
     async fn reset(&self, destination: &str) {
-        let key = (destination.to_string(),);
-        let _ = transact(&self.backend, TransactConfig::default(), |txn| {
-            let Some(current) = self
-                .table
-                .get(txn, &key)
-                .map_err(to_kv_err)?
-                .and_then(|b| serde_json::from_slice::<DestinationState>(&b).ok())
-            else {
-                return Ok(());
-            };
-            let updated = DestinationState {
-                failure_count: 0,
-                retry_at_ms: None,
-                failing_since_ms: None,
-                ..current
-            };
-            let bytes = serde_json::to_vec(&updated)
-                .map_err(|e| hs_kv::KvError::backend(DecodeError(e.to_string())))?;
-            self.table.put(txn, &key, &bytes).map_err(to_kv_err)
-        });
+        let destination = destination.to_owned();
+        self.off_runtime(move |backend, table| {
+            update_state(backend, table, &destination, |current| {
+                current.map(|current| DestinationState {
+                    failure_count: 0,
+                    retry_at_ms: None,
+                    failing_since_ms: None,
+                    ..current
+                })
+            });
+        })
+        .await;
     }
 
     async fn forget(&self, destination: &str) {
         let key = (destination.to_string(),);
-        let _ = transact(&self.backend, TransactConfig::default(), |txn| {
-            self.table.delete(txn, &key).map_err(to_kv_err)
-        });
+        self.off_runtime(move |backend, table| {
+            let _ = transact(backend, TransactConfig::default(), |txn| {
+                table.delete(txn, &key).map_err(to_kv_err)
+            });
+        })
+        .await;
     }
 }
 

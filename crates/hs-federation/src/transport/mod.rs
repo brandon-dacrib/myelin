@@ -229,6 +229,63 @@ fn apply_x_matrix_layer(
         // it is added last. See `crate::xmatrix::verify_x_matrix`'s doc for the same note.
         .layer(axum::middleware::from_fn(xmatrix::verify_x_matrix))
         .layer(axum::Extension(x_matrix_ctx))
+        // Outermost: a request waits for a slot before its signature is checked, since the
+        // check can mean fetching the origin's keys.
+        .layer(axum::middleware::from_fn(bound_inbound))
+}
+
+/// How many inbound federation requests (every signed route: `/send`, `/user/devices`, the
+/// joins, the reads) are worked on at once, their `X-Matrix` checks included. The rest wait
+/// for a slot, holding no thread, for at most [`INBOUND_SLOT_WAIT`].
+///
+/// A storm of requests then queues instead of each one taking a share of the runtime: on
+/// 2026-10-14 the demo, having told some 1,400 servers its users' whole device lists at boot,
+/// was asked for them back 472 times in a minute while `/send`s took five seconds each, and
+/// nothing bounded how much of that ran at once (`docs/status/06-federation.md`, "The boot
+/// freeze"). Requests that are not federation's (`/health/live`, the client API) never wait
+/// here.
+pub const INBOUND_CONCURRENCY: usize = 64;
+
+/// How long an inbound federation request waits for one of the [`INBOUND_CONCURRENCY`] slots
+/// before it is answered `429 M_LIMIT_EXCEEDED` with a `Retry-After`: a sending server retries
+/// a transaction, and a server resyncing a device list asks again later.
+pub const INBOUND_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+static INBOUND_SLOTS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(INBOUND_CONCURRENCY)));
+
+/// Inbound federation requests holding a slot right now ([`INBOUND_CONCURRENCY`]).
+#[must_use]
+pub fn inbound_in_flight() -> usize {
+    INBOUND_CONCURRENCY.saturating_sub(INBOUND_SLOTS.available_permits())
+}
+
+/// The layer that holds each inbound federation request to one of [`INBOUND_CONCURRENCY`]
+/// slots for as long as it is worked on.
+async fn bound_inbound(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let waited_from = std::time::Instant::now();
+    let slot = tokio::time::timeout(INBOUND_SLOT_WAIT, INBOUND_SLOTS.clone().acquire_owned()).await;
+    let Ok(Ok(_slot)) = slot else {
+        crate::metrics::record_inbound_refused();
+        tracing::warn!(
+            path = request.uri().path(),
+            waited_ms = u64::try_from(waited_from.elapsed().as_millis()).unwrap_or(u64::MAX),
+            limit = INBOUND_CONCURRENCY,
+            "an inbound federation request waited for a free slot and was refused: answered \
+             429 so the other server tries again later"
+        );
+        return axum::response::IntoResponse::into_response(
+            hs_http::error::MatrixError::rate_limited(
+                u64::try_from(INBOUND_SLOT_WAIT.as_millis()).unwrap_or(u64::MAX),
+            ),
+        );
+    };
+    crate::metrics::record_inbound_slot_wait(waited_from.elapsed().as_secs_f64());
+    let _in_flight = crate::metrics::InboundInFlight::enter();
+    next.run(request).await
 }
 
 #[cfg(test)]
