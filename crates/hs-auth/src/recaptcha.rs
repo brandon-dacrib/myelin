@@ -65,13 +65,11 @@ impl RecaptchaVerifier for HttpRecaptchaVerifier {
         if let Some(ip) = check.remote_ip {
             form.push(("remoteip", ip));
         }
-        let answer = self
-            .client
-            .post(check.siteverify_api)
-            .form(&form)
-            .send()
-            .await
-            .map_err(|e| format!("could not reach the CAPTCHA service: {e}"))?;
+        // Outside every span (`hs_telemetry::outside_spans`, decision 0048).
+        let answer =
+            hs_telemetry::outside_spans(self.client.post(check.siteverify_api).form(&form).send())
+                .await
+                .map_err(|e| format!("could not reach the CAPTCHA service: {e}"))?;
         if !answer.status().is_success() {
             return Err(format!("the CAPTCHA service answered {}", answer.status()));
         }

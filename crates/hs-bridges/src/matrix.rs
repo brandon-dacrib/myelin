@@ -64,11 +64,14 @@ impl MatrixClient {
         if let Some(body) = body {
             request = request.json(&body);
         }
-        let response = request.send().await.map_err(|e| MatrixError {
-            context: format!("{context}: {e}"),
-            status: 0,
-            errcode: String::new(),
-        })?;
+        // Outside every span (`hs_telemetry::outside_spans`, decision 0048).
+        let response = hs_telemetry::outside_spans(request.send())
+            .await
+            .map_err(|e| MatrixError {
+                context: format!("{context}: {e}"),
+                status: 0,
+                errcode: String::new(),
+            })?;
         let status = response.status().as_u16();
         let body: Value = response.json().await.unwrap_or(Value::Null);
         if (200..300).contains(&status) {

@@ -12,6 +12,7 @@ hs-kv = { path = "../hs-kv" }
 hs-tables = { path = "../hs-tables" }
 hs-model = { path = "../hs-model" }
 hs-http = { path = "../hs-http" }
+hs-telemetry = { path = "../hs-telemetry" }
 hs-auth = { path = "../hs-auth" }
 ruma = { workspace = true }
 axum = { workspace = true }

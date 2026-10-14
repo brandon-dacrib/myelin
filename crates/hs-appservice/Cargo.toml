@@ -12,6 +12,7 @@ ruma = { workspace = true }
 hs-admin = { path = "../hs-admin" }
 hs-auth = { path = "../hs-auth" }
 hs-http = { path = "../hs-http" }
+hs-telemetry = { path = "../hs-telemetry" }
 hs-kv = { path = "../hs-kv" }
 hs-tables = { path = "../hs-tables" }
 serde = { workspace = true }

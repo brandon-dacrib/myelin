@@ -11,6 +11,7 @@ description = "Bridge offerings and per-user bridge instances: the manager, the 
 hs-admin = { path = "../hs-admin" }
 # `hs_http::client::builder()`: the one outbound HTTP client, under the outbound address policy.
 hs-http = { path = "../hs-http" }
+hs-telemetry = { path = "../hs-telemetry" }
 hs-kv = { path = "../hs-kv" }
 hs-model = { path = "../hs-model" }
 hs-tables = { path = "../hs-tables" }

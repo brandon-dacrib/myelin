@@ -120,7 +120,18 @@ impl HttpPusherClient {
         let mut last_reason: String;
         loop {
             attempt += 1;
-            match self.http.post(gateway_url).json(body).send().await {
+            // One attempt, timed by a span held around it; the exchange runs outside every span
+            // (`hs_telemetry::outside_spans`, decision 0048).
+            let http_span = tracing::info_span!(
+                "push.http",
+                attempt,
+                "otel.name" = "POST /_matrix/push/v1/notify",
+                "otel.kind" = "client",
+            );
+            let sent =
+                hs_telemetry::outside_spans(self.http.post(gateway_url).json(body).send()).await;
+            drop(http_span);
+            match sent {
                 Ok(response) => {
                     let status = response.status();
                     if status.is_success() {

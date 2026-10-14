@@ -347,10 +347,8 @@ impl CasValidator for HttpCasValidator {
             encode_component(ticket),
             encode_component(service)
         );
-        let response = self
-            .client()?
-            .get(&url)
-            .send()
+        // Outside every span (`hs_telemetry::outside_spans`, decision 0048).
+        let response = hs_telemetry::outside_spans(self.client()?.get(&url).send())
             .await
             .map_err(|e| CasError::Transport(e.to_string()))?;
         let status = response.status();

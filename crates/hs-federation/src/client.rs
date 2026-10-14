@@ -652,6 +652,7 @@ impl FederationClient {
             .build_request(destination, method, path, body, true)
             .await?;
 
+        // Run below through `hs_telemetry::outside_spans`.
         let exchange = async {
             let response = request
                 .send()

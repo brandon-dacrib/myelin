@@ -172,9 +172,9 @@ impl HttpAdminApi {
         request: reqwest::RequestBuilder,
         endpoint: &AdminEndpoint,
     ) -> Result<T, AdminError> {
-        let response = request
-            .bearer_auth(&endpoint.token)
-            .send()
+        // Outside every span (`hs_telemetry::outside_spans`, decision 0048): the reconciler's
+        // span would otherwise live as long as the pooled connection.
+        let response = hs_telemetry::outside_spans(request.bearer_auth(&endpoint.token).send())
             .await
             .map_err(|e| AdminError::Transport(e.to_string()))?;
         let status = response.status().as_u16();

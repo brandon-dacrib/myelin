@@ -278,9 +278,8 @@ pub async fn guarded_fetch(
             .build()
             .map_err(|e| FetchError::Request(e.to_string()))?;
 
-        let response = client
-            .get(parsed.clone())
-            .send()
+        // Outside every span (`hs_telemetry::outside_spans`, decision 0048).
+        let response = hs_telemetry::outside_spans(client.get(parsed.clone()).send())
             .await
             .map_err(|e| FetchError::Request(e.to_string()))?;
 

@@ -440,10 +440,15 @@ impl Forwarder {
     where
         IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
-        let (send_request, connection) =
-            hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(io))
-                .await
-                .map_err(|e| ForwardError::Transport(format!("HTTP/2 handshake: {e}")))?;
+        // Outside every span (`hs_telemetry::outside_spans`, decision 0048): the handshake
+        // spawns the connection's driver through `TokioExecutor`, which (with `hyper-util`'s
+        // `tracing` feature) enters the current span in it, and the connection is pooled for
+        // the life of the process, so the forwarded request's trace would never be exported.
+        let (send_request, connection) = hs_telemetry::outside_spans(
+            hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(io)),
+        )
+        .await
+        .map_err(|e| ForwardError::Transport(format!("HTTP/2 handshake: {e}")))?;
         tokio::spawn(async move {
             let _ = connection.await;
         });

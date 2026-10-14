@@ -65,7 +65,12 @@ impl HttpCallbackClient {
     {
         let url = format!("{}/{hook}", self.base_url);
         let body = CallbackRequest::new(payload);
-        let response = self.http.post(&url).json(&body).send().await?;
+        // Timed by a span held around the exchange, which itself runs outside every span
+        // (`hs_telemetry::outside_spans`, decision 0048).
+        let http_span = tracing::info_span!("module.http", hook, "otel.kind" = "client");
+        let response = hs_telemetry::outside_spans(self.http.post(&url).json(&body).send()).await;
+        drop(http_span);
+        let response = response?;
         match response.status() {
             reqwest::StatusCode::OK => {
                 let envelope: CallbackResponse<Resp> = response.json().await?;

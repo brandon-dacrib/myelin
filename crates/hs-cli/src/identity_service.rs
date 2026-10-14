@@ -104,10 +104,12 @@ impl HttpIdentityService {
             Some(token) => request.bearer_auth(token),
             None => request,
         };
-        let response = request
-            .send()
-            .await
-            .map_err(|e| unreachable_identity_server(&e.to_string()))?;
+        // Timed by a span held around it; the exchange runs outside every span
+        // (`hs_telemetry::outside_spans`, decision 0048).
+        let http_span = tracing::info_span!("identity_server.http", "otel.kind" = "client");
+        let response = hs_telemetry::outside_spans(request.send()).await;
+        drop(http_span);
+        let response = response.map_err(|e| unreachable_identity_server(&e.to_string()))?;
         let status = response.status();
         let body: Value = response.json().await.unwrap_or(Value::Null);
         if !status.is_success() {
@@ -265,10 +267,12 @@ impl IdentityService for HttpIdentityService {
 async fn identity_server_answer(
     request: reqwest::RequestBuilder,
 ) -> Result<(u16, Value), hs_auth::threepid::IdentityServerError> {
-    let response = request
-        .send()
-        .await
-        .map_err(|e| hs_auth::threepid::IdentityServerError::Unreachable(e.to_string()))?;
+    let http_span = tracing::info_span!("identity_server.http", "otel.kind" = "client");
+    // Outside every span (`hs_telemetry::outside_spans`, decision 0048).
+    let response = hs_telemetry::outside_spans(request.send()).await;
+    drop(http_span);
+    let response =
+        response.map_err(|e| hs_auth::threepid::IdentityServerError::Unreachable(e.to_string()))?;
     let status = response.status().as_u16();
     let body: Value = response.json().await.unwrap_or(Value::Null);
     Ok((status, body))

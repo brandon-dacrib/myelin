@@ -216,7 +216,10 @@ impl ContentScanner for HttpScanner {
             .body(body.to_vec());
         builder = self.apply_auth(builder);
 
-        let resp = builder.send().await.map_err(classify_reqwest_error)?;
+        // Outside every span (`hs_telemetry::outside_spans`, decision 0048).
+        let resp = hs_telemetry::outside_spans(builder.send())
+            .await
+            .map_err(classify_reqwest_error)?;
         Self::parse_response(resp).await
     }
 
@@ -226,7 +229,10 @@ impl ContentScanner for HttpScanner {
             .get(self.poll_url())
             .query(&[("ticket", ticket.0.as_str())]);
         builder = self.apply_auth(builder);
-        let resp = builder.send().await.map_err(classify_reqwest_error)?;
+        // Outside every span (`hs_telemetry::outside_spans`, decision 0048).
+        let resp = hs_telemetry::outside_spans(builder.send())
+            .await
+            .map_err(classify_reqwest_error)?;
         Self::parse_response(resp).await
     }
 }

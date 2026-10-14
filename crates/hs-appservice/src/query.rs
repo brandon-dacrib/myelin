@@ -136,13 +136,11 @@ impl AppserviceQueryTransport for HttpQueryTransport {
     ) -> Result<Option<Value>, String> {
         let base = url.trim_end_matches('/');
         let full_url = format!("{base}/_matrix/app/v1{path_and_query}");
-        let response = self
-            .client
-            .get(&full_url)
-            .bearer_auth(hs_token)
-            .send()
-            .await
-            .map_err(|e| crate::error::error_chain(&e))?;
+        // Outside every span (`hs_telemetry::outside_spans`, decision 0048).
+        let response =
+            hs_telemetry::outside_spans(self.client.get(&full_url).bearer_auth(hs_token).send())
+                .await
+                .map_err(|e| crate::error::error_chain(&e))?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }

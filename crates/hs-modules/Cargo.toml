@@ -16,6 +16,7 @@ tracing = { workspace = true }
 reqwest = { workspace = true }
 # The shared outbound client builder (`hs_http::client`): one root store, one address policy.
 hs-http = { path = "../hs-http" }
+hs-telemetry = { path = "../hs-telemetry" }
 tokio = { workspace = true }
 
 [dev-dependencies]

@@ -176,15 +176,17 @@ impl BridgeLogins {
         &self,
         request: &WhoamiRequest,
     ) -> Result<AdminBridgeLogins, AdminBridgeLoginsError> {
-        let response = self
-            .client
-            .get(&request.url)
-            .query(&[("user_id", request.user_id.as_str())])
-            .bearer_auth(&request.secret)
-            .header(reqwest::header::ACCEPT, "application/json")
-            .send()
-            .await
-            .map_err(|e| transport_error(&e))?;
+        // Outside every span (`hs_telemetry::outside_spans`, decision 0048).
+        let response = hs_telemetry::outside_spans(
+            self.client
+                .get(&request.url)
+                .query(&[("user_id", request.user_id.as_str())])
+                .bearer_auth(&request.secret)
+                .header(reqwest::header::ACCEPT, "application/json")
+                .send(),
+        )
+        .await
+        .map_err(|e| transport_error(&e))?;
         let status = response.status();
         let body = response.text().await.map_err(|e| transport_error(&e))?;
         if !status.is_success() {

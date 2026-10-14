@@ -98,20 +98,22 @@ impl PingTransport for HttpPingTransport {
                 serde_json::Value::String(id.to_string()),
             );
         }
-        let response = self
-            .client
-            .post(&full_url)
-            .bearer_auth(hs_token)
-            .json(&serde_json::Value::Object(body))
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    PingTransportError::Timeout
-                } else {
-                    PingTransportError::ConnectionFailed(crate::error::error_chain(&e))
-                }
-            })?;
+        // Outside every span (`hs_telemetry::outside_spans`, decision 0048).
+        let response = hs_telemetry::outside_spans(
+            self.client
+                .post(&full_url)
+                .bearer_auth(hs_token)
+                .json(&serde_json::Value::Object(body))
+                .send(),
+        )
+        .await
+        .map_err(|e| {
+            if e.is_timeout() {
+                PingTransportError::Timeout
+            } else {
+                PingTransportError::ConnectionFailed(crate::error::error_chain(&e))
+            }
+        })?;
         if response.status().is_success() {
             Ok(())
         } else {

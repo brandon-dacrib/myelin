@@ -139,13 +139,24 @@ impl TransactionSender for HttpTransactionSender {
         let base = url.trim_end_matches('/');
         let encoded_txn = urlencoding_minimal(txn_id);
         let full_url = format!("{base}/_matrix/app/v1/transactions/{encoded_txn}");
-        let response = self
-            .client
-            .put(&full_url)
-            .bearer_auth(hs_token)
-            .json(body)
-            .send()
-            .await
+        // The exchange, timed by a span held around it; the request itself runs outside every
+        // span (`hs_telemetry::outside_spans`, decision 0048), or a connection it opens would
+        // hold the transaction's spans open for as long as the connection lives.
+        let http_span = tracing::info_span!(
+            "appservice.http",
+            "otel.name" = "PUT /_matrix/app/v1/transactions",
+            "otel.kind" = "client",
+        );
+        let response = hs_telemetry::outside_spans(
+            self.client
+                .put(&full_url)
+                .bearer_auth(hs_token)
+                .json(body)
+                .send(),
+        )
+        .await;
+        drop(http_span);
+        let response = response
             // The cause, not just "error sending request for url (...)": that is what the
             // delivery log and the appservice's `last_error` say.
             .map_err(|e| crate::error::error_chain(&e))?;
