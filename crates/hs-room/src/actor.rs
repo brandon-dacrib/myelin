@@ -382,6 +382,18 @@ enum PersistKind {
     AfterFetchedState { snapshot: Vec<EventSn> },
 }
 
+impl PersistKind {
+    /// The kind's name, for the `room.persist` span.
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Ordinary => "ordinary",
+            Self::NewRoom => "new_room",
+            Self::RemoteJoin { .. } => "remote_join",
+            Self::AfterFetchedState { .. } => "after_fetched_state",
+        }
+    }
+}
+
 /// Which state [`RoomActor::authorize_remote_at`] checks an event against, besides the one its
 /// own `auth_events` imply.
 #[derive(Clone, Copy)]
@@ -1631,6 +1643,13 @@ impl<B: KvBackend> RoomActor<B> {
                 .iter()
                 .map(|sn| self.root_after(*sn))
                 .collect::<Result<_, _>>()?;
+            // Resolving forks is state resolution proper, and can be slow; one root is a
+            // lookup. Only in a recorded trace (decision 0048).
+            let _resolving = if roots.len() > 1 && hs_telemetry::current_is_sampled() {
+                tracing::info_span!("room.state_resolution", forks = roots.len()).entered()
+            } else {
+                tracing::Span::none().entered()
+            };
             self.store
                 .resolve(&self.room_version, &roots)
                 .map_err(|e| RoomError::State(e.to_string()))?
@@ -1938,23 +1957,32 @@ impl<B: KvBackend> RoomActor<B> {
         }
         let prev_refs = self.refs_for(prev_events)?;
         let state = self.state_view(prev_events)?;
-        let event = pipeline::build_and_authorize(
-            &self.room_version,
-            &self.rules,
-            Some(&self.room_id),
-            &self.identity.server_name,
-            &self.identity.signing_key,
-            now_ms,
-            &prev_refs,
-            &state,
-            NewEvent {
-                event_type,
-                state_key,
-                sender,
-                content,
-                redacts,
-            },
-        )?;
+        // Building (hashes, signature) and the auth rules against the state before it.
+        let authorizing = if hs_telemetry::current_is_sampled() {
+            tracing::info_span!("room.build_and_authorize")
+        } else {
+            tracing::Span::none()
+        };
+        let event = authorizing.in_scope(|| {
+            pipeline::build_and_authorize(
+                &self.room_version,
+                &self.rules,
+                Some(&self.room_id),
+                &self.identity.server_name,
+                &self.identity.signing_key,
+                now_ms,
+                &prev_refs,
+                &state,
+                NewEvent {
+                    event_type,
+                    state_key,
+                    sender,
+                    content,
+                    redacts,
+                },
+            )
+        })?;
+        drop(authorizing);
         self.persist(event.clone())?;
         Ok(event)
     }
@@ -2311,6 +2339,37 @@ impl<B: KvBackend> RoomActor<B> {
         auth_sns: &[EventSn],
         at: StateBefore,
     ) -> Result<(), RoomError> {
+        // `room.event_auth`, in a recorded trace (decision 0048): the auth rules against the
+        // event's `auth_events` and the state before it (which may be a state resolution).
+        if !hs_telemetry::current_is_sampled() {
+            return self.authorize_remote_unspanned(event, prev_sns, auth_sns, at);
+        }
+        let span = tracing::info_span!(
+            "room.event_auth",
+            event_id = %event.event_id(),
+            outcome = tracing::field::Empty,
+        );
+        let result =
+            span.in_scope(|| self.authorize_remote_unspanned(event, prev_sns, auth_sns, at));
+        span.record(
+            "outcome",
+            match &result {
+                Ok(()) => "allowed",
+                Err(RoomError::Forbidden(_)) => "refused",
+                Err(_) => "failed",
+            },
+        );
+        result
+    }
+
+    /// [`RoomActor::authorize_remote_at`]'s work, without its span.
+    fn authorize_remote_unspanned(
+        &self,
+        event: &Event,
+        prev_sns: &[EventSn],
+        auth_sns: &[EventSn],
+        at: StateBefore,
+    ) -> Result<(), RoomError> {
         let mut auth_flat = FlatState::new();
         let mut auth_event_refs = Vec::with_capacity(auth_sns.len());
         for &sn in auth_sns {
@@ -2497,6 +2556,18 @@ impl<B: KvBackend> RoomActor<B> {
     /// refuses an ID a room already has, with [`RoomError::RoomAlreadyExists`] and nothing
     /// written or changed in memory.
     fn persist_with(&mut self, event: Event, kind: PersistKind) -> Result<EventSn, RoomError> {
+        // The event's write: its transaction, the state store's feed and the in-memory
+        // indexes. Only in a recorded trace (decision 0048).
+        let _persisting = if hs_telemetry::current_is_sampled() {
+            tracing::info_span!(
+                "room.persist",
+                event_id = %event.event_id(),
+                kind = kind.name(),
+            )
+            .entered()
+        } else {
+            tracing::Span::none().entered()
+        };
         if self.deleted {
             return Err(RoomError::RoomNotFound(self.room_id.to_string()));
         }
@@ -8760,6 +8831,67 @@ mod tests {
     /// Deliverable 4's core claim: a remote event round-trips byte-identically (its `event_id`
     /// still hashes correctly after storage) and reaches both the timeline and the publish stream
     /// `hs-user`'s feeds subscribe to.
+    #[test]
+    fn a_traced_send_and_a_remote_event_show_auth_and_persistence_as_spans() {
+        let mut actor = room("public_chat");
+        let bob = user_id!("@bob:remote.example");
+        actor
+            .membership_action(
+                bob.to_owned(),
+                Action::Join,
+                bob.to_owned(),
+                serde_json::json!({}),
+                2,
+            )
+            .unwrap();
+        let ((), trace) = hs_telemetry::testing::trace_sync(|| {
+            actor
+                .send_event(
+                    user_id!("@alice:hs1").to_owned(),
+                    "m.room.message".into(),
+                    None,
+                    serde_json::json!({"body": "hi"}),
+                    None,
+                    3,
+                )
+                .unwrap();
+        });
+        let built = trace.find("room.build_and_authorize").expect("built");
+        let persisted = trace.find("room.persist").expect("persisted");
+        assert_eq!(persisted.attr("kind"), Some("ordinary"));
+        assert!(persisted.attr("event_id").is_some());
+        assert_ne!(built.span_id, persisted.span_id);
+        let txn = trace
+            .0
+            .iter()
+            .find(|s| s.name.starts_with("kv "))
+            .unwrap_or_else(|| panic!("no store transaction in {:?}", trace.names()));
+        assert!(trace.is_under(txn, persisted), "{:?}", trace.names());
+
+        let remote_key = hs_model::signing::SigningKeyPair::generate("1");
+        let remote_server = ruma::ServerName::parse("remote.example").unwrap();
+        let remote_event = build_remote_message(&actor, bob, &remote_server, &remote_key, "hi");
+        let (outcome, trace) =
+            hs_telemetry::testing::trace_sync(|| actor.accept_remote_event(remote_event));
+        assert!(matches!(outcome, Ok(RemoteEventOutcome::Stored(_))));
+        let auth = trace.find("room.event_auth").expect("the auth check");
+        assert_eq!(auth.attr("outcome"), Some("allowed"));
+        assert!(trace.find("room.persist").is_some());
+
+        // Outside a trace, none of it: no `room.persist` of its own.
+        actor
+            .send_event(
+                user_id!("@alice:hs1").to_owned(),
+                "m.room.message".into(),
+                None,
+                serde_json::json!({"body": "untraced"}),
+                None,
+                4,
+            )
+            .unwrap();
+        assert!(hs_telemetry::testing::traces_rooted_at("room.persist").is_empty());
+    }
+
     #[test]
     fn accept_remote_event_round_trips_byte_identically_and_reaches_publish_stream() {
         let mut actor = room("public_chat");

@@ -2747,6 +2747,7 @@ dependencies = [
  "hs-model",
  "hs-state",
  "hs-tables",
+ "hs-telemetry",
  "hs-testkit",
  "prometheus-client",
  "proptest",
