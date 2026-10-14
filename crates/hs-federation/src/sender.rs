@@ -426,6 +426,9 @@ struct Shared {
     /// [`SLOW_STORE_WARNING_INTERVAL`] at most, however many workers are waiting.
     slow_store_ops: AtomicU64,
     slow_store_warned_ms: AtomicU64,
+    /// The spans that queued the most recent PDUs, by sequence number, oldest first, at most
+    /// [`RECENT_LINKS`]: what a transaction's trace links to (only sampled ones are kept).
+    recent_links: Mutex<std::collections::VecDeque<(u64, hs_telemetry::TraceLink)>>,
 }
 
 /// A store operation of the sender's this slow is counted for the next warning
@@ -619,6 +622,7 @@ impl FederationSender {
                 store_slots: tokio::sync::Semaphore::new(STORE_CONCURRENCY),
                 slow_store_ops: AtomicU64::new(0),
                 slow_store_warned_ms: AtomicU64::new(0),
+                recent_links: Mutex::new(std::collections::VecDeque::new()),
             }),
             queues: Mutex::new(HashMap::new()),
             pdu_order: Mutex::new(()),
@@ -953,6 +957,7 @@ impl FederationSender {
         let pdu = Arc::new(pdu);
         let room_id = pdu.get("room_id").and_then(Value::as_str);
         let max = self.shared.config.max_queued_pdus_per_destination.max(1);
+        let link = hs_telemetry::TraceLink::current();
         for batch in targets.chunks(ENQUEUE_BATCH) {
             let started = std::time::Instant::now();
             let outcome = self.shared.store.enqueue(batch, room_id, &pdu, max);
@@ -968,6 +973,9 @@ impl FederationSender {
                     continue;
                 }
             };
+            if !link.is_empty() {
+                self.shared.remember_link(enqueued.seq, link.clone());
+            }
             self.hand_over_pdu(&pdu, room_id, max, enqueued);
         }
     }
@@ -1750,8 +1758,9 @@ async fn run_worker(
                 .collect();
             let pdus: Vec<Arc<Value>> = rows.iter().map(|(_, pdu)| pdu.clone()).collect();
             let edu_batch = shared.gather_edus(&destination, &edus).await;
+            let links = shared.links_for(&rows);
             match shared
-                .send_batch(&destination, &pdus, &edu_batch.edus, Mode::Queue)
+                .send_batch(&destination, &pdus, &edu_batch.edus, &links, Mode::Queue)
                 .await
             {
                 Delivery::ShutDown => return,
@@ -1772,7 +1781,7 @@ async fn run_worker(
                     // Waiting, but none could be read (logged): wait for the next doorbell.
                 } else {
                     match shared
-                        .send_batch(&destination, &[], &edu_batch.edus, Mode::Queue)
+                        .send_batch(&destination, &[], &edu_batch.edus, &[], Mode::Queue)
                         .await
                     {
                         Delivery::ShutDown => return,
@@ -1813,8 +1822,9 @@ async fn run_worker(
             if !batch.is_empty() || !edu_batch.edus.is_empty() {
                 let through = batch.last().map_or(acked_through, |(seq, _)| *seq);
                 let pdus: Vec<Arc<Value>> = batch.iter().map(|(_, pdu)| pdu.clone()).collect();
+                let links = shared.links_for(&batch);
                 match shared
-                    .send_batch(&destination, &pdus, &edu_batch.edus, Mode::Queue)
+                    .send_batch(&destination, &pdus, &edu_batch.edus, &links, Mode::Queue)
                     .await
                 {
                     Delivery::ShutDown => return,
@@ -1847,7 +1857,42 @@ fn room_positions(rows: &[(u64, Arc<Value>)]) -> Vec<(String, u64)> {
     rooms.into_iter().collect()
 }
 
+/// How many PDUs' trace links [`Shared::remember_link`] keeps: a transaction sent later than
+/// this many PDUs after its own were queued is not linked to their requests.
+const RECENT_LINKS: usize = 1024;
+
 impl Shared {
+    /// Keeps the span that queued the PDU with sequence number `seq`, for its transaction.
+    fn remember_link(&self, seq: u64, link: hs_telemetry::TraceLink) {
+        let mut links = self
+            .recent_links
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        links.push_back((seq, link));
+        while links.len() > RECENT_LINKS {
+            links.pop_front();
+        }
+    }
+
+    /// The kept links of the PDUs in `rows`.
+    fn links_for(&self, rows: &[(u64, Arc<Value>)]) -> Vec<hs_telemetry::TraceLink> {
+        let links = self
+            .recent_links
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if links.is_empty() {
+            return Vec::new();
+        }
+        let mut found: Vec<hs_telemetry::TraceLink> = Vec::new();
+        for (seq, _) in rows {
+            // The same sequence number for every destination of one enqueue; kept in order.
+            if let Ok(i) = links.binary_search_by_key(seq, |(s, _)| *s) {
+                found.push(links[i].1.clone());
+            }
+        }
+        found
+    }
+
     fn sends_here(&self, destination: &str) -> bool {
         self.gate
             .read()
@@ -1961,10 +2006,12 @@ impl Shared {
         destination: &str,
         pdus: &[Arc<Value>],
         edus: &[Arc<Value>],
+        links: &[hs_telemetry::TraceLink],
         mode: Mode,
     ) -> Delivery {
         let txn_id = self.next_txn_id();
-        self.deliver(destination, &txn_id, pdus, edus, mode).await
+        self.deliver(destination, &txn_id, pdus, edus, links, mode)
+            .await
     }
 
     /// A transaction's EDUs: the destination's oldest durable ones from the store, then
@@ -2269,7 +2316,7 @@ impl Shared {
             }
             if !pdus.is_empty() {
                 match self
-                    .send_batch(destination, &pdus, &[], Mode::CatchUp)
+                    .send_batch(destination, &pdus, &[], &[], Mode::CatchUp)
                     .await
                 {
                     Delivery::ShutDown => return false,
@@ -2378,6 +2425,7 @@ impl Shared {
         txn_id: &str,
         pdus: &[Arc<Value>],
         edus: &[Arc<Value>],
+        links: &[hs_telemetry::TraceLink],
         mode: Mode,
     ) -> Delivery {
         let path = format!("/_matrix/federation/v1/send/{txn_id}");
@@ -2423,7 +2471,11 @@ impl Shared {
                 edus = edus.len(),
                 failures_before = failures,
                 outcome = tracing::field::Empty,
+                links_dropped = tracing::field::Empty,
             );
+            // Linked to the requests that queued its PDUs: a transaction is not part of their
+            // traces (it may carry many, and run long after they answered), but says so.
+            hs_telemetry::add_links(&attempt, links);
             let sent = tracing::Instrument::instrument(
                 self.client.send(destination, "PUT", &path, Some(&body)),
                 attempt.clone(),
@@ -2868,6 +2920,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_transaction_is_a_trace_of_its_own_linked_to_the_request_that_queued_its_pdu() {
+        let peer = FakeFederationPeer::new("peer.example.org");
+        let (destination, _auth) = spawn_peer(&peer).await;
+        let sender = FederationSender::with_config(client(), US, fast());
+        let ((), request) = hs_telemetry::testing::trace(async {
+            sender.enqueue_pdu([destination.clone()], pdu(0));
+        })
+        .await;
+        assert!(wait_for(Duration::from_secs(10), || sender.pending_pdus() == 0).await);
+        let request_trace = &request.find("test").unwrap().trace_id;
+        let transactions = hs_telemetry::testing::traces_rooted_at("federation.transaction");
+        let linked = transactions
+            .iter()
+            .find_map(|t| {
+                t.find("federation.transaction")
+                    .filter(|s| s.links.contains(request_trace))
+                    .map(|s| (t, s))
+            })
+            .unwrap_or_else(|| panic!("no transaction links to the request: {transactions:?}"));
+        let (trace, attempt) = linked;
+        assert_eq!(attempt.attr("outcome"), Some("accepted"));
+        assert_eq!(attempt.attr("pdus"), Some("1"));
+        assert_ne!(&attempt.trace_id, request_trace, "a trace of its own");
+        let http = trace
+            .find("PUT /_matrix/federation/v1/send")
+            .expect("the HTTP request, named by its endpoint");
+        assert_eq!(http.kind, "client");
+        assert!(trace.is_under(http, attempt));
+    }
+
+    #[tokio::test]
     async fn three_pdus_go_out_as_one_signed_transaction() {
         let peer = FakeFederationPeer::new("peer.example.org");
         let (destination, auth) = spawn_peer(&peer).await;
@@ -3188,6 +3271,7 @@ mod tests {
             store_slots: tokio::sync::Semaphore::new(STORE_CONCURRENCY),
             slow_store_ops: AtomicU64::new(0),
             slow_store_warned_ms: AtomicU64::new(0),
+            recent_links: Mutex::new(std::collections::VecDeque::new()),
         };
         assert_eq!(shared.backoff(1), Duration::from_millis(100));
         assert_eq!(shared.backoff(2), Duration::from_millis(200));

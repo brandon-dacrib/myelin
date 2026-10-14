@@ -1501,8 +1501,22 @@ impl<F: KeyServerFetcher> RemoteKeyCache<F> {
     async fn fetch_origin(&self, server_name: &str) -> Result<(), KeyLookupError> {
         let started = tokio::time::Instant::now();
         let fetch_timeout = self.fetch_timeout();
-        let outcome =
-            tokio::time::timeout(fetch_timeout, self.fetcher.fetch_server_key(server_name)).await;
+        // `federation.key_fetch` in a recorded trace: the request that needed the key waited
+        // for this.
+        let span = if hs_telemetry::current_is_sampled() {
+            tracing::info_span!(
+                "federation.key_fetch",
+                server_name,
+                outcome = tracing::field::Empty,
+            )
+        } else {
+            tracing::Span::none()
+        };
+        let outcome = tracing::Instrument::instrument(
+            tokio::time::timeout(fetch_timeout, self.fetcher.fetch_server_key(server_name)),
+            span.clone(),
+        )
+        .await;
         let result: Result<(), (&'static str, String)> = match outcome {
             Err(_elapsed) => Err((
                 "timeout",
@@ -1518,6 +1532,14 @@ impl<F: KeyServerFetcher> RemoteKeyCache<F> {
                 .ingest(server_name, &doc, Ingest::Fetched(Source::Origin))
                 .map_err(|error| ("invalid_response", error.to_string())),
         };
+        span.record(
+            "outcome",
+            match &result {
+                Ok(()) => "fetched",
+                Err((label, _)) => label,
+            },
+        );
+        drop(span);
         match result {
             Ok(()) => {
                 self.failures
@@ -1639,9 +1661,23 @@ impl<F: KeyServerFetcher> RemoteKeyCache<F> {
         let body = serde_json::json!({ "server_keys": server_keys });
         let started = tokio::time::Instant::now();
         let fetch_timeout = self.fetch_timeout();
-        let answer = tokio::time::timeout(
-            fetch_timeout,
-            self.fetcher.query_notary(&notary.server_name, &body),
+        // `federation.notary_query` in a recorded trace.
+        let span = if hs_telemetry::current_is_sampled() {
+            tracing::info_span!(
+                "federation.notary_query",
+                notary = %notary.server_name,
+                keys = batch.len(),
+                outcome = tracing::field::Empty,
+            )
+        } else {
+            tracing::Span::none()
+        };
+        let answer = tracing::Instrument::instrument(
+            tokio::time::timeout(
+                fetch_timeout,
+                self.fetcher.query_notary(&notary.server_name, &body),
+            ),
+            span.clone(),
         )
         .await;
         let outcome = match answer {
@@ -1653,6 +1689,14 @@ impl<F: KeyServerFetcher> RemoteKeyCache<F> {
             ),
             Ok(Some(answer)) => self.ingest_notary_answer(notary, &answer, batch),
         };
+        span.record(
+            "outcome",
+            match &outcome {
+                NotaryOutcome::Nothing => "answered",
+                NotaryOutcome::Failed(_) => "failed",
+            },
+        );
+        drop(span);
         match &outcome {
             NotaryOutcome::Failed(_) => {
                 crate::metrics::record_key_fetch_failure("notary");

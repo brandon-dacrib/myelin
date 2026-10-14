@@ -59,6 +59,8 @@ hs-state = { path = "../hs-state" }
 
 [dev-dependencies]
 hs-testkit = { path = "../hs-testkit" }
+# `hs_telemetry::testing`: the sender's and key fetcher's spans, read back in tests.
+hs-telemetry = { path = "../hs-telemetry", features = ["testing"] }
 tempfile.workspace = true
 tower = { workspace = true, features = ["util"] }
 rcgen.workspace = true

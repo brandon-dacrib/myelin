@@ -359,7 +359,7 @@ impl DeviceListAnnouncer {
     ) -> Self {
         let task = tokio::spawn(async move {
             // The place for the whole server, from before places were kept per shard.
-            let legacy = off_runtime(&sender, |sender| {
+            let legacy = off_runtime(&sender, "announcer.read_legacy_position", |sender| {
                 sender.stored_position(ANNOUNCER_POSITION).ok().flatten()
             })
             .await
@@ -394,14 +394,28 @@ impl DeviceListAnnouncer {
                         continue;
                     };
                     let started = std::time::Instant::now();
-                    let Some(users) = announce_step(
-                        &hub,
-                        &e2e,
-                        &sender,
-                        &shards,
-                        &own_server,
-                        (from, to),
-                        &group,
+                    // Each step is a trace of its own (a background pass, decision 0048):
+                    // reading the stream's stretch, each user's announcement, storing the place.
+                    let step_span = tracing::info_span!(
+                        parent: None,
+                        "federation.device_list_announce",
+                        from,
+                        to,
+                        stream = now,
+                        shards = group.len(),
+                        users = tracing::field::Empty,
+                    );
+                    let Some(users) = tracing::Instrument::instrument(
+                        announce_step(
+                            &hub,
+                            &e2e,
+                            &sender,
+                            &shards,
+                            &own_server,
+                            (from, to),
+                            &group,
+                        ),
+                        step_span.clone(),
                     )
                     .await
                     else {
@@ -424,8 +438,16 @@ impl DeviceListAnnouncer {
                         .iter()
                         .map(|shard| (announcer_position(*shard), to))
                         .collect();
-                    match off_runtime(&sender, move |sender| sender.store_positions(&writes)).await
-                    {
+                    step_span.record("users", users);
+                    let stored = tracing::Instrument::instrument(
+                        off_runtime(&sender, "announcer.store_positions", move |sender| {
+                            sender.store_positions(&writes)
+                        }),
+                        step_span.clone(),
+                    )
+                    .await;
+                    drop(step_span);
+                    match stored {
                         Some(Ok(())) => {}
                         Some(Err(error)) => tracing::warn!(
                             %error,
@@ -481,10 +503,11 @@ impl Drop for DeviceListAnnouncer {
 /// or the runtime shutting down).
 async fn off_runtime<T: Send + 'static>(
     sender: &Arc<FederationSender>,
+    name: &'static str,
     work: impl FnOnce(&FederationSender) -> T + Send + 'static,
 ) -> Option<T> {
     let sender = sender.clone();
-    hs_telemetry::spans::spawn_blocking("federation.edu_store", move || work(&sender))
+    hs_telemetry::spans::spawn_blocking(name, move || work(&sender))
         .await
         .ok()
 }
@@ -509,7 +532,7 @@ async fn take_on(
         return;
     }
     let names = taken.clone();
-    let stored = off_runtime(sender, move |sender| {
+    let stored = off_runtime(sender, "announcer.read_positions", move |sender| {
         names
             .into_iter()
             .map(|shard| {
@@ -587,7 +610,21 @@ async fn announce_step<B: KvBackend + 'static>(
         if user_id.server_name() != own_server {
             continue;
         }
-        announce(hub, e2e, sender, shards, &user_id, group).await?;
+        let user_span = if hs_telemetry::current_is_sampled() {
+            tracing::info_span!(
+                "federation.device_list_announce_user",
+                user_id = %user_id,
+                edus = tracing::field::Empty,
+                destinations = tracing::field::Empty,
+            )
+        } else {
+            tracing::Span::none()
+        };
+        tracing::Instrument::instrument(
+            announce(hub, e2e, sender, shards, &user_id, group),
+            user_span,
+        )
+        .await?;
         announced += 1;
     }
     Some(announced)
@@ -683,7 +720,11 @@ async fn announce<B: KvBackend + 'static>(
         }
     };
     let user = user_id.to_string();
-    let records = match off_runtime(sender, move |sender| sender.announced(&user)).await {
+    let records = match off_runtime(sender, "announcer.read_records", move |sender| {
+        sender.announced(&user)
+    })
+    .await
+    {
         Some(Ok(records)) => records,
         Some(Err(error)) => {
             tracing::warn!(%user_id, %error, "cannot read what was announced of a user's devices");
@@ -728,6 +769,9 @@ async fn announce<B: KvBackend + 'static>(
             );
             continue;
         }
+        let span = tracing::Span::current();
+        span.record("edus", edus.len());
+        span.record("destinations", destinations.len());
         for (edu_type, content) in edus {
             let coalesce_key = match edu_type {
                 "m.signing_key_update" => format!("signing {user_id}"),
@@ -747,7 +791,7 @@ async fn announce<B: KvBackend + 'static>(
             // signing-key update is (`hs_federation::sender::DURABLE_EDU_TYPES`); written on a
             // blocking thread, a batch of destinations at a time.
             let destinations = destinations.clone();
-            off_runtime(sender, move |sender| {
+            off_runtime(sender, "announcer.enqueue_edu", move |sender| {
                 sender.enqueue_edu_local(destinations, edu_type, content, Some(coalesce_key));
             })
             .await?;
@@ -757,7 +801,7 @@ async fn announce<B: KvBackend + 'static>(
     let record = announced_to_json(&after);
     let shards: Vec<u32> = group.iter().copied().collect();
     let user = user_id.to_string();
-    match off_runtime(sender, move |sender| {
+    match off_runtime(sender, "announcer.store_record", move |sender| {
         sender.set_announced(&user, &shards, &record)
     })
     .await

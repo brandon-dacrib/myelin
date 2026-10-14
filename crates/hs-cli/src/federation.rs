@@ -1441,12 +1441,47 @@ async fn device_list_answer<B: KvBackend + 'static>(
     user_id: &ruma::UserId,
     answers: &DeviceListAnswers,
 ) -> Option<Value> {
+    // `federation.user_devices` in a recorded trace: whether the answer was the one kept for
+    // the user's list as it stands (`cached`), and how many devices it named.
+    let span = if hs_telemetry::current_is_sampled() {
+        tracing::info_span!(
+            "federation.user_devices",
+            cached = tracing::field::Empty,
+            devices = tracing::field::Empty,
+        )
+    } else {
+        tracing::Span::none()
+    };
+    let answer = tracing::Instrument::instrument(
+        device_list_answer_unspanned(e2e, user_id, answers, &span),
+        span.clone(),
+    )
+    .await;
+    if let Some(devices) = answer
+        .as_ref()
+        .and_then(|a| a.get("devices"))
+        .and_then(Value::as_array)
+    {
+        span.record("devices", devices.len());
+    }
+    answer
+}
+
+/// [`device_list_answer`]'s work; records `cached` on its `span`.
+async fn device_list_answer_unspanned<B: KvBackend + 'static>(
+    e2e: &hs_e2e::state::E2eState<B>,
+    user_id: &ruma::UserId,
+    answers: &DeviceListAnswers,
+    span: &tracing::Span,
+) -> Option<Value> {
     let before = e2e.store.user_stream_pos(user_id).await.ok();
     if let Some(position) = before
         && let Some(answer) = answers.get(user_id.as_str(), position)
     {
+        span.record("cached", true);
         return Some(answer);
     }
+    span.record("cached", false);
     let answer = match hs_e2e::federation::federation_user_devices(e2e, user_id).await {
         Ok(answer) => answer?,
         Err(error) => {
