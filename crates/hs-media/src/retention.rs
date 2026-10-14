@@ -169,7 +169,34 @@ pub fn spawn_sweeper<B: KvBackend + 'static>(
             let Some(retention) = repository.config().remote_media_retention else {
                 continue;
             };
-            match sweep_once(&repository, retention.into()).await {
+            // Each pass is a trace of its own (decision 0048).
+            let span = tracing::info_span!(
+                parent: None,
+                "media.retention_pass",
+                selected = tracing::field::Empty,
+                deleted = tracing::field::Empty,
+                failed = tracing::field::Empty,
+                "otel.status_code" = tracing::field::Empty,
+                "error.message" = tracing::field::Empty,
+            );
+            let swept = tracing::Instrument::instrument(
+                sweep_once(&repository, retention.into()),
+                span.clone(),
+            )
+            .await;
+            match &swept {
+                Ok(pass) => {
+                    span.record("selected", pass.selected);
+                    span.record("deleted", pass.deleted);
+                    span.record("failed", pass.failed);
+                }
+                Err(error) => {
+                    span.record("otel.status_code", "error");
+                    span.record("error.message", tracing::field::display(error));
+                }
+            }
+            drop(span);
+            match swept {
                 Ok(pass) => {
                     metrics.record(&pass);
                     if pass.selected > 0 || pass.kept > 0 {

@@ -106,7 +106,7 @@ impl HttpIdentityService {
         };
         // Timed by a span held around it; the exchange runs outside every span
         // (`hs_telemetry::outside_spans`, decision 0048).
-        let http_span = tracing::info_span!("identity_server.http", "otel.kind" = "client");
+        let http_span = identity_server_span();
         let response = hs_telemetry::outside_spans(request.send()).await;
         drop(http_span);
         let response = response.map_err(|e| unreachable_identity_server(&e.to_string()))?;
@@ -263,11 +263,21 @@ impl IdentityService for HttpIdentityService {
     }
 }
 
+/// The span an identity-server exchange is timed by: `identity_server.http`, only inside a
+/// recorded trace (decision 0048).
+fn identity_server_span() -> tracing::Span {
+    if hs_telemetry::current_is_sampled() {
+        tracing::info_span!("identity_server.http", "otel.kind" = "client")
+    } else {
+        tracing::Span::none()
+    }
+}
+
 /// What a call to an identity server came back with, for [`hs_auth::threepid`]'s calls.
 async fn identity_server_answer(
     request: reqwest::RequestBuilder,
 ) -> Result<(u16, Value), hs_auth::threepid::IdentityServerError> {
-    let http_span = tracing::info_span!("identity_server.http", "otel.kind" = "client");
+    let http_span = identity_server_span();
     // Outside every span (`hs_telemetry::outside_spans`, decision 0048).
     let response = hs_telemetry::outside_spans(request.send()).await;
     drop(http_span);

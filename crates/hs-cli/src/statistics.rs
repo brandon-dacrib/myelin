@@ -144,7 +144,9 @@ impl<B: KvBackend + 'static> ServerStatistics<B> {
             ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticks.tick().await;
-                if let Err(error) = self.sample().await {
+                // Each sample is a trace of its own (decision 0048).
+                let span = tracing::info_span!(parent: None, "statistics.sample");
+                if let Err(error) = tracing::Instrument::instrument(self.sample(), span).await {
                     tracing::warn!(%error, "could not sample the statistics");
                 }
             }

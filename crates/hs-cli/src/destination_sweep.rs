@@ -83,7 +83,11 @@ impl DestinationSweep {
         let task = tokio::spawn(async move {
             tokio::time::sleep(SWEEP_FIRST_AFTER).await;
             loop {
-                sweep_once(&source, &retention).await;
+                // Each sweep is a trace of its own (decision 0048); one that is off makes none.
+                if retention.get().is_some() {
+                    let span = tracing::info_span!(parent: None, "federation.destination_sweep");
+                    tracing::Instrument::instrument(sweep_once(&source, &retention), span).await;
+                }
                 tokio::time::sleep(SWEEP_EVERY).await;
             }
         })

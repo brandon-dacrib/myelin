@@ -754,9 +754,22 @@ impl Pipeline {
     fn spawn_delivery(&self, user_id: OwnedUserId, pusher: Pusher, url: String, payload: Value) {
         let http = self.deps.http.clone();
         let pushers = self.deps.pushers.clone();
-        tokio::spawn(async move {
-            deliver(&http, pushers.as_ref(), &user_id, &pusher, &url, &payload).await;
-        });
+        // One notification to a push gateway is a trace of its own (decision 0048), each
+        // attempt a `push.http` child: it runs on after whatever caused it.
+        let span = tracing::info_span!(
+            parent: None,
+            "push.notify",
+            app_id = %pusher.ids.app_id,
+            outcome = tracing::field::Empty,
+            "otel.status_code" = tracing::field::Empty,
+            "error.message" = tracing::field::Empty,
+        );
+        tokio::spawn(tracing::Instrument::instrument(
+            async move {
+                deliver(&http, pushers.as_ref(), &user_id, &pusher, &url, &payload).await;
+            },
+            span,
+        ));
     }
 }
 
@@ -769,10 +782,12 @@ async fn deliver(
     url: &str,
     payload: &Value,
 ) {
+    let span = tracing::Span::current();
     match http.notify(url, payload).await {
         Ok(rejected) => {
             if rejected.contains(&pusher.ids.pushkey) {
                 count_push("rejected");
+                span.record("outcome", "rejected");
                 tracing::info!(
                     user = %user_id,
                     app_id = %pusher.ids.app_id,
@@ -784,11 +799,15 @@ async fn deliver(
                 }
             } else {
                 count_push("sent");
+                span.record("outcome", "sent");
                 tracing::debug!(user = %user_id, app_id = %pusher.ids.app_id, url, "push sent");
             }
         }
         Err(e) => {
             count_push("failed");
+            span.record("outcome", "failed");
+            span.record("otel.status_code", "error");
+            span.record("error.message", tracing::field::display(&e));
             tracing::warn!(user = %user_id, app_id = %pusher.ids.app_id, url, error = %e, "push failed");
         }
     }

@@ -9,6 +9,7 @@ description = "The native admin API under /api/v1: OpenAPI 3.1 contract, router 
 
 [dependencies]
 hs-http = { path = "../hs-http" }
+hs-telemetry = { path = "../hs-telemetry" }
 hs-config = { path = "../hs-config" }
 axum = { workspace = true }
 tokio = { workspace = true }

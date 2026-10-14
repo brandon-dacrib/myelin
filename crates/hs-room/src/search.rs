@@ -679,15 +679,33 @@ async fn catch_up<B: KvBackend + 'static>(rooms: &RoomRegistry<B>, why: &str) {
     );
     let mut remaining = behind.len();
     crate::metrics::set_search_rooms_behind(remaining);
+    // A catch-up with rooms to index is a trace of its own (decision 0048); one that finds
+    // every room current makes none. The indexing of each room an update names is not traced:
+    // that is one per event.
+    let span = tracing::info_span!(
+        parent: None,
+        "search.catch_up",
+        why,
+        rooms = behind.len(),
+        positions_behind = events_behind,
+        events = tracing::field::Empty,
+    );
     let mut indexed = 0u64;
-    for (room_id, _) in behind {
-        match index_room(rooms, &room_id).await {
-            Ok(n) => indexed += n,
-            Err(error) => tracing::warn!(%error, %room_id, "search index: could not index a room"),
+    let pass = async {
+        for (room_id, _) in behind {
+            match index_room(rooms, &room_id).await {
+                Ok(n) => indexed += n,
+                Err(error) => {
+                    tracing::warn!(%error, %room_id, "search index: could not index a room");
+                }
+            }
+            remaining -= 1;
+            crate::metrics::set_search_rooms_behind(remaining);
         }
-        remaining -= 1;
-        crate::metrics::set_search_rooms_behind(remaining);
-    }
+    };
+    tracing::Instrument::instrument(pass, span.clone()).await;
+    span.record("events", indexed);
+    drop(span);
     tracing::info!(
         events = indexed,
         documents = index.documents().unwrap_or(0),

@@ -2176,6 +2176,7 @@ dependencies = [
  "futures",
  "hs-config",
  "hs-http",
+ "hs-telemetry",
  "http-body-util",
  "prometheus-client",
  "rand 0.9.5",

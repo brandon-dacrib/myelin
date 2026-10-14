@@ -67,7 +67,12 @@ impl HttpCallbackClient {
         let body = CallbackRequest::new(payload);
         // Timed by a span held around the exchange, which itself runs outside every span
         // (`hs_telemetry::outside_spans`, decision 0048).
-        let http_span = tracing::info_span!("module.http", hook, "otel.kind" = "client");
+        // Only inside a recorded trace: a hook called outside one would be a span alone.
+        let http_span = if hs_telemetry::current_is_sampled() {
+            tracing::info_span!("module.http", hook, "otel.kind" = "client")
+        } else {
+            tracing::Span::none()
+        };
         let response = hs_telemetry::outside_spans(self.http.post(&url).json(&body).send()).await;
         drop(http_span);
         let response = response?;

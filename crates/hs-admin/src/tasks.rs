@@ -292,6 +292,15 @@ impl TaskRegistry {
         Fut: Future<Output = Result<serde_json::Value, Problem>> + Send + 'static,
     {
         let mut task = Task::scheduled(action, resource, created_by);
+        // The task's work is a trace of its own (`admin.task`), linked to the request that
+        // started it: it outlives that request.
+        let span = tracing::info_span!(
+            parent: None,
+            "admin.task",
+            action = %task.action,
+            task_id = %task.id,
+        );
+        hs_telemetry::TraceLink::current().add_to(&span);
         task.status = TaskStatus::Running;
         task.started_at = Some(task.created_at.clone());
         let (stop, stopped) = watch::channel(false);
@@ -307,14 +316,17 @@ impl TaskRegistry {
             registry: Arc::clone(self),
             stopped: stopped.clone(),
         };
-        tokio::spawn(async move {
-            let mut stopped = stopped;
-            let outcome = tokio::select! {
-                outcome = work(context) => Some(outcome),
-                () = wait_until_stopped(&mut stopped) => None,
-            };
-            registry.finish(&id, outcome).await;
-        });
+        tokio::spawn(tracing::Instrument::instrument(
+            async move {
+                let mut stopped = stopped;
+                let outcome = tokio::select! {
+                    outcome = work(context) => Some(outcome),
+                    () = wait_until_stopped(&mut stopped) => None,
+                };
+                registry.finish(&id, outcome).await;
+            },
+            span,
+        ));
         Ok(task)
     }
 
