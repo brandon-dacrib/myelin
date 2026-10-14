@@ -21,6 +21,15 @@ carries the generated notes for that merge.
   bridge no longer uses failed with `401` for mautrix-imessage, which logs its bot in instead of
   using MSC4190, so the stale device stayed and the bridge logged "Dropping OTK counts targeted to
   someone else" on every transaction. Verified against the real binary.
+- **One room no longer stops every `/sync` on the server.** The session hub, which turns room
+  events into each user's sync feed, fed one update at a time; when one update's room did not
+  answer, nothing else reached any client (the demo, 2026-10-14: half an hour of "Connectivity
+  to the server has been lost" while messages were still being accepted). Rooms are now fed side
+  by side, a room the hub cannot get through holds only its own updates, and `/sync` no longer
+  waits for it. A stuck update is logged with its room and the step it is stuck at
+  (`the session hub is stuck on a room update`), and new gauges show whether the hub keeps up
+  (`hs_user_hub_lag_updates`, `hs_user_hub_oldest_pending_seconds`,
+  `hs_user_hub_stuck_updates`).
 - **The bridge pump no longer spins on a stream it cannot prune.** Once more than 10,000
   receipts, presence changes or to-device messages waited to be pruned, the store refused the
   single delete every time and the appservice ephemeral pump retried it four times a second,

@@ -120,8 +120,11 @@ pub struct RoomWake {
     /// it, and so how far a receiver's copy of the room must read ([`RoomMirror::prefetch`]).
     /// A batch carrying several wakes for one room keeps the highest.
     pub room_pos: i64,
-    /// `hs_room::protocol::RoomUpdate::global_seq` on the sender's registry stream; `0` for a
-    /// re-read after falling behind, which carries no number.
+    /// The sender's consumed mark once it had fed this update: every update numbered up to it
+    /// on the sender's registry stream (`hs_room::protocol::RoomUpdate::global_seq`) is fed.
+    /// Not the update's own number: the sender feeds rooms side by side, and an update can
+    /// finish before an earlier one (`crate::hub`'s module docs). `0` for a re-read after
+    /// falling behind, which carries no number.
     pub global_seq: u64,
     /// The users the owner's hub woke for this update: every active member of the room, plus
     /// whoever this update changed the membership of. Empty when the update fed nobody (the

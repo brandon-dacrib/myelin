@@ -30,8 +30,29 @@
 //! integration layer (`hs-cli`, or these tests) must call [`SessionHub::watch_room`] itself for
 //! every room as it is created or loaded -- see `docs/status/05-sync.md` for the exact,
 //! near-mechanical addition this implies for `crates/hs-cli/src/serve.rs`.
+//!
+//! # One room at a time, many rooms at once
+//!
+//! The registry's stream is one sequence of every room's updates. The hub receives them in
+//! order and hands each to its room's queue; a worker per room with anything queued feeds that
+//! room's updates in order, at most [`ROOM_WORKERS`] rooms at once. Until 2026-10-14 one loop
+//! fed every update in turn, and an update whose room work did not finish -- the room's actor
+//! busy with something that ran for minutes, or never finished -- stopped every feed on the
+//! server behind it: on the demo, half an hour of nothing reaching any `/sync` while every room
+//! went on accepting events. Now a room the hub cannot get through holds only its own later
+//! updates and one worker. Within a room the order is what it always was; across rooms it never
+//! mattered (each update's writes are its own room's records and its members' feed entries,
+//! each in its own transaction).
+//!
+//! What the hub has received and not finished, and which step each update in hand is at, is
+//! kept in [`crate::hub_progress`]: the consumed mark (`/sync`'s read-your-writes wait,
+//! [`SessionHub::wait_for_consumed`]) is the highest number below which everything is fed, a
+//! read stops waiting for an update the hub has had for longer than
+//! [`crate::hub_progress::STALL_AFTER`], and a watchdog ([`SessionHub::check_progress`]) warns,
+//! naming the room, the update and the step, when a step has not moved for
+//! [`crate::hub_progress::STUCK_WARN_AFTER`], and keeps the `hs_user_hub_*` gauges current.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -69,6 +90,23 @@ const MIRROR_MAX_IDLE: Duration = Duration::from_secs(600);
 /// names before it wakes the batch's users anyway (decision 0022). Well under the mesh's wake
 /// deadline (`hs-cli`'s `sync_cluster`, two seconds).
 const PREFETCH_WAIT: Duration = Duration::from_millis(250);
+
+/// How many rooms' updates the hub feeds at once (the module docs, "One room at a time, many
+/// rooms at once"). Each worker is one room's updates in order; a room the hub cannot get
+/// through holds one.
+pub const ROOM_WORKERS: usize = 8;
+
+/// How often the hub's watchdog ([`SessionHub::check_progress`]) looks at what the workers are
+/// doing and updates the `hs_user_hub_*` gauges.
+const WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long a re-read after a lag waits for one room's head before it moves on to the next
+/// room: a room the hub cannot read must not stop the re-read of every other.
+const REREAD_HEAD_WAIT: Duration = Duration::from_secs(10);
+
+/// How often a read waiting for the hub ([`SessionHub::wait_for_consumed`]) looks again
+/// whether what it waits for has stalled, between the hub's own signals.
+const SETTLE_RECHECK: Duration = Duration::from_millis(50);
 
 /// How many coalesced feed entries a user keeps by default
 /// ([`SessionHub::set_retention`]): `hs-config`'s `server.sync.feed_retention_entries` default.
@@ -373,9 +411,24 @@ pub struct SessionHub<B: KvBackend, R: RoomSource<B>> {
     /// feed alone.
     fan_out_threshold: usize,
     wakers: Mutex<HashMap<OwnedUserId, Arc<Notify>>>,
-    /// The `global_seq` of the last update [`SessionHub::consume_updates`] finished processing
-    /// from the registry's global stream. See [`SessionHub::wait_for_consumed`].
+    /// The consumed mark: every update [`SessionHub::consume_updates`] received from the
+    /// registry's global stream numbered up to it is finished. See
+    /// [`SessionHub::wait_for_consumed`] and [`crate::hub_progress`].
     consumed: tokio::sync::watch::Sender<u64>,
+    /// What the hub has received and not finished, and what each update in hand is doing.
+    progress: crate::hub_progress::Progress,
+    /// Each room's updates waiting for its worker, for every room that has one running (the
+    /// module docs, "One room at a time, many rooms at once"). A `std::sync::Mutex`: every
+    /// critical section is a push or a pop.
+    room_queues: std::sync::Mutex<HashMap<ruma::OwnedRoomId, VecDeque<RoomUpdate>>>,
+    /// [`ROOM_WORKERS`] permits: a room's worker holds one while it feeds an update.
+    room_workers: Arc<tokio::sync::Semaphore>,
+    /// Held while one update's membership records and feed entries are written: the rooms'
+    /// workers read their rooms side by side, and write one at a time, as the single loop
+    /// always did. Only store work happens under it, never a room read.
+    feed_writer: tokio::sync::Mutex<()>,
+    /// Whether the watchdog ([`SessionHub::check_progress`]) has been started.
+    watchdog_started: std::sync::atomic::AtomicBool,
     /// Per peer (`replica#generation`), the highest consumed mark its wake batches have carried
     /// here. See [`SessionHub::receive_wakes`] and [`SessionHub::settle_before_read`]. A
     /// `std::sync::Mutex`: every critical section is a map lookup with no `.await` inside.
@@ -472,6 +525,11 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
             fan_out_threshold,
             wakers: Mutex::new(HashMap::new()),
             consumed: tokio::sync::watch::channel(0).0,
+            progress: crate::hub_progress::Progress::default(),
+            room_queues: std::sync::Mutex::new(HashMap::new()),
+            room_workers: Arc::new(tokio::sync::Semaphore::new(ROOM_WORKERS)),
+            feed_writer: tokio::sync::Mutex::new(()),
+            watchdog_started: std::sync::atomic::AtomicBool::new(false),
             peer_consumed: std::sync::Mutex::new(HashMap::new()),
             cluster: OnceLock::new(),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
@@ -1093,24 +1151,144 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
     /// own join had been written, and told nothing. Waiting here, for what was published before
     /// the request arrived, is what makes a client's own writes visible to its next read. The
     /// wait is bounded: a hub that has fallen seconds behind should not hold every sync with it.
+    ///
+    /// Nor does it wait for an update the hub has had in hand for longer than
+    /// [`crate::hub_progress::STALL_AFTER`]: that one is stuck (the watchdog says where), and
+    /// waiting for it would only add the whole bound to every read on the server. Until
+    /// 2026-10-14 a stuck update made every `/sync` wait the bound and log a warning.
     pub async fn wait_for_consumed(&self, seq: u64, at_most: Duration) {
         if seq == 0 || *self.consumed.borrow() >= seq {
             return;
         }
-        let mut rx = self.consumed.subscribe();
-        if tokio::time::timeout(at_most, rx.wait_for(|consumed| *consumed >= seq))
-            .await
-            .is_err()
-        {
-            // The read goes ahead from before the caller's own writes: worth an operator's
-            // attention, since it means the hub is far behind the rooms.
+        let deadline = tokio::time::Instant::now() + at_most;
+        let mut changed = self.progress.subscribe();
+        loop {
+            if *self.consumed.borrow() >= seq {
+                return;
+            }
+            if self.progress.settled_through(seq) {
+                tracing::debug!(
+                    waited_for = seq,
+                    consumed = *self.consumed.borrow(),
+                    "reading without the room updates the session hub is stuck on"
+                );
+                return;
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let _ = tokio::time::timeout_at(deadline.min(now + SETTLE_RECHECK), changed.changed())
+                .await;
+        }
+        // The read goes ahead from before the caller's own writes: worth an operator's
+        // attention, since it means the hub is far behind the rooms.
+        let oldest = self
+            .progress
+            .status(self.rooms.global_published_seq())
+            .oldest_pending;
+        tracing::warn!(
+            waited_for = seq,
+            consumed = *self.consumed.borrow(),
+            waited_ms = u64::try_from(at_most.as_millis()).unwrap_or(u64::MAX),
+            oldest_room_id = oldest.as_ref().map(|o| o.room_id.as_str()),
+            oldest_global_seq = oldest.as_ref().map(|o| o.global_seq),
+            oldest_waiting_ms = oldest
+                .as_ref()
+                .map(|o| u64::try_from(o.waiting_for.as_millis()).unwrap_or(u64::MAX)),
+            "the session hub did not catch up with the room stream in time; reading anyway"
+        );
+    }
+
+    /// What the hub is doing with the room stream: how far it is behind, the oldest update it
+    /// has not finished, and which step each update in hand is at
+    /// ([`crate::hub_progress::HubStatus`]). For health checks and diagnostics.
+    #[must_use]
+    pub fn status(&self) -> crate::hub_progress::HubStatus {
+        self.progress.status(self.rooms.global_published_seq())
+    }
+
+    /// Sets the hub's two stall thresholds: how long an update may be in hand before a read
+    /// stops waiting for it ([`crate::hub_progress::STALL_AFTER`]) and how long one step may
+    /// last before the watchdog warns ([`crate::hub_progress::STUCK_WARN_AFTER`]).
+    pub fn set_stall_thresholds(&self, stall_after: Duration, stuck_warn_after: Duration) {
+        self.progress.set_thresholds(stall_after, stuck_warn_after);
+    }
+
+    /// One look by the watchdog: sets the `hs_user_hub_*` gauges, and warns about every update
+    /// whose step has not moved for [`crate::hub_progress::STUCK_WARN_AFTER`] (once a
+    /// [`crate::hub_progress::STUCK_WARN_REPEAT`] while it stays stuck) and about updates
+    /// waiting that long for a worker. Returns the status it looked at. Called every
+    /// [`WATCHDOG_INTERVAL`] by the task [`SessionHub::watch_all`] starts.
+    pub fn check_progress(&self) -> crate::hub_progress::HubStatus {
+        let status = self.status();
+        crate::metrics::set_hub_position(status.published, status.consumed);
+        crate::metrics::set_hub_health(
+            status
+                .oldest_pending
+                .as_ref()
+                .map_or(Duration::ZERO, |o| o.waiting_for),
+            status.stuck,
+        );
+        let warnings = self.progress.due_warnings();
+        for stuck in &warnings.stuck {
+            crate::metrics::count_stuck_warning();
             tracing::warn!(
-                waited_for = seq,
-                consumed = *self.consumed.borrow(),
-                waited_ms = u64::try_from(at_most.as_millis()).unwrap_or(u64::MAX),
-                "the session hub did not catch up with the room stream in time; reading anyway"
+                room_id = %stuck.room_id,
+                global_seq = stuck.global_seq,
+                step = stuck.step,
+                step_secs = stuck.step_for.as_secs(),
+                in_hand_secs = stuck.in_hand_for.as_secs(),
+                queued_behind = stuck.queued_behind,
+                consumed = status.consumed,
+                published = status.published,
+                "the session hub is stuck on a room update: this room's later updates wait \
+                 behind it, and the consumed mark with them; other rooms are still fed"
             );
         }
+        if let Some(waiting) = &warnings.waiting {
+            tracing::warn!(
+                room_id = %waiting.room_id,
+                global_seq = waiting.global_seq,
+                waiting_secs = waiting.waiting_for.as_secs(),
+                rooms_in_hand = ?status
+                    .in_hand
+                    .iter()
+                    .map(|u| (u.room_id.as_str(), u.step))
+                    .collect::<Vec<_>>(),
+                consumed = status.consumed,
+                published = status.published,
+                "room updates are waiting for the session hub's workers, every one of which is busy"
+            );
+        }
+        status
+    }
+
+    /// Starts the watchdog ([`SessionHub::check_progress`] every [`WATCHDOG_INTERVAL`]) once
+    /// per hub. It holds the hub weakly and stops when the hub is gone.
+    fn start_watchdog(self: &Arc<Self>)
+    where
+        B: 'static,
+        R: 'static,
+    {
+        if self
+            .watchdog_started
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        let hub = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(WATCHDOG_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                let Some(hub) = hub.upgrade() else {
+                    return;
+                };
+                hub.check_progress();
+            }
+        });
     }
 
     /// Tells every `/sync` that is waiting for news to answer now, with whatever it has, and
@@ -1874,6 +2052,7 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         R: 'static,
     {
         let rx = handle.subscribe().await;
+        self.start_watchdog();
         let hub = Arc::clone(self);
         tokio::spawn(async move { hub.consume_updates(rx).await })
     }
@@ -1896,90 +2075,167 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         B: 'static,
         R: 'static,
     {
+        self.start_watchdog();
         let hub = Arc::clone(self);
         tokio::spawn(async move { hub.consume_updates(updates).await })
     }
 
-    /// The shared drain loop behind [`SessionHub::watch_room`] and [`SessionHub::watch_all`].
-    async fn consume_updates(&self, mut updates: tokio::sync::broadcast::Receiver<RoomUpdate>) {
+    /// The shared receive loop behind [`SessionHub::watch_room`] and [`SessionHub::watch_all`]:
+    /// hands each update to its room's worker ([`SessionHub::dispatch`]) and never waits on a
+    /// room itself, so no room can stop it.
+    async fn consume_updates(
+        self: Arc<Self>,
+        mut updates: tokio::sync::broadcast::Receiver<RoomUpdate>,
+    ) where
+        B: 'static,
+        R: 'static,
+    {
         loop {
             match updates.recv().await {
-                Ok(update) => {
-                    let seq = update.global_seq;
-                    let room_id = update.room_id.clone();
-                    let room_pos = update.room_pos;
-                    let woken = match self.handle_room_update(update).await {
-                        Ok(woken) => woken,
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                %room_id,
-                                room_pos,
-                                global_seq = seq,
-                                "failed to process a room update into user feeds"
-                            );
-                            Vec::new()
-                        }
-                    };
-                    // Processed or failed, it has been dealt with: nobody should wait for it.
-                    if seq > 0 {
-                        self.consumed.send_if_modified(|current| {
-                            if seq > *current {
-                                *current = seq;
-                                true
-                            } else {
-                                false
-                            }
-                        });
-                    }
-                    // The other replicas hear of it after the feeds are written and the mark
-                    // moved, so that a peer released by this number reads what it stands for.
-                    if let Some(link) = self.cluster.get() {
-                        link.cluster.publish(RoomWake {
-                            room_id,
-                            room_pos,
-                            global_seq: seq,
-                            users: woken,
-                        });
-                    }
-                }
+                Ok(update) => self.dispatch(update),
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                     // This hub missed `skipped` publishes, and cannot get them back from the
                     // channel. Which rooms they were about is unknowable, so every resident room
-                    // is re-read from where it is now: `process_room_update` on a room's head
-                    // writes any membership row that is missing and gives every active member a
-                    // feed entry at the head. At worst that repeats something a client has
-                    // already seen; what it prevents is an invitation whose only update was
-                    // among the skipped ones never reaching its target, which is what this arm
-                    // used to do while saying nothing was lost.
+                    // is re-read from where it is now ([`SessionHub::reread_resident_rooms`]),
+                    // on its own task: a room whose head cannot be read must not stop this
+                    // loop. The skipped numbers hold nothing back: the consumed mark counts
+                    // only what was received (`crate::hub_progress`).
                     tracing::warn!(
                         skipped,
                         "session hub fell behind the room stream; re-reading every resident room"
                     );
-                    for handle in self.rooms.resident_handles().await {
-                        let Some(head) = handle.query(|actor| actor.head_update()).await else {
-                            continue;
-                        };
-                        let room_id = head.room_id.clone();
-                        let room_pos = head.room_pos;
-                        match self.handle_room_update(head).await {
-                            Ok(woken) => {
-                                if let Some(link) = self.cluster.get() {
-                                    link.cluster.publish(RoomWake {
-                                        room_id,
-                                        room_pos,
-                                        global_seq: 0,
-                                        users: woken,
-                                    });
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "failed to re-read a room after falling behind");
-                            }
-                        }
-                    }
+                    let hub = Arc::clone(&self);
+                    tokio::spawn(async move { hub.reread_resident_rooms().await });
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    }
+
+    /// Hands `update` to its room's queue, starting the room's worker if it has none running
+    /// (the module docs, "One room at a time, many rooms at once").
+    fn dispatch(self: &Arc<Self>, update: RoomUpdate)
+    where
+        B: 'static,
+        R: 'static,
+    {
+        self.progress.received(update.global_seq, &update.room_id);
+        let room_id = update.room_id.clone();
+        let start_worker = {
+            let mut queues = self
+                .room_queues
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match queues.get_mut(&room_id) {
+                Some(queue) => {
+                    queue.push_back(update);
+                    false
+                }
+                None => {
+                    queues.insert(room_id.clone(), VecDeque::from([update]));
+                    true
+                }
+            }
+        };
+        if start_worker {
+            let hub = Arc::clone(self);
+            tokio::spawn(async move { hub.feed_room(room_id).await });
+        }
+    }
+
+    /// One room's worker: feeds the room's queued updates in order, holding a worker permit for
+    /// each, until the queue is empty, then removes the queue -- under the same lock as the
+    /// pop, so an update queued meanwhile starts a new worker rather than being left behind.
+    async fn feed_room(self: Arc<Self>, room_id: ruma::OwnedRoomId) {
+        loop {
+            let next = {
+                let mut queues = self
+                    .room_queues
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let next = queues.get_mut(&room_id).and_then(VecDeque::pop_front);
+                if next.is_none() {
+                    queues.remove(&room_id);
+                }
+                next
+            };
+            let Some(update) = next else {
+                return;
+            };
+            // The semaphore is never closed, so this only ever waits.
+            let Ok(_permit) = Arc::clone(&self.room_workers).acquire_owned().await else {
+                return;
+            };
+            self.feed_one(update).await;
+        }
+    }
+
+    /// Feeds one update, moves the consumed mark and tells the other replicas.
+    async fn feed_one(&self, update: RoomUpdate) {
+        let seq = update.global_seq;
+        let room_id = update.room_id.clone();
+        let room_pos = update.room_pos;
+        let woken = match self.handle_room_update(update).await {
+            Ok(woken) => woken,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    %room_id,
+                    room_pos,
+                    global_seq = seq,
+                    "failed to process a room update into user feeds"
+                );
+                Vec::new()
+            }
+        };
+        // Processed or failed, it has been dealt with: nobody should wait for it.
+        let mark = self.progress.finished(seq);
+        self.consumed.send_if_modified(|current| {
+            if mark > *current {
+                *current = mark;
+                true
+            } else {
+                false
+            }
+        });
+        let consumed = *self.consumed.borrow();
+        crate::metrics::set_hub_position(self.rooms.global_published_seq(), consumed);
+        // The other replicas hear of it after the feeds are written and the mark moved, so
+        // that a peer released by the mark reads what it stands for. The wake carries the
+        // mark, not the update's own number: with rooms fed side by side, an update can finish
+        // before an earlier one has, and a peer must not take its number as everything up to it.
+        if let Some(link) = self.cluster.get() {
+            link.cluster.publish(RoomWake {
+                room_id,
+                room_pos,
+                global_seq: if seq == 0 { 0 } else { consumed },
+                users: woken,
+            });
+        }
+    }
+
+    /// After a lag: every resident room is fed again from its head, through the rooms' queues
+    /// like any update. `process_room_update` on a room's head writes any membership row that
+    /// is missing and gives every active member a feed entry at the head. At worst that repeats
+    /// something a client has already seen; what it prevents is an invitation whose only update
+    /// was among the skipped ones never reaching its target. Each head is read with a bound
+    /// ([`REREAD_HEAD_WAIT`]); a room that does not answer is skipped, with a warning.
+    async fn reread_resident_rooms(self: Arc<Self>)
+    where
+        B: 'static,
+        R: 'static,
+    {
+        for handle in self.rooms.resident_handles().await {
+            match tokio::time::timeout(REREAD_HEAD_WAIT, handle.query(|actor| actor.head_update()))
+                .await
+            {
+                Ok(Some(head)) => self.dispatch(head),
+                Ok(None) => {}
+                Err(_) => tracing::warn!(
+                    wait_secs = REREAD_HEAD_WAIT.as_secs(),
+                    "a resident room did not answer for its head while the session hub re-read \
+                     the rooms after falling behind; it is skipped"
+                ),
             }
         }
     }
@@ -2000,8 +2256,12 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
     /// [`SessionHub::apply_room_update`] under the hub's own error handling: the wrapper the
     /// watchers and [`SessionHub::process_room_update`] call. Copying tags and `m.direct` onto
     /// an upgraded room's replacement happens inside, as the join is applied.
+    ///
+    /// The update is tracked while it is in hand ([`crate::hub_progress`]): each step it takes
+    /// is recorded, so the watchdog can say which room it is stuck on and where.
     async fn handle_room_update(&self, update: RoomUpdate) -> Result<Vec<OwnedUserId>, UserError> {
-        self.apply_room_update(update).await
+        let in_hand = self.progress.begin(&update.room_id, update.global_seq);
+        self.apply_room_update(update, &in_hand).await
     }
 
     /// Copies what `user_id`'s account data says about `old_room_id` onto `new_room_id`, its
@@ -2206,18 +2466,23 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
     async fn apply_room_update(
         &self,
         mut update: RoomUpdate,
+        in_hand: &crate::hub_progress::InHand<'_>,
     ) -> Result<Vec<OwnedUserId>, UserError> {
         if !self.owns_room(&update.room_id) {
             return Ok(Vec::new());
         }
+        in_hand.step("loading the room");
         let handle = match self.rooms.get_or_load(&update.room_id).await {
             Ok(handle) => handle,
             Err(hs_room::RoomError::RoomNotFound(_)) => {
+                in_hand.step("applying a gone room's membership changes");
                 return self.apply_update_for_a_gone_room(update).await;
             }
             Err(error) => return Err(error.into()),
         };
+        in_hand.step("checking the update's memberships against the room's state");
         drop_memberships_that_lost(&handle, &mut update).await;
+        in_hand.step("reading the room's members and directory entry");
         let (active_members, member_count, directory) = handle
             .query(|actor| {
                 let members = actor.members()?;
@@ -2236,6 +2501,7 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
             })
             .await?;
 
+        in_hand.step("writing the public room list and the member index");
         match directory {
             Some(entry) => self.store.upsert_public_room(entry).await?,
             None => self.store.remove_public_room(&update.room_id).await?,
@@ -2262,6 +2528,7 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         // old room with them: the replacement is a direct chat if the old room was, and
         // carries the old room's tags (Synapse's `copy_user_state_on_room_upgrade`, from its
         // join handler; Sytest's "/upgrade preserves direct room state").
+        in_hand.step("carrying account data and push rules onto an upgraded room");
         if update
             .membership_deltas
             .iter()
@@ -2286,6 +2553,7 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         // may well be newer than the joiner's last presence change. Restamp it so that it
         // reaches them (`PresenceRegistry::restamp`); the wake below is the same one the join
         // itself causes. Complement's "Existing members see new members' presence" is this.
+        in_hand.step("restamping joiners' presence");
         for delta in &update.membership_deltas {
             if delta.membership == "join"
                 && let Some(seq) = self.presence.restamp(&delta.user_id).await
@@ -2298,8 +2566,15 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
             }
         }
 
+        in_hand.step("sharing joiners' presence with other servers");
         self.share_presence_on_join(&update, &joined_members).await;
 
+        // The feed writes of every room go one at a time ([`SessionHub::feed_writer`]): the
+        // users in many rooms -- an owner, a bridge's bot -- have one feed head each, and rooms
+        // fed side by side would otherwise keep conflicting on it.
+        in_hand.step("waiting for the feed writer");
+        let writer = self.feed_writer.lock().await;
+        in_hand.step("writing membership records and feed entries");
         let started = std::time::Instant::now();
         let fan_out = self.fan_out(&update, hot, &targets).await?;
         if fan_out.flipped > 0 {
@@ -2317,11 +2592,19 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         // after the membership records, so that a sync which sees this position also sees the
         // membership the update made -- the other way round, a sync could resume a member who
         // has only just joined from their own join, and send them nothing of the room.
-        if hot {
-            let hot_seq = self
-                .store
-                .append_hot_position(&update.room_id, update.room_pos)
-                .await?;
+        let hot_seq = if hot {
+            in_hand.step("writing the hot-room stream");
+            Some(
+                self.store
+                    .append_hot_position(&update.room_id, update.room_pos)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        drop(writer);
+        if let Some(hot_seq) = hot_seq {
+            in_hand.step("compacting the hot-room stream");
             self.compact_hot_stream_if_due(hot_seq).await;
         }
         crate::metrics::observe_fan_out(
@@ -2333,15 +2616,19 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         // The membership records say who shares a room with whom now: a remote user this
         // update took the last shared room from has their device-list copy marked stale,
         // before anyone is woken to ask for it.
+        in_hand.step("marking remote device lists stale");
         self.mark_unshared_remote_lists_stale(&update, &targets)
             .await;
+        in_hand.step("feeding the room's peekers");
         let peekers = self.fan_out_to_peekers(&update, hot, &targets).await?;
         // And everyone is woken last, once everything a woken `/sync` will read is written.
+        in_hand.step("waking long-polls");
         for user_id in targets.keys().chain(peekers.iter()) {
             self.wake(user_id).await;
         }
         // The feeds that outgrew their retention are compacted after the wake: a compaction
         // is a scan the woken syncs need not wait for, and it deletes nothing they read.
+        in_hand.step("compacting feeds");
         self.compact_feeds(&fan_out.report.feeds_to_compact).await;
 
         let mut woken: Vec<OwnedUserId> = targets.into_keys().collect();
@@ -2661,6 +2948,7 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
                 }
             })
             .collect();
+        let writer = self.feed_writer.lock().await;
         let report = self
             .store
             .apply_fan_out(
@@ -2670,6 +2958,7 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
                 self.feed_retention(),
             )
             .await?;
+        drop(writer);
         for user_id in &user_ids {
             self.wake(user_id).await;
         }
@@ -4069,5 +4358,118 @@ mod tests {
             hub.store().compact_hot_stream(2).await.unwrap() <= 4,
             "between one and two retentions"
         );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // A room the hub cannot get through (the demo's wedge, 2026-10-14).
+    // ---------------------------------------------------------------------------------------
+
+    /// Holds `handle`'s actor until the returned sender is dropped or sent to: what a room
+    /// operation that does not finish (a read that runs for minutes, a lock never released)
+    /// does to everybody else who needs the room. Returns once the actor is held.
+    async fn hold_room(
+        handle: &hs_room::actor::RoomActorHandle<MemoryBackend>,
+    ) -> std::sync::mpsc::Sender<()> {
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (held, is_held) = tokio::sync::oneshot::channel::<()>();
+        let handle = handle.clone();
+        tokio::spawn(async move {
+            handle
+                .query(move |_| {
+                    let _ = held.send(());
+                    let _ = released.recv();
+                })
+                .await;
+        });
+        is_held.await.unwrap();
+        release
+    }
+
+    /// Whether `user`'s feed names `room_id`.
+    async fn feed_names(hub: &TestHub, user: &UserId, room_id: &RoomId) -> bool {
+        hub.store()
+            .feed_since(user, 0)
+            .await
+            .unwrap()
+            .iter()
+            .any(|entry| entry.room_id == room_id)
+    }
+
+    /// The demo's wedge (2026-10-14): one room's update the hub could not get through -- its
+    /// actor held by an operation that did not finish -- stopped every other room's feed with
+    /// it, because the hub fed one update at a time. Here room A is held while an update for A
+    /// and then one for B reach the hub: Bob's feed must get B while A is still held, the
+    /// hub's status must name A and the step it is waiting at, a read must not wait for A, and
+    /// A's update must go through once the room is released.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_room_the_hub_cannot_get_through_does_not_stop_every_other_rooms_feed() {
+        let (hub, rooms) = hub(usize::MAX);
+        hub.set_stall_thresholds(Duration::from_millis(200), Duration::from_millis(300));
+        let alice = user_id!("@alice:hub.test").to_owned();
+        let bob = user_id!("@bob:hub.test").to_owned();
+        let (room_a, a) = create(&rooms, &alice, "private_chat").await;
+        let (room_b, b) = create(&rooms, &bob, "private_chat").await;
+        let mut update_a = room_a.query(|r| r.head_update()).await.unwrap();
+        let mut update_b = room_b.query(|r| r.head_update()).await.unwrap();
+        update_a.global_seq = 1;
+        update_b.global_seq = 2;
+
+        let release = hold_room(&room_a).await;
+        let (stream, updates) = tokio::sync::broadcast::channel(16);
+        std::mem::forget(hub.watch_all(updates));
+        stream.send(update_a).unwrap();
+        stream.send(update_b).unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !feed_names(&hub, &bob, &b).await {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "room B's update never reached Bob's feed while room A was held: the hub is \
+                 wedged on A"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!feed_names(&hub, &alice, &a).await, "A is still held");
+
+        // A holds the consumed mark: B is done, but not everything up to it is.
+        assert_eq!(*hub.consumed.borrow(), 0);
+        let status = hub.status();
+        assert_eq!(status.pending, 1);
+        assert_eq!(status.in_hand.len(), 1);
+        assert_eq!(status.in_hand[0].room_id, a);
+        assert_eq!(status.in_hand[0].global_seq, 1);
+        assert_eq!(
+            status.in_hand[0].step,
+            "reading the room's members and directory entry"
+        );
+        // Once A's update has been in hand past the stall threshold, a read stops waiting for
+        // it, and past the warning threshold the watchdog names it.
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        let waited = std::time::Instant::now();
+        hub.wait_for_consumed(2, Duration::from_secs(5)).await;
+        assert!(
+            waited.elapsed() < Duration::from_secs(1),
+            "a read does not wait for a stuck update: {:?}",
+            waited.elapsed()
+        );
+        let status = hub.check_progress();
+        assert_eq!(status.stuck, 1);
+        assert_eq!(status.lag(), status.published);
+        assert!(
+            hub.progress.due_warnings().stuck.is_empty(),
+            "check_progress warned already"
+        );
+
+        drop(release);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !feed_names(&hub, &alice, &a).await {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "A's update went through once A was released"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        hub.wait_for_consumed(2, Duration::from_secs(5)).await;
+        assert_eq!(*hub.consumed.borrow(), 2);
     }
 }

@@ -46,6 +46,7 @@ pub mod edu;
 pub mod error;
 pub mod filter;
 pub mod hub;
+pub mod hub_progress;
 pub mod lazy_members;
 pub mod metrics;
 pub mod presence;

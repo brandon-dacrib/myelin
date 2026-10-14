@@ -1,6 +1,6 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-10-14 (the ephemeral pump's prune busy loop; fix on `agent/ephemeral-prune`). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+Written 2026-09-20 by the integration lead, last revised 2026-10-14 (the session hub wedge; fix on `agent/hub-wedge`. Earlier: the ephemeral pump's prune busy loop; fix on `agent/ephemeral-prune`). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
@@ -20,6 +20,24 @@ tells a bridge stale counts (2026-10-13's 16-minute drain counted only `@brandon
 computes them at send time.
 
 ## Resume here: 2026-10-14 -- the overnight liveness kills; a refused prune spun the ephemeral pump; the fix is `agent/ephemeral-prune`
+## Resume here: 2026-10-14, evening -- the session hub wedged on one room and every feed stopped; the fix is `agent/hub-wedge`
+
+0.3.17 stopped delivering anything to clients from ~18:07 UTC (Element: "Connectivity to the
+server has been lost") while sends, `/health` and `/versions` were fine. **Cause**: the session
+hub fed room updates one at a time and waits on each room's actor with no bound; it went into
+update 70 and never came out (`hs_user_fan_out_duration_seconds_count` stuck at 69 = `consumed`;
+239 updates of every room queued behind it by 18:36). Compaction (68e58686) is ruled out:
+`hs_user_compactions_total` has never had a series. Which room and what held its actor the
+INFO logs do not say (status 05, 2026-10-14, has the evidence). **The fix** (status 05): rooms
+are fed side by side, one worker per room and eight at once, store writes still one at a time;
+a read does not wait for an update stuck over 5 s; a watchdog warns `the session hub is stuck
+on a room update` with the room, update and step after 30 s; gauges `hs_user_hub_lag_updates`,
+`hs_user_hub_oldest_pending_seconds`, `hs_user_hub_stuck_updates`. Readiness is deliberately
+not tied to it (one replica: it would take the only endpoint away). **After the roll**: watch
+`hs_user_hub_lag_updates` stay near 0, and if the stuck warning appears, its room and step are
+the next fix (likely an `hs-room` read under the room's lock).
+
+## Earlier: 2026-10-14 -- the overnight liveness kills; a refused prune spun the ephemeral pump; the fix is `agent/ephemeral-prune`
 
 0.3.10 was liveness-killed four times overnight (04:46-04:52 and 10:46 UTC) with federation off
 and no scraping, while Loki logged ~3,300 `appservice ephemeral delivery could not read a

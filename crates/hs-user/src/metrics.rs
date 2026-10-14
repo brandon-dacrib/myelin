@@ -1,13 +1,14 @@
 //! Process-wide metrics of this crate: what the room mirror (`crate::cluster::RoomMirror`) does
 //! on a replica that reads rooms it does not own (decision 0022), what a room update's fan-out
-//! costs its owner's session hub (`crate::hub::SessionHub`), and what retention prunes.
+//! costs its owner's session hub (`crate::hub::SessionHub`), what retention prunes, and whether
+//! the hub keeps up with the rooms (`crate::hub_progress`).
 //!
 //! Process-wide statics, like `hs_room::metrics`: the mirror runs far from any registry, and a
 //! metric is only atomics. [`register_metrics`] puts them on `/metrics`; `hs-cli` calls it once
 //! at startup.
 
 use std::sync::LazyLock;
-use std::sync::atomic::AtomicI64;
+use std::sync::atomic::{AtomicI64, AtomicU64};
 use std::time::Duration;
 
 use prometheus_client::metrics::counter::Counter;
@@ -88,6 +89,47 @@ static PRUNED_ENTRIES: LazyLock<Family<StreamLabels, Counter>> = LazyLock::new(F
 /// `hs_user_compactions_total{stream}`: compaction runs, by stream.
 static COMPACTIONS: LazyLock<Family<StreamLabels, Counter>> = LazyLock::new(Family::default);
 
+/// `hs_user_hub_published_seq`: the newest update number the room registry has published.
+static HUB_PUBLISHED: LazyLock<Gauge<i64, AtomicI64>> = LazyLock::new(Gauge::default);
+
+/// `hs_user_hub_consumed_seq`: the session hub's consumed mark.
+static HUB_CONSUMED: LazyLock<Gauge<i64, AtomicI64>> = LazyLock::new(Gauge::default);
+
+/// `hs_user_hub_lag_updates`: published minus consumed.
+static HUB_LAG: LazyLock<Gauge<i64, AtomicI64>> = LazyLock::new(Gauge::default);
+
+/// `hs_user_hub_oldest_pending_seconds`: how long the oldest update the hub has received and not
+/// finished has been waiting; `0` when there is none.
+static HUB_OLDEST_PENDING: LazyLock<Gauge<f64, AtomicU64>> = LazyLock::new(Gauge::default);
+
+/// `hs_user_hub_stuck_updates`: updates in hand whose step has not moved for the stuck-step
+/// threshold.
+static HUB_STUCK: LazyLock<Gauge<i64, AtomicI64>> = LazyLock::new(Gauge::default);
+
+/// `hs_user_hub_stuck_warnings_total`: warnings the hub's watchdog logged about an update stuck
+/// at one step.
+static HUB_STUCK_WARNINGS: LazyLock<Counter> = LazyLock::new(Counter::default);
+
+/// Records the hub's position on the room stream: `published` by the registry, `consumed` by
+/// the hub.
+pub(crate) fn set_hub_position(published: u64, consumed: u64) {
+    HUB_PUBLISHED.set(i64::try_from(published).unwrap_or(i64::MAX));
+    HUB_CONSUMED.set(i64::try_from(consumed).unwrap_or(i64::MAX));
+    HUB_LAG.set(i64::try_from(published.saturating_sub(consumed)).unwrap_or(i64::MAX));
+}
+
+/// Records the watchdog's view: how long the oldest pending update has waited, and how many
+/// updates in hand are stuck.
+pub(crate) fn set_hub_health(oldest_pending: Duration, stuck: usize) {
+    HUB_OLDEST_PENDING.set(oldest_pending.as_secs_f64());
+    HUB_STUCK.set(i64::try_from(stuck).unwrap_or(i64::MAX));
+}
+
+/// Counts one stuck-update warning.
+pub(crate) fn count_stuck_warning() {
+    HUB_STUCK_WARNINGS.inc();
+}
+
 /// Records one room update's fan-out to `members` members in `elapsed`, taking `transactions`
 /// store transactions of which `fallbacks` were single members.
 pub(crate) fn observe_fan_out(
@@ -153,7 +195,10 @@ pub(crate) fn count_wake_covered() {
 /// `hs_user_mirror_catchup_duration_seconds{kind}` and `hs_user_mirror_wakes_covered_total`
 /// (decision 0022); `hs_user_fan_out_duration_seconds`, `hs_user_fan_out_members_total` and
 /// `hs_user_fan_out_transactions_total{outcome}` (the owner's fan-out);
-/// `hs_user_pruned_entries_total{stream}` and `hs_user_compactions_total{stream}` (retention).
+/// `hs_user_pruned_entries_total{stream}` and `hs_user_compactions_total{stream}` (retention);
+/// `hs_user_hub_published_seq`, `hs_user_hub_consumed_seq`, `hs_user_hub_lag_updates`,
+/// `hs_user_hub_oldest_pending_seconds`, `hs_user_hub_stuck_updates` and
+/// `hs_user_hub_stuck_warnings_total` (whether the session hub keeps up with the rooms).
 pub fn register_metrics(registry: &mut prometheus_client::registry::Registry) {
     registry.register(
         "hs_user_mirror_rooms",
@@ -209,4 +254,61 @@ pub fn register_metrics(registry: &mut prometheus_client::registry::Registry) {
         "Retention compaction runs, by stream (feed, hot_room_stream)",
         COMPACTIONS.clone(),
     );
+    registry.register(
+        "hs_user_hub_published_seq",
+        "The newest room update number the room registry has published",
+        HUB_PUBLISHED.clone(),
+    );
+    registry.register(
+        "hs_user_hub_consumed_seq",
+        "The session hub's consumed mark: every room update numbered up to it is in the feeds",
+        HUB_CONSUMED.clone(),
+    );
+    registry.register(
+        "hs_user_hub_lag_updates",
+        "Room updates published and not yet in the feeds (published minus consumed)",
+        HUB_LAG.clone(),
+    );
+    registry.register(
+        "hs_user_hub_oldest_pending_seconds",
+        "How long the oldest room update the session hub has received and not finished has \
+         been waiting; 0 when none",
+        HUB_OLDEST_PENDING.clone(),
+    );
+    registry.register(
+        "hs_user_hub_stuck_updates",
+        "Room updates the session hub has had at one step for longer than 30 seconds",
+        HUB_STUCK.clone(),
+    );
+    registry.register(
+        "hs_user_hub_stuck_warnings",
+        "Warnings the session hub's watchdog logged about a room update stuck at one step",
+        HUB_STUCK_WARNINGS.clone(),
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The hub's gauges are on `/metrics`, with their values.
+    #[test]
+    fn the_hub_gauges_are_rendered() {
+        let mut registry = prometheus_client::registry::Registry::default();
+        register_metrics(&mut registry);
+        set_hub_position(10, 7);
+        set_hub_health(Duration::from_millis(1500), 1);
+        let mut text = String::new();
+        prometheus_client::encoding::text::encode(&mut text, &registry).unwrap();
+        for line in [
+            "hs_user_hub_published_seq 10",
+            "hs_user_hub_consumed_seq 7",
+            "hs_user_hub_lag_updates 3",
+            "hs_user_hub_oldest_pending_seconds 1.5",
+            "hs_user_hub_stuck_updates 1",
+            "hs_user_hub_stuck_warnings_total",
+        ] {
+            assert!(text.contains(line), "{line} in:\n{text}");
+        }
+    }
 }

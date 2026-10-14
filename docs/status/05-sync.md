@@ -1,12 +1,126 @@
 # 05 Sync: status
 
-Last updated: 2026-10-09 (the scale 1 -> 2 bug, below; then session 19: wave 2's three named leftovers were already closed by session 17, rechecked on `6e24c2c0`; `event_fields` is applied; a real-binary test for the peeked long-poll. Session 18: two long-polls that never saw their change were a lost
+Last updated: 2026-10-14 (the demo's session hub wedge, below: one room the hub could not get through stopped every feed; rooms are now fed side by side and a stuck update is named. Then 2026-10-09: the scale 1 -> 2 bug; session 19: wave 2's three named leftovers were already closed by session 17, rechecked on `6e24c2c0`; `event_fields` is applied; a real-binary test for the peeked long-poll. Session 18: two long-polls that never saw their change were a lost
 push-rule write and a membership event that lost to the room's state, not the long-poll. Session 17: a filtered long-poll waits for real news, a fresh
 batch's `prev_batch` and order follow Synapse's initial sync, peeked hot rooms wake a long-poll and
 are pruned for erased senders. Session 16: Sytest's sync leftovers -- timelines from the newest end with holes, gap state, peeking, presence on joins, filters for presence/account data/ephemeral, remote users in the directory. Session 15: `device_lists` counts invites and rejoins, `/keys/changes` walks memberships between two tokens, a remote copy goes stale with the last shared room. Session 14: the owner's fan-out in batches, and feed retention.
 Session 13: `/joined_rooms` read-your-writes. Session 12: RFC 0018, a non-owner's room copy
 catches up instead of reloading. Session 11, session 10, session 9, session 8, session 7 and
 the integration note follow; sessions 1-6 are preserved unchanged further down.)
+
+
+## 2026-10-14 (branch `agent/hub-wedge`): one room the hub could not get through stopped every feed
+
+**Symptom** (the demo, 0.3.17 = `a724b962`, one pod, Fjall, federation off): from about 18:07
+UTC nothing new reached any client; Element said "Connectivity to the server has been lost".
+`/health` and `/versions` answered in 10 ms, sends were accepted (185 between 18:26 and 18:32,
+all under 16 s), no restarts. `hs_user::hub` warned every ~80 s that it "did not catch up with
+the room stream", `consumed` stuck at 69 from 18:13:08 to 18:36+ while `waited_for` climbed
+113 -> 308. CPU went from ~1.8 to 2.5-3.2 cores from 18:15, when Element reloaded and started
+issuing `/event` and `/relations` reads.
+
+**Evidence** (Loki and Prometheus, read through the owner's proxy before the restart):
+
+- `hs_user_fan_out_duration_seconds_count` stopped at **69**, between the 18:05 and 18:08
+  scrapes, and never moved again; `consumed` is 69. Every update the hub finished did one
+  fan-out, and the hub finished nothing after the 69th: it was inside update 70.
+- It had happened before in the same process (the counter flat at 57 from 17:50 to ~18:05, then
+  12 more) and in every boot today: `consumed` stuck at 3 from 17:43:51 to 17:46:04 before a
+  liveness kill, at 5 at 17:38, at 0-6 at 17:40-17:41.
+- The hub fed one update at a time (`consume_updates` awaited each `handle_room_update`), and
+  every read it makes of a room is `RoomActorHandle::query`, which waits for the room's lock
+  with no bound. One update whose room work did not finish held every later update of every
+  room: 239 of them by 18:36.
+- **Compaction (68e58686) is not it.** `hs_user_compactions_total` has never had a series in
+  Prometheus (a counter family with no samples is not rendered), so no feed or hot-stream
+  compaction has run; the compactions also run after the fan-out counter, which had stopped,
+  and both loops are bounded (at most 50 batches of 1,000). The single-transaction limit they
+  were batched for is real but was never reached here.
+- **Which room, and what held it, the data does not say**: INFO logs only, and nothing recorded
+  where inside an update the hub was. What the data does show: room loads that take minutes
+  (eight loads over 120 s since the boot, about 400 s each, `hs_room_load_seconds`); the
+  appservice room pump, which reads rooms through the same actor queries (`events_after`,
+  `joined_members_after`), delivered its last event at 18:25:02 while 185 sends followed; and
+  `!fX4orHRDlXa86iGwiX` crossing its 1,000-event cache at 18:13:09, one second after the first
+  warning, which means something was reading many of that room's events then. A room actor
+  held by a long read fits all of it; the watchdog below will name the room and step the next
+  time.
+- Reproduced in a test (below) by holding one room's actor while its update and another room's
+  reach the hub: before the fix the second room's feed entry never appeared.
+
+**The fix** (`crates/hs-user/src/hub.rs`, new `crates/hs-user/src/hub_progress.rs`):
+
+- **Rooms are fed side by side.** The receive loop only hands each update to its room's queue
+  (`SessionHub::dispatch`); a worker per room with anything queued feeds that room's updates in
+  order, at most `ROOM_WORKERS` (8) rooms at once. A room the hub cannot get through holds its
+  own later updates and one worker, nothing else. The store writes (membership records, feed
+  entries, the hot-room stream) still go one at a time, under `feed_writer`, so rooms fed side
+  by side do not keep conflicting on the feed head of a user who is in all of them (the owner,
+  a bridge's bot); only store work happens under that lock, never a room read.
+- **The consumed mark** is the highest number below which every received update is finished
+  (`hub_progress::Progress`): an update still in hand holds it, however many later ones are done,
+  so read-your-writes means what it meant. Numbers skipped by a lag hold nothing. A cluster wake
+  now carries this mark instead of the update's own number.
+- **A read does not wait for a stuck update.** `wait_for_consumed` (every `/sync`,
+  `/joined_rooms`, directory search) stops waiting for updates the hub has had for longer than
+  `STALL_AFTER` (5 s) and reads at once; before, every `/sync` on the server waited the whole
+  500 ms bound and warned. Its timeout warning now names the oldest pending room and update.
+- **The re-read after a lag** runs on its own task, a room's head at a time with a 10 s bound
+  each, through the rooms' queues; it used to run inline in the receive loop.
+- **A wedge is visible.** Each update in hand records its step ("loading the room", "reading
+  the room's members and directory entry", "waiting for the feed writer", "writing membership
+  records and feed entries", ...). A watchdog (`SessionHub::check_progress`, every 5 s) warns
+  `the session hub is stuck on a room update` with `room_id`, `global_seq`, `step`,
+  `step_secs`, `in_hand_secs`, `queued_behind`, `consumed` and `published` once a step has not
+  moved for 30 s, again every 60 s while it stays stuck, and logs at `info` when it moves on or
+  finishes; it warns `room updates are waiting for the session hub's workers` when the oldest
+  update has waited 30 s with no worker on it (all eight busy). Gauges:
+  `hs_user_hub_published_seq`, `hs_user_hub_consumed_seq`, `hs_user_hub_lag_updates`,
+  `hs_user_hub_oldest_pending_seconds`, `hs_user_hub_stuck_updates`, and the counter
+  `hs_user_hub_stuck_warnings_total`. `SessionHub::status()` returns the same as a
+  `hub_progress::HubStatus`.
+
+**Readiness is not wired to it** (decision): the demo is one replica, and a failing
+`/health/ready` removes its only endpoint, turning "one room's feed is stuck" into "nothing
+answers". With rooms fed side by side a stuck room no longer stops the server; alert on
+`hs_user_hub_stuck_updates > 0` or `hs_user_hub_oldest_pending_seconds > 60` instead. Liveness
+is untouched. `SessionHub::status()` is there if track 12 wants readiness for multi-replica
+deployments.
+
+**Tests.** `hub::tests::a_room_the_hub_cannot_get_through_does_not_stop_every_other_rooms_feed`
+holds room A's actor, sends A's update and then B's to the hub: B's update reaches Bob's feed
+while A is held (failed before the fix: "the hub is wedged on A"), the consumed mark stays at 0,
+`status()` names A, update 1, at "reading the room's members and directory entry", a read past
+the stall threshold does not wait, `check_progress` counts it stuck, and A's update goes
+through once released. `hub_progress::tests` (4): the mark is held by the oldest unfinished
+update and skips numbers never received; a read stops waiting past the threshold; a stuck step
+is warned about once a repeat, with what queues behind it; updates waiting for a worker are
+warned about. `metrics::tests::the_hub_gauges_are_rendered`.
+
+**Real binary.** A debug `hs serve` (Fjall, `event_cache_size: 50`, `feed_retention_entries:
+5`, `hot_room_stream_retention_entries: 5`), six users each syncing in a loop with read
+receipts, four rooms, 2,000 messages from all six with typing and `/event` reads: every member's
+`/sync` showed every room's last message, no warnings, and `/metrics` read
+`hs_user_hub_published_seq 2042`, `hs_user_hub_consumed_seq 2042`, `hs_user_hub_lag_updates 0`,
+`hs_user_hub_stuck_updates 0`. The wedge itself was not reproduced on the binary (the operation
+that held the demo's room is not known); the test above reproduces the mechanism.
+
+**Verification.** `cargo test -p hs-user` (all pass), `cargo clippy -p hs-user --all-targets
+-- -D warnings`, `cargo fmt --all --check`; `cargo test -p hs-cli --test e2e --test
+sync_polling --test peeking --test room_upgrade --test invites_and_notices --test
+cluster_mirror --test cluster_ephemeral --test cluster_create_room --test cluster_rejoin
+--test cluster_device_lists` (the cluster ones with `HS_CLUSTER_TEST_POSTGRES_DSN` set).
+
+**Next.**
+
+- After the roll, read the first `the session hub is stuck on a room update` warning, if any:
+  its room and step are the operation to fix (likely in `hs-room`: a read that runs for minutes
+  under the room's lock).
+- For track 04: `RoomRegistry::get_or_load` does not share a load in progress, so every caller
+  of a room that is not resident loads it in full (the demo's loads take ~400 s each, and Element
+  retrying `/sync` starts more); and `RoomActorHandle::query` waits for the room's lock with no
+  bound and no sign of what holds it.
+- A room stuck for hours keeps its updates queued in memory; bounded by how long it is stuck.
 
 
 ## 2026-10-09 (branch `agent/scale-sync-bug`): the scale 1 -> 2 bug the cluster smoke found
