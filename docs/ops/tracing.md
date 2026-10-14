@@ -193,7 +193,13 @@ handshake without it); a blocking hop is `hs_telemetry::spans::spawn_blocking`; 
 another replica sends `hs_telemetry::current_traceparent()` and the receiver calls
 `hs_telemetry::continue_trace`. To test a span, turn on `hs-telemetry`'s `testing` feature as a
 dev-dependency and run the code in `hs_telemetry::testing::trace` (or read a background pass's
-trace with `traces_rooted_at`).
+trace with `traces_rooted_at`). A span that closes after the code returns (a background
+task's, another replica's) is waited for with a deadline, never slept or yielded for:
+`testing::trace_until` for the test's own trace, `testing::wait_for_trace_rooted_at` for a
+background pass's. The recorder rebuilds `tracing`'s callsite interest cache when recording
+starts, because a callsite first reached by another test while the recorder was being
+installed could otherwise stay disabled for the rest of the process (it did:
+`crates/hs-telemetry/tests/testing_install_race.rs`).
 
 On the cluster, Tempo's search API answers through the API server's service proxy:
 `/api/v1/namespaces/monitoring-system/services/tempo:3200/proxy/api/search?tags=service.name%3Dmyelin`.

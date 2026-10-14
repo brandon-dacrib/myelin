@@ -2941,16 +2941,20 @@ mod tests {
         .await;
         assert!(wait_for(Duration::from_secs(10), || sender.pending_pdus() == 0).await);
         let request_trace = &request.find("test").unwrap().trace_id;
-        let transactions = hs_telemetry::testing::traces_rooted_at("federation.transaction");
-        let linked = transactions
-            .iter()
-            .find_map(|t| {
-                t.find("federation.transaction")
-                    .filter(|s| s.links.contains(request_trace))
-                    .map(|s| (t, s))
-            })
-            .unwrap_or_else(|| panic!("no transaction links to the request: {transactions:?}"));
-        let (trace, attempt) = linked;
+        // The accepted attempt linked to the request, waited for rather than assumed closed
+        // (other tests' transactions, and any earlier attempt of this one, are left alone).
+        let trace = hs_telemetry::testing::wait_for_trace_rooted_at(
+            "federation.transaction",
+            Duration::from_secs(10),
+            |t| {
+                t.find("federation.transaction").is_some_and(|s| {
+                    s.links.contains(request_trace) && s.attr("outcome") == Some("accepted")
+                })
+            },
+        )
+        .await
+        .unwrap_or_else(|seen| panic!("no accepted transaction links to the request: {seen:?}"));
+        let attempt = trace.find("federation.transaction").unwrap();
         assert_eq!(attempt.attr("outcome"), Some("accepted"));
         assert_eq!(attempt.attr("pdus"), Some("1"));
         assert_ne!(&attempt.trace_id, request_trace, "a trace of its own");

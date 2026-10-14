@@ -2516,23 +2516,28 @@ mod tests {
             .layer(hs_telemetry::RequestIdLayer::new());
 
         // The client's own trace, which the forwarding replica's request continues.
-        let (response, trace) = hs_telemetry::testing::trace(async {
-            let make_join = Request::builder()
-                .method("GET")
-                .uri("/_matrix/federation/v1/make_join/%21abc%3Aexample.org/%40bob%3Aremote.example?ver=11")
-                .header(http::header::AUTHORIZATION, "X-Matrix origin=\"remote.example\"")
-                .header("traceparent", hs_telemetry::current_traceparent().unwrap())
-                .header("x-request-id", "one-id")
-                .body(Body::empty())
-                .unwrap();
-            let response = app_a.oneshot(make_join).await.unwrap();
-            // The forwarding side's spans close a scheduler round after the response: a task
-            // the mesh connection runs holds them that long.
-            for _ in 0..3 {
-                tokio::task::yield_now().await;
-            }
-            response
-        })
+        // The forwarding side's spans close after the response (a task the mesh connection runs
+        // holds them a while): waited for, with a deadline, until all four are there.
+        let (response, trace) = hs_telemetry::testing::trace_until(
+            async {
+                let make_join = Request::builder()
+                    .method("GET")
+                    .uri("/_matrix/federation/v1/make_join/%21abc%3Aexample.org/%40bob%3Aremote.example?ver=11")
+                    .header(http::header::AUTHORIZATION, "X-Matrix origin=\"remote.example\"")
+                    .header("traceparent", hs_telemetry::current_traceparent().unwrap())
+                    .header("x-request-id", "one-id")
+                    .body(Body::empty())
+                    .unwrap();
+                app_a.oneshot(make_join).await.unwrap()
+            },
+            Duration::from_secs(10),
+            |trace| {
+                trace.find("GET {forwarded to the room's owner}").is_some()
+                    && trace.find("mesh forward federation").is_some()
+                    && trace.find("mesh handle http.proxy").is_some()
+                    && trace.0.iter().any(|s| s.kind == "server" && s.name == "GET")
+            },
+        )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(seen_b.lock().unwrap().len(), 1, "the owner answered it");

@@ -8,15 +8,30 @@
 //! do not see each other's spans. Global, so work moved to another thread (`spawn_blocking`)
 //! is recorded too; a test binary that installs another global subscriber cannot use this.
 //!
+//! A span that closes after the code returned (a background task's, another replica's) is
+//! waited for with a deadline, never slept for: [`trace_until`] for the caller's own trace,
+//! [`wait_for_trace_rooted_at`] for a background pass's.
+//!
+//! Every entry point that starts recording ([`install`], [`trace`], [`trace_sync`],
+//! [`trace_until`]) rebuilds `tracing`'s callsite interest cache once the recorder is the
+//! global default. `tracing-core` caches, per callsite, whether any subscriber wants its spans,
+//! and a callsite first reached on another thread while the global default is being set can
+//! cache "never" (asked of the no-op dispatcher that is still the default) after the
+//! recorder's own registration rebuilt it: that span is then not made again in the process.
+//! In a test binary the other tests keep running while one installs the recorder, so this
+//! happened (a sender test found no `federation.transaction` span at all, under load). The
+//! rebuild, made after the global default is set and before the test's code runs, corrects it.
+//!
 //! ```ignore
 //! let (_, spans) = hs_telemetry::testing::trace(async { store.save(..).await }).await;
 //! let txn = spans.iter().find(|s| s.name == "kv.transaction").unwrap();
 //! assert_eq!(txn.attr("mutations"), Some("2"));
 //! ```
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::Duration;
 
 use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter};
@@ -113,15 +128,26 @@ impl Trace {
     }
 }
 
+/// Where the recorder's spans go: every exported span until a test takes it, and a signal to
+/// the waiters each time more arrive.
 #[derive(Debug, Clone, Default)]
-struct Memory(Arc<Mutex<Vec<SpanData>>>);
+struct Memory {
+    spans: Arc<Mutex<Vec<SpanData>>>,
+    exported: Arc<tokio::sync::Notify>,
+}
+
+impl Memory {
+    fn lock(&self) -> MutexGuard<'_, Vec<SpanData>> {
+        self.spans
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
 
 impl SpanExporter for Memory {
     async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
-        self.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .extend(batch);
+        self.lock().extend(batch);
+        self.exported.notify_waiters();
         Ok(())
     }
 }
@@ -136,7 +162,16 @@ static INSTALLED: OnceLock<Installed> = OnceLock::new();
 /// Installs the recording subscriber, if it is not yet: call it before code whose root spans a
 /// test reads with [`traces_rooted_at`]. [`trace`] and [`trace_sync`] install it themselves.
 pub fn install() {
-    installed();
+    recording();
+}
+
+/// [`installed`], with every callsite's cached interest rebuilt now that the recorder is the
+/// global default (see the module docs). Called where recording starts, before the code under
+/// test runs, so a callsite whose first use raced with the install is enabled again by then.
+fn recording() -> &'static Installed {
+    let installed = installed();
+    tracing::callsite::rebuild_interest_cache();
+    installed
 }
 
 fn installed() -> &'static Installed {
@@ -161,13 +196,13 @@ fn installed() -> &'static Installed {
 /// The spans exported so far whose trace is `trace_id`, taken out of the store.
 fn take(installed: &Installed, trace_id: &str) -> Trace {
     let _ = installed.provider.force_flush();
-    let mut all = installed
-        .memory
-        .0
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    take_from(&mut installed.memory.lock(), trace_id)
+}
+
+/// The spans in `spans` whose trace is `trace_id`, taken out.
+fn take_from(spans: &mut Vec<SpanData>, trace_id: &str) -> Trace {
     let mut mine = Vec::new();
-    all.retain(|span| {
+    spans.retain(|span| {
         if span.span_context.trace_id().to_string() == trace_id {
             mine.push(ExportedSpan::from_data(span));
             false
@@ -176,6 +211,29 @@ fn take(installed: &Installed, trace_id: &str) -> Trace {
         }
     });
     Trace(mine)
+}
+
+/// The spans in `spans` whose trace is `trace_id`, left where they are.
+fn copy_from(spans: &[SpanData], trace_id: &str) -> Trace {
+    Trace(
+        spans
+            .iter()
+            .filter(|span| span.span_context.trace_id().to_string() == trace_id)
+            .map(ExportedSpan::from_data)
+            .collect(),
+    )
+}
+
+/// The ids of the traces in `spans` that have a span named `name`, the latest first, each once.
+fn ids_with(spans: &[SpanData], name: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    spans
+        .iter()
+        .rev()
+        .filter(|span| span.name == name)
+        .map(|span| span.span_context.trace_id().to_string())
+        .filter(|id| seen.insert(id.clone()))
+        .collect()
 }
 
 fn root() -> (tracing::Span, String) {
@@ -187,15 +245,38 @@ fn root() -> (tracing::Span, String) {
 /// Runs `future` in a new trace (root span `test`) and returns its output and the trace's
 /// spans. See the module docs.
 pub async fn trace<F: Future>(future: F) -> (F::Output, Trace) {
-    let installed = installed();
+    let installed = recording();
     let (root, trace_id) = root();
     let out = future.instrument(root).await;
     (out, take(installed, &trace_id))
 }
 
+/// [`trace`], then waits for the spans of the trace that close after `future` returned (a
+/// task's that outlives it, or another replica's that continued the trace) until `done` holds
+/// of the spans so far, or `deadline` passes. The spans so far are returned either way, so the
+/// test's own assertions say what was missing.
+pub async fn trace_until<F: Future>(
+    future: F,
+    deadline: Duration,
+    done: impl Fn(&Trace) -> bool,
+) -> (F::Output, Trace) {
+    let installed = recording();
+    let (root, trace_id) = root();
+    let out = future.instrument(root).await;
+    let mut spans = take(installed, &trace_id);
+    if !done(&spans) {
+        let _ = wait_until(deadline, || {
+            spans.0.extend(take(installed, &trace_id).0);
+            done(&spans).then_some(())
+        })
+        .await;
+    }
+    (out, spans)
+}
+
 /// [`trace`] for synchronous code.
 pub fn trace_sync<T>(f: impl FnOnce() -> T) -> (T, Trace) {
-    let installed = installed();
+    let installed = recording();
     let (root, trace_id) = root();
     let out = root.in_scope(f);
     drop(root);
@@ -216,22 +297,61 @@ pub fn spans_of_trace(trace_id: &str) -> Trace {
 pub fn traces_rooted_at(root_name: &str) -> Vec<Trace> {
     let installed = installed();
     let _ = installed.provider.force_flush();
-    let ids: Vec<String> = {
-        let all = installed
-            .memory
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut ids: Vec<String> = all
+    let mut all = installed.memory.lock();
+    ids_with(&all, root_name)
+        .iter()
+        .map(|id| take_from(&mut all, id))
+        .collect()
+}
+
+/// Waits for the trace of a background pass (one with a span named `root_name`, a root of its
+/// own) that `matches` holds of, until `deadline` passes, and takes it out of the store.
+/// Traces that do not match are left, so tests running at once that each wait for their own
+/// pass of one kind do not take each other's.
+///
+/// # Errors
+/// No matching trace was exported before `deadline`: the error holds every trace with a span
+/// named `root_name` that was (left in the store), for the test's failure message.
+pub async fn wait_for_trace_rooted_at(
+    root_name: &str,
+    deadline: Duration,
+    matches: impl Fn(&Trace) -> bool,
+) -> Result<Trace, Vec<Trace>> {
+    let installed = installed();
+    let found = wait_until(deadline, || {
+        let mut all = installed.memory.lock();
+        let id = ids_with(&all, root_name)
+            .into_iter()
+            .find(|id| matches(&copy_from(&all, id)))?;
+        Some(take_from(&mut all, &id))
+    })
+    .await;
+    found.ok_or_else(|| {
+        let all = installed.memory.lock();
+        ids_with(&all, root_name)
             .iter()
-            .rev()
-            .filter(|s| s.name == root_name)
-            .map(|s| s.span_context.trace_id().to_string())
-            .collect();
-        ids.dedup();
-        ids
-    };
-    ids.iter().map(|id| take(installed, id)).collect()
+            .map(|id| copy_from(&all, id))
+            .collect()
+    })
+}
+
+/// Calls `check` until it returns something: now, then each time more spans are exported, and
+/// once more when `deadline` has passed. Woken by the exports, not by polling.
+async fn wait_until<T>(deadline: Duration, mut check: impl FnMut() -> Option<T>) -> Option<T> {
+    let installed = installed();
+    let until = tokio::time::Instant::now() + deadline;
+    loop {
+        // Registered before the check, so an export between the check and the wait wakes it.
+        let mut exported = std::pin::pin!(installed.memory.exported.notified());
+        exported.as_mut().enable();
+        let _ = installed.provider.force_flush();
+        if let Some(found) = check() {
+            return Some(found);
+        }
+        if tokio::time::timeout_at(until, exported).await.is_err() {
+            return check();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -276,5 +396,60 @@ mod tests {
         assert!(spans.is_under(moved, test));
         assert!(spans.find("elsewhere").is_none());
         assert!(other.find("elsewhere").is_some());
+    }
+
+    #[tokio::test]
+    async fn a_span_that_closes_after_the_code_returned_is_waited_for() {
+        let looks = std::sync::atomic::AtomicUsize::new(0);
+        let ((), spans) = trace_until(
+            async {
+                // Held by a task that runs only once the test's task waits: on this runtime's
+                // one thread, not before `trace_until` has looked once and missed it.
+                let late = tracing::info_span!(target: "hs_test", "closes.later");
+                tokio::spawn(async move { drop(late) });
+            },
+            Duration::from_secs(10),
+            |spans| {
+                looks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                spans.find("closes.later").is_some() && spans.find("test").is_some()
+            },
+        )
+        .await;
+        assert!(
+            looks.into_inner() > 1,
+            "found by waiting, not on the first look"
+        );
+        let late = spans.find("closes.later").expect("the late span");
+        assert!(spans.is_under(late, spans.find("test").expect("the root")));
+    }
+
+    #[tokio::test]
+    async fn a_background_pass_is_waited_for_and_other_passes_are_left() {
+        install();
+        let pass = |which: &'static str| {
+            tokio::spawn(async move {
+                tokio::task::yield_now().await;
+                drop(
+                    tracing::info_span!(target: "hs_test", parent: None, "test.pass", which)
+                        .entered(),
+                );
+            })
+        };
+        pass("theirs");
+        pass("mine");
+        let mine = wait_for_trace_rooted_at("test.pass", Duration::from_secs(10), |trace| {
+            trace.find("test.pass").and_then(|s| s.attr("which")) == Some("mine")
+        })
+        .await
+        .expect("my pass");
+        assert_eq!(mine.0.len(), 1);
+        let theirs = wait_for_trace_rooted_at("test.pass", Duration::from_secs(10), |trace| {
+            trace.find("test.pass").and_then(|s| s.attr("which")) == Some("theirs")
+        })
+        .await;
+        assert!(theirs.is_ok(), "the other pass was left in the store");
+
+        let none = wait_for_trace_rooted_at("test.pass", Duration::from_millis(50), |_| true).await;
+        assert!(none.unwrap_err().is_empty());
     }
 }

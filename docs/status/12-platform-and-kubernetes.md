@@ -60,6 +60,18 @@ happens after they answer.
   seen; tests at once in one binary see only their own trace), `traces_rooted_at`,
   `spans_of_trace`, `install`. Used by the new tests in `hs-kv`, `hs-room`, `hs-federation`,
   `hs-appservice`, `hs-cli`.
+- **The span tests hold under load** (the coordinator's gate failed once on the
+  `hs-federation` sender test: "no transaction links to the request: []"). Cause: `tracing-core`
+  caches each callsite's interest on first use, and a callsite first reached by another test
+  while the recorder was being installed cached "never" (the no-op dispatcher was still the
+  default) after the recorder's own rebuild: that span was then never made in the process. The
+  recorder now rebuilds the interest cache when recording starts (`install`, `trace`,
+  `trace_sync`, `trace_until`). `crates/hs-telemetry/tests/testing_install_race.rs` shows it:
+  without the rebuild, 36 of 500 runs left callsites disabled; with it, 0 of 500. Spans that
+  close after the code returns are now waited for with a deadline, woken by each export:
+  `testing::trace_until` (the `hs-cli` forwarded-request test, which yielded three times) and
+  `testing::wait_for_trace_rooted_at` (the `hs-federation` test; takes only the matching trace,
+  leaving other tests' passes).
 
 ### Verified
 
