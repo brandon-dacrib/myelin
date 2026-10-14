@@ -202,6 +202,13 @@ pub fn trace_sync<T>(f: impl FnOnce() -> T) -> (T, Trace) {
     (out, take(installed, &trace_id))
 }
 
+/// The spans of trace `trace_id` exported since they were last taken: what a test's trace
+/// held that had not closed yet when [`trace`] returned.
+#[must_use]
+pub fn spans_of_trace(trace_id: &str) -> Trace {
+    take(installed(), trace_id)
+}
+
 /// The spans of a trace that is not the caller's (a background pass's, which is a root of its
 /// own): every span exported so far whose trace has a span named `root_name`, the latest such
 /// trace first. Spans that are not yet closed are not there.

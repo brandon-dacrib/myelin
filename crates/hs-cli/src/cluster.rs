@@ -1417,9 +1417,14 @@ impl RoomShardGate {
             .await
             .map_err(|e| format!("reading the request body: {e}"))?;
 
+        // The request's span here is named for what happened to it: the owner's span, a child
+        // of this one, has the route.
+        hs_telemetry::record_route(parts.method.as_str(), "{forwarded to the room's owner}");
         let mut headers = Vec::new();
         for (name, value) in parts.headers.iter() {
-            if is_hop_by_hop(name.as_str()) {
+            // The caller's trace context is this request's span's parent already; the owner is
+            // given this replica's own (`traceparent` on the envelope).
+            if is_hop_by_hop(name.as_str()) || is_trace_context(name.as_str()) {
                 continue;
             }
             if let Ok(v) = value.to_str() {
@@ -1453,11 +1458,9 @@ impl RoomShardGate {
             origin: self.origin.clone(),
             origin_generation: self.origin_generation,
             hops: 0,
-            traceparent: parts
-                .headers
-                .get(http::header::HeaderName::from_static("traceparent"))
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned),
+            // This request's span, so the owner's handling joins its trace (`hs_cluster`'s
+            // forwarder puts its own `mesh.forward` span here when the trace is recorded).
+            traceparent: hs_telemetry::current_traceparent(),
             payload: Bytes::from(payload),
         };
 
@@ -1540,7 +1543,15 @@ impl ShardHandler for ProxyShardHandler {
             .method(proxied.method.as_str())
             .uri(proxied.uri.as_str());
         for (name, value) in &proxied.headers {
+            if is_trace_context(name) {
+                continue;
+            }
             builder = builder.header(name.as_str(), value.as_str());
+        }
+        // The replayed request continues the forwarding replica's trace: under the mesh's span
+        // for it here (`mesh.handle`), or straight under the forwarder's.
+        if let Some(traceparent) = hs_telemetry::current_traceparent().or(env.traceparent.clone()) {
+            builder = builder.header("traceparent", traceparent);
         }
         let mut request = match builder.body(Body::from(body)) {
             Ok(r) => r,
@@ -1589,6 +1600,11 @@ impl ShardHandler for ProxyShardHandler {
             },
         }
     }
+}
+
+/// Whether `name` is a W3C trace-context header, which a forward replaces rather than copies.
+fn is_trace_context(name: &str) -> bool {
+    name.eq_ignore_ascii_case("traceparent") || name.eq_ignore_ascii_case("tracestate")
 }
 
 fn bad_request(message: String) -> Reply {
@@ -2459,6 +2475,84 @@ mod tests {
             vec!["/_matrix/federation/v1/send/txn1".to_owned()],
             "only `/send` ran on the replica it reached"
         );
+    }
+
+    /// A request forwarded to the room's owner is one trace: the forwarding replica's request,
+    /// its `mesh.forward`, the owner's `mesh.handle` and the owner's own request span, each
+    /// under the one before, with one request id.
+    #[tokio::test]
+    async fn a_forwarded_request_is_one_trace_across_the_two_replicas() {
+        let b_addr = format!("127.0.0.1:{}", free_port());
+        let seen_b = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ownership_b: Arc<dyn Ownership> = scripted(&b_addr, true, None);
+        let app_b = gate(ownership_b.clone(), true)
+            .layer(federation_router(seen_b.clone()))
+            .layer(hs_telemetry::RequestIdLayer::new());
+        let deps = Arc::new(MeshDeps {
+            authenticator: Arc::new(SharedSecretAuthenticator::new(TEST_SECRET)),
+            ownership: ownership_b,
+            handler: Arc::new(ProxyShardHandler {
+                app: app_b,
+                routes: Arc::default(),
+            }),
+            idempotency: Arc::new(IdempotencyCache::new(Duration::from_secs(5), 16)),
+            in_flight: Arc::new(tokio::sync::Semaphore::new(8)),
+            nudge: None,
+            peers: None,
+        });
+        let server = MeshServer::new(b_addr.clone(), None).unwrap();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        tokio::spawn(async move {
+            server.serve(deps, shutdown_rx).await.unwrap();
+        });
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(&b_addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let app_a = gate(scripted("127.0.0.1:1", false, Some(&b_addr)), true)
+            .layer(federation_router(Arc::default()))
+            .layer(hs_telemetry::RequestIdLayer::new());
+
+        // The client's own trace, which the forwarding replica's request continues.
+        let (response, trace) = hs_telemetry::testing::trace(async {
+            let make_join = Request::builder()
+                .method("GET")
+                .uri("/_matrix/federation/v1/make_join/%21abc%3Aexample.org/%40bob%3Aremote.example?ver=11")
+                .header(http::header::AUTHORIZATION, "X-Matrix origin=\"remote.example\"")
+                .header("traceparent", hs_telemetry::current_traceparent().unwrap())
+                .header("x-request-id", "one-id")
+                .body(Body::empty())
+                .unwrap();
+            let response = app_a.oneshot(make_join).await.unwrap();
+            // The forwarding side's spans close a scheduler round after the response: a task
+            // the mesh connection runs holds them that long.
+            for _ in 0..3 {
+                tokio::task::yield_now().await;
+            }
+            response
+        })
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(seen_b.lock().unwrap().len(), 1, "the owner answered it");
+        let names = trace.names();
+        let forwarding = trace
+            .find("GET {forwarded to the room's owner}")
+            .unwrap_or_else(|| panic!("the forwarding replica's request in {names:?}"));
+        let forward = trace.find("mesh forward federation").expect("mesh.forward");
+        let handle = trace.find("mesh handle http.proxy").expect("mesh.handle");
+        let owner = trace
+            .0
+            .iter()
+            .find(|s| s.kind == "server" && s.name == "GET")
+            .unwrap_or_else(|| panic!("the owner's request in {names:?}"));
+        assert!(trace.is_under(forward, forwarding));
+        assert!(trace.is_under(handle, forward));
+        assert!(trace.is_under(owner, handle));
+        assert_eq!(forward.kind, "client");
+        assert_eq!(forwarding.attr("request_id"), Some("one-id"));
+        assert_eq!(owner.attr("request_id"), Some("one-id"));
     }
 
     /// A forward on a route a shard handler was added for goes to that handler, not to the

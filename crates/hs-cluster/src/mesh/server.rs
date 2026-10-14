@@ -263,7 +263,28 @@ async fn handle_forward(req: Request<Incoming>, deps: &Arc<MeshDeps>) -> Respons
 
     let shard = env.shard;
     let key = env.idempotency_key;
-    let reply = deps.handler.handle(env, fence).await;
+    // `mesh.handle`, kind server, continuing the forwarder's trace when it sent one; nothing
+    // when it did not (the replayed request is its own trace then).
+    let span = match &env.traceparent {
+        Some(traceparent) => {
+            let span = tracing::info_span!(
+                parent: None,
+                "mesh.handle",
+                "otel.name" = format!("mesh handle {}", env.route).as_str(),
+                "otel.kind" = "server",
+                shard = %env.shard,
+                hops = env.hops,
+                status = tracing::field::Empty,
+            );
+            hs_telemetry::continue_trace(&span, traceparent);
+            span
+        }
+        None => tracing::Span::none(),
+    };
+    let reply =
+        tracing::Instrument::instrument(deps.handler.handle(env, fence), span.clone()).await;
+    span.record("status", reply.status);
+    drop(span);
     // A `503` is a refusal that did nothing (`hs-room`'s fence answers it when ownership moved
     // under the write), and the forwarder retries it with this same key: remembering it would
     // answer every retry from the cache, so a write fenced once would fail until the deadline
@@ -300,7 +321,29 @@ async fn handle_peer(req: Request<Incoming>, deps: &Arc<MeshDeps>) -> Response<F
         (Ok(route), Ok(origin)) => (route, ReplicaId::new(origin)),
         (Err(msg), _) | (_, Err(msg)) => return respond(StatusCode::BAD_REQUEST, msg),
     };
-    reply_response(handler.handle(origin, &route, payload).await)
+    // `mesh.peer`, continuing the sender's trace when it sent one; nothing when it did not
+    // (most peer messages are a background task's, and would be a span alone).
+    let span = match parts
+        .headers
+        .get(headers::TRACEPARENT)
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(traceparent) => {
+            let span = tracing::info_span!(
+                parent: None,
+                "mesh.peer",
+                "otel.name" = format!("mesh peer {route}").as_str(),
+                "otel.kind" = "server",
+                origin = %origin,
+            );
+            hs_telemetry::continue_trace(&span, traceparent);
+            span
+        }
+        None => tracing::Span::none(),
+    };
+    reply_response(
+        tracing::Instrument::instrument(handler.handle(origin, &route, payload), span).await,
+    )
 }
 
 fn misdirected(deps: &Arc<MeshDeps>, shard: ShardId) -> Response<Full<Bytes>> {

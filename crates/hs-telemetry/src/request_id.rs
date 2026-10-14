@@ -127,6 +127,11 @@ pub mod fields {
     pub const USER_ID: &str = "matrix.user_id";
     /// The authenticated origin server, for a federation request.
     pub const ORIGIN: &str = "matrix.origin";
+    /// Who called the admin API: the principal's id (a user id, a client's or a service
+    /// account's id). Recorded by `hs-admin`'s scope check.
+    pub const ADMIN_PRINCIPAL: &str = "admin.principal";
+    /// The admin API principal's kind: `user`, `client`, `service_account` or `legacy`.
+    pub const ADMIN_PRINCIPAL_KIND: &str = "admin.principal_kind";
     /// The OpenTelemetry span name (`GET /_matrix/client/v3/sync`), `tracing-opentelemetry`'s
     /// special field.
     pub const OTEL_NAME: &str = "otel.name";
@@ -146,6 +151,8 @@ fn request_span<B>(req: &Request<B>, request_id: &str) -> tracing::Span {
         "http.response.status_code" = tracing::field::Empty,
         "matrix.user_id" = tracing::field::Empty,
         "matrix.origin" = tracing::field::Empty,
+        "admin.principal" = tracing::field::Empty,
+        "admin.principal_kind" = tracing::field::Empty,
         "otel.name" = method,
         "otel.kind" = "server",
         "otel.status_code" = tracing::field::Empty,

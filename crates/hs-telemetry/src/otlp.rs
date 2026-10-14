@@ -558,6 +558,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_admin_apis_caller_is_on_the_request_span() {
+        let capture = Capture::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(capture.clone())
+            .with_sampler(sampler(1.0))
+            .build();
+        let subscriber = tracing_subscriber::registry().with(layer_from_provider(&provider));
+        let _default = tracing::subscriber::set_default(subscriber);
+        let svc = RequestIdLayer::new().layer(tower::service_fn(|_req: Request<()>| {
+            let span = tracing::Span::current();
+            span.record(crate::request_id::fields::ADMIN_PRINCIPAL, "ci-deployer");
+            span.record(
+                crate::request_id::fields::ADMIN_PRINCIPAL_KIND,
+                "service_account",
+            );
+            async { Ok::<_, std::convert::Infallible>(Response::new(())) }
+        }));
+        let _ = svc
+            .oneshot(Request::get("/api/v1/users").body(()).unwrap())
+            .await
+            .unwrap();
+        provider.force_flush().unwrap();
+        let spans = capture.0.lock().unwrap().clone();
+        let request = spans
+            .iter()
+            .find(|s| s.span_kind == SpanKind::Server)
+            .unwrap();
+        assert_eq!(
+            attr(request, "admin.principal")
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("ci-deployer")
+        );
+        assert_eq!(
+            attr(request, "admin.principal_kind")
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("service_account")
+        );
+    }
+
+    #[tokio::test]
     async fn a_client_error_is_not_a_failed_span() {
         let spans = one_request(1.0, None, StatusCode::NOT_FOUND).await;
         let request = spans

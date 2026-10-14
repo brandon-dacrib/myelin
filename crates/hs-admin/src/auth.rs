@@ -87,6 +87,28 @@ pub enum ScopeDecision {
     InsufficientScope(hs_http::Problem),
 }
 
+/// Says on the request's span (`hs_telemetry::RequestIdLayer`'s) who is calling:
+/// `admin.principal` and `admin.principal_kind`, and `matrix.user_id` for a user.
+fn record_caller(principal: &Principal) {
+    use crate::model::PrincipalKind;
+    use hs_telemetry::request_id::fields;
+
+    let span = tracing::Span::current();
+    span.record(fields::ADMIN_PRINCIPAL, principal.id.as_str());
+    span.record(
+        fields::ADMIN_PRINCIPAL_KIND,
+        match principal.kind {
+            PrincipalKind::User => "user",
+            PrincipalKind::Client => "client",
+            PrincipalKind::ServiceAccount => "service_account",
+            PrincipalKind::Legacy => "legacy",
+        },
+    );
+    if matches!(principal.kind, PrincipalKind::User | PrincipalKind::Legacy) {
+        span.record(fields::USER_ID, principal.id.as_str());
+    }
+}
+
 /// Extracts the bearer token from an `Authorization` header, verifies it, and checks it against
 /// `required` (`None` means "any authenticated principal", as for `GET /me`). This is the single
 /// enforcement point the router skeleton wires every operation through.
@@ -110,6 +132,7 @@ pub async fn require_scope(
         Ok(p) => p,
         Err(e) => return ScopeDecision::Unauthenticated(e.to_problem()),
     };
+    record_caller(&principal);
     if let Some(required) = required
         && !principal.has_scope(required)
     {

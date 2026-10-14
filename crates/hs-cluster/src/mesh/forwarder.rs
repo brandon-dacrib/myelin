@@ -116,6 +116,37 @@ impl Forwarder {
         kind: &'static str,
         mut env: Envelope,
     ) -> Result<Reply, ForwardError> {
+        // `mesh.forward`, kind client, inside a recorded trace: the forward's attempts, waits
+        // and retries. The owner's handling continues this trace (`traceparent`).
+        let span = if hs_telemetry::current_is_sampled() {
+            tracing::info_span!(
+                "mesh.forward",
+                "otel.name" = format!("mesh forward {kind}").as_str(),
+                "otel.kind" = "client",
+                shard = %env.shard,
+                route = %env.route,
+                status = tracing::field::Empty,
+            )
+        } else {
+            tracing::Span::none()
+        };
+        if let Some(traceparent) = span.in_scope(hs_telemetry::current_traceparent) {
+            env.traceparent = Some(traceparent);
+        }
+        let record_on = span.clone();
+        let result = tracing::Instrument::instrument(self.forward_attempts(kind, env), span).await;
+        if let Ok(reply) = &result {
+            record_on.record("status", reply.status);
+        }
+        result
+    }
+
+    /// [`Forwarder::forward_as`]'s attempts.
+    async fn forward_attempts(
+        &self,
+        kind: &'static str,
+        mut env: Envelope,
+    ) -> Result<Reply, ForwardError> {
         let start = Instant::now();
         let deadline_at = start + env.deadline;
         env.hops += 1;
@@ -332,6 +363,10 @@ impl Forwarder {
             .uri("/mesh/v1/peer")
             .header(headers::ROUTE, route)
             .header(headers::ORIGIN, self.ownership.me().as_str());
+        // The handler's work joins the sender's trace, when there is one.
+        if let Some(traceparent) = hs_telemetry::current_traceparent() {
+            builder = builder.header(headers::TRACEPARENT, traceparent);
+        }
         if let AuthMode::SharedSecret { secret } = &self.auth {
             builder = builder.header(http::header::AUTHORIZATION, format!("Bearer {secret}"));
         }

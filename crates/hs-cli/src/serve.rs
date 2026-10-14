@@ -601,8 +601,7 @@ fn build_router<B: KvBackend>(
         .layer(Extension(unstable_features))
         .layer(Extension(metrics.clone()))
         .layer(Extension(cluster.cluster.clone()))
-        .layer(middleware::from_fn_with_state(metrics, track_metrics))
-        .layer(hs_telemetry::RequestIdLayer::new());
+        .layer(middleware::from_fn_with_state(metrics, track_metrics));
 
     // Outermost layer: gates every `/rooms/{roomId}/...` request (and `/join` or `/knock` by id,
     // or by an alias it resolves first) on shard ownership before it can reach `hs-room`'s
@@ -611,6 +610,11 @@ fn build_router<B: KvBackend>(
     // single-node behavior beyond one cheap path scan per request.
     let router =
         crate::cluster::RoomShardGate::with_alias_resolver(cluster, alias_resolver).layer(router);
+
+    // Outside the gate, so a request this replica forwards to a room's owner has a span here
+    // too, and its `X-Request-Id` and trace go with it: the owner's handling of it is part of
+    // the same trace (`crate::cluster`'s forwarding sets `traceparent`).
+    let router = router.layer(hs_telemetry::RequestIdLayer::new());
 
     (router, manifest)
 }

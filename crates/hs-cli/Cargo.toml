@@ -84,6 +84,8 @@ rustls-pemfile = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# `hs_telemetry::testing`: a forwarded request's trace across two replicas, read back in tests.
+hs-telemetry = { path = "../hs-telemetry", features = ["testing"] }
 # `tests/outbound_ipv6_only_peer.rs` captures the server's log to check the warning an operator
 # sees when the outbound address policy hides a peer's only working address.
 tracing-subscriber = { workspace = true }
