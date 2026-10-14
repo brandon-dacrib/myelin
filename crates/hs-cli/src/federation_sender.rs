@@ -416,9 +416,11 @@ pub async fn forward_update<B: KvBackend + 'static>(
         // thread: the writes wait on the backend. Awaited, so this room's events (and every
         // other's: the feeder is one task) are queued in the order they were made.
         let (sender, queued_for) = (sender.clone(), destinations.clone());
+        // The transaction that carries it links to the request that wrote the event.
+        let link = update.trace.clone();
         if let Err(error) =
             hs_telemetry::spans::spawn_blocking("federation.enqueue_pdu", move || {
-                sender.enqueue_pdu(queued_for, pdu)
+                sender.enqueue_pdu_linked(queued_for, pdu, link)
             })
             .await
         {

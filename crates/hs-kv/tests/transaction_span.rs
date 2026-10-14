@@ -57,7 +57,7 @@ fn outside_a_trace_a_transaction_makes_no_span() {
     let backend = MemoryBackend::new();
     let things = backend.keyspace("things").unwrap();
     // Installs the recording subscriber, then runs a transaction with no span around it.
-    let _ = hs_telemetry::testing::trace_sync(|| ());
+    hs_telemetry::testing::install();
     transact(&backend, TransactConfig::default(), |txn| {
         txn.put(&things, b"untraced", b"1")
     })

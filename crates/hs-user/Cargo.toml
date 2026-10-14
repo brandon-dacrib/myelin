@@ -26,6 +26,7 @@ hs-kv = { path = "../hs-kv" }
 hs-tables = { path = "../hs-tables" }
 hs-auth = { path = "../hs-auth" }
 hs-http = { path = "../hs-http" }
+hs-telemetry = { path = "../hs-telemetry" }
 hs-room = { path = "../hs-room" }
 # Added session 4 (track 05) per docs/rfcs/0013-e2ee-sync-extensions.md: GET /sync needs hs-e2e's
 # store traits (to-device queue, device-list stream, one-time/fallback key counts) to populate

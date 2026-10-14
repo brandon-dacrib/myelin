@@ -36,5 +36,7 @@ prometheus-client = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
+# `hs_telemetry::testing`: the scheduler's and pumps' spans, read back in tests.
+hs-telemetry = { path = "../hs-telemetry", features = ["testing"] }
 hs-kv = { path = "../hs-kv" }
 tower = { workspace = true }

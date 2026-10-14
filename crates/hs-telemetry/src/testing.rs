@@ -133,7 +133,13 @@ struct Installed {
 
 static INSTALLED: OnceLock<Installed> = OnceLock::new();
 
-fn install() -> &'static Installed {
+/// Installs the recording subscriber, if it is not yet: call it before code whose root spans a
+/// test reads with [`traces_rooted_at`]. [`trace`] and [`trace_sync`] install it themselves.
+pub fn install() {
+    installed();
+}
+
+fn installed() -> &'static Installed {
     INSTALLED.get_or_init(|| {
         let memory = Memory::default();
         let provider = SdkTracerProvider::builder()
@@ -181,7 +187,7 @@ fn root() -> (tracing::Span, String) {
 /// Runs `future` in a new trace (root span `test`) and returns its output and the trace's
 /// spans. See the module docs.
 pub async fn trace<F: Future>(future: F) -> (F::Output, Trace) {
-    let installed = install();
+    let installed = installed();
     let (root, trace_id) = root();
     let out = future.instrument(root).await;
     (out, take(installed, &trace_id))
@@ -189,7 +195,7 @@ pub async fn trace<F: Future>(future: F) -> (F::Output, Trace) {
 
 /// [`trace`] for synchronous code.
 pub fn trace_sync<T>(f: impl FnOnce() -> T) -> (T, Trace) {
-    let installed = install();
+    let installed = installed();
     let (root, trace_id) = root();
     let out = root.in_scope(f);
     drop(root);
@@ -201,7 +207,7 @@ pub fn trace_sync<T>(f: impl FnOnce() -> T) -> (T, Trace) {
 /// trace first. Spans that are not yet closed are not there.
 #[must_use]
 pub fn traces_rooted_at(root_name: &str) -> Vec<Trace> {
-    let installed = install();
+    let installed = installed();
     let _ = installed.provider.force_flush();
     let ids: Vec<String> = {
         let all = installed

@@ -2870,6 +2870,7 @@ dependencies = [
  "hs-push",
  "hs-room",
  "hs-tables",
+ "hs-telemetry",
  "hs-testkit",
  "prometheus-client",
  "proptest",

@@ -2922,6 +2922,7 @@ impl<B: KvBackend> RoomActor<B> {
             membership_deltas,
             push_evaluation_inputs: Vec::new(),
             global_seq: 0,
+            trace: hs_telemetry::TraceLink::current(),
         };
         self.note_redaction(&event);
         self.hold(event_sn, event, Some(room_pos));
@@ -4812,6 +4813,7 @@ impl<B: KvBackend> RoomActor<B> {
             membership_deltas: Vec::new(),
             push_evaluation_inputs: Vec::new(),
             global_seq: 0,
+            trace: hs_telemetry::TraceLink::default(),
         })
     }
 

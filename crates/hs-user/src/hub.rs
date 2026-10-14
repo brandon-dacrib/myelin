@@ -2260,7 +2260,9 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
     /// The update is tracked while it is in hand ([`crate::hub_progress`]): each step it takes
     /// is recorded, so the watchdog can say which room it is stuck on and where.
     async fn handle_room_update(&self, update: RoomUpdate) -> Result<Vec<OwnedUserId>, UserError> {
-        let in_hand = self.progress.begin(&update.room_id, update.global_seq);
+        let in_hand = self
+            .progress
+            .begin(&update.room_id, update.global_seq, &update.trace);
         let span = in_hand.span().clone();
         let result =
             tracing::Instrument::instrument(self.apply_room_update(update, &in_hand), span).await;

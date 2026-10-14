@@ -789,7 +789,7 @@ impl<B: KvBackend + 'static> AppserviceDelivery<B> {
                         if !gate.pumps_here() {
                             continue;
                         }
-                        pump.pump_room(update.room_id.as_str()).await
+                        pump.pump_room_caused_by(update.room_id.as_str(), &update.trace).await
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
                         if !gate.pumps_here() {

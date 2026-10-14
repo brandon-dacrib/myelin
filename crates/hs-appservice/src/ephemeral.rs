@@ -304,6 +304,9 @@ pub struct EphemeralPump<B: KvBackend> {
     devices: Arc<dyn DeviceSource>,
     /// Rooms whose typing changed since the last tick.
     typing_rooms: Mutex<BTreeSet<String>>,
+    /// The spans that rang the doorbell since the last tick (a client's typing or receipt
+    /// request, when its trace is sampled), for the next pass's span to link to.
+    links: Mutex<Vec<hs_telemetry::TraceLink>>,
     wake: Notify,
     /// What the last prunes found, and when a failed one was last logged.
     prune: Mutex<PruneState>,
@@ -376,6 +379,7 @@ impl<B: KvBackend> EphemeralPump<B> {
             source,
             devices,
             typing_rooms: Mutex::new(BTreeSet::new()),
+            links: Mutex::new(Vec::new()),
             wake: Notify::new(),
             prune: Mutex::new(PruneState::default()),
             metrics: None,
@@ -394,6 +398,16 @@ impl<B: KvBackend> EphemeralPump<B> {
     /// The doorbell: notes a typing change's room, and wakes whoever is waiting in
     /// [`EphemeralPump::wait`]. Returns at once; safe to call from a request handler.
     pub fn note(&self, change: &Change) {
+        let link = hs_telemetry::TraceLink::current();
+        if !link.is_empty() {
+            let mut links = self
+                .links
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if links.len() < hs_telemetry::spans::MAX_LINKS_PER_SPAN {
+                links.push(link);
+            }
+        }
         if let Change::Typing { room_id } = change {
             self.typing_rooms
                 .lock()
@@ -509,141 +523,187 @@ impl<B: KvBackend> EphemeralPump<B> {
         let mut receipt_positions = self.positions(&ephemeral, RECEIPTS, receipts_head)?;
         let mut presence_positions = self.positions(&ephemeral, PRESENCE, presence_head)?;
         let mut to_device_positions = self.positions(&ephemeral, TO_DEVICE, to_device_head)?;
-
-        if !ephemeral.is_empty() {
-            self.pump_receipts(
-                &ephemeral,
-                &mut receipt_positions,
-                &mut builds,
-                &mut facts_cache,
-            )
-            .await?;
-            self.pump_presence(
-                &ephemeral,
-                &mut presence_positions,
-                &mut builds,
-                &mut facts_cache,
-            )
-            .await?;
-            self.pump_to_device(&ephemeral, &mut to_device_positions, &mut builds)
-                .await?;
-        }
-        for (index, listener) in ephemeral.iter().enumerate() {
-            let build = builds.entry(listener.row.id.clone()).or_default();
-            build
-                .positions
-                .push((RECEIPTS.to_owned(), receipt_positions.per_listener[index]));
-            build
-                .positions
-                .push((PRESENCE.to_owned(), presence_positions.per_listener[index]));
-            build.positions.push((
-                TO_DEVICE.to_owned(),
-                to_device_positions.per_listener[index],
-            ));
-        }
-
-        // Device lists: one read per MSC3202 listener, from its own position to the head.
         let device_lists_head = self
             .devices
             .device_lists_head()
             .await
             .map_err(AppserviceError::Store)?;
-        for listener in &msc3202 {
-            let pos = self
-                .registry
-                .store()
-                .ephemeral_pos(&listener.row.id, DEVICE_LISTS)?
-                .unwrap_or(device_lists_head);
-            let build = builds.entry(listener.row.id.clone()).or_default();
-            if device_lists_head > pos {
-                let changed = self
-                    .devices
-                    .device_lists_changed(pos, device_lists_head)
-                    .await
-                    .map_err(AppserviceError::Store)?;
-                for user_id in changed {
-                    if self
-                        .interested_in_user_or_their_rooms(listener, &user_id, &mut facts_cache)
-                        .await?
-                    {
-                        build.txn.device_lists.changed.push(user_id);
+
+        // A pass with something to do is a trace of its own (`appservice.ephemeral_pass`),
+        // linked to the requests that rang the doorbell; the four-a-second ticks that find
+        // nothing are not traced (decision 0048).
+        let links = std::mem::take(
+            &mut *self
+                .links
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let mut has_work = !typing_rooms.is_empty()
+            || receipt_positions.floor < receipts_head
+            || presence_positions.floor < presence_head
+            || to_device_positions.floor < to_device_head;
+        if !has_work {
+            for listener in &msc3202 {
+                let pos = self
+                    .registry
+                    .store()
+                    .ephemeral_pos(&listener.row.id, DEVICE_LISTS)?
+                    .unwrap_or(device_lists_head);
+                if pos < device_lists_head {
+                    has_work = true;
+                    break;
+                }
+            }
+        }
+        let span = if has_work {
+            tracing::info_span!(
+                parent: None,
+                "appservice.ephemeral_pass",
+                typing_rooms = typing_rooms.len(),
+                receipts = receipts_head.saturating_sub(receipt_positions.floor.min(receipts_head)),
+                presence = presence_head.saturating_sub(presence_positions.floor.min(presence_head)),
+                to_device =
+                    to_device_head.saturating_sub(to_device_positions.floor.min(to_device_head)),
+                appservices = tracing::field::Empty,
+                links_dropped = tracing::field::Empty,
+            )
+        } else {
+            tracing::Span::none()
+        };
+        hs_telemetry::add_links(&span, &links);
+        let rest = async {
+            if !ephemeral.is_empty() {
+                self.pump_receipts(
+                    &ephemeral,
+                    &mut receipt_positions,
+                    &mut builds,
+                    &mut facts_cache,
+                )
+                .await?;
+                self.pump_presence(
+                    &ephemeral,
+                    &mut presence_positions,
+                    &mut builds,
+                    &mut facts_cache,
+                )
+                .await?;
+                self.pump_to_device(&ephemeral, &mut to_device_positions, &mut builds)
+                    .await?;
+            }
+            for (index, listener) in ephemeral.iter().enumerate() {
+                let build = builds.entry(listener.row.id.clone()).or_default();
+                build
+                    .positions
+                    .push((RECEIPTS.to_owned(), receipt_positions.per_listener[index]));
+                build
+                    .positions
+                    .push((PRESENCE.to_owned(), presence_positions.per_listener[index]));
+                build.positions.push((
+                    TO_DEVICE.to_owned(),
+                    to_device_positions.per_listener[index],
+                ));
+            }
+
+            // Device lists: one read per MSC3202 listener, from its own position to the head.
+            for listener in &msc3202 {
+                let pos = self
+                    .registry
+                    .store()
+                    .ephemeral_pos(&listener.row.id, DEVICE_LISTS)?
+                    .unwrap_or(device_lists_head);
+                let build = builds.entry(listener.row.id.clone()).or_default();
+                if device_lists_head > pos {
+                    let changed = self
+                        .devices
+                        .device_lists_changed(pos, device_lists_head)
+                        .await
+                        .map_err(AppserviceError::Store)?;
+                    for user_id in changed {
+                        if self
+                            .interested_in_user_or_their_rooms(listener, &user_id, &mut facts_cache)
+                            .await?
+                        {
+                            build.txn.device_lists.changed.push(user_id);
+                        }
                     }
                 }
+                build
+                    .positions
+                    .push((DEVICE_LISTS.to_owned(), device_lists_head));
             }
-            build
-                .positions
-                .push((DEVICE_LISTS.to_owned(), device_lists_head));
-        }
 
-        // MSC3202 key counts, for every transaction with something in it.
-        for listener in &msc3202 {
-            let Some(build) = builds.get_mut(&listener.row.id) else {
-                continue;
-            };
-            if build.txn.is_empty() {
-                continue;
-            }
-            let mut users: BTreeSet<String> = BTreeSet::from([listener.bot_user_id.clone()]);
-            for room_id in &build.rooms {
-                if let Some(facts) = room_facts(source, &mut facts_cache, room_id).await? {
-                    users.extend(
-                        facts
-                            .joined_members
-                            .iter()
-                            .filter(|m| listener.interest().user(m))
-                            .cloned(),
-                    );
+            // MSC3202 key counts, for every transaction with something in it.
+            for listener in &msc3202 {
+                let Some(build) = builds.get_mut(&listener.row.id) else {
+                    continue;
+                };
+                if build.txn.is_empty() {
+                    continue;
                 }
+                let mut users: BTreeSet<String> = BTreeSet::from([listener.bot_user_id.clone()]);
+                for room_id in &build.rooms {
+                    if let Some(facts) = room_facts(source, &mut facts_cache, room_id).await? {
+                        users.extend(
+                            facts
+                                .joined_members
+                                .iter()
+                                .filter(|m| listener.interest().user(m))
+                                .cloned(),
+                        );
+                    }
+                }
+                users.extend(build.txn.to_device.iter().map(|m| m.to_user_id.clone()));
+                let (counts, fallback) = key_counts_for(self.devices.as_ref(), &users).await?;
+                build.txn.one_time_keys_count = counts;
+                build.txn.unused_fallback_key_types = fallback;
             }
-            users.extend(build.txn.to_device.iter().map(|m| m.to_user_id.clone()));
-            let (counts, fallback) = key_counts_for(self.devices.as_ref(), &users).await?;
-            build.txn.one_time_keys_count = counts;
-            build.txn.unused_fallback_key_types = fallback;
-        }
 
-        // One store transaction for every body and every position.
-        let mut deliveries = Vec::with_capacity(builds.len());
-        let mut touched = Vec::new();
-        for listener in &all {
-            let Some(build) = builds.remove(&listener.row.id) else {
-                continue;
+            // One store transaction for every body and every position.
+            let mut deliveries = Vec::with_capacity(builds.len());
+            let mut touched = Vec::new();
+            for listener in &all {
+                let Some(build) = builds.remove(&listener.row.id) else {
+                    continue;
+                };
+                let body = wire_body(&listener.row, &build.txn);
+                if body.is_some() {
+                    touched.push(listener.row.id.clone());
+                }
+                deliveries.push(EphemeralDelivery {
+                    appservice_id: listener.row.id.clone(),
+                    body,
+                    positions: build.positions,
+                });
+            }
+            if !deliveries.is_empty() {
+                self.registry
+                    .store()
+                    .enqueue_ephemeral(&deliveries, self.registry.now_ms())?;
+            }
+
+            // Nobody needs what every listener has been sent (a position is the last entry dealt
+            // with, so everything at or below the lowest one, as just stored). With nobody
+            // listening, nothing is kept. Never above the head read at the start: an entry appended
+            // since may not have been read by anyone.
+            let bound = |positions: &Positions, head: u64| {
+                let sent = positions
+                    .per_listener
+                    .iter()
+                    .copied()
+                    .min()
+                    .unwrap_or(u64::MAX);
+                sent.min(head).saturating_add(1)
             };
-            let body = wire_body(&listener.row, &build.txn);
-            if body.is_some() {
-                touched.push(listener.row.id.clone());
-            }
-            deliveries.push(EphemeralDelivery {
-                appservice_id: listener.row.id.clone(),
-                body,
-                positions: build.positions,
-            });
-        }
-        if !deliveries.is_empty() {
-            self.registry
-                .store()
-                .enqueue_ephemeral(&deliveries, self.registry.now_ms())?;
-        }
-
-        // Nobody needs what every listener has been sent (a position is the last entry dealt
-        // with, so everything at or below the lowest one, as just stored). With nobody
-        // listening, nothing is kept. Never above the head read at the start: an entry appended
-        // since may not have been read by anyone.
-        let bound = |positions: &Positions, head: u64| {
-            let sent = positions
-                .per_listener
-                .iter()
-                .copied()
-                .min()
-                .unwrap_or(u64::MAX);
-            sent.min(head).saturating_add(1)
+            self.prune_streams([
+                bound(&receipt_positions, receipts_head),
+                bound(&presence_positions, presence_head),
+                bound(&to_device_positions, to_device_head),
+            ])
+            .await;
+            tracing::Span::current().record("appservices", touched.len());
+            Ok(touched)
         };
-        self.prune_streams([
-            bound(&receipt_positions, receipts_head),
-            bound(&presence_positions, presence_head),
-            bound(&to_device_positions, to_device_head),
-        ])
-        .await;
-        Ok(touched)
+        tracing::Instrument::instrument(rest, span).await
     }
 
     fn prune_state(&self) -> std::sync::MutexGuard<'_, PruneState> {

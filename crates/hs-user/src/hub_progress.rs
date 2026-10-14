@@ -205,7 +205,12 @@ impl Progress {
     /// Starts tracking one update in hand: `room_id`'s update `global_seq` (`0` for a re-read
     /// or a direct call that carries no number). The returned guard records its steps, and
     /// stops tracking it when dropped.
-    pub(crate) fn begin(&self, room_id: &RoomId, global_seq: u64) -> InHand<'_> {
+    pub(crate) fn begin(
+        &self,
+        room_id: &RoomId,
+        global_seq: u64,
+        cause: &hs_telemetry::TraceLink,
+    ) -> InHand<'_> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let now = Instant::now();
         // A root span: an update reaches the hub from the room stream, not from a request.
@@ -217,6 +222,8 @@ impl Progress {
             "otel.status_code" = tracing::field::Empty,
             "error.message" = tracing::field::Empty,
         );
+        // Linked to the request that wrote the event, when its trace was sampled.
+        cause.add_to(&span);
         self.lock().active.insert(
             id,
             Active {
@@ -512,7 +519,7 @@ mod tests {
         p.received(7, a);
         p.received(8, a);
         p.received(9, b);
-        let in_hand = p.begin(a, 7);
+        let in_hand = p.begin(a, 7, &hs_telemetry::TraceLink::default());
         in_hand.step("reading the room's members and directory entry");
         assert!(p.due_warnings().stuck.is_empty());
         tokio::time::advance(Duration::from_secs(31)).await;
@@ -541,7 +548,7 @@ mod tests {
         p.set_thresholds(Duration::from_secs(5), Duration::from_secs(30));
         let (a, b) = (room_id!("!a:x"), room_id!("!b:x"));
         p.received(1, b);
-        let _busy = p.begin(a, 0);
+        let _busy = p.begin(a, 0, &hs_telemetry::TraceLink::default());
         tokio::time::advance(Duration::from_secs(31)).await;
         let warnings = p.due_warnings();
         let waiting = warnings.waiting.expect("1 has waited with no worker on it");

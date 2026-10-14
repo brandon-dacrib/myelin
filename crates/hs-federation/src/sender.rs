@@ -905,6 +905,18 @@ impl FederationSender {
     /// After [`FederationSender::shutdown`] every call is a logged no-op, as is a store that
     /// refuses the write (logged at `error`: that is a failing disk, not a normal path).
     pub fn enqueue_pdu(&self, destinations: impl IntoIterator<Item = String>, pdu: Value) {
+        self.enqueue_pdu_linked(destinations, pdu, hs_telemetry::TraceLink::current());
+    }
+
+    /// [`FederationSender::enqueue_pdu`], with the span the transaction carrying the PDU links
+    /// to given (`link`, the request that wrote the event) rather than taken from the current
+    /// span: for a caller that queues events from the room stream, outside any request.
+    pub fn enqueue_pdu_linked(
+        &self,
+        destinations: impl IntoIterator<Item = String>,
+        pdu: Value,
+        link: hs_telemetry::TraceLink,
+    ) {
         if self.shared.shut_down.load(Ordering::Acquire) {
             tracing::debug!("outbound federation sender is shut down; dropping a PDU");
             return;
@@ -957,7 +969,6 @@ impl FederationSender {
         let pdu = Arc::new(pdu);
         let room_id = pdu.get("room_id").and_then(Value::as_str);
         let max = self.shared.config.max_queued_pdus_per_destination.max(1);
-        let link = hs_telemetry::TraceLink::current();
         for batch in targets.chunks(ENQUEUE_BATCH) {
             let started = std::time::Instant::now();
             let outcome = self.shared.store.enqueue(batch, room_id, &pdu, max);

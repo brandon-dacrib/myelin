@@ -287,7 +287,49 @@ impl<B: KvBackend> Pump<B> {
     /// # Errors
     /// Returns [`AppserviceError::Store`] if the store or the room source fails.
     pub async fn pump_room(&self, room_id: &str) -> Result<Vec<String>, AppserviceError> {
+        self.pump_room_caused_by(room_id, &hs_telemetry::TraceLink::default())
+            .await
+    }
+
+    /// [`Pump::pump_room`] for an update of the room `cause` made (the span the event was
+    /// written in, `RoomUpdate::trace`). With an appservice registered, the pass is a trace of
+    /// its own, `appservice.pump_room` (`room_id`, `appservices` queued for), linked to
+    /// `cause`; with none, it is not traced (it only moves the room's cursor).
+    ///
+    /// # Errors
+    /// [`Pump::pump_room`]'s.
+    pub async fn pump_room_caused_by(
+        &self,
+        room_id: &str,
+        cause: &hs_telemetry::TraceLink,
+    ) -> Result<Vec<String>, AppserviceError> {
         let listeners = self.listeners()?;
+        if listeners.is_empty() {
+            return self.pump_room_for(room_id, listeners).await;
+        }
+        let span = tracing::info_span!(
+            parent: None,
+            "appservice.pump_room",
+            room_id,
+            listeners = listeners.len(),
+            appservices = tracing::field::Empty,
+        );
+        cause.add_to(&span);
+        let record_on = span.clone();
+        let touched =
+            tracing::Instrument::instrument(self.pump_room_for(room_id, listeners), span).await;
+        if let Ok(touched) = &touched {
+            record_on.record("appservices", touched.len());
+        }
+        touched
+    }
+
+    /// [`Pump::pump_room`]'s work, for `listeners`.
+    async fn pump_room_for(
+        &self,
+        room_id: &str,
+        listeners: Vec<Listener>,
+    ) -> Result<Vec<String>, AppserviceError> {
         let mut touched = BTreeMap::new();
         loop {
             let cursor = self.registry.store().room_cursor(room_id)?.unwrap_or(0);

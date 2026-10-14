@@ -450,15 +450,70 @@ impl<B: KvBackend> Scheduler<B> {
             .reduce(|a, b| merge_json(&a, &b))
             .unwrap_or(Value::Object(serde_json::Map::new()));
 
+        // One delivery attempt is a trace of its own (a background pass, decision 0048): the
+        // user queries made first, the HTTP exchange and the queue's bookkeeping. A drain that
+        // finds nothing to send makes no span.
+        let counts = body_counts(&merged);
+        let span = tracing::info_span!(
+            parent: None,
+            "appservice.transaction",
+            appservice = %appservice_id,
+            txn_id = through_seq,
+            entries = batch.len(),
+            events = counts.events,
+            ephemeral = counts.typing + counts.receipts + counts.presence,
+            to_device = counts.to_device,
+            outcome = tracing::field::Empty,
+            "otel.status_code" = tracing::field::Empty,
+            "error.message" = tracing::field::Empty,
+        );
+        let record_on = span.clone();
+        let result = tracing::Instrument::instrument(
+            self.deliver_batch(appservice_id, &row, &url, batch, through_seq, merged, now),
+            span,
+        )
+        .await;
+        match &result {
+            Ok(DrainOutcome::Delivered { .. }) => {
+                record_on.record("outcome", "delivered");
+            }
+            Ok(DrainOutcome::Failed { error, .. }) => {
+                record_on.record("outcome", "failed");
+                record_on.record("otel.status_code", "error");
+                record_on.record("error.message", error.as_str());
+            }
+            Ok(_) => {}
+            Err(error) => {
+                record_on.record("outcome", "store_error");
+                record_on.record("otel.status_code", "error");
+                record_on.record("error.message", tracing::field::display(error));
+            }
+        };
+        result
+    }
+
+    /// [`Scheduler::drain`]'s delivery of one `batch`, merged into `merged`, as transaction
+    /// `through_seq`, and the queue's and health record's bookkeeping after it.
+    #[allow(clippy::too_many_arguments)]
+    async fn deliver_batch(
+        &self,
+        appservice_id: &str,
+        row: &crate::store::AppserviceRow,
+        url: &str,
+        batch: Vec<QueuedTransaction>,
+        through_seq: u64,
+        merged: Value,
+        now: u64,
+    ) -> Result<DrainOutcome, AppserviceError>
+    where
+        B: 'static,
+    {
         if let Some(user_queries) = &self.user_queries {
-            user_queries.before_delivery(&row, &merged).await;
+            user_queries.before_delivery(row, &merged).await;
         }
 
         let txn_id = through_seq.to_string();
-        let outcome = self
-            .sender
-            .send(&url, &row.hs_token, &txn_id, &merged)
-            .await;
+        let outcome = self.sender.send(url, &row.hs_token, &txn_id, &merged).await;
 
         match outcome {
             Ok(()) => {
@@ -728,6 +783,51 @@ mod tests {
 
         // Delivered entries are removed from the queue.
         assert!(registry.store().queue_for("a").unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_delivery_attempt_is_a_trace_of_its_own_and_an_empty_drain_is_not() {
+        hs_telemetry::testing::install();
+        let (registry, clock) = registry_with("traced", Some("http://bridge.local"));
+        let sender = MockSender::new();
+        let scheduler = Scheduler::new(registry.clone(), clock, Arc::new(sender.clone()));
+        scheduler.enqueue("traced", &event_txn("hi")).unwrap();
+        scheduler.drain("traced").await.unwrap();
+        let traces = hs_telemetry::testing::traces_rooted_at("appservice.transaction");
+        let attempt = traces
+            .iter()
+            .filter_map(|t| t.find("appservice.transaction"))
+            .find(|s| s.attr("appservice") == Some("traced"))
+            .unwrap_or_else(|| panic!("no transaction span: {traces:?}"));
+        assert_eq!(attempt.attr("outcome"), Some("delivered"));
+        assert_eq!(attempt.attr("entries"), Some("1"));
+        assert_eq!(attempt.attr("events"), Some("1"));
+        assert_eq!(attempt.parent_span_id, "0000000000000000", "a root");
+
+        sender.fail_next(1);
+        scheduler.enqueue("traced", &event_txn("again")).unwrap();
+        scheduler.drain("traced").await.unwrap();
+        let failed = hs_telemetry::testing::traces_rooted_at("appservice.transaction")
+            .iter()
+            .filter_map(|t| t.find("appservice.transaction").cloned())
+            .find(|s| s.attr("appservice") == Some("traced"))
+            .expect("the failed attempt");
+        assert_eq!(failed.attr("outcome"), Some("failed"));
+        assert!(failed.failed);
+
+        // Nothing queued: no trace.
+        let _ = hs_telemetry::testing::traces_rooted_at("appservice.transaction");
+        assert_eq!(
+            scheduler.drain("traced").await.unwrap(),
+            DrainOutcome::Waiting
+        );
+        assert!(
+            hs_telemetry::testing::traces_rooted_at("appservice.transaction")
+                .iter()
+                .all(|t| t
+                    .find("appservice.transaction")
+                    .is_none_or(|s| s.attr("appservice") != Some("traced")))
+        );
     }
 
     #[tokio::test]

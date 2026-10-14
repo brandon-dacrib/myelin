@@ -136,11 +136,36 @@ impl AppserviceQueryTransport for HttpQueryTransport {
     ) -> Result<Option<Value>, String> {
         let base = url.trim_end_matches('/');
         let full_url = format!("{base}/_matrix/app/v1{path_and_query}");
-        // Outside every span (`hs_telemetry::outside_spans`, decision 0048).
+        // A user or room query, named by its endpoint (never the user or alias asked about),
+        // timed by a span held around the exchange; the exchange itself runs outside every span
+        // (`hs_telemetry::outside_spans`, decision 0048).
+        let endpoint = if path_and_query.starts_with("/rooms/") {
+            "GET /_matrix/app/v1/rooms"
+        } else if path_and_query.starts_with("/users/") {
+            "GET /_matrix/app/v1/users"
+        } else if path_and_query.starts_with("/thirdparty/") {
+            "GET /_matrix/app/v1/thirdparty"
+        } else {
+            "GET /_matrix/app/v1"
+        };
+        let span = if hs_telemetry::current_is_sampled() {
+            tracing::info_span!(
+                "appservice.query",
+                "otel.name" = endpoint,
+                "otel.kind" = "client",
+                "http.response.status_code" = tracing::field::Empty,
+            )
+        } else {
+            tracing::Span::none()
+        };
         let response =
             hs_telemetry::outside_spans(self.client.get(&full_url).bearer_auth(hs_token).send())
-                .await
-                .map_err(|e| crate::error::error_chain(&e))?;
+                .await;
+        if let Ok(response) = &response {
+            span.record("http.response.status_code", response.status().as_u16());
+        }
+        drop(span);
+        let response = response.map_err(|e| crate::error::error_chain(&e))?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }

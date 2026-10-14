@@ -161,4 +161,8 @@ pub struct RoomUpdate {
     /// of what that consumer writes -- `/sync` -- wait until it has read everything that was
     /// published before the reader asked. See `RoomRegistry::global_published_seq`.
     pub global_seq: u64,
+    /// The span the event was written in (a client's send, an inbound PDU's handling), when
+    /// its trace is sampled: what a consumer's own trace of this update (the session hub's,
+    /// federation's, the appservice pump's) links to. Empty otherwise.
+    pub trace: hs_telemetry::TraceLink,
 }
