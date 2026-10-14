@@ -1,5 +1,155 @@
 # 12. Platform and Kubernetes
 
+## 2026-10-14, late night (branch `agent/otlp-traces-2`): traces reach the store, the background work and the other replica (stage 2)
+
+Stage 2 of "traces properly instrumented into the app, so that we can tell what is going
+wrong" (the owner). Stage 1 (below) traced requests; this traces what they wait on and what
+happens after they answer.
+
+### Done
+
+- **Outbound HTTP outside spans everywhere** (decision 0048, rule 6): appservice transactions,
+  queries, pings and bridge-login checks; push gateways; URL previews; the media scanner; the
+  identity server; module callbacks; CAPTCHA and CAS; the bridge manager's Matrix calls; the
+  operator's admin calls; the mesh's HTTP/2 handshake (its pooled connection lives as long as
+  the process, so the first forwarded request to each peer was never exported).
+  `crates/hs-telemetry/tests/outbound_http_outside_spans.rs` reads the server's sources and
+  fails on a `reqwest` send or `hyper` client handshake outside test code without
+  `outside_spans` in its statement (the `hs` CLI's one-shot client commands are exempt, named).
+- **The store**: `hs_kv::transact` is `kv <Type::function>` (the closure's caller, from
+  `type_name`) with `attempts`, `mutations`, `keyspaces`, failed on error, and a `kv.commit`
+  child; `KvWrite` gained `mutations()` and `written_keyspaces()` (all three backends).
+  `hs_telemetry::spans::spawn_blocking` is `spawn_blocking` inside the caller's span, with a
+  named span and a `blocking_wait` child when sampled; the federation sender's store,
+  destination records, EDU/PDU queueing, device-list answers and the appservice queue use it.
+- **Only when sampled**: `hs_telemetry::current_is_sampled()` guards every small span added
+  here. Measured (`otlp::tests::cost_of_a_guarded_span`, release, under the JSON log layer and
+  the OTLP layer inside a request span): the check 80-195 ns; an unguarded span ~1 µs at ratio 0
+  and 1; a guarded one 81 ns at ratio 0.
+- **The room**: `room.state_resolution` (forks, only for more than one), `room.build_and_authorize`,
+  `room.event_auth` (event_id, outcome), `room.persist` (event_id, kind) with the store
+  transaction under it.
+- **Federation**: `federation.user_devices` (cached, devices); the device-list announcer's step as
+  a root `federation.device_list_announce` with a span per user and its store hops named;
+  `federation.key_fetch` and `federation.notary_query` (outcome); an outbound
+  `federation.transaction` links to the requests that wrote its PDUs (kept by sequence number
+  for the last 1,024, channel or store path); `RoomUpdate::trace` carries the span that wrote an
+  event so the federation feeder (`FederationSender::enqueue_pdu_linked`), the session hub and
+  the appservice pump link to it. `federation.pdu`'s `event_id` is the computed one for room
+  versions 3+ (it was `$unknown`).
+- **Appservices**: `appservice.transaction` per delivery attempt (none for an empty drain),
+  `appservice.pump_room` (only with a bridge registered), `appservice.ephemeral_pass` (only
+  when it has work for a listening bridge; linked to the doorbell's requests),
+  `appservice.query` client spans named by endpoint.
+- **Background passes**: `push.notify` (with `push.http` attempts), `admin.task` (linked to the
+  request that started it), `media.retention_pass`, `federation.destination_sweep`,
+  `statistics.sample`, `search.catch_up` (only with rooms behind).
+- **Across replicas**: `RequestIdLayer` is now outside the shard gate, so a forwarded request
+  has a span on the forwarding replica (`METHOD {forwarded to the room's owner}`) and its
+  request id travels; `mesh.forward` (client) sends its `traceparent` on the envelope;
+  `mesh.handle` (server) continues it and the replayed request continues `mesh.handle`; peer
+  messages carry it too (`mesh.peer`).
+- **Admin API caller**: `admin.principal`, `admin.principal_kind` (and `matrix.user_id` for a
+  user) on the request span, from the scope check.
+- **Export health**: `hs_telemetry_spans_exported_total`, `_dropped_total` (counted by a span
+  processor in front of the batch processor, which keeps its own drops to itself),
+  `_failed_total`, `hs_telemetry_span_export_queue`; registered by `Metrics::new`, at zero with
+  tracing off.
+- **Test support**: `hs-telemetry`'s `testing` feature: `testing::trace(future)` runs code in a
+  trace of its own and returns its exported spans (global subscriber, so blocking threads are
+  seen; tests at once in one binary see only their own trace), `traces_rooted_at`,
+  `spans_of_trace`, `install`. Used by the new tests in `hs-kv`, `hs-room`, `hs-federation`,
+  `hs-appservice`, `hs-cli`.
+
+### Verified
+
+- Tests: `hs-telemetry` (with and without `otlp`/`testing`: sampled check, traceparent round
+  trip incl. unsampled, links capped at 32 with `links_dropped`, the drop-counting processor,
+  export metrics, the admin caller, caller names, the blocking helper, the lint and its own
+  fixture); `hs-kv` `tests/transaction_span.rs`; `hs-room`
+  `a_traced_send_and_a_remote_event_show_auth_and_persistence_as_spans`; `hs-federation`
+  `a_transaction_is_a_trace_of_its_own_linked_to_the_request_that_queued_its_pdu`;
+  `hs-appservice` `a_delivery_attempt_is_a_trace_of_its_own_and_an_empty_drain_is_not`;
+  `hs-cli` `a_forwarded_request_is_one_trace_across_the_two_replicas`. Suites:
+  `cargo test -p` hs-telemetry, hs-kv, hs-tables, hs-room, hs-federation, hs-appservice,
+  hs-user, hs-media, hs-push, hs-modules, hs-admin, hs-cluster, hs-bridges, hs-cli (PostgreSQL
+  for its cluster tests); clippy `-D warnings` on each, hs-telemetry also without features.
+- **Real binary, Jaeger 1.62** (`mirror.gcr.io/jaegertracing/all-in-one`), debug `hs`, two
+  servers federating over HTTPS with a private CA (`127.0.0.1:18448` and `:18449`, TLS
+  listeners, `federation.custom_ca_certificates`), an appservice on A answered by a stand-in:
+  - **A federated send.** Alice's `PUT .../send` on A (7.9 ms): `room send_event_txn` →
+    `room.build_and_authorize` 2.5 ms, `room.persist` 1.9 ms → `kv RoomActor::persist_with`
+    (`mutations=10`, nine keyspaces) → `kv.commit` 0.5 ms. A's `federation.transaction`
+    (destination B, `pdus=1`, accepted, 22 ms) links to that trace; under it
+    `PUT /_matrix/federation/v1/send` (client) → slot wait, resolve, `federation.http` 20.8 ms.
+    B's `PUT /_matrix/federation/v1/send/{txnId}` (13.8 ms): `federation.authenticate` →
+    `federation.pdu` 11.8 ms → `room accept_pushed_event` / `accept_verified_event` with
+    `room.actor.lock_wait` 1.7 and 3.0 ms (another operation on the room), `room
+    accept_remote_event` → `room.event_auth` (allowed), `room.state_resolution` (`forks=2`),
+    `room.persist`.
+  - **An appservice delivery.** `appservice.pump_room` (linked to B's inbound `/send` on A)
+    → `room events_after`, `kv AppserviceStore::enqueue_for_room`; `appservice.transaction`
+    (`entries=1`, `events=1`, delivered, 12.5 ms) → `PUT /_matrix/app/v1/transactions` (client)
+    6.4 ms, `appservice.store` → `blocking_wait`, `kv AppserviceStore::delete_queue_entries`,
+    `kv AppserviceStore::put_health`. Alice's typing: `appservice.ephemeral_pass`
+    (`typing_rooms=1`, `appservices=1`) linked to the typing request.
+  - **Background passes.** `federation.device_list_announce` (`from=1 to=3 users=1`) →
+    `federation.device_list_announce_user` (`edus=1`) → `announcer.read_records`,
+    `announcer.enqueue_edu` → `kv KvOutboundStore::enqueue_durable_edu`, `announcer.store_record`;
+    then `announcer.store_positions`. `statistics.sample` at boot. B's key query made A answer
+    `GET /_matrix/federation/v1/user/devices/{userId}` → `federation.device_list_answer` →
+    `blocking_wait`, `federation.user_devices` (`cached=false`, `devices=1`).
+  - **A forwarded cluster request.** `cluster_create_room` (two real `hs` processes on one
+    PostgreSQL 17 from `public.ecr.aws`) run with the tracing variables set: `PUT {forwarded to
+    the room's owner}` → `mesh forward client` (`route=http.proxy`, `shard=room/2`) → `mesh
+    handle http.proxy` → the owner's `PUT .../send/{eventType}/{txnId}` with the same
+    `request_id`, → `room.build_and_authorize` 34 ms and `kv.commit` 4.4 ms on PostgreSQL.
+  - `/metrics` on A after the run: `hs_telemetry_spans_exported_total 474`, dropped 0, failed 0,
+    queue 0.
+  - Found and fixed on the way: `federation.pdu` showed `$unknown` for v3+ rooms (and a second
+    `event_id` attribute once recorded); a server without bridges made a one-span
+    `appservice.ephemeral_pass` on every typing notice.
+- **Latency** (10,000 sequential authenticated `whoami`, one keep-alive connection, debug
+  build, this desktop, Python client): tracing off p50 0.202 ms / p99 0.257; ratio 0 0.226 /
+  0.289; ratio 1 with Jaeger up 0.230 / 0.304; ratio 1 with the collector refused 0.229 /
+  0.293. Stage 1 measured off 0.33, ratio 0 0.36, ratio 1 refused 0.39 with a slower client:
+  the cost over tracing off is the same or smaller (ratio 0 +0.024 ms against +0.03; ratio 1
+  +0.028 against +0.06).
+- **Cluster Tempo**: no `myelin` traces yet (`/api/search?tags=service.name%3Dmyelin` empty);
+  stage 1 is not rolled.
+
+### Next
+
+`traceparent` to bridges and remote homeservers is not sent (decision 0048, "Left"); inbound
+`traceparent` is honoured from any caller; store reads outside `transact` (snapshots) have no
+span; EDUs and appservice queue entries carry no link. After the roll: check the demo's Tempo
+for `kv .*` spans with `attempts > 1`, `appservice.transaction` durations per bridge, and
+`hs_telemetry_spans_dropped_total`.
+
+### Decisions made
+
+- Small spans are guarded by the sampled check rather than by level filtering: a `debug` span
+  would need `RUST_LOG` to be exported at all, and the global level filter would hide it from
+  the trace store too.
+- No `traceparent` to remote homeservers or bridges: a trace id is ours, and a remote's sampled
+  flag would decide our sampling on their side the way it does on ours today.
+- `RequestIdLayer` moved outside the shard gate (`hs-cli/src/serve.rs`), so every request has a
+  span before it is forwarded; forwarded requests now carry the forwarding replica's request id.
+- Links, not parenthood, from a background pass to its cause; at most 32 per span.
+- Store transaction spans are named after the closure's caller (`type_name`), not given a name at
+  each of ~200 call sites.
+
+### Interfaces provided / needed
+
+Provided: `hs_telemetry::{current_is_sampled, current_traceparent, continue_trace, TraceLink,
+add_links}`, `hs_telemetry::spans::{spawn_blocking, caller_of, caller_of_value,
+MAX_LINKS_PER_SPAN}`, `hs_telemetry::export_stats`, `hs_telemetry::request_id::fields::{ADMIN_PRINCIPAL,
+ADMIN_PRINCIPAL_KIND}`, the `testing` feature; `hs_kv::KvWrite::{mutations, written_keyspaces}`;
+`hs_room::protocol::RoomUpdate::trace`; `hs_federation::sender::FederationSender::enqueue_pdu_linked`;
+`hs_appservice::pump::Pump::pump_room_caused_by`. Needed: none. Shared dependencies added:
+none to the workspace; `hs-telemetry` is now a dependency of hs-kv, hs-room, hs-user,
+hs-appservice, hs-auth, hs-admin, hs-bridges, hs-cluster, hs-modules and hs-push.
+
 ## 2026-10-14, night (branch `agent/otlp-traces`): the binary exports traces, instrumented for today's outages (stage 1)
 
 The owner asked for the demo to send traces to the cluster's collector, then widened it: "traces

@@ -15,6 +15,22 @@ carries the generated notes for that merge.
 
 ## Unreleased
 
+- **Traces reach the background work and the store.** A traced request now shows its store
+  transactions (named after the code that asked, with what they wrote), each wait for a blocking
+  thread, state resolution, event authorization and the event's write. Background work is a
+  trace of its own and says what caused it: an outbound federation transaction links to the
+  client's send that queued its event, appservice deliveries, the appservice room and ephemeral
+  pumps, the device-list announcer's steps, push notifications, admin tasks, media retention,
+  the destination sweep, statistics samples and search catch-ups. Key fetches, notary queries
+  and `/user/devices` answers are spans. A request forwarded between cluster replicas is one
+  trace with one request id. An admin API request names its caller. `/metrics` says how export
+  is going (`hs_telemetry_spans_exported_total`, `_dropped_total`, `_failed_total`,
+  `hs_telemetry_span_export_queue`). Every outbound HTTP call (appservices, push gateways, URL
+  previews, media scanning, the identity server, modules) no longer keeps the caller's trace from
+  being exported while its connection stays open. The small spans are made only when the trace
+  is sampled, so an unsampled request costs what it did. Verified against the real binary with
+  Jaeger: two servers federating over TLS, an appservice, and two clustered replicas;
+  `docs/ops/tracing.md`.
 - **Traces show where a slow or failing request spent its time.** The shipped binary now exports
   OpenTelemetry traces over OTLP/gRPC (it was compiled without the exporter, so
   `telemetry.tracing` did nothing). Every HTTP request is a trace named by its route, with its

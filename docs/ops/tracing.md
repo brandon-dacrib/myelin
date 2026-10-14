@@ -93,6 +93,75 @@ Inside requests and background work:
 | `hub.room_update` (`room_id`, `global_seq`) | session hub, a trace per update | One room update fanned out to its members. Each step is a child span named by the step (`reading the room's members and directory entry`, `waiting for the feed writer`, `writing membership records and feed entries`, …), the same names the hub's stuck-update warning uses. |
 | `federation.transaction` (`destination`, `txn_id`, `pdus`, `edus`, `outcome`) | federation sender, a trace per attempt | One attempt at an outbound transaction. |
 | `federation.request` (`destination`, status) | every outbound federation call | Kind `client`, named by endpoint (`PUT /_matrix/federation/v1/send`). Children `federation.request.slot_wait` (the per-destination limit), `federation.resolve` (well-known, SRV, DNS) and `federation.http` (the exchange). |
+| `kv <Type::function>` (`attempts`, `mutations`, `keyspaces`) | every store transaction in a recorded trace | One `hs_kv::transact`, named after the code that asked (`kv RoomActor::persist_with`, `kv TablesAuthStore::upsert_device`): how many tries it took (conflicts retry), how many puts and deletes, which keyspaces. Child `kv.commit` (on PostgreSQL, where the writes are sent). Failed when the transaction failed. |
+| `<name>` with child `blocking_wait` | work moved to a blocking thread (`hs_telemetry::spans::spawn_blocking`) | `federation.store <op>`, `federation.destination_store`, `appservice.store`, `announcer.*`, `federation.device_list_answer`, ...: the wait for a thread (`blocking_wait`) apart from the work. |
+| `room.build_and_authorize` | a local event | Building, hashing and signing the event and checking it against the auth rules. |
+| `room.event_auth` (`event_id`, `outcome`) | a remote event | The auth rules against its `auth_events` and the state before it: `allowed`, `refused`, `failed`. |
+| `room.state_resolution` (`forks`) | an event whose state is more than one fork | State resolution proper (one fork is a lookup, not traced). |
+| `room.persist` (`event_id`, `kind`) | every event written | The event's transaction and the in-memory indexes; the store transaction is its child. |
+| `federation.key_fetch` (`server_name`, `outcome`), `federation.notary_query` (`notary`, `keys`, `outcome`) | a server key not cached | The origin's `/_matrix/key/v2/server`, or a notary's `/_matrix/key/v2/query`, that a request waited for. |
+| `federation.user_devices` (`cached`, `devices`) | `GET /_matrix/federation/v1/user/devices/{userId}` | The answer, and whether it was the one kept for the list as it stands. |
+| `appservice.query` | a user or alias query to a bridge | Kind `client`, named by endpoint (`GET /_matrix/app/v1/users`). |
+| `mesh.forward` (`shard`, `route`, `status`) | a request this replica sends to a room's owner | Kind `client`; its retries and waits. The owner's `mesh.handle` and request span are its children (see "Across replicas"). |
+
+### Background work
+
+Each pass of a background loop is a trace of its own (a root span), made only when the pass has
+something to do. A pass caused by a request **links** to it (Tempo and Jaeger show a link,
+"follows from", to the other trace), so a slow delivery can be followed back to the send:
+
+| Root span | What it is | Links to |
+|---|---|---|
+| `federation.transaction` (`destination`, `txn_id`, `pdus`, `edus`, `outcome`) | one attempt at an outbound transaction | the requests that wrote its PDUs (a client's send, an inbound PDU), the last 1,024 PDUs' |
+| `federation.device_list_announce` (`from`, `to`, `stream`, `shards`, `users`) | one step of the device-list announcer; a child `federation.device_list_announce_user` (`user_id`, `edus`, `destinations`) per user, with the store hops `announcer.read_records`, `announcer.enqueue_edu`, `announcer.store_record`, `announcer.store_positions` | |
+| `hub.room_update` | one room update fanned out to its members (stage 1) | the request that wrote the event |
+| `appservice.transaction` (`appservice`, `txn_id`, `entries`, `events`, `ephemeral`, `to_device`, `outcome`) | one delivery attempt to a bridge: the user queries made first, `PUT /_matrix/app/v1/transactions` (kind `client`), the queue's bookkeeping. Failed when the bridge did not take it | |
+| `appservice.pump_room` (`room_id`, `listeners`, `appservices`) | queueing a room's new events for the bridges (only with a bridge registered) | the request that wrote the event |
+| `appservice.ephemeral_pass` (`typing_rooms`, `receipts`, `presence`, `to_device`, `appservices`) | queueing typing, receipts, presence, to-device and device lists for bridges; the ticks that find nothing are not traced | the requests that rang its doorbell (typing, receipts) |
+| `push.notify` (`app_id`, `outcome`) | one notification to a push gateway, each attempt a `push.http` child | |
+| `admin.task` (`action`, `task_id`) | an admin task's work | the request that started it |
+| `media.retention_pass` (`selected`, `deleted`, `failed`) | the hourly remote-media retention pass | |
+| `federation.destination_sweep`, `statistics.sample`, `search.catch_up` (`why`, `rooms`, `events`) | the destination sweep, the quarter-hourly statistics sample, a search-index catch-up with rooms behind | |
+| `room.load` | a room load started at boot (stage 1) | |
+
+### Across replicas
+
+A request a replica forwards to the room's owner (the shard gate) is **one trace**: the
+forwarding replica's request span (named `METHOD {forwarded to the room's owner}`), its
+`mesh.forward`, the owner's `mesh.handle` (kind `server`, continuing the forwarder's
+`traceparent`) and the owner's own request span named by its route, all with the same
+`request_id`. A peer message sent from inside a trace (`mesh.peer` on the receiver) joins it the
+same way. A client's own `traceparent` makes the forwarding replica's request span its child,
+and the owner sees this replica's, not the client's.
+
+### Who called
+
+A client request records `matrix.user_id`; a federation request `matrix.origin`; an admin API
+request `admin.principal` (a user id, a client's or a service account's id) and
+`admin.principal_kind`, and `matrix.user_id` for a user.
+
+### What the small spans cost
+
+Store transactions, blocking hops, state resolution, event auth, persistence, key fetches and
+the other small spans above are made only when the trace is **sampled**
+(`hs_telemetry::current_is_sampled`): an unsampled request still has its request span (the log
+uses it) but nothing under it is built. The check costs 80-200 ns; a span costs about 1 µs
+(`hs-telemetry`'s `otlp::tests::cost_of_a_guarded_span`, release build). With the collector up,
+10,000 sequential `whoami` on a debug build: tracing off p50 0.202 ms / p99 0.257 ms, ratio 0
+0.226 / 0.289, ratio 1 0.230 / 0.304 (2026-10-14, `docs/status/12-platform-and-kubernetes.md`).
+
+### Export health on `/metrics`
+
+| Metric | Meaning |
+|---|---|
+| `hs_telemetry_spans_exported_total` | Spans the collector accepted. |
+| `hs_telemetry_spans_dropped_total` | Spans finished while 4,096 already waited (a collector down, slow or unreachable): never queued. |
+| `hs_telemetry_spans_failed_total` | Spans in batches the collector refused or that timed out. |
+| `hs_telemetry_span_export_queue` | Spans waiting for export. |
+
+`dropped` or `failed` rising while `exported` does not is a collector that is not taking spans
+(alert on `rate(hs_telemetry_spans_dropped_total[10m]) > 0`). They exist at zero when tracing is
+off.
 
 ## Finding things
 
@@ -103,7 +172,28 @@ In Grafana's Tempo data source (or Tempo's API):
 - a user's requests: `{ span.matrix.user_id = "@alice:example.org" }`;
 - a stuck or slow room load: `{ name = "room.load" && duration > 5s }`;
 - a slow hub update, by step: `{ name = "hub.room_update" && duration > 1s }`, then its children;
-- a destination that keeps failing: `{ name = "federation.transaction" && span.destination = "example.org" }`.
+- a destination that keeps failing: `{ name = "federation.transaction" && span.destination = "example.org" }`;
+- a slow store transaction: `{ name =~ "kv .*" && duration > 100ms }`, or one that retried:
+  `{ name =~ "kv .*" && span.attempts > 1 }`;
+- a bridge that is slow to take transactions: `{ name = "appservice.transaction" && span.appservice = "<id>" && duration > 1s }`;
+- what a client's message did after the request answered: open its trace, note the trace id,
+  then `{ name = "federation.transaction" }` and look for the link to it (Tempo's "Links" tab);
+- a forwarded request: `{ name = "mesh.handle" }`, or the request id on either replica;
+- who did that through the admin API: `{ span.admin.principal = "<id>" }`.
+
+## Writing spans
+
+The rules are decision 0048's. In short: name spans `<subsystem>.<operation>`; a span around a
+small, frequent operation is made only when `hs_telemetry::current_is_sampled()`; a unit of
+background work is a root span (`parent: None`) made only when there is work, linked to what
+caused it with `hs_telemetry::TraceLink` (capture `TraceLink::current()` where the work is
+queued, `add_to` the pass's span); outbound HTTP runs in `hs_telemetry::outside_spans` (the test
+`crates/hs-telemetry/tests/outbound_http_outside_spans.rs` fails on a `reqwest` send or `hyper`
+handshake without it); a blocking hop is `hs_telemetry::spans::spawn_blocking`; a call to
+another replica sends `hs_telemetry::current_traceparent()` and the receiver calls
+`hs_telemetry::continue_trace`. To test a span, turn on `hs-telemetry`'s `testing` feature as a
+dev-dependency and run the code in `hs_telemetry::testing::trace` (or read a background pass's
+trace with `traces_rooted_at`).
 
 On the cluster, Tempo's search API answers through the API server's service proxy:
 `/api/v1/namespaces/monitoring-system/services/tempo:3200/proxy/api/search?tags=service.name%3Dmyelin`.

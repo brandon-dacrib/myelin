@@ -4,6 +4,26 @@ Written 2026-09-20 by the integration lead, last revised 2026-10-14 (the session
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
+## 2026-10-14, late night -- traces, stage 2: the store, background work and the other replica; the branch is `agent/otlp-traces-2`
+
+On top of stage 1 (below): every outbound HTTP call runs outside the caller's spans (a test
+keeps it so); store transactions (`kv <Type::function>`: attempts, mutations, keyspaces) and
+blocking hops (`blocking_wait` apart from the work); state resolution, event auth and
+persistence; key fetches, notary queries, `/user/devices` and the device-list announcer's steps;
+appservice deliveries, pumps and queries; a root span per background pass with work (push,
+admin tasks, media retention, the destination sweep, statistics, search catch-up), linked to
+the request that caused it where known (a `federation.transaction` links to the client's send);
+a forwarded request is one trace across replicas with one request id; the admin API's caller on
+the request span; `hs_telemetry_spans_{exported,dropped,failed}_total` and
+`hs_telemetry_span_export_queue` on `/metrics`. Small spans are made only when the trace is
+sampled. Verified on the real binary with Jaeger (two servers over TLS, an appservice, two
+clustered replicas on PostgreSQL) and re-measured: `whoami` p50 off 0.202 ms, ratio 0 0.226,
+ratio 1 0.230 (`docs/status/12-platform-and-kubernetes.md`, `docs/ops/tracing.md`). **Left**:
+`traceparent` to bridges and remote servers (not sent, decision 0048), inbound `traceparent`
+honoured from any caller, snapshot reads, links for EDUs and appservice queue entries. **After
+the roll**: Tempo `{ name =~ "kv .*" && span.attempts > 1 }`, `appservice.transaction` by
+bridge, and `hs_telemetry_spans_dropped_total`.
+
 ## 2026-10-14, night -- traces: the binary exports them, the demo sends them to Tempo; the branch is `agent/otlp-traces`
 
 `hs` was built without the OTLP exporter, so `telemetry.tracing` did nothing. Now on by
