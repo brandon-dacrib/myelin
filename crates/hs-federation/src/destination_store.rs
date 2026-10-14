@@ -448,6 +448,25 @@ mod tests {
         assert!(kv.get("gone.example.org").await.is_ready(now_ms()));
     }
 
+    /// A success on a destination already healthy, recorded under a minute ago, writes
+    /// nothing; one after a failure clears it.
+    #[tokio::test]
+    async fn kv_store_writes_a_success_only_when_it_changes_something() {
+        let store = KvDestinationStore::open(MemoryBackend::new()).unwrap();
+        store.record_success("c.example.org").await;
+        let first = store.get("c.example.org").await;
+        assert!(first.is_settled_success(now_ms()));
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        store.record_success("c.example.org").await;
+        assert_eq!(store.get("c.example.org").await, first);
+        store.record_failure("c.example.org", 60_000).await;
+        assert_eq!(store.get("c.example.org").await.failure_count, 1);
+        store.record_success("c.example.org").await;
+        let after = store.get("c.example.org").await;
+        assert_eq!(after.failure_count, 0);
+        assert!(after.is_ready(now_ms()));
+    }
+
     #[tokio::test]
     async fn kv_store_unknown_destination_is_ready() {
         let backend = MemoryBackend::new();

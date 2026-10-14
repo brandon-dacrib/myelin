@@ -301,6 +301,54 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
+    /// Each inbound federation request holds one of the slots while it is worked on, and gives
+    /// it back when answered: requests in flight are counted, and the count comes back down.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_inbound_request_holds_a_slot_while_it_is_worked_on() {
+        // Closed until the three are counted; a semaphore keeps every release however early.
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let held = gate.clone();
+        let app = axum::Router::new()
+            .route(
+                "/slow",
+                axum::routing::get(move || {
+                    let held = held.clone();
+                    async move {
+                        if let Ok(permit) = held.acquire().await {
+                            permit.forget();
+                        }
+                        "done"
+                    }
+                }),
+            )
+            .layer(axum::middleware::from_fn(bound_inbound));
+        let before = inbound_in_flight();
+        let requests: Vec<_> = (0..3)
+            .map(|_| {
+                let app = app.clone();
+                tokio::spawn(async move {
+                    app.oneshot(Request::get("/slow").body(Body::empty()).unwrap())
+                        .await
+                        .unwrap()
+                        .status()
+                })
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        while inbound_in_flight() < before + 3 {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "three requests held slots"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        gate.add_permits(3);
+        for request in requests {
+            assert_eq!(request.await.unwrap(), StatusCode::OK);
+        }
+        assert!(inbound_in_flight() <= before, "the slots came back");
+    }
+
     struct EmptyFetcher;
     #[async_trait]
     impl KeyServerFetcher for EmptyFetcher {

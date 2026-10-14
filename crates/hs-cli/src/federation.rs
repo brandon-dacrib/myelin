@@ -2174,3 +2174,29 @@ pub async fn run_join_room(args: &crate::cli::FederationJoinRoomArgs) -> i32 {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A kept device-list answer is given again only at the position it was read at, and the
+    /// store of answers is bounded.
+    #[test]
+    fn a_device_list_answer_is_given_again_only_at_its_position() {
+        let answers = DeviceListAnswers::default();
+        let answer = serde_json::json!({"user_id": "@a:x", "stream_id": 7, "devices": []});
+        answers.put("@a:x", 7, answer.clone());
+        assert_eq!(answers.get("@a:x", 7), Some(answer));
+        assert_eq!(answers.get("@a:x", 8), None, "the list moved on");
+        assert_eq!(answers.get("@b:x", 7), None);
+        for n in 0..DeviceListAnswers::MAX_USERS + 10 {
+            answers.put(&format!("@u{n}:x"), 1, serde_json::json!({}));
+        }
+        let kept = answers
+            .answers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        assert!(kept <= DeviceListAnswers::MAX_USERS, "{kept}");
+    }
+}

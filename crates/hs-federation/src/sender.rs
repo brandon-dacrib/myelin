@@ -3871,6 +3871,88 @@ mod tests {
         assert_eq!(second.pending_edus_for(&destination), 0);
     }
 
+    /// A durable EDU and a PDU for more destinations than one store transaction covers
+    /// ([`ENQUEUE_BATCH`]) reach every destination's queue, each once, and the PDU is counted
+    /// pending once per destination; the store operations are timed. The destinations refuse
+    /// connections, so what was queued stays to be counted.
+    #[tokio::test]
+    async fn an_enqueue_for_more_destinations_than_a_batch_reaches_every_one() {
+        let store: Arc<dyn OutboundStore> =
+            Arc::new(KvOutboundStore::open(MemoryBackend::new()).unwrap());
+        let sender = FederationSender::with_store(client(), US, fast(), store.clone());
+        let destinations: Vec<String> = (0..ENQUEUE_BATCH * 2 + 17)
+            .map(|i| format!("d{i}.example.org:1"))
+            .collect();
+        let timed = crate::metrics::sender_store_operations("enqueue");
+        sender.enqueue_durable_edu(
+            destinations.clone(),
+            "m.device_list_update",
+            serde_json::json!({"user_id": "@alice:us.example.org", "device_id": "D", "stream_id": 1}),
+            Some("device @alice:us.example.org D".to_owned()),
+        );
+        sender.enqueue_pdu(destinations.clone(), pdu(1));
+        for destination in &destinations {
+            assert_eq!(store.durable_edu_len(destination).unwrap(), 1, "{destination}");
+            assert_eq!(store.queue_len(destination).unwrap(), 1, "{destination}");
+        }
+        assert_eq!(sender.pending_pdus(), destinations.len());
+        assert!(
+            crate::metrics::sender_store_operations("enqueue") >= timed + 6,
+            "three batches of each, timed"
+        );
+        sender.shutdown();
+    }
+
+    /// A success on a destination already healthy, recorded under a minute ago, writes nothing:
+    /// its recorded time stays what it was. A success after a failure is written.
+    #[test]
+    fn a_success_on_a_healthy_destination_writes_nothing() {
+        let store = KvOutboundStore::open(MemoryBackend::new()).unwrap();
+        store.record_success("a.example.org").unwrap();
+        let first = store.state("a.example.org").unwrap().unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        store.record_success("a.example.org").unwrap();
+        assert_eq!(store.state("a.example.org").unwrap().unwrap(), first);
+        store
+            .record_failure("a.example.org", "HTTP 502", u64::MAX / 2)
+            .unwrap();
+        store.record_success("a.example.org").unwrap();
+        let after = store.state("a.example.org").unwrap().unwrap();
+        assert_eq!(after.failures, 0);
+        assert!(after.last_success_ms >= first.last_success_ms);
+        assert!(after.is_settled_success(now_ms()));
+    }
+
+    /// What the device-list announcer told each shard about a user is kept by user and shard,
+    /// in both stores, and one user's records are not another's.
+    #[test]
+    fn announcement_records_are_kept_by_user_and_shard() {
+        let stores: Vec<Box<dyn OutboundStore>> = vec![
+            Box::new(InMemoryOutboundStore::new()),
+            Box::new(KvOutboundStore::open(MemoryBackend::new()).unwrap()),
+        ];
+        for store in stores {
+            let first = serde_json::json!({"stream_id": 7, "devices": {}});
+            let second = serde_json::json!({"stream_id": 9, "devices": {"D": {"keys": null}}});
+            store
+                .set_announced("@a:us.example.org", &[0, 1, 2], &first)
+                .unwrap();
+            store
+                .set_announced("@a:us.example.org", &[1], &second)
+                .unwrap();
+            let records = store.announced("@a:us.example.org").unwrap();
+            assert_eq!(
+                records,
+                std::collections::BTreeMap::from([
+                    (0, first.clone()),
+                    (1, second),
+                    (2, first)
+                ])
+            );
+            assert!(store.announced("@b:us.example.org").unwrap().is_empty());
+        }
+    }
+
     /// A destination's durable EDU queue is bounded: past
     /// [`SenderConfig::max_queued_durable_edus_per_destination`] the oldest goes.
     #[tokio::test]
