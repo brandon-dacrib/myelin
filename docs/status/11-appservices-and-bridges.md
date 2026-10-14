@@ -1,6 +1,9 @@
 # Status: track 11, appservices and bridges
 
-Last updated: 2026-10-14 (the ephemeral pump's stream prunes, and the sync feed and hot-room
+Last updated: 2026-10-14, later (an appservice removes its users' devices without
+user-interactive auth, MSC4190 or not, so the manager can remove the iMessage bot's left-behind
+device whose key counts the bridge drops; below); before that 2026-10-14 (the ephemeral pump's
+stream prunes, and the sync feed and hot-room
 stream compactions, delete in bounded batches; a failed prune no longer fails the tick; below);
 before that 2026-10-13, afternoon (a drain starts where the waiting entries start, the backlog
 list and replays read a page at a time, and queue work runs off the async workers; the drain is
@@ -46,6 +49,75 @@ manager) and an instance's Kubernetes objects say whose bridge they are; before 
 (who has signed in to a bridge; the `cluster` runtime run on kind); before that 2026-09-30
 (ephemeral, to-device and device-list delivery); before that 2026-09-27 (RFC 0017 run against
 the real binary), 2026-09-27 (the bridge manager) and 2026-09-25.
+
+## Session 2026-10-14, later (branch `agent/otk-counts-device`): the iMessage bot's left-behind device can be removed
+
+**Seen.** The demo's mautrix-imessage bridge (legacy mautrix-go, on the owner's Mac) logged
+`WRN Dropping OTK counts targeted to someone else` about 1,800 times since 2026-10-13 14:08 EDT:
+1,729 for `@brandon` / `J6CEqTqXcJ` on 2026-10-13 14:08-14:24 (the owner's counts, which the
+registration's non-exclusive owner namespace makes Synapse send too; see 2026-10-10), and, since
+the bridge started again on 2026-10-14 14:24 EDT, two per transaction for
+`@imessagebot_brandon` / `yLLbqe7oX4`.
+
+**The facts, read-only.**
+
+- The bridge's crypto device is `h7ijM5DMbF` (`crypto_account` in `imessage-brandon.db`; "Found
+  existing device ID for bot in database" at start).
+- `yLLbqe7oX4` was made by the bridge's own `/login` (`m.login.application_service`) at
+  2026-10-13 14:08:42 EDT; the bridge stopped at 14:09:43 before saving its crypto account, and
+  the next start logged in again and got `h7ijM5DMbF`. The bridge log has no `keys/upload` for
+  `yLLbqe7oX4`: it never had keys.
+- The server counts every device of the bot, keys or not, as Synapse does
+  (`count_bulk_e2e_one_time_keys_for_as` is `devices LEFT JOIN e2e_one_time_keys_json`), so each
+  transaction carries `yLLbqe7oX4` (0 keys, dropped by the bridge) beside `h7ijM5DMbF`. The
+  bridge's real device is told its count: on 2026-10-13 14:24:21 it was told 0, uploaded 50 and
+  read back 50; since then nothing to top up. So encryption to the bridge was not broken by this;
+  the warning is noise from a stale device.
+- Why 2026-10-13 14:08-14:24 carried only `@brandon`'s counts and none of the bot's: those were
+  the backlog (server transaction ids 4181 to 38741, drained in 16 minutes), and a transaction's
+  MSC3202 counts are computed when it is queued, not when it is sent. Queued before the bot had
+  today's devices, they counted none of them; the first fresh one (38761) counted both users.
+  Synapse computes them at send time. Not changed here (it is the scheduler's queue, which another
+  branch is in); a follow-up below.
+- The manager already removes a bot's left-behind device (2026-10-10, decision 0041), and tried:
+  Loki, 2026-10-14T18:10:41Z (a day after the device was last seen), `could not settle the bot's
+  cross-signing identity ... could not remove the bot's old device yLLbqe7oX4: delete device:
+  401`. `DELETE /devices/{id}` skipped user-interactive auth only for an appservice with
+  `io.element.msc4190`; the WhatsApp and Signal bridges set it, the legacy iMessage bridge does
+  not, so its stale device stayed and the instance's identity step kept failing (backing off).
+
+**Fix** (`hs-auth`, `crates/hs-auth/src/routes/devices.rs`; the coordinator's assignment, one
+function): `skips_uia_to_delete_devices` is true for any appservice requester, MSC4190 or not,
+for `DELETE /devices/{id}` and `POST /delete_devices`, as Synapse decides it
+(`requester.app_service_id` in `DeviceRestServlet` and `DeleteDevicesRestServlet`; read, not
+copied). Creating a device with `PUT /devices/{id}` stays MSC4190's. An appservice could already
+log in as any of its users, so this grants nothing it could not do; a double-puppeting
+registration's owner is in that set, as in Synapse.
+
+**Key counts unchanged.** Counting a device without keys stays (it is what makes an MSC4190
+bridge upload its first keys, 2026-10-12, and it is Synapse's behaviour); a deleted device's keys
+are removed by `hs-e2e`'s notifier, so a removed device stops being counted.
+
+**Tests.** `hs-auth`: `an_appservice_without_msc4190_removes_its_users_device_without_uia`,
+`an_appservice_without_msc4190_bulk_removes_devices_without_uia`,
+`an_appservice_without_msc4190_still_cannot_create_a_device`,
+`a_user_still_needs_uia_to_bulk_remove_devices`. Real binary (`hs-cli --test
+appservice_ephemeral`):
+`a_legacy_bridge_bots_left_behind_device_is_removed_and_no_longer_counted`: a registration
+without MSC4190, the bot logged in twice, keys for the second device only; the transaction counts
+both (0 and 2); `DELETE /devices/{first}?user_id=<bot>` with the appservice token succeeds; the
+bot's `/devices` lists one; the next transaction counts only the device in use.
+
+**Operator.** None needed after a roll: the manager's next look at the instance removes
+`yLLbqe7oX4` (logged at `INFO`, "removed a device the bridge bot no longer uses", and listed in
+the instance's `removed_bot_devices`), the instance's identity reason clears, and the warning
+stops. To remove it before a roll: admin UI, Users, `@imessagebot_brandon:myelin.dacrib.net`,
+Devices, `yLLbqe7oX4`, Sign out (or `POST /api/v1/users/@imessagebot_brandon:myelin.dacrib.net/devices/bulk-delete`
+with `{"device_ids": ["yLLbqe7oX4"]}`). Never `h7ijM5DMbF`.
+
+**Next.** Compute a transaction's MSC3202 counts when it is sent, not when it is queued (Synapse's
+`_compute_msc3202_otk_counts_and_fallback_keys` runs in the sender), so a bridge draining a
+backlog is told its devices' counts as they are, not as they were hours before.
 
 ## Session 2026-10-14 (branch `agent/ephemeral-prune`): the ephemeral pump's prune no longer spins on a refused transaction
 

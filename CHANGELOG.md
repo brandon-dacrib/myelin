@@ -15,6 +15,12 @@ carries the generated notes for that merge.
 
 ## Unreleased
 
+- **A legacy bridge's left-behind bot device is removed.** An appservice now removes its users'
+  devices (`DELETE /devices/{id}`, `POST /delete_devices`) without user-interactive auth whether
+  or not it sets MSC4190, as Synapse allows. The bridge manager's cleanup of a bot device a
+  bridge no longer uses failed with `401` for mautrix-imessage, which logs its bot in instead of
+  using MSC4190, so the stale device stayed and the bridge logged "Dropping OTK counts targeted to
+  someone else" on every transaction. Verified against the real binary.
 - **The bridge pump no longer spins on a stream it cannot prune.** Once more than 10,000
   receipts, presence changes or to-device messages waited to be pruned, the store refused the
   single delete every time and the appservice ephemeral pump retried it four times a second,

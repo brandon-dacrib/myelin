@@ -4,6 +4,21 @@ Written 2026-09-20 by the integration lead, last revised 2026-10-14 (the ephemer
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
+## 2026-10-14, later -- the iMessage bridge's "Dropping OTK counts targeted to someone else" is a left-behind bot device the manager could not remove; the fix is `agent/otk-counts-device`
+
+The bridge's crypto device is `h7ijM5DMbF` and it is told its counts (it uploaded 50 keys on
+2026-10-13 when told 0). The warning is for `yLLbqe7oX4`, a keyless bot device a crashed start's
+`/login` left on 2026-10-13; the server counts every device of the bot, as Synapse does. The
+manager tried to remove it once it was a day unseen and got `401` (Loki, 18:10:41Z): `DELETE
+/devices/{id}` skipped user-interactive auth only for MSC4190 appservices, and the legacy
+iMessage bridge is not one. **The fix** (`hs-auth`, status 11): any appservice removes its users'
+devices without UIA, as in Synapse. **After the roll**: the manager logs `removed a device the
+bridge bot no longer uses ... device=yLLbqe7oX4 kept_device=h7ijM5DMbF`, the warning stops. Or
+now, by hand: admin UI, Users, `@imessagebot_brandon`, Devices, `yLLbqe7oX4`, Sign out.
+**Follow-up**: MSC3202 counts are computed when a transaction is queued, so a drained backlog
+tells a bridge stale counts (2026-10-13's 16-minute drain counted only `@brandon`); Synapse
+computes them at send time.
+
 ## Resume here: 2026-10-14 -- the overnight liveness kills; a refused prune spun the ephemeral pump; the fix is `agent/ephemeral-prune`
 
 0.3.10 was liveness-killed four times overnight (04:46-04:52 and 10:46 UTC) with federation off

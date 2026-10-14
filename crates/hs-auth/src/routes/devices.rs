@@ -135,9 +135,7 @@ pub async fn put_device(
 }
 
 /// `DELETE /devices/{deviceId}`: requires UIA re-authentication (the body carries `auth`), unless
-/// the requester is an MSC4190-enabled appservice (`requester.appservice.msc4190_enabled`, per
-/// `docs/rfcs/0009-appservice-identity-capability-flags.md`), which skips it — a masqueraded
-/// appservice user has no credentials of its own to re-authenticate with.
+/// the requester is an appservice ([`skips_uia_to_delete_devices`]).
 pub async fn delete_device(
     State(state): State<AuthState>,
     requester: Requester,
@@ -145,12 +143,8 @@ pub async fn delete_device(
     raw_body: Bytes,
 ) -> Result<Response, MatrixError> {
     let body = parse_optional_json_body(&raw_body)?;
-    let msc4190 = requester
-        .appservice
-        .as_ref()
-        .is_some_and(|a| a.msc4190_enabled);
     let operation = format!("DELETE /devices/{device_id}");
-    if !msc4190
+    if !skips_uia_to_delete_devices(&requester)
         && let Some(response) =
             reauth::run_for_operation(&state, &requester, &body, &operation).await?
     {
@@ -177,15 +171,34 @@ pub async fn delete_device(
     Ok(Json(json!({})).into_response())
 }
 
-/// `POST /delete_devices`: bulk delete, also requires UIA.
+/// Whether a device deletion by `requester` skips user-interactive auth: it does for any
+/// appservice acting as one of its users, MSC4190 flag or not, as Synapse decides it
+/// (`requester.app_service_id` in `synapse/rest/client/devices.py`'s `DeviceRestServlet` and
+/// `DeleteDevicesRestServlet`). A masqueraded user has no credentials of its own to
+/// re-authenticate with, and an appservice that may log in as the user (`/login` with
+/// `m.login.application_service`) may as well remove the device such a login left behind. The
+/// server's bridge manager depends on it: it removes the devices a bridge's bot no longer uses
+/// with the bridge's own token, and a legacy mautrix bridge, which logs its bot in rather than
+/// setting `io.element.msc4190`, otherwise kept its stale device forever (`401`), and was sent
+/// that device's MSC3202 key counts in every transaction ("Dropping OTK counts targeted to
+/// someone else"). Creating a device (`PUT /devices/{deviceId}` on an unknown id) stays MSC4190's
+/// alone, as it is in Synapse.
+#[must_use]
+pub fn skips_uia_to_delete_devices(requester: &Requester) -> bool {
+    requester.appservice.is_some()
+}
+
+/// `POST /delete_devices`: bulk delete, also requires UIA unless the requester is an appservice
+/// ([`skips_uia_to_delete_devices`]).
 pub async fn post_delete_devices(
     State(state): State<AuthState>,
     requester: Requester,
     raw_body: Bytes,
 ) -> Result<Response, MatrixError> {
     let body = parse_optional_json_body(&raw_body)?;
-    if let Some(response) =
-        reauth::run_for_operation(&state, &requester, &body, "POST /delete_devices").await?
+    if !skips_uia_to_delete_devices(&requester)
+        && let Some(response) =
+            reauth::run_for_operation(&state, &requester, &body, "POST /delete_devices").await?
     {
         return Ok(response);
     }
@@ -582,6 +595,96 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// An appservice that logs its users in (`m.login.application_service`) and never set
+    /// `io.element.msc4190`: a legacy mautrix bridge, as the demo's iMessage bridge is.
+    fn legacy_appservice_requester(user_id: ruma::OwnedUserId) -> Requester {
+        let mut requester = msc4190_appservice_requester(user_id);
+        if let Some(appservice) = requester.appservice.as_mut() {
+            appservice.msc4190_enabled = false;
+        }
+        requester
+    }
+
+    #[tokio::test]
+    async fn an_appservice_without_msc4190_removes_its_users_device_without_uia() {
+        let (state, notifier) = state_with_recording_notifier();
+        let (state, requester, did) = state_with_device_using(state).await;
+        let requester = legacy_appservice_requester(requester.user_id.clone());
+        let response = delete_device(
+            State(state.clone()),
+            requester.clone(),
+            Path(did.to_string()),
+            Bytes::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            state
+                .store
+                .get_device(&requester.user_id, &did)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // The notifier is what removes the device's keys (hs-e2e), so it must hear of it.
+        assert_eq!(notifier.0.lock().unwrap().as_slice(), &[requester.user_id]);
+    }
+
+    #[tokio::test]
+    async fn an_appservice_without_msc4190_bulk_removes_devices_without_uia() {
+        let (state, requester, did) = state_with_device().await;
+        let requester = legacy_appservice_requester(requester.user_id.clone());
+        let body = json!({"devices": [did.to_string()]});
+        let response =
+            post_delete_devices(State(state.clone()), requester.clone(), body_bytes(body))
+                .await
+                .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            state
+                .store
+                .list_devices(&requester.user_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_appservice_without_msc4190_still_cannot_create_a_device() {
+        let (state, requester, _) = state_with_device().await;
+        let requester = legacy_appservice_requester(requester.user_id.clone());
+        let err = put_device(
+            State(state),
+            requester,
+            Path("NEWDEV".to_string()),
+            PermissiveJson(json!({})),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_user_still_needs_uia_to_bulk_remove_devices() {
+        let (state, requester, did) = state_with_device().await;
+        let body = json!({"devices": [did.to_string()]});
+        let response =
+            post_delete_devices(State(state.clone()), requester.clone(), body_bytes(body))
+                .await
+                .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            state
+                .store
+                .get_device(&requester.user_id, &did)
+                .await
+                .unwrap()
+                .is_some()
         );
     }
 

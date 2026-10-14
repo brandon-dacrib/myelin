@@ -1057,6 +1057,175 @@ async fn a_bridge_device_made_without_keys_is_told_it_has_none() {
     let _ = server.stop();
 }
 
+/// A legacy mautrix bridge (no `io.element.msc4190`) logs its bot in with
+/// `m.login.application_service` each time it starts without a crypto account. One that stops
+/// before saving its account (the demo's iMessage bridge, 2026-10-13) leaves a device with no
+/// keys behind, and every transaction counts that device too, as Synapse counts it: the bridge
+/// drops those counts ("Dropping OTK counts targeted to someone else"), its own device's beside
+/// them reach it. The server's bridge manager removes such a device with the bridge's own token;
+/// that `DELETE` needed user-interactive auth from an appservice without MSC4190 (`401`), so the
+/// device stayed. It succeeds now, as in Synapse, and the next transaction counts the device the
+/// bridge uses and nothing else.
+#[tokio::test]
+async fn a_legacy_bridge_bots_left_behind_device_is_removed_and_no_longer_counted() {
+    let dir = tempfile::tempdir().unwrap();
+    let (bridge_url, bridge) = stand_in().await;
+    let registration_path = dir.path().join("registration.yaml");
+    std::fs::write(&registration_path, registration_yaml(&bridge_url)).unwrap();
+    let port = reserve_port();
+    let data_dir = dir.path().join("data");
+    let config_path = dir.path().join("hs.yaml");
+    std::fs::write(
+        &config_path,
+        config_yaml(port, &data_dir, &registration_path),
+    )
+    .unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let mut server = HsProcess::serve(&config_path);
+    let _ = admin_token_of(&mut server, &client, &base).await;
+
+    let alice = register(&client, &base, "alice").await;
+    let registered: Value = client
+        .post(format!("{base}/_matrix/client/v3/register"))
+        .bearer_auth(AS_TOKEN)
+        .json(&json!({
+            "type": "m.login.application_service",
+            "username": "bridgebot",
+            "inhibit_login": true,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let bot_id = "@bridgebot:example.org";
+    assert_eq!(registered["user_id"], bot_id, "{registered}");
+    // Two starts of the bridge, each logging the bot in: the first never got as far as keys.
+    let login = || async {
+        let session: Value = client
+            .post(format!("{base}/_matrix/client/v3/login"))
+            .bearer_auth(AS_TOKEN)
+            .json(&json!({
+                "type": "m.login.application_service",
+                "identifier": {"type": "m.id.user", "user": bot_id},
+                "initial_device_display_name": "iMessage bridge",
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let device = session["device_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{session}"))
+            .to_owned();
+        let token = session["access_token"].as_str().unwrap().to_owned();
+        (device, token)
+    };
+    let (left_behind, _) = login().await;
+    let (in_use, in_use_token) = login().await;
+    assert_ne!(left_behind, in_use);
+    let own = Caller {
+        client: client.clone(),
+        base: base.clone(),
+        token: in_use_token,
+        masquerade: None,
+    };
+    let (status, body) = own
+        .call(
+            reqwest::Method::POST,
+            "/_matrix/client/v3/keys/upload",
+            Some(json!({
+                "device_keys": device_keys(bot_id, &in_use),
+                "one_time_keys": {
+                    "signed_curve25519:AAAAAA": {"key": "k1", "signatures": {}},
+                    "signed_curve25519:AAAAAB": {"key": "k2", "signatures": {}},
+                },
+            })),
+        )
+        .await;
+    assert!(status.is_success(), "{status} {body}");
+
+    let bot = Caller {
+        client: client.clone(),
+        base: base.clone(),
+        token: AS_TOKEN.to_owned(),
+        masquerade: Some(bot_id.to_owned()),
+    };
+    let created = alice
+        .matrix(
+            reqwest::Method::POST,
+            "/createRoom",
+            Some(json!({"preset": "private_chat", "invite": [bot_id]})),
+        )
+        .await;
+    let room_id = created["room_id"].as_str().unwrap().to_owned();
+    bot.matrix(
+        reqwest::Method::POST,
+        &format!("/join/{}", escape(&room_id)),
+        None,
+    )
+    .await;
+    // The bot's devices in the newest transaction that counts the bot's keys.
+    let counted = |bridge: &StandIn| -> Option<Vec<String>> {
+        bridge.transactions().iter().rev().find_map(|txn| {
+            txn["device_one_time_keys_count"][bot_id]
+                .as_object()
+                .map(|devices| devices.keys().cloned().collect())
+        })
+    };
+    alice.say(&room_id, "before").await;
+    until("both of the bot's devices were counted", || async {
+        counted(&bridge).is_some_and(|devices| devices.len() == 2)
+    })
+    .await;
+    let txns = bridge.transactions();
+    let latest = txns
+        .iter()
+        .rev()
+        .find(|txn| txn["device_one_time_keys_count"][bot_id].is_object())
+        .unwrap();
+    assert_eq!(
+        latest["device_one_time_keys_count"][bot_id][&left_behind]["signed_curve25519"], 0,
+        "{latest}"
+    );
+    assert_eq!(
+        latest["device_one_time_keys_count"][bot_id][&in_use]["signed_curve25519"], 2,
+        "{latest}"
+    );
+
+    // What the bridge manager does: remove it with the appservice's token, acting as the bot.
+    let (status, body) = bot
+        .call(
+            reqwest::Method::DELETE,
+            &format!("/_matrix/client/v3/devices/{left_behind}"),
+            None,
+        )
+        .await;
+    assert!(
+        status.is_success(),
+        "an appservice removes its bot's device without UIA: {status} {body}"
+    );
+    let listed = bot.matrix(reqwest::Method::GET, "/devices", None).await;
+    let listed: Vec<&str> = listed["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|d| d["device_id"].as_str())
+        .collect();
+    assert_eq!(listed, vec![in_use.as_str()]);
+
+    alice.say(&room_id, "after").await;
+    until("only the device the bridge uses is counted", || async {
+        counted(&bridge).is_some_and(|devices| devices == vec![in_use.clone()])
+    })
+    .await;
+    let _ = server.stop();
+}
+
 /// `user`'s `device` as `/keys/query` lists it, asked as `caller`.
 async fn queried_device(caller: &Caller, user: &str, device: &str) -> Value {
     caller
