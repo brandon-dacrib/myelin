@@ -1218,6 +1218,11 @@ impl<B: KvBackend> RoomActor<B> {
         actor.store.log_open_summary(room_id);
         actor.warm_cache();
         crate::metrics::observe_room_load(started.elapsed(), replay);
+        // On the registry's `room.load.from_store` span, when the load runs in one.
+        let span = tracing::Span::current();
+        span.record("timeline_events", actor.timeline.len());
+        span.record("replayed", replay);
+        span.record("state_records_fed", fed);
         tracing::debug!(
             room_id = %room_id,
             timeline = actor.timeline.len(),
@@ -7010,17 +7015,67 @@ impl<B: KvBackend> RoomActorHandle<B> {
         T: Send + 'static,
         F: FnOnce(&mut RoomActor<B>) -> T + Send + 'static,
     {
+        self.with_actor_named(op_name::<F>(), f).await
+    }
+
+    /// [`RoomActorHandle::with_actor`], traced as `op`.
+    ///
+    /// Each call is a `room.actor` span named `room <op>` (the function the closure was written
+    /// in: `send_event`, or a caller's own function for [`RoomActorHandle::query`]), with the
+    /// room's id, and two child spans that say where the time went before the work began:
+    /// `room.actor.blocking_wait`, waiting for a blocking thread, and `room.actor.lock_wait`,
+    /// waiting for the room's lock (another operation on the same room). The work itself is the
+    /// rest of the parent span, and whatever spans it opens are its children.
+    async fn with_actor_named<T, F>(&self, op: &'static str, f: F) -> T
+    where
+        B: 'static,
+        T: Send + 'static,
+        F: FnOnce(&mut RoomActor<B>) -> T + Send + 'static,
+    {
         let inner = self.inner.clone();
+        // Only inside something already traced (a request, a hub update, a background pass):
+        // an operation with nothing around it would be a one-span trace of its own, and the
+        // search indexer and the pumps make thousands of those.
+        let traced = !tracing::Span::current().is_none();
+        let span = if traced {
+            tracing::info_span!(
+                "room.actor",
+                op,
+                "otel.name" = format_args!("room {op}"),
+                room_id = tracing::field::Empty,
+            )
+        } else {
+            tracing::Span::none()
+        };
+        let blocking_wait = if traced {
+            tracing::info_span!(parent: &span, "room.actor.blocking_wait")
+        } else {
+            tracing::Span::none()
+        };
+        let work_span = span.clone();
         // `spawn_blocking` needs a `'static` future; we hold the `tokio::sync::Mutex` guard only
         // inside the blocking closure, never across an `.await`.
-        tokio::task::spawn_blocking(move || {
-            let mut guard = inner.blocking_lock();
+        let task = tokio::task::spawn_blocking(move || {
+            drop(blocking_wait);
+            let _in_span = work_span.enter();
+            let mut guard = {
+                let _waiting = if traced {
+                    tracing::info_span!("room.actor.lock_wait").entered()
+                } else {
+                    tracing::Span::none().entered()
+                };
+                inner.blocking_lock()
+            };
+            if traced {
+                work_span.record("room_id", guard.room_id().as_str());
+            }
             // Release what the previous operation's reads pinned (`working_set`).
             guard.begin_operation();
             f(&mut guard)
-        })
-        .await
-        .expect("room actor task panicked")
+        });
+        tracing::Instrument::instrument(task, span)
+            .await
+            .expect("room actor task panicked")
     }
 
     /// `crate::protocol`'s `send_event` command.
@@ -7406,8 +7461,38 @@ impl<B: KvBackend> RoomActorHandle<B> {
         T: Send + 'static,
         F: FnOnce(&RoomActor<B>) -> T + Send + 'static,
     {
-        self.with_actor(move |actor| f(actor)).await
+        self.with_actor_named(op_name::<F>(), move |actor| f(actor))
+            .await
     }
+}
+
+/// The function a closure of type `F` was written in, for naming a span after it:
+/// `hs_user::hub::SessionHub<B, R>::apply_room_update::{{closure}}::{{closure}}` is
+/// `apply_room_update`. Read from [`std::any::type_name`], which is meant for diagnostics and
+/// promises no format; anything this cannot take apart is named whole.
+fn op_name<F>() -> &'static str {
+    let mut name = std::any::type_name::<F>();
+    while let Some(outer) = name.strip_suffix("::{{closure}}") {
+        name = outer;
+    }
+    // A generic function's own arguments: `build<hs_kv::memory::MemoryBackend, ...>`.
+    if name.ends_with('>') {
+        let mut depth = 0usize;
+        for (i, c) in name.char_indices().rev() {
+            match c {
+                '>' => depth += 1,
+                '<' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        name = &name[..i];
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    name.rsplit("::").next().unwrap_or(name)
 }
 
 #[cfg(test)]
@@ -7416,6 +7501,29 @@ mod tests {
     use hs_kv::memory::MemoryBackend;
     use proptest::prelude::*;
     use ruma::{RoomVersionId, user_id};
+
+    #[test]
+    fn a_room_operation_is_named_after_the_function_its_closure_was_written_in() {
+        fn generic_caller<T: Default>() -> &'static str {
+            fn named<F>(_: &F) -> &'static str {
+                op_name::<F>()
+            }
+            let f = || T::default();
+            named(&f)
+        }
+        let f = |_: &u8| ();
+        fn named<F>(_: &F) -> &'static str {
+            op_name::<F>()
+        }
+        assert_eq!(
+            named(&f),
+            "a_room_operation_is_named_after_the_function_its_closure_was_written_in"
+        );
+        assert_eq!(
+            generic_caller::<Vec<std::collections::HashMap<u8, u8>>>(),
+            "generic_caller"
+        );
+    }
 
     pub(super) fn room(preset: &str) -> RoomActor<MemoryBackend> {
         let backend = MemoryBackend::new();

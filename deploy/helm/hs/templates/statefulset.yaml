@@ -105,6 +105,19 @@ spec:
             - name: HS__SERVER__PUBLIC_BASEURL
               value: {{ .Values.publicBaseUrl | quote }}
             {{- end }}
+            {{- if .Values.telemetry.tracing.enabled }}
+            ## Trace export, pinned through the environment for the reason above: the ConfigMap's
+            ## `telemetry.tracing` seeds the database once, on the first start, and the database
+            ## outranks it after that, so turning tracing on in the values of an installed release
+            ## did nothing until these (2026-10-14). Only when it is on: with it off, the setting
+            ## is the database's, and the admin interface can turn it on.
+            - name: HS__TELEMETRY__TRACING__ENABLED
+              value: "true"
+            - name: HS__TELEMETRY__TRACING__OTLP_ENDPOINT
+              value: {{ required "telemetry.tracing.otlpEndpoint is required when telemetry.tracing.enabled is true (e.g. http://otel-collector.monitoring:4317, OTLP over gRPC)" .Values.telemetry.tracing.otlpEndpoint | quote }}
+            - name: HS__TELEMETRY__TRACING__SAMPLE_RATIO
+              value: {{ .Values.telemetry.tracing.sampleRatio | quote }}
+            {{- end }}
             {{- if .Values.secrets.signingKey.existingSecret }}
             ## A *directory*, not a file: the loader (crates/hs-cli/src/identity.rs) reads every
             ## regular file in it, Synapse-style, for the first parseable key. Pointing it at a

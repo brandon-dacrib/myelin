@@ -315,7 +315,12 @@ pub async fn verify_x_matrix(
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    match do_verify(&ctx, req).await {
+    // The request's own span (`hs_telemetry::RequestIdLayer`) is told who the request claims
+    // to be from; the verification, whose key lookup can mean a fetch from the origin or a
+    // notary, is a span of its own.
+    let request_span = tracing::Span::current();
+    let verifying = tracing::info_span!("federation.authenticate");
+    match tracing::Instrument::instrument(do_verify(&ctx, req, &request_span), verifying).await {
         Ok(req) => next.run(req).await,
         Err(e) => e.into_response(),
     }
@@ -342,8 +347,13 @@ fn signed_uri(req: &Request<Body>) -> String {
         .map_or_else(|| uri.to_string(), |pq| pq.as_str().to_string())
 }
 
-async fn do_verify(ctx: &XMatrixContext, req: Request<Body>) -> Result<Request<Body>, VerifyError> {
+async fn do_verify(
+    ctx: &XMatrixContext,
+    req: Request<Body>,
+    request_span: &tracing::Span,
+) -> Result<Request<Body>, VerifyError> {
     let auth = parse_x_matrix_header(req.headers()).map_err(VerifyError::Parse)?;
+    request_span.record("matrix.origin", auth.origin.as_str());
     // A server name's port is a number: `localhost:http` names nothing a key could be fetched
     // from (Sytest's "Non-numeric ports in server names are rejected").
     if ruma::ServerName::parse(&auth.origin).is_err() {
@@ -367,11 +377,12 @@ async fn do_verify(ctx: &XMatrixContext, req: Request<Body>) -> Result<Request<B
         Some(serde_json::from_slice(&bytes).map_err(|_| VerifyError::BadJsonBody)?)
     };
 
-    let verifying_key = ctx
-        .key_cache
-        .get_current(&auth.origin, &auth.key_id)
-        .await
-        .map_err(VerifyError::KeyLookup)?;
+    let verifying_key = tracing::Instrument::instrument(
+        ctx.key_cache.get_current(&auth.origin, &auth.key_id),
+        tracing::info_span!("federation.origin_key", key_id = %auth.key_id),
+    )
+    .await
+    .map_err(VerifyError::KeyLookup)?;
 
     let mut object = signing_object(
         &method,

@@ -285,6 +285,25 @@ impl Default for ClientConfig {
     }
 }
 
+/// The endpoint a federation path names, for a span's name: its first four segments, without
+/// the ids and query after them (`/_matrix/federation/v1/send/1234` is
+/// `/_matrix/federation/v1/send`, `/_matrix/key/v2/query` stays as it is).
+fn endpoint_of(path: &str) -> &str {
+    let path = path.split('?').next().unwrap_or(path);
+    let mut end = path.len();
+    let mut slashes = 0;
+    for (i, c) in path.char_indices() {
+        if c == '/' {
+            slashes += 1;
+            if slashes == 5 {
+                end = i;
+                break;
+            }
+        }
+    }
+    &path[..end]
+}
+
 /// `error`'s message followed by every cause underneath it. `reqwest::Error`'s own `Display`
 /// says only "error sending request for url (...)"; the reason -- a certificate rejected for its
 /// name, a refused connection, a resolver with no answer -- is in its source chain, and a
@@ -443,6 +462,48 @@ impl FederationClient {
         path: &str,
         body: Option<&serde_json::Value>,
     ) -> Result<FederationResponse, ClientError> {
+        // A client span named by the endpoint (`PUT /_matrix/federation/v1/send`), not the
+        // whole path, which carries ids; its children are the wait for a slot to the
+        // destination, resolving it, and the HTTP exchange.
+        let span = tracing::info_span!(
+            "federation.request",
+            "otel.name" = format_args!("{method} {}", endpoint_of(path)),
+            "otel.kind" = "client",
+            destination,
+            "http.request.method" = method,
+            "http.response.status_code" = tracing::field::Empty,
+            "otel.status_code" = tracing::field::Empty,
+            "error.message" = tracing::field::Empty,
+        );
+        let result = tracing::Instrument::instrument(
+            self.send_traced(destination, method, path, body),
+            span.clone(),
+        )
+        .await;
+        match &result {
+            Ok(response) => {
+                span.record("http.response.status_code", response.status);
+                if response.status >= 500 {
+                    span.record("otel.status_code", "error");
+                }
+            }
+            Err(ClientError::Backoff { .. } | ClientError::Disabled) => {}
+            Err(error) => {
+                span.record("otel.status_code", "error");
+                span.record("error.message", tracing::field::display(error));
+            }
+        }
+        result
+    }
+
+    /// [`FederationClient::send`]'s body, inside its span.
+    async fn send_traced(
+        &self,
+        destination: &str,
+        method: &str,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<FederationResponse, ClientError> {
         if !self.config.enabled {
             return Err(ClientError::Disabled);
         }
@@ -460,11 +521,12 @@ impl FederationClient {
         }
 
         let waited_from = std::time::Instant::now();
-        let permit = self
-            .semaphore_for(destination)
-            .acquire_owned()
-            .await
-            .expect("semaphore is never closed");
+        let permit = tracing::Instrument::instrument(
+            self.semaphore_for(destination).acquire_owned(),
+            tracing::info_span!("federation.request.slot_wait"),
+        )
+        .await
+        .expect("semaphore is never closed");
         let waited = waited_from.elapsed();
         if waited >= SLOW_PERMIT_WAIT {
             tracing::info!(
@@ -513,11 +575,14 @@ impl FederationClient {
         body: Option<&serde_json::Value>,
         signed: bool,
     ) -> Result<reqwest::RequestBuilder, ClientError> {
-        let outcome = discovery::resolve(
-            destination,
-            self.well_known.as_ref(),
-            self.srv.as_ref(),
-            self.addr.as_ref(),
+        let outcome = tracing::Instrument::instrument(
+            discovery::resolve(
+                destination,
+                self.well_known.as_ref(),
+                self.srv.as_ref(),
+                self.addr.as_ref(),
+            ),
+            tracing::info_span!("federation.resolve", destination),
         )
         .await
         .map_err(|e| ClientError::Discovery(destination.to_string(), e.to_string()))?;
@@ -587,15 +652,23 @@ impl FederationClient {
             .build_request(destination, method, path, body, true)
             .await?;
 
-        let response = request
-            .send()
-            .await
-            .map_err(|e| ClientError::Request(destination.to_string(), error_chain(&e)))?;
-        let status = response.status().as_u16();
-
-        let bytes = read_capped(response, MAX_RESPONSE_BODY_BYTES)
-            .await
-            .ok_or_else(|| ClientError::ResponseTooLarge(destination.to_string()))?;
+        let exchange = async {
+            let response = request
+                .send()
+                .await
+                .map_err(|e| ClientError::Request(destination.to_string(), error_chain(&e)))?;
+            let status = response.status().as_u16();
+            let bytes = read_capped(response, MAX_RESPONSE_BODY_BYTES)
+                .await
+                .ok_or_else(|| ClientError::ResponseTooLarge(destination.to_string()))?;
+            Ok::<_, ClientError>((status, bytes))
+        };
+        // Timed by a span held around the exchange rather than entered in it: the exchange
+        // runs outside every span (`hs_telemetry::outside_spans`), or the connection task it
+        // may spawn would hold this request's spans open for as long as the connection lives.
+        let http_span = tracing::info_span!("federation.http");
+        let (status, bytes) = hs_telemetry::outside_spans(exchange).await?;
+        drop(http_span);
 
         let parsed = if bytes.is_empty() {
             serde_json::Value::Null
@@ -914,8 +987,8 @@ impl FederationClient {
         let request = self
             .build_request(destination, "GET", path, None, signed)
             .await?;
-        let mut response = request
-            .send()
+        // Outside every span: see `send_inner`.
+        let mut response = hs_telemetry::outside_spans(request.send())
             .await
             .map_err(|e| ClientError::Request(destination.to_string(), error_chain(&e)))?;
         let status = response.status().as_u16();
@@ -1069,6 +1142,30 @@ mod tests {
     use crate::discovery::WellKnownOutcome;
     use async_trait::async_trait;
     use hs_testkit::fake_federation::FakeFederationPeer;
+
+    #[test]
+    fn a_request_span_is_named_by_its_endpoint_not_its_ids() {
+        assert_eq!(
+            endpoint_of("/_matrix/federation/v1/send/1234"),
+            "/_matrix/federation/v1/send"
+        );
+        assert_eq!(
+            endpoint_of("/_matrix/federation/v1/user/devices/@a:b"),
+            "/_matrix/federation/v1/user"
+        );
+        assert_eq!(
+            endpoint_of("/_matrix/federation/v1/backfill/!r:b?limit=10&v=$e"),
+            "/_matrix/federation/v1/backfill"
+        );
+        assert_eq!(
+            endpoint_of("/_matrix/key/v2/query"),
+            "/_matrix/key/v2/query"
+        );
+        assert_eq!(
+            endpoint_of("/_matrix/federation/v1/version"),
+            "/_matrix/federation/v1/version"
+        );
+    }
 
     /// A room-version-3 event ID is standard base64 and may carry `/`, `+` and `=`: in a path
     /// segment only the `/` (and anything else outside `pchar`) is encoded; in a query value `+`

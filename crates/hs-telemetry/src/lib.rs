@@ -28,6 +28,7 @@ pub mod error;
 pub mod init;
 pub mod metrics;
 pub mod request_id;
+pub mod spans;
 
 #[cfg(feature = "otlp")]
 mod otlp;
@@ -38,5 +39,6 @@ pub use error::TelemetryError;
 pub use init::{Guard, Level, LogFormat, LogLevelHandle, Options, init};
 pub use metrics::{EncodeInFlight, HttpLabels, Metrics, TimedCollector};
 pub use request_id::{
-    REQUEST_ID_HEADER, RequestIdLayer, RequestIdService, request_id_from_headers,
+    REQUEST_ID_HEADER, RequestIdLayer, RequestIdService, record_route, request_id_from_headers,
 };
+pub use spans::outside_spans;

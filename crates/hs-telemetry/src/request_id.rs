@@ -85,16 +85,18 @@ where
             req.headers_mut().insert(REQUEST_ID_HEADER.clone(), value);
         }
 
-        let span = tracing::info_span!("request", request_id = %request_id);
+        let span = request_span(&req, &request_id);
         let response_id = request_id.clone();
         let fut = {
-            let _entered = span.clone();
+            let _entered = span.enter();
             self.inner.call(req)
         };
 
+        let record_on = span.clone();
         Box::pin(tracing::Instrument::instrument(
             async move {
                 let mut response = fut.await?;
+                record_status(&record_on, response.status());
                 if let Ok(value) = HeaderValue::from_str(&response_id) {
                     response
                         .headers_mut()
@@ -104,6 +106,90 @@ where
             },
             span,
         ))
+    }
+}
+
+/// The fields of the span every request runs in, by name. A span's field must be declared when
+/// the span is made for a later `record` to land, so these are all declared (most of them empty)
+/// by [`RequestIdService`]; code further in fills them with `tracing::Span::current().record(..)`.
+/// Named after OpenTelemetry's HTTP semantic conventions where one exists.
+pub mod fields {
+    /// The request id ([`super::REQUEST_ID_HEADER`]).
+    pub const REQUEST_ID: &str = "request_id";
+    /// `GET`, `PUT`, ...
+    pub const METHOD: &str = "http.request.method";
+    /// The matched route template (`/_matrix/client/v3/rooms/{roomId}/send/...`), never the raw
+    /// path. Recorded by whatever routes the request (`hs-cli`'s metrics middleware).
+    pub const ROUTE: &str = "http.route";
+    /// The response's status code.
+    pub const STATUS: &str = "http.response.status_code";
+    /// The authenticated Matrix user, for a client or admin request.
+    pub const USER_ID: &str = "matrix.user_id";
+    /// The authenticated origin server, for a federation request.
+    pub const ORIGIN: &str = "matrix.origin";
+    /// The OpenTelemetry span name (`GET /_matrix/client/v3/sync`), `tracing-opentelemetry`'s
+    /// special field.
+    pub const OTEL_NAME: &str = "otel.name";
+}
+
+/// Makes the span a request runs in: a root span (or the child of the caller's span, when the
+/// request carries a W3C `traceparent` and OTLP export is compiled in) of kind `server`, named
+/// by its method until the router names its route ([`record_route`]).
+fn request_span<B>(req: &Request<B>, request_id: &str) -> tracing::Span {
+    let method = req.method().as_str();
+    let span = tracing::info_span!(
+        parent: None,
+        "request",
+        request_id = %request_id,
+        "http.request.method" = method,
+        "http.route" = tracing::field::Empty,
+        "http.response.status_code" = tracing::field::Empty,
+        "matrix.user_id" = tracing::field::Empty,
+        "matrix.origin" = tracing::field::Empty,
+        "otel.name" = method,
+        "otel.kind" = "server",
+        "otel.status_code" = tracing::field::Empty,
+        "error.type" = tracing::field::Empty,
+    );
+    #[cfg(feature = "otlp")]
+    if !span.is_disabled() {
+        crate::otlp::continue_remote_trace(req.headers(), &span);
+        // An attribute of the exported span only, not a field: it would otherwise be repeated
+        // on every log line the request writes.
+        tracing_opentelemetry::OpenTelemetrySpanExt::set_attribute(
+            &span,
+            "url.path",
+            req.uri().path().to_owned(),
+        );
+    }
+    span
+}
+
+/// Records the response's status on the request's span; a 5xx marks the span as failed.
+fn record_status(span: &tracing::Span, status: http::StatusCode) {
+    span.record(fields::STATUS, status.as_u16());
+    if status.is_server_error() {
+        span.record("otel.status_code", "error");
+        span.record("error.type", status.as_str());
+    }
+}
+
+/// Names the current request's route: records [`fields::ROUTE`] and renames the span
+/// `METHOD route`. Call it from inside the router, where the matched template is known, while
+/// the request's span is the current one.
+pub fn record_route(method: &str, route: &str) {
+    let span = tracing::Span::current();
+    let name = format!("{method} {route}");
+    span.record(fields::ROUTE, route);
+    span.record(fields::OTEL_NAME, name.as_str());
+    // `tracing-opentelemetry` takes `otel.name` only until the span has started (been entered,
+    // or had a child), which by the time a request is routed it has; rename the started span.
+    #[cfg(feature = "otlp")]
+    if !span.is_disabled() {
+        use opentelemetry::trace::TraceContextExt as _;
+        tracing_opentelemetry::OpenTelemetrySpanExt::context(&span)
+            .span()
+            .update_name(name);
     }
 }
 

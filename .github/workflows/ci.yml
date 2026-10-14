@@ -63,6 +63,10 @@ jobs:
           # fixing commit needs, and a red run that saves nothing makes the next run a cold build.
           cache-on-failure: true
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # `hs-cli` turns on `hs-telemetry`'s `otlp` feature by default, so the workspace build
+      # never compiles the crate without it; this keeps that configuration (a library user's,
+      # or `hs-cli --no-default-features`) compiling.
+      - run: cargo clippy -p hs-telemetry --all-targets -- -D warnings
 
   test:
     name: test (${{ matrix.arch }})

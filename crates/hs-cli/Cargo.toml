@@ -15,6 +15,13 @@ path = "src/main.rs"
 name = "hs_cli"
 path = "src/lib.rs"
 
+[features]
+default = ["otlp"]
+# OpenTelemetry trace export (OTLP over gRPC) and W3C `traceparent` continuation, compiled into
+# the shipped binary so `telemetry.tracing.enabled` works on every image, CD binary and release
+# (it is still off until configured). `--no-default-features` builds without it.
+otlp = ["hs-telemetry/otlp"]
+
 [dependencies]
 hs-config = { path = "../hs-config" }
 hs-cluster = { path = "../hs-cluster" }

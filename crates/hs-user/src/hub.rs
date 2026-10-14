@@ -2261,7 +2261,13 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
     /// is recorded, so the watchdog can say which room it is stuck on and where.
     async fn handle_room_update(&self, update: RoomUpdate) -> Result<Vec<OwnedUserId>, UserError> {
         let in_hand = self.progress.begin(&update.room_id, update.global_seq);
-        self.apply_room_update(update, &in_hand).await
+        let span = in_hand.span().clone();
+        let result =
+            tracing::Instrument::instrument(self.apply_room_update(update, &in_hand), span).await;
+        if let Err(e) = &result {
+            in_hand.record_error(e);
+        }
+        result
     }
 
     /// Copies what `user_id`'s account data says about `old_room_id` onto `new_room_id`, its

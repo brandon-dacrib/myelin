@@ -2406,11 +2406,40 @@ impl Shared {
             if self.shut_down.load(Ordering::Acquire) {
                 return Delivery::ShutDown;
             }
-            let wait = match self
-                .client
-                .send(destination, "PUT", &path, Some(&body))
-                .await
-            {
+            // One attempt at the transaction is a trace of its own: the sender's workers are
+            // background tasks, not part of any request. The HTTP request is its child.
+            let attempt = tracing::info_span!(
+                parent: None,
+                "federation.transaction",
+                destination,
+                txn_id,
+                pdus = pdus.len(),
+                edus = edus.len(),
+                failures_before = failures,
+                outcome = tracing::field::Empty,
+            );
+            let sent = tracing::Instrument::instrument(
+                self.client.send(destination, "PUT", &path, Some(&body)),
+                attempt.clone(),
+            )
+            .await;
+            attempt.record(
+                "outcome",
+                match &sent {
+                    Ok(response) if (200..300).contains(&response.status) => "accepted",
+                    Ok(_) => "rejected",
+                    Err(ClientError::Backoff { .. }) => "deferred",
+                    Err(
+                        ClientError::Disabled
+                        | ClientError::DomainDenied(_)
+                        | ClientError::IpDenied(_),
+                    ) => "dropped",
+                    Err(ClientError::Discovery(..)) => "unresolvable",
+                    Err(_) => "failed",
+                },
+            );
+            drop(attempt);
+            let wait = match sent {
                 Ok(response) if (200..300).contains(&response.status) => {
                     crate::metrics::record_transaction("accepted");
                     crate::metrics::record_pdus_sent(pdus.len() as u64);

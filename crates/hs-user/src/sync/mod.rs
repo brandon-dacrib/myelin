@@ -625,17 +625,25 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
     user_id: &UserId,
     mut params: SyncParams,
 ) -> Result<(Value, SyncToken), UserError> {
+    use tracing::Instrument as _;
+
     let deadline = Instant::now() + params.timeout;
 
     // Everything published before this request arrived is in the feeds before they are read:
     // see `SessionHub::wait_for_consumed`, and `SessionHub::settle_before_read` for the same
     // promise across replicas. Taken before the long-poll, so a request that then waits for
     // news is not also holding a stale idea of what has already happened.
-    hub.settle_before_read(READ_YOUR_WRITES_WAIT).await;
+    //
+    // The three phases of a `/sync` are spans of their own (`sync.settle`,
+    // `sync.wait_for_news`, `sync.build_batch`), so a slow one's trace says whether it waited
+    // for the session hub, waited for news (as a long-poll should), or spent its time building.
+    hub.settle_before_read(READ_YOUR_WRITES_WAIT)
+        .instrument(tracing::info_span!("sync.settle"))
+        .await;
 
     // An initial sync, or `full_state`, answers at once with everything.
     if params.since.is_none() || params.full_state {
-        return build_batch(hub, e2e, user_id, &params).await;
+        return traced_batch(hub, e2e, user_id, &params).await;
     }
 
     // An incremental sync waits for news, builds a batch, and if the batch has nothing in it
@@ -655,8 +663,9 @@ pub async fn build<B: KvBackend + 'static, R: RoomSource<B>>(
             &params.filter,
             deadline,
         )
+        .instrument(tracing::info_span!("sync.wait_for_news"))
         .await?;
-        let (response, token) = build_batch(hub, e2e, user_id, &params).await?;
+        let (response, token) = traced_batch(hub, e2e, user_id, &params).await?;
         if !response_is_empty(&response) || Instant::now() >= deadline || hub.is_shutting_down() {
             return Ok((response, token));
         }
@@ -688,6 +697,33 @@ fn response_is_empty(response: &Value) -> bool {
         && empty_array(&response["to_device"]["events"])
         && empty_array(&response["device_lists"]["changed"])
         && empty_array(&response["device_lists"]["left"])
+}
+
+/// [`build_batch`] in a `sync.build_batch` span that records whether it was an initial sync and
+/// how many joined rooms the response carries.
+async fn traced_batch<B: KvBackend + 'static, R: RoomSource<B>>(
+    hub: &SessionHub<B, R>,
+    e2e: &Arc<dyn E2eStore>,
+    user_id: &UserId,
+    params: &SyncParams,
+) -> Result<(Value, SyncToken), UserError> {
+    let span = tracing::info_span!(
+        "sync.build_batch",
+        initial = params.since.is_none(),
+        full_state = params.full_state,
+        joined_rooms = tracing::field::Empty,
+    );
+    let result =
+        tracing::Instrument::instrument(build_batch(hub, e2e, user_id, params), span.clone()).await;
+    if let Ok((response, _)) = &result {
+        span.record(
+            "joined_rooms",
+            response["rooms"]["join"]
+                .as_object()
+                .map_or(0, serde_json::Map::len),
+        );
+    }
+    result
 }
 
 /// One `/sync` batch from `params.since` (or from nothing) to now, without waiting: the body

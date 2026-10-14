@@ -280,6 +280,20 @@ telemetry:
     ## `json` (default, for log collectors) or `text` (Synapse-like, for a human tailing logs).
     format: json
     level: info
+  ## OpenTelemetry traces, sent over OTLP/gRPC to a collector (an OpenTelemetry Collector,
+  ## Grafana Alloy, Tempo's own OTLP receiver, Jaeger). Every request is a trace of its own
+  ## (`GET /_matrix/client/v3/sync`, with its route, status, request id and user or origin
+  ## server), with child spans for room loads, the session hub's steps, federation sends and the
+  ## rest; a request carrying a W3C `traceparent` continues its caller's trace. Export is batched
+  ## on a thread of its own with a bounded queue: a collector that is down costs dropped spans,
+  ## never a slower request.
+  ##
+  ## When `enabled`, the three settings are pinned through the pod's environment
+  ## (`HS__TELEMETRY__TRACING__*`), which outranks the database, so turning this on takes effect
+  ## on an installed release's next rollout; when off, the setting is the database's.
+  ##   enabled: true
+  ##   otlpEndpoint: http://otel-collector.monitoring.svc:4317
+  ##   sampleRatio: 0.1   # share of requests traced; a caller's sampled `traceparent` is always kept
   tracing:
     enabled: false
     otlpEndpoint: ""

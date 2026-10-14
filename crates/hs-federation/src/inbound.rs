@@ -19,6 +19,7 @@
 //! `docs/status/06-federation.md` for the RFC this gap needs from track 04.
 
 use std::collections::HashMap;
+use std::ops::ControlFlow;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
@@ -593,200 +594,217 @@ pub async fn process_transaction(
             .and_then(Value::as_str)
             .unwrap_or("$unknown")
             .to_owned();
+        // Each PDU is a span of its own (`federation.pdu`), under the request's: verifying
+        // it, placing it in its room, and fetching what it stands on are its children.
+        let pdu_span = tracing::info_span!(
+            "federation.pdu",
+            event_id = %fallback_id,
+            room_id = pdu.get("room_id").and_then(serde_json::Value::as_str),
+        );
+        let step = tracing::Instrument::instrument(
+            async {
 
-        let Some(room_id) = pdu.get("room_id").and_then(Value::as_str) else {
-            results.insert(fallback_id, serde_json::json!({"error": "missing room_id"}));
-            continue;
-        };
+            let Some(room_id) = pdu.get("room_id").and_then(Value::as_str) else {
+                results.insert(fallback_id, serde_json::json!({"error": "missing room_id"}));
+                return ControlFlow::Continue(());
+            };
 
-        let Some(room_version_str) = rooms.room_version(room_id).await else {
-            // A room this server has never held: ignored, as Synapse ignores it ("Ignoring PDU
-            // for unknown room_id"). Answered with the error it always was.
-            crate::metrics::record_pdu_dropped("unknown_room");
-            tracing::info!(
-                origin,
-                room_id,
-                event_id = %fallback_id,
-                "ignored a PDU received over federation for a room this server does not know"
-            );
-            results.insert(fallback_id, serde_json::json!({"error": "unknown room"}));
-            continue;
-        };
-        let Ok(room_version) = RoomVersionId::try_from(room_version_str.as_str()) else {
-            results.insert(
-                fallback_id,
-                serde_json::json!({"error": "unsupported room version"}),
-            );
-            continue;
-        };
-
-        // The room's server ACL, once per room per transaction: a PDU from a server the room
-        // bans is refused before it is even verified, as Synapse does.
-        let acl = match acl_verdicts.get(room_id) {
-            Some(verdict) => verdict.clone(),
-            None => {
-                let verdict = crate::acl::check_origin(rooms, room_id, origin).await;
-                acl_verdicts.insert(room_id.to_owned(), verdict.clone());
-                verdict
-            }
-        };
-        if let Err(message) = acl {
-            crate::metrics::record_acl_refusal("send");
-            tracing::info!(
-                origin,
-                room_id,
-                "refused a PDU: the room's server ACL denies the sending server"
-            );
-            let event_id = Event::parse(pdu, room_version.clone())
-                .map_or(fallback_id, |event| event.event_id().to_string());
-            results.insert(event_id, serde_json::json!({ "error": message }));
-            continue;
-        }
-
-        let event = match verify_pdu(pdu, &room_version, key_cache).await {
-            Ok(event) => event,
-            Err(err) => {
-                results.insert(fallback_id, serde_json::json!({"error": err.to_string()}));
-                continue;
-            }
-        };
-        let event_id = event.event_id().to_string();
-        let logged_id = event_id.clone();
-        let value = event_json(&event);
-        match sink.accept_pushed_event(room_id, &event_id, &value).await {
-            // No user of this server is in the room: ignored, as Synapse ignores it, answered
-            // `{}` (Synapse's `process_pdu` answers it so too).
-            Ok(WriteOutcome::NotInRoom) => {
-                crate::metrics::record_pdu_dropped("not_in_room");
+            let Some(room_version_str) = rooms.room_version(room_id).await else {
+                // A room this server has never held: ignored, as Synapse ignores it ("Ignoring PDU
+                // for unknown room_id"). Answered with the error it always was.
+                crate::metrics::record_pdu_dropped("unknown_room");
                 tracing::info!(
                     origin,
                     room_id,
-                    event_id = %event_id,
-                    "ignored a PDU received over federation: no user of this server is in its room"
+                    event_id = %fallback_id,
+                    "ignored a PDU received over federation for a room this server does not know"
                 );
-                results.insert(event_id, serde_json::json!({}));
-            }
-            Ok(_) => {
-                results.insert(event_id, serde_json::json!({}));
-            }
-            // In a cluster, the room's shard moved away from this replica and its new owner
-            // could not be reached in time either: nothing was stored. The whole transaction is
-            // answered `503` and not remembered, so the sender sends it again once ownership
-            // has settled; what this one did store is already known then.
-            Err(rejected) if rejected.not_owner => {
-                tracing::warn!(
-                    origin,
-                    txn_id,
-                    room_id,
-                    event_id = %event_id,
-                    reason = %rejected.error,
-                    "a PDU's room is owned by another replica that could not be reached; \
-                     answering the transaction 503 so that the sender retries it"
+                results.insert(fallback_id, serde_json::json!({"error": "unknown room"}));
+                return ControlFlow::Continue(());
+            };
+            let Ok(room_version) = RoomVersionId::try_from(room_version_str.as_str()) else {
+                results.insert(
+                    fallback_id,
+                    serde_json::json!({"error": "unsupported room version"}),
                 );
-                return Err(TransactionError::NotOwner(rejected.error));
-            }
-            // Only auth events are missing: they are fetched one by one (`/event`), as Synapse
-            // and Dendrite do, not walked for -- `/get_missing_events` and `/backfill` are for
-            // prev events, and a server answering this one need not serve them (Complement's
-            // `TestInboundFederationRejectsEventsWithRejectedAuthEvents` fails on either).
-            Err(rejected)
-                if !rejected.missing_ancestors.is_empty()
-                    && ancestor_fetcher.is_some()
-                    && only_auth_events_missing(&value, &rejected.missing_ancestors) =>
-            {
-                let fetcher = ancestor_fetcher.expect("checked Some above");
-                match crate::state_fallback::fetch_missing_auth_events(
+                return ControlFlow::Continue(());
+            };
+
+            // The room's server ACL, once per room per transaction: a PDU from a server the room
+            // bans is refused before it is even verified, as Synapse does.
+            let acl = match acl_verdicts.get(room_id) {
+                Some(verdict) => verdict.clone(),
+                None => {
+                    let verdict = crate::acl::check_origin(rooms, room_id, origin).await;
+                    acl_verdicts.insert(room_id.to_owned(), verdict.clone());
+                    verdict
+                }
+            };
+            if let Err(message) = acl {
+                crate::metrics::record_acl_refusal("send");
+                tracing::info!(
                     origin,
                     room_id,
-                    &room_version,
-                    rejected.missing_ancestors.clone(),
-                    fetcher,
-                    key_cache,
-                    sink,
-                )
-                .await
+                    "refused a PDU: the room's server ACL denies the sending server"
+                );
+                let event_id = Event::parse(pdu, room_version.clone())
+                    .map_or(fallback_id, |event| event.event_id().to_string());
+                results.insert(event_id, serde_json::json!({ "error": message }));
+                return ControlFlow::Continue(());
+            }
+
+            let event = match verify_pdu(pdu, &room_version, key_cache).await {
+                Ok(event) => event,
+                Err(err) => {
+                    results.insert(fallback_id, serde_json::json!({"error": err.to_string()}));
+                    return ControlFlow::Continue(());
+                }
+            };
+            let event_id = event.event_id().to_string();
+            let logged_id = event_id.clone();
+            let value = event_json(&event);
+            match sink.accept_pushed_event(room_id, &event_id, &value).await {
+                // No user of this server is in the room: ignored, as Synapse ignores it, answered
+                // `{}` (Synapse's `process_pdu` answers it so too).
+                Ok(WriteOutcome::NotInRoom) => {
+                    crate::metrics::record_pdu_dropped("not_in_room");
+                    tracing::info!(
+                        origin,
+                        room_id,
+                        event_id = %event_id,
+                        "ignored a PDU received over federation: no user of this server is in its room"
+                    );
+                    results.insert(event_id, serde_json::json!({}));
+                }
+                Ok(_) => {
+                    results.insert(event_id, serde_json::json!({}));
+                }
+                // In a cluster, the room's shard moved away from this replica and its new owner
+                // could not be reached in time either: nothing was stored. The whole transaction is
+                // answered `503` and not remembered, so the sender sends it again once ownership
+                // has settled; what this one did store is already known then.
+                Err(rejected) if rejected.not_owner => {
+                    tracing::warn!(
+                        origin,
+                        txn_id,
+                        room_id,
+                        event_id = %event_id,
+                        reason = %rejected.error,
+                        "a PDU's room is owned by another replica that could not be reached; \
+                         answering the transaction 503 so that the sender retries it"
+                    );
+                    return ControlFlow::Break(TransactionError::NotOwner(rejected.error));
+                }
+                // Only auth events are missing: they are fetched one by one (`/event`), as Synapse
+                // and Dendrite do, not walked for -- `/get_missing_events` and `/backfill` are for
+                // prev events, and a server answering this one need not serve them (Complement's
+                // `TestInboundFederationRejectsEventsWithRejectedAuthEvents` fails on either).
+                Err(rejected)
+                    if !rejected.missing_ancestors.is_empty()
+                        && ancestor_fetcher.is_some()
+                        && only_auth_events_missing(&value, &rejected.missing_ancestors) =>
                 {
-                    Ok(()) => match sink.accept_verified_event(room_id, &event_id, &value).await {
-                        Ok(_) => {
-                            results.insert(event_id, serde_json::json!({}));
-                        }
-                        Err(still_rejected) => {
-                            let result = rejection_result(origin, &event_id, &still_rejected);
+                    let fetcher = ancestor_fetcher.expect("checked Some above");
+                    match crate::state_fallback::fetch_missing_auth_events(
+                        origin,
+                        room_id,
+                        &room_version,
+                        rejected.missing_ancestors.clone(),
+                        fetcher,
+                        key_cache,
+                        sink,
+                    )
+                    .await
+                    {
+                        Ok(()) => match sink.accept_verified_event(room_id, &event_id, &value).await {
+                            Ok(_) => {
+                                results.insert(event_id, serde_json::json!({}));
+                            }
+                            Err(still_rejected) => {
+                                let result = rejection_result(origin, &event_id, &still_rejected);
+                                results.insert(event_id, result);
+                            }
+                        },
+                        Err(reason) => {
+                            let result = dropped_result(
+                                origin,
+                                &event_id,
+                                "missing_auth_events",
+                                &format!("{}; fetching them: {reason}", rejected.error),
+                            );
                             results.insert(event_id, result);
                         }
-                    },
-                    Err(reason) => {
-                        let result = dropped_result(
-                            origin,
-                            &event_id,
-                            "missing_auth_events",
-                            &format!("{}; fetching them: {reason}", rejected.error),
-                        );
-                        results.insert(event_id, result);
                     }
                 }
+                Err(rejected)
+                    if !rejected.missing_ancestors.is_empty() && ancestor_fetcher.is_some() =>
+                {
+                    let fetcher = ancestor_fetcher.expect("checked Some above");
+                    // What this server holds, for the gap-shaped request (`crate::backfill`'s
+                    // module docs): its forward extremities are the oldest end of the gap, this
+                    // event the newest.
+                    let context = crate::backfill::GapContext {
+                        latest_event_id: Some(event_id.clone()),
+                        earliest_events: rooms
+                            .forward_extremities(room_id)
+                            .await
+                            .map(|extremities| extremities.into_iter().map(|(id, _)| id).collect())
+                            .unwrap_or_default(),
+                    };
+                    let outcome = crate::backfill::resolve_missing_ancestors(
+                        origin,
+                        room_id,
+                        &room_version,
+                        rejected.missing_ancestors.clone(),
+                        &context,
+                        fetcher,
+                        key_cache,
+                        sink,
+                        backfill_limits,
+                    )
+                    .await;
+                    match outcome {
+                        Ok(()) => match sink.accept_verified_event(room_id, &event_id, &value).await {
+                            Ok(_) => {
+                                results.insert(event_id, serde_json::json!({}));
+                            }
+                            Err(still_rejected) => {
+                                let result = rejection_result(origin, &event_id, &still_rejected);
+                                results.insert(event_id, result);
+                            }
+                        },
+                        Err(gave_up) => {
+                            let result = dropped_result(
+                                origin,
+                                &event_id,
+                                "missing_ancestors",
+                                &format!("{}; backfill attempt to close it {gave_up}", rejected.error),
+                            );
+                            results.insert(event_id, result);
+                        }
+                    }
+                }
+                Err(rejected) => {
+                    let result = rejection_result(origin, &event_id, &rejected);
+                    results.insert(event_id, result);
+                }
             }
-            Err(rejected)
-                if !rejected.missing_ancestors.is_empty() && ancestor_fetcher.is_some() =>
-            {
-                let fetcher = ancestor_fetcher.expect("checked Some above");
-                // What this server holds, for the gap-shaped request (`crate::backfill`'s
-                // module docs): its forward extremities are the oldest end of the gap, this
-                // event the newest.
-                let context = crate::backfill::GapContext {
-                    latest_event_id: Some(event_id.clone()),
-                    earliest_events: rooms
-                        .forward_extremities(room_id)
-                        .await
-                        .map(|extremities| extremities.into_iter().map(|(id, _)| id).collect())
-                        .unwrap_or_default(),
-                };
-                let outcome = crate::backfill::resolve_missing_ancestors(
+            if let Some(result) = results.get(&logged_id) {
+                tracing::debug!(
                     origin,
                     room_id,
-                    &room_version,
-                    rejected.missing_ancestors.clone(),
-                    &context,
-                    fetcher,
-                    key_cache,
-                    sink,
-                    backfill_limits,
-                )
-                .await;
-                match outcome {
-                    Ok(()) => match sink.accept_verified_event(room_id, &event_id, &value).await {
-                        Ok(_) => {
-                            results.insert(event_id, serde_json::json!({}));
-                        }
-                        Err(still_rejected) => {
-                            let result = rejection_result(origin, &event_id, &still_rejected);
-                            results.insert(event_id, result);
-                        }
-                    },
-                    Err(gave_up) => {
-                        let result = dropped_result(
-                            origin,
-                            &event_id,
-                            "missing_ancestors",
-                            &format!("{}; backfill attempt to close it {gave_up}", rejected.error),
-                        );
-                        results.insert(event_id, result);
-                    }
-                }
+                    event_id = %logged_id,
+                    %result,
+                    "processed a PDU received over federation"
+                );
             }
-            Err(rejected) => {
-                let result = rejection_result(origin, &event_id, &rejected);
-                results.insert(event_id, result);
-            }
-        }
-        if let Some(result) = results.get(&logged_id) {
-            tracing::debug!(
-                origin,
-                room_id,
-                event_id = %logged_id,
-                %result,
-                "processed a PDU received over federation"
-            );
+                    ControlFlow::Continue(())
+            },
+            pdu_span,
+        )
+        .await;
+        if let ControlFlow::Break(error) = step {
+            return Err(error);
         }
     }
 
@@ -797,7 +815,16 @@ pub async fn process_transaction(
                     && let Some(edu) =
                         crate::acl::filter_edu(rooms, origin, edu, &mut acl_verdicts).await
                 {
-                    sink.receive_edu(origin, edu).await;
+                    let edu_type = edu_type_of(&edu);
+                    tracing::Instrument::instrument(
+                        sink.receive_edu(origin, edu),
+                        tracing::info_span!(
+                            "federation.edu",
+                            edu_type,
+                            "otel.name" = format_args!("federation.edu {edu_type}"),
+                        ),
+                    )
+                    .await;
                 }
             }
             Err(error) => {
@@ -809,6 +836,20 @@ pub async fn process_transaction(
     let response = serde_json::json!({ "pdus": Value::Object(results) });
     transactions.put(origin, txn_id, response.clone()).await;
     Ok(response)
+}
+
+/// An EDU's type for a span's name: one of the types the spec defines, or `other`. The type is
+/// whatever the sending server wrote, so it is never used as a name as it stands.
+fn edu_type_of(edu: &crate::edu::Edu) -> &'static str {
+    match edu.edu_type.as_str() {
+        "m.typing" => "m.typing",
+        "m.receipt" => "m.receipt",
+        "m.presence" => "m.presence",
+        "m.device_list_update" => "m.device_list_update",
+        "m.signing_key_update" => "m.signing_key_update",
+        "m.direct_to_device" => "m.direct_to_device",
+        _ => "other",
+    }
 }
 
 /// Whether every one of `missing` is an `auth_events` entry of `event` and none a `prev_events`

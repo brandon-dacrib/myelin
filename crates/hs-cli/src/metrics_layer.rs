@@ -34,6 +34,9 @@ pub async fn track_metrics(
         .as_ref()
         .map(|p| p.as_str().to_owned())
         .unwrap_or_else(|| "{unmatched}".to_owned());
+    // The request's span (`hs_telemetry::RequestIdLayer`, the next layer out) is named here,
+    // where the route is known: `PUT /_matrix/client/v3/rooms/{roomId}/send/{eventType}/{txnId}`.
+    hs_telemetry::record_route(&method, &route);
     let start = Instant::now();
     let response = next.run(req).await;
     metrics.record_http_request(

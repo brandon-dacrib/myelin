@@ -511,7 +511,9 @@ impl Default for HttpWellKnownFetcher {
 impl WellKnownFetcher for HttpWellKnownFetcher {
     async fn fetch(&self, hostname: &str) -> WellKnownOutcome {
         let url = format!("https://{hostname}/.well-known/matrix/server");
-        let response = match self.client.get(&url).send().await {
+        // Outside every span, so that the connection task it may spawn does not hold the
+        // caller's spans open (`hs_telemetry::outside_spans`).
+        let response = match hs_telemetry::outside_spans(self.client.get(&url).send()).await {
             Ok(r) if r.status().is_success() => r,
             _ => {
                 return WellKnownOutcome::Absent {

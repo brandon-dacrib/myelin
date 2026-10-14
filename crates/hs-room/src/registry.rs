@@ -615,17 +615,32 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
             }
         }
 
-        let load = {
+        let (load, in_flight) = {
             let mut loading = self
                 .loading
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            loading.entry(room_id.to_owned()).or_default().clone()
+            match loading.entry(room_id.to_owned()) {
+                std::collections::hash_map::Entry::Occupied(entry) => (entry.get().clone(), true),
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    (slot.insert(Arc::default()).clone(), false)
+                }
+            }
         };
-        let outcome = load
-            .get_or_try_init(|| self.load_and_register(room_id, fence))
-            .await
-            .cloned();
+        // Waiting for a load another caller started is a span of its own (`room.load.wait`), so
+        // a trace shows a request held up behind somebody else's load rather than a gap; the
+        // load itself is `room.load`, in whichever trace started it.
+        let waiting = if in_flight {
+            tracing::info_span!("room.load.wait", room_id = %room_id)
+        } else {
+            tracing::Span::none()
+        };
+        let outcome = tracing::Instrument::instrument(
+            load.get_or_try_init(|| self.traced_load(room_id, fence)),
+            waiting,
+        )
+        .await
+        .cloned();
         // Over, one way or the other: the next miss (after an unload, or after this failed for
         // everyone waiting) loads afresh.
         {
@@ -651,6 +666,35 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// [`RoomRegistry::load_and_register`] in a `room.load` span: a child of whatever asked for
+    /// the room, or a trace of its own when nothing traced did (a load at start-up). Its
+    /// children say where a slow load's time went: `room.load.slot_wait` (one of the
+    /// [`MAX_CONCURRENT_LOADS`] slots), `room.load.blocking_wait` (a blocking thread), and
+    /// `room.load.from_store` (the read itself, with the timeline's length, whether the state
+    /// store's records were replayed and how many events it was fed).
+    async fn traced_load(
+        &self,
+        room_id: &ruma::RoomId,
+        fence: Option<hs_cluster::Fence>,
+    ) -> Result<RoomActorHandle<B>, RoomError> {
+        let span = tracing::info_span!(
+            "room.load",
+            room_id = %room_id,
+            "otel.status_code" = tracing::field::Empty,
+            "error.message" = tracing::field::Empty,
+        );
+        let result =
+            tracing::Instrument::instrument(self.load_and_register(room_id, fence), span.clone())
+                .await;
+        if let Err(error) = &result
+            && !matches!(error, RoomError::RoomNotFound(_))
+        {
+            span.record("otel.status_code", "error");
+            span.record("error.message", tracing::field::display(error));
+        }
+        result
+    }
+
     /// [`RoomRegistry::get_or_load`]'s load of a room that is not resident: from the store, on a
     /// blocking thread and in one of the [`MAX_CONCURRENT_LOADS`] slots, then registered.
     async fn load_and_register(
@@ -663,10 +707,25 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
         let identity = self.identity.clone();
         let owned_room_id = room_id.to_owned();
         // The semaphore is never closed; were it, the load would run unbounded.
-        let _slot = self.load_slots.acquire().await.ok();
+        let _slot = tracing::Instrument::instrument(
+            self.load_slots.acquire(),
+            tracing::info_span!("room.load.slot_wait"),
+        )
+        .await
+        .ok();
         self.loads_started
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let blocking_wait = tracing::info_span!("room.load.blocking_wait");
+        let from_store = tracing::info_span!(
+            "room.load.from_store",
+            timeline_events = tracing::field::Empty,
+            replayed = tracing::field::Empty,
+            state_records_fed = tracing::field::Empty,
+        );
         let loaded = tokio::task::spawn_blocking(move || {
+            drop(blocking_wait);
+            // `RoomActor::load` records the counts on this span.
+            let _in_span = from_store.enter();
             RoomActor::load(backend, tables, identity, &owned_room_id)
         })
         .await

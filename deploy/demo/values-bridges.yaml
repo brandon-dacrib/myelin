@@ -15,6 +15,17 @@
 # file existed, with brandon's instance `bridge-d2854412-...`): declaring it here keeps it as
 # it is, and makes a fresh install of the demo come up with it.
 
+# Traces to the cluster's OpenTelemetry gateway, which forwards them to Tempo
+# (`tempo.monitoring-system:3200`; Grafana's Tempo data source, service `myelin`). Every request
+# is sampled: the demo serves a handful of people and their bridges, a few requests a second at
+# most, and the point of tracing it is to see the one slow `/sync` or stuck room load when it
+# happens, which a 10% sample would usually miss. Lower it if the demo gets busy.
+telemetry:
+  tracing:
+    enabled: true
+    otlpEndpoint: http://otel-gateway-collector.monitoring-system.svc:4317
+    sampleRatio: 1.0
+
 bridges:
   enabled: true
   offerings:

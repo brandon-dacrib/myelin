@@ -277,7 +277,11 @@ async fn hold_a_slot(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let waited_from = std::time::Instant::now();
-    let slot = tokio::time::timeout(wait, slots.clone().acquire_owned()).await;
+    let slot = tracing::Instrument::instrument(
+        tokio::time::timeout(wait, slots.clone().acquire_owned()),
+        tracing::info_span!("federation.inbound_slot_wait"),
+    )
+    .await;
     let Ok(Ok(_slot)) = slot else {
         crate::metrics::record_inbound_refused();
         tracing::warn!(

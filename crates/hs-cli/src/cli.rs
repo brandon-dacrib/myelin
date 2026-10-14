@@ -945,8 +945,10 @@ async fn run_serve(args: &ServeArgs) -> i32 {
         }
     };
 
+    // `service.name` on exported traces: the product's name, which is what an operator looks
+    // for in a trace store holding many services ("hs" is ambiguous there).
     let telemetry_options =
-        crate::config_bridge::telemetry_options_from(&config, "hs", env!("CARGO_PKG_VERSION"));
+        crate::config_bridge::telemetry_options_from(&config, "myelin", env!("CARGO_PKG_VERSION"));
     let telemetry_guard = match hs_telemetry::init(&telemetry_options) {
         Ok(guard) => Some(guard),
         Err(e) => {

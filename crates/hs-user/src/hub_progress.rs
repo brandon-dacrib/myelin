@@ -22,6 +22,9 @@
 //! - Each update in hand records its step ([`InHand::step`]); the hub's watchdog warns, naming
 //!   the room, the update and the step, when a step has not moved for
 //!   [`STUCK_WARN_AFTER`], and sets the `hs_user_hub_*` gauges.
+//! - Each update is a trace of its own ([`InHand::span`], `hub.room_update`), and each step a
+//!   child span of it (`hub.step`, named by the step), so a slow update in a trace store shows
+//!   which step the time went to, as the watchdog's warning does for a stuck one.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
@@ -205,6 +208,15 @@ impl Progress {
     pub(crate) fn begin(&self, room_id: &RoomId, global_seq: u64) -> InHand<'_> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let now = Instant::now();
+        // A root span: an update reaches the hub from the room stream, not from a request.
+        let span = tracing::info_span!(
+            parent: None,
+            "hub.room_update",
+            room_id = %room_id,
+            global_seq,
+            "otel.status_code" = tracing::field::Empty,
+            "error.message" = tracing::field::Empty,
+        );
         self.lock().active.insert(
             id,
             Active {
@@ -216,7 +228,12 @@ impl Progress {
                 warned_at: None,
             },
         );
-        InHand { progress: self, id }
+        InHand {
+            progress: self,
+            id,
+            span,
+            step_span: Mutex::new(tracing::Span::none()),
+        }
     }
 
     /// The hub's state for an operator: see [`HubStatus`].
@@ -314,11 +331,34 @@ impl Progress {
 pub(crate) struct InHand<'a> {
     progress: &'a Progress,
     id: u64,
+    /// The update's span (`hub.room_update`), which the update's work runs in.
+    span: tracing::Span,
+    /// The current step's span, a child of `span`; replaced (so closed) by the next step.
+    step_span: Mutex<tracing::Span>,
 }
 
 impl InHand<'_> {
+    /// The update's span: run the update's work in it (`.instrument(in_hand.span().clone())`).
+    pub(crate) fn span(&self) -> &tracing::Span {
+        &self.span
+    }
+
+    /// Marks the update's span as failed with `error`.
+    pub(crate) fn record_error(&self, error: &dyn std::fmt::Display) {
+        self.span.record("otel.status_code", "error");
+        self.span
+            .record("error.message", tracing::field::display(error));
+    }
+
     /// Records that the update has reached `step` (a short phrase: what it is waiting for).
     pub(crate) fn step(&self, step: &'static str) {
+        let step_span =
+            tracing::info_span!(parent: &self.span, "hub.step", step, "otel.name" = step);
+        // The previous step's span ends here, as its step does.
+        *self
+            .step_span
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = step_span;
         if let Some(active) = self.progress.lock().active.get_mut(&self.id) {
             if active.warned_at.is_some() {
                 tracing::info!(

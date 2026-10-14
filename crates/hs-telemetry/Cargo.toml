@@ -9,12 +9,13 @@ description = "Tracing, structured logs, request ids, Prometheus metrics, health
 
 [features]
 default = []
-# OpenTelemetry OTLP export of traces (and optionally logs) over gRPC.
+# OpenTelemetry OTLP export of traces over gRPC, and W3C `traceparent` continuation. On in the
+# shipped `hs` binary (hs-cli's default `otlp` feature); export still only happens when
+# `telemetry.tracing.enabled` is set.
 otlp = [
     "dep:opentelemetry",
     "dep:opentelemetry_sdk",
     "dep:opentelemetry-otlp",
-    "dep:opentelemetry-appender-tracing",
     "dep:tracing-opentelemetry",
 ]
 # Sentry error and panic reporting fed from `tracing` events.
@@ -37,10 +38,10 @@ rand = { workspace = true }
 hex = { workspace = true }
 time = { version = "0.3", features = ["formatting", "macros"] }
 
-opentelemetry = { version = "0.32", optional = true }
-opentelemetry_sdk = { version = "0.32", optional = true }
-opentelemetry-otlp = { version = "0.32", optional = true, default-features = false, features = ["grpc-tonic", "trace", "logs", "tls-ring", "tls-webpki-roots"] }
-opentelemetry-appender-tracing = { version = "0.32", optional = true }
+# Traces only: no metrics (Prometheus has those) and no log export (the pod's log has those).
+opentelemetry = { version = "0.32", optional = true, default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.32", optional = true, default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.32", optional = true, default-features = false, features = ["grpc-tonic", "trace", "tls-ring", "tls-webpki-roots"] }
 tracing-opentelemetry = { version = "0.33", optional = true, default-features = false }
 
 sentry = { version = "0.49", optional = true, default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls", "tracing"] }

@@ -40,6 +40,8 @@ ipnet.workspace = true
 # `crate::metrics` (the EDU counters), registered into `hs-telemetry`'s shared registry by hs-cli.
 prometheus-client.workspace = true
 hs-model = { path = "../hs-model" }
+# `hs_telemetry::outside_spans`: outbound HTTP runs outside the caller's spans.
+hs-telemetry = { path = "../hs-telemetry" }
 hs-kv = { path = "../hs-kv" }
 hs-tables = { path = "../hs-tables" }
 hs-http = { path = "../hs-http" }

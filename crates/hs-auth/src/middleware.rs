@@ -235,7 +235,24 @@ async fn authenticate_user_token(
     })
 }
 
+/// [`authenticate_request`] in an `auth.authenticate` span, telling the request's own span
+/// (`hs_telemetry::RequestIdLayer`'s `matrix.user_id`) who the request is from.
 async fn authenticate(parts: &mut Parts, state: &AuthState) -> Result<Requester, MatrixError> {
+    let result = tracing::Instrument::instrument(
+        authenticate_request(parts, state),
+        tracing::info_span!("auth.authenticate"),
+    )
+    .await;
+    if let Ok(requester) = &result {
+        tracing::Span::current().record("matrix.user_id", requester.user_id.as_str());
+    }
+    result
+}
+
+async fn authenticate_request(
+    parts: &mut Parts,
+    state: &AuthState,
+) -> Result<Requester, MatrixError> {
     let token = extract_token(parts, state).await?;
     let query = query_params(parts, state).await;
 

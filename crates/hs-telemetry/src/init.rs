@@ -53,11 +53,19 @@ impl Level {
     /// working as designed, not something to act on, and on the demo it was ~10,000 lines in
     /// 9 minutes, enough to rotate the pod's log down to a few minutes of history.
     ///
+    /// At `info` Ruma's push-rule evaluation is held to `warn`: it opens an `info` span for
+    /// every node of every event's JSON it flattens (`flatten_value`), a dozen spans per event
+    /// per evaluation, which cost time on every send and were one-span traces of their own once
+    /// traces were exported (2026-10-14).
+    ///
     /// Asking for `debug` or `trace` is asking for everything, so those are left alone, and
     /// `RUST_LOG` overrides all of it.
     fn default_directives(self) -> String {
         match self {
-            Level::Info => "info,lsm_tree=warn,fjall=warn,ruma_state_res=error".to_owned(),
+            Level::Info => {
+                "info,lsm_tree=warn,fjall=warn,ruma_state_res=error,ruma_common::push=warn"
+                    .to_owned()
+            }
             Level::Warn => "warn,ruma_state_res=error".to_owned(),
             other => other.as_str().to_owned(),
         }
