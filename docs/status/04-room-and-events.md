@@ -71,7 +71,7 @@ At 200 members the squared term is small. The harness shows how it grows with me
   time when a load takes longer than 10 s (`load_report::SLOW_LOAD`).
 - `RoomActor::take_load_report()`.
 
-**Unloading** (coordinator's addition; decision 0049):
+**Unloading** (coordinator's addition; decision 0051):
 - `server.rooms.idle_unload_after` unset now means 30 minutes, and `0s` means never.
 - New `server.rooms.memory_unload_fraction`, default 0.75. Above it, a quarter of the
   unloadable rooms go, least recently used first, then the unloader waits 30 s

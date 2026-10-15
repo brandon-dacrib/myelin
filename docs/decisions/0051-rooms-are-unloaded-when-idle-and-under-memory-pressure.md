@@ -1,4 +1,4 @@
-# 0049: Rooms are unloaded after half an hour unused, and least recently used first under memory pressure
+# 0051: Rooms are unloaded after half an hour unused, and least recently used first under memory pressure
 
 Date: 2026-10-15. Track 04 (`hs-room`'s registry), with `hs-config` and `hs-cli` wiring.
 

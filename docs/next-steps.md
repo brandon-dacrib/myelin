@@ -1,58 +1,6 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-10-15 (Discord's delivery timeouts were a replay of the 2026-10-12 flood; fix on `agent/discord-delivery-timeouts`. Before: the memory climb with federation on; fix on `agent/fed-memory-growth`. Before: the session hub wedge; fix on `agent/hub-wedge`. Earlier: the ephemeral pump's prune busy loop; fix on `agent/ephemeral-prune`). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
-
-The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
-
-## 2026-10-15 -- Discord's delivery timeouts were a replay of the 2026-10-12 flood; the fix is `agent/discord-delivery-timeouts`
-
-At 19:56 UTC Discord's 260 dead letters were replayed from its page (dead-lettered 260 -> 60 and
-depth 0 -> 200 between two scrapes, oldest 260,626 s old): the 2026-10-12 flood of decision 0046,
-encrypted events of rooms the bridge does not bridge and the owner's to-device messages. Federation
-coming back on sent Discord nothing. A replay kept the spent attempt count, a transaction was twenty
-room pages (624 to 1,076 events), mautrix-go answers only when every event is in its channel, so
-the 30 s timeout fired on each, each was dead-lettered on its one attempt and the next sent, 13 in
-six minutes; the bridge dispatched all of them anyway (done by 20:25). Ids were 20 apart because
-each was a new batch; the one retry (3624, across the 19:58 restart) kept its id. Slack's
-"Degraded" was its pod restarting: ten refused connections in four minutes dead-lettered a
-transaction. Fixed (decision 0049, `docs/status/11-appservices-and-bridges.md`): a retry is exactly
-the failed transaction under its id; timeouts, unreachable bridges and 5xx/408/429 are retried for
-a day (a timeout waits at least 60 s), a refusal ten times; at most 100 items a transaction, halved
-on each timeout; 60 s request timeout; a replay gets a fresh budget; `POST
-/api/v1/appservices/{id}/discard` and the backlog's contents (when, what, which rooms) with the
-bridge page's Discard and confirmed Replay; `health_reason` on the Registrations page; a ping
-answered after the failures makes a bridge healthy. New series: `hs_appservice_transaction_seconds`,
-`hs_appservice_transaction_failures_total{reason}`, `hs_appservice_transaction_retries_total`,
-`hs_appservice_dead_lettered_total`, `hs_appservice_batch_item_limit`. **After the roll**: on each
-bridge's page look at the dead letters' dates and rooms; the 2026-10-12 flood's (discord, signal,
-linkedin, meta, whatsapp; Discord's were in fact delivered) want Discard, Slack's three (today's
-restart) want Replay, and iMessage's 3,545 need a look. Then Ping each degraded bridge.
-**Left**: dead letters do not expire; the timeout, the day and the cap are constants.
-Written 2026-09-20 by the integration lead, last revised 2026-10-15 (the Slack bridge's full volume; fix on `agent/bridge-volume-size`. Before: the memory climb with federation on; fix on `agent/fed-memory-growth`. Before that: the session hub wedge; fix on `agent/hub-wedge`. Earlier: the ephemeral pump's prune busy loop; fix on `agent/ephemeral-prune`). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
-
-The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
-
-## 2026-10-15 -- the Slack bridge's volume filled with its own logs; the fix is `agent/bridge-volume-size`
-
-`bridge-slack-brandon` sat in `Init:CrashLoopBackOff` from 2026-10-14 (`cp: write error: No
-space left on device`, 1 GiB at 0.98), and the only sign was "degraded". mautrix's default
-logging also writes up to 1.1 GB of `logs/bridge.log*` into `/data`; Slack's debug log is
-~600 MB a day. Decision 0050: rendered mautrix configs log to stdout only (checked with the real
-bridge); deployed bridges get 5 GiB (was 1 GiB) and an administrator can raise one on its page
-(`PUT .../instances/{user}` `volume_size`, OpenAPI 0.1.19); a volume never shrinks (the operator
-applies the larger of spec and claim, `VolumeSize` condition instead of a failed reconcile; the
-manager's writes keep a size raised by hand); the operator measures every bridge volume from the
-kubelet once a minute into `status.volume` (ClusterRole `nodes`, `nodes/stats`; chart
-`bridges.operator.volumeStats`), the server shows "volume nearly full / full" with what to do on
-the Registrations, offering and bridge pages, `hs_bridge_volume_used_ratio`,
-`HsBridgeVolume{NearlyFull,Full}` alerts, `WARN`s from both; the init container's last words reach
-the status, and "No space left on device" is explained. **Owner, on the demo:** raise
-`bridge-slack-brandon` to 5Gi now (the coordinator is asking); after the roll (every bridge
-restarts once, and grows to 5 GiB), `kubectl -n myelin exec deploy/bridge-slack-brandon -c bridge
--- rm -rf /data/logs` (and the same for the others if wanted), and check the operator's log has
-no "cannot read the kubelet's volume statistics". **Left:** an offering-wide default size; kind
-volumes have no statistics, so the sweep's first real measurement is the demo's.
-Written 2026-09-20 by the integration lead, last revised 2026-10-15 (room loads and unloading; `agent/room-load-speed`. Before: the memory climb with federation on; fix on `agent/fed-memory-growth`. Earlier: the session hub wedge; fix on `agent/hub-wedge`. Earlier: the ephemeral pump's prune busy loop; fix on `agent/ephemeral-prune`). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+Written 2026-09-20 by the integration lead, last revised 2026-10-15 (room loads and unloading; `agent/room-load-speed`. Before: the Slack bridge's full volume; fix on `agent/bridge-volume-size`. Before: Discord's delivery timeouts were a replay of the 2026-10-12 flood; fix on `agent/discord-delivery-timeouts`. Before: the memory climb with federation on; fix on `agent/fed-memory-growth`. Before: the session hub wedge; fix on `agent/hub-wedge`. Earlier: the ephemeral pump's prune busy loop; fix on `agent/ephemeral-prune`). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
@@ -80,7 +28,7 @@ by root), not on every message.
 **New metrics.** Per-phase load spans and `hs_room_load_phase_seconds{phase}`; a `warn` with the
 slowest phase for a load over 10 s, counted in `hs_room_slow_loads_total`.
 
-**Unloading** (decision 0049):
+**Unloading** (decision 0051):
 - `server.rooms.idle_unload_after` now defaults to 30 min (`0s` keeps rooms for ever).
 - New `server.rooms.memory_unload_fraction`, 0.75: least recently used rooms go first, a
   quarter per pass, with a 30 s cooldown between passes that unloaded.
@@ -105,6 +53,52 @@ cooldown.
 - `state_at_event` over big rooms' history materialises the state (about 6 ms an event at
   3,000 members).
 - Tempo on the cluster needs fixing (CrashLoopBackOff).
+
+## 2026-10-15 -- the Slack bridge's volume filled with its own logs; the fix is `agent/bridge-volume-size`
+
+`bridge-slack-brandon` sat in `Init:CrashLoopBackOff` from 2026-10-14 (`cp: write error: No
+space left on device`, 1 GiB at 0.98), and the only sign was "degraded". mautrix's default
+logging also writes up to 1.1 GB of `logs/bridge.log*` into `/data`; Slack's debug log is
+~600 MB a day. Decision 0050: rendered mautrix configs log to stdout only (checked with the real
+bridge); deployed bridges get 5 GiB (was 1 GiB) and an administrator can raise one on its page
+(`PUT .../instances/{user}` `volume_size`, OpenAPI 0.1.19); a volume never shrinks (the operator
+applies the larger of spec and claim, `VolumeSize` condition instead of a failed reconcile; the
+manager's writes keep a size raised by hand); the operator measures every bridge volume from the
+kubelet once a minute into `status.volume` (ClusterRole `nodes`, `nodes/stats`; chart
+`bridges.operator.volumeStats`), the server shows "volume nearly full / full" with what to do on
+the Registrations, offering and bridge pages, `hs_bridge_volume_used_ratio`,
+`HsBridgeVolume{NearlyFull,Full}` alerts, `WARN`s from both; the init container's last words reach
+the status, and "No space left on device" is explained. **Owner, on the demo:** raise
+`bridge-slack-brandon` to 5Gi now (the coordinator is asking); after the roll (every bridge
+restarts once, and grows to 5 GiB), `kubectl -n myelin exec deploy/bridge-slack-brandon -c bridge
+-- rm -rf /data/logs` (and the same for the others if wanted), and check the operator's log has
+no "cannot read the kubelet's volume statistics". **Left:** an offering-wide default size; kind
+volumes have no statistics, so the sweep's first real measurement is the demo's.
+
+## 2026-10-15 -- Discord's delivery timeouts were a replay of the 2026-10-12 flood; the fix is `agent/discord-delivery-timeouts`
+
+At 19:56 UTC Discord's 260 dead letters were replayed from its page (dead-lettered 260 -> 60 and
+depth 0 -> 200 between two scrapes, oldest 260,626 s old): the 2026-10-12 flood of decision 0046,
+encrypted events of rooms the bridge does not bridge and the owner's to-device messages. Federation
+coming back on sent Discord nothing. A replay kept the spent attempt count, a transaction was twenty
+room pages (624 to 1,076 events), mautrix-go answers only when every event is in its channel, so
+the 30 s timeout fired on each, each was dead-lettered on its one attempt and the next sent, 13 in
+six minutes; the bridge dispatched all of them anyway (done by 20:25). Ids were 20 apart because
+each was a new batch; the one retry (3624, across the 19:58 restart) kept its id. Slack's
+"Degraded" was its pod restarting: ten refused connections in four minutes dead-lettered a
+transaction. Fixed (decision 0049, `docs/status/11-appservices-and-bridges.md`): a retry is exactly
+the failed transaction under its id; timeouts, unreachable bridges and 5xx/408/429 are retried for
+a day (a timeout waits at least 60 s), a refusal ten times; at most 100 items a transaction, halved
+on each timeout; 60 s request timeout; a replay gets a fresh budget; `POST
+/api/v1/appservices/{id}/discard` and the backlog's contents (when, what, which rooms) with the
+bridge page's Discard and confirmed Replay; `health_reason` on the Registrations page; a ping
+answered after the failures makes a bridge healthy. New series: `hs_appservice_transaction_seconds`,
+`hs_appservice_transaction_failures_total{reason}`, `hs_appservice_transaction_retries_total`,
+`hs_appservice_dead_lettered_total`, `hs_appservice_batch_item_limit`. **After the roll**: on each
+bridge's page look at the dead letters' dates and rooms; the 2026-10-12 flood's (discord, signal,
+linkedin, meta, whatsapp; Discord's were in fact delivered) want Discard, Slack's three (today's
+restart) want Replay, and iMessage's 3,545 need a look. Then Ping each degraded bridge.
+**Left**: dead letters do not expire; the timeout, the day and the cap are constants.
 
 ## 2026-10-15 -- the demo's memory climb with federation on was abandoned room loads; the fix is `agent/fed-memory-growth`
 
