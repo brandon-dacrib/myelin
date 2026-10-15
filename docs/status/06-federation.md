@@ -1,5 +1,119 @@
 # 06 Federation: status
 
+## 2026-10-15 (branch `agent/fed-memory-growth`): the memory climb with federation on -- room loads abandoned by callers who gave up, restarted by the next, each still running
+
+**Asked**: the demo, rolled to 0.3.21 at 14:58 UTC with federation on (first time since the
+0.3.17 boot-freeze fix) and tracing at ratio 1.0, grew linearly from 436 MB to 2,026 MB in 19
+minutes (~120 MB a minute, `container_memory_working_set_bytes`) and never levelled; node tp0n1
+ran out (MemAvailable 2.7 GB -> 0.5 GB) and went `NotReady` at 15:16:46. Find what grows, bound
+it, and add a process-level safety net.
+
+**What the demo showed** (Prometheus, Loki and Tempo through the owner's proxy, 14:56-15:18):
+- **`hs_room_actors_alive` climbed 45 -> 120 while `hs_room_resident_rooms` stayed at 40** and
+  `hs_room_load_seconds_count` moved 47 -> 48. On 0.3.17 with federation off the two gauges were
+  equal all day (71/70, 152/152, 165/165). 80 room actors were alive that no resident room and no
+  finished load accounted for.
+- `container_threads` 495 (the blocking pool near its 512 cap), CPU 3.5-3.9 cores throughout,
+  `process_resident_memory_bytes` 726 MB -> 2,087 MB.
+- Tempo: inbound `/send` traces of 60 s and 180 s (the sending servers' timeouts) ending in
+  `room.load.wait`; `room.load` for `!aPQx8...` started at 15:01:47, 15:02:47, 15:03:11, 15:03:50,
+  15:04:16, each ending when its caller gave up; a `room.load.from_store` of **687 s for a room of
+  three timeline events** (`!L58ME6...`), outliving its parent `/send` (179.8 s). 189 waits on
+  `!ping12Z...`, 122 on `!BHvcNj...:codestorm.net`, 51 on `!c10y...`, 35 on `!L58ME6...`.
+- `hs_federation_inbound_in_flight` pinned at 55-64 of 64 (the `/send`s waiting on loads), hence
+  the 106 `429`s; the hub's 30 s "reading the room's members" steps and the 7 `/state_ids`
+  fallback timeouts are the same loads seen from elsewhere.
+- Ruled out by their gauges, flat over the window: `hs_federation_sender_destinations` (1,689),
+  `..._sender_pdus_pending` (85), `..._sender_state_bytes` (122 KB), `..._sender_edus_queued` (0),
+  `..._device_list_announcer_behind` (0), `hs_telemetry_span_export_queue` (<= 718, 0 dropped),
+  `hs_kv_fjall_write_buffer_bytes` (<= 26 MB), `hs_kv_fjall_sealed_memtables` (0),
+  `hs_user_mirror_rooms` (0), the appservice queues (0). The `/user/devices` cache
+  (`DeviceListAnswers`) is bounded at 4,096 users. `hs_room_events_cached` grew 2k -> 18k with
+  the abandoned actors (each actor's cache is bounded; the actors were not).
+
+**What it was**: `RoomRegistry::get_or_load` (track 04's crate) ran a room's load inside the
+first caller's future: the load slot (`MAX_CONCURRENT_LOADS`, 8) and the single-flight
+`OnceCell` initialisation belonged to that caller. When the caller was cancelled -- a sending
+server hanging up on `/send` after 60 or 180 s, which hyper turns into dropping the handler, or a
+timeout around a hub prefetch -- the slot was given back and the `OnceCell` left uninitialised,
+while the load itself went on in `spawn_blocking` to an end nobody read. The next caller started
+the room's load again. Every round of give-ups added a round of loads over the limit; with more
+loads sharing the cores each took longer, so more callers gave up: the boot freeze's "465 loads
+at once" by another road, which the 8-slot bound of 2026-10-14 did not close. Each running load
+holds an actor (with its event cache and state) and a store snapshot, so memory grew with the
+number of abandoned loads, linearly, until the node ran out.
+
+**Reproduced on the real binary** (`hs serve`, debug build, embedded Fjall, 12 rooms of 20,000
+messages, nothing resident; 6 rounds of 10 `GET /messages` per room at once, each client giving
+up after 0.5 s; then one patient read):
+
+| | 0.3.21's registry | this branch |
+|---|---|---|
+| actors alive after 6 rounds | 110 (0 resident) | 8 (`hs_room_loads_running` 8, in progress 12) |
+| threads | 34 -> 143 | 34 -> 41 |
+| room loads made | 111 for 12 rooms | 12 |
+| rooms resident when it settled | 1 of 12 | 12 of 12, 76 s after the first request |
+| the patient read | 329 s | 0.09 s |
+| RSS peak | 831 MB | 305 MB |
+
+**Fixed**:
+- `hs-room` registry: a load runs in a task of its own (`LoadJob`), which holds the load slot (in
+  the blocking closure itself, so it is never given back before the read ends), registers the
+  room and answers every waiter on a `watch` channel; callers, the first included, only wait.
+  A cancelled caller leaves the load running for the next. The loads under way are listed by
+  room; the task takes its entry off when it has answered. Every waiter of a failed load gets the
+  error (rebuilt per waiter: `RoomNotFound`, `UnsupportedRoomVersion`, `Fenced`, `RoomBlocked`,
+  `State`, `Internal` as they were, any other as `Internal` with its text); the next caller after
+  a failure loads afresh. A load task that panics is noticed by its waiters, which clear its entry.
+- `hs-federation` inbound: the `/send` idempotency cache (`InMemoryTransactionStore`) kept every
+  transaction's response for the life of the process; now an hour each and at most 16,384.
+- `hs-cli` memory guard (`crate::memory_guard`): every 5 s, resident memory against the
+  container's limit (cgroup v2 `memory.max`, else v1 `memory.limit_in_bytes`); at
+  `federation.inbound_memory_shed_fraction` (new, hot, default 0.85, `0` off) inbound federation
+  is shed: `hs_federation::transport::set_inbound_shedding` makes the inbound layer answer every
+  signed federation request `429` with `Retry-After: 60` before it takes a slot, until memory is
+  five points under the line. On the demo's 3 GiB limit that is 2.6 GB -- above the 2.0 GB the
+  node died at, so on that node the limit itself is the thing to lower (see Left).
+
+**Observability** (new): `hs_room_loads_in_progress`, `hs_room_loads_running` (never above 8),
+`hs_room_load_slot_waits_total`, and a `warn` at most once a minute when every slot is taken;
+`hs_room_actors_alive`'s help says it should equal resident rooms plus loads running (plus
+mirror copies). `hs_process_memory_limit_bytes`, `hs_process_memory_budget_ratio`,
+`hs_federation_inbound_shedding`, `hs_federation_inbound_shed_total` (a `warn` when shedding
+starts, `info` when it stops), `hs_federation_inbound_transactions_remembered` (a `warn` at most
+hourly when the count bound forgets one).
+
+**Tests**: `a_load_goes_on_for_the_next_caller_when_its_first_gives_up`,
+`loads_stay_within_their_slots_however_often_callers_give_up` (3 rounds of 24 cancelled callers:
+8 loads reach the store, at most 8 at once, each room read once),
+`a_failed_load_answers_every_waiter_and_is_forgotten`, `a_waiter_gets_the_error_the_load_ended_with`
+(`hs-room`); `a_request_is_shed_at_once_while_memory_is_over_budget`,
+`remembered_transactions_are_bounded_by_count_and_age` (`hs-federation`);
+`a_cgroup_limit_is_read_and_no_limit_is_none`,
+`shedding_starts_at_the_line_and_stops_below_it_less_the_hysteresis`,
+`the_ratio_is_resident_over_limit` (`hs-cli`). `cargo test -p hs-room -p hs-federation -p
+hs-config`, `cargo test -p hs-cli --lib -- memory_guard process_metrics`, and clippy `-D
+warnings` on the four crates pass. The full workspace gate was not run (the merge queue runs it).
+
+**Left**:
+- After the roll, on the demo: `hs_room_actors_alive` should track `hs_room_resident_rooms` +
+  `hs_room_loads_running`, `hs_room_loads_running` <= 8, `container_threads` well under 495, and
+  `container_memory_working_set_bytes` should level. Watch `hs_room_load_slot_waits_total` and the
+  slot `warn`: big rooms still load slowly, now one at a time each.
+- Why one load of a three-event room took 687 s is not settled: most of it was the ~80 duplicate
+  loads sharing four cores, but these rooms' loads hold many outliers (the `/state_ids` fallback
+  stores a room's whole state as outliers) and one Fjall snapshot each for their whole length.
+  A load of a big remote room (`!ping12Z...`, `!BHvcNj...`) alone should be measured after the
+  roll (`room.load.from_store` in Tempo). Track 04/01.
+- The memory guard's default line (0.85 of `memory.max`) cannot protect a node with less free
+  memory than the pod's limit (tp0n1 had 2.7 GB free for a 3 GiB limit, among many pods). The
+  chart should set the limit to what the node can give, or the operator lower the fraction; the
+  guard is untested against a real cgroup (macOS has none; the parsing and the decision are
+  unit-tested).
+- Inbound `/send` still stops processing when its sender hangs up: the PDUs after the one waiting
+  on a load are taken on the retry. Synapse finishes a transaction it has started; doing that
+  needs the transaction's own task, holding its inbound slot, and is a separate change.
+
 ## 2026-10-14 (branch `agent/federation-boot-freeze`): the boot freeze with federation on -- store work on the runtime's threads, a resync storm the announcer provoked, and duplicate room loads
 
 **Asked**: the demo (0.3.17, embedded Fjall on a Longhorn volume, one pod, eight cores) froze

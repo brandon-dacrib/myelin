@@ -1,8 +1,30 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-10-14 (the session hub wedge; fix on `agent/hub-wedge`. Earlier: the ephemeral pump's prune busy loop; fix on `agent/ephemeral-prune`). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+Written 2026-09-20 by the integration lead, last revised 2026-10-15 (the memory climb with federation on; fix on `agent/fed-memory-growth`. Before: the session hub wedge; fix on `agent/hub-wedge`. Earlier: the ephemeral pump's prune busy loop; fix on `agent/ephemeral-prune`). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
+
+## 2026-10-15 -- the demo's memory climb with federation on was abandoned room loads; the fix is `agent/fed-memory-growth`
+
+0.3.21 with federation on grew ~120 MB a minute until node tp0n1 went `NotReady` (15:16 UTC).
+`hs_room_actors_alive` rose 45 -> 120 while 40 rooms were resident and one load finished;
+495 threads; Tempo showed the same rooms' `room.load` restarted each time a sending server hung
+up on `/send` (60/180 s), and one 687 s load of a three-event room. `RoomRegistry::get_or_load`
+ran the load in its first caller's future: a cancelled caller gave back the load slot and left
+the single-flight cell empty while its load ran on, and the next caller loaded the room again.
+Now a load is a task of its own that holds its slot and answers every waiter; on the real binary
+(12 big rooms, 720 callers giving up after 0.5 s) 0.3.21's registry made 111 loads with 110
+actors and 143 threads, never got 11 of the rooms resident and took 329 s for a patient read;
+the branch made 12 loads, 8 at a time, 41 threads, all resident in 76 s, the read 0.09 s. Also:
+the `/send` idempotency cache is bounded (an hour, 16,384), and a memory guard sheds inbound
+federation (`429`) above `federation.inbound_memory_shed_fraction` (0.85) of the container's
+limit. New gauges: `hs_room_loads_{in_progress,running}`, `hs_room_load_slot_waits_total`,
+`hs_process_memory_{limit_bytes,budget_ratio}`, `hs_federation_inbound_{shedding,shed_total,
+transactions_remembered}` (`docs/status/06-federation.md`). **After the roll**: actors alive ~=
+resident + running, running <= 8, working set levels. **Left**: why a big remote room's single
+load is slow (outliers, one snapshot per load; track 04/01); the pod's 3 GiB limit is more than
+tp0n1 had free, so the chart's limit or the fraction should come down for that node; `/send`
+still stops when its sender hangs up.
 
 ## 2026-10-14, late night -- traces, stage 2: the store, background work and the other replica; the branch is `agent/otlp-traces-2`
 
