@@ -219,6 +219,14 @@ pub const MEMORY_UNLOAD_MIN_IDLE: Duration = Duration::from_secs(60);
 /// consumer does not pin a room for ever.
 pub const PENDING_UPDATE_GRACE: Duration = Duration::from_secs(600);
 
+/// How long [`RoomRegistry::spawn_memory_pressure_unloader`] waits after a pass that unloaded
+/// rooms before it reads memory again. Resident memory falls only as the allocator gives freed
+/// pages back, and on the real binary (macOS's allocator, 2026-10-15) that was some 70 s after
+/// the rooms went: checking every 5 s, the loop saw no change and unloaded every room it could,
+/// a quarter at a time, before the first drop showed. Thirty seconds lets most of a step show
+/// before the next.
+pub const MEMORY_UNLOAD_COOLDOWN: Duration = Duration::from_secs(30);
+
 /// What share of the rooms it may unload one memory check unloads, least recently used first:
 /// a quarter, so that resident memory, which falls only as the allocator gives pages back, is
 /// read again before more go.
@@ -1665,13 +1673,20 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(MEMORY_CHECK_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut last_unload: Option<Instant> = None;
             loop {
                 interval.tick().await;
                 if registry.memory_unload_fraction() <= 0.0 {
                     continue;
                 }
-                if let Some(ratio) = read_ratio() {
-                    registry.relieve_memory_pressure(ratio).await;
+                if last_unload.is_some_and(|at| at.elapsed() < MEMORY_UNLOAD_COOLDOWN) {
+                    continue;
+                }
+                if let Some(ratio) = read_ratio()
+                    && let Some(pass) = registry.relieve_memory_pressure(ratio).await
+                    && pass.unloaded > 0
+                {
+                    last_unload = Some(Instant::now());
                 }
             }
         })
@@ -2623,5 +2638,33 @@ mod tests {
         assert_eq!(registry.evict_idle(Duration::ZERO).await, 1);
         assert!(resident(&registry, &ids[0]).await);
         drop(held);
+    }
+
+    /// The running unloader waits out its cooldown after a pass that unloaded, so that memory
+    /// the allocator has not yet given back does not make it unload everything.
+    #[tokio::test(start_paused = true)]
+    async fn the_pressure_unloader_waits_between_passes_that_unload() {
+        let registry = registry();
+        rooms_nobody_holds(&registry, 8).await;
+        tokio::time::advance(MEMORY_UNLOAD_MIN_IDLE).await;
+        let task = registry.spawn_memory_pressure_unloader(|| Some(0.9));
+        let settle = || async {
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        };
+        // The first tick is at once: a quarter of eight.
+        settle().await;
+        assert_eq!(registry.resident_count().await, 6);
+        // Within the cooldown, checks pass without unloading.
+        tokio::time::advance(MEMORY_CHECK_INTERVAL * 3).await;
+        settle().await;
+        assert_eq!(registry.resident_count().await, 6);
+        // Past it, the next pass.
+        tokio::time::advance(MEMORY_UNLOAD_COOLDOWN).await;
+        settle().await;
+        assert_eq!(registry.resident_count().await, 4);
+        task.abort();
     }
 }
