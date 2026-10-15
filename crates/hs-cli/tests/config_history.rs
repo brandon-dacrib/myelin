@@ -365,6 +365,7 @@ async fn a_changed_setting_is_listed_reverted_and_a_secret_never_leaves() {
     let storage = hs_cli::storage::open_storage(&hs_config::StorageConfig::Embedded(
         hs_config::storage::EmbeddedStorageConfig {
             data_dir: data_dir.clone(),
+            ..Default::default()
         },
     ))
     .unwrap();

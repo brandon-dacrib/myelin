@@ -37,16 +37,31 @@ pub struct EmbeddedStorageConfig {
     /// Directory holding the embedded database files.
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
+    /// How much of the database's recently read blocks the server keeps in memory, decompressed,
+    /// so that reading them again needs neither the disk nor the decompressor. 64 MiB by
+    /// default, twice Fjall's own default: enough for the rows a busy server's resident rooms
+    /// keep reading (members, state, recent events) without growing the process by more than a
+    /// small share of a typical 1-3 GiB container limit. Raise it on a server with memory to
+    /// spare; Fjall suggests up to a quarter of the memory available. Counted in the process's
+    /// resident memory, so in `server.rooms.memory_unload_fraction` and
+    /// `federation.inbound_memory_shed_fraction` too. Read at start-up.
+    #[serde(default = "default_cache_size")]
+    pub cache_size: crate::size::ByteSize,
 }
 
 fn default_data_dir() -> PathBuf {
     PathBuf::from("./data")
 }
 
+fn default_cache_size() -> crate::size::ByteSize {
+    crate::size::ByteSize::mib(64)
+}
+
 impl Default for EmbeddedStorageConfig {
     fn default() -> Self {
         Self {
             data_dir: default_data_dir(),
+            cache_size: default_cache_size(),
         }
     }
 }

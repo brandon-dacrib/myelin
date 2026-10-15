@@ -101,6 +101,7 @@ fn a_write_buffer_over_the_cap_is_rotated_and_flushed_and_reads_stay_right() {
     let options = FjallOptions {
         write_buffer_cap: Some(256 * 1024),
         max_memtable_size: 64 * 1024 * 1024,
+        ..FjallOptions::default()
     };
     let backend = FjallBackend::open_with_options(dir.path(), options).expect("open");
     assert_eq!(backend.options(), options);
@@ -132,6 +133,7 @@ fn a_small_memtable_size_makes_fjall_flush_on_its_own() {
     let options = FjallOptions {
         write_buffer_cap: None,
         max_memtable_size: 128 * 1024,
+        ..FjallOptions::default()
     };
     let backend = FjallBackend::open_with_options(dir.path(), options).expect("open");
     assert_eq!(backend.write_buffer_stats().cap, None);

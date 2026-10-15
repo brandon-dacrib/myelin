@@ -53,7 +53,8 @@
       "$ref": "#/$defs/StorageConfig",
       "default": {
         "backend": "embedded",
-        "data_dir": "./data"
+        "data_dir": "./data",
+        "cache_size": "64M"
       },
       "x-applies": "bootstrap"
     },
@@ -644,6 +645,11 @@
               "type": "string",
               "default": "./data"
             },
+            "cache_size": {
+              "description": "How much of the database's recently read blocks the server keeps in memory, decompressed,\nso that reading them again needs neither the disk nor the decompressor. 64 MiB by\ndefault, twice Fjall's own default: enough for the rows a busy server's resident rooms\nkeep reading (members, state, recent events) without growing the process by more than a\nsmall share of a typical 1-3 GiB container limit. Raise it on a server with memory to\nspare; Fjall suggests up to a quarter of the memory available. Counted in the process's\nresident memory, so in `server.rooms.memory_unload_fraction` and\n`federation.inbound_memory_shed_fraction` too. Read at start-up.",
+              "$ref": "#/$defs/ByteSize",
+              "default": "64M"
+            },
             "backend": {
               "type": "string",
               "const": "embedded"
@@ -761,6 +767,14 @@
           ]
         }
       ]
+    },
+    "ByteSize": {
+      "description": "A byte size: a number with an optional unit (K, M, G, T with 1024 multipliers; KiB/MiB/GiB; KB/MB/GB with 1000 multipliers), or an integer byte count.",
+      "type": [
+        "string",
+        "integer"
+      ],
+      "x-bytesize": true
     },
     "SecretString": {
       "description": "An inline secret value. Prefer the matching `*_file` key to avoid putting secrets in the config file.",
@@ -1109,14 +1123,6 @@
           ]
         }
       ]
-    },
-    "ByteSize": {
-      "description": "A byte size: a number with an optional unit (K, M, G, T with 1024 multipliers; KiB/MiB/GiB; KB/MB/GB with 1000 multipliers), or an integer byte count.",
-      "type": [
-        "string",
-        "integer"
-      ],
-      "x-bytesize": true
     },
     "ThumbnailSize": {
       "description": "One generated thumbnail size. Corresponds to one entry in Synapse's\n`thumbnail_sizes`.",

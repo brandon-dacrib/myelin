@@ -709,6 +709,7 @@ mod tests {
         let storage = crate::storage::open_storage(&hs_config::StorageConfig::Embedded(
             hs_config::storage::EmbeddedStorageConfig {
                 data_dir: dir.path().to_owned(),
+                ..Default::default()
             },
         ))
         .unwrap();
@@ -763,6 +764,7 @@ mod tests {
         let storage = crate::storage::open_storage(&hs_config::StorageConfig::Embedded(
             hs_config::storage::EmbeddedStorageConfig {
                 data_dir: dir.path().to_owned(),
+                ..Default::default()
             },
         ))
         .unwrap();

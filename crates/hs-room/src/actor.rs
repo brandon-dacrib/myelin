@@ -322,6 +322,23 @@ struct StateKeyRowJson {
     event_type: String,
     #[serde(default)]
     state_key: Option<String>,
+    #[serde(default)]
+    content: StateKeyRowContent,
+}
+
+/// The part of an event's `content` [`StateKeyRow`] reads: a membership's `membership`.
+#[derive(serde::Deserialize, Default)]
+struct StateKeyRowContent {
+    #[serde(default)]
+    membership: Option<String>,
+}
+
+/// A held event's type, state key and `content.membership`
+/// ([`RoomActor::held_state_row`]).
+struct HeldStateRow {
+    event_type: String,
+    state_key: Option<String>,
+    membership: Option<String>,
 }
 
 /// The part of an event's JSON [`LoadRow`] reads.
@@ -516,6 +533,14 @@ pub struct RoomActor<B: KvBackend> {
     /// The roots of [`RoomActor::deferred_roots`] computed so far: behind a `RefCell` because a
     /// read through `&self` computes them.
     lazy_roots: RefCell<HashMap<EventSn, <ProductionStateStore<B> as StateStore>::Root>>,
+    /// [`RoomActor::membership_list`] as last read, with the root of the state it was read at.
+    #[allow(clippy::type_complexity)]
+    membership_cache: RefCell<
+        Option<(
+            <ProductionStateStore<B> as StateStore>::Root,
+            Arc<[(OwnedUserId, String)]>,
+        )>,
+    >,
     /// Placed outliers [`RoomActor::load`] found without a `Tables::state_snapshots` row and
     /// gave a state in memory (`(outlier, the state before it)`), waiting to be written back
     /// by [`RoomActor::persist_repaired_outlier_states`]. See [`RoomActor::load`]'s "Placed
@@ -903,6 +928,7 @@ impl<B: KvBackend> RoomActor<B> {
             placed_outlier_roots: HashMap::new(),
             deferred_roots: HashMap::new(),
             lazy_roots: RefCell::new(HashMap::new()),
+            membership_cache: RefCell::new(None),
             repaired_outlier_states: Vec::new(),
             fetched_state_outliers: HashSet::new(),
             rejected_history: HashSet::new(),
@@ -1840,25 +1866,36 @@ impl<B: KvBackend> RoomActor<B> {
         snapshot: &<B as KvBackend>::Snapshot,
         sn: EventSn,
     ) -> Option<(String, String)> {
+        let row = self.held_state_row(snapshot, sn)?;
+        row.state_key.map(|key| (row.event_type, key))
+    }
+
+    /// What [`RoomActor::held_state_key`] and [`RoomActor::membership_list`] read of a held
+    /// event: its type, state key and `content.membership`, from the event in memory or else
+    /// from its row ([`StateKeyRow`]). `None` if this actor does not hold it.
+    fn held_state_row(
+        &self,
+        snapshot: &<B as KvBackend>::Snapshot,
+        sn: EventSn,
+    ) -> Option<HeldStateRow> {
+        let from_event = |event: &Event| HeldStateRow {
+            event_type: event.header().event_type.clone(),
+            state_key: event.header().state_key.clone(),
+            membership: event
+                .json()
+                .get("content")
+                .and_then(CanonicalJsonValue::as_object)
+                .and_then(|content| content.get("membership"))
+                .and_then(CanonicalJsonValue::as_str)
+                .map(str::to_owned),
+        };
         let in_memory = self
             .pins
             .get(&sn)
-            .map(|event| {
-                (
-                    event.header().event_type.clone(),
-                    event.header().state_key.clone(),
-                )
-            })
-            .or_else(|| {
-                self.cache.borrow().peek(sn).map(|event| {
-                    (
-                        event.header().event_type.clone(),
-                        event.header().state_key.clone(),
-                    )
-                })
-            });
-        if let Some((event_type, state_key)) = in_memory {
-            return state_key.map(|key| (event_type, key));
+            .map(&from_event)
+            .or_else(|| self.cache.borrow().peek(sn).map(|event| from_event(event)));
+        if in_memory.is_some() {
+            return in_memory;
         }
         let bytes = match self.tables.events.get(snapshot, &(sn,)) {
             Ok(Some(bytes)) => bytes,
@@ -1881,7 +1918,11 @@ impl<B: KvBackend> RoomActor<B> {
         if !held {
             return None;
         }
-        row.json.state_key.map(|key| (row.json.event_type, key))
+        Some(HeldStateRow {
+            event_type: row.json.event_type,
+            state_key: row.json.state_key,
+            membership: row.json.content.membership,
+        })
     }
 
     /// Leaves the root of the state after `sn` -- its explicit state (`Tables::state_snapshots`),
@@ -5664,6 +5705,50 @@ impl<B: KvBackend> RoomActor<B> {
         self.event(sn)
     }
 
+    /// Every member in the room's current state with their membership (`join`, `invite`,
+    /// `leave`, `ban`, `knock`), sorted by user: what [`RoomActor::members`] gives without the
+    /// events. Remembered for the state it was read at, so asking again while the state is
+    /// unchanged (a room's messages do not change it) costs nothing; reading it afresh reads
+    /// each member's row for its state key and membership alone, not the whole event.
+    /// `hs-user`'s session hub asks for it on every update of every room, which for a room of
+    /// thousands of members was a parse of every member event per message.
+    ///
+    /// # Errors
+    /// Returns [`RoomError::State`] if the state store fails.
+    pub fn membership_list(&self) -> Result<Arc<[(OwnedUserId, String)]>, RoomError> {
+        let root = self.current_view()?.root;
+        if let Some((cached_root, list)) = self.membership_cache.borrow().as_ref()
+            && *cached_root == root
+        {
+            return Ok(list.clone());
+        }
+        let diff = self
+            .store
+            .diff(self.store.empty_root(), root)
+            .map_err(|e| RoomError::State(e.to_string()))?;
+        let snapshot = self.backend.snapshot();
+        let mut list: Vec<(OwnedUserId, String)> = Vec::new();
+        for sn in diff.added.values() {
+            let Some(row) = self.held_state_row(&snapshot, *sn) else {
+                continue;
+            };
+            if row.event_type != "m.room.member" {
+                continue;
+            }
+            let (Some(state_key), Some(membership)) = (row.state_key, row.membership) else {
+                continue;
+            };
+            let Ok(user_id) = UserId::parse(state_key.as_str()) else {
+                continue;
+            };
+            list.push((user_id.to_owned(), membership));
+        }
+        list.sort();
+        let list: Arc<[(OwnedUserId, String)]> = list.into();
+        *self.membership_cache.borrow_mut() = Some((root, list.clone()));
+        Ok(list)
+    }
+
     /// Every current `m.room.member` event.
     ///
     /// # Errors
@@ -7810,6 +7895,77 @@ mod tests {
             1,
         )
         .unwrap()
+    }
+
+    /// The membership list is what the member events say, read without decoding them (here,
+    /// after the cache that held them is emptied), and is read again only when the state moves.
+    #[test]
+    fn the_membership_list_follows_the_state_and_is_kept_while_it_holds() {
+        let mut actor = room("public_chat");
+        let alice = user_id!("@alice:hs1").to_owned();
+        let bob = user_id!("@bob:hs1").to_owned();
+        let carol = user_id!("@carol:hs1").to_owned();
+        for user in [&bob, &carol] {
+            actor
+                .membership_action(
+                    user.clone(),
+                    crate::membership::Action::Join,
+                    user.clone(),
+                    serde_json::json!({}),
+                    2,
+                )
+                .unwrap();
+        }
+        actor.set_cache_capacity(event_cache::CacheCapacity::new(0));
+        actor.begin_operation();
+        let list = actor.membership_list().unwrap();
+        assert_eq!(
+            list.to_vec(),
+            vec![
+                (alice.clone(), "join".to_owned()),
+                (bob.clone(), "join".to_owned()),
+                (carol.clone(), "join".to_owned()),
+            ]
+        );
+        // A message changes no state: the same list, not read again.
+        actor
+            .send_event(
+                bob.clone(),
+                "m.room.message".to_owned(),
+                None,
+                serde_json::json!({"msgtype": "m.text", "body": "hi"}),
+                None,
+                3,
+            )
+            .unwrap();
+        assert!(Arc::ptr_eq(&list, &actor.membership_list().unwrap()));
+        actor
+            .membership_action(
+                carol.clone(),
+                crate::membership::Action::Leave,
+                carol.clone(),
+                serde_json::json!({}),
+                4,
+            )
+            .unwrap();
+        let after = actor.membership_list().unwrap();
+        assert_eq!(
+            after
+                .iter()
+                .find(|(user, _)| *user == carol)
+                .map(|(_, m)| m.as_str()),
+            Some("leave")
+        );
+        let joined: Vec<_> = actor
+            .joined_members()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e.header().state_key.clone())
+            .collect();
+        assert_eq!(
+            after.iter().filter(|(_, m)| m == "join").count(),
+            joined.len()
+        );
     }
 
     /// A member who left may still read the room's state as of their leave; a banned one may

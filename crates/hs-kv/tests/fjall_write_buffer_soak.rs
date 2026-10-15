@@ -53,6 +53,7 @@ fn rss_stays_flat_under_the_write_buffer_cap() {
         FjallOptions {
             write_buffer_cap: None,
             max_memtable_size: 64 * 1024 * 1024,
+            ..FjallOptions::default()
         }
     } else {
         FjallOptions::default()

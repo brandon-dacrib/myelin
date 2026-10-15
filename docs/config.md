@@ -66,6 +66,7 @@ and tests.
 | Field | Type | Default | Applies | Description |
 |---|---|---|---|---|
 | `data_dir` | string | `"./data"` | bootstrap (where the database is, read before it is open) | Directory holding the embedded database files. |
+| `cache_size` | string \| integer | `"64M"` | bootstrap (where the database is, read before it is open) | How much of the database's recently read blocks the server keeps in memory, decompressed, so that reading them again needs neither the disk nor the decompressor. 64 MiB by default, twice Fjall's own default: enough for the rows a busy server's resident rooms keep reading (members, state, recent events) without growing the process by more than a small share of a typical 1-3 GiB container limit. Raise it on a server with memory to spare; Fjall suggests up to a quarter of the memory available. Counted in the process's resident memory, so in `server.rooms.memory_unload_fraction` and `federation.inbound_memory_shed_fraction` too. Read at start-up. |
 
 ### `storage` variant: `postgres`
 

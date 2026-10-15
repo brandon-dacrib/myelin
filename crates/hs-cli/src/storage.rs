@@ -125,7 +125,8 @@ impl std::fmt::Debug for OpenedStorage {
 pub fn open_storage(config: &hs_config::StorageConfig) -> Result<OpenedStorage, StorageOpenError> {
     match config {
         hs_config::StorageConfig::Embedded(embedded) => {
-            open_embedded(&embedded.data_dir).map(OpenedStorage::Embedded)
+            open_embedded(&embedded.data_dir, embedded.cache_size.as_u64())
+                .map(OpenedStorage::Embedded)
         }
         hs_config::StorageConfig::Postgres(pg) => open_postgres(pg).map(OpenedStorage::Postgres),
         hs_config::StorageConfig::Slatedb(_) => {
@@ -211,14 +212,23 @@ fn ssl_mode_of(mode: hs_config::storage::PostgresSslMode) -> hs_kv::postgres_tls
     }
 }
 
-fn open_embedded(path: &Path) -> Result<hs_kv::fjall_backend::FjallBackend, StorageOpenError> {
+fn open_embedded(
+    path: &Path,
+    cache_size: u64,
+) -> Result<hs_kv::fjall_backend::FjallBackend, StorageOpenError> {
     std::fs::create_dir_all(path).map_err(|e| StorageOpenError::FjallDataDir {
         path: path.to_owned(),
         source: hs_kv::KvError::backend(e),
     })?;
-    hs_kv::fjall_backend::FjallBackend::open(path).map_err(|source| StorageOpenError::Fjall {
-        path: path.to_owned(),
-        source,
+    let options = hs_kv::fjall_backend::FjallOptions {
+        cache_size,
+        ..Default::default()
+    };
+    hs_kv::fjall_backend::FjallBackend::open_with_options(path, options).map_err(|source| {
+        StorageOpenError::Fjall {
+            path: path.to_owned(),
+            source,
+        }
     })
 }
 
@@ -232,6 +242,7 @@ mod tests {
         let config =
             hs_config::StorageConfig::Embedded(hs_config::storage::EmbeddedStorageConfig {
                 data_dir: dir.path().to_owned(),
+                cache_size: hs_config::size::ByteSize::mib(8),
             });
         let opened = open_storage(&config).unwrap();
         let OpenedStorage::Embedded(backend) = opened else {

@@ -250,7 +250,11 @@ fn public_directory_entry<B: KvBackend>(
         topic: field("m.room.topic", "topic")?,
         canonical_alias: field("m.room.canonical_alias", "alias")?,
         avatar_url: field("m.room.avatar", "url")?,
-        num_joined_members: actor.joined_members()?.len(),
+        num_joined_members: actor
+            .membership_list()?
+            .iter()
+            .filter(|(_, membership)| membership == "join")
+            .count(),
         world_readable,
         guest_can_join,
     }))
@@ -2493,17 +2497,11 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         in_hand.step("reading the room's members and directory entry");
         let (active_members, member_count, directory) = handle
             .query(|actor| {
-                let members = actor.members()?;
+                // Remembered by the room for its current state: a message, which changes no
+                // state, reads nothing here (`RoomActor::membership_list`).
+                let members = actor.membership_list()?;
                 let count = members.len();
-                let active: Vec<(OwnedUserId, String)> = members
-                    .iter()
-                    .filter_map(|e| {
-                        let state_key = e.header().state_key.clone()?;
-                        let user_id = UserId::parse(state_key.as_str()).ok()?.to_owned();
-                        let membership = membership_of(e)?;
-                        Some((user_id, membership))
-                    })
-                    .collect();
+                let active: Vec<(OwnedUserId, String)> = members.to_vec();
                 let directory = public_directory_entry(actor)?;
                 Ok::<_, hs_room::RoomError>((active, count, directory))
             })

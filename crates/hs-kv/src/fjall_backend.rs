@@ -81,6 +81,10 @@ pub const FJALL_WRITE_BUFFER_CAP: u64 = 32 * 1024 * 1024;
 /// back.
 pub const FJALL_MEMTABLE_SIZE: u64 = 16 * 1024 * 1024;
 
+/// The default size of Fjall's block cache for a [`FjallBackend`]: 64 MiB, twice Fjall's own
+/// default (`hs-config`'s `storage.cache_size`, which `hs serve` passes).
+pub const FJALL_CACHE_SIZE: u64 = 64 * 1024 * 1024;
+
 /// Tuning of a [`FjallBackend`]. [`FjallBackend::open`] uses [`FjallOptions::default`]; the
 /// fields exist for tests and benchmarks (a tiny cap makes a flush observable in milliseconds) and
 /// for an operator setting, should one ever be needed.
@@ -92,6 +96,9 @@ pub struct FjallOptions {
     /// `max_memtable_size` for every Fjall keyspace this backend creates (not for keyspaces
     /// recovered from an existing directory, whose size Fjall persisted at their creation).
     pub max_memtable_size: u64,
+    /// The block cache's capacity in bytes: decompressed blocks recently read, shared by every
+    /// keyspace.
+    pub cache_size: u64,
 }
 
 impl Default for FjallOptions {
@@ -99,6 +106,7 @@ impl Default for FjallOptions {
         Self {
             write_buffer_cap: Some(FJALL_WRITE_BUFFER_CAP),
             max_memtable_size: FJALL_MEMTABLE_SIZE,
+            cache_size: FJALL_CACHE_SIZE,
         }
     }
 }
@@ -186,6 +194,7 @@ impl FjallBackend {
         // Not `Builder::max_write_buffer_size`: in Fjall 3.1.10 it is stored and never read (see
         // the module docs), so the cap is enforced in `enforce_write_buffer_cap` instead.
         let db = fjall::OptimisticTxDatabase::builder(path)
+            .cache_size(options.cache_size)
             .open()
             .map_err(KvError::from)?;
         let inner = Arc::new(Inner {
@@ -209,6 +218,7 @@ impl FjallBackend {
             fresh,
             write_buffer_cap_bytes = options.write_buffer_cap,
             memtable_bytes = options.max_memtable_size,
+            cache_bytes = options.cache_size,
             "opened the Fjall database"
         );
         Ok(Self { inner })
