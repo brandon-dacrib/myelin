@@ -174,7 +174,7 @@ retry arrives before it has finished the first attempt (mautrix-go dedupes only 
 **Seen.** The demo's Slack bridge stopped on 2026-10-14 when its 1 GiB volume filled (its init
 container: `cp: write error: No space left on device`); the Registrations page said only
 "degraded" for over a day. Its own log files filled it: mautrix's default `logging` also writes
-`./logs/bridge.log` into `/data`, up to 1.1 GB. Decision 0049; the platform side (the operator's
+`./logs/bridge.log` into `/data`, up to 1.1 GB. Decision 0050; the platform side (the operator's
 never-shrink, the volume sweep, the chart) is in `docs/status/12-platform-and-kubernetes.md`.
 
 **Done.**
@@ -192,7 +192,7 @@ never-shrink, the volume sweep, the chart) is in `docs/status/12-platform-and-ku
   (`watch_volumes`): `hs_bridge_volume_used_ratio{bridge,bridge_type}` and
   `hs_bridge_volume_capacity_bytes` (`crates/hs-bridges/src/metrics.rs`), a `WARN` when one
   becomes nearly full (85%) or full (95%), an `INFO` when it has room again.
-  `BridgeVolume` (OpenAPI 0.1.18) is on `BridgeInstance.volume` and, through the
+  `BridgeVolume` (OpenAPI 0.1.19) is on `BridgeInstance.volume` and, through the
   offering-aware directory, on `AppService.volume`, so the Registrations page can say "Volume
   full". A deployment whose last words say "No space left on device" or "database or disk is
   full" is a full volume whatever was measured.

@@ -4,7 +4,7 @@
 
 The demo's Slack bridge stopped on 2026-10-14 with a full 1 GiB volume (its init container:
 `cp: write error: No space left on device`), and for a day the only sign was "degraded".
-Decision 0049; the recovery is in `docs/bridges/mautrix.md`, "2026-10-15: a full volume".
+Decision 0050; the recovery is in `docs/bridges/mautrix.md`, "2026-10-15: a full volume".
 
 ### Done
 
@@ -81,7 +81,7 @@ Decision 0049; the recovery is in `docs/bridges/mautrix.md`, "2026-10-15: a full
 
 ### Decisions made
 
-- Decision 0049 (kubelet direct over the node proxy; insecure kubelet TLS by default, as
+- Decision 0050 (kubelet direct over the node proxy; insecure kubelet TLS by default, as
   metrics-server on this cluster; 85% and 95%; 5 GiB).
 
 ### Interfaces provided / needed

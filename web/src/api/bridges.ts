@@ -759,7 +759,7 @@ export function useBridgeInstanceFiles() {
 }
 
 /**
- * The volume of a bridge this server deploys (OpenAPI 0.1.18): its size, how full the operator
+ * The volume of a bridge this server deploys (OpenAPI 0.1.19): its size, how full the operator
  * last measured it, and `ok`, `nearly_full`, `full` or `unknown` with what to do. On
  * `BridgeInstance.volume` and `AppService.volume`; null for a bridge run elsewhere.
  */

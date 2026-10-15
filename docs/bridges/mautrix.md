@@ -331,7 +331,7 @@ error: No space left on device`, and the pod sat in `Init:CrashLoopBackOff` for 
 `logging` writes `./logs/bridge.log` in `/data` besides standard output, rotated at 100 MB with
 ten backups (up to 1.1 GB), and the Slack bridge logs about 600 MB a day at debug.
 
-**What changed** (decision 0049):
+**What changed** (decision 0050):
 
 - The rendered config logs to standard output only (a `logging` section with one `stdout`
   writer), which the cluster's log collector keeps.

@@ -1,4 +1,4 @@
-# 0049: A bridge's volume only grows, starts at 5 GiB, and is measured
+# 0050: A bridge's volume only grows, starts at 5 GiB, and is measured
 
 Date: 2026-10-15. Track 12 (`hs-operator`, the chart), track 11 (`hs-bridges`), track 15
 (`hs-admin`), track 16 (`web/`).

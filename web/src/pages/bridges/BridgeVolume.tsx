@@ -22,7 +22,7 @@ import {
 import { cn } from "@/lib/cn";
 
 /**
- * A deployed bridge's volume (OpenAPI 0.1.18, `BridgeVolume`): how full it is, and the control to
+ * A deployed bridge's volume (OpenAPI 0.1.19, `BridgeVolume`): how full it is, and the control to
  * give it a larger size. The bridge's page and the offering page's dialog show the same pieces.
  * A bridge whose volume fills stops (the demo's Slack bridge, 2026-10-15: its init container
  * could not copy its files, `No space left on device`), so a nearly full or full volume says so

@@ -37,9 +37,9 @@ The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/
 `bridge-slack-brandon` sat in `Init:CrashLoopBackOff` from 2026-10-14 (`cp: write error: No
 space left on device`, 1 GiB at 0.98), and the only sign was "degraded". mautrix's default
 logging also writes up to 1.1 GB of `logs/bridge.log*` into `/data`; Slack's debug log is
-~600 MB a day. Decision 0049: rendered mautrix configs log to stdout only (checked with the real
+~600 MB a day. Decision 0050: rendered mautrix configs log to stdout only (checked with the real
 bridge); deployed bridges get 5 GiB (was 1 GiB) and an administrator can raise one on its page
-(`PUT .../instances/{user}` `volume_size`, OpenAPI 0.1.18); a volume never shrinks (the operator
+(`PUT .../instances/{user}` `volume_size`, OpenAPI 0.1.19); a volume never shrinks (the operator
 applies the larger of spec and claim, `VolumeSize` condition instead of a failed reconcile; the
 manager's writes keep a size raised by hand); the operator measures every bridge volume from the
 kubelet once a minute into `status.volume` (ClusterRole `nodes`, `nodes/stats`; chart

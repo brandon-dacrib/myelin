@@ -3,7 +3,7 @@ import type { BadgeProps } from "@/components/ui/badge/Badge";
 import { formatBytes } from "@/lib/format";
 
 /**
- * How the pages word a deployed bridge's volume (`BridgeVolume`, OpenAPI 0.1.18). The server
+ * How the pages word a deployed bridge's volume (`BridgeVolume`, OpenAPI 0.1.19). The server
  * judges the state (`nearly_full` from 85% used, `full` from 95% or when the bridge stopped saying
  * it could not write) and words what to do in `message`; this only picks the badge and the
  * numbers.

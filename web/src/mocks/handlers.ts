@@ -239,7 +239,7 @@ const registeredIds = new Set(appservices.map((a) => a.id));
 
 /**
  * An appservice as the server answers it: its double puppeting linked (`linkedAppservice`), and
- * for the registration of a bridge this server deploys, that instance's volume (OpenAPI 0.1.18).
+ * for the registration of a bridge this server deploys, that instance's volume (OpenAPI 0.1.19).
  */
 function appserviceView(appservice: Parameters<typeof linkedAppservice>[0]) {
   return {

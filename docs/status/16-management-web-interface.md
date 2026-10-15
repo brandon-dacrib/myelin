@@ -11,7 +11,7 @@ server folds each double-puppeting registration; branch `agent/fold-doublepuppet
 ## 2026-10-15: a deployed bridge's volume is on its pages, and its size is set there (branch `agent/bridge-volume-size`)
 
 The demo's Slack bridge stopped with a full volume and the Registrations page said only
-"Degraded" (decision 0049). With OpenAPI 0.1.18 (`BridgeVolume` on `AppService.volume` and
+"Degraded" (decision 0050). With OpenAPI 0.1.19 (`BridgeVolume` on `AppService.volume` and
 `BridgeInstance.volume`, `BridgeInstanceRequest.volume_size`):
 
 - **Registrations** (`BridgesListPage.tsx`): under the health badge, "Volume full" (danger) or
