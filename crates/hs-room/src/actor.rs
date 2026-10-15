@@ -486,6 +486,16 @@ pub struct RoomActor<B: KvBackend> {
     /// `Tables::state_snapshots` row -- is held here as a root and read in its place
     /// ([`RoomActor::root_after`]).
     placed_outlier_roots: HashMap<EventSn, <ProductionStateStore<B> as StateStore>::Root>,
+    /// Events with an explicit state (`Tables::state_snapshots`: a placed outlier, an outlier
+    /// held with a fetched state) whose root [`RoomActor::load`] left to the first read that
+    /// needs it ([`RoomActor::root_after`]), with whether the event itself goes over its state
+    /// (`true`, as [`RoomActor::record_placed_outlier_state`] has it; `false` for a rejected
+    /// one, as [`RoomActor::record_rejected_outlier_state`]). A root computed for one is kept
+    /// in [`RoomActor::lazy_roots`]; one recorded in `placed_outlier_roots` since wins.
+    deferred_roots: HashMap<EventSn, bool>,
+    /// The roots of [`RoomActor::deferred_roots`] computed so far: behind a `RefCell` because a
+    /// read through `&self` computes them.
+    lazy_roots: RefCell<HashMap<EventSn, <ProductionStateStore<B> as StateStore>::Root>>,
     /// Placed outliers [`RoomActor::load`] found without a `Tables::state_snapshots` row and
     /// gave a state in memory (`(outlier, the state before it)`), waiting to be written back
     /// by [`RoomActor::persist_repaired_outlier_states`]. See [`RoomActor::load`]'s "Placed
@@ -871,6 +881,8 @@ impl<B: KvBackend> RoomActor<B> {
             next_room_pos: 1,
             gaps: BTreeMap::new(),
             placed_outlier_roots: HashMap::new(),
+            deferred_roots: HashMap::new(),
+            lazy_roots: RefCell::new(HashMap::new()),
             repaired_outlier_states: Vec::new(),
             fetched_state_outliers: HashSet::new(),
             rejected_history: HashSet::new(),
@@ -1055,9 +1067,12 @@ impl<B: KvBackend> RoomActor<B> {
         // Only the rejected, and the outliers the store must be fed, are decoded: a room whose
         // records are complete reads each outlier's bookkeeping fields and one state-store row.
         let mut outliers: Vec<(EventSn, Event)> = Vec::new();
+        // Every outlier, for the outliers held with a fetched state (`held_states` below).
+        let mut outlier_sns: Vec<EventSn> = Vec::new();
         for item in actor.tables.outliers.range(&snapshot, outlier_spec) {
             let ((_, sn), _) = item?;
             clock.report_mut().outliers += 1;
+            outlier_sns.push(sn);
             let Some(bytes) = events_table.get(&snapshot, &(sn,))? else {
                 continue;
             };
@@ -1084,20 +1099,31 @@ impl<B: KvBackend> RoomActor<B> {
             actor.absorb_loaded_outlier(sn, event, feed)?;
         }
 
-        clock.begin("state_rows");
-        // The explicit states timeline events were fed to the store with, if any.
-        let snapshot_spec = hs_tables::keyspace::TypedKeyspace::<
-            B::Keyspace,
-            crate::persist::StateSnapshotKey,
-        >::prefix(&(room_sn,));
-        let mut explicit_states: HashMap<EventSn, Vec<EventSn>> = HashMap::new();
-        for item in actor.tables.state_snapshots.range(&snapshot, snapshot_spec) {
-            let ((_, sn), value) = item?;
-            let sns = decode_event_sns(value.as_ref())
-                .ok_or_else(|| RoomError::Internal("corrupt state snapshot entry".into()))?;
-            explicit_states.insert(sn, sns);
-        }
-        clock.report_mut().state_rows = explicit_states.len();
+        // The explicit states events were held with (`Tables::state_snapshots`) are read one
+        // by one, and only where the load needs one: an event the state store must be fed, or a
+        // placed outlier without a row (which has none to read). Every placed history event has
+        // a row naming the whole state before it, so reading them all -- as every load did until
+        // 2026-10-15 -- decoded the room's state once per backfilled event; and a placed or
+        // fetched-state outlier's root, computed from its row, is left to the first read that
+        // asks for the state after it ([`RoomActor::root_after`]), since building one parses
+        // every event of the state: with every member event a backfilled room's join brought
+        // placed in its history, that was the room's state squared, minutes on the demo.
+        let state_snapshots = actor.tables.state_snapshots.clone();
+        let mut state_rows_read = 0usize;
+        let mut read_state_row = |sn: EventSn| -> Result<Option<Vec<EventSn>>, RoomError> {
+            state_rows_read += 1;
+            let Some(value) = state_snapshots.get(&snapshot, &(room_sn, sn))? else {
+                return Ok(None);
+            };
+            decode_event_sns(value.as_ref())
+                .map(Some)
+                .ok_or_else(|| RoomError::Internal("corrupt state snapshot entry".into()))
+        };
+        let has_state_row = |sn: EventSn| -> Result<bool, RoomError> {
+            Ok(state_snapshots.get(&snapshot, &(room_sn, sn))?.is_some())
+        };
+        // Outliers given a timeline position, which `held_states` passes over.
+        let mut placed_outliers: HashSet<EventSn> = HashSet::new();
 
         clock.begin("timeline");
 
@@ -1140,25 +1166,31 @@ impl<B: KvBackend> RoomActor<B> {
             // placement (its `state_snapshots` row) is what reads of the state after it see.
             // (Its row says so: a placed outlier keeps its outlier flag.)
             if flags.is_outlier() || actor.rejected.contains(&event_sn) {
-                let state = match explicit_states.remove(&event_sn) {
-                    Some(state) => state,
-                    None => {
-                        let state = actor.state_before_placed_outlier(room_pos, event_sn)?;
-                        actor
-                            .repaired_outlier_states
-                            .push((event_sn, state.clone()));
-                        state
-                    }
-                };
+                placed_outliers.insert(event_sn);
+                if has_state_row(event_sn)? {
+                    actor.timeline.insert(room_pos, event_sn);
+                    actor.defer_explicit_root(event_sn, true);
+                    continue;
+                }
+                let state = actor.state_before_placed_outlier(room_pos, event_sn)?;
+                actor
+                    .repaired_outlier_states
+                    .push((event_sn, state.clone()));
                 actor.timeline.insert(room_pos, event_sn);
                 actor.record_placed_outlier_state(event_sn, &state)?;
                 continue;
             }
-            let explicit_state = explicit_states.remove(&event_sn);
-            if row.json.event_type != "m.room.redaction" && !actor.must_feed(event_sn, feed)? {
+            let must_feed = actor.must_feed(event_sn, feed)?;
+            if row.json.event_type != "m.room.redaction" && !must_feed {
                 actor.absorb_loaded_row(event_sn, room_pos, flags, &row);
                 continue;
             }
+            // Only an event the store is fed reads the state it was held with.
+            let explicit_state = if must_feed {
+                read_state_row(event_sn)?
+            } else {
+                None
+            };
             let Some((event, purged)) = read_event_row(event_sn)? else {
                 continue;
             };
@@ -1183,18 +1215,18 @@ impl<B: KvBackend> RoomActor<B> {
 
         clock.begin("held_states");
         // An outlier held with a fetched state and no timeline position (`fetched_state`): the
-        // state after it is the one it was held with, as at the time it was.
-        for (sn, state) in explicit_states {
-            if !actor.known(sn) {
+        // state after it is the one it was held with, as at the time it was (the outlier over
+        // it, unless it was rejected) -- computed when first read, like a placed outlier's.
+        for sn in outlier_sns {
+            if placed_outliers.contains(&sn) || !has_state_row(sn)? {
                 continue;
             }
-            if actor.rejected.contains(&sn) {
-                actor.record_rejected_outlier_state(sn, &state)?;
-            } else {
-                actor.record_placed_outlier_state(sn, &state)?;
-            }
+            let rejected = actor.rejected.contains(&sn);
+            actor.defer_explicit_root(sn, !rejected);
             actor.fetched_state_outliers.insert(sn);
         }
+        clock.report_mut().state_rows = state_rows_read;
+        clock.report_mut().deferred_roots = actor.deferred_roots.len();
 
         clock.begin("extremities");
         // The authoritative forward-extremity set is whatever `RoomActor::persist` last wrote to
@@ -1706,6 +1738,15 @@ impl<B: KvBackend> RoomActor<B> {
         if let Some(root) = self.placed_outlier_roots.get(&sn) {
             return Ok(*root);
         }
+        if let Some(&with_event) = self.deferred_roots.get(&sn) {
+            if let Some(root) = self.lazy_roots.borrow().get(&sn) {
+                return Ok(*root);
+            }
+            if let Some(root) = self.compute_deferred_root(sn, with_event)? {
+                self.lazy_roots.borrow_mut().insert(sn, root);
+                return Ok(root);
+            }
+        }
         self.store.state_at(sn).map_err(|e| {
             // The store not knowing an event the room cites (an extremity, a prev event) is a
             // room whose rows disagree with each other -- what a copy behind the store writing
@@ -1765,6 +1806,51 @@ impl<B: KvBackend> RoomActor<B> {
         self.store
             .apply(self.store.empty_root(), &diff)
             .map_err(|e| RoomError::State(e.to_string()))
+    }
+
+    /// Leaves the root of the state after `sn` -- its explicit state (`Tables::state_snapshots`),
+    /// with `sn` over it when `with_event` -- to the first read that needs it
+    /// ([`RoomActor::root_after`]), as [`RoomActor::load`] does for every placed and
+    /// fetched-state outlier.
+    fn defer_explicit_root(&mut self, sn: EventSn, with_event: bool) {
+        self.deferred_roots.insert(sn, with_event);
+    }
+
+    /// Whether the state after `sn` is an explicit one (a placed outlier's, or an outlier held
+    /// with a fetched state) rather than the state store's own.
+    pub(crate) fn has_explicit_root(&self, sn: EventSn) -> bool {
+        self.placed_outlier_roots.contains_key(&sn) || self.deferred_roots.contains_key(&sn)
+    }
+
+    /// Computes a deferred root ([`RoomActor::deferred_roots`]) from its event's state row.
+    /// `None` when the row is gone (the room deleted under the actor): the caller falls back
+    /// to the state store's own.
+    ///
+    /// # Errors
+    /// [`RoomError::Store`] if the row cannot be read, [`RoomError::Internal`] if it does not
+    /// decode, [`RoomError::State`] if the store fails.
+    fn compute_deferred_root(
+        &self,
+        sn: EventSn,
+        with_event: bool,
+    ) -> Result<Option<<ProductionStateStore<B> as StateStore>::Root>, RoomError> {
+        let snapshot = self.backend.snapshot();
+        let Some(value) = self
+            .tables
+            .state_snapshots
+            .get(&snapshot, &(self.room_sn, sn))?
+        else {
+            return Ok(None);
+        };
+        let state = decode_event_sns(value.as_ref())
+            .ok_or_else(|| RoomError::Internal("corrupt state snapshot entry".into()))?;
+        let _computing = if hs_telemetry::current_is_sampled() {
+            tracing::info_span!("room.explicit_root", entries = state.len()).entered()
+        } else {
+            tracing::Span::none().entered()
+        };
+        self.root_from_sns(&state, with_event.then_some(sn))
+            .map(Some)
     }
 
     /// Records the state after an outlier placed in the timeline: `state_before` with the

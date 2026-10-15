@@ -153,7 +153,7 @@ impl<B: KvBackend> RoomActor<B> {
             }
             // A rejected outlier held with a fetched state has a state after it of its own
             // (the state before it); its prev events are not held to walk back to.
-            if !self.rejected.contains(&sn) || self.placed_outlier_roots.contains_key(&sn) {
+            if !self.rejected.contains(&sn) || self.has_explicit_root(sn) {
                 out.push(sn);
                 continue;
             }
