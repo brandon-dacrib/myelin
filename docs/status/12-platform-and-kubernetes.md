@@ -1,5 +1,90 @@
 # 12. Platform and Kubernetes
 
+## 2026-10-15 (branch `agent/bridge-volume-size`): a bridge's volume only grows, starts at 5 GiB, and is measured
+
+The demo's Slack bridge stopped on 2026-10-14 with a full 1 GiB volume (its init container:
+`cp: write error: No space left on device`), and for a day the only sign was "degraded".
+Decision 0049; the recovery is in `docs/bridges/mautrix.md`, "2026-10-15: a full volume".
+
+### Done
+
+- **Never shrink** (`crates/hs-operator/src/bridge.rs`, `controller.rs`): the claim is applied at
+  `claim_size`, the larger of the spec's size and the claim's request or capacity
+  (`crate::quantity`, Kubernetes quantities as bytes). A smaller spec logs one `WARN` and is the
+  `Bridge`'s `VolumeSize` condition (`ShrinkRefused`), never a failed reconcile. A larger spec
+  the claim's StorageClass will not grow (no `allowVolumeExpansion`, or a static PV) is
+  `GrowthRefused` with the API server's words, one `WARN`, and the rest of the bridge is still
+  reconciled: until then every reconcile failed at the claim, before the Deployment, which with
+  the new 5 GiB default would have frozen every bridge on such a class.
+  `KubeBridgeClient::apply` (`deploy.rs`) writes a `Bridge` with the larger of its size and the
+  cluster's (`keep_larger_storage`), so a size raised by hand survives the manager's next write.
+- **Default 5 GiB** (`crds::bridge::DEFAULT_STORAGE_SIZE`), the CRD's default too.
+- **The init container keeps its last words** (`FallbackToLogsOnError`): "No space left on
+  device" reaches the status.
+- **The volume sweep** (`crates/hs-operator/src/volume.rs`): every minute, each node running a
+  bridge pod is asked for its kubelet `/stats/summary`; each bridge's claim measurement goes into
+  `status.volume` (`VolumeStatus`, written when it moves 1%, crosses a level or is 15 minutes
+  old), `hs_operator_bridge_volume_used_ratio{bridge}`, and a `WARN` at 85% / 95% once per
+  crossing (`INFO` when it has room again). A pod that is not running has no statistics, so the
+  last measurement stays. Sources: `--volume-stats kubelet` (default; `get` on `nodes`,
+  `nodes/stats`; `--kubelet-insecure-tls` for self-signed kubelet certificates), `apiserver`
+  (the node proxy, `nodes/proxy`), `off`.
+- **Chart**: `bridges.operator.volumeStats.{source,kubeletInsecureTLS}` (kubelet, true), a
+  ClusterRole/Binding named `<namespace>-<fullname>-bridge-volumes` granting exactly what the
+  source needs (none when off), the flags on the operator; `HsBridgeVolumeNearlyFull` (85%, 10m,
+  warning) and `HsBridgeVolumeFull` (95%, 5m, critical) on `hs_bridge_volume_used_ratio`, with
+  promtool tests. `deploy/operator/` grants the same ClusterRole.
+- **`deploy/operator/ci/kind-smoke.sh`**: after the stand-in Bridge is Ready, the operator must
+  read the kubelet without a refusal, and a spec patched to 32Mi must leave the 64Mi claim alone
+  with `ShrinkRefused` and no failed reconcile, then clear when patched back.
+- The server side (tracks 11, 15, 16 on this branch): `docs/status/11-appservices-and-bridges.md`.
+
+### Verified
+
+- `cargo test -p hs-operator` (new: `quantity`, `volume`, `a_claim_never_shrinks`,
+  `a_refused_shrink_is_a_condition_...`, `a_full_volume_reaches_the_status_...`,
+  `the_status_keeps_the_last_volume_measurement`, `writing_a_bridge_keeps_a_volume_raised_by_hand`,
+  `the_chart_grants_the_volume_sweep_what_its_source_needs`); `cargo test -p hs-cli --lib
+  bridges:: cli::tests::the_operator`; `deploy/helm/hs/ci/alerts-test.sh` (17 rules, promtool
+  test passes); `cargo clippy -p hs-operator -p hs-admin -p hs-bridges -p hs-appservice -p hs-cli
+  --all-targets -- -D warnings`.
+- The summary parser's fixture (`volume.rs`) is what the demo's kubelet answered on tp0n1
+  (`/api/v1/nodes/tp0n1/proxy/stats/summary` through the owner's proxy, read-only), trimmed. The
+  same read showed what the sweep has to live with: the Slack bridge's pod, stuck in its init
+  container, was not in the summary at all, which is why the last measurement is kept.
+
+- **On kind (v1.33.1), the real binary**: `hs operator --namespace vt --volume-stats apiserver`
+  run from the desktop against a kind cluster, a stand-in `Bridge` on a static `local` PV (which,
+  unlike local-path's hostPath, has kubelet statistics): `status.volume` written on the first
+  sweep (`capacityBytes 370575147008`, `usedBytes 113215479808`); spec patched to 32Mi:
+  `ShrinkRefused`, the claim kept 64Mi, one `WARN`, the pod rolled to Ready, no failed
+  reconcile; patched to 128Mi: the API server refused the resize, which failed every reconcile
+  until `GrowthRefused` was added, then `GrowthRefused`, Ready; patched back to 64Mi: the
+  condition went with one `INFO`. `--volume-stats kubelet` cannot be run from the desktop
+  (macOS refuses a session's binaries the route to the kind node, "No route to host"; Apple's
+  curl reaches it), so the kubelet path was run in-cluster: see below.
+
+### Next
+
+- Run `deploy/operator/ci/kind-smoke.sh` on kind with this branch's image (CD runs it on the
+  amd64 leg); a kind volume (local-path, hostPath) has no statistics, so `status.volume` is
+  first seen on the demo after the roll.
+- On the demo after the roll: `kubectl -n myelin get bridges -o
+  custom-columns=NAME:.metadata.name,USED:.status.volume.usedBytes,CAP:.status.volume.capacityBytes`,
+  `hs_bridge_volume_used_ratio` in Prometheus, no "cannot read the kubelet's volume statistics"
+  in the operator's log.
+
+### Decisions made
+
+- Decision 0049 (kubelet direct over the node proxy; insecure kubelet TLS by default, as
+  metrics-server on this cluster; 85% and 95%; 5 GiB).
+
+### Interfaces provided / needed
+
+- `OperatorStatus.volume` (`status.volume` on every kind's CRD; only `Bridge` fills it),
+  `BridgeInstanceStatus.{storage_size,volume}`, `hs_operator::quantity`, `hs_operator::volume`.
+- `hs operator --volume-stats`, `--kubelet-insecure-tls`.
+
 ## 2026-10-14, late night (branch `agent/otlp-traces-2`): traces reach the store, the background work and the other replica (stage 2)
 
 Stage 2 of "traces properly instrumented into the app, so that we can tell what is going

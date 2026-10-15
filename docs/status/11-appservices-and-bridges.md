@@ -4,6 +4,9 @@ Last updated: 2026-10-15 (Discord's delivery timeouts: a retry is the same trans
 transient failure is retried for a day, transactions carry at most 100 items and shrink when a
 bridge times out, a replay gets a fresh budget, dead letters can be seen and discarded, and the
 health says why; decision 0049; below); before that 2026-10-14, later (an appservice removes its users' devices without
+Last updated: 2026-10-15 (a deployed bridge's volume is 5 GiB, can be raised from its page,
+only grows, and a full one says so; mautrix bridges log to standard output only; below); before
+that 2026-10-14, later (an appservice removes its users' devices without
 user-interactive auth, MSC4190 or not, so the manager can remove the iMessage bot's left-behind
 device whose key counts the bridge drops; below); before that 2026-10-14 (the ephemeral pump's
 stream prunes, and the sync feed and hot-room
@@ -166,6 +169,52 @@ promtool case). Web: `npm run check` (704 unit tests) and `npm run test:e2e` (75
 the item cap are constants, not settings. A bridge still handles an in-flight duplicate when a
 retry arrives before it has finished the first attempt (mautrix-go dedupes only finished ids); the
 60 s floor after a timeout makes that rare.
+## Session 2026-10-15 (branch `agent/bridge-volume-size`): a full volume says so, and a bridge's volume can be raised
+
+**Seen.** The demo's Slack bridge stopped on 2026-10-14 when its 1 GiB volume filled (its init
+container: `cp: write error: No space left on device`); the Registrations page said only
+"degraded" for over a day. Its own log files filled it: mautrix's default `logging` also writes
+`./logs/bridge.log` into `/data`, up to 1.1 GB. Decision 0049; the platform side (the operator's
+never-shrink, the volume sweep, the chart) is in `docs/status/12-platform-and-kubernetes.md`.
+
+**Done.**
+
+- **Logs to standard output only** (`hs_admin::bridge_types`, `stdout_logging`, both mautrix-go
+  layouts). Checked with the real bridge: `real_mautrix_login.rs`,
+  `a_bridge_rolled_with_a_render_without_its_pickle_key_keeps_its_own`, now also asserts that the
+  bridge keeps the rendered writers and makes no `/data/logs`.
+- **A size per instance** (`InstanceRow::volume_size`; `hs_admin::bridge_volume`): default 5Gi;
+  `PUT /bridge-offerings/{type}/instances/{user_id}` with `volume_size` (a whole Mi/Gi/Ti, 1Gi
+  to 1Ti, never less than the volume has, the cluster's larger size included; `400` at
+  `/volume_size` otherwise, or for an instance run elsewhere). The deployment's fingerprint
+  carries it, so the next step applies it and the bridge restarts.
+- **How full it is**: the manager reads each deployed instance's `Bridge` once a minute
+  (`watch_volumes`): `hs_bridge_volume_used_ratio{bridge,bridge_type}` and
+  `hs_bridge_volume_capacity_bytes` (`crates/hs-bridges/src/metrics.rs`), a `WARN` when one
+  becomes nearly full (85%) or full (95%), an `INFO` when it has room again.
+  `BridgeVolume` (OpenAPI 0.1.18) is on `BridgeInstance.volume` and, through the
+  offering-aware directory, on `AppService.volume`, so the Registrations page can say "Volume
+  full". A deployment whose last words say "No space left on device" or "database or disk is
+  full" is a full volume whatever was measured.
+- **`explain_deployment`** turns those words into "the bridge's volume is full: the step that
+  copies its configuration in (or the bridge) could not write to it ... give it a larger volume
+  size on its page", on the instance's reason while deploying and on its page once ready.
+- **UI** (track 16, on this branch): the Registrations, offering and bridge pages show the
+  volume and its state; the bridge's page sets its size, explained inline.
+
+**Verified.** `cargo test -p hs-bridges` (new: `a_bridge_stopped_by_a_full_volume_says_so_...`,
+`an_instance_is_deployed_with_a_five_gib_volume_unless_one_is_set`,
+`a_volume_raised_by_hand_is_kept_and_not_shrunk_from_the_admin_api`,
+`a_nearly_full_volume_is_counted_and_on_the_registration`, `a_volume_change_is_logged_once_...`,
+`metrics::tests`); `cargo test -p hs-admin` (`bridge_volume::tests`, `volume_tests`, the logging
+assertions, the OpenAPI contract tests).
+
+**Left.** An offering-wide default size (today the default is the server's, 5Gi, and a size is
+per instance). In cluster mode only the replica running the bridge manager (the global shard's
+owner) has `AppService.volume` and the gauges; another replica answers the list without it (the
+instance endpoints read the cluster on any replica), and a replica that handed the shard on keeps
+its last gauge values (the alerts take the `max`). Removing a bridge's old `/data/logs` is by hand
+(`docs/bridges/mautrix.md`, "2026-10-15: a full volume").
 
 ## Session 2026-10-14, later (branch `agent/otk-counts-device`): the iMessage bot's left-behind device can be removed
 

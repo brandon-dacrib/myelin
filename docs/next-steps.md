@@ -28,6 +28,30 @@ bridge's page look at the dead letters' dates and rooms; the 2026-10-12 flood's 
 linkedin, meta, whatsapp; Discord's were in fact delivered) want Discard, Slack's three (today's
 restart) want Replay, and iMessage's 3,545 need a look. Then Ping each degraded bridge.
 **Left**: dead letters do not expire; the timeout, the day and the cap are constants.
+Written 2026-09-20 by the integration lead, last revised 2026-10-15 (the Slack bridge's full volume; fix on `agent/bridge-volume-size`. Before: the memory climb with federation on; fix on `agent/fed-memory-growth`. Before that: the session hub wedge; fix on `agent/hub-wedge`. Earlier: the ephemeral pump's prune busy loop; fix on `agent/ephemeral-prune`). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+
+The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
+
+## 2026-10-15 -- the Slack bridge's volume filled with its own logs; the fix is `agent/bridge-volume-size`
+
+`bridge-slack-brandon` sat in `Init:CrashLoopBackOff` from 2026-10-14 (`cp: write error: No
+space left on device`, 1 GiB at 0.98), and the only sign was "degraded". mautrix's default
+logging also writes up to 1.1 GB of `logs/bridge.log*` into `/data`; Slack's debug log is
+~600 MB a day. Decision 0049: rendered mautrix configs log to stdout only (checked with the real
+bridge); deployed bridges get 5 GiB (was 1 GiB) and an administrator can raise one on its page
+(`PUT .../instances/{user}` `volume_size`, OpenAPI 0.1.18); a volume never shrinks (the operator
+applies the larger of spec and claim, `VolumeSize` condition instead of a failed reconcile; the
+manager's writes keep a size raised by hand); the operator measures every bridge volume from the
+kubelet once a minute into `status.volume` (ClusterRole `nodes`, `nodes/stats`; chart
+`bridges.operator.volumeStats`), the server shows "volume nearly full / full" with what to do on
+the Registrations, offering and bridge pages, `hs_bridge_volume_used_ratio`,
+`HsBridgeVolume{NearlyFull,Full}` alerts, `WARN`s from both; the init container's last words reach
+the status, and "No space left on device" is explained. **Owner, on the demo:** raise
+`bridge-slack-brandon` to 5Gi now (the coordinator is asking); after the roll (every bridge
+restarts once, and grows to 5 GiB), `kubectl -n myelin exec deploy/bridge-slack-brandon -c bridge
+-- rm -rf /data/logs` (and the same for the others if wanted), and check the operator's log has
+no "cannot read the kubelet's volume statistics". **Left:** an offering-wide default size; kind
+volumes have no statistics, so the sweep's first real measurement is the demo's.
 
 ## 2026-10-15 -- the demo's memory climb with federation on was abandoned room loads; the fix is `agent/fed-memory-growth`
 

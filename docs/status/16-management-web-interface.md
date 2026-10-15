@@ -4,6 +4,33 @@ Last updated: 2026-10-15 (a bridge's dead letters can be seen, replayed with a c
 and discarded, and the Registrations tab says why a bridge is not healthy; below); before that
 2026-10-13 (the Registrations tab pages by bridge: the server folds each
 double-puppeting registration; branch `agent/fold-doublepuppet-server`).
+Last updated: 2026-10-15 (a deployed bridge's volume: how full, and its size; branch
+`agent/bridge-volume-size`); before that 2026-10-13 (the Registrations tab pages by bridge: the
+server folds each double-puppeting registration; branch `agent/fold-doublepuppet-server`).
+
+## 2026-10-15: a deployed bridge's volume is on its pages, and its size is set there (branch `agent/bridge-volume-size`)
+
+The demo's Slack bridge stopped with a full volume and the Registrations page said only
+"Degraded" (decision 0049). With OpenAPI 0.1.18 (`BridgeVolume` on `AppService.volume` and
+`BridgeInstance.volume`, `BridgeInstanceRequest.volume_size`):
+
+- **Registrations** (`BridgesListPage.tsx`): under the health badge, "Volume full" (danger) or
+  "Volume nearly full" (warning), the server's message as its tooltip and screen-reader text;
+  "What the columns mean" explains them.
+- **The bridge's page** (`BridgeDetailPage.tsx`): a volume badge in the header, a banner with what
+  to do when nearly full or full, and an Overview section "Volume": size (and a size raised by hand
+  in the cluster), a meter of what is used, when it was measured, and a "New size" form explained
+  inline (it holds the bridge's database and configuration, it only grows, it grows in place and
+  the bridge restarts, new bridges get 5Gi). A refused size shows the API's `/volume_size` detail
+  under the field. The instance is found among its offering's instances by `appservice_id`.
+- **The offering page**: each deployed instance's row has a volume line and a "Volume" dialog with
+  the same details and form.
+- Shared pieces in `src/pages/bridges/BridgeVolume.tsx` and `src/lib/bridge-volume.ts`; mocks give a
+  full Slack bridge and validate `volume_size` like the server.
+
+Verified: `npm run check` (89 files, 704 tests, build), `npm run test:e2e` (75 passed, new
+`e2e/bridge-volume.spec.ts` with axe checks). Mock-backed only; the server side is tested in
+`hs-admin` and `hs-bridges`.
 
 ## 2026-10-15: dead letters can be reviewed and discarded, and health says why (branch `agent/discord-delivery-timeouts`, track 11)
 

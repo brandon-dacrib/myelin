@@ -322,6 +322,37 @@ two settings, and which one decides what to do:
 Running it: `cargo build -p hs-cli --bin hs`, then `cargo test -p hs-bridge-conformance --test
 real_mautrix_login -- --nocapture` with Docker reachable.
 
+## 2026-10-15: a full volume
+
+**What happened.** The demo's Slack bridge (`bridge-slack-brandon`, a 1 GiB Longhorn claim)
+stopped on 2026-10-14: its volume was full, the operator's init container failed `cp: write
+error: No space left on device`, and the pod sat in `Init:CrashLoopBackOff` for over a day with
+"degraded" as the only sign. What filled it was the bridge's own log files: mautrix's default
+`logging` writes `./logs/bridge.log` in `/data` besides standard output, rotated at 100 MB with
+ten backups (up to 1.1 GB), and the Slack bridge logs about 600 MB a day at debug.
+
+**What changed** (decision 0049):
+
+- The rendered config logs to standard output only (a `logging` section with one `stdout`
+  writer), which the cluster's log collector keeps.
+- A deployed bridge's volume is 5 GiB unless an administrator sets another on the bridge's page
+  (Bridges, then the bridge: Volume), and it only ever grows.
+- The operator measures each volume once a minute; the bridge's page, the Registrations and
+  offering pages say "volume nearly full" (85%) or "volume full" (95%, or the bridge said "No
+  space left on device"), with what to do; `hs_bridge_volume_used_ratio` and the
+  `HsBridgeVolume*` alerts carry it to Prometheus, and both the operator and the server log a
+  `WARN`.
+
+**The recovery.**
+
+1. Give it a larger volume: on the bridge's page, Volume, set a larger size (or `kubectl -n
+   <ns> patch bridge <name> --type merge -p '{"spec":{"storage":{"size":"5Gi"}}}'`). The claim
+   grows in place, keeping what is on it; the StorageClass must allow expansion (Longhorn's
+   does). The bridge restarts and the init container's copy succeeds.
+2. Once the server that renders stdout-only logging has rolled, the old log files are dead
+   weight and can go (the bridge must be running for `exec`):
+   `kubectl -n <ns> exec deploy/<name> -c bridge -- rm -rf /data/logs`.
+
 ## 2026-10-12: double puppeting is a registration of its own, and the bridges are not flooded
 
 Five of the demo's six bridges stalled: "Degraded", no transactions taken, pods Running and
