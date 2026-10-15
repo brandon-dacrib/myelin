@@ -1,5 +1,24 @@
 # 01 Storage engine: status
 
+## Fjall's block cache is a setting: `storage.cache_size`, 64 MiB by default (2026-10-15, branch `agent/room-load-speed`)
+
+`FjallOptions` gained `cache_size` (`FJALL_CACHE_SIZE`, 64 MiB). `FjallBackend::open_with_options`
+passes it to `fjall::Builder::cache_size`, and the "opened the Fjall database" line logs it as
+`cache_bytes`. Fjall's own default, which every `hs serve` used until now, is 32 MiB.
+
+`hs-config`'s `EmbeddedStorageConfig` has `cache_size` (a `ByteSize`, bootstrap, read at
+start-up), which `hs-cli`'s `open_embedded` passes. The cache counts in resident memory, so
+it counts against `server.rooms.memory_unload_fraction` and
+`federation.inbound_memory_shed_fraction` too.
+
+Measured for track 04's room loads (`crates/hs-room/tests/load_speed.rs`): a cold load (store
+reopened, cache empty) and a warm one differ by little, 0.094 s against 0.085 s for a room of
+16,066 events. The demo's slow loads were CPU in the room actor (status 04, same date), not
+block reads. The larger default is for the member and state reads resident rooms repeat.
+
+Callers that build `FjallOptions` or `EmbeddedStorageConfig` literally now add
+`..Default::default()`: `hs-kv`'s write-buffer tests and `hs-cli`'s config tests do.
+
 ## The PostgreSQL commit flushes its writes in bulk (2026-10-04, branch `agent/postgres-bulk-flush`)
 
 RFC 0021, now accepted: track 05's batched fan-out (decision 0026) left the writes as the whole

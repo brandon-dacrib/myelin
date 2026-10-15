@@ -25,8 +25,9 @@ federated room of thousands of members took seconds to minutes to load.
 - New `server.rooms.memory_unload_fraction`, default **0.75**, hot: every 5 s
   (`RoomRegistry::spawn_memory_pressure_unloader`), with resident memory at or over that share
   of the limit, the registry unloads a quarter of the rooms it may, least recently used first,
-  until memory is back under the line. Then resident memory, which falls only as the allocator
-  returns pages, is read again before more rooms go. The line is ten points under the federation
+  until memory is back under the line. After each pass that unloaded it waits 30 s, because
+  resident memory falls only as the allocator returns pages, and it should see the step before
+  more rooms go. The line is ten points under the federation
   shedding line, so rooms go first. The reading is the memory guard's (cgroup `memory.max`,
   else v1 `memory.limit_in_bytes`, else the new `HS_MEMORY_LIMIT_BYTES` for a process outside
   a container).
@@ -51,7 +52,13 @@ federated room of thousands of members took seconds to minutes to load.
 A room can be unloaded and loaded again during a day. That costs a load, now well under a second
 even for a backfilled room of thousands of members (`crates/hs-room/tests/load_speed.rs`). The
 first read of a room after it is unloaded pays that load. A server that wants the old behaviour
-sets `idle_unload_after: 0s` and `memory_unload_fraction: 0`. Measured on the real binary (status
-04, 2026-10-15): resident memory after an unload falls by less than the rooms' share, because the
-allocator keeps freed pages. The pressure pass therefore unloads in steps and reads memory again
-between them, and does not assume one pass frees its rooms' memory.
+sets `idle_unload_after: 0s` and `memory_unload_fraction: 0`.
+
+Measured on the real binary (status 04, 2026-10-15):
+- In the deploy image (static musl), resident memory followed unloads within seconds. Under a
+  280 MiB cgroup limit, three passes took the process from 0.90 to 0.71 of it and stopped.
+- On macOS, the allocator gave the pages back about 20 s after the last of the rooms went. A
+  loop reading every 5 s had already unloaded everything it could.
+
+So after a pass that unloaded, the loop waits 30 s (`MEMORY_UNLOAD_COOLDOWN`) before it reads
+memory again.

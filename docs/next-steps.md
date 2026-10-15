@@ -52,6 +52,59 @@ restarts once, and grows to 5 GiB), `kubectl -n myelin exec deploy/bridge-slack-
 -- rm -rf /data/logs` (and the same for the others if wanted), and check the operator's log has
 no "cannot read the kubelet's volume statistics". **Left:** an offering-wide default size; kind
 volumes have no statistics, so the sweep's first real measurement is the demo's.
+Written 2026-09-20 by the integration lead, last revised 2026-10-15 (room loads and unloading; `agent/room-load-speed`. Before: the memory climb with federation on; fix on `agent/fed-memory-growth`. Earlier: the session hub wedge; fix on `agent/hub-wedge`. Earlier: the ephemeral pump's prune busy loop; fix on `agent/ephemeral-prune`). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+
+The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
+
+## 2026-10-15, evening -- room loads were the room's state squared; rooms now unload; the branch is `agent/room-load-speed`
+
+**The demo's slow loads.** On the demo's 0.3.22 boot (19:58-20:20 UTC), loads were CPU-bound:
+130 loads totalled 1,436 s, 16 of them over 10 s, and the pod sat at 3-3.4 of 4 cores while 4-8
+loads ran. Local rooms waited for load slots behind them. Tempo was crash-looping, so there were
+no traces.
+
+`RoomActor::load` decoded every `state_snapshots` row. Every backfilled event has one, naming
+the whole state before it. For each member event the join brought as an outlier and backfill
+later placed, the load built a state root by parsing every event of that state.
+
+Now the load point-reads a row only where it needs one, and an explicit root is built the first
+time somebody asks for it, from the rows' type and state key alone. A backfilled room of 3,000
+members and 16k events loads in 0.094 s, against 3.75 s before (release harness,
+`crates/hs-room/tests/load_speed.rs`). On two real binaries a 200-member backfilled room's first
+read after a restart takes 0.12 s, against 0.35 s on main
+(`crates/hs-cli/tests/room_load_speed.rs`).
+
+**The hub.** It reads a room's members once per state (`RoomActor::membership_list`, remembered
+by root), not on every message.
+
+**New metrics.** Per-phase load spans and `hs_room_load_phase_seconds{phase}`; a `warn` with the
+slowest phase for a load over 10 s, counted in `hs_room_slow_loads_total`.
+
+**Unloading** (decision 0049):
+- `server.rooms.idle_unload_after` now defaults to 30 min (`0s` keeps rooms for ever).
+- New `server.rooms.memory_unload_fraction`, 0.75: least recently used rooms go first, a
+  quarter per pass, with a 30 s cooldown between passes that unloaded.
+- A room is never unloaded while somebody holds it, while it loads, or while an update it
+  published is waiting for the hub.
+- `hs_room_unloads_total{reason}`.
+- `HS_MEMORY_LIMIT_BYTES` gives a process outside a container a limit.
+
+Verified in the musl deploy image under a cgroup limit: RSS falls within seconds of unloads,
+and the loop stops at the line. On macOS the allocator returns memory about 20 s late, hence the
+cooldown.
+
+**Fjall's block cache** is `storage.cache_size`, 64 MiB.
+
+**After the roll**:
+- `hs_room_load_phase_seconds` and `hs_room_slow_loads_total`;
+- `hs_room_unloads_total` against `hs_process_memory_budget_ratio`;
+- the hub's "stuck on a room update" WARNs, which should be gone.
+
+**Left**:
+- Every placed history event still writes a full-state row (disk, not load time).
+- `state_at_event` over big rooms' history materialises the state (about 6 ms an event at
+  3,000 members).
+- Tempo on the cluster needs fixing (CrashLoopBackOff).
 
 ## 2026-10-15 -- the demo's memory climb with federation on was abandoned room loads; the fix is `agent/fed-memory-growth`
 

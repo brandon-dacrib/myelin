@@ -2,6 +2,146 @@
 
 Track brief: `docs/workstreams/04-room-and-events.md`. Owner crate: `hs-room`.
 
+## 2026-10-15 (branch `agent/room-load-speed`): a backfilled federated room loads in a tenth of a second, the hub reads members once per state, and rooms are unloaded
+
+**Asked**: room loads on the demo (0.3.22, embedded Fjall, 4 cores, federation on) took 30 s to
+11 minutes, and the session hub was stuck on "reading the room's members and directory entry"
+for 30-343 s. Find where a load spends its time, fix the biggest costs, and add unloading
+(coordinator, same day): a default for `idle_unload_after`, and unloading under memory pressure.
+
+**Evidence from the demo** (read only, 19:58-20:20 UTC boot of 0.3.22). Tempo was in
+CrashLoopBackOff (53 restarts), so there were no traces, and the evidence comes from Prometheus
+and Loki:
+- `hs_room_load_seconds{state="read"}`: 130 loads, 1,436 s in total. 16 took over 10 s, 6 over
+  30 s and one over 120 s. None replayed: every room's state records were complete, so the
+  RFC 0025 migration was not the cost.
+- The `hs` container used 2.9-3.4 of its 4 cores from 20:02 to 20:17, with
+  `hs_room_loads_running` at 4-8. The loads were CPU-bound, not I/O-bound.
+- Local rooms on `myelin.dacrib.net` waited for a load slot (`every room load slot is taken`,
+  `waits` up to 52). They were slow because they queued behind the big remote rooms' loads,
+  not because loading them cost much.
+- The hub's slow step came after `get_or_load` returned, and it recurred for rooms already
+  resident (`!nlCuo...:mtux.nl` 91 s, then again 124 s). That was `actor.members()` plus
+  `joined_members()`: a parse of every member event on every update.
+
+**Where a load spent its time** (new phase timings, `crates/hs-room/tests/load_speed.rs`,
+release, Fjall on disk). A room joined over federation and backfilled to its creation is the
+demo's shape. Measured with 3,000 members and 16,066 timeline events:
+- before: **3.75 s** cold. `timeline` took 3.35 s and `state_rows` 0.34 s. Every placed
+  history event carries a `state_snapshots` row naming the whole state before it. The load
+  decoded every row (about 190 MB at this size), and for each of the 3,000 member events the
+  join brought as outliers and backfill later placed, it built a state root by parsing every
+  event of that state (`root_from_sns` through `event_uncached`). That is the room's state
+  squared, about 4.5 M event parses with reference hashes here. On rooms of tens of thousands
+  of members, with 8 loads on 4 cores, it took minutes.
+- after: **0.094 s** cold, 0.085 s warm. A local room of 16,005 events takes 0.04 s in both.
+
+**Fixed** (`crates/hs-room/src/actor.rs`):
+- The load no longer range-scans `state_snapshots`. It point-reads a row only where it needs
+  one: an event the state store must be fed (rare), or the existence check for a placed outlier
+  and for an unplaced outlier (a fetched-state outlier).
+- A placed or fetched-state outlier's root is deferred (`deferred_roots`). It is computed on the
+  first `root_after` that asks, and kept (`lazy_roots`). `has_explicit_root` replaces the map
+  check in `rejected.rs`.
+- `root_from_sns` reads each entry's type and state key from its row (`StateKeyRow`, with serde
+  skipping the rest) or from memory, not as a parsed event, and pins nothing.
+- `RoomActor::membership_list()` returns `(user, membership)` for the current state. It is
+  remembered by state root, so a message reads nothing. The hub (`hs-user`'s
+  `apply_room_update` and `public_directory_entry`) uses it instead of `members()` and
+  `joined_members()`.
+
+**Real binary** (`crates/hs-cli/tests/room_load_speed.rs`, ignored, debug build): two `hs`
+processes over TLS, A's room of 200 members and 1,000 more messages, bob on B reading the whole
+history back (B backfills 1,415 events), then B restarts:
+
+| | main (59d3cb71) | this branch |
+|---|---|---|
+| bob's first read after the restart (loads the room) | 0.353 s | 0.123 s |
+| `hs_room_load_seconds` per load | 0.23 s | 0.10 s |
+
+At 200 members the squared term is small. The harness shows how it grows with members.
+
+**Observability** (new):
+- `room.load.phase` spans named `room.load.<phase>`: `open`, `outliers`, `timeline`,
+  `held_states`, `extremities`, `finish`, plus the registry's `slot_wait`, `blocking_wait` and
+  `register`. On a sampled trace, a deferred root is a `room.explicit_root` span when it is
+  built.
+- `hs_room_load_phase_seconds{phase}`.
+- `hs_room_slow_loads_total`, and a `warn` naming the room, its slowest phase and every phase
+  time when a load takes longer than 10 s (`load_report::SLOW_LOAD`).
+- `RoomActor::take_load_report()`.
+
+**Unloading** (coordinator's addition; decision 0049):
+- `server.rooms.idle_unload_after` unset now means 30 minutes, and `0s` means never.
+- New `server.rooms.memory_unload_fraction`, default 0.75. Above it, a quarter of the
+  unloadable rooms go, least recently used first, then the unloader waits 30 s
+  (`MEMORY_UNLOAD_COOLDOWN`) before it reads memory again.
+- A room is never unloaded while:
+  - somebody holds a handle to it (`RoomActorHandle::holders`);
+  - its load is under way;
+  - it published an update after its last use, less than 10 minutes ago;
+  - for pressure only, it was used within the last minute.
+- `evict_idle` no longer evicts a held room.
+- `hs_room_unloads_total{reason}`. Idle unloads log at `info`; each pressure pass logs at `warn`
+  with its counts.
+- The memory reading is the memory guard's. `HS_MEMORY_LIMIT_BYTES` gives a process outside a
+  container a limit.
+
+Verified on the real binary (macOS, debug; 40 rooms of 600 events):
+- The idle sweep unloaded all 40 one to two minutes after their last use (`idle_unload_after`
+  1m). RSS stayed at 322 MiB, and reading every room again took it to 328 MiB, not double: the
+  freed memory was reused, not returned.
+- With a 400 MiB limit (ratio 0.81), the pressure passes unloaded 1, 10, 8, 6, 4, 3, 2, 2, 1,
+  1, 1, 1 rooms, one pass every 5 s (this run had no cooldown yet). RSS did not move until
+  20 s after the last unload, then fell from 324 to 95 MiB.
+
+  macOS's allocator gives pages back late, and the loop, reading every 5 s, unloaded every room
+  it could first. That is why the cooldown exists. The demo's image links musl statically, so
+  the same runs were repeated in the deploy image (`deploy/Dockerfile`, release, musl,
+  distroless; this branch without the cooldown), in Docker with a real cgroup limit:
+  - Idle: RSS fell from 240 to 94 MiB in the same 15 s sample as the 40 unloads (and to
+    83 MiB later). Reading every room again took it back to 242 MiB.
+  - Pressure (`--memory 280m`, ratio 0.90): three passes unloaded 1, 10 and 8 rooms. RSS went
+    252 -> 231 -> 198 MiB, ratio 0.71, under the line. Unloading stopped there, with the other
+    21 rooms still resident.
+
+  So under musl, resident memory follows unloads within seconds, and the loop stops where it
+  should.
+
+**Fjall's block cache** is now `storage.cache_size` (bootstrap, default 64 MiB, twice Fjall's
+32 MiB). Measured here, cold and warm loads differ by little (0.094 s against 0.085 s), so the
+cache is not what made loads slow; the larger default is for the members and state reads
+resident rooms repeat.
+
+**Tests**:
+- `cargo test -p hs-room`, all passing. New: `tests/load_speed.rs`
+  `a_backfilled_federated_room_reloads_the_same` (state at every 7th event equals the
+  resident's after reload; members and timeline the same across two loads);
+  `the_membership_list_follows_the_state_and_is_kept_while_it_holds`;
+  `memory_pressure_unloads_the_least_recently_used_rooms_nobody_needs`;
+  `memory_pressure_unloading_is_off_at_zero`;
+  `the_idle_sweep_leaves_held_rooms_and_untaken_updates`;
+  `the_pressure_unloader_waits_between_passes_that_unload`; and `load_report`'s two tests.
+- `cargo test -p hs-config`: `rooms_unload_after_half_an_hour_unless_told_otherwise` (an
+  explicit `null` gets the default) and `rejects_a_memory_unload_fraction_outside_zero_to_one`.
+  The web schema fixture and `docs/config.md` are regenerated.
+- `cargo test -p hs-kv`, `-p hs-user`, and `-p hs-cli --lib` with `federation_sender`,
+  `config_hot`, `config_history` and `config_reload`.
+- Measurements, ignored:
+  - `cargo test -p hs-room --release --test load_speed -- --ignored --nocapture`, with
+    `HS_ROOM_LOAD_MEMBERS` and `HS_ROOM_LOAD_MESSAGES`;
+  - `cargo test -p hs-cli --test room_load_speed -- --ignored --nocapture`.
+
+**Left**:
+- `state_at_event` over a big room's history is still about 6 ms an event at 3,000 members,
+  local or federated, because it materialises the full state as events.
+- Every placed history event still writes a full-state row. Storage grows with history times
+  state, and that is now a write and disk cost, not a load cost.
+- The hub's other per-update reads (directory fields) are small but not remembered.
+- Tempo on the demo is crash-looping; the new spans will show only once it runs.
+- After the roll, check `hs_room_load_phase_seconds`, `hs_room_slow_loads_total` and
+  `hs_room_unloads_total`, and whether RSS follows unloads under musl.
+
 ## 2026-10-14 (track 06's branch `agent/federation-boot-freeze`): a room loads once however many ask, eight at a time
 
 `RoomRegistry::get_or_load` shared nothing: every caller asking for a room that was not
