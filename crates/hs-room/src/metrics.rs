@@ -57,6 +57,29 @@ static ROOM_LOADS: LazyLock<LabelledHistograms> = LazyLock::new(|| {
     })
 });
 
+/// `hs_room_load_phase_seconds{phase}`: how long each phase of a room load took
+/// (`crate::actor::load_report`): the read's own passes (`open`, `outliers`, `state_rows`,
+/// `timeline`, `held_states`, `extremities`, `finish`) and the registry's around them
+/// (`slot_wait`, `blocking_wait`, `register`). Where `hs_room_load_seconds` says a load was
+/// slow, this says which part.
+static LOAD_PHASES: LazyLock<LabelledHistograms> = LazyLock::new(|| {
+    Family::new_with_constructor(|| {
+        Histogram::new([
+            0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 120.0,
+        ])
+    })
+});
+
+/// `hs_room_unloads_total{reason}`: resident rooms the registry unloaded, by why -- `idle`
+/// (unused for `server.rooms.idle_unload_after`) or `memory` (the process over
+/// `server.rooms.memory_unload_fraction` of its memory limit, least recently used first).
+static UNLOADS: LazyLock<Family<Vec<(String, String)>, Counter>> = LazyLock::new(Family::default);
+
+/// `hs_room_slow_loads_total`: room loads that took longer than
+/// `crate::actor::load_report::SLOW_LOAD` from their start to their registration, each also
+/// logged at `warn` with the room and its slowest phase.
+static SLOW_LOADS: LazyLock<Counter> = LazyLock::new(Counter::default);
+
 /// `hs_room_stale_copies_reloaded_total`: resident copies of a room `RoomRegistry::get_or_load`
 /// dropped because the room's shard changed hands since the copy was loaded (the fencing epoch
 /// moved: this replica lost the shard and got it back), each followed by a load from the store.
@@ -329,6 +352,40 @@ pub(crate) fn observe_room_load(elapsed: std::time::Duration, replayed: bool) {
         .observe(elapsed.as_secs_f64());
 }
 
+/// Observes one phase of a room load in `hs_room_load_phase_seconds`.
+pub(crate) fn observe_load_phase(phase: &'static str, took: std::time::Duration) {
+    LOAD_PHASES
+        .get_or_create(&vec![("phase".to_owned(), phase.to_owned())])
+        .observe(took.as_secs_f64());
+}
+
+/// Counts `rooms` unloaded for `reason` (`idle` or `memory`) in `hs_room_unloads_total`.
+pub(crate) fn count_unloads(reason: &'static str, rooms: usize) {
+    UNLOADS
+        .get_or_create(&vec![("reason".to_owned(), reason.to_owned())])
+        .inc_by(rooms as u64);
+}
+
+/// `hs_room_unloads_total{reason}` as it stands.
+#[must_use]
+pub fn unloads(reason: &str) -> u64 {
+    UNLOADS
+        .get_or_create(&vec![("reason".to_owned(), reason.to_owned())])
+        .get()
+}
+
+/// Counts one load slower than `crate::actor::load_report::SLOW_LOAD` in
+/// `hs_room_slow_loads_total`.
+pub(crate) fn count_slow_load() {
+    SLOW_LOADS.inc();
+}
+
+/// `hs_room_slow_loads_total` as it stands.
+#[must_use]
+pub fn slow_loads() -> u64 {
+    SLOW_LOADS.get()
+}
+
 /// Counts `repaired` events fed to the state store because it had no record of them
 /// (`hs_room_state_records_repaired_total`).
 pub(crate) fn count_state_records_repaired(repaired: u64) {
@@ -437,6 +494,27 @@ pub fn register_metrics(registry: &mut prometheus_client::registry::Registry) {
         "Time taken to load a room into its actor, by whether its state records were read \
          (complete) or its history replayed into them (a room from before they were durable)",
         ROOM_LOADS.clone(),
+    );
+    registry.register(
+        "hs_room_load_phase_seconds",
+        "Time taken by each phase of a room load: the read's passes (open, outliers, \
+         state_rows, timeline, held_states, extremities, finish) and the registry's (slot_wait, \
+         blocking_wait, register)",
+        LOAD_PHASES.clone(),
+    );
+    // Registered without `_total`: the text encoder appends it.
+    registry.register(
+        "hs_room_unloads",
+        "Resident rooms unloaded, by reason: idle (unused for server.rooms.idle_unload_after) or \
+         memory (over server.rooms.memory_unload_fraction of the memory limit)",
+        UNLOADS.clone(),
+    );
+    // Registered without `_total`: the text encoder appends it.
+    registry.register(
+        "hs_room_slow_loads",
+        "Room loads that took longer than ten seconds from start to registration, each logged \
+         at warn with its slowest phase",
+        SLOW_LOADS.clone(),
     );
     // Registered without `_total`: the text encoder appends it.
     registry.register(

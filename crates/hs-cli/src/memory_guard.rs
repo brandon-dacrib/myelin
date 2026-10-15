@@ -34,12 +34,23 @@ pub const HYSTERESIS: f64 = 0.05;
 /// `PAGE_COUNTER_MAX` pages, about 2^63 bytes, rounded to the page size).
 const UNLIMITED_V1: u64 = 1 << 60;
 
+/// The environment variable that gives this process a memory limit, in bytes, where no cgroup
+/// does: a server run outside a container (systemd without `MemoryMax`, a desktop) that should
+/// still unload rooms and shed federation before it runs its machine out. A cgroup limit, when
+/// there is one, wins.
+pub const MEMORY_LIMIT_ENV: &str = "HS_MEMORY_LIMIT_BYTES";
+
 /// The memory limit of this process's container, in bytes: cgroup v2's `memory.max`, else
-/// cgroup v1's `memory.limit_in_bytes`. `None` without a cgroup, or with no limit set.
+/// cgroup v1's `memory.limit_in_bytes`, else [`MEMORY_LIMIT_ENV`]. `None` without any of them.
 #[must_use]
 pub fn cgroup_memory_limit() -> Option<u64> {
     read_limit("/sys/fs/cgroup/memory.max")
         .or_else(|| read_limit("/sys/fs/cgroup/memory/memory.limit_in_bytes"))
+        .or_else(|| {
+            std::env::var(MEMORY_LIMIT_ENV)
+                .ok()
+                .and_then(|text| parse_cgroup_limit(&text))
+        })
 }
 
 fn read_limit(path: &str) -> Option<u64> {

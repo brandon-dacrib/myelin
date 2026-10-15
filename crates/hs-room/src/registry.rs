@@ -84,6 +84,11 @@ pub(crate) struct GlobalStream {
     next_seq: std::sync::Mutex<u64>,
     /// Mirrors `next_seq` for lock-free reads.
     published: std::sync::atomic::AtomicU64,
+    /// When each resident room last published, for the unloaders: a room that published since
+    /// it was last used has an update its consumers (`hs-user`'s session hub, which asks for
+    /// the room as it takes each one) have not taken yet, and is not unloaded under them
+    /// ([`RoomRegistry::unload_candidates`]). Entries go with their room.
+    last_published: std::sync::Mutex<HashMap<OwnedRoomId, Instant>>,
 }
 
 impl GlobalStream {
@@ -96,6 +101,10 @@ impl GlobalStream {
         update.global_seq = *next;
         self.published
             .store(*next, std::sync::atomic::Ordering::Release);
+        self.last_published
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(update.room_id.clone(), Instant::now());
         let _ = self.sender.send(update);
     }
 }
@@ -164,6 +173,10 @@ pub struct RoomRegistry<B: KvBackend> {
     /// (`server.rooms.idle_unload_after`). Read by [`RoomRegistry::spawn_idle_unloader`]'s task
     /// on every sweep.
     idle_unload_after_secs: Arc<std::sync::atomic::AtomicU64>,
+    /// The share of the process's memory limit above which least recently used rooms are
+    /// unloaded (`server.rooms.memory_unload_fraction`), as `f64` bits; `0` never. Read by
+    /// [`RoomRegistry::spawn_memory_pressure_unloader`]'s task on every check.
+    memory_unload_fraction: Arc<std::sync::atomic::AtomicU64>,
     /// The loads under way, by room ([`RoomRegistry::get_or_load`]): everyone who asks for a
     /// room that is loading waits for that load instead of starting one of their own.
     loading: Arc<std::sync::Mutex<LoadsUnderWay<B>>>,
@@ -185,6 +198,66 @@ pub struct RoomRegistry<B: KvBackend> {
 /// taking every core and the whole blocking pool, and the demo spent some 400 seconds on each
 /// load with federation off (`docs/status/06-federation.md`, "The boot freeze").
 pub const MAX_CONCURRENT_LOADS: usize = 8;
+
+/// The share of the memory limit above which [`RoomRegistry::spawn_memory_pressure_unloader`]
+/// unloads rooms, until `server.rooms.memory_unload_fraction` says otherwise: ten points under
+/// the line at which inbound federation is shed (`federation.inbound_memory_shed_fraction`,
+/// 0.85), so that rooms go first and shedding is left for what unloading cannot free.
+pub const DEFAULT_MEMORY_UNLOAD_FRACTION: f64 = 0.75;
+
+/// How often [`RoomRegistry::spawn_memory_pressure_unloader`] compares the process's memory
+/// with its limit: as often as the memory guard does.
+pub const MEMORY_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+/// A room used more recently than this is never unloaded for memory: whoever used it is
+/// likely to again, and a room unloaded under its users is loaded straight back.
+pub const MEMORY_UNLOAD_MIN_IDLE: Duration = Duration::from_secs(60);
+
+/// How long a room that published an update since it was last used is kept for the update's
+/// consumers to take it (`hs-user`'s session hub asks for the room as it takes each update,
+/// which counts as a use). Past this the update is taken to have been dealt with: a stuck
+/// consumer does not pin a room for ever.
+pub const PENDING_UPDATE_GRACE: Duration = Duration::from_secs(600);
+
+/// What share of the rooms it may unload one memory check unloads, least recently used first:
+/// a quarter, so that resident memory, which falls only as the allocator gives pages back, is
+/// read again before more go.
+const MEMORY_UNLOAD_SHARE: usize = 4;
+
+/// Why a resident room is unloaded, for `hs_room_unloads_total{reason}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnloadReason {
+    /// Unused for `server.rooms.idle_unload_after`.
+    Idle,
+    /// The process is over `server.rooms.memory_unload_fraction` of its memory limit.
+    Memory,
+}
+
+impl UnloadReason {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Memory => "memory",
+        }
+    }
+}
+
+/// What one unload pass found and did ([`RoomRegistry::unload_rooms`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UnloadPass {
+    /// Rooms resident before the pass.
+    pub resident: usize,
+    /// Rooms that could have been unloaded: unused for long enough, held by nobody else, with
+    /// no update waiting for its consumers and no load under way.
+    pub eligible: usize,
+    /// Rooms unloaded.
+    pub unloaded: usize,
+    /// Rooms unused for long enough but held right now by a request or a task, or reloading.
+    pub in_use: usize,
+    /// Rooms unused for long enough but with an update published since their last use that
+    /// its consumers have not taken ([`PENDING_UPDATE_GRACE`]).
+    pub pending_update: usize,
+}
 
 /// How often [`RoomRegistry::spawn_idle_unloader`] looks for rooms idle longer than
 /// `server.rooms.idle_unload_after`.
@@ -287,6 +360,7 @@ impl<B: KvBackend + 'static> LoadJob<B> {
         let tables = self.tables.clone();
         let identity = self.identity.clone();
         let owned_room_id = room_id.to_owned();
+        let started = std::time::Instant::now();
         let slot = match self.load_slots.clone().try_acquire_owned() {
             Ok(slot) => Some(slot),
             Err(_) => {
@@ -301,9 +375,11 @@ impl<B: KvBackend + 'static> LoadJob<B> {
                 .ok()
             }
         };
+        let slot_wait = started.elapsed();
         self.loads_started
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let blocking_wait = tracing::info_span!("room.load.blocking_wait");
+        let asked_for_thread = std::time::Instant::now();
         let from_store = tracing::info_span!(
             "room.load.from_store",
             timeline_events = tracing::field::Empty,
@@ -322,6 +398,7 @@ impl<B: KvBackend + 'static> LoadJob<B> {
             let _slot = slot;
             let _running = crate::metrics::load_running();
             drop(blocking_wait);
+            let blocking_wait = asked_for_thread.elapsed();
             #[cfg(test)]
             if let Some(hook) = before_load {
                 hook();
@@ -329,13 +406,16 @@ impl<B: KvBackend + 'static> LoadJob<B> {
             // `RoomActor::load` records the counts on this span.
             let _in_span = from_store.enter();
             RoomActor::load(backend, tables, identity, &owned_room_id)
+                .map(|loaded| (loaded, blocking_wait))
         })
         .await
         .map_err(|e| RoomError::Internal(format!("room load task failed: {e}")))??;
 
-        let Some(mut actor) = loaded else {
+        let (Some(mut actor), blocking_wait) = loaded else {
             return Err(RoomError::RoomNotFound(room_id.to_string()));
         };
+        let registering = std::time::Instant::now();
+        let mut report = actor.take_load_report().unwrap_or_default();
         actor.set_cache_capacity(self.event_cache_capacity.clone());
         actor.set_fencing(self.fencing.get().cloned());
         match actor.persist_repaired_outlier_states() {
@@ -375,8 +455,43 @@ impl<B: KvBackend + 'static> LoadJob<B> {
         entry.last_used = Instant::now();
         let handle = entry.handle.clone();
         RoomRegistry::<B>::note_residents(&rooms);
+        drop(rooms);
+        report.record("slot_wait", slot_wait);
+        report.record("blocking_wait", blocking_wait);
+        report.record("register", registering.elapsed());
+        report_slow_load(room_id, &report, started.elapsed());
         Ok(handle)
     }
+}
+
+/// Says at `warn`, with the room, its slowest phase and every phase's time, that a load took
+/// longer than [`crate::actor::load_report::SLOW_LOAD`] from its start (slot wait included) to
+/// its registration; counted in `hs_room_slow_loads_total`.
+fn report_slow_load(
+    room_id: &ruma::RoomId,
+    report: &crate::actor::load_report::LoadReport,
+    took: std::time::Duration,
+) {
+    if took <= crate::actor::load_report::SLOW_LOAD {
+        return;
+    }
+    crate::metrics::count_slow_load();
+    let (slowest_phase, slowest_secs) = report
+        .slowest()
+        .map_or(("none", 0.0), |(phase, took)| (phase, took.as_secs_f64()));
+    tracing::warn!(
+        %room_id,
+        took_secs = took.as_secs_f64(),
+        slowest_phase,
+        slowest_secs,
+        phases = %report.phases_line(),
+        timeline_events = report.timeline_events,
+        outliers = report.outliers,
+        state_rows = report.state_rows,
+        deferred_roots = report.deferred_roots,
+        "a room load took longer than ten seconds (hs_room_load_phase_seconds, \
+         hs_room_slow_loads_total)"
+    );
 }
 
 /// Says at `warn`, at most once a [`SLOT_WAIT_WARN_INTERVAL`], that a room load found every
@@ -467,6 +582,7 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
             sender,
             next_seq: std::sync::Mutex::new(0),
             published: std::sync::atomic::AtomicU64::new(0),
+            last_published: std::sync::Mutex::default(),
         });
         Ok(Self {
             backend,
@@ -487,6 +603,9 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
             joining: Arc::default(),
             event_cache_capacity: CacheCapacity::default(),
             idle_unload_after_secs: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            memory_unload_fraction: Arc::new(std::sync::atomic::AtomicU64::new(
+                DEFAULT_MEMORY_UNLOAD_FRACTION.to_bits(),
+            )),
             loading: Arc::default(),
             load_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_LOADS)),
             loads_started: Arc::default(),
@@ -545,10 +664,15 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
                 let Some(max_idle) = registry.idle_unload_after() else {
                     continue;
                 };
-                let unloaded = registry.evict_idle(max_idle).await;
-                if unloaded > 0 {
+                let pass = registry
+                    .unload_rooms(UnloadReason::Idle, max_idle, PENDING_UPDATE_GRACE, None)
+                    .await;
+                if pass.unloaded > 0 {
                     tracing::info!(
-                        unloaded,
+                        unloaded = pass.unloaded,
+                        resident_before = pass.resident,
+                        in_use = pass.in_use,
+                        pending_update = pass.pending_update,
                         idle_for = ?max_idle,
                         "unloaded rooms nobody had used for a while; each is loaded again on its next use"
                     );
@@ -1377,16 +1501,180 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
         crate::actor::room_block_reason(&self.backend, &self.tables, room_id)
     }
 
-    /// Drops every resident actor idle longer than `max_idle`. Intended to be called
-    /// periodically (see [`RoomRegistry::spawn_eviction_sweeper`]); safe to call directly in
-    /// tests for a deterministic assertion instead of waiting on a timer.
+    /// Unloads every resident room idle longer than `max_idle` that nobody else holds a handle
+    /// to, whatever updates it has published since ([`RoomRegistry::unload_rooms`] with no
+    /// grace and no limit), returning how many it unloaded: the explicit eviction, for tests and
+    /// for a caller that knows no consumer is behind. The background unloaders wait for
+    /// consumers ([`PENDING_UPDATE_GRACE`]).
     pub async fn evict_idle(&self, max_idle: Duration) -> usize {
+        self.unload_rooms(UnloadReason::Idle, max_idle, Duration::ZERO, None)
+            .await
+            .unloaded
+    }
+
+    /// One unload pass: of the resident rooms unused for at least `min_idle`, those nobody else
+    /// holds a handle to (a request or task using the room right now: unloading it would leave
+    /// them on an actor a later load would duplicate), with no update published since their
+    /// last use that is younger than `pending_grace` ([`PENDING_UPDATE_GRACE`] for the
+    /// background unloaders: `hs-user`'s session hub has not taken it yet) and no load under
+    /// way, unloads the least recently used -- all of them, or at most `limit`. Counted in `hs_room_unloads_total{reason}`. A room unloaded loses
+    /// nothing durable; its next use loads it again.
+    pub async fn unload_rooms(
+        &self,
+        reason: UnloadReason,
+        min_idle: Duration,
+        pending_grace: Duration,
+        limit: Option<usize>,
+    ) -> UnloadPass {
         let mut rooms = self.rooms.lock().await;
-        let before = rooms.len();
         let now = Instant::now();
-        rooms.retain(|_, entry| now.duration_since(entry.last_used) < max_idle);
+        let mut pass = UnloadPass {
+            resident: rooms.len(),
+            ..UnloadPass::default()
+        };
+        let mut last_published = self
+            .global
+            .last_published
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Entries of rooms no longer resident (unloaded, forgotten, deleted) go here, so the
+        // map stays as large as the set of resident rooms.
+        last_published.retain(|room_id, _| rooms.contains_key(room_id));
+        let mut candidates: Vec<(Instant, OwnedRoomId)> = Vec::new();
+        {
+            let loading = self
+                .loading
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (room_id, entry) in rooms.iter() {
+                if now.duration_since(entry.last_used) < min_idle {
+                    continue;
+                }
+                if entry.handle.holders() > 1 || loading.contains_key(room_id) {
+                    pass.in_use += 1;
+                    continue;
+                }
+                if last_published.get(room_id).is_some_and(|published| {
+                    *published > entry.last_used && now.duration_since(*published) < pending_grace
+                }) {
+                    pass.pending_update += 1;
+                    continue;
+                }
+                candidates.push((entry.last_used, room_id.clone()));
+            }
+        }
+        pass.eligible = candidates.len();
+        candidates.sort();
+        candidates.truncate(limit.unwrap_or(usize::MAX));
+        for (_, room_id) in &candidates {
+            rooms.remove(room_id);
+            last_published.remove(room_id);
+        }
+        drop(last_published);
+        pass.unloaded = candidates.len();
         Self::note_residents(&rooms);
-        before - rooms.len()
+        drop(rooms);
+        if pass.unloaded > 0 {
+            crate::metrics::count_unloads(reason.label(), pass.unloaded);
+        }
+        pass
+    }
+
+    /// Sets the share of the process's memory limit above which
+    /// [`RoomRegistry::spawn_memory_pressure_unloader`]'s task unloads rooms
+    /// (`server.rooms.memory_unload_fraction`); `0` or less never. Read at the next check.
+    pub fn set_memory_unload_fraction(&self, fraction: f64) {
+        self.memory_unload_fraction
+            .store(fraction.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The memory line as it stands ([`RoomRegistry::set_memory_unload_fraction`]).
+    #[must_use]
+    pub fn memory_unload_fraction(&self) -> f64 {
+        f64::from_bits(
+            self.memory_unload_fraction
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// One memory check: with `ratio` (resident memory over the process's limit) at or above
+    /// the line, unloads a quarter of the rooms it may (at least one), least recently used
+    /// first, each unused for at least [`MEMORY_UNLOAD_MIN_IDLE`], and logs at `warn` what it
+    /// did. `None` when under the line (or the line is off), else the pass.
+    pub async fn relieve_memory_pressure(&self, ratio: f64) -> Option<UnloadPass> {
+        let line = self.memory_unload_fraction();
+        if line <= 0.0 || ratio < line {
+            return None;
+        }
+        // Surveyed first (a pass that unloads nothing), then cut to a share of what it found.
+        let survey = self
+            .unload_rooms(
+                UnloadReason::Memory,
+                MEMORY_UNLOAD_MIN_IDLE,
+                PENDING_UPDATE_GRACE,
+                Some(0),
+            )
+            .await;
+        if survey.eligible == 0 {
+            tracing::debug!(
+                ratio,
+                memory_unload_fraction = line,
+                resident = survey.resident,
+                in_use = survey.in_use,
+                pending_update = survey.pending_update,
+                "over the memory line for unloading rooms, and no room may be unloaded"
+            );
+            return Some(survey);
+        }
+        let share = survey.eligible.div_ceil(MEMORY_UNLOAD_SHARE).max(1);
+        let pass = self
+            .unload_rooms(
+                UnloadReason::Memory,
+                MEMORY_UNLOAD_MIN_IDLE,
+                PENDING_UPDATE_GRACE,
+                Some(share),
+            )
+            .await;
+        tracing::warn!(
+            ratio,
+            memory_unload_fraction = line,
+            unloaded = pass.unloaded,
+            eligible = pass.eligible,
+            resident_before = pass.resident,
+            in_use = pass.in_use,
+            pending_update = pass.pending_update,
+            "the process is over its memory line for rooms: unloaded the least recently used \
+             (each is loaded again on its next use; hs_room_unloads_total with reason memory, \
+             hs_process_memory_budget_ratio)"
+        );
+        Some(pass)
+    }
+
+    /// Spawns the task that, every [`MEMORY_CHECK_INTERVAL`], reads the process's memory as a
+    /// share of its limit with `read_ratio` (`None`: no limit known, nothing done) and runs
+    /// [`RoomRegistry::relieve_memory_pressure`] with it. What `hs serve` installs, with the
+    /// memory guard's reading (`hs_cli::memory_guard::memory_budget`).
+    pub fn spawn_memory_pressure_unloader<F>(
+        self: &Arc<Self>,
+        read_ratio: F,
+    ) -> tokio::task::JoinHandle<()>
+    where
+        F: Fn() -> Option<f64> + Send + Sync + 'static,
+    {
+        let registry = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(MEMORY_CHECK_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                if registry.memory_unload_fraction() <= 0.0 {
+                    continue;
+                }
+                if let Some(ratio) = read_ratio() {
+                    registry.relieve_memory_pressure(ratio).await;
+                }
+            }
+        })
     }
 
     /// Spawns a background task that calls [`RoomRegistry::evict_idle`] every `sweep_interval`.
@@ -2166,5 +2454,174 @@ mod tests {
                 break;
             }
         }
+    }
+
+    /// Creates `n` rooms and lets go of their handles, as a consumer that took every update
+    /// would: each is asked for once more after its creation, which is what `hs-user`'s session
+    /// hub does with every update it takes.
+    async fn rooms_nobody_holds(
+        registry: &Arc<RoomRegistry<MemoryBackend>>,
+        n: usize,
+    ) -> Vec<OwnedRoomId> {
+        let mut ids = Vec::new();
+        for _ in 0..n {
+            let handle = registry
+                .create_room(
+                    user_id!("@alice:registry.test").to_owned(),
+                    CreateRoomRequest::default(),
+                    1,
+                )
+                .await
+                .expect("create");
+            let room_id = handle.query(|a| a.room_id().to_owned()).await;
+            drop(handle);
+            drop(registry.get_or_load(&room_id).await.expect("resident"));
+            ids.push(room_id);
+            // Distinct last uses, oldest first.
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        ids
+    }
+
+    async fn resident(registry: &RoomRegistry<MemoryBackend>, room_id: &RoomId) -> bool {
+        registry.rooms.lock().await.contains_key(room_id)
+    }
+
+    /// Over the memory line, rooms go least recently used first, a quarter of those that may go
+    /// per check; a room used within the floor, one somebody holds, and one with an update its
+    /// consumers have not taken all stay; under the line nothing is done.
+    #[tokio::test(start_paused = true)]
+    async fn memory_pressure_unloads_the_least_recently_used_rooms_nobody_needs() {
+        let registry = registry();
+        let ids = rooms_nobody_holds(&registry, 8).await;
+        let before = crate::metrics::unloads("memory");
+
+        // Every room was used within the floor: over the line, nothing may go.
+        let pass = registry
+            .relieve_memory_pressure(0.9)
+            .await
+            .expect("over the line");
+        assert_eq!(pass.unloaded, 0);
+        assert_eq!(pass.resident, 8);
+
+        tokio::time::advance(MEMORY_UNLOAD_MIN_IDLE).await;
+        // Under the line: nothing.
+        assert!(registry.relieve_memory_pressure(0.5).await.is_none());
+
+        // The oldest is held by a request; the second has an update nobody has taken.
+        let held = registry.get_or_load(&ids[0]).await.expect("resident");
+        tokio::time::advance(MEMORY_UNLOAD_MIN_IDLE).await;
+        let second = registry.get_or_load(&ids[1]).await.expect("resident");
+        tokio::time::advance(MEMORY_UNLOAD_MIN_IDLE).await;
+        second
+            .send_event(
+                user_id!("@alice:registry.test").to_owned(),
+                "m.room.message".to_owned(),
+                None,
+                serde_json::json!({"msgtype": "m.text", "body": "unread by the hub"}),
+                None,
+                2,
+            )
+            .await
+            .expect("send");
+        drop(second);
+
+        let pass = registry
+            .relieve_memory_pressure(0.8)
+            .await
+            .expect("over the line");
+        assert_eq!(pass.in_use, 1, "{pass:?}");
+        assert_eq!(pass.pending_update, 1, "{pass:?}");
+        assert_eq!(pass.eligible, 6, "{pass:?}");
+        assert_eq!(pass.unloaded, 2, "a quarter of six, rounded up: {pass:?}");
+        // The two least recently used of the six: rooms 2 and 3.
+        assert!(!resident(&registry, &ids[2]).await);
+        assert!(!resident(&registry, &ids[3]).await);
+        assert!(resident(&registry, &ids[4]).await);
+        assert!(resident(&registry, &ids[0]).await, "held");
+        assert!(resident(&registry, &ids[1]).await, "an update not taken");
+        assert_eq!(crate::metrics::unloads("memory") - before, 2);
+
+        // Checks go on until nothing may go; the held room and the untaken update stay.
+        for _ in 0..4 {
+            registry.relieve_memory_pressure(0.8).await;
+        }
+        assert_eq!(registry.resident_count().await, 2);
+
+        // Once the update has waited past the grace, it no longer keeps its room.
+        tokio::time::advance(PENDING_UPDATE_GRACE).await;
+        let pass = registry
+            .relieve_memory_pressure(0.8)
+            .await
+            .expect("over the line");
+        assert_eq!(pass.unloaded, 1);
+        assert!(resident(&registry, &ids[0]).await, "still held");
+        drop(held);
+
+        // An unloaded room comes back on its next use.
+        let back = registry.get_or_load(&ids[2]).await.expect("loads again");
+        assert_eq!(back.query(|a| a.room_id().to_owned()).await, ids[2]);
+    }
+
+    /// The line at zero turns pressure unloading off.
+    #[tokio::test(start_paused = true)]
+    async fn memory_pressure_unloading_is_off_at_zero() {
+        let registry = registry();
+        rooms_nobody_holds(&registry, 2).await;
+        tokio::time::advance(MEMORY_UNLOAD_MIN_IDLE * 2).await;
+        registry.set_memory_unload_fraction(0.0);
+        assert!(registry.relieve_memory_pressure(0.99).await.is_none());
+        assert_eq!(registry.resident_count().await, 2);
+        registry.set_memory_unload_fraction(DEFAULT_MEMORY_UNLOAD_FRACTION);
+        assert_eq!(
+            registry
+                .relieve_memory_pressure(0.99)
+                .await
+                .map(|pass| pass.unloaded),
+            Some(1)
+        );
+    }
+
+    /// The idle sweep unloads what has been unused for the setting, counts it, and leaves a room
+    /// somebody holds and one whose update is waiting.
+    #[tokio::test(start_paused = true)]
+    async fn the_idle_sweep_leaves_held_rooms_and_untaken_updates() {
+        let registry = registry();
+        let ids = rooms_nobody_holds(&registry, 3).await;
+        let held = registry.get_or_load(&ids[0]).await.expect("resident");
+        let busy = registry.get_or_load(&ids[1]).await.expect("resident");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        busy.send_event(
+            user_id!("@alice:registry.test").to_owned(),
+            "m.room.message".to_owned(),
+            None,
+            serde_json::json!({"msgtype": "m.text", "body": "for the hub"}),
+            None,
+            2,
+        )
+        .await
+        .expect("send");
+        drop(busy);
+        tokio::time::advance(Duration::from_secs(300)).await;
+        let before = crate::metrics::unloads("idle");
+        let pass = registry
+            .unload_rooms(
+                UnloadReason::Idle,
+                Duration::from_secs(300),
+                PENDING_UPDATE_GRACE,
+                None,
+            )
+            .await;
+        assert_eq!(
+            (pass.unloaded, pass.in_use, pass.pending_update),
+            (1, 1, 1),
+            "{pass:?}"
+        );
+        assert!(!resident(&registry, &ids[2]).await);
+        assert_eq!(crate::metrics::unloads("idle") - before, 1);
+        // The explicit eviction does not wait for consumers, but never takes a held room.
+        assert_eq!(registry.evict_idle(Duration::ZERO).await, 1);
+        assert!(resident(&registry, &ids[0]).await);
+        drop(held);
     }
 }

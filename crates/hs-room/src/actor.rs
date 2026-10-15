@@ -36,6 +36,7 @@ pub mod event_cache;
 mod fetched_state;
 pub mod gaps;
 mod history;
+pub mod load_report;
 /// What [`RoomActor`]'s reader view gives a requester who is banned from the room.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BannedReader {
@@ -582,6 +583,10 @@ pub struct RoomActor<B: KvBackend> {
     /// stored row said `redacted`, with how many catch-ups have re-checked each since
     /// (`catch_up`'s module docs).
     pending_redactions: HashMap<EventSn, u32>,
+    /// Where the load that made this actor spent its time ([`RoomActor::load`]), until the
+    /// registry takes it ([`RoomActor::take_load_report`]). `None` for an actor made any other
+    /// way.
+    load_report: Option<load_report::LoadReport>,
 }
 
 impl<B: KvBackend> RoomActor<B> {
@@ -886,6 +891,7 @@ impl<B: KvBackend> RoomActor<B> {
             rewrites_seen: 0,
             create_sn: None,
             pending_redactions: HashMap::new(),
+            load_report: None,
         }
     }
 
@@ -973,6 +979,8 @@ impl<B: KvBackend> RoomActor<B> {
         room_id: &RoomId,
     ) -> Result<Option<Self>, RoomError> {
         let started = std::time::Instant::now();
+        let mut clock = load_report::PhaseClock::new();
+        clock.begin("open");
         let snapshot = backend.snapshot();
         let Some(room_sn) = tables.room_sn.lookup(&snapshot, room_id.as_bytes())? else {
             return Ok(None);
@@ -1039,6 +1047,7 @@ impl<B: KvBackend> RoomActor<B> {
         // topologically again here rather than trusting key order alone, so a snapshot event
         // whose `EventSn` happened to be interned early (as a relation target, say) still comes
         // after its own ancestors.
+        clock.begin("outliers");
         let outlier_spec = hs_tables::keyspace::TypedKeyspace::<
             B::Keyspace,
             crate::persist::OutlierKey,
@@ -1048,6 +1057,7 @@ impl<B: KvBackend> RoomActor<B> {
         let mut outliers: Vec<(EventSn, Event)> = Vec::new();
         for item in actor.tables.outliers.range(&snapshot, outlier_spec) {
             let ((_, sn), _) = item?;
+            clock.report_mut().outliers += 1;
             let Some(bytes) = events_table.get(&snapshot, &(sn,))? else {
                 continue;
             };
@@ -1074,6 +1084,7 @@ impl<B: KvBackend> RoomActor<B> {
             actor.absorb_loaded_outlier(sn, event, feed)?;
         }
 
+        clock.begin("state_rows");
         // The explicit states timeline events were fed to the store with, if any.
         let snapshot_spec = hs_tables::keyspace::TypedKeyspace::<
             B::Keyspace,
@@ -1086,6 +1097,9 @@ impl<B: KvBackend> RoomActor<B> {
                 .ok_or_else(|| RoomError::Internal("corrupt state snapshot entry".into()))?;
             explicit_states.insert(sn, sns);
         }
+        clock.report_mut().state_rows = explicit_states.len();
+
+        clock.begin("timeline");
 
         let range_spec = hs_tables::keyspace::TypedKeyspace::<
             B::Keyspace,
@@ -1101,6 +1115,7 @@ impl<B: KvBackend> RoomActor<B> {
             entries.push((room_pos, EventSn::from_be_bytes(sn_bytes)));
         }
         entries.sort_by_key(|(pos, _)| *pos);
+        clock.report_mut().timeline_events = entries.len();
 
         for (index, (room_pos, event_sn)) in entries.into_iter().enumerate() {
             // What the replay pinned so far is released every so often, so that a load's peak
@@ -1166,6 +1181,7 @@ impl<B: KvBackend> RoomActor<B> {
             )?;
         }
 
+        clock.begin("held_states");
         // An outlier held with a fetched state and no timeline position (`fetched_state`): the
         // state after it is the one it was held with, as at the time it was.
         for (sn, state) in explicit_states {
@@ -1180,6 +1196,7 @@ impl<B: KvBackend> RoomActor<B> {
             actor.fetched_state_outliers.insert(sn);
         }
 
+        clock.begin("extremities");
         // The authoritative forward-extremity set is whatever `RoomActor::persist` last wrote to
         // `Tables::extremities_fwd` -- read it directly rather than inferring it from timeline
         // replay order (which is only "the last event replayed" and is wrong the moment a room
@@ -1207,6 +1224,7 @@ impl<B: KvBackend> RoomActor<B> {
             gap_rows.push((top, record));
         }
         actor.restore_gaps(gap_rows);
+        clock.begin("finish");
         if actor.create_sn.is_none() {
             actor.create_sn = actor.current_create_sn()?;
         }
@@ -1229,6 +1247,7 @@ impl<B: KvBackend> RoomActor<B> {
         }
         actor.store.log_open_summary(room_id);
         actor.warm_cache();
+        actor.load_report = Some(clock.finish());
         crate::metrics::observe_room_load(started.elapsed(), replay);
         // On the registry's `room.load.from_store` span, when the load runs in one.
         let span = tracing::Span::current();
@@ -1256,6 +1275,13 @@ impl<B: KvBackend> RoomActor<B> {
         }
 
         Ok(Some(actor))
+    }
+
+    /// Where the load that made this actor spent its time, phase by phase
+    /// ([`load_report::LoadReport`]); `None` for an actor not made by [`RoomActor::load`], or
+    /// once taken.
+    pub fn take_load_report(&mut self) -> Option<load_report::LoadReport> {
+        self.load_report.take()
     }
 
     /// The state before an outlier placed at `room_pos` whose placement wrote no state row
@@ -7073,6 +7099,14 @@ impl<B: KvBackend> RoomActorHandle<B> {
     #[must_use]
     pub fn same_actor(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// How many handles to this actor exist, this one included: more than the registry's own
+    /// means a request or task is using the room right now, and the registry does not unload it
+    /// under them (`crate::registry::RoomRegistry::unload_rooms`).
+    #[must_use]
+    pub fn holders(&self) -> usize {
+        Arc::strong_count(&self.inner)
     }
 
     /// Subscribes to the room's publish stream (`crate::protocol::RoomUpdate`).

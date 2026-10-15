@@ -311,13 +311,16 @@ pub fn apply_rooms<B: hs_kv::KvBackend>(
     config: &hs_config::server::RoomsConfig,
 ) {
     rooms.set_event_cache_size(config.event_cache_size as usize);
-    let idle: Option<std::time::Duration> = config.idle_unload_after.map(Into::into);
+    let idle = config.idle_unload_after();
     rooms.set_idle_unload_after(idle);
+    rooms.set_memory_unload_fraction(config.memory_unload_fraction);
     tracing::info!(
         event_cache_size = config.event_cache_size,
         idle_unload_after = ?idle,
-        "each room keeps this many recent events in memory; the rest is read from the database \
-         (server.rooms)"
+        memory_unload_fraction = config.memory_unload_fraction,
+        "each room keeps this many recent events in memory; the rest is read from the database; \
+         a room unused this long, or the least recently used above this share of the memory \
+         limit, is unloaded (server.rooms)"
     );
 }
 

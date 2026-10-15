@@ -20,7 +20,8 @@
         },
         "rooms": {
           "event_cache_size": 1000,
-          "idle_unload_after": null
+          "idle_unload_after": null,
+          "memory_unload_fraction": 0.75
         }
       }
     },
@@ -423,7 +424,8 @@
           "$ref": "#/$defs/RoomsConfig",
           "default": {
             "event_cache_size": 1000,
-            "idle_unload_after": null
+            "idle_unload_after": null,
+            "memory_unload_fraction": 0.75
           },
           "x-applies": "hot"
         }
@@ -466,7 +468,7 @@
           "default": 1000
         },
         "idle_unload_after": {
-          "description": "How long a room nobody has used stays in memory before it is unloaded, checked once a\nminute. A room is loaded again, from the database, the next time it is used; the load\nreads the room's history, so a large room takes seconds to come back. Unset (the\ndefault), a room stays loaded for as long as the server runs. Synapse has no equivalent;\nit holds no room in memory between requests.",
+          "description": "How long a room nobody has used stays in memory before it is unloaded, checked once a\nminute. A room is loaded again, from the database, the next time it is used, which takes\nwell under a second for most rooms. Unset, 30 minutes: what Synapse keeps an unused cache\nentry for (`caches.cache_entry_ttl`), long enough that a room in use is never reloaded\nbetween two of its users' syncs, short enough that the rooms a server federates with\nbut nobody here reads do not stay in memory all day. `0s` keeps every room loaded for as\nlong as the server runs. A room that a request is using, or whose latest update has not\nyet reached its members' syncs, is not unloaded.",
           "anyOf": [
             {
               "$ref": "#/$defs/Duration"
@@ -476,6 +478,12 @@
             }
           ],
           "default": null
+        },
+        "memory_unload_fraction": {
+          "description": "The share of the container's memory limit (its cgroup's `memory.max`) above which this\nserver unloads the rooms least recently used, a quarter of those it may at each check\n(every five seconds), until its memory is back under the line. A room used in the last\nminute, being used by a request, or with an update not yet delivered to its members is\nkept. Ten points under `federation.inbound_memory_shed_fraction` by default, so rooms\nare unloaded before other servers' requests are refused. On `/metrics` as\n`hs_room_unloads_total{reason=\"memory\"}`; a server with no limit never unloads for\nmemory. Between 0 and 1; `0` turns it off. Synapse has no setting for it.",
+          "type": "number",
+          "format": "double",
+          "default": 0.75
         }
       },
       "additionalProperties": false

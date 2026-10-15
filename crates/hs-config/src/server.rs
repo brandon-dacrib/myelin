@@ -96,12 +96,46 @@ pub struct RoomsConfig {
     pub event_cache_size: u32,
 
     /// How long a room nobody has used stays in memory before it is unloaded, checked once a
-    /// minute. A room is loaded again, from the database, the next time it is used; the load
-    /// reads the room's history, so a large room takes seconds to come back. Unset (the
-    /// default), a room stays loaded for as long as the server runs. Synapse has no equivalent;
-    /// it holds no room in memory between requests.
+    /// minute. A room is loaded again, from the database, the next time it is used, which takes
+    /// well under a second for most rooms. Unset, 30 minutes: what Synapse keeps an unused cache
+    /// entry for (`caches.cache_entry_ttl`), long enough that a room in use is never reloaded
+    /// between two of its users' syncs, short enough that the rooms a server federates with
+    /// but nobody here reads do not stay in memory all day. `0s` keeps every room loaded for as
+    /// long as the server runs. A room that a request is using, or whose latest update has not
+    /// yet reached its members' syncs, is not unloaded.
     #[serde(default)]
     pub idle_unload_after: Option<crate::duration::Duration>,
+
+    /// The share of the container's memory limit (its cgroup's `memory.max`) above which this
+    /// server unloads the rooms least recently used, a quarter of those it may at each check
+    /// (every five seconds), until its memory is back under the line. A room used in the last
+    /// minute, being used by a request, or with an update not yet delivered to its members is
+    /// kept. Ten points under `federation.inbound_memory_shed_fraction` by default, so rooms
+    /// are unloaded before other servers' requests are refused. On `/metrics` as
+    /// `hs_room_unloads_total{reason="memory"}`; a server with no limit never unloads for
+    /// memory. Between 0 and 1; `0` turns it off. Synapse has no setting for it.
+    #[serde(default = "default_memory_unload_fraction")]
+    pub memory_unload_fraction: f64,
+}
+
+/// How long an unused room stays loaded when `server.rooms.idle_unload_after` is unset.
+pub const DEFAULT_IDLE_UNLOAD_AFTER: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+fn default_memory_unload_fraction() -> f64 {
+    0.75
+}
+
+impl RoomsConfig {
+    /// How long an unused room stays loaded, as the server applies it: the setting, 30 minutes
+    /// ([`DEFAULT_IDLE_UNLOAD_AFTER`]) when unset, and `None` (for ever) when it is `0s`.
+    #[must_use]
+    pub fn idle_unload_after(&self) -> Option<std::time::Duration> {
+        match self.idle_unload_after {
+            None => Some(DEFAULT_IDLE_UNLOAD_AFTER),
+            Some(after) if after.is_zero() => None,
+            Some(after) => Some(after.as_std()),
+        }
+    }
 }
 
 fn default_event_cache_size() -> u32 {
@@ -113,6 +147,7 @@ impl Default for RoomsConfig {
         Self {
             event_cache_size: default_event_cache_size(),
             idle_unload_after: None,
+            memory_unload_fraction: default_memory_unload_fraction(),
         }
     }
 }
@@ -216,6 +251,15 @@ impl Validate for ServerConfig {
                 );
             }
         }
+        if !(0.0..=1.0).contains(&self.rooms.memory_unload_fraction) {
+            errors.push(
+                format!("{prefix}.rooms.memory_unload_fraction"),
+                format!(
+                    "{} must be between 0 and 1 (0 turns it off)",
+                    self.rooms.memory_unload_fraction
+                ),
+            );
+        }
     }
 }
 
@@ -233,6 +277,41 @@ mod tests {
         .validate("server", &mut errors);
         assert_eq!(errors.0[0].path, "server.server_name");
         assert_eq!(errors.0[0].message, "must not be empty");
+    }
+
+    #[test]
+    fn rooms_unload_after_half_an_hour_unless_told_otherwise() {
+        let mut rooms = RoomsConfig::default();
+        assert_eq!(
+            rooms.idle_unload_after(),
+            Some(std::time::Duration::from_secs(1800))
+        );
+        rooms.idle_unload_after = Some(crate::duration::Duration::ZERO);
+        assert_eq!(rooms.idle_unload_after(), None, "0s keeps rooms for ever");
+        rooms.idle_unload_after = Some(crate::duration::Duration::from_mins(5));
+        assert_eq!(
+            rooms.idle_unload_after(),
+            Some(std::time::Duration::from_secs(300))
+        );
+        // A stored section that names the setting as null, as one saved before the default
+        // existed does, gets the default too.
+        let stored: RoomsConfig =
+            serde_json::from_value(serde_json::json!({"idle_unload_after": null})).expect("parses");
+        assert_eq!(stored.idle_unload_after(), Some(DEFAULT_IDLE_UNLOAD_AFTER));
+        assert!((stored.memory_unload_fraction - 0.75).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn rejects_a_memory_unload_fraction_outside_zero_to_one() {
+        let mut errors = ValidationErrors::new();
+        let mut config = ServerConfig {
+            server_name: "example.org".into(),
+            ..Default::default()
+        };
+        config.rooms.memory_unload_fraction = 1.5;
+        config.validate("server", &mut errors);
+        assert_eq!(errors.0.len(), 1);
+        assert_eq!(errors.0[0].path, "server.rooms.memory_unload_fraction");
     }
 
     #[test]

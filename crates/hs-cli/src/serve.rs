@@ -1670,6 +1670,12 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     // so a change is in force at once (the `server` hook below sets them again).
     crate::live_config::apply_rooms(&rooms, &config.server.rooms);
     let _idle_unloader = rooms.spawn_idle_unloader();
+    // Above `server.rooms.memory_unload_fraction` of the memory limit, the least recently used
+    // rooms are unloaded, on the memory guard's reading (`crate::memory_guard`): below its
+    // federation shedding line, so rooms go first.
+    let _memory_unloader = rooms.spawn_memory_pressure_unloader(|| {
+        crate::memory_guard::memory_budget().map(|budget| budget.ratio())
+    });
     // An administrator's change to a user's display name or avatar (`users.update`) is carried
     // into the user's rooms the way their own `PUT /profile/...` is: the record changes in
     // `hs-auth`, and the room layer re-stamps their membership everywhere they are joined.
