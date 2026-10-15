@@ -18,7 +18,12 @@ the request span; `hs_telemetry_spans_{exported,dropped,failed}_total` and
 `hs_telemetry_span_export_queue` on `/metrics`. Small spans are made only when the trace is
 sampled. Verified on the real binary with Jaeger (two servers over TLS, an appservice, two
 clustered replicas on PostgreSQL) and re-measured: `whoami` p50 off 0.202 ms, ratio 0 0.226,
-ratio 1 0.230 (`docs/status/12-platform-and-kubernetes.md`, `docs/ops/tracing.md`). **Left**:
+ratio 1 0.230 (`docs/status/12-platform-and-kubernetes.md`, `docs/ops/tracing.md`). The gate's
+failing sender test was not a race. The test recorder never made `outside_spans`'s span, so,
+with `hyper-util`'s `tracing` feature that only the workspace build turns on, a pooled
+connection held the transaction's trace open. The recorder now makes that span. The `testing`
+feature turns `hyper-util/tracing` on, so `cargo test -p` matches the gate. The server's level
+filter now always keeps the span, `RUST_LOG` included. **Left**:
 `traceparent` to bridges and remote servers (not sent, decision 0048), inbound `traceparent`
 honoured from any caller, snapshot reads, links for EDUs and appservice queue entries. **After
 the roll**: Tempo `{ name =~ "kv .*" && span.attempts > 1 }`, `appservice.transaction` by

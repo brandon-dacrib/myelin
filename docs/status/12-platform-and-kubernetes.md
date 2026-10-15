@@ -72,6 +72,39 @@ happens after they answer.
   `testing::trace_until` (the `hs-cli` forwarded-request test, which yielded three times) and
   `testing::wait_for_trace_rooted_at` (the `hs-federation` test; takes only the matching trace,
   leaving other tests' passes).
+- **The sender test fails no more in the workspace gate** (it failed there a second time, at
+  6607bcda: about 43 `federation.transaction` traces recorded, none linked). The cause was not
+  a race, and the failure was deterministic in the workspace build. The test's own transaction
+  never closed: its `PUT /_matrix/federation/v1/send` child stayed open (idle 10 s) until the
+  sender was dropped. The 43 traces were other tests' transactions, closed when those tests
+  dropped their senders, and none of them queued a PDU inside a trace, so none had a link. Two
+  things combined:
+  1. `outside_spans` makes an `info` span of target `hs_telemetry::detached`. The test
+     recorder had one layer, the OTLP layer, and its filter leaves that target out. With no
+     layer wanting the span, the registry did not make it, the caller's `federation.request`
+     span stayed current inside the wrapper, and the pooled connection's task held it open.
+  2. `hyper-util` spawns that connection task `in_current_span()` only with its `tracing`
+     feature. `kube-client` turns the feature on, and so does the workspace's test build
+     (feature unification). `cargo test -p hs-federation` built `hyper-util` without it, so
+     the test passed alone (250 stressed runs, 0 failures) and failed in the gate. Built with
+     `--features hyper-util/tracing`, it failed 6 runs in 6, alone or with the whole lib.
+  Fixes, all in `hs-telemetry`. The recorder adds a layer that wants only the detached span,
+  so the span is made and not exported (test
+  `testing::tests::a_task_spawned_outside_spans_does_not_hold_the_trace_open`, which failed
+  before the fix with `Some("hs_test")` as the current span's target). The `testing` feature
+  turns on `hyper-util/tracing`, so `cargo test -p <crate>` sees what the gate and the shipped
+  binary see. With that, `cargo test -p hs-federation --lib` failed every time before the
+  recorder fix and passed 64 runs in 64 after it (8 binaries at once, 10 CPU hogs). In the
+  server, `init` adds `hs_telemetry::detached=info` to every level filter, `RUST_LOG` and
+  live level changes included. The level filter is global, so before this a filter that kept
+  some of the server's `info` spans and left this target out (`RUST_LOG=warn,hs_federation=info`,
+  say) disabled the span, and pooled connections held traces open in production too (test
+  `init::tests::the_detached_span_is_made_whatever_the_level_filter_says`, which fails
+  without the directive). At the default level nothing changes: `info` already kept the span.
+  How links get onto spans did not change. The other span tests (`hs-kv`, `hs-room`,
+  `hs-appservice`, `hs-cli`'s forwarded request, `hs-telemetry`) pass with the new feature.
+  None of them reads a span held by a pooled connection except `hs-cli`'s, which waits with
+  `trace_until` and now does not have to.
 
 ### Verified
 
@@ -150,6 +183,12 @@ for `kv .*` spans with `attempts > 1`, `appservice.transaction` durations per br
 - Links, not parenthood, from a background pass to its cause; at most 32 per span.
 - Store transaction spans are named after the closure's caller (`type_name`), not given a name at
   each of ~200 call sites.
+- `hs-telemetry`'s `testing` feature turns on `hyper-util/tracing`, so a span test built with
+  `cargo test -p` runs under the same span propagation as the workspace build and the shipped
+  binary. A test that passes alone and fails in the gate is worse than one that fails in both.
+- `init` adds `hs_telemetry::detached=info` to the level filter even when `RUST_LOG` is set. It
+  adds one span per outbound exchange that the filter would otherwise have left out, and logs
+  nothing for it.
 
 ### Interfaces provided / needed
 
@@ -159,7 +198,8 @@ MAX_LINKS_PER_SPAN}`, `hs_telemetry::export_stats`, `hs_telemetry::request_id::f
 ADMIN_PRINCIPAL_KIND}`, the `testing` feature; `hs_kv::KvWrite::{mutations, written_keyspaces}`;
 `hs_room::protocol::RoomUpdate::trace`; `hs_federation::sender::FederationSender::enqueue_pdu_linked`;
 `hs_appservice::pump::Pump::pump_room_caused_by`. Needed: none. Shared dependencies added:
-none to the workspace; `hs-telemetry` is now a dependency of hs-kv, hs-room, hs-user,
+none to the workspace (`hs-telemetry` takes the workspace's `hyper-util` as an optional
+dependency, only for the `testing` feature's flag on it); `hs-telemetry` is now a dependency of hs-kv, hs-room, hs-user,
 hs-appservice, hs-auth, hs-admin, hs-bridges, hs-cluster, hs-modules and hs-push.
 
 ## 2026-10-14, night (branch `agent/otlp-traces`): the binary exports traces, instrumented for today's outages (stage 1)

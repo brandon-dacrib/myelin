@@ -201,6 +201,14 @@ starts, because a callsite first reached by another test while the recorder was 
 installed could otherwise stay disabled for the rest of the process (it did:
 `crates/hs-telemetry/tests/testing_install_race.rs`).
 
+`outside_spans` works only when its span (`hs_telemetry::detached`, `info`) is actually made.
+A subscriber that no layer of wants it disables it, and then the caller's span stays current
+and a pooled connection's task holds the trace open. The server's level filter always keeps it
+(`init` adds `hs_telemetry::detached=info`, also to `RUST_LOG`), and so does the test recorder.
+The `testing` feature turns on `hyper-util`'s `tracing` feature, which spawns connection tasks
+in the current span (as `kube-client` makes the shipped binary and the workspace build do), so
+a crate's own `cargo test -p` sees the same thing as the gate does.
+
 On the cluster, Tempo's search API answers through the API server's service proxy:
 `/api/v1/namespaces/monitoring-system/services/tempo:3200/proxy/api/search?tags=service.name%3Dmyelin`.
 

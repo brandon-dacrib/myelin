@@ -2818,6 +2818,7 @@ version = "0.3.0"
 dependencies = [
  "hex",
  "http",
+ "hyper-util",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",

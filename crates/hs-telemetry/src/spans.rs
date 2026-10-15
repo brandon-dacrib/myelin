@@ -23,9 +23,10 @@ pub const DETACHED_TARGET: &str = "hs_telemetry::detached";
 /// rather than the caller's: they say what they are about themselves. Time the exchange with a
 /// span held around the call, not entered inside it.
 ///
-/// With a filter that leaves `info` spans of this target out (`RUST_LOG=hs_federation=debug`
-/// alone, say) the span is not made, and the caller's spans are held as before; the default
-/// filters keep it.
+/// It works only when the span is made: a subscriber none of whose layers wants it disables
+/// it, and the caller's spans are then held as before. [`crate::init()`] adds a directive for it
+/// to whatever level filter is set (`RUST_LOG` included), and the test recorder
+/// (`hs_telemetry::testing`) has a layer for it; a subscriber built some other way needs the same.
 pub fn outside_spans<F: Future>(future: F) -> Instrumented<F> {
     future
         .instrument(tracing::info_span!(target: "hs_telemetry::detached", parent: None, "outbound"))

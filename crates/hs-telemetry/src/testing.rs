@@ -18,9 +18,18 @@
 //! and a callsite first reached on another thread while the global default is being set can
 //! cache "never" (asked of the no-op dispatcher that is still the default) after the
 //! recorder's own registration rebuilt it: that span is then not made again in the process.
-//! In a test binary the other tests keep running while one installs the recorder, so this
-//! happened (a sender test found no `federation.transaction` span at all, under load). The
-//! rebuild, made after the global default is set and before the test's code runs, corrects it.
+//! In a test binary the other tests keep running while one installs the recorder, so this can
+//! happen. The rebuild, made after the global default is set and before the test's code runs,
+//! corrects it.
+//!
+//! The recorder makes [`crate::outside_spans`]'s span (it does not export it), as the server's
+//! log layers do: with no layer wanting it, the span was not made, the caller's span stayed
+//! current inside the wrapper, and a connection task `hyper-util` spawned there held the
+//! caller's trace open for as long as the pooled connection lived. That is why a sender test
+//! never saw its own `federation.transaction` close in the workspace gate (2026-10-14). The
+//! `testing` feature turns on `hyper-util`'s `tracing` feature, which spawns connection tasks
+//! that way, so `cargo test -p <crate>` sees what the workspace build (and the shipped binary,
+//! through `kube-client`) does; without it a test could pass alone and fail in the gate.
 //!
 //! ```ignore
 //! let (_, spans) = hs_telemetry::testing::trace(async { store.save(..).await }).await;
@@ -36,6 +45,7 @@ use std::time::Duration;
 use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter};
 use tracing::Instrument as _;
+use tracing_subscriber::Layer as _;
 use tracing_subscriber::layer::SubscriberExt as _;
 
 /// One exported span, in plain values.
@@ -181,8 +191,17 @@ fn installed() -> &'static Installed {
             .with_simple_exporter(memory.clone())
             .with_sampler(crate::otlp::sampler(1.0))
             .build();
-        let subscriber =
-            tracing_subscriber::registry().with(crate::otlp::layer_from_provider(&provider));
+        // The second layer wants only `outside_spans`'s span, which the OTLP layer leaves out:
+        // with no layer wanting it the registry would not make it, so it would not become the
+        // current span, and a task spawned inside it would hold the caller's spans open (see
+        // the module docs). In the server the log layers want it.
+        let subscriber = tracing_subscriber::registry()
+            .with(crate::otlp::layer_from_provider(&provider))
+            .with(tracing_subscriber::layer::Identity::new().with_filter(
+                tracing_subscriber::filter::filter_fn(|metadata| {
+                    metadata.target() == crate::spans::DETACHED_TARGET
+                }),
+            ));
         if tracing::subscriber::set_global_default(subscriber).is_err() {
             panic!(
                 "hs_telemetry::testing needs to install the global subscriber, and this test \
@@ -421,6 +440,50 @@ mod tests {
         );
         let late = spans.find("closes.later").expect("the late span");
         assert!(spans.is_under(late, spans.find("test").expect("the root")));
+    }
+
+    /// `outside_spans` works under the recorder as it does in the server: its `outbound` span is
+    /// made (the recorder does not export it), so a task spawned inside it the way `hyper-util`
+    /// spawns a connection's does not hold the test's spans open. Before 2026-10-14 no layer
+    /// of the recorder wanted that span, so it was not made, the caller's span stayed current,
+    /// and a sender test's transaction was held open by its pooled connection until the test
+    /// gave up waiting for it (in the workspace gate, where `hyper-util`'s `tracing` is on).
+    #[tokio::test]
+    async fn a_task_spawned_outside_spans_does_not_hold_the_trace_open() {
+        let (release, held) = tokio::sync::oneshot::channel::<()>();
+        let ((), spans) = trace_until(
+            async {
+                let request = tracing::info_span!(target: "hs_test", "request.with.a.connection");
+                tracing::Instrument::instrument(
+                    crate::outside_spans(async {
+                        assert_eq!(
+                            tracing::Span::current().metadata().map(|m| m.target()),
+                            Some(crate::spans::DETACHED_TARGET),
+                            "the detached span is made under the recorder, and is current"
+                        );
+                        // `hyper-util`'s executor, with its `tracing` feature.
+                        tokio::spawn(tracing::Instrument::in_current_span(async move {
+                            let _ = held.await;
+                        }));
+                    }),
+                    request,
+                )
+                .await;
+            },
+            Duration::from_secs(10),
+            |spans| spans.find("request.with.a.connection").is_some(),
+        )
+        .await;
+        assert!(
+            spans.find("request.with.a.connection").is_some(),
+            "exported while the spawned task still lives: {:?}",
+            spans.names()
+        );
+        assert!(
+            spans.find("outbound").is_none(),
+            "the detached span is not exported"
+        );
+        let _ = release.send(());
     }
 
     #[tokio::test]

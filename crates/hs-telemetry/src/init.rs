@@ -193,7 +193,7 @@ impl LogLevelHandle {
             return Err(TelemetryError::LogFilterPinned);
         }
         self.handle
-            .reload(EnvFilter::new(level.default_directives()))
+            .reload(keep_detached(EnvFilter::new(level.default_directives())))
             .map_err(|e| TelemetryError::Reload(e.to_string()))
     }
 }
@@ -205,6 +205,25 @@ impl Drop for Guard {
             let _ = provider.shutdown();
         }
         // sentry::ClientInitGuard flushes and shuts down its transport on drop already.
+    }
+}
+
+/// The directive [`keep_detached`] adds: [`crate::outside_spans`]'s span, at its level.
+const DETACHED_DIRECTIVE: &str = "hs_telemetry::detached=info";
+
+/// `filter`, letting [`crate::outside_spans`]'s span through whatever else it says.
+///
+/// The level filter is global: a span it leaves out is not made for any layer. Without its
+/// span, `outside_spans` leaves the caller's span current, and a connection task spawned inside
+/// holds the caller's spans (and the trace) open for as long as the pooled connection lives:
+/// what the wrapper is there to prevent. A filter that keeps some of the server's spans and not
+/// this one (`RUST_LOG=warn,hs_federation=info`, say) did exactly that before 2026-10-14. The
+/// span is only ever a parent: no line is logged for it, and it is not exported.
+fn keep_detached(filter: EnvFilter) -> EnvFilter {
+    match DETACHED_DIRECTIVE.parse() {
+        Ok(directive) => filter.add_directive(directive),
+        // A constant that parses (a test says so); kept total rather than unwrapped.
+        Err(_) => filter,
     }
 }
 
@@ -239,7 +258,9 @@ fn use_color(stdout_is_terminal: bool, no_color: Option<&std::ffi::OsStr>) -> bo
 pub fn init(options: &Options) -> Result<Guard, TelemetryError> {
     let from_env = EnvFilter::try_from_default_env().ok();
     let pinned_by_env = from_env.is_some();
-    let filter = from_env.unwrap_or_else(|| EnvFilter::new(options.level.default_directives()));
+    let filter = keep_detached(
+        from_env.unwrap_or_else(|| EnvFilter::new(options.level.default_directives())),
+    );
     // Behind a reload layer, so the level can change on a running server
     // ([`Guard::log_level`]). It is the first layer on the registry, which is what the handle's
     // type says.
@@ -461,6 +482,45 @@ mod tests {
             pinned.set_level(Level::Debug),
             Err(TelemetryError::LogFilterPinned)
         ));
+    }
+
+    /// Whatever the level filter keeps of the server's spans, `outside_spans`'s span is made
+    /// and is current inside it, so a task spawned there does not inherit the caller's span.
+    #[test]
+    fn the_detached_span_is_made_whatever_the_level_filter_says() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        assert!(
+            DETACHED_DIRECTIVE
+                .parse::<tracing_subscriber::filter::Directive>()
+                .is_ok()
+        );
+        for directives in [
+            "warn,hs_federation=info".to_owned(),
+            Level::Warn.default_directives(),
+            Level::Info.default_directives(),
+            "off".to_owned(),
+        ] {
+            let subscriber = tracing_subscriber::registry()
+                .with(keep_detached(EnvFilter::new(&directives)))
+                .with(tracing_subscriber::fmt::layer().with_writer(std::io::sink));
+            let inside = tracing::subscriber::with_default(subscriber, || {
+                let request = tracing::info_span!(target: "hs_federation::client", "request");
+                let _entered = request.enter();
+                let detached =
+                    tracing::info_span!(target: "hs_telemetry::detached", parent: None, "outbound");
+                detached.in_scope(|| {
+                    tracing::Span::current()
+                        .metadata()
+                        .map(|m| m.target().to_owned())
+                })
+            });
+            assert_eq!(
+                inside.as_deref(),
+                Some(crate::spans::DETACHED_TARGET),
+                "under {directives:?}"
+            );
+        }
     }
 
     #[test]

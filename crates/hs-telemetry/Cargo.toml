@@ -19,8 +19,12 @@ otlp = [
     "dep:tracing-opentelemetry",
 ]
 # `hs_telemetry::testing`: run code in a trace of its own and read back the spans it exported, for
-# other crates' tests of their spans (a dev-dependency feature).
-testing = ["otlp"]
+# other crates' tests of their spans (a dev-dependency feature). It turns on `hyper-util`'s
+# `tracing` feature, as `kube-client` does in the shipped binary and so in the workspace's test
+# build: with it a new connection's task is spawned in the span current when it was opened, and
+# a crate's own `cargo test -p` has to see that too, or a span test that passes there fails in
+# the workspace gate (2026-10-14).
+testing = ["otlp", "dep:hyper-util", "hyper-util/tracing"]
 # Sentry error and panic reporting fed from `tracing` events.
 sentry = ["dep:sentry"]
 
@@ -46,6 +50,8 @@ opentelemetry = { version = "0.32", optional = true, default-features = false, f
 opentelemetry_sdk = { version = "0.32", optional = true, default-features = false, features = ["trace"] }
 opentelemetry-otlp = { version = "0.32", optional = true, default-features = false, features = ["grpc-tonic", "trace", "tls-ring", "tls-webpki-roots"] }
 tracing-opentelemetry = { version = "0.33", optional = true, default-features = false }
+# Only for the `testing` feature's `tracing` flag on it (see there); already in every tree.
+hyper-util = { workspace = true, optional = true }
 
 sentry = { version = "0.49", optional = true, default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls", "tracing"] }
 
