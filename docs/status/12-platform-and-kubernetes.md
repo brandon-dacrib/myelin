@@ -62,7 +62,12 @@ Decision 0049; the recovery is in `docs/bridges/mautrix.md`, "2026-10-15: a full
   until `GrowthRefused` was added, then `GrowthRefused`, Ready; patched back to 64Mi: the
   condition went with one `INFO`. `--volume-stats kubelet` cannot be run from the desktop
   (macOS refuses a session's binaries the route to the kind node, "No route to host"; Apple's
-  curl reaches it), so the kubelet path was run in-cluster: see below.
+  curl reaches it), so the kubelet path was run in-cluster with `deploy/operator/ci/kind-smoke.sh
+  myelin:volume-smoke --kind volsmoke` (image built from this branch): PASSED, the chart's operator
+  read every kubelet with no refusal (RBAC `nodes`/`nodes/stats`, `--kubelet-insecure-tls`), and
+  the 32Mi patch kept the 64Mi claim with `ShrinkRefused`. A measured `status.volume` through the
+  kubelet path in-cluster was not seen: the kind cluster was removed before the sweep after the
+  local-PV Bridge was created; the demo after the roll is the first.
 
 ### Next
 
