@@ -549,6 +549,7 @@ const REAL_HANDLERS: &[&str] = &[
     "appservices.ping",
     "appservices.rotate_tokens",
     "appservices.replay",
+    "appservices.discard",
     "bridge_types.list",
     "bridge_types.get",
     "bridge_types.render",
@@ -3833,6 +3834,7 @@ enum AppserviceAction {
     Ping,
     RotateTokens,
     Replay(AdminAppserviceReplay),
+    Discard(crate::model::AdminAppserviceDiscard),
 }
 
 impl AppserviceAction {
@@ -3843,6 +3845,7 @@ impl AppserviceAction {
             Self::Ping => "appservices.ping",
             Self::RotateTokens => "appservices.rotate_tokens",
             Self::Replay(_) => "appservices.replay",
+            Self::Discard(_) => "appservices.discard",
         }
     }
 
@@ -3853,6 +3856,7 @@ impl AppserviceAction {
             Self::Ping => "appservice.pinged",
             Self::RotateTokens => "appservice.tokens_rotated",
             Self::Replay(_) => "appservice.replayed",
+            Self::Discard(_) => "appservice.discarded",
         }
     }
 }
@@ -3969,6 +3973,21 @@ async fn appservice_action(
                         Err(e) => return e.to_problem().with_instance(instance).into_response(),
                     }
                 }
+                AppserviceAction::Discard(request) => {
+                    let asked = json!({
+                        "transaction_ids": request.transaction_ids,
+                        "before": request.before,
+                    });
+                    match appservices.discard(&id, request).await {
+                        Ok(discarded) => (
+                            200,
+                            json!({ "discarded": discarded }),
+                            json!({ "discarded": discarded, "requested": asked }),
+                        ),
+                        Err(SourceError::NotFound) => return no_such_appservice(&id, &instance),
+                        Err(e) => return e.to_problem().with_instance(instance).into_response(),
+                    }
+                }
             };
             if let Err(resp) = record_mutation(
                 state,
@@ -4046,6 +4065,33 @@ async fn appservices_rotate_tokens(
     body: axum::body::Bytes,
 ) -> Response {
     appservice_action(&state, &headers, &body, id, AppserviceAction::RotateTokens).await
+}
+
+/// `POST /api/v1/appservices/{id}/discard` (`bridges:write`): deletes dead-lettered
+/// transactions for good, never one still waiting. `200` with `{"discarded": n}`; audited as
+/// `appservice.discarded` with what was asked.
+async fn appservices_discard(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let request: crate::model::AdminAppserviceDiscard = match parse_optional_json(&body) {
+        Ok(v) => v,
+        Err(p) => {
+            return p
+                .with_instance(format!("/api/v1/appservices/{id}/discard"))
+                .into_response();
+        }
+    };
+    appservice_action(
+        &state,
+        &headers,
+        &body,
+        id,
+        AppserviceAction::Discard(request),
+    )
+    .await
 }
 
 /// `POST /api/v1/appservices/{id}/replay`.
@@ -5789,6 +5835,7 @@ fn register_real_operation(builder: Builder<AdminState>, op: OperationDef) -> Bu
             builder.add(method, &full_path, appservices_rotate_tokens, meta)
         }
         "appservices.replay" => builder.add(method, &full_path, appservices_replay, meta),
+        "appservices.discard" => builder.add(method, &full_path, appservices_discard, meta),
         "bridge_types.list" => builder.add(method, &full_path, bridge_types_list, meta),
         "bridge_types.get" => builder.add(method, &full_path, bridge_types_get, meta),
         "bridge_types.render" => builder.add(method, &full_path, bridge_types_render, meta),
@@ -9819,6 +9866,10 @@ mod tests {
                             attempts: 10,
                             last_error: Some("connection refused".into()),
                             dead_lettered: true,
+                            enqueued_at: Some("2026-10-12T19:35:00.000Z".into()),
+                            events: 40,
+                            room_ids: vec!["!a:example.org".into()],
+                            ..Default::default()
                         },
                         crate::model::AdminAppserviceBacklogEntry {
                             transaction_id: "8".into(),
@@ -9826,6 +9877,7 @@ mod tests {
                             attempts: 1,
                             last_error: None,
                             dead_lettered: false,
+                            ..Default::default()
                         },
                     ],
                 )
@@ -10425,6 +10477,97 @@ mod tests {
                 "{expected} should be audited exactly once"
             );
         }
+    }
+
+    /// `POST /appservices/{id}/discard` deletes dead letters (what each carried is on the
+    /// backlog page, so the operator can see what they are first), never an entry that waits,
+    /// and is audited with what was asked.
+    #[tokio::test]
+    async fn discarding_deletes_dead_letters_only_and_is_audited() {
+        let (router, _manifest) = build_router(state_with_appservices());
+        let (_, body, _) = call(
+            &router,
+            "GET",
+            "/api/v1/appservices/irc/backlog",
+            None,
+            None,
+        )
+        .await;
+        let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(page["items"][0]["events"], 40, "{page}");
+        assert_eq!(page["items"][0]["room_ids"], json!(["!a:example.org"]));
+        assert_eq!(page["items"][0]["enqueued_at"], "2026-10-12T19:35:00.000Z");
+
+        let (status, body, _) = call(
+            &router,
+            "POST",
+            "/api/v1/appservices/irc/discard",
+            Some(json!({"before": "yesterday"})),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // Queued after the cut-off: nothing.
+        let (status, body, _) = call(
+            &router,
+            "POST",
+            "/api/v1/appservices/irc/discard",
+            Some(json!({"before": "2026-10-01T00:00:00Z"})),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let answer: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(answer["discarded"], 0);
+
+        let (status, body, _) = call(
+            &router,
+            "POST",
+            "/api/v1/appservices/irc/discard",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let answer: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(answer["discarded"], 1);
+        let (_, body, _) = call(
+            &router,
+            "GET",
+            "/api/v1/appservices/irc/backlog",
+            None,
+            None,
+        )
+        .await;
+        let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let ids: Vec<&str> = page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["transaction_id"].as_str())
+            .collect();
+        assert_eq!(ids, ["8"], "the waiting one stays: {page}");
+        assert_eq!(
+            audit_entries_for_action(&router, "appservices.discard")
+                .await
+                .len(),
+            2
+        );
+        let (status, _, _) = call(
+            &router,
+            "POST",
+            "/api/v1/appservices/nope/discard",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

@@ -109,6 +109,14 @@ impl<B: KvBackend + 'static> AppserviceDirectory for OfferingAwareDirectory<B> {
         self.inner.replay(id, request).await
     }
 
+    async fn discard(
+        &self,
+        id: &str,
+        request: hs_admin::model::AdminAppserviceDiscard,
+    ) -> Result<usize, SourceError> {
+        self.inner.discard(id, request).await
+    }
+
     async fn logins(
         &self,
         id: &str,

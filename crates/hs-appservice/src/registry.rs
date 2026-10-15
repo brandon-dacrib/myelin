@@ -82,6 +82,9 @@ pub struct Health {
     /// The last `m.room_key.withheld` delivered to one of the appservice's users
     /// (`AppServiceHealth.last_key_withheld`).
     pub last_key_withheld: Option<crate::store::KeyWithheldRow>,
+    /// Why the status is what it is, in words for an operator; `None` when it is healthy.
+    /// Before 2026-10-15 the Bridges page said "Degraded" and nothing else.
+    pub reason: Option<String>,
 }
 
 fn compute_status(paused: bool, health: &HealthRow, threshold: u32) -> HealthStatus {
@@ -99,10 +102,76 @@ fn compute_status(paused: bool, health: &HealthRow, threshold: u32) -> HealthSta
     if health.consecutive_failures == 0 && !last_ping_failed {
         return HealthStatus::Healthy;
     }
+    if failures_answered_since(health) {
+        return HealthStatus::Healthy;
+    }
     if health.consecutive_failures >= threshold {
         return HealthStatus::Down;
     }
     HealthStatus::Degraded
+}
+
+/// Whether a ping succeeded after the last failed delivery: the appservice answers again, and
+/// the failures are history until the next transaction says otherwise. Without this a bridge
+/// whose failed transactions were all dead-lettered, and which was sent nothing since, stayed
+/// "degraded" however often it answered a ping.
+fn failures_answered_since(health: &HealthRow) -> bool {
+    health.last_ping_success == Some(true)
+        && match (health.last_ping_at_ms, health.last_failure_at_ms) {
+            (Some(ping), Some(failure)) => ping > failure,
+            _ => false,
+        }
+}
+
+/// [`Health::reason`]: the status in words for an operator.
+fn status_reason(
+    status: HealthStatus,
+    has_url: bool,
+    health: &HealthRow,
+    threshold: u32,
+) -> Option<String> {
+    let last_error = health
+        .last_error
+        .as_deref()
+        .map(|e| format!(" The last error: {e}"))
+        .unwrap_or_default();
+    match status {
+        HealthStatus::Healthy => None,
+        HealthStatus::Paused => Some(
+            "Paused by an operator: transactions are queued and not sent until it is resumed."
+                .to_owned(),
+        ),
+        HealthStatus::Unknown if !has_url => Some(
+            "It has no URL, so the server never sends it anything (a bridge's double \
+             puppeting registration, say)."
+                .to_owned(),
+        ),
+        HealthStatus::Unknown => Some(
+            "Nothing has been delivered to it or pinged yet, so there is nothing to judge."
+                .to_owned(),
+        ),
+        HealthStatus::Degraded | HealthStatus::Down if health.consecutive_failures == 0 => {
+            Some(format!(
+                "Its last ping failed, and nothing has been delivered to it since.{last_error}"
+            ))
+        }
+        HealthStatus::Degraded => Some(format!(
+            "The last {} transaction{} to it failed; it is marked down at {threshold}. It is \
+             healthy again once a transaction is delivered or a ping is answered.{last_error}",
+            health.consecutive_failures,
+            if health.consecutive_failures == 1 {
+                ""
+            } else {
+                "s"
+            },
+        )),
+        HealthStatus::Down => Some(format!(
+            "The last {} transactions to it failed, {threshold} or more in a row; nothing is \
+             getting through. It is healthy again once a transaction is delivered or a ping is \
+             answered.{last_error}",
+            health.consecutive_failures,
+        )),
+    }
 }
 
 /// One backlog entry as the admin API reports it (`AppServiceBacklogEntry`).
@@ -118,6 +187,45 @@ pub struct BacklogEntry {
     pub last_error: Option<String>,
     /// Whether this entry has exhausted its retry budget.
     pub dead_lettered: bool,
+    /// When it was queued, in milliseconds since the epoch.
+    pub enqueued_at_ms: u64,
+    /// What it carries: timeline events.
+    pub events: usize,
+    /// Ephemeral events (typing, receipts, presence).
+    pub ephemeral: usize,
+    /// To-device messages.
+    pub to_device: usize,
+    /// The rooms its events and ephemeral events are in, each once, the first
+    /// [`BACKLOG_ROOMS`] of them.
+    pub room_ids: Vec<String>,
+}
+
+/// How many of an entry's rooms a backlog entry names.
+pub const BACKLOG_ROOMS: usize = 5;
+
+/// The rooms `body`'s events and ephemeral events are in, each once, in order, at most
+/// [`BACKLOG_ROOMS`].
+fn rooms_in(body: &serde_json::Value) -> Vec<String> {
+    let mut rooms: Vec<String> = Vec::new();
+    for key in ["events", "ephemeral", "de.sorunome.msc2409.ephemeral"] {
+        for event in body
+            .get(key)
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(room) = event.get("room_id").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if !rooms.iter().any(|r| r == room) {
+                if rooms.len() == BACKLOG_ROOMS {
+                    return rooms;
+                }
+                rooms.push(room.to_owned());
+            }
+        }
+    }
+    rooms
 }
 
 /// The appservice registry: registration storage, namespace conflict detection, health, and the
@@ -506,14 +614,17 @@ impl<B: KvBackend> Registry<B> {
             .get(id)?
             .ok_or_else(|| AppserviceError::NotFound(id.to_string()))?;
         let health_row = self.store.health(id)?;
+        let threshold = self.failure_threshold();
         let status = if row.url.is_none() && !row.paused {
             // Never sent anything (a bridge's double-puppeting registration, say): there is no
             // delivery to judge, whatever was recorded while it had a url.
             HealthStatus::Unknown
         } else {
-            compute_status(row.paused, &health_row, self.failure_threshold())
+            compute_status(row.paused, &health_row, threshold)
         };
+        let reason = status_reason(status, row.url.is_some(), &health_row, threshold);
         Ok(Health {
+            reason,
             status,
             last_ping_at_ms: health_row.last_ping_at_ms,
             last_error: health_row.last_error,
@@ -562,12 +673,20 @@ impl<B: KvBackend> Registry<B> {
         let entries = page
             .entries
             .into_iter()
-            .map(|e| BacklogEntry {
-                transaction_id: e.seq.to_string(),
-                age_ms: now.saturating_sub(e.enqueued_at_ms),
-                attempts: e.attempts,
-                last_error: e.last_error,
-                dead_lettered: e.status == QueueStatus::DeadLettered,
+            .map(|e| {
+                let counts = crate::transaction::body_counts(&e.body);
+                BacklogEntry {
+                    transaction_id: e.seq.to_string(),
+                    age_ms: now.saturating_sub(e.enqueued_at_ms),
+                    attempts: e.attempts,
+                    last_error: e.last_error,
+                    dead_lettered: e.status == QueueStatus::DeadLettered,
+                    enqueued_at_ms: e.enqueued_at_ms,
+                    events: counts.events,
+                    ephemeral: counts.typing + counts.receipts + counts.presence,
+                    to_device: counts.to_device,
+                    room_ids: rooms_in(&e.body),
+                }
             })
             .collect();
         Ok((entries, page.next_after))
@@ -1087,5 +1206,85 @@ mod tests {
         r.add(&reg("a", "abot", r"^@a_.*:example\.org$", true))
             .unwrap();
         assert_eq!(r.health("a").unwrap().status, HealthStatus::Unknown);
+    }
+
+    /// The Bridges page said "Degraded" and nothing more (the demo, 2026-10-15): the health
+    /// now says why, and a ping answered after the failures ends them.
+    #[test]
+    fn health_says_why_and_a_ping_answered_after_the_failures_ends_them() {
+        let r = registry();
+        r.add(&reg("a", "abot", r"^@a_.*:example\.org$", true))
+            .unwrap();
+        let mut row = r.store().health("a").unwrap();
+        row.last_success_at_ms = Some(100);
+        row.consecutive_failures = 13;
+        row.last_failure_at_ms = Some(900);
+        row.last_error = Some("operation timed out".to_owned());
+        r.store().put_health("a", &row).unwrap();
+        let health = r.health("a").unwrap();
+        assert_eq!(health.status, HealthStatus::Degraded);
+        let reason = health.reason.unwrap();
+        assert!(
+            reason.starts_with("The last 13 transactions to it failed; it is marked down at"),
+            "{reason}"
+        );
+        assert!(
+            reason.ends_with("The last error: operation timed out"),
+            "{reason}"
+        );
+
+        // A ping before the last failure changes nothing; one after it does.
+        row.last_ping_at_ms = Some(800);
+        row.last_ping_success = Some(true);
+        r.store().put_health("a", &row).unwrap();
+        assert_eq!(r.health("a").unwrap().status, HealthStatus::Degraded);
+        row.last_ping_at_ms = Some(950);
+        r.store().put_health("a", &row).unwrap();
+        let health = r.health("a").unwrap();
+        assert_eq!(health.status, HealthStatus::Healthy);
+        assert_eq!(health.reason, None);
+
+        row.last_ping_success = Some(false);
+        row.consecutive_failures = 0;
+        r.store().put_health("a", &row).unwrap();
+        let health = r.health("a").unwrap();
+        assert_eq!(health.status, HealthStatus::Degraded);
+        assert!(
+            health
+                .reason
+                .unwrap()
+                .starts_with("Its last ping failed, and nothing has been delivered")
+        );
+
+        r.pause("a").unwrap();
+        assert!(r.health("a").unwrap().reason.unwrap().starts_with("Paused"));
+    }
+
+    /// A backlog entry says when it was queued, what it carries and its rooms (at most five),
+    /// so an operator can tell an incident's leftovers from a bridge's own traffic before
+    /// replaying or discarding them.
+    #[test]
+    fn a_backlog_entry_says_what_it_carries_and_where() {
+        let r = registry();
+        r.add(&reg("a", "abot", r"^@a_.*:example\.org$", true))
+            .unwrap();
+        let events: Vec<serde_json::Value> = (0..8)
+            .map(|i| serde_json::json!({"type": "m.room.encrypted", "room_id": format!("!r{}:x", i % 7)}))
+            .collect();
+        let body = serde_json::json!({
+            "events": events,
+            "ephemeral": [{"type": "m.receipt", "room_id": "!r0:x"}],
+            "to_device": [{"type": "m.room_key_request"}, {"type": "m.room_key_request"}],
+        });
+        r.store().enqueue("a", body, 400).unwrap();
+        let (page, _) = r.backlog_page("a", None, 10).unwrap();
+        let entry = &page[0];
+        assert_eq!(entry.enqueued_at_ms, 400);
+        assert_eq!(entry.age_ms, 600);
+        assert_eq!((entry.events, entry.ephemeral, entry.to_device), (8, 1, 2));
+        assert_eq!(
+            entry.room_ids,
+            ["!r0:x", "!r1:x", "!r2:x", "!r3:x", "!r4:x"]
+        );
     }
 }

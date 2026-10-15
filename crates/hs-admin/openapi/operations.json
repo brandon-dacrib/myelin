@@ -55,6 +55,15 @@
       "idempotent_post": false
     },
     {
+      "method": "POST",
+      "path": "/appservices/{id}/discard",
+      "operation_id": "appservices.discard",
+      "scope": "bridges:write",
+      "public": false,
+      "tag": "Bridges",
+      "idempotent_post": true
+    },
+    {
       "method": "GET",
       "path": "/appservices/{id}/health",
       "operation_id": "appservices.health",

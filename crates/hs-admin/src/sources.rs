@@ -19,13 +19,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::model::{
-    AdminAppservice, AdminAppserviceBacklogEntry, AdminAppserviceCreate, AdminAppserviceHealth,
-    AdminAppserviceLinks, AdminAppserviceReplay, AdminAppserviceTokens, AdminBridgeLogins,
-    AdminDestination, AdminDevice, AdminPasswordReset, AdminRoom, AdminRoomMember, AdminUser,
-    ClusterStatus, ConfigChange, ConfigReloadReport, ConfigSection, ConfigSettingChange,
-    ConfigSettingValue, ConfigValidateReport, ExternalId, RecoveryAdministrator,
-    RecoveryInspection, RecoveryLink, RecoveryLinkKind, RecoveryLinkRequest, RecoveryResetRequest,
-    SetupRequest, SetupSession, StatisticsOverview, ThreePid,
+    AdminAppservice, AdminAppserviceBacklogEntry, AdminAppserviceCreate, AdminAppserviceDiscard,
+    AdminAppserviceHealth, AdminAppserviceLinks, AdminAppserviceReplay, AdminAppserviceTokens,
+    AdminBridgeLogins, AdminDestination, AdminDevice, AdminPasswordReset, AdminRoom,
+    AdminRoomMember, AdminUser, ClusterStatus, ConfigChange, ConfigReloadReport, ConfigSection,
+    ConfigSettingChange, ConfigSettingValue, ConfigValidateReport, ExternalId,
+    RecoveryAdministrator, RecoveryInspection, RecoveryLink, RecoveryLinkKind, RecoveryLinkRequest,
+    RecoveryResetRequest, SetupRequest, SetupSession, StatisticsOverview, ThreePid,
 };
 
 /// Why a data-source call failed. Mirrors [`crate::auth::AuthError`]'s "only unavailable escapes
@@ -2610,6 +2610,19 @@ pub trait AppserviceDirectory: Send + Sync + 'static {
     async fn ping(&self, id: &str) -> Result<AdminAppserviceHealth, SourceError>;
     /// Puts dead-lettered transactions back in the queue for immediate retry. Returns how many.
     async fn replay(&self, id: &str, request: AdminAppserviceReplay) -> Result<usize, SourceError>;
+    /// Deletes dead-lettered transactions for good (never one still waiting). Returns how many.
+    ///
+    /// The default answers [`SourceError::Unavailable`], for a directory that cannot.
+    async fn discard(
+        &self,
+        id: &str,
+        request: AdminAppserviceDiscard,
+    ) -> Result<usize, SourceError> {
+        let _ = (id, request);
+        Err(SourceError::Unavailable(
+            "this appservice directory cannot discard dead-lettered transactions".to_owned(),
+        ))
+    }
     /// Who has signed in to the bridge `id`, and as what, as its provisioning API says
     /// ([`crate::bridge_logins`]): `user_id`, or a per-user instance's owner when absent. A
     /// bridge type with no such API is an `Ok` with `supported: false`; a bridge that could not
@@ -2770,6 +2783,11 @@ impl InMemoryAppserviceDirectory {
                 "paused".to_owned()
             } else {
                 row.health.status.clone()
+            },
+            health_reason: if row.paused {
+                Some("Paused by an operator.".to_owned())
+            } else {
+                row.health.reason.clone()
             },
             created_at: row.created_at.clone(),
             bridge_type: r
@@ -3000,6 +3018,9 @@ impl AppserviceDirectory for InMemoryAppserviceDirectory {
         self.with_row(id, |row| {
             row.health = AdminAppserviceHealth {
                 status: if unreachable { "down" } else { "healthy" }.to_owned(),
+                reason: unreachable.then(|| {
+                    "Its last ping failed, and nothing has been delivered to it since.".to_owned()
+                }),
                 last_ping_at: Some(hs_http::time::now_rfc3339()),
                 last_error: unreachable.then(|| "connection refused".to_owned()),
                 last_key_withheld: None,
@@ -3026,6 +3047,38 @@ impl AppserviceDirectory for InMemoryAppserviceDirectory {
                 }
             }
             replayed
+        })
+    }
+
+    async fn discard(
+        &self,
+        id: &str,
+        request: AdminAppserviceDiscard,
+    ) -> Result<usize, SourceError> {
+        let before = match request.before.as_deref() {
+            Some(before) => Some(hs_http::time::parse_rfc3339(before).map_err(|e| {
+                SourceError::InvalidField {
+                    pointer: "/before",
+                    detail: format!("not an RFC 3339 timestamp: {e}"),
+                }
+            })?),
+            None => None,
+        };
+        self.with_row(id, |row| {
+            let before_len = row.backlog.len();
+            row.backlog.retain(|entry| {
+                let wanted = request.transaction_ids.is_empty()
+                    || request.transaction_ids.contains(&entry.transaction_id);
+                let old_enough = match (before, entry.enqueued_at.as_deref()) {
+                    (None, _) => true,
+                    (Some(before), Some(at)) => {
+                        hs_http::time::parse_rfc3339(at).is_ok_and(|at| at < before)
+                    }
+                    (Some(_), None) => false,
+                };
+                !(entry.dead_lettered && wanted && old_enough)
+            });
+            before_len - row.backlog.len()
         })
     }
 

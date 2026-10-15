@@ -968,6 +968,10 @@ pub struct AdminAppservice {
     /// [`AdminAppserviceHealth::status`] carries, so a list can be coloured without a request per
     /// row.
     pub health: String,
+    /// Why `health` is what it is, in words for an operator (the same as
+    /// [`AdminAppserviceHealth::reason`]); `None` when healthy.
+    #[serde(default)]
+    pub health_reason: Option<String>,
     /// RFC 3339 millisecond-precision UTC.
     pub created_at: String,
     /// The catalogue entry (`GET /bridge-types`) this appservice was created from, read from
@@ -1075,6 +1079,10 @@ pub struct AdminAppserviceLinks {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AdminAppserviceHealth {
     pub status: String,
+    /// Why `status` is what it is, in words for an operator: how many transactions in a row
+    /// failed and the threshold for `down`, a failed ping, a pause. `None` when healthy.
+    #[serde(default)]
+    pub reason: Option<String>,
     pub last_ping_at: Option<String>,
     pub last_error: Option<String>,
     /// The last `m.room_key.withheld` delivered to one of the appservice's users: a client
@@ -1122,6 +1130,22 @@ pub struct AdminAppserviceBacklogEntry {
     pub attempts: u32,
     pub last_error: Option<String>,
     pub dead_lettered: bool,
+    /// When it was queued, RFC 3339; `None` from a directory that does not know.
+    #[serde(default)]
+    pub enqueued_at: Option<String>,
+    /// What it carries: timeline events.
+    #[serde(default)]
+    pub events: u64,
+    /// Ephemeral events (typing, receipts, presence).
+    #[serde(default)]
+    pub ephemeral: u64,
+    /// To-device messages.
+    #[serde(default)]
+    pub to_device: u64,
+    /// The rooms its events are in, each once, at most five: enough to tell whether it is
+    /// about rooms the bridge bridges.
+    #[serde(default)]
+    pub room_ids: Vec<String>,
 }
 
 /// The OpenAPI `AppServiceTokens` schema: the body of `POST /appservices/{id}/rotate-tokens`,
@@ -1165,6 +1189,18 @@ impl std::fmt::Debug for AdminAppserviceCreate {
             )
             .finish()
     }
+}
+
+/// The OpenAPI `AppServiceDiscardRequest` schema: which dead-lettered transactions to delete
+/// for good. Both absent means all of them. Entries still waiting to be sent are never
+/// discarded.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AdminAppserviceDiscard {
+    #[serde(default)]
+    pub transaction_ids: Vec<String>,
+    /// RFC 3339; only entries queued before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
 }
 
 /// The OpenAPI `AppServiceReplayRequest` schema: which dead-lettered transactions to send again.

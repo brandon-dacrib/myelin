@@ -260,6 +260,7 @@ fn router(state: MockState) -> Router {
         .route("/api/v1/appservices/{id}/ping", post(appservice_ping))
         .route("/api/v1/appservices/{id}/rotate-tokens", post(appservice_rotate_tokens))
         .route("/api/v1/appservices/{id}/replay", post(appservice_replay))
+        .route("/api/v1/appservices/{id}/discard", post(appservice_discard))
         // cluster
         .route("/api/v1/cluster", get(|| async { Json(fixtures::cluster_status()) }))
         .route("/api/v1/cluster/replicas", get(list_replicas))
@@ -1846,7 +1847,7 @@ async fn appservice_backlog(
         return not_found("appservice", &id);
     }
     let backlog = vec![
-        json!({"transaction_id": "txn-42", "age_ms": 12_000, "attempts": 3, "last_error": "connection reset", "dead_lettered": false}),
+        json!({"transaction_id": "txn-42", "age_ms": 12_000, "attempts": 3, "last_error": "connection reset", "dead_lettered": false, "enqueued_at": hs_http::time::now_rfc3339(), "events": 4, "ephemeral": 1, "to_device": 0, "room_ids": ["!lobby:example.org"]}),
     ];
     Json(page_json(&backlog, &q)).into_response()
 }
@@ -1929,6 +1930,31 @@ async fn appservice_rotate_tokens(
     )
     .await;
     Json(json!({"as_token": format!("as-{}", hs_admin::model::new_id()), "hs_token": format!("hs-{}", hs_admin::model::new_id())})).into_response()
+}
+
+/// `POST /api/v1/appservices/{id}/discard`: the mock's backlog holds no dead letters, so
+/// nothing is discarded; audited as the real one is.
+async fn appservice_discard(
+    State(state): State<MockState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let actor = match require_auth(&state, &headers) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    if find_index(&*state.db.read().await, "appservices", "id", &id).is_none() {
+        return not_found("appservice", &id);
+    }
+    emit_and_audit(
+        &state,
+        "appservices.discard",
+        &actor,
+        ResourceRef::new("appservice", id),
+        json!({"discarded": 0}),
+    )
+    .await;
+    Json(json!({"discarded": 0})).into_response()
 }
 
 async fn appservice_replay(

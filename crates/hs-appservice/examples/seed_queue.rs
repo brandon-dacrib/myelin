@@ -77,6 +77,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                     next_attempt_at_ms: enqueued_at_ms,
                     status: QueueStatus::DeadLettered,
                     last_error: Some("connection refused".to_owned()),
+                    txn_id: None,
+                    first_failed_at_ms: Some(enqueued_at_ms),
                 },
             )?;
         }

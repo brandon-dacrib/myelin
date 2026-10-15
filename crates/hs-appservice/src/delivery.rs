@@ -24,7 +24,7 @@ use hs_kv::KvBackend;
 use tokio::sync::Notify;
 
 use crate::error::AppserviceError;
-use crate::scheduler::{DrainOutcome, Scheduler};
+use crate::scheduler::{DrainOutcome, Scheduler, SendErrorKind};
 
 /// How often a worker whose oldest entry is backing off looks again. The backoff itself is kept
 /// in the queue row against the scheduler's clock; this is only how promptly its end is noticed.
@@ -123,13 +123,24 @@ impl<B: KvBackend + 'static> Delivery<B> {
                     count,
                     dead_lettered,
                     error,
+                    reason,
+                    txn_id,
+                    attempt,
+                    elapsed_ms,
+                    retry_in_ms,
                 }) => {
-                    tracing::warn!(
-                        appservice = %appservice_id,
-                        count,
-                        dead_lettered,
-                        %error,
-                        "could not deliver to this appservice; it will be tried again"
+                    log_failure(
+                        &appservice_id,
+                        &Failure {
+                            count,
+                            dead_lettered,
+                            error: &error,
+                            reason,
+                            txn_id,
+                            attempt,
+                            elapsed_ms,
+                            retry_in_ms,
+                        },
                     );
                     RETRY_CHECK
                 }
@@ -144,6 +155,66 @@ impl<B: KvBackend + 'static> Delivery<B> {
             };
             let _ = tokio::time::timeout(pause, wake.notified()).await;
         }
+    }
+}
+
+/// What [`log_failure`] says about one failed attempt.
+struct Failure<'a> {
+    count: usize,
+    dead_lettered: usize,
+    error: &'a str,
+    reason: SendErrorKind,
+    txn_id: u64,
+    attempt: u32,
+    elapsed_ms: u64,
+    retry_in_ms: Option<u64>,
+}
+
+/// One line per failed attempt, saying which of three things happened: entries set aside for
+/// good (dead-lettered, what an operator has to act on), a bridge too slow to answer (it took
+/// the transaction and may still be working on it), or a bridge that could not be reached or
+/// refused. Each names the transaction id, so a retry under the same id is visible as one.
+fn log_failure(appservice_id: &str, f: &Failure<'_>) {
+    let reason = f.reason.as_str();
+    if f.dead_lettered > 0 {
+        tracing::warn!(
+            appservice = %appservice_id,
+            txn_id = f.txn_id,
+            attempt = f.attempt,
+            reason,
+            elapsed_ms = f.elapsed_ms,
+            count = f.count,
+            dead_lettered = f.dead_lettered,
+            error = %f.error,
+            "gave up delivering a transaction to this appservice; its entries are dead-lettered \
+             and wait for an operator to replay or discard them"
+        );
+    } else if f.reason == SendErrorKind::TimedOut {
+        tracing::warn!(
+            appservice = %appservice_id,
+            txn_id = f.txn_id,
+            attempt = f.attempt,
+            reason,
+            elapsed_ms = f.elapsed_ms,
+            count = f.count,
+            retry_in_ms = f.retry_in_ms,
+            error = %f.error,
+            "this appservice did not answer a transaction in time and may still be working on \
+             it; the same transaction is sent again after a pause, and new ones go out smaller \
+             until it keeps up"
+        );
+    } else {
+        tracing::warn!(
+            appservice = %appservice_id,
+            txn_id = f.txn_id,
+            attempt = f.attempt,
+            reason,
+            elapsed_ms = f.elapsed_ms,
+            count = f.count,
+            retry_in_ms = f.retry_in_ms,
+            error = %f.error,
+            "could not deliver to this appservice; it will be tried again"
+        );
     }
 }
 
@@ -267,7 +338,7 @@ mod tests {
             hs_token: &str,
             txn_id: &str,
             body: &Value,
-        ) -> Result<(), String> {
+        ) -> Result<(), crate::scheduler::SendError> {
             if url.contains("stuck") {
                 std::future::pending::<()>().await;
             }

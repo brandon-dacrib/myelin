@@ -10,7 +10,7 @@ openapi: 3.1.0
 info:
   title: hs-admin API
   summary: The native administration and moderation API for the homeserver.
-  version: 0.1.17
+  version: 0.1.18
   description: 'The only API the management interface (track 16) talks to. See docs/rfcs/0004-admin-api.md for the full design rationale: resource modeling, naming, pagination, filtering, errors, idempotency, scopes, versioning and the event stream. This document is the contract; the hs-admin router''s contract tests assert the router and this document agree on paths and methods (RFC 0004 section 1, decision D15.16).'
   contact:
     name: 'Track 15: Admin API and modules'
@@ -556,6 +556,55 @@ paths:
           $ref: '#/components/responses/RateLimited'
         '404':
           $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /appservices/{id}/discard:
+    post:
+      summary: Discard dead-lettered transactions
+      description: Deletes dead-lettered transactions for good; an entry still waiting to be sent is never touched. With neither filter, every dead-lettered entry. What each carried (events, ephemeral events, to-device messages and its rooms) is on the backlog page (appservices.backlog), so an operator can see what is being dropped first. A replay (appservices.replay) sends them instead; replaying days-old entries sends the bridge days-old events.
+      operationId: appservices.discard
+      tags:
+      - Bridges
+      security:
+      - OAuth2:
+        - bridges:write
+      parameters:
+      - $ref: '#/components/parameters/AppserviceId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AppServiceDiscardRequest'
+      responses:
+        '200':
+          description: How many were discarded.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - discarded
+                properties:
+                  discarded:
+                    type: integer
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/InsufficientScope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/IdempotencyInFlight'
+        '422':
+          $ref: '#/components/responses/IdempotencyMismatch'
         '500':
           $ref: '#/components/responses/Internal'
         '503':
@@ -8334,6 +8383,11 @@ components:
           - down
           - paused
           - unknown
+        health_reason:
+          type:
+          - string
+          - 'null'
+          description: Why health is what it is, in words for an operator (the same as AppServiceHealth.reason); null when healthy.
         created_at:
           type: string
           format: date-time
@@ -8373,7 +8427,7 @@ components:
           description: Entries waiting to be sent, including any backing off after a failed attempt.
         dead_lettered:
           type: integer
-          description: Entries that ran out of delivery attempts and wait for a replay (appservices.replay).
+          description: Entries whose retry budget ran out (a transaction the bridge refused ten times, or one it could not be reached for, did not answer in time, or answered 5xx, 408 or 429 for a day). They are kept until an operator replays them (appservices.replay) or discards them (appservices.discard).
         oldest_pending_age_ms:
           type:
           - integer
@@ -8414,6 +8468,12 @@ components:
           - down
           - paused
           - unknown
+          description: healthy when the last transaction was delivered (or a ping answered since the last failure); degraded after one or more transactions in a row failed, or a ping failed with nothing delivered since; down once the failures in a row reach the server's threshold (appservices.tracking_failure_threshold); unknown before anything has been sent or pinged, and always for a registration with no url.
+        reason:
+          type:
+          - string
+          - 'null'
+          description: Why status is what it is, in words for an operator; null when healthy.
         last_ping_at:
           type:
           - string
@@ -8516,6 +8576,38 @@ components:
           - 'null'
         dead_lettered:
           type: boolean
+        enqueued_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: When it was queued.
+        events:
+          type: integer
+          description: Timeline events it carries.
+        ephemeral:
+          type: integer
+          description: Ephemeral events (typing, receipts, presence) it carries.
+        to_device:
+          type: integer
+          description: To-device messages it carries.
+        room_ids:
+          type: array
+          items:
+            type: string
+          description: The rooms its events are in, each once, at most five.
+    AppServiceDiscardRequest:
+      type: object
+      description: Which dead-lettered transactions to discard; with neither, all of them.
+      properties:
+        transaction_ids:
+          type: array
+          items:
+            type: string
+        before:
+          type: string
+          format: date-time
+          description: Only entries queued before this time.
     AppServiceReplayRequest:
       type: object
       properties:

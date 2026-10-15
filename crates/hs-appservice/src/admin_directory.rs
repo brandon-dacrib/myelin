@@ -14,9 +14,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use hs_admin::model::{
-    AdminAppservice, AdminAppserviceBacklogEntry, AdminAppserviceCreate, AdminAppserviceHealth,
-    AdminAppserviceLinks, AdminAppserviceQueue, AdminAppserviceReplay, AdminAppserviceTokens,
-    AdminBridgeLogins, AdminKeyWithheld,
+    AdminAppservice, AdminAppserviceBacklogEntry, AdminAppserviceCreate, AdminAppserviceDiscard,
+    AdminAppserviceHealth, AdminAppserviceLinks, AdminAppserviceQueue, AdminAppserviceReplay,
+    AdminAppserviceTokens, AdminBridgeLogins, AdminKeyWithheld,
 };
 use hs_admin::sources::{
     AdminAppserviceBacklogPage, AdminAppserviceRegistration, AppserviceDirectory,
@@ -30,7 +30,7 @@ use crate::ping::PingService;
 use crate::provisioning::BridgeLogins;
 use crate::registration::Registration;
 use crate::registry::{BacklogEntry, Health, Registry};
-use crate::scheduler::{ReplayRequest, Scheduler};
+use crate::scheduler::{DiscardRequest, ReplayRequest, Scheduler};
 use crate::store::AppserviceRow;
 
 /// Told the id of an appservice that has just had transactions put back in its queue.
@@ -103,6 +103,7 @@ impl<B: KvBackend + 'static> RegistryAppserviceDirectory<B> {
             protocols: row.protocols.clone(),
             paused: row.paused,
             health: status_word(&health),
+            health_reason: health.reason.clone(),
             created_at: hs_http::time::rfc3339_from_millis(
                 i64::try_from(row.created_at_ms).unwrap_or(i64::MAX),
             ),
@@ -142,6 +143,7 @@ fn status_word(health: &Health) -> String {
 fn admin_health(health: Health) -> AdminAppserviceHealth {
     AdminAppserviceHealth {
         status: status_word(&health),
+        reason: health.reason.clone(),
         last_ping_at: health
             .last_ping_at_ms
             .map(|ms| hs_http::time::rfc3339_from_millis(i64::try_from(ms).unwrap_or(i64::MAX))),
@@ -168,7 +170,28 @@ fn admin_backlog(entry: BacklogEntry) -> AdminAppserviceBacklogEntry {
         attempts: entry.attempts,
         last_error: entry.last_error,
         dead_lettered: entry.dead_lettered,
+        enqueued_at: Some(hs_http::time::rfc3339_from_millis(
+            i64::try_from(entry.enqueued_at_ms).unwrap_or(i64::MAX),
+        )),
+        events: u64::try_from(entry.events).unwrap_or(u64::MAX),
+        ephemeral: u64::try_from(entry.ephemeral).unwrap_or(u64::MAX),
+        to_device: u64::try_from(entry.to_device).unwrap_or(u64::MAX),
+        room_ids: entry.room_ids,
     }
+}
+
+/// An RFC 3339 field of a request, as milliseconds since the epoch.
+fn millis_of(value: Option<&str>, pointer: &'static str) -> Result<Option<u64>, SourceError> {
+    value
+        .map(|at| {
+            hs_http::time::parse_rfc3339(at)
+                .map(|dt| u64::try_from(dt.unix_timestamp() * 1000).unwrap_or(0))
+                .map_err(|e| SourceError::InvalidField {
+                    pointer,
+                    detail: format!("not an RFC 3339 timestamp: {e}"),
+                })
+        })
+        .transpose()
 }
 
 /// The registry's errors as the admin API's. A conflict of any kind -- id, token, namespace --
@@ -321,17 +344,7 @@ impl<B: KvBackend + 'static> AppserviceDirectory for RegistryAppserviceDirectory
     }
 
     async fn replay(&self, id: &str, request: AdminAppserviceReplay) -> Result<usize, SourceError> {
-        let since_ms = match request.since.as_deref() {
-            Some(since) => Some(
-                hs_http::time::parse_rfc3339(since)
-                    .map(|dt| u64::try_from(dt.unix_timestamp() * 1000).unwrap_or(0))
-                    .map_err(|e| SourceError::InvalidField {
-                        pointer: "/since",
-                        detail: format!("not an RFC 3339 timestamp: {e}"),
-                    })?,
-            ),
-            None => None,
-        };
+        let since_ms = millis_of(request.since.as_deref(), "/since")?;
         let replayed = self
             .scheduler
             .replay(
@@ -346,6 +359,31 @@ impl<B: KvBackend + 'static> AppserviceDirectory for RegistryAppserviceDirectory
             (self.nudge)(id);
         }
         Ok(replayed)
+    }
+
+    async fn discard(
+        &self,
+        id: &str,
+        request: AdminAppserviceDiscard,
+    ) -> Result<usize, SourceError> {
+        let before_ms = millis_of(request.before.as_deref(), "/before")?;
+        let scheduler = self.scheduler.clone();
+        let id = id.to_owned();
+        // On the blocking pool: it walks the queue's heads, and a bridge that was off for a day
+        // has tens of thousands.
+        tokio::task::spawn_blocking(move || {
+            scheduler
+                .discard(
+                    &id,
+                    &DiscardRequest {
+                        transaction_ids: request.transaction_ids,
+                        before_ms,
+                    },
+                )
+                .map_err(to_source)
+        })
+        .await
+        .map_err(|e| SourceError::Unavailable(format!("discarding did not finish: {e}")))?
     }
 
     async fn logins(

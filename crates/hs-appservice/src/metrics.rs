@@ -5,6 +5,23 @@
 //! - `hs_appservice_transactions_total{appservice,outcome}`: transactions the scheduler
 //!   attempted, by what became of each: `delivered` (the appservice answered 2xx) or `failed`
 //!   (it did not; the transaction is retried, or dead-lettered once its attempts are spent).
+//! - `hs_appservice_transaction_seconds{appservice,outcome}`: how long each attempt's HTTP
+//!   exchange took, by `delivered`, `failed` or `timed_out`. A bridge whose handler blocks
+//!   until its own event channel has room (mautrix-go's does) shows here as latency climbing
+//!   toward the request timeout before it shows as failures.
+//! - `hs_appservice_transaction_failures_total{appservice,reason}`: failed attempts by why:
+//!   `timed_out` (the bridge took the request and did not answer in time; it may still be
+//!   working on it), `unreachable` (no connection), `unavailable` (5xx, 408 or 429) and
+//!   `rejected` (any other status). The first three are transient: the transaction is sent
+//!   again under the same id until it has failed for a day.
+//! - `hs_appservice_transaction_retries_total{appservice}`: attempts that sent a transaction id
+//!   already tried once, with exactly the same entries (the spec's idempotency contract).
+//! - `hs_appservice_dead_lettered_total{appservice}`: queue entries set aside because their
+//!   retry budget ran out.
+//! - `hs_appservice_batch_item_limit{appservice}`: how many items (events, ephemeral events
+//!   and to-device messages) the next new transaction may carry. It starts at 100 (Synapse's
+//!   cap), halves each time the appservice times out and doubles back on each delivery: below
+//!   100 means the bridge has recently been too slow to answer.
 //! - `hs_appservice_delivered_items_total{appservice,kind}`: what delivered transactions
 //!   carried, by kind: `events`, `typing`, `receipts`, `presence` (MSC2409 ephemeral events),
 //!   `to_device` (MSC2409/MSC4203 to-device messages), `device_list_changes`,
@@ -47,6 +64,8 @@
 
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
+use prometheus_client::metrics::gauge::Gauge;
+use prometheus_client::metrics::histogram::Histogram;
 use prometheus_client::registry::Registry;
 
 use std::sync::Arc;
@@ -63,6 +82,32 @@ pub struct TransactionLabels {
     pub appservice: String,
     /// `delivered` or `failed`.
     pub outcome: String,
+}
+
+/// Labels of `hs_appservice_transaction_failures_total`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, prometheus_client::encoding::EncodeLabelSet)]
+pub struct FailureLabels {
+    /// The registration id.
+    pub appservice: String,
+    /// `timed_out`, `unreachable`, `unavailable` or `rejected`.
+    pub reason: String,
+}
+
+/// Labels of the per-appservice series that carry nothing else.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, prometheus_client::encoding::EncodeLabelSet)]
+pub struct AppserviceLabels {
+    /// The registration id.
+    pub appservice: String,
+}
+
+/// The buckets of `hs_appservice_transaction_seconds`, in seconds: from a bridge that answers
+/// at once to one that holds the request past the 60-second timeout.
+const TRANSACTION_SECONDS_BUCKETS: [f64; 13] = [
+    0.005, 0.025, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 30.0, 45.0, 60.0,
+];
+
+fn transaction_seconds_histogram() -> Histogram {
+    Histogram::new(TRANSACTION_SECONDS_BUCKETS)
 }
 
 /// Labels of `hs_appservice_delivered_items_total`.
@@ -112,10 +157,20 @@ pub struct EphemeralStreamLabels {
 }
 
 /// The delivery metric families. Cheap to clone; every clone counts into the same families.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct AppserviceMetrics {
     /// `hs_appservice_transactions_total{appservice,outcome}`.
     pub transactions_total: Family<TransactionLabels, Counter>,
+    /// `hs_appservice_transaction_seconds{appservice,outcome}`.
+    pub transaction_seconds: Family<TransactionLabels, Histogram, fn() -> Histogram>,
+    /// `hs_appservice_transaction_failures_total{appservice,reason}`.
+    pub transaction_failures_total: Family<FailureLabels, Counter>,
+    /// `hs_appservice_transaction_retries_total{appservice}`.
+    pub transaction_retries_total: Family<AppserviceLabels, Counter>,
+    /// `hs_appservice_dead_lettered_total{appservice}`.
+    pub dead_lettered_total: Family<AppserviceLabels, Counter>,
+    /// `hs_appservice_batch_item_limit{appservice}`.
+    pub batch_item_limit: Family<AppserviceLabels, Gauge>,
     /// `hs_appservice_delivered_items_total{appservice,kind}`.
     pub delivered_items_total: Family<DeliveredItemLabels, Counter>,
     /// `hs_admin_bridge_login_queries_total{type,outcome}`.
@@ -130,6 +185,25 @@ pub struct AppserviceMetrics {
     pub ephemeral_prune_failures_total: Family<EphemeralStreamLabels, Counter>,
 }
 
+impl Default for AppserviceMetrics {
+    fn default() -> Self {
+        Self {
+            transactions_total: Family::default(),
+            transaction_seconds: Family::new_with_constructor(transaction_seconds_histogram),
+            transaction_failures_total: Family::default(),
+            transaction_retries_total: Family::default(),
+            dead_lettered_total: Family::default(),
+            batch_item_limit: Family::default(),
+            delivered_items_total: Family::default(),
+            bridge_login_queries_total: Family::default(),
+            key_withheld_total: Family::default(),
+            queries_total: Family::default(),
+            ephemeral_pruned_total: Family::default(),
+            ephemeral_prune_failures_total: Family::default(),
+        }
+    }
+}
+
 impl AppserviceMetrics {
     /// Registers the families into `registry` (the shared one, in `hs serve`).
     #[must_use]
@@ -141,6 +215,35 @@ impl AppserviceMetrics {
             "hs_appservice_transactions",
             "Appservice transactions attempted, by appservice and outcome (delivered, failed)",
             metrics.transactions_total.clone(),
+        );
+        registry.register(
+            "hs_appservice_transaction_seconds",
+            "How long each appservice transaction's HTTP exchange took, by appservice and \
+             outcome (delivered, failed, timed_out)",
+            metrics.transaction_seconds.clone(),
+        );
+        registry.register(
+            "hs_appservice_transaction_failures",
+            "Failed appservice transaction attempts, by appservice and reason (timed_out, \
+             unreachable, unavailable, rejected)",
+            metrics.transaction_failures_total.clone(),
+        );
+        registry.register(
+            "hs_appservice_transaction_retries",
+            "Appservice transaction attempts that sent an already-tried transaction id again, \
+             with the same entries",
+            metrics.transaction_retries_total.clone(),
+        );
+        registry.register(
+            "hs_appservice_dead_lettered",
+            "Appservice queue entries dead-lettered because their retry budget ran out",
+            metrics.dead_lettered_total.clone(),
+        );
+        registry.register(
+            "hs_appservice_batch_item_limit",
+            "How many items the next new transaction to an appservice may carry; below 100 the \
+             appservice has recently timed out",
+            metrics.batch_item_limit.clone(),
         );
         registry.register(
             "hs_appservice_delivered_items",
@@ -253,14 +356,61 @@ impl AppserviceMetrics {
         }
     }
 
-    /// Counts a transaction the appservice did not accept.
-    pub fn record_failed(&self, appservice: &str) {
+    /// Counts a transaction the appservice did not accept, and why (`reason`, one of
+    /// [`crate::scheduler::SendErrorKind::as_str`]'s words).
+    pub fn record_failed(&self, appservice: &str, reason: &str) {
         self.transactions_total
             .get_or_create(&TransactionLabels {
                 appservice: appservice.to_owned(),
                 outcome: "failed".to_owned(),
             })
             .inc();
+        self.transaction_failures_total
+            .get_or_create(&FailureLabels {
+                appservice: appservice.to_owned(),
+                reason: reason.to_owned(),
+            })
+            .inc();
+    }
+
+    /// Times one attempt's HTTP exchange: `outcome` is `delivered`, `failed` or `timed_out`.
+    pub fn record_attempt_seconds(&self, appservice: &str, outcome: &str, seconds: f64) {
+        self.transaction_seconds
+            .get_or_create(&TransactionLabels {
+                appservice: appservice.to_owned(),
+                outcome: outcome.to_owned(),
+            })
+            .observe(seconds);
+    }
+
+    /// Counts one attempt that sent an already-tried transaction id again.
+    pub fn record_retry(&self, appservice: &str) {
+        self.transaction_retries_total
+            .get_or_create(&AppserviceLabels {
+                appservice: appservice.to_owned(),
+            })
+            .inc();
+    }
+
+    /// Counts `entries` queue entries dead-lettered.
+    pub fn record_dead_lettered(&self, appservice: &str, entries: usize) {
+        if entries == 0 {
+            return;
+        }
+        self.dead_lettered_total
+            .get_or_create(&AppserviceLabels {
+                appservice: appservice.to_owned(),
+            })
+            .inc_by(u64::try_from(entries).unwrap_or(u64::MAX));
+    }
+
+    /// Sets the item limit of `appservice`'s next new transaction.
+    pub fn set_batch_item_limit(&self, appservice: &str, limit: usize) {
+        self.batch_item_limit
+            .get_or_create(&AppserviceLabels {
+                appservice: appservice.to_owned(),
+            })
+            .set(i64::try_from(limit).unwrap_or(i64::MAX));
     }
 }
 
@@ -397,7 +547,11 @@ mod tests {
                 ..BodyCounts::default()
             },
         );
-        metrics.record_failed("irc");
+        metrics.record_failed("irc", "timed_out");
+        metrics.record_attempt_seconds("irc", "timed_out", 60.0);
+        metrics.record_retry("irc");
+        metrics.record_dead_lettered("irc", 20);
+        metrics.set_batch_item_limit("irc", 50);
         metrics.record_login_query("mautrix-whatsapp", "answered");
         metrics.record_query("irc", "user", "yes");
         let mut text = String::new();
@@ -414,6 +568,15 @@ mod tests {
             ),
             "{text}"
         );
+        for line in [
+            "hs_appservice_transaction_failures_total{appservice=\"irc\",reason=\"timed_out\"} 1",
+            "hs_appservice_transaction_seconds_count{appservice=\"irc\",outcome=\"timed_out\"} 1",
+            "hs_appservice_transaction_retries_total{appservice=\"irc\"} 1",
+            "hs_appservice_dead_lettered_total{appservice=\"irc\"} 20",
+            "hs_appservice_batch_item_limit{appservice=\"irc\"} 50",
+        ] {
+            assert!(text.contains(line), "{line} in {text}");
+        }
         assert!(
             text.contains(
                 "hs_appservice_delivered_items_total{appservice=\"irc\",kind=\"events\"} 2"

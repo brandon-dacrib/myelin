@@ -136,6 +136,10 @@ pub struct HealthRow {
     pub consecutive_failures: u32,
     /// The most recent delivery error, if any.
     pub last_error: Option<String>,
+    /// When the last delivery attempt failed. A ping that succeeds after it says the
+    /// appservice answers again, and its health is judged by that ping.
+    #[serde(default)]
+    pub last_failure_at_ms: Option<u64>,
     /// The last `m.room_key.withheld` delivered to one of this appservice's users (a client
     /// refused to share a room's keys with the bridge, so the bridge could not read a message),
     /// recorded by the scheduler as it delivers. `None` until one has been.
@@ -194,6 +198,19 @@ pub struct QueuedTransaction {
     pub status: QueueStatus,
     /// The most recent delivery error, if any.
     pub last_error: Option<String>,
+    /// The transaction id this entry was last sent under, set when an attempt fails. Every
+    /// entry of a failed batch carries the batch's id, and the retry sends exactly those entries
+    /// under it again, whatever has been queued since: the spec's idempotency contract, which a
+    /// bridge that took the first attempt and answered too late relies on. `None` until the
+    /// first failure, and again after a replay (a replay is a new composition, so a new id).
+    #[serde(default)]
+    pub txn_id: Option<u64>,
+    /// When the first failed attempt since the entry was queued (or replayed) was made. A
+    /// transient failure (unreachable, timed out, a 5xx, 408 or 429) dead-letters an entry only
+    /// once it has been failing for `SchedulerConfig::give_up_after_ms`, not after a count of
+    /// attempts: a bridge restarting or catching up is not one that refuses its transactions.
+    #[serde(default)]
+    pub first_failed_at_ms: Option<u64>,
 }
 
 /// [`AppserviceStore::queue_summary`]: one appservice's queue in three numbers.
@@ -732,6 +749,8 @@ impl<B: KvBackend> AppserviceStore<B> {
             next_attempt_at_ms: now_ms,
             status: QueueStatus::Pending,
             last_error: None,
+            txn_id: None,
+            first_failed_at_ms: None,
         };
         let value = serde_json::to_vec(&entry)
             .map_err(|e| hs_kv::KvError::backend(EncodeFail(e.to_string())))?;
@@ -1172,8 +1191,12 @@ impl<B: KvBackend> AppserviceStore<B> {
     }
 
     /// Puts `id`'s dead-lettered entries that `matches(seq, enqueued_at_ms)` back in the queue
-    /// for immediate retry: status pending, next attempt at `now_ms`, error cleared, attempt
-    /// count kept. Walks the heads [`QUEUE_HEADS_PER_READ`] at a time and rewrites the matching
+    /// for immediate retry: status pending, next attempt at `now_ms`, error cleared, and a
+    /// fresh retry budget (attempts, first failure and transaction id reset). Before 2026-10-15
+    /// the attempt count was kept, so a replayed entry had one attempt left: on the demo a
+    /// replay of Discord's 260 dead letters sent each batch once, the bridge took longer than
+    /// the request timeout, and every batch was dead-lettered again within 31 seconds while
+    /// the bridge went on processing them. Walks the heads [`QUEUE_HEADS_PER_READ`] at a time and rewrites the matching
     /// entries [`REQUEUES_PER_TXN`] per transaction, so a replay of tens of thousands neither
     /// holds them in memory nor writes them in one transaction. Returns how many it put back;
     /// an entry delivered or put back by someone else meanwhile is left alone.
@@ -1218,6 +1241,71 @@ impl<B: KvBackend> AppserviceStore<B> {
         Ok(requeued)
     }
 
+    /// Deletes `id`'s dead-lettered entries that `matches(seq, enqueued_at_ms)`: an operator
+    /// has looked at what the bridge was never sent and decided it should not be. Entries still
+    /// waiting are never touched. Walks the heads [`QUEUE_HEADS_PER_READ`] at a time and
+    /// deletes one chunk per transaction, re-checking each entry's status inside it, so an
+    /// entry replayed meanwhile is left alone. Returns how many it deleted.
+    ///
+    /// # Errors
+    /// Returns [`AppserviceError::Store`]/[`AppserviceError::Decode`] on failure; entries
+    /// already deleted stay deleted.
+    pub fn discard_dead_lettered(
+        &self,
+        id: &str,
+        matches: impl Fn(u64, u64) -> bool,
+    ) -> Result<usize, AppserviceError> {
+        // Entries leave the dead letters below the floor: what the summaries remember of the
+        // queues' fronts is counted again.
+        self.front_generation.fetch_add(1, Ordering::AcqRel);
+        let mut discarded = 0usize;
+        let mut after = None;
+        loop {
+            let chunk = {
+                let snap = self.backend.snapshot();
+                self.heads_after(&snap, id, after, QUEUE_HEADS_PER_READ)?
+            };
+            let Some((last, _)) = chunk.last() else {
+                break;
+            };
+            after = Some(*last);
+            let keys: Vec<(String, u64)> = chunk
+                .iter()
+                .filter(|(seq, head)| {
+                    head.status == QueueStatus::DeadLettered && matches(*seq, head.enqueued_at_ms)
+                })
+                .map(|(seq, _)| (id.to_string(), *seq))
+                .collect();
+            if !keys.is_empty() {
+                discarded += transact(&self.backend, TransactConfig::default(), |txn| {
+                    let mut deleted = 0usize;
+                    for key in &keys {
+                        let Some(head) = self.txn_queue_head.get(txn, key).map_err(to_kv)? else {
+                            continue;
+                        };
+                        let head: QueueHead = serde_json::from_slice(&head)
+                            .map_err(|e| hs_kv::KvError::backend(EncodeFail(e.to_string())))?;
+                        if head.status != QueueStatus::DeadLettered {
+                            continue;
+                        }
+                        self.txn_queue.delete(txn, key).map_err(to_kv)?;
+                        self.txn_queue_head.delete(txn, key).map_err(to_kv)?;
+                        deleted += 1;
+                    }
+                    Ok(deleted)
+                })
+                .map_err(|e| AppserviceError::Store(e.to_string()))?;
+            }
+            if chunk.len() < QUEUE_HEADS_PER_READ {
+                break;
+            }
+        }
+        // Counted again after the deletes too: a summary taken between the generation's first
+        // bump and the last delete may have remembered entries that are gone now.
+        self.front_generation.fetch_add(1, Ordering::AcqRel);
+        Ok(discarded)
+    }
+
     /// [`AppserviceStore::requeue_dead_lettered`]'s writes for `keys`, in one transaction.
     fn requeue_in_one_transaction(
         &self,
@@ -1239,6 +1327,9 @@ impl<B: KvBackend> AppserviceStore<B> {
                 entry.status = QueueStatus::Pending;
                 entry.next_attempt_at_ms = now_ms;
                 entry.last_error = None;
+                entry.attempts = 0;
+                entry.first_failed_at_ms = None;
+                entry.txn_id = None;
                 let body = serde_json::to_vec(&entry)
                     .map_err(|e| hs_kv::KvError::backend(EncodeFail(e.to_string())))?;
                 let head = serde_json::to_vec(&QueueHead::of(&entry))
@@ -1979,7 +2070,7 @@ mod tests {
     }
 
     /// A replay walks the queue by heads and puts back only the dead-lettered entries asked
-    /// for, keeping their attempt counts; removing an appservice takes its whole queue.
+    /// for, with a fresh retry budget; removing an appservice takes its whole queue.
     #[test]
     fn requeue_and_purge_walk_the_queue_by_heads() {
         let s = store();
@@ -1993,7 +2084,7 @@ mod tests {
         assert_eq!(summary.pending, 900);
         let first = &s.pending_batch("a", 1).unwrap()[0];
         assert_eq!(first.seq, 2);
-        assert_eq!(first.attempts, 10);
+        assert_eq!(first.attempts, 0);
         assert_eq!(first.next_attempt_at_ms, 42);
         assert!(first.last_error.is_none());
 
