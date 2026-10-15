@@ -1892,7 +1892,7 @@ impl<B: KvBackend> RoomActor<B> {
         let in_memory = self
             .pins
             .get(&sn)
-            .map(&from_event)
+            .map(from_event)
             .or_else(|| self.cache.borrow().peek(sn).map(|event| from_event(event)));
         if in_memory.is_some() {
             return in_memory;
