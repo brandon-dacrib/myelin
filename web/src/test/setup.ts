@@ -3,7 +3,7 @@ import { afterEach, afterAll } from "vitest";
 import { cleanup, configure } from "@testing-library/react";
 import { server } from "@/mocks/node";
 import { resetBridgeOfferings } from "@/mocks/data/bridge-offerings";
-import { resetAppserviceSecrets } from "@/mocks/data/appservices";
+import { resetAppserviceBacklog, resetAppserviceSecrets } from "@/mocks/data/appservices";
 import { resetRegistrationTokens } from "@/mocks/data/registration-tokens";
 import { resetAdminTokens } from "@/mocks/data/admin-tokens";
 import { resetServerNotices } from "@/mocks/data/server-notices";
@@ -94,6 +94,8 @@ afterEach(() => {
   // The mock's bridge offerings are mutable module state (PUT and DELETE change them).
   resetBridgeOfferings();
   resetAppserviceSecrets();
+  // And each bridge's queue (a replay or a discard empties it of dead letters).
+  resetAppserviceBacklog();
   // So are the registration tokens and the server-notice history.
   resetRegistrationTokens();
   resetAdminTokens();

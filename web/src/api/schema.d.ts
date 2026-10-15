@@ -103,6 +103,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/appservices/{id}/discard": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Discard dead-lettered transactions
+         * @description Deletes dead-lettered transactions for good; an entry still waiting to be sent is never touched. With neither filter, every dead-lettered entry. What each carried (events, ephemeral events, to-device messages and its rooms) is on the backlog page (appservices.backlog), so an operator can see what is being dropped first. A replay (appservices.replay) sends them instead; replaying days-old entries sends the bridge days-old events.
+         */
+        post: operations["appservices.discard"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/appservices/{id}/health": {
         parameters: {
             query?: never;
@@ -2610,6 +2630,8 @@ export interface components {
             double_puppet_for?: string | null;
             /** @enum {string} */
             health?: "healthy" | "degraded" | "down" | "paused" | "unknown";
+            /** @description Why health is what it is, in words for an operator (the same as AppServiceHealth.reason); null when healthy. */
+            health_reason?: string | null;
             id?: string;
             links?: {
                 login_url?: string | null;
@@ -2626,7 +2648,20 @@ export interface components {
             age_ms?: number;
             attempts?: number;
             dead_lettered?: boolean;
+            /**
+             * Format: date-time
+             * @description When it was queued.
+             */
+            enqueued_at?: string | null;
+            /** @description Ephemeral events (typing, receipts, presence) it carries. */
+            ephemeral?: number;
+            /** @description Timeline events it carries. */
+            events?: number;
             last_error?: string | null;
+            /** @description The rooms its events are in, each once, at most five. */
+            room_ids?: string[];
+            /** @description To-device messages it carries. */
+            to_device?: number;
             transaction_id?: string;
         };
         AppServiceBacklogEntryPage: components["schemas"]["PageEnvelope"] & {
@@ -2636,6 +2671,15 @@ export interface components {
             registration?: Record<string, never>;
             registration_yaml?: string;
         };
+        /** @description Which dead-lettered transactions to discard; with neither, all of them. */
+        AppServiceDiscardRequest: {
+            /**
+             * Format: date-time
+             * @description Only entries queued before this time.
+             */
+            before?: string;
+            transaction_ids?: string[];
+        };
         AppServiceHealth: {
             last_error?: string | null;
             /** @description The last `m.room_key.withheld` delivered to one of the appservice's users. A client refused to share a room's keys with the bridge, so the bridge could not read a message and told the person so; `m.unverified` means the person's client excludes devices their owner has not cross-signed, which the manager settles for its own instances' bots. Null until one has been delivered. */
@@ -2644,7 +2688,12 @@ export interface components {
             last_ping_at?: string | null;
             /** @description Set when this appservice was registered by hand (through the wizard or a registration file) for a network this server now offers as a bridge offering. Its namespace covers the ghost users of every instance the offering makes, so a message for one of them reaches both bridges. Says which offering and what to do; null for any other appservice. */
             overlaps_offering?: components["schemas"]["OfferingOverlap"] | null;
-            /** @enum {string} */
+            /** @description Why status is what it is, in words for an operator; null when healthy. */
+            reason?: string | null;
+            /**
+             * @description healthy when the last transaction was delivered (or a ping answered since the last failure); degraded after one or more transactions in a row failed, or a ping failed with nothing delivered since; down once the failures in a row reach the server's threshold (appservices.tracking_failure_threshold); unknown before anything has been sent or pinged, and always for a registration with no url.
+             * @enum {string}
+             */
             status?: "healthy" | "degraded" | "down" | "paused" | "unknown";
         };
         AppServiceOverlap: {
@@ -2659,7 +2708,7 @@ export interface components {
         };
         /** @description What waits to be sent to this appservice, read from its delivery queue when the row is answered. Each entry is one room's page of events or one batch of ephemeral data; up to twenty are merged into one transaction. A bridge that keeps up holds pending near 0. The hs_appservice_queue_depth, hs_appservice_queue_dead_lettered and hs_appservice_queue_oldest_age_seconds gauges say the same per appservice. */
         AppServiceQueue: {
-            /** @description Entries that ran out of delivery attempts and wait for a replay (appservices.replay). */
+            /** @description Entries whose retry budget ran out (a transaction the bridge refused ten times, or one it could not be reached for, did not answer in time, or answered 5xx, 408 or 429 for a day). They are kept until an operator replays them (appservices.replay) or discards them (appservices.discard). */
             dead_lettered: number;
             /** @description How long the oldest waiting entry has waited, in milliseconds; null when nothing waits. */
             oldest_pending_age_ms?: number | null;
@@ -4517,6 +4566,47 @@ export interface operations {
             401: components["responses"]["Unauthenticated"];
             403: components["responses"]["InsufficientScope"];
             404: components["responses"]["NotFound"];
+            429: components["responses"]["RateLimited"];
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    "appservices.discard": {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description 1-255 visible ASCII characters. Replays return the stored response for 24 hours. */
+                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                /** @description An appservice id. */
+                id: components["parameters"]["AppserviceId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["AppServiceDiscardRequest"];
+            };
+        };
+        responses: {
+            /** @description How many were discarded. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        discarded: number;
+                    };
+                };
+            };
+            400: components["responses"]["ValidationFailed"];
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["InsufficientScope"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["IdempotencyInFlight"];
+            422: components["responses"]["IdempotencyMismatch"];
             429: components["responses"]["RateLimited"];
             500: components["responses"]["Internal"];
             503: components["responses"]["Unavailable"];

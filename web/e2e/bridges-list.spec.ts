@@ -32,9 +32,16 @@ test.describe("Bridges list", () => {
     const names = page.getByRole("table").getByRole("link");
     await expect(names.first()).toHaveText("Signal");
     await expect(names.last()).toHaveText("Discord");
-    // Each bridge's own queue: Telegram has one transaction waiting, Signal two that failed.
+    // Each bridge's own queue: Telegram has one transaction waiting, Signal two dead-lettered,
+    // which are reviewed on its page.
     await expect(page.getByTestId("queue-telegram")).toHaveText(/1 waiting, oldest 6m/);
-    await expect(page.getByTestId("queue-signal")).toHaveText(/2 failed/);
+    await expect(page.getByTestId("queue-signal")).toHaveText(
+      /2 dead-lettered.*Review on the bridge's page/,
+    );
+    // Why a bridge is not healthy, in the server's words.
+    await expect(page.getByTestId("health-reason-signal")).toHaveText(
+      /^The last 24 transactions to it failed/,
+    );
     // The summary strip counts each state and filters the table.
     await page.getByRole("button", { name: /^Down 1$/ }).click();
     await expect(page).toHaveURL(/state=down/);

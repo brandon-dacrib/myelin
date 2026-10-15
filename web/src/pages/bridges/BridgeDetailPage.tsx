@@ -16,7 +16,6 @@ import {
   usePauseAppservice,
   useResumeAppservice,
   useRotateAppserviceTokens,
-  useReplayAppserviceBacklog,
   useDeleteAppservice,
   usePingAppservice,
   type AppService,
@@ -38,9 +37,20 @@ import { RelativeTime } from "@/components/RelativeTime";
 import { toast } from "@/components/ui/toast/toast-store";
 import { getSession, hasScope } from "@/lib/auth";
 import { bridgeKind, bridgeTitle, bridgeTypeOf, botMatrixId } from "@/lib/bridge-catalogue";
-import { bridgeHealthMeta, formatBacklogEntry, healthKeyOf } from "@/lib/bridge-state";
+import { bridgeHealthMeta, healthKeyOf } from "@/lib/bridge-state";
 import { cn } from "@/lib/cn";
+import { BridgeTransactions } from "./BridgeTransactions";
 import { EditBridgeDialog } from "./EditBridgeDialog";
+
+/** The health-reason box's colours, by the health badge's status. */
+const REASON_BOX: Record<string, string> = {
+  danger: "border-danger-border bg-danger-bg text-danger",
+  warning: "border-warning-border bg-warning-bg text-warning",
+  info: "border-info-border bg-info-bg text-info",
+  muted: "border-muted-status-border bg-muted-status-bg text-muted-status",
+  success: "border-success-border bg-success-bg text-success",
+  neutral: "border-border bg-surface-sunken text-text",
+};
 
 const TABS = ["overview", "sign-in", "registration", "transactions", "danger"] as const;
 const TAB_LABELS: Record<(typeof TABS)[number], string> = {
@@ -99,7 +109,6 @@ export function BridgeDetailPage() {
   const pause = usePauseAppservice();
   const resume = useResumeAppservice();
   const rotate = useRotateAppserviceTokens();
-  const replay = useReplayAppserviceBacklog();
   const del = useDeleteAppservice();
   const ping = usePingAppservice();
 
@@ -140,8 +149,15 @@ export function BridgeDetailPage() {
   const name = bridgeTitle(bridge, type);
   const botId = botMatrixId(bridge.sender_localpart, server?.name);
   const meta = bridgeHealthMeta[healthKeyOf(bridge)];
-  const pendingBacklog = (backlog?.items ?? []).filter((e) => !e.dead_lettered);
-  const deadLettered = (backlog?.items ?? []).filter((e) => e.dead_lettered);
+  // The whole queue's counts when the server gives them (OpenAPI 0.1.11); the backlog page
+  // below holds only its first 50 entries.
+  const pendingCount =
+    bridge.queue?.pending ?? (backlog?.items ?? []).filter((e) => !e.dead_lettered).length;
+  const deadLetteredCount =
+    bridge.queue?.dead_lettered ?? (backlog?.items ?? []).filter((e) => e.dead_lettered).length;
+  // Why the health is what it is, in the server's words (OpenAPI 0.1.18); null when healthy.
+  // `undefined` is a server older than that, whose last error is shown instead.
+  const healthReason = health ? health.reason : bridge.health_reason;
 
   return (
     <div className="mx-auto max-w-[90rem] p-6">
@@ -307,10 +323,21 @@ export function BridgeDetailPage() {
         </div>
       </div>
 
-      {health?.last_error && (
-        <div className="mt-4 rounded-md border border-danger-border bg-danger-bg px-4 py-3 text-sm text-danger">
-          {health.last_error}
+      {healthReason ? (
+        <div
+          className={cn("mt-4 rounded-md border px-4 py-3 text-sm", REASON_BOX[meta.status])}
+          data-testid="health-reason"
+        >
+          <span className="font-medium">{meta.label}: </span>
+          {healthReason}
         </div>
+      ) : (
+        healthReason === undefined &&
+        health?.last_error && (
+          <div className="mt-4 rounded-md border border-danger-border bg-danger-bg px-4 py-3 text-sm text-danger">
+            {health.last_error}
+          </div>
+        )
       )}
 
       {health?.overlaps_offering && (
@@ -382,13 +409,22 @@ export function BridgeDetailPage() {
             <Tile label="Backlog">
               {backlogIsError ? (
                 <QueryProblemState error={backlogError} resource="the backlog" compact />
-              ) : (backlog?.items.length ?? 0) === 0 ? (
+              ) : pendingCount + deadLetteredCount === 0 ? (
                 <span className="text-sm text-text">Nothing waiting</span>
               ) : (
                 <span className="text-sm text-text">
-                  {pendingBacklog.length} pending
-                  {deadLettered.length > 0 && (
-                    <span className="text-danger">, {deadLettered.length} dead-lettered</span>
+                  {pendingCount} pending
+                  {deadLetteredCount > 0 && (
+                    <>
+                      <span className="text-danger">, {deadLetteredCount} dead-lettered</span>{" "}
+                      <button
+                        type="button"
+                        className="text-accent hover:underline"
+                        onClick={() => setActiveTab("transactions")}
+                      >
+                        Review
+                      </button>
+                    </>
                   )}
                 </span>
               )}
@@ -491,60 +527,15 @@ export function BridgeDetailPage() {
         </Content>
 
         <Content value="transactions" className="py-6">
-          {backlogIsError ? (
-            <QueryProblemState error={backlogError} resource="transactions" />
-          ) : (backlog?.items.length ?? 0) === 0 ? (
-            <p className="text-sm text-text-muted">No pending or dead-lettered transactions.</p>
-          ) : (
-            <>
-              {deadLettered.length > 0 && (
-                <div className="mb-4 flex items-center justify-between rounded-md border border-warning-border bg-warning-bg px-4 py-3">
-                  <p className="text-sm text-warning">
-                    {deadLettered.length} dead-lettered transaction
-                    {deadLettered.length === 1 ? "" : "s"}.
-                  </p>
-                  <Button
-                    variant="secondary"
-                    size="sm"
-                    disabled={!canWrite}
-                    onClick={() =>
-                      replay.mutate(id, {
-                        onSuccess: (task) =>
-                          toast({ title: `Replaying dead letters (task ${task?.id ?? ""})` }),
-                        onError: () => toast({ title: "Couldn't start replay", variant: "danger" }),
-                      })
-                    }
-                  >
-                    Replay all
-                  </Button>
-                </div>
-              )}
-              <ul className="divide-y divide-border rounded-md border border-border">
-                {backlog?.items.map((entry) => (
-                  <li
-                    key={entry.transaction_id}
-                    className="flex items-center justify-between gap-3 px-4 py-3"
-                  >
-                    <span className="font-identifier text-text-muted">{entry.transaction_id}</span>
-                    <span className="flex items-center gap-3">
-                      {entry.last_error && (
-                        <span className="text-xs text-danger">{entry.last_error}</span>
-                      )}
-                      <span className="text-xs text-text-muted">
-                        {entry.attempts} {entry.attempts === 1 ? "attempt" : "attempts"}
-                      </span>
-                      <span className="text-xs text-text-muted">
-                        {formatBacklogEntry(entry.age_ms ?? 0, entry.dead_lettered ?? false)}
-                      </span>
-                      <Badge status={entry.dead_lettered ? "danger" : "info"}>
-                        {entry.dead_lettered ? "Gave up" : "Waiting"}
-                      </Badge>
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            </>
-          )}
+          <BridgeTransactions
+            id={id}
+            name={name}
+            canWrite={canWrite}
+            entries={backlog?.items}
+            queue={bridge.queue}
+            isError={backlogIsError}
+            error={backlogError}
+          />
         </Content>
 
         <Content value="danger" className="py-6">

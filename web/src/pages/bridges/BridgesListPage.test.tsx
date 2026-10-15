@@ -21,12 +21,33 @@ describe("Bridges list", () => {
     // The mock's Telegram bridge has one transaction waiting six minutes; Signal has two that
     // ran out of attempts; WhatsApp has nothing waiting.
     expect(await screen.findByTestId("queue-telegram")).toHaveTextContent("1 waiting, oldest 6m");
-    expect(screen.getByTestId("queue-signal")).toHaveTextContent("2 failed");
+    const signal = screen.getByTestId("queue-signal");
+    expect(signal).toHaveTextContent("2 dead-lettered");
+    // Where they are dealt with, and what they are on hover.
+    const hint = within(signal).getByText("Review on the bridge's page");
+    expect(hint).toHaveAttribute("title", expect.stringMatching(/replays or discards them/));
     expect(screen.getByTestId("queue-whatsapp")).toHaveTextContent("Up to date");
+    expect(
+      within(screen.getByTestId("queue-whatsapp")).queryByText("Review on the bridge's page"),
+    ).toBeNull();
     // The columns are explained behind a disclosure, not above the list.
     expect(screen.getByText(/what the server has queued for a bridge/)).not.toBeVisible();
     await userEvent.click(screen.getByText("What the columns mean"));
     expect(screen.getByText(/what the server has queued for a bridge/)).toBeVisible();
+    expect(screen.getByText(/the bridge refused them 10/)).toBeVisible();
+  });
+
+  it("says why each bridge that is not healthy is not, and nothing for a healthy one", async () => {
+    renderBridgesRoute("/bridges/registrations", BridgesListPage, "/bridges/registrations");
+    const signal = await screen.findByTestId("health-reason-signal");
+    expect(signal).toHaveTextContent(/^The last 24 transactions to it failed/);
+    // Clamped to two lines on screen; the whole of it on hover.
+    expect(signal).toHaveAttribute("title", expect.stringMatching(/The last error: Connection/));
+    expect(screen.getByTestId("health-reason-telegram")).toHaveTextContent(
+      /it is marked down at 20/,
+    );
+    expect(screen.getByTestId("health-reason-discord")).toHaveTextContent(/^Paused by an operator/);
+    expect(screen.queryByTestId("health-reason-whatsapp")).toBeNull();
   });
 
   it("marks the server's own bridge manager as built in, not as a bridge of unknown health", async () => {

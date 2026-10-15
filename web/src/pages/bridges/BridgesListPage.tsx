@@ -151,15 +151,43 @@ export function BridgesListPage() {
             </span>
           );
         }
-        const meta = bridgeHealthMeta[healthKeyOf(b)];
-        return <Badge status={meta.status}>{meta.label}</Badge>;
+        const key = healthKeyOf(b);
+        const meta = bridgeHealthMeta[key];
+        // Why it is not healthy, in the server's words (OpenAPI 0.1.18): two lines here, the
+        // whole of it on hover and to a screen reader, and again on the bridge's page.
+        const reason = key === "healthy" ? null : b.health_reason;
+        return (
+          <span className="flex max-w-xs flex-col items-start gap-1">
+            <Badge status={meta.status}>{meta.label}</Badge>
+            {reason && (
+              <span
+                className="line-clamp-2 text-xs text-text-muted"
+                title={reason}
+                data-testid={`health-reason-${b.id}`}
+              >
+                {reason}
+              </span>
+            )}
+          </span>
+        );
       },
-      renderCompact: (b) =>
-        isBuiltInAppservice(b)
-          ? "Built in"
-          : isSendsNothingAppservice(b)
-            ? "Sends nothing"
-            : bridgeHealthMeta[healthKeyOf(b)].label,
+      renderCompact: (b) => {
+        if (isBuiltInAppservice(b)) return "Built in";
+        if (isSendsNothingAppservice(b)) return "Sends nothing";
+        const key = healthKeyOf(b);
+        const label = bridgeHealthMeta[key].label;
+        const reason = key === "healthy" ? null : b.health_reason;
+        return reason ? (
+          <span className="flex flex-col items-end text-right">
+            {label}
+            <span className="line-clamp-2 text-xs text-text-muted" title={reason}>
+              {reason}
+            </span>
+          </span>
+        ) : (
+          label
+        );
+      },
     },
     {
       key: "queue",
@@ -168,12 +196,26 @@ export function BridgesListPage() {
       render: (b) => {
         const queue = describeQueue(b.queue);
         return (
-          <span data-testid={`queue-${b.id}`}>
-            <Badge status={queue.status}>{queue.text}</Badge>
+          <span data-testid={`queue-${b.id}`} className="flex max-w-xs flex-col items-start gap-1">
+            <Badge status={queue.status} className="whitespace-nowrap">
+              {queue.text}
+            </Badge>
+            {queue.hint && (
+              <span className="text-xs text-text-muted" title={queue.hint}>
+                Review on the bridge&apos;s page
+              </span>
+            )}
           </span>
         );
       },
-      renderCompact: (b) => describeQueue(b.queue).text,
+      renderCompact: (b) => {
+        const queue = describeQueue(b.queue);
+        return queue.hint ? (
+          <span title={queue.hint}>{queue.text}, review on the bridge&apos;s page</span>
+        ) : (
+          queue.text
+        );
+      },
     },
     {
       key: "bot",
@@ -268,8 +310,10 @@ export function BridgesListPage() {
               <div>
                 <dt className="inline font-medium text-text">State: </dt>
                 <dd className="inline">
-                  whether the bridge answers the server. Unknown means nothing has been sent to it
-                  since the server started, so there is nothing to judge by yet.
+                  whether the bridge answers the server, and when it does not, why, in the
+                  server&apos;s words. Unknown means nothing has been sent to it since the server
+                  started, so there is nothing to judge by yet. A bridge is healthy again as soon as
+                  a transaction is delivered or a Test connection is answered.
                 </dd>
               </div>
               <div>
@@ -277,8 +321,11 @@ export function BridgesListPage() {
                 <dd className="inline">
                   what the server has queued for a bridge and not yet delivered. Each bridge has its
                   own queue, so one that is slow or down never holds up another; a count that keeps
-                  growing, or an oldest wait past a minute, is a bridge falling behind, and failed
-                  ones can be sent again from the bridge&apos;s page.
+                  growing, or an oldest wait past a minute, is a bridge falling behind.
+                  Dead-lettered ones are those the server gave up on: the bridge refused them 10
+                  times, or could not be reached, did not answer in time, or answered with an error
+                  for a whole day. They stay until someone replays them (sends them again now) or
+                  discards them (deletes them for good) on the bridge&apos;s page.
                 </dd>
               </div>
               <div>

@@ -5,11 +5,13 @@ import {
   appserviceBacklog,
   appserviceRegistration,
   appserviceLogins,
+  discardDeadLetters,
   findAppservice,
   isFoldedDoublePuppet,
   linkedAppservice,
   patchAppservice,
   pingAppservice,
+  replayDeadLetters,
 } from "./data/appservices";
 import { bridgeTypes } from "./data/bridge-types";
 import {
@@ -962,7 +964,12 @@ export const handlers = [
     };
     appservices.unshift(created);
     registeredIds.add(id);
-    appserviceHealth[id] = { status: "unknown", last_ping_at: null, last_error: null };
+    appserviceHealth[id] = {
+      status: "unknown",
+      reason: "Nothing has been delivered to it or pinged yet, so there is nothing to judge.",
+      last_ping_at: null,
+      last_error: null,
+    };
     appserviceBacklog[id] = [];
     appserviceRegistration[id] = body.registration ?? { id };
     return HttpResponse.json(linkedAppservice(created), { status: 201 });
@@ -1120,15 +1127,34 @@ export const handlers = [
     return HttpResponse.json({ as_token, hs_token });
   }),
 
+  // OpenAPI 0.1.18: deletes dead letters for good, never a waiting entry; `200 {discarded}`.
+  http.post(`${API}/appservices/:id/discard`, async ({ params, request }) => {
+    const id = String(params.id);
+    const text = await request.text();
+    const body = (text ? JSON.parse(text) : {}) as {
+      transaction_ids?: string[];
+      before?: string;
+    };
+    if (body.before !== undefined && Number.isNaN(Date.parse(body.before))) {
+      const detail = "before must be an RFC 3339 date-time";
+      return problem(400, "validation-failed", "Validation failed", {
+        detail,
+        errors: [{ pointer: "/before", detail }],
+      });
+    }
+    const discarded = discardDeadLetters(id, body);
+    if (discarded === undefined) return problem(404, "not-found", "Appservice not found");
+    return HttpResponse.json({ discarded });
+  }),
+
   http.post(`${API}/appservices/:id/replay`, ({ params }) => {
     const id = String(params.id);
-    const entries = appserviceBacklog[id];
-    if (!entries)
+    // As the server does: only dead letters are put back (and, here, delivered at once).
+    if (replayDeadLetters(id) === undefined)
       return HttpResponse.json(
         { type: "urn:hs:problem:not-found", title: "Not found" },
         { status: 404 },
       );
-    appserviceBacklog[id] = [];
     return HttpResponse.json(
       {
         id: `task-${crypto.randomUUID().slice(0, 8)}`,

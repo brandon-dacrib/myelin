@@ -1,14 +1,43 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import userEvent from "@testing-library/user-event";
-import { screen, waitFor, within } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import { http, HttpResponse } from "msw";
 import { signIn, signOut } from "@/lib/auth";
 import { server } from "@/mocks/node";
+import { Toaster } from "@/components/ui/toast/Toaster";
 import { renderBridgesRoute } from "./test-utils";
 import { BridgeDetailPage } from "./BridgeDetailPage";
 
 function renderBridge(id: string) {
   return renderBridgesRoute("/bridges/$bridgeId", BridgeDetailPage, `/bridges/${id}`);
+}
+
+/** The bridge's page on its Transactions tab, with toasts rendered. */
+async function openTransactions(id: string) {
+  render(<Toaster />);
+  renderBridge(id);
+  await userEvent.click(await screen.findByRole("tab", { name: "Transactions" }));
+}
+
+/** What the page sent to `POST /appservices/{id}/{action}`: its body and Idempotency-Key. */
+interface Sent {
+  body: unknown;
+  idempotencyKey: string | null;
+}
+
+function recordPost(path: string, answer: () => Response): Sent[] {
+  const sent: Sent[] = [];
+  server.use(
+    http.post(path, async ({ request }) => {
+      const text = await request.text();
+      sent.push({
+        body: text ? JSON.parse(text) : undefined,
+        idempotencyKey: request.headers.get("Idempotency-Key"),
+      });
+      return answer();
+    }),
+  );
+  return sent;
 }
 
 beforeEach(async () => {
@@ -150,5 +179,183 @@ describe("Bridge page", () => {
     const dialog = await screen.findByRole("dialog");
     await userEvent.click(within(dialog).getByRole("button", { name: "Remove registration" }));
     await waitFor(() => expect(deleted).toBe(true));
+  });
+});
+
+describe("Bridge health", () => {
+  it("says why a bridge is not healthy, in the server's words, beside its state", async () => {
+    renderBridge("signal");
+    const reason = await screen.findByTestId("health-reason");
+    expect(reason).toHaveTextContent(
+      /^Down: The last 24 transactions to it failed, 20 or more in a row; nothing is getting through\./,
+    );
+    expect(reason).toHaveTextContent(/The last error: Connection refused/);
+  });
+
+  it("says nothing of the kind for a healthy bridge", async () => {
+    renderBridge("whatsapp");
+    expect(await screen.findByRole("heading", { level: 1 })).toBeInTheDocument();
+    await waitFor(() => expect(screen.getAllByText("Healthy").length).toBeGreaterThan(0));
+    expect(screen.queryByTestId("health-reason")).toBeNull();
+  });
+
+  it("shows the last error from a server that gives no reason", async () => {
+    server.use(
+      http.get("/api/v1/appservices/signal/health", () =>
+        HttpResponse.json({ status: "down", last_ping_at: null, last_error: "connection refused" }),
+      ),
+    );
+    renderBridge("signal");
+    expect(await screen.findByText("connection refused")).toBeInTheDocument();
+    expect(screen.queryByTestId("health-reason")).toBeNull();
+  });
+});
+
+describe("Bridge transactions", () => {
+  it("lists each entry with when it was queued, what it carries, its rooms and its last error", async () => {
+    await openTransactions("signal");
+    const entry = await screen.findByTestId("backlog-entry-tx_700");
+    expect(within(entry).getByText("Dead-lettered")).toBeInTheDocument();
+    expect(entry).toHaveTextContent("queued 3 d ago");
+    expect(entry).toHaveTextContent("10 attempts");
+    expect(entry).toHaveTextContent("Carries 48 events");
+    // At most five rooms are listed, so five may be the first of more.
+    expect(entry).toHaveTextContent("in these rooms and maybe more:");
+    const rooms = within(entry).getByRole("list", { name: "Rooms" });
+    expect(within(rooms).getAllByRole("listitem")).toHaveLength(5);
+    // Shortened on screen with its server kept; whole on hover and to a screen reader.
+    expect(within(rooms).getByText("!OGEhHV…:matrix.org")).toHaveAttribute("aria-hidden", "true");
+    expect(
+      within(rooms).getByText("!OGEhHVWSdvArJzumhm:matrix.org").closest("code"),
+    ).toHaveAttribute("title", "!OGEhHVWSdvArJzumhm:matrix.org");
+    expect(entry).toHaveTextContent(
+      "Last error: the bridge answered 400 M_UNKNOWN: unsupported event type",
+    );
+    expect(screen.getByTestId("backlog-entry-tx_701")).toHaveTextContent(
+      "Carries 3 events · 2 ephemeral · 1 to-device in room",
+    );
+  });
+
+  it("explains dead letters, how many there are and how old the oldest is", async () => {
+    await openTransactions("signal");
+    const box = await screen.findByTestId("dead-letters");
+    expect(box).toHaveTextContent("2 dead-lettered transactions, the oldest queued 3d ago.");
+    expect(box).toHaveTextContent(/the bridge refused each of them 10 times/);
+    expect(box).toHaveTextContent(/answered 5xx, 408 or 429/);
+    expect(box).toHaveTextContent(/discarding is usually right/);
+  });
+
+  it("says nothing waits for a bridge with an empty queue, and offers no replay or discard", async () => {
+    await openTransactions("whatsapp");
+    expect(
+      await screen.findByText("No pending or dead-lettered transactions."),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId("dead-letters")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Replay all" })).toBeNull();
+  });
+
+  it("discards every dead letter only after a confirmation that says how many and that it is final", async () => {
+    const sent = recordPost("/api/v1/appservices/signal/discard", () =>
+      HttpResponse.json({ discarded: 2 }),
+    );
+    await openTransactions("signal");
+    await userEvent.click(await screen.findByRole("button", { name: "Discard all dead letters" }));
+    const dialog = await screen.findByRole("dialog");
+    expect(
+      within(dialog).getByRole("heading", { name: "Discard 2 dead-lettered transactions?" }),
+    ).toBeInTheDocument();
+    expect(dialog).toHaveTextContent(/is never sent them\. This cannot be undone\./);
+    expect(dialog).toHaveTextContent(/still waiting to be sent are not touched/);
+    expect(sent).toHaveLength(0);
+    await userEvent.click(within(dialog).getByRole("button", { name: "Discard all" }));
+    await waitFor(() => expect(sent).toHaveLength(1));
+    // Neither filter: every dead letter. A fresh Idempotency-Key, as every action sends.
+    expect(sent[0]!.body).toEqual({});
+    expect(sent[0]!.idempotencyKey).toBeTruthy();
+    expect(await screen.findByText("Discarded 2 dead-lettered transactions")).toBeInTheDocument();
+  });
+
+  it("sends nothing when the discard is cancelled", async () => {
+    const sent = recordPost("/api/v1/appservices/signal/discard", () =>
+      HttpResponse.json({ discarded: 2 }),
+    );
+    await openTransactions("signal");
+    await userEvent.click(await screen.findByRole("button", { name: "Discard all dead letters" }));
+    const dialog = await screen.findByRole("dialog");
+    await userEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(sent).toHaveLength(0);
+  });
+
+  it("discards one transaction from its row, and it leaves the list", async () => {
+    await openTransactions("signal");
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Discard transaction tx_701" }),
+    );
+    const dialog = await screen.findByRole("dialog");
+    expect(
+      within(dialog).getByRole("heading", { name: "Discard transaction tx_701?" }),
+    ).toBeInTheDocument();
+    expect(dialog).toHaveTextContent(
+      /It carries 3 events · 2 ephemeral · 1 to-device\. It is deleted for good .* This cannot be undone\./,
+    );
+    await userEvent.click(within(dialog).getByRole("button", { name: "Discard" }));
+    expect(await screen.findByText("Transaction tx_701 discarded")).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByTestId("backlog-entry-tx_701")).toBeNull());
+    expect(screen.getByTestId("backlog-entry-tx_700")).toBeInTheDocument();
+    expect(screen.getByTestId("dead-letters")).toHaveTextContent("1 dead-lettered transaction,");
+  });
+
+  it("says so when a discard is refused", async () => {
+    recordPost("/api/v1/appservices/signal/discard", () =>
+      HttpResponse.json(
+        {
+          type: "urn:hs:problem:not-found",
+          title: "Not found",
+          status: 404,
+          detail: "no appservice signal",
+        },
+        { status: 404 },
+      ),
+    );
+    await openTransactions("signal");
+    await userEvent.click(await screen.findByRole("button", { name: "Discard all dead letters" }));
+    const dialog = await screen.findByRole("dialog");
+    await userEvent.click(within(dialog).getByRole("button", { name: "Discard all" }));
+    expect(await screen.findByText("Couldn't discard the dead letters")).toBeInTheDocument();
+    expect(screen.getByText("no appservice signal")).toBeInTheDocument();
+  });
+
+  it("replays only after a confirmation that says how many, how old, and that old events are sent now", async () => {
+    const sent = recordPost("/api/v1/appservices/signal/replay", () =>
+      HttpResponse.json(
+        {
+          id: "task-replay1",
+          action: "appservice.replay",
+          status: "running",
+          resource: { type: "appservice", id: "signal" },
+          created_at: new Date().toISOString(),
+        },
+        { status: 202 },
+      ),
+    );
+    await openTransactions("signal");
+    await userEvent.click(await screen.findByRole("button", { name: "Replay all" }));
+    const dialog = await screen.findByRole("dialog");
+    expect(
+      within(dialog).getByRole("heading", { name: "Replay 2 dead-lettered transactions?" }),
+    ).toBeInTheDocument();
+    expect(dialog).toHaveTextContent(
+      /The oldest was queued 3d ago: the bridge receives events that old now, as if they were new\./,
+    );
+    expect(dialog).toHaveTextContent(/discard them instead/);
+    expect(sent).toHaveLength(0);
+    await userEvent.click(within(dialog).getByRole("button", { name: "Replay all" }));
+    await waitFor(() => expect(sent).toHaveLength(1));
+    expect(sent[0]!.idempotencyKey).toBeTruthy();
+    expect(
+      await screen.findByText(/^Replaying 2 dead-lettered transactions to /),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Task task-replay1")).toBeInTheDocument();
   });
 });

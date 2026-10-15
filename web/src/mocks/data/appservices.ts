@@ -114,14 +114,21 @@ export const DOUBLE_PUPPET_FOR_KEY = "io.myelin.double_puppet_for";
 /**
  * `appservice` as the server answers it: `double_puppet` is the registration whose
  * `double_puppet_for` names it (the first by id, should two), read from the whole registry
- * (`AdminAppservice::link_double_puppets`).
+ * (`AdminAppservice::link_double_puppets`); `health_reason` is its health's `reason`, and `queue`
+ * is counted from its backlog.
  */
 export function linkedAppservice(appservice: AppService): AppService {
   const named = appservices
     .filter((o) => o.id !== appservice.id && o.double_puppet_for === appservice.id)
     .map((o) => o.id ?? "")
     .sort();
-  return { ...appservice, double_puppet: named[0] ?? null };
+  const id = appservice.id ?? "";
+  return {
+    ...appservice,
+    double_puppet: named[0] ?? null,
+    health_reason: appserviceHealth[id]?.reason ?? null,
+    queue: queueOf(id, appservice.queue),
+  };
 }
 
 /**
@@ -136,54 +143,168 @@ export function isFoldedDoublePuppet(appservice: AppService): boolean {
   return bridge !== undefined && linkedAppservice(bridge).double_puppet === appservice.id;
 }
 
+/**
+ * `reason` is the server's own wording (`hs_appservice::registry::status_reason`): null when
+ * healthy, otherwise why the status is what it is, ending with the last error when there is one.
+ */
 export const appserviceHealth: Record<string, AppServiceHealth> = {
-  whatsapp: { status: "healthy", last_ping_at: iso(60_000), last_error: null },
+  whatsapp: { status: "healthy", reason: null, last_ping_at: iso(60_000), last_error: null },
   telegram: {
     status: "degraded",
+    reason:
+      "The last 3 transactions to it failed; it is marked down at 20. It is healthy again once a transaction is delivered or a ping is answered. The last error: Rate limited by Telegram (FLOOD_WAIT 60)",
     last_ping_at: iso(6 * 60_000),
     last_error: "Rate limited by Telegram (FLOOD_WAIT 60)",
   },
   signal: {
     status: "down",
+    reason:
+      "The last 24 transactions to it failed, 20 or more in a row; nothing is getting through. It is healthy again once a transaction is delivered or a ping is answered. The last error: Connection refused: signal daemon not responding on :29328",
     last_ping_at: iso(3 * 3_600_000),
     last_error: "Connection refused: signal daemon not responding on :29328",
   },
-  discord: { status: "paused", last_ping_at: iso(20 * 3_600_000), last_error: null },
-  slack: { status: "unknown", last_ping_at: null, last_error: null },
-  "slack-doublepuppet": { status: "unknown", last_ping_at: null, last_error: null },
+  discord: {
+    status: "paused",
+    reason: "Paused by an operator: transactions are queued and not sent until it is resumed.",
+    last_ping_at: iso(20 * 3_600_000),
+    last_error: null,
+  },
+  slack: {
+    status: "unknown",
+    reason: "Nothing has been delivered to it or pinged yet, so there is nothing to judge.",
+    last_ping_at: null,
+    last_error: null,
+  },
+  "slack-doublepuppet": {
+    status: "unknown",
+    reason:
+      "It has no URL, so the server never sends it anything (a bridge's double puppeting registration, say).",
+    last_ping_at: null,
+    last_error: null,
+  },
 };
 
-export const appserviceBacklog: Record<string, AppServiceBacklogEntry[]> = {
-  whatsapp: [],
-  telegram: [
-    {
-      transaction_id: "tx_88a",
-      age_ms: 6 * 60_000,
-      attempts: 3,
-      last_error: "FLOOD_WAIT_60",
-      dead_lettered: false,
-    },
-  ],
-  signal: [
-    {
-      transaction_id: "tx_701",
-      age_ms: 3 * 3_600_000,
-      attempts: 8,
-      last_error: "connect: connection refused",
-      dead_lettered: true,
-    },
-    {
-      transaction_id: "tx_700",
-      age_ms: 3.2 * 3_600_000,
-      attempts: 8,
-      last_error: "connect: connection refused",
-      dead_lettered: true,
-    },
-  ],
-  discord: [],
-  slack: [],
-  "slack-doublepuppet": [],
-};
+/** A backlog entry queued `msAgo` ago, with what it carries (OpenAPI 0.1.18). */
+function entry(
+  transaction_id: string,
+  msAgo: number,
+  rest: Omit<AppServiceBacklogEntry, "transaction_id" | "age_ms" | "enqueued_at">,
+): AppServiceBacklogEntry {
+  return { transaction_id, age_ms: msAgo, enqueued_at: iso(msAgo), ...rest };
+}
+
+/**
+ * Each bridge's queue, oldest first as the server pages it. Signal's two dead letters are the
+ * demo's case: one from an incident three days ago (encrypted events in rooms the bridge does
+ * not bridge, which it refused ten times), and one from this afternoon's outage.
+ */
+function seedBacklog(): Record<string, AppServiceBacklogEntry[]> {
+  return {
+    whatsapp: [],
+    telegram: [
+      entry("tx_88a", 6 * 60_000, {
+        attempts: 3,
+        last_error: "FLOOD_WAIT_60",
+        dead_lettered: false,
+        events: 2,
+        ephemeral: 1,
+        to_device: 0,
+        room_ids: ["!family:example.org"],
+      }),
+    ],
+    signal: [
+      entry("tx_700", 3 * 24 * 3_600_000, {
+        attempts: 10,
+        last_error: "the bridge answered 400 M_UNKNOWN: unsupported event type",
+        dead_lettered: true,
+        events: 48,
+        ephemeral: 0,
+        to_device: 0,
+        room_ids: [
+          "!OGEhHVWSdvArJzumhm:matrix.org",
+          "!cJGsTSfRphIleQlbVM:example.org",
+          "!vjbuWnLMDWdXUwqDjq:matrix.org",
+          "!hqgHbCbDUNtzgqzqyA:element.io",
+          "!AbCdEfGhIjKlMnOpQr:example.org",
+        ],
+      }),
+      entry("tx_701", 3 * 3_600_000, {
+        attempts: 8,
+        last_error: "connect: connection refused",
+        dead_lettered: true,
+        events: 3,
+        ephemeral: 2,
+        to_device: 1,
+        room_ids: ["!signalnotes:example.org"],
+      }),
+    ],
+    discord: [],
+    slack: [],
+    "slack-doublepuppet": [],
+  };
+}
+
+export const appserviceBacklog: Record<string, AppServiceBacklogEntry[]> = seedBacklog();
+
+/**
+ * Puts every bridge's queue back as it started (Vitest calls this between tests): a replay or a
+ * discard changes it.
+ */
+export function resetAppserviceBacklog(): void {
+  for (const key of Object.keys(appserviceBacklog)) delete appserviceBacklog[key];
+  Object.assign(appserviceBacklog, seedBacklog());
+}
+
+/**
+ * `AppService.queue` as the server reads it from the bridge's delivery queue: counted from
+ * {@link appserviceBacklog}, so a replay or a discard shows on the list too.
+ */
+function queueOf(id: string, fallback: AppService["queue"]): AppService["queue"] {
+  const entries = appserviceBacklog[id];
+  if (!entries) return fallback;
+  const pending = entries.filter((e) => !e.dead_lettered);
+  return {
+    pending: pending.length,
+    dead_lettered: entries.length - pending.length,
+    oldest_pending_age_ms:
+      pending.length === 0 ? null : Math.max(...pending.map((e) => e.age_ms ?? 0)),
+  };
+}
+
+/**
+ * `POST /appservices/{id}/discard` in the mock: deletes the dead letters that match (every one
+ * with neither filter; `before` keeps those queued at or after it) and never a waiting entry.
+ * Undefined for an unknown appservice.
+ */
+export function discardDeadLetters(
+  id: string,
+  request: { transaction_ids?: string[]; before?: string },
+): number | undefined {
+  const entries = appserviceBacklog[id];
+  if (!entries) return undefined;
+  const before = request.before === undefined ? undefined : Date.parse(request.before);
+  const ids = request.transaction_ids === undefined ? undefined : new Set(request.transaction_ids);
+  const matches = (e: AppServiceBacklogEntry) =>
+    Boolean(e.dead_lettered) &&
+    (ids === undefined || ids.has(e.transaction_id ?? "")) &&
+    (before === undefined || Date.parse(e.enqueued_at ?? "") < before);
+  const kept = entries.filter((e) => !matches(e));
+  appserviceBacklog[id] = kept;
+  return entries.length - kept.length;
+}
+
+/**
+ * `POST /appservices/{id}/replay` in the mock: every dead letter is sent again and, the mock's
+ * bridges being well, delivered; waiting entries are left to the queue. Undefined for an unknown
+ * appservice.
+ */
+export function replayDeadLetters(id: string): number | undefined {
+  const entries = appserviceBacklog[id];
+  if (!entries) return undefined;
+  const kept = entries.filter((e) => !e.dead_lettered);
+  appserviceBacklog[id] = kept;
+  return entries.length - kept.length;
+}
 
 export const appserviceRegistration: Record<string, Record<string, unknown>> = Object.fromEntries(
   appservices.map((a) => [
@@ -259,24 +380,33 @@ export function pingAppservice(id: string): AppService | undefined {
   if (!appservice) return undefined;
   const now = new Date().toISOString();
   if (appservice.paused) {
-    appserviceHealth[id] = { status: "paused", last_ping_at: now, last_error: null };
+    appserviceHealth[id] = {
+      status: "paused",
+      reason: "Paused by an operator: transactions are queued and not sent until it is resumed.",
+      last_ping_at: now,
+      last_error: null,
+    };
   } else if (!appservice.url) {
     appserviceHealth[id] = {
       status: "down",
+      reason:
+        "Its last ping failed, and nothing has been delivered to it since. The last error: the registration has no url, so there is nothing to ping",
       last_ping_at: now,
       last_error: "the registration has no url, so there is nothing to ping",
     };
   } else if (id === "signal") {
     appserviceHealth[id] = {
+      ...appserviceHealth[id],
       status: "down",
       last_ping_at: now,
       last_error: "Connection refused: signal daemon not responding on :29328",
     };
   } else {
-    appserviceHealth[id] = { status: "healthy", last_ping_at: now, last_error: null };
+    // A ping answered after failures marks the bridge healthy again.
+    appserviceHealth[id] = { status: "healthy", reason: null, last_ping_at: now, last_error: null };
   }
   appservice.health = appserviceHealth[id]!.status;
-  return appservice;
+  return linkedAppservice(appservice);
 }
 
 /** A bridge instance of an offering, as `appserviceLogins` needs it (`./bridge-offerings`). */

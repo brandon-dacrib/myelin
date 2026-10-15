@@ -460,6 +460,18 @@ export function useRotateAppserviceTokens() {
   });
 }
 
+/** What a replay or a discard changes: the backlog, and the queue counts on the bridge's rows. */
+function invalidateAfterQueueChange(qc: ReturnType<typeof useQueryClient>, id: string) {
+  qc.invalidateQueries({ queryKey: ["appservice-backlog", id] });
+  qc.invalidateQueries({ queryKey: ["appservice", id] });
+  qc.invalidateQueries({ queryKey: ["appservices"] });
+}
+
+/**
+ * Replays every dead-lettered transaction (`POST /appservices/{id}/replay`, a `Task`): each is
+ * sent again now with a fresh retry budget, however old it is, so the bridge receives old events
+ * as if they were new. Entries still waiting are not touched.
+ */
 export function useReplayAppserviceBacklog() {
   const qc = useQueryClient();
   return useMutation({
@@ -470,7 +482,41 @@ export function useReplayAppserviceBacklog() {
       });
       return unwrap(result);
     },
-    onSuccess: (_data, id) => qc.invalidateQueries({ queryKey: ["appservice-backlog", id] }),
+    onSuccess: (_data, id) => invalidateAfterQueueChange(qc, id),
+  });
+}
+
+/** `AppServiceDiscardRequest` (OpenAPI 0.1.18): which dead letters; neither field means all. */
+export type AppServiceDiscardRequest = components["schemas"]["AppServiceDiscardRequest"];
+
+export interface DiscardDeadLettersVariables {
+  id: string;
+  /** Only these transactions (a backlog entry's `transaction_id`). */
+  transactionIds?: string[];
+  /** Only entries queued before this time (RFC 3339). */
+  before?: string;
+}
+
+/**
+ * Discards dead-lettered transactions for good (`POST /appservices/{id}/discard`, OpenAPI
+ * 0.1.18): the bridge is never sent them. With neither `transactionIds` nor `before`, every dead
+ * letter. The server never deletes an entry still waiting to be sent, and answers how many it
+ * discarded.
+ */
+export function useDiscardAppserviceDeadLetters() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ id, transactionIds, before }: DiscardDeadLettersVariables) => {
+      const body: AppServiceDiscardRequest = {};
+      if (transactionIds !== undefined) body.transaction_ids = transactionIds;
+      if (before !== undefined) body.before = before;
+      const result = await api.POST("/appservices/{id}/discard", {
+        params: { path: { id }, header: { "Idempotency-Key": newIdempotencyKey() } },
+        body,
+      });
+      return unwrap(result);
+    },
+    onSuccess: (_data, { id }) => invalidateAfterQueueChange(qc, id),
   });
 }
 
