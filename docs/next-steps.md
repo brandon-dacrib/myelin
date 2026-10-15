@@ -1,8 +1,33 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-10-15 (the memory climb with federation on; fix on `agent/fed-memory-growth`. Before: the session hub wedge; fix on `agent/hub-wedge`. Earlier: the ephemeral pump's prune busy loop; fix on `agent/ephemeral-prune`). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+Written 2026-09-20 by the integration lead, last revised 2026-10-15 (Discord's delivery timeouts were a replay of the 2026-10-12 flood; fix on `agent/discord-delivery-timeouts`. Before: the memory climb with federation on; fix on `agent/fed-memory-growth`. Before: the session hub wedge; fix on `agent/hub-wedge`. Earlier: the ephemeral pump's prune busy loop; fix on `agent/ephemeral-prune`). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
+
+## 2026-10-15 -- Discord's delivery timeouts were a replay of the 2026-10-12 flood; the fix is `agent/discord-delivery-timeouts`
+
+At 19:56 UTC Discord's 260 dead letters were replayed from its page (dead-lettered 260 -> 60 and
+depth 0 -> 200 between two scrapes, oldest 260,626 s old): the 2026-10-12 flood of decision 0046,
+encrypted events of rooms the bridge does not bridge and the owner's to-device messages. Federation
+coming back on sent Discord nothing. A replay kept the spent attempt count, a transaction was twenty
+room pages (624 to 1,076 events), mautrix-go answers only when every event is in its channel, so
+the 30 s timeout fired on each, each was dead-lettered on its one attempt and the next sent, 13 in
+six minutes; the bridge dispatched all of them anyway (done by 20:25). Ids were 20 apart because
+each was a new batch; the one retry (3624, across the 19:58 restart) kept its id. Slack's
+"Degraded" was its pod restarting: ten refused connections in four minutes dead-lettered a
+transaction. Fixed (decision 0049, `docs/status/11-appservices-and-bridges.md`): a retry is exactly
+the failed transaction under its id; timeouts, unreachable bridges and 5xx/408/429 are retried for
+a day (a timeout waits at least 60 s), a refusal ten times; at most 100 items a transaction, halved
+on each timeout; 60 s request timeout; a replay gets a fresh budget; `POST
+/api/v1/appservices/{id}/discard` and the backlog's contents (when, what, which rooms) with the
+bridge page's Discard and confirmed Replay; `health_reason` on the Registrations page; a ping
+answered after the failures makes a bridge healthy. New series: `hs_appservice_transaction_seconds`,
+`hs_appservice_transaction_failures_total{reason}`, `hs_appservice_transaction_retries_total`,
+`hs_appservice_dead_lettered_total`, `hs_appservice_batch_item_limit`. **After the roll**: on each
+bridge's page look at the dead letters' dates and rooms; the 2026-10-12 flood's (discord, signal,
+linkedin, meta, whatsapp; Discord's were in fact delivered) want Discard, Slack's three (today's
+restart) want Replay, and iMessage's 3,545 need a look. Then Ping each degraded bridge.
+**Left**: dead letters do not expire; the timeout, the day and the cap are constants.
 
 ## 2026-10-15 -- the demo's memory climb with federation on was abandoned room loads; the fix is `agent/fed-memory-growth`
 

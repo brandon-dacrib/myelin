@@ -1,6 +1,9 @@
 # Status: track 11, appservices and bridges
 
-Last updated: 2026-10-14, later (an appservice removes its users' devices without
+Last updated: 2026-10-15 (Discord's delivery timeouts: a retry is the same transaction, a
+transient failure is retried for a day, transactions carry at most 100 items and shrink when a
+bridge times out, a replay gets a fresh budget, dead letters can be seen and discarded, and the
+health says why; decision 0049; below); before that 2026-10-14, later (an appservice removes its users' devices without
 user-interactive auth, MSC4190 or not, so the manager can remove the iMessage bot's left-behind
 device whose key counts the bridge drops; below); before that 2026-10-14 (the ephemeral pump's
 stream prunes, and the sync feed and hot-room
@@ -49,6 +52,120 @@ manager) and an instance's Kubernetes objects say whose bridge they are; before 
 (who has signed in to a bridge; the `cluster` runtime run on kind); before that 2026-09-30
 (ephemeral, to-device and device-list delivery); before that 2026-09-27 (RFC 0017 run against
 the real binary), 2026-09-27 (the bridge manager) and 2026-09-25.
+
+## Session 2026-10-15 (branch `agent/discord-delivery-timeouts`): Discord's delivery timeouts were a replay of the 2026-10-12 flood
+
+**Seen on the demo** (v0.3.22, federation turned on at 19:58 UTC): `could not deliver to this
+appservice; it will be tried again ... count: 20, dead_lettered: 20, ... /transactions/3524:
+operation timed out` for `discord-brandon`, one every 31 s from 19:56:37 (3524, 3564, 3584, 3604,
+3624, ... 3804); `hs_appservice_transactions_total{appservice="discord-brandon",outcome="failed"}`
+9 and no `delivered` since boot; mautrix-discord's "Event channel is full" 307 times in hour 19
+and 3,787 in 20:00-20:10, mostly `m.room.encrypted` and `m.receipt`, and `Failed to send
+decryption error notice ... /rooms/!RZcNK4rQkNAMMv9jsL.../join: M_FORBIDDEN`; Discord and Slack
+"Degraded" on the Registrations page with no reason.
+
+**What happened** (Loki for both logs, Prometheus for the queue gauges; read only):
+
+1. *A replay, not federation.* Between the 19:43 and 19:58 scrapes, on the same pod,
+   `hs_appservice_queue_dead_lettered{appservice="discord-brandon"}` went 260 -> 60 and
+   `hs_appservice_queue_depth` 0 -> 200, with `hs_appservice_queue_oldest_age_seconds` 260,626:
+   the dead letters were put back at about 19:56 (the page's "Replay all"; the replay was audited
+   but not logged). They were queued 2026-10-12 19:34, the flood decision 0046 describes (the
+   registration then claimed the owner, so the bridge was sent every room he was in): encrypted
+   events of rooms the bridge does not bridge (hence the `403` joins for its decryption notices),
+   the owner's to-device messages ("Dropping to-device event targeted to someone else",
+   `@brandon`) and his one-time-key counts. Nothing new was queued for Discord after the restart
+   (depth 0 since 20:08): today's registration claims only its ghosts and bot, so federation
+   coming back sent it nothing.
+2. *One attempt each.* A replay kept the spent attempt count, so each batch was sent once and
+   dead-lettered on its first failure (`dead_lettered: 20` on every line).
+3. *Huge transactions.* Twenty queue entries to a transaction, each a room's page of up to 100
+   events: the bridge's "Starting handling of transaction" lines say `pdu` 624, 1060, 1026, 913,
+   781, 781, 1076, 291, 264, 84, 0, 4, 2. mautrix-go answers only when every event is in its
+   channel, and spends 3 + 22 s per event it cannot decrypt: 3524 took 91 s to dispatch.
+4. *Timed out but delivered.* The 30 s timeout fired every time; the bridge went on dispatching
+   after the server hung up (14 "Finished dispatching" by 20:25, the warnings down to 42 in
+   20:20-20:30). Everything the server counted as failed reached the bridge, and the 260 dead
+   letters were back.
+5. *Ids.* 20 apart because each was a new batch of twenty entries. The one retry (3624, after the
+   19:58 restart cut its first attempt) reused its id, and the bridge handled it twice because the
+   first was still in flight. Latent bug found reading the code: a retry re-formed its batch, so a
+   failed batch of fewer than twenty that grew before its retry went under a new id with its old
+   events in it.
+6. *Slack* was "Degraded" for a different reason: its pod restarted around 19:03 and transaction
+   147686 was refused (`Connect`) ten times in four minutes and dead-lettered (`slack-brandon` 3).
+7. *Dead letters never expire, and nothing showed what they were.* The red "N failed" (discord
+   260, signal 260, linkedin 280, meta 280, whatsapp 300: the 2026-10-12 flood; imessage 3,545;
+   slack 3) stays until a replay, and the only action offered was to send them all again.
+
+**Fixed** (decision 0049):
+
+- `scheduler.rs`: a failed batch's entries record its id (`QueuedTransaction::txn_id`) and the
+  retry sends exactly them under it. `TransactionSender::send` returns a `SendError` with a
+  `SendErrorKind` (`TimedOut`, `Unreachable`, `Unavailable` for 5xx/408/429, `Rejected`).
+  Transient failures are retried, backing off to 5 min, until failing for a day
+  (`give_up_after_ms`, from `first_failed_at_ms`); a timeout waits at least 60 s
+  (`timeout_backoff_ms`); `Rejected` is dead-lettered after 10 attempts as before. The entries of
+  one transaction share one attempt count and are dead-lettered together. A new transaction
+  carries at most `max_items` (100) items, the first entry always; the per-appservice limit halves
+  on a timeout and doubles back on a delivery. `HttpTransactionSender::new` waits 60 s
+  (`TRANSACTION_TIMEOUT`). `Scheduler::discard` deletes matching dead letters; `replay` resets the
+  budget. Both are logged.
+- `store.rs`: `discard_dead_lettered` (by heads, re-checking status in the transaction; the queue
+  front counts are recounted); `requeue_dead_lettered` resets attempts, first failure and id.
+  `HealthRow::last_failure_at_ms`.
+- `registry.rs`: `Health::reason` (in words: how many failed in a row and the `down` threshold,
+  the last error; a failed ping; paused; unknown). A ping answered after the last failure makes
+  the bridge healthy again. `BacklogEntry` says when it was queued, its events, ephemeral and
+  to-device counts and up to five rooms.
+- `delivery.rs`: the failure line carries `txn_id`, `attempt`, `reason`, `elapsed_ms` and
+  `retry_in_ms`, and says separately when a bridge is too slow ("did not answer a transaction in
+  time and may still be working on it") and when entries are dead-lettered ("gave up ...; its
+  entries are dead-lettered and wait for an operator to replay or discard them").
+- Metrics: `hs_appservice_transaction_seconds{appservice,outcome}` (delivered, failed,
+  timed_out), `hs_appservice_transaction_failures_total{appservice,reason}`,
+  `hs_appservice_transaction_retries_total`, `hs_appservice_dead_lettered_total`,
+  `hs_appservice_batch_item_limit`; the `appservice.transaction` span has `attempt`, `retry` and
+  `reason`.
+- Admin API (OpenAPI 0.1.18): `POST /api/v1/appservices/{id}/discard` (`bridges:write`,
+  `{transaction_ids?, before?}`, `200 {"discarded": n}`, audited `appservice.discarded`;
+  `AppserviceDirectory::discard`, default `Unavailable`; `hs-bridges`' wrapper delegates);
+  `AppServiceBacklogEntry.{enqueued_at, events, ephemeral, to_device, room_ids}`;
+  `AppService.health_reason`, `AppServiceHealth.reason`. `hs-admin-mock` serves discard.
+- Web (track 16's pages, by this branch; `docs/status/16-management-web-interface.md`): the
+  Registrations tab shows `health_reason` under a non-healthy badge and "N dead-lettered" with
+  "Review on the bridge's page" instead of "N failed"; the bridge page shows the health reason, and
+  its Transactions tab (`web/src/pages/bridges/BridgeTransactions.tsx`) explains dead letters,
+  lists each entry's age, contents and rooms, confirms "Replay all" with the count and the oldest
+  entry's age (and that the bridge receives events that old now), and offers "Discard all dead
+  letters" and a per-entry Discard behind a confirmation. Mocks serve discard and the new fields;
+  `web/e2e/bridge-dead-letters.spec.ts` drives it.
+
+**Verified.** `cargo test -p hs-appservice` (139, among them
+`a_retry_sends_the_same_entries_under_the_same_txn_id_whatever_arrived_since`,
+`a_transient_failure_is_retried_until_it_has_failed_for_a_day`,
+`a_rejected_transaction_is_dead_lettered_after_max_attempts`,
+`a_timeout_waits_before_its_retry_and_shrinks_new_transactions_until_a_delivery`,
+`a_transaction_carries_at_most_max_items_and_a_larger_entry_goes_alone`,
+`a_replayed_entry_gets_a_fresh_retry_budget`,
+`discard_deletes_the_matching_dead_letters_and_nothing_that_waits`,
+`health_says_why_and_a_ping_answered_after_the_failures_ends_them`,
+`a_backlog_entry_says_what_it_carries_and_where`), `-p hs-admin` (with
+`discarding_deletes_dead_letters_only_and_is_audited`), `-p hs-bridges`,
+`-p hs-bridge-conformance`. Real binary: `cargo test -p hs-cli --test appservice_retries`: a
+bridge answering `503` while a message is sent is retried under one id with the same body until it
+answers, the backlog page shows the entry's event and room, the row says `degraded` with a reason
+naming the `503`, then `healthy` with none; the failure, reason, retry and latency series and the
+log line are checked. Also `appservice_isolation`, `appservice_ephemeral`, `appservice_queries`,
+`bridge_offerings`, `bridge_logins`. Chart: `deploy/helm/hs/ci/alerts-test.sh` (the
+`HsAppserviceDeadLettered` alert watched `hs_appservice_queue_dead_lettered_total`, which was
+never exported, so it could not fire; it now watches `hs_appservice_dead_lettered_total`, with a
+promtool case). Web: `npm run check` (704 unit tests) and `npm run test:e2e` (75).
+
+**Left.** No automatic expiry of dead letters (decision 0049 says why). The timeout, the day and
+the item cap are constants, not settings. A bridge still handles an in-flight duplicate when a
+retry arrives before it has finished the first attempt (mautrix-go dedupes only finished ids); the
+60 s floor after a timeout makes that rare.
 
 ## Session 2026-10-14, later (branch `agent/otk-counts-device`): the iMessage bot's left-behind device can be removed
 
@@ -2287,6 +2404,15 @@ to anything broken.
 
 ## Interfaces provided
 
+- 2026-10-15: `hs_appservice::scheduler::{SendError, SendErrorKind, DiscardRequest,
+  TRANSACTION_TIMEOUT, Scheduler::{discard, item_limit}}`, `SchedulerConfig::{max_items,
+  give_up_after_ms, timeout_backoff_ms}`, `DrainOutcome::Failed`'s `reason`, `txn_id`,
+  `attempt`, `elapsed_ms`, `retry_in_ms`; `TransactionSender::send` returns `SendError` (was
+  `String`); `QueuedTransaction::{txn_id, first_failed_at_ms}`,
+  `AppserviceStore::discard_dead_lettered`, `HealthRow::last_failure_at_ms`, `Health::reason`,
+  `BacklogEntry::{enqueued_at_ms, events, ephemeral, to_device, room_ids}`. Admin API (0.1.18):
+  `appservices.discard`, `AppService.health_reason`, `AppServiceHealth.reason`, the backlog
+  entry's contents; `AppserviceDirectory::discard`.
 - 2026-10-10: admin API `BridgeInstance.removed_bot_devices` (schema `RemovedBotDevice`, OpenAPI
   0.1.13; `hs_admin::model::AdminRemovedBotDevice`); `hs_bridges::manager::{bot_devices_plan,
   STALE_BOT_DEVICE_MS}`; `hs_bridges::matrix::MatrixClient::{devices, delete_device}`. Server
@@ -2345,6 +2471,11 @@ to anything broken.
 
 ## Decisions made
 
+- **2026-10-15, decision 0049: a transient delivery failure is retried for a day under the same
+  transaction id.** Timeouts, unreachable bridges and 5xx/408/429 are retried until failing for a
+  day; a refused transaction is dead-lettered after ten attempts; a retry is exactly the failed
+  transaction; transactions carry at most 100 items and halve on a timeout; a replay gets a fresh
+  budget; dead letters are kept until an operator replays or discards them.
 - **2026-10-10, decision 0041: the manager removes a bot's device the bridge left behind.** The
   device in use is the bot's device with keys seen last (`last_seen_ts`, which the server now
   writes when an appservice acts as a device); another device last seen before it and a day ago

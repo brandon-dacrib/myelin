@@ -1,7 +1,25 @@
 # 16. Management web interface: status
 
-Last updated: 2026-10-13 (the Registrations tab pages by bridge: the server folds each
+Last updated: 2026-10-15 (a bridge's dead letters can be seen, replayed with a confirmation
+and discarded, and the Registrations tab says why a bridge is not healthy; below); before that
+2026-10-13 (the Registrations tab pages by bridge: the server folds each
 double-puppeting registration; branch `agent/fold-doublepuppet-server`).
+
+## 2026-10-15: dead letters can be reviewed and discarded, and health says why (branch `agent/discord-delivery-timeouts`, track 11)
+
+On the demo the Registrations tab said "Degraded" with no reason and "N failed" in red forever,
+and the only action was "Replay all", which re-sent Discord three-day-old flood events
+(decision 0049). With OpenAPI 0.1.18: the list shows `health_reason` under a non-healthy badge
+and "N dead-lettered" / "Review on the bridge's page"; the bridge page shows `reason` from
+`/health`, the Backlog tile counts from `bridge.queue`, and the new Transactions tab
+(`BridgeTransactions.tsx`) explains what dead letters are, lists each entry's age, attempts,
+contents ("Carries 3 events · 2 ephemeral · 1 to-device") and rooms, confirms "Replay all" with
+the count and the oldest entry's age, and offers "Discard all dead letters" and per-entry
+Discard (`useDiscardAppserviceDeadLetters`, `POST /appservices/{id}/discard`, with an
+Idempotency-Key). Replay and discard refresh the list too. Mock replay now removes only dead
+letters. Tests: `BridgeDetailPage.test.tsx` (11 new), `BridgesListPage.test.tsx`,
+`bridge-state.test.ts`, `e2e/bridge-dead-letters.spec.ts` (new, with axe checks);
+`npm run check` and `npm run test:e2e` (75) pass.
 
 ## 2026-10-13: the Registrations tab pages by bridge (branch `agent/fold-doublepuppet-server`)
 
