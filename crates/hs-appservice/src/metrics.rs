@@ -47,7 +47,8 @@
 //!   and `hs_appservice_queue_oldest_age_seconds{appservice}`: gauges read from the queue on
 //!   every scrape ([`QueueCollector`]): how many queued entries wait to be sent (a backing-off
 //!   one included; each is one room's page of events or one ephemeral batch, merged up to
-//!   twenty to a transaction), how many ran out of attempts and wait for a replay, and how long
+//!   twenty and 100 items to a transaction), how many spent their retry budget and wait for an
+//!   operator to replay or discard them, and how long
 //!   the oldest waiting one has waited (0 when none does). A bridge that keeps up holds the depth
 //!   near 0 and the age under a second; a depth that climbs while the other bridges' stay flat
 //!   is that bridge falling behind. Reported by the replica that delivers to the appservice
@@ -491,8 +492,8 @@ impl prometheus_client::collector::Collector for QueueCollector {
         }
         let mut family = encoder.encode_descriptor(
             "hs_appservice_queue_dead_lettered",
-            "Queued entries that ran out of delivery attempts and wait for an operator's replay, \
-             by appservice",
+            "Queued entries that spent their retry budget and wait for an operator to replay or \
+             discard them, by appservice",
             None,
             MetricType::Gauge,
         )?;

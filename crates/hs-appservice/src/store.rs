@@ -218,7 +218,8 @@ pub struct QueuedTransaction {
 pub struct QueueSummary {
     /// Entries waiting to be sent, those backing off after a failure included.
     pub pending: u64,
-    /// Entries that ran out of attempts and wait for an operator's replay.
+    /// Entries that spent their retry budget and wait for an operator to replay or discard
+    /// them.
     pub dead_lettered: u64,
     /// When the oldest waiting entry was queued; `None` when nothing waits.
     pub oldest_pending_at_ms: Option<u64>,

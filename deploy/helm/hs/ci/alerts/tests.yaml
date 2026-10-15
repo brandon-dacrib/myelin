@@ -268,6 +268,32 @@ tests:
                 page in the admin interface's Bridges section says what it last answered.
 
   - interval: 30s
+    name: transactions for a bridge dead-lettered in the last hour
+    input_series:
+      - series: 'hs_appservice_dead_lettered_total{namespace="hs", service="myelin", pod="myelin-0", appservice="discord"}'
+        values: '0x10 20x10'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: HsAppserviceDeadLettered
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: HsAppserviceDeadLettered
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: hs
+              service: myelin
+              pod: myelin-0
+              appservice: discord
+            exp_annotations:
+              summary: "transactions for discord were dead-lettered in the last hour"
+              description: >-
+                The bridge refused them ten times, or could not be reached, did not answer in time
+                or answered 5xx for a day, so what they carried did not reach it (decision 0049).
+                The bridge's page in the Bridges section lists them with when they were queued,
+                what they carry and their rooms, and can replay or discard them.
+
+  - interval: 30s
     name: dropped outbound federation events in the last hour
     input_series:
       - series: 'hs_federation_outbound_pdus_dropped_total{namespace="hs", service="myelin", pod="myelin-0"}'

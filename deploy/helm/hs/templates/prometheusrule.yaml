@@ -235,15 +235,16 @@ spec:
               it. The bridge's pod (`kubectl -n {{ $ns }} get bridges`) is down or refusing, and its
               page in the admin interface's Bridges section says what it last answered.
         - alert: HsAppserviceDeadLettered
-          expr: increase(hs_appservice_queue_dead_lettered_total{namespace="{{ $ns }}", service="{{ $svc }}"}[1h]) > 0
+          expr: increase(hs_appservice_dead_lettered_total{namespace="{{ $ns }}", service="{{ $svc }}"}[1h]) > 0
           labels:
             severity: warning
           annotations:
             summary: "transactions for {{ "{{ $labels.appservice }}" }} were dead-lettered in the last hour"
             description: >-
-              The bridge refused them for longer than the queue keeps retrying, so what they
-              carried did not reach it. The Bridges page lists dead-lettered transactions and
-              can replay them.
+              The bridge refused them ten times, or could not be reached, did not answer in time
+              or answered 5xx for a day, so what they carried did not reach it (decision 0049).
+              The bridge's page in the Bridges section lists them with when they were queued,
+              what they carry and their rooms, and can replay or discard them.
     - name: {{ $svc }}.resources
       rules:
         - alert: HsMemoryNearLimit
