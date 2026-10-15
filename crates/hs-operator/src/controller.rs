@@ -8,9 +8,18 @@
 //! than at the next periodic requeue. While a bridge is not Ready it is also requeued every
 //! [`REQUEUE_NOT_READY`] as a backstop.
 //!
+//! The claim is applied at [`crate::bridge::claim_size`]: never smaller than it already is, so a
+//! `Bridge` written with a smaller size than someone raised its volume to keeps the larger volume
+//! (and says so in a `VolumeSize` condition) instead of failing every reconcile on the API
+//! server's refusal to shrink a claim.
+//!
+//! Beside the controller runs the volume sweep ([`crate::volume`]), which measures each bridge's
+//! volume and records it in the `Bridge`'s `status.volume`.
+//!
 //! The other kinds' reconcilers in [`crate::reconcile`] are stubs and are not run here.
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use futures::StreamExt as _;
@@ -23,7 +32,8 @@ use kube::runtime::watcher;
 use kube::{Api, Client, ResourceExt as _};
 
 use crate::bridge::{
-    MANAGER, desired_deployment, desired_pvc, desired_service, pod_selector, status_from,
+    ClaimSize, MANAGER, claim_size, desired_deployment, desired_pvc_of_size, desired_service,
+    is_resize_refusal, pod_selector, status_from, with_volume_size_condition,
 };
 use crate::crds::{Bridge, Phase};
 use crate::metrics::OperatorMetrics;
@@ -52,6 +62,9 @@ pub struct Options {
     /// The StorageClass a bridge's claim asks for when its `Bridge` names none (the chart's
     /// `bridges.defaultStorageClassName`); `None` for the cluster's default.
     pub default_storage_class: Option<String>,
+    /// Where the volume sweep reads each bridge's volume statistics from
+    /// ([`crate::volume`]); off by default here, on (the kubelet) for `hs operator`.
+    pub volume_stats: crate::volume::VolumeStatsSource,
 }
 
 /// The label selector of everything the `Bridge` controller watches besides the `Bridge`s:
@@ -86,6 +99,9 @@ struct Context {
     client: Client,
     options: Options,
     metrics: OperatorMetrics,
+    /// The size each bridge's spec was last found asking its claim to shrink to, so that the
+    /// refusal is logged once rather than on every reconcile.
+    refused_shrinks: Mutex<BTreeMap<String, String>>,
 }
 
 /// Runs the `Bridge` controller in `namespace` until SIGTERM or Ctrl-C, then finishes the
@@ -130,7 +146,13 @@ pub async fn run_with_metrics(
 
     tracing::info!(namespace = %namespace, "bridge operator starting");
     let pod_namespace = namespace.clone();
-    Controller::new(bridges, watcher::Config::default())
+    let sweep = crate::volume::run(
+        client.clone(),
+        namespace.clone(),
+        options.volume_stats,
+        metrics.clone(),
+    );
+    let controller = Controller::new(bridges, watcher::Config::default())
         .owns(deployments, owned())
         .owns(services, owned())
         .owns(claims, owned())
@@ -147,6 +169,7 @@ pub async fn run_with_metrics(
                 client: client.clone(),
                 options,
                 metrics,
+                refused_shrinks: Mutex::default(),
             }),
         )
         .for_each(|result| async move {
@@ -157,8 +180,12 @@ pub async fn run_with_metrics(
                 }
                 Err(e) => tracing::warn!(error = %e, "bridge reconcile failed"),
             }
-        })
-        .await;
+        });
+    // The sweep never ends by itself: it stops with the controller.
+    tokio::select! {
+        () = controller => {}
+        () = sweep => {}
+    }
     tracing::info!(namespace = %namespace, "bridge operator stopped");
     Ok(())
 }
@@ -194,10 +221,28 @@ async fn reconcile_bridge(bridge: Arc<Bridge>, ctx: &Context) -> Result<Action, 
     let apply = PatchParams::apply(MANAGER).force();
 
     let claims: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), &namespace);
-    let pvc = pvc_with_default_class(&bridge, ctx.options.default_storage_class.as_deref());
-    claims
-        .patch(&crate::bridge::pvc_name(&name), &apply, &Patch::Apply(&pvc))
-        .await?;
+    let claim_name = crate::bridge::pvc_name(&name);
+    let existing = claims.get_opt(&claim_name).await?;
+    let mut size = claim_size(&bridge.spec.storage.size, existing.as_ref());
+    let pvc = pvc_with_default_class(
+        &bridge,
+        &size.size,
+        ctx.options.default_storage_class.as_deref(),
+    );
+    match claims.patch(&claim_name, &apply, &Patch::Apply(&pvc)).await {
+        Ok(_) => {}
+        // A claim its StorageClass will not grow keeps its size, and the bridge is still
+        // reconciled: before this every reconcile failed here, before the Deployment.
+        Err(kube::Error::Api(e)) if is_resize_refusal(e.code, &e.message) => {
+            let kept = existing
+                .as_ref()
+                .and_then(crate::bridge::current_size)
+                .unwrap_or_else(|| size.size.clone());
+            size = size.growth_refused(kept, &e.message);
+        }
+        Err(e) => return Err(e.into()),
+    }
+    note_refused_size(ctx, &name, &size);
 
     let deployments: Api<Deployment> = Api::namespaced(client.clone(), &namespace);
     let deployment = deployments
@@ -214,7 +259,11 @@ async fn reconcile_bridge(bridge: Arc<Bridge>, ctx: &Context) -> Result<Action, 
         .list(&ListParams::default().labels(&pod_selector(&name)))
         .await?;
 
-    let status = status_from(&bridge, Some(&deployment), &pod_list.items);
+    let status = with_volume_size_condition(
+        status_from(&bridge, Some(&deployment), &pod_list.items),
+        &size,
+        bridge.status.as_ref(),
+    );
     let phase = status.phase;
     if bridge.status.as_ref() != Some(&status) {
         let bridges: Api<Bridge> = Api::namespaced(client.clone(), &namespace);
@@ -234,9 +283,56 @@ async fn reconcile_bridge(bridge: Arc<Bridge>, ctx: &Context) -> Result<Action, 
     })
 }
 
-/// The bridge's claim, asking for `default_class` when the `Bridge` names no StorageClass.
-fn pvc_with_default_class(bridge: &Bridge, default_class: Option<&str>) -> PersistentVolumeClaim {
-    let mut pvc = desired_pvc(bridge);
+/// Logs, once per size asked for, that `bridge`'s spec asks for a size its claim cannot take
+/// (smaller than it has, or larger than its StorageClass lets it grow) and the claim keeps its
+/// size; and, once, that it no longer does.
+fn note_refused_size(ctx: &Context, bridge: &str, size: &ClaimSize) {
+    let mut refused = ctx
+        .refused_shrinks
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let asked = size
+        .refused_shrink
+        .as_ref()
+        .or(size.refused_growth.as_ref().map(|(asked, _)| asked));
+    match asked {
+        Some(asked) if refused.get(bridge) != Some(asked) => {
+            match &size.refused_growth {
+                Some((_, why)) => tracing::warn!(
+                    bridge = %bridge,
+                    asked = %asked,
+                    kept = %size.size,
+                    why = %why,
+                    "the Bridge asks for a larger volume than its claim can grow to; the claim \
+                     keeps its size (the Bridge's VolumeSize condition says so)"
+                ),
+                None => tracing::warn!(
+                    bridge = %bridge,
+                    asked = %asked,
+                    kept = %size.size,
+                    "the Bridge asks for a smaller volume than its claim has; a volume cannot \
+                     shrink, so the claim keeps its size (the Bridge's VolumeSize condition says so)"
+                ),
+            }
+            refused.insert(bridge.to_owned(), asked.clone());
+        }
+        None => {
+            if refused.remove(bridge).is_some() {
+                tracing::info!(bridge = %bridge, size = %size.size, "the Bridge's volume size matches its claim again");
+            }
+        }
+        Some(_) => {}
+    }
+}
+
+/// The bridge's claim at `size`, asking for `default_class` when the `Bridge` names no
+/// StorageClass.
+fn pvc_with_default_class(
+    bridge: &Bridge,
+    size: &str,
+    default_class: Option<&str>,
+) -> PersistentVolumeClaim {
+    let mut pvc = desired_pvc_of_size(bridge, size);
     if let (Some(spec), Some(class)) = (pvc.spec.as_mut(), default_class)
         && spec.storage_class_name.is_none()
         && !class.is_empty()
@@ -284,7 +380,7 @@ mod tests {
             },
         );
         let class = |b: &Bridge, d: Option<&str>| {
-            pvc_with_default_class(b, d)
+            pvc_with_default_class(b, "5Gi", d)
                 .spec
                 .and_then(|s| s.storage_class_name)
         };
@@ -346,7 +442,7 @@ mod tests {
         ));
         assert!(selects(
             &selector,
-            desired_pvc(&bridge).metadata.labels.as_ref()
+            crate::bridge::desired_pvc(&bridge).metadata.labels.as_ref()
         ));
 
         // A Homeserver of the same name in the same namespace: its pods carry

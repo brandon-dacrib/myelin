@@ -197,6 +197,26 @@ spec:
                 format: int32
                 nullable: true
                 type: integer
+              volume:
+                description: How full the workload's volume was when last measured. The `Bridge` controller fills it from the kubelet's volume statistics (`crate::volume`); the other kinds leave it unset. Kept as it was while no new measurement comes in (a pod that is not running has none), so a volume that filled up and stopped its pod still says so.
+                nullable: true
+                properties:
+                  capacityBytes:
+                    description: The filesystem's size in bytes (what the volume holds, which can be a little less than the claim's size).
+                    format: int64
+                    type: integer
+                  observedAt:
+                    description: When the kubelet measured it, RFC 3339.
+                    type: string
+                  usedBytes:
+                    description: Bytes in use.
+                    format: int64
+                    type: integer
+                required:
+                - capacityBytes
+                - observedAt
+                - usedBytes
+                type: object
             type: object
         required:
         - spec

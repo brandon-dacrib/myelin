@@ -37,7 +37,9 @@ pub mod crds;
 pub mod deploy;
 pub mod homeserver;
 pub mod metrics;
+pub mod quantity;
 pub mod reconcile;
+pub mod volume;
 
 use std::net::SocketAddr;
 

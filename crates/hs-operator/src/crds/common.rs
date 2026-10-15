@@ -97,6 +97,38 @@ pub struct OperatorStatus {
     /// `lastTransitionTime`). Empty until the first reconcile.
     #[serde(default)]
     pub conditions: Vec<Condition>,
+    /// How full the workload's volume was when last measured. The `Bridge` controller fills it
+    /// from the kubelet's volume statistics (`crate::volume`); the other kinds leave it unset.
+    /// Kept as it was while no new measurement comes in (a pod that is not running has none), so
+    /// a volume that filled up and stopped its pod still says so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume: Option<VolumeStatus>,
+}
+
+/// One measurement of a volume, as the kubelet reported it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct VolumeStatus {
+    /// The filesystem's size in bytes (what the volume holds, which can be a little less than
+    /// the claim's size).
+    pub capacity_bytes: i64,
+    /// Bytes in use.
+    pub used_bytes: i64,
+    /// When the kubelet measured it, RFC 3339.
+    pub observed_at: String,
+}
+
+impl VolumeStatus {
+    /// `used_bytes / capacity_bytes`, between 0 and 1; 0 for an empty measurement.
+    #[must_use]
+    pub fn used_ratio(&self) -> f64 {
+        if self.capacity_bytes <= 0 {
+            return 0.0;
+        }
+        #[allow(clippy::cast_precision_loss)] // a ratio, not a byte count
+        let ratio = self.used_bytes as f64 / self.capacity_bytes as f64;
+        ratio.clamp(0.0, 1.0)
+    }
 }
 
 #[cfg(test)]
@@ -126,6 +158,28 @@ mod tests {
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["readyReplicas"], 1);
         assert_eq!(json["observedGeneration"], 2);
+        assert!(
+            json.get("volume").is_none(),
+            "no volume until one is measured"
+        );
+    }
+
+    #[test]
+    fn a_volume_measurement_is_camel_case_with_its_ratio() {
+        let volume = VolumeStatus {
+            capacity_bytes: 1000,
+            used_bytes: 980,
+            observed_at: "2026-10-15T20:00:00Z".to_owned(),
+        };
+        let json = serde_json::to_value(&volume).unwrap();
+        assert_eq!(json["capacityBytes"], 1000);
+        assert_eq!(json["usedBytes"], 980);
+        assert!((volume.used_ratio() - 0.98).abs() < 1e-9);
+        let empty = VolumeStatus {
+            capacity_bytes: 0,
+            ..volume
+        };
+        assert!(empty.used_ratio().abs() < f64::EPSILON);
     }
 
     #[test]

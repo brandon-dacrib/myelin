@@ -296,6 +296,50 @@ echo "svc/smoke endpoints: $endpoints"
 [ -n "$endpoints" ] || fail "the Service has no ready endpoint"
 k get bridge smoke -o jsonpath='{"status: "}{.status}{"\n"}'
 
+say "Its volume: measured through the kubelet, and never shrunk"
+# The operator's volume sweep reads each node's kubelet (/stats/summary, `--volume-stats
+# kubelet`, the chart's default) once a minute. A kubelet reports statistics only for volume
+# types that have them (kind's local-path provisioner makes hostPath volumes, which have none),
+# so on kind what is checked is that the operator can read the kubelet at all: its RBAC
+# (nodes, nodes/stats) and its TLS (--kubelet-insecure-tls). Where the volume has statistics
+# they land in the Bridge's status.volume.
+mark
+k logs "deploy/$OPERATOR" | grep -q 'measuring bridge volumes' \
+  || fail "the bridge operator's log does not say it measures volumes"
+volume_state() {
+  if k logs "deploy/$OPERATOR" | grep -q "cannot read the kubelet's volume statistics"; then
+    echo "refused: $(k logs "deploy/$OPERATOR" | grep "cannot read the kubelet's volume statistics" | tail -1)"
+  elif [ $((SECONDS - T0)) -ge 75 ]; then
+    echo "read: status.volume $(k get bridge smoke -o jsonpath='{.status.volume}')"
+  else
+    echo "waiting for a sweep"
+  fi
+}
+watch_until volume_state '^read: ' '^refused: '
+# A spec asking for less than the claim has: the claim keeps its size, the reconcile does not
+# fail, and the Bridge's VolumeSize condition says so (the API server refuses to shrink a claim;
+# before 2026-10-15 every reconcile of such a Bridge failed on it).
+echo '$ kubectl patch bridge smoke --type merge -p {"spec":{"storage":{"size":"32Mi"}}}'
+k patch bridge smoke --type merge -p '{"spec":{"storage":{"size":"32Mi"}}}' >/dev/null
+mark
+shrink_state() {
+  k get bridge smoke -o jsonpath='{.status.conditions[?(@.type=="VolumeSize")].reason} {.status.phase}'
+}
+watch_until shrink_state '^ShrinkRefused Ready$'
+requested="$(k get pvc smoke-data -o jsonpath='{.spec.resources.requests.storage}')"
+echo "pvc/smoke-data requests $requested"
+[ "$requested" = "64Mi" ] || fail "the claim was asked to shrink to $requested"
+k get bridge smoke -o jsonpath='{.status.conditions[?(@.type=="VolumeSize")].message}{"\n"}'
+k logs "deploy/$OPERATOR" | grep -q 'asks for a smaller volume than its claim has' \
+  || fail "the operator did not log the refused shrink"
+if k logs "deploy/$OPERATOR" | grep -q 'bridge reconcile failed'; then
+  fail "a reconcile failed: $(k logs "deploy/$OPERATOR" | grep 'bridge reconcile failed' | tail -1)"
+fi
+echo '$ kubectl patch bridge smoke --type merge -p {"spec":{"storage":{"size":"64Mi"}}}'
+k patch bridge smoke --type merge -p '{"spec":{"storage":{"size":"64Mi"}}}' >/dev/null
+mark
+watch_until shrink_state '^ Ready$'
+
 say "An image that does not exist: Degraded, with the kubelet's reason"
 mark
 echo "\$ kubectl patch bridge smoke: image tag no-such-tag-myelin-smoke"

@@ -50,6 +50,9 @@ pub const ANNOTATION_SPEC_HASH: &str = "myelin.dev/spec-hash";
 pub const ANNOTATION_FILES_HASH: &str = "myelin.dev/files-hash";
 /// The `condition.type` [`status_from`] reports.
 pub const CONDITION_AVAILABLE: &str = "Available";
+/// The `condition.type` that says the spec asked the volume to shrink and it did not
+/// ([`with_volume_size_condition`]); absent while the claim has the spec's size.
+pub const CONDITION_VOLUME_SIZE: &str = "VolumeSize";
 /// Name of the bridge's container port, which the Service targets.
 pub const PORT_NAME: &str = "appservice";
 
@@ -289,8 +292,16 @@ fn owner_reference(bridge: &Bridge) -> Option<OwnerReference> {
 }
 
 /// The bridge's volume claim, `<name>-data`: ReadWriteOnce, the spec's size and StorageClass.
+/// The controller applies it at [`claim_size`] rather than the spec's size where the claim
+/// already holds more ([`desired_pvc_of_size`]).
 #[must_use]
 pub fn desired_pvc(bridge: &Bridge) -> PersistentVolumeClaim {
+    desired_pvc_of_size(bridge, &bridge.spec.storage.size)
+}
+
+/// [`desired_pvc`] asking for `size` instead of the spec's.
+#[must_use]
+pub fn desired_pvc_of_size(bridge: &Bridge, size: &str) -> PersistentVolumeClaim {
     let storage = &bridge.spec.storage;
     PersistentVolumeClaim {
         metadata: metadata(bridge, pvc_name(&bridge.name_any())),
@@ -300,13 +311,94 @@ pub fn desired_pvc(bridge: &Bridge) -> PersistentVolumeClaim {
             resources: Some(VolumeResourceRequirements {
                 requests: Some(BTreeMap::from([(
                     "storage".to_owned(),
-                    Quantity(storage.size.clone()),
+                    Quantity(size.to_owned()),
                 )])),
                 limits: None,
             }),
             ..PersistentVolumeClaimSpec::default()
         }),
         status: None,
+    }
+}
+
+/// The size a bridge's claim is applied at, and whether the spec asked for a size the claim
+/// cannot take.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimSize {
+    /// What to request: the spec's size, or the claim's current request or capacity where that
+    /// is larger.
+    pub size: String,
+    /// Set when the spec asks for less than the claim holds: a volume cannot shrink (the API
+    /// server refuses a smaller request), so the claim keeps [`Self::size`] and this says what
+    /// was asked for.
+    pub refused_shrink: Option<String>,
+    /// Set when the spec asks for more and the API server refused to grow the claim (its
+    /// StorageClass does not allow expansion, or it was not dynamically provisioned): what was
+    /// asked for and the API server's words. The claim keeps [`Self::size`], and the rest of the
+    /// bridge is still reconciled ([`Self::growth_refused`]).
+    pub refused_growth: Option<(String, String)>,
+}
+
+impl ClaimSize {
+    /// This size, after the API server refused to grow the claim from `kept` with `why`.
+    #[must_use]
+    pub fn growth_refused(self, kept: String, why: &str) -> Self {
+        Self {
+            refused_growth: Some((self.size, why.to_owned())),
+            size: kept,
+            refused_shrink: None,
+        }
+    }
+}
+
+/// Whether the API server's refusal of a claim apply (`message`, with HTTP `code`) is a refusal
+/// to resize it: `only dynamically provisioned pvc can be resized and the storageclass that
+/// provisions the pvc must support resize` (403, the admission plugin) and its relatives.
+#[must_use]
+pub fn is_resize_refusal(code: u16, message: &str) -> bool {
+    matches!(code, 403 | 422) && message.contains("resize")
+}
+
+/// What `existing` holds now: the larger of its request and its capacity, when it has either.
+#[must_use]
+pub fn current_size(existing: &PersistentVolumeClaim) -> Option<String> {
+    let request = existing
+        .spec
+        .as_ref()
+        .and_then(|s| s.resources.as_ref())
+        .and_then(|r| r.requests.as_ref())
+        .and_then(|r| r.get("storage"))
+        .map(|q| q.0.as_str());
+    let capacity = existing
+        .status
+        .as_ref()
+        .and_then(|s| s.capacity.as_ref())
+        .and_then(|c| c.get("storage"))
+        .map(|q| q.0.as_str());
+    match (request, capacity) {
+        (Some(r), Some(c)) => Some(crate::quantity::larger(r, c).to_owned()),
+        (r, c) => r.or(c).map(str::to_owned),
+    }
+}
+
+/// What a bridge's claim should request: the larger of the spec's `desired` size and what the
+/// `existing` claim requests or has (`status.capacity`). A volume never shrinks: asking for less
+/// than the claim's request is refused by the API server, which would fail every reconcile of the
+/// bridge, and less than its capacity is not something any volume can do. Someone who raised a
+/// claim (or its `Bridge`) by hand keeps the larger volume when the homeserver writes the
+/// `Bridge` again with a smaller size.
+#[must_use]
+pub fn claim_size(desired: &str, existing: Option<&PersistentVolumeClaim>) -> ClaimSize {
+    let current = existing.and_then(current_size);
+    let size = match &current {
+        Some(current) => crate::quantity::larger(desired, current),
+        None => desired,
+    };
+    let refused_shrink = (size != desired).then(|| desired.to_owned());
+    ClaimSize {
+        size: size.to_owned(),
+        refused_shrink,
+        refused_growth: None,
     }
 }
 
@@ -378,6 +470,11 @@ pub fn desired_deployment(bridge: &Bridge) -> Deployment {
             },
             data_mount.clone(),
         ]),
+        // The script's last words reach the `Bridge`'s status the way the bridge's own do:
+        // `cp: write error: No space left on device` from a full volume, which until
+        // 2026-10-15 reached it only as "files: CrashLoopBackOff" (the demo's Slack bridge,
+        // stuck a day before anyone knew why).
+        termination_message_policy: Some("FallbackToLogsOnError".to_owned()),
         resources: Some(ResourceRequirements {
             requests: Some(BTreeMap::from([
                 ("memory".to_owned(), Quantity("16Mi".to_owned())),
@@ -580,7 +677,62 @@ fn status_at(
             observed_generation: generation,
             last_transition_time,
         }],
+        // Measured by the volume sweep (`crate::volume`), not here: kept as it was.
+        volume: bridge.status.as_ref().and_then(|s| s.volume.clone()),
     }
+}
+
+/// `status` with a [`CONDITION_VOLUME_SIZE`] condition when the spec asked the claim to shrink
+/// (`size`, from [`claim_size`]), saying what it keeps and why; without one otherwise. Its
+/// `lastTransitionTime` is kept from `previous` while the message stays the same.
+#[must_use]
+pub fn with_volume_size_condition(
+    mut status: OperatorStatus,
+    size: &ClaimSize,
+    previous: Option<&OperatorStatus>,
+) -> OperatorStatus {
+    status
+        .conditions
+        .retain(|c| c.type_ != CONDITION_VOLUME_SIZE);
+    let kept = &size.size;
+    let (reason, message) = match (&size.refused_shrink, &size.refused_growth) {
+        (Some(asked), _) => (
+            "ShrinkRefused",
+            format!(
+                "spec.storage.size asks for {asked}, less than the {kept} the volume already \
+                 has; a volume cannot shrink, so it keeps {kept}. Set spec.storage.size to \
+                 {kept} or more to clear this"
+            ),
+        ),
+        (None, Some((asked, why))) => (
+            "GrowthRefused",
+            format!(
+                "spec.storage.size asks for {asked}, but the claim cannot grow from {kept}: \
+                 {why}. It keeps {kept}; growing it needs a StorageClass with \
+                 allowVolumeExpansion: true (or set spec.storage.size back to {kept})"
+            ),
+        ),
+        (None, None) => return status,
+    };
+    let last_transition_time = previous
+        .and_then(|p| {
+            p.conditions
+                .iter()
+                .find(|c| c.type_ == CONDITION_VOLUME_SIZE && c.message == message)
+        })
+        .map_or_else(
+            || Time(k8s_openapi::chrono::Utc::now()),
+            |c| c.last_transition_time.clone(),
+        );
+    status.conditions.push(Condition {
+        type_: CONDITION_VOLUME_SIZE.to_owned(),
+        status: "False".to_owned(),
+        reason: reason.to_owned(),
+        message,
+        observed_generation: status.observed_generation,
+        last_transition_time,
+    });
+    status
 }
 
 fn all_container_statuses(pod: &Pod) -> impl Iterator<Item = &ContainerStatus> {
@@ -1277,6 +1429,185 @@ mod tests {
             main.termination_message_policy.as_deref(),
             Some("FallbackToLogsOnError")
         );
+    }
+
+    #[test]
+    fn a_full_volume_reaches_the_status_from_the_init_containers_last_words() {
+        // The demo's Slack bridge on 2026-10-15: the copy script's `cp` hit a full volume, and
+        // the status said only "files: CrashLoopBackOff".
+        let init = &desired_deployment(&bridge())
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap()
+            .init_containers
+            .unwrap()[0];
+        assert_eq!(
+            init.termination_message_policy.as_deref(),
+            Some("FallbackToLogsOnError")
+        );
+        let mut pod = pod_waiting(true, "CrashLoopBackOff", Some("back-off 5m0s"));
+        pod.status
+            .as_mut()
+            .unwrap()
+            .init_container_statuses
+            .as_mut()
+            .unwrap()[0]
+            .last_state = Some(ContainerState {
+            terminated: Some(k8s_openapi::api::core::v1::ContainerStateTerminated {
+                exit_code: 1,
+                message: Some(
+                    "carried pickle_key into /data/config.yaml\ncp: write error: No space left \
+                     on device\n"
+                        .to_owned(),
+                ),
+                ..Default::default()
+            }),
+            ..ContainerState::default()
+        });
+        let s = status_at(&bridge(), Some(&deployment_with_ready(0)), &[pod], t(10));
+        assert_eq!(s.phase, Phase::Degraded);
+        assert_eq!(
+            s.conditions[0].message,
+            "files: CrashLoopBackOff: back-off 5m0s; it last exited saying: cp: write error: No \
+             space left on device"
+        );
+    }
+
+    #[test]
+    fn the_status_keeps_the_last_volume_measurement() {
+        let mut b = bridge();
+        let mut status = status_at(&b, Some(&deployment_with_ready(1)), &[], t(10));
+        assert!(status.volume.is_none());
+        status.volume = Some(crate::crds::VolumeStatus {
+            capacity_bytes: 1_020_702_720,
+            used_bytes: 1_000_000_000,
+            observed_at: "2026-10-14T08:00:00Z".to_owned(),
+        });
+        b.status = Some(status.clone());
+        // The pod stopped and nothing new was measured: the status still says how full it was,
+        // and an unchanged state compares equal, so it is not written again.
+        let again = status_at(&b, Some(&deployment_with_ready(1)), &[], t(20));
+        assert_eq!(again.volume, status.volume);
+        assert_eq!(Some(&again), b.status.as_ref());
+    }
+
+    fn claim(request: &str, capacity: Option<&str>) -> PersistentVolumeClaim {
+        let mut pvc = desired_pvc_of_size(&bridge(), request);
+        if let Some(capacity) = capacity {
+            pvc.status = Some(k8s_openapi::api::core::v1::PersistentVolumeClaimStatus {
+                capacity: Some(BTreeMap::from([(
+                    "storage".to_owned(),
+                    Quantity(capacity.to_owned()),
+                )])),
+                ..Default::default()
+            });
+        }
+        pvc
+    }
+
+    #[test]
+    fn a_claim_never_shrinks() {
+        // A new claim, or one the spec grows: the spec's size.
+        assert_eq!(
+            claim_size("5Gi", None),
+            ClaimSize {
+                size: "5Gi".to_owned(),
+                refused_shrink: None,
+                refused_growth: None,
+            }
+        );
+        assert_eq!(
+            claim_size("5Gi", Some(&claim("1Gi", Some("1Gi")))),
+            ClaimSize {
+                size: "5Gi".to_owned(),
+                refused_shrink: None,
+                refused_growth: None,
+            }
+        );
+        // Raised by hand to 10Gi, then the homeserver writes 5Gi: the claim keeps 10Gi, and
+        // the refusal is reported instead of failing every reconcile.
+        assert_eq!(
+            claim_size("5Gi", Some(&claim("10Gi", Some("10Gi")))),
+            ClaimSize {
+                size: "10Gi".to_owned(),
+                refused_shrink: Some("5Gi".to_owned()),
+                refused_growth: None,
+            }
+        );
+        // The provisioner gave more than was asked: the capacity counts too.
+        assert_eq!(
+            claim_size("1Gi", Some(&claim("1Gi", Some("2Gi")))).size,
+            "2Gi"
+        );
+        // An expansion still in progress (request raised, capacity not yet): the request.
+        assert_eq!(
+            claim_size("1Gi", Some(&claim("5Gi", Some("1Gi")))).size,
+            "5Gi"
+        );
+        // The same size written differently is not a shrink.
+        assert_eq!(
+            claim_size("1Gi", Some(&claim("1024Mi", None))),
+            ClaimSize {
+                size: "1Gi".to_owned(),
+                refused_shrink: None,
+                refused_growth: None,
+            }
+        );
+        let applied = desired_pvc_of_size(&bridge(), "10Gi");
+        assert_eq!(
+            applied.spec.unwrap().resources.unwrap().requests.unwrap()["storage"],
+            Quantity("10Gi".to_owned())
+        );
+    }
+
+    /// kind's local-path volumes, and any StorageClass without `allowVolumeExpansion`: the API
+    /// server refuses to grow the claim. Found running the operator on kind on 2026-10-15,
+    /// where every reconcile then failed before the Deployment was applied.
+    #[test]
+    fn a_refused_growth_keeps_the_claim_and_says_why() {
+        let why = "persistentvolumeclaims \"smoke-data\" is forbidden: only dynamically \
+                   provisioned pvc can be resized and the storageclass that provisions the pvc \
+                   must support resize";
+        assert!(is_resize_refusal(403, why));
+        assert!(!is_resize_refusal(403, "pvc is forbidden: exceeded quota"));
+        assert!(!is_resize_refusal(500, why));
+        let existing = claim("64Mi", Some("64Mi"));
+        assert_eq!(current_size(&existing).as_deref(), Some("64Mi"));
+        let refused = claim_size("128Mi", Some(&existing)).growth_refused("64Mi".to_owned(), why);
+        assert_eq!(refused.size, "64Mi");
+        let b = bridge();
+        let base = status_at(&b, Some(&deployment_with_ready(1)), &[], t(10));
+        let with = with_volume_size_condition(base, &refused, None);
+        let c = &with.conditions[1];
+        assert_eq!(c.reason, "GrowthRefused");
+        assert!(c.message.contains("asks for 128Mi"), "{}", c.message);
+        assert!(c.message.contains("cannot grow from 64Mi"), "{}", c.message);
+        assert!(c.message.contains("allowVolumeExpansion"), "{}", c.message);
+        assert_eq!(with.phase, Phase::Ready);
+    }
+
+    #[test]
+    fn a_refused_shrink_is_a_condition_that_keeps_its_time_and_goes_when_fixed() {
+        let b = bridge();
+        let base = status_at(&b, Some(&deployment_with_ready(1)), &[], t(10));
+        let refused = claim_size("1Gi", Some(&claim("5Gi", Some("5Gi"))));
+        let with = with_volume_size_condition(base.clone(), &refused, None);
+        assert_eq!(with.conditions.len(), 2);
+        let c = &with.conditions[1];
+        assert_eq!(c.type_, CONDITION_VOLUME_SIZE);
+        assert_eq!(c.status, "False");
+        assert_eq!(c.reason, "ShrinkRefused");
+        assert!(c.message.contains("asks for 1Gi"), "{}", c.message);
+        assert!(c.message.contains("keeps 5Gi"), "{}", c.message);
+        // The next reconcile finds the same: the same condition, time and all.
+        let again = with_volume_size_condition(base.clone(), &refused, Some(&with));
+        assert_eq!(again, with);
+        // The spec raised to match: the condition goes.
+        let fixed = claim_size("5Gi", Some(&claim("5Gi", Some("5Gi"))));
+        let cleared = with_volume_size_condition(with, &fixed, None);
+        assert_eq!(cleared, base);
     }
 
     #[test]

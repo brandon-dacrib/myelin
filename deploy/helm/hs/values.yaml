@@ -523,6 +523,22 @@ bridges:
         memory: 128Mi
     ## Extra arguments after `operator --namespace <release namespace>`.
     extraArgs: []
+    ## How the operator measures how full each bridge's volume is, about once a minute. The
+    ## measurement goes into each Bridge's status (and from there to the bridge's page in the
+    ## admin interface, the server's hs_bridge_volume_used_ratio gauge and the
+    ## HsBridgeVolume* alerts), and the operator logs a warning when a volume passes 85%. A
+    ## bridge whose volume fills stops: the demo's Slack bridge did on 2026-10-14.
+    volumeStats:
+      ## `kubelet`: each node's kubelet (/stats/summary, as metrics-server reads it), which needs
+      ## `get` on nodes and nodes/stats (a ClusterRole this chart makes). `apiserver`: through
+      ## the API server's node proxy, which needs `get` on nodes/proxy instead (that also
+      ## reaches the kubelet's other endpoints, so it is not the default). `off`: not measured.
+      source: kubelet
+      ## Do not verify the kubelet's serving certificate (metrics-server's
+      ## --kubelet-insecure-tls). kubeadm, kind and Talos kubelets serve a self-signed one unless
+      ## serving certificates are bootstrapped (rotate-server-certificates and an approver); set
+      ## false on a cluster whose kubelet certificates the cluster CA signs.
+      kubeletInsecureTLS: true
   ## The StorageClass a bridge's volume asks for when its `Bridge` names none; empty for the
   ## cluster's default. Passed to the operator (`--default-storage-class`). A claim's class
   ## cannot change once it exists, so this applies to bridges created after it is set.

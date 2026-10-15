@@ -53,6 +53,53 @@ subjects:
   - kind: ServiceAccount
     name: {{ $name }}
     namespace: {{ .Release.Namespace }}
+{{- $volumeStats := .Values.bridges.operator.volumeStats | default dict }}
+{{- $volumeSource := $volumeStats.source | default "kubelet" }}
+{{- if not (has $volumeSource (list "kubelet" "apiserver" "off")) }}
+{{- fail (printf "bridges.operator.volumeStats.source must be kubelet, apiserver or off, not %q" $volumeSource) }}
+{{- end }}
+{{- if ne $volumeSource "off" }}
+{{- /*
+Measuring bridge volumes (bridges.operator.volumeStats) reads node-level statistics, which no
+namespaced Role can grant: a ClusterRole, named after the release and its namespace so two
+releases never share one. `kubelet`: the node's address (nodes get) and its kubelet's
+/stats/summary (nodes/stats get, which the kubelet asks the API server about). `apiserver`: the
+API server's node proxy (nodes/proxy get).
+*/}}
+{{- $clusterName := printf "%s-%s-bridge-volumes" .Release.Namespace (include "hs.fullname" .) | trunc 63 | trimSuffix "-" }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $clusterName }}
+  labels:
+    {{- include "hs.bridgesOperatorLabels" . | nindent 4 }}
+rules:
+  {{- if eq $volumeSource "kubelet" }}
+  - apiGroups: [""]
+    resources: ["nodes", "nodes/stats"]
+    verbs: ["get"]
+  {{- else }}
+  - apiGroups: [""]
+    resources: ["nodes/proxy"]
+    verbs: ["get"]
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $clusterName }}
+  labels:
+    {{- include "hs.bridgesOperatorLabels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $clusterName }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -101,6 +148,11 @@ spec:
             {{- with .Values.bridges.defaultStorageClassName }}
             - --default-storage-class
             - {{ . | quote }}
+            {{- end }}
+            - --volume-stats
+            - {{ $volumeSource | quote }}
+            {{- if and (eq $volumeSource "kubelet") $volumeStats.kubeletInsecureTLS }}
+            - --kubelet-insecure-tls
             {{- end }}
             {{- with .Values.bridges.operator.extraArgs }}
             {{- toYaml . | nindent 12 }}

@@ -171,6 +171,35 @@ pub struct OperatorArgs {
     /// for example `0.0.0.0:9090`.
     #[arg(long = "metrics-address")]
     pub metrics_address: Option<std::net::SocketAddr>,
+
+    /// Where to read how full each bridge's volume is: `kubelet` (each node's kubelet,
+    /// `/stats/summary`; needs `get` on `nodes` and `nodes/stats`), `apiserver` (the API
+    /// server's node proxy; needs `get` on `nodes/proxy`) or `off`. The measurement goes into
+    /// each `Bridge`'s `status.volume`, the `hs_operator_bridge_volume_used_ratio` gauge and a
+    /// warning when a volume passes 85%.
+    #[arg(long = "volume-stats", default_value = "kubelet", value_parser = ["kubelet", "apiserver", "off"])]
+    pub volume_stats: String,
+
+    /// With `--volume-stats kubelet`, do not verify the kubelet's serving certificate (as
+    /// metrics-server's `--kubelet-insecure-tls`): kubeadm, kind and Talos kubelets serve a
+    /// self-signed one unless serving certificates are bootstrapped.
+    #[arg(long = "kubelet-insecure-tls")]
+    pub kubelet_insecure_tls: bool,
+}
+
+impl OperatorArgs {
+    /// The volume-statistics source the flags name.
+    #[must_use]
+    pub fn volume_stats_source(&self) -> hs_operator::volume::VolumeStatsSource {
+        use hs_operator::volume::VolumeStatsSource;
+        match self.volume_stats.as_str() {
+            "off" => VolumeStatsSource::Off,
+            "apiserver" => VolumeStatsSource::ApiServerProxy,
+            _ => VolumeStatsSource::Kubelet {
+                insecure_tls: self.kubelet_insecure_tls,
+            },
+        }
+    }
 }
 
 /// `hs routes-manifest` arguments.
@@ -510,6 +539,7 @@ async fn run_operator(args: &OperatorArgs) -> i32 {
     let options = hs_operator::RunOptions {
         bridges: hs_operator::controller::Options {
             default_storage_class: args.default_storage_class.clone().filter(|c| !c.is_empty()),
+            volume_stats: args.volume_stats_source(),
         },
         homeservers: args.homeservers,
         metrics_address: args.metrics_address,
@@ -1181,6 +1211,34 @@ mod tests {
             }
             _ => panic!("expected Serve"),
         }
+    }
+
+    #[test]
+    fn the_operator_measures_bridge_volumes_through_the_kubelet_unless_told_otherwise() {
+        use hs_operator::volume::VolumeStatsSource;
+        let source = |args: &[&str]| match Cli::parse_from(args).command {
+            Command::Operator(args) => args.volume_stats_source(),
+            _ => panic!("expected Operator"),
+        };
+        assert_eq!(
+            source(&["hs", "operator"]),
+            VolumeStatsSource::Kubelet {
+                insecure_tls: false
+            }
+        );
+        assert_eq!(
+            source(&["hs", "operator", "--kubelet-insecure-tls"]),
+            VolumeStatsSource::Kubelet { insecure_tls: true }
+        );
+        assert_eq!(
+            source(&["hs", "operator", "--volume-stats", "apiserver"]),
+            VolumeStatsSource::ApiServerProxy
+        );
+        assert_eq!(
+            source(&["hs", "operator", "--volume-stats", "off"]),
+            VolumeStatsSource::Off
+        );
+        assert!(Cli::try_parse_from(["hs", "operator", "--volume-stats", "prometheus"]).is_err());
     }
 
     #[test]

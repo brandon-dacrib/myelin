@@ -8,9 +8,11 @@
 //! | `hs_operator_reconcile_errors_total` | counter | `kind`, `reason` |
 //! | `hs_operator_drains_in_flight` | gauge | `kind` |
 //! | `hs_operator_drains_total` | counter | `outcome` (`started`, `completed`, `timed_out`, `aborted`, `refused`, `undrained`) |
+//! | `hs_operator_bridge_volume_used_ratio` | gauge | `bridge` (the `Bridge`'s name) |
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use prometheus_client::encoding::EncodeLabelSet;
@@ -44,6 +46,13 @@ pub struct KindLabels {
     pub kind: String,
 }
 
+/// One `Bridge`, by name.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, EncodeLabelSet)]
+pub struct BridgeLabels {
+    /// The `Bridge`'s name (`bridge-slack-alice`).
+    pub bridge: String,
+}
+
 /// How a drain step ended.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, EncodeLabelSet)]
 pub struct DrainLabels {
@@ -63,6 +72,9 @@ pub struct OperatorMetrics {
     pub drains_in_flight: Family<KindLabels, Gauge>,
     /// `hs_operator_drains_total{outcome}`.
     pub drains: Family<DrainLabels, Counter>,
+    /// `hs_operator_bridge_volume_used_ratio{bridge}`: how full each bridge's volume was when
+    /// last measured, 0 to 1 (`crate::volume`).
+    pub bridge_volume_used_ratio: Family<BridgeLabels, Gauge<f64, AtomicU64>>,
     draining: Arc<Mutex<BTreeSet<String>>>,
 }
 
@@ -88,6 +100,7 @@ impl OperatorMetrics {
         let reconcile_errors = Family::<ErrorLabels, Counter>::default();
         let drains_in_flight = Family::<KindLabels, Gauge>::default();
         let drains = Family::<DrainLabels, Counter>::default();
+        let bridge_volume_used_ratio = Family::<BridgeLabels, Gauge<f64, AtomicU64>>::default();
         registry.with_registry(|r| {
             r.register(
                 "hs_operator_reconcile_duration_seconds",
@@ -109,6 +122,12 @@ impl OperatorMetrics {
                 "Drain steps the operator took, by outcome",
                 drains.clone(),
             );
+            r.register(
+                "hs_operator_bridge_volume_used_ratio",
+                "How full each bridge's volume was when the kubelet last measured it, 0 to 1; \
+                 a bridge stops at 1 (its writes fail)",
+                bridge_volume_used_ratio.clone(),
+            );
             // The admin-API client (`homeserver::admin::HttpAdminApi`) is built by
             // `hs_http::client::builder()`, so its connections are counted by the
             // process-wide `hs_outbound_*` counters; they are served here, as `hs serve`
@@ -121,8 +140,25 @@ impl OperatorMetrics {
             reconcile_errors,
             drains_in_flight,
             drains,
+            bridge_volume_used_ratio,
             draining: Arc::default(),
         }
+    }
+
+    /// Sets `bridge`'s volume gauge to `ratio`.
+    pub fn set_bridge_volume(&self, bridge: &str, ratio: f64) {
+        self.bridge_volume_used_ratio
+            .get_or_create(&BridgeLabels {
+                bridge: bridge.to_owned(),
+            })
+            .set(ratio);
+    }
+
+    /// Drops `bridge`'s volume gauge (a deleted bridge).
+    pub fn remove_bridge_volume(&self, bridge: &str) {
+        self.bridge_volume_used_ratio.remove(&BridgeLabels {
+            bridge: bridge.to_owned(),
+        });
     }
 
     /// The registry, for rendering.

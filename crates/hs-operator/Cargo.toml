@@ -47,5 +47,7 @@ hs-http = { path = "../hs-http" }
 hs-telemetry = { path = "../hs-telemetry" }
 prometheus-client = { workspace = true }
 axum = { workspace = true }
+# The kubelet summary request of the volume sweep (`src/volume.rs`), through `kube::Client::request_text`.
+http = { workspace = true }
 
 [dev-dependencies]

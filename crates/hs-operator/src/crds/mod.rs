@@ -12,7 +12,7 @@ pub mod pushgateway;
 
 pub use appservice::{AppService, AppServiceSpec};
 pub use bridge::{Bridge, BridgeSpec, BridgeStorage};
-pub use common::{ImageSpec, OperatorStatus, Phase, SecretKeyRef};
+pub use common::{ImageSpec, OperatorStatus, Phase, SecretKeyRef, VolumeStatus};
 pub use homeserver::{
     AdminApiSpec, AntiAffinity, ClusterSpec, DrainReason, DrainSpec, DrainStatus,
     DrainTimeoutPolicy, EmbeddedStorageSpec, Homeserver, HomeserverSpec, HomeserverStatus,
@@ -201,6 +201,87 @@ mod tests {
                 "{off} still renders the CRD"
             );
         }
+    }
+
+    /// The chart lets the operator measure bridge volumes (`crate::volume`) with the least the
+    /// chosen source needs: `nodes` and `nodes/stats` for the kubelet (the default), `nodes/proxy`
+    /// for the API server's proxy, nothing when off; and passes the source to `hs operator`.
+    #[test]
+    fn the_chart_grants_the_volume_sweep_what_its_source_needs() {
+        let Some(default) = helm_template(&[]) else {
+            return;
+        };
+        let rules = |objects: &[serde_json::Value]| -> Vec<serde_json::Value> {
+            objects
+                .iter()
+                .filter(|o| o["kind"] == "ClusterRole")
+                .flat_map(|o| o["rules"].as_array().cloned().unwrap_or_default())
+                .collect()
+        };
+        let args = |objects: &[serde_json::Value]| -> Vec<String> {
+            let operator = objects
+                .iter()
+                .find(|o| {
+                    o["kind"] == "Deployment"
+                        && o["metadata"]["name"]
+                            .as_str()
+                            .is_some_and(|n| n.ends_with("bridges-operator"))
+                })
+                .expect("the operator's Deployment");
+            operator["spec"]["template"]["spec"]["containers"][0]["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|a| a.as_str().unwrap().to_owned())
+                .collect()
+        };
+        let granted = rules(&default);
+        assert_eq!(granted.len(), 1, "{granted:?}");
+        assert_eq!(
+            granted[0]["resources"],
+            serde_json::json!(["nodes", "nodes/stats"])
+        );
+        assert_eq!(granted[0]["verbs"], serde_json::json!(["get"]));
+        let binding = default
+            .iter()
+            .find(|o| o["kind"] == "ClusterRoleBinding")
+            .unwrap();
+        assert_eq!(binding["subjects"][0]["namespace"], "myelin");
+        let a = args(&default);
+        assert!(
+            a.windows(2).any(|w| w == ["--volume-stats", "kubelet"]),
+            "{a:?}"
+        );
+        assert!(a.contains(&"--kubelet-insecure-tls".to_owned()), "{a:?}");
+
+        let verified = helm_template(&[
+            "--set",
+            "bridges.operator.volumeStats.kubeletInsecureTLS=false",
+        ])
+        .unwrap();
+        assert!(!args(&verified).contains(&"--kubelet-insecure-tls".to_owned()));
+
+        let proxy =
+            helm_template(&["--set", "bridges.operator.volumeStats.source=apiserver"]).unwrap();
+        assert_eq!(
+            rules(&proxy)[0]["resources"],
+            serde_json::json!(["nodes/proxy"])
+        );
+        assert!(
+            args(&proxy)
+                .windows(2)
+                .any(|w| w == ["--volume-stats", "apiserver"])
+        );
+        assert!(!args(&proxy).contains(&"--kubelet-insecure-tls".to_owned()));
+
+        let off = helm_template(&["--set", "bridges.operator.volumeStats.source=off"]).unwrap();
+        assert!(rules(&off).is_empty());
+        assert!(!off.iter().any(|o| o["kind"] == "ClusterRoleBinding"));
+        assert!(
+            args(&off)
+                .windows(2)
+                .any(|w| w == ["--volume-stats", "off"])
+        );
     }
 
     #[test]

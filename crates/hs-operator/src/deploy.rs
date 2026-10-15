@@ -20,7 +20,7 @@ use crate::bridge::{
     ANNOTATION_APPSERVICE_ID, ANNOTATION_FILES_HASH, ANNOTATION_OWNER, CONDITION_AVAILABLE,
     LABEL_APPSERVICE_ID, LABEL_BRIDGE_TYPE, LABEL_OWNER, label_value,
 };
-use crate::crds::{Bridge, BridgeSpec, BridgeStorage, ImageSpec, Phase};
+use crate::crds::{Bridge, BridgeSpec, BridgeStorage, ImageSpec, Phase, VolumeStatus};
 
 /// The field manager the homeserver applies `Bridge`s and Secrets with.
 pub const FIELD_MANAGER: &str = "myelin-homeserver";
@@ -63,7 +63,9 @@ pub struct BridgeInstanceSpec {
     /// ([`ANNOTATION_FILES_HASH`]) so that a change rolls the pod, and the operator's init
     /// container carries the secrets a mautrix bridge generated into the new copy.
     pub files: BTreeMap<String, String>,
-    /// The volume size, a Kubernetes quantity; `1Gi` when unset.
+    /// The volume size, a Kubernetes quantity; [`crate::crds::bridge::DEFAULT_STORAGE_SIZE`]
+    /// when unset. [`KubeBridgeClient::apply`] never writes a size smaller than the one the
+    /// `Bridge` in the cluster already asks for: someone may have raised it by hand.
     pub storage_size: Option<String>,
 }
 
@@ -85,6 +87,12 @@ pub struct BridgeInstanceStatus {
     /// Where the homeserver reaches it: `http://<name>.<namespace>.svc:<port>`, the registration's
     /// `url`.
     pub service_url: String,
+    /// The volume size the `Bridge` asks for (`spec.storage.size`), which may be larger than the
+    /// one the homeserver last wrote: someone may have raised it by hand.
+    pub storage_size: String,
+    /// How full its volume was when the operator last measured it; `None` before the first
+    /// measurement, or where the operator does not measure (`hs operator --volume-stats off`).
+    pub volume: Option<VolumeStatus>,
 }
 
 /// What [`KubeBridgeClient`] can fail with.
@@ -319,7 +327,7 @@ impl KubeBridgeClient {
         validate(spec)?;
         let params = PatchParams::apply(FIELD_MANAGER).force();
         let bridges: Api<Bridge> = Api::namespaced(self.client.clone(), &self.namespace);
-        let bridge = bridge_object(spec, &self.namespace);
+        let mut bridge = bridge_object(spec, &self.namespace);
 
         let mut secret = files_secret(spec, &self.namespace);
         // `data`, not `stringData`: server-side apply does not track `stringData` keys, so a
@@ -335,6 +343,14 @@ impl KubeBridgeClient {
         let secret_name = files_secret_name(&spec.name);
 
         let applied = if let Some(existing) = bridges.get_opt(&spec.name).await? {
+            if let Some(kept) = keep_larger_storage(&mut bridge, &existing) {
+                tracing::info!(
+                    bridge = %spec.name,
+                    asked = spec.storage_size.as_deref().unwrap_or_default(),
+                    kept = %kept,
+                    "the Bridge already asks for a larger volume than this server would write: kept it"
+                );
+            }
             secret.metadata.owner_references = existing.controller_owner_ref(&()).map(|r| vec![r]);
             secrets
                 .patch(&secret_name, &params, &Patch::Apply(&secret))
@@ -533,6 +549,21 @@ fn bridge_object(spec: &BridgeInstanceSpec, namespace: &str) -> Bridge {
     bridge
 }
 
+/// Raises `bridge`'s volume size to `existing`'s where that is larger, so that writing a `Bridge`
+/// never undoes someone raising its volume by hand (`kubectl edit`, or the size set in the admin
+/// interface on another replica): the operator would keep the claim at the larger size anyway
+/// (`crate::bridge::claim_size`), but would report the smaller spec as a refused shrink. Returns
+/// the size kept, when it kept one.
+pub fn keep_larger_storage(bridge: &mut Bridge, existing: &Bridge) -> Option<String> {
+    let current = &existing.spec.storage.size;
+    let larger = crate::quantity::larger(&bridge.spec.storage.size, current).to_owned();
+    if larger == bridge.spec.storage.size {
+        return None;
+    }
+    bridge.spec.storage.size.clone_from(&larger);
+    Some(larger)
+}
+
 /// A short, stable hash of a set of files (16 hex digits of SHA-256 over names and contents),
 /// what [`ANNOTATION_FILES_HASH`] carries.
 #[must_use]
@@ -579,6 +610,8 @@ fn instance_status(bridge: &Bridge, namespace: &str) -> BridgeInstanceStatus {
         ready: status.phase == Phase::Ready,
         message,
         image: bridge.spec.image.reference(),
+        storage_size: bridge.spec.storage.size.clone(),
+        volume: status.volume,
     }
 }
 
@@ -675,7 +708,7 @@ mod tests {
         assert_eq!(bridge.spec.appservice_id, "whatsapp-alice");
         assert_eq!(bridge.spec.owner.as_deref(), Some("@alice:example.org"));
         assert_eq!(bridge.spec.port, 29318);
-        assert_eq!(bridge.spec.storage.size, "1Gi");
+        assert_eq!(bridge.spec.storage.size, "5Gi");
         assert!(bridge.status.is_none());
         let secret: Secret = serde_yaml_ng::from_value(docs[0].clone()).unwrap();
         assert_eq!(secret.string_data.unwrap().len(), 2);
@@ -709,8 +742,33 @@ mod tests {
     #[test]
     fn storage_size_is_passed_through() {
         let mut s = spec();
+        s.storage_size = Some("10Gi".to_owned());
+        assert_eq!(bridge_object(&s, "ns").spec.storage.size, "10Gi");
+    }
+
+    #[test]
+    fn writing_a_bridge_keeps_a_volume_raised_by_hand() {
+        // The demo's bridges were written at 1Gi; the owner raises one to 10Gi by hand, and the
+        // next write from the homeserver (a new image tag) asks for its 5Gi default.
+        let mut by_hand = bridge_object(&spec(), "ns");
+        by_hand.spec.storage.size = "10Gi".to_owned();
+        let mut s = spec();
         s.storage_size = Some("5Gi".to_owned());
-        assert_eq!(bridge_object(&s, "ns").spec.storage.size, "5Gi");
+        let mut written = bridge_object(&s, "ns");
+        assert_eq!(
+            keep_larger_storage(&mut written, &by_hand).as_deref(),
+            Some("10Gi")
+        );
+        assert_eq!(written.spec.storage.size, "10Gi");
+        // A larger size from the homeserver (the administrator raised it) goes through.
+        s.storage_size = Some("20Gi".to_owned());
+        let mut written = bridge_object(&s, "ns");
+        assert_eq!(keep_larger_storage(&mut written, &by_hand), None);
+        assert_eq!(written.spec.storage.size, "20Gi");
+        // The same size written differently is left as written.
+        by_hand.spec.storage.size = "20480Mi".to_owned();
+        assert_eq!(keep_larger_storage(&mut written, &by_hand), None);
+        assert_eq!(written.spec.storage.size, "20Gi");
     }
 
     #[test]
@@ -775,8 +833,15 @@ mod tests {
                 observed_generation: Some(1),
                 last_transition_time: Time(k8s_openapi::chrono::Utc::now()),
             }],
+            volume: Some(VolumeStatus {
+                capacity_bytes: 1_000,
+                used_bytes: 990,
+                observed_at: "2026-10-15T20:00:00Z".to_owned(),
+            }),
         });
         let degraded = instance_status(&b, "myelin");
+        assert_eq!(degraded.storage_size, "5Gi");
+        assert_eq!(degraded.volume.as_ref().map(|v| v.used_bytes), Some(990));
         assert_eq!(degraded.phase, Phase::Degraded);
         assert_eq!(
             degraded.message.as_deref(),

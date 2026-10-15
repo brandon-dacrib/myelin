@@ -123,12 +123,12 @@ spec:
                 type: object
               storage:
                 default:
-                  size: 1Gi
+                  size: 5Gi
                 description: 'The bridge''s volume, mounted at `/data`: its configuration, registration and SQLite database.'
                 properties:
                   size:
-                    default: 1Gi
-                    description: Requested size, a Kubernetes quantity (`1Gi`).
+                    default: 5Gi
+                    description: 'Requested size, a Kubernetes quantity (`5Gi`, the default). The operator only ever grows the volume: a size smaller than the claim already has is kept at the claim''s size and reported as the `VolumeSize` condition. Growing it needs a StorageClass with `allowVolumeExpansion: true`.'
                     type: string
                   storageClassName:
                     description: The StorageClass to request; the cluster's default when unset.
@@ -201,6 +201,26 @@ spec:
                 format: int32
                 nullable: true
                 type: integer
+              volume:
+                description: How full the workload's volume was when last measured. The `Bridge` controller fills it from the kubelet's volume statistics (`crate::volume`); the other kinds leave it unset. Kept as it was while no new measurement comes in (a pod that is not running has none), so a volume that filled up and stopped its pod still says so.
+                nullable: true
+                properties:
+                  capacityBytes:
+                    description: The filesystem's size in bytes (what the volume holds, which can be a little less than the claim's size).
+                    format: int64
+                    type: integer
+                  observedAt:
+                    description: When the kubelet measured it, RFC 3339.
+                    type: string
+                  usedBytes:
+                    description: Bytes in use.
+                    format: int64
+                    type: integer
+                required:
+                - capacityBytes
+                - observedAt
+                - usedBytes
+                type: object
             type: object
         required:
         - spec

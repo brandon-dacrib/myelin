@@ -294,6 +294,53 @@ tests:
                 what they carry and their rooms, and can replay or discard them.
 
   - interval: 30s
+    name: a bridge's volume filling up warns, then pages when full
+    input_series:
+      # The demo's Slack bridge, 2026-10-12 to 10-14, as the server reports it; and a healthy
+      # one, which raises nothing.
+      - series: 'hs_bridge_volume_used_ratio{namespace="hs", service="myelin", pod="myelin-0", bridge="slack-brandon", bridge_type="mautrix-slack"}'
+        values: '0.48x20 0.9x40 0.98x40'
+      - series: 'hs_bridge_volume_used_ratio{namespace="hs", service="myelin", pod="myelin-0", bridge="signal-brandon", bridge_type="mautrix-signal"}'
+        values: '0.12x100'
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: HsBridgeVolumeNearlyFull
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: HsBridgeVolumeNearlyFull
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: hs
+              bridge: slack-brandon
+              bridge_type: mautrix-slack
+            exp_annotations:
+              summary: "the bridge slack-brandon's volume is 90% full"
+              description: >-
+                When it fills, the bridge cannot write its database and stops. Raise its volume
+                size on the bridge's page in the admin interface (Bridges, then the bridge): the
+                volume grows in place and the bridge restarts. `kubectl -n hs get bridges`
+                lists them; the StorageClass must allow volume expansion.
+      - eval_time: 25m
+        alertname: HsBridgeVolumeFull
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: HsBridgeVolumeFull
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              namespace: hs
+              bridge: slack-brandon
+              bridge_type: mautrix-slack
+            exp_annotations:
+              summary: "the bridge slack-brandon's volume is full"
+              description: >-
+                The bridge stops, or has stopped, because it cannot write to its volume ("No
+                space left on device"). Raise its volume size on the bridge's page in the admin
+                interface: the volume grows in place, keeping everything on it, and the bridge
+                starts again.
+
+  - interval: 30s
     name: dropped outbound federation events in the last hour
     input_series:
       - series: 'hs_federation_outbound_pdus_dropped_total{namespace="hs", service="myelin", pod="myelin-0"}'

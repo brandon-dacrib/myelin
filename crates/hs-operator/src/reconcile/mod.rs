@@ -145,6 +145,7 @@ pub fn initial_status(observed_generation: Option<i64>) -> OperatorStatus {
         observed_generation,
         ready_replicas: Some(0),
         conditions: Vec::new(),
+        volume: None,
     }
 }
 

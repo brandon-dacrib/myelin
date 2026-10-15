@@ -245,6 +245,39 @@ spec:
               or answered 5xx for a day, so what they carried did not reach it (decision 0049).
               The bridge's page in the Bridges section lists them with when they were queued,
               what they carry and their rooms, and can replay or discard them.
+{{- if .Values.bridges.enabled }}
+        # A bridge the server deploys keeps its database on its own volume; a full one stops
+        # it (the demo's Slack bridge, 2026-10-14, stopped a day before anyone knew). The
+        # operator measures each volume and the server publishes it as
+        # hs_bridge_volume_used_ratio; `max by` because in cluster mode the replica that ran
+        # the bridge manager before a hand-off keeps its last value.
+        - alert: HsBridgeVolumeNearlyFull
+          expr: |
+            max by (namespace, bridge, bridge_type) (hs_bridge_volume_used_ratio{namespace="{{ $ns }}", service="{{ $svc }}"}) >= 0.85
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "the bridge {{ "{{ $labels.bridge }}" }}'s volume is {{ "{{ $value | humanizePercentage }}" }} full"
+            description: >-
+              When it fills, the bridge cannot write its database and stops. Raise its volume
+              size on the bridge's page in the admin interface (Bridges, then the bridge): the
+              volume grows in place and the bridge restarts. `kubectl -n {{ $ns }} get bridges`
+              lists them; the StorageClass must allow volume expansion.
+        - alert: HsBridgeVolumeFull
+          expr: |
+            max by (namespace, bridge, bridge_type) (hs_bridge_volume_used_ratio{namespace="{{ $ns }}", service="{{ $svc }}"}) >= 0.95
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "the bridge {{ "{{ $labels.bridge }}" }}'s volume is full"
+            description: >-
+              The bridge stops, or has stopped, because it cannot write to its volume ("No
+              space left on device"). Raise its volume size on the bridge's page in the admin
+              interface: the volume grows in place, keeping everything on it, and the bridge
+              starts again.
+{{- end }}
     - name: {{ $svc }}.resources
       rules:
         - alert: HsMemoryNearLimit

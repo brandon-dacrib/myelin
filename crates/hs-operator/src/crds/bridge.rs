@@ -82,7 +82,10 @@ pub struct BridgeSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BridgeStorage {
-    /// Requested size, a Kubernetes quantity (`1Gi`).
+    /// Requested size, a Kubernetes quantity (`5Gi`, the default). The operator only ever grows
+    /// the volume: a size smaller than the claim already has is kept at the claim's size and
+    /// reported as the `VolumeSize` condition. Growing it needs a StorageClass with
+    /// `allowVolumeExpansion: true`.
     #[serde(default = "default_storage_size")]
     pub size: String,
     /// The StorageClass to request; the cluster's default when unset.
@@ -99,8 +102,15 @@ impl Default for BridgeStorage {
     }
 }
 
+/// The size of a bridge's volume when its `Bridge` names none, and of every bridge the
+/// homeserver deploys unless an administrator sets another: 5 GiB. A mautrix bridge keeps its
+/// SQLite database there and, unless told otherwise, up to 1.1 GB of its own log files
+/// (`logs/bridge.log`, ten 100 MB backups); the demo's Slack bridge filled 1 GiB in under three
+/// days (2026-10-12 to 10-14). Until 2026-10-15 the default was 1 GiB.
+pub const DEFAULT_STORAGE_SIZE: &str = "5Gi";
+
 fn default_storage_size() -> String {
-    "1Gi".to_owned()
+    DEFAULT_STORAGE_SIZE.to_owned()
 }
 
 #[cfg(test)]
@@ -133,7 +143,7 @@ mod tests {
         assert_eq!(json["bridgeType"], "mautrix-whatsapp");
         assert_eq!(json["appserviceId"], "whatsapp-alice");
         assert_eq!(json["filesSecret"], "bridge-1a2b3c4d-files");
-        assert_eq!(json["storage"]["size"], "1Gi");
+        assert_eq!(json["storage"]["size"], "5Gi");
         let back: BridgeSpec = serde_json::from_value(json).unwrap();
         assert_eq!(back, spec);
     }

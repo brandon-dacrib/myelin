@@ -66,6 +66,37 @@ subjects:
   - kind: ServiceAccount
     name: myelin-operator
 ---
+# Measuring how full each bridge's volume is (`hs operator --volume-stats kubelet`, the default):
+# the node's address and its kubelet's /stats/summary. Node-level, so a ClusterRole; kustomize
+# sets the subject's namespace. Drop both and add `--volume-stats off` to the args to go without.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: myelin-operator-bridge-volumes
+  labels:
+    app.kubernetes.io/name: myelin-operator
+    app.kubernetes.io/component: operator
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "nodes/stats"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: myelin-operator-bridge-volumes
+  labels:
+    app.kubernetes.io/name: myelin-operator
+    app.kubernetes.io/component: operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: myelin-operator-bridge-volumes
+subjects:
+  - kind: ServiceAccount
+    name: myelin-operator
+    namespace: default
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -98,7 +129,9 @@ spec:
         - name: operator
           image: ghcr.io/brandon-dacrib/myelin:main
           imagePullPolicy: Always
-          args: ["operator", "--homeservers", "--metrics-address", "0.0.0.0:9090"]
+          # Kubelets serve self-signed certificates on kubeadm, kind and Talos: drop
+          # --kubelet-insecure-tls where the cluster CA signs them.
+          args: ["operator", "--homeservers", "--metrics-address", "0.0.0.0:9090", "--kubelet-insecure-tls"]
           env:
             - name: POD_NAMESPACE
               valueFrom:
