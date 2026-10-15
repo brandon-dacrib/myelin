@@ -116,6 +116,8 @@ impl<B: KvBackend + 'static> RegistryAppserviceDirectory<B> {
             double_puppet: None,
             links: AdminAppserviceLinks::default(),
             queue: self.queue(&row.id)?,
+            // The bridge manager's directory (`hs-bridges`) fills it for its own instances.
+            volume: None,
         })
     }
 

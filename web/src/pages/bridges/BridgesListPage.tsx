@@ -30,6 +30,7 @@ import {
   sortByAttention,
 } from "@/lib/bridge-catalogue";
 import { bridgeHealthMeta, describeQueue, healthKeyOf } from "@/lib/bridge-state";
+import { volumeMessage, volumeNeedsAttention, volumeStateMeta } from "@/lib/bridge-volume";
 import { cn } from "@/lib/cn";
 import { BridgesTabs } from "./BridgesTabs";
 
@@ -156,9 +157,20 @@ export function BridgesListPage() {
         // Why it is not healthy, in the server's words (OpenAPI 0.1.18): two lines here, the
         // whole of it on hover and to a screen reader, and again on the bridge's page.
         const reason = key === "healthy" ? null : b.health_reason;
+        // A full volume stops a bridge, and its health alone only says it is degraded or down
+        // (the demo's Slack bridge, 2026-10-15): the volume says why, at a glance.
+        const volume = volumeNeedsAttention(b.volume) ? b.volume : null;
         return (
-          <span className="flex max-w-xs flex-col items-start gap-1">
+          <span className="flex max-w-xs flex-col items-start gap-1" data-testid={`state-${b.id}`}>
             <Badge status={meta.status}>{meta.label}</Badge>
+            {volume && (
+              <span title={volumeMessage(volume) ?? undefined}>
+                <Badge status={volumeStateMeta[volume.state].status}>
+                  {volumeStateMeta[volume.state].label}
+                </Badge>
+                <span className="sr-only">: {volumeMessage(volume)}</span>
+              </span>
+            )}
             {reason && (
               <span
                 className="line-clamp-2 text-xs text-text-muted"
@@ -175,7 +187,10 @@ export function BridgesListPage() {
         if (isBuiltInAppservice(b)) return "Built in";
         if (isSendsNothingAppservice(b)) return "Sends nothing";
         const key = healthKeyOf(b);
-        const label = bridgeHealthMeta[key].label;
+        const health = bridgeHealthMeta[key].label;
+        const label = volumeNeedsAttention(b.volume)
+          ? `${health} · ${volumeStateMeta[b.volume.state].label}`
+          : health;
         const reason = key === "healthy" ? null : b.health_reason;
         return reason ? (
           <span className="flex flex-col items-end text-right">
@@ -313,7 +328,10 @@ export function BridgesListPage() {
                   whether the bridge answers the server, and when it does not, why, in the
                   server&apos;s words. Unknown means nothing has been sent to it since the server
                   started, so there is nothing to judge by yet. A bridge is healthy again as soon as
-                  a transaction is delivered or a Test connection is answered.
+                  a transaction is delivered or a Test connection is answered. For a bridge this
+                  server runs, Volume nearly full or Volume full beneath it says the disk the bridge
+                  keeps its database on is running out; a full one stops the bridge. Its page says
+                  how full and lets you give it a larger size.
                 </dd>
               </div>
               <div>

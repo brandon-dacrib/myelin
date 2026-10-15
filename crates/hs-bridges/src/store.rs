@@ -204,6 +204,11 @@ pub struct InstanceRow {
     /// switched off.
     #[serde(default)]
     pub double_puppet: Option<DoublePuppetRow>,
+    /// The size of its volume an administrator set (`PUT .../instances/{user}` with
+    /// `volume_size`, `hs_admin::bridge_volume::parse_size`); `None` for the default
+    /// (`hs_admin::bridge_volume::DEFAULT_SIZE`). Only ever raised: a volume cannot shrink.
+    #[serde(default)]
+    pub volume_size: Option<String>,
     pub created_at_ms: u64,
     /// When it entered its current state.
     pub state_since_ms: u64,
@@ -249,6 +254,7 @@ impl InstanceRow {
             registered_fingerprint: None,
             applied_fingerprint: None,
             double_puppet: None,
+            volume_size: None,
             created_at_ms: now_ms,
             state_since_ms: now_ms,
             ready_at_ms: None,

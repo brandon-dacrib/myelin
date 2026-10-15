@@ -5,6 +5,7 @@ import { http, HttpResponse } from "msw";
 import { signIn, signOut } from "@/lib/auth";
 import { server } from "@/mocks/node";
 import { Toaster } from "@/components/ui/toast/Toaster";
+import { setVolumeSize } from "@/mocks/data/bridge-offerings";
 import { renderBridgesRoute } from "./test-utils";
 import { BridgeDetailPage } from "./BridgeDetailPage";
 
@@ -357,5 +358,115 @@ describe("Bridge transactions", () => {
       await screen.findByText(/^Replaying 2 dead-lettered transactions to /),
     ).toBeInTheDocument();
     expect(screen.getByText("Task task-replay1")).toBeInTheDocument();
+  });
+});
+
+describe("Bridge page: volume", () => {
+  // The mock server's `slack-brandon` is Brandon's Slack bridge from the Slack offering, which
+  // this server deploys: 98% of a 1Gi volume, stopped for want of space (the demo's, 2026-10-15).
+  it("says a deployed bridge's volume is full, how full, and what to do", async () => {
+    renderBridge("slack-brandon");
+    const alert = await screen.findByTestId("volume-alert");
+    expect(alert).toHaveTextContent(/Volume full\./);
+    expect(alert).toHaveTextContent(/No space left on device/);
+    const section = within(screen.getByRole("region", { name: "Volume" }));
+    expect(section.getByText("1Gi")).toBeInTheDocument();
+    expect(section.getByText("1003.5 MiB of 1.0 GiB used (98%)")).toBeInTheDocument();
+    expect(section.getByRole("meter", { name: "Volume used" })).toHaveAttribute(
+      "aria-valuenow",
+      "98",
+    );
+    expect(section.getByText(/Measured/)).toBeInTheDocument();
+    // The size control, once the offering's instance is found, suggests double the size and says
+    // what the volume holds and what growing it does.
+    expect(await section.findByRole("textbox", { name: "New size" })).toHaveValue("2Gi");
+    const explained = section.getByText(/holds the bridge's database and configuration/);
+    expect(explained).toHaveTextContent(/can only grow/);
+    expect(explained).toHaveTextContent(/keeping everything on it, and the bridge restarts/);
+    expect(explained).toHaveTextContent(/A new bridge gets 5Gi/);
+    expect(section.getByText("A whole number of Mi, Gi or Ti, from 1Gi up to 1Ti.")).toBeVisible();
+  });
+
+  it("gives the bridge a larger volume through its offering's instance", async () => {
+    let sent: { path: string; body: unknown } | undefined;
+    server.events.on("request:start", async ({ request }) => {
+      if (request.method === "PUT" && request.url.includes("/instances/"))
+        sent = { path: new URL(request.url).pathname, body: await request.clone().json() };
+    });
+    try {
+      renderBridge("slack-brandon");
+      const field = await screen.findByRole("textbox", { name: "New size" });
+      await userEvent.clear(field);
+      await userEvent.type(field, "4Gi");
+      await userEvent.click(screen.getByRole("button", { name: "Set size" }));
+      await waitFor(() =>
+        expect(sent).toEqual({
+          path: "/api/v1/bridge-offerings/mautrix-slack/instances/%40brandon%3Aexample.org",
+          body: { volume_size: "4Gi" },
+        }),
+      );
+      // The registration is read again: the volume has room, and the alert is gone.
+      await waitFor(() => expect(screen.queryByTestId("volume-alert")).toBeNull());
+      const section = within(screen.getByRole("region", { name: "Volume" }));
+      expect(await section.findByText("4Gi")).toBeInTheDocument();
+      expect(section.getByText(/of 4\.0 GiB used \(25%\)/)).toBeInTheDocument();
+    } finally {
+      server.events.removeAllListeners();
+    }
+  });
+
+  it("shows the server's refusal of a smaller size under the field", async () => {
+    // Grown to 4Gi already; the mock server refuses less, as the real one does.
+    setVolumeSize("mautrix-slack", "@brandon:example.org", "4Gi");
+    renderBridge("slack-brandon");
+    const field = await screen.findByRole("textbox", { name: "New size" });
+    expect(field).toHaveValue("8Gi");
+    await userEvent.clear(field);
+    await userEvent.type(field, "2Gi");
+    await userEvent.click(screen.getByRole("button", { name: "Set size" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "volume_size 2Gi is less than the 4Gi the volume has now; a volume cannot shrink.",
+    );
+    expect(field).toHaveAttribute("aria-invalid", "true");
+    // Nothing changed.
+    expect(screen.getByRole("region", { name: "Volume" })).toHaveTextContent("4Gi");
+  });
+
+  it("shows the server's refusal of a size below the smallest", async () => {
+    renderBridge("slack-brandon");
+    const field = await screen.findByRole("textbox", { name: "New size" });
+    await userEvent.clear(field);
+    await userEvent.type(field, "512Mi");
+    await userEvent.click(screen.getByRole("button", { name: "Set size" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "volume_size 512Mi is less than 1Gi, the smallest volume a bridge gets.",
+    );
+    expect(screen.getByTestId("volume-alert")).toBeInTheDocument();
+  });
+
+  it("checks how a size is written before asking the server", async () => {
+    renderBridge("slack-brandon");
+    const field = await screen.findByRole("textbox", { name: "New size" });
+    await userEvent.clear(field);
+    await userEvent.type(field, "10GB");
+    await userEvent.click(screen.getByRole("button", { name: "Set size" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "A size is a whole number of Mi, Gi or Ti, such as 10Gi.",
+    );
+  });
+
+  it("cannot set the size without bridges:write", async () => {
+    signOut();
+    await signIn(["bridges:read"]);
+    renderBridge("slack-brandon");
+    expect(await screen.findByRole("textbox", { name: "New size" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Set size" })).toBeDisabled();
+  });
+
+  it("has no volume section for a bridge run elsewhere", async () => {
+    renderBridge("telegram");
+    expect(await screen.findByRole("heading", { level: 1 })).toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Volume" })).toBeNull();
+    expect(screen.queryByTestId("volume-alert")).toBeNull();
   });
 });

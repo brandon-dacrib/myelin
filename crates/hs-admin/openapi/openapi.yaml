@@ -114,6 +114,15 @@ info:
       nothing queued and, with failing_for, every one failing that long whose queue is only for
       rooms this server left, answering DestinationPruneReport; Destination.shared_rooms_count
       and the list''s shares_room filter (decision 0042).'
+  - version: 0.1.18
+    date: '2026-10-15'
+    notes: 'Additive: BridgeVolume, the volume of a bridge this server deploys (its size, how
+      full the operator last measured it, and state ok, nearly_full, full or unknown with what
+      to do), on BridgeInstance.volume and AppService.volume; BridgeInstanceRequest.volume_size
+      sets an instance''s volume size (a whole Mi, Gi or Ti from 1Gi to 1Ti, never less than it
+      has: 400 at /volume_size otherwise); BridgeDeployment.storage_size,
+      volume_capacity_bytes, volume_used_bytes and volume_observed_at. The default volume is
+      5Gi (it was 1Gi).'
 servers:
 - url: /api/v1
   description: Same origin as /_matrix on the client listener.
@@ -8415,6 +8424,11 @@ components:
               - 'null'
         queue:
           $ref: '#/components/schemas/AppServiceQueue'
+        volume:
+          oneOf:
+          - $ref: '#/components/schemas/BridgeVolume'
+          - type: 'null'
+          description: For the registration of a bridge this server deploys, its volume as the bridge manager last read it (about once a minute), so a list can say a bridge's volume is nearly full or full without a request per row. Null for any other registration.
     AppServiceQueue:
       type: object
       description: What waits to be sent to this appservice, read from its delivery queue when the row is answered. Each entry is one room's page of events or one batch of ephemeral data; up to twenty are merged into one transaction. A bridge that keeps up holds pending near 0. The hs_appservice_queue_depth, hs_appservice_queue_dead_lettered and hs_appservice_queue_oldest_age_seconds gauges say the same per appservice.
@@ -8738,6 +8752,11 @@ components:
           - string
           - 'null'
           description: 'For an instance run elsewhere: where this server reaches the bridge, as `host`, `host:port` or a full `http(s)://` URL (a bare host takes the type''s port). The registration''s `url` and the files the bridge runs from are rewritten with it. `null` leaves it as it is. Refused for an instance this server deploys.'
+        volume_size:
+          type:
+          - string
+          - 'null'
+          description: 'For an instance this server deploys: the size of its volume, a whole number of `Mi`, `Gi` or `Ti` (`10Gi`) from 1Gi to 1Ti. A volume cannot shrink, so a size less than it has now (BridgeVolume.cluster_size, else BridgeVolume.size) is refused, as is any size for an instance run elsewhere: 400 naming `/volume_size`. The volume grows in place, keeping what is on it (the StorageClass must allow expansion), and the bridge restarts. `null` leaves it as it is.'
     BridgeLogins:
       type: object
       description: Who has signed in to a bridge and as what, as the bridge's provisioning API says.
@@ -9090,6 +9109,64 @@ components:
           items:
             $ref: '#/components/schemas/RemovedBotDevice'
           description: The bot's devices the manager removed because the bridge had moved on to a newer one, newest last; the last five. A bridge whose crypto store was reset makes a new device and leaves the old one registered, and clients go on encrypting room keys to it (and withholding keys from it). The manager removes a bot's device once another device of the bot with keys was seen in use after it and it has gone unseen for a day; the device in use is never removed.
+        volume:
+          oneOf:
+          - $ref: '#/components/schemas/BridgeVolume'
+          - type: 'null'
+          description: Its volume, for an instance this server deploys; null for one run elsewhere.
+    BridgeVolume:
+      type: object
+      description: 'The volume of a bridge this server deploys, mounted at /data: its database, configuration and anything else it keeps. The operator measures it about once a minute from the kubelet''s volume statistics; a bridge whose volume fills stops, so nearly_full and full say what to do.'
+      required:
+      - size
+      - size_set
+      - state
+      properties:
+        size:
+          type: string
+          description: The size this server asks for, a Kubernetes quantity (`5Gi`), set for the instance (BridgeInstanceRequest.volume_size) or the default, 5Gi.
+        size_set:
+          type: boolean
+          description: Whether size was set for this instance; false for the default.
+        cluster_size:
+          type:
+          - string
+          - 'null'
+          description: What the Bridge in the cluster asks for when that is more than size (someone raised it by hand); the volume keeps it, since a volume never shrinks.
+        capacity_bytes:
+          type:
+          - integer
+          - 'null'
+          description: The filesystem's size in bytes when last measured.
+        used_bytes:
+          type:
+          - integer
+          - 'null'
+          description: Bytes in use when last measured.
+        used_ratio:
+          type:
+          - number
+          - 'null'
+          description: used_bytes / capacity_bytes, 0 to 1.
+        observed_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: When the kubelet measured it. A bridge that is not running is not measured, so a full volume that stopped its bridge keeps its last measurement.
+        state:
+          type: string
+          enum:
+          - ok
+          - nearly_full
+          - full
+          - unknown
+          description: '`nearly_full` from 85% used, `full` from 95% or when the bridge stopped saying it could not write (`No space left on device`, `database or disk is full`), `unknown` before the first measurement.'
+        message:
+          type:
+          - string
+          - 'null'
+          description: What a nearly full or full volume means and what to do, in a sentence for a person; null otherwise.
     RemovedBotDevice:
       type: object
       required:
@@ -9143,6 +9220,27 @@ components:
           - string
           - 'null'
           description: What the operator last said (a pull failure, a crash loop, waiting for the pod).
+        storage_size:
+          type:
+          - string
+          - 'null'
+          description: The volume size the Bridge asks for (spec.storage.size), which is more than this server wrote where someone raised it by hand.
+        volume_capacity_bytes:
+          type:
+          - integer
+          - 'null'
+          description: The volume's filesystem size in bytes when the operator last measured it (the Bridge's status.volume); null before the first measurement.
+        volume_used_bytes:
+          type:
+          - integer
+          - 'null'
+          description: Bytes in use on the volume when the operator last measured it.
+        volume_observed_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: When that measurement was taken.
     BridgeInstanceFiles:
       type: object
       properties:

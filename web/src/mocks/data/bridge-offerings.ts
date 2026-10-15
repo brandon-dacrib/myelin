@@ -4,13 +4,15 @@ import type {
   BridgeInstanceFiles,
   BridgeOffering,
   BridgeOfferingRequest,
+  BridgeVolume,
 } from "@/api/bridges";
 import { appservices } from "./appservices";
 import { bridgeTypes } from "./bridge-types";
 
 /**
  * RFC 0017's offerings and instances, as the mock server keeps them: a WhatsApp offering the
- * cluster runs (people in every state, one of them stuck on an image pull) and an iMessage
+ * cluster runs (people in every state, one of them stuck on an image pull), a Slack offering the
+ * cluster runs whose one bridge has filled its volume (the demo's, 2026-10-15), and an iMessage
  * offering that runs elsewhere. Instances created while the mock runs walk the state machine
  * by the clock, so a page watching one sees it go from requested to ready in about ten seconds.
  */
@@ -111,6 +113,62 @@ function resourceName(appserviceId: string): string {
   return `bridge-${h.toString(16).padStart(8, "0")}`;
 }
 
+const MiB = 2 ** 20;
+const GiB = 2 ** 30;
+
+/** The volume a new instance this server deploys gets: the 5Gi default, not measured yet. */
+function defaultVolume(): BridgeVolume {
+  return {
+    size: "5Gi",
+    size_set: false,
+    cluster_size: null,
+    capacity_bytes: null,
+    used_bytes: null,
+    used_ratio: null,
+    observed_at: null,
+    state: "unknown",
+    message: null,
+  };
+}
+
+/** What the server says about a volume `used` bytes full, as `hs_bridges` words it. */
+function measuredVolume(
+  volume: BridgeVolume,
+  used: number,
+  capacity: number,
+  observedAt: string,
+  stoppedForSpace = false,
+): BridgeVolume {
+  const ratio = used / capacity;
+  const state = stoppedForSpace || ratio >= 0.95 ? "full" : ratio >= 0.85 ? "nearly_full" : "ok";
+  const pct = Math.round(ratio * 100);
+  const message =
+    state === "full"
+      ? stoppedForSpace
+        ? `The bridge's volume is full (${pct}% used) and the bridge stopped: it could not write (No space left on device). Give it a larger size; the volume grows in place and the bridge restarts.`
+        : `The bridge's volume is full (${pct}% used), so the bridge cannot write and stops. Give it a larger size; the volume grows in place and the bridge restarts.`
+      : state === "nearly_full"
+        ? `The bridge's volume is ${pct}% used; when it fills, the bridge stops. Give it a larger size before then.`
+        : null;
+  return {
+    ...volume,
+    capacity_bytes: capacity,
+    used_bytes: used,
+    used_ratio: ratio,
+    observed_at: observedAt,
+    state,
+    message,
+  };
+}
+
+const QUANTITY_UNITS: Record<string, number> = { Mi: MiB, Gi: GiB, Ti: 2 ** 40 };
+
+/** `5Gi` in bytes, for the units the server takes; null for anything else. */
+function quantityBytes(quantity: string): number | null {
+  const match = /^(\d+)(Mi|Gi|Ti)$/.exec(quantity);
+  return match ? Number(match[1]) * QUANTITY_UNITS[match[2]] : null;
+}
+
 function newTokens(id: string) {
   const rand = () => Math.random().toString(36).slice(2, 10);
   return { as: `as_${id}_${rand()}`, hs: `hs_${id}_${rand()}` };
@@ -141,6 +199,7 @@ function makeInstance(
     health: null,
     created_at: new Date().toISOString(),
     ready_at: null,
+    volume: offering.runtime === "cluster" ? defaultVolume() : null,
     tokens: newTokens(appserviceId),
     ...fields,
   };
@@ -175,6 +234,15 @@ function seed() {
     options: { encryption: true, double_puppeting: true, backfill: true },
     created_at: iso(14 * DAY),
   };
+  const slack: MockOffering = {
+    type: "mautrix-slack",
+    enabled: true,
+    runtime: "cluster",
+    imageTag: "v0.2609.1",
+    access: { all_local_users: true, users: [] },
+    options: { encryption: true, double_puppeting: true, backfill: true },
+    created_at: iso(30 * DAY),
+  };
   const imessage: MockOffering = {
     type: "mautrix-imessage",
     enabled: true,
@@ -200,7 +268,9 @@ function seed() {
     return i;
   };
   const alice = ready("@alice:example.org", 12 * DAY);
+  alice.volume = measuredVolume(defaultVolume(), 612 * MiB, 5 * GiB, iso(40_000));
   const ops = ready("@ops:example.org", 13 * DAY);
+  ops.volume = measuredVolume(defaultVolume(), 148 * MiB, 5 * GiB, iso(55_000));
   const carol = makeInstance(whatsapp, "@carol:example.org", {
     state: "starting",
     reason: "Waiting for the bridge to answer this server's ping.",
@@ -221,6 +291,29 @@ function seed() {
     'ImagePullBackOff: Back-off pulling image "dock.mau.dev/mautrix/whatsapp:v0.12.1": toomanyrequests: rate limit exceeded',
   );
 
+  // The demo's Slack bridge (2026-10-15): deployed with the old 1Gi default, which filled; its
+  // init container could not copy its files and the bridge stopped for a day.
+  const brandon = makeInstance(slack, "@brandon:example.org", {
+    state: "ready",
+    health: "degraded",
+    created_at: iso(30 * DAY),
+    ready_at: iso(30 * DAY - 120_000),
+    chat_started_by: "owner",
+  });
+  brandon.volume = measuredVolume(
+    { ...defaultVolume(), size: "1Gi", size_set: true },
+    0.98 * GiB,
+    GiB,
+    iso(26 * 3_600_000),
+    true,
+  );
+  brandon.deployment = deploymentFor(
+    slack,
+    brandon,
+    "Degraded",
+    "Init:CrashLoopBackOff: init container copy-files exited 1: cp: write error: No space left on device",
+  );
+
   const aliceMac = makeInstance(imessage, "@alice:example.org", {
     state: "starting",
     reason: waitingReason(imessage.type),
@@ -229,9 +322,10 @@ function seed() {
   });
 
   return {
-    offerings: [whatsapp, imessage],
+    offerings: [whatsapp, slack, imessage],
     instances: {
       [whatsapp.type]: [alice, ops, carol, dave],
+      [slack.type]: [brandon],
       [imessage.type]: [aliceMac],
     } as Record<string, MockInstance[]>,
   };
@@ -290,11 +384,35 @@ function advance(offering: MockOffering, instance: MockInstance): MockInstance {
     health: "healthy",
     ready_at: new Date(instance.startedAt + 9_000).toISOString(),
     deployment: deploymentFor(offering, base, "Ready", null),
+    // Once it runs, the operator measures it: a new bridge uses little of its volume.
+    volume:
+      base.volume && base.volume.state === "unknown"
+        ? measuredVolume(
+            base.volume,
+            24 * MiB,
+            quantityBytes(base.volume.cluster_size ?? base.volume.size) ?? 5 * GiB,
+            new Date(instance.startedAt + 9_000).toISOString(),
+          )
+        : base.volume,
   };
 }
 
 function publicInstance(instance: MockInstance): BridgeInstance {
   const { startedAt: _startedAt, tokens: _tokens, ...rest } = instance;
+  // The deployment carries what the Bridge asks for and the operator last measured.
+  const volume = rest.volume;
+  if (rest.deployment && volume) {
+    return {
+      ...rest,
+      deployment: {
+        ...rest.deployment,
+        storage_size: volume.cluster_size ?? volume.size,
+        volume_capacity_bytes: volume.capacity_bytes ?? null,
+        volume_used_bytes: volume.used_bytes ?? null,
+        volume_observed_at: volume.observed_at ?? null,
+      },
+    };
+  }
   return rest;
 }
 
@@ -513,6 +631,62 @@ export function putInstance(
   return publicInstance(advance(offering, instance));
 }
 
+/**
+ * Why a `PUT` with `volume_size` would be refused, or `null`, as the real server says it (a 400
+ * naming `/volume_size`): only for an instance this server deploys, a whole number of Mi, Gi or
+ * Ti, from 1Gi to 1Ti, and never less than the volume has now.
+ */
+export function volumeSizeRefusal(type: string, userSegment: string, size: string): string | null {
+  const offering = findOffering(type);
+  const instance = findInstance(type, userSegment);
+  if (!offering || !instance) return null;
+  const name = catalogueEntry(type)?.name ?? type;
+  if (offering.runtime !== "cluster" || !instance.volume)
+    return `${name} runs elsewhere, so this server has no volume of it to size; its volume is wherever it runs.`;
+  const bytes = quantityBytes(size.trim());
+  if (bytes === null)
+    return `volume_size "${size}" is not a whole number of Mi, Gi or Ti (such as 10Gi).`;
+  if (bytes < GiB)
+    return `volume_size ${size} is less than 1Gi, the smallest volume a bridge gets.`;
+  if (bytes > 2 ** 40)
+    return `volume_size ${size} is more than 1Ti, the largest volume a bridge gets.`;
+  const current = instance.volume.cluster_size ?? instance.volume.size;
+  const currentBytes = quantityBytes(current) ?? 0;
+  if (bytes < currentBytes)
+    return `volume_size ${size} is less than the ${current} the volume has now; a volume cannot shrink.`;
+  return null;
+}
+
+/**
+ * Sets an instance's volume size (checked with `volumeSizeRefusal` first). The volume grows in
+ * place and the bridge restarts; the mock measures it again at once, so a full volume reads as
+ * having room.
+ */
+export function setVolumeSize(type: string, userSegment: string, size: string): void {
+  const instance = findInstance(type, userSegment);
+  if (!instance?.volume) return;
+  const bytes = quantityBytes(size.trim()) ?? 0;
+  const grown: BridgeVolume = {
+    ...instance.volume,
+    size: size.trim(),
+    size_set: true,
+    // The cluster's own larger size is overtaken once this server asks for at least as much.
+    cluster_size: null,
+  };
+  instance.volume =
+    instance.volume.used_bytes != null
+      ? measuredVolume(grown, instance.volume.used_bytes, bytes, new Date().toISOString())
+      : grown;
+  if (
+    instance.deployment &&
+    instance.deployment.phase === "Degraded" &&
+    instance.state === "ready"
+  ) {
+    instance.deployment = { ...instance.deployment, phase: "Ready", ready: true, message: null };
+    instance.health = "healthy";
+  }
+}
+
 export function deleteInstance(type: string, userSegment: string): boolean {
   const instance = findInstance(type, userSegment);
   if (!instance) return false;
@@ -612,7 +786,7 @@ export function instanceFiles(type: string, userSegment: string): BridgeInstance
     `  image: { repository: ${imageOf(offering).split(":")[0]}, tag: ${offering.imageTag} }`,
     `  port: ${port}`,
     `  filesSecret: ${name}-files`,
-    "  storage: { size: 1Gi }",
+    `  storage: { size: ${instance.volume?.cluster_size ?? instance.volume?.size ?? "5Gi"} }`,
   ].join("\n");
   // For a program on a Mac: what the real server renders beside the two YAML files, which
   // fetches the pinned build when it is not there yet, clears its quarantine flag and starts it.

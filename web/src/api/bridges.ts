@@ -757,3 +757,49 @@ export function useBridgeInstanceFiles() {
       ),
   });
 }
+
+/**
+ * The volume of a bridge this server deploys (OpenAPI 0.1.18): its size, how full the operator
+ * last measured it, and `ok`, `nearly_full`, `full` or `unknown` with what to do. On
+ * `BridgeInstance.volume` and `AppService.volume`; null for a bridge run elsewhere.
+ */
+export type BridgeVolume = components["schemas"]["BridgeVolume"];
+export type BridgeVolumeState = BridgeVolume["state"];
+
+/** What `useSetBridgeVolumeSize` is called with. */
+export interface SetBridgeVolumeSizeVariables {
+  /** The offering's bridge type (`mautrix-slack`). */
+  type: string;
+  /** The instance's owner, or `_` for a shared instance (`instanceUserSegment`). */
+  userId: string;
+  /** The new size: a whole `Mi`, `Gi` or `Ti` (`10Gi`). */
+  size: string;
+  /** The instance's registration, when known: the bridge's page reads `volume` from it. */
+  appserviceId?: string | null;
+}
+
+/**
+ * Sets the size of an instance's volume (`PUT .../instances/{user_id}` with `volume_size`, a
+ * whole `Mi`, `Gi` or `Ti` from 1Gi to 1Ti, never less than it has now). The volume grows in
+ * place keeping its data, and the bridge restarts. The server refuses anything else with a 400
+ * naming `/volume_size`, which the caller shows beside the field. Needs `bridges:write`.
+ */
+export function useSetBridgeVolumeSize() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ type, userId, size }: SetBridgeVolumeSizeVariables) =>
+      unwrap(
+        await api.PUT("/bridge-offerings/{type}/instances/{user_id}", {
+          params: { path: { type, user_id: userId } },
+          body: { volume_size: size },
+        }),
+      ),
+    onSuccess: (instance, { type, userId, appserviceId }) => {
+      qc.setQueryData(["bridge-instance", type, userId], instance);
+      qc.invalidateQueries({ queryKey: ["bridge-instance", type, userId] });
+      invalidateOffering(qc, type);
+      const id = appserviceId ?? instance.appservice_id;
+      if (id) qc.invalidateQueries({ queryKey: ["appservice", id] });
+    },
+  });
+}

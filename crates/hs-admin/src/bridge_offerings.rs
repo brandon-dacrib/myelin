@@ -55,6 +55,17 @@ pub trait BridgeOfferingSource: Send + Sync + 'static {
         user_id: &str,
         address: &str,
     ) -> Result<BridgeInstance, SourceError>;
+    /// Sets the size of the volume of an instance this server deploys
+    /// ([`crate::bridge_volume::parse_size`]: a whole `Mi`, `Gi` or `Ti`, 1Gi to 1Ti, never
+    /// less than the volume has now). The volume grows in place and the bridge restarts.
+    /// [`SourceError::InvalidField`] at `/volume_size` for a size refused, or for an instance run
+    /// elsewhere.
+    async fn set_instance_volume_size(
+        &self,
+        bridge_type: &str,
+        user_id: &str,
+        size: &str,
+    ) -> Result<BridgeInstance, SourceError>;
     async fn delete_instance(&self, bridge_type: &str, user_id: &str) -> Result<(), SourceError>;
     /// The files to run an instance elsewhere, with its own tokens.
     async fn instance_files(
@@ -247,9 +258,10 @@ impl BridgeOfferingSource for InMemoryBridgeOfferings {
         bridge_type: &str,
         user_id: &str,
     ) -> Result<BridgeInstance, SourceError> {
-        if self.get(bridge_type).await?.is_none() {
+        let Some(offering) = self.get(bridge_type).await? else {
             return Err(SourceError::NotFound);
-        }
+        };
+        let offering_runtime = offering.runtime;
         let mut instances = self.instances.write().expect("lock");
         let instance = instances
             .entry((bridge_type.to_owned(), user_id.to_owned()))
@@ -258,6 +270,9 @@ impl BridgeOfferingSource for InMemoryBridgeOfferings {
                 user_id: (user_id != SHARED_INSTANCE).then(|| user_id.to_owned()),
                 state: "requested".into(),
                 created_at: "2026-09-26T00:00:00.000Z".into(),
+                volume: (offering_runtime == "cluster").then(|| {
+                    crate::bridge_volume::view(crate::bridge_volume::DEFAULT_SIZE, false, None)
+                }),
                 ..BridgeInstance::default()
             });
         Ok(instance.clone())
@@ -284,6 +299,40 @@ impl BridgeOfferingSource for InMemoryBridgeOfferings {
             .get_mut(&(bridge_type.to_owned(), user_id.to_owned()))
             .ok_or(SourceError::NotFound)?;
         instance.url = Some(url);
+        Ok(instance.clone())
+    }
+
+    async fn set_instance_volume_size(
+        &self,
+        bridge_type: &str,
+        user_id: &str,
+        size: &str,
+    ) -> Result<BridgeInstance, SourceError> {
+        let offering = self.get(bridge_type).await?.ok_or(SourceError::NotFound)?;
+        if offering.runtime != "cluster" {
+            return Err(SourceError::InvalidField {
+                pointer: "/volume_size",
+                detail: "this server does not deploy that bridge: its volume is wherever it runs"
+                    .into(),
+            });
+        }
+        let mut instances = self.instances.write().expect("lock");
+        let instance = instances
+            .get_mut(&(bridge_type.to_owned(), user_id.to_owned()))
+            .ok_or(SourceError::NotFound)?;
+        let current = instance
+            .volume
+            .as_ref()
+            .map(|v| v.cluster_size.clone().unwrap_or_else(|| v.size.clone()));
+        let (size, _) =
+            crate::bridge_volume::parse_size(size, current.as_deref()).map_err(|detail| {
+                SourceError::InvalidField {
+                    pointer: "/volume_size",
+                    detail,
+                }
+            })?;
+        let deployment = instance.deployment.clone();
+        instance.volume = Some(crate::bridge_volume::view(&size, true, deployment.as_ref()));
         Ok(instance.clone())
     }
 
@@ -430,5 +479,88 @@ mod address_tests {
         ] {
             assert!(instance_url(bad, 29331).is_err(), "{bad:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod volume_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_deployed_instances_volume_size_is_set_and_never_shrunk() {
+        let source = InMemoryBridgeOfferings::in_cluster("myelin");
+        source
+            .put("mautrix-slack", BridgeOfferingRequest::default())
+            .await
+            .unwrap();
+        let created = source
+            .put_instance("mautrix-slack", "@alice:example.org")
+            .await
+            .unwrap();
+        let volume = created.volume.unwrap();
+        assert_eq!(volume.size, crate::bridge_volume::DEFAULT_SIZE);
+        assert!(!volume.size_set);
+
+        let raised = source
+            .set_instance_volume_size("mautrix-slack", "@alice:example.org", "20Gi")
+            .await
+            .unwrap();
+        let volume = raised.volume.unwrap();
+        assert_eq!(volume.size, "20Gi");
+        assert!(volume.size_set);
+
+        let shrink = source
+            .set_instance_volume_size("mautrix-slack", "@alice:example.org", "10Gi")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&shrink, SourceError::InvalidField { pointer: "/volume_size", detail } if detail.contains("cannot shrink")),
+            "{shrink:?}"
+        );
+        let junk = source
+            .set_instance_volume_size("mautrix-slack", "@alice:example.org", "lots")
+            .await
+            .unwrap_err();
+        assert!(matches!(junk, SourceError::InvalidField { .. }), "{junk:?}");
+        assert!(matches!(
+            source
+                .set_instance_volume_size("mautrix-slack", "@bob:example.org", "20Gi")
+                .await,
+            Err(SourceError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_instance_run_elsewhere_has_no_volume_to_size() {
+        let source = InMemoryBridgeOfferings::default();
+        source
+            .put(
+                "mautrix-imessage",
+                BridgeOfferingRequest {
+                    runtime: Some("elsewhere".into()),
+                    ..BridgeOfferingRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        let created = source
+            .put_instance("mautrix-imessage", "@alice:example.org")
+            .await
+            .unwrap();
+        assert!(created.volume.is_none());
+        let refused = source
+            .set_instance_volume_size("mautrix-imessage", "@alice:example.org", "10Gi")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                SourceError::InvalidField {
+                    pointer: "/volume_size",
+                    ..
+                }
+            ),
+            "{refused:?}"
+        );
     }
 }

@@ -50,6 +50,67 @@ describe("Bridges list", () => {
     expect(screen.queryByTestId("health-reason-whatsapp")).toBeNull();
   });
 
+  it("says at a glance that a bridge's volume is full, and what that means", async () => {
+    // The mock's `slack-brandon` is a bridge this server deploys whose 1Gi volume filled (the
+    // demo's Slack bridge, 2026-10-15): its health alone only said Degraded.
+    renderBridgesRoute("/bridges/registrations", BridgesListPage, "/bridges/registrations");
+    const state = await screen.findByTestId("state-slack-brandon");
+    expect(within(state).getByText("Degraded")).toBeInTheDocument();
+    const full = within(state).getByText("Volume full");
+    expect(full.closest("[title]")).toHaveAttribute(
+      "title",
+      expect.stringMatching(/No space left on device/),
+    );
+    expect(state).toHaveTextContent(/No space left on device/);
+    // A bridge whose volume has room, or that has none here, says nothing of it.
+    expect(within(screen.getByTestId("state-whatsapp")).queryByText(/Volume/)).toBeNull();
+    await userEvent.click(screen.getByText("What the columns mean"));
+    expect(screen.getByText(/Volume nearly full or Volume full beneath it/)).toBeVisible();
+  });
+
+  it("warns of a nearly full volume, and keeps quiet about one with room", async () => {
+    const volume = (state: "ok" | "nearly_full", ratio: number) => ({
+      size: "5Gi",
+      size_set: false,
+      cluster_size: null,
+      capacity_bytes: 5 * 2 ** 30,
+      used_bytes: ratio * 5 * 2 ** 30,
+      used_ratio: ratio,
+      observed_at: new Date().toISOString(),
+      state,
+      message: state === "nearly_full" ? "The bridge's volume is 90% used." : null,
+    });
+    server.use(
+      http.get("/api/v1/appservices", () =>
+        HttpResponse.json({
+          items: [
+            {
+              id: "signal-alice",
+              sender_localpart: "signalbot_alice",
+              url: "http://bridge-signal-alice.myelin.svc:29328",
+              health: "healthy",
+              volume: volume("nearly_full", 0.9),
+            },
+            {
+              id: "signal-bob",
+              sender_localpart: "signalbot_bob",
+              url: "http://bridge-signal-bob.myelin.svc:29328",
+              health: "healthy",
+              volume: volume("ok", 0.1),
+            },
+          ],
+          next_cursor: null,
+          prev_cursor: null,
+        }),
+      ),
+    );
+    renderBridgesRoute("/bridges/registrations", BridgesListPage, "/bridges/registrations");
+    const alice = await screen.findByTestId("state-signal-alice");
+    expect(within(alice).getByText("Volume nearly full")).toBeInTheDocument();
+    expect(alice).toHaveTextContent(/90% used/);
+    expect(within(screen.getByTestId("state-signal-bob")).queryByText(/Volume/)).toBeNull();
+  });
+
   it("marks the server's own bridge manager as built in, not as a bridge of unknown health", async () => {
     server.use(
       http.get("/api/v1/appservices", () =>

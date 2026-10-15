@@ -1,7 +1,9 @@
 //! The admin API's appservice directory with the bridge manager's knowledge added: a bridge
 //! registered by hand for a network this server offers says so in its health
-//! (`AppServiceHealth.overlaps_offering`, [`crate::overlap`]). Everything else is the inner
-//! directory's, untouched.
+//! (`AppServiceHealth.overlaps_offering`, [`crate::overlap`]), and the registration of an
+//! instance this server deploys carries its volume (`AppService.volume`, as the manager last
+//! read it), so the Registrations page can say "volume full" rather than only "degraded".
+//! Everything else is the inner directory's, untouched.
 
 use std::sync::Arc;
 
@@ -52,11 +54,18 @@ impl<B: KvBackend + 'static> OfferingAwareDirectory<B> {
 #[async_trait]
 impl<B: KvBackend + 'static> AppserviceDirectory for OfferingAwareDirectory<B> {
     async fn list(&self) -> Result<Vec<AdminAppservice>, SourceError> {
-        self.inner.list().await
+        let mut items = self.inner.list().await?;
+        for item in &mut items {
+            item.volume = self.manager.volume_of_appservice(&item.id);
+        }
+        Ok(items)
     }
 
     async fn get(&self, id: &str) -> Result<Option<AdminAppservice>, SourceError> {
-        self.inner.get(id).await
+        Ok(self.inner.get(id).await?.map(|mut item| {
+            item.volume = self.manager.volume_of_appservice(&item.id);
+            item
+        }))
     }
 
     async fn create(&self, request: AdminAppserviceCreate) -> Result<AdminAppservice, SourceError> {

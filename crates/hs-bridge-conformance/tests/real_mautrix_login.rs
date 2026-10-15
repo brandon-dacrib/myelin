@@ -1223,6 +1223,24 @@ async fn rolled_keeps_its_own_pickle_key() -> Result<()> {
     .await?;
     let own = pickle_key_of(&scene.bridge.read_file("/data/config.yaml")?)
         .context("the bridge wrote no pickle key of its own")?;
+    // Its logs go to standard output only (2026-10-15): mautrix's default also writes up to
+    // 1.1 GB of log files into /data (`logs/bridge.log` and ten 100 MB backups), which filled
+    // the demo's Slack bridge's 1 GiB volume. The bridge's config upgrader must keep the
+    // rendered `logging` section as written, and the bridge must make no log directory.
+    let written: Value = serde_yaml_ng::from_str(&scene.bridge.read_file("/data/config.yaml")?)?;
+    let writers = written["logging"]["writers"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !writers.is_empty() && writers.iter().all(|w| w["type"] == "stdout"),
+        "the bridge rewrote its logging writers: {writers:?}"
+    );
+    let data = docker(&["exec", &scene.bridge.name, "ls", "-A", "/data"])?;
+    assert!(
+        !data.lines().any(|l| l.trim() == "logs"),
+        "the bridge made a log directory in /data: {data}"
+    );
     let files = scene
         .admin
         .ok(

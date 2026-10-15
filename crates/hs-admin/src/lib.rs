@@ -46,6 +46,7 @@ pub mod auth;
 pub mod bridge_logins;
 pub mod bridge_offerings;
 pub mod bridge_types;
+pub mod bridge_volume;
 pub mod cluster;
 pub mod config_schema;
 pub mod events;

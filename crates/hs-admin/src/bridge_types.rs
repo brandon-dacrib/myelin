@@ -1312,7 +1312,27 @@ fn mautrix_config(p: &MautrixParams<'_>) -> String {
         out.push_str("provisioning:\n");
         out.push_str(&format!("  shared_secret: {secret}\n"));
     }
+    stdout_logging(&mut out);
     out
+}
+
+/// The `logging` section of a mautrix bridge's config (both of mautrix-go's layouts): its
+/// default level, written to standard output only, which the cluster's log collector (or
+/// `docker logs`) keeps. mautrix's own default also writes `./logs/bridge.log` in the bridge's
+/// working directory, `/data`, rotated at 100 MB with ten backups: up to 1.1 GB of the bridge's
+/// volume. On the demo that filled the Slack bridge's 1 GiB volume in under three days
+/// (2026-10-12 to 10-14, about 500 MB a day at its debug level), and the bridge stopped. The
+/// config upgrader keeps a `logging` section as written, so the file writer stays off. A
+/// bridge's files from before keep their old log files until they are removed by hand
+/// (`docs/bridges/mautrix.md`, "A full volume").
+fn stdout_logging(out: &mut String) {
+    out.push_str("# Logs go to standard output only, which the cluster keeps. The bridge's\n");
+    out.push_str("# default also writes up to 1.1 GB of log files into its volume.\n");
+    out.push_str("logging:\n");
+    out.push_str("  min_level: debug\n");
+    out.push_str("  writers:\n");
+    out.push_str("    - type: stdout\n");
+    out.push_str("      format: pretty-colored\n");
 }
 
 /// How many messages a legacy bridge backfills when a portal is created, per kind of chat,
@@ -1432,6 +1452,7 @@ fn mautrix_legacy_config(p: &MautrixParams<'_>) -> String {
     if let Some(network) = &p.network {
         out.push_str(network);
     }
+    stdout_logging(&mut out);
     out
 }
 
@@ -2453,6 +2474,12 @@ mod tests {
         assert_eq!(config["encryption"]["appservice"], true);
         assert_eq!(config["encryption"]["msc4190"], true);
         assert_eq!(config["backfill"]["enabled"], true);
+        // Logs to standard output only: mautrix's default file writer filled the demo's Slack
+        // bridge's 1 GiB volume with up to 1.1 GB of logs (2026-10-14).
+        let writers = config["logging"]["writers"].as_array().unwrap();
+        assert_eq!(writers.len(), 1);
+        assert_eq!(writers[0]["type"], "stdout");
+        assert!(!config_text.contains("type: file"));
         // A provisioning secret of its own, the same in the config and the registration, so the
         // server can ask the bridge who has signed in; and a different one each render.
         let secret = r[PROVISIONING_SECRET_KEY]
@@ -3027,6 +3054,9 @@ mod tests {
             serde_yaml_ng::from_str(shared.config_yaml.as_deref().unwrap()).unwrap();
         assert_eq!(config["appservice"]["database"]["type"], "sqlite3-fk-wal");
         assert!(config.get("database").is_none());
+        // Its logs go to standard output only, as bridgev2's do.
+        assert_eq!(config["logging"]["writers"][0]["type"], "stdout");
+        assert!(config["logging"]["writers"].get(1).is_none());
 
         // Every other mautrix type keeps bridgev2's layout.
         let config = instance_config("mautrix-whatsapp", Some("@alice:chat.example.net"), None);

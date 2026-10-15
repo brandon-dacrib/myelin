@@ -2643,6 +2643,8 @@ export interface components {
             rate_limited?: boolean;
             sender_localpart?: string;
             url?: string | null;
+            /** @description For the registration of a bridge this server deploys, its volume as the bridge manager last read it (about once a minute), so a list can say a bridge's volume is nearly full or full without a request per row. Null for any other registration. */
+            volume?: components["schemas"]["BridgeVolume"] | null;
         };
         AppServiceBacklogEntry: {
             age_ms?: number;
@@ -2773,6 +2775,17 @@ export interface components {
             phase: "Pending" | "Ready" | "Degraded";
             ready: boolean;
             service_url?: string;
+            /** @description The volume size the Bridge asks for (spec.storage.size), which is more than this server wrote where someone raised it by hand. */
+            storage_size?: string | null;
+            /** @description The volume's filesystem size in bytes when the operator last measured it (the Bridge's status.volume); null before the first measurement. */
+            volume_capacity_bytes?: number | null;
+            /**
+             * Format: date-time
+             * @description When that measurement was taken.
+             */
+            volume_observed_at?: string | null;
+            /** @description Bytes in use on the volume when the operator last measured it. */
+            volume_used_bytes?: number | null;
         };
         BridgeDeploymentTarget: {
             available: boolean;
@@ -2824,6 +2837,8 @@ export interface components {
             url?: string | null;
             /** @description The owner; null for a shared type's instance. */
             user_id: string | null;
+            /** @description Its volume, for an instance this server deploys; null for one run elsewhere. */
+            volume?: components["schemas"]["BridgeVolume"] | null;
         };
         BridgeInstanceFiles: {
             compose_yaml?: string;
@@ -2841,6 +2856,8 @@ export interface components {
         BridgeInstanceRequest: {
             /** @description For an instance run elsewhere: where this server reaches the bridge, as `host`, `host:port` or a full `http(s)://` URL (a bare host takes the type's port). The registration's `url` and the files the bridge runs from are rewritten with it. `null` leaves it as it is. Refused for an instance this server deploys. */
             address?: string | null;
+            /** @description For an instance this server deploys: the size of its volume, a whole number of `Mi`, `Gi` or `Ti` (`10Gi`) from 1Gi to 1Ti. A volume cannot shrink, so a size less than it has now (BridgeVolume.cluster_size, else BridgeVolume.size) is refused, as is any size for an instance run elsewhere: 400 naming `/volume_size`. The volume grows in place, keeping what is on it (the StorageClass must allow expansion), and the bridge restarts. `null` leaves it as it is. */
+            volume_size?: string | null;
         };
         BridgeLogin: {
             /** @description The remote network's id for the login. */
@@ -3022,6 +3039,33 @@ export interface components {
             double_puppet_registration_yaml?: string;
             registration?: Record<string, never>;
             registration_yaml?: string;
+        };
+        /** @description The volume of a bridge this server deploys, mounted at /data: its database, configuration and anything else it keeps. The operator measures it about once a minute from the kubelet's volume statistics; a bridge whose volume fills stops, so nearly_full and full say what to do. */
+        BridgeVolume: {
+            /** @description The filesystem's size in bytes when last measured. */
+            capacity_bytes?: number | null;
+            /** @description What the Bridge in the cluster asks for when that is more than size (someone raised it by hand); the volume keeps it, since a volume never shrinks. */
+            cluster_size?: string | null;
+            /** @description What a nearly full or full volume means and what to do, in a sentence for a person; null otherwise. */
+            message?: string | null;
+            /**
+             * Format: date-time
+             * @description When the kubelet measured it. A bridge that is not running is not measured, so a full volume that stopped its bridge keeps its last measurement.
+             */
+            observed_at?: string | null;
+            /** @description The size this server asks for, a Kubernetes quantity (`5Gi`), set for the instance (BridgeInstanceRequest.volume_size) or the default, 5Gi. */
+            size: string;
+            /** @description Whether size was set for this instance; false for the default. */
+            size_set: boolean;
+            /**
+             * @description `nearly_full` from 85% used, `full` from 95% or when the bridge stopped saying it could not write (`No space left on device`, `database or disk is full`), `unknown` before the first measurement.
+             * @enum {string}
+             */
+            state: "ok" | "nearly_full" | "full" | "unknown";
+            /** @description Bytes in use when last measured. */
+            used_bytes?: number | null;
+            /** @description used_bytes / capacity_bytes, 0 to 1. */
+            used_ratio?: number | null;
         };
         ClusterStatus: {
             /** @description How many times since the answering replica started a drain released every shard it owned at once rather than one lease at a time (`hs_cluster_drain_released_at_once_total`). Absent for a single node. */

@@ -584,6 +584,12 @@ pub struct BridgeInstanceRequest {
     /// leaves it as it is.
     #[serde(default)]
     pub address: Option<String>,
+    /// For an instance this server deploys: the size of its volume, a whole number of `Mi`,
+    /// `Gi` or `Ti` (`10Gi`), at least 1Gi and at most 1Ti, and never less than the volume has
+    /// now (a volume cannot shrink). The volume grows in place and the bridge restarts.
+    /// `None` leaves it as it is ([`crate::bridge_volume`]).
+    #[serde(default)]
+    pub volume_size: Option<String>,
 }
 
 /// The OpenAPI `BridgeLogins` schema: `GET /appservices/{id}/logins`, who has signed in to a
@@ -802,6 +808,50 @@ pub struct BridgeDeployment {
     pub phase: String,
     pub ready: bool,
     pub message: Option<String>,
+    /// The volume size the `Bridge` asks for (`spec.storage.size`): what this server wrote, or
+    /// more where someone raised it by hand.
+    #[serde(default)]
+    pub storage_size: Option<String>,
+    /// The volume's size and use in bytes, and when the operator last measured them; `None`
+    /// before the first measurement (or where the operator does not measure).
+    #[serde(default)]
+    pub volume_capacity_bytes: Option<u64>,
+    #[serde(default)]
+    pub volume_used_bytes: Option<u64>,
+    #[serde(default)]
+    pub volume_observed_at: Option<String>,
+}
+
+/// The OpenAPI `BridgeVolume` schema: the volume of a bridge this server deploys, how full it
+/// is and what to do about it ([`crate::bridge_volume::view`]).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BridgeVolume {
+    /// The size this server asks for: the one set for the instance, else the default
+    /// ([`crate::bridge_volume::DEFAULT_SIZE`]).
+    pub size: String,
+    /// Whether [`Self::size`] was set for this instance; `false` for the default.
+    pub size_set: bool,
+    /// What the `Bridge` in the cluster asks for, when it is more than [`Self::size`] (raised
+    /// by hand): the volume keeps it, since a volume never shrinks.
+    #[serde(default)]
+    pub cluster_size: Option<String>,
+    /// The filesystem's size and use when last measured, and when that was.
+    #[serde(default)]
+    pub capacity_bytes: Option<u64>,
+    #[serde(default)]
+    pub used_bytes: Option<u64>,
+    /// `used_bytes / capacity_bytes`, 0 to 1.
+    #[serde(default)]
+    pub used_ratio: Option<f64>,
+    #[serde(default)]
+    pub observed_at: Option<String>,
+    /// `ok`, `nearly_full` (85% used or more), `full` (95% or more, or the bridge failed writing
+    /// to it: "No space left on device"), or `unknown` (not measured yet).
+    pub state: String,
+    /// What a nearly full or full volume means and what to do, in a sentence for a person;
+    /// `None` otherwise.
+    #[serde(default)]
+    pub message: Option<String>,
 }
 
 /// The OpenAPI `BridgeInstance` schema: one user's bridge.
@@ -863,6 +913,9 @@ pub struct BridgeInstance {
     /// keys to it), newest last; the last few only.
     #[serde(default)]
     pub removed_bot_devices: Vec<AdminRemovedBotDevice>,
+    /// Its volume, for an instance this server deploys; `None` for one run elsewhere.
+    #[serde(default)]
+    pub volume: Option<BridgeVolume>,
 }
 
 /// The OpenAPI `RemovedBotDevice` schema: a bridge bot's device the bridge manager removed.
@@ -994,6 +1047,11 @@ pub struct AdminAppservice {
     /// What waits to be sent to it (`AppService.queue`), read when the row is answered.
     #[serde(default)]
     pub queue: AdminAppserviceQueue,
+    /// For the registration of a bridge this server deploys: its volume, as the bridge manager
+    /// last measured it, so a list can say "volume full" without a request per row. `None` for
+    /// any other registration.
+    #[serde(default)]
+    pub volume: Option<BridgeVolume>,
 }
 
 impl AdminAppservice {

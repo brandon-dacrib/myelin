@@ -2801,6 +2801,8 @@ impl InMemoryAppserviceDirectory {
             double_puppet: None,
             links: AdminAppserviceLinks::default(),
             queue: crate::model::AdminAppserviceQueue::default(),
+            // Filled by the bridge manager's directory (`hs-bridges`), for its own instances.
+            volume: None,
         }
     }
 

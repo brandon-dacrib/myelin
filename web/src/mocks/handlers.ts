@@ -30,6 +30,8 @@ import {
   overlapOfAppservice,
   putInstance,
   putOffering,
+  setVolumeSize,
+  volumeSizeRefusal,
 } from "./data/bridge-offerings";
 import {
   beforeValues,
@@ -234,6 +236,17 @@ function filteredAuditEntries(url: URL, datesOnly = false) {
 }
 
 const registeredIds = new Set(appservices.map((a) => a.id));
+
+/**
+ * An appservice as the server answers it: its double puppeting linked (`linkedAppservice`), and
+ * for the registration of a bridge this server deploys, that instance's volume (OpenAPI 0.1.18).
+ */
+function appserviceView(appservice: Parameters<typeof linkedAppservice>[0]) {
+  return {
+    ...linkedAppservice(appservice),
+    volume: instanceByAppservice(appservice.id ?? "")?.volume ?? null,
+  };
+}
 
 /** An RFC 9457 body from the closed catalog in RFC 0004 section 3.5. */
 function problem(
@@ -878,7 +891,21 @@ export const handlers = [
         });
       }
     }
-    return HttpResponse.json(putInstance(type, user, body.address));
+    if (body.volume_size != null) {
+      const refusal = volumeSizeRefusal(type, user, body.volume_size);
+      if (refusal) {
+        return problem(400, "validation", "Validation failed", {
+          detail: refusal,
+          errors: [{ pointer: "/volume_size", detail: refusal }],
+        });
+      }
+    }
+    const instance = putInstance(type, user, body.address);
+    if (body.volume_size != null) {
+      setVolumeSize(type, user, body.volume_size);
+      return HttpResponse.json(getInstance(type, user));
+    }
+    return HttpResponse.json(instance);
   }),
 
   http.delete(`${API}/bridge-offerings/:type/instances/:user_id`, ({ params }) =>
@@ -910,7 +937,7 @@ export const handlers = [
     const sorted = [...filtered].sort(
       (a, b) => (severity[a.health ?? "unknown"] ?? 9) - (severity[b.health ?? "unknown"] ?? 9),
     );
-    const { items, next_cursor, prev_cursor } = paginate(sorted.map(linkedAppservice), url);
+    const { items, next_cursor, prev_cursor } = paginate(sorted.map(appserviceView), url);
     return HttpResponse.json({ items, next_cursor, prev_cursor });
   }),
 
@@ -972,7 +999,7 @@ export const handlers = [
     };
     appserviceBacklog[id] = [];
     appserviceRegistration[id] = body.registration ?? { id };
-    return HttpResponse.json(linkedAppservice(created), { status: 201 });
+    return HttpResponse.json(appserviceView(created), { status: 201 });
   }),
 
   http.get(`${API}/appservices/:id`, ({ params }) => {
@@ -982,7 +1009,7 @@ export const handlers = [
         { type: "urn:hs:problem:not-found", title: "Appservice not found", status: 404 },
         { status: 404 },
       );
-    return HttpResponse.json(linkedAppservice(appservice));
+    return HttpResponse.json(appserviceView(appservice));
   }),
 
   http.patch(`${API}/appservices/:id`, async ({ params, request }) => {
@@ -1012,7 +1039,7 @@ export const handlers = [
         { type: "urn:hs:problem:not-found", title: "Appservice not found", status: 404 },
         { status: 404 },
       );
-    return HttpResponse.json(linkedAppservice(appservice));
+    return HttpResponse.json(appserviceView(appservice));
   }),
 
   http.delete(`${API}/appservices/:id`, ({ params }) => {
@@ -1043,7 +1070,7 @@ export const handlers = [
     const id = String(params.id);
     const userId = new URL(request.url).searchParams.get("user_id");
     // A person's bridge from an offering is registered too; ask it about its owner.
-    const instance = findAppservice(id) ? undefined : instanceByAppservice(id);
+    const instance = instanceByAppservice(id);
     const bridgeType = findAppservice(id)?.bridge_type ?? instance?.type;
     const type = bridgeTypes.find((t) => t.id === bridgeType);
     const { status, body } = appserviceLogins(
@@ -1091,7 +1118,7 @@ export const handlers = [
         { status: 404 },
       );
     appservice.paused = true;
-    return HttpResponse.json(linkedAppservice(appservice));
+    return HttpResponse.json(appserviceView(appservice));
   }),
 
   http.post(`${API}/appservices/:id/resume`, ({ params }) => {
@@ -1102,7 +1129,7 @@ export const handlers = [
         { status: 404 },
       );
     appservice.paused = false;
-    return HttpResponse.json(linkedAppservice(appservice));
+    return HttpResponse.json(appserviceView(appservice));
   }),
 
   http.post(`${API}/appservices/:id/ping`, ({ params }) => {

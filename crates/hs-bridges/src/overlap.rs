@@ -158,6 +158,7 @@ mod tests {
             double_puppet: None,
             links: Default::default(),
             queue: Default::default(),
+            volume: None,
         }
     }
 

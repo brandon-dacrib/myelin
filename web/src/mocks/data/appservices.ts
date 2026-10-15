@@ -87,6 +87,24 @@ export const appservices: AppService[] = [
     queue: { pending: 0, dead_lettered: 0, oldest_pending_age_ms: null },
   },
   {
+    // Brandon's Slack bridge from the Slack offering, which this server deploys: its volume
+    // filled and the bridge stopped (the demo's, 2026-10-15). `volume` is the instance's, added
+    // when the row is answered (`handlers.ts`).
+    id: "slack-brandon",
+    sender_localpart: "slackbot_brandon",
+    url: "http://bridge-slack-brandon.myelin.svc:29335",
+    namespaces: {},
+    rate_limited: false,
+    protocols: ["slack"],
+    bridge_type: "mautrix-slack",
+    paused: false,
+    health: "degraded",
+    created_at: iso(30 * 24 * 3_600_000),
+    double_puppet_for: null,
+    links: { login_url: null },
+    queue: { pending: 0, dead_lettered: 0, oldest_pending_age_ms: null },
+  },
+  {
     // Slack's double puppeting (decision 0046): no url, a shared claim on its owner, and
     // `io.myelin.double_puppet_for`. `GET /appservices?fold_double_puppets=true` leaves it out and
     // Slack's row names it in `double_puppet`.
@@ -175,6 +193,13 @@ export const appserviceHealth: Record<string, AppServiceHealth> = {
     last_ping_at: null,
     last_error: null,
   },
+  "slack-brandon": {
+    status: "degraded",
+    reason:
+      "The last 6 transactions to it failed; it is marked down at 20. It is healthy again once a transaction is delivered or a ping is answered. The last error: The bridge did not answer: its pod is not ready (Init:CrashLoopBackOff).",
+    last_ping_at: iso(26 * 3_600_000),
+    last_error: "The bridge did not answer: its pod is not ready (Init:CrashLoopBackOff).",
+  },
   "slack-doublepuppet": {
     status: "unknown",
     reason:
@@ -240,6 +265,7 @@ function seedBacklog(): Record<string, AppServiceBacklogEntry[]> {
     ],
     discord: [],
     slack: [],
+    "slack-brandon": [],
     "slack-doublepuppet": [],
   };
 }
@@ -434,7 +460,8 @@ export function appserviceLogins(
     ? {
         bridge_type: registered.bridge_type ?? null,
         health: registered.health ?? null,
-        owner: null,
+        // A person's bridge from an offering registered here too is asked about its owner.
+        owner: instance?.owner ?? null,
       }
     : instance;
   if (!appservice)

@@ -37,6 +37,54 @@ beforeEach(async () => {
 });
 afterEach(() => signOut());
 
+describe("Bridge offering page: volumes", () => {
+  it("shows a full volume on its row", async () => {
+    renderOffering("mautrix-slack");
+    // Brandon's Slack bridge filled its 1Gi volume (the demo's, 2026-10-15).
+    const brandon = await rowFor("@brandon:example.org");
+    const line = brandon.getByTestId("volume-line");
+    expect(within(line).getByText("Volume full")).toBeInTheDocument();
+    expect(line).toHaveTextContent(/No space left on device/);
+  });
+
+  it("shows how much of a volume with room is used", async () => {
+    renderOffering("mautrix-whatsapp");
+    const alice = await rowFor("@alice:example.org");
+    expect(alice.getByTestId("volume-line")).toHaveTextContent(
+      "Volume 612.0 MiB of 5.0 GiB used (12%)",
+    );
+    // Not deployed yet: nothing measured, so its size only.
+    const carol = await rowFor("@carol:example.org");
+    expect(carol.getByTestId("volume-line")).toHaveTextContent("Volume 5Gi, not measured yet");
+  });
+
+  it("gives a bridge a larger volume from its row", async () => {
+    renderOffering("mautrix-slack");
+    await userEvent.click(await tableButton("Volume for @brandon:example.org"));
+    const dialog = within(await screen.findByRole("dialog"));
+    expect(dialog.getByText("1003.5 MiB of 1.0 GiB used (98%)")).toBeInTheDocument();
+    expect(dialog.getByText(/holds the bridge's database and configuration/)).toBeInTheDocument();
+    const field = dialog.getByRole("textbox", { name: "New size" });
+    await userEvent.clear(field);
+    await userEvent.type(field, "10Gi");
+    await userEvent.click(dialog.getByRole("button", { name: "Set size" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    const brandon = await rowFor("@brandon:example.org");
+    await waitFor(() =>
+      expect(brandon.getByTestId("volume-line")).toHaveTextContent(
+        "Volume 1003.5 MiB of 10.0 GiB used (10%)",
+      ),
+    );
+  });
+
+  it("has no volume for a bridge run elsewhere", async () => {
+    renderOffering("mautrix-imessage");
+    await rowFor("@alice:example.org");
+    expect(screen.queryByTestId("volume-line")).toBeNull();
+    expect(screen.queryByRole("button", { name: /^Volume for/ })).toBeNull();
+  });
+});
+
 describe("Bridge offering page", () => {
   it("says whether each person has signed in to their bridge", async () => {
     renderOffering("mautrix-whatsapp");

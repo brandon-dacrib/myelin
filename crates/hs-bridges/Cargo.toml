@@ -20,6 +20,8 @@ axum = { workspace = true }
 base64 = { workspace = true }
 ed25519-dalek = { workspace = true }
 hex = { workspace = true }
+# `hs_bridge_volume_*` gauges (`src/metrics.rs`), served by `hs serve`.
+prometheus-client = { workspace = true }
 rand = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true }

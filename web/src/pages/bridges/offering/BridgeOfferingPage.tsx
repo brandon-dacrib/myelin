@@ -42,6 +42,13 @@ import {
   runtimeMeta,
   deploymentPhaseMeta,
 } from "@/lib/bridge-offerings";
+import {
+  currentVolumeSize,
+  describeVolumeUsage,
+  volumeMessage,
+  volumeNeedsAttention,
+} from "@/lib/bridge-volume";
+import { VolumeSizeDialog, VolumeStateBadge } from "../BridgeVolume";
 import { AddInstanceDialog } from "./AddInstanceDialog";
 import { InstanceFilesDialog } from "./InstanceFilesDialog";
 import { InstanceNextSteps } from "./InstanceNextSteps";
@@ -87,6 +94,8 @@ export function BridgeOfferingPage() {
   const [filesFor, setFilesFor] = useState<BridgeInstance | null>(null);
   // The owner segment, not the instance: the dialog follows the live row as the page polls.
   const [macSetupFor, setMacSetupFor] = useState<string | null>(null);
+  // The same for the volume dialog: it shows the live row's measurement.
+  const [volumeFor, setVolumeFor] = useState<string | null>(null);
   const [removing, setRemoving] = useState<BridgeInstance | null>(null);
   const [adding, setAdding] = useState(false);
   const [editing, setEditing] = useState(false);
@@ -113,6 +122,10 @@ export function BridgeOfferingPage() {
   const offering = offeringQuery.data;
   const catalogueType = types?.find((t) => t.id === type);
   const mac = runsOnMac(catalogueType);
+  const volumeInstance =
+    volumeFor === null
+      ? null
+      : (instances.find((i) => instanceUserSegment(i) === volumeFor) ?? null);
   const macSetupInstance =
     macSetupFor === null
       ? null
@@ -208,6 +221,17 @@ export function BridgeOfferingPage() {
             onClick={() => openFiles(instance)}
           >
             Files
+          </Button>
+        )}
+        {instance.volume && (
+          <Button
+            variant="ghost"
+            size="sm"
+            aria-label={`Volume for ${owner}`}
+            title="How full its volume is, and a larger size"
+            onClick={() => setVolumeFor(instanceUserSegment(instance))}
+          >
+            Volume
           </Button>
         )}
         {instance.user_id && (
@@ -453,6 +477,19 @@ export function BridgeOfferingPage() {
           }
         }}
         onRenderFiles={() => macSetupFor !== null && files.mutate({ type, userId: macSetupFor })}
+      />
+
+      <VolumeSizeDialog
+        open={volumeInstance !== null}
+        onOpenChange={(open) => !open && setVolumeFor(null)}
+        volume={volumeInstance?.volume ?? null}
+        type={type}
+        userId={volumeFor ?? "_"}
+        appserviceId={volumeInstance?.appservice_id}
+        bridgeName={
+          volumeInstance?.user_id ? `${instanceOwnerLabel(volumeInstance)}'s ${name} bridge` : name
+        }
+        canWrite={canWrite}
       />
 
       <Dialog open={removing !== null} onOpenChange={(open) => !open && setRemoving(null)}>
@@ -810,7 +847,30 @@ function DeploymentCell({
       {d.message && (
         <span className="font-identifier text-xs break-words text-text-muted">{d.message}</span>
       )}
+      {instance.volume && <VolumeLine volume={instance.volume} />}
     </div>
+  );
+}
+
+/**
+ * The deployment's volume in a line: a nearly full or full one as a badge with the server's
+ * message (a full volume stops the bridge), any other as how much is used. Volume in the row's
+ * actions has the rest and the size control.
+ */
+function VolumeLine({ volume }: { volume: NonNullable<BridgeInstance["volume"]> }) {
+  if (volumeNeedsAttention(volume)) {
+    return (
+      <span className="flex flex-col items-start gap-0.5" data-testid="volume-line">
+        <VolumeStateBadge volume={volume} />
+        <span className="text-xs text-text-muted">{volumeMessage(volume)}</span>
+      </span>
+    );
+  }
+  const usage = describeVolumeUsage(volume);
+  return (
+    <span className="text-xs text-text-muted" data-testid="volume-line">
+      Volume {usage ?? `${currentVolumeSize(volume)}, not measured yet`}
+    </span>
   );
 }
 

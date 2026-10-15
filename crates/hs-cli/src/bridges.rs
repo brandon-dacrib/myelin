@@ -104,6 +104,16 @@ fn deployment(status: BridgeInstanceStatus) -> BridgeDeployment {
         .into(),
         ready: status.ready,
         message: status.message,
+        storage_size: Some(status.storage_size),
+        volume_capacity_bytes: status
+            .volume
+            .as_ref()
+            .and_then(|v| u64::try_from(v.capacity_bytes).ok()),
+        volume_used_bytes: status
+            .volume
+            .as_ref()
+            .and_then(|v| u64::try_from(v.used_bytes).ok()),
+        volume_observed_at: status.volume.map(|v| v.observed_at),
     }
 }
 
@@ -166,6 +176,60 @@ impl Runtime for KubernetesRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The server's default volume and thresholds are the operator's: a `Bridge` written without
+    /// a size gets the same volume as one the manager sizes, and the two say "nearly full" and
+    /// "full" at the same point.
+    #[test]
+    fn the_server_and_the_operator_agree_on_bridge_volumes() {
+        assert_eq!(
+            hs_admin::bridge_volume::DEFAULT_SIZE,
+            hs_operator::crds::bridge::DEFAULT_STORAGE_SIZE
+        );
+        assert!(
+            (hs_admin::bridge_volume::NEARLY_FULL - hs_operator::volume::NEARLY_FULL).abs()
+                < f64::EPSILON
+        );
+        assert!((hs_admin::bridge_volume::FULL - hs_operator::volume::FULL).abs() < f64::EPSILON);
+        for q in [
+            "1Gi", "5Gi", "1536Mi", "2G", "1.5Gi", "1e9", "1500m", "10Ti", "1GB", "", "-1Gi",
+        ] {
+            assert_eq!(
+                hs_admin::bridge_volume::quantity_bytes(q).map(u128::from),
+                hs_operator::quantity::bytes(q),
+                "{q:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_operators_measurement_reaches_the_admin_api() {
+        let status = BridgeInstanceStatus {
+            name: "bridge-slack-brandon".into(),
+            namespace: "myelin".into(),
+            phase: Phase::Degraded,
+            ready: false,
+            message: Some(
+                "files: CrashLoopBackOff: back-off 5m0s; it last exited saying: cp: write error: \
+                 No space left on device"
+                    .into(),
+            ),
+            image: "dock.mau.dev/mautrix/slack:v0.2609.1".into(),
+            service_url: "http://bridge-slack-brandon.myelin.svc:29335".into(),
+            storage_size: "1Gi".into(),
+            volume: Some(hs_operator::crds::VolumeStatus {
+                capacity_bytes: 1_020_702_720,
+                used_bytes: 1_000_301_568,
+                observed_at: "2026-10-14T08:00:00Z".into(),
+            }),
+        };
+        let d = deployment(status);
+        assert_eq!(d.storage_size.as_deref(), Some("1Gi"));
+        assert_eq!(d.volume_used_bytes, Some(1_000_301_568));
+        let volume = hs_admin::bridge_volume::view("1Gi", false, Some(&d));
+        assert_eq!(volume.state, "full");
+        assert!(volume.message.unwrap().contains("No space left on device"));
+    }
 
     #[test]
     fn declared_offerings_parse_as_the_put_body_with_a_type() {

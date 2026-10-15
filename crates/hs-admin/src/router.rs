@@ -3290,13 +3290,18 @@ async fn bridge_instances_put(
         Some(("bridge_instances.put", "bridge_instance.requested", target)),
         StatusCode::OK,
         |s| async move {
-            let created = s.put_instance(&t, &user).await?;
-            Ok(Some(match request.address.as_deref().map(str::trim) {
-                Some(address) if !address.is_empty() => {
-                    s.set_instance_address(&t, &user, address).await?
-                }
-                _ => created,
-            }))
+            let mut instance = s.put_instance(&t, &user).await?;
+            if let Some(address) = request.address.as_deref().map(str::trim)
+                && !address.is_empty()
+            {
+                instance = s.set_instance_address(&t, &user, address).await?;
+            }
+            if let Some(size) = request.volume_size.as_deref().map(str::trim)
+                && !size.is_empty()
+            {
+                instance = s.set_instance_volume_size(&t, &user, size).await?;
+            }
+            Ok(Some(instance))
         },
     )
     .await

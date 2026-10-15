@@ -12,14 +12,18 @@ import {
   useAppserviceHealth,
   useAppserviceBacklog,
   useAppserviceRegistration,
+  useBridgeInstances,
   useBridgeTypes,
   usePauseAppservice,
   useResumeAppservice,
   useRotateAppserviceTokens,
   useDeleteAppservice,
   usePingAppservice,
+  instanceUserSegment,
   type AppService,
   type AppserviceNamespaces,
+  type BridgeInstance,
+  type BridgeVolume,
 } from "@/api/bridges";
 import { useServerInfo } from "@/api/dashboard";
 import { ApiProblemError } from "@/api/problem";
@@ -38,9 +42,11 @@ import { toast } from "@/components/ui/toast/toast-store";
 import { getSession, hasScope } from "@/lib/auth";
 import { bridgeKind, bridgeTitle, bridgeTypeOf, botMatrixId } from "@/lib/bridge-catalogue";
 import { bridgeHealthMeta, healthKeyOf } from "@/lib/bridge-state";
+import { volumeMessage, volumeNeedsAttention, volumeStateMeta } from "@/lib/bridge-volume";
 import { cn } from "@/lib/cn";
 import { BridgeTransactions } from "./BridgeTransactions";
 import { EditBridgeDialog } from "./EditBridgeDialog";
+import { VolumeDetails, VolumeSizeForm, VolumeStateBadge } from "./BridgeVolume";
 
 /** The health-reason box's colours, by the health badge's status. */
 const REASON_BOX: Record<string, string> = {
@@ -105,6 +111,10 @@ export function BridgeDetailPage() {
     isError: registrationIsError,
     error: registrationError,
   } = useAppserviceRegistration(bridgeId, activeTab === "registration" && canWrite);
+  // A bridge this server deploys has a volume; setting its size goes through the offering's
+  // instance, found among the type's instances by its registration's id.
+  const volumeType = bridge?.volume ? (bridge.bridge_type ?? undefined) : undefined;
+  const typeInstances = useBridgeInstances(volumeType);
 
   const pause = usePauseAppservice();
   const resume = useResumeAppservice();
@@ -176,6 +186,7 @@ export function BridgeDetailPage() {
             <div className="flex items-center gap-3">
               <h1 className="text-xl text-text">{name}</h1>
               <Badge status={meta.status}>{meta.label}</Badge>
+              {volumeNeedsAttention(bridge.volume) && <VolumeStateBadge volume={bridge.volume} />}
             </div>
             <p className="mt-1 flex flex-wrap items-center gap-x-2 text-sm text-text-muted">
               <span>{bridgeKind(bridge, type)}</span>
@@ -323,6 +334,24 @@ export function BridgeDetailPage() {
         </div>
       </div>
 
+      {volumeNeedsAttention(bridge.volume) && (
+        <div
+          className={cn(
+            "mt-4 rounded-md border px-4 py-3 text-sm",
+            bridge.volume.state === "full"
+              ? "border-danger-border bg-danger-bg text-danger"
+              : "border-warning-border bg-warning-bg text-warning",
+          )}
+          data-testid="volume-alert"
+        >
+          <span className="font-medium">{volumeStateMeta[bridge.volume.state].label}.</span>{" "}
+          {volumeMessage(bridge.volume)}{" "}
+          {activeTab === "overview"
+            ? "Give it a larger size under Volume below."
+            : "Give it a larger size under Volume on the Overview tab."}
+        </div>
+      )}
+
       {healthReason ? (
         <div
           className={cn("mt-4 rounded-md border px-4 py-3 text-sm", REASON_BOX[meta.status])}
@@ -463,6 +492,18 @@ export function BridgeDetailPage() {
               />
             )}
           </dl>
+          {bridge.volume && (
+            <VolumeSection
+              volume={bridge.volume}
+              bridgeType={bridge.bridge_type ?? null}
+              appserviceId={id}
+              bridgeName={name}
+              instances={typeInstances.data}
+              instancesLoading={typeInstances.isLoading}
+              instancesFailed={typeInstances.isError}
+              canWrite={canWrite}
+            />
+          )}
           <h2 className="mt-6 text-sm font-medium text-text">Namespaces</h2>
           <p className="mt-1 text-sm text-text-muted">
             The user IDs, room aliases and room IDs this bridge speaks for. An exclusive rule means
@@ -717,6 +758,75 @@ function DoublePuppetRegistration({
         </div>
       )}
     </div>
+  );
+}
+
+/**
+ * The Overview tab's Volume section, for a bridge this server deploys: how full its volume is and
+ * the control to give it a larger size. The size is set on the offering's instance (`PUT
+ * .../instances/{user_id}`), which is found among its type's instances by this registration's id.
+ */
+function VolumeSection({
+  volume,
+  bridgeType,
+  appserviceId,
+  bridgeName,
+  instances,
+  instancesLoading,
+  instancesFailed,
+  canWrite,
+}: {
+  volume: BridgeVolume;
+  bridgeType: string | null;
+  appserviceId: string;
+  bridgeName: string;
+  instances: BridgeInstance[] | undefined;
+  instancesLoading: boolean;
+  instancesFailed: boolean;
+  canWrite: boolean;
+}) {
+  const instance = instances?.find((i) => i.appservice_id === appserviceId);
+  return (
+    <section aria-labelledby="volume" className="mt-6">
+      <h2 id="volume" className="text-sm font-medium text-text">
+        Volume
+      </h2>
+      <p className="mt-1 text-sm text-text-muted">
+        This server runs this bridge in the cluster, with a volume of its own mounted at{" "}
+        <code className="font-identifier">/data</code>. The operator measures it about once a minute
+        while the bridge runs.
+      </p>
+      <div className="mt-3 flex flex-col gap-5">
+        <VolumeDetails volume={volume} />
+        {bridgeType && instance ? (
+          <VolumeSizeForm
+            volume={volume}
+            type={bridgeType}
+            userId={instanceUserSegment(instance)}
+            appserviceId={appserviceId}
+            bridgeName={bridgeName}
+            canWrite={canWrite}
+          />
+        ) : instancesLoading ? (
+          <SkeletonText lines={2} />
+        ) : (
+          <p className="text-sm text-text-muted">
+            {instancesFailed
+              ? "Its offering's bridges could not be read, so its size cannot be set from here. "
+              : "It is not among its offering's bridges, so its size cannot be set from here. "}
+            {bridgeType && (
+              <Link
+                to="/bridges/offerings/$type"
+                params={{ type: bridgeType }}
+                className="text-accent hover:underline"
+              >
+                The offering&apos;s page
+              </Link>
+            )}
+          </p>
+        )}
+      </div>
+    </section>
   );
 }
 

@@ -1604,6 +1604,9 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     metrics.with_registry(hs_push::email::register_metrics);
     // History fetched from other servers into rooms' timelines (`crate::backfill`).
     metrics.with_registry(crate::backfill::register_metrics);
+    // How full each deployed bridge's volume is (`hs_bridge_volume_*`), read from the operator's
+    // measurement by the bridge manager about once a minute.
+    metrics.with_registry(hs_bridges::metrics::register_metrics);
     // Federation requests a room's server ACL refused, and notary key queries.
     metrics.with_registry(hs_federation::metrics::register_transport_metrics);
     // The process's own resident and virtual memory, read from the OS at each scrape

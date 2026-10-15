@@ -31,9 +31,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use hs_admin::bridge_offerings::{BridgeOfferingSource, SHARED_INSTANCE};
 use hs_admin::bridge_types::{self, BRIDGE_INSTANCE_KEY, InstanceRender, InstanceSpec};
+use hs_admin::bridge_volume;
 use hs_admin::model::{
     AdminAppserviceCreate, AdminOfferingOverlap, BridgeDeploymentTarget, BridgeInstance,
-    BridgeInstanceFiles, BridgeOffering, BridgeOfferingRequest,
+    BridgeInstanceFiles, BridgeOffering, BridgeOfferingRequest, BridgeVolume,
 };
 use hs_admin::sources::{AppserviceDirectory, SourceError};
 use hs_kv::KvBackend;
@@ -233,7 +234,25 @@ pub struct BridgeManager<B: KvBackend> {
     /// again ([`step_backoff`]). In memory: a restart tries each once more straight away.
     /// Cleared for an instance when someone asks for it again or its offering changes.
     backoff: Mutex<HashMap<(String, String), Backoff>>,
+    /// The volumes of the instances it deploys, as last read ([`Self::watch_volumes`]).
+    volumes: Mutex<VolumeWatch>,
 }
+
+/// What [`BridgeManager::watch_volumes`] last found.
+#[derive(Debug, Default)]
+struct VolumeWatch {
+    /// When it last looked.
+    checked_ms: u64,
+    /// Each deployed instance's volume, by appservice id, for the appservice list
+    /// ([`BridgeManager::volume_of_appservice`]).
+    by_appservice: HashMap<String, BridgeVolume>,
+    /// The bridge type of each, for the gauges' labels.
+    types: HashMap<String, String>,
+}
+
+/// How often the manager reads its deployed instances' volumes. The operator measures them
+/// about once a minute too.
+const VOLUME_CHECK_MS: u64 = 60_000;
 
 impl<B: KvBackend> std::fmt::Debug for BridgeManager<B> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -283,6 +302,7 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             declared: Mutex::new(Vec::new()),
             overlaps_logged: Mutex::new((0, BTreeSet::new())),
             backoff: Mutex::new(HashMap::new()),
+            volumes: Mutex::new(VolumeWatch::default()),
         }))
     }
 
@@ -661,6 +681,107 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
         *logged = (now, current);
     }
 
+    /// The volume of the instance registered as `appservice_id`, as [`Self::watch_volumes`]
+    /// last read it; `None` for a registration that is not an instance this server deploys,
+    /// or before the first look.
+    #[must_use]
+    pub fn volume_of_appservice(&self, appservice_id: &str) -> Option<BridgeVolume> {
+        self.volumes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .by_appservice
+            .get(appservice_id)
+            .cloned()
+    }
+
+    /// Reads the volume of every instance it deploys, at most every [`VOLUME_CHECK_MS`]: sets
+    /// `hs_bridge_volume_used_ratio` and `hs_bridge_volume_capacity_bytes`
+    /// ([`crate::metrics`]), keeps each for the appservice list, and logs a `WARN` when one
+    /// becomes nearly full or full (and an `INFO` when it has room again), once each time.
+    async fn watch_volumes(&self) {
+        let Some(runtime) = &self.runtime else {
+            return;
+        };
+        let now = now_ms();
+        {
+            let watch = self
+                .volumes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if watch.checked_ms != 0 && now.saturating_sub(watch.checked_ms) < VOLUME_CHECK_MS {
+                return;
+            }
+        }
+        let (Ok(rows), Ok(offerings)) = (self.store.instances(None), self.store.offerings()) else {
+            return;
+        };
+        let deployed: HashSet<&str> = offerings
+            .iter()
+            .filter(|o| o.runtime == "cluster")
+            .map(|o| o.bridge_type.as_str())
+            .collect();
+        let mut found = HashMap::new();
+        let mut types = HashMap::new();
+        for row in &rows {
+            let (Some(id), Some(name)) = (&row.appservice_id, &row.deploy_name) else {
+                continue;
+            };
+            if !deployed.contains(row.bridge_type.as_str())
+                || matches!(
+                    row.state,
+                    InstanceState::Requested | InstanceState::Registered | InstanceState::Removing
+                )
+            {
+                continue;
+            }
+            let Ok(deployment) = runtime.status(name).await else {
+                continue;
+            };
+            let volume = bridge_volume::view(
+                volume_size(row),
+                row.volume_size.is_some(),
+                deployment.as_ref(),
+            );
+            found.insert(id.clone(), volume);
+            types.insert(id.clone(), row.bridge_type.clone());
+        }
+        let mut watch = self
+            .volumes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (id, volume) in &found {
+            let bridge_type = types.get(id).map_or("", String::as_str);
+            crate::metrics::set_volume(id, bridge_type, volume);
+            let before = watch.by_appservice.get(id).map(|v| v.state.as_str());
+            match volume_change(before, &volume.state) {
+                Some(tracing::Level::WARN) => tracing::warn!(
+                    bridge_type,
+                    appservice = %id,
+                    state = %volume.state,
+                    used_percent = volume.used_ratio.map(|r| (r * 100.0).round()),
+                    size = %volume.cluster_size.as_deref().unwrap_or(&volume.size),
+                    "{}",
+                    volume.message.as_deref().unwrap_or("a bridge's volume is filling up")
+                ),
+                Some(_) => tracing::info!(
+                    bridge_type,
+                    appservice = %id,
+                    used_percent = volume.used_ratio.map(|r| (r * 100.0).round()),
+                    "a bridge's volume has room again"
+                ),
+                None => {}
+            }
+        }
+        for (id, bridge_type) in &watch.types {
+            if !found.contains_key(id) {
+                crate::metrics::remove_volume(id, bridge_type);
+            }
+        }
+        watch.by_appservice = found;
+        watch.types = types;
+        watch.checked_ms = now;
+    }
+
     async fn instance_view(&self, row: &InstanceRow) -> BridgeInstance {
         let deployment = match (&self.runtime, &row.deploy_name) {
             (Some(runtime), Some(name)) if row.state != InstanceState::Requested => {
@@ -668,6 +789,19 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             }
             _ => None,
         };
+        let deployed = self
+            .store
+            .offering(&row.bridge_type)
+            .ok()
+            .flatten()
+            .is_some_and(|o| o.runtime == "cluster");
+        let volume = deployed.then(|| {
+            bridge_volume::view(
+                volume_size(row),
+                row.volume_size.is_some(),
+                deployment.as_ref(),
+            )
+        });
         let health = match &row.appservice_id {
             Some(id) => self.directory.health(id).await.ok(),
             None => None,
@@ -731,6 +865,7 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
                     kept_device: d.kept_device.clone(),
                 })
                 .collect(),
+            volume,
         }
     }
 
@@ -847,7 +982,7 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             port: render.port,
             args: render.args.clone(),
             files: render.files.clone(),
-            storage_size: Some("1Gi".to_owned()),
+            storage_size: Some(volume_size(row).to_owned()),
         })
     }
 
@@ -856,6 +991,7 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
     /// Advances every instance one step.
     pub async fn tick(&self) {
         self.log_overlaps().await;
+        self.watch_volumes().await;
         let rows = match self.store.instances(None) {
             Ok(rows) => rows,
             Err(e) => {
@@ -2341,23 +2477,70 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
 ///   on 2026-10-09, to a bridge first started before the server rendered a key, when a roll
 ///   dropped the bridge's own; the operator's init container has carried it since. The store
 ///   cannot be read without the old key, so the recovery is resetting it.
+/// - `No space left on device` (the operator's init container copying the bridge's files, or
+///   the bridge itself) or SQLite's `database or disk is full`: the bridge's volume is full. It
+///   happened on the demo on 2026-10-14, to the Slack bridge's 1 GiB volume, which its own log
+///   files had filled; its init container failed `cp: write error: No space left on device` and
+///   the bridge was stopped a day before anyone knew why. The recovery is a larger volume.
 #[must_use]
 pub fn explain_deployment(message: &str) -> Option<String> {
-    message
-        .contains("the supplied account key is invalid")
-        .then(|| {
+    if message.contains("the supplied account key is invalid") {
+        return Some(
             "the bridge cannot read its encryption store: it was started with a different \
              pickle key from the one the store was made with (\"the supplied account key is \
              invalid\"), and it will not start until the store is reset. The steps are in \
              docs/bridges/mautrix.md, \"The supplied account key is invalid\"; the person's \
              sign-in survives them"
-                .to_owned()
-        })
+                .to_owned(),
+        );
+    }
+    if bridge_volume::says_disk_full(message) {
+        let init = message.starts_with("files:");
+        return Some(format!(
+            "the bridge's volume is full: {} could not write to it (\"No space left on \
+             device\"), so the bridge cannot start. Give it a larger volume size on its page \
+             (Bridges, then the bridge): the volume grows in place, keeping everything on it, \
+             and the bridge starts again",
+            if init {
+                "the step that copies its configuration in before it starts"
+            } else {
+                "the bridge"
+            }
+        ));
+    }
+    None
+}
+
+/// The volume size `row`'s instance asks for: the one set for it, else the default.
+fn volume_size(row: &InstanceRow) -> &str {
+    row.volume_size
+        .as_deref()
+        .unwrap_or(bridge_volume::DEFAULT_SIZE)
 }
 
 /// `message` explained where [`explain_deployment`] knows it, else as it is.
 fn explained(message: Option<String>) -> Option<String> {
     message.map(|m| explain_deployment(&m).unwrap_or(m))
+}
+
+/// How loudly to say that a volume's state went from `before` (`None` at the first look since
+/// the server started) to `now` (`BridgeVolume::state`): `WARN` when it becomes nearly full or
+/// full, `INFO` when a nearly full or full one is `ok` again, else nothing. `unknown` (not
+/// measured) changes nothing.
+fn volume_change(before: Option<&str>, now: &str) -> Option<tracing::Level> {
+    let rank = |s: &str| match s {
+        "ok" => Some(0),
+        "nearly_full" => Some(1),
+        "full" => Some(2),
+        _ => None,
+    };
+    let now_rank = rank(now)?;
+    match before.and_then(rank) {
+        None if now_rank > 0 => Some(tracing::Level::WARN),
+        Some(b) if now_rank > b => Some(tracing::Level::WARN),
+        Some(b) if b > 0 && now_rank == 0 => Some(tracing::Level::INFO),
+        _ => None,
+    }
 }
 
 /// A fingerprint of what a deployment asks the runtime for: the image, the port, the arguments
@@ -2739,6 +2922,71 @@ impl<B: KvBackend + 'static> BridgeOfferingSource for BridgeManager<B> {
         Ok(self.instance_view(&row).await)
     }
 
+    async fn set_instance_volume_size(
+        &self,
+        bridge_type: &str,
+        user_id: &str,
+        size: &str,
+    ) -> Result<BridgeInstance, SourceError> {
+        let offering = self
+            .store
+            .offering(bridge_type)
+            .map_err(store_err)?
+            .ok_or(SourceError::NotFound)?;
+        if offering.runtime != "cluster" {
+            return Err(SourceError::InvalidField {
+                pointer: "/volume_size",
+                detail: "this server does not deploy that bridge: its volume is wherever it runs"
+                    .into(),
+            });
+        }
+        let row = self
+            .store
+            .instance(bridge_type, user_id)
+            .map_err(store_err)?
+            .ok_or(SourceError::NotFound)?;
+        // What the volume has now: the size asked for, or more where the `Bridge` in the
+        // cluster was raised by hand. A volume cannot shrink below either.
+        let deployment = match (&self.runtime, &row.deploy_name) {
+            (Some(runtime), Some(name)) => runtime.status(name).await.ok().flatten(),
+            _ => None,
+        };
+        let current = bridge_volume::view(
+            volume_size(&row),
+            row.volume_size.is_some(),
+            deployment.as_ref(),
+        );
+        let has = current.cluster_size.unwrap_or(current.size);
+        let (size, _) = bridge_volume::parse_size(size, Some(&has)).map_err(|detail| {
+            SourceError::InvalidField {
+                pointer: "/volume_size",
+                detail,
+            }
+        })?;
+        let row = self
+            .store
+            .update_instance(bridge_type, user_id, |r| {
+                if r.volume_size.as_deref() == Some(size.as_str()) {
+                    return false;
+                }
+                r.volume_size = Some(size.clone());
+                true
+            })
+            .map_err(store_err)?
+            .ok_or(SourceError::NotFound)?;
+        tracing::info!(
+            bridge_type,
+            owner = user_id,
+            from = %has,
+            to = %size,
+            "an administrator set a bridge's volume size: the volume grows and the bridge restarts"
+        );
+        // The deployment's fingerprint carries the size: the next step applies it.
+        self.clear_backoff(bridge_type, Some(user_id));
+        self.wake();
+        Ok(self.instance_view(&row).await)
+    }
+
     async fn delete_instance(&self, bridge_type: &str, user_id: &str) -> Result<(), SourceError> {
         tracing::debug!(
             bridge_type,
@@ -3000,6 +3248,10 @@ mod tests {
         warning: Mutex<Option<String>>,
         /// When set, every deployment is degraded with this message: a crash-looping bridge.
         crash: Mutex<Option<String>>,
+        /// When set, every deployment's volume measured `(used, capacity)` bytes.
+        measured: Mutex<Option<(u64, u64)>>,
+        /// When set, every `Bridge` asks for this volume size: raised by hand in the cluster.
+        raised: Mutex<Option<String>>,
     }
 
     impl FakeRuntime {
@@ -3032,7 +3284,8 @@ mod tests {
             );
         }
 
-        fn deployment(spec: &DeploySpec) -> BridgeDeployment {
+        fn deployment(&self, spec: &DeploySpec) -> BridgeDeployment {
+            let measured = *self.measured.lock().unwrap();
             BridgeDeployment {
                 namespace: "chat".into(),
                 name: spec.name.clone(),
@@ -3041,6 +3294,15 @@ mod tests {
                 phase: "Ready".into(),
                 ready: true,
                 message: None,
+                storage_size: self
+                    .raised
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .or_else(|| spec.storage_size.clone()),
+                volume_capacity_bytes: measured.map(|m| m.1),
+                volume_used_bytes: measured.map(|m| m.0),
+                volume_observed_at: measured.map(|_| "2026-10-14T08:00:00Z".into()),
             }
         }
     }
@@ -3069,13 +3331,13 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(spec.name.clone(), spec.clone());
-            Ok(Self::deployment(spec))
+            Ok(self.deployment(spec))
         }
 
         async fn status(&self, name: &str) -> Result<Option<BridgeDeployment>, String> {
             let crash = self.crash.lock().unwrap().clone();
             Ok(self.spec(name).as_ref().map(|spec| {
-                let mut d = Self::deployment(spec);
+                let mut d = self.deployment(spec);
                 if let Some(message) = crash {
                     d.phase = "Degraded".into();
                     d.ready = false;
@@ -3298,6 +3560,210 @@ mod tests {
             view.reason
         );
         assert!(explain_deployment("bridge: CrashLoopBackOff").is_none());
+    }
+
+    /// The demo's Slack bridge on 2026-10-15: its 1 GiB volume full, the operator's init
+    /// container failing `cp: write error: No space left on device`. The instance says the
+    /// volume is full and what to do, not only that it crash-loops.
+    #[tokio::test]
+    async fn a_bridge_stopped_by_a_full_volume_says_so_with_what_to_do() {
+        const OWNER: &str = "@brandon:example.org";
+        let (manager, runtime) = cluster_manager();
+        manager.put("mautrix-slack", cluster()).await.unwrap();
+        manager.put_instance("mautrix-slack", OWNER).await.unwrap();
+        manager.tick().await; // registered
+        manager.tick().await; // deploying
+        *runtime.crash.lock().unwrap() = Some(
+            "files: CrashLoopBackOff: back-off 5m0s restarting failed container=files; it last \
+             exited saying: cp: write error: No space left on device"
+                .into(),
+        );
+        manager.tick().await;
+        let row = manager
+            .store
+            .instance("mautrix-slack", OWNER)
+            .unwrap()
+            .unwrap();
+        let reason = row.reason.unwrap();
+        assert!(
+            reason.starts_with("the bridge's volume is full"),
+            "{reason}"
+        );
+        assert!(reason.contains("copies its configuration in"), "{reason}");
+        assert!(reason.contains("larger volume size"), "{reason}");
+        let view = manager
+            .instance("mautrix-slack", OWNER)
+            .await
+            .unwrap()
+            .unwrap();
+        let volume = view.volume.unwrap();
+        assert_eq!(volume.state, "full");
+        assert!(volume.message.unwrap().contains("could not write"));
+
+        // The bridge itself, later: SQLite's words.
+        let text = explain_deployment(
+            "bridge: CrashLoopBackOff: back-off 5m0s; it last exited saying: FTL Failed to start \
+             bridge error=\"database or disk is full\"",
+        )
+        .unwrap();
+        assert!(text.contains("the bridge could not write"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn an_instance_is_deployed_with_a_five_gib_volume_unless_one_is_set() {
+        const OWNER: &str = "@brandon:example.org";
+        let (manager, runtime) = cluster_manager();
+        manager.put("mautrix-slack", cluster()).await.unwrap();
+        manager.put_instance("mautrix-slack", OWNER).await.unwrap();
+        manager.tick().await; // registered
+        manager.tick().await; // deploying
+        let spec = runtime.spec("bridge-slack-brandon").unwrap();
+        assert_eq!(spec.storage_size.as_deref(), Some("5Gi"));
+        let view = manager
+            .instance("mautrix-slack", OWNER)
+            .await
+            .unwrap()
+            .unwrap();
+        let volume = view.volume.unwrap();
+        assert_eq!(volume.size, "5Gi");
+        assert!(!volume.size_set);
+        assert_eq!(volume.state, "unknown", "not measured yet");
+
+        // An administrator raises it: the next step applies it, which restarts the bridge.
+        let applies = *runtime.applies.lock().unwrap();
+        let set = manager
+            .set_instance_volume_size("mautrix-slack", OWNER, "20Gi")
+            .await
+            .unwrap();
+        assert_eq!(set.volume.as_ref().unwrap().size, "20Gi");
+        assert!(set.volume.unwrap().size_set);
+        manager.tick().await;
+        assert_eq!(*runtime.applies.lock().unwrap(), applies + 1);
+        let spec = runtime.spec("bridge-slack-brandon").unwrap();
+        assert_eq!(spec.storage_size.as_deref(), Some("20Gi"));
+        let row = manager
+            .store
+            .instance("mautrix-slack", OWNER)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.volume_size.as_deref(), Some("20Gi"));
+        assert_eq!(row.state, InstanceState::Deploying);
+
+        // Smaller than it has: refused, and nothing changes.
+        let refused = manager
+            .set_instance_volume_size("mautrix-slack", OWNER, "10Gi")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&refused, SourceError::InvalidField { pointer: "/volume_size", detail } if detail.contains("cannot shrink")),
+            "{refused:?}"
+        );
+        // Not a size.
+        assert!(matches!(
+            manager
+                .set_instance_volume_size("mautrix-slack", OWNER, "a lot")
+                .await,
+            Err(SourceError::InvalidField { .. })
+        ));
+    }
+
+    /// Someone raised the `Bridge` to 50Gi by hand (`kubectl edit`): the server keeps asking
+    /// for its own size, the cluster keeps the larger one (`KubeBridgeClient::apply`), and an
+    /// administrator cannot set a size below what the volume has.
+    #[tokio::test]
+    async fn a_volume_raised_by_hand_is_kept_and_not_shrunk_from_the_admin_api() {
+        const OWNER: &str = "@brandon:example.org";
+        let (manager, runtime) = cluster_manager();
+        manager.put("mautrix-slack", cluster()).await.unwrap();
+        manager.put_instance("mautrix-slack", OWNER).await.unwrap();
+        manager.tick().await;
+        manager.tick().await;
+        *runtime.raised.lock().unwrap() = Some("50Gi".into());
+        let view = manager
+            .instance("mautrix-slack", OWNER)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(view.volume.unwrap().cluster_size.as_deref(), Some("50Gi"));
+        let refused = manager
+            .set_instance_volume_size("mautrix-slack", OWNER, "20Gi")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&refused, SourceError::InvalidField { detail, .. } if detail.contains("has 50Gi now")),
+            "{refused:?}"
+        );
+        assert!(
+            manager
+                .set_instance_volume_size("mautrix-slack", OWNER, "60Gi")
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_nearly_full_volume_is_counted_and_on_the_registration() {
+        const OWNER: &str = "@brandon:example.org";
+        let (manager, runtime) = cluster_manager();
+        manager.put("mautrix-slack", cluster()).await.unwrap();
+        manager.put_instance("mautrix-slack", OWNER).await.unwrap();
+        manager.tick().await; // registered
+        manager.tick().await; // deploying
+        // A look every minute: this one finds it deployed and not measured yet.
+        manager.volumes.lock().unwrap().checked_ms = 1;
+        manager.tick().await;
+        assert_eq!(
+            manager.volume_of_appservice("slack-brandon").unwrap().state,
+            "unknown"
+        );
+        *runtime.measured.lock().unwrap() = Some((900_000_000, 1_000_000_000));
+        // The next look waits for its minute.
+        manager.tick().await;
+        assert_eq!(
+            manager.volume_of_appservice("slack-brandon").unwrap().state,
+            "unknown"
+        );
+        manager.volumes.lock().unwrap().checked_ms = 1;
+        manager.tick().await;
+        let volume = manager.volume_of_appservice("slack-brandon").unwrap();
+        assert_eq!(volume.state, "nearly_full");
+        assert!(volume.message.unwrap().contains("nearly full (90% used"));
+        assert_eq!(
+            crate::metrics::used_ratio("slack-brandon", "mautrix-slack"),
+            Some(0.9)
+        );
+        assert!(manager.volume_of_appservice("whatsapp-brandon").is_none());
+
+        // The instance goes: so do its gauges and its entry.
+        manager
+            .delete_instance("mautrix-slack", OWNER)
+            .await
+            .unwrap();
+        manager.volumes.lock().unwrap().checked_ms = 1;
+        manager.tick().await;
+        assert!(manager.volume_of_appservice("slack-brandon").is_none());
+        assert_eq!(
+            crate::metrics::used_ratio("slack-brandon", "mautrix-slack"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_volume_change_is_logged_once_each_way() {
+        use tracing::Level;
+        assert_eq!(volume_change(None, "ok"), None);
+        assert_eq!(volume_change(None, "unknown"), None);
+        assert_eq!(volume_change(None, "full"), Some(Level::WARN));
+        assert_eq!(volume_change(Some("ok"), "nearly_full"), Some(Level::WARN));
+        assert_eq!(
+            volume_change(Some("nearly_full"), "full"),
+            Some(Level::WARN)
+        );
+        assert_eq!(volume_change(Some("full"), "full"), None);
+        assert_eq!(volume_change(Some("full"), "nearly_full"), None);
+        assert_eq!(volume_change(Some("full"), "ok"), Some(Level::INFO));
+        assert_eq!(volume_change(Some("unknown"), "full"), Some(Level::WARN));
+        assert_eq!(volume_change(Some("full"), "unknown"), None);
     }
 
     #[tokio::test]

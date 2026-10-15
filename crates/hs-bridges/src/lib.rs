@@ -20,6 +20,7 @@ pub mod directory;
 pub mod front_door;
 pub mod manager;
 pub mod matrix;
+pub mod metrics;
 pub mod overlap;
 pub mod runtime;
 pub mod store;
