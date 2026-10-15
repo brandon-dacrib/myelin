@@ -165,7 +165,13 @@ impl<B: KvBackend> RoomActor<B> {
     /// wrote since bumps the room's rewrite counter, and a copy reloads on its next catch-up)
     /// or at its position in this actor's timeline (so a copy does not hold the owner's rows
     /// past its head, nor a row another writer put at a position this copy holds otherwise).
-    fn row_is_held(&self, sn: EventSn, room_id: &str, flags: u8, room_pos: Option<i64>) -> bool {
+    pub(super) fn row_is_held(
+        &self,
+        sn: EventSn,
+        room_id: &str,
+        flags: u8,
+        room_pos: Option<i64>,
+    ) -> bool {
         if room_id != self.room_id.as_str() {
             return false;
         }

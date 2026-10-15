@@ -304,6 +304,26 @@ struct LoadRow {
     json: LoadRowJson,
 }
 
+/// What [`RoomActor::root_from_sns`] reads of a stored row ([`PersistedEvent`]) for a state
+/// entry not in memory: whether the room holds it, and its type and state key.
+#[derive(serde::Deserialize)]
+struct StateKeyRow {
+    room_id: String,
+    flags: u8,
+    #[serde(default)]
+    room_pos: Option<i64>,
+    json: StateKeyRowJson,
+}
+
+/// The part of an event's JSON [`StateKeyRow`] reads.
+#[derive(serde::Deserialize)]
+struct StateKeyRowJson {
+    #[serde(rename = "type")]
+    event_type: String,
+    #[serde(default)]
+    state_key: Option<String>,
+}
+
 /// The part of an event's JSON [`LoadRow`] reads.
 #[derive(serde::Deserialize)]
 struct LoadRowJson {
@@ -1782,6 +1802,11 @@ impl<B: KvBackend> RoomActor<B> {
     /// entry winning), then `plus` over them. Entries this actor does not hold, or that are
     /// not state events, are skipped.
     ///
+    /// An entry not in memory is not decoded into an event: its row's type and state key are
+    /// all a root needs ([`StateKeyRow`]). A root names the whole state, so building one this
+    /// way is a read and a small parse per member rather than a parse, a canonicalisation and
+    /// a reference hash, and pins nothing.
+    ///
     /// # Errors
     /// [`RoomError::State`] if the store fails.
     fn root_from_sns(
@@ -1790,22 +1815,73 @@ impl<B: KvBackend> RoomActor<B> {
         plus: Option<EventSn>,
     ) -> Result<<ProductionStateStore<B> as StateStore>::Root, RoomError> {
         let mut diff = hs_state::api::StateDiff::default();
+        let snapshot = self.backend.snapshot();
         for sn in state.iter().chain(plus.iter()) {
-            let Some(event) = self.event_uncached(*sn) else {
-                continue;
-            };
-            let Some(state_key) = event.header().state_key.as_deref() else {
+            let Some((event_type, state_key)) = self.held_state_key(&snapshot, *sn) else {
                 continue;
             };
             let key = self
                 .store
-                .intern_state_key(&event.header().event_type, state_key)
+                .intern_state_key(&event_type, &state_key)
                 .map_err(|e| RoomError::State(e.to_string()))?;
             diff.added.insert(key, *sn);
         }
         self.store
             .apply(self.store.empty_root(), &diff)
             .map_err(|e| RoomError::State(e.to_string()))
+    }
+
+    /// The `(type, state_key)` of `sn` if this actor holds it and it is a state event: from the
+    /// event in memory, or else from its row without decoding the event ([`StateKeyRow`]),
+    /// held as [`RoomActor::event_uncached`] would find it (rejected, purged, an outlier, or at
+    /// its timeline position).
+    fn held_state_key(
+        &self,
+        snapshot: &<B as KvBackend>::Snapshot,
+        sn: EventSn,
+    ) -> Option<(String, String)> {
+        let in_memory = self
+            .pins
+            .get(&sn)
+            .map(|event| {
+                (
+                    event.header().event_type.clone(),
+                    event.header().state_key.clone(),
+                )
+            })
+            .or_else(|| {
+                self.cache.borrow().peek(sn).map(|event| {
+                    (
+                        event.header().event_type.clone(),
+                        event.header().state_key.clone(),
+                    )
+                })
+            });
+        if let Some((event_type, state_key)) = in_memory {
+            return state_key.map(|key| (event_type, key));
+        }
+        let bytes = match self.tables.events.get(snapshot, &(sn,)) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return None,
+            Err(error) => {
+                tracing::warn!(room_id = %self.room_id, event_sn = %sn, %error, "could not read an event row");
+                return None;
+            }
+        };
+        let row: StateKeyRow = match serde_json::from_slice(&bytes) {
+            Ok(row) => row,
+            Err(error) => {
+                tracing::warn!(room_id = %self.room_id, event_sn = %sn, %error, "could not decode an event row");
+                return None;
+            }
+        };
+        let held = self.rejected.contains(&sn)
+            || self.purged.contains(&sn)
+            || self.row_is_held(sn, &row.room_id, row.flags, row.room_pos);
+        if !held {
+            return None;
+        }
+        row.json.state_key.map(|key| (row.json.event_type, key))
     }
 
     /// Leaves the root of the state after `sn` -- its explicit state (`Tables::state_snapshots`),

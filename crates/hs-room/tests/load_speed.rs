@@ -379,6 +379,28 @@ fn measure_room_loads() {
             "{label}: members() of {members} took {:.3}s",
             started.elapsed().as_secs_f64()
         );
+        // The state at every 50th event of the history, placed member joins among them: what a
+        // client reading the room's history back makes the server compute.
+        let (page, _) = actor.paginate(
+            Some(PaginationToken::new(i64::MIN / 2, Direction::Forward)),
+            Direction::Forward,
+            usize::MAX,
+        );
+        let ids: Vec<OwnedEventId> = page
+            .iter()
+            .step_by(50)
+            .map(|e| e.event_id().to_owned())
+            .collect();
+        drop(page);
+        let started = Instant::now();
+        for id in &ids {
+            actor.state_at_event(id).expect("state").expect("known");
+        }
+        println!(
+            "{label}: the state at {} events across the history took {:.3}s",
+            ids.len(),
+            started.elapsed().as_secs_f64()
+        );
     }
 }
 
