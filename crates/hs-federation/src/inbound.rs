@@ -499,15 +499,71 @@ pub trait TransactionStore: Send + Sync {
 
 /// The in-memory [`TransactionStore`] used both by this crate's own tests and by `hs-cli`'s
 /// wiring.
-#[derive(Default)]
+///
+/// Bounded: a response is remembered for [`TRANSACTIONS_REMEMBERED_FOR`] (a sending server
+/// retries a transaction within minutes, and sends the next only once this one is answered), and
+/// at most [`MAX_TRANSACTIONS_REMEMBERED`] are held, the oldest forgotten first. Until 2026-10-15
+/// every transaction's response was kept for the life of the process.
+/// `hs_federation_inbound_transactions_remembered` shows how many are held; a `warn`, at most
+/// once an hour, says when the count bound (not the age) forgot one.
 pub struct InMemoryTransactionStore {
-    seen: Mutex<HashMap<(String, String), Value>>,
+    seen: Mutex<RememberedTransactions>,
+    max: usize,
+    keep_for: std::time::Duration,
+}
+
+/// How long [`InMemoryTransactionStore`] remembers a transaction's response.
+pub const TRANSACTIONS_REMEMBERED_FOR: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// How many transaction responses [`InMemoryTransactionStore`] holds at most.
+pub const MAX_TRANSACTIONS_REMEMBERED: usize = 16_384;
+
+#[derive(Default)]
+struct RememberedTransactions {
+    responses: HashMap<(String, String), Value>,
+    /// Arrival order, oldest first: the key and when its response was recorded.
+    order: std::collections::VecDeque<((String, String), std::time::Instant)>,
+    /// When the count bound last forgot a response and said so.
+    last_warned: Option<std::time::Instant>,
+}
+
+impl Default for InMemoryTransactionStore {
+    fn default() -> Self {
+        Self::with_bounds(MAX_TRANSACTIONS_REMEMBERED, TRANSACTIONS_REMEMBERED_FOR)
+    }
 }
 
 impl InMemoryTransactionStore {
+    /// A store with the default bounds.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A store holding at most `max` responses, each for at most `keep_for`.
+    #[must_use]
+    pub fn with_bounds(max: usize, keep_for: std::time::Duration) -> Self {
+        Self {
+            seen: Mutex::new(RememberedTransactions::default()),
+            max: max.max(1),
+            keep_for,
+        }
+    }
+
+    /// How many responses are held right now.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .responses
+            .len()
+    }
+
+    /// Whether no response is held.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -516,16 +572,51 @@ impl TransactionStore for InMemoryTransactionStore {
     async fn get(&self, origin: &str, txn_id: &str) -> Option<Value> {
         self.seen
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .responses
             .get(&(origin.to_owned(), txn_id.to_owned()))
             .cloned()
     }
 
     async fn put(&self, origin: &str, txn_id: &str, response: Value) {
-        self.seen
+        let now = std::time::Instant::now();
+        let mut seen = self
+            .seen
             .lock()
-            .unwrap()
-            .insert((origin.to_owned(), txn_id.to_owned()), response);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key = (origin.to_owned(), txn_id.to_owned());
+        if seen.responses.insert(key.clone(), response).is_none() {
+            seen.order.push_back((key, now));
+        }
+        let mut forgotten_by_count = 0usize;
+        while let Some((_, at)) = seen.order.front() {
+            let too_old = now.duration_since(*at) >= self.keep_for;
+            let too_many = seen.responses.len() > self.max;
+            if !too_old && !too_many {
+                break;
+            }
+            if let Some((oldest, _)) = seen.order.pop_front() {
+                seen.responses.remove(&oldest);
+                if !too_old {
+                    forgotten_by_count += 1;
+                }
+            }
+        }
+        if forgotten_by_count > 0
+            && seen
+                .last_warned
+                .is_none_or(|at| now.duration_since(at) >= std::time::Duration::from_secs(3600))
+        {
+            seen.last_warned = Some(now);
+            tracing::warn!(
+                limit = self.max,
+                remembered_for_secs = self.keep_for.as_secs(),
+                "more inbound transactions arrived within the hour than this server remembers; \
+                 the oldest are forgotten, and a retry of one of them is processed again (said \
+                 at most once an hour; hs_federation_inbound_transactions_remembered)"
+            );
+        }
+        crate::metrics::set_inbound_transactions_remembered(seen.responses.len());
     }
 }
 
@@ -1698,5 +1789,35 @@ mod tests {
         );
         assert!(crate::metrics::acl_refusals("typing") > typing_before);
         assert!(crate::metrics::acl_refusals("receipt") >= receipts_before + 2);
+    }
+
+    /// The transaction cache forgets the oldest responses past its count, and any older than
+    /// its age, so a long-lived server does not keep every transaction it was ever sent.
+    #[tokio::test]
+    async fn remembered_transactions_are_bounded_by_count_and_age() {
+        let store = InMemoryTransactionStore::with_bounds(3, std::time::Duration::from_secs(3600));
+        for n in 0..5 {
+            store
+                .put("a.example", &format!("t{n}"), serde_json::json!({"n": n}))
+                .await;
+        }
+        assert_eq!(store.len(), 3);
+        assert!(store.get("a.example", "t0").await.is_none());
+        assert!(store.get("a.example", "t1").await.is_none());
+        assert_eq!(
+            store.get("a.example", "t4").await,
+            Some(serde_json::json!({"n": 4}))
+        );
+        // The same transaction again replaces its response and takes no second place.
+        store
+            .put("a.example", "t4", serde_json::json!({"n": 44}))
+            .await;
+        assert_eq!(store.len(), 3);
+        assert!(store.get("a.example", "t2").await.is_some());
+
+        let aging = InMemoryTransactionStore::with_bounds(100, std::time::Duration::ZERO);
+        aging.put("a.example", "old", serde_json::json!({})).await;
+        aging.put("a.example", "new", serde_json::json!({})).await;
+        assert!(aging.is_empty(), "nothing outlives an age of zero");
     }
 }

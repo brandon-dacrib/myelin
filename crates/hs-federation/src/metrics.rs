@@ -643,6 +643,16 @@ pub fn inbound_shed() -> u64 {
     INBOUND_SHED.get()
 }
 
+static INBOUND_TRANSACTIONS_REMEMBERED: std::sync::LazyLock<
+    prometheus_client::metrics::gauge::Gauge,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Sets `hs_federation_inbound_transactions_remembered`: inbound transactions whose responses
+/// `crate::inbound::InMemoryTransactionStore` holds for a retry.
+pub fn set_inbound_transactions_remembered(n: usize) {
+    INBOUND_TRANSACTIONS_REMEMBERED.set(i64::try_from(n).unwrap_or(i64::MAX));
+}
+
 /// Sets `hs_federation_inbound_shedding`: `1` while inbound federation is shed for memory.
 pub(crate) fn set_inbound_shedding(on: bool) {
     INBOUND_SHEDDING.set(i64::from(on));
@@ -919,6 +929,12 @@ pub fn register_transport_metrics(registry: &mut Registry) {
         "Inbound federation requests answered 429 at once because the process was over its \
          memory budget (federation.inbound_memory_shed_fraction)",
         INBOUND_SHED.clone(),
+    );
+    registry.register(
+        "hs_federation_inbound_transactions_remembered",
+        "Inbound transactions whose responses are held to answer a retry (at most 16384, \
+         each for an hour)",
+        INBOUND_TRANSACTIONS_REMEMBERED.clone(),
     );
     registry.register(
         "hs_federation_inbound_shedding",
