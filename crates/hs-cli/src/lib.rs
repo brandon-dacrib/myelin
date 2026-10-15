@@ -36,6 +36,7 @@ pub mod identity;
 pub mod identity_service;
 pub mod live_config;
 pub mod media;
+pub mod memory_guard;
 pub mod metrics_layer;
 pub mod migration;
 pub mod overview;

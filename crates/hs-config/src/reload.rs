@@ -259,6 +259,10 @@ pub const SETTINGS: &[Setting] = &[
         "built into the federation client's backoff",
     ),
     hot(
+        "/federation/inbound_memory_shed_fraction",
+        "the memory guard reads it at each check (every five seconds)",
+    ),
+    hot(
         "/federation/key_fetch_timeout",
         "the key cache reads it for each fetch of another server's keys",
     ),

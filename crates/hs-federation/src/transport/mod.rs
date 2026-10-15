@@ -254,6 +254,31 @@ pub const INBOUND_SLOT_WAIT: std::time::Duration = std::time::Duration::from_sec
 static INBOUND_SLOTS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
     std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(INBOUND_CONCURRENCY)));
 
+/// Whether inbound federation is being shed ([`set_inbound_shedding`]).
+static SHEDDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// How long a server whose request was shed for memory is asked to wait before trying again.
+pub const SHED_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Turns shedding of inbound federation on or off, returning whether it was on. While it is
+/// on, every inbound federation request (the routes behind [`bound_inbound`]) is answered
+/// `429 M_LIMIT_EXCEEDED` with a `Retry-After` of [`SHED_RETRY_AFTER`] at once, before it takes
+/// a slot or is read: what `hs-cli`'s memory guard does when the process is over
+/// `federation.inbound_memory_shed_fraction` of its memory limit. A sending server retries a
+/// refused transaction, so nothing is lost; requests already being worked on finish.
+/// `hs_federation_inbound_shedding` shows the state, `hs_federation_inbound_shed_total` the
+/// requests refused; the guard logs each change.
+pub fn set_inbound_shedding(on: bool) -> bool {
+    crate::metrics::set_inbound_shedding(on);
+    SHEDDING.swap(on, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether inbound federation is being shed for memory right now ([`set_inbound_shedding`]).
+#[must_use]
+pub fn inbound_shedding() -> bool {
+    SHEDDING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Inbound federation requests holding a slot right now ([`INBOUND_CONCURRENCY`]).
 #[must_use]
 pub fn inbound_in_flight() -> usize {
@@ -266,16 +291,33 @@ async fn bound_inbound(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    hold_a_slot(&INBOUND_SLOTS, INBOUND_SLOT_WAIT, request, next).await
+    hold_a_slot(&INBOUND_SLOTS, &SHEDDING, INBOUND_SLOT_WAIT, request, next).await
 }
 
-/// [`bound_inbound`]'s body, over any `slots` and `wait` (tests use their own).
+/// The answer to an inbound federation request shed for memory ([`set_inbound_shedding`]).
+fn shed(request: &axum::extract::Request) -> axum::response::Response {
+    crate::metrics::record_inbound_shed();
+    tracing::debug!(
+        path = request.uri().path(),
+        "an inbound federation request was refused: the server is over its memory budget"
+    );
+    axum::response::IntoResponse::into_response(hs_http::error::MatrixError::rate_limited(
+        u64::try_from(SHED_RETRY_AFTER.as_millis()).unwrap_or(u64::MAX),
+    ))
+}
+
+/// [`bound_inbound`]'s body, over any `slots`, `shedding` flag and `wait` (tests use their
+/// own). A request is shed at once while `shedding` is set ([`set_inbound_shedding`]).
 async fn hold_a_slot(
     slots: &Arc<tokio::sync::Semaphore>,
+    shedding: &std::sync::atomic::AtomicBool,
     wait: std::time::Duration,
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    if shedding.load(std::sync::atomic::Ordering::Relaxed) {
+        return shed(&request);
+    }
     let waited_from = std::time::Instant::now();
     let slot = tracing::Instrument::instrument(
         tokio::time::timeout(wait, slots.clone().acquire_owned()),
@@ -342,7 +384,15 @@ mod tests {
             .layer(axum::middleware::from_fn(move |request, next| {
                 let slots = layer_slots.clone();
                 async move {
-                    hold_a_slot(&slots, std::time::Duration::from_millis(200), request, next).await
+                    let never = std::sync::atomic::AtomicBool::new(false);
+                    hold_a_slot(
+                        &slots,
+                        &never,
+                        std::time::Duration::from_millis(200),
+                        request,
+                        next,
+                    )
+                    .await
                 }
             }));
         let call = |app: axum::Router| {
@@ -369,6 +419,62 @@ mod tests {
         assert_eq!(first.await.unwrap().status(), StatusCode::OK);
         assert_eq!(second.await.unwrap().status(), StatusCode::OK);
         assert_eq!(slots.available_permits(), 2, "the slots came back");
+    }
+
+    /// While inbound federation is shed for memory, a request is answered `429` with a
+    /// `Retry-After` at once, without reaching its handler or taking a slot; once shedding is
+    /// off, requests are worked on again.
+    #[tokio::test]
+    async fn a_request_is_shed_at_once_while_memory_is_over_budget() {
+        let reached = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = reached.clone();
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let shedding = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (layer_slots, layer_shedding) = (slots.clone(), shedding.clone());
+        let app = axum::Router::new()
+            .route(
+                "/work",
+                axum::routing::get(move || {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    async { "done" }
+                }),
+            )
+            .layer(axum::middleware::from_fn(move |request, next| {
+                let (slots, shedding) = (layer_slots.clone(), layer_shedding.clone());
+                async move {
+                    hold_a_slot(
+                        &slots,
+                        &shedding,
+                        std::time::Duration::from_millis(200),
+                        request,
+                        next,
+                    )
+                    .await
+                }
+            }));
+        let shed_before = crate::metrics::inbound_shed();
+
+        let refused = app
+            .clone()
+            .oneshot(Request::get("/work").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        shedding.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(slots.available_permits(), 1, "a shed request takes no slot");
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            refused.headers().get("retry-after").unwrap(),
+            &SHED_RETRY_AFTER.as_secs().to_string()
+        );
+        assert_eq!(reached.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(crate::metrics::inbound_shed() > shed_before);
+
+        let answered = app
+            .oneshot(Request::get("/work").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(answered.status(), StatusCode::OK);
+        assert_eq!(reached.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     struct EmptyFetcher;

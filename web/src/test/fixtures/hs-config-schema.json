@@ -173,7 +173,8 @@
               "ed25519:auto": "Noi6WqcDj0QmPxCNQqgezwTlBKrfqehY1u2FyWP9uYw"
             }
           }
-        ]
+        ],
+        "inbound_memory_shed_fraction": 0.85
       }
     },
     "rate_limits": {
@@ -1615,6 +1616,13 @@
               }
             }
           ],
+          "x-applies": "hot"
+        },
+        "inbound_memory_shed_fraction": {
+          "description": "The share of the container's memory limit (its cgroup's `memory.max`) above which this\nserver stops taking other servers' requests and answers each `429` with a `Retry-After`\nuntil its memory is back below the line, less five points. A sending server retries a\ntransaction it is refused, so nothing is lost; what the server holds in memory gets the\nchance to drain before the kernel kills the process, or, with many pods on one node, the\nnode runs out. Checked every five seconds against the process's resident memory, on\n`/metrics` as `hs_process_memory_budget_ratio`, with the limit as\n`hs_process_memory_limit_bytes`; a server with no limit (no cgroup, or none set) never\nsheds. Between 0 and 1; `0` turns shedding off. Synapse has no setting for it. A change\napplies at the next check.",
+          "type": "number",
+          "format": "double",
+          "default": 0.85,
           "x-applies": "hot"
         }
       },

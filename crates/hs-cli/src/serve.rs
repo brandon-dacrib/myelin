@@ -1945,6 +1945,19 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     // The runtime's heartbeat, and the watchdog thread that says when it stops beating
     // (`crate::runtime_heartbeat`): stopped when the server's parts are dropped at shutdown.
     keep_alive.push(Arc::new(crate::runtime_heartbeat::RuntimeHeartbeat::start()));
+    // The memory guard (`crate::memory_guard`): refuses other servers' requests while the
+    // process is over `federation.inbound_memory_shed_fraction` of its container's limit.
+    let memory_guard = Arc::new(crate::memory_guard::MemoryGuard::start(
+        config.federation.inbound_memory_shed_fraction,
+    ));
+    if let Some(live) = &options.live_config {
+        let guard = memory_guard.clone();
+        live.on_change("federation", move |config| {
+            guard.set_fraction(config.federation.inbound_memory_shed_fraction);
+            Ok(())
+        });
+    }
+    keep_alive.push(memory_guard);
     // How `POST /join` reaches a room hosted elsewhere (`crate::remote_join`): over the
     // federation mount's own client, so only when federation is on.
     let remote_join: Option<Arc<dyn hs_room::remote_join::RemoteJoin>>;

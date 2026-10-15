@@ -33,6 +33,10 @@ const fn default_max_queued_durable_edus_per_destination() -> u32 {
     10_000
 }
 
+const fn default_inbound_memory_shed_fraction() -> f64 {
+    0.85
+}
+
 fn default_forget_unused_destinations_after() -> Duration {
     Duration::from_secs(7 * 24 * 60 * 60)
 }
@@ -242,6 +246,19 @@ pub struct FederationConfig {
     /// at once: the next key the server does not hold is asked of the new list.
     #[serde(default = "default_trusted_key_servers")]
     pub trusted_key_servers: Vec<TrustedKeyServer>,
+
+    /// The share of the container's memory limit (its cgroup's `memory.max`) above which this
+    /// server stops taking other servers' requests and answers each `429` with a `Retry-After`
+    /// until its memory is back below the line, less five points. A sending server retries a
+    /// transaction it is refused, so nothing is lost; what the server holds in memory gets the
+    /// chance to drain before the kernel kills the process, or, with many pods on one node, the
+    /// node runs out. Checked every five seconds against the process's resident memory, on
+    /// `/metrics` as `hs_process_memory_budget_ratio`, with the limit as
+    /// `hs_process_memory_limit_bytes`; a server with no limit (no cgroup, or none set) never
+    /// sheds. Between 0 and 1; `0` turns shedding off. Synapse has no setting for it. A change
+    /// applies at the next check.
+    #[serde(default = "default_inbound_memory_shed_fraction")]
+    pub inbound_memory_shed_fraction: f64,
 }
 
 impl Default for FederationConfig {
@@ -264,6 +281,7 @@ impl Default for FederationConfig {
             allow_public_rooms_over_federation: false,
             allow_device_name_lookup_over_federation: false,
             trusted_key_servers: default_trusted_key_servers(),
+            inbound_memory_shed_fraction: default_inbound_memory_shed_fraction(),
         }
     }
 }
@@ -343,6 +361,12 @@ impl Validate for FederationConfig {
             errors.push(
                 format!("{prefix}.key_fetch_timeout"),
                 "must be greater than 0",
+            );
+        }
+        if !(0.0..=1.0).contains(&self.inbound_memory_shed_fraction) {
+            errors.push(
+                format!("{prefix}.inbound_memory_shed_fraction"),
+                "must be between 0 and 1 (0 turns shedding off)",
             );
         }
         if self.max_queued_pdus_per_destination == 0 {

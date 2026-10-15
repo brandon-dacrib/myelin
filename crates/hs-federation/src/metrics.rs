@@ -627,6 +627,27 @@ pub fn inbound_refused() -> u64 {
     INBOUND_REFUSED.get()
 }
 
+static INBOUND_SHED: std::sync::LazyLock<Counter> = std::sync::LazyLock::new(Counter::default);
+static INBOUND_SHEDDING: std::sync::LazyLock<prometheus_client::metrics::gauge::Gauge> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Counts one inbound federation request answered `429` at once because the process is over
+/// its memory budget (`hs_federation_inbound_shed_total`; `crate::transport::set_inbound_shedding`).
+pub fn record_inbound_shed() {
+    INBOUND_SHED.inc();
+}
+
+/// How many inbound federation requests were shed for memory, in this process.
+#[must_use]
+pub fn inbound_shed() -> u64 {
+    INBOUND_SHED.get()
+}
+
+/// Sets `hs_federation_inbound_shedding`: `1` while inbound federation is shed for memory.
+pub(crate) fn set_inbound_shedding(on: bool) {
+    INBOUND_SHEDDING.set(i64::from(on));
+}
+
 /// Records how long an inbound federation request waited for its slot
 /// (`hs_federation_inbound_slot_wait_seconds`).
 pub fn record_inbound_slot_wait(seconds: f64) {
@@ -891,6 +912,19 @@ pub fn register_transport_metrics(registry: &mut Registry) {
         "Inbound federation requests answered 429 because none of the slots for inbound \
          requests came free in time",
         INBOUND_REFUSED.clone(),
+    );
+    // Registered without `_total`: the text encoder appends it.
+    registry.register(
+        "hs_federation_inbound_shed",
+        "Inbound federation requests answered 429 at once because the process was over its \
+         memory budget (federation.inbound_memory_shed_fraction)",
+        INBOUND_SHED.clone(),
+    );
+    registry.register(
+        "hs_federation_inbound_shedding",
+        "1 while inbound federation requests are refused because the process is over its \
+         memory budget, 0 otherwise",
+        INBOUND_SHEDDING.clone(),
     );
     registry.register(
         "hs_federation_inbound_slot_wait_seconds",

@@ -112,7 +112,7 @@ pub struct RoomRegistry<B: KvBackend> {
     backend: B,
     tables: Tables<B>,
     identity: HomeserverIdentity,
-    rooms: Mutex<HashMap<OwnedRoomId, Entry<B>>>,
+    rooms: Arc<Mutex<HashMap<OwnedRoomId, Entry<B>>>>,
     /// Every resident room's updates, fanned into one stream. See
     /// [`RoomRegistry::subscribe_global`] and `docs/rfcs/0012-room-registry-global-updates.md`.
     global: Arc<GlobalStream>,
@@ -137,7 +137,7 @@ pub struct RoomRegistry<B: KvBackend> {
     /// the default until `hs-cli` installs one) means every actor this registry constructs or
     /// loads runs with no cluster-fencing check at all -- `RoomActor::persist` behaves exactly as
     /// it did before this hook existed.
-    fencing: OnceLock<Arc<crate::fencing::RoomFencing<B>>>,
+    fencing: Arc<OnceLock<Arc<crate::fencing::RoomFencing<B>>>>,
     /// See [`crate::third_party_invite::IdentityService`] and
     /// [`RoomRegistry::install_identity_service`]. Unset (the default until `hs-cli` installs one)
     /// refuses every third-party invite `M_THREEPID_DENIED`.
@@ -166,11 +166,15 @@ pub struct RoomRegistry<B: KvBackend> {
     idle_unload_after_secs: Arc<std::sync::atomic::AtomicU64>,
     /// The loads under way, by room ([`RoomRegistry::get_or_load`]): everyone who asks for a
     /// room that is loading waits for that load instead of starting one of their own.
-    loading: std::sync::Mutex<HashMap<OwnedRoomId, Arc<tokio::sync::OnceCell<RoomActorHandle<B>>>>>,
+    loading: Arc<std::sync::Mutex<LoadsUnderWay<B>>>,
     /// How many room loads run at once ([`MAX_CONCURRENT_LOADS`]).
-    load_slots: tokio::sync::Semaphore,
+    load_slots: Arc<tokio::sync::Semaphore>,
     /// How many loads this registry has started ([`RoomRegistry::loads_started`]).
-    loads_started: std::sync::atomic::AtomicU64,
+    loads_started: Arc<std::sync::atomic::AtomicU64>,
+    /// Run on the blocking thread just before a room is read from the store, in tests that
+    /// need a load to take a while.
+    #[cfg(test)]
+    before_load: BeforeLoad,
 }
 
 /// How many rooms [`RoomRegistry::get_or_load`] loads at once; the rest wait their turn,
@@ -185,6 +189,240 @@ pub const MAX_CONCURRENT_LOADS: usize = 8;
 /// How often [`RoomRegistry::spawn_idle_unloader`] looks for rooms idle longer than
 /// `server.rooms.idle_unload_after`.
 pub const IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// What everyone waiting for a room's load is told once it is over: the handle, or the error
+/// the load ended with (shared, since many may wait; see [`error_for_waiter`]).
+type LoadAnswer<B> = Option<Result<RoomActorHandle<B>, Arc<RoomError>>>;
+
+/// The loads under way, by room: each a channel its load's own task answers on.
+type LoadsUnderWay<B> = HashMap<OwnedRoomId, tokio::sync::watch::Receiver<LoadAnswer<B>>>;
+
+/// A hook a test runs on the blocking thread just before a room is read from the store.
+#[cfg(test)]
+type BeforeLoad = Arc<std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>;
+
+/// How often, at most, [`LoadJob::run`] says at `warn` that every load slot is taken.
+const SLOT_WAIT_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// When [`LoadJob::run`] last said every load slot was taken, in seconds since the process's
+/// first load; `0` for never.
+static LAST_SLOT_WAIT_WARNING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The process's first load, the epoch [`LAST_SLOT_WAIT_WARNING`] counts from.
+static FIRST_LOAD: std::sync::LazyLock<std::time::Instant> =
+    std::sync::LazyLock::new(std::time::Instant::now);
+
+/// A room load in a task of its own ([`RoomRegistry::get_or_load`]): what it needs of the
+/// registry, held by shared handle so that it outlives every caller waiting for it.
+struct LoadJob<B: KvBackend> {
+    backend: B,
+    tables: Tables<B>,
+    identity: HomeserverIdentity,
+    rooms: Arc<Mutex<HashMap<OwnedRoomId, Entry<B>>>>,
+    global: Arc<GlobalStream>,
+    fencing: Arc<OnceLock<Arc<crate::fencing::RoomFencing<B>>>>,
+    event_cache_capacity: CacheCapacity,
+    load_slots: Arc<tokio::sync::Semaphore>,
+    loads_started: Arc<std::sync::atomic::AtomicU64>,
+    loading: Arc<std::sync::Mutex<LoadsUnderWay<B>>>,
+    #[cfg(test)]
+    before_load: BeforeLoad,
+}
+
+impl<B: KvBackend + 'static> LoadJob<B> {
+    /// Loads `room_id`, registers it, answers everyone waiting on `tell`, and takes the load off
+    /// the registry's list of loads under way. Runs in the `room.load` span
+    /// [`RoomRegistry::get_or_load`] made for it; its children say where a slow load's time went:
+    /// `room.load.slot_wait` (one of the [`MAX_CONCURRENT_LOADS`] slots),
+    /// `room.load.blocking_wait` (a blocking thread), and `room.load.from_store` (the read
+    /// itself, with the timeline's length, whether the state store's records were replayed and
+    /// how many events it was fed).
+    async fn run(
+        self,
+        room_id: OwnedRoomId,
+        fence: Option<hs_cluster::Fence>,
+        tell: tokio::sync::watch::Sender<LoadAnswer<B>>,
+    ) {
+        let result = self.load_and_register(&room_id, fence).await;
+        if let Err(error) = &result
+            && !matches!(error, RoomError::RoomNotFound(_))
+        {
+            let span = tracing::Span::current();
+            span.record("otel.status_code", "error");
+            span.record("error.message", tracing::field::display(error));
+        }
+        // Answered first, then taken off the list: a caller that finds the load listed always
+        // gets this answer, and one that comes after finds the room resident (or, after a
+        // failure, starts a load of its own).
+        tell.send_replace(Some(result.map_err(Arc::new)));
+        let mine = tell.subscribe();
+        let mut loading = self
+            .loading
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if loading
+            .get(&room_id)
+            .is_some_and(|current| current.same_channel(&mine))
+        {
+            loading.remove(&room_id);
+        }
+        crate::metrics::set_loads_in_progress(loading.len());
+    }
+
+    /// The load of a room that is not resident: from the store, on a blocking thread and in one
+    /// of the [`MAX_CONCURRENT_LOADS`] slots, then registered. A room that became resident
+    /// since the caller looked (a load that finished in between) is handed out as it is.
+    async fn load_and_register(
+        &self,
+        room_id: &ruma::RoomId,
+        fence: Option<hs_cluster::Fence>,
+    ) -> Result<RoomActorHandle<B>, RoomError> {
+        if let Some(entry) = self.rooms.lock().await.get_mut(room_id)
+            && !RoomRegistry::<B>::copy_is_stale(entry.fence, fence)
+        {
+            entry.last_used = Instant::now();
+            return Ok(entry.handle.clone());
+        }
+        let backend = self.backend.clone();
+        let tables = self.tables.clone();
+        let identity = self.identity.clone();
+        let owned_room_id = room_id.to_owned();
+        let slot = match self.load_slots.clone().try_acquire_owned() {
+            Ok(slot) => Some(slot),
+            Err(_) => {
+                crate::metrics::count_load_slot_wait();
+                warn_slots_taken(room_id);
+                // The semaphore is never closed; were it, the load would run unbounded.
+                tracing::Instrument::instrument(
+                    self.load_slots.clone().acquire_owned(),
+                    tracing::info_span!("room.load.slot_wait"),
+                )
+                .await
+                .ok()
+            }
+        };
+        self.loads_started
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let blocking_wait = tracing::info_span!("room.load.blocking_wait");
+        let from_store = tracing::info_span!(
+            "room.load.from_store",
+            timeline_events = tracing::field::Empty,
+            replayed = tracing::field::Empty,
+            state_records_fed = tracing::field::Empty,
+        );
+        #[cfg(test)]
+        let before_load = self
+            .before_load
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let loaded = tokio::task::spawn_blocking(move || {
+            // The slot and the running count go with the read itself, so that neither is given
+            // back before the read is over, whatever happens to the task around it.
+            let _slot = slot;
+            let _running = crate::metrics::load_running();
+            drop(blocking_wait);
+            #[cfg(test)]
+            if let Some(hook) = before_load {
+                hook();
+            }
+            // `RoomActor::load` records the counts on this span.
+            let _in_span = from_store.enter();
+            RoomActor::load(backend, tables, identity, &owned_room_id)
+        })
+        .await
+        .map_err(|e| RoomError::Internal(format!("room load task failed: {e}")))??;
+
+        let Some(mut actor) = loaded else {
+            return Err(RoomError::RoomNotFound(room_id.to_string()));
+        };
+        actor.set_cache_capacity(self.event_cache_capacity.clone());
+        actor.set_fencing(self.fencing.get().cloned());
+        match actor.persist_repaired_outlier_states() {
+            Ok(0) => {}
+            Ok(written) => {
+                tracing::info!(%room_id, written, "wrote back the state rows of placed outliers the load repaired")
+            }
+            Err(RoomError::Fenced(msg)) => {
+                tracing::debug!(%room_id, %msg, "the state rows of placed outliers the load repaired stay unwritten: this replica does not own the room")
+            }
+            Err(error) => {
+                tracing::warn!(%room_id, %error, "could not write back the state rows of placed outliers the load repaired; they will be repaired again on the next load")
+            }
+        }
+
+        let mut rooms = self.rooms.lock().await;
+        let entry = match rooms.entry(room_id.to_owned()) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                // Loaded twice at once; the other load won, and this actor is dropped unused.
+                entry.into_mut()
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                // Joined to the global stream like a created room is. It was not, once, so a
+                // room loaded from disk -- every room, after a restart -- published to nobody:
+                // nothing that happened in it reached `/sync`, push, or a bridge. Every test
+                // created its rooms in the process that read them, and the first one that did
+                // not found it. Under the lock, so that the head announcement and the entry are
+                // one step for anybody racing to load the same room.
+                actor.join_global_stream(self.global.clone());
+                slot.insert(Entry {
+                    handle: RoomActorHandle::new(actor),
+                    last_used: Instant::now(),
+                    fence,
+                })
+            }
+        };
+        entry.last_used = Instant::now();
+        let handle = entry.handle.clone();
+        RoomRegistry::<B>::note_residents(&rooms);
+        Ok(handle)
+    }
+}
+
+/// Says at `warn`, at most once a [`SLOT_WAIT_WARN_INTERVAL`], that a room load found every
+/// one of the [`MAX_CONCURRENT_LOADS`] slots taken: the bound is doing its work, and requests
+/// that need a room not yet resident are waiting for it.
+fn warn_slots_taken(room_id: &ruma::RoomId) {
+    let now = FIRST_LOAD.elapsed().as_secs().max(1);
+    let last = LAST_SLOT_WAIT_WARNING.load(std::sync::atomic::Ordering::Relaxed);
+    if (last == 0 || now.saturating_sub(last) >= SLOT_WAIT_WARN_INTERVAL.as_secs())
+        && LAST_SLOT_WAIT_WARNING
+            .compare_exchange(
+                last,
+                now,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+    {
+        tracing::warn!(
+            %room_id,
+            limit = MAX_CONCURRENT_LOADS,
+            waits = crate::metrics::load_slot_waits(),
+            "every room load slot is taken; this room's load waits for one \
+             (hs_room_loads_in_progress, hs_room_load_slot_waits_total; said at most once a \
+             minute)"
+        );
+    }
+}
+
+/// The error a caller waiting for a room's load gets when the load failed. Several may wait,
+/// and [`RoomError`] is not `Clone`: the variants a caller acts on (the room is missing, its
+/// version is unknown, this replica is fenced, the room is blocked) are rebuilt as they were,
+/// and any other is reported as [`RoomError::Internal`] with the original's text.
+fn error_for_waiter(error: &RoomError) -> RoomError {
+    match error {
+        RoomError::RoomNotFound(room) => RoomError::RoomNotFound(room.clone()),
+        RoomError::UnsupportedRoomVersion(version) => {
+            RoomError::UnsupportedRoomVersion(version.clone())
+        }
+        RoomError::Fenced(msg) => RoomError::Fenced(msg.clone()),
+        RoomError::RoomBlocked(reason) => RoomError::RoomBlocked(reason.clone()),
+        RoomError::State(msg) => RoomError::State(msg.clone()),
+        RoomError::Internal(msg) => RoomError::Internal(msg.clone()),
+        other => RoomError::Internal(other.to_string()),
+    }
+}
 
 /// A join through another server under way, from [`RoomRegistry::remote_join_started`] until
 /// this is dropped.
@@ -234,13 +472,13 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
             backend,
             tables,
             identity,
-            rooms: Mutex::new(HashMap::new()),
+            rooms: Arc::new(Mutex::new(HashMap::new())),
             global,
             global_token_resolver: OnceLock::new(),
             backfill: OnceLock::new(),
             remote_hierarchy: OnceLock::new(),
             hierarchy_sessions: crate::hierarchy::PaginationSessions::default(),
-            fencing: OnceLock::new(),
+            fencing: Arc::new(OnceLock::new()),
             server_notices_user: OnceLock::new(),
             identity_service: OnceLock::new(),
             reports,
@@ -249,9 +487,11 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
             joining: Arc::default(),
             event_cache_capacity: CacheCapacity::default(),
             idle_unload_after_secs: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            loading: std::sync::Mutex::new(HashMap::new()),
-            load_slots: tokio::sync::Semaphore::new(MAX_CONCURRENT_LOADS),
-            loads_started: std::sync::atomic::AtomicU64::new(0),
+            loading: Arc::default(),
+            load_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_LOADS)),
+            loads_started: Arc::default(),
+            #[cfg(test)]
+            before_load: Arc::default(),
         })
     }
 
@@ -575,12 +815,30 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
     /// (`/sync` `500 unknown event EventSn#...`, sends `500 cited event not in history`).
     ///
     /// One load per room at a time: whoever asks for a room another caller is loading waits for
-    /// that load and gets its handle; a load that fails is made again by the next one waiting.
-    /// At most [`MAX_CONCURRENT_LOADS`] rooms load at once, each on a blocking thread.
+    /// that load and gets its handle. At most [`MAX_CONCURRENT_LOADS`] rooms load at once, each
+    /// on a blocking thread.
+    ///
+    /// # A load belongs to nobody who waits for it
+    /// The load runs in a task of its own, which holds the load slot and registers the room,
+    /// and every caller -- the one that started it included -- only waits for its answer. A
+    /// caller that gives up (an inbound `/send` whose sending server hung up after 60 or 180
+    /// seconds, a timeout around a prefetch) leaves the load running for the next one. Until
+    /// 2026-10-15 the first caller ran the load itself: when it was cancelled its slot was
+    /// released while the load went on, on its blocking thread, to an end nobody read, and the
+    /// next caller started the room's load again. On the demo, with federation on, the loads of
+    /// a few big rooms were restarted that way every time a sending server gave up on a
+    /// transaction: room actors alive (`hs_room_actors_alive`) climbed from 45 to 120 while 40
+    /// rooms were resident, 495 threads ran, every core was busy with copies of the same loads,
+    /// each therefore slower (one took 687 seconds for a room of three timeline events), and the
+    /// process grew some 120 MB a minute until the node ran out of memory
+    /// (`docs/status/06-federation.md`, "2026-10-15: the memory climb").
     ///
     /// # Errors
     /// Returns [`RoomError::RoomNotFound`] if the room does not exist, or any error
-    /// [`RoomActor::load`] can return.
+    /// [`RoomActor::load`] can return (every caller waiting for a load that failed gets the
+    /// error; one other than the room being missing, its version unknown or the replica fenced
+    /// arrives as [`RoomError::Internal`] carrying the original's text). The next caller after
+    /// a failed load starts a new one.
     pub async fn get_or_load(
         &self,
         room_id: &ruma::RoomId,
@@ -615,165 +873,113 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
             }
         }
 
-        let (load, in_flight) = {
+        let (mut answer, started_here) = {
             let mut loading = self
                 .loading
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match loading.entry(room_id.to_owned()) {
-                std::collections::hash_map::Entry::Occupied(entry) => (entry.get().clone(), true),
-                std::collections::hash_map::Entry::Vacant(slot) => {
-                    (slot.insert(Arc::default()).clone(), false)
+            match loading.get(room_id) {
+                Some(answer) => (answer.clone(), false),
+                None => {
+                    let (tell, answer) = tokio::sync::watch::channel(None);
+                    loading.insert(room_id.to_owned(), answer.clone());
+                    crate::metrics::set_loads_in_progress(loading.len());
+                    // The load's span is a child of whatever asked for the room first (or a
+                    // trace of its own when nothing traced did: a load at start-up), and may
+                    // outlive it.
+                    let span = tracing::info_span!(
+                        "room.load",
+                        room_id = %room_id,
+                        "otel.status_code" = tracing::field::Empty,
+                        "error.message" = tracing::field::Empty,
+                    );
+                    tokio::spawn(tracing::Instrument::instrument(
+                        self.load_job().run(room_id.to_owned(), fence, tell),
+                        span,
+                    ));
+                    (answer, true)
                 }
             }
         };
         // Waiting for a load another caller started is a span of its own (`room.load.wait`), so
         // a trace shows a request held up behind somebody else's load rather than a gap; the
         // load itself is `room.load`, in whichever trace started it.
-        let waiting = if in_flight {
-            tracing::info_span!("room.load.wait", room_id = %room_id)
-        } else {
+        let waiting = if started_here {
             tracing::Span::none()
+        } else {
+            tracing::info_span!("room.load.wait", room_id = %room_id)
         };
         let outcome = tracing::Instrument::instrument(
-            load.get_or_try_init(|| self.traced_load(room_id, fence)),
+            async {
+                answer
+                    .wait_for(Option::is_some)
+                    .await
+                    .map(|seen| seen.clone())
+            },
             waiting,
         )
-        .await
-        .cloned();
-        // Over, one way or the other: the next miss (after an unload, or after this failed for
-        // everyone waiting) loads afresh.
-        {
-            let mut loading = self
-                .loading
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if loading
-                .get(room_id)
-                .is_some_and(|current| Arc::ptr_eq(current, &load))
-            {
-                loading.remove(room_id);
+        .await;
+        match outcome {
+            Ok(Some(Ok(handle))) => Ok(handle),
+            Ok(Some(Err(error))) => Err(error_for_waiter(&error)),
+            // The load's task ended without an answer: it panicked. Nobody else will clear its
+            // entry, so the first waiter to see that does, and the next caller loads afresh.
+            Ok(None) | Err(_) => {
+                let mut loading = self
+                    .loading
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if loading
+                    .get(room_id)
+                    .is_some_and(|current| current.same_channel(&answer))
+                {
+                    loading.remove(room_id);
+                    crate::metrics::set_loads_in_progress(loading.len());
+                }
+                Err(RoomError::Internal(format!(
+                    "the load of room {room_id} stopped without an answer"
+                )))
             }
         }
-        outcome
     }
 
     /// How many room loads from the store this registry has started: one per room that was not
-    /// resident when asked for, however many asked for it at once.
+    /// resident when asked for, however many asked for it at once, and however many of them gave
+    /// up waiting.
     #[must_use]
     pub fn loads_started(&self) -> u64 {
         self.loads_started
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// [`RoomRegistry::load_and_register`] in a `room.load` span: a child of whatever asked for
-    /// the room, or a trace of its own when nothing traced did (a load at start-up). Its
-    /// children say where a slow load's time went: `room.load.slot_wait` (one of the
-    /// [`MAX_CONCURRENT_LOADS`] slots), `room.load.blocking_wait` (a blocking thread), and
-    /// `room.load.from_store` (the read itself, with the timeline's length, whether the state
-    /// store's records were replayed and how many events it was fed).
-    async fn traced_load(
-        &self,
-        room_id: &ruma::RoomId,
-        fence: Option<hs_cluster::Fence>,
-    ) -> Result<RoomActorHandle<B>, RoomError> {
-        let span = tracing::info_span!(
-            "room.load",
-            room_id = %room_id,
-            "otel.status_code" = tracing::field::Empty,
-            "error.message" = tracing::field::Empty,
-        );
-        let result =
-            tracing::Instrument::instrument(self.load_and_register(room_id, fence), span.clone())
-                .await;
-        if let Err(error) = &result
-            && !matches!(error, RoomError::RoomNotFound(_))
-        {
-            span.record("otel.status_code", "error");
-            span.record("error.message", tracing::field::display(error));
-        }
-        result
+    /// How many rooms are being loaded right now (or are waiting for one of the
+    /// [`MAX_CONCURRENT_LOADS`] slots to be): what `hs_room_loads_in_progress` shows for this
+    /// registry.
+    #[must_use]
+    pub fn loads_in_progress(&self) -> usize {
+        self.loading
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
-    /// [`RoomRegistry::get_or_load`]'s load of a room that is not resident: from the store, on a
-    /// blocking thread and in one of the [`MAX_CONCURRENT_LOADS`] slots, then registered.
-    async fn load_and_register(
-        &self,
-        room_id: &ruma::RoomId,
-        fence: Option<hs_cluster::Fence>,
-    ) -> Result<RoomActorHandle<B>, RoomError> {
-        let backend = self.backend.clone();
-        let tables = self.tables.clone();
-        let identity = self.identity.clone();
-        let owned_room_id = room_id.to_owned();
-        // The semaphore is never closed; were it, the load would run unbounded.
-        let _slot = tracing::Instrument::instrument(
-            self.load_slots.acquire(),
-            tracing::info_span!("room.load.slot_wait"),
-        )
-        .await
-        .ok();
-        self.loads_started
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let blocking_wait = tracing::info_span!("room.load.blocking_wait");
-        let from_store = tracing::info_span!(
-            "room.load.from_store",
-            timeline_events = tracing::field::Empty,
-            replayed = tracing::field::Empty,
-            state_records_fed = tracing::field::Empty,
-        );
-        let loaded = tokio::task::spawn_blocking(move || {
-            drop(blocking_wait);
-            // `RoomActor::load` records the counts on this span.
-            let _in_span = from_store.enter();
-            RoomActor::load(backend, tables, identity, &owned_room_id)
-        })
-        .await
-        .expect("room load task panicked")?;
-
-        let Some(mut actor) = loaded else {
-            return Err(RoomError::RoomNotFound(room_id.to_string()));
-        };
-        actor.set_cache_capacity(self.event_cache_capacity.clone());
-        actor.set_fencing(self.fencing.get().cloned());
-        match actor.persist_repaired_outlier_states() {
-            Ok(0) => {}
-            Ok(written) => {
-                tracing::info!(%room_id, written, "wrote back the state rows of placed outliers the load repaired")
-            }
-            Err(RoomError::Fenced(msg)) => {
-                tracing::debug!(%room_id, %msg, "the state rows of placed outliers the load repaired stay unwritten: this replica does not own the room")
-            }
-            Err(error) => {
-                tracing::warn!(%room_id, %error, "could not write back the state rows of placed outliers the load repaired; they will be repaired again on the next load")
-            }
+    /// What a load's own task needs of this registry: shared handles, never the registry
+    /// itself, so the task can outlive every caller waiting for it.
+    fn load_job(&self) -> LoadJob<B> {
+        LoadJob {
+            backend: self.backend.clone(),
+            tables: self.tables.clone(),
+            identity: self.identity.clone(),
+            rooms: self.rooms.clone(),
+            global: self.global.clone(),
+            fencing: self.fencing.clone(),
+            event_cache_capacity: self.event_cache_capacity.clone(),
+            load_slots: self.load_slots.clone(),
+            loads_started: self.loads_started.clone(),
+            loading: self.loading.clone(),
+            #[cfg(test)]
+            before_load: self.before_load.clone(),
         }
-
-        let mut rooms = self.rooms.lock().await;
-        let entry = match rooms.entry(room_id.to_owned()) {
-            std::collections::hash_map::Entry::Occupied(entry) => {
-                // Loaded twice at once; the other load won, and this actor is dropped unused.
-                entry.into_mut()
-            }
-            std::collections::hash_map::Entry::Vacant(slot) => {
-                // Joined to the global stream like a created room is. It was not, once, so a
-                // room loaded from disk -- every room, after a restart -- published to nobody:
-                // nothing that happened in it reached `/sync`, push, or a bridge. Every test
-                // created its rooms in the process that read them, and the first one that did
-                // not found it. Under the lock, so that the head announcement and the entry are
-                // one step for anybody racing to load the same room.
-                actor.join_global_stream(self.global.clone());
-                slot.insert(Entry {
-                    handle: RoomActorHandle::new(actor),
-                    last_used: Instant::now(),
-                    fence,
-                })
-            }
-        };
-        entry.last_used = Instant::now();
-        let handle = entry.handle.clone();
-        Self::note_residents(&rooms);
-        Ok(handle)
     }
 
     /// Creates a new room (`crate::actor::RoomActor::create_room`) and registers it.
@@ -1283,6 +1489,230 @@ mod tests {
                 Err(RoomError::RoomNotFound(_))
             ));
         }
+    }
+
+    /// A gate the test hook ([`RoomRegistry::before_load`]) stops every load at until it is
+    /// opened, counting how many loads are at it at once and the most there ever were.
+    #[derive(Default)]
+    struct LoadGate {
+        open: std::sync::Mutex<bool>,
+        opened: std::sync::Condvar,
+        at_gate: std::sync::atomic::AtomicUsize,
+        most_at_once: std::sync::atomic::AtomicUsize,
+        entered: std::sync::atomic::AtomicUsize,
+    }
+
+    impl LoadGate {
+        fn install<B: KvBackend + 'static>(self: &Arc<Self>, registry: &RoomRegistry<B>) {
+            let gate = self.clone();
+            *registry.before_load.lock().unwrap() = Some(Arc::new(move || gate.pass()));
+        }
+
+        fn pass(&self) {
+            use std::sync::atomic::Ordering::SeqCst;
+            let now = self.at_gate.fetch_add(1, SeqCst) + 1;
+            self.most_at_once.fetch_max(now, SeqCst);
+            self.entered.fetch_add(1, SeqCst);
+            let mut open = self.open.lock().unwrap();
+            while !*open {
+                open = self.opened.wait(open).unwrap();
+            }
+            drop(open);
+            self.at_gate.fetch_sub(1, SeqCst);
+        }
+
+        fn open(&self) {
+            *self.open.lock().unwrap() = true;
+            self.opened.notify_all();
+        }
+
+        async fn wait_for_entered(&self, n: usize) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while self.entered.load(std::sync::atomic::Ordering::SeqCst) < n {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "only {} loads reached the gate, expected {n}",
+                    self.entered.load(std::sync::atomic::Ordering::SeqCst)
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+    }
+
+    /// `rooms` rooms made in one registry, and a second registry over the same store with
+    /// nothing resident: what a restarted server sees.
+    async fn restarted_with_rooms(
+        rooms: usize,
+    ) -> (Arc<RoomRegistry<MemoryBackend>>, Vec<OwnedRoomId>) {
+        let backend = MemoryBackend::new();
+        let first = RoomRegistry::open(
+            backend.clone(),
+            HomeserverIdentity::for_tests("registry.test"),
+        )
+        .unwrap();
+        let creator = ruma::user_id!("@alice:registry.test").to_owned();
+        let mut ids = Vec::new();
+        for n in 0..rooms {
+            ids.push(
+                first
+                    .create_room(
+                        creator.clone(),
+                        crate::actor::CreateRoomRequest::default(),
+                        1_000 + n as i64,
+                    )
+                    .await
+                    .unwrap()
+                    .query(|actor| actor.room_id().to_owned())
+                    .await,
+            );
+        }
+        let restarted = Arc::new(
+            RoomRegistry::open(backend, HomeserverIdentity::for_tests("registry.test")).unwrap(),
+        );
+        (restarted, ids)
+    }
+
+    /// A caller that gives up on a room's load (a sending server that hung up on its `/send`)
+    /// leaves the load running: the next caller waits for that same load instead of starting
+    /// the room's load again, and gets the actor it made. Until 2026-10-15 the second caller
+    /// started a second load, and the first went on, on its blocking thread, for nobody.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_load_goes_on_for_the_next_caller_when_its_first_gives_up() {
+        let (registry, rooms) = restarted_with_rooms(1).await;
+        let gate = Arc::new(LoadGate::default());
+        gate.install(&registry);
+
+        let first = {
+            let (registry, room_id) = (registry.clone(), rooms[0].clone());
+            tokio::spawn(async move { registry.get_or_load(&room_id).await })
+        };
+        gate.wait_for_entered(1).await;
+        first.abort();
+        assert!(first.await.is_err_and(|e| e.is_cancelled()));
+
+        let second = {
+            let (registry, room_id) = (registry.clone(), rooms[0].clone());
+            tokio::spawn(async move { registry.get_or_load(&room_id).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            registry.loads_started(),
+            1,
+            "the second caller waits for the first load"
+        );
+        assert_eq!(registry.loads_in_progress(), 1);
+
+        gate.open();
+        let handle = second.await.unwrap().unwrap();
+        assert_eq!(registry.loads_started(), 1);
+        assert_eq!(gate.entered.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(registry.loads_in_progress(), 0);
+        assert_eq!(registry.resident_count().await, 1);
+        let again = registry.get_or_load(&rooms[0]).await.unwrap();
+        assert!(again.same_actor(&handle));
+    }
+
+    /// However often callers give up and ask again, no more than [`MAX_CONCURRENT_LOADS`] loads
+    /// read the store at once, and each room is read once. Until 2026-10-15 a cancelled caller
+    /// gave its slot back while its load went on, so every round of callers giving up added a
+    /// round of loads over the limit: the demo's 495 threads.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn loads_stay_within_their_slots_however_often_callers_give_up() {
+        let room_count = 3 * MAX_CONCURRENT_LOADS;
+        let (registry, rooms) = restarted_with_rooms(room_count).await;
+        let gate = Arc::new(LoadGate::default());
+        gate.install(&registry);
+        let ask_for_every_room = || -> Vec<_> {
+            rooms
+                .iter()
+                .map(|room_id| {
+                    let (registry, room_id) = (registry.clone(), room_id.clone());
+                    tokio::spawn(async move { registry.get_or_load(&room_id).await })
+                })
+                .collect()
+        };
+
+        for _ in 0..3 {
+            let askers = ask_for_every_room();
+            gate.wait_for_entered(MAX_CONCURRENT_LOADS).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            for asker in askers {
+                asker.abort();
+                let _ = asker.await;
+            }
+        }
+        assert_eq!(
+            gate.entered.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_CONCURRENT_LOADS,
+            "only the loads holding a slot have reached the store"
+        );
+        assert_eq!(registry.loads_in_progress(), room_count);
+
+        let askers = ask_for_every_room();
+        gate.open();
+        for asker in askers {
+            asker.await.unwrap().unwrap();
+        }
+        assert!(
+            gate.most_at_once.load(std::sync::atomic::Ordering::SeqCst) <= MAX_CONCURRENT_LOADS,
+            "at most {MAX_CONCURRENT_LOADS} loads at once, saw {}",
+            gate.most_at_once.load(std::sync::atomic::Ordering::SeqCst)
+        );
+        assert_eq!(
+            registry.loads_started(),
+            room_count as u64,
+            "each room read once"
+        );
+        assert_eq!(registry.resident_count().await, room_count);
+        assert_eq!(registry.loads_in_progress(), 0);
+    }
+
+    /// Everyone waiting for the load of a room that is not there is told so, and the load is
+    /// not left listed: a later caller looks again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failed_load_answers_every_waiter_and_is_forgotten() {
+        let (registry, _) = restarted_with_rooms(0).await;
+        let gate = Arc::new(LoadGate::default());
+        gate.install(&registry);
+        let missing = ruma::room_id!("!missing:registry.test").to_owned();
+        let askers: Vec<_> = (0..3)
+            .map(|_| {
+                let (registry, room_id) = (registry.clone(), missing.clone());
+                tokio::spawn(async move { registry.get_or_load(&room_id).await })
+            })
+            .collect();
+        gate.wait_for_entered(1).await;
+        gate.open();
+        for asker in askers {
+            assert!(matches!(
+                asker.await.unwrap(),
+                Err(RoomError::RoomNotFound(_))
+            ));
+        }
+        assert_eq!(registry.loads_in_progress(), 0);
+        assert!(matches!(
+            registry.get_or_load(&missing).await,
+            Err(RoomError::RoomNotFound(_))
+        ));
+        assert_eq!(registry.loads_started(), 2);
+    }
+
+    /// The error a waiter gets keeps the variants callers act on and carries the text of any
+    /// other.
+    #[test]
+    fn a_waiter_gets_the_error_the_load_ended_with() {
+        assert!(matches!(
+            error_for_waiter(&RoomError::RoomNotFound("!r:x".into())),
+            RoomError::RoomNotFound(r) if r == "!r:x"
+        ));
+        assert!(matches!(
+            error_for_waiter(&RoomError::Fenced("moved".into())),
+            RoomError::Fenced(m) if m == "moved"
+        ));
+        assert!(matches!(
+            error_for_waiter(&RoomError::BadRequest("odd".into())),
+            RoomError::Internal(m) if m.contains("odd")
+        ));
     }
 
     fn registry() -> Arc<RoomRegistry<MemoryBackend>> {

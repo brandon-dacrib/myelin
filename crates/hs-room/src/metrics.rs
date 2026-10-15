@@ -78,13 +78,67 @@ static SOFT_FAILED_EVENTS: LazyLock<Counter> = LazyLock::new(Counter::default);
 static EVENTS_CACHED: LazyLock<Gauge<i64, AtomicI64>> = LazyLock::new(Gauge::default);
 
 /// `hs_room_actors_alive`: room actors alive in this process -- the registry's resident rooms,
-/// plus the short-lived copies a read on a replica that does not own the room loads.
+/// plus the loads running (`hs_room_loads_running`), plus the short-lived copies a read on a
+/// replica that does not own the room loads and `hs-user`'s mirror holds. Equal to
+/// `hs_room_resident_rooms` on an idle single node; far above it, actors are alive that nothing
+/// accounts for (the 2026-10-15 memory climb: abandoned loads still running).
 static ACTORS_ALIVE: LazyLock<Gauge<i64, AtomicI64>> = LazyLock::new(Gauge::default);
 
 /// `hs_room_resident_rooms`: rooms the registry holds loaded right now
 /// (`crate::registry::RoomRegistry`), each with its own event cache; unloaded after
 /// `server.rooms.idle_unload_after` unused, when that is set.
 static RESIDENT_ROOMS: LazyLock<Gauge<i64, AtomicI64>> = LazyLock::new(Gauge::default);
+
+/// `hs_room_loads_in_progress`: rooms whose load from the store is under way or waiting for one
+/// of `crate::registry::MAX_CONCURRENT_LOADS` slots (`RoomRegistry::get_or_load`), however
+/// many callers wait for each.
+static LOADS_IN_PROGRESS: LazyLock<Gauge<i64, AtomicI64>> = LazyLock::new(Gauge::default);
+
+/// `hs_room_loads_running`: room loads holding one of `crate::registry::MAX_CONCURRENT_LOADS`
+/// slots right now, each reading a room on a blocking thread. Never more than the limit: with
+/// `hs_room_actors_alive` well above `hs_room_resident_rooms` plus this, actors are alive that
+/// nothing accounts for.
+static LOADS_RUNNING: LazyLock<Gauge<i64, AtomicI64>> = LazyLock::new(Gauge::default);
+
+/// `hs_room_load_slot_waits_total`: room loads that found every slot taken and waited for one.
+static LOAD_SLOT_WAITS: LazyLock<Counter> = LazyLock::new(Counter::default);
+
+/// Sets `hs_room_loads_in_progress`.
+pub(crate) fn set_loads_in_progress(n: usize) {
+    LOADS_IN_PROGRESS.set(i64::try_from(n).unwrap_or(i64::MAX));
+}
+
+/// One room load more holds a slot, until the returned guard is dropped.
+pub(crate) fn load_running() -> LoadRunning {
+    LOADS_RUNNING.inc();
+    LoadRunning(())
+}
+
+/// A room load holding a slot (`hs_room_loads_running`), for as long as it lives.
+pub(crate) struct LoadRunning(());
+
+impl Drop for LoadRunning {
+    fn drop(&mut self) {
+        LOADS_RUNNING.dec();
+    }
+}
+
+/// `hs_room_loads_running` as it stands.
+#[must_use]
+pub fn loads_running() -> i64 {
+    LOADS_RUNNING.get()
+}
+
+/// Counts one room load that waited for a slot.
+pub(crate) fn count_load_slot_wait() {
+    LOAD_SLOT_WAITS.inc();
+}
+
+/// `hs_room_load_slot_waits_total` as it stands.
+#[must_use]
+pub fn load_slot_waits() -> u64 {
+    LOAD_SLOT_WAITS.get()
+}
 
 /// Sets `hs_room_resident_rooms`.
 pub(crate) fn set_resident_rooms(n: usize) {
@@ -443,6 +497,22 @@ pub fn register_metrics(registry: &mut prometheus_client::registry::Registry) {
         RESIDENT_ROOMS.clone(),
     );
     registry.register(
+        "hs_room_loads_in_progress",
+        "Rooms whose load from the store is under way or waiting for a load slot",
+        LOADS_IN_PROGRESS.clone(),
+    );
+    registry.register(
+        "hs_room_loads_running",
+        "Room loads holding one of the load slots (at most 8), each on a blocking thread",
+        LOADS_RUNNING.clone(),
+    );
+    // Registered without `_total`: the text encoder appends it.
+    registry.register(
+        "hs_room_load_slot_waits",
+        "Room loads that found every load slot taken and waited for one",
+        LOAD_SLOT_WAITS.clone(),
+    );
+    registry.register(
         "hs_room_actors_alive",
         "Room actors alive: the registry's resident rooms plus short-lived copies loaded for \
          a read on a replica that does not own the room",
@@ -489,6 +559,9 @@ mod tests {
         prometheus_client::encoding::text::encode(&mut text, &registry).unwrap();
         assert!(text.contains("hs_room_events_cached "), "{text}");
         assert!(text.contains("hs_room_resident_rooms "), "{text}");
+        assert!(text.contains("hs_room_loads_in_progress "), "{text}");
+        assert!(text.contains("hs_room_loads_running "), "{text}");
+        assert!(text.contains("hs_room_load_slot_waits_total "), "{text}");
         assert!(text.contains("hs_room_event_cache_misses_total "), "{text}");
     }
 

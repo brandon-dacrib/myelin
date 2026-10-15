@@ -115,6 +115,31 @@ impl Collector for ProcessMemoryCollector {
                 MetricType::Gauge,
             )?
             .encode_gauge(&as_gauge(memory.virtual_bytes))?;
+        // The container's limit and the share of it in use, what `crate::memory_guard` sheds
+        // inbound federation on: absent without a limit.
+        if let Some(limit) = crate::memory_guard::cgroup_memory_limit() {
+            let budget = crate::memory_guard::MemoryBudget {
+                resident_bytes: memory.resident_bytes,
+                limit_bytes: limit,
+            };
+            encoder
+                .encode_descriptor(
+                    "hs_process_memory_limit_bytes",
+                    "The memory limit of this process's container (its cgroup's memory.max)",
+                    None,
+                    MetricType::Gauge,
+                )?
+                .encode_gauge(&as_gauge(limit))?;
+            encoder
+                .encode_descriptor(
+                    "hs_process_memory_budget_ratio",
+                    "Resident memory as a share of the container's memory limit; inbound \
+                     federation is refused above federation.inbound_memory_shed_fraction",
+                    None,
+                    MetricType::Gauge,
+                )?
+                .encode_gauge(&budget.ratio())?;
+        }
         Ok(())
     }
 }
