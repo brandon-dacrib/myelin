@@ -1178,9 +1178,17 @@ async fn a_legacy_bridge_bots_left_behind_device_is_removed_and_no_longer_counte
         })
     };
     alice.say(&room_id, "before").await;
-    until("both of the bot's devices were counted", || async {
-        counted(&bridge).is_some_and(|devices| devices.len() == 2)
-    })
+    // A transaction queued when the bot logged in counts both devices at 0, before the in-use
+    // one's upload: wait for one that has the upload in it.
+    until(
+        "both of the bot's devices were counted, with the upload",
+        || async {
+            counted(&bridge).is_some_and(|devices| devices.len() == 2)
+                && bridge.transactions().iter().rev().any(|txn| {
+                    txn["device_one_time_keys_count"][bot_id][&in_use]["signed_curve25519"] == 2
+                })
+        },
+    )
     .await;
     let txns = bridge.transactions();
     let latest = txns
