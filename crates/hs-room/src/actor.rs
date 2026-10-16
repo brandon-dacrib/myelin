@@ -1760,25 +1760,34 @@ impl<B: KvBackend> RoomActor<B> {
         let root = if prev_sns.is_empty() {
             self.store.empty_root()
         } else {
-            let mut roots: Vec<_> = prev_sns
+            let roots: Vec<_> = prev_sns
                 .iter()
                 .map(|sn| self.root_after(*sn))
                 .collect::<Result<_, _>>()?;
-            // The same state twice is one fork, and the order forks come in changes nothing
-            // the resolution answers: sorted, the set is the cache's key.
-            roots.sort_unstable();
-            roots.dedup();
-            if let [root] = roots[..] {
-                root
-            } else {
-                self.resolve_forks(roots)?
-            }
+            self.resolve_roots(roots)?
         };
         Ok(RoomStateView {
             store: &self.store,
             root,
             bodies: EventMap(self),
         })
+    }
+
+    /// The state resolved across `roots` (at least one): the root itself when they all name
+    /// one state, otherwise [`RoomActor::resolve_forks`] of the distinct ones.
+    fn resolve_roots(
+        &self,
+        mut roots: Vec<<ProductionStateStore<B> as StateStore>::Root>,
+    ) -> Result<<ProductionStateStore<B> as StateStore>::Root, RoomError> {
+        // The same state twice is one fork, and the order forks come in changes nothing
+        // the resolution answers: sorted, the set is the cache's key.
+        roots.sort_unstable();
+        roots.dedup();
+        match roots[..] {
+            [] => Ok(self.store.empty_root()),
+            [root] => Ok(root),
+            _ => self.resolve_forks(roots),
+        }
     }
 
     /// The state resolution of `forks` (more than one root, sorted and distinct), from

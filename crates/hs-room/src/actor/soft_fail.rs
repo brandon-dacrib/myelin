@@ -7,8 +7,9 @@
 //! in state resolution and the federation protocol as usual, but nobody here needs to see it.
 //! So, as the spec says and Synapse does (`_check_for_soft_fail`), the third of the receipt
 //! checks is against the *current state*: the state resolved across every forward extremity,
-//! and the state before the event itself (Synapse adds that set too: a gap in the graph could
-//! leave this server's view of the current state stale, and a gap is easy to manufacture). An
+//! and, when a prev event of it is not in the timeline, the state before the event as one more
+//! fork (Synapse adds that set then: a gap in the graph could leave this server's view of the
+//! current state stale, and a gap is easy to manufacture; `current_state_for_soft_fail`). An
 //! event that fails only that check is **soft failed**:
 //!
 //! - it is stored, indexed, placed in the timeline and fed to the state store as any event is
@@ -45,9 +46,11 @@ use hs_model::ids::EventSn;
 use hs_state::auth::{self, IncomingEvent};
 use ruma::{EventId, UserId};
 
+use hs_state::kv_store::ProductionStateStore;
+
 use super::{RoomActor, extract_redacts};
 use crate::error::RoomError;
-use crate::pipeline;
+use crate::pipeline::{self, EventMap, RoomStateView};
 
 /// How many soft-failed or rejected prev events [`RoomActor::superseded_extremities`] walks
 /// through before it stops: a chain that long is an attack, not a room.
@@ -77,13 +80,7 @@ impl<B: KvBackend> RoomActor<B> {
         {
             return Ok(None);
         }
-        let mut at = self.forward_extremities_vec();
-        for sn in effective {
-            if !at.contains(&sn) {
-                at.push(sn);
-            }
-        }
-        let current = self.state_view(&at)?;
+        let current = self.current_state_for_soft_fail(&effective)?;
 
         let content = event
             .json()
@@ -109,6 +106,48 @@ impl<B: KvBackend> RoomActor<B> {
                 .err()
                 .map(|e| e.to_string()),
         )
+    }
+
+    /// The "current state" [`RoomActor::soft_fail_reason`] checks an event against, given its
+    /// effective prev events, as Synapse's `_check_for_soft_fail` chooses it:
+    ///
+    /// - every prev event in the timeline: the room's current state, the resolution across the
+    ///   forward extremities, which every other read of the room asks for too (and is
+    ///   remembered, [`RoomActor::resolve_forks`]);
+    /// - a prev event that is not (an outlier of a fetched state, the edge of a gap): that
+    ///   resolution with one more fork, the state before the event, which the auth check has
+    ///   just resolved ([`RoomActor::authorize_remote`]) -- a gap could leave this server's
+    ///   current state stale, and a gap is easy to manufacture.
+    ///
+    /// Never one fork per prev event: an event citing twenty prev events in a forked room made
+    /// that a resolution of twenty-odd forks no read had asked for before, remembered by none
+    /// after, for every event received (the demo's `#ping`, 2026-10-16: two to fifteen seconds
+    /// each, with the room's lock held).
+    ///
+    /// # Errors
+    /// [`RoomError::State`] if the state store fails.
+    fn current_state_for_soft_fail(
+        &self,
+        effective_prev: &[EventSn],
+    ) -> Result<RoomStateView<'_, ProductionStateStore<B>>, RoomError> {
+        let gap = effective_prev
+            .iter()
+            .any(|sn| self.room_pos_of(*sn).is_none());
+        if !gap && !self.forward_extremities.is_empty() {
+            return self.current_view();
+        }
+        let mut roots: Vec<_> = self
+            .forward_extremities
+            .iter()
+            .map(|sn| self.root_after(*sn))
+            .collect::<Result<_, _>>()?;
+        roots.push(self.state_view(effective_prev)?.root);
+        let root = self.resolve_roots(roots)?;
+        Ok(RoomStateView {
+            store: &self.store,
+            root,
+            bodies: EventMap(self),
+        })
     }
 
     /// The forward extremities an accepted event citing `prev_sns` supersedes: the prev events
@@ -498,5 +537,70 @@ mod tests {
         assert_eq!(page[0].event_id(), d.event_id());
         assert_eq!(page[1].event_id(), pl.event_id());
         assert!(actor.event_by_id(c.event_id()).is_none());
+    }
+
+    /// An event citing older events of two branches is checked against the room's current
+    /// state -- the resolution of the two extremities -- and the state before it, never one
+    /// fork per prev event besides: bob's displayname differs at A1, A2, B1 and B2, so citing
+    /// A1 and B1 with A2 and B2 the extremities made a resolution of four forks until
+    /// 2026-10-16 (the demo's `#ping`: twenty-odd, seconds each, for every event received).
+    #[test]
+    fn the_soft_fail_check_resolves_the_extremities_not_every_prev_event() {
+        let mut actor = room("public_chat");
+        let bob: &UserId = user_id!("@bob:remote.example");
+        let key = signing::SigningKeyPair::generate("1");
+        let room_id = actor.room_id().to_string();
+        let create = state_id(&actor, "m.room.create", "");
+        let power = state_id(&actor, "m.room.power_levels", "");
+        let join_rules = state_id(&actor, "m.room.join_rules", "");
+        let (head, depth) = actor.forward_extremity_ids().remove(0);
+        let member = |name: &str, prev: &str, auth_member: Option<&str>, depth: i64| {
+            let mut auth = vec![create.clone(), power.clone(), join_rules.clone()];
+            auth.extend(auth_member.map(str::to_owned));
+            remote_pdu(
+                &key,
+                serde_json::json!({
+                    "type": "m.room.member", "state_key": bob.as_str(), "sender": bob.as_str(),
+                    "room_id": room_id, "origin_server_ts": 10 + depth, "depth": depth,
+                    "content": {"membership": "join", "displayname": name},
+                    "prev_events": [prev],
+                    "auth_events": auth,
+                }),
+            )
+        };
+        let accept = |actor: &mut RoomActor<MemoryBackend>, event: &Event| {
+            assert!(matches!(
+                actor.accept_remote_event(event.clone()).unwrap(),
+                RemoteEventOutcome::Stored(_)
+            ));
+            event.event_id().to_string()
+        };
+        let j = member("j", head.as_str(), None, depth + 1);
+        let j_id = accept(&mut actor, &j);
+        let a1 = member("a1", &j_id, Some(&j_id), depth + 2);
+        let a1_id = accept(&mut actor, &a1);
+        let a2 = member("a2", &a1_id, Some(&a1_id), depth + 3);
+        let a2_id = accept(&mut actor, &a2);
+        let b1 = member("b1", &j_id, Some(&j_id), depth + 2);
+        let b1_id = accept(&mut actor, &b1);
+        let b2 = member("b2", &b1_id, Some(&b1_id), depth + 3);
+        let b2_id = accept(&mut actor, &b2);
+        assert_eq!(extremity_ids(&actor), sorted(vec![a2_id, b2_id]));
+
+        let x = remote_pdu(
+            &key,
+            serde_json::json!({
+                "type": "m.room.message", "sender": bob.as_str(), "room_id": room_id,
+                "origin_server_ts": 50, "depth": depth + 4, "content": {"body": "x"},
+                "prev_events": [a1_id, b1_id],
+                "auth_events": [create, power, a1_id],
+            }),
+        );
+        accept(&mut actor, &x);
+        assert_eq!(
+            actor.resolutions.borrow().widest(),
+            2,
+            "a resolution of more forks than the extremities or the prev events"
+        );
     }
 }

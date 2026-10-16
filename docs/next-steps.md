@@ -1,43 +1,41 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-10-16 (forked rooms are merged and pruned, and a resolution reads about the room once however many forks; `agent/extremity-merge`. Before: the hub's members step and the idle CPU were repeated state resolutions; `agent/hub-members-step`. Before: handover: the demo, the releases and what is next, below. Before: test servers are handed their ports still bound; `agent/test-port-races`. Before: room loads and unloading; `agent/room-load-speed`. Before: the Slack bridge's full volume; fix on `agent/bridge-volume-size`. Before: Discord's delivery timeouts were a replay of the 2026-10-12 flood; fix on `agent/discord-delivery-timeouts`. Before: the memory climb with federation on; fix on `agent/fed-memory-growth`. Before: the session hub wedge; fix on `agent/hub-wedge`. Earlier: the ephemeral pump's prune busy loop; fix on `agent/ephemeral-prune`). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+Written 2026-09-20 by the integration lead, last revised 2026-10-16 (v0.3.28 on the demo; the soft-fail check resolved one fork per prev event; `agent/soft-fail-forks`. Before: forked rooms are merged and pruned, and a resolution reads about the room once however many forks; `agent/extremity-merge`. Before: the hub's members step and the idle CPU were repeated state resolutions; `agent/hub-members-step`. Before: handover: the demo, the releases and what is next, below. Before: test servers are handed their ports still bound; `agent/test-port-races`. Before: room loads and unloading; `agent/room-load-speed`. Before: the Slack bridge's full volume; fix on `agent/bridge-volume-size`. Before: Discord's delivery timeouts were a replay of the 2026-10-12 flood; fix on `agent/discord-delivery-timeouts`. Before: the memory climb with federation on; fix on `agent/fed-memory-growth`. Before: the session hub wedge; fix on `agent/hub-wedge`. Earlier: the ephemeral pump's prune busy loop; fix on `agent/ephemeral-prune`). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
 ## 2026-10-16 -- handover: where the demo is, what to roll, what to check, what is next
 
-**Branches.** None unmerged (`git branch -r --no-merged origin/main` is empty). Merged on
-2026-10-15/16, in order: `fed-memory-growth` (59d3cb71, v0.3.22), `discord-delivery-timeouts`
-(cca7896b, v0.3.23), `bridge-volume-size` (88f1db4f, v0.3.24), `room-load-speed` (35c09f43; its CI
-failed on a clippy 1.99 lint and on arm64 running out of memory, so it was not released),
-`clippy-1-99` (5b2e687c), `ci-arm64-test-kill` (bca4e474, the release that carries room loads:
-v0.3.25 once CD tags it), `test-port-races` (e184f73c, tests only).
+**Branches.** `agent/soft-fail-forks` (below) is the only one in flight; everything else is
+merged. Merged on 2026-10-15/16, in order: `fed-memory-growth` (v0.3.22),
+`discord-delivery-timeouts` (v0.3.23), `bridge-volume-size` (v0.3.24), `room-load-speed`,
+`clippy-1-99`, `ci-arm64-test-kill` (v0.3.25), `test-port-races`, `hub-members-step` (v0.3.27),
+`extremity-merge` (v0.3.28).
 
-**The demo** (Helm release `myelin`, namespace `myelin`, node tp0n1) was last seen at 20:20 UTC
-on 2026-10-15 running **v0.3.22 with federation on** and `resources.limits.memory=1536Mi` (requests
-1Gi), set on the command line since the 15:16 incident, when 0.3.21's abandoned room loads took
-the pod to 2 GB and tp0n1 out of memory (the owner rebooted the tp0 board; Postgres and Longhorn
-recovered by 16:33). With 0.3.22 memory levelled near 1.05 GB, then rose with resident rooms
-(1.17 GB, 133 rooms at 20:20) because nothing unloaded rooms; the memory guard sheds inbound
-federation at 85%. The session's kubectl proxy lost its route at about 21:30 and nothing on the
-cluster was seen after that. Slack's Bridge CR was raised to 5Gi by hand (20:11) and the bridge
-came back.
+**The demo** (Helm release `myelin`, namespace `myelin`, node tp0n1) runs **v0.3.28 with
+federation on** since 14:29 UTC on 2026-10-16, `resources.limits.memory=1536Mi`. Seen at 14:40:
+ready in 26 s, no restarts, 222 rooms resident, RSS 785 MB, no "hub stuck" warnings. Dummy events
+merged `!c10y-...` (107 extremities) and `#ping` (104) within five minutes;
+`hs_room_forward_extremities_max` 6-17 since. Still costly: the soft-fail check's resolutions of
+extremities plus every prev event (27-100 forks, 2-15 s each, for nearly every PDU in those two
+rooms), 0.75 of a core and a 7 s p99 on the hub's members step; the fix is
+`agent/soft-fail-forks` (status 04). CPU was 3.8 cores in the first ten minutes (cold loads).
 
-**To roll** (the owner pastes it from the plain SSH shell; `helm upgrade` is refused to sessions).
-Use v0.3.25 once tagged, else v0.3.24. `--force-conflicts` is needed once: the Bridge CRD's
-`.spec.versions` is owned by a past `kubectl apply`, and Helm 4's server-side apply refused it
-(0.3.24's first try failed with "conflict with \"kubectl\": .spec.versions" and changed nothing).
+**To roll** (the owner pastes it from the plain SSH shell, one short line at a time; `helm
+upgrade` is refused to sessions). `--force-conflicts` is no longer needed.
 
 ```
-V=0.3.25; helm --kube-context admin@dacrib0 get values myelin -n myelin -o yaml > /tmp/myelin-values.yaml && helm --kube-context admin@dacrib0 upgrade myelin oci://ghcr.io/brandon-dacrib/charts/hs --version $V -n myelin -f /tmp/myelin-values.yaml -f https://raw.githubusercontent.com/brandon-dacrib/myelin/v$V/deploy/demo/values-bridges.yaml --set image.tag=$V --set-json 'extraEnv=[]' --set resources.limits.memory=1536Mi --set resources.requests.memory=1Gi --force-conflicts && kubectl --context admin@dacrib0 -n myelin delete pod myelin-hs-0
+V=0.3.29
+K="--kube-context admin@dacrib0"
+U=https://raw.githubusercontent.com/brandon-dacrib/myelin/v$V/deploy/demo/values-bridges.yaml
+helm $K get values myelin -n myelin -o yaml > /tmp/mv.yaml
+helm $K upgrade myelin oci://ghcr.io/brandon-dacrib/charts/hs --version $V -n myelin -f /tmp/mv.yaml -f $U --set image.tag=$V --set-json 'extraEnv=[]' --set resources.limits.memory=1536Mi
+kubectl --context admin@dacrib0 -n myelin delete pod myelin-hs-0
 ```
 
 `extraEnv=[]` is federation on; `[{"name":"HS__FEDERATION__ENABLED","value":"false"}]` is off.
-Every bridge restarts once (5Gi volumes, stdout-only logging, the init container).
 
-**After the roll, by the owner:** `kubectl --context admin@dacrib0 -n myelin exec
-deploy/bridge-slack-brandon -c bridge -- rm -rf /data/logs` (mautrix's old file logs filled 1 GiB);
-on each bridge's Transactions tab discard the 2026-10-12 leftovers (discord, signal, linkedin,
+**By the owner, not yet confirmed:** on each bridge's Transactions tab discard the 2026-10-12 leftovers (discord, signal, linkedin,
 meta, whatsapp; Discord's were in fact delivered), replay Slack's 3, look at iMessage's 3,545
 before choosing; "Test connection" on any bridge still degraded.
 
@@ -51,8 +49,10 @@ no "the session hub is stuck on a room update"; `hs_federation_inbound_shed_tota
 cluster) and no "cannot read the kubelet's volume statistics" in the operator's log; tp0n1's
 MemAvailable; Element syncing without pauses.
 
-**Broken outside the code:** Tempo (`monitoring-system/tempo-0`) was crash-looping (53 restarts on
-2026-10-15 evening), so no traces are kept; not yet looked at.
+**Broken outside the code:** Tempo (`monitoring-system/tempo-0`) is OOMKilled at its 1Gi limit
+while completing a WAL block (127 restarts by 2026-10-16 morning), so few traces are kept; raise
+its memory limit to 4Gi (`kubectl --context admin@dacrib0 -n monitoring-system set resources
+statefulset/tempo -c tempo --limits=memory=4Gi`, and in its Helm values), owner's step.
 
 **Next, in the order suggested:**
 1. The `interop` workflow (myelin and Synapse) has failed on every merge to main since at least

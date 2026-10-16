@@ -53,6 +53,16 @@ impl<R: PartialEq + Copy> ResolutionCache<R> {
         self.entries.truncate(KEPT);
     }
 
+    /// How many forks the widest kept resolution resolved (0 if none is kept).
+    #[cfg(test)]
+    pub(crate) fn widest(&self) -> usize {
+        self.entries
+            .iter()
+            .map(|(key, _)| key.len())
+            .max()
+            .unwrap_or(0)
+    }
+
     /// How many resolutions are kept.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {

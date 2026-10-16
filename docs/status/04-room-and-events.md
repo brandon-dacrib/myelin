@@ -2,6 +2,41 @@
 
 Track brief: `docs/workstreams/04-room-and-events.md`. Owner crate: `hs-room`.
 
+## 2026-10-16, afternoon (branch `agent/soft-fail-forks`): the soft-fail check resolves the extremities, not one fork per prev event
+
+**Seen** on the demo after the v0.3.28 roll (14:29 UTC): the dummy events worked (`!c10y-...`
+107 extremities and `#ping` 104 merged by 14:34, `hs_room_forward_extremities_max` 6), but the
+slow-resolution log still showed a resolution of 27-32 forks in `#ping` and 91-100 in `!c10y-...`
+for almost every PDU received (spans `federation.pdu` > `room.actor`), 2-15 s each, never a cache
+hit: about 12 resolutions a minute, 0.75 of a core, with the room's lock held, so the hub's
+"members and directory entry" step (a query queued behind them) had a p99 of 7 s and the pod sat
+at 3.8 cores.
+
+**Found**: `soft_fail_reason` resolved the state at the forward extremities *plus every prev
+event* of the incoming event, each prev event its own fork. A remote event citing many prev
+events in a forked room made a set of forks no read had asked for and none would again.
+Synapse's `_check_for_soft_fail` uses the room's current state (the extremities alone) when every
+prev event is in the timeline, and only for a gap adds the state *before the event* -- one fork,
+which the auth check has just resolved.
+
+**Done** (`crates/hs-room/src/actor/soft_fail.rs`, `RoomActor::current_state_for_soft_fail`;
+`RoomActor::resolve_roots` factored out of `state_view`): Synapse's choice. No prev event out of
+the timeline: `current_view()`, the resolution every other read of the room asks for and
+`ResolutionCache` keeps. Otherwise the extremities' roots plus the root of the state before the
+event. Test `the_soft_fail_check_resolves_the_extremities_not_every_prev_event` (bob's
+displayname forked into two branches, an event citing the older half of each): the widest
+resolution run is 2 forks; 4 on the old code. Sytest's soft-failure cases
+(`soft_failed_events_are_held_hidden_and_never_extremities`,
+`an_event_citing_a_soft_failed_one_...`) pass unchanged.
+
+**Left**: the state before each incoming event is still a resolution of its own prev events (the
+spec's; Synapse's too), so a remote server citing twenty forks costs one such resolution per
+event; refusing more than 20 `prev_events` (Synapse's "Too many prev_events") is still open
+(track 06). **After the roll, check**: the slow-resolution log's `forks` for `#ping` and
+`!c10y-...` at the extremities' count (under ~20) rather than extremities plus prev events;
+`rate(hs_room_state_resolution_seconds_sum)` well under the 0.75 s/s seen at 14:40; the hub's
+members step p99 under a second; container CPU.
+
 ## 2026-10-16 (branch `agent/extremity-merge`): forward extremities are capped, pruned and merged with dummy events
 
 **Asked**: forked federated rooms on the demo (`#ping`, codestorm.net's `!c10y-...`) keep many
