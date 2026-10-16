@@ -80,6 +80,23 @@ static UNLOADS: LazyLock<Family<Vec<(String, String)>, Counter>> = LazyLock::new
 /// logged at `warn` with the room and its slowest phase.
 static SLOW_LOADS: LazyLock<Counter> = LazyLock::new(Counter::default);
 
+/// `hs_room_state_resolution_seconds`: how long each state resolution a room actor ran took
+/// (`RoomActor::state_view` over more than one fork: a room's current state while it has more
+/// than one forward extremity, or the state before an event citing more than one). The CPU a
+/// room of unmerged forks costs; its `_count` is the resolutions run.
+static STATE_RESOLUTIONS: LazyLock<Histogram> = LazyLock::new(|| {
+    Histogram::new([
+        0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 120.0,
+    ])
+});
+
+/// How many resolutions `STATE_RESOLUTIONS` has observed, readable without encoding.
+static STATE_RESOLUTIONS_RUN: LazyLock<Counter> = LazyLock::new(Counter::default);
+
+/// `hs_room_state_resolution_cache_hits_total`: state resolutions a room actor did not run
+/// because it had resolved the same forks already (`RoomActor::state_view`'s cache).
+static STATE_RESOLUTION_CACHE_HITS: LazyLock<Counter> = LazyLock::new(Counter::default);
+
 /// `hs_room_stale_copies_reloaded_total`: resident copies of a room `RoomRegistry::get_or_load`
 /// dropped because the room's shard changed hands since the copy was loaded (the fencing epoch
 /// moved: this replica lost the shard and got it back), each followed by a load from the store.
@@ -374,6 +391,30 @@ pub fn unloads(reason: &str) -> u64 {
         .get()
 }
 
+/// Records one state resolution run, and how long it took (`hs_room_state_resolution_seconds`).
+pub(crate) fn observe_state_resolution(took: std::time::Duration) {
+    STATE_RESOLUTIONS.observe(took.as_secs_f64());
+    STATE_RESOLUTIONS_RUN.inc();
+}
+
+/// State resolutions room actors in this process have run (`hs_room_state_resolution_seconds`'s
+/// count).
+#[must_use]
+pub fn state_resolutions() -> u64 {
+    STATE_RESOLUTIONS_RUN.get()
+}
+
+/// Counts one state resolution answered from a room actor's cache.
+pub(crate) fn count_state_resolution_cache_hit() {
+    STATE_RESOLUTION_CACHE_HITS.inc();
+}
+
+/// `hs_room_state_resolution_cache_hits_total` as it stands.
+#[must_use]
+pub fn state_resolution_cache_hits() -> u64 {
+    STATE_RESOLUTION_CACHE_HITS.get()
+}
+
 /// Counts one load slower than `crate::actor::load_report::SLOW_LOAD` in
 /// `hs_room_slow_loads_total`.
 pub(crate) fn count_slow_load() {
@@ -508,6 +549,18 @@ pub fn register_metrics(registry: &mut prometheus_client::registry::Registry) {
         "Resident rooms unloaded, by reason: idle (unused for server.rooms.idle_unload_after) or \
          memory (over server.rooms.memory_unload_fraction of the memory limit)",
         UNLOADS.clone(),
+    );
+    registry.register(
+        "hs_room_state_resolution_seconds",
+        "Time taken by each state resolution a room actor ran: a room's current state while it \
+         has more than one forward extremity, or the state before an event citing more than one",
+        STATE_RESOLUTIONS.clone(),
+    );
+    // Registered without `_total`: the text encoder appends it.
+    registry.register(
+        "hs_room_state_resolution_cache_hits",
+        "State resolutions a room actor answered from its cache: the same forks resolved already",
+        STATE_RESOLUTION_CACHE_HITS.clone(),
     );
     // Registered without `_total`: the text encoder appends it.
     registry.register(

@@ -50,6 +50,7 @@ enum BannedReader {
 mod new_room_ids;
 pub mod redactions;
 mod rejected;
+mod resolutions;
 mod soft_fail;
 mod working_set;
 
@@ -72,6 +73,10 @@ pub const MAX_ID_ATTEMPTS_PER_SHARD: u32 = 16;
 /// How many events [`RoomActor::load`] replays between two releases of what the replay
 /// pinned (`working_set`): the bound on a load's transient memory, in events.
 const LOAD_PIN_RELEASE_EVERY: usize = 256;
+
+/// A state resolution at least this long is logged (at `info`, with the room and the number of
+/// forks): a room whose forks cost that much is one an operator wants named.
+const SLOW_RESOLUTION: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// A state-store error met inside one of this actor's transactions, as the `hs_kv::KvError`
 /// the transaction must carry: a storage error as itself (so a conflict is retried), anything
@@ -541,6 +546,11 @@ pub struct RoomActor<B: KvBackend> {
             Arc<[(OwnedUserId, String)]>,
         )>,
     >,
+    /// The state resolutions this actor has run, by the forks they resolved
+    /// ([`RoomActor::resolve_forks`]): what keeps a forked room's current state from being
+    /// resolved again on every read.
+    resolutions:
+        RefCell<resolutions::ResolutionCache<<ProductionStateStore<B> as StateStore>::Root>>,
     /// Placed outliers [`RoomActor::load`] found without a `Tables::state_snapshots` row and
     /// gave a state in memory (`(outlier, the state before it)`), waiting to be written back
     /// by [`RoomActor::persist_repaired_outlier_states`]. See [`RoomActor::load`]'s "Placed
@@ -929,6 +939,7 @@ impl<B: KvBackend> RoomActor<B> {
             deferred_roots: HashMap::new(),
             lazy_roots: RefCell::new(HashMap::new()),
             membership_cache: RefCell::new(None),
+            resolutions: RefCell::default(),
             repaired_outlier_states: Vec::new(),
             fetched_state_outliers: HashSet::new(),
             rejected_history: HashSet::new(),
@@ -1743,26 +1754,71 @@ impl<B: KvBackend> RoomActor<B> {
         let root = if prev_sns.is_empty() {
             self.store.empty_root()
         } else {
-            let roots: Vec<_> = prev_sns
+            let mut roots: Vec<_> = prev_sns
                 .iter()
                 .map(|sn| self.root_after(*sn))
                 .collect::<Result<_, _>>()?;
-            // Resolving forks is state resolution proper, and can be slow; one root is a
-            // lookup. Only in a recorded trace (decision 0048).
-            let _resolving = if roots.len() > 1 && hs_telemetry::current_is_sampled() {
-                tracing::info_span!("room.state_resolution", forks = roots.len()).entered()
+            // The same state twice is one fork, and the order forks come in changes nothing
+            // the resolution answers: sorted, the set is the cache's key.
+            roots.sort_unstable();
+            roots.dedup();
+            if let [root] = roots[..] {
+                root
             } else {
-                tracing::Span::none().entered()
-            };
-            self.store
-                .resolve(&self.room_version, &roots)
-                .map_err(|e| RoomError::State(e.to_string()))?
+                self.resolve_forks(roots)?
+            }
         };
         Ok(RoomStateView {
             store: &self.store,
             root,
             bodies: EventMap(self),
         })
+    }
+
+    /// The state resolution of `forks` (more than one root, sorted and distinct), from
+    /// [`RoomActor::resolutions`] when these forks were resolved already. A room whose forward
+    /// extremities stay forked asks this of every read of its current state -- the session
+    /// hub's nine per room update, `/sync`, every federation PDU's soft-fail check -- and a
+    /// resolution of a room of real forks takes seconds (the demo's `#ping` room, 2026-10-16:
+    /// 15 s on a cold load, the hub's step 30 to 50 s with the room's lock held).
+    ///
+    /// A root names a state by its content (`hs_state::frames`), stays valid for as long as the
+    /// store does, and the resolution of the same forks over the same events answers the same
+    /// state, so a remembered answer is never stale: a new event that changes the extremities
+    /// asks for a different set of forks.
+    fn resolve_forks(
+        &self,
+        forks: Vec<<ProductionStateStore<B> as StateStore>::Root>,
+    ) -> Result<<ProductionStateStore<B> as StateStore>::Root, RoomError> {
+        if let Some(root) = self.resolutions.borrow_mut().get(&forks) {
+            crate::metrics::count_state_resolution_cache_hit();
+            return Ok(root);
+        }
+        // Resolving forks is state resolution proper, and can be slow. Only in a recorded
+        // trace (decision 0048).
+        let _resolving = if hs_telemetry::current_is_sampled() {
+            tracing::info_span!("room.state_resolution", forks = forks.len()).entered()
+        } else {
+            tracing::Span::none().entered()
+        };
+        let started = std::time::Instant::now();
+        let root = self
+            .store
+            .resolve(&self.room_version, &forks)
+            .map_err(|e| RoomError::State(e.to_string()))?;
+        let took = started.elapsed();
+        crate::metrics::observe_state_resolution(took);
+        if took >= SLOW_RESOLUTION {
+            tracing::info!(
+                room_id = %self.room_id,
+                forks = forks.len(),
+                took_ms = took.as_millis() as u64,
+                "a state resolution took over a second (hs_room_state_resolution_seconds); its \
+                 answer is kept for the next read of the same forks"
+            );
+        }
+        self.resolutions.borrow_mut().insert(forks, root);
+        Ok(root)
     }
 
     /// The room's current, resolved state: `RoomActor::state_view` at every current forward
