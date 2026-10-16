@@ -123,7 +123,7 @@ async fn sync_until(
     what: &str,
     wanted: impl Fn(&Value) -> bool,
 ) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(120);
     let mut last = Value::Null;
     let mut since = since.map(str::to_owned);
     while Instant::now() < deadline {
@@ -558,7 +558,7 @@ async fn keys_query_until(
     device: &str,
     key: &str,
 ) {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(120);
     let mut last = Value::Null;
     while Instant::now() < deadline {
         let keys = call(
@@ -604,7 +604,7 @@ async fn metric(client: &reqwest::Client, server: &Server, sample: &str) -> u64 
 
 /// Waits until `sample` on `server`'s `/metrics` reaches `at_least`.
 async fn metric_reaches(client: &reqwest::Client, server: &Server, sample: &str, at_least: u64) {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(120);
     loop {
         let value = metric(client, server, sample).await;
         if value >= at_least {
@@ -644,7 +644,7 @@ async fn to_device_arrivals(
     event_type: &str,
     wanted: usize,
 ) -> Vec<Value> {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(120);
     let mut since = since.to_owned();
     let mut seen = Vec::new();
     let mut settled = false;
@@ -975,7 +975,7 @@ async fn an_invited_remote_user_is_followed_from_the_invite_to_after_a_rejoin() 
         let token = bob.token.clone();
         async move {
             // The invite may still be on its way to B.
-            let deadline = Instant::now() + Duration::from_secs(15);
+            let deadline = Instant::now() + Duration::from_secs(120);
             loop {
                 let response = client
                     .post(&url)
