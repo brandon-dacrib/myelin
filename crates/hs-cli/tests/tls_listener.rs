@@ -74,7 +74,7 @@ fn config(
              listeners:\n  listeners:\n\
              \x20   - port: {tls_port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, federation, health, metrics]\n\
              \x20     tls:\n        certificate_path: {cert:?}\n        private_key_path: {key:?}\n\
-             \x20   - port: {plain_port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, health]\n\
+             \x20   - port: {plain_port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, federation, health]\n\
              storage:\n  backend: embedded\n  data_dir: {:?}\n\
              media:\n  storage:\n    backend: local\n    path: {:?}\n",
             dir.join("data"),

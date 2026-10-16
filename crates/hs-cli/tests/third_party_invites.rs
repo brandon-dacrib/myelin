@@ -172,7 +172,7 @@ async fn an_email_invite_reaches_its_owner_through_an_allowed_identity_server_on
         &config_path,
         format!(
             "server:\n  server_name: example.org\n\
-             listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, federation, health, metrics]\n\
+             listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, federation, admin, health, metrics]\n\
              storage:\n  backend: embedded\n  data_dir: {:?}\n\
              media:\n  storage:\n    backend: local\n    path: {:?}\n\
              federation:\n  enabled: false\n\

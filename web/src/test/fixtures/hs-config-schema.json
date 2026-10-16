@@ -42,6 +42,8 @@
               "client",
               "federation",
               "media",
+              "metrics",
+              "admin",
               "health"
             ],
             "x_forwarded": false
@@ -534,6 +536,8 @@
                 "client",
                 "federation",
                 "media",
+                "metrics",
+                "admin",
                 "health"
               ],
               "x_forwarded": false
@@ -615,35 +619,35 @@
       ]
     },
     "ListenerResource": {
-      "description": "A resource family a listener can serve. Synapse calls these `resources`\nwith `names` like `client`, `federation`, `media`, `metrics`; we keep\nthe same vocabulary since it is what operators already know.",
+      "description": "A resource family a listener can serve. Synapse calls these `resources`\nwith `names` like `client`, `federation`, `media`, `metrics`; we keep\nthe same vocabulary since it is what operators already know.\n\nA listener answers only the route families it names (`hs serve` refuses\nthe rest with `404 M_UNRECOGNIZED`, as it does an unknown route), so a\npublic listener can leave `metrics` and `admin` to a private one. Every\npath the server has belongs to exactly one family; the variants say which.",
       "oneOf": [
         {
-          "description": "`/_matrix/client/*` and legacy `/_matrix/r0/*`.",
+          "description": "`/_matrix/client/*` (including the authenticated media routes under\n`/_matrix/client/v1/media`, which a client needs wherever it talks to\nthe server), legacy `/_matrix/r0/*`, `/_synapse/client/*`,\n`/.well-known/matrix/client` and `/.well-known/matrix/support`, and the\nbridge manager's own front door under `/_myelin/bridges`.",
           "type": "string",
           "const": "client"
         },
         {
-          "description": "`/_matrix/federation/*`, `/_matrix/key/*`.",
+          "description": "`/_matrix/federation/*`, `/_matrix/key/*` and `/.well-known/matrix/server`.",
           "type": "string",
           "const": "federation"
         },
         {
-          "description": "`/_matrix/media/*`.",
+          "description": "The legacy, unauthenticated `/_matrix/media/*`. (The authenticated media\nroutes under `/_matrix/client/v1/media` belong to `client`.)",
           "type": "string",
           "const": "media"
         },
         {
-          "description": "Prometheus text exposition.",
+          "description": "Prometheus text exposition at `/metrics`.",
           "type": "string",
           "const": "metrics"
         },
         {
-          "description": "The native `/api/v1` admin API and the embedded management web UI.",
+          "description": "The native `/api/v1` admin API, the embedded management web UI under\n`/admin` (and the bare `/`, which redirects there), and the Synapse admin\ncompatibility surface under `/_synapse/admin`.",
           "type": "string",
           "const": "admin"
         },
         {
-          "description": "`/health` liveness/readiness only, no auth, for load balancers.",
+          "description": "`/health/*` liveness/readiness only, no auth, for load balancers.",
           "type": "string",
           "const": "health"
         }

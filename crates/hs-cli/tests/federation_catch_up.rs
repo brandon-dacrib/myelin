@@ -126,7 +126,7 @@ fn config_yaml(
     // client's connection-level backoff and the sender's per-transaction one.
     format!(
         "server:\n  server_name: \"{server_name}\"\n\
-         listeners:\n  listeners:\n    - port: {client_port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, federation, health]\n\
+         listeners:\n  listeners:\n    - port: {client_port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, federation, admin, health]\n\
          storage:\n  backend: embedded\n  data_dir: {data_dir:?}\n\
          media:\n  storage:\n    backend: local\n    path: {media_dir:?}\n\
          auth:\n  enable_registration: true\n\

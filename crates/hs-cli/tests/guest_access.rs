@@ -172,7 +172,7 @@ async fn a_guest_reads_joins_talks_is_removed_and_upgrades_once_an_operator_allo
         &config_path,
         format!(
             "server:\n  server_name: example.org\n\
-             listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, health, metrics]\n\
+             listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, admin, health, metrics]\n\
              storage:\n  backend: embedded\n  data_dir: {:?}\n\
              media:\n  storage:\n    backend: local\n    path: {:?}\n\
              federation:\n  enabled: false\n\

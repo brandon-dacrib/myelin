@@ -17,7 +17,7 @@ fn test_config(data_dir: &std::path::Path) -> hs_config::Config {
     let media_dir = data_dir.join("media");
     let yaml = format!(
         "server:\n  server_name: {SERVER}\n\
-         listeners:\n  listeners:\n    - port: 1\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, health, metrics]\n\
+         listeners:\n  listeners:\n    - port: 1\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, media, admin, health, metrics]\n\
          storage:\n  backend: embedded\n  data_dir: {data_dir:?}\n\
          media:\n  storage:\n    backend: local\n    path: {media_dir:?}\n\
          auth:\n  enable_registration: true\n",
@@ -674,7 +674,7 @@ async fn a_forked_rooms_extremities_are_reported_and_trimmed() {
         &config_path,
         format!(
             "server:\n  server_name: {SERVER}\n\
-             listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, health, metrics]\n\
+             listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, media, admin, health, metrics]\n\
              storage:\n  backend: embedded\n  data_dir: {data_dir:?}\n\
              media:\n  storage:\n    backend: local\n    path: {media_dir:?}\n\
              auth:\n  enable_registration: true\n",

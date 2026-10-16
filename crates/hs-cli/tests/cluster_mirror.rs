@@ -245,7 +245,7 @@ const ROOM_SHARDS: u32 = 16;
 fn replica_config(db: &Database, dir: &std::path::Path, port: u16, mesh_port: u16) -> String {
     format!(
         "server:\n  server_name: cluster.example.org\n  signing_key_path: {keys:?}\n\
-         listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, health, metrics]\n\
+         listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, admin, health, metrics]\n\
          storage:\n  backend: postgres\n  host: {host}\n  port: {pg_port}\n  database: {name}\n  user: {user}\n  password: {password}\n  tls: false\n  pool_size: 8\n\
          media:\n  storage:\n    backend: local\n    path: {media:?}\n\
          auth:\n  enable_registration: true\n\

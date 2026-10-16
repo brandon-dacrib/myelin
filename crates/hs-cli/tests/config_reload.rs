@@ -158,7 +158,7 @@ async fn lowering_the_send_limit_through_the_admin_api_limits_the_next_message_w
         &config_path,
         format!(
             "server:\n  server_name: example.org\n\
-             listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, health, metrics]\n\
+             listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, admin, health, metrics]\n\
              storage:\n  backend: embedded\n  data_dir: {:?}\n\
              media:\n  storage:\n    backend: local\n    path: {:?}\n\
              auth:\n  enable_registration: true\n",

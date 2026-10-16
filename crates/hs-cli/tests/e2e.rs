@@ -28,7 +28,7 @@ fn test_config_yaml(port: u16, data_dir: &std::path::Path) -> String {
     let media_dir = data_dir.join("media");
     format!(
         "server:\n  server_name: example.org\n\
-         listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, health, metrics]\n\
+         listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, federation, media, admin, health, metrics]\n\
          storage:\n  backend: embedded\n  data_dir: {:?}\n\
          media:\n  storage:\n    backend: local\n    path: {:?}\n\
          auth:\n  enable_registration: true\n",
@@ -1468,7 +1468,7 @@ async fn hs_recover_gets_a_locked_out_administrator_back_in_with_the_real_binary
         &config_path,
         format!(
             "server:\n  server_name: example.org\n  signing_key_path: {keys:?}\n\
-             listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, health]\n\
+             listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, federation, media, admin, health, metrics]\n\
              storage:\n  backend: embedded\n  data_dir: {data_dir:?}\n\
              media:\n  storage:\n    backend: local\n    path: {:?}\n",
             data_dir.join("media")

@@ -199,7 +199,7 @@ async fn a_single_node_is_one_replica_owning_every_shard_and_cannot_be_drained()
         &config_path,
         format!(
             "server:\n  server_name: example.org\n\
-             listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, health, metrics]\n\
+             listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, admin, health, metrics]\n\
              storage:\n  backend: embedded\n  data_dir: {:?}\n\
              media:\n  storage:\n    backend: local\n    path: {:?}\n",
             dir.path().join("data"),
@@ -374,7 +374,7 @@ impl Drop for Database {
 fn replica_config(db: &Database, dir: &std::path::Path, port: u16, mesh_port: u16) -> String {
     format!(
         "server:\n  server_name: cluster.example.org\n  signing_key_path: {keys:?}\n\
-         listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, health, metrics]\n\
+         listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, admin, health, metrics]\n\
          storage:\n  backend: postgres\n  host: {host}\n  port: {pg_port}\n  database: {name}\n  user: {user}\n  password: {password}\n  tls: false\n\
          media:\n  storage:\n    backend: local\n    path: {media:?}\n\
          cluster:\n  single_node: false\n  room_shards: 4\n  user_shards: 4\n  heartbeat_interval: 500ms\n  lease_ttl: 3s\n  mesh:\n    port: {mesh_port}\n    shared_secret: cluster-admin-test-secret\n",

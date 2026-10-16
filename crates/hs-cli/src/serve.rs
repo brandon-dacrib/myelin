@@ -344,10 +344,10 @@ impl std::fmt::Debug for ServeOptions {
 ///   its paths are absolute, not spec-relative (see its own doc comment).
 /// - `/health/live`, `/health/ready`, `/metrics`.
 ///
-/// Every configured listener serves this same router regardless of its declared `resources`
-/// list — per-listener resource filtering (splitting `client`/`federation`/`media`/`metrics`
-/// traffic onto different sockets, the way Synapse's `listeners[].resources` does) is not
-/// implemented yet; see `docs/status/12-platform-and-kubernetes.md`.
+/// Every configured listener is bound to this same router, behind a filter that answers only
+/// the route families its `resources` list names (`crate::listener_resources`), the way
+/// Synapse's `listeners[].resources` splits `client`/`federation`/`media`/`metrics` traffic onto
+/// different sockets.
 fn build_router<B: KvBackend>(
     auth: AuthState,
     mounts: Mounts<B>,
@@ -2817,7 +2817,14 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
                     }
                     None => Bound::Plain(tcp),
                 };
-            listeners.push((bound, actual_addr, listener_cfg.x_forwarded));
+            let resources = crate::listener_resources::ResourceSet::new(&listener_cfg.resources);
+            tracing::info!(
+                listener = %addr_str,
+                resources = %resources.names(),
+                x_forwarded = listener_cfg.x_forwarded,
+                "listener serves these resource families; the rest answer 404 on it"
+            );
+            listeners.push((bound, actual_addr, listener_cfg.x_forwarded, resources));
         }
     }
 
@@ -2828,18 +2835,39 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
              listener address or the mesh's; they are not served"
         );
     }
-    let addrs: Vec<SocketAddr> = listeners.iter().map(|(_, addr, _)| *addr).collect();
+    let addrs: Vec<SocketAddr> = listeners.iter().map(|(_, addr, _, _)| *addr).collect();
+    // The addresses the server talks to itself on, and roots its links at: the first listener
+    // serving the family in question, since a listener serving only `metrics` answers neither
+    // the bridge manager's front door (`client`) nor the setup page (`admin`).
+    let addrs_serving = |resource: hs_config::listeners::ListenerResource| -> Vec<SocketAddr> {
+        let mut preferred: Vec<SocketAddr> = listeners
+            .iter()
+            .filter(|(_, _, _, resources)| resources.contains(resource))
+            .map(|(_, addr, _, _)| *addr)
+            .collect();
+        let rest: Vec<SocketAddr> = addrs
+            .iter()
+            .filter(|a| !preferred.contains(a))
+            .copied()
+            .collect();
+        preferred.extend(rest);
+        preferred
+    };
+    let client_addrs = addrs_serving(hs_config::listeners::ListenerResource::Client);
+    let admin_addrs = addrs_serving(hs_config::listeners::ListenerResource::Admin);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let mut tasks = tokio::task::JoinSet::new();
-    for (bound, addr, x_forwarded) in listeners {
+    for (bound, addr, x_forwarded, resources) in listeners {
+        // Only the route families this listener's `resources` names; the rest get a 404 here,
+        // before the router (`crate::listener_resources`).
+        let app = crate::listener_resources::layer(app.clone(), resources);
         // A listener behind a proxy (`x_forwarded`) has its `X-Forwarded-For` believed when a
         // per-address rate limit asks who the client is (`hs_http::buckets::ClientIp`).
         let app = if x_forwarded {
-            app.clone()
-                .layer(Extension(hs_http::buckets::TrustForwardedFor))
+            app.layer(Extension(hs_http::buckets::TrustForwardedFor))
         } else {
-            app.clone()
+            app
         };
         let mut shutdown_rx = shutdown_rx.clone();
         let shutdown = async move {
@@ -2865,7 +2893,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     }
 
     let join = tokio::spawn(async move { while tasks.join_next().await.is_some() {} });
-    let mut loopback = addrs[0];
+    let mut loopback = client_addrs[0];
     if loopback.ip().is_unspecified() {
         loopback.set_ip(if loopback.is_ipv4() {
             std::net::Ipv4Addr::LOCALHOST.into()
@@ -2883,13 +2911,16 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     // server that cannot work out whether to offer setup still serves: everything else about it
     // is fine, and `hs register --admin` remains a way in.
     // The recovery link `hs recover` is handed is rooted the same way, at the same moment.
-    recovery.set_link_base(link_base(config.server.public_baseurl.as_deref(), &addrs));
+    recovery.set_link_base(link_base(
+        config.server.public_baseurl.as_deref(),
+        &admin_addrs,
+    ));
     // The `server` settings, all read per request: the .well-known documents, /versions'
     // unstable features, the recovery link's root and the address rendered into a bridge's files.
     // (The first-run setup link is offered once, below, with the value in force now.)
     if let Some(live) = &options.live_config {
         let recovery = recovery.clone();
-        let addrs = addrs.clone();
+        let addrs = admin_addrs.clone();
         let capabilities_config = options.capabilities_config.clone();
         let hub = sync_hub.clone();
         live.on_change("server", move |config| {
@@ -2921,9 +2952,13 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         });
     }
     let setup_link = match setup.offer().await {
-        Ok(token) => {
-            token.map(|token| setup_link(config.server.public_baseurl.as_deref(), &addrs, &token))
-        }
+        Ok(token) => token.map(|token| {
+            setup_link(
+                config.server.public_baseurl.as_deref(),
+                &admin_addrs,
+                &token,
+            )
+        }),
         Err(e) => {
             tracing::error!(error = %e, "could not determine whether this server needs its first administrator; no setup link will be offered");
             None
@@ -2983,8 +3018,9 @@ fn setup_link(public_baseurl: Option<&str>, addrs: &[SocketAddr], token: &str) -
 }
 
 /// Where the setup and recovery links are rooted: `server.public_baseurl` without its trailing
-/// slash, or else the first listener's bound address -- `http://localhost:<port>` for a wildcard
-/// bind (`0.0.0.0`, `::`), `http://<ip>:<port>` for a listener bound to one address.
+/// slash, or else the first listener's bound address (the first serving `admin`, which is where
+/// the links lead) -- `http://localhost:<port>` for a wildcard bind (`0.0.0.0`, `::`),
+/// `http://<ip>:<port>` for a listener bound to one address.
 fn link_base(public_baseurl: Option<&str>, addrs: &[SocketAddr]) -> String {
     match configured_public_baseurl(public_baseurl) {
         Some(url) => url.trim_end_matches('/').to_owned(),
@@ -3383,6 +3419,20 @@ mod tests {
                 .any(|r| r.path == "/_matrix/client/v3/login")
         );
         handle.shutdown().await;
+    }
+
+    /// Every route the server mounts belongs to a resource family, so a listener naming every
+    /// family serves everything and nothing is unreachable by accident of its prefix.
+    #[test]
+    fn every_manifest_route_belongs_to_a_listener_resource() {
+        let manifest = route_manifest();
+        let orphans: Vec<&str> = manifest
+            .routes
+            .iter()
+            .map(|r| r.path.as_str())
+            .filter(|path| crate::listener_resources::resource_for(path).is_none())
+            .collect();
+        assert!(orphans.is_empty(), "{orphans:?}");
     }
 
     #[test]

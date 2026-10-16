@@ -343,11 +343,12 @@ measure_pods() {
 }
 
 # The cluster's own view, per pod, from /metrics: shards owned, ownership changes, forwards
-# retried, fenced writes. A port-forward per pod, read once.
+# retried, fenced writes. A port-forward per pod to the metrics port (9090, the chart's
+# `service.metricsPort`: the client port does not serve /metrics), read once.
 cluster_metrics() {
   local p port=$((LOCAL_PORT + 1)) pid text
   for p in $(k get pods -l "app.kubernetes.io/instance=$RELEASE" -o jsonpath='{.items[*].metadata.name}'); do
-    kubectl --context "$CONTEXT" -n "$NAMESPACE" port-forward "pod/$p" "$port:8008" --address 127.0.0.1 >/dev/null 2>&1 &
+    kubectl --context "$CONTEXT" -n "$NAMESPACE" port-forward "pod/$p" "$port:9090" --address 127.0.0.1 >/dev/null 2>&1 &
     pid=$!
     for _ in $(seq 1 20); do [ "$(http_code "http://127.0.0.1:$port/health/live")" = "200" ] && break; sleep 0.5; done
     text="$(curl -s "http://127.0.0.1:$port/metrics" || true)"

@@ -133,7 +133,7 @@ async fn the_legacy_event_stream_and_initial_syncs_answer_from_the_sync_feed() {
         &config_path,
         format!(
             "server:\n  server_name: example.org\n\
-             listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, health]\n\
+             listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, admin, health]\n\
              storage:\n  backend: embedded\n  data_dir: {:?}\n\
              media:\n  storage:\n    backend: local\n    path: {:?}\n\
              federation:\n  enabled: false\n\

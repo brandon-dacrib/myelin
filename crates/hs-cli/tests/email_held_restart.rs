@@ -98,7 +98,7 @@ fn config_yaml_holding(
 ) -> String {
     format!(
         "server:\n  server_name: example.org\n\
-         listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, health]\n\
+         listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, admin, health]\n\
          storage:\n  backend: embedded\n  data_dir: {:?}\n\
          media:\n  storage:\n    backend: local\n    path: {:?}\n\
          auth:\n  enable_registration: true\n\

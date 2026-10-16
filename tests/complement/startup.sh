@@ -113,7 +113,9 @@ listeners:
   listeners:
     - port: 8008
       bind_addresses: ["0.0.0.0"]
-      resources: [client, federation, media, health]
+      # `admin` for /_synapse/admin/v1/register, below: a listener serves only the resource
+      # families it names.
+      resources: [client, federation, media, health, admin]
 auth:
   enable_registration: true
   enable_legacy_login: true

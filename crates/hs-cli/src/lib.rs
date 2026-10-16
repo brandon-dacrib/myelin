@@ -35,6 +35,7 @@ pub mod hierarchy;
 pub mod identity;
 pub mod identity_service;
 mod inherited_listeners;
+pub mod listener_resources;
 pub mod live_config;
 pub mod media;
 pub mod memory_guard;

@@ -20,7 +20,7 @@ fn config(port: u16, data_dir: &std::path::Path) -> hs_config::Config {
     // followed; the default blocks loopback, as a real deployment must.
     let yaml = format!(
         "server:\n  server_name: \"127.0.0.1:{port}\"\n\
-         listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, federation, health]\n\
+         listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, federation, media, health, metrics]\n\
          storage:\n  backend: embedded\n  data_dir: {data_dir:?}\n\
          media:\n  storage:\n    backend: local\n    path: {media_dir:?}\n  url_preview_ip_range_blocklist: []\n\
          auth:\n  enable_registration: true\n\

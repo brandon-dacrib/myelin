@@ -12,21 +12,57 @@ use crate::error::{Validate, ValidationErrors};
 /// A resource family a listener can serve. Synapse calls these `resources`
 /// with `names` like `client`, `federation`, `media`, `metrics`; we keep
 /// the same vocabulary since it is what operators already know.
+///
+/// A listener answers only the route families it names (`hs serve` refuses
+/// the rest with `404 M_UNRECOGNIZED`, as it does an unknown route), so a
+/// public listener can leave `metrics` and `admin` to a private one. Every
+/// path the server has belongs to exactly one family; the variants say which.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ListenerResource {
-    /// `/_matrix/client/*` and legacy `/_matrix/r0/*`.
+    /// `/_matrix/client/*` (including the authenticated media routes under
+    /// `/_matrix/client/v1/media`, which a client needs wherever it talks to
+    /// the server), legacy `/_matrix/r0/*`, `/_synapse/client/*`,
+    /// `/.well-known/matrix/client` and `/.well-known/matrix/support`, and the
+    /// bridge manager's own front door under `/_myelin/bridges`.
     Client,
-    /// `/_matrix/federation/*`, `/_matrix/key/*`.
+    /// `/_matrix/federation/*`, `/_matrix/key/*` and `/.well-known/matrix/server`.
     Federation,
-    /// `/_matrix/media/*`.
+    /// The legacy, unauthenticated `/_matrix/media/*`. (The authenticated media
+    /// routes under `/_matrix/client/v1/media` belong to `client`.)
     Media,
-    /// Prometheus text exposition.
+    /// Prometheus text exposition at `/metrics`.
     Metrics,
-    /// The native `/api/v1` admin API and the embedded management web UI.
+    /// The native `/api/v1` admin API, the embedded management web UI under
+    /// `/admin` (and the bare `/`, which redirects there), and the Synapse admin
+    /// compatibility surface under `/_synapse/admin`.
     Admin,
-    /// `/health` liveness/readiness only, no auth, for load balancers.
+    /// `/health/*` liveness/readiness only, no auth, for load balancers.
     Health,
+}
+
+impl ListenerResource {
+    /// Every resource family, in the order the configuration reference lists them.
+    pub const ALL: [ListenerResource; 6] = [
+        ListenerResource::Client,
+        ListenerResource::Federation,
+        ListenerResource::Media,
+        ListenerResource::Metrics,
+        ListenerResource::Admin,
+        ListenerResource::Health,
+    ];
+
+    /// The family's name as it is spelled in a configuration file (`client`, `federation`, ...).
+    pub fn name(self) -> &'static str {
+        match self {
+            ListenerResource::Client => "client",
+            ListenerResource::Federation => "federation",
+            ListenerResource::Media => "media",
+            ListenerResource::Metrics => "metrics",
+            ListenerResource::Admin => "admin",
+            ListenerResource::Health => "health",
+        }
+    }
 }
 
 /// TLS material for a listener.
@@ -79,17 +115,16 @@ pub struct ListenersConfig {
     pub listeners: Vec<Listener>,
 }
 
+/// One plaintext listener on 8008 serving every resource family: what `hs serve --data-dir
+/// ./data --server-name example.org` and the one-variable container run get, so the admin
+/// interface, its setup link, `/health` and `/metrics` are all on the one port. A deployment that
+/// wants `metrics` and `admin` off the public port lists its own listeners (the Helm chart does).
 fn default_listeners() -> Vec<Listener> {
     vec![Listener {
         bind_addresses: default_bind_addresses(),
         port: 8008,
         tls: None,
-        resources: vec![
-            ListenerResource::Client,
-            ListenerResource::Federation,
-            ListenerResource::Media,
-            ListenerResource::Health,
-        ],
+        resources: ListenerResource::ALL.to_vec(),
         x_forwarded: false,
     }]
 }
@@ -187,6 +222,26 @@ mod tests {
         }
         .validate("listeners", &mut errors);
         assert_eq!(errors.0[0].path, "listeners.listeners[0].resources");
+    }
+
+    #[test]
+    fn default_listener_serves_every_resource_on_8008() {
+        let listeners = ListenersConfig::default().listeners;
+        assert_eq!(listeners.len(), 1);
+        assert_eq!(listeners[0].port, 8008);
+        for resource in ListenerResource::ALL {
+            assert!(listeners[0].resources.contains(&resource), "{resource:?}");
+        }
+    }
+
+    #[test]
+    fn resource_names_round_trip_through_serde() {
+        for resource in ListenerResource::ALL {
+            let yaml = serde_yaml_ng::to_string(&resource).unwrap();
+            assert_eq!(yaml.trim(), resource.name());
+            let back: ListenerResource = serde_yaml_ng::from_str(&yaml).unwrap();
+            assert_eq!(back, resource);
+        }
     }
 
     #[test]

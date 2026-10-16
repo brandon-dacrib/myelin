@@ -203,7 +203,7 @@ async fn sessions_bind_their_user_and_operation_and_registration_remembers_what_
         &config_path,
         format!(
             "server:\n  server_name: example.org\n  signing_key_path: {:?}\n\
-             listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, federation, health, metrics]\n\
+             listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, federation, admin, health, metrics]\n\
              storage:\n  backend: embedded\n  data_dir: {:?}\n\
              media:\n  storage:\n    backend: local\n    path: {:?}\n\
              rate_limits:\n  enabled: false\n\

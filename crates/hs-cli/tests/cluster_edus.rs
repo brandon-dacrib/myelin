@@ -107,7 +107,7 @@ fn replica_config(
 ) -> hs_config::Config {
     let yaml = format!(
         "server:\n  server_name: \"{server_name}\"\n  signing_key_path: {keys:?}\n\
-         listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, federation, health, metrics]\n\
+         listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, federation, admin, health, metrics]\n\
          storage:\n  backend: postgres\n  host: {host}\n  port: {pg_port}\n  database: {name}\n  user: {user}\n  password: {password}\n  tls: false\n\
          media:\n  storage:\n    backend: local\n    path: {media:?}\n\
          auth:\n  enable_registration: true\n\
@@ -128,7 +128,7 @@ fn replica_config(
 fn single_config(port: u16, dir: &std::path::Path) -> hs_config::Config {
     let yaml = format!(
         "server:\n  server_name: \"127.0.0.1:{port}\"\n\
-         listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, federation, health, metrics]\n\
+         listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, federation, admin, health, metrics]\n\
          storage:\n  backend: embedded\n  data_dir: {data:?}\n\
          media:\n  storage:\n    backend: local\n    path: {media:?}\n\
          auth:\n  enable_registration: true\n\

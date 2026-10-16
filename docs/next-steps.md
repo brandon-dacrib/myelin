@@ -30,6 +30,19 @@ holds them)` naming ten components; an operator reading the log of a routine res
 not see a warning, so either break the cycles or demote the line until they are broken.
 
 ## 2026-10-16 -- a bridge's double puppet is no longer rate-limited when its appservice is not; the branch is `agent/puppet-rate-limit`
+## 2026-10-16 -- a listener serves only the resources it names; the branch is `agent/listener-resources`
+
+`listeners[].resources` was never consulted: the chart's public port served `/metrics` and the
+admin API, and its metrics port served everything. Now each listener answers only the route
+families it lists (track 12; `crates/hs-cli/src/listener_resources.rs`), the chart's ports are
+`[client, federation, media, health, admin]` and `[metrics, health]`, the no-configuration
+defaults list all six so the one-port install is unchanged, and `hs serve` logs what each
+listener serves. **After the roll, check**: `/metrics` through the ingress is 404 and the
+ServiceMonitor's scrape (port 9090) still has `hs_http_requests_total`; `/admin/` and the Element
+client still answer on the public port; the log has one `listener serves these resource
+families` line per port. **Left**: the chart's `federationPort` (8448) container port has no
+listener behind it (pre-existing, not touched here).
+
 
 The iMessage bridge's catch-up got `429`s every 5 s: its double puppet of @brandon logs in with
 `m.login.application_service` and its own `as_token`, and the token that returned was limited as

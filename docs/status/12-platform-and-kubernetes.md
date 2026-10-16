@@ -1,5 +1,40 @@
 # 12. Platform and Kubernetes
 
+## 2026-10-16, evening (branch `agent/listener-resources`): a listener serves only the resources it names
+
+`listeners[].resources` was parsed, validated and ignored: every listener served the whole
+router, so the chart's public port answered `/metrics` (unauthenticated) and the admin API, and
+its metrics port answered the client and admin APIs. Now (`crates/hs-cli/src/listener_resources.rs`)
+each bound listener has a filter in front of the shared router that classifies the request path
+into one family by prefix and answers the unknown-endpoint `404` (`M_UNRECOGNIZED`, or the admin
+API's RFC 9457 shape under `/api/v1`) for a family the listener does not name; the mesh listener
+keeps the unfiltered router. The families: `client` is `/_matrix/client/*` (including the
+authenticated media under `/_matrix/client/v1/media`: a client must get avatars from the port it
+logs in on), `/_matrix/r0/*`, `/_synapse/client/*`, `/.well-known/matrix/{client,support}` and
+the bridge manager's `/_myelin/bridges`; `federation` is `/_matrix/federation/*`, `/_matrix/key/*`
+and `/.well-known/matrix/server`; `media` is the legacy `/_matrix/media/*`; `metrics` is
+`/metrics`; `admin` is `/api/v1/*`, `/admin*`, the bare `/` and `/_synapse/admin/*`; `health` is
+`/health/*`. A unit test checks every route in the manifest belongs to a family. `hs serve` logs
+one info line per listener with its address and the families it serves. The setup and recovery
+links are rooted at the first listener serving `admin`, and the bridge manager's loopback is the
+first serving `client`.
+
+**Defaults and the chart.** `default_listeners()` (no listener configuration: the docker
+one-liner, `hs serve --data-dir ... --server-name ...`) now names all six families on 8008, so
+the admin interface, the setup link, `/health` and `/metrics` stay on the one port;
+`docs/config.md` regenerated. The chart's client port is `[client, federation, media, health,
+admin]` and its metrics port `[metrics, health]` (the probes hit the client port and keep
+working; `/metrics` is off the ingress). `deploy/helm/hs/ci/cluster-smoke.sh` reads `/metrics`
+through a port-forward to 9090 now. Complement's config gained `admin` for
+`/_synapse/admin/v1/register`; Sytest's and the Synapse federation harness's hit nothing outside
+what they list. Every hs-cli test fixture lists what its test uses (most gained `admin`, for the
+shared-secret register the tests create admins with).
+
+Verified: `cargo test -p hs-cli --test listener_resources` (the real binary with `[client,
+health]` and `[metrics, admin]` listeners: each answers what it lists, 404s the rest, and the
+log names both), the classifier's unit tests, `helm lint` and `helm template` (the rendered
+listeners above), and the three-crate gate in the branch's report.
+
 ## 2026-10-16, afternoon (branch `agent/kind-smoke-stand-in`): the kind smoke pulls its stand-in itself
 
 CD's `image (amd64)` job failed twice on 2026-10-16 (v0.3.28's first run, then 9befe464's) in

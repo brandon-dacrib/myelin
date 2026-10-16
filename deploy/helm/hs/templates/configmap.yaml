@@ -17,14 +17,22 @@ data:
   # StatefulSet passes those as `HS__` environment variables, which outrank everything.
   homeserver.yaml: |
     {{- $backend := include "hs.storageBackend" . }}
+    {{- /*
+    A listener answers only the route families its `resources` names (crates/hs-cli/src/
+    listener_resources.rs); the rest are 404 on it. The public port carries what the ingress
+    exposes: the client and federation APIs, legacy media, the probes, and the admin API and
+    management interface (the chart's ingress routes /admin and /api/v1 there). /metrics is
+    only on the metrics port, which the ServiceMonitor scrapes and nothing exposes; health is
+    there too so a probe may use either port.
+    */}}
     listeners:
       listeners:
         - port: {{ .Values.service.clientPort }}
           bind_addresses: ["::"]
-          resources: [client, federation, health]
+          resources: [client, federation, media, health, admin]
         - port: {{ .Values.service.metricsPort }}
           bind_addresses: ["::"]
-          resources: [metrics]
+          resources: [metrics, health]
     {{- if ne $backend "embedded" }}
     storage:
       backend: {{ $backend }}

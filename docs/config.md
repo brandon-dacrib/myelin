@@ -48,7 +48,7 @@ health checks, this interface, metrics). Set per replica at install.
 
 | Field | Type | Default | Applies | Description |
 |---|---|---|---|---|
-| `listeners` | array<object> | `[{"bind_addresses":["::"],"port":8008,"tls":null,"resources":["client","federation","media","health"],"x_forwarded":false}]` | bootstrap (sockets this process binds at startup) | One entry per bound socket. |
+| `listeners` | array<object> | `[{"bind_addresses":["::"],"port":8008,"tls":null,"resources":["client","federation","media","metrics","admin","health"],"x_forwarded":false}]` | bootstrap (sockets this process binds at startup) | One entry per bound socket. |
 
 
 ## `storage`

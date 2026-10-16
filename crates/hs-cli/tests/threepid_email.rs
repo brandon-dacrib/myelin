@@ -245,7 +245,7 @@ async fn an_email_address_is_validated_registered_with_signed_in_by_added_and_re
         &config_path,
         format!(
             "server:\n  server_name: example.org\n  public_baseurl: {base}/\n\
-             listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, health, metrics]\n\
+             listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, admin, health, metrics]\n\
              storage:\n  backend: embedded\n  data_dir: {data:?}\n\
              media:\n  storage:\n    backend: local\n    path: {:?}\n\
              auth:\n  enable_registration: true\n\
@@ -436,7 +436,7 @@ async fn a_forgotten_password_is_reset_by_email() {
         &config_path,
         format!(
             "server:\n  server_name: example.org\n  public_baseurl: {base}/\n\
-             listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, health, metrics]\n\
+             listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, admin, health, metrics]\n\
              storage:\n  backend: embedded\n  data_dir: {data:?}\n\
              media:\n  storage:\n    backend: local\n    path: {:?}\n\
              auth:\n  enable_registration: true\n  next_link_domain_whitelist: [app.example]\n\

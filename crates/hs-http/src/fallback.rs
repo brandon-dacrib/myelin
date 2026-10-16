@@ -43,10 +43,20 @@ where
 
 /// No route matched this path at all.
 async fn unknown_endpoint(request: Request) -> Response {
-    if is_admin(request.uri().path()) {
+    unknown_endpoint_response(request.uri().path())
+}
+
+/// The response for a path this server does not serve, in the error shape that path's API
+/// speaks: RFC 9457 `404` under [`ADMIN_PREFIX`], `404 M_UNRECOGNIZED` everywhere else.
+///
+/// What the fallback answers when no route matches, and what a listener answers for a route
+/// family it is configured not to serve (`listeners[].resources`): to a caller the two are the
+/// same, "this endpoint is not here".
+pub fn unknown_endpoint_response(path: &str) -> Response {
+    if is_admin(path) {
         Problem::not_found()
             .with_detail("no such endpoint")
-            .with_instance(request.uri().path())
+            .with_instance(path)
             .into_response()
     } else {
         MatrixError::unrecognized().into_response()

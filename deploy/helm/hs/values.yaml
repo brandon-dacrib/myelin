@@ -306,6 +306,11 @@ telemetry:
     #   secretKey: dsn
     environment: production
 
+## The ports and what each listener on them serves (templates/configmap.yaml renders the
+## listeners; a listener answers only the resource families it names, the rest are 404 on it):
+## clientPort carries the client and federation APIs, legacy media, /health and the admin API
+## with the management interface (/api/v1, /admin); metricsPort carries /metrics and /health
+## only, for the ServiceMonitor, and is not exposed by the ingress.
 service:
   type: ClusterIP
   clientPort: 8008

@@ -222,7 +222,7 @@ async fn cas_signs_people_in_creates_accounts_and_confirms_user_interactive_auth
         &config_path,
         format!(
             "server:\n  server_name: example.org\n  public_baseurl: http://127.0.0.1:{port}/\n\
-             listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, health, metrics]\n\
+             listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, admin, health, metrics]\n\
              storage:\n  backend: embedded\n  data_dir: {:?}\n\
              media:\n  storage:\n    backend: local\n    path: {:?}\n\
              federation:\n  enabled: false\n\
@@ -399,7 +399,7 @@ async fn cas_follows_the_public_address_trusts_listed_clients_and_respects_bridg
         &config_path,
         format!(
             "server:\n  server_name: example.org\n  public_baseurl: https://before.example/\n\
-             listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, health, metrics]\n\
+             listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, admin, health, metrics]\n\
              storage:\n  backend: embedded\n  data_dir: {:?}\n\
              media:\n  storage:\n    backend: local\n    path: {:?}\n\
              federation:\n  enabled: false\n\

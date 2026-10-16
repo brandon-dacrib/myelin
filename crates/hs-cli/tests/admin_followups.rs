@@ -32,7 +32,7 @@ fn config(port: u16, data_dir: &std::path::Path) -> hs_config::Config {
     let media_dir = data_dir.join("media");
     let yaml = format!(
         "server:\n  server_name: \"127.0.0.1:{port}\"\n\
-         listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, federation, health, metrics]\n\
+         listeners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, federation, admin, health, metrics]\n\
          storage:\n  backend: embedded\n  data_dir: {data_dir:?}\n\
          media:\n  storage:\n    backend: local\n    path: {media_dir:?}\n\
          auth:\n  enable_registration: true\n\

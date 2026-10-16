@@ -33,6 +33,14 @@ never seen it. Everything that was verified for it says how.
   reporting through GitHub, turned on for the repository on 2026-10-16, with the supported
   versions and the design notes an auditor should know) and `CODE_OF_CONDUCT.md`.
 
+- **A listener serves only the resources it names.** `listeners[].resources` is enforced:
+  the Helm chart's public port no longer answers `/metrics`, and its metrics port answers
+  `/metrics` and `/health` and nothing else; a route a listener does not serve is the same
+  `404 M_UNRECOGNIZED` as an unknown one. The one-port defaults (`hs serve --data-dir ...
+  --server-name ...`, the container one-liner) list every resource, so the admin interface, the
+  setup link, `/health` and `/metrics` stay on 8008. `hs serve` logs, per listener, what it
+  serves. Verified with the real binary serving two listeners (`[client, health]` and
+  `[metrics, admin]`), `helm template`, and the server's whole route manifest classified.
 - **Traces reach the background work and the store.** A traced request now shows its store
   transactions (named after the code that asked, with what they wrote), each wait for a blocking
   thread, state resolution, event authorization and the event's write. Background work is a
