@@ -11,6 +11,14 @@ It now pulls it with Docker (five tries, 10-50 s apart) and always `kind load`s 
 "could not pull the stand-in" if every try fails; the Bridge's `pullPolicy: IfNotPresent` then
 finds it on the node. Checked: `bash -n`; the next CD run is the real test.
 
+**The same day, later** (branch `agent/smoke-stand-in-mirror`): CD for 0d4afb81 (v0.3.31) failed
+five tries out of five with "toomanyrequests: Data limit exceeded": public.ecr.aws refuses
+anonymous pulls once a runner's address has used its data allowance, and no retry gets past
+that. The script now tries `public.ecr.aws/...`, then `mirror.gcr.io/library/<name>` (Google's
+Docker Hub mirror, which `deploy/Dockerfile` already uses for its base images), then
+`docker.io/library/<name>`, three tries each, tags whatever answered as `$STAND_IN` and loads
+that. Checked: `bash -n`; `docker pull mirror.gcr.io/library/nginx:alpine` answers.
+
 ## 2026-10-16 (branch `agent/ci-arm64-test-kill`): arm64's test job ran out of memory linking; it links with lld now
 
 From 35c09f43 every `test (arm64)` run ended mid-build with `exit code 143` and, in the

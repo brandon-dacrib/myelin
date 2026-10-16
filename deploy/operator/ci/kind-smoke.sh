@@ -252,14 +252,25 @@ say "A Bridge running a stand-in ($STAND_IN, port $STAND_IN_PORT)"
 # the Bridge Degraded and no release). Pulled by the kubelet it would also break any name kind
 # loads later with the same image ID (`kind load` and the kubelet's pull conflict).
 if [ -n "$KIND_CLUSTER" ]; then
+  # Each source is tried in turn, a few times each: public.ecr.aws also refuses anonymous pulls
+  # outright once a runner's address has used its data allowance ("toomanyrequests: Data limit
+  # exceeded", CD for 0d4afb81, 2026-10-16), which no retry gets past. Whatever answers is
+  # tagged as $STAND_IN, the name the Bridge below runs.
+  stand_in_name="${STAND_IN##*/}"
   if ! docker image inspect "$STAND_IN" >/dev/null 2>&1; then
-    for attempt in 1 2 3 4 5; do
-      docker pull -q "$STAND_IN" >/dev/null && break
-      echo "pulling $STAND_IN failed (attempt $attempt of 5)"
-      sleep $((attempt * 10))
+    for source in "$STAND_IN" "mirror.gcr.io/library/$stand_in_name" "docker.io/library/$stand_in_name"; do
+      for attempt in 1 2 3; do
+        if docker pull -q "$source" >/dev/null; then
+          [ "$source" = "$STAND_IN" ] || docker tag "$source" "$STAND_IN"
+          echo "stand-in pulled from $source"
+          break 2
+        fi
+        echo "pulling $source failed (attempt $attempt of 3)"
+        sleep $((attempt * 5))
+      done
     done
   fi
-  docker image inspect "$STAND_IN" >/dev/null 2>&1 || fail "could not pull the stand-in $STAND_IN"
+  docker image inspect "$STAND_IN" >/dev/null 2>&1 || fail "could not pull the stand-in $STAND_IN from any source"
   run kind load docker-image "$STAND_IN" --name "$KIND_CLUSTER" >/dev/null
 fi
 stand_in_repo="${STAND_IN%:*}"
