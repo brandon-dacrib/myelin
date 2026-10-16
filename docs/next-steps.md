@@ -21,6 +21,23 @@ extremities plus every prev event (27-100 forks, 2-15 s each, for nearly every P
 rooms), 0.75 of a core and a 7 s p99 on the hub's members step; the fix is
 `agent/soft-fail-forks` (status 04). CPU was 3.8 cores in the first ten minutes (cold loads).
 
+**Outage, 2026-10-16 06:25-14:28 UTC (found afterwards, from the iMessage bridge's 502s).** On
+v0.3.25 the pod went into CrashLoopBackOff at 06:25: every boot logged up to "trusted key servers
+(notaries) in force", then nothing, and was killed (exit 137, not OOM: about 96 MB) when the
+startup probe's 150 s ran out; 0.45-1 core busy, no disk I/O. It ended with the v0.3.28 roll
+(ready in 26 s), which cut the rows a resolution of many forks reads (289 forks: 156,800 ->
+5,477). Likely cause, not proven: `#ping`'s forward extremities passed ~250 overnight and one
+resolution of them on 0.3.25 outlasted the probes, at runtime and then at every boot. Prometheus
+fired `KubePodNotReady`, `TargetDown` and `KubeStatefulSetReplicasMismatch` for the whole time;
+Alertmanager has no receiver that reaches anyone, so nobody heard. The iMessage bridge's requests
+got 502 from the Funnel throughout; two incoming chats (+1 314-795-6244 at 13:21 UTC, +1 833-904-6203
+at 14:27 UTC) failed to create their portals and have no room until the contact writes again.
+Bridge restarted 16:43 UTC and catching up; its double puppet (`login_shared_secret: appservice`,
+an ordinary access token for `@brandon`) is under `rate_limits.message` like any user, as on
+Synapse: 429s, retried after 5 s. An override for `@brandon` (Users, rate limit, 0) exempts it.
+**Still growing**: `#ping` has 248 extremities on v0.3.29; one dummy event per 5 min merges 10
+and the room adds more; the fix in flight is `agent/dummy-event-chain`.
+
 **To roll** (the owner pastes it from the plain SSH shell, one short line at a time; `helm
 upgrade` is refused to sessions). `--force-conflicts` is no longer needed.
 
