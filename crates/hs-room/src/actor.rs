@@ -7459,6 +7459,26 @@ impl<B: KvBackend> RoomActorHandle<B> {
             .await
     }
 
+    /// `RoomActor::send_dummy_chain` (`extremities`) with its time budget
+    /// (`extremities::DUMMY_CHAIN_BUDGET`), under one hold of the room's lock.
+    ///
+    /// # Errors
+    /// As `RoomActor::send_dummy_chain`.
+    pub async fn send_dummy_chain(
+        &self,
+        now_ms: i64,
+        target: usize,
+        max: usize,
+    ) -> Result<extremities::DummyChain, RoomError>
+    where
+        B: 'static,
+    {
+        self.with_actor(move |actor| {
+            actor.send_dummy_chain(now_ms, target, max, extremities::DUMMY_CHAIN_BUDGET)
+        })
+        .await
+    }
+
     /// Subscribes to the room's publish stream (`crate::protocol::RoomUpdate`).
     pub async fn subscribe(&self) -> tokio::sync::broadcast::Receiver<RoomUpdate> {
         self.inner.lock().await.subscribe()

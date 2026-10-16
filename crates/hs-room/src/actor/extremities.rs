@@ -23,9 +23,10 @@
 //! - **Dummy events** ([`RoomActor::send_dummy_event`], Synapse's
 //!   `_send_dummy_events_to_fill_extremities`). A room with more than
 //!   `server.rooms.dummy_events_threshold` extremities that none of this server's users writes
-//!   to is merged by an `org.matrix.dummy_event` one of its joined local users is allowed to
-//!   send; `crate::registry::RoomRegistry::spawn_extremity_maintainer` decides which rooms and
-//!   how often. Nobody sees a dummy event: [`RoomActor::event_visible_to`] hides it from every
+//!   to is merged by `org.matrix.dummy_event`s one of its joined local users is allowed to
+//!   send, a chain of them each citing the one before ([`RoomActor::send_dummy_chain`]);
+//!   `crate::registry::RoomRegistry::spawn_extremity_maintainer` decides which rooms, how many
+//!   and how often. Nobody sees a dummy event: [`RoomActor::event_visible_to`] hides it from every
 //!   client read, as Synapse's `filter_events_for_client` does.
 
 use std::collections::HashSet;
@@ -89,6 +90,31 @@ impl PersistedSinceMaintenance {
     fn is_empty(&self) -> bool {
         self.events.is_empty()
     }
+}
+
+/// How long one [`RoomActor::send_dummy_chain`] may go on holding the room before it stops
+/// after the dummy event in hand (the maintainer's): each dummy event resolves the states of
+/// the up to ten extremities it cites, under the room's lock, and the next pass carries on.
+/// In the demo's `#ping` (2026-10-16) a resolution of 75 forks took 1.2-1.9 s; one of ten
+/// takes a fraction of that.
+pub const DUMMY_CHAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// What one [`RoomActor::send_dummy_chain`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DummyChain {
+    /// The room's forward extremities before the first.
+    pub before: usize,
+    /// And after the last.
+    pub after: usize,
+    /// The dummy events sent, in order.
+    pub events: Vec<ruma::OwnedEventId>,
+    /// How many extremities each cited, in the same order.
+    pub cited: Vec<usize>,
+    /// The local member that sent the last one.
+    pub sender: Option<OwnedUserId>,
+    /// No joined local user could send the first (none joined, none with the power, or the
+    /// room is blocked).
+    pub no_local_sender: bool,
 }
 
 /// What one [`RoomActor::send_dummy_event`] did.
@@ -315,44 +341,137 @@ impl<B: KvBackend> RoomActor<B> {
     /// [`MAX_PREV_EVENTS`] of them, the deepest), as the first joined local user, in user-id
     /// order, the auth rules allow, when the room has more than one extremity. It is
     /// published and federated as any event this server sends, and hidden from clients
-    /// ([`RoomActor::event_visible_to`]).
+    /// ([`RoomActor::event_visible_to`]). A chain of one: [`RoomActor::send_dummy_chain`].
     ///
     /// # Errors
-    /// [`RoomError::RoomNotFound`] for a deleted room; anything else
-    /// [`RoomActor::send_event`] fails with except the refusals that mean "not this user"
-    /// (`Forbidden`) or "nobody" (a blocked room).
+    /// As [`RoomActor::send_dummy_chain`].
     pub fn send_dummy_event(&mut self, now_ms: i64) -> Result<DummyOutcome, RoomError> {
+        let chain = self.send_dummy_chain(now_ms, 1, 1, DUMMY_CHAIN_BUDGET)?;
+        Ok(match (chain.sender, chain.events.first()) {
+            (Some(sender), Some(event_id)) => DummyOutcome::Sent {
+                sender,
+                event_id: event_id.clone(),
+                cited: chain.cited.first().copied().unwrap_or(0),
+            },
+            _ if chain.no_local_sender => DummyOutcome::NoLocalSender,
+            _ => DummyOutcome::NotForked,
+        })
+    }
+
+    /// Sends dummy events one after another, under one hold of the room, until the room has at
+    /// most `target` forward extremities (at least one), `max` were sent, or `budget` has
+    /// passed since the first began (the first is always tried). Each cites at most
+    /// [`MAX_PREV_EVENTS`] extremities, the deepest; a dummy event is one deeper than every
+    /// event it cites, so the next one cites it and nine others, and every dummy after the
+    /// first merges nine more: a room of `n` is down to `target` after `(n - target) / 9`
+    /// rounded up. Nothing is sent into a room already at or under `target`.
+    ///
+    /// The sender is the first joined local user, in user-id order, the auth rules allow (the
+    /// membership is read once, from the state before the first); later dummy events try the
+    /// user that sent the last one first. One chain under one hold costs one resolution of the
+    /// current state at its start and one at its end (the pruning check, and every reader
+    /// after), where as many separate dummy events cost one each: in a room of 250 forks a
+    /// resolution takes seconds.
+    ///
+    /// Counts `hs_room_dummy_events_total{outcome}`: `sent` per event, `no_local_sender` when
+    /// no user could send the first, `failed` when sending one failed.
+    ///
+    /// # Errors
+    /// [`RoomError::RoomNotFound`] for a deleted room; anything else [`RoomActor::send_event`]
+    /// fails with on the *first* dummy event, except the refusals that mean "not this user"
+    /// (`Forbidden`) or "nobody" (a blocked room). A failure after the first stops the chain,
+    /// is logged, and answers what was sent.
+    pub fn send_dummy_chain(
+        &mut self,
+        now_ms: i64,
+        target: usize,
+        max: usize,
+        budget: std::time::Duration,
+    ) -> Result<DummyChain, RoomError> {
         if self.deleted {
             return Err(RoomError::RoomNotFound(self.room_id.to_string()));
         }
-        if self.forward_extremities.len() <= 1 {
-            return Ok(DummyOutcome::NotForked);
+        let target = target.max(1);
+        let before = self.forward_extremities.len();
+        let mut chain = DummyChain {
+            before,
+            after: before,
+            ..DummyChain::default()
+        };
+        if before <= target || max == 0 {
+            return Ok(chain);
         }
         let own = self.identity.server_name.clone();
-        let mut local: Vec<OwnedUserId> = self
+        let mut candidates: Vec<OwnedUserId> = self
             .membership_list()?
             .iter()
             .filter(|(user, membership)| membership == "join" && user.server_name() == own)
             .map(|(user, _)| user.clone())
             .collect();
-        local.sort();
-        let cited = self.prev_events_for_new_event().len();
-        for sender in local {
-            match self.send_event(
+        candidates.sort();
+        let started = std::time::Instant::now();
+        while chain.events.len() < max && self.forward_extremities.len() > target {
+            if !chain.events.is_empty() && started.elapsed() >= budget {
+                tracing::info!(
+                    room_id = %self.room_id,
+                    sent = chain.events.len(),
+                    left = self.forward_extremities.len(),
+                    budget_ms = budget.as_millis() as u64,
+                    "stopped a chain of dummy events at its time budget; the next pass goes on"
+                );
+                break;
+            }
+            match self.send_one_dummy(&mut candidates, now_ms) {
+                Ok(Some((sender, event_id, cited))) => {
+                    chain.sender = Some(sender);
+                    chain.events.push(event_id);
+                    chain.cited.push(cited);
+                }
+                Ok(None) => {
+                    if chain.events.is_empty() {
+                        crate::metrics::count_dummy_event("no_local_sender");
+                        chain.no_local_sender = true;
+                    }
+                    break;
+                }
+                Err(error) if chain.events.is_empty() => return Err(error),
+                Err(error) => {
+                    tracing::warn!(
+                        room_id = %self.room_id,
+                        sent = chain.events.len(),
+                        %error,
+                        "could not send the next dummy event of a chain; keeping those sent"
+                    );
+                    break;
+                }
+            }
+        }
+        chain.after = self.forward_extremities.len();
+        Ok(chain)
+    }
+
+    /// One dummy event as the first of `candidates` the auth rules allow: answers who sent it,
+    /// its ID and how many extremities it cited, or `None` when nobody could. A candidate
+    /// refused is dropped from `candidates`, and the one that sent it moves to the front.
+    fn send_one_dummy(
+        &mut self,
+        candidates: &mut Vec<OwnedUserId>,
+        now_ms: i64,
+    ) -> Result<Option<(OwnedUserId, ruma::OwnedEventId, usize)>, RoomError> {
+        let prev_sns = self.prev_events_for_new_event();
+        while let Some(sender) = candidates.first().cloned() {
+            match self.send_event_citing(
                 sender.clone(),
                 DUMMY_EVENT_TYPE.to_owned(),
                 None,
                 serde_json::json!({}),
                 None,
                 now_ms,
+                &prev_sns,
             ) {
                 Ok(event) => {
                     crate::metrics::count_dummy_event("sent");
-                    return Ok(DummyOutcome::Sent {
-                        sender,
-                        event_id: event.event_id().to_owned(),
-                        cited,
-                    });
+                    return Ok(Some((sender, event.event_id().to_owned(), prev_sns.len())));
                 }
                 Err(RoomError::Forbidden(reason)) => {
                     tracing::debug!(
@@ -361,16 +480,16 @@ impl<B: KvBackend> RoomActor<B> {
                         %reason,
                         "this user may not send a dummy event here; trying the next"
                     );
+                    candidates.remove(0);
                 }
-                Err(RoomError::RoomBlocked(_)) => break,
+                Err(RoomError::RoomBlocked(_)) => return Ok(None),
                 Err(error) => {
                     crate::metrics::count_dummy_event("failed");
                     return Err(error);
                 }
             }
         }
-        crate::metrics::count_dummy_event("no_local_sender");
-        Ok(DummyOutcome::NoLocalSender)
+        Ok(None)
     }
 }
 
@@ -805,6 +924,100 @@ mod tests {
         );
     }
 
+    /// `room()` forked `forks` ways at its head by alice.
+    fn forked_room(forks: i64) -> RoomActor<MemoryBackend> {
+        let mut actor = room();
+        let alice = user_id!("@alice:hs1").to_owned();
+        let head = actor.forward_extremities_vec();
+        for n in 0..forks {
+            actor
+                .send_event_citing(
+                    alice.clone(),
+                    "m.room.message".to_owned(),
+                    None,
+                    serde_json::json!({"msgtype": "m.text", "body": format!("fork {n}")}),
+                    None,
+                    10 + n,
+                    &head,
+                )
+                .unwrap();
+        }
+        actor
+    }
+
+    /// A chain of dummy events brings a room of 60 extremities down to the target in one go:
+    /// each cites at most ten, every one after the first cites the one before (it is the
+    /// deepest), so each merges nine more; none changes the state or is shown to a client, and a
+    /// room at the target is sent none.
+    #[test]
+    fn a_dummy_chain_merges_a_room_down_to_the_target() {
+        let mut actor = forked_room(60);
+        let alice = user_id!("@alice:hs1").to_owned();
+        assert_eq!(actor.forward_extremity_count(), 60);
+        let before = state_ids(&actor);
+        let sent_before = crate::metrics::dummy_events("sent");
+
+        let chain = actor
+            .send_dummy_chain(1_000, 10, 10, DUMMY_CHAIN_BUDGET)
+            .unwrap();
+        // 60 -> 51 -> 42 -> 33 -> 24 -> 15 -> 6.
+        assert_eq!(chain.events.len(), 6);
+        assert_eq!((chain.before, chain.after), (60, 6));
+        assert_eq!(actor.forward_extremity_count(), 6);
+        assert_eq!(chain.cited, vec![MAX_PREV_EVENTS; 6]);
+        assert_eq!(chain.sender.as_ref(), Some(&alice));
+        assert!(!chain.no_local_sender);
+        assert!(crate::metrics::dummy_events("sent") >= sent_before + 6);
+        for (i, event_id) in chain.events.iter().enumerate() {
+            let event = actor.event_by_id(event_id).unwrap().clone();
+            assert_eq!(event.header().event_type, DUMMY_EVENT_TYPE);
+            let prevs = pipeline::decode_event_ids(event.json().get("prev_events"));
+            assert!(
+                prevs.len() <= MAX_PREV_EVENTS,
+                "{} prev events",
+                prevs.len()
+            );
+            if i > 0 {
+                assert!(
+                    prevs.contains(&chain.events[i - 1]),
+                    "dummy event {i} cites the one before it"
+                );
+            }
+            assert!(!actor.event_visible_to(&event, &alice).unwrap());
+        }
+        assert!(
+            extremity_ids(&actor).contains(chain.events.last().unwrap()),
+            "the last dummy event is an extremity, the rest are merged"
+        );
+        assert_eq!(state_ids(&actor), before, "dummy events are no state");
+
+        // At the target: nothing more.
+        let again = actor
+            .send_dummy_chain(2_000, 10, 10, DUMMY_CHAIN_BUDGET)
+            .unwrap();
+        assert!(again.events.is_empty());
+        assert!(!again.no_local_sender);
+        assert_eq!((again.before, again.after), (6, 6));
+    }
+
+    /// A chain stops at its count, and past its time budget after the first dummy event (the
+    /// first is always sent).
+    #[test]
+    fn a_dummy_chain_stops_at_its_cap_and_its_budget() {
+        let mut actor = forked_room(60);
+        let chain = actor
+            .send_dummy_chain(1_000, 10, 3, DUMMY_CHAIN_BUDGET)
+            .unwrap();
+        assert_eq!(chain.events.len(), 3);
+        assert_eq!(actor.forward_extremity_count(), 60 - 3 * 9);
+
+        let chain = actor
+            .send_dummy_chain(2_000, 10, 10, std::time::Duration::ZERO)
+            .unwrap();
+        assert_eq!(chain.events.len(), 1);
+        assert_eq!(actor.forward_extremity_count(), 60 - 4 * 9);
+    }
+
     /// A room none of this server's users is joined to gets no dummy event.
     #[test]
     fn no_dummy_event_without_a_joined_local_user() {
@@ -843,6 +1056,12 @@ mod tests {
             room.actor.send_dummy_event(1_000).unwrap(),
             DummyOutcome::NoLocalSender
         );
+        assert_eq!(room.actor.forward_extremity_count(), 3);
+        let chain = room
+            .actor
+            .send_dummy_chain(1_000, 1, 10, DUMMY_CHAIN_BUDGET)
+            .unwrap();
+        assert!(chain.no_local_sender && chain.events.is_empty());
         assert_eq!(room.actor.forward_extremity_count(), 3);
     }
 }

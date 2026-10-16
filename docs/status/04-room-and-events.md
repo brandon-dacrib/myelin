@@ -2,6 +2,68 @@
 
 Track brief: `docs/workstreams/04-room-and-events.md`. Owner crate: `hs-room`.
 
+## 2026-10-16, evening (branch `agent/dummy-event-chain`): a forked room is merged by a chain of dummy events, not one a pass
+
+**Asked**: the demo's `#ping` (v0.3.29) has 248 forward extremities and keeps growing. The
+maintainer sends one dummy event per room per `server.rooms.dummy_events_interval` (5 min), which
+merges nine; a burst of pings answered by many servers adds about 25, and pruning drops nothing
+there (the extremities' states mostly equal the resolved state). Bring a room far over the
+threshold down within a few passes without flooding federation.
+
+**Done** (decision 0052 amended; `crates/hs-room/src/actor/extremities.rs`,
+`crates/hs-room/src/registry/extremity_maintainer.rs`):
+
+- `RoomActor::send_dummy_chain(now_ms, target, max, budget)` sends dummy events one after another
+  under one hold of the room until it has at most `target` extremities, `max` were sent, or
+  `budget` has passed (the first is always tried). Each cites at most `MAX_PREV_EVENTS` (10), the
+  deepest; a dummy event is one deeper than everything it cites, so the next one cites it and nine
+  others and each merges nine (a test checks every dummy after the first cites the one before).
+  The sender's membership is read once, from the state at the chain's start; later dummy events
+  try the last sender first. One chain costs one resolution of the full set of forks at its start
+  and one at its end; separate dummy events would cost one each (each changes the set, and the
+  pruning check and every reader after it resolve the new one). `RoomActorHandle::send_dummy_chain`
+  runs it with `DUMMY_CHAIN_BUDGET` (5 s). `send_dummy_event` is a chain of one.
+- The maintainer sends a due room a chain to `server.rooms.dummy_events_threshold`, at most
+  `DUMMY_EVENTS_PER_ROOM_PER_PASS` (10) a pass: 90 extremities per interval, 250 down to ten in
+  three intervals; at most 50 events a minute to federation (ten a room, `DUMMY_ROOMS_PER_PASS`
+  five rooms). Interval, "no local sender" exclusion and the threshold's meaning are unchanged; a
+  room at or under the threshold is sent nothing. `ExtremityPass::dummies_sent` is now
+  `Vec<RoomDummies { room_id, sent, before, after }>`.
+- **Not a setting**: the per-pass cap is a constant (`dummy_events_interval` sets the pace; the
+  cap bounds one pass's lock hold and federation burst). The doc comments of
+  `server.rooms.dummy_events_threshold` and `dummy_events_interval` -- the admin UI's inline
+  explanation -- describe the chain (web schema fixture regenerated), and the boot log of
+  `server.rooms` carries `dummy_events_per_room_per_pass`.
+- Observability: per room an `info` "sent a chain of dummy events to merge this room's forward
+  extremities" with `dummy_events`, `extremities_before`, `extremities_after`, `threshold`; per
+  pass an `info` with `rooms`, `dummy_events`, `max_extremities_before`; an `info` if a chain
+  stops at its time budget, a `warn` if a dummy event after the first fails.
+  `hs_room_dummy_events_total{outcome}` counts each one; no new metrics.
+- Tests (`cargo test -p hs-room --lib extremit`): a room of 60 goes to 6 in one chain of six
+  dummy events, each citing at most ten and every one after the first citing the one before,
+  hidden from clients, state unchanged, and a room at the target is sent none; a chain stops at
+  its cap and at its budget (after the first); a room with no joined local user is reported as
+  such by the chain; the maintainer takes a room of 120 to 30 in one pass (ten dummy events) and
+  to 3 in the next interval (three), sends nothing within the interval, and nothing into a room
+  under the threshold.
+- Real binary (`hs serve`, embedded Fjall, `dummy_events_threshold: 10`,
+  `dummy_events_interval: 30s`, port 28461): alice registered and created a room; with the
+  server stopped, `crates/hs-room/tests/fork_on_disk.rs` (an ignored tool) forked it 120 ways in
+  its store; after a restart and one `/sync`, the passes logged `dummy_events=10
+  extremities_before=120 extremities_after=30` (in 32 ms) and a minute later `dummy_events=3
+  extremities_before=30 extremities_after=3`, then nothing; `/metrics` read
+  `hs_room_dummy_events_total{outcome="sent"} 13`, `hs_room_forward_extremities_max 3`;
+  `/messages` (127 events) and `/sync` showed no dummy event.
+
+**How to verify**: `cargo test -p hs-room --lib extremit`; for the real binary, the steps above
+(`fork_on_disk.rs`'s doc comment has the command).
+
+**Left**: the cap and budget are constants. If `#ping` adds extremities faster than 90 per five
+minutes, lower `dummy_events_interval` (hot). **After the roll, check**:
+`hs_room_forward_extremities_max` under ~20 for `#ping` within ~30 min, the dummy counter with no
+`failed`, the chain log lines, the slow-resolution log's `forks` falling, and no "stopped a chain
+of dummy events at its time budget".
+
 ## 2026-10-16, afternoon (branch `agent/soft-fail-forks`): the soft-fail check resolves the extremities, not one fork per prev event
 
 **Seen** on the demo after the v0.3.28 roll (14:29 UTC): the dummy events worked (`!c10y-...`

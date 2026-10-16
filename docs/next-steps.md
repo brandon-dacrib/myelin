@@ -6,7 +6,8 @@ The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/
 
 ## 2026-10-16 -- handover: where the demo is, what to roll, what to check, what is next
 
-**Branches.** `agent/soft-fail-forks` (below) is the only one in flight; everything else is
+**Branches.** `agent/dummy-event-chain` (below) is the only one in flight (`agent/soft-fail-forks`
+is merged); everything else is
 merged. Merged on 2026-10-15/16, in order: `fed-memory-growth` (v0.3.22),
 `discord-delivery-timeouts` (v0.3.23), `bridge-volume-size` (v0.3.24), `room-load-speed`,
 `clippy-1-99`, `ci-arm64-test-kill` (v0.3.25), `test-port-races`, `hub-members-step` (v0.3.27),
@@ -37,6 +38,17 @@ an ordinary access token for `@brandon`) is under `rate_limits.message` like any
 Synapse: 429s, retried after 5 s. An override for `@brandon` (Users, rate limit, 0) exempts it.
 **Still growing**: `#ping` has 248 extremities on v0.3.29; one dummy event per 5 min merges 10
 and the room adds more; the fix in flight is `agent/dummy-event-chain`.
+
+**`agent/dummy-event-chain`** (pushed, not merged; status 04 and decision 0052): a due room is
+sent a chain of up to ten dummy events a pass, each citing the one before and nine more
+extremities, until it is at `server.rooms.dummy_events_threshold` (90 merged per interval
+instead of 9). Real binary: a room forked 120 ways went 120 -> 30 -> 3 in two passes, no dummy
+event in `/messages` or `/sync`. **After its roll, check**: `hs_room_forward_extremities_max`
+under ~20 for `#ping` within ~30 min; `hs_room_dummy_events_total{outcome="sent"}` rising by up
+to ten a room each five minutes, with no `failed`; Loki's "sent a chain of dummy events" lines
+(`dummy_events`, `extremities_before`, `extremities_after`); the slow-resolution log's `forks`
+falling for `#ping`; no "stopped a chain of dummy events at its time budget" (if it appears, a
+dummy event's resolution of ten forks is slower than expected).
 
 **To roll** (the owner pastes it from the plain SSH shell, one short line at a time; `helm
 upgrade` is refused to sessions). `--force-conflicts` is no longer needed.

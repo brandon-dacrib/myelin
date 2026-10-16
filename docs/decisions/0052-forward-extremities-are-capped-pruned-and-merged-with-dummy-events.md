@@ -49,7 +49,22 @@ refused there.
   a dummy event into at most five rooms with more than `server.rooms.dummy_events_threshold`
   extremities, the most forked first, at most once per `server.rooms.dummy_events_interval` per
   room. The sender is the first joined local user, in user-id order, the auth rules allow; a room
-  with none is left alone for an hour. A room busy with another operation is skipped, not waited
+  with none is left alone for an hour.
+- **Chained dummy events** (amended 2026-10-16, branch `agent/dummy-event-chain`). One dummy
+  event per room per interval, as Synapse, merges nine extremities every five minutes; the demo's
+  `#ping` gained about 25 with each burst of pings that many servers answered and grew past 248.
+  A due room is now sent a *chain* under one hold of its lock (`RoomActor::send_dummy_chain`):
+  dummy events one after another until it is at the threshold, at most
+  `DUMMY_EVENTS_PER_ROOM_PER_PASS` (10) a pass, stopping early once the chain has held the room
+  for `DUMMY_CHAIN_BUDGET` (5 s; the first is always sent). Each still cites at most ten
+  extremities, the deepest; a dummy event is one deeper than everything it cites, so the next one
+  cites it and nine others, and each merges nine: 90 a room per interval, 250 down to ten in
+  three. Not one dummy event citing more than ten: Synapse refuses more than 20 `prev_events`,
+  and this server cites ten like Synapse. One chain under one hold costs one resolution of the
+  room's full set of forks at its start and one at its end, where separate dummy events would
+  each change the set and cost one. At most 50 events a minute to federation (ten a room, five
+  rooms). The cap is a constant, not a setting: `dummy_events_interval` sets the pace. The pass
+  logs each room at `info` with `dummy_events`, `extremities_before` and `extremities_after`. A room busy with another operation is skipped, not waited
   for. Dummy events are published and federated like any event, and hidden from every client
   read (`RoomActor::event_visible_to`), as Synapse's `filter_events_for_client`.
 - **Configuration** (hot, under `server.rooms`): `dummy_events_threshold`, default 10 (Synapse's
@@ -64,7 +79,7 @@ refused there.
 
 ## Consequences
 
-- A forked room converges within a few intervals of being noticed, without anyone writing to it,
+- A forked room converges within a few intervals of being noticed (a room of 250 in three), without anyone writing to it,
   and the resolutions its extremity changes cost go with it.
 - Clients never see dummy events; other servers and appservices receive them, as from Synapse.
 - Inbound events with more than 20 `prev_events` or 10 `auth_events` are still accepted here

@@ -491,14 +491,14 @@
           "default": 0.75
         },
         "dummy_events_threshold": {
-          "description": "How many forward extremities a room may have before this server sends an\n`org.matrix.dummy_event` into it to merge them. Every read of the current state of a\nroom with more than one is a state resolution of its forks, which in a large federated\nroom takes seconds. A room collects them when other servers' events fork it and none of\nthis server's users writes there (every event this server sends cites up to ten). The\nevent is sent as a joined local user who may send events, cites the ten deepest\nextremities, goes to the other servers in the room, and is never shown to clients. Checked\nonce a minute, at most five rooms at a time, the most forked first; forks that do not\nchange the room's state are also dropped as events arrive. Synapse's\n`dummy_events_threshold`, with the same default. `0` sends none.",
+          "description": "How many forward extremities a room may have before this server sends an\n`org.matrix.dummy_event` into it to merge them. Every read of the current state of a\nroom with more than one is a state resolution of its forks, which in a large federated\nroom takes seconds. A room collects them when other servers' events fork it and none of\nthis server's users writes there (every event this server sends cites up to ten). The\nevent is sent as a joined local user who may send events, cites the ten deepest\nextremities, goes to the other servers in the room, and is never shown to clients. A room\nfar past the threshold is sent a short chain of them, each citing the one before and\nnine more extremities, until it is at the threshold (at most ten a room each\n`dummy_events_interval`). Checked once a minute, at most five rooms at a time, the most\nforked first; forks that do not change the room's state are also dropped as events\narrive. Synapse's `dummy_events_threshold`, with the same default. `0` sends none.",
           "type": "integer",
           "format": "uint32",
           "minimum": 0,
           "default": 10
         },
         "dummy_events_interval": {
-          "description": "The least time between two dummy events in one room (see `dummy_events_threshold`):\neach merges up to ten extremities, so a room of 30 is down to three in three intervals.\nSynapse checks every five minutes, the default here.",
+          "description": "The least time between two rounds of dummy events in one room (see\n`dummy_events_threshold`): a round is a chain of up to ten, which merges up to 90\nextremities, so a room of 250 is down to the threshold in three intervals. Synapse checks\nevery five minutes (one dummy event a room), the default here.",
           "$ref": "#/$defs/Duration",
           "default": "5m"
         }

@@ -322,10 +322,12 @@ pub fn apply_rooms<B: hs_kv::KvBackend>(
         memory_unload_fraction = config.memory_unload_fraction,
         dummy_events_threshold = config.dummy_events_threshold,
         dummy_events_interval = %config.dummy_events_interval,
+        dummy_events_per_room_per_pass = hs_room::registry::DUMMY_EVENTS_PER_ROOM_PER_PASS,
         "each room keeps this many recent events in memory; the rest is read from the database; \
          a room unused this long, or the least recently used above this share of the memory \
          limit, is unloaded; a room with more forward extremities than the threshold is sent a \
-         dummy event to merge them, at most once per interval (server.rooms)"
+         chain of dummy events (at most this many) to merge them down to it, at most once per \
+         interval (server.rooms)"
     );
 }
 

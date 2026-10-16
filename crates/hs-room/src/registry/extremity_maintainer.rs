@@ -4,11 +4,19 @@
 //! (`crate::actor::extremities` has the why).
 //!
 //! As Synapse's `_send_dummy_events_to_fill_extremities`: at most [`DUMMY_ROOMS_PER_PASS`]
-//! rooms a pass, the most forked first, one dummy event each, and a room no local user could
-//! send one into is left alone for [`DUMMY_EXCLUSION`]. Synapse runs its pass every five
-//! minutes; here the pass runs every minute for the gauges and sends dummy events into a room
-//! at most once per `server.rooms.dummy_events_interval` (five minutes by default). A dummy
-//! event cites at most ten extremities, so a room of 30 is down to three in three of them.
+//! rooms a pass, the most forked first, and a room no local user could send one into is left
+//! alone for [`DUMMY_EXCLUSION`]. Synapse runs its pass every five minutes; here the pass runs
+//! every minute for the gauges and sends dummy events into a room at most once per
+//! `server.rooms.dummy_events_interval` (five minutes by default).
+//!
+//! Unlike Synapse, which sends one dummy event per room a pass, a room is sent a *chain* of up
+//! to [`DUMMY_EVENTS_PER_ROOM_PER_PASS`], until it is at the threshold
+//! (`RoomActor::send_dummy_chain`): a dummy event cites at most ten extremities, so one a pass
+//! merges nine every five minutes, and the demo's `#ping` (2026-10-16) gained about 25 with
+//! each burst of pings answered by many servers and grew past 248. A chain merges nine per
+//! dummy event: 250 extremities are down to ten in three passes.
+//!
+//! [`RoomActor::send_dummy_chain`]: crate::actor::RoomActor::send_dummy_chain
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -20,7 +28,6 @@ use ruma::OwnedRoomId;
 use tokio::time::Instant;
 
 use super::RoomRegistry;
-use crate::actor::extremities::DummyOutcome;
 
 /// How often [`RoomRegistry::spawn_extremity_maintainer`]'s pass runs.
 pub const EXTREMITY_PASS_INTERVAL: Duration = Duration::from_secs(60);
@@ -32,6 +39,16 @@ pub const EXTREMITIES_WARN_AT: usize = 50;
 
 /// How many rooms one pass sends dummy events into at most (Synapse's 5).
 pub const DUMMY_ROOMS_PER_PASS: usize = 5;
+
+/// How many dummy events one pass sends into one room at most, in a chain, each merging nine
+/// more extremities than the one before (module docs): 90 extremities a room each
+/// `server.rooms.dummy_events_interval`, ten times Synapse's one dummy event, against the ~25
+/// a burst of pings added to the demo's `#ping` (2026-10-16). A cap, not a target: a room is
+/// sent only as many as bring it to `server.rooms.dummy_events_threshold`. Ten a room and
+/// [`DUMMY_ROOMS_PER_PASS`] rooms is at most 50 events a minute to the rooms' servers. Not
+/// configurable: `dummy_events_interval` sets the pace, and the chain stops early at
+/// `hs_room::actor::extremities::DUMMY_CHAIN_BUDGET` of the room's lock.
+pub const DUMMY_EVENTS_PER_ROOM_PER_PASS: usize = 10;
 
 /// How long a room none of this server's joined users could send a dummy event into is left
 /// out of the pass before it is tried again. Synapse leaves such a room for a week; an hour
@@ -63,12 +80,25 @@ pub struct ExtremityPass {
     pub rooms_read: usize,
     /// The most extremities a room read had.
     pub max_extremities: usize,
-    /// Rooms a dummy event was sent into, with how many extremities each had before it.
-    pub dummies_sent: Vec<(OwnedRoomId, usize)>,
+    /// Rooms dummy events were sent into, and what they did there.
+    pub dummies_sent: Vec<RoomDummies>,
     /// Rooms no local user could send one into.
     pub no_local_sender: Vec<OwnedRoomId>,
     /// Rooms newly logged at `warn` for passing [`EXTREMITIES_WARN_AT`].
     pub warned: Vec<OwnedRoomId>,
+}
+
+/// The dummy events one pass sent into one room.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomDummies {
+    /// The room.
+    pub room_id: OwnedRoomId,
+    /// How many dummy events were sent, in a chain (at most [`DUMMY_EVENTS_PER_ROOM_PER_PASS`]).
+    pub sent: usize,
+    /// The room's forward extremities before the first.
+    pub before: usize,
+    /// And after the last.
+    pub after: usize,
 }
 
 impl<B: KvBackend + 'static> RoomRegistry<B> {
@@ -113,8 +143,10 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
                 let pass = registry.maintain_extremities_pass(&mut state).await;
                 if !pass.dummies_sent.is_empty() {
                     tracing::info!(
-                        rooms = ?pass.dummies_sent,
-                        "sent dummy events to merge the forward extremities of rooms past \
+                        rooms = pass.dummies_sent.len(),
+                        dummy_events = pass.dummies_sent.iter().map(|r| r.sent).sum::<usize>(),
+                        max_extremities_before = pass.max_extremities,
+                        "a pass sent dummy events to merge the forward extremities of rooms past \
                          server.rooms.dummy_events_threshold (hs_room_dummy_events_total)"
                     );
                 }
@@ -124,8 +156,10 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
 
     /// One pass of the maintainer (module docs): reads every resident room's extremity count
     /// without waiting for a room another operation holds, sets the gauges, warns of rooms past
-    /// [`EXTREMITIES_WARN_AT`], and sends dummy events into the rooms past the threshold that
-    /// are due one.
+    /// [`EXTREMITIES_WARN_AT`], and sends a chain of dummy events into each room past the
+    /// threshold that is due them, until it is at the threshold or
+    /// [`DUMMY_EVENTS_PER_ROOM_PER_PASS`] were sent. Logs each such room at `info` with how many
+    /// it was sent and its extremities before and after.
     pub async fn maintain_extremities_pass(
         &self,
         state: &mut ExtremityMaintainer,
@@ -192,14 +226,33 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
             let Some(handle) = self.resident_handle(&room_id).await else {
                 continue;
             };
-            let outcome = handle.send_dummy_event(crate::metrics::now_ms()).await;
+            let outcome = handle
+                .send_dummy_chain(
+                    crate::metrics::now_ms(),
+                    threshold,
+                    DUMMY_EVENTS_PER_ROOM_PER_PASS,
+                )
+                .await;
             match outcome {
-                Ok(DummyOutcome::Sent { .. }) => {
+                Ok(chain) if !chain.events.is_empty() => {
+                    tracing::info!(
+                        %room_id,
+                        dummy_events = chain.events.len(),
+                        extremities_before = chain.before,
+                        extremities_after = chain.after,
+                        threshold,
+                        "sent a chain of dummy events to merge this room's forward extremities \
+                         (hs_room_dummy_events_total)"
+                    );
                     state.last_dummy.insert(room_id.clone(), now);
-                    pass.dummies_sent.push((room_id, n));
+                    pass.dummies_sent.push(RoomDummies {
+                        room_id,
+                        sent: chain.events.len(),
+                        before: chain.before,
+                        after: chain.after,
+                    });
                 }
-                Ok(DummyOutcome::NotForked) => {}
-                Ok(DummyOutcome::NoLocalSender) => {
+                Ok(chain) if chain.no_local_sender => {
                     tracing::info!(
                         %room_id,
                         extremities = n,
@@ -209,6 +262,8 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
                     state.excluded.insert(room_id.clone(), now);
                     pass.no_local_sender.push(room_id);
                 }
+                // At the threshold by now (another operation merged it since it was counted).
+                Ok(_) => {}
                 Err(error) => {
                     tracing::warn!(
                         %room_id,
@@ -271,47 +326,69 @@ mod tests {
     }
 
     /// The pass reads every resident room's extremities into the gauges, warns of a room past
-    /// [`EXTREMITIES_WARN_AT`] once, sends a dummy event into a room past the threshold, and
-    /// not again into the same room within the interval; a threshold of 0 sends none.
+    /// [`EXTREMITIES_WARN_AT`] once, sends a chain of dummy events into a room past the
+    /// threshold -- capped at [`DUMMY_EVENTS_PER_ROOM_PER_PASS`] a pass, bringing a room of 120
+    /// to the threshold in two -- and none into the same room within the interval or into a
+    /// room at or under the threshold; a threshold of 0 sends none.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_pass_measures_warns_and_merges_rooms_past_the_threshold() {
         let backend = MemoryBackend::new();
         let registry =
             RoomRegistry::open(backend.clone(), HomeserverIdentity::for_tests("maint.test"))
                 .unwrap();
-        let big = forked(&backend, 60);
+        let big = forked(&backend, 120);
         let big_id = big.room_id().to_owned();
         let small = forked(&backend, 2);
         let handle = registry.insert(big).await;
-        registry.insert(small).await;
+        let small_handle = registry.insert(small).await;
         let mut state = ExtremityMaintainer::default();
+        let dummies = |sent, before, after| RoomDummies {
+            room_id: big_id.clone(),
+            sent,
+            before,
+            after,
+        };
 
         registry.set_dummy_events_threshold(0);
         let pass = registry.maintain_extremities_pass(&mut state).await;
         assert_eq!(pass.rooms_read, 2);
-        assert_eq!(pass.max_extremities, 60);
+        assert_eq!(pass.max_extremities, 120);
         assert_eq!(pass.warned, vec![big_id.clone()]);
         assert!(pass.dummies_sent.is_empty(), "threshold 0 sends nothing");
 
         registry.set_dummy_events_threshold(DEFAULT_DUMMY_EVENTS_THRESHOLD);
         let pass = registry.maintain_extremities_pass(&mut state).await;
         assert!(pass.warned.is_empty(), "warned once");
-        assert_eq!(pass.dummies_sent, vec![(big_id.clone(), 60)]);
+        // Ten dummy events, nine merged by each: 120 -> 30.
+        assert_eq!(pass.dummies_sent, vec![dummies(10, 120, 30)]);
         assert_eq!(
             handle.query(|actor| actor.forward_extremity_count()).await,
-            60 - 10 + 1
+            30
         );
 
         // Within the interval: not again.
         let pass = registry.maintain_extremities_pass(&mut state).await;
         assert!(pass.dummies_sent.is_empty());
-        assert_eq!(pass.max_extremities, 51);
+        assert_eq!(pass.max_extremities, 30);
 
+        // The next interval: 30 -> 21 -> 12 -> 3, and no further than the threshold needs.
         registry.set_dummy_events_interval(Duration::ZERO);
         let pass = registry.maintain_extremities_pass(&mut state).await;
-        assert_eq!(pass.dummies_sent, vec![(big_id.clone(), 51)]);
+        assert_eq!(pass.dummies_sent, vec![dummies(3, 30, 3)]);
         assert_eq!(crate::metrics::forward_extremity_rooms("+Inf"), 2);
-        assert!(crate::metrics::dummy_events("sent") >= 2);
+        assert!(crate::metrics::dummy_events("sent") >= 13);
+
+        // At or under the threshold: nothing, for either room.
+        let pass = registry.maintain_extremities_pass(&mut state).await;
+        assert!(pass.dummies_sent.is_empty());
+        assert_eq!(pass.max_extremities, 3);
+        assert_eq!(
+            small_handle
+                .query(|actor| actor.forward_extremity_count())
+                .await,
+            2,
+            "a room under the threshold is sent no dummy event"
+        );
 
         // A room another operation holds is skipped, not waited for.
         let busy = handle.clone();

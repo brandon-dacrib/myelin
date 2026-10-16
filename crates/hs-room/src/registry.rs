@@ -19,8 +19,8 @@ use crate::protocol::RoomUpdate;
 
 pub mod extremity_maintainer;
 pub use extremity_maintainer::{
-    DEFAULT_DUMMY_EVENTS_INTERVAL, DEFAULT_DUMMY_EVENTS_THRESHOLD, EXTREMITIES_WARN_AT,
-    ExtremityMaintainer, ExtremityPass,
+    DEFAULT_DUMMY_EVENTS_INTERVAL, DEFAULT_DUMMY_EVENTS_THRESHOLD, DUMMY_EVENTS_PER_ROOM_PER_PASS,
+    EXTREMITIES_WARN_AT, ExtremityMaintainer, ExtremityPass, RoomDummies,
 };
 
 struct Entry<B: KvBackend> {
