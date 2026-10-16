@@ -2,6 +2,32 @@
 
 Track brief: `docs/workstreams/04-room-and-events.md`. Owner crate: `hs-room`.
 
+## 2026-10-16 (track 05's branch `agent/hub-members-step`): a forked room's current state is resolved once per set of forks
+
+A room with more than one forward extremity answered every read of its current state
+(`state_event`, `membership_list`, `full_state`, ...) with a fresh state resolution of the
+forks: nothing remembered it. On the demo (v0.3.25) the `#ping` and codestorm.net rooms, full
+of unmerged forks, took 15-22 s for one (their loads' `finish` phase), and the session hub's
+nine reads per update held the room's lock 30-50 s; the same reads of every PDU, EDU and
+appservice pass kept about two cores busy. Track 05's status (2026-10-16) has the evidence.
+
+- `RoomActor::state_view` sorts and deduplicates the fork roots it resolves, and
+  `RoomActor::resolve_forks` keeps the last eight resolutions per actor by that set
+  (`crates/hs-room/src/actor/resolutions.rs`). Roots are content addresses
+  (`hs_state::frames`), so nothing is invalidated: a new event that changes the extremities is
+  a different key. A resolution over a second is logged at `info`.
+- New metrics: `hs_room_state_resolution_seconds` (histogram, `_count` = resolutions run) and
+  `hs_room_state_resolution_cache_hits_total`.
+- `crates/hs-room/tests/fork_reads.rs`: a forked room (2,000 members, 12 forks 40 deep, Fjall,
+  release) read the way the hub reads it went from 295-302 ms and 9 resolutions a read to
+  38-41 ms (1 resolution) the first time and 0.2 ms after; `joined_members()` costs 16.8 ms and
+  1,487 event reads there, `membership_list()` 3.8 µs.
+- **Left for this track:** the first read after each change still resolves under the lock.
+  Synapse keeps extremities few with a dummy event citing them all once there are more than
+  ten (`_send_dummy_events_to_fill_extremities`) and by pruning old extremities that do not
+  change the state (`_prune_extremities`); and `hs-state` should say why one resolution of 797
+  state events takes 15 s cold.
+
 ## 2026-10-15 (branch `agent/room-load-speed`): a backfilled federated room loads in a tenth of a second, the hub reads members once per state, and rooms are unloaded
 
 **Asked**: room loads on the demo (0.3.22, embedded Fjall, 4 cores, federation on) took 30 s to

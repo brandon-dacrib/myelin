@@ -1,12 +1,123 @@
 # 05 Sync: status
 
-Last updated: 2026-10-14 (the demo's session hub wedge, below: one room the hub could not get through stopped every feed; rooms are now fed side by side and a stuck update is named. Then 2026-10-09: the scale 1 -> 2 bug; session 19: wave 2's three named leftovers were already closed by session 17, rechecked on `6e24c2c0`; `event_fields` is applied; a real-binary test for the peeked long-poll. Session 18: two long-polls that never saw their change were a lost
+Last updated: 2026-10-16 (the hub's "members and directory entry" step, below: nine state
+resolutions per room update on forked rooms; each set of forks is now resolved once. Then
+2026-10-14: the demo's session hub wedge: one room the hub could not get through stopped every feed; rooms are now fed side by side and a stuck update is named. Then 2026-10-09: the scale 1 -> 2 bug; session 19: wave 2's three named leftovers were already closed by session 17, rechecked on `6e24c2c0`; `event_fields` is applied; a real-binary test for the peeked long-poll. Session 18: two long-polls that never saw their change were a lost
 push-rule write and a membership event that lost to the room's state, not the long-poll. Session 17: a filtered long-poll waits for real news, a fresh
 batch's `prev_batch` and order follow Synapse's initial sync, peeked hot rooms wake a long-poll and
 are pruned for erased senders. Session 16: Sytest's sync leftovers -- timelines from the newest end with holes, gap state, peeking, presence on joins, filters for presence/account data/ephemeral, remote users in the directory. Session 15: `device_lists` counts invites and rejoins, `/keys/changes` walks memberships between two tokens, a remote copy goes stale with the last shared room. Session 14: the owner's fan-out in batches, and feed retention.
 Session 13: `/joined_rooms` read-your-writes. Session 12: RFC 0018, a non-owner's room copy
 catches up instead of reloading. Session 11, session 10, session 9, session 8, session 7 and
 the integration note follow; sessions 1-6 are preserved unchanged further down.)
+
+
+## 2026-10-16 (branch `agent/hub-members-step`): the hub's 30-second step was nine state resolutions
+
+**Symptom** (the demo, v0.3.25, one pod, Fjall, federation on, booted 02:53 UTC): the hub's
+watchdog warned 18 times in 14 minutes that it was stuck at "reading the room's members and
+directory entry", 30-34 s into the step, moving on after 34-64 s
+(`hs_user_hub_stuck_warnings_total` 1 -> 14). Always the same two rooms:
+`!ping12Z19lU3TzHS4slLsUNPx-I7MZKyneYRUlO7voU` (a `#ping` room) and
+`!c10y-N9TQGHzj6Ne3OKqn-MEO8EhfRWrD3-CD-W9AEM` (codestorm.net's). Element's syncs paused with
+them. The `hs` container sat at 1.9-2.3 cores with no `/sync` traffic at all (as it did six
+hours earlier on 0.3.22: 2.27 cores), and the rooms' event caches missed 545-776 times a second.
+
+**Evidence** (Loki, Prometheus and the pod's `/metrics`, read-only through the owner's proxy):
+
+- The `#ping` room has **797 state events**, not thousands ("held a missing prev event with the
+  state another server answered for it", `state_events: 797`): the membership list of 797 rows
+  is milliseconds to read. The step's time was not the list.
+- Both rooms' loads were the only slow ones, and both in the `finish` phase: `#ping` 21.6 s with
+  `finish=15.8s`, codestorm's 24.4 s with `finish=21.8s` ("a room load took longer than ten
+  seconds"). `finish` is `current_create_sn`, one read of the current state; the rooms' logs
+  ("a gap is open below the event that brought it back", soft-failed events, `/state_ids`
+  fallbacks every minute) are those of rooms with many unmerged forward extremities.
+- A room with more than one forward extremity has no single current state:
+  `RoomActor::current_view` resolves the states at every extremity, and until now ran that
+  state resolution afresh on **every** read -- nothing remembered it. The hub's step makes nine
+  such reads per update: `membership_list` (remembered per root, but finding the root is the
+  resolution), then `public_directory_entry`'s seven `state_event`s and `membership_list` again.
+  Nine resolutions of a few seconds each, under the room's lock, is the 30-50 s.
+- The same reads run for every PDU (`server_acl`, the soft-fail check), every EDU's membership
+  check, the federation sender and appservice delivery: the idle CPU.
+- And the event-cache misses: the federation sender's `joined_servers` (every EDU and PDU sent),
+  appservice delivery's `room_facts` (every room of every user whose presence or receipt an
+  ephemeral pass weighs; the 11.7 s load of `!GKVyCiGpCbOAFTbbUm:matrix.debian.social`, 31,794
+  outliers, was started by `appservice.ephemeral_pass`), `visible_to` and `latest_local_pdu`
+  asked for `joined_members()`, which parses every member event of the current state; and
+  `membership_of` parsed the whole state to find one member.
+
+**Reproduced** in `crates/hs-room/tests/fork_reads.rs`, `measure_hub_reads_on_a_forked_room`
+(release, Fjall in a temporary directory): a public room of 2,000 members forked 12 ways, each
+branch 40 leaves deep, read the way the hub reads it.
+
+| | before | after |
+|---|---|---|
+| one hub-shaped read (members + directory entry) | 295-302 ms, 9 resolutions | 38-41 ms the first time (1 resolution), 0.2 ms after |
+| one `state_event` after them | 33 ms | 0.03 ms |
+| joined members by their events / by the membership list | 16.8 ms, 1,487 event reads | 3.8 µs, none |
+
+The demo's rooms resolve far slower than this synthetic one (15-22 s cold, the loads say), so
+the step there goes from nine resolutions to at most one per change of the room's extremities,
+and to none for every later read until the next change.
+
+**The fix:**
+
+- `hs-room` (track 04's crate, `crates/hs-room/src/actor.rs`, new `actor/resolutions.rs`):
+  `RoomActor::state_view` sorts and deduplicates the roots of the forks it is asked for, and
+  `resolve_forks` keeps the last eight resolutions by that set (`ResolutionCache`). A root
+  names a state by content (`hs_state::frames`) and stays valid for as long as the store does,
+  so a remembered answer is never stale: a new event that changes the extremities asks for a
+  different set. A resolution over a second is logged at `info` with the room and the number
+  of forks. New metrics: `hs_room_state_resolution_seconds` (histogram; its `_count` is the
+  resolutions run) and `hs_room_state_resolution_cache_hits_total`.
+- `hs-cli` (`federation.rs`, `federation_sender.rs`, `appservice_delivery.rs`): who is joined is
+  read from `membership_list()` (rows, remembered per state) in `joined_servers`, `visible_to`,
+  `latest_local_pdu` and `room_facts`; `membership_of` is one `state_event` lookup.
+- `hs-user` (`hub_progress.rs`, `metrics.rs`): **`hs_user_hub_step_seconds{step}`**, every step
+  of every room update by the names the stuck warning uses, the last step observed when the
+  update is dropped. Where the stuck counter says the hub stalls, this says which step, for
+  every update.
+
+**Verified:** `cargo test -p hs-room` (all, and the new `fork_reads` tests: a forked room's
+current state is resolved at most once for any number of reads; a new extremity set is resolved
+afresh and answers what a fresh resolution does; a merge goes back to a lookup;
+`ResolutionCache`'s own tests), `cargo test -p hs-user` (the new
+`each_steps_time_is_observed_by_its_name`, the metrics render test), `cargo test -p hs-cli
+--lib` and its appservice and federation integration tests. The real `hs` binary (local, port
+28471, a public room, four joins and twenty messages) renders `hs_user_hub_step_seconds` for the
+fourteen steps it went through (the members step 0.6 ms on average there) and the two resolution metrics.
+
+**On the demo after the roll, check:** `hs_room_state_resolution_seconds_count` grows by about
+one per event in the forked rooms, not nine-plus; `hs_room_state_resolution_cache_hits_total`
+grows much faster; `hs_user_hub_step_seconds{step="reading the room's members and directory
+entry"}` p99 under a resolution's time; `hs_user_hub_stuck_warnings_total` flat;
+`hs_room_event_cache_misses_total`'s rate far under 500/s; container CPU.
+
+**Not done, and next:**
+
+- The first read after each change of a forked room's extremities still runs one resolution
+  under the room's lock, and the `#ping` room's takes seconds. Synapse keeps a room's
+  extremities few by sending a dummy event (`org.matrix.dummy_event`) that cites them all once
+  a room has more than ten and a local user may send one
+  (`_send_dummy_events_to_fill_extremities`), and by pruning old extremities whose removal does
+  not change the state (`_prune_extremities`). Either is track 04's (and 06's) to decide.
+- Why one resolution of 797 state events takes 15-22 s cold is `hs-state`'s to measure (the
+  auth difference of forks spanning gaps and fetched states, read through Fjall).
+- A client or bridge has been posting `read_markers` and room `account_data` together at
+  0.9-2.8 a second since this boot (0.003 a second six hours before), with no `/sync`; each one
+  is a receipt EDU and an appservice ephemeral delivery (`slack-brandon`). Worth naming the
+  user.
+
+### Decisions made (2026-10-16)
+
+- The resolution cache lives in the room actor, keyed by the sorted, distinct fork roots, eight
+  entries per actor: roots are content addresses, so there is nothing to invalidate. Sorting
+  the forks before resolving can make the result a different root (a different base frame) of
+  the same state than an unsorted call would have; nothing compares roots across that change.
+- Edited `hs-room` and `hs-cli` from this track's branch, as the 2026-10-15 room-load work did:
+  the hub's step is only as cheap as the room's current-state read, and the CPU was in those
+  crates' callers.
 
 
 ## 2026-10-14 (branch `agent/hub-wedge`): one room the hub could not get through stopped every feed

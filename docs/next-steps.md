@@ -1,6 +1,6 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-10-16 (handover: the demo, the releases and what is next, below. Before: test servers are handed their ports still bound; `agent/test-port-races`. Before: room loads and unloading; `agent/room-load-speed`. Before: the Slack bridge's full volume; fix on `agent/bridge-volume-size`. Before: Discord's delivery timeouts were a replay of the 2026-10-12 flood; fix on `agent/discord-delivery-timeouts`. Before: the memory climb with federation on; fix on `agent/fed-memory-growth`. Before: the session hub wedge; fix on `agent/hub-wedge`. Earlier: the ephemeral pump's prune busy loop; fix on `agent/ephemeral-prune`). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+Written 2026-09-20 by the integration lead, last revised 2026-10-16 (the hub's members step and the idle CPU were repeated state resolutions; `agent/hub-members-step`. Before: handover: the demo, the releases and what is next, below. Before: test servers are handed their ports still bound; `agent/test-port-races`. Before: room loads and unloading; `agent/room-load-speed`. Before: the Slack bridge's full volume; fix on `agent/bridge-volume-size`. Before: Discord's delivery timeouts were a replay of the 2026-10-12 flood; fix on `agent/discord-delivery-timeouts`. Before: the memory climb with federation on; fix on `agent/fed-memory-growth`. Before: the session hub wedge; fix on `agent/hub-wedge`. Earlier: the ephemeral pump's prune busy loop; fix on `agent/ephemeral-prune`). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
@@ -70,6 +70,34 @@ MemAvailable; Element syncing without pauses.
    constants, not settings (decision 0049); dead letters never expire, on purpose.
 8. In cluster mode only the replica running the bridge manager fills `AppService.volume` and the
    bridge volume gauges (decision 0050).
+
+## 2026-10-16 -- the hub's 30-second "members and directory entry" step and the idle two cores were state resolutions run again on every read; the fix is `agent/hub-members-step`
+
+On v0.3.25 the hub was stuck 30-64 s at "reading the room's members and directory entry" on two
+rooms only (`#ping`, `!ping12Z19...`, and codestorm.net's `!c10y-...`), and the pod burned 2+
+cores with no `/sync` at all. Both rooms carry many unmerged forward extremities; their loads'
+`finish` phase (one current-state read) took 15.8 s and 21.8 s. A forked room's current state is
+a state resolution of its forks, and the room actor ran it afresh on every read: the hub's step
+is nine such reads, and every PDU, EDU, federation send and appservice pass made more. The event
+cache's 545-776 misses a second came from `joined_members()` (every member event parsed) in the
+federation sender's `joined_servers` and appservice delivery's `room_facts`.
+
+- **Fixed**: `hs-room` keeps the last eight resolutions per room by their (sorted) fork roots, so
+  a set of forks is resolved once; `hs-cli` reads who is joined from `membership_list()` (rows,
+  remembered per state) and `membership_of` with one lookup. Measured (`crates/hs-room/tests/
+  fork_reads.rs`, release): a hub-shaped read of a 2,000-member room forked 12 ways, 300 ms and
+  9 resolutions -> 40 ms once, then 0.2 ms; who-is-joined 16.8 ms and 1,487 event reads -> 3.8 µs.
+- **New metrics**: `hs_user_hub_step_seconds{step}`, `hs_room_state_resolution_seconds`,
+  `hs_room_state_resolution_cache_hits_total`; a resolution over a second is logged at `info`.
+- **After the roll, check**: resolutions about one per event in those rooms, cache hits far more;
+  the members step's p99; `hs_user_hub_stuck_warnings_total` flat; event-cache misses well under
+  500/s; container CPU.
+- **Left**: the first read after each change still resolves (seconds, under the room's lock).
+  Synapse's dummy events citing all extremities past ten and its extremity pruning are the next
+  step (track 04/06); why a 797-event resolution takes 15 s cold is `hs-state`'s to measure. A
+  client or bridge (receipts reach `slack-brandon`) posts `read_markers` plus room `account_data`
+  at 0.9-2.8/s since this boot with no `/sync`; worth naming. Status 05 and 04 (2026-10-16) have
+  the details.
 
 ## 2026-10-16 -- arm64's CI test job ran out of memory linking, and no release went out; the fix is `agent/ci-arm64-test-kill`
 
