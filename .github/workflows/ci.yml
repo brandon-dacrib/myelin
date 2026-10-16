@@ -82,6 +82,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # arm64 links with lld, as amd64 already does. Since Rust 1.90 x86_64-unknown-linux-gnu links
+      # with the toolchain's rust-lld by default; aarch64-unknown-linux-gnu still calls GNU ld
+      # through cc. hs-cli alone has about ninety test binaries, each linking most of the
+      # workspace, and on 2026-10-15 four GNU ld processes linking them at once (beside four
+      # rustc) used the runner's 16 GB and its 3 GB of swap: the VM's runner service was stopped
+      # mid-build ("The runner has received a shutdown signal", exit 143, runs 38819710756,
+      # 38825454622 and the diagnostic run 38829082468). lld needs a fraction of GNU ld's memory
+      # and time for the same binaries. The toolchain ships rust-lld and a `gcc-ld/ld.lld`
+      # wrapper beside it; `-B` points cc at that directory, so no package is installed and the
+      # linker always matches rustc. This step runs before rust-cache so the cache key, which
+      # hashes CARGO_* and RUST* variables, changes with it.
+      - name: Link with the toolchain's lld (arm64)
+        if: matrix.arch == 'arm64'
+        run: |
+          gcc_ld="$(rustc --print sysroot)/lib/rustlib/aarch64-unknown-linux-gnu/bin/gcc-ld"
+          test -x "$gcc_ld/ld.lld" || { echo "::error::no ld.lld in $gcc_ld"; exit 1; }
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C link-arg=-fuse-ld=lld -C link-arg=-B$gcc_ld" >> "$GITHUB_ENV"
+      # Headroom on top of lld: the arm64 image has 3 GB of swap and over 100 GB of free disk, so
+      # 8 GB more swap costs a second and turns a future peak into a slower link rather than a
+      # stopped runner.
+      - name: Add swap (arm64)
+        if: matrix.arch == 'arm64'
+        run: |
+          sudo fallocate -l 8G /ci-swapfile
+          sudo chmod 600 /ci-swapfile
+          sudo mkswap /ci-swapfile >/dev/null
+          sudo swapon /ci-swapfile
+          swapon --show
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: test-${{ matrix.arch }}
@@ -92,6 +120,9 @@ jobs:
       - uses: azure/setup-helm@v4
       - name: Runner resources before the build
         run: .github/scripts/runner-resources.sh
+      # The watch prints memory, swap, disk, target/ and the linkers running every fifteen seconds.
+      # A runner that runs out of memory is stopped mid-step and no `if: failure()` step runs, so
+      # the watch's last line is the only record of what ran out.
       - name: cargo test --workspace --all-targets
         run: |
           .github/scripts/runner-resources.sh --watch 15 &
