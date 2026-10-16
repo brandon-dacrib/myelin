@@ -103,16 +103,11 @@ impl ShardHandler for Echo {
     }
 }
 
-/// A port nobody is listening on at the moment of the call. `MeshServer` binds the address it
-/// is given only inside `serve`, so a test has to pick the port first; the gap in which another
-/// process could take it is the same one every in-process server test in this workspace lives
-/// with.
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind :0")
-        .local_addr()
-        .expect("local_addr")
-        .port()
+/// A listener on a loopback port the system picked, kept bound and handed to the server
+/// (`MeshServer::with_listener`): the address has to be known before the server starts, and
+/// releasing the port to have the server bind it again let another process take it in between.
+fn reserve_listener() -> std::net::TcpListener {
+    std::net::TcpListener::bind("127.0.0.1:0").expect("bind :0")
 }
 
 struct RunningServer {
@@ -124,8 +119,8 @@ struct RunningServer {
 /// Starts a mutual-TLS mesh server presenting `material`, accepting peers whose certificate
 /// chains to the CA in `material` and carries a DNS SAN ending in `peer_san_suffix`.
 async fn spawn_mtls_server(material: TlsMaterial, peer_san_suffix: &str) -> RunningServer {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
+    let listener = reserve_listener();
+    let addr = listener.local_addr().expect("local_addr").to_string();
     let handled = Arc::new(AtomicUsize::new(0));
     let deps = Arc::new(MeshDeps {
         authenticator: Arc::new(MutualTlsAuthenticator::new(Some(
@@ -138,7 +133,9 @@ async fn spawn_mtls_server(material: TlsMaterial, peer_san_suffix: &str) -> Runn
         nudge: None,
         peers: None,
     });
-    let server = MeshServer::new(addr.clone(), Some(&material)).expect("server config");
+    let server = MeshServer::new(addr.clone(), Some(&material))
+        .expect("server config")
+        .with_listener(listener);
     let (shutdown, shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
         server

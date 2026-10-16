@@ -11,14 +11,6 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-fn reserve_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 fn config(port: u16, data_dir: &std::path::Path) -> hs_config::Config {
     let media_dir = data_dir.join("media");
     let yaml = format!(
@@ -40,12 +32,15 @@ struct Server {
     _dir: tempfile::TempDir,
 }
 
-async fn start(port: u16) -> Server {
+/// A server on a port reserved for it and handed over still bound (`hs_testkit::ports`).
+async fn start(reserved: hs_testkit::ports::ReservedPort) -> Server {
+    let port = reserved.port();
     let dir = tempfile::tempdir().unwrap();
     let handle = hs_cli::serve::spawn_serve(
         config(port, dir.path()),
         hs_cli::serve::ServeOptions {
             federation_scheme: Some("http"),
+            listeners: hs_cli::serve::PreboundListeners::new([reserved.into_listener()]),
             ..Default::default()
         },
     )
@@ -160,10 +155,8 @@ async fn admin_until(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_destination_is_forgotten_once_no_room_is_shared_and_refused_while_one_is() {
-    let port_a = reserve_port();
-    let port_b = reserve_port();
-    let a = start(port_a).await;
-    let b = start(port_b).await;
+    let a = start(hs_testkit::ports::reserve()).await;
+    let b = start(hs_testkit::ports::reserve()).await;
     let client = reqwest::Client::new();
     let ops = admin_token(&client, &a).await;
 

@@ -575,17 +575,20 @@ struct HsProcess {
 }
 
 impl HsProcess {
-    fn serve(config_path: &std::path::Path) -> Self {
+    /// Starts `hs serve`, handing it `listener` still bound (`hs_testkit::ports::pass_to`).
+    fn serve(config_path: &std::path::Path, listener: hs_testkit::ports::ReservedPort) -> Self {
         use std::io::BufRead;
-        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_hs"))
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_hs"));
+        command
             .args(["serve", "-c"])
             .arg(config_path)
             .env_remove("RUST_LOG")
             .env_remove("HS_DATA_DIR")
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-            .expect("the hs binary should start");
+            .stderr(std::process::Stdio::inherit());
+        hs_testkit::ports::pass_to(&mut command, [listener]);
+        let mut child = command.spawn().expect("the hs binary should start");
+        drop(command);
         let stdout = child.stdout.take().unwrap();
         let (tx, lines) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -642,14 +645,6 @@ impl Drop for HsProcess {
     }
 }
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 /// Waits until the server answers its health check.
 async fn wait_healthy(base: &str) {
     for _ in 0..400 {
@@ -669,7 +664,10 @@ async fn wait_healthy(base: &str) {
 async fn a_forked_rooms_extremities_are_reported_and_trimmed() {
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("data");
-    let port = free_port();
+    // Kept for the whole test, a clone handed to each start: the port is never released, so the
+    // restart gets it back (nothing asks for the server while it is down).
+    let reserved = hs_testkit::ports::reserve();
+    let port = reserved.port();
     let config_path = dir.path().join("homeserver.yaml");
     let media_dir = data_dir.join("media");
     std::fs::write(
@@ -690,7 +688,7 @@ async fn a_forked_rooms_extremities_are_reported_and_trimmed() {
     };
 
     // A room with one extremity.
-    let mut first = HsProcess::serve(&config_path);
+    let mut first = HsProcess::serve(&config_path, reserved.try_clone().unwrap());
     let line = first.wait_for("setup_link=");
     let setup_token: String = line
         .split_once("#token=")
@@ -775,7 +773,7 @@ async fn a_forked_rooms_extremities_are_reported_and_trimmed() {
     }
 
     // The server again: two extremities, trimmed to one, and the room goes on.
-    let mut second = HsProcess::serve(&config_path);
+    let mut second = HsProcess::serve(&config_path, reserved.try_clone().unwrap());
     second.wait_for("listening");
     wait_healthy(&base).await;
     let two = admin.get(&format!("{room}/forward-extremities")).await;

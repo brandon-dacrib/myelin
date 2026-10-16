@@ -34,23 +34,6 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-/// A port for a subprocess's configuration file; never the same one twice in this process.
-fn reserve_port() -> u16 {
-    static HANDED_OUT: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
-    loop {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let mut handed_out = HANDED_OUT.lock().unwrap();
-        if !handed_out.contains(&port) {
-            handed_out.push(port);
-            return port;
-        }
-    }
-}
-
 fn rand_suffix() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -73,7 +56,12 @@ struct HsProcess {
 }
 
 impl HsProcess {
-    fn serve(config_path: &std::path::Path, envs: &[(&str, &str)]) -> Self {
+    /// `listeners` are handed to it still bound (`hs_testkit::ports::pass_to`).
+    fn serve(
+        config_path: &std::path::Path,
+        envs: &[(&str, &str)],
+        listeners: impl IntoIterator<Item = hs_testkit::ports::ReservedPort>,
+    ) -> Self {
         use std::io::BufRead;
         let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_hs"));
         command
@@ -87,7 +75,9 @@ impl HsProcess {
         for (key, value) in envs {
             command.env(key, value);
         }
+        hs_testkit::ports::pass_to(&mut command, listeners);
         let mut child = command.spawn().expect("the hs binary should start");
+        drop(command);
         let stdout = child.stdout.take().unwrap();
         let (tx, lines) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -857,7 +847,19 @@ async fn a_replica_that_does_not_own_a_room_reads_only_its_new_events() {
     let messages = env_or("HS_MIRROR_BENCH_MESSAGES", 10).max(1);
 
     let dir = tempfile::tempdir().unwrap();
-    let ports: Vec<(u16, u16)> = (0..3).map(|_| (reserve_port(), reserve_port())).collect();
+    let mut listeners: Vec<_> = (0..3)
+        .map(|_| {
+            Some([
+                hs_testkit::ports::reserve(),
+                hs_testkit::ports::reserve_wildcard(),
+            ])
+        })
+        .collect();
+    let ports: Vec<(u16, u16)> = listeners
+        .iter()
+        .flatten()
+        .map(|[port, mesh]| (port.port(), mesh.port()))
+        .collect();
     let configs: Vec<std::path::PathBuf> = ["a", "b1", "b2"]
         .iter()
         .zip(&ports)
@@ -879,12 +881,16 @@ async fn a_replica_that_does_not_own_a_room_reads_only_its_new_events() {
     let client = reqwest::Client::new();
 
     // A first (it makes the signing key and the schema), then the two readers.
-    let mut hs_a = HsProcess::serve(&configs[0], &[]);
+    let mut hs_a = HsProcess::serve(&configs[0], &[], listeners[0].take().unwrap());
     let setup_line = hs_a.wait_for("setup_link=");
     let admin = first_admin(&client, a, &setup_line).await;
-    let mut hs_b1 = HsProcess::serve(&configs[1], &[("HS_SYNC_MIRROR_FULL_RELOAD", "1")]);
+    let mut hs_b1 = HsProcess::serve(
+        &configs[1],
+        &[("HS_SYNC_MIRROR_FULL_RELOAD", "1")],
+        listeners[1].take().unwrap(),
+    );
     hs_b1.wait_for("listening");
-    let mut hs_b2 = HsProcess::serve(&configs[2], &[]);
+    let mut hs_b2 = HsProcess::serve(&configs[2], &[], listeners[2].take().unwrap());
     hs_b2.wait_for("listening");
 
     // Every replica active with shards, and every shard owned.

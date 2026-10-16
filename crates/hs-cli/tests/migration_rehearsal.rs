@@ -45,7 +45,10 @@ const SERVER_NAME: &str = "rehearsal.test";
 const SHARED_SECRET: &str = "rehearsal-shared-secret";
 const PG_PASSWORD: &str = "hspg";
 
-fn free_port() -> u16 {
+/// A host port for a container to publish: bound and released, since Docker cannot be handed
+/// a listener (`hs_testkit::ports`). If another process takes it first, `docker run` fails
+/// loudly with the port named; the `hs` this test starts is handed its port still bound.
+fn docker_host_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -108,17 +111,23 @@ struct HsProcess {
 }
 
 impl HsProcess {
-    fn serve(config_path: &Path) -> Self {
+    /// Starts `hs serve`, handing it `listeners` still bound (`hs_testkit::ports::pass_to`).
+    fn serve(
+        config_path: &Path,
+        listeners: impl IntoIterator<Item = hs_testkit::ports::ReservedPort>,
+    ) -> Self {
         use std::io::BufRead;
-        let mut child = Command::new(env!("CARGO_BIN_EXE_hs"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hs"));
+        command
             .args(["serve", "-c"])
             .arg(config_path)
             .env_remove("RUST_LOG")
             .env_remove("HS_DATA_DIR")
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-            .expect("the hs binary should start");
+            .stderr(std::process::Stdio::inherit());
+        hs_testkit::ports::pass_to(&mut command, listeners);
+        let mut child = command.spawn().expect("the hs binary should start");
+        drop(command);
         let stdout = child.stdout.take().unwrap();
         let (tx, lines) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -385,7 +394,7 @@ async fn a_real_synapse_is_migrated_with_its_sessions_keys_and_a_delta_after_the
     docker(&["network", "create", &net]).unwrap();
 
     // ---- PostgreSQL for Synapse, reachable from Synapse by name and from here by port.
-    let pg_port = free_port().to_string();
+    let pg_port = docker_host_port().to_string();
     docker(&[
         "run",
         "-d",
@@ -482,7 +491,7 @@ async fn a_real_synapse_is_migrated_with_its_sessions_keys_and_a_delta_after_the
          root: {level: WARNING, handlers: [console]}\n",
     )
     .unwrap();
-    let synapse_port = free_port().to_string();
+    let synapse_port = docker_host_port().to_string();
     docker(&[
         "run",
         "-d",
@@ -722,7 +731,8 @@ async fn a_real_synapse_is_migrated_with_its_sessions_keys_and_a_delta_after_the
         keys.join(format!("{SERVER_NAME}.signing.key")),
     )
     .unwrap();
-    let port = free_port();
+    let listener = hs_testkit::ports::reserve();
+    let port = listener.port();
     let config_path = dir.path().join("hs.yaml");
     std::fs::write(
         &config_path,
@@ -737,7 +747,7 @@ async fn a_real_synapse_is_migrated_with_its_sessions_keys_and_a_delta_after_the
         ),
     )
     .unwrap();
-    let mut hs = HsProcess::serve(&config_path);
+    let mut hs = HsProcess::serve(&config_path, [listener.try_clone().unwrap()]);
     let setup_line = hs.wait_for("setup_link=");
     let setup_token = setup_line
         .rsplit_once("#token=")
@@ -892,7 +902,7 @@ async fn a_real_synapse_is_migrated_with_its_sessions_keys_and_a_delta_after_the
     // Pointing clients here is the operator's DNS flip; here they were on 127.0.0.1 all along.
     // A restart in between, as a deployment has one.
     hs.stop();
-    let mut hs = HsProcess::serve(&config_path);
+    let mut hs = HsProcess::serve(&config_path, [listener.try_clone().unwrap()]);
     hs.wait_for("listening");
 
     // ---- The other side.

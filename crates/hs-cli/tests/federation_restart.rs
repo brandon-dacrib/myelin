@@ -33,17 +33,23 @@ struct HsProcess {
 }
 
 impl HsProcess {
-    fn serve(config_path: &std::path::Path) -> Self {
+    /// `listeners` are handed to it still bound (`hs_testkit::ports::pass_to`).
+    fn serve(
+        config_path: &std::path::Path,
+        listeners: impl IntoIterator<Item = hs_testkit::ports::ReservedPort>,
+    ) -> Self {
         use std::io::BufRead;
-        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_hs"))
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_hs"));
+        command
             .args(["serve", "-c"])
             .arg(config_path)
             .env_remove("RUST_LOG")
             .env_remove("HS_DATA_DIR")
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-            .expect("the hs binary should start");
+            .stderr(std::process::Stdio::inherit());
+        hs_testkit::ports::pass_to(&mut command, listeners);
+        let mut child = command.spawn().expect("the hs binary should start");
+        drop(command);
         let stdout = child.stdout.take().unwrap();
         let (tx, lines) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -108,25 +114,6 @@ impl Drop for HsProcess {
     }
 }
 
-/// A port for a server that is started as a subprocess from a configuration file, which has to
-/// name one. Never the same port twice in this test process; another process on the machine
-/// taking it in the gap remains possible, and rare.
-fn reserve_port() -> u16 {
-    static HANDED_OUT: Mutex<Vec<u16>> = Mutex::new(Vec::new());
-    loop {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let mut handed_out = HANDED_OUT.lock().unwrap();
-        if !handed_out.contains(&port) {
-            handed_out.push(port);
-            return port;
-        }
-    }
-}
-
 fn config_yaml(
     client_port: u16,
     server_name: &str,
@@ -144,6 +131,13 @@ fn config_yaml(
          auth:\n  enable_registration: true\n\
          federation:\n  ip_range_blocklist: []\n  custom_ca_certificates: [{ca_path:?}]\n  max_retry_backoff: 2s\n"
     )
+}
+
+/// A reserved port's listener (`hs_testkit::ports`), for the in-test TLS proxy.
+fn tokio_listener(reserved: hs_testkit::ports::ReservedPort) -> TcpListener {
+    let listener = reserved.into_listener();
+    listener.set_nonblocking(true).unwrap();
+    TcpListener::from_std(listener).unwrap()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -430,10 +424,13 @@ async fn an_event_queued_for_a_server_that_is_down_arrives_after_a_restart_of_th
 
     // Four ports: each server's plaintext listener and the TLS proxy in front of it. The
     // proxy's port is the server's name.
-    let a_port = reserve_port();
-    let a_tls_port = reserve_port();
-    let b_port = reserve_port();
-    let b_tls_port = reserve_port();
+    // Each port is held from here until its server or proxy takes it (`hs_testkit::ports`).
+    let a_listener = hs_testkit::ports::reserve();
+    let a_tls_listener = hs_testkit::ports::reserve();
+    let b_listener = hs_testkit::ports::reserve();
+    let b_tls_listener = hs_testkit::ports::reserve();
+    let (a_port, a_tls_port) = (a_listener.port(), a_tls_listener.port());
+    let (b_port, b_tls_port) = (b_listener.port(), b_tls_listener.port());
     let a_name = format!("127.0.0.1:{a_tls_port}");
     let b_name = format!("127.0.0.1:{b_tls_port}");
     let a_base = format!("http://127.0.0.1:{a_port}");
@@ -452,18 +449,10 @@ async fn an_event_queued_for_a_server_that_is_down_arrives_after_a_restart_of_th
     )
     .unwrap();
 
-    let a_proxy = Proxy::start(
-        TcpListener::bind(("127.0.0.1", a_tls_port)).await.unwrap(),
-        tls.acceptor.clone(),
-        a_port,
-    );
-    let b_proxy = Proxy::start(
-        TcpListener::bind(("127.0.0.1", b_tls_port)).await.unwrap(),
-        tls.acceptor.clone(),
-        b_port,
-    );
-    let mut a = HsProcess::serve(&a_config);
-    let mut b = HsProcess::serve(&b_config);
+    let a_proxy = Proxy::start(tokio_listener(a_tls_listener), tls.acceptor.clone(), a_port);
+    let b_proxy = Proxy::start(tokio_listener(b_tls_listener), tls.acceptor.clone(), b_port);
+    let mut a = HsProcess::serve(&a_config, [a_listener.try_clone().unwrap()]);
+    let mut b = HsProcess::serve(&b_config, [b_listener]);
     a.wait_for("listening");
     b.wait_for("listening");
     let admin = admin_token_of(&mut a, &a_base).await;
@@ -519,7 +508,9 @@ async fn an_event_queued_for_a_server_that_is_down_arrives_after_a_restart_of_th
         a_log.contains("kept for the next start"),
         "A should have said what it kept queued:\n{a_log}"
     );
-    let mut a = HsProcess::serve(&a_config);
+    // A comes back on the same port, handed the socket this test kept (it is never released;
+    // nothing is sent to A while it is down).
+    let mut a = HsProcess::serve(&a_config, [a_listener]);
     let resumed = wait_for_listening_and(&mut a, "resuming an outbound federation queue");
     assert!(resumed.contains(&b_name), "{resumed}");
     let row = destination_until(&a_base, &admin, &b_name, Duration::from_secs(30), |row| {
@@ -534,6 +525,8 @@ async fn an_event_queued_for_a_server_that_is_down_arrives_after_a_restart_of_th
 
     // B's port opens again, and what alice said while it was closed arrives -- sent by a
     // process that never saw her send it.
+    // B's proxy port is bound again by port: it had to be closed (connections refused) while
+    // B was down, so no handle on it could be kept.
     let b_proxy = Proxy::start(
         TcpListener::bind(("127.0.0.1", b_tls_port)).await.unwrap(),
         tls.acceptor.clone(),

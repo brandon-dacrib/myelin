@@ -9,14 +9,6 @@
 
 use serde_json::Value;
 
-fn reserve_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 fn config(port: u16, data_dir: &std::path::Path, federation: bool) -> hs_config::Config {
     let yaml = format!(
         "server:\n  server_name: \"127.0.0.1:{port}\"\n\
@@ -33,12 +25,15 @@ fn config(port: u16, data_dir: &std::path::Path, federation: bool) -> hs_config:
 /// Boots `hs serve` and returns the status and body of an unsigned `GET /version`, and the
 /// status of an unsigned `GET /publicRooms` (a signed route, for contrast).
 async fn unsigned_version(federation: bool) -> (u16, Value, u16) {
-    let port = reserve_port();
+    // Reserved and handed to the server still bound (`hs_testkit::ports`).
+    let reserved = hs_testkit::ports::reserve();
+    let port = reserved.port();
     let dir = tempfile::tempdir().unwrap();
     let server = hs_cli::serve::spawn_serve(
         config(port, dir.path(), federation),
         hs_cli::serve::ServeOptions {
             federation_scheme: Some("http"),
+            listeners: hs_cli::serve::PreboundListeners::new([reserved.into_listener()]),
             ..Default::default()
         },
     )

@@ -12,14 +12,6 @@
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 /// One run of the real `hs` binary (the harness of `admin_user_identity.rs`).
 struct HsProcess {
     child: std::process::Child,
@@ -28,17 +20,23 @@ struct HsProcess {
 }
 
 impl HsProcess {
-    fn serve(config_path: &std::path::Path) -> Self {
+    /// `listeners` are handed to it still bound (`hs_testkit::ports::pass_to`).
+    fn serve(
+        config_path: &std::path::Path,
+        listeners: impl IntoIterator<Item = hs_testkit::ports::ReservedPort>,
+    ) -> Self {
         use std::io::BufRead;
-        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_hs"))
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_hs"));
+        command
             .args(["serve", "-c"])
             .arg(config_path)
             .env_remove("RUST_LOG")
             .env_remove("HS_DATA_DIR")
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-            .expect("the hs binary should start");
+            .stderr(std::process::Stdio::inherit());
+        hs_testkit::ports::pass_to(&mut command, listeners);
+        let mut child = command.spawn().expect("the hs binary should start");
+        drop(command);
         let stdout = child.stdout.take().unwrap();
         let (tx, lines) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -152,7 +150,8 @@ async fn metrics(base: &str) -> String {
 #[tokio::test]
 async fn lowering_the_send_limit_through_the_admin_api_limits_the_next_message_without_a_restart() {
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
+    let listener = hs_testkit::ports::reserve();
+    let port = listener.port();
     let config_path = dir.path().join("hs.yaml");
     // The default server-wide limit: ten back to back, then one every five seconds.
     std::fs::write(
@@ -169,7 +168,7 @@ async fn lowering_the_send_limit_through_the_admin_api_limits_the_next_message_w
     )
     .unwrap();
 
-    let mut hs = HsProcess::serve(&config_path);
+    let mut hs = HsProcess::serve(&config_path, [listener]);
     let setup_line = hs.wait_for("setup_link=");
     let setup_token = setup_line
         .rsplit_once("#token=")

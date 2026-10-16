@@ -21,17 +21,20 @@ struct HsProcess {
 }
 
 impl HsProcess {
-    fn serve(config_path: &std::path::Path) -> Self {
+    /// Starts `hs serve`, handing it `listener` still bound (`hs_testkit::ports::pass_to`).
+    fn serve(config_path: &std::path::Path, listener: hs_testkit::ports::ReservedPort) -> Self {
         use std::io::BufRead;
-        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_hs"))
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_hs"));
+        command
             .args(["serve", "-c"])
             .arg(config_path)
             .env_remove("RUST_LOG")
             .env_remove("HS_DATA_DIR")
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-            .expect("the hs binary should start");
+            .stderr(std::process::Stdio::inherit());
+        hs_testkit::ports::pass_to(&mut command, [listener]);
+        let mut child = command.spawn().expect("the hs binary should start");
+        drop(command);
         let stdout = child.stdout.take().unwrap();
         let (tx, lines) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -86,14 +89,6 @@ impl Drop for HsProcess {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
-}
-
-fn reserve_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 fn token(kind: &str) -> String {
@@ -243,7 +238,8 @@ async fn a_failed_transaction_is_retried_under_its_own_id_and_the_admin_api_says
         ),
     )
     .unwrap();
-    let port = reserve_port();
+    let listener = hs_testkit::ports::reserve();
+    let port = listener.port();
     let data_dir = dir.path().join("data");
     let media_dir = data_dir.join("media");
     let config_path = dir.path().join("hs.yaml");
@@ -262,7 +258,7 @@ async fn a_failed_transaction_is_retried_under_its_own_id_and_the_admin_api_says
     .unwrap();
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
-    let mut server = HsProcess::serve(&config_path);
+    let mut server = HsProcess::serve(&config_path, listener);
     let setup_line = server.wait_for("setup_link=");
     let setup_token = setup_line
         .split("#token=")

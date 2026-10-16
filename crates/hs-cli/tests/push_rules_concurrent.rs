@@ -8,14 +8,6 @@
 
 use serde_json::{Value, json};
 
-fn reserve_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 fn config(port: u16, data_dir: &std::path::Path) -> hs_config::Config {
     let media_dir = data_dir.join("media");
     let yaml = format!(
@@ -91,11 +83,18 @@ fn room_rules(global: &Value) -> Vec<String> {
 
 #[tokio::test]
 async fn room_rules_added_at_once_are_all_kept_and_synced() {
-    let port = reserve_port();
+    let reserved = hs_testkit::ports::reserve();
+    let port = reserved.port();
     let dir = tempfile::tempdir().unwrap();
-    let handle = hs_cli::serve::spawn_serve(config(port, dir.path()), Default::default())
-        .await
-        .expect("the server boots");
+    let handle = hs_cli::serve::spawn_serve(
+        config(port, dir.path()),
+        hs_cli::serve::ServeOptions {
+            listeners: hs_cli::serve::PreboundListeners::new([reserved.into_listener()]),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("the server boots");
     let base = handle.base_url();
     let client = reqwest::Client::new();
     let (_, token) = register(&client, &base, "bob").await;

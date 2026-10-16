@@ -2283,6 +2283,7 @@ dependencies = [
  "hs-http",
  "hs-kv",
  "hs-operator",
+ "hs-testkit",
  "matrix-sdk",
  "matrix-sdk-crypto",
  "reqwest 0.12.28",
@@ -2595,6 +2596,7 @@ name = "hs-loadgen"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "hs-testkit",
  "matrix-sdk",
  "reqwest 0.12.28",
  "serde_json",
@@ -2850,6 +2852,7 @@ dependencies = [
  "hs-kv",
  "http",
  "http-body-util",
+ "libc",
  "serde",
  "serde_json",
  "thiserror 2.0.20",

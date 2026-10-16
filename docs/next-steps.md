@@ -1,6 +1,6 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-10-15 (room loads and unloading; `agent/room-load-speed`. Before: the Slack bridge's full volume; fix on `agent/bridge-volume-size`. Before: Discord's delivery timeouts were a replay of the 2026-10-12 flood; fix on `agent/discord-delivery-timeouts`. Before: the memory climb with federation on; fix on `agent/fed-memory-growth`. Before: the session hub wedge; fix on `agent/hub-wedge`. Earlier: the ephemeral pump's prune busy loop; fix on `agent/ephemeral-prune`). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+Written 2026-09-20 by the integration lead, last revised 2026-10-15 (test servers are handed their ports still bound; `agent/test-port-races`. Before: room loads and unloading; `agent/room-load-speed`. Before: the Slack bridge's full volume; fix on `agent/bridge-volume-size`. Before: Discord's delivery timeouts were a replay of the 2026-10-12 flood; fix on `agent/discord-delivery-timeouts`. Before: the memory climb with federation on; fix on `agent/fed-memory-growth`. Before: the session hub wedge; fix on `agent/hub-wedge`. Earlier: the ephemeral pump's prune busy loop; fix on `agent/ephemeral-prune`). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
@@ -25,6 +25,42 @@ cache) compiled in 8m07s; attempt 2 (warm) compiled in 6m09s against 11m43s befo
 `crates/hs-cli/tests/federation_room_versions.rs`, `version_11` took a free port from
 `TcpListener::bind(":0")`, dropped the listener, and was beaten to the port (`AddrInUse`). Pass
 the bound listener to the server, or retry the bind. The pattern is likely in other hs-cli tests.
+## 2026-10-15, late -- the `AddrInUse` flakes: no test releases a server's port before the server has it; the branch is `agent/test-port-races`
+
+**What failed.** CI run 38830814904 (arm64, attempt 1): `federation_room_versions.rs` could not
+boot, `Bind { addr: "127.0.0.1:39139", .. AddrInUse }`. Every real-server test bound port 0,
+dropped the listener and had the server bind the number again later; under load something else
+took it in between. The merge gate's load-dependent failures were the same kind.
+
+**What changed.** The listener bound to port 0 is handed to the server:
+`hs_testkit::ports::reserve()` and then `ServeOptions::listeners`
+(`hs_cli::serve::PreboundListeners`, also the mesh via `MeshServer::with_listener`) in process,
+or `hs_testkit::ports::pass_to(&mut command, ..)` for the real binary, which inherits the socket
+and adopts it from `HS_INHERITED_LISTENER_FDS` (`crates/hs-cli/src/inherited_listeners.rs`).
+76 `hs-cli` test files, hs-cli's own unit tests, `hs-cluster`'s mesh tests, `hs-loadgen`'s
+harness, the real mautrix test's `hs`, three `hs-federation` sender tests (a bound,
+not-listening socket for a destination that comes up later) and `hs-media`'s ICAP tests (retry)
+moved. What is left on bind-and-release, and why, is in `docs/status/14-test-and-conformance.md`
+session 13. New tests: `hs-testkit` `ports` (5), `hs-cli` `inherited_listeners` (2 unit, 3
+real-binary).
+
+**Rule for new tests:** never hand a server a port number you released; reserve with
+`hs_testkit::ports` and hand over the listener.
+
+**Verified (2026-10-15, this machine, gate PostgreSQL sourced so nothing SKIPs).** Each migrated
+file passed once on its own. Then the 24 `federation_*` and `cluster_*` test binaries, run in
+concurrent lanes, each lane all 24 in order, so the same tests overlap: 3 lanes (72 binary runs,
+249 tests, 6 min 10 s) and 4 lanes (96 runs, 332 tests, 6 min 30 s), every one passing, and no
+`AddrInUse` or "Address already in use" in any log. The old pattern's window, measured in a
+Linux container (`python:3.12-slim`, 16 threads each binding 0, releasing, opening a listener
+and four connections, waiting up to 50 ms and binding the port again): 7 of 4,800 ports were
+taken in between; on macOS, whose allocator is random over a wider range, 0 of 4,800, which is
+why it flaked on CI's Linux runners first. With the listener held, the server never binds the
+number, so it cannot lose it. `cargo clippy` with `-D warnings` on `hs-cli`, `hs-testkit`,
+`hs-loadgen`, `hs-cluster`, `hs-federation`, `hs-media` and `hs-bridge-conformance` is clean;
+`cargo test -p hs-testkit -p hs-cluster -p hs-loadgen`, `hs-cli --lib` (serve, cluster,
+inherited listeners), `hs-media` ICAP and the three `hs-federation` sender tests pass. The full
+workspace gate is the merge queue's.
 
 ## 2026-10-15, evening -- room loads were the room's state squared; rooms now unload; the branch is `agent/room-load-speed`
 

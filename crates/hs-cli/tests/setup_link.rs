@@ -12,14 +12,6 @@ use serde_json::json;
 
 const HINT: &str = "replacing the host if needed";
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 fn config_yaml(port: u16, data_dir: &std::path::Path, public_baseurl: Option<&str>) -> String {
     let server_extra = public_baseurl
         .map(|url| format!("  public_baseurl: {url:?}\n"))
@@ -42,18 +34,24 @@ struct HsProcess {
 }
 
 impl HsProcess {
-    fn serve(config_path: &std::path::Path) -> Self {
+    /// Starts `hs serve`, handing it `listeners` still bound (`hs_testkit::ports::pass_to`).
+    fn serve(
+        config_path: &std::path::Path,
+        listeners: impl IntoIterator<Item = hs_testkit::ports::ReservedPort>,
+    ) -> Self {
         use std::io::BufRead;
-        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_hs"))
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_hs"));
+        command
             .args(["serve", "-c"])
             .arg(config_path)
             .env_remove("RUST_LOG")
             .env_remove("HS_DATA_DIR")
             .env_remove("HS__SERVER__PUBLIC_BASEURL")
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-            .expect("the hs binary should start");
+            .stderr(std::process::Stdio::inherit());
+        hs_testkit::ports::pass_to(&mut command, listeners);
+        let mut child = command.spawn().expect("the hs binary should start");
+        drop(command);
         let stdout = child.stdout.take().unwrap();
         let (tx, lines) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -137,17 +135,18 @@ fn link_of(line: &str) -> String {
 async fn without_public_baseurl_the_link_names_the_listener_and_works_on_any_host() {
     let dir = tempfile::tempdir().unwrap();
     // Never 8008, so a link that still says `localhost:8008` or ignores the port fails.
-    let mut port = free_port();
-    while port == 8008 {
-        port = free_port();
+    let mut listener = hs_testkit::ports::reserve();
+    while listener.port() == 8008 {
+        listener = hs_testkit::ports::reserve();
     }
+    let port = listener.port();
     let config_path = dir.path().join("homeserver.yaml");
     std::fs::write(
         &config_path,
         config_yaml(port, &dir.path().join("data"), None),
     )
     .unwrap();
-    let mut server = HsProcess::serve(&config_path);
+    let mut server = HsProcess::serve(&config_path, [listener]);
 
     let line = server.wait_for("setup_link=");
     let link = link_of(&line);
@@ -207,7 +206,8 @@ async fn without_public_baseurl_the_link_names_the_listener_and_works_on_any_hos
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn with_public_baseurl_the_link_names_it_and_no_hint_follows() {
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
+    let listener = hs_testkit::ports::reserve();
+    let port = listener.port();
     let config_path = dir.path().join("homeserver.yaml");
     std::fs::write(
         &config_path,
@@ -218,7 +218,7 @@ async fn with_public_baseurl_the_link_names_it_and_no_hint_follows() {
         ),
     )
     .unwrap();
-    let mut server = HsProcess::serve(&config_path);
+    let mut server = HsProcess::serve(&config_path, [listener]);
 
     let line = server.wait_for("setup_link=");
     let link = link_of(&line);

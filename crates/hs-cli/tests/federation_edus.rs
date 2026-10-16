@@ -10,14 +10,6 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-fn reserve_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 fn config(port: u16, data_dir: &std::path::Path) -> hs_config::Config {
     let media_dir = data_dir.join("media");
     let yaml = format!(
@@ -38,12 +30,15 @@ struct Server {
     _dir: tempfile::TempDir,
 }
 
-async fn start(port: u16) -> Server {
+/// A server on a port reserved for it and handed over still bound (`hs_testkit::ports`).
+async fn start(reserved: hs_testkit::ports::ReservedPort) -> Server {
+    let port = reserved.port();
     let dir = tempfile::tempdir().unwrap();
     let handle = hs_cli::serve::spawn_serve(
         config(port, dir.path()),
         hs_cli::serve::ServeOptions {
             federation_scheme: Some("http"),
+            listeners: hs_cli::serve::PreboundListeners::new([reserved.into_listener()]),
             ..Default::default()
         },
     )
@@ -269,8 +264,8 @@ async fn shared_room(
 
 #[tokio::test]
 async fn typing_receipts_and_presence_cross_between_servers_in_both_directions() {
-    let a = start(reserve_port()).await;
-    let b = start(reserve_port()).await;
+    let a = start(hs_testkit::ports::reserve()).await;
+    let b = start(hs_testkit::ports::reserve()).await;
     let client = reqwest::Client::new();
     let alice = register(&client, &a.base, "alice").await;
     let bob = register(&client, &b.base, "bob").await;
@@ -453,8 +448,8 @@ async fn upload_keys_with(
 
 #[tokio::test]
 async fn a_device_added_on_one_server_is_a_device_list_change_on_the_other() {
-    let a = start(reserve_port()).await;
-    let b = start(reserve_port()).await;
+    let a = start(hs_testkit::ports::reserve()).await;
+    let b = start(hs_testkit::ports::reserve()).await;
     let client = reqwest::Client::new();
     let alice = register(&client, &a.base, "alice").await;
     let bob = register(&client, &b.base, "bob").await;
@@ -692,8 +687,8 @@ async fn to_device_arrivals(
 
 #[tokio::test]
 async fn to_device_messages_cross_between_servers_in_both_directions_once() {
-    let a = start(reserve_port()).await;
-    let b = start(reserve_port()).await;
+    let a = start(hs_testkit::ports::reserve()).await;
+    let b = start(hs_testkit::ports::reserve()).await;
     let client = reqwest::Client::new();
     let alice = register(&client, &a.base, "alice").await;
     let bob = register(&client, &b.base, "bob").await;
@@ -795,8 +790,8 @@ async fn to_device_messages_cross_between_servers_in_both_directions_once() {
 
 #[tokio::test]
 async fn a_cross_signing_key_change_is_a_signing_key_update_on_the_other_server() {
-    let a = start(reserve_port()).await;
-    let b = start(reserve_port()).await;
+    let a = start(hs_testkit::ports::reserve()).await;
+    let b = start(hs_testkit::ports::reserve()).await;
     let client = reqwest::Client::new();
     let alice = register(&client, &a.base, "alice").await;
     let bob = register(&client, &b.base, "bob").await;
@@ -930,8 +925,8 @@ async fn keys_changes(
 ///   more, instead of being served as it was (Complement's `when_remote_user_rejoins_a_room`).
 #[tokio::test]
 async fn an_invited_remote_user_is_followed_from_the_invite_to_after_a_rejoin() {
-    let a = start(reserve_port()).await;
-    let b = start(reserve_port()).await;
+    let a = start(hs_testkit::ports::reserve()).await;
+    let b = start(hs_testkit::ports::reserve()).await;
     let client = reqwest::Client::new();
     let alice = register(&client, &a.base, "alice").await;
     let bob = register(&client, &b.base, "bob").await;

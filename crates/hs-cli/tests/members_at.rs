@@ -6,14 +6,6 @@
 
 use serde_json::{Value, json};
 
-fn reserve_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 async fn register(client: &reqwest::Client, base: &str, username: &str) -> (String, String) {
     let first: Value = client
         .post(format!("{base}/_matrix/client/v3/register"))
@@ -46,7 +38,8 @@ async fn register(client: &reqwest::Client, base: &str, username: &str) -> (Stri
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn members_at_a_point_are_the_members_then_and_before_every_event_not_found() {
-    let port = reserve_port();
+    let reserved = hs_testkit::ports::reserve();
+    let port = reserved.port();
     let dir = tempfile::tempdir().unwrap();
     let yaml = format!(
         "server:\n  server_name: \"127.0.0.1:{port}\"\n\
@@ -60,7 +53,10 @@ async fn members_at_a_point_are_the_members_then_and_before_every_event_not_foun
     );
     let server = hs_cli::serve::spawn_serve(
         hs_config::Config::from_yaml(&yaml).unwrap(),
-        hs_cli::serve::ServeOptions::default(),
+        hs_cli::serve::ServeOptions {
+            listeners: hs_cli::serve::PreboundListeners::new([reserved.into_listener()]),
+            ..Default::default()
+        },
     )
     .await
     .expect("the server boots");

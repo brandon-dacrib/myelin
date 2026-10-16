@@ -5,7 +5,9 @@
 
 use serde_json::{Value, json};
 
-fn reserve_port() -> u16 {
+/// A port nothing listens on, for a server nobody answers for: bound and dropped on purpose,
+/// since the test wants it refused (the servers themselves are handed their reserved listeners).
+fn unused_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -32,12 +34,15 @@ struct Server {
     _dir: tempfile::TempDir,
 }
 
-async fn start(port: u16) -> Server {
+/// A server on a port reserved for it and handed over still bound (`hs_testkit::ports`).
+async fn start(reserved: hs_testkit::ports::ReservedPort) -> Server {
+    let port = reserved.port();
     let dir = tempfile::tempdir().unwrap();
     let handle = hs_cli::serve::spawn_serve(
         config(port, dir.path()),
         hs_cli::serve::ServeOptions {
             federation_scheme: Some("http"),
+            listeners: hs_cli::serve::PreboundListeners::new([reserved.into_listener()]),
             ..Default::default()
         },
     )
@@ -76,8 +81,8 @@ async fn assert_signed_by(client: &reqwest::Client, doc: &Value, signer: &Server
 
 #[tokio::test]
 async fn the_key_id_spelling_and_the_notary_answer_on_the_real_binary() {
-    let a = start(reserve_port()).await;
-    let b = start(reserve_port()).await;
+    let a = start(hs_testkit::ports::reserve()).await;
+    let b = start(hs_testkit::ports::reserve()).await;
     let client = reqwest::Client::new();
 
     // The deprecated key-id spelling: the same document, whatever key it names. It was not
@@ -151,7 +156,7 @@ async fn the_key_id_spelling_and_the_notary_answer_on_the_real_binary() {
     // A server nobody answers for is left out.
     let unreachable: Value = client
         .post(format!("{}/_matrix/key/v2/query", a.base))
-        .json(&json!({"server_keys": {format!("127.0.0.1:{}", reserve_port()): {}}}))
+        .json(&json!({"server_keys": {format!("127.0.0.1:{}", unused_port()): {}}}))
         .send()
         .await
         .unwrap()

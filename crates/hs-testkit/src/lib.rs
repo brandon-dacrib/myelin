@@ -19,6 +19,8 @@
 //!   below is built on.
 //! - [`fake_appservice`], [`fake_federation`], [`fake_pushgw`], [`fake_smtp`]: recording doubles
 //!   for the four external systems a homeserver pushes to.
+//! - [`ports`]: ports for servers a test starts, reserved by a listener that is handed to the
+//!   server rather than released for it to bind again.
 //!
 //! # Proving the DSL works
 //!
@@ -27,7 +29,9 @@
 //! which is this crate's own acceptance test: if that file breaks, the DSL is not fit for
 //! purpose.
 
-#![forbid(unsafe_code)]
+// `deny`, not `forbid`: `ports::pass_to` needs one `unsafe` block (`CommandExt::pre_exec`),
+// allowed there alone with its justification.
+#![deny(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod clock;
@@ -36,6 +40,8 @@ pub mod fake_federation;
 pub mod fake_pushgw;
 pub mod fake_smtp;
 pub mod matrix_error;
+#[allow(unsafe_code)]
+pub mod ports;
 pub mod record_log;
 pub mod scenario;
 

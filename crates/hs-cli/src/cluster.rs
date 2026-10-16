@@ -476,8 +476,15 @@ impl ClusterHandles {
     /// process's own client listeners: a forwarded request re-enters it in-process on the owner,
     /// so the owner's own auth middleware, room actor and persistence run exactly as they would
     /// for a request that arrived directly (see this module's docs).
+    ///
+    /// A listener in `prebound` bound to the mesh's listen address is served instead of binding
+    /// it (see [`crate::serve::PreboundListeners`]).
     #[must_use]
-    pub fn spawn_mesh(&self, app: axum::Router) -> Option<MeshRuntime> {
+    pub fn spawn_mesh(
+        &self,
+        app: axum::Router,
+        prebound: &crate::serve::PreboundListeners,
+    ) -> Option<MeshRuntime> {
         let mesh = self.mesh.as_ref()?;
         let (authenticator, tls_material): (Arc<dyn Authenticator>, Option<&TlsMaterial>) =
             match &mesh.auth {
@@ -515,7 +522,15 @@ impl ClusterHandles {
                 .then(|| self.peer_routes.clone() as Arc<dyn hs_cluster::mesh::PeerHandler>),
         });
         let server = match MeshServer::new(mesh.listen_addr.clone(), tls_material) {
-            Ok(server) => server,
+            Ok(server) => match mesh
+                .listen_addr
+                .parse::<std::net::SocketAddr>()
+                .ok()
+                .and_then(|addr| prebound.take(addr))
+            {
+                Some(listener) => server.with_listener(listener),
+                None => server,
+            },
             Err(error) => {
                 tracing::error!(
                     %error,
@@ -2079,20 +2094,20 @@ mod tests {
         assert!(seen.lock().unwrap().is_empty(), "the handler must not run");
     }
 
-    /// A port nobody is listening on right now; `MeshServer` binds only inside `serve`.
-    fn free_port() -> u16 {
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
+    /// A loopback listener on a port the system picked, kept bound for the mesh server
+    /// (`MeshServer::with_listener`) and its address: releasing the port for the server to bind
+    /// again would let another process take it in between.
+    fn reserve_mesh() -> (std::net::TcpListener, String) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        (listener, addr)
     }
 
     #[tokio::test]
     async fn on_a_non_owner_create_room_is_forwarded_to_the_owner_which_creates_it() {
         // Replica B owns every shard and runs a mesh listener whose handler replays forwards
         // against B's own gated router, exactly as `spawn_mesh` wires it in production.
-        let b_addr = format!("127.0.0.1:{}", free_port());
+        let (b_listener, b_addr) = reserve_mesh();
         let seen_b = Arc::new(std::sync::Mutex::new(Vec::new()));
         let ownership_b: Arc<dyn Ownership> = scripted(&b_addr, true, None);
         let app_b = gate(ownership_b.clone(), true).layer(create_room_router(seen_b.clone()));
@@ -2108,7 +2123,9 @@ mod tests {
             nudge: None,
             peers: None,
         });
-        let server = MeshServer::new(b_addr.clone(), None).unwrap();
+        let server = MeshServer::new(b_addr.clone(), None)
+            .unwrap()
+            .with_listener(b_listener);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         tokio::spawn(async move {
             server.serve(deps, shutdown_rx).await.unwrap();
@@ -2271,7 +2288,7 @@ mod tests {
     #[tokio::test]
     async fn on_a_non_owner_a_join_by_alias_is_forwarded_to_the_owner_by_room_id() {
         // B owns every shard and serves the mesh, as in the `/createRoom` test above.
-        let b_addr = format!("127.0.0.1:{}", free_port());
+        let (b_listener, b_addr) = reserve_mesh();
         let seen_b = Arc::new(std::sync::Mutex::new(Vec::new()));
         let ownership_b: Arc<dyn Ownership> = scripted(&b_addr, true, None);
         let app_b = gate(ownership_b.clone(), true).layer(join_router(seen_b.clone()));
@@ -2287,7 +2304,9 @@ mod tests {
             nudge: None,
             peers: None,
         });
-        let server = MeshServer::new(b_addr.clone(), None).unwrap();
+        let server = MeshServer::new(b_addr.clone(), None)
+            .unwrap()
+            .with_listener(b_listener);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         tokio::spawn(async move {
             server.serve(deps, shutdown_rx).await.unwrap();
@@ -2388,7 +2407,7 @@ mod tests {
     /// `/send` names no room and still runs where it lands.
     #[tokio::test]
     async fn on_a_non_owner_a_federation_request_for_a_room_is_forwarded_to_the_owner() {
-        let b_addr = format!("127.0.0.1:{}", free_port());
+        let (b_listener, b_addr) = reserve_mesh();
         let seen_b = Arc::new(std::sync::Mutex::new(Vec::new()));
         let ownership_b: Arc<dyn Ownership> = scripted(&b_addr, true, None);
         let app_b = gate(ownership_b.clone(), true).layer(federation_router(seen_b.clone()));
@@ -2404,7 +2423,9 @@ mod tests {
             nudge: None,
             peers: None,
         });
-        let server = MeshServer::new(b_addr.clone(), None).unwrap();
+        let server = MeshServer::new(b_addr.clone(), None)
+            .unwrap()
+            .with_listener(b_listener);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         tokio::spawn(async move {
             server.serve(deps, shutdown_rx).await.unwrap();
@@ -2482,7 +2503,7 @@ mod tests {
     /// under the one before, with one request id.
     #[tokio::test]
     async fn a_forwarded_request_is_one_trace_across_the_two_replicas() {
-        let b_addr = format!("127.0.0.1:{}", free_port());
+        let (b_listener, b_addr) = reserve_mesh();
         let seen_b = Arc::new(std::sync::Mutex::new(Vec::new()));
         let ownership_b: Arc<dyn Ownership> = scripted(&b_addr, true, None);
         let app_b = gate(ownership_b.clone(), true)
@@ -2500,7 +2521,9 @@ mod tests {
             nudge: None,
             peers: None,
         });
-        let server = MeshServer::new(b_addr.clone(), None).unwrap();
+        let server = MeshServer::new(b_addr.clone(), None)
+            .unwrap()
+            .with_listener(b_listener);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         tokio::spawn(async move {
             server.serve(deps, shutdown_rx).await.unwrap();
@@ -2705,7 +2728,7 @@ mod tests {
         Arc<std::sync::Mutex<Vec<String>>>,
         watch::Sender<bool>,
     ) {
-        let b_addr = format!("127.0.0.1:{}", free_port());
+        let (b_listener, b_addr) = reserve_mesh();
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let ownership_b: Arc<dyn Ownership> = scripted(&b_addr, true, None);
         let recorded = seen.clone();
@@ -2732,7 +2755,9 @@ mod tests {
             nudge: None,
             peers: None,
         });
-        let server = MeshServer::new(b_addr.clone(), None).unwrap();
+        let server = MeshServer::new(b_addr.clone(), None)
+            .unwrap()
+            .with_listener(b_listener);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         tokio::spawn(async move {
             server.serve(deps, shutdown_rx).await.unwrap();
@@ -2850,7 +2875,7 @@ mod tests {
     /// fence's `503 M_UNKNOWN` (seen in `tests/cluster_create_room.rs` under load).
     #[tokio::test]
     async fn a_create_room_fenced_here_is_made_again_on_the_new_owner() {
-        let b_addr = format!("127.0.0.1:{}", free_port());
+        let (b_listener, b_addr) = reserve_mesh();
         let seen_b = Arc::new(std::sync::Mutex::new(Vec::new()));
         let ownership_b: Arc<dyn Ownership> = scripted(&b_addr, true, None);
         let app_b = gate(ownership_b.clone(), true).layer(create_room_router(seen_b.clone()));
@@ -2866,7 +2891,9 @@ mod tests {
             nudge: None,
             peers: None,
         });
-        let server = MeshServer::new(b_addr.clone(), None).unwrap();
+        let server = MeshServer::new(b_addr.clone(), None)
+            .unwrap()
+            .with_listener(b_listener);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         tokio::spawn(async move {
             server.serve(deps, shutdown_rx).await.unwrap();

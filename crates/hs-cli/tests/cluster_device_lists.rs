@@ -26,22 +26,6 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-fn reserve_port() -> u16 {
-    static HANDED_OUT: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
-    loop {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let mut handed_out = HANDED_OUT.lock().unwrap();
-        if !handed_out.contains(&port) {
-            handed_out.push(port);
-            return port;
-        }
-    }
-}
-
 fn rand_suffix() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -175,11 +159,21 @@ fn single_config(port: u16, dir: &std::path::Path) -> hs_config::Config {
     hs_config::Config::from_yaml(&yaml).expect("the configuration parses")
 }
 
-async fn serve(config: hs_config::Config) -> hs_cli::serve::ServeHandle {
+/// Starts a server on `config`, handing it `reserved` (its listener, and a replica's mesh) still
+/// bound (`hs_testkit::ports`).
+async fn serve(
+    config: hs_config::Config,
+    reserved: impl IntoIterator<Item = hs_testkit::ports::ReservedPort>,
+) -> hs_cli::serve::ServeHandle {
     hs_cli::serve::spawn_serve(
         config,
         hs_cli::serve::ServeOptions {
             federation_scheme: Some("http"),
+            listeners: hs_cli::serve::PreboundListeners::new(
+                reserved
+                    .into_iter()
+                    .map(hs_testkit::ports::ReservedPort::into_listener),
+            ),
             ..Default::default()
         },
     )
@@ -263,17 +257,26 @@ where
 struct HsProcess(std::process::Child);
 
 impl HsProcess {
-    fn serve(config_path: &std::path::Path, log: &std::path::Path) -> Self {
+    /// Starts `hs serve`, handing it `reserved` (its listener and mesh) still bound
+    /// (`hs_testkit::ports::pass_to`); the command, and with it this process's copies of the
+    /// sockets, is dropped once the child is spawned, so a killed replica's ports refuse.
+    fn serve(
+        config_path: &std::path::Path,
+        log: &std::path::Path,
+        reserved: impl IntoIterator<Item = hs_testkit::ports::ReservedPort>,
+    ) -> Self {
         let log = std::fs::File::create(log).unwrap();
-        let child = std::process::Command::new(env!("CARGO_BIN_EXE_hs"))
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_hs"));
+        command
             .args(["serve", "-c"])
             .arg(config_path)
             .env_remove("RUST_LOG")
             .env_remove("HS_DATA_DIR")
             .stdout(log.try_clone().unwrap())
-            .stderr(log)
-            .spawn()
-            .expect("the hs binary should start");
+            .stderr(log);
+        hs_testkit::ports::pass_to(&mut command, reserved);
+        let child = command.spawn().expect("the hs binary should start");
+        drop(command);
         Self(child)
     }
 
@@ -328,7 +331,10 @@ async fn a_device_list_change_made_while_its_destinations_shard_had_no_live_owne
         .timeout(Duration::from_secs(20))
         .build()
         .unwrap();
-    let (port_1, port_2) = (reserve_port(), reserve_port());
+    // Every port is reserved and handed to its server still bound (`hs_testkit::ports`); the
+    // mesh binds every interface, so its ports are reserved on the wildcard address.
+    let (listen_1, listen_2) = (hs_testkit::ports::reserve(), hs_testkit::ports::reserve());
+    let (port_1, port_2) = (listen_1.port(), listen_2.port());
     let a_name = format!("127.0.0.1:{port_1}");
     let layout = hs_cluster::ShardLayout {
         rooms: 4,
@@ -338,10 +344,12 @@ async fn a_device_list_change_made_while_its_destinations_shard_had_no_live_owne
     // Mesh ports (the replicas' identities) such that replica 1, the one that lives, is the
     // rendezvous owner of at least one user shard and one room shard: alice and her room go
     // there.
-    let mesh_1 = reserve_port();
+    let mesh_listen_1 = hs_testkit::ports::reserve_wildcard();
+    let mesh_1 = mesh_listen_1.port();
     let replica_1_id = hs_cluster::ReplicaId::new(format!("127.0.0.1:{mesh_1}"));
-    let (mesh_2, replica_2_id) = loop {
-        let port = reserve_port();
+    let (mesh_listen_2, mesh_2, replica_2_id) = loop {
+        let reserved = hs_testkit::ports::reserve_wildcard();
+        let port = reserved.port();
         let id = hs_cluster::ReplicaId::new(format!("127.0.0.1:{port}"));
         let ones = |kind| {
             (0..4).any(|index| {
@@ -352,22 +360,27 @@ async fn a_device_list_change_made_while_its_destinations_shard_had_no_live_owne
             })
         };
         if ones(hs_cluster::ShardKind::User) && ones(hs_cluster::ShardKind::Room) {
-            break (port, id);
+            break (reserved, port, id);
         }
     };
     // B's port, such that its federation shard is replica 2's.
-    let (port_b, b_shard) = loop {
-        let port = reserve_port();
+    let (listen_b, port_b, b_shard) = loop {
+        let reserved = hs_testkit::ports::reserve();
+        let port = reserved.port();
         let shard = layout.federation_shard(&format!("127.0.0.1:{port}"));
         if hs_cluster::hash::desired_owner(shard, [&replica_1_id, &replica_2_id])
             == Some(&replica_2_id)
         {
-            break (port, format!("federation/{}", shard.index));
+            break (reserved, port, format!("federation/{}", shard.index));
         }
     };
 
     // Replica 1 first (it makes the signing key and the schema), then replica 2.
-    let replica_1 = serve(replica_config(&db, dir.path(), &a_name, port_1, mesh_1)).await;
+    let replica_1 = serve(
+        replica_config(&db, dir.path(), &a_name, port_1, mesh_1),
+        [listen_1, mesh_listen_1],
+    )
+    .await;
     let setup_link = replica_1
         .setup_link
         .clone()
@@ -378,9 +391,13 @@ async fn a_device_list_change_made_while_its_destinations_shard_had_no_live_owne
         replica_yaml(&db, dir.path(), &a_name, port_2, mesh_2),
     )
     .unwrap();
-    let mut replica_2 = HsProcess::serve(&config_2, &dir.path().join("replica-2.log"));
+    let mut replica_2 = HsProcess::serve(
+        &config_2,
+        &dir.path().join("replica-2.log"),
+        [listen_2, mesh_listen_2],
+    );
     let b_dir = tempfile::tempdir().unwrap();
-    let b = serve(single_config(port_b, b_dir.path())).await;
+    let b = serve(single_config(port_b, b_dir.path()), [listen_b]).await;
     let base_1 = replica_1.base_url();
 
     let setup_token: String = setup_link

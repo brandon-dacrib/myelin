@@ -16,14 +16,6 @@ use serde_json::{Value, json};
 const AS_TOKEN: &str = "as_token_for_the_federated_alias_test_000000000000000000000000000";
 const HS_TOKEN: &str = "hs_token_for_the_federated_alias_test_000000000000000000000000000";
 
-fn reserve_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 fn config(port: u16, data_dir: &std::path::Path, registration: Option<&str>) -> hs_config::Config {
     let media_dir = data_dir.join("media");
     let appservices = registration
@@ -48,11 +40,18 @@ struct Server {
     _dir: tempfile::TempDir,
 }
 
-async fn start(port: u16, dir: tempfile::TempDir, registration: Option<&str>) -> Server {
+/// A server on a port reserved for it and handed over still bound (`hs_testkit::ports`).
+async fn start(
+    reserved: hs_testkit::ports::ReservedPort,
+    dir: tempfile::TempDir,
+    registration: Option<&str>,
+) -> Server {
+    let port = reserved.port();
     let handle = hs_cli::serve::spawn_serve(
         config(port, dir.path(), registration),
         hs_cli::serve::ServeOptions {
             federation_scheme: Some("http"),
+            listeners: hs_cli::serve::PreboundListeners::new([reserved.into_listener()]),
             ..Default::default()
         },
     )
@@ -162,7 +161,8 @@ async fn start_bridge() -> (String, Bridge) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn another_server_asking_for_a_bridges_alias_gets_the_room_the_bridge_makes() {
     let (bridge_url, bridge) = start_bridge().await;
-    let a_port = reserve_port();
+    let a_reserved = hs_testkit::ports::reserve();
+    let a_port = a_reserved.port();
     let a_name = format!("127.0.0.1:{a_port}");
     let a_dir = tempfile::tempdir().unwrap();
     let registration = a_dir.path().join("bridge.yaml");
@@ -176,8 +176,13 @@ async fn another_server_asking_for_a_bridges_alias_gets_the_room_the_bridge_make
         ),
     )
     .unwrap();
-    let a = start(a_port, a_dir, Some(registration.to_str().unwrap())).await;
-    let b = start(reserve_port(), tempfile::tempdir().unwrap(), None).await;
+    let a = start(a_reserved, a_dir, Some(registration.to_str().unwrap())).await;
+    let b = start(
+        hs_testkit::ports::reserve(),
+        tempfile::tempdir().unwrap(),
+        None,
+    )
+    .await;
     assert_eq!(a.name, a_name);
     *bridge.homeserver.lock().unwrap() = Some(a.base.clone());
 

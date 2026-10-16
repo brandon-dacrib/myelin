@@ -22,23 +22,6 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-/// A port for a subprocess's configuration file; never the same one twice in this process.
-fn reserve_port() -> u16 {
-    static HANDED_OUT: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
-    loop {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let mut handed_out = HANDED_OUT.lock().unwrap();
-        if !handed_out.contains(&port) {
-            handed_out.push(port);
-            return port;
-        }
-    }
-}
-
 /// One run of the real `hs` binary, reading its log.
 struct HsProcess {
     child: std::process::Child,
@@ -47,17 +30,23 @@ struct HsProcess {
 }
 
 impl HsProcess {
-    fn serve(config_path: &std::path::Path) -> Self {
+    /// `listeners` are handed to it still bound (`hs_testkit::ports::pass_to`).
+    fn serve(
+        config_path: &std::path::Path,
+        listeners: impl IntoIterator<Item = hs_testkit::ports::ReservedPort>,
+    ) -> Self {
         use std::io::BufRead;
-        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_hs"))
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_hs"));
+        command
             .args(["serve", "-c"])
             .arg(config_path)
             .env_remove("RUST_LOG")
             .env_remove("HS_DATA_DIR")
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-            .expect("the hs binary should start");
+            .stderr(std::process::Stdio::inherit());
+        hs_testkit::ports::pass_to(&mut command, listeners);
+        let mut child = command.spawn().expect("the hs binary should start");
+        drop(command);
         let stdout = child.stdout.take().unwrap();
         let (tx, lines) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -203,7 +192,8 @@ where
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_single_node_is_one_replica_owning_every_shard_and_cannot_be_drained() {
     let dir = tempfile::tempdir().unwrap();
-    let port = reserve_port();
+    let listener = hs_testkit::ports::reserve();
+    let port = listener.port();
     let config_path = dir.path().join("homeserver.yaml");
     std::fs::write(
         &config_path,
@@ -219,7 +209,7 @@ async fn a_single_node_is_one_replica_owning_every_shard_and_cannot_be_drained()
     .unwrap();
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
-    let mut hs = HsProcess::serve(&config_path);
+    let mut hs = HsProcess::serve(&config_path, [listener]);
     let setup_line = hs.wait_for("setup_link=");
     let token = first_admin(&client, &base, &setup_line).await;
 
@@ -428,8 +418,13 @@ async fn a_replica_drained_through_another_hands_off_every_shard_stays_drained_a
         return;
     };
     let dir = tempfile::tempdir().unwrap();
-    let (port_a, port_b) = (reserve_port(), reserve_port());
-    let (mesh_a, mesh_b) = (reserve_port(), reserve_port());
+    let (listener_a, listener_b) = (hs_testkit::ports::reserve(), hs_testkit::ports::reserve());
+    let (mesh_listener_a, mesh_listener_b) = (
+        hs_testkit::ports::reserve_wildcard(),
+        hs_testkit::ports::reserve_wildcard(),
+    );
+    let (port_a, port_b) = (listener_a.port(), listener_b.port());
+    let (mesh_a, mesh_b) = (mesh_listener_a.port(), mesh_listener_b.port());
     let config_a = dir.path().join("a.yaml");
     let config_b = dir.path().join("b.yaml");
     std::fs::write(&config_a, replica_config(&db, dir.path(), port_a, mesh_a)).unwrap();
@@ -440,10 +435,19 @@ async fn a_replica_drained_through_another_hands_off_every_shard_stays_drained_a
     let client = reqwest::Client::new();
 
     // A first (it makes the signing key and the schema), then B.
-    let mut hs_a = HsProcess::serve(&config_a);
+    let mut hs_a = HsProcess::serve(&config_a, [listener_a, mesh_listener_a]);
     let setup_line = hs_a.wait_for("setup_link=");
     let token = first_admin(&client, &a, &setup_line).await;
-    let mut hs_b = HsProcess::serve(&config_b);
+    // B is restarted below on the same ports: the test keeps its sockets and hands each run a
+    // clone, so the ports are never released. Nothing is sent to B while it is down (it is
+    // drained, so nothing is forwarded to it).
+    let mut hs_b = HsProcess::serve(
+        &config_b,
+        [
+            listener_b.try_clone().unwrap(),
+            mesh_listener_b.try_clone().unwrap(),
+        ],
+    );
     hs_b.wait_for("listening");
 
     // Both active, and between them they own the whole layout.
@@ -565,7 +569,7 @@ async fn a_replica_drained_through_another_hands_off_every_shard_stays_drained_a
     );
     let listed = replicas(&client, &a, &token).await;
     assert_eq!(find(&listed, &id_b).unwrap()["status"], "drained");
-    let mut hs_b = HsProcess::serve(&config_b);
+    let mut hs_b = HsProcess::serve(&config_b, [listener_b, mesh_listener_b]);
     hs_b.wait_for("listening");
     eventually(
         Duration::from_secs(30),

@@ -1300,6 +1300,9 @@ async fn a_shared_offering_has_its_one_instance_from_the_start_and_heisenbridge_
     assert_eq!(registration["io.myelin.bridge_instance"], "_");
 
     // Run it for real when it is installed; otherwise a stand-in, so the machine still turns.
+    // Heisenbridge binds its port itself and cannot be handed a listener
+    // (`hs_testkit::ports`), so this one is still bound and released: only the run with
+    // heisenbridge installed can lose it.
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()

@@ -33,17 +33,23 @@ struct HsProcess {
 }
 
 impl HsProcess {
-    fn serve(config_path: &std::path::Path) -> Self {
+    /// Starts `hs serve`, handing it `listeners` still bound (`hs_testkit::ports::pass_to`).
+    fn serve(
+        config_path: &std::path::Path,
+        listeners: impl IntoIterator<Item = hs_testkit::ports::ReservedPort>,
+    ) -> Self {
         use std::io::BufRead;
-        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_hs"))
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_hs"));
+        command
             .args(["serve", "-c"])
             .arg(config_path)
             .env_remove("RUST_LOG")
             .env_remove("HS_DATA_DIR")
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-            .expect("the hs binary should start");
+            .stderr(std::process::Stdio::inherit());
+        hs_testkit::ports::pass_to(&mut command, listeners);
+        let mut child = command.spawn().expect("the hs binary should start");
+        drop(command);
         let stdout = child.stdout.take().unwrap();
         let (tx, lines) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -110,20 +116,11 @@ impl Drop for HsProcess {
     }
 }
 
-fn reserve_port() -> u16 {
-    static HANDED_OUT: Mutex<Vec<u16>> = Mutex::new(Vec::new());
-    loop {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let mut handed_out = HANDED_OUT.lock().unwrap();
-        if !handed_out.contains(&port) {
-            handed_out.push(port);
-            return port;
-        }
-    }
+/// A reserved port's listener (`hs_testkit::ports`) for a proxy to accept on.
+fn tokio_listener(reserved: hs_testkit::ports::ReservedPort) -> TcpListener {
+    let listener = reserved.into_listener();
+    listener.set_nonblocking(true).unwrap();
+    TcpListener::from_std(listener).unwrap()
 }
 
 fn config_yaml(
@@ -345,10 +342,13 @@ async fn measure_the_load_of_a_backfilled_federated_room_after_a_restart() {
     let ca_path = dir.path().join("ca.pem");
     std::fs::write(&ca_path, &tls.ca_pem).unwrap();
 
-    let a_port = reserve_port();
-    let a_tls_port = reserve_port();
-    let b_port = reserve_port();
-    let b_tls_port = reserve_port();
+    // Every port is held from here on and handed to whatever serves it (`hs_testkit::ports`).
+    let a_listener = hs_testkit::ports::reserve();
+    let a_tls_listener = hs_testkit::ports::reserve();
+    let b_listener = hs_testkit::ports::reserve();
+    let b_tls_listener = hs_testkit::ports::reserve();
+    let (a_port, a_tls_port) = (a_listener.port(), a_tls_listener.port());
+    let (b_port, b_tls_port) = (b_listener.port(), b_tls_listener.port());
     let a_name = format!("127.0.0.1:{a_tls_port}");
     let b_name = format!("127.0.0.1:{b_tls_port}");
     let a_base = format!("http://127.0.0.1:{a_port}");
@@ -366,18 +366,14 @@ async fn measure_the_load_of_a_backfilled_federated_room_after_a_restart() {
     )
     .unwrap();
 
-    let a_proxy = Proxy::start(
-        TcpListener::bind(("127.0.0.1", a_tls_port)).await.unwrap(),
-        tls.acceptor.clone(),
-        a_port,
-    );
+    let a_proxy = Proxy::start(tokio_listener(a_tls_listener), tls.acceptor.clone(), a_port);
     let b_proxy = Proxy::start(
-        TcpListener::bind(("127.0.0.1", b_tls_port)).await.unwrap(),
+        tokio_listener(b_tls_listener.try_clone().unwrap()),
         tls.acceptor.clone(),
         b_port,
     );
-    let mut a = HsProcess::serve(&a_config);
-    let mut b = HsProcess::serve(&b_config);
+    let mut a = HsProcess::serve(&a_config, [a_listener]);
+    let mut b = HsProcess::serve(&b_config, [b_listener.try_clone().unwrap()]);
     a.wait_for("listening");
     b.wait_for("listening");
 
@@ -458,14 +454,10 @@ async fn measure_the_load_of_a_backfilled_federated_room_after_a_restart() {
     b_proxy.stop();
     b.stop();
     let started = Instant::now();
-    let mut b = HsProcess::serve(&b_config);
+    let mut b = HsProcess::serve(&b_config, [b_listener]);
     b.wait_for("listening");
     println!("B restarted in {:.1}s", started.elapsed().as_secs_f64());
-    let _b_proxy = Proxy::start(
-        TcpListener::bind(("127.0.0.1", b_tls_port)).await.unwrap(),
-        tls.acceptor.clone(),
-        b_port,
-    );
+    let _b_proxy = Proxy::start(tokio_listener(b_tls_listener), tls.acceptor.clone(), b_port);
     let before = metrics(&b_base, &["hs_room_load_seconds_count"]).await;
     let started = Instant::now();
     let (status, page) = call(

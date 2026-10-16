@@ -28,14 +28,6 @@ use serde_json::{Value, json};
 const PASSWORD: &str = "sUp3rs3kr1t";
 const SHARED_SECRET: &str = "a-shared-secret-for-the-test";
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 /// One run of the real `hs` binary (the harness of `guest_access.rs`).
 struct HsProcess {
     child: std::process::Child,
@@ -44,17 +36,20 @@ struct HsProcess {
 }
 
 impl HsProcess {
-    fn serve(config_path: &std::path::Path) -> Self {
+    /// Starts `hs serve`, handing it `listener` still bound (`hs_testkit::ports::pass_to`).
+    fn serve(config_path: &std::path::Path, listener: hs_testkit::ports::ReservedPort) -> Self {
         use std::io::BufRead;
-        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_hs"))
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_hs"));
+        command
             .args(["serve", "-c"])
             .arg(config_path)
             .env_remove("RUST_LOG")
             .env_remove("HS_DATA_DIR")
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-            .expect("the hs binary should start");
+            .stderr(std::process::Stdio::inherit());
+        hs_testkit::ports::pass_to(&mut command, [listener]);
+        let mut child = command.spawn().expect("the hs binary should start");
+        drop(command);
         let stdout = child.stdout.take().unwrap();
         let (tx, lines) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -201,7 +196,8 @@ fn password_auth(user: &str, session: Option<&str>) -> Value {
 async fn sessions_bind_their_user_and_operation_and_registration_remembers_what_it_was_sent() {
     let siteverify = fake_captcha_service().await;
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
+    let listener = hs_testkit::ports::reserve();
+    let port = listener.port();
     let config_path = dir.path().join("hs.yaml");
     std::fs::write(
         &config_path,
@@ -219,7 +215,7 @@ async fn sessions_bind_their_user_and_operation_and_registration_remembers_what_
         ),
     )
     .unwrap();
-    let mut hs = HsProcess::serve(&config_path);
+    let mut hs = HsProcess::serve(&config_path, listener);
     hs.wait_for(&["setup_link="]);
     let nobody = Caller {
         base: format!("http://127.0.0.1:{port}"),

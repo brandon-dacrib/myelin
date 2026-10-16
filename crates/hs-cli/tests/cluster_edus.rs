@@ -21,22 +21,6 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-fn reserve_port() -> u16 {
-    static HANDED_OUT: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
-    loop {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let mut handed_out = HANDED_OUT.lock().unwrap();
-        if !handed_out.contains(&port) {
-            handed_out.push(port);
-            return port;
-        }
-    }
-}
-
 fn rand_suffix() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -155,11 +139,21 @@ fn single_config(port: u16, dir: &std::path::Path) -> hs_config::Config {
     hs_config::Config::from_yaml(&yaml).expect("the configuration parses")
 }
 
-async fn serve(config: hs_config::Config) -> hs_cli::serve::ServeHandle {
+/// Starts a server on `config`, handing it `reserved` (its listener, and a replica's mesh) still
+/// bound (`hs_testkit::ports`).
+async fn serve(
+    config: hs_config::Config,
+    reserved: impl IntoIterator<Item = hs_testkit::ports::ReservedPort>,
+) -> hs_cli::serve::ServeHandle {
     hs_cli::serve::spawn_serve(
         config,
         hs_cli::serve::ServeOptions {
             federation_scheme: Some("http"),
+            listeners: hs_cli::serve::PreboundListeners::new(
+                reserved
+                    .into_iter()
+                    .map(hs_testkit::ports::ReservedPort::into_listener),
+            ),
             ..Default::default()
         },
     )
@@ -249,20 +243,39 @@ async fn a_to_device_message_sent_through_a_replica_that_does_not_send_for_its_d
     };
     let dir = tempfile::tempdir().unwrap();
     let client = reqwest::Client::new();
-    let (port_1, port_2, port_b) = (reserve_port(), reserve_port(), reserve_port());
-    let (mesh_1, mesh_2) = (reserve_port(), reserve_port());
+    // Every port is reserved and handed to its server still bound (`hs_testkit::ports`); the
+    // mesh binds every interface, so its ports are reserved on the wildcard address.
+    let (listen_1, listen_2, listen_b) = (
+        hs_testkit::ports::reserve(),
+        hs_testkit::ports::reserve(),
+        hs_testkit::ports::reserve(),
+    );
+    let (mesh_listen_1, mesh_listen_2) = (
+        hs_testkit::ports::reserve_wildcard(),
+        hs_testkit::ports::reserve_wildcard(),
+    );
+    let (port_1, port_2, port_b) = (listen_1.port(), listen_2.port(), listen_b.port());
+    let (mesh_1, mesh_2) = (mesh_listen_1.port(), mesh_listen_2.port());
     let a_name = format!("127.0.0.1:{port_1}");
     let b_name = format!("127.0.0.1:{port_b}");
 
     // Replica 1 first (it makes the signing key and the schema), then replica 2.
-    let replica_1 = serve(replica_config(&db, dir.path(), &a_name, port_1, mesh_1)).await;
+    let replica_1 = serve(
+        replica_config(&db, dir.path(), &a_name, port_1, mesh_1),
+        [listen_1, mesh_listen_1],
+    )
+    .await;
     let setup_link = replica_1
         .setup_link
         .clone()
         .expect("a fresh server offers a setup link");
-    let replica_2 = serve(replica_config(&db, dir.path(), &a_name, port_2, mesh_2)).await;
+    let replica_2 = serve(
+        replica_config(&db, dir.path(), &a_name, port_2, mesh_2),
+        [listen_2, mesh_listen_2],
+    )
+    .await;
     let b_dir = tempfile::tempdir().unwrap();
-    let b = serve(single_config(port_b, b_dir.path())).await;
+    let b = serve(single_config(port_b, b_dir.path()), [listen_b]).await;
     let bases = [
         (format!("127.0.0.1:{mesh_1}"), replica_1.base_url()),
         (format!("127.0.0.1:{mesh_2}"), replica_2.base_url()),

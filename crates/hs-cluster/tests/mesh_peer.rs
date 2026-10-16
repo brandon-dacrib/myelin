@@ -52,13 +52,10 @@ impl PeerHandler for Recording {
 
 /// Starts a mesh server on a free loopback port and returns its address plus a shutdown handle.
 async fn serve(peers: Option<Arc<dyn PeerHandler>>) -> (String, watch::Sender<bool>) {
-    // Reserve a port the same way the rest of this workspace's tests do: bind to 0, read the
-    // port back, release it, and hand the address to the server. The window in which another
-    // process could take it is real and small.
-    let addr = {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        probe.local_addr().unwrap().to_string()
-    };
+    // Bind port 0, read the port back and hand the bound listener to the server: releasing it
+    // for the server to bind again would let another process take it in between.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
     let deps = Arc::new(MeshDeps {
         authenticator: Arc::new(SharedSecretAuthenticator::new(SECRET)),
         ownership: SingleNode::new(ReplicaId::new(addr.clone())),
@@ -68,7 +65,9 @@ async fn serve(peers: Option<Arc<dyn PeerHandler>>) -> (String, watch::Sender<bo
         nudge: None,
         peers,
     });
-    let server = MeshServer::new(addr.clone(), None).unwrap();
+    let server = MeshServer::new(addr.clone(), None)
+        .unwrap()
+        .with_listener(listener);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
         server.serve(deps, shutdown_rx).await.unwrap();

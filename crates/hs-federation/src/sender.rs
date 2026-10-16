@@ -3303,9 +3303,11 @@ mod tests {
     #[tokio::test]
     async fn what_was_queued_is_sent_by_the_next_sender_over_the_same_store_in_order() {
         // A port nothing listens on yet: the first sender's attempts fail at connect.
-        let reserved = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        // Bound but not listening: a connection to it is refused, as to a server that is down,
+        // and nothing else can take the port before the destination comes up on it.
+        let reserved = tokio::net::TcpSocket::new_v4().unwrap();
+        reserved.bind((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
         let port = reserved.local_addr().unwrap().port();
-        drop(reserved);
         let destination = format!("localhost:{port}");
         let backend = MemoryBackend::new();
         let store: Arc<dyn OutboundStore> =
@@ -3337,9 +3339,7 @@ mod tests {
 
         // The destination comes up; a new sender over the same backend is the restart.
         let peer = FakeFederationPeer::new("peer.example.org");
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))
-            .await
-            .unwrap();
+        let listener = reserved.listen(1024).unwrap();
         spawn_peer_on(&peer, listener);
         let second = FederationSender::with_store(
             client(),
@@ -3731,9 +3731,11 @@ mod tests {
     /// one transaction -- and then, out of catch-up, ordinary delivery resumes.
     #[tokio::test]
     async fn a_destination_down_past_its_queue_bound_gets_each_rooms_latest_event_then_its_queue() {
-        let reserved = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        // Bound but not listening: a connection to it is refused, as to a server that is down,
+        // and nothing else can take the port before the destination comes up on it.
+        let reserved = tokio::net::TcpSocket::new_v4().unwrap();
+        reserved.bind((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
         let port = reserved.local_addr().unwrap().port();
-        drop(reserved);
         let destination = format!("localhost:{port}");
         let store: Arc<dyn OutboundStore> = Arc::new(InMemoryOutboundStore::new());
         let sender = FederationSender::with_store(
@@ -3787,9 +3789,7 @@ mod tests {
 
         // The destination comes up.
         let peer = FakeFederationPeer::new("peer.example.org");
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))
-            .await
-            .unwrap();
+        let listener = reserved.listen(1024).unwrap();
         spawn_peer_on(&peer, listener);
         assert!(
             wait_for(Duration::from_secs(10), || store
@@ -3911,9 +3911,11 @@ mod tests {
     /// notice queued before the restart is gone with the process, as it should be.
     #[tokio::test]
     async fn durable_edus_survive_a_restart_and_wait_for_a_destination_that_is_down() {
-        let reserved = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        // Bound but not listening: a connection to it is refused, as to a server that is down,
+        // and nothing else can take the port before the destination comes up on it.
+        let reserved = tokio::net::TcpSocket::new_v4().unwrap();
+        reserved.bind((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
         let port = reserved.local_addr().unwrap().port();
-        drop(reserved);
         let destination = format!("localhost:{port}");
         let backend = MemoryBackend::new();
         let store: Arc<dyn OutboundStore> =
@@ -3954,9 +3956,7 @@ mod tests {
         );
 
         let peer = FakeFederationPeer::new("peer.example.org");
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))
-            .await
-            .unwrap();
+        let listener = reserved.listen(1024).unwrap();
         spawn_peer_on(&peer, listener);
         let second = FederationSender::with_store(
             client(),

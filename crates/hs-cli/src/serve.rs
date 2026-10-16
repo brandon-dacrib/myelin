@@ -180,6 +180,115 @@ pub struct ServeOptions {
     /// name to resolve to addresses of its choosing -- an unreachable IPv6 one beside a
     /// listener of its own, say -- sets its own; nothing in a configuration file can.
     pub federation_resolvers: Option<FederationResolvers>,
+    /// Listeners already bound by whoever starts the server, served in place of binding the
+    /// configured address again ([`PreboundListeners`]). Empty (the default) binds every
+    /// configured listener, which is what `hs serve` does unless it was handed sockets in
+    /// [`INHERITED_LISTENERS_ENV`].
+    pub listeners: PreboundListeners,
+}
+
+/// The environment variable through which `hs serve` is handed listening sockets its parent
+/// already bound: a comma-separated list of the inherited file descriptors' numbers. Each must
+/// be an open, listening TCP socket; it is served in place of binding the configured listener
+/// (or the cluster mesh listener) whose address it is bound to. Unix only.
+///
+/// This is how a test starts the real binary on a port it reserved without ever releasing the
+/// port: `hs-testkit`'s `ports` module binds port 0, writes the port into the configuration,
+/// and passes the bound socket to the child. Binding, releasing and having `hs` bind the port
+/// again let another process take it in between, and under a loaded test run it did (`Bind {
+/// addr: "127.0.0.1:39139", .. AddrInUse }`).
+pub const INHERITED_LISTENERS_ENV: &str = "HS_INHERITED_LISTENER_FDS";
+
+/// Listening sockets bound before the server started, each served in place of binding the
+/// configured listener whose address it is bound to: see [`ServeOptions::listeners`].
+///
+/// A listener is matched by its exact local address (`127.0.0.1:8008` serves a listener
+/// configured as `127.0.0.1` on port 8008; one bound to `0.0.0.0:8449` serves the cluster mesh
+/// on port 8449) and is taken once; one that matches nothing is closed when the server stops.
+/// Cloning shares the same set, which is what lets [`ServeOptions`] stay `Clone`.
+#[derive(Clone, Default)]
+pub struct PreboundListeners(Arc<std::sync::Mutex<Vec<std::net::TcpListener>>>);
+
+impl PreboundListeners {
+    /// The given listeners, to be matched against the configuration by local address.
+    pub fn new(listeners: impl IntoIterator<Item = std::net::TcpListener>) -> Self {
+        Self(Arc::new(std::sync::Mutex::new(
+            listeners.into_iter().collect(),
+        )))
+    }
+
+    /// The listening sockets named in [`INHERITED_LISTENERS_ENV`], if it is set; none if not.
+    ///
+    /// # Errors
+    /// The variable is set but is not a list of descriptor numbers, or one of them is not an
+    /// open, listening TCP socket, or (not Unix) it is set at all.
+    pub fn inherited() -> Result<Self, InheritedListenersError> {
+        match std::env::var(INHERITED_LISTENERS_ENV) {
+            Ok(value) => Ok(Self::new(crate::inherited_listeners::adopt(&value)?)),
+            Err(std::env::VarError::NotPresent) => Ok(Self::default()),
+            Err(std::env::VarError::NotUnicode(_)) => Err(InheritedListenersError::NotANumber(
+                "(not valid UTF-8)".to_owned(),
+            )),
+        }
+    }
+
+    /// Takes the listener bound to exactly `addr`, if there is one.
+    pub(crate) fn take(&self, addr: SocketAddr) -> Option<std::net::TcpListener> {
+        let mut listeners = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let index = listeners
+            .iter()
+            .position(|listener| listener.local_addr().is_ok_and(|bound| bound == addr))?;
+        Some(listeners.swap_remove(index))
+    }
+
+    /// How many are left untaken.
+    pub fn len(&self) -> usize {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    /// Whether none are left untaken.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl std::fmt::Debug for PreboundListeners {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let listeners = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f.debug_list()
+            .entries(listeners.iter().filter_map(|l| l.local_addr().ok()))
+            .finish()
+    }
+}
+
+/// Why the sockets in [`INHERITED_LISTENERS_ENV`] could not be adopted.
+#[derive(Debug, thiserror::Error)]
+pub enum InheritedListenersError {
+    /// An entry is not a descriptor number this process could have inherited (below 3 is
+    /// standard input, output or error).
+    #[error("{INHERITED_LISTENERS_ENV}: {0:?} is not an inherited descriptor number")]
+    NotANumber(String),
+    /// The descriptor is not an open, listening TCP socket.
+    #[error("{INHERITED_LISTENERS_ENV}: descriptor {fd} is not a listening TCP socket: {source}")]
+    NotAListener {
+        /// The descriptor.
+        fd: i32,
+        /// What checking it found.
+        #[source]
+        source: std::io::Error,
+    },
+    /// Inheriting listeners is implemented on Unix only.
+    #[error("{INHERITED_LISTENERS_ENV} is set, but inheriting listeners needs Unix")]
+    Unsupported,
 }
 
 /// The SRV and A/AAAA resolvers server discovery uses: see
@@ -200,6 +309,7 @@ impl std::fmt::Debug for ServeOptions {
             .field("media_bulk_pause", &self.media_bulk_pause)
             .field("live_config", &self.live_config.is_some())
             .field("federation_resolvers", &self.federation_resolvers.is_some())
+            .field("listeners", &self.listeners)
             .finish()
     }
 }
@@ -2636,7 +2746,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     // The mesh listener replays a forwarded request against this exact router (see
     // `crate::cluster::ClusterHandles::spawn_mesh`'s doc comment): a `None` in single-node mode,
     // where nothing should ever dial in.
-    let mesh = cluster_handles.spawn_mesh(app.clone());
+    let mesh = cluster_handles.spawn_mesh(app.clone(), &options.listeners);
     let cluster = cluster_handles.cluster.clone();
 
     if let Some(path) = &options.routes_manifest_path {
@@ -2662,12 +2772,17 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
                         "not a valid socket address",
                     ),
                 })?;
-            let tcp = TcpListener::bind(socket_addr)
-                .await
-                .map_err(|source| ServeError::Bind {
-                    addr: addr_str.clone(),
-                    source,
-                })?;
+            let tcp = match options.listeners.take(socket_addr) {
+                // Bound already by whoever started the server (`PreboundListeners`).
+                Some(listener) => listener
+                    .set_nonblocking(true)
+                    .and_then(|()| TcpListener::from_std(listener)),
+                None => TcpListener::bind(socket_addr).await,
+            }
+            .map_err(|source| ServeError::Bind {
+                addr: addr_str.clone(),
+                source,
+            })?;
             let actual_addr = tcp.local_addr().map_err(|source| ServeError::Bind {
                 addr: addr_str.clone(),
                 source,
@@ -2702,6 +2817,13 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         }
     }
 
+    if !options.listeners.is_empty() {
+        tracing::warn!(
+            unmatched = ?options.listeners,
+            "listeners were handed to this server already bound, and some match no configured \
+             listener address or the mesh's; they are not served"
+        );
+    }
     let addrs: Vec<SocketAddr> = listeners.iter().map(|(_, addr, _)| *addr).collect();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -2982,47 +3104,67 @@ mod tests {
         });
     }
 
+    /// A configuration whose one listener is on a loopback port the system picked, and that
+    /// port's listener, still bound, to hand to the server ([`ServeOptions::listeners`]).
+    ///
     /// `hs-config` itself rejects `port: 0` (`ListenersConfig::validate`: "0 is not a bindable
-    /// port; choose an explicit port") since it is meaningful for a real deployment to reject —
-    /// an operator who wrote `port: 0` almost certainly meant to write a real port. Tests still
-    /// want an OS-assigned ephemeral port, so this reserves one the same way the OS would (bind
-    /// to `127.0.0.1:0`, read back the assigned port, then release it) and hands that concrete
-    /// port number to `hs-config`. This has an unavoidable, harmless TOCTOU race against another
-    /// process grabbing the same port before `spawn_serve` rebinds it; acceptable for a test.
-    fn reserve_ephemeral_port() -> u16 {
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
-    }
-
+    /// port; choose an explicit port"), so the port is picked by binding `127.0.0.1:0`; the
+    /// listener is kept rather than released for the server to bind again, which would let
+    /// another process take the port in between.
+    ///
     /// Each test needs its own embedded storage directory: `hs-config`'s default (`./data`) is
     /// shared across the whole process, and Fjall exclusively locks its data directory, so two
     /// tests opening it concurrently would collide. The returned `TempDir` must be kept alive
     /// (its `Drop` removes the directory) for as long as the server using it is running.
-    fn test_config(port: u16) -> (hs_config::Config, tempfile::TempDir) {
+    fn test_config() -> (hs_config::Config, tempfile::TempDir, PreboundListeners) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
         let dir = tempfile::tempdir().unwrap();
         let yaml = format!(
             "server:\n  server_name: example.org\nlisteners:\n  listeners:\n    - port: {port}\n      bind_addresses: [\"127.0.0.1\"]\n      resources: [client, health, metrics]\nauth:\n  enable_registration: true\nstorage:\n  backend: embedded\n  data_dir: {:?}\n",
             dir.path()
         );
-        (hs_config::Config::from_yaml(&yaml).unwrap(), dir)
+        (
+            hs_config::Config::from_yaml(&yaml).unwrap(),
+            dir,
+            PreboundListeners::new([listener]),
+        )
     }
 
     #[tokio::test]
-    async fn binds_an_ephemeral_port_and_reports_it() {
-        let (config, _dir) = test_config(reserve_ephemeral_port());
-        let handle = spawn_serve(config, ServeOptions::default()).await.unwrap();
-        assert_eq!(handle.addrs.len(), 1);
-        assert_ne!(handle.addrs[0].port(), 0);
+    async fn serves_the_listener_it_was_handed_and_reports_it() {
+        let (config, _dir, listeners) = test_config();
+        let port = config.listeners.listeners[0].port;
+        let handle = spawn_serve(
+            config,
+            ServeOptions {
+                listeners: listeners.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(handle.addrs, [SocketAddr::from(([127, 0, 0, 1], port))]);
+        assert!(listeners.is_empty(), "the handed listener was taken");
+        let live = reqwest::get(format!("{}/health/live", handle.base_url()))
+            .await
+            .unwrap();
+        assert_eq!(live.status(), reqwest::StatusCode::OK);
         handle.shutdown().await;
     }
 
     #[tokio::test]
     async fn health_live_and_ready_respond_ok() {
-        let (config, _dir) = test_config(reserve_ephemeral_port());
-        let handle = spawn_serve(config, ServeOptions::default()).await.unwrap();
+        let (config, _dir, listeners) = test_config();
+        let handle = spawn_serve(
+            config,
+            ServeOptions {
+                listeners,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         let base = handle.base_url();
         let client = reqwest::Client::new();
         let live = client
@@ -3045,8 +3187,16 @@ mod tests {
     /// and ordinary requests are untouched: the process is not broken, it is leaving.
     #[tokio::test]
     async fn readiness_is_withdrawn_before_anything_else_stops() {
-        let (config, _dir) = test_config(reserve_ephemeral_port());
-        let handle = spawn_serve(config, ServeOptions::default()).await.unwrap();
+        let (config, _dir, listeners) = test_config();
+        let handle = spawn_serve(
+            config,
+            ServeOptions {
+                listeners,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         let base = handle.base_url();
         let client = reqwest::Client::new();
 
@@ -3076,8 +3226,16 @@ mod tests {
 
     #[tokio::test]
     async fn metrics_endpoint_serves_prometheus_text_and_has_data_after_traffic() {
-        let (config, _dir) = test_config(reserve_ephemeral_port());
-        let handle = spawn_serve(config, ServeOptions::default()).await.unwrap();
+        let (config, _dir, listeners) = test_config();
+        let handle = spawn_serve(
+            config,
+            ServeOptions {
+                listeners,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         let base = handle.base_url();
         let client = reqwest::Client::new();
 
@@ -3109,8 +3267,16 @@ mod tests {
 
     #[tokio::test]
     async fn versions_endpoint_responds_with_supported_versions_and_empty_features_by_default() {
-        let (config, _dir) = test_config(reserve_ephemeral_port());
-        let handle = spawn_serve(config, ServeOptions::default()).await.unwrap();
+        let (config, _dir, listeners) = test_config();
+        let handle = spawn_serve(
+            config,
+            ServeOptions {
+                listeners,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         let base = handle.base_url();
         let res = reqwest::get(format!("{base}/_matrix/client/versions"))
             .await
@@ -3124,7 +3290,7 @@ mod tests {
 
     #[tokio::test]
     async fn versions_endpoint_reflects_capabilities_config_overrides() {
-        let (mut config, _dir) = test_config(reserve_ephemeral_port());
+        let (config, _dir, listeners) = test_config();
         let capabilities_dir = tempfile::tempdir().unwrap();
         let capabilities_path = capabilities_dir.path().join("capabilities.yaml");
         std::fs::write(
@@ -3132,14 +3298,12 @@ mod tests {
             "unstable_features:\n  org.matrix.msc9999: true\n",
         )
         .unwrap();
-        // Reuse the same listener/storage config, just swap in a fresh port to avoid clashing
-        // with other tests that might still be shutting down.
-        config.listeners.listeners[0].port = reserve_ephemeral_port();
 
         let handle = spawn_serve(
             config,
             ServeOptions {
                 capabilities_config: Some(capabilities_path),
+                listeners,
                 ..Default::default()
             },
         )
@@ -3159,8 +3323,16 @@ mod tests {
 
     #[tokio::test]
     async fn capabilities_endpoint_is_mounted_under_v3_and_r0() {
-        let (config, _dir) = test_config(reserve_ephemeral_port());
-        let handle = spawn_serve(config, ServeOptions::default()).await.unwrap();
+        let (config, _dir, listeners) = test_config();
+        let handle = spawn_serve(
+            config,
+            ServeOptions {
+                listeners,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         let base = handle.base_url();
         let client = reqwest::Client::new();
         for prefix in ["v3", "r0"] {
@@ -3179,13 +3351,14 @@ mod tests {
 
     #[tokio::test]
     async fn routes_manifest_is_written_when_a_path_is_given() {
-        let (config, _dir) = test_config(reserve_ephemeral_port());
+        let (config, _dir, listeners) = test_config();
         let out_dir = tempfile::tempdir().unwrap();
         let manifest_path = out_dir.path().join("routes.json");
         let handle = spawn_serve(
             config,
             ServeOptions {
                 routes_manifest_path: Some(manifest_path.clone()),
+                listeners,
                 ..Default::default()
             },
         )

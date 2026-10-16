@@ -24,17 +24,20 @@ struct HsProcess {
 }
 
 impl HsProcess {
-    fn serve(config_path: &std::path::Path) -> Self {
+    /// Starts `hs serve`, handing it `listener` still bound (`hs_testkit::ports::pass_to`).
+    fn serve(config_path: &std::path::Path, listener: hs_testkit::ports::ReservedPort) -> Self {
         use std::io::BufRead;
-        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_hs"))
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_hs"));
+        command
             .args(["serve", "-c"])
             .arg(config_path)
             .env_remove("RUST_LOG")
             .env_remove("HS_DATA_DIR")
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-            .expect("the hs binary should start");
+            .stderr(std::process::Stdio::inherit());
+        hs_testkit::ports::pass_to(&mut command, [listener]);
+        let mut child = command.spawn().expect("the hs binary should start");
+        drop(command);
         let stdout = child.stdout.take().unwrap();
         let (tx, lines) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -103,15 +106,6 @@ impl Drop for HsProcess {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
-}
-
-/// A port for a server started from a configuration file, which has to name one.
-fn reserve_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 fn config_yaml(
@@ -489,7 +483,8 @@ async fn a_bridge_is_sent_ephemeral_data_once_across_a_restart_and_not_while_pau
     let (bridge_url, bridge) = stand_in().await;
     let registration_path = dir.path().join("registration.yaml");
     std::fs::write(&registration_path, registration_yaml(&bridge_url)).unwrap();
-    let port = reserve_port();
+    let listener = hs_testkit::ports::reserve();
+    let port = listener.port();
     let data_dir = dir.path().join("data");
     let config_path = dir.path().join("hs.yaml");
     std::fs::write(
@@ -500,7 +495,11 @@ async fn a_bridge_is_sent_ephemeral_data_once_across_a_restart_and_not_while_pau
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
 
-    let mut server = HsProcess::serve(&config_path);
+    let mut server = HsProcess::serve(
+        &config_path,
+        // Kept here and cloned to each start: the restart below serves the same port.
+        listener.try_clone().unwrap(),
+    );
     // The setup link is logged once the server is listening.
     let admin_token = admin_token_of(&mut server, &client, &base).await;
     let admin = Caller {
@@ -822,7 +821,7 @@ async fn a_bridge_is_sent_ephemeral_data_once_across_a_restart_and_not_while_pau
         first_log.contains("delivered a transaction to an appservice"),
         "{first_log}"
     );
-    let mut server = HsProcess::serve(&config_path);
+    let mut server = HsProcess::serve(&config_path, listener);
     server.wait_for("listening");
     // Long enough for a pump that resends to have done so: the poll is every 250 ms.
     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -958,7 +957,8 @@ async fn a_bridge_device_made_without_keys_is_told_it_has_none() {
         ),
     )
     .unwrap();
-    let port = reserve_port();
+    let listener = hs_testkit::ports::reserve();
+    let port = listener.port();
     let data_dir = dir.path().join("data");
     let config_path = dir.path().join("hs.yaml");
     std::fs::write(
@@ -968,7 +968,7 @@ async fn a_bridge_device_made_without_keys_is_told_it_has_none() {
     .unwrap();
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
-    let mut server = HsProcess::serve(&config_path);
+    let mut server = HsProcess::serve(&config_path, listener);
     let _ = admin_token_of(&mut server, &client, &base).await;
 
     let alice = register(&client, &base, "alice").await;
@@ -1072,7 +1072,8 @@ async fn a_legacy_bridge_bots_left_behind_device_is_removed_and_no_longer_counte
     let (bridge_url, bridge) = stand_in().await;
     let registration_path = dir.path().join("registration.yaml");
     std::fs::write(&registration_path, registration_yaml(&bridge_url)).unwrap();
-    let port = reserve_port();
+    let listener = hs_testkit::ports::reserve();
+    let port = listener.port();
     let data_dir = dir.path().join("data");
     let config_path = dir.path().join("hs.yaml");
     std::fs::write(
@@ -1082,7 +1083,7 @@ async fn a_legacy_bridge_bots_left_behind_device_is_removed_and_no_longer_counte
     .unwrap();
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
-    let mut server = HsProcess::serve(&config_path);
+    let mut server = HsProcess::serve(&config_path, listener);
     let _ = admin_token_of(&mut server, &client, &base).await;
 
     let alice = register(&client, &base, "alice").await;
@@ -1290,7 +1291,8 @@ async fn a_bot_device_signed_by_a_replaced_identity_is_signed_by_the_new_one() {
         ),
     )
     .unwrap();
-    let port = reserve_port();
+    let listener = hs_testkit::ports::reserve();
+    let port = listener.port();
     let data_dir = dir.path().join("data");
     let config_path = dir.path().join("hs.yaml");
     std::fs::write(
@@ -1300,7 +1302,7 @@ async fn a_bot_device_signed_by_a_replaced_identity_is_signed_by_the_new_one() {
     .unwrap();
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
-    let mut server = HsProcess::serve(&config_path);
+    let mut server = HsProcess::serve(&config_path, listener);
     let _ = admin_token_of(&mut server, &client, &base).await;
 
     let registered: Value = client

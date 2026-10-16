@@ -17,7 +17,7 @@ Use Rust edition 2024 and `rustfmt` defaults (four-space indentation). Crate nam
 
 ## Testing Guidelines
 
-Add focused tests with behavior changes. Rust crate tests and integration tests under `crates/*/tests/` use the shared `hs-testkit` where appropriate. UI unit and component tests use Vitest, Testing Library, and MSW; browser flows use Playwright. No numeric coverage threshold is documented. For protocol changes, consult the relevant harness in `tests/` and update the corresponding `docs/status/` entry with verified results.
+Add focused tests with behavior changes. Rust crate tests and integration tests under `crates/*/tests/` use the shared `hs-testkit` where appropriate. A test that starts a server never binds port 0, drops the listener and hands the number on (another process can take it in between; that was the `AddrInUse` flake): reserve with `hs_testkit::ports::reserve()` and hand the bound listener over, through `ServeOptions::listeners` in process or `hs_testkit::ports::pass_to` for the `hs` binary. UI unit and component tests use Vitest, Testing Library, and MSW; browser flows use Playwright. No numeric coverage threshold is documented. For protocol changes, consult the relevant harness in `tests/` and update the corresponding `docs/status/` entry with verified results.
 
 ## Commit & Pull Request Guidelines
 

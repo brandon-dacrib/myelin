@@ -50,25 +50,6 @@ fn test_config(port: u16, data_dir: &std::path::Path) -> hs_config::Config {
     config
 }
 
-/// A port for a server that is started as a *subprocess* from a configuration file, which has
-/// to name one. Never the same port twice in this test process, whatever the kernel hands out;
-/// another process on the machine taking it in the gap remains possible, and rare.
-fn reserve_ephemeral_port() -> u16 {
-    static HANDED_OUT: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
-    loop {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let mut handed_out = HANDED_OUT.lock().unwrap();
-        if !handed_out.contains(&port) {
-            handed_out.push(port);
-            return port;
-        }
-    }
-}
-
 /// `GET /sync` until `wanted` is true of the response, or a few seconds have passed. A room's
 /// membership rows and feed entries are written by the session hub off a background stream, so
 /// a sync sent the instant after a join or an invitation can honestly come back without it; a
@@ -1311,17 +1292,20 @@ struct HsProcess {
 }
 
 impl HsProcess {
-    fn serve(config_path: &std::path::Path) -> Self {
+    /// Starts `hs serve`, handing it `listener` still bound (`hs_testkit::ports::pass_to`).
+    fn serve(config_path: &std::path::Path, listener: hs_testkit::ports::ReservedPort) -> Self {
         use std::io::BufRead;
-        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_hs"))
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_hs"));
+        command
             .args(["serve", "-c"])
             .arg(config_path)
             .env_remove("RUST_LOG")
             .env_remove("HS_DATA_DIR")
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-            .expect("the hs binary should start");
+            .stderr(std::process::Stdio::inherit());
+        hs_testkit::ports::pass_to(&mut command, [listener]);
+        let mut child = command.spawn().expect("the hs binary should start");
+        drop(command);
         let stdout = child.stdout.take().unwrap();
         let (tx, lines) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -1391,7 +1375,10 @@ impl Drop for HsProcess {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_real_binary_logs_the_same_setup_link_until_it_is_used_and_never_after() {
     let dir = tempfile::tempdir().unwrap();
-    let port = reserve_ephemeral_port();
+    // Kept for the whole test, a clone handed to each start: the port is never released, so
+    // the restart gets it back (nothing here asks for the server while it is down).
+    let reserved = hs_testkit::ports::reserve();
+    let port = reserved.port();
     let config_path = dir.path().join("homeserver.yaml");
     std::fs::write(
         &config_path,
@@ -1401,7 +1388,7 @@ async fn the_real_binary_logs_the_same_setup_link_until_it_is_used_and_never_aft
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
 
-    let mut first = HsProcess::serve(&config_path);
+    let mut first = HsProcess::serve(&config_path, reserved.try_clone().unwrap());
     let line = first.wait_for("setup_link=");
     assert!(
         line.contains("WARN"),
@@ -1421,7 +1408,7 @@ async fn the_real_binary_logs_the_same_setup_link_until_it_is_used_and_never_aft
 
     // A restart before anybody has used it: yesterday's link still works, because it is the
     // same link.
-    let mut second = HsProcess::serve(&config_path);
+    let mut second = HsProcess::serve(&config_path, reserved.try_clone().unwrap());
     let line = second.wait_for("setup_link=");
     assert!(
         line.contains(&token),
@@ -1442,7 +1429,7 @@ async fn the_real_binary_logs_the_same_setup_link_until_it_is_used_and_never_aft
     );
 
     // And now there is an administrator, so there is no offer and nothing to log.
-    let mut third = HsProcess::serve(&config_path);
+    let mut third = HsProcess::serve(&config_path, reserved.try_clone().unwrap());
     third.wait_for("listening");
     assert!(!needs_setup(&client, &base).await);
     let log = third.stop();
@@ -1472,7 +1459,8 @@ fn hs_recover(signing_key: &std::path::Path, server_url: &str) -> std::process::
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hs_recover_gets_a_locked_out_administrator_back_in_with_the_real_binary() {
     let dir = tempfile::tempdir().unwrap();
-    let port = reserve_ephemeral_port();
+    let reserved = hs_testkit::ports::reserve();
+    let port = reserved.port();
     let data_dir = dir.path().join("data");
     let keys = dir.path().join("keys");
     let config_path = dir.path().join("homeserver.yaml");
@@ -1490,7 +1478,7 @@ async fn hs_recover_gets_a_locked_out_administrator_back_in_with_the_real_binary
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
 
-    let mut server = HsProcess::serve(&config_path);
+    let mut server = HsProcess::serve(&config_path, reserved);
     let line = server.wait_for("setup_link=");
     let setup_link = line.split_once("setup_link=").unwrap().1;
     let setup_token: String = setup_token_of(setup_link)
@@ -2237,7 +2225,10 @@ async fn a_bridge_is_sent_what_happens_in_a_room_its_bot_is_in_even_across_a_res
         ),
     )
     .unwrap();
-    let port = reserve_ephemeral_port();
+    // Kept for the whole test, a clone handed to each start: the port is never released, so
+    // the restart gets it back (nothing here asks for the server while it is down).
+    let reserved = hs_testkit::ports::reserve();
+    let port = reserved.port();
     let config_path = dir.path().join("homeserver.yaml");
     std::fs::write(
         &config_path,
@@ -2248,7 +2239,7 @@ async fn a_bridge_is_sent_what_happens_in_a_room_its_bot_is_in_even_across_a_res
         ),
     )
     .unwrap();
-    let mut server = HsProcess::serve(&config_path);
+    let mut server = HsProcess::serve(&config_path, reserved.try_clone().unwrap());
     server.wait_for("listening");
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
@@ -2416,7 +2407,7 @@ async fn a_bridge_is_sent_what_happens_in_a_room_its_bot_is_in_even_across_a_res
     // said the moment it is up, before anything but the pump's own catch-up has had a chance
     // to nudge the bridge's worker.
     server.stop();
-    let mut server = HsProcess::serve(&config_path);
+    let mut server = HsProcess::serve(&config_path, reserved.try_clone().unwrap());
     server.wait_for("listening");
     say("said just after the restart", "t3").await;
     let mut waited = 0;
@@ -2455,7 +2446,10 @@ async fn a_bridge_is_sent_what_happens_in_a_room_its_bot_is_in_even_across_a_res
 #[tokio::test]
 async fn after_a_restart_a_message_in_an_old_room_still_reaches_the_other_person() {
     let dir = tempfile::tempdir().unwrap();
-    let port = reserve_ephemeral_port();
+    // Kept for the whole test, a clone handed to each start: the port is never released, so
+    // the restart gets it back (nothing here asks for the server while it is down).
+    let reserved = hs_testkit::ports::reserve();
+    let port = reserved.port();
     let config_path = dir.path().join("homeserver.yaml");
     std::fs::write(
         &config_path,
@@ -2486,7 +2480,7 @@ async fn after_a_restart_a_message_in_an_old_room_still_reaches_the_other_person
         }
     };
 
-    let mut server = HsProcess::serve(&config_path);
+    let mut server = HsProcess::serve(&config_path, reserved.try_clone().unwrap());
     server.wait_for("listening");
     let mut tokens = Vec::new();
     for name in ["old-alice", "old-bob"] {
@@ -2528,7 +2522,7 @@ async fn after_a_restart_a_message_in_an_old_room_still_reaches_the_other_person
     let since = synced["next_batch"].as_str().unwrap().to_owned();
 
     server.stop();
-    let mut server = HsProcess::serve(&config_path);
+    let mut server = HsProcess::serve(&config_path, reserved.try_clone().unwrap());
     server.wait_for("listening");
 
     call(
@@ -3715,14 +3709,17 @@ async fn an_administrator_can_find_quarantine_protect_and_delete_uploaded_media(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn receipts_and_presence_are_still_there_after_a_restart_of_the_real_binary() {
     let dir = tempfile::tempdir().unwrap();
-    let port = reserve_ephemeral_port();
+    // Kept for the whole test, a clone handed to each start: the port is never released, so
+    // the restart gets it back (nothing here asks for the server while it is down).
+    let reserved = hs_testkit::ports::reserve();
+    let port = reserved.port();
     let config_path = dir.path().join("homeserver.yaml");
     std::fs::write(
         &config_path,
         test_config_yaml(port, &dir.path().join("data")),
     )
     .unwrap();
-    let mut server = HsProcess::serve(&config_path);
+    let mut server = HsProcess::serve(&config_path, reserved.try_clone().unwrap());
     server.wait_for("listening");
     let base = format!("http://127.0.0.1:{port}");
 
@@ -3857,7 +3854,7 @@ async fn receipts_and_presence_are_still_there_after_a_restart_of_the_real_binar
 
     let log = server.stop();
     assert!(log.contains("listening"), "{log}");
-    let mut server = HsProcess::serve(&config_path);
+    let mut server = HsProcess::serve(&config_path, reserved.try_clone().unwrap());
     server.wait_for("listening");
 
     // An initial sync on the new process: the read receipt (public to alice, and bob's own

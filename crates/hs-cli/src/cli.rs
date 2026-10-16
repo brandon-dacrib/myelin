@@ -927,6 +927,16 @@ async fn run_register(args: &RegisterArgs) -> i32 {
 async fn run_serve(args: &ServeArgs) -> i32 {
     // The boot is timed from here to every listener bound (`crate::boot`).
     let boot_started = std::time::Instant::now();
+    // Listening sockets the parent bound and passed down (`crate::serve::INHERITED_LISTENERS_ENV`),
+    // adopted first, so they are close-on-exec again before anything this process starts could
+    // inherit them.
+    let listeners = match crate::serve::PreboundListeners::inherited() {
+        Ok(listeners) => listeners,
+        Err(e) => {
+            eprintln!("hs serve: {e}");
+            return 1;
+        }
+    };
     let source = if let Some(synapse_path) = &args.synapse_config {
         match crate::synapse_serve::load_synapse_config(
             synapse_path,
@@ -1072,6 +1082,7 @@ async fn run_serve(args: &ServeArgs) -> i32 {
         media_bulk_pause: std::time::Duration::ZERO,
         live_config: Some(live_config),
         federation_resolvers: None,
+        listeners,
     };
     let setup_link_hint =
         crate::serve::setup_link_host_hint(config.server.public_baseurl.as_deref());

@@ -18,7 +18,9 @@ use std::time::{Duration, Instant};
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 
-fn reserve_port() -> u16 {
+/// A port nothing listens on, for a server nobody answers for: bound and dropped on purpose,
+/// since the test wants it refused (the servers themselves are handed their reserved listeners).
+fn unused_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -94,12 +96,15 @@ impl Server {
 
     /// [`Server::start`] with `options` (federation over plain HTTP whatever they say).
     async fn start_with(options: hs_cli::serve::ServeOptions) -> Self {
-        let port = reserve_port();
+        // Reserved and handed to the server still bound (`hs_testkit::ports`).
+        let reserved = hs_testkit::ports::reserve();
+        let port = reserved.port();
         let dir = tempfile::tempdir().unwrap();
         let handle = hs_cli::serve::spawn_serve(
             config(port, dir.path()),
             hs_cli::serve::ServeOptions {
                 federation_scheme: Some("http"),
+                listeners: hs_cli::serve::PreboundListeners::new([reserved.into_listener()]),
                 ..options
             },
         )
@@ -544,7 +549,7 @@ async fn a_key_refresh_fetches_from_the_other_server_and_shared_rooms_are_listed
     assert!(cached["keys"][0]["valid_until_at"].is_string(), "{cached}");
 
     // A server nobody answers for: the task fails and says so.
-    let nowhere = format!("127.0.0.1:{}", reserve_port());
+    let nowhere = format!("127.0.0.1:{}", unused_port());
     let task = a
         .admin
         .expect(

@@ -8,6 +8,8 @@ publish.workspace = true
 description = "hs-loadgen: matrix-rust-sdk driving a real `hs serve` process over real HTTP (track 05)"
 
 [dependencies]
+# `hs_testkit::ports`: the boot hands `hs` its port still bound (`src/harness.rs`).
+hs-testkit = { path = "../hs-testkit" }
 matrix-sdk = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }

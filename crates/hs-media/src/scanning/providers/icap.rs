@@ -395,23 +395,42 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicU64, Ordering};
 
+        /// Builds the server `make` describes on a free loopback port, and the port.
+        ///
+        /// `icap_rs` binds inside `build` and cannot be handed a bound listener, so the port is
+        /// picked by binding port 0 and releasing it; something else can take it before `build`
+        /// binds it, and then it is tried again on another.
+        async fn build_on_a_free_port(
+            make: impl Fn(&str) -> icap_rs::server::ServerBuilder,
+        ) -> (Server, u16) {
+            for _ in 0..5 {
+                let port = StdTcpListener::bind("127.0.0.1:0")
+                    .unwrap()
+                    .local_addr()
+                    .unwrap()
+                    .port();
+                match make(&format!("127.0.0.1:{port}")).build().await {
+                    Ok(server) => return (server, port),
+                    Err(e) if e.to_string().contains("in use") => continue,
+                    Err(e) => panic!("the ICAP server did not start: {e}"),
+                }
+            }
+            panic!("five ports in a row were taken before the ICAP server bound them");
+        }
+
         async fn start_server(
             istag: &'static str,
             behavior: impl Fn(&IncomingRequest) -> OutResponse + Send + Sync + 'static,
         ) -> u16 {
-            let std_listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
-            let port = std_listener.local_addr().unwrap().port();
-            drop(std_listener);
             let behavior = Arc::new(behavior);
             let handler = move |req: IncomingRequest| {
                 let behavior = Arc::clone(&behavior);
                 async move { Ok::<OutResponse, icap_rs::HandlerError>(behavior(&req)) }
             };
-            let server = Server::builder()
-                .bind(&format!("127.0.0.1:{port}"))
-                .route_respmod(
+            let (server, port) = build_on_a_free_port(|addr| {
+                Server::builder().bind(addr).route_respmod(
                     "virus_scan",
-                    handler,
+                    handler.clone(),
                     Some(
                         ServiceOptions::new()
                             .with_static_istag(istag)
@@ -420,9 +439,8 @@ mod tests {
                             .with_preview(4),
                     ),
                 )
-                .build()
-                .await
-                .unwrap();
+            })
+            .await;
             tokio::spawn(async move {
                 let _ = server.run().await;
             });
@@ -521,9 +539,6 @@ mod tests {
         async fn transfer_ignore_skips_the_scan_entirely() {
             let called = Arc::new(AtomicU64::new(0));
             let called_for_handler = Arc::clone(&called);
-            let std_listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
-            let port = std_listener.local_addr().unwrap().port();
-            drop(std_listener);
             let handler = move |_req: IncomingRequest| {
                 let called = Arc::clone(&called_for_handler);
                 async move {
@@ -533,11 +548,10 @@ mod tests {
                     )
                 }
             };
-            let server = Server::builder()
-                .bind(&format!("127.0.0.1:{port}"))
-                .route_respmod(
+            let (server, port) = build_on_a_free_port(|addr| {
+                Server::builder().bind(addr).route_respmod(
                     "virus_scan",
-                    handler,
+                    handler.clone(),
                     Some(
                         ServiceOptions::new()
                             .with_static_istag("\"v1\"")
@@ -548,9 +562,8 @@ mod tests {
                             .with_default_transfer_behavior(icap_rs::TransferBehavior::Preview),
                     ),
                 )
-                .build()
-                .await
-                .unwrap();
+            })
+            .await;
             tokio::spawn(async move {
                 let _ = server.run().await;
             });

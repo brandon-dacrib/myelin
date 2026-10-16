@@ -9,15 +9,6 @@ use hs_admin::assets::{EMBEDDED_UI, EmbeddedUi};
 use reqwest::StatusCode;
 use serde_json::Value;
 
-/// A port nothing is listening on right now.
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 /// The real `hs` binary, killed when dropped.
 struct HsProcess(std::process::Child);
 
@@ -31,7 +22,9 @@ impl Drop for HsProcess {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_root_sends_a_browser_somewhere_useful_and_takes_no_other_path() {
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
+    // Handed to `hs` still bound (`hs_testkit::ports`), so nothing can take it meanwhile.
+    let listener = hs_testkit::ports::reserve();
+    let port = listener.port();
     let config_path = dir.path().join("homeserver.yaml");
     std::fs::write(
         &config_path,
@@ -45,17 +38,17 @@ async fn the_root_sends_a_browser_somewhere_useful_and_takes_no_other_path() {
         ),
     )
     .unwrap();
-    let mut hs = HsProcess(
-        std::process::Command::new(env!("CARGO_BIN_EXE_hs"))
-            .args(["serve", "-c"])
-            .arg(&config_path)
-            .env_remove("RUST_LOG")
-            .env_remove("HS_DATA_DIR")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-            .expect("the hs binary should start"),
-    );
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_hs"));
+    command
+        .args(["serve", "-c"])
+        .arg(&config_path)
+        .env_remove("RUST_LOG")
+        .env_remove("HS_DATA_DIR")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit());
+    hs_testkit::ports::pass_to(&mut command, [listener]);
+    let mut hs = HsProcess(command.spawn().expect("the hs binary should start"));
+    drop(command);
     let base = format!("http://127.0.0.1:{port}");
     // A browser follows redirects; this client must not, or it could not see the redirect.
     let client = reqwest::Client::builder()

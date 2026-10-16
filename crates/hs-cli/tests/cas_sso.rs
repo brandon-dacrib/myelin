@@ -15,12 +15,23 @@ use std::sync::{Arc, Mutex};
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+/// Starts `hs serve -c config_path`, handing it `listener` still bound
+/// (`hs_testkit::ports::pass_to`), with its standard output going to `stdout`.
+fn spawn_hs(
+    config_path: &std::path::Path,
+    listener: hs_testkit::ports::ReservedPort,
+    stdout: std::process::Stdio,
+) -> std::process::Child {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_hs"));
+    command
+        .args(["serve", "-c"])
+        .arg(config_path)
+        .env_remove("RUST_LOG")
+        .env_remove("HS_DATA_DIR")
+        .stdout(stdout)
+        .stderr(std::process::Stdio::inherit());
+    hs_testkit::ports::pass_to(&mut command, [listener]);
+    command.spawn().expect("the hs binary should start")
 }
 
 /// The real `hs serve`, killed when dropped.
@@ -204,7 +215,8 @@ async fn cas_signs_people_in_creates_accounts_and_confirms_user_interactive_auth
     let fake = Arc::new(FakeCas::default());
     let cas_port = start_fake_cas(fake.clone()).await;
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
+    let listener = hs_testkit::ports::reserve();
+    let port = listener.port();
     let config_path = dir.path().join("hs.yaml");
     std::fs::write(
         &config_path,
@@ -221,17 +233,11 @@ async fn cas_signs_people_in_creates_accounts_and_confirms_user_interactive_auth
         ),
     )
     .unwrap();
-    let _hs = HsProcess(
-        std::process::Command::new(env!("CARGO_BIN_EXE_hs"))
-            .args(["serve", "-c"])
-            .arg(&config_path)
-            .env_remove("RUST_LOG")
-            .env_remove("HS_DATA_DIR")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-            .expect("the hs binary should start"),
-    );
+    let _hs = HsProcess(spawn_hs(
+        &config_path,
+        listener,
+        std::process::Stdio::null(),
+    ));
     let client = Client {
         base: format!("http://127.0.0.1:{port}"),
         http: reqwest::Client::builder()
@@ -377,7 +383,8 @@ async fn cas_follows_the_public_address_trusts_listed_clients_and_respects_bridg
     let fake = Arc::new(FakeCas::default());
     let cas_port = start_fake_cas(fake.clone()).await;
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
+    let listener = hs_testkit::ports::reserve();
+    let port = listener.port();
     let base = format!("http://127.0.0.1:{port}");
     let registration = dir.path().join("irc.yaml");
     std::fs::write(
@@ -404,15 +411,7 @@ async fn cas_follows_the_public_address_trusts_listed_clients_and_respects_bridg
         ),
     )
     .unwrap();
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_hs"))
-        .args(["serve", "-c"])
-        .arg(&config_path)
-        .env_remove("RUST_LOG")
-        .env_remove("HS_DATA_DIR")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
-        .spawn()
-        .expect("the hs binary should start");
+    let mut child = spawn_hs(&config_path, listener, std::process::Stdio::piped());
     let stdout = child.stdout.take().unwrap();
     let _hs = HsProcess(child);
     let (tx, lines) = std::sync::mpsc::channel::<String>();

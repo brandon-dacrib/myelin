@@ -7,14 +7,6 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-fn reserve_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 fn config(port: u16, data_dir: &std::path::Path) -> hs_config::Config {
     let media_dir = data_dir.join("media");
     let yaml = format!(
@@ -36,12 +28,16 @@ struct Server {
     _dir: tempfile::TempDir,
 }
 
-async fn start(port: u16) -> Server {
+/// A server on a port reserved for it and handed over still bound (`hs_testkit::ports`).
+async fn start() -> Server {
+    let reserved = hs_testkit::ports::reserve();
+    let port = reserved.port();
     let dir = tempfile::tempdir().unwrap();
     let handle = hs_cli::serve::spawn_serve(
         config(port, dir.path()),
         hs_cli::serve::ServeOptions {
             federation_scheme: Some("http"),
+            listeners: hs_cli::serve::PreboundListeners::new([reserved.into_listener()]),
             ..Default::default()
         },
     )
@@ -128,8 +124,8 @@ struct Joined {
 
 /// Alice makes a public room of `version` on A; bob, on B, joins it through A.
 async fn join_across(version: &str) -> Joined {
-    let a = start(reserve_port()).await;
-    let b = start(reserve_port()).await;
+    let a = start().await;
+    let b = start().await;
     let client = reqwest::Client::new();
     let (_, alice_token) = register(&client, &a.base, "alice").await;
     let (_, bob_token) = register(&client, &b.base, "bob").await;
@@ -242,8 +238,8 @@ async fn a_version_1_room_is_joined_over_federation_and_messages_cross() {
 /// passed or failed from one run to the next); six in a row all succeeding was about 1 in 60.
 #[tokio::test]
 async fn invites_in_a_version_3_room_reach_another_server_whatever_their_event_ids() {
-    let a = start(reserve_port()).await;
-    let b = start(reserve_port()).await;
+    let a = start().await;
+    let b = start().await;
     let client = reqwest::Client::new();
     let (_, alice_token) = register(&client, &a.base, "alice").await;
     let created: Value = client

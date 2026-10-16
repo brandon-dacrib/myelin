@@ -15,14 +15,6 @@ use serde_json::{Value, json};
 
 const DUAL_STACK_HOST: &str = "dual-stack.test";
 
-fn reserve_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 fn config(
     server_name: &str,
     port: u16,
@@ -74,7 +66,13 @@ struct Server {
     _dir: tempfile::TempDir,
 }
 
-async fn start(server_name: &str, port: u16, extra: &str) -> Server {
+/// A server on `reserved`, handed over still bound (`hs_testkit::ports`).
+async fn start(
+    server_name: &str,
+    reserved: hs_testkit::ports::ReservedPort,
+    extra: &str,
+) -> Server {
+    let port = reserved.port();
     let dir = tempfile::tempdir().unwrap();
     let resolver = Arc::new(DualStack);
     let handle = hs_cli::serve::spawn_serve(
@@ -82,6 +80,7 @@ async fn start(server_name: &str, port: u16, extra: &str) -> Server {
         hs_cli::serve::ServeOptions {
             federation_scheme: Some("http"),
             federation_resolvers: Some((resolver.clone(), resolver)),
+            listeners: hs_cli::serve::PreboundListeners::new([reserved.into_listener()]),
             ..Default::default()
         },
     )
@@ -163,9 +162,9 @@ async fn ask_profile(client: &reqwest::Client, asker: &Server, alice: &str) -> (
 
 #[tokio::test]
 async fn a_dual_stack_server_with_a_dead_ipv6_address_is_reached_under_either_policy() {
-    let port_a = reserve_port();
-    let name_a = format!("{DUAL_STACK_HOST}:{port_a}");
-    let a = start(&name_a, port_a, "").await;
+    let reserved_a = hs_testkit::ports::reserve();
+    let name_a = format!("{DUAL_STACK_HOST}:{}", reserved_a.port());
+    let a = start(&name_a, reserved_a, "").await;
     let client = reqwest::Client::new();
     let (alice, alice_token) = register(&client, &a.base, "alice").await;
     let put = client
@@ -181,8 +180,8 @@ async fn a_dual_stack_server_with_a_dead_ipv6_address_is_reached_under_either_po
     assert_eq!(put.status(), 200);
 
     // 1. The default: IPv4 only. B never tries the IPv6 address.
-    let port_b = reserve_port();
-    let b = start(&format!("127.0.0.1:{port_b}"), port_b, "").await;
+    let reserved_b = hs_testkit::ports::reserve();
+    let b = start(&format!("127.0.0.1:{}", reserved_b.port()), reserved_b, "").await;
     assert!(hs_http::outbound::ipv4_only(), "the default is IPv4 only");
     let v6_failures_before = metric(
         &b.base,
@@ -208,10 +207,10 @@ async fn a_dual_stack_server_with_a_dead_ipv6_address_is_reached_under_either_po
 
     // 2. IPv6 on (`network.outbound.ipv4_only: false`): the dead IPv6 address is tried first,
     //    the connector falls back to IPv4, and the query still succeeds.
-    let port_c = reserve_port();
+    let reserved_c = hs_testkit::ports::reserve();
     let c = start(
-        &format!("127.0.0.1:{port_c}"),
-        port_c,
+        &format!("127.0.0.1:{}", reserved_c.port()),
+        reserved_c,
         "network:\n  outbound:\n    ipv4_only: false\n",
     )
     .await;

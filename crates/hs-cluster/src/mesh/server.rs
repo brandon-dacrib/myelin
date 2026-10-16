@@ -52,6 +52,9 @@ pub struct MeshDeps {
 pub struct MeshServer {
     listen_addr: String,
     tls_server_config: Option<Arc<rustls::ServerConfig>>,
+    /// A listener the caller already bound to `listen_addr` ([`MeshServer::with_listener`]),
+    /// served instead of binding the address again.
+    listener: Option<std::net::TcpListener>,
 }
 
 impl MeshServer {
@@ -73,7 +76,21 @@ impl MeshServer {
         Ok(Self {
             listen_addr: listen_addr.into(),
             tls_server_config,
+            listener: None,
         })
+    }
+
+    /// Serves on `listener`, which the caller has already bound, instead of binding
+    /// `listen_addr` when [`MeshServer::serve`] starts.
+    ///
+    /// A test that needs the mesh's port before the server starts (to write it into a peer's
+    /// configuration) binds port 0, reads the port the system gave it and hands the bound
+    /// listener over here. Releasing the port and binding it again later would let another
+    /// process take it in between, which under a loaded test run it sometimes did.
+    #[must_use]
+    pub fn with_listener(mut self, listener: std::net::TcpListener) -> Self {
+        self.listener = Some(listener);
+        self
     }
 
     /// Serves until `shutdown` carries `true`. Each accepted connection is handled on its own
@@ -81,13 +98,21 @@ impl MeshServer {
     /// stop the listener.
     ///
     /// # Errors
-    /// Returns an I/O error only if the listener itself could not be bound.
+    /// Returns an I/O error only if the listener itself could not be bound (or, given one with
+    /// [`MeshServer::with_listener`], could not be made non-blocking and registered with the
+    /// runtime).
     pub async fn serve(
-        self,
+        mut self,
         deps: Arc<MeshDeps>,
         mut shutdown: watch::Receiver<bool>,
     ) -> std::io::Result<()> {
-        let listener = TcpListener::bind(&self.listen_addr).await?;
+        let listener = match self.listener.take() {
+            Some(listener) => {
+                listener.set_nonblocking(true)?;
+                TcpListener::from_std(listener)?
+            }
+            None => TcpListener::bind(&self.listen_addr).await?,
+        };
         loop {
             tokio::select! {
                 accepted = listener.accept() => {

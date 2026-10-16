@@ -18,14 +18,6 @@
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 /// One run of the real `hs` binary (the harness of `config_reload.rs`).
 struct HsProcess {
     child: std::process::Child,
@@ -34,17 +26,23 @@ struct HsProcess {
 }
 
 impl HsProcess {
-    fn serve(config_path: &std::path::Path) -> Self {
+    /// Starts `hs serve`, handing it `listeners` still bound (`hs_testkit::ports::pass_to`).
+    fn serve(
+        config_path: &std::path::Path,
+        listeners: impl IntoIterator<Item = hs_testkit::ports::ReservedPort>,
+    ) -> Self {
         use std::io::BufRead;
-        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_hs"))
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_hs"));
+        command
             .args(["serve", "-c"])
             .arg(config_path)
             .env_remove("RUST_LOG")
             .env_remove("HS_DATA_DIR")
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-            .expect("the hs binary should start");
+            .stderr(std::process::Stdio::inherit());
+        hs_testkit::ports::pass_to(&mut command, listeners);
+        let mut child = command.spawn().expect("the hs binary should start");
+        drop(command);
         let stdout = child.stdout.take().unwrap();
         let (tx, lines) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -172,11 +170,12 @@ async fn first_admin_token(hs: &mut HsProcess, base: &str) -> String {
 #[tokio::test]
 async fn a_public_base_url_publishes_the_server_document_by_default() {
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
+    let listener = hs_testkit::ports::reserve();
+    let port = listener.port();
     let base = format!("http://127.0.0.1:{port}");
     let config_path = config(dir.path(), port, "https://example.org");
 
-    let mut hs = HsProcess::serve(&config_path);
+    let mut hs = HsProcess::serve(&config_path, [listener]);
     let token = first_admin_token(&mut hs, &base).await;
 
     // 1. Derived at boot, and the log says so.
@@ -272,11 +271,12 @@ async fn a_public_base_url_publishes_the_server_document_by_default() {
 #[tokio::test]
 async fn an_http_public_base_url_publishes_no_server_document_at_boot() {
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
+    let listener = hs_testkit::ports::reserve();
+    let port = listener.port();
     let base = format!("http://127.0.0.1:{port}");
     let config_path = config(dir.path(), port, "http://localhost:8008");
 
-    let mut hs = HsProcess::serve(&config_path);
+    let mut hs = HsProcess::serve(&config_path, [listener]);
     hs.wait_for(&["setup_link="]);
     let (status, _) = well_known_server(&base).await;
     assert_eq!(status, StatusCode::NOT_FOUND);

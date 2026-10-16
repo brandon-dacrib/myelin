@@ -9,14 +9,6 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-fn reserve_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 fn config(port: u16, data_dir: &std::path::Path) -> hs_config::Config {
     let media_dir = data_dir.join("media");
     let yaml = format!(
@@ -38,12 +30,16 @@ struct Server {
     _dir: tempfile::TempDir,
 }
 
-async fn start(port: u16) -> Server {
+/// A server on a port reserved for it and handed over still bound (`hs_testkit::ports`).
+async fn start() -> Server {
+    let reserved = hs_testkit::ports::reserve();
+    let port = reserved.port();
     let dir = tempfile::tempdir().unwrap();
     let handle = hs_cli::serve::spawn_serve(
         config(port, dir.path()),
         hs_cli::serve::ServeOptions {
             federation_scheme: Some("http"),
+            listeners: hs_cli::serve::PreboundListeners::new([reserved.into_listener()]),
             ..Default::default()
         },
     )
@@ -234,10 +230,8 @@ async fn join(client: &reqwest::Client, base: &str, token: &str, room: &str, via
 
 #[tokio::test]
 async fn a_space_across_two_servers_is_walked_from_either_side() {
-    let port_a = reserve_port();
-    let port_b = reserve_port();
-    let a = start(port_a).await;
-    let b = start(port_b).await;
+    let a = start().await;
+    let b = start().await;
     let client = reqwest::Client::new();
 
     let (alice, alice_token) = register(&client, &a.base, "alice").await;

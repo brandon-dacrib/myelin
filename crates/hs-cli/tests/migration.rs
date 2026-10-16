@@ -30,14 +30,6 @@ fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../hs-compat/tests/fixtures/synapse-small")
 }
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 /// A fresh database holding the fixture, dropped afterwards.
 struct SynapseDatabase {
     admin_dsn: String,
@@ -145,17 +137,23 @@ struct HsProcess {
 }
 
 impl HsProcess {
-    fn serve(config_path: &Path) -> Self {
+    /// Starts `hs serve`, handing it `listeners` still bound (`hs_testkit::ports::pass_to`).
+    fn serve(
+        config_path: &Path,
+        listeners: impl IntoIterator<Item = hs_testkit::ports::ReservedPort>,
+    ) -> Self {
         use std::io::BufRead;
-        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_hs"))
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_hs"));
+        command
             .args(["serve", "-c"])
             .arg(config_path)
             .env_remove("RUST_LOG")
             .env_remove("HS_DATA_DIR")
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-            .expect("the hs binary should start");
+            .stderr(std::process::Stdio::inherit());
+        hs_testkit::ports::pass_to(&mut command, listeners);
+        let mut child = command.spawn().expect("the hs binary should start");
+        drop(command);
         let stdout = child.stdout.take().unwrap();
         let (tx, lines) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -325,7 +323,8 @@ async fn a_synapse_database_is_migrated_verified_and_cut_over_through_the_admin_
         keys.join("fixture.test.signing.key"),
     )
     .unwrap();
-    let port = free_port();
+    let listener = hs_testkit::ports::reserve();
+    let port = listener.port();
     std::fs::write(
         dir.path().join("hs.yaml"),
         format!(
@@ -341,7 +340,7 @@ async fn a_synapse_database_is_migrated_verified_and_cut_over_through_the_admin_
     .unwrap();
 
     let config_path = dir.path().join("hs.yaml");
-    let mut hs = HsProcess::serve(&config_path);
+    let mut hs = HsProcess::serve(&config_path, [listener.try_clone().unwrap()]);
     let setup_line = hs.wait_for("setup_link=");
     let setup_token = setup_line
         .rsplit_once("#token=")
@@ -462,7 +461,7 @@ async fn a_synapse_database_is_migrated_verified_and_cut_over_through_the_admin_
 
     // A restart: the migration is where it was.
     hs.stop();
-    let mut hs = HsProcess::serve(&config_path);
+    let mut hs = HsProcess::serve(&config_path, [listener.try_clone().unwrap()]);
     hs.wait_for("listening");
     let after_restart = ops.get("/api/v1/migration").await;
     assert_eq!(
@@ -522,7 +521,7 @@ async fn a_synapse_database_is_migrated_verified_and_cut_over_through_the_admin_
     assert!(counter("hs_migration_peak_rss_bytes") > 1_000_000.0);
 
     hs.stop();
-    let mut hs = HsProcess::serve(&config_path);
+    let mut hs = HsProcess::serve(&config_path, [listener.try_clone().unwrap()]);
     hs.wait_for("listening");
     assert_eq!(ops.get("/api/v1/migration").await["status"], "completed");
 
@@ -1058,7 +1057,8 @@ async fn rooms_joined_over_federation_are_migrated_and_served() {
         keys.join("127.0.0.1:18301.signing.key"),
     )
     .unwrap();
-    let port = free_port();
+    let listener = hs_testkit::ports::reserve();
+    let port = listener.port();
     std::fs::write(
         work.path().join("hs.yaml"),
         format!(
@@ -1072,7 +1072,7 @@ async fn rooms_joined_over_federation_are_migrated_and_served() {
         ),
     )
     .unwrap();
-    let mut hs = HsProcess::serve(&work.path().join("hs.yaml"));
+    let mut hs = HsProcess::serve(&work.path().join("hs.yaml"), [listener]);
     let setup_line = hs.wait_for("setup_link=");
     let setup_token = setup_line
         .rsplit_once("#token=")

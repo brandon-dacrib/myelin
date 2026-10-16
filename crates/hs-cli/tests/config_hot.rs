@@ -18,14 +18,6 @@
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 /// One run of the real `hs` binary (the harness of `config_reload.rs`).
 struct HsProcess {
     child: std::process::Child,
@@ -34,17 +26,23 @@ struct HsProcess {
 }
 
 impl HsProcess {
-    fn serve(config_path: &std::path::Path) -> Self {
+    /// `listeners` are handed to it still bound (`hs_testkit::ports::pass_to`).
+    fn serve(
+        config_path: &std::path::Path,
+        listeners: impl IntoIterator<Item = hs_testkit::ports::ReservedPort>,
+    ) -> Self {
         use std::io::BufRead;
-        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_hs"))
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_hs"));
+        command
             .args(["serve", "-c"])
             .arg(config_path)
             .env_remove("RUST_LOG")
             .env_remove("HS_DATA_DIR")
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-            .expect("the hs binary should start");
+            .stderr(std::process::Stdio::inherit());
+        hs_testkit::ports::pass_to(&mut command, listeners);
+        let mut child = command.spawn().expect("the hs binary should start");
+        drop(command);
         let stdout = child.stdout.take().unwrap();
         let (tx, lines) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -252,7 +250,8 @@ fn one_request() -> Value {
 #[tokio::test]
 async fn hot_settings_apply_to_the_running_server_without_a_restart() {
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
+    let listener = hs_testkit::ports::reserve();
+    let port = listener.port();
     let config_path = dir.path().join("hs.yaml");
     std::fs::write(
         &config_path,
@@ -269,7 +268,7 @@ async fn hot_settings_apply_to_the_running_server_without_a_restart() {
     )
     .unwrap();
 
-    let mut hs = HsProcess::serve(&config_path);
+    let mut hs = HsProcess::serve(&config_path, [listener]);
     let setup_line = hs.wait_for(&["setup_link="]);
     let setup_token = setup_line
         .rsplit_once("#token=")
@@ -513,7 +512,8 @@ async fn hot_settings_apply_to_the_running_server_without_a_restart() {
 #[tokio::test]
 async fn settings_that_had_no_reader_are_read_or_gone() {
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
+    let listener = hs_testkit::ports::reserve();
+    let port = listener.port();
     let config_path = dir.path().join("hs.yaml");
     std::fs::write(
         &config_path,
@@ -531,7 +531,7 @@ async fn settings_that_had_no_reader_are_read_or_gone() {
     )
     .unwrap();
 
-    let mut hs = HsProcess::serve(&config_path);
+    let mut hs = HsProcess::serve(&config_path, [listener]);
     let setup_line = hs.wait_for(&["setup_link="]);
     // Logged once the log is listening: at the latest the follower's ten-second re-read.
     for pointer in [
@@ -679,7 +679,8 @@ async fn settings_that_had_no_reader_are_read_or_gone() {
 #[tokio::test]
 async fn the_durable_edu_bound_applies_without_a_restart() {
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
+    let listener = hs_testkit::ports::reserve();
+    let port = listener.port();
     let config_path = dir.path().join("hs.yaml");
     std::fs::write(
         &config_path,
@@ -695,7 +696,7 @@ async fn the_durable_edu_bound_applies_without_a_restart() {
     )
     .unwrap();
 
-    let mut hs = HsProcess::serve(&config_path);
+    let mut hs = HsProcess::serve(&config_path, [listener]);
     let setup_line = hs.wait_for(&["setup_link="]);
     let setup_token = setup_line
         .rsplit_once("#token=")

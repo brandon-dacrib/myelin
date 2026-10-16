@@ -15,14 +15,6 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-fn reserve_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 /// One `hs serve` process, its stdout read line by line.
 struct HsProcess {
     child: std::process::Child,
@@ -31,17 +23,23 @@ struct HsProcess {
 }
 
 impl HsProcess {
-    fn serve(config_path: &std::path::Path) -> Self {
+    /// Starts `hs serve`, handing it `listeners` still bound (`hs_testkit::ports::pass_to`).
+    fn serve(
+        config_path: &std::path::Path,
+        listeners: impl IntoIterator<Item = hs_testkit::ports::ReservedPort>,
+    ) -> Self {
         use std::io::BufRead;
-        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_hs"))
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_hs"));
+        command
             .args(["serve", "-c"])
             .arg(config_path)
             .env_remove("RUST_LOG")
             .env_remove("HS_DATA_DIR")
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-            .expect("the hs binary should start");
+            .stderr(std::process::Stdio::inherit());
+        hs_testkit::ports::pass_to(&mut command, listeners);
+        let mut child = command.spawn().expect("the hs binary should start");
+        drop(command);
         let stdout = child.stdout.take().unwrap();
         let (tx, lines) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -311,14 +309,15 @@ async fn upgrade_and_follow(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_tombstone_names_a_replacement_room_that_can_be_joined_by_that_id() {
     let dir = tempfile::tempdir().unwrap();
-    let port = reserve_port();
+    let listener = hs_testkit::ports::reserve();
+    let port = listener.port();
     let config = dir.path().join("hs.yaml");
     std::fs::write(&config, config_yaml(port, &dir.path().join("data"))).unwrap();
     let client = Client {
         http: reqwest::Client::new(),
         base: format!("http://127.0.0.1:{port}"),
     };
-    let mut hs = HsProcess::serve(&config);
+    let mut hs = HsProcess::serve(&config, [listener]);
     hs.wait_for("listening");
 
     let alice = client.register("alice").await;
@@ -375,14 +374,15 @@ async fn a_tombstone_names_a_replacement_room_that_can_be_joined_by_that_id() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_upgrade_carries_bans_the_directory_entry_and_federation_closure() {
     let dir = tempfile::tempdir().unwrap();
-    let port = reserve_port();
+    let listener = hs_testkit::ports::reserve();
+    let port = listener.port();
     let config = dir.path().join("hs.yaml");
     std::fs::write(&config, config_yaml(port, &dir.path().join("data"))).unwrap();
     let client = Client {
         http: reqwest::Client::new(),
         base: format!("http://127.0.0.1:{port}"),
     };
-    let mut hs = HsProcess::serve(&config);
+    let mut hs = HsProcess::serve(&config, [listener]);
     hs.wait_for("listening");
     let post = reqwest::Method::POST;
 
@@ -510,14 +510,15 @@ async fn an_upgrade_carries_bans_the_directory_entry_and_federation_closure() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_upgraded_direct_chat_is_still_a_direct_chat_for_the_upgrader() {
     let dir = tempfile::tempdir().unwrap();
-    let port = reserve_port();
+    let listener = hs_testkit::ports::reserve();
+    let port = listener.port();
     let config = dir.path().join("hs.yaml");
     std::fs::write(&config, config_yaml(port, &dir.path().join("data"))).unwrap();
     let client = Client {
         http: reqwest::Client::new(),
         base: format!("http://127.0.0.1:{port}"),
     };
-    let mut hs = HsProcess::serve(&config);
+    let mut hs = HsProcess::serve(&config, [listener]);
     hs.wait_for("listening");
 
     let alice = client.register("alice").await;
@@ -598,14 +599,15 @@ async fn an_upgraded_direct_chat_is_still_a_direct_chat_for_the_upgrader() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn push_rules_about_the_old_room_follow_its_members_into_the_replacement() {
     let dir = tempfile::tempdir().unwrap();
-    let port = reserve_port();
+    let listener = hs_testkit::ports::reserve();
+    let port = listener.port();
     let config = dir.path().join("hs.yaml");
     std::fs::write(&config, config_yaml(port, &dir.path().join("data"))).unwrap();
     let client = Client {
         http: reqwest::Client::new(),
         base: format!("http://127.0.0.1:{port}"),
     };
-    let mut hs = HsProcess::serve(&config);
+    let mut hs = HsProcess::serve(&config, [listener]);
     hs.wait_for("listening");
 
     let alice = client.register("alice").await;

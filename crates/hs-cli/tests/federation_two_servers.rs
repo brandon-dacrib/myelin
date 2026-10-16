@@ -18,14 +18,6 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-fn reserve_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 fn config(port: u16, data_dir: &std::path::Path) -> hs_config::Config {
     let media_dir = data_dir.join("media");
     let yaml = format!(
@@ -48,12 +40,15 @@ struct Server {
     _dir: tempfile::TempDir,
 }
 
-async fn start(port: u16) -> Server {
+/// A server on a port reserved for it and handed over still bound (`hs_testkit::ports`).
+async fn start(reserved: hs_testkit::ports::ReservedPort) -> Server {
+    let port = reserved.port();
     let dir = tempfile::tempdir().unwrap();
     let handle = hs_cli::serve::spawn_serve(
         config(port, dir.path()),
         hs_cli::serve::ServeOptions {
             federation_scheme: Some("http"),
+            listeners: hs_cli::serve::PreboundListeners::new([reserved.into_listener()]),
             ..Default::default()
         },
     )
@@ -202,10 +197,8 @@ fn state_types(sync: &Value, room_id: &str) -> Vec<String> {
 
 #[tokio::test]
 async fn a_user_joins_a_room_on_another_server_and_messages_flow_both_ways() {
-    let port_a = reserve_port();
-    let port_b = reserve_port();
-    let a = start(port_a).await;
-    let b = start(port_b).await;
+    let a = start(hs_testkit::ports::reserve()).await;
+    let b = start(hs_testkit::ports::reserve()).await;
     let client = reqwest::Client::new();
 
     let (alice, alice_token) = register(&client, &a.base, "alice").await;
@@ -718,10 +711,8 @@ async fn set_topic(client: &reqwest::Client, base: &str, token: &str, room_id: &
 /// rather than walking back from what it held, where that topic does not exist.
 #[tokio::test]
 async fn the_state_at_fetched_history_is_asked_of_the_server_that_sent_it() {
-    let port_a = reserve_port();
-    let port_b = reserve_port();
-    let a = start(port_a).await;
-    let b = start(port_b).await;
+    let a = start(hs_testkit::ports::reserve()).await;
+    let b = start(hs_testkit::ports::reserve()).await;
     let client = reqwest::Client::new();
 
     let (_alice, alice_token) = register(&client, &a.base, "alice").await;
@@ -869,10 +860,8 @@ async fn the_state_at_fetched_history_is_asked_of_the_server_that_sent_it() {
 
 #[tokio::test]
 async fn joining_through_a_server_that_does_not_know_the_room_is_not_found() {
-    let port_a = reserve_port();
-    let port_b = reserve_port();
-    let a = start(port_a).await;
-    let b = start(port_b).await;
+    let a = start(hs_testkit::ports::reserve()).await;
+    let b = start(hs_testkit::ports::reserve()).await;
     let client = reqwest::Client::new();
     let (_bob, bob_token) = register(&client, &b.base, "bob").await;
 
@@ -901,10 +890,8 @@ async fn joining_through_a_server_that_does_not_know_the_room_is_not_found() {
 /// are `404`s on B too.
 #[tokio::test]
 async fn a_remote_users_profile_and_a_remote_alias_are_asked_of_their_server() {
-    let port_a = reserve_port();
-    let port_b = reserve_port();
-    let a = start(port_a).await;
-    let b = start(port_b).await;
+    let a = start(hs_testkit::ports::reserve()).await;
+    let b = start(hs_testkit::ports::reserve()).await;
     let client = reqwest::Client::new();
     let (alice, alice_token) = register(&client, &a.base, "alice").await;
     let (_bob, bob_token) = register(&client, &b.base, "bob").await;

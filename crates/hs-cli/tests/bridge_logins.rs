@@ -23,17 +23,20 @@ struct HsProcess {
 }
 
 impl HsProcess {
-    fn serve(config_path: &std::path::Path) -> Self {
+    /// Starts `hs serve`, handing it `listener` still bound (`hs_testkit::ports::pass_to`).
+    fn serve(config_path: &std::path::Path, listener: hs_testkit::ports::ReservedPort) -> Self {
         use std::io::BufRead;
-        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_hs"))
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_hs"));
+        command
             .args(["serve", "-c"])
             .arg(config_path)
             .env_remove("RUST_LOG")
             .env_remove("HS_DATA_DIR")
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-            .expect("the hs binary should start");
+            .stderr(std::process::Stdio::inherit());
+        hs_testkit::ports::pass_to(&mut command, [listener]);
+        let mut child = command.spawn().expect("the hs binary should start");
+        drop(command);
         let stdout = child.stdout.take().unwrap();
         let (tx, lines) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -80,7 +83,9 @@ impl Drop for HsProcess {
     }
 }
 
-fn reserve_port() -> u16 {
+/// A port nothing listens on (bound and dropped): the address of a bridge that is not running.
+/// Nothing is ever started on it, so the port being taken meanwhile cannot break the test.
+fn closed_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -218,7 +223,8 @@ async fn the_admin_api_says_who_has_signed_in_to_a_bridge_and_says_so_when_it_ca
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("data");
     let media_dir = data_dir.join("media");
-    let port = reserve_port();
+    let listener = hs_testkit::ports::reserve();
+    let port = listener.port();
     let config_path = dir.path().join("homeserver.yaml");
     std::fs::write(
         &config_path,
@@ -232,7 +238,7 @@ async fn the_admin_api_says_who_has_signed_in_to_a_bridge_and_says_so_when_it_ca
     )
     .unwrap();
     let base = format!("http://127.0.0.1:{port}");
-    let mut hs = HsProcess::serve(&config_path);
+    let mut hs = HsProcess::serve(&config_path, listener);
     let line = hs.wait_for("setup_link=");
     let setup_token: String = line
         .split_once("#token=")
@@ -356,7 +362,7 @@ async fn the_admin_api_says_who_has_signed_in_to_a_bridge_and_says_so_when_it_ca
     assert!(irc["reason"].as_str().unwrap().contains("control room"));
 
     // A mautrix-signal bridge that is not running: an answer with the error in it.
-    let closed = format!("http://127.0.0.1:{}", reserve_port());
+    let closed = format!("http://127.0.0.1:{}", closed_port());
     add_bridge(
         &admin,
         "mautrix-signal",

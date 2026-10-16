@@ -27,15 +27,6 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-/// A port nothing is listening on right now.
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 /// The real `hs` binary, killed (`SIGKILL`) when dropped.
 struct HsProcess(std::process::Child);
 
@@ -63,19 +54,26 @@ fn field<'a>(line: &'a str, name: &str) -> Option<&'a str> {
     Some(rest.split_whitespace().next().unwrap_or(rest))
 }
 
-/// Starts `hs serve` and waits, up to `bound`, for its `listening` line.
-fn boot(config: &std::path::Path, bound: Duration) -> (HsProcess, Listening) {
+/// Starts `hs serve`, handing it `listener` still bound (`hs_testkit::ports::pass_to`), and
+/// waits, up to `bound`, for its `listening` line.
+fn boot(
+    config: &std::path::Path,
+    listener: hs_testkit::ports::ReservedPort,
+    bound: Duration,
+) -> (HsProcess, Listening) {
     let launched = Instant::now();
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_hs"))
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_hs"));
+    command
         .args(["serve", "-c"])
         .arg(config)
         .env_remove("RUST_LOG")
         .env_remove("HS_DATA_DIR")
         .env("NO_COLOR", "1")
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
-        .spawn()
-        .expect("the hs binary should start");
+        .stderr(std::process::Stdio::inherit());
+    hs_testkit::ports::pass_to(&mut command, [listener]);
+    let mut child = command.spawn().expect("the hs binary should start");
+    drop(command);
     let stdout = child.stdout.take().unwrap();
     let process = HsProcess(child);
     let (tx, rx) = mpsc::channel();
@@ -144,7 +142,8 @@ async fn whoami(base: &str, token: &str) -> Value {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cold_boot_is_quick_and_a_kill_right_after_it_loses_nothing() {
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
+    let listener = hs_testkit::ports::reserve();
+    let port = listener.port();
     let config = dir.path().join("homeserver.yaml");
     std::fs::write(
         &config,
@@ -169,7 +168,12 @@ async fn a_cold_boot_is_quick_and_a_kill_right_after_it_loses_nothing() {
         .unwrap();
     assert!(status.success());
 
-    let (cold_process, cold) = boot(&config, Duration::from_secs(120));
+    let (cold_process, cold) = boot(
+        &config,
+        // Kept here and cloned to each boot: the warm boot below serves the same port.
+        listener.try_clone().unwrap(),
+        Duration::from_secs(120),
+    );
     eprintln!("cold boot: {cold:?}, line after {:?}", cold.seen_after);
     assert!(cold.cold, "the first boot over an empty directory is cold");
     assert!(
@@ -209,7 +213,7 @@ async fn a_cold_boot_is_quick_and_a_kill_right_after_it_loses_nothing() {
     // A crash, not a shutdown: nothing gets to flush or persist on the way out.
     drop(cold_process);
 
-    let (_warm_process, warm) = boot(&config, Duration::from_secs(120));
+    let (_warm_process, warm) = boot(&config, listener, Duration::from_secs(120));
     eprintln!("warm boot: {warm:?}, line after {:?}", warm.seen_after);
     assert!(!warm.cold);
     assert_eq!(warm.keyspaces_created, 0);

@@ -18,23 +18,6 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-/// A port for a subprocess's configuration file; never the same one twice in this process.
-fn reserve_port() -> u16 {
-    static HANDED_OUT: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
-    loop {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let mut handed_out = HANDED_OUT.lock().unwrap();
-        if !handed_out.contains(&port) {
-            handed_out.push(port);
-            return port;
-        }
-    }
-}
-
 fn rand_suffix() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -50,17 +33,23 @@ struct HsProcess {
 }
 
 impl HsProcess {
-    fn serve(config_path: &std::path::Path) -> Self {
+    /// `listeners` are handed to it still bound (`hs_testkit::ports::pass_to`).
+    fn serve(
+        config_path: &std::path::Path,
+        listeners: impl IntoIterator<Item = hs_testkit::ports::ReservedPort>,
+    ) -> Self {
         use std::io::BufRead;
-        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_hs"))
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_hs"));
+        command
             .args(["serve", "-c"])
             .arg(config_path)
             .env_remove("RUST_LOG")
             .env_remove("HS_DATA_DIR")
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-            .expect("the hs binary should start");
+            .stderr(std::process::Stdio::inherit());
+        hs_testkit::ports::pass_to(&mut command, listeners);
+        let mut child = command.spawn().expect("the hs binary should start");
+        drop(command);
         let stdout = child.stdout.take().unwrap();
         let (tx, lines) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -486,8 +475,13 @@ async fn a_replica_that_gets_a_room_back_writes_from_the_store_not_its_old_copy(
         return;
     };
     let dir = tempfile::tempdir().unwrap();
-    let (port_a, port_b) = (reserve_port(), reserve_port());
-    let (mesh_a, mesh_b) = (reserve_port(), reserve_port());
+    let (listener_a, listener_b) = (hs_testkit::ports::reserve(), hs_testkit::ports::reserve());
+    let (mesh_listener_a, mesh_listener_b) = (
+        hs_testkit::ports::reserve_wildcard(),
+        hs_testkit::ports::reserve_wildcard(),
+    );
+    let (port_a, port_b) = (listener_a.port(), listener_b.port());
+    let (mesh_a, mesh_b) = (mesh_listener_a.port(), mesh_listener_b.port());
     let config_a = dir.path().join("a.yaml");
     let config_b = dir.path().join("b.yaml");
     std::fs::write(&config_a, replica_config(&db, dir.path(), port_a, mesh_a)).unwrap();
@@ -498,10 +492,10 @@ async fn a_replica_that_gets_a_room_back_writes_from_the_store_not_its_old_copy(
     let client = reqwest::Client::new();
 
     // A first (it makes the signing key and the schema), then B.
-    let mut hs_a = HsProcess::serve(&config_a);
+    let mut hs_a = HsProcess::serve(&config_a, [listener_a, mesh_listener_a]);
     let setup_line = hs_a.wait_for("setup_link=");
     let admin = first_admin(&client, &a, &setup_line).await;
-    let mut hs_b = HsProcess::serve(&config_b);
+    let mut hs_b = HsProcess::serve(&config_b, [listener_b, mesh_listener_b]);
     hs_b.wait_for("listening");
 
     let alice = register(&client, &a, "alice").await;
@@ -532,7 +526,9 @@ async fn a_replica_that_gets_a_room_back_writes_from_the_store_not_its_old_copy(
 
     // 2. B comes back and takes the room back. B loads the room from the store and writes two
     //    messages; A's copy is now two events behind the store, and nothing tells it.
-    let mut hs_b = HsProcess::serve(&config_b);
+    // B's restarts bind its ports themselves: while B is down A takes its rooms over, and a
+    // connection to B's mesh must be refused then, not left waiting in a held socket's backlog.
+    let mut hs_b = HsProcess::serve(&config_b, []);
     hs_b.wait_for("listening");
     wait_for_owner(&client, &a, &admin, &room, &id_b).await;
     send_message(&client, &b, &room_path, &alice, "m2 (B)").await;
@@ -548,7 +544,7 @@ async fn a_replica_that_gets_a_room_back_writes_from_the_store_not_its_old_copy(
     // 4. B rejoins and loads the room from the store, as hs-1 did in the smoke. Everything a
     //    client reads of the room must still work, through either replica, and carry all four
     //    messages.
-    let mut hs_b = HsProcess::serve(&config_b);
+    let mut hs_b = HsProcess::serve(&config_b, []);
     hs_b.wait_for("listening");
     wait_for_owner(&client, &a, &admin, &room, &id_b).await;
 

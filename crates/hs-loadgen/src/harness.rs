@@ -6,7 +6,6 @@
 //! talking to a real, independently-running server over a real socket, the way Element Web or any
 //! other client would, with no shortcuts through this workspace's own test scaffolding.
 
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -83,15 +82,6 @@ fn find_hs_binary() -> Result<PathBuf> {
     );
 }
 
-/// Picks a free TCP port by binding to port 0 and immediately releasing it. There is an
-/// unavoidable race between this and the child process binding the same port (something else
-/// could grab it in between); `crates/hs-cli/tests/e2e.rs` accepts the same race for the same
-/// reason: no better option exists without threading a socket fd into the child.
-fn reserve_ephemeral_port() -> Result<u16> {
-    let listener = TcpListener::bind("127.0.0.1:0").context("binding an ephemeral port")?;
-    Ok(listener.local_addr()?.port())
-}
-
 fn write_config(data_dir: &Path, port: u16, server_name: &str) -> Result<PathBuf> {
     let yaml = format!(
         "server:\n  server_name: {server_name}\n\
@@ -118,19 +108,29 @@ fn write_config(data_dir: &Path, port: u16, server_name: &str) -> Result<PathBuf
 pub async fn spawn(server_name: &str) -> Result<ServerHandle> {
     let binary = find_hs_binary()?;
     let data_dir = tempfile::tempdir().context("creating temp data dir")?;
-    let port = reserve_ephemeral_port()?;
+    // The port is picked by binding port 0 and the bound socket is passed to the child, which
+    // serves it (`hs_testkit::ports::pass_to`): released for the child to bind again, another
+    // process could take it in between.
+    let listener = hs_testkit::ports::ReservedPort::bind(std::net::Ipv4Addr::LOCALHOST)
+        .context("binding an ephemeral port")?;
+    let port = listener.port();
     let config_path = write_config(data_dir.path(), port, server_name)?;
     let base_url = format!("http://127.0.0.1:{port}");
 
-    let child = Command::new(&binary)
+    let mut command = Command::new(&binary);
+    command
         .arg("serve")
         .arg("-c")
         .arg(&config_path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    hs_testkit::ports::pass_to(&mut command, [listener]);
+    let child = command
         .spawn()
         .with_context(|| format!("spawning {binary:?} serve -c {config_path:?}"))?;
+    // The command holds this process's copy of the socket; the child has its own.
+    drop(command);
 
     let mut handle = ServerHandle {
         child,
@@ -154,7 +154,7 @@ async fn wait_for_ready(handle: &mut ServerHandle) -> Result<()> {
     let mut last_err: Option<String> = None;
 
     while tokio::time::Instant::now() < deadline {
-        // The process may have exited already (bad config, port race, panic); surface that
+        // The process may have exited already (bad config, a port in use, panic); surface that
         // immediately with its captured stderr instead of spinning until the timeout.
         if let Some(status) = handle
             .child

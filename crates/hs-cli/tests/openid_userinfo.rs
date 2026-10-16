@@ -11,14 +11,6 @@
 
 use serde_json::{Value, json};
 
-fn reserve_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 fn config(port: u16, data_dir: &std::path::Path, federation: bool) -> hs_config::Config {
     let yaml = format!(
         "server:\n  server_name: \"127.0.0.1:{port}\"\n\
@@ -67,12 +59,14 @@ async fn register(client: &reqwest::Client, base: &str, username: &str) -> (Stri
 /// A token from `request_token` is exchanged for its user; a made-up one is `401
 /// M_UNKNOWN_TOKEN`, no token `401 M_MISSING_TOKEN`. Then: is a signed federation route served?
 async fn openid_round_trip(federation: bool) {
-    let port = reserve_port();
+    let reserved = hs_testkit::ports::reserve();
+    let port = reserved.port();
     let dir = tempfile::tempdir().unwrap();
     let server = hs_cli::serve::spawn_serve(
         config(port, dir.path(), federation),
         hs_cli::serve::ServeOptions {
             federation_scheme: Some("http"),
+            listeners: hs_cli::serve::PreboundListeners::new([reserved.into_listener()]),
             ..Default::default()
         },
     )

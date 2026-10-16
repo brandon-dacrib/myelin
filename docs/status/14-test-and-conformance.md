@@ -1,5 +1,72 @@
 # 14 Test and conformance (integration lead): status
 
+## Session 13 (2026-10-15, branch `agent/test-port-races`): no test releases a server's port before the server has it
+
+**The flake.** GitHub run 38830814904 (arm64, attempt 1) failed in `hs-cli`'s
+`federation_room_versions.rs` with `Bind { addr: "127.0.0.1:39139", .. AddrInUse }`, and the
+local merge gate had the same load-dependent kind. Every real-server test picked a port by
+binding `127.0.0.1:0`, dropping the listener, writing the port into the configuration and having
+the server bind it again later. Anything on the machine could take the port in between: another
+test's `bind(0)` (39139 is odd, which is where Linux puts `bind(0)` ports), or the source port of
+any outgoing connection. Under the gate's load the window, which includes a debug binary's
+boot, was long enough to lose.
+
+**The fix: the listener bound to port 0 is never dropped; it is handed to the server.**
+
+- `hs_testkit::ports` (new): `reserve()` (`127.0.0.1`), `reserve_wildcard()` (`0.0.0.0`, for the
+  cluster mesh, which binds `0.0.0.0:<cluster.mesh.port>`), `ReservedPort::{port, addr,
+  into_listener, try_clone}`; `pass_to(&mut Command, listeners)` for the real binary;
+  `retry_on_addr_in_use` and `is_addr_in_use` for a server that cannot be handed a listener.
+- In-process servers: `hs_cli::serve::ServeOptions::listeners`, a `PreboundListeners` set matched
+  by exact local address against the configured listeners and the mesh's listen address
+  (`hs_cluster::mesh::MeshServer::with_listener`, new). A handed listener that matches nothing
+  is logged (`warn`) and not served.
+- The `hs` binary as a child: `pass_to` makes the sockets inheritable in the forked child only
+  (`pre_exec` clearing `FD_CLOEXEC`; they stay close-on-exec in the test process, so a sibling
+  child spawned meanwhile does not inherit them) and names them in `HS_INHERITED_LISTENER_FDS`.
+  `hs serve` adopts them first thing (`crates/hs-cli/src/inherited_listeners.rs`): each must be
+  above 2, listed once, open, a TCP stream socket, listening (`SO_ACCEPTCONN`; on macOS, which
+  does not answer that option, a socket without a peer) and IPv4 or IPv6, checked for all
+  before any is owned; then they are close-on-exec again. A bad entry stops the boot with its
+  descriptor named.
+- Restarts on the same port keep the reservation and pass `try_clone()` to each start, unless the
+  test needs refusals while the server is down (federation catch-up's proxy, `cluster_rejoin`'s
+  B); those restarts bind by port, with a comment saying why.
+- `hs-federation`'s three sender tests whose destination is down and then comes up on the same
+  port hold a socket that is bound but not listening (refused, as a server that is down, yet
+  reserved) and `listen()` on it when it comes up.
+
+**Moved:** 76 `hs-cli` integration test files (every `reserve_port`/`free_port` helper that fed
+a server is gone), `hs-cli`'s `serve.rs` and `cluster.rs` unit tests, `hs-cluster`'s
+`mesh_mtls.rs` and `mesh_peer.rs`, `hs-loadgen`'s harness, `hs-bridge-conformance`'s
+`real_mautrix_login.rs` (the `hs` side), three `hs-federation` sender tests, and `hs-media`'s
+ICAP tests (`icap_rs` binds inside `build`, so they retry on another port when theirs is taken).
+New: `crates/hs-cli/tests/inherited_listeners.rs` (the binary serves an inherited listener,
+ignores one that matches nothing, releases the port when it exits, refuses descriptor 2, and the
+variable's name agrees with `hs-testkit`'s).
+
+**Left on bind-and-release, on purpose:** ports that must refuse connections (`unused_port()`
+in `admin_followups.rs` and `federation_keys.rs`, `closed_port()` in `bridge_logins.rs`, dead
+destinations in other crates' unit tests); ports a separate program binds (Docker's published
+ports in `migration_rehearsal.rs` and `real_mautrix_login.rs`, heisenbridge in
+`bridge_offerings.rs`). `e2e.rs`, `admin_rooms.rs`' in-process boot, `bridge_offerings.rs` and
+`in_process_restart.rs` already set port 0 after parsing and read the bound address back.
+
+**Verified (2026-10-15, this machine, gate PostgreSQL sourced so nothing SKIPs).** Each migrated
+file passed once on its own. Then the 24 `federation_*` and `cluster_*` test binaries, run in
+concurrent lanes, each lane all 24 in order, so the same tests overlap: 3 lanes (72 binary runs,
+249 tests, 6 min 10 s) and 4 lanes (96 runs, 332 tests, 6 min 30 s), every one passing, and no
+`AddrInUse` or "Address already in use" in any log. The old pattern's window, measured in a
+Linux container (`python:3.12-slim`, 16 threads each binding 0, releasing, opening a listener
+and four connections, waiting up to 50 ms and binding the port again): 7 of 4,800 ports were
+taken in between; on macOS, whose allocator is random over a wider range, 0 of 4,800, which is
+why it flaked on CI's Linux runners first. With the listener held, the server never binds the
+number, so it cannot lose it. `cargo clippy` with `-D warnings` on `hs-cli`, `hs-testkit`,
+`hs-loadgen`, `hs-cluster`, `hs-federation`, `hs-media` and `hs-bridge-conformance` is clean;
+`cargo test -p hs-testkit -p hs-cluster -p hs-loadgen`, `hs-cli --lib` (serve, cluster,
+inherited listeners), `hs-media` ICAP and the three `hs-federation` sender tests pass. The full
+workspace gate is the merge queue's.
+
 ## Session 12 (2026-10-08, branch `agent/ops-harness`): the harness lessons of 2026-10-04/05
 
 **1. The Complement lock is in the repository.** `tests/complement/lock.sh <command...>` holds
@@ -1567,6 +1634,11 @@ it runs on Sytest's own image, session 5.)
   `FakePushGateway`, `FakeSmtpSink`, `matrix_error::{assert_matrix_error, MatrixErrorExpectation}`.
   Every crate in the workspace should write its integration tests against this
   (`docs/decisions/0002-workspace-conventions.md`).
+- `hs_testkit::ports` (session 13): the one way a test gives a server its port. `reserve()` /
+  `reserve_wildcard()`, then `ReservedPort::into_listener()` into
+  `hs_cli::serve::ServeOptions::listeners` (in-process) or `ports::pass_to(&mut command, ..)`
+  (the `hs` binary, via `HS_INHERITED_LISTENER_FDS`). Never bind port 0, drop it and hand the
+  number to a server.
 - `hs-spec-coverage`: the `hs-spec-coverage` binary and its library (`ApiFamily`, `SpecRoute`,
   `RouteManifest`, `CoverageReport`, `render_markdown`) — any track can run
   `cargo run -p hs-spec-coverage -- --routes <their routes.json>` to see their own coverage.
@@ -1594,6 +1666,13 @@ it runs on Sytest's own image, session 5.)
 
 ## Decisions made
 
+- **(session 13) A test's server port is never released before the server has it.** The test
+  binds port 0 and hands the bound socket over (`hs_testkit::ports`); the real binary inherits it
+  (`HS_INHERITED_LISTENER_FDS`, Unix; elsewhere `pass_to` releases it and the child binds as
+  before). Chosen over retrying a boot on `AddrInUse` because it removes the window rather than
+  surviving it, and because a fresh port on retry is impossible once the port is in the server's
+  name or a peer's configuration. `hs-testkit` went from `forbid(unsafe_code)` to `deny`, allowed
+  in `ports` alone for `pre_exec`.
 - **(session 5) Sytest runs only in Docker, on `matrixdotorg/sytest`**, never with CPAN on the
   host; the binary is built on the same Debian release as the image. Certificates are verified
   (Sytest's CA trusted), unlike Sytest's own Synapse/Dendrite configurations, because turning
@@ -1685,7 +1764,8 @@ it runs on Sytest's own image, session 5.)
 
 ## Shared dependencies added
 
-None. `hs-testkit` and `hs-spec-coverage` use only workspace dependencies already present
+Session 13: `hs-testkit` depends on `libc` (already a workspace dependency); `hs-loadgen` on
+`hs-testkit`; `hs-bridge-conformance` dev-depends on `hs-testkit`. Before that: none. `hs-testkit` and `hs-spec-coverage` use only workspace dependencies already present
 (`axum`, `http`, `http-body-util`, `tower`, `tokio`, `serde`, `serde_json`, `serde_yaml_ng`,
 `bytes`, `thiserror`, `tracing`) plus path dependencies on `hs-kv` (regular) and `hs-auth`
 (dev-only, for the integration test). No new `[workspace.dependencies]` entries were needed.

@@ -25,23 +25,6 @@ use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// A port for a configuration file; never the same one twice in this process.
-fn reserve_port() -> u16 {
-    static HANDED_OUT: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
-    loop {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let mut handed_out = HANDED_OUT.lock().unwrap();
-        if !handed_out.contains(&port) {
-            handed_out.push(port);
-            return port;
-        }
-    }
-}
-
 fn nanos() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -145,11 +128,11 @@ fn servers() -> Option<Servers> {
 fn config(
     db: &Database,
     dir: &Path,
+    port: u16,
     host: Option<&str>,
     ssl_mode: &str,
     root_cert: Option<&Path>,
 ) -> String {
-    let port = reserve_port();
     let root_cert = root_cert
         .map(|p| format!("  ssl_root_cert: {p:?}\n"))
         .unwrap_or_default();
@@ -169,17 +152,20 @@ fn config(
 }
 
 /// The storage line and exit status of one `hs serve`: the log line the backend writes on
-/// opening (`Ok`), or the process's whole output once it has exited (`Err`).
-fn boot(config_path: &Path) -> Result<String, String> {
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_hs"))
+/// opening (`Ok`), or the process's whole output once it has exited (`Err`). `listener`, the
+/// configured listener's port, is handed to it still bound (`hs_testkit::ports::pass_to`).
+fn boot(config_path: &Path, listener: hs_testkit::ports::ReservedPort) -> Result<String, String> {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_hs"));
+    command
         .args(["serve", "-c"])
         .arg(config_path)
         .env_remove("RUST_LOG")
         .env_remove("HS_DATA_DIR")
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("the hs binary should start");
+        .stderr(std::process::Stdio::piped());
+    hs_testkit::ports::pass_to(&mut command, [listener]);
+    let mut child = command.spawn().expect("the hs binary should start");
+    drop(command);
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     for reader in [
         Box::new(child.stdout.take().unwrap()) as Box<dyn std::io::Read + Send>,
@@ -308,12 +294,21 @@ fn every_ssl_mode_through_the_real_binary() {
     for (i, case) in ok_cases.iter().enumerate() {
         let (db, mode) = (case.db, case.mode);
         let path = dir.path().join(format!("ok-{i}-{mode}.yaml"));
+        let listener = hs_testkit::ports::reserve();
         std::fs::write(
             &path,
-            config(db, dir.path(), case.host, mode, case.root_cert),
+            config(
+                db,
+                dir.path(),
+                listener.port(),
+                case.host,
+                mode,
+                case.root_cert,
+            ),
         )
         .unwrap();
-        let line = boot(&path).unwrap_or_else(|out| panic!("{mode} should boot; it said:\n{out}"));
+        let line = boot(&path, listener)
+            .unwrap_or_else(|out| panic!("{mode} should boot; it said:\n{out}"));
         assert_eq!(field(&line, "ssl_mode"), Some(mode), "{line}");
         assert_eq!(
             field(&line, "encrypted"),
@@ -327,8 +322,20 @@ fn every_ssl_mode_through_the_real_binary() {
 
     // require against the plain server: refused at startup, naming the setting.
     let path = dir.path().join("fail-require-plain.yaml");
-    std::fs::write(&path, config(&plain_db, dir.path(), None, "require", None)).unwrap();
-    let out = boot(&path).expect_err("require against a plain server must not boot");
+    let listener = hs_testkit::ports::reserve();
+    std::fs::write(
+        &path,
+        config(
+            &plain_db,
+            dir.path(),
+            listener.port(),
+            None,
+            "require",
+            None,
+        ),
+    )
+    .unwrap();
+    let out = boot(&path, listener).expect_err("require against a plain server must not boot");
     assert!(
         out.contains("storage.postgres.ssl_mode = require could not be satisfied"),
         "{out}"
@@ -337,18 +344,21 @@ fn every_ssl_mode_through_the_real_binary() {
 
     // verify-full by IP address: the certificate names localhost, so the name check fails.
     let path = dir.path().join("fail-verify-full-ip.yaml");
+    let listener = hs_testkit::ports::reserve();
     std::fs::write(
         &path,
         config(
             &tls_db,
             dir.path(),
+            listener.port(),
             Some("127.0.0.1"),
             "verify-full",
             Some(cert),
         ),
     )
     .unwrap();
-    let out = boot(&path).expect_err("verify-full by an address the certificate does not name");
+    let out =
+        boot(&path, listener).expect_err("verify-full by an address the certificate does not name");
     assert!(
         out.contains("storage.postgres.ssl_mode = verify-full could not be satisfied"),
         "{out}"

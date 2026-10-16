@@ -142,7 +142,10 @@ struct Server {
 }
 
 impl Server {
-    fn start(dir: &Path, port: u16) -> Result<Self> {
+    /// Starts `hs serve` on `listener`'s port, handing it the listener still bound
+    /// (`hs_testkit::ports::pass_to`).
+    fn start(dir: &Path, listener: hs_testkit::ports::ReservedPort) -> Result<Self> {
+        let port = listener.port();
         let data = dir.join("data");
         let media = dir.join("media");
         let config = format!(
@@ -155,7 +158,8 @@ impl Server {
         );
         let path = dir.join("homeserver.yaml");
         std::fs::write(&path, config)?;
-        let mut child = Command::new(hs_binary().context("hs binary")?)
+        let mut command = Command::new(hs_binary().context("hs binary")?);
+        command
             .args(["serve", "-c"])
             .arg(&path)
             .env(
@@ -164,9 +168,10 @@ impl Server {
             )
             .env_remove("HS_DATA_DIR")
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("starting hs serve")?;
+            .stderr(Stdio::piped());
+        hs_testkit::ports::pass_to(&mut command, [listener]);
+        let mut child = command.spawn().context("starting hs serve")?;
+        drop(command);
         let lines = Arc::new(Mutex::new(Vec::new()));
         for reader in [
             Box::new(child.stdout.take().context("stdout")?) as Box<dyn std::io::Read + Send>,
@@ -505,6 +510,8 @@ impl Drop for Bridge {
     }
 }
 
+/// A port for the bridge container's published port. Docker binds it on the host, and cannot be
+/// handed a bound socket, so this one is still picked by binding port 0 and releasing it.
 fn reserve_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .and_then(|l| l.local_addr())
@@ -578,8 +585,8 @@ async fn set_up_with(
     edit: fn(&str) -> String,
 ) -> Result<Scene> {
     let dir = tempfile::tempdir()?;
-    let port = reserve_port();
-    let server = Server::start(dir.path(), port)?;
+    // `hs` listens on every interface here (the bridge container reaches it through the host).
+    let server = Server::start(dir.path(), hs_testkit::ports::reserve_wildcard())?;
     let admin = claim_server(&server).await?;
     let alice = register(&server.base, "alice").await?;
     let alice_id = alice.user_id().context("alice's id")?.to_string();

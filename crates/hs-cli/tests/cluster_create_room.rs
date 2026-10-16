@@ -31,22 +31,6 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-fn reserve_port() -> u16 {
-    static HANDED_OUT: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
-    loop {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let mut handed_out = HANDED_OUT.lock().unwrap();
-        if !handed_out.contains(&port) {
-            handed_out.push(port);
-            return port;
-        }
-    }
-}
-
 fn rand_suffix() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -62,17 +46,23 @@ struct HsProcess {
 }
 
 impl HsProcess {
-    fn serve(config_path: &std::path::Path) -> Self {
+    /// `listeners` are handed to it still bound (`hs_testkit::ports::pass_to`).
+    fn serve(
+        config_path: &std::path::Path,
+        listeners: impl IntoIterator<Item = hs_testkit::ports::ReservedPort>,
+    ) -> Self {
         use std::io::BufRead;
-        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_hs"))
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_hs"));
+        command
             .args(["serve", "-c"])
             .arg(config_path)
             .env_remove("RUST_LOG")
             .env_remove("HS_DATA_DIR")
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-            .expect("the hs binary should start");
+            .stderr(std::process::Stdio::inherit());
+        hs_testkit::ports::pass_to(&mut command, listeners);
+        let mut child = command.spawn().expect("the hs binary should start");
+        drop(command);
         let stdout = child.stdout.take().unwrap();
         let (tx, lines) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -322,9 +312,19 @@ async fn room_shard_owners(
 /// replica: a correct, stable map in which this test has nothing to measure, and in which it
 /// used to wait out its minute for a split that never comes and fail ("two replicas never
 /// settled sharing the room shards").
-fn mesh_ports_that_split_the_room_shards(layout: hs_cluster::ShardLayout) -> (u16, u16) {
+/// The two are returned still bound, to be handed to the replicas (`hs_testkit::ports`).
+fn mesh_ports_that_split_the_room_shards(
+    layout: hs_cluster::ShardLayout,
+) -> (
+    hs_testkit::ports::ReservedPort,
+    hs_testkit::ports::ReservedPort,
+) {
     loop {
-        let (mesh_1, mesh_2) = (reserve_port(), reserve_port());
+        let (listener_1, listener_2) = (
+            hs_testkit::ports::reserve_wildcard(),
+            hs_testkit::ports::reserve_wildcard(),
+        );
+        let (mesh_1, mesh_2) = (listener_1.port(), listener_2.port());
         let ids = [
             hs_cluster::ReplicaId::new(format!("127.0.0.1:{mesh_1}")),
             hs_cluster::ReplicaId::new(format!("127.0.0.1:{mesh_2}")),
@@ -336,7 +336,7 @@ fn mesh_ports_that_split_the_room_shards(layout: hs_cluster::ShardLayout) -> (u1
             })
             .count();
         if firsts > 0 && firsts < layout.rooms as usize {
-            return (mesh_1, mesh_2);
+            return (listener_1, listener_2);
         }
     }
 }
@@ -351,13 +351,15 @@ async fn every_v12_room_is_built_by_the_owner_of_its_shard_whichever_replica_too
     };
     let dir = tempfile::tempdir().unwrap();
     let client = reqwest::Client::new();
-    let (port_1, port_2) = (reserve_port(), reserve_port());
+    let (listener_1, listener_2) = (hs_testkit::ports::reserve(), hs_testkit::ports::reserve());
+    let (port_1, port_2) = (listener_1.port(), listener_2.port());
     let layout = hs_cluster::ShardLayout {
         rooms: 4,
         users: 4,
         ..hs_cluster::ShardLayout::default()
     };
-    let (mesh_1, mesh_2) = mesh_ports_that_split_the_room_shards(layout);
+    let (mesh_listener_1, mesh_listener_2) = mesh_ports_that_split_the_room_shards(layout);
+    let (mesh_1, mesh_2) = (mesh_listener_1.port(), mesh_listener_2.port());
     let name = format!("127.0.0.1:{port_1}");
 
     // Replica 1 first (it makes the signing key and the schema), then replica 2.
@@ -373,9 +375,9 @@ async fn every_v12_room_is_built_by_the_owner_of_its_shard_whichever_replica_too
         replica_config(&db, dir.path(), &name, port_2, mesh_2),
     )
     .unwrap();
-    let mut replica_1 = HsProcess::serve(&config_1);
+    let mut replica_1 = HsProcess::serve(&config_1, [listener_1, mesh_listener_1]);
     let setup_line = replica_1.wait_for("setup_link=");
-    let mut replica_2 = HsProcess::serve(&config_2);
+    let mut replica_2 = HsProcess::serve(&config_2, [listener_2, mesh_listener_2]);
     replica_2.wait_for("listening");
     let replicas = [
         (

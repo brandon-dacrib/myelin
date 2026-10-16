@@ -17,14 +17,6 @@ fn config_yaml(port: u16, data_dir: &std::path::Path) -> String {
     )
 }
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 /// One run of the real `hs` binary. A restart has to be a new process: an in-process server's
 /// background tasks keep the store's lock until the process exits (see `tests/e2e.rs`).
 struct HsProcess {
@@ -34,17 +26,23 @@ struct HsProcess {
 }
 
 impl HsProcess {
-    fn serve(config_path: &std::path::Path) -> Self {
+    /// Starts `hs serve`, handing it `listeners` still bound (`hs_testkit::ports::pass_to`).
+    fn serve(
+        config_path: &std::path::Path,
+        listeners: impl IntoIterator<Item = hs_testkit::ports::ReservedPort>,
+    ) -> Self {
         use std::io::BufRead;
-        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_hs"))
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_hs"));
+        command
             .args(["serve", "-c"])
             .arg(config_path)
             .env_remove("RUST_LOG")
             .env_remove("HS_DATA_DIR")
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-            .expect("the hs binary should start");
+            .stderr(std::process::Stdio::inherit());
+        hs_testkit::ports::pass_to(&mut command, listeners);
+        let mut child = command.spawn().expect("the hs binary should start");
+        drop(command);
         let stdout = child.stdout.take().unwrap();
         let (tx, lines) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -155,7 +153,8 @@ impl Client {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_report_reaches_the_inbox_is_resolved_and_everything_survives_a_restart() {
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
+    let listener = hs_testkit::ports::reserve();
+    let port = listener.port();
     let config_path = dir.path().join("homeserver.yaml");
     std::fs::write(&config_path, config_yaml(port, &dir.path().join("data"))).unwrap();
     let client = Client {
@@ -163,7 +162,7 @@ async fn a_report_reaches_the_inbox_is_resolved_and_everything_survives_a_restar
         base: format!("http://127.0.0.1:{port}"),
     };
 
-    let mut server = HsProcess::serve(&config_path);
+    let mut server = HsProcess::serve(&config_path, [listener.try_clone().unwrap()]);
     let line = server.wait_for("setup_link=");
     let setup_token: String = line
         .split_once("/admin/setup#token=")
@@ -370,7 +369,7 @@ async fn a_report_reaches_the_inbox_is_resolved_and_everything_survives_a_restar
     server.stop();
 
     // After a restart: the reports, their decisions and the task are all still there.
-    let mut server = HsProcess::serve(&config_path);
+    let mut server = HsProcess::serve(&config_path, [listener.try_clone().unwrap()]);
     server.wait_for("listening");
     let login: Value = client
         .http

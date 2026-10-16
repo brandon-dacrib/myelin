@@ -9,15 +9,6 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// A port nothing is listening on right now.
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 /// The real `hs` binary, killed when dropped.
 struct HsProcess(std::process::Child);
 
@@ -113,26 +104,30 @@ async fn negotiated_alpn(port: u16, ca_pem: &str, alpn: &[Vec<u8>]) -> Option<Ve
     tls.get_ref().1.alpn_protocol().map(<[u8]>::to_vec)
 }
 
-fn spawn(config_path: &std::path::Path) -> HsProcess {
-    HsProcess(
-        std::process::Command::new(env!("CARGO_BIN_EXE_hs"))
-            .args(["serve", "-c"])
-            .arg(config_path)
-            .env_remove("RUST_LOG")
-            .env_remove("HS_DATA_DIR")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .expect("the hs binary should start"),
-    )
+/// Starts `hs serve`, handing it `listeners` still bound (`hs_testkit::ports::pass_to`).
+fn spawn(
+    config_path: &std::path::Path,
+    listeners: impl IntoIterator<Item = hs_testkit::ports::ReservedPort>,
+) -> HsProcess {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_hs"));
+    command
+        .args(["serve", "-c"])
+        .arg(config_path)
+        .env_remove("RUST_LOG")
+        .env_remove("HS_DATA_DIR")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    hs_testkit::ports::pass_to(&mut command, listeners);
+    HsProcess(command.spawn().expect("the hs binary should start"))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_listener_with_tls_is_served_as_https_by_the_binary_itself() {
     let dir = tempfile::tempdir().unwrap();
     let pki = mint(dir.path());
-    let tls_port = free_port();
-    let plain_port = free_port();
+    let (tls_listener, plain_listener) =
+        (hs_testkit::ports::reserve(), hs_testkit::ports::reserve());
+    let (tls_port, plain_port) = (tls_listener.port(), plain_listener.port());
     let config_path = config(
         dir.path(),
         tls_port,
@@ -140,7 +135,7 @@ async fn a_listener_with_tls_is_served_as_https_by_the_binary_itself() {
         &pki.cert_path,
         &pki.key_path,
     );
-    let mut hs = spawn(&config_path);
+    let mut hs = spawn(&config_path, [tls_listener, plain_listener]);
 
     let trusting = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(pki.ca_pem.as_bytes()).unwrap())
@@ -259,8 +254,9 @@ async fn a_listener_with_tls_is_served_as_https_by_the_binary_itself() {
 async fn a_key_that_does_not_match_the_certificate_stops_the_start_naming_the_listener() {
     let dir = tempfile::tempdir().unwrap();
     let pki = mint(dir.path());
-    let tls_port = free_port();
-    let plain_port = free_port();
+    let (tls_listener, plain_listener) =
+        (hs_testkit::ports::reserve(), hs_testkit::ports::reserve());
+    let (tls_port, plain_port) = (tls_listener.port(), plain_listener.port());
     let config_path = config(
         dir.path(),
         tls_port,
@@ -268,7 +264,7 @@ async fn a_key_that_does_not_match_the_certificate_stops_the_start_naming_the_li
         &pki.cert_path,
         &pki.other_key_path,
     );
-    let mut hs = spawn(&config_path);
+    let mut hs = spawn(&config_path, [tls_listener, plain_listener]);
     let deadline = Instant::now() + Duration::from_secs(300);
     let status = loop {
         if let Some(status) = hs.0.try_wait().unwrap() {

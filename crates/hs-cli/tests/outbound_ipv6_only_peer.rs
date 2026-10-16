@@ -20,25 +20,18 @@ use serde_json::{Value, json};
 
 const PEER_HOST: &str = "v6-peer.test";
 
-/// A port free on `[::1]` and on `127.0.0.1` (so the IPv4 connect is refused, not answered by
-/// something else), or `None` when this host has no IPv6 loopback.
-fn reserve_v6_port() -> Option<u16> {
+/// A port reserved on `[::1]` (kept bound, to be handed to the peer) that is free on
+/// `127.0.0.1` too (so the IPv4 connect is refused, not answered by something else; that side
+/// is only checked, bound and dropped, since nothing is meant to listen there), or `None` when
+/// this host has no IPv6 loopback.
+fn reserve_v6_port() -> Option<hs_testkit::ports::ReservedPort> {
     for _ in 0..20 {
-        let v6 = std::net::TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).ok()?;
-        let port = v6.local_addr().ok()?.port();
-        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return Some(port);
+        let v6 = hs_testkit::ports::ReservedPort::bind(Ipv6Addr::LOCALHOST).ok()?;
+        if std::net::TcpListener::bind(("127.0.0.1", v6.port())).is_ok() {
+            return Some(v6);
         }
     }
     None
-}
-
-fn reserve_v4_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 fn config(
@@ -92,7 +85,14 @@ struct Server {
     _dir: tempfile::TempDir,
 }
 
-async fn start(server_name: &str, bind: &str, port: u16, extra: &str) -> Server {
+/// A server listening on `bind`, on `reserved`, handed over still bound (`hs_testkit::ports`).
+async fn start(
+    server_name: &str,
+    bind: &str,
+    reserved: hs_testkit::ports::ReservedPort,
+    extra: &str,
+) -> Server {
+    let port = reserved.port();
     let dir = tempfile::tempdir().unwrap();
     let resolver = Arc::new(LikeLocalhost);
     let handle = hs_cli::serve::spawn_serve(
@@ -100,6 +100,7 @@ async fn start(server_name: &str, bind: &str, port: u16, extra: &str) -> Server 
         hs_cli::serve::ServeOptions {
             federation_scheme: Some("http"),
             federation_resolvers: Some((resolver.clone(), resolver)),
+            listeners: hs_cli::serve::PreboundListeners::new([reserved.into_listener()]),
             ..Default::default()
         },
     )
@@ -189,7 +190,7 @@ impl std::io::Write for Captured {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_peer_on_ipv6_alone_under_the_ipv4_only_policy_is_one_clear_warning() {
-    let Some(port_a) = reserve_v6_port() else {
+    let Some(reserved_a) = reserve_v6_port() else {
         eprintln!("SKIP: this host has no IPv6 loopback ([::1] cannot be bound)");
         return;
     };
@@ -203,7 +204,8 @@ async fn a_peer_on_ipv6_alone_under_the_ipv4_only_policy_is_one_clear_warning() 
     tracing::subscriber::set_global_default(subscriber).expect("the only subscriber");
 
     // The peer: listens on [::1] only, named by a host that resolves to both families.
-    let a = start(&format!("{PEER_HOST}:{port_a}"), "::1", port_a, "").await;
+    let port_a = reserved_a.port();
+    let a = start(&format!("{PEER_HOST}:{port_a}"), "::1", reserved_a, "").await;
     assert!(
         a.base.contains("[::1]"),
         "the peer listens on IPv6: {}",
@@ -224,8 +226,14 @@ async fn a_peer_on_ipv6_alone_under_the_ipv4_only_policy_is_one_clear_warning() 
     assert_eq!(put.status(), 200);
 
     // 1. The default policy, IPv4 only: the asker connects to 127.0.0.1, which is refused.
-    let port_b = reserve_v4_port();
-    let b = start(&format!("127.0.0.1:{port_b}"), "127.0.0.1", port_b, "").await;
+    let reserved_b = hs_testkit::ports::reserve();
+    let b = start(
+        &format!("127.0.0.1:{}", reserved_b.port()),
+        "127.0.0.1",
+        reserved_b,
+        "",
+    )
+    .await;
     assert!(hs_http::outbound::ipv4_only(), "the default is IPv4 only");
     let (status, body) = ask_profile(&client, &b, &alice).await;
     assert_ne!(
@@ -263,11 +271,11 @@ async fn a_peer_on_ipv6_alone_under_the_ipv4_only_policy_is_one_clear_warning() 
     }
 
     // 2. What the warning says to do: a server with IPv6 on reaches the peer.
-    let port_c = reserve_v4_port();
+    let reserved_c = hs_testkit::ports::reserve();
     let c = start(
-        &format!("127.0.0.1:{port_c}"),
+        &format!("127.0.0.1:{}", reserved_c.port()),
         "127.0.0.1",
-        port_c,
+        reserved_c,
         "network:\n  outbound:\n    ipv4_only: false\n",
     )
     .await;

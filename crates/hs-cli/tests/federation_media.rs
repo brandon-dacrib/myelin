@@ -14,14 +14,6 @@
 
 use serde_json::{Value, json};
 
-fn reserve_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 fn config(port: u16, data_dir: &std::path::Path) -> hs_config::Config {
     let media_dir = data_dir.join("media");
     // `url_preview_ip_range_blocklist: []` lets a redirect to the loopback stand-in origin be
@@ -44,12 +36,15 @@ struct Server {
     _dir: tempfile::TempDir,
 }
 
-async fn start(port: u16) -> Server {
+/// A server on a port reserved for it and handed over still bound (`hs_testkit::ports`).
+async fn start(reserved: hs_testkit::ports::ReservedPort) -> Server {
+    let port = reserved.port();
     let dir = tempfile::tempdir().unwrap();
     let handle = hs_cli::serve::spawn_serve(
         config(port, dir.path()),
         hs_cli::serve::ServeOptions {
             federation_scheme: Some("http"),
+            listeners: hs_cli::serve::PreboundListeners::new([reserved.into_listener()]),
             ..Default::default()
         },
     )
@@ -142,8 +137,8 @@ fn metric(text: &str, series: &str) -> u64 {
 
 #[tokio::test]
 async fn a_user_on_b_gets_an_avatar_and_an_attachment_from_a_and_still_does_with_a_down() {
-    let a = start(reserve_port()).await;
-    let b = start(reserve_port()).await;
+    let a = start(hs_testkit::ports::reserve()).await;
+    let b = start(hs_testkit::ports::reserve()).await;
     let client = reqwest::Client::new();
     let alice = register(&client, &a.base, "alice").await;
     let bob = register(&client, &b.base, "bob").await;
@@ -356,7 +351,7 @@ async fn stand_in(content: &'static [u8]) -> StandIn {
 async fn b_fetches_from_an_older_server_and_from_one_that_redirects() {
     const CONTENT: &[u8] = b"GIF89a but really just some bytes";
     let other = stand_in(CONTENT).await;
-    let b = start(reserve_port()).await;
+    let b = start(hs_testkit::ports::reserve()).await;
     let client = reqwest::Client::new();
     let bob = register(&client, &b.base, "bob").await;
     let media = format!("{}/_matrix/client/v1/media", b.base);
@@ -402,7 +397,7 @@ async fn b_fetches_from_an_older_server_and_from_one_that_redirects() {
 #[tokio::test]
 async fn a_serves_its_own_media_to_a_signed_request_and_to_nothing_else() {
     let other = stand_in(b"unused").await;
-    let a = start(reserve_port()).await;
+    let a = start(hs_testkit::ports::reserve()).await;
     let client = reqwest::Client::new();
     let alice = register(&client, &a.base, "alice").await;
     let avatar = png();
