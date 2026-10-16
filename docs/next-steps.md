@@ -4,6 +4,28 @@ Written 2026-09-20 by the integration lead, last revised 2026-10-15 (room loads 
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
+## 2026-10-16 -- arm64's CI test job ran out of memory linking, and no release went out; the fix is `agent/ci-arm64-test-kill`
+
+From 35c09f43, `test (arm64)` was stopped mid-build every time: exit 143, and in the per-attempt
+log "The runner has received a shutdown signal". `ci-ok` failed, so CD released nothing. The image
+and rustc were the same as the last green run, and the cache was not the cause. A diagnostic run
+(38829082468) printed the runner's memory every 15 s. Its last line before the stop was 14.1 of
+15.9 GB used, 3 GB swap full, four rustc and **four GNU ld** linking hs-cli's ~90 test binaries.
+amd64 links with rust-lld by default since Rust 1.90 and peaked at 9.9 GB in the same run. The
+room-load branch made arm64 go from just fitting to not fitting.
+
+**Fix** (`.github/workflows/ci.yml`): arm64's test job links with the toolchain's own lld
+(`-fuse-ld=lld -B<sysroot>/.../gcc-ld`) and gets 8 GB more swap. A 15-second resource watch
+(`.github/scripts/runner-resources.sh`) runs inside `cargo test` on both architectures, and a
+snapshot runs before the build and after a failure. **Proof:** run 38830814904. Attempt 1 (cold
+cache) compiled in 8m07s; attempt 2 (warm) compiled in 6m09s against 11m43s before, peaked at
+9.0 GB, and is green along with `ci-ok`. Details: `docs/status/12-platform-and-kubernetes.md`.
+
+**Left (hs-cli's owner):** attempt 1 then failed one test on a port race. In
+`crates/hs-cli/tests/federation_room_versions.rs`, `version_11` took a free port from
+`TcpListener::bind(":0")`, dropped the listener, and was beaten to the port (`AddrInUse`). Pass
+the bound listener to the server, or retry the bind. The pattern is likely in other hs-cli tests.
+
 ## 2026-10-15, evening -- room loads were the room's state squared; rooms now unload; the branch is `agent/room-load-speed`
 
 **The demo's slow loads.** On the demo's 0.3.22 boot (19:58-20:20 UTC), loads were CPU-bound:

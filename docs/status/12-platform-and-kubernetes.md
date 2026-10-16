@@ -1,5 +1,71 @@
 # 12. Platform and Kubernetes
 
+## 2026-10-16 (branch `agent/ci-arm64-test-kill`): arm64's test job ran out of memory linking; it links with lld now
+
+From 35c09f43 every `test (arm64)` run ended mid-build with `exit code 143` and, in the
+per-attempt log (`gh api repos/brandon-dacrib/myelin/actions/jobs/<id>/logs`, not `gh run view
+--log`, which shows the latest attempt only), "The runner has received a shutdown signal". `ci-ok`
+failed, so CD released nothing. amd64 passed every time.
+
+### Cause, with evidence
+
+- **Not the image, toolchain or cache.** The last green run (38811379769, 88f1db4f) and the
+  failing ones ran the same image (ubuntu24-arm64 20261012.149.1, provisioner 20261012.601) and
+  the same rustc 1.99.1; the kill came with the cache and without it.
+- **Memory.** A diagnostic run (38829082468, `.github/scripts/runner-resources.sh --watch 15`)
+  printed this 13 s before the runner was stopped: `mem used 14133/15947 MiB, swap 2830/3071
+  (3070 at the line before), rustc 4 ld 4`, disk at 102 GB free. Every kill was a few minutes into
+  linking hs-cli's test binaries (about ninety, each linking most of the workspace).
+- **Why arm64 only.** Since Rust 1.90 `x86_64-unknown-linux-gnu` links with the toolchain's
+  rust-lld; `aarch64-unknown-linux-gnu` still calls GNU ld through cc. Four GNU ld processes plus
+  four rustc did not fit in 16 GB + 3 GB swap. amd64 in the same run peaked at 9.9 GB and 1.1 GB
+  of swap. The room-load branch (a new hs-cli test binary, a larger hs-room) took arm64 from
+  just fitting to not fitting: the last green arm64 compile took 11m43s even with a warm cache.
+
+### Done
+
+- `.github/workflows/ci.yml`, job `test`, arm64 only: **links with the toolchain's lld**
+  (`CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C link-arg=-fuse-ld=lld -C
+  link-arg=-B<sysroot>/lib/rustlib/aarch64-unknown-linux-gnu/bin/gcc-ld`). There is no apt package,
+  and the linker always matches rustc. The step fails loudly if the toolchain stops shipping
+  `gcc-ld/ld.lld`. It runs before rust-cache, so the cache key changes with it. The job also adds
+  **8 GB of swap** (`/ci-swapfile`; the image has 3 GB and over 100 GB of free disk).
+- **Diagnosable next time:** `.github/scripts/runner-resources.sh` prints a snapshot before the
+  build and, if the runner survives, after a failure (`if: failure()`). While `cargo test` runs it
+  prints a line every 15 s with memory, swap, disk, `target/`, the rustc / ld / lld counts and
+  the four largest processes. A runner that runs out of memory is stopped mid-step and runs no
+  later step, so the last watch line is the record. Both architectures print it; amd64 builds and
+  tests the same as before.
+
+### Verified
+
+- Run 38830814904 (0bbc9b20), attempt 1, cold cache: arm64 compiled in **8m07s** (the last green
+  run took 11m43s warm). Peak `mem used` was 8.9 GB, during two 3.6 GB rustc for hs-cli's tests.
+  Peak swap was 3.35 GB of 11.2 GB, while three rust-lld were linking at 2-2.9 GB RSS each (mostly
+  mapped input files). The tests then ran, and one failed on a port race unrelated to this change
+  (see Next). amd64 passed.
+- Attempt 2 of the same run (failed jobs re-run, warm cache): **`test (arm64)` green** (job
+  116754194675). It compiled in 6m09s (11m43s before), with peak `mem used` 9.0 GB and peak swap
+  1.8 GB. `ci-ok` was green.
+
+### Next
+
+- **hs-cli's free-port race (not this track's crate):**
+  `crates/hs-cli/tests/federation_room_versions.rs` takes a port with `TcpListener::bind("127.0.0.1:0")`,
+  drops the listener, and boots the server on that port later. Tests in the same binary run in
+  parallel, and so do outbound connections. On arm64 the `version_11` case lost the port: `Bind {
+  addr: "127.0.0.1:39139", ... AddrInUse }`. The fix belongs to the owner of that test: hand the
+  bound listener to `spawn_serve`, or retry on `AddrInUse`. The same pattern is likely in other
+  hs-cli tests.
+- `target/` reaches about 45 GB on both architectures (amd64 had 41 GB left after its build), so
+  disk is the next ceiling. Over 100 GB is free before the build, so it is not close yet.
+
+### Decisions made
+
+- lld on arm64 rather than `-j2` or less debug info: it brings arm64 to what amd64 already does,
+  costs no coverage or backtrace detail, and made the build faster rather than slower. The swap
+  is headroom on top of it, not the fix.
+
 ## 2026-10-15 (branch `agent/bridge-volume-size`): a bridge's volume only grows, starts at 5 GiB, and is measured
 
 The demo's Slack bridge stopped on 2026-10-14 with a full 1 GiB volume (its init container:
