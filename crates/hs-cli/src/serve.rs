@@ -1780,6 +1780,10 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     // so a change is in force at once (the `server` hook below sets them again).
     crate::live_config::apply_rooms(&rooms, &config.server.rooms);
     let _idle_unloader = rooms.spawn_idle_unloader();
+    // Once a minute: the forward-extremity gauges, a warn for a badly forked room, and dummy
+    // events into rooms past `server.rooms.dummy_events_threshold` (hs-room's
+    // `actor::extremities`).
+    let _extremity_maintainer = rooms.spawn_extremity_maintainer();
     // Above `server.rooms.memory_unload_fraction` of the memory limit, the least recently used
     // rooms are unloaded, on the memory guard's reading (`crate::memory_guard`): below its
     // federation shedding line, so rooms go first.

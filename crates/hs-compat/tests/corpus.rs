@@ -215,6 +215,7 @@ fn kitchen_sink_translates_every_mapped_key_with_no_override() {
         config.server.admin_contact.as_deref(),
         Some("mailto:admin@example.org")
     );
+    assert_eq!(config.server.rooms.dummy_events_threshold, 25);
     assert_eq!(
         config.server.signing_key_path.to_str(),
         Some("/etc/hs/signing.key")

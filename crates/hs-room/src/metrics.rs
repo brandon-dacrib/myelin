@@ -97,6 +97,34 @@ static STATE_RESOLUTIONS_RUN: LazyLock<Counter> = LazyLock::new(Counter::default
 /// because it had resolved the same forks already (`RoomActor::state_view`'s cache).
 static STATE_RESOLUTION_CACHE_HITS: LazyLock<Counter> = LazyLock::new(Counter::default);
 
+/// The upper bounds of `hs_room_forward_extremities_rooms{le}`'s buckets (Synapse's
+/// `synapse_forward_extremities` has the same shape).
+pub const EXTREMITY_BUCKETS: [usize; 12] = [1, 2, 3, 5, 7, 10, 15, 20, 50, 100, 200, 500];
+
+/// `hs_room_forward_extremities_rooms{le}`: how many resident rooms have at most `le` forward
+/// extremities, as of the extremity maintainer's last pass (once a minute,
+/// `crate::registry::RoomRegistry::spawn_extremity_maintainer`); `le="+Inf"` is every room it
+/// read. A histogram of rooms, not of observations: each pass replaces the last.
+static FORWARD_EXTREMITY_ROOMS: LazyLock<LabelledGauges> = LazyLock::new(Family::default);
+
+/// Gauges by a set of labels.
+type LabelledGauges = Family<Vec<(String, String)>, Gauge<i64, AtomicI64>>;
+
+/// `hs_room_forward_extremities_max`: the most forward extremities any resident room has, as
+/// of the maintainer's last pass. A room past `crate::registry::EXTREMITIES_WARN_AT` is also
+/// logged at `warn`, by name.
+static FORWARD_EXTREMITIES_MAX: LazyLock<Gauge<i64, AtomicI64>> = LazyLock::new(Gauge::default);
+
+/// `hs_room_dummy_events_total{outcome}`: dummy events the extremity maintainer tried to send
+/// into rooms with more than `server.rooms.dummy_events_threshold` forward extremities --
+/// `sent`, `no_local_sender` (no joined local user may send one) or `failed`.
+static DUMMY_EVENTS: LazyLock<Family<Vec<(String, String)>, Counter>> =
+    LazyLock::new(Family::default);
+
+/// `hs_room_extremities_pruned_total`: forward extremities dropped because they do not change
+/// the room's resolved state (`crate::actor::extremities`).
+static EXTREMITIES_PRUNED: LazyLock<Counter> = LazyLock::new(Counter::default);
+
 /// `hs_room_stale_copies_reloaded_total`: resident copies of a room `RoomRegistry::get_or_load`
 /// dropped because the room's shard changed hands since the copy was loaded (the fencing epoch
 /// moved: this replica lost the shard and got it back), each followed by a load from the store.
@@ -415,6 +443,62 @@ pub fn state_resolution_cache_hits() -> u64 {
     STATE_RESOLUTION_CACHE_HITS.get()
 }
 
+/// Records the maintainer's pass over resident rooms' forward extremity counts: the bucketed
+/// gauge and the maximum.
+pub(crate) fn set_forward_extremity_counts(counts: &[usize]) {
+    for le in EXTREMITY_BUCKETS {
+        let at_most = counts.iter().filter(|c| **c <= le).count();
+        FORWARD_EXTREMITY_ROOMS
+            .get_or_create(&vec![("le".to_owned(), le.to_string())])
+            .set(i64::try_from(at_most).unwrap_or(i64::MAX));
+    }
+    FORWARD_EXTREMITY_ROOMS
+        .get_or_create(&vec![("le".to_owned(), "+Inf".to_owned())])
+        .set(i64::try_from(counts.len()).unwrap_or(i64::MAX));
+    let max = counts.iter().copied().max().unwrap_or(0);
+    FORWARD_EXTREMITIES_MAX.set(i64::try_from(max).unwrap_or(i64::MAX));
+}
+
+/// `hs_room_forward_extremities_max` as it stands.
+#[must_use]
+pub fn forward_extremities_max() -> i64 {
+    FORWARD_EXTREMITIES_MAX.get()
+}
+
+/// `hs_room_forward_extremities_rooms{le}` as it stands (`le` as written, `"+Inf"` included).
+#[must_use]
+pub fn forward_extremity_rooms(le: &str) -> i64 {
+    FORWARD_EXTREMITY_ROOMS
+        .get_or_create(&vec![("le".to_owned(), le.to_owned())])
+        .get()
+}
+
+/// Counts one dummy event attempt by `outcome`.
+pub(crate) fn count_dummy_event(outcome: &'static str) {
+    DUMMY_EVENTS
+        .get_or_create(&vec![("outcome".to_owned(), outcome.to_owned())])
+        .inc();
+}
+
+/// `hs_room_dummy_events_total{outcome}` as it stands.
+#[must_use]
+pub fn dummy_events(outcome: &str) -> u64 {
+    DUMMY_EVENTS
+        .get_or_create(&vec![("outcome".to_owned(), outcome.to_owned())])
+        .get()
+}
+
+/// Counts `n` forward extremities pruned.
+pub(crate) fn count_extremities_pruned(n: usize) {
+    EXTREMITIES_PRUNED.inc_by(n as u64);
+}
+
+/// `hs_room_extremities_pruned_total` as it stands.
+#[must_use]
+pub fn extremities_pruned() -> u64 {
+    EXTREMITIES_PRUNED.get()
+}
+
 /// Counts one load slower than `crate::actor::load_report::SLOW_LOAD` in
 /// `hs_room_slow_loads_total`.
 pub(crate) fn count_slow_load() {
@@ -561,6 +645,31 @@ pub fn register_metrics(registry: &mut prometheus_client::registry::Registry) {
         "hs_room_state_resolution_cache_hits",
         "State resolutions a room actor answered from its cache: the same forks resolved already",
         STATE_RESOLUTION_CACHE_HITS.clone(),
+    );
+    registry.register(
+        "hs_room_forward_extremities_rooms",
+        "Resident rooms with at most le forward extremities, as of the last minute's pass (le=+Inf \
+         is every room read); more than one means every read of the room's current state is a \
+         state resolution",
+        FORWARD_EXTREMITY_ROOMS.clone(),
+    );
+    registry.register(
+        "hs_room_forward_extremities_max",
+        "The most forward extremities any resident room has, as of the last minute's pass",
+        FORWARD_EXTREMITIES_MAX.clone(),
+    );
+    // Registered without `_total`: the text encoder appends it.
+    registry.register(
+        "hs_room_dummy_events",
+        "Dummy events sent to merge the forward extremities of rooms past \
+         server.rooms.dummy_events_threshold, by outcome (sent, no_local_sender, failed)",
+        DUMMY_EVENTS.clone(),
+    );
+    // Registered without `_total`: the text encoder appends it.
+    registry.register(
+        "hs_room_extremities_pruned",
+        "Forward extremities dropped because they do not change the room's resolved state",
+        EXTREMITIES_PRUNED.clone(),
     );
     // Registered without `_total`: the text encoder appends it.
     registry.register(

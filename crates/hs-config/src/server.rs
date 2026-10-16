@@ -116,6 +116,33 @@ pub struct RoomsConfig {
     /// memory. Between 0 and 1; `0` turns it off. Synapse has no setting for it.
     #[serde(default = "default_memory_unload_fraction")]
     pub memory_unload_fraction: f64,
+
+    /// How many forward extremities a room may have before this server sends an
+    /// `org.matrix.dummy_event` into it to merge them. Every read of the current state of a
+    /// room with more than one is a state resolution of its forks, which in a large federated
+    /// room takes seconds. A room collects them when other servers' events fork it and none of
+    /// this server's users writes there (every event this server sends cites up to ten). The
+    /// event is sent as a joined local user who may send events, cites the ten deepest
+    /// extremities, goes to the other servers in the room, and is never shown to clients. Checked
+    /// once a minute, at most five rooms at a time, the most forked first; forks that do not
+    /// change the room's state are also dropped as events arrive. Synapse's
+    /// `dummy_events_threshold`, with the same default. `0` sends none.
+    #[serde(default = "default_dummy_events_threshold")]
+    pub dummy_events_threshold: u32,
+
+    /// The least time between two dummy events in one room (see `dummy_events_threshold`):
+    /// each merges up to ten extremities, so a room of 30 is down to three in three intervals.
+    /// Synapse checks every five minutes, the default here.
+    #[serde(default = "default_dummy_events_interval")]
+    pub dummy_events_interval: crate::duration::Duration,
+}
+
+fn default_dummy_events_threshold() -> u32 {
+    10
+}
+
+fn default_dummy_events_interval() -> crate::duration::Duration {
+    crate::duration::Duration::from_mins(5)
 }
 
 /// How long an unused room stays loaded when `server.rooms.idle_unload_after` is unset.
@@ -148,6 +175,8 @@ impl Default for RoomsConfig {
             event_cache_size: default_event_cache_size(),
             idle_unload_after: None,
             memory_unload_fraction: default_memory_unload_fraction(),
+            dummy_events_threshold: default_dummy_events_threshold(),
+            dummy_events_interval: default_dummy_events_interval(),
         }
     }
 }

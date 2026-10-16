@@ -57,6 +57,12 @@ use crate::keys::DynRemoteKeyCache;
 use crate::room_source::{RoomDataSource, RoomSourceError};
 use crate::sender::OutboundPduSink;
 
+/// How many of the room's forward extremities a `make_join` template cites at most, the
+/// deepest: Synapse's figure for any event a server creates, and the room layer's
+/// (`hs_room::actor::extremities::MAX_PREV_EVENTS`). Synapse refuses an event citing more than
+/// 20.
+pub const MAX_TEMPLATE_PREV_EVENTS: usize = 10;
+
 /// Why a join handshake call failed.
 #[derive(Debug, Clone)]
 pub enum JoinError {
@@ -511,6 +517,14 @@ pub async fn make_membership(
         ));
     }
     let depth = extremities.iter().map(|(_, d)| *d).max().unwrap_or(0) + 1;
+    // The template cites at most ten extremities, the deepest: what an event this server
+    // creates cites (`hs_room::actor::extremities::MAX_PREV_EVENTS`, Synapse's figure). A join
+    // citing more than 20 is refused by Synapse ("Too many prev_events").
+    let mut extremities = extremities;
+    if extremities.len() > MAX_TEMPLATE_PREV_EVENTS {
+        extremities.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        extremities.truncate(MAX_TEMPLATE_PREV_EVENTS);
+    }
     let mut prev_events = Vec::with_capacity(extremities.len());
     for (id, _) in &extremities {
         prev_events.push(encode_ref(rooms, room_id, id, &room_version, &rules).await?);
@@ -1410,6 +1424,37 @@ mod tests {
         assert!(auth_events.contains(&serde_json::json!("$create")));
         assert!(auth_events.contains(&serde_json::json!("$power")));
         assert!(auth_events.contains(&serde_json::json!("$joinrules")));
+    }
+
+    /// A room of 25 forks: the template cites the ten deepest, not all 25 (Synapse refuses an
+    /// event citing more than 20), and its depth is still one past the deepest.
+    #[tokio::test]
+    async fn make_join_cites_at_most_ten_extremities_the_deepest() {
+        let (fixture, room_id, _) = room_with_creator();
+        let (_, mut room) = fixture.rooms_for_test().into_iter().next().unwrap();
+        room.extremities = (0..25).map(|n| (format!("$fork{n}"), 4 + n)).collect();
+        let mut rooms = InMemoryRoomSource::new();
+        rooms.insert_room(&room_id, room);
+        let template = make_join(
+            &rooms,
+            &room_id,
+            "@bob:remote.example.org",
+            &[],
+            "resident.example.org",
+        )
+        .await
+        .unwrap();
+        let mut cited: Vec<String> = template.event["prev_events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_owned())
+            .collect();
+        cited.sort();
+        let mut expected: Vec<String> = (15..25).map(|n| format!("$fork{n}")).collect();
+        expected.sort();
+        assert_eq!(cited, expected);
+        assert_eq!(template.event["depth"], 4 + 24 + 1);
     }
 
     #[tokio::test]

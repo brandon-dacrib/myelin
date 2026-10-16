@@ -36,6 +36,9 @@ pub struct LoadReport {
     /// Explicit states whose root the load did not compute, left to the first read that needs
     /// one ([`super::RoomActor::root_after`]).
     pub deferred_roots: usize,
+    /// The room's forward extremities: more than one makes the load's `finish` (and every
+    /// later read of the current state) a state resolution of that many forks.
+    pub extremities: usize,
 }
 
 impl LoadReport {

@@ -21,7 +21,9 @@
         "rooms": {
           "event_cache_size": 1000,
           "idle_unload_after": null,
-          "memory_unload_fraction": 0.75
+          "memory_unload_fraction": 0.75,
+          "dummy_events_threshold": 10,
+          "dummy_events_interval": "5m"
         }
       }
     },
@@ -426,7 +428,9 @@
           "default": {
             "event_cache_size": 1000,
             "idle_unload_after": null,
-            "memory_unload_fraction": 0.75
+            "memory_unload_fraction": 0.75,
+            "dummy_events_threshold": 10,
+            "dummy_events_interval": "5m"
           },
           "x-applies": "hot"
         }
@@ -485,6 +489,18 @@
           "type": "number",
           "format": "double",
           "default": 0.75
+        },
+        "dummy_events_threshold": {
+          "description": "How many forward extremities a room may have before this server sends an\n`org.matrix.dummy_event` into it to merge them. Every read of the current state of a\nroom with more than one is a state resolution of its forks, which in a large federated\nroom takes seconds. A room collects them when other servers' events fork it and none of\nthis server's users writes there (every event this server sends cites up to ten). The\nevent is sent as a joined local user who may send events, cites the ten deepest\nextremities, goes to the other servers in the room, and is never shown to clients. Checked\nonce a minute, at most five rooms at a time, the most forked first; forks that do not\nchange the room's state are also dropped as events arrive. Synapse's\n`dummy_events_threshold`, with the same default. `0` sends none.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "default": 10
+        },
+        "dummy_events_interval": {
+          "description": "The least time between two dummy events in one room (see `dummy_events_threshold`):\neach merges up to ten extremities, so a room of 30 is down to three in three intervals.\nSynapse checks every five minutes, the default here.",
+          "$ref": "#/$defs/Duration",
+          "default": "5m"
         }
       },
       "additionalProperties": false

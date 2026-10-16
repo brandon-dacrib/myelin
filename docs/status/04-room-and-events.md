@@ -2,6 +2,70 @@
 
 Track brief: `docs/workstreams/04-room-and-events.md`. Owner crate: `hs-room`.
 
+## 2026-10-16 (branch `agent/extremity-merge`): forward extremities are capped, pruned and merged with dummy events
+
+**Asked**: forked federated rooms on the demo (`#ping`, codestorm.net's `!c10y-...`) keep many
+forward extremities, changing about once a minute, and every change costs a 15-22 s state
+resolution under the room's lock. Do what Synapse does to keep the set small, and find why one
+resolution is so slow.
+
+**Found** (this server, before): every event it built cited *every* extremity
+(`send_event`, `build_membership_event`, `make_join`'s template), so in a room of more than 20
+forks Synapse would refuse its events ("Too many prev_events"); nothing pruned extremities and
+nothing merged a room none of this server's users writes to. Also: state-store roots are not
+canonical -- a resolution whose answer is exactly one fork's state is a different root -- so root
+equality cannot say "same state" (the store's `diff` can).
+
+**Done** (decision 0052, `crates/hs-room/src/actor/extremities.rs`,
+`crates/hs-room/src/registry/extremity_maintainer.rs`):
+
+- `prev_events` capped at ten, the deepest then latest (`MAX_PREV_EVENTS`); `make_join`
+  templates too (`hs_federation::join::MAX_TEMPLATE_PREV_EVENTS`).
+- Pruning after every handle operation that persisted events (`RoomActor::after_operation` ->
+  `maintain_extremities`), Synapse's `_prune_extremities` rules; state identical before and after.
+- Dummy events: `RoomRegistry::spawn_extremity_maintainer` (installed by `hs serve`), once a
+  minute, at most five rooms a pass, one per room per `server.rooms.dummy_events_interval`
+  (default 5 min) past `server.rooms.dummy_events_threshold` (default 10, `0` off), sent as the
+  first joined local user the auth rules allow; hidden from clients (`event_visible_to`).
+  Synapse's `dummy_events_threshold` is translated by `hs-compat`.
+- Metrics: `hs_room_forward_extremities_rooms{le}`, `hs_room_forward_extremities_max`,
+  `hs_room_dummy_events_total{outcome}`, `hs_room_extremities_pruned_total`; `warn` for a room
+  past 50 extremities; the slow-load `warn` carries `extremities`.
+- Tests (`cargo test -p hs-room --lib extremit`): pruning a stuck remote extremity keeps the
+  state identical and survives a reload; a recent one, or this server's own, is kept; pruning runs
+  by itself through the handle; local events cite the ten deepest; a dummy event merges ten,
+  is hidden, and needs a joined local user; the maintainer's pass measures, warns once, merges,
+  rate-limits per room and skips a busy room. `hs-federation`: `make_join` cites ten.
+  `hs-compat`'s kitchen sink translates `dummy_events_threshold`.
+
+- Real binary (`hs serve`, embedded Fjall, `dummy_events_threshold: 3`,
+  `dummy_events_interval: 30s`): the config loads and is logged, the maintainer's first pass
+  sets the gauges, and after a room is created and written to the next pass reads
+  `hs_room_forward_extremities_rooms{le="1"} 1`, `_max 1`; no errors.
+
+**Why one resolution was slow** (status 02, 2026-10-16, has the detail): the demo's rooms are
+version 12 (v2.1 resolution) on Fjall over a Longhorn volume, where every row a cache misses is a
+network read, and the rows a resolution read grew with the number of forks: each fork re-read
+the chain-cover links of its state events, and each fork's whole auth chain was read where only
+the chains' difference is used. `hs-state` now caches links on snapshot readers, reads only new
+links, computes the auth difference over every fork at once, and drops forks of identical state
+before resolving (and answers a fork's own root when its state wins). New harness
+`crates/hs-room/tests/fork_resolution.rs` (a federated v12 room of 800 members forked by stuck
+extremities, cold Fjall load): rows read in the resolution, 25 forks 18,216 -> 5,150; 289 forks
+156,800 -> 5,477 (`finish` 168 ms -> 126-131 ms locally; local SSD hides most of the cost, so
+the demo's own `rows_read` and `hs_state_resolution_rows_read_total` after the roll are the
+proof). `RoomActor::resolve_forks`'s slow-resolution log carries `rows_read`.
+
+**Left**: inbound events citing more than 20 `prev_events` (or 10 `auth_events`) are still
+accepted (Synapse refuses them; track 06). Pruning's thresholds are Synapse's constants.
+`ResolutionCache` and `membership_cache` are keyed by root, and roots are not canonical, so they
+can miss for an identical state the resolution built afresh. The state store's record cache
+(1,024) is smaller than one v2.1 resolution of a 2,800-event room reads. The demo's load
+`extremities` phase took 1.3-4 s (it also restores the timeline's gaps); not investigated.
+**After the roll, check**: `hs_room_forward_extremities_max` and `_rooms{le}` on the demo,
+`hs_room_dummy_events_total{outcome}`, `hs_room_extremities_pruned_total`, the `extremities`
+field of slow-load warnings for `#ping` and `!c10y-...`, and resolutions per minute falling.
+
 ## 2026-10-16 (track 05's branch `agent/hub-members-step`): a forked room's current state is resolved once per set of forks
 
 A room with more than one forward extremity answered every read of its current state

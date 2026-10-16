@@ -19,6 +19,7 @@
 server_name: kitchen-sink.example.org
 public_baseurl: "https://ks.example.org/"
 admin_contact: "mailto:admin@example.org"
+dummy_events_threshold: 25
 report_stats: true
 
 signing_key_path: /etc/hs/signing.key

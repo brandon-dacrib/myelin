@@ -256,9 +256,9 @@ pub const OPTIONS: &[KeyInfo] = &[
     },
     KeyInfo {
         key: "dummy_events_threshold",
-        classification: Classification::Unsupported,
-        native: "",
-        note: "R-PHASE1 (hs-room, forward-extremity maintenance).",
+        classification: Classification::Mapped,
+        native: "`server.rooms.dummy_events_threshold`",
+        note: "",
     },
     KeyInfo {
         key: "delete_stale_devices_after",

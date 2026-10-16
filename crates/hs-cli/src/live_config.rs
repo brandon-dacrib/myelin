@@ -314,13 +314,18 @@ pub fn apply_rooms<B: hs_kv::KvBackend>(
     let idle = config.idle_unload_after();
     rooms.set_idle_unload_after(idle);
     rooms.set_memory_unload_fraction(config.memory_unload_fraction);
+    rooms.set_dummy_events_threshold(config.dummy_events_threshold as usize);
+    rooms.set_dummy_events_interval(config.dummy_events_interval.as_std());
     tracing::info!(
         event_cache_size = config.event_cache_size,
         idle_unload_after = ?idle,
         memory_unload_fraction = config.memory_unload_fraction,
+        dummy_events_threshold = config.dummy_events_threshold,
+        dummy_events_interval = %config.dummy_events_interval,
         "each room keeps this many recent events in memory; the rest is read from the database; \
          a room unused this long, or the least recently used above this share of the memory \
-         limit, is unloaded (server.rooms)"
+         limit, is unloaded; a room with more forward extremities than the threshold is sent a \
+         dummy event to merge them, at most once per interval (server.rooms)"
     );
 }
 

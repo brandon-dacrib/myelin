@@ -33,6 +33,7 @@ use crate::timeline::{Direction, PaginationToken};
 pub mod admin_ops;
 pub mod catch_up;
 pub mod event_cache;
+pub mod extremities;
 mod fetched_state;
 pub mod gaps;
 mod history;
@@ -652,6 +653,9 @@ pub struct RoomActor<B: KvBackend> {
     /// registry takes it ([`RoomActor::take_load_report`]). `None` for an actor made any other
     /// way.
     load_report: Option<load_report::LoadReport>,
+    /// The events persisted since the last [`RoomActor::maintain_extremities`]: what its
+    /// pruning reads (`extremities`).
+    persisted_since_maintenance: extremities::PersistedSinceMaintenance,
 }
 
 impl<B: KvBackend> RoomActor<B> {
@@ -961,6 +965,7 @@ impl<B: KvBackend> RoomActor<B> {
             create_sn: None,
             pending_redactions: HashMap::new(),
             load_report: None,
+            persisted_since_maintenance: extremities::PersistedSinceMaintenance::default(),
         }
     }
 
@@ -1313,6 +1318,7 @@ impl<B: KvBackend> RoomActor<B> {
             gap_rows.push((top, record));
         }
         actor.restore_gaps(gap_rows);
+        clock.report_mut().extremities = actor.forward_extremities.len();
         clock.begin("finish");
         if actor.create_sn.is_none() {
             actor.create_sn = actor.current_create_sn()?;
@@ -1813,6 +1819,9 @@ impl<B: KvBackend> RoomActor<B> {
                 room_id = %self.room_id,
                 forks = forks.len(),
                 took_ms = took.as_millis() as u64,
+                // Rows of the state store it read (`hs_state_resolution_rows_read_total`): on
+                // a slow disk, about one cold read each.
+                rows_read = hs_state::metrics::resolution_profile::last_resolution_rows(),
                 "a state resolution took over a second (hs_room_state_resolution_seconds); its \
                  answer is kept for the next read of the same forks"
             );
@@ -2118,7 +2127,8 @@ impl<B: KvBackend> RoomActor<B> {
             return Ok(existing);
         }
         self.refuse_malformed_local_state(&event_type, state_key.as_deref(), &content)?;
-        let prev_sns = self.forward_extremities_vec();
+        // Every extremity up to ten, the deepest past that (`extremities`).
+        let prev_sns = self.prev_events_for_new_event();
         self.send_event_citing(
             sender, event_type, state_key, content, redacts, now_ms, &prev_sns,
         )
@@ -3193,6 +3203,7 @@ impl<B: KvBackend> RoomActor<B> {
         if let Some(below) = gap_below {
             self.open_gap(room_pos, below, &event);
         }
+        self.note_persisted_for_maintenance(event_sn, &event);
 
         let update = RoomUpdate {
             room_sn: self.room_sn,
@@ -4364,7 +4375,7 @@ impl<B: KvBackend> RoomActor<B> {
         {
             return Ok(existing);
         }
-        let prev_sns = self.forward_extremities_vec();
+        let prev_sns = self.prev_events_for_new_event();
         let prev_refs = self.refs_for(&prev_sns)?;
         let state = self.state_view(&prev_sns)?;
         pipeline::build_and_authorize(
@@ -6206,6 +6217,11 @@ impl<B: KvBackend> RoomActor<B> {
     /// this actor does not hold `event` (should not happen for an event this same actor just
     /// handed back from its own cache).
     pub fn event_visible_to(&self, event: &Event, requester: &UserId) -> Result<bool, RoomError> {
+        // A dummy event only cites extremities (`extremities`): nobody is shown one, as
+        // Synapse's `filter_events_for_client` shows nobody one.
+        if event.header().event_type == extremities::DUMMY_EVENT_TYPE {
+            return Ok(false);
+        }
         // The spec's rule for a user's own membership events is "allowed under their membership
         // before it, or after it" -- and then there is the case that rule leaves out. Somebody
         // who declines an invitation (or has it withdrawn, or is banned while still only
@@ -7412,6 +7428,28 @@ impl<B: KvBackend> RoomActorHandle<B> {
         Arc::strong_count(&self.inner)
     }
 
+    /// Runs `f` over the actor if no other operation holds it right now, without waiting and
+    /// on the calling thread: for a cheap look (`f` must not do I/O) by a background pass that
+    /// would rather skip a busy room than queue behind it. `None` when the room is busy.
+    pub fn try_peek<T>(&self, f: impl FnOnce(&RoomActor<B>) -> T) -> Option<T> {
+        self.inner.try_lock().ok().map(|guard| f(&guard))
+    }
+
+    /// `RoomActor::send_dummy_event` (`extremities`), under the room's lock.
+    ///
+    /// # Errors
+    /// As `RoomActor::send_dummy_event`.
+    pub async fn send_dummy_event(
+        &self,
+        now_ms: i64,
+    ) -> Result<extremities::DummyOutcome, RoomError>
+    where
+        B: 'static,
+    {
+        self.with_actor(move |actor| actor.send_dummy_event(now_ms))
+            .await
+    }
+
     /// Subscribes to the room's publish stream (`crate::protocol::RoomUpdate`).
     pub async fn subscribe(&self) -> tokio::sync::broadcast::Receiver<RoomUpdate> {
         self.inner.lock().await.subscribe()
@@ -7481,7 +7519,9 @@ impl<B: KvBackend> RoomActorHandle<B> {
             }
             // Release what the previous operation's reads pinned (`working_set`).
             guard.begin_operation();
-            f(&mut guard)
+            let out = f(&mut guard);
+            guard.after_operation();
+            out
         });
         tracing::Instrument::instrument(task, span)
             .await

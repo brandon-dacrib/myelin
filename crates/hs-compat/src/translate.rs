@@ -649,6 +649,11 @@ fn translate_key(key: &str, v: &Value, config: &mut Config) {
         }
         "public_baseurl" => config.server.public_baseurl = v.as_str().map(str::to_owned),
         "admin_contact" => config.server.admin_contact = v.as_str().map(str::to_owned),
+        "dummy_events_threshold" => {
+            if let Some(n) = v.as_u64() {
+                config.server.rooms.dummy_events_threshold = u32::try_from(n).unwrap_or(u32::MAX);
+            }
+        }
         // Nothing to carry over (`hs_config::retired`): this server sends no usage statistics,
         // and keeps sessions and tokens in its store, so nothing is signed with a macaroon key.
         "report_stats" | "macaroon_secret_key" | "macaroon_secret_key_path" => {}

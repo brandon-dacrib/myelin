@@ -1,6 +1,6 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-10-16 (the hub's members step and the idle CPU were repeated state resolutions; `agent/hub-members-step`. Before: handover: the demo, the releases and what is next, below. Before: test servers are handed their ports still bound; `agent/test-port-races`. Before: room loads and unloading; `agent/room-load-speed`. Before: the Slack bridge's full volume; fix on `agent/bridge-volume-size`. Before: Discord's delivery timeouts were a replay of the 2026-10-12 flood; fix on `agent/discord-delivery-timeouts`. Before: the memory climb with federation on; fix on `agent/fed-memory-growth`. Before: the session hub wedge; fix on `agent/hub-wedge`. Earlier: the ephemeral pump's prune busy loop; fix on `agent/ephemeral-prune`). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+Written 2026-09-20 by the integration lead, last revised 2026-10-16 (forked rooms are merged and pruned, and a resolution reads about the room once however many forks; `agent/extremity-merge`. Before: the hub's members step and the idle CPU were repeated state resolutions; `agent/hub-members-step`. Before: handover: the demo, the releases and what is next, below. Before: test servers are handed their ports still bound; `agent/test-port-races`. Before: room loads and unloading; `agent/room-load-speed`. Before: the Slack bridge's full volume; fix on `agent/bridge-volume-size`. Before: Discord's delivery timeouts were a replay of the 2026-10-12 flood; fix on `agent/discord-delivery-timeouts`. Before: the memory climb with federation on; fix on `agent/fed-memory-growth`. Before: the session hub wedge; fix on `agent/hub-wedge`. Earlier: the ephemeral pump's prune busy loop; fix on `agent/ephemeral-prune`). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
@@ -70,6 +70,35 @@ MemAvailable; Element syncing without pauses.
    constants, not settings (decision 0049); dead letters never expire, on purpose.
 8. In cluster mode only the replica running the bridge manager fills `AppService.volume` and the
    bridge volume gauges (decision 0050).
+
+## 2026-10-16 -- forked rooms are merged and pruned as Synapse does, and a resolution no longer reads more the more forks there are; the branch is `agent/extremity-merge`
+
+Follow-up to `agent/hub-members-step`: the first read after each change of a forked room's
+extremities still resolved, and in `#ping` and `!c10y-...` they changed about once a minute.
+
+- **Fixed (track 04, decision 0052)**: events this server builds, and `make_join` templates,
+  cite at most ten extremities, the deepest (it cited all of them: past 20, Synapse refuses the
+  event). After each operation that persisted events, extremities whose state the resolution did
+  not pick are dropped by Synapse's `_prune_extremities` rules (state identical before and
+  after). Once a minute a pass sends an `org.matrix.dummy_event`, hidden from clients, into up to
+  five rooms past `server.rooms.dummy_events_threshold` (default 10, `0` off; Synapse's key is
+  translated) at most once per `server.rooms.dummy_events_interval` (default 5 min) per room.
+- **Fixed (track 02)**: a resolution re-read the chain-cover links of every fork's state and
+  every fork's whole auth chain; on the demo's Longhorn volume each such row is a network read.
+  Now links are cached on snapshot readers and the auth difference is computed once over all
+  forks: `crates/hs-room/tests/fork_resolution.rs` (v12, 800 members, cold Fjall) reads 5,150
+  rows instead of 18,216 at 25 forks and 5,477 instead of 156,800 at 289.
+- **New metrics**: `hs_room_forward_extremities_rooms{le}`, `hs_room_forward_extremities_max`,
+  `hs_room_dummy_events_total{outcome}`, `hs_room_extremities_pruned_total`,
+  `hs_state_resolution_rows_read_total`; a `warn` for a room past 50 extremities; slow loads
+  and slow resolutions log `extremities` and `rows_read`.
+- **After the roll, check**: the extremity gauges and dummy-event counter, the two rooms'
+  extremity counts falling to a few within minutes, resolutions per minute and their
+  `rows_read`, the hub's members step p99.
+- **Left**: inbound events with more than 20 `prev_events` are still accepted (track 06);
+  root-keyed caches can miss for a rebuilt identical state; the state record cache (1,024) is
+  small for a v2.1 resolution of a large room; the 1.3-4 s `extremities` load phase on the demo
+  is unexplained. Status 04 and 02 (2026-10-16) have the details.
 
 ## 2026-10-16 -- the hub's 30-second "members and directory entry" step and the idle two cores were state resolutions run again on every read; the fix is `agent/hub-members-step`
 

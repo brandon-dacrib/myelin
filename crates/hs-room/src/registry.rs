@@ -17,6 +17,12 @@ use crate::identity::HomeserverIdentity;
 use crate::persist::Tables;
 use crate::protocol::RoomUpdate;
 
+pub mod extremity_maintainer;
+pub use extremity_maintainer::{
+    DEFAULT_DUMMY_EVENTS_INTERVAL, DEFAULT_DUMMY_EVENTS_THRESHOLD, EXTREMITIES_WARN_AT,
+    ExtremityMaintainer, ExtremityPass,
+};
+
 struct Entry<B: KvBackend> {
     handle: RoomActorHandle<B>,
     last_used: Instant,
@@ -177,6 +183,13 @@ pub struct RoomRegistry<B: KvBackend> {
     /// unloaded (`server.rooms.memory_unload_fraction`), as `f64` bits; `0` never. Read by
     /// [`RoomRegistry::spawn_memory_pressure_unloader`]'s task on every check.
     memory_unload_fraction: Arc<std::sync::atomic::AtomicU64>,
+    /// How many forward extremities a resident room may have before
+    /// [`RoomRegistry::spawn_extremity_maintainer`]'s pass sends a dummy event into it
+    /// (`server.rooms.dummy_events_threshold`); `0` never.
+    dummy_events_threshold: Arc<std::sync::atomic::AtomicU64>,
+    /// The least time between two dummy events into one room, in milliseconds
+    /// (`server.rooms.dummy_events_interval`).
+    dummy_events_interval_ms: Arc<std::sync::atomic::AtomicU64>,
     /// The loads under way, by room ([`RoomRegistry::get_or_load`]): everyone who asks for a
     /// room that is loading waits for that load instead of starting one of their own.
     loading: Arc<std::sync::Mutex<LoadsUnderWay<B>>>,
@@ -497,6 +510,7 @@ fn report_slow_load(
         outliers = report.outliers,
         state_rows = report.state_rows,
         deferred_roots = report.deferred_roots,
+        extremities = report.extremities,
         "a room load took longer than ten seconds (hs_room_load_phase_seconds, \
          hs_room_slow_loads_total)"
     );
@@ -613,6 +627,12 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
             idle_unload_after_secs: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             memory_unload_fraction: Arc::new(std::sync::atomic::AtomicU64::new(
                 DEFAULT_MEMORY_UNLOAD_FRACTION.to_bits(),
+            )),
+            dummy_events_threshold: Arc::new(std::sync::atomic::AtomicU64::new(
+                DEFAULT_DUMMY_EVENTS_THRESHOLD as u64,
+            )),
+            dummy_events_interval_ms: Arc::new(std::sync::atomic::AtomicU64::new(
+                DEFAULT_DUMMY_EVENTS_INTERVAL.as_millis() as u64,
             )),
             loading: Arc::default(),
             load_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_LOADS)),
@@ -1722,6 +1742,15 @@ impl<B: KvBackend + 'static> RoomRegistry<B> {
     /// How many rooms are currently resident. For tests and diagnostics.
     pub async fn resident_count(&self) -> usize {
         self.rooms.lock().await.len()
+    }
+
+    /// The handle of `room_id` if it is resident right now; never loads it.
+    pub async fn resident_handle(&self, room_id: &RoomId) -> Option<RoomActorHandle<B>> {
+        self.rooms
+            .lock()
+            .await
+            .get(room_id)
+            .map(|entry| entry.handle.clone())
     }
 
     /// A handle to every room resident right now. For a consumer of the global stream that has
