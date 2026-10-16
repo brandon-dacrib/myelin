@@ -390,8 +390,8 @@ pub fn config_value(spec: &HomeserverSpec) -> Value {
     config.insert(
         "listeners".to_owned(),
         json!({"listeners": [
-            {"port": CLIENT_PORT, "bind_addresses": ["::"], "resources": ["client", "federation", "health"]},
-            {"port": METRICS_PORT, "bind_addresses": ["::"], "resources": ["metrics"]},
+            {"port": CLIENT_PORT, "bind_addresses": ["::"], "resources": ["client", "federation", "media", "health", "admin"]},
+            {"port": METRICS_PORT, "bind_addresses": ["::"], "resources": ["metrics", "health"]},
         ]}),
     );
     match spec.storage.backend {
