@@ -115,6 +115,24 @@ pub trait EventFetch {
         }
         seen
     }
+
+    /// The auth difference of `sets` (each a state's events): every event in the auth chain
+    /// of some set's events ([`EventFetch::auth_chain`]) but not of every set's. The default
+    /// computes each set's auth chain; the production store answers from its chain-cover
+    /// index without naming the events every set shares.
+    fn auth_difference(&self, sets: &[Vec<OwnedEventId>]) -> EventIdSet<OwnedEventId> {
+        let chains: Vec<EventIdSet<OwnedEventId>> =
+            sets.iter().map(|ids| self.auth_chain(ids)).collect();
+        let mut difference = EventIdSet::new();
+        for chain in &chains {
+            for id in chain.iter() {
+                if !chains.iter().all(|other| other.contains(id.as_ref())) {
+                    difference.insert(id.clone());
+                }
+            }
+        }
+        difference
+    }
 }
 
 impl EventFetch for EventStore {

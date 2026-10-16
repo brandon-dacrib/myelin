@@ -177,6 +177,15 @@ impl<Ks: Clone> Tables<Ks> {
     }
 }
 
+/// One chain's links, as far as they have been read ([`Caches::chain_links`]).
+#[derive(Debug, Clone, Default)]
+pub struct ChainLinks {
+    /// Every link at a sequence up to this has been read.
+    pub read_to: u32,
+    /// `(sequence, target)`, ascending by sequence.
+    pub links: Vec<(u32, ChainPosition)>,
+}
+
 /// The bounded caches in front of the keyspaces. `Root` is the representation's root type.
 pub struct Caches<Root> {
     /// Decoded `state_at` roots.
@@ -189,6 +198,17 @@ pub struct Caches<Root> {
     pub key_rev: LruCache<StateKeyId, (String, String)>,
     /// Chain positions with the event's key.
     pub chain_pos: LruCache<EventSn, (ChainPosition, StateKeyId)>,
+    /// The chain-cover links recorded at a position, read through a snapshot (never through a
+    /// transaction: see `Reader::over_snapshot`). Every resolution's auth difference starts
+    /// from the links at each state event of each fork, and forks share most of their state,
+    /// so until 2026-10-16 most of a resolution's reads were these, read again for every fork
+    /// and every resolution.
+    pub links: LruCache<ChainPosition, Arc<[ChainPosition]>>,
+    /// Each chain's links as far as they have been read through a snapshot (the same rule as
+    /// `links`): a chain's links below its tip never change once committed, so a resolution's
+    /// walks over the same chains -- once per fork, and again for every resolution -- read each
+    /// link once.
+    pub chain_links: LruCache<ChainId, ChainLinks>,
     /// Event records.
     pub records: LruCache<EventSn, Arc<EventRecord>>,
 }
@@ -203,6 +223,8 @@ impl<Root> Caches<Root> {
             key_fwd: LruCache::new(sizes.keys),
             key_rev: LruCache::new(sizes.keys),
             chain_pos: LruCache::new(sizes.chain_positions),
+            links: LruCache::new(sizes.chain_positions),
+            chain_links: LruCache::new(sizes.chain_positions),
             records: LruCache::new(sizes.records),
         }
     }
@@ -280,12 +302,37 @@ pub struct Reader<'a, Ks, R, Root> {
     pub kv: &'a R,
     /// The caches.
     pub caches: &'a RefCell<Caches<Root>>,
+    /// Whether `kv` sees only committed rows (a snapshot), so that chain-cover links read
+    /// through it may be cached: a position's links are written once, with the position, and
+    /// never change once committed -- but a transaction's own uncommitted ones could still be
+    /// rolled back.
+    committed_only: bool,
 }
 
 impl<'a, Ks, R: KvRead<Keyspace = Ks>, Root: Copy> Reader<'a, Ks, R, Root> {
-    /// A reader over `kv`.
+    /// A reader over `kv`, which may be a transaction that sees its own writes.
     pub fn new(tables: &'a Tables<Ks>, kv: &'a R, caches: &'a RefCell<Caches<Root>>) -> Self {
-        Self { tables, kv, caches }
+        Self {
+            tables,
+            kv,
+            caches,
+            committed_only: false,
+        }
+    }
+
+    /// A reader over a snapshot, which sees committed rows only: chain-cover links read through
+    /// it are cached ([`Caches::links`]).
+    pub fn over_snapshot(
+        tables: &'a Tables<Ks>,
+        kv: &'a R,
+        caches: &'a RefCell<Caches<Root>>,
+    ) -> Self {
+        Self {
+            tables,
+            kv,
+            caches,
+            committed_only: true,
+        }
     }
 
     /// The raw `state_at` row of `event`, if any (decoding is the representation's).
@@ -293,6 +340,10 @@ impl<'a, Ks, R: KvRead<Keyspace = Ks>, Root: Copy> Reader<'a, Ks, R, Root> {
     /// # Errors
     /// Returns [`DurableError::Kv`] on a backend failure.
     pub fn state_at_bytes(&self, event: EventSn) -> Result<Option<Bytes>, DurableError> {
+        crate::metrics::resolution_profile::count_kv(
+            crate::metrics::resolution_profile::KvSite::StateAt,
+            1,
+        );
         Ok(self.kv.get(&self.tables.state_at, &event.to_be_bytes())?)
     }
 
@@ -304,6 +355,10 @@ impl<'a, Ks, R: KvRead<Keyspace = Ks>, Root: Copy> Reader<'a, Ks, R, Root> {
         if let Some(id) = self.caches.borrow_mut().event_ids.get(&event) {
             return Ok(Some(id.clone()));
         }
+        crate::metrics::resolution_profile::count_kv(
+            crate::metrics::resolution_profile::KvSite::EventId,
+            1,
+        );
         let Some(bytes) = self.kv.get(&self.tables.event_id, &event.to_be_bytes())? else {
             return Ok(None);
         };
@@ -339,6 +394,10 @@ impl<'a, Ks, R: KvRead<Keyspace = Ks>, Root: Copy> Reader<'a, Ks, R, Root> {
         }
         let keys: Vec<[u8; 8]> = misses.iter().map(|&i| events[i].to_be_bytes()).collect();
         let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+        crate::metrics::resolution_profile::count_kv(
+            crate::metrics::resolution_profile::KvSite::EventId,
+            refs.len() as u64,
+        );
         let values = self.kv.multi_get(&self.tables.event_id, &refs)?;
         let mut caches = self.caches.borrow_mut();
         for (&i, value) in misses.iter().zip(values) {
@@ -368,6 +427,10 @@ impl<'a, Ks, R: KvRead<Keyspace = Ks>, Root: Copy> Reader<'a, Ks, R, Root> {
         if let Some(id) = self.caches.borrow_mut().key_fwd.get(&pair) {
             return Ok(Some(*id));
         }
+        crate::metrics::resolution_profile::count_kv(
+            crate::metrics::resolution_profile::KvSite::Key,
+            1,
+        );
         let Some(bytes) = self
             .kv
             .get(&self.tables.key_fwd, &key_name(event_type, state_key))?
@@ -413,6 +476,10 @@ impl<'a, Ks, R: KvRead<Keyspace = Ks>, Root: Copy> Reader<'a, Ks, R, Root> {
             .map(|&i| u64::from(keys[i].get()).to_be_bytes())
             .collect();
         let refs: Vec<&[u8]> = names.iter().map(|k| k.as_slice()).collect();
+        crate::metrics::resolution_profile::count_kv(
+            crate::metrics::resolution_profile::KvSite::Key,
+            refs.len() as u64,
+        );
         let values = self.kv.multi_get(&self.tables.key_rev, &refs)?;
         let mut caches = self.caches.borrow_mut();
         for (&i, value) in misses.iter().zip(values) {
@@ -435,6 +502,10 @@ impl<'a, Ks, R: KvRead<Keyspace = Ks>, Root: Copy> Reader<'a, Ks, R, Root> {
         if let Some(record) = self.caches.borrow_mut().records.get(&event) {
             return Ok(Some(Arc::clone(record)));
         }
+        crate::metrics::resolution_profile::count_kv(
+            crate::metrics::resolution_profile::KvSite::Record,
+            1,
+        );
         let Some(bytes) = self.kv.get(&self.tables.event, &event.to_be_bytes())? else {
             return Ok(None);
         };
@@ -444,6 +515,41 @@ impl<'a, Ks, R: KvRead<Keyspace = Ks>, Root: Copy> Reader<'a, Ks, R, Root> {
             .borrow_mut()
             .insert_record(event, Arc::clone(&record));
         Ok(Some(record))
+    }
+
+    /// The links recorded on `chain` at sequences `after + 1..=up_to`, each with its sequence,
+    /// ascending: one range read.
+    ///
+    /// # Errors
+    /// Returns [`DurableError`] on a backend failure or a corrupt row.
+    fn read_links(
+        &self,
+        chain: ChainId,
+        after: u32,
+        up_to: u32,
+    ) -> Result<Vec<(u32, ChainPosition)>, DurableError> {
+        let spec = RangeSpec::new(
+            Bound::Excluded(Bytes::copy_from_slice(&chain_key(chain, after))),
+            Bound::Included(Bytes::copy_from_slice(&chain_key(chain, up_to))),
+        );
+        let mut out = Vec::new();
+        let mut rows = 0u64;
+        for item in self.kv.range(&self.tables.chain_link, spec) {
+            let (key, value) = item?;
+            rows += 1;
+            let corrupt = || DurableError::Corrupt {
+                keyspace: KS_CHAIN_LINK,
+            };
+            let at = decode_chain_key(&key).ok_or_else(corrupt)?;
+            for target in decode_links(&value).ok_or_else(corrupt)? {
+                out.push((at.sequence, target));
+            }
+        }
+        crate::metrics::resolution_profile::count_kv(
+            crate::metrics::resolution_profile::KvSite::ChainLink,
+            rows,
+        );
+        Ok(out)
     }
 
     /// The layout version recorded for `room_id`, if any.
@@ -470,6 +576,10 @@ impl<Ks, R: KvRead<Keyspace = Ks>, Root: Copy> ChainReader for Reader<'_, Ks, R,
         if let Some(entry) = self.caches.borrow_mut().chain_pos.get(&event) {
             return Ok(Some(*entry));
         }
+        crate::metrics::resolution_profile::count_kv(
+            crate::metrics::resolution_profile::KvSite::ChainPosition,
+            1,
+        );
         let Some(bytes) = self.kv.get(&self.tables.chain_pos, &event.to_be_bytes())? else {
             return Ok(None);
         };
@@ -488,6 +598,10 @@ impl<Ks, R: KvRead<Keyspace = Ks>, Root: Copy> ChainReader for Reader<'_, Ks, R,
     }
 
     fn tip_of(&self, chain: ChainId) -> Result<u32, DurableError> {
+        crate::metrics::resolution_profile::count_kv(
+            crate::metrics::resolution_profile::KvSite::ChainTip,
+            1,
+        );
         match self
             .kv
             .get(&self.tables.chain_tip, &chain.0.to_be_bytes())?
@@ -500,33 +614,81 @@ impl<Ks, R: KvRead<Keyspace = Ks>, Root: Copy> ChainReader for Reader<'_, Ks, R,
     }
 
     fn links_at(&self, at: ChainPosition) -> Result<Vec<ChainPosition>, DurableError> {
-        match self
+        if self.committed_only
+            && let Some(known) = self.caches.borrow_mut().chain_links.peek(&at.chain)
+            && known.read_to >= at.sequence
+        {
+            let from = known.links.partition_point(|(s, _)| *s < at.sequence);
+            let to = known.links.partition_point(|(s, _)| *s <= at.sequence);
+            return Ok(known.links[from..to].iter().map(|(_, t)| *t).collect());
+        }
+        if self.committed_only
+            && let Some(links) = self.caches.borrow_mut().links.get(&at)
+        {
+            return Ok(links.to_vec());
+        }
+        crate::metrics::resolution_profile::count_kv(
+            crate::metrics::resolution_profile::KvSite::ChainLink,
+            1,
+        );
+        let links = match self
             .kv
             .get(&self.tables.chain_link, &chain_key(at.chain, at.sequence))?
         {
-            None => Ok(Vec::new()),
+            None => Vec::new(),
             Some(bytes) => decode_links(&bytes).ok_or(DurableError::Corrupt {
                 keyspace: KS_CHAIN_LINK,
-            }),
+            })?,
+        };
+        if self.committed_only {
+            self.caches
+                .borrow_mut()
+                .links
+                .insert(at, Arc::from(links.as_slice()));
         }
+        Ok(links)
     }
 
-    fn links_up_to(
+    fn links_between(
         &self,
         chain: ChainId,
-        sequence: u32,
+        after: u32,
+        up_to: u32,
     ) -> Result<Vec<ChainPosition>, DurableError> {
-        let spec = RangeSpec::new(
-            Bound::Included(Bytes::copy_from_slice(&chain_key(chain, 0))),
-            Bound::Included(Bytes::copy_from_slice(&chain_key(chain, sequence))),
-        );
-        let mut out = Vec::new();
-        for item in self.kv.range(&self.tables.chain_link, spec) {
-            let (_, value) = item?;
-            out.extend(decode_links(&value).ok_or(DurableError::Corrupt {
-                keyspace: KS_CHAIN_LINK,
-            })?);
+        if after >= up_to {
+            return Ok(Vec::new());
         }
+        if !self.committed_only {
+            return Ok(self
+                .read_links(chain, after, up_to)?
+                .into_iter()
+                .map(|(_, target)| target)
+                .collect());
+        }
+        // Through a snapshot, the chain's links are remembered as far as they have been read
+        // (`Caches::chain_links`), and only what lies past that is read.
+        let mut known = self
+            .caches
+            .borrow_mut()
+            .chain_links
+            .remove(&chain)
+            .unwrap_or_default();
+        if known.read_to < up_to {
+            let more = self.read_links(chain, known.read_to, up_to)?;
+            known.links.extend(more);
+            known.read_to = up_to;
+        }
+        let from = known
+            .links
+            .partition_point(|(sequence, _)| *sequence <= after);
+        let to = known
+            .links
+            .partition_point(|(sequence, _)| *sequence <= up_to);
+        let out = known.links[from..to]
+            .iter()
+            .map(|(_, target)| *target)
+            .collect();
+        self.caches.borrow_mut().chain_links.insert(chain, known);
         Ok(out)
     }
 
@@ -551,6 +713,10 @@ impl<Ks, R: KvRead<Keyspace = Ks>, Root: Copy> ChainReader for Reader<'_, Ks, R,
             })?;
             out.push(EventSn::new(sn));
         }
+        crate::metrics::resolution_profile::count_kv(
+            crate::metrics::resolution_profile::KvSite::ChainEvent,
+            out.len() as u64,
+        );
         Ok(out)
     }
 }
@@ -668,12 +834,13 @@ impl<Ks, W: KvWrite<Keyspace = Ks>, Root: Copy> ChainReader for Writer<'_, Ks, W
         self.reader().links_at(at)
     }
 
-    fn links_up_to(
+    fn links_between(
         &self,
         chain: ChainId,
-        sequence: u32,
+        after: u32,
+        up_to: u32,
     ) -> Result<Vec<ChainPosition>, DurableError> {
-        self.reader().links_up_to(chain, sequence)
+        self.reader().links_between(chain, after, up_to)
     }
 
     fn events_between(
@@ -816,6 +983,46 @@ mod tests {
                 expected.sort();
                 actual.sort();
                 prop_assert_eq!(actual, expected);
+            }
+        }
+
+        /// A snapshot reader remembers the links it read (`Caches::links`,
+        /// `Caches::chain_links`) across snapshots while the DAG grows under it: every answer,
+        /// after every event, is still the in-memory index's.
+        #[test]
+        fn cached_links_stay_right_as_chains_grow((auth, keys) in dag_strategy(14)) {
+            let backend = MemoryBackend::new();
+            let tables = Tables::open(&backend).unwrap();
+            let caches: RefCell<Caches<[u8; 16]>> = RefCell::new(Caches::new(CacheSizes::default()));
+            let mut memory = ChainCoverIndex::new();
+            for (i, a) in auth.iter().enumerate() {
+                let auth_sn: Vec<EventSn> = a.iter().map(|&j| sn(j as u64)).collect();
+                memory.add_event(sn(i as u64), StateKeyId::new(keys[i]), &auth_sn);
+                transact(&backend, TransactConfig::default(), |txn| {
+                    let mut writer = Writer::new(&tables, txn, &caches);
+                    chain_cover::add_event(&mut writer, sn(i as u64), StateKeyId::new(keys[i]), &auth_sn)
+                        .map_err(|e| KvError::backend(std::io::Error::other(e.to_string())))?;
+                    Ok(())
+                }).unwrap();
+                let snapshot = backend.snapshot();
+                let reader = Reader::over_snapshot(&tables, &snapshot, &caches);
+                for j in 0..=i {
+                    let expected = memory.contains(sn(i as u64), sn(j as u64));
+                    let actual = chain_cover::contains(&reader, sn(i as u64), sn(j as u64)).unwrap();
+                    prop_assert_eq!(actual, expected, "contains({}, {}) after {}", i, j, i);
+                }
+                if i >= 2 {
+                    let sets = vec![
+                        vec![sn(i as u64), sn((i / 2) as u64)],
+                        vec![sn((i - 1) as u64)],
+                        vec![sn((i - 2) as u64), sn(0)],
+                    ];
+                    let mut expected = memory.auth_chain_difference(&sets);
+                    let mut actual = chain_cover::auth_chain_difference(&reader, &sets).unwrap();
+                    expected.sort();
+                    actual.sort();
+                    prop_assert_eq!(actual, expected, "difference after {}", i);
+                }
             }
         }
     }

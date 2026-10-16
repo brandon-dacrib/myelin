@@ -1,8 +1,83 @@
 # 02 State and model: status
 
-Updated: 2026-10-12 (the room actor's half landed: a room loads without replaying its history;
+Updated: 2026-10-16 (a resolution reads each row about once, however many forks; below).
+Before that 2026-10-12 (the room actor's half landed: a room loads without replaying its history;
 decision 0045). Before that 2026-10-10 (the state store's per-event records are durable; below). Before that
 2026-09-30 (a mainline tie-break bug).
+
+## 2026-10-16: a state resolution reads each row it needs about once, however many forks it resolves (`agent/extremity-merge`)
+
+**Asked** (track 04's extremity work): why one resolution of the demo's forked federated rooms
+(`#ping`, codestorm.net's; room version 12, 797 state events, 2,157 outliers, 613 timeline
+events) took 15.8 s and 21.8 s in their loads' `finish` phase (v0.3.25).
+
+**Measured.** `crates/hs-room/tests/fork_resolution.rs` (new) builds the demo's shape: a room
+joined over federation (state and auth chain as outliers), forked by *stuck* extremities --
+events citing a prev event taken with the state another server answered for it
+(`accept_prev_event_with_state`), each carrying the room's state as of a point far back. On a
+local SSD a cold resolution is fast (31 ms for 25 forks, 168 ms for 289); what grew was the
+**rows read**, counted per resolution by a new profile (`hs_state::metrics::resolution_profile`:
+phase times, and rows read by keyspace, per thread so a resolution's own reads are exact). The
+demo's store is Fjall on a Longhorn volume in a 1.5 GiB pod, so a row its caches miss costs a
+network read; 15 s is about what 10^4-10^5 such reads cost. The reads grew with the forks:
+
+- every fork's coverage walk read the chain-cover links at each of its state events
+  (`links_at`, never cached): forks share most of their state, so the same rows, once per fork;
+- every fork's **whole** auth chain was materialised and named (`events_between` plus event
+  IDs), although ruma uses the chains only for their difference.
+
+**Fixed** (`crates/hs-state/src/{chain_cover,durable,kv_store,metrics}.rs`,
+`state_res/{mod,v2}.rs`):
+
+- `Caches::links` and `Caches::chain_links`: a position's links, and each chain's links as far
+  as read, are cached through a snapshot reader (`Reader::over_snapshot`, what
+  `KvStateStore::reader` builds; a transaction's `Writer` never caches them, since its own rows
+  could still roll back). Committed links never change: a link is written once, with its
+  position, and a chain only grows past its tip.
+- `ChainReader::links_up_to(chain, s)` is now `links_between(chain, after, up_to)`: `coverage`
+  reads only the links past what it had covered (it re-read the chain from its start on every
+  raise), and seeds its walk furthest-first.
+- `EventFetch::auth_difference` (default: the old per-set chains): the production store answers
+  it with `chain_cover::auth_chain_difference` over all forks at once, naming only the
+  difference; `state_res::v2` hands ruma `[difference, {}]`, whose difference is exactly it.
+- `resolve_with` drops forks whose full state equals another's (two roots can name one state:
+  a root names a state by how it was written) and, when the answer is one fork's state, returns
+  **that fork's root** instead of writing a new one. A caller comparing roots (the room actor's
+  `ResolutionCache`, its `membership_cache`, track 04's extremity pruning) now sees "same
+  state" as "same root" in that case.
+
+**Before and after**, `cargo test -p hs-room --release --test fork_resolution -- --ignored
+--nocapture` (800 members, v12, cold load; rows read inside the one resolution):
+
+| forks | rows read before | after | `finish` before | after |
+|---|---|---|---|---|
+| 25 (`HS_FED_FORKS=24`) | 18,216 (chain links 12,728) | 5,150 (1,020) | 31 ms | 26 ms |
+| 289 (`HS_FED_FORKS=300`) | 156,800 (chain links 135,408; chain events 17,161) | 5,477 (1,023; 225) | 168 ms | 126 ms |
+
+After, the rows are the room's own (each record, event ID, key and position once), not a
+multiple of the forks. Local time is CPU now: for 289 forks, 50 ms building the forks' string
+state maps and 40 ms of coverage walks. The hub-shaped `fork_reads` measurement (2,000
+members, 12 local forks) is 36 ms for the first read (38-41 ms before).
+
+**Tests**: `durable::tests::cached_links_stay_right_as_chains_grow` (proptest: a snapshot
+reader whose caches persist while the DAG grows answers `contains` and the auth difference as
+the in-memory index does; fails if the cache stops extending),
+`kv_store::tests::a_resolution_that_answers_a_forks_state_answers_its_root`, and in hs-room
+`fork_resolution::a_resolution_reads_about_the_same_rows_for_four_forks_as_for_sixteen` (492 vs
+506 rows; 726 vs 1,257 with the link caches off) and `a_cold_reload_of_a_federated_fork_answers_
+the_same_state`. The production-store/oracle/ruma cross-checks (`fork_production_cross_check`,
+proptest) are unchanged and green: the auth difference and the root reuse answer the same
+states. `cargo test -p hs-state` (83 + 7 + 1) green; `cargo clippy -p hs-state --all-targets
+-D warnings` clean.
+
+**Observability**: `hs_state_resolution_rows_read_total` (new); the room actor's "a state
+resolution took over a second" line now carries `rows_read`.
+
+**Not verified on the demo**: that its 15 s was reads. After the roll, the slow-resolution line's
+`rows_read` and `hs_state_resolution_rows_read_total` against `hs_room_state_resolution_seconds`
+say. **Left**: the record cache (1,024) is smaller than a v2.1 resolution's working set in a
+room of ~2,800 events (the conflicted subgraph walks every ancestor's record), so a second
+resolution there re-reads records; the per-fork string maps are the next CPU cost.
 
 ## 2026-10-10: the store opens without replaying the room (RFC 0025), on `agent/state-load`
 

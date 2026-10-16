@@ -222,6 +222,10 @@ impl<KV: KvBackend> FrameRepr<KV> {
     }
 
     fn load(&self, hash: [u8; 16]) -> Result<FrameRecord, Error> {
+        crate::metrics::resolution_profile::count_kv(
+            crate::metrics::resolution_profile::KvSite::Frame,
+            1,
+        );
         let snap = self.backend.snapshot();
         let bytes = snap
             .get(&self.frames, &hash)?

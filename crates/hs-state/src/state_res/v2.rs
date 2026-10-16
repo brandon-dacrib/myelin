@@ -65,13 +65,28 @@ pub fn resolve<F: EventFetch + ?Sized>(
         Some(adapter)
     };
 
-    let auth_chains: Vec<EventIdSet<OwnedEventId>> = states
+    use crate::metrics::resolution_profile::{self as profile, Phase};
+    let fetches = std::cell::Cell::new(0u64);
+    let fetch_event = |id: &EventId| -> Option<Adapter> {
+        fetches.set(fetches.get() + 1);
+        fetch_event(id)
+    };
+    let phase_started = std::time::Instant::now();
+    // `ruma-state-res` takes each state's full auth chain and uses them for one thing: their
+    // auth difference (the union less the intersection). The store answers the difference
+    // itself ([`EventFetch::auth_difference`]), which the chain-cover index does without
+    // naming the events every fork shares -- most of a room's history, in every fork -- and it
+    // is handed over as one chain beside an empty one, whose difference is exactly it. Until
+    // 2026-10-16 every fork's whole auth chain was read and named here.
+    let sets: Vec<Vec<OwnedEventId>> = states
         .iter()
-        .map(|state| {
-            let ids: Vec<OwnedEventId> = state.values().cloned().collect();
-            store.auth_chain(&ids)
-        })
+        .map(|state| state.values().cloned().collect())
         .collect();
+    let difference = store.auth_difference(&sets);
+    profile::count_auth_difference_events(difference.len() as u64);
+    let auth_chains: Vec<EventIdSet<OwnedEventId>> = vec![difference, EventIdSet::new()];
+    profile::add(Phase::AuthChains, phase_started.elapsed());
+    let phase_started = std::time::Instant::now();
 
     let converted: Vec<ruma::state_res::StateMap<OwnedEventId>> = states
         .iter()
@@ -100,11 +115,16 @@ pub fn resolve<F: EventFetch + ?Sized>(
         // which loses an event between two conflicted ones that the full conflicted set needs
         // (Complement's `TestMSC4297StateResolutionV2_1_includes_conflicted_subgraph`).
         |conflicted: &ruma::state_res::StateMap<Vec<OwnedEventId>>| {
+            let started = std::time::Instant::now();
             let ids: Vec<OwnedEventId> = conflicted.values().flatten().cloned().collect();
-            Some(conflicted_subgraph(&ids, store))
+            let subgraph = conflicted_subgraph(&ids, store);
+            profile::add(Phase::Subgraph, started.elapsed());
+            Some(subgraph)
         },
     )
     .map_err(|e| StateResError::UnsupportedInput(e.to_string()))?;
+    profile::add(Phase::Algorithm, phase_started.elapsed());
+    profile::count_fetches(fetches.get());
 
     Ok(result
         .into_iter()

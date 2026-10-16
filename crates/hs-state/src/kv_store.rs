@@ -521,7 +521,8 @@ impl<R: StateRepr, KV: KvBackend> KvStateStore<R, KV> {
         &'a self,
         kv: &'a Rd,
     ) -> Reader<'a, KV::Keyspace, Rd, R::Root> {
-        Reader::new(&self.tables, kv, &self.caches)
+        // Only ever handed a snapshot: a transaction's reads go through its `Writer`.
+        Reader::over_snapshot(&self.tables, kv, &self.caches)
     }
 
     /// The root recorded for `event` through `reader`, cached if seen before.
@@ -700,10 +701,28 @@ impl<R: StateRepr, KV: KvBackend> KvStateStore<R, KV> {
             return Ok(forks[0]);
         }
 
-        let scratch: IdScratch = RefCell::new(HashMap::new());
-        let mut state_maps: Vec<state_res::StateMap> = Vec::with_capacity(forks.len());
+        use crate::metrics::resolution_profile::{self as profile, Phase};
+        profile::count_resolution();
+        let reads = profile::ResolutionReads::start();
+        let phase_started = Instant::now();
+        // Forks of the same state are one fork, however their roots were built (a root names a
+        // state by how it was written, so two roots can hold one state): neither resolution
+        // version's answer depends on how many forks agree, only on what they hold.
+        let mut distinct: Vec<(R::Root, BTreeMap<StateKeyId, EventSn>)> =
+            Vec::with_capacity(forks.len());
         for root in forks {
             let full = self.repr.full_state(*root).map_err(KvStoreError::Repr)?;
+            if !distinct.iter().any(|(_, seen)| *seen == full) {
+                distinct.push((*root, full));
+            }
+        }
+        if let [(only, _)] = distinct[..] {
+            reads.finish();
+            return Ok(only);
+        }
+        let scratch: IdScratch = RefCell::new(HashMap::new());
+        let mut state_maps: Vec<state_res::StateMap> = Vec::with_capacity(distinct.len());
+        for (_, full) in &distinct {
             let keys: Vec<StateKeyId> = full.keys().copied().collect();
             let sns: Vec<EventSn> = full.values().copied().collect();
             let pairs = reader.key_pairs(&keys)?;
@@ -720,6 +739,7 @@ impl<R: StateRepr, KV: KvBackend> KvStateStore<R, KV> {
             state_maps.push(map);
         }
 
+        profile::add(Phase::StateMaps, phase_started.elapsed());
         let fetch = KvEventFetch {
             reader,
             scratch: &scratch,
@@ -733,6 +753,7 @@ impl<R: StateRepr, KV: KvBackend> KvStateStore<R, KV> {
             }
         };
 
+        let phase_started = Instant::now();
         let mut resolved_map = BTreeMap::new();
         for ((event_type, state_key), id) in resolved {
             let Some(&sn) = scratch.borrow().get(&id) else {
@@ -745,13 +766,22 @@ impl<R: StateRepr, KV: KvBackend> KvStateStore<R, KV> {
             resolved_map.insert(key_id, sn);
         }
 
+        // A resolution whose answer is one of the forks' states answers that fork's root: the
+        // same state under the same name, so that a caller comparing roots (the room actor's
+        // caches, its extremity pruning) sees it is, and nothing is written.
+        if let Some((root, _)) = distinct.iter().find(|(_, full)| *full == resolved_map) {
+            profile::add(Phase::Write, phase_started.elapsed());
+            reads.finish();
+            return Ok(*root);
+        }
+
         // Base the result on one fork (the first) rather than rebuilding from the empty state:
         // a representation with structural sharing (candidates B and C) only benefits from that
         // sharing if resolution's *write* is expressed as a diff against something it already
         // has, not as "every key, from scratch," which would defeat the whole point of measuring
         // structural sharing under "resolution time on forks."
-        let base = forks[0];
-        let base_map = self.repr.full_state(base).map_err(KvStoreError::Repr)?;
+        let (base, base_map) = &distinct[0];
+        let base = *base;
         let mut added = BTreeMap::new();
         for (key, sn) in &resolved_map {
             if base_map.get(key) != Some(sn) {
@@ -764,7 +794,10 @@ impl<R: StateRepr, KV: KvBackend> KvStateStore<R, KV> {
             .copied()
             .collect();
         let diff = StateDiff { added, removed };
-        self.repr.apply(base, &diff).map_err(KvStoreError::Repr)
+        let root = self.repr.apply(base, &diff).map_err(KvStoreError::Repr);
+        profile::add(Phase::Write, phase_started.elapsed());
+        reads.finish();
+        root
     }
 }
 
@@ -837,13 +870,46 @@ impl<Ks, Rd: KvRead<Keyspace = Ks>, Root: Copy> EventFetch for KvEventFetch<'_, 
         if let Some(event) = self.arena.get(id) {
             return Some(event);
         }
-        match self.load(id) {
+        let started = Instant::now();
+        let loaded = self.load(id);
+        crate::metrics::resolution_profile::add(
+            crate::metrics::resolution_profile::Phase::EventReads,
+            started.elapsed(),
+        );
+        match loaded {
             Ok(event) => event,
             Err(error) => {
                 // `EventFetch` has no error channel (a missing event and a failed read look the
                 // same to a resolver, which then reports a missing event); the cause is logged.
                 tracing::warn!(event_id = %id, %error, "could not read an event record for state resolution");
                 None
+            }
+        }
+    }
+
+    fn auth_difference(&self, sets: &[Vec<OwnedEventId>]) -> EventIdSet<OwnedEventId> {
+        let sns: Vec<Vec<EventSn>> = {
+            let scratch = self.scratch.borrow();
+            sets.iter()
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(|id| scratch.get(id).copied())
+                        .collect()
+                })
+                .collect()
+        };
+        let difference = match chain_cover::auth_chain_difference(self.reader, &sns) {
+            Ok(difference) => difference,
+            Err(error) => {
+                tracing::warn!(%error, "could not read the chain-cover index for state resolution");
+                return EventIdSet::new();
+            }
+        };
+        match self.ids_of(&difference) {
+            Ok(ids) => ids.into_iter().collect(),
+            Err(error) => {
+                tracing::warn!(%error, "could not read event ids for an auth difference");
+                EventIdSet::new()
             }
         }
     }
@@ -1131,6 +1197,102 @@ mod tests {
                 .unwrap(),
             Some(true)
         );
+    }
+
+    /// A resolution whose answer is one fork's state answers that fork's root, and forks of one
+    /// state built different ways resolve to one of them: roots a caller can compare.
+    #[test]
+    fn a_resolution_that_answers_a_forks_state_answers_its_root() {
+        let backend = MemoryBackend::default();
+        let store = KvStateStore::open(RoomVersionId::V11, backend).unwrap();
+        let room_id = RoomId::parse("!r:hs1").unwrap();
+        let creator = UserId::parse("@c:hs1").unwrap();
+        let add = |n: u64,
+                   event_type: &str,
+                   state_key: Option<&str>,
+                   content: serde_json::Value,
+                   auth: &[u64],
+                   prev: &[u64]| {
+            let auth: Vec<EventSn> = auth.iter().map(|a| EventSn::new(*a)).collect();
+            let prev: Vec<EventSn> = prev.iter().map(|p| EventSn::new(*p)).collect();
+            store
+                .add_event(
+                    EventSn::new(n),
+                    EventId::parse(format!("${n}:hs1")).unwrap(),
+                    room_id.clone(),
+                    event_type,
+                    state_key,
+                    creator.clone(),
+                    obj(content),
+                    n as i64,
+                    n as i64,
+                    &auth,
+                    &prev,
+                    prev == [EventSn::new(1)],
+                )
+                .unwrap()
+        };
+        add(
+            1,
+            "m.room.create",
+            Some(""),
+            json!({"creator": creator.as_str()}),
+            &[],
+            &[],
+        );
+        add(
+            2,
+            "m.room.member",
+            Some(creator.as_str()),
+            json!({"membership": "join"}),
+            &[1],
+            &[1],
+        );
+        add(
+            3,
+            "m.room.power_levels",
+            Some(""),
+            json!({"users": {creator.as_str(): 100}}),
+            &[1, 2],
+            &[2],
+        );
+        // One branch changes the topic; the other only talks.
+        let topic = add(
+            4,
+            "m.room.topic",
+            Some(""),
+            json!({"topic": "a"}),
+            &[3, 2],
+            &[3],
+        );
+        let talk = add(
+            5,
+            "m.room.message",
+            None,
+            json!({"body": "hi"}),
+            &[3, 2],
+            &[3],
+        );
+
+        let resolved = store.resolve(&RoomVersionId::V11, &[talk, topic]).unwrap();
+        assert_eq!(
+            resolved, topic,
+            "the topic branch's state is the answer, by its own root"
+        );
+
+        // The state after event 3, written again from nothing: another root, the same state.
+        let full = store.diff(store.empty_root(), talk).unwrap();
+        let rebuilt = store.apply(store.empty_root(), &full).unwrap();
+        assert_ne!(rebuilt, talk, "a different root for the same state");
+        assert!(store.diff(rebuilt, talk).unwrap().added.is_empty());
+        let one = store
+            .resolve(&RoomVersionId::V11, &[rebuilt, talk])
+            .unwrap();
+        assert!(one == rebuilt || one == talk, "one of the two, not a third");
+        let resolved = store
+            .resolve(&RoomVersionId::V11, &[rebuilt, topic, talk])
+            .unwrap();
+        assert_eq!(resolved, topic);
     }
 
     #[test]

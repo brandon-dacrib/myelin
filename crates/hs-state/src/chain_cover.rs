@@ -84,12 +84,16 @@ pub trait ChainReader {
     /// Returns `Self::Error` on a storage failure.
     fn links_at(&self, at: ChainPosition) -> Result<Vec<ChainPosition>, Self::Error>;
 
-    /// Every link recorded on `chain` at a sequence `<= sequence`, in any order.
+    /// Every link recorded on `chain` at a sequence in `after + 1..=up_to`, in any order.
     ///
     /// # Errors
     /// Returns `Self::Error` on a storage failure.
-    fn links_up_to(&self, chain: ChainId, sequence: u32)
-    -> Result<Vec<ChainPosition>, Self::Error>;
+    fn links_between(
+        &self,
+        chain: ChainId,
+        after: u32,
+        up_to: u32,
+    ) -> Result<Vec<ChainPosition>, Self::Error>;
 
     /// The events placed at `from..=to` on `chain`, ascending by sequence; a position with no
     /// event is skipped.
@@ -276,6 +280,11 @@ pub fn coverage<R: ChainReader + ?Sized>(
         stack.extend(reader.links_at(pos)?);
     }
 
+    // The furthest seed of each chain first (the stack pops the last), so that a chain the
+    // roots reach at many sequences -- a room's state names every member's latest membership,
+    // and many sit on one chain -- is covered once, at the furthest, not raised step by step.
+    stack.sort_unstable_by_key(|p| (p.sequence, p.chain));
+
     while let Some(pos) = stack.pop() {
         let entry = reach.entry(pos.chain).or_insert(0);
         if pos.sequence <= *entry {
@@ -283,8 +292,12 @@ pub fn coverage<R: ChainReader + ?Sized>(
             // followed when that coverage was recorded.
             continue;
         }
-        *entry = pos.sequence;
-        stack.extend(reader.links_up_to(pos.chain, pos.sequence)?);
+        // Only the links past what was covered: those up to it were followed when it was.
+        // Until 2026-10-16 every raise read the chain's links from its start again, which on
+        // a room of long chains was most of a state resolution's reads (`hs-room`'s
+        // `tests/fork_resolution.rs`).
+        let covered = std::mem::replace(entry, pos.sequence);
+        stack.extend(reader.links_between(pos.chain, covered, pos.sequence)?);
     }
 
     Ok(reach)
@@ -488,13 +501,21 @@ impl ChainReader for ChainCoverIndex {
             .unwrap_or_default())
     }
 
-    fn links_up_to(&self, chain: ChainId, sequence: u32) -> Result<Vec<ChainPosition>, Infallible> {
+    fn links_between(
+        &self,
+        chain: ChainId,
+        after: u32,
+        up_to: u32,
+    ) -> Result<Vec<ChainPosition>, Infallible> {
+        if after >= up_to {
+            return Ok(Vec::new());
+        }
         Ok(self
             .links
             .get(&chain)
             .map(|by_seq| {
                 by_seq
-                    .range(..=sequence)
+                    .range(after + 1..=up_to)
                     .flat_map(|(_, targets)| targets.iter().copied())
                     .collect()
             })
