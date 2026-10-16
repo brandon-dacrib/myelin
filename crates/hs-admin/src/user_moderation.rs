@@ -125,6 +125,12 @@ pub struct AdminSession {
     /// `users.login_as`.
     #[serde(default)]
     pub support_session: bool,
+    /// The application service this session was issued to, when an
+    /// `m.login.application_service` login made it: a bridge double puppeting the user, whose
+    /// requests on it are rate-limited as that appservice's are (decision 0053). Absent for
+    /// every other session, and for one issued before the server recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issued_by_appservice: Option<String>,
 }
 
 /// One room a user has a membership in: the OpenAPI `RoomMember` schema, with the room it is

@@ -57,6 +57,44 @@ pub struct Requester {
     /// [`AppserviceIdentity::appservice_id`] instead). Used for token-scoped rate limiting, for
     /// `mark used` bookkeeping, and by `/logout` to invalidate exactly this session.
     pub access_token_id: Option<TokenHash>,
+
+    /// Set when this request's access token was issued to an application service: the session
+    /// an `m.login.application_service` login (or registration) made, as a bridge double
+    /// puppeting a real user does (decision 0053). Unlike [`Requester::appservice`] the request
+    /// is an ordinary user session in every other respect (no masquerading, no namespace
+    /// checks, no appservice-only endpoints); this only attributes it to that appservice for
+    /// rate limiting ([`Requester::rate_limit_exemption`]). Resolved against the appservice's
+    /// current registration when the request is authenticated. `default` so that a requester
+    /// serialized without it (a replica one release behind, over the mesh) still reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issued_by_appservice: Option<IssuingAppservice>,
+}
+
+/// The application service a user's access token was issued to
+/// ([`Requester::issued_by_appservice`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssuingAppservice {
+    /// The registration's `id`.
+    pub appservice_id: String,
+    /// The registration's `rate_limited` flag when the request was authenticated. `false` means
+    /// the session is exempt from rate limiting, as the appservice's own requests are, unless an
+    /// administrator gave the user a rate-limit override.
+    pub rate_limited: bool,
+}
+
+/// Why a request is exempt from rate limiting ([`Requester::rate_limit_exemption`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimitExemption {
+    /// The request is the appservice's own (its `as_token`, masquerading or not) and its
+    /// registration says `rate_limited: false`: exempt from every limit, a per-user override
+    /// included (as Synapse, which checks the appservice before the override).
+    Appservice,
+    /// The request's access token was issued to an appservice whose registration says
+    /// `rate_limited: false` (a bridge's double puppet): exempt from the limits the
+    /// appservice's own requests are exempt from, unless an administrator set a rate-limit
+    /// override for the user, which then applies -- the account is a real person's, and an
+    /// override on it is a deliberate choice about it.
+    IssuedToAppservice,
 }
 
 /// The application service identity asserted for a request, including MSC3202 device
@@ -104,6 +142,38 @@ impl Requester {
         }
     }
 
+    /// Whether, and why, this request is exempt from rate limiting: its appservice's
+    /// registration (or that of the appservice its access token was issued to) says
+    /// `rate_limited: false`. Every rate-limit check that exempts appservices asks this, through
+    /// [`Requester::exempt_from_rate_limits`] when it knows about per-user overrides.
+    #[must_use]
+    pub fn rate_limit_exemption(&self) -> Option<RateLimitExemption> {
+        if self.appservice.as_ref().is_some_and(|a| !a.rate_limited) {
+            Some(RateLimitExemption::Appservice)
+        } else if self
+            .issued_by_appservice
+            .as_ref()
+            .is_some_and(|a| !a.rate_limited)
+        {
+            Some(RateLimitExemption::IssuedToAppservice)
+        } else {
+            None
+        }
+    }
+
+    /// True if this request skips a rate limit, given whether the user has an administrator's
+    /// rate-limit override (`user_has_override`; `false` for a limit no override applies to).
+    /// The order: an appservice's own request is exempt even over an override; a session issued
+    /// to an appservice is exempt unless there is an override; anyone else is not exempt.
+    #[must_use]
+    pub fn exempt_from_rate_limits(&self, user_has_override: bool) -> bool {
+        match self.rate_limit_exemption() {
+            Some(RateLimitExemption::Appservice) => true,
+            Some(RateLimitExemption::IssuedToAppservice) => !user_has_override,
+            None => false,
+        }
+    }
+
     /// A plain, non-guest, non-admin user requester with no device — convenience for tests and
     /// for internal call paths (background jobs, imports) that act as a user without going
     /// through HTTP authentication.
@@ -118,6 +188,7 @@ impl Requester {
             suspended: false,
             appservice: None,
             access_token_id: None,
+            issued_by_appservice: None,
         }
     }
 
@@ -163,6 +234,82 @@ mod tests {
         });
         assert_eq!(r.authenticated_entity(), "irc-bridge");
         assert_eq!(r.user_id, user_id!("@bot_bob:example.org"));
+    }
+
+    /// Decision 0053's order: an appservice's own request is exempt even over a per-user
+    /// override; a session issued to an appservice only without one; a `rate_limited: true`
+    /// registration exempts neither.
+    #[test]
+    fn rate_limit_exemptions_and_overrides() {
+        let identity = |rate_limited| AppserviceIdentity {
+            appservice_id: "imessage".to_string(),
+            sender: user_id!("@imessagebot:example.org").to_owned(),
+            masqueraded_user: true,
+            masqueraded_device_id: None,
+            rate_limited,
+            msc4190_enabled: false,
+        };
+        let issued = |rate_limited| IssuingAppservice {
+            appservice_id: "imessage".to_string(),
+            rate_limited,
+        };
+        let plain = Requester::for_user(user_id!("@brandon:example.org").to_owned());
+        assert_eq!(plain.rate_limit_exemption(), None);
+        assert!(!plain.exempt_from_rate_limits(false));
+
+        let own = Requester {
+            appservice: Some(identity(false)),
+            ..plain.clone()
+        };
+        assert_eq!(
+            own.rate_limit_exemption(),
+            Some(RateLimitExemption::Appservice)
+        );
+        assert!(own.exempt_from_rate_limits(false));
+        assert!(own.exempt_from_rate_limits(true));
+        let limited_own = Requester {
+            appservice: Some(identity(true)),
+            ..plain.clone()
+        };
+        assert!(!limited_own.exempt_from_rate_limits(false));
+
+        let puppet = Requester {
+            issued_by_appservice: Some(issued(false)),
+            ..plain.clone()
+        };
+        assert_eq!(
+            puppet.rate_limit_exemption(),
+            Some(RateLimitExemption::IssuedToAppservice)
+        );
+        assert!(puppet.exempt_from_rate_limits(false));
+        assert!(!puppet.exempt_from_rate_limits(true));
+        let limited_puppet = Requester {
+            issued_by_appservice: Some(issued(true)),
+            ..plain
+        };
+        assert_eq!(limited_puppet.rate_limit_exemption(), None);
+        assert!(!limited_puppet.exempt_from_rate_limits(false));
+    }
+
+    /// A requester serialized by a replica that predates `issued_by_appservice` still reads
+    /// (the mesh carries it as JSON), and one without it is serialized as before.
+    #[test]
+    fn a_requester_without_the_issuing_appservice_still_reads() {
+        let r = Requester::for_user(user_id!("@alice:example.org").to_owned());
+        let json = serde_json::to_value(&r).unwrap();
+        assert!(json.get("issued_by_appservice").is_none(), "{json}");
+        let back: Requester = serde_json::from_value(json).unwrap();
+        assert_eq!(back.issued_by_appservice, None);
+        let puppet = Requester {
+            issued_by_appservice: Some(IssuingAppservice {
+                appservice_id: "imessage".to_string(),
+                rate_limited: false,
+            }),
+            ..r
+        };
+        let back: Requester =
+            serde_json::from_value(serde_json::to_value(&puppet).unwrap()).unwrap();
+        assert_eq!(back, puppet);
     }
 
     #[test]

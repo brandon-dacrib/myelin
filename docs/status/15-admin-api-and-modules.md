@@ -2,6 +2,14 @@
 
 Track brief: `docs/workstreams/15-admin-api-and-modules.md`. Owner crates: `hs-admin`, `hs-modules`, `hs-identity`, `hs-http` (shared with 07 and 14).
 
+## 2026-10-16: `Session.issued_by_appservice` (OpenAPI 0.1.20, branch `agent/puppet-rate-limit`, track 07)
+
+Additive: `users.sessions.list` items carry `issued_by_appservice`, the appservice an
+`m.login.application_service` login issued the session to (a bridge's double puppet; decision
+0053), absent otherwise. `AdminSession` has the field; `hs-auth`'s
+`AuthStoreUserModeration::sessions` fills it from the user's access tokens
+(`TokenStore::list_access_tokens_for_user`). `cargo test -p hs-admin` passes (contract included).
+
 ## 2026-10-13: the server folds a bridge's double-puppeting registration into its row
 
 Branch `agent/fold-doublepuppet-server` (tracks 15, 11, 16; decision 0046 amended).

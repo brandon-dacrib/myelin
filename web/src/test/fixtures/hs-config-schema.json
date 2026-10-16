@@ -1691,7 +1691,7 @@
           "x-applies": "hot"
         },
         "message": {
-          "description": "How fast one user may send events: messages, room settings (state) and redactions,\ncounted per sender. An administrator can give one user other limits on their user page.\nCorresponds to Synapse's `rc_message`. Bridges that\nregistered with `rate_limited: false` are exempt.",
+          "description": "How fast one user may send events: messages, room settings (state) and redactions,\ncounted per sender. An administrator can give one user other limits on their user page.\nCorresponds to Synapse's `rc_message`. Bridges that\nregistered with `rate_limited: false` are exempt, and so are the sessions they sign in to\ndouble puppet a person, unless that person has limits of their own.",
           "$ref": "#/$defs/RateLimitBucket",
           "default": {
             "per_second": 0.2,

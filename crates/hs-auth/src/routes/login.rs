@@ -122,6 +122,9 @@ pub async fn post_login(
             .map_err(MatrixError::limit_exceeded)?;
     }
 
+    // The appservice an `m.login.application_service` login issues the session to (decision
+    // 0053); `None` for every other login type.
+    let mut issued_by_appservice = None;
     let user_id = if login_info.login_type() == SHARED_SECRET_AUTH_LOGIN_TYPE {
         resolve_shared_secret_auth_login(&state, &login_info.data()).await?
     } else {
@@ -141,8 +144,11 @@ pub async fn post_login(
             }
             LoginInfo::Token(t) => resolve_token_login(&state, &t.token).await?,
             LoginInfo::ApplicationService(as_info) => {
-                resolve_appservice_login(&state, &headers, &query, as_info.identifier.as_ref())
-                    .await?
+                let (user_id, appservice_id) =
+                    resolve_appservice_login(&state, &headers, &query, as_info.identifier.as_ref())
+                        .await?;
+                issued_by_appservice = Some(appservice_id);
+                user_id
             }
             _ => {
                 return Err(MatrixError::new(
@@ -166,12 +172,13 @@ pub async fn post_login(
         return Err(MatrixError::user_locked());
     }
 
-    let session = session::create_session(
+    let session = session::create_session_issued_by(
         &state,
         &user_id,
         device_id,
         initial_device_display_name,
         refresh,
+        issued_by_appservice,
     )
     .await?;
 
@@ -349,12 +356,14 @@ async fn resolve_shared_secret_auth_login(
     Ok(user_id)
 }
 
+/// The user an `m.login.application_service` login logs in, and the id of the appservice whose
+/// token asked (the one the session is issued to, decision 0053).
 async fn resolve_appservice_login(
     state: &AuthState,
     headers: &HeaderMap,
     query: &HashMap<String, String>,
     identifier: Option<&UserIdentifier>,
-) -> Result<OwnedUserId, MatrixError> {
+) -> Result<(OwnedUserId, String), MatrixError> {
     let token = bearer_or_query_token(headers, query).ok_or_else(MatrixError::missing_token)?;
     let record: AppserviceRecord = state
         .appservices
@@ -363,7 +372,7 @@ async fn resolve_appservice_login(
         .ok_or_else(|| MatrixError::unknown_token(false))?;
 
     let Some(identifier) = identifier else {
-        return Ok(record.sender);
+        return Ok((record.sender, record.appservice_id));
     };
     let UserIdentifier::Matrix(m) = identifier else {
         return Err(MatrixError::invalid_param(
@@ -405,7 +414,7 @@ async fn resolve_appservice_login(
             ))
             .await?;
     }
-    Ok(user_id)
+    Ok((user_id, record.appservice_id))
 }
 
 fn bearer_or_query_token(headers: &HeaderMap, query: &HashMap<String, String>) -> Option<String> {
@@ -538,6 +547,158 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Logs in with `body` (and `as_token` as the bearer, if given); the response's JSON.
+    async fn login_json(state: &AuthState, as_token: Option<&str>, body: Value) -> Value {
+        let mut headers = HeaderMap::new();
+        if let Some(token) = as_token {
+            headers.insert(AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
+        }
+        let response = post_login(
+            State(state.clone()),
+            headers,
+            Query(HashMap::new()),
+            hs_http::buckets::ClientIp(None),
+            PermissiveJson(body),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// The requester the middleware makes of a request bearing `token`.
+    async fn requester_for(state: &AuthState, token: &str) -> crate::requester::Requester {
+        use axum::extract::FromRequestParts;
+        let (mut parts, ()) = axum::http::Request::builder()
+            .uri("/x")
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .body(())
+            .unwrap()
+            .into_parts();
+        crate::requester::Requester::from_request_parts(&mut parts, state)
+            .await
+            .unwrap()
+    }
+
+    /// Decision 0053: the session an `m.login.application_service` login makes (a bridge's
+    /// double puppet) is attributed to the appservice that logged in, on the token record and,
+    /// resolved against the registration as it stands, on every request's requester -- without
+    /// making the request an appservice's. Its `/refresh` keeps the attribution. The same
+    /// user's password session is not attributed. An edited registration applies to the next
+    /// request; a removed one leaves the session an ordinary one.
+    #[tokio::test]
+    async fn an_appservice_login_issues_a_session_attributed_to_the_appservice() {
+        use crate::appservice::{AppserviceRecord, InMemoryAppserviceRegistry, NamespaceRule};
+        use crate::requester::{IssuingAppservice, RateLimitExemption};
+        let brandon = user_id!("@brandon:example.org");
+        let mut record = AppserviceRecord::new(
+            "imessage",
+            user_id!("@imessagebot:example.org").to_owned(),
+            vec![NamespaceRule {
+                regex: regex::Regex::new(r"@brandon:example\.org").unwrap(),
+                exclusive: false,
+            }],
+        );
+        record.rate_limited = false;
+        let registry = std::sync::Arc::new(InMemoryAppserviceRegistry::new());
+        registry.insert("as_token_imessage", record.clone());
+        let state = state_with_password_user(brandon, "hunter2")
+            .await
+            .with_appservices(registry.clone());
+
+        let puppet = login_json(
+            &state,
+            Some("as_token_imessage"),
+            json!({
+                "type": "m.login.application_service",
+                "identifier": {"type": "m.id.user", "user": "brandon"},
+                "refresh_token": true,
+            }),
+        )
+        .await;
+        let own = login_json(
+            &state,
+            None,
+            json!({"type": "m.login.password", "identifier": {"type": "m.id.user", "user": "brandon"}, "password": "hunter2"}),
+        )
+        .await;
+        let puppet_token = puppet["access_token"].as_str().unwrap();
+        let own_token = own["access_token"].as_str().unwrap();
+
+        let stored = state
+            .store
+            .get_access_token(&TokenHash::of(puppet_token))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.issued_by_appservice.as_deref(), Some("imessage"));
+        let stored_own = state
+            .store
+            .get_access_token(&TokenHash::of(own_token))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_own.issued_by_appservice, None);
+
+        let requester = requester_for(&state, puppet_token).await;
+        assert_eq!(requester.user_id, brandon);
+        assert_eq!(requester.appservice, None, "not an appservice request");
+        assert_eq!(
+            requester.issued_by_appservice,
+            Some(IssuingAppservice {
+                appservice_id: "imessage".to_owned(),
+                rate_limited: false
+            })
+        );
+        assert_eq!(
+            requester.rate_limit_exemption(),
+            Some(RateLimitExemption::IssuedToAppservice)
+        );
+        assert!(requester.exempt_from_rate_limits(false));
+        assert!(!requester.exempt_from_rate_limits(true), "an override wins");
+        let own_requester = requester_for(&state, own_token).await;
+        assert_eq!(own_requester.issued_by_appservice, None);
+        assert_eq!(own_requester.rate_limit_exemption(), None);
+
+        // A refreshed session is still the appservice's.
+        let refreshed = crate::routes::refresh::post_refresh(
+            State(state.clone()),
+            PermissiveJson(json!({"refresh_token": puppet["refresh_token"]})),
+        )
+        .await
+        .unwrap()
+        .0;
+        let refreshed_token = refreshed["access_token"].as_str().unwrap();
+        assert_eq!(
+            requester_for(&state, refreshed_token)
+                .await
+                .rate_limit_exemption(),
+            Some(RateLimitExemption::IssuedToAppservice)
+        );
+
+        // The registration now says `rate_limited: true`: the next request is limited.
+        record.rate_limited = true;
+        registry.insert("as_token_imessage", record);
+        let requester = requester_for(&state, refreshed_token).await;
+        assert_eq!(
+            requester
+                .issued_by_appservice
+                .as_ref()
+                .map(|a| a.rate_limited),
+            Some(true)
+        );
+        assert_eq!(requester.rate_limit_exemption(), None);
+
+        // Removed: an ordinary session.
+        registry.remove("as_token_imessage");
+        let requester = requester_for(&state, refreshed_token).await;
+        assert_eq!(requester.issued_by_appservice, None);
+        assert_eq!(requester.rate_limit_exemption(), None);
     }
 
     /// `auth.password.enabled` off: `GET /login` does not offer `m.login.password` and a

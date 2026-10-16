@@ -4,6 +4,23 @@ Written 2026-09-20 by the integration lead, last revised 2026-10-16 (v0.3.28 on 
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
+## 2026-10-16 -- a bridge's double puppet is no longer rate-limited when its appservice is not; the branch is `agent/puppet-rate-limit`
+
+The iMessage bridge's catch-up got `429`s every 5 s: its double puppet of @brandon logs in with
+`m.login.application_service` and its own `as_token`, and the token that returned was limited as
+an ordinary user's. Now (track 07, decision 0053) that token is attributed to the appservice and
+exempt when the registration says `rate_limited: false` (unless the person has a rate-limit
+override, which then applies); his Element session stays limited. New counter
+`hs_room_puppet_rate_limit_exempt_writes_total`; the Users page marks the session "Bridge double
+puppet" (OpenAPI 0.1.20). **Tokens issued before the roll are not attributed**: after the roll,
+sign out the iMessage bridge's old double-puppet session of @brandon (Users, @brandon,
+Sessions/Devices: the device last seen from the Mac's address) so the bridge logs in again, or
+restart the bridge if it does not. **After the roll, check**: the new session is marked "Bridge
+double puppet" (`imessage-brandon`); no `429` in the bridge's log; during a catch-up
+`hs_room_server_rate_limited_writes_total` stays flat while
+`hs_room_puppet_rate_limit_exempt_writes_total` rises. **Left**: none known; status 07
+(2026-10-16) has the details.
+
 ## 2026-10-16 -- handover: where the demo is, what to roll, what to check, what is next
 
 **Branches.** `agent/dummy-event-chain` (below) is the only one in flight (`agent/soft-fail-forks`

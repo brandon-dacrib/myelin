@@ -35,6 +35,42 @@ describe("ActivityCard", { timeout: 20_000 }, () => {
     expect(table.getByText("Support session")).toBeInTheDocument();
   });
 
+  it("marks a session a bridge signed in to double puppet the user, and says what that means", async () => {
+    await signIn();
+    server.use(
+      http.get("*/api/v1/users/:user_id/sessions", () =>
+        HttpResponse.json({
+          items: [
+            {
+              device_id: "IMSGPUPPET",
+              display_name: null,
+              ip: null,
+              user_agent: null,
+              last_seen_at: null,
+              support_session: false,
+              issued_by_appservice: "imessage",
+            },
+            {
+              device_id: "ALICEWEB",
+              display_name: "Chrome, Windows",
+              ip: null,
+              user_agent: null,
+              last_seen_at: null,
+              support_session: false,
+            },
+          ],
+          next_cursor: null,
+        }),
+      ),
+    );
+    await renderCard();
+    const table = within(await screen.findByRole("table", { name: "Sessions" }, SLOW));
+    expect(await table.findByText("IMSGPUPPET")).toBeInTheDocument();
+    expect(table.getAllByText("Bridge double puppet")).toHaveLength(1);
+    expect(table.getByText("imessage")).toBeInTheDocument();
+    expect(table.getByText(/Rate-limited as the bridge is/)).toBeInTheDocument();
+  });
+
   it("lists rooms with links to each room's page, and filters by membership", async () => {
     await signIn();
     const user = userEvent.setup();

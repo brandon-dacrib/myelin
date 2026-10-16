@@ -8,6 +8,16 @@ Last updated: 2026-10-15 (a deployed bridge's volume: how full, and its size; br
 `agent/bridge-volume-size`); before that 2026-10-13 (the Registrations tab pages by bridge: the
 server folds each double-puppeting registration; branch `agent/fold-doublepuppet-server`).
 
+## 2026-10-16: a bridge's double-puppet session is marked on the user's page (branch `agent/puppet-rate-limit`, track 07)
+
+The Users page's Activity card, Sessions tab, marks a session whose `issued_by_appservice` is set
+(OpenAPI 0.1.20; `schema.d.ts` regenerated) with an info badge "Bridge double puppet" and a line
+saying which bridge signed in and that it is rate-limited as the bridge is (decision 0053); the
+compact rendering says "(double puppet of bridge <id>)". Test:
+`src/pages/users/ActivityCard.test.tsx` ("marks a session a bridge signed in to double puppet the
+user"). The mock fixtures have no such session (adding a device would change the users' device
+counts other tests read); the test supplies one. `npm run check` passes.
+
 ## 2026-10-15: a deployed bridge's volume is on its pages, and its size is set there (branch `agent/bridge-volume-size`)
 
 The demo's Slack bridge stopped with a full volume and the Registrations page said only

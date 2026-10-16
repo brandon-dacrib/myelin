@@ -34,6 +34,32 @@ pub async fn create_session(
     initial_device_display_name: Option<String>,
     refresh: bool,
 ) -> Result<NewSession, MatrixError> {
+    create_session_issued_by(
+        state,
+        user_id,
+        device_id,
+        initial_device_display_name,
+        refresh,
+        None,
+    )
+    .await
+}
+
+/// [`create_session`], recording on the access token (and the refresh token, if one is minted)
+/// the application service the session is issued to, when it is: an `m.login.application_service`
+/// login or registration, or a `/refresh` of such a session
+/// ([`AccessTokenRecord::issued_by_appservice`], decision 0053).
+///
+/// # Errors
+/// As [`create_session`].
+pub async fn create_session_issued_by(
+    state: &AuthState,
+    user_id: &UserId,
+    device_id: Option<OwnedDeviceId>,
+    initial_device_display_name: Option<String>,
+    refresh: bool,
+    issued_by_appservice: Option<String>,
+) -> Result<NewSession, MatrixError> {
     let now = state.now_ms();
     let device_id = device_id.unwrap_or_else(ruma::DeviceId::new);
 
@@ -92,6 +118,7 @@ pub async fn create_session(
             expires_at_ms: expires_in_ms.map(|ms| now + ms),
             refresh_token_hash: refresh_hash,
             last_used_ms: Some(now),
+            issued_by_appservice: issued_by_appservice.clone(),
         })
         .await?;
 
@@ -111,6 +138,7 @@ pub async fn create_session(
                     .get()
                     .session_lifetime_ms
                     .map(|ms| now + ms),
+                issued_by_appservice,
             })
             .await?;
     }

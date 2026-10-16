@@ -102,6 +102,7 @@ mod tests {
                 expires_at_ms: None,
                 refresh_token_hash: Some(refresh_hash),
                 last_used_ms: None,
+                issued_by_appservice: None,
             })
             .await
             .unwrap();
@@ -116,6 +117,7 @@ mod tests {
                 replaced_by: None,
                 expires_at_ms: None,
                 ultimate_session_expiry_ms: None,
+                issued_by_appservice: None,
             })
             .await
             .unwrap();
@@ -183,6 +185,7 @@ mod tests {
                 expires_at_ms: None,
                 refresh_token_hash: None,
                 last_used_ms: None,
+                issued_by_appservice: None,
             })
             .await
             .unwrap();
@@ -220,6 +223,7 @@ mod tests {
                     expires_at_ms: None,
                     refresh_token_hash: None,
                     last_used_ms: None,
+                    issued_by_appservice: None,
                 })
                 .await
                 .unwrap();

@@ -496,7 +496,14 @@ async fn register_appservice_user(
         .get("inhibit_login")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    finish_registration(state, &user_id, body, inhibit_login).await
+    finish_registration(
+        state,
+        &user_id,
+        body,
+        inhibit_login,
+        Some(appservice.appservice_id.clone()),
+    )
+    .await
 }
 
 /// `POST /register?kind=guest`: a guest account (no password, [`UserRecord::is_guest`]) with a
@@ -529,7 +536,7 @@ async fn register_guest(state: &AuthState, body: &Value) -> Result<Response, Mat
         .get("inhibit_login")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    finish_registration(state, &user_id, body, inhibit_login).await
+    finish_registration(state, &user_id, body, inhibit_login, None).await
 }
 
 /// The guest account a registration with `guest_access_token` upgrades: the spec's "Guest
@@ -812,7 +819,7 @@ async fn register_user(
         // This session already made its account: log it in again (Synapse: "Already registered
         // user ID for this session").
         tracing::info!(%user_id, "a registration session finished again; logging its account in");
-        return finish_registration(state, &user_id, &params_value, inhibit_login).await;
+        return finish_registration(state, &user_id, &params_value, inhibit_login, None).await;
     }
 
     let password_hash = match (&password_raw, stored_password_hash) {
@@ -883,7 +890,7 @@ async fn register_user(
         tracing::warn!(%error, %user_id, "could not add the email address a registration validated");
     }
 
-    finish_registration(state, &user_id, &params_value, inhibit_login).await
+    finish_registration(state, &user_id, &params_value, inhibit_login, None).await
 }
 
 async fn fresh_user_id(state: &AuthState) -> Result<OwnedUserId, MatrixError> {
@@ -897,11 +904,15 @@ async fn fresh_user_id(state: &AuthState) -> Result<OwnedUserId, MatrixError> {
     Err(MatrixError::internal())
 }
 
+/// The response to a successful registration, with a new session unless `inhibit_login`;
+/// `issued_by_appservice` is the appservice that registered the account, whose session it then
+/// is (decision 0053).
 async fn finish_registration(
     state: &AuthState,
     user_id: &UserId,
     body: &Value,
     inhibit_login: bool,
+    issued_by_appservice: Option<String>,
 ) -> Result<Response, MatrixError> {
     if inhibit_login {
         return Ok(Json(json!({"user_id": user_id})).into_response());
@@ -920,12 +931,13 @@ async fn finish_registration(
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
-    let session = session::create_session(
+    let session = session::create_session_issued_by(
         state,
         user_id,
         device_id,
         initial_device_display_name,
         refresh,
+        issued_by_appservice,
     )
     .await?;
 
@@ -2010,6 +2022,16 @@ mod tests {
         let json = body_json(response).await;
         assert_eq!(json["user_id"], "@irc_alice:example.org");
         assert!(json["access_token"].is_string(), "{json}");
+        // The session is the appservice's (decision 0053).
+        let token = state
+            .store
+            .get_access_token(&crate::token::TokenHash::of(
+                json["access_token"].as_str().unwrap(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(token.issued_by_appservice.as_deref(), Some("irc"));
 
         // Twice is a conflict, which every bridge expects and treats as "already done".
         let body = json!({"type": "m.login.application_service", "username": "ircbot"});

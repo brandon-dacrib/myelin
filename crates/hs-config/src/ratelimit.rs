@@ -130,7 +130,8 @@ pub struct RateLimitConfig {
     /// How fast one user may send events: messages, room settings (state) and redactions,
     /// counted per sender. An administrator can give one user other limits on their user page.
     /// Corresponds to Synapse's `rc_message`. Bridges that
-    /// registered with `rate_limited: false` are exempt.
+    /// registered with `rate_limited: false` are exempt, and so are the sessions they sign in to
+    /// double puppet a person, unless that person has limits of their own.
     #[serde(default = "default_message", deserialize_with = "partial_message")]
     pub message: RateLimitBucket,
     /// How fast accounts may be created from one client address (`POST /register`). Counted when

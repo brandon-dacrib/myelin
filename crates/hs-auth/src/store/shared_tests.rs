@@ -314,6 +314,7 @@ pub(crate) async fn device_and_token_lifecycle<S: AuthStore>(s: &S) {
         expires_at_ms: None,
         refresh_token_hash: None,
         last_used_ms: None,
+        issued_by_appservice: None,
     })
     .await
     .unwrap();
@@ -431,6 +432,7 @@ pub(crate) async fn access_token_bulk_deletes<S: AuthStore>(s: &S) {
             expires_at_ms: None,
             refresh_token_hash: None,
             last_used_ms: None,
+            issued_by_appservice: None,
         })
         .await
         .unwrap();
@@ -462,6 +464,7 @@ pub(crate) async fn mark_access_token_used_updates_last_used<S: AuthStore>(s: &S
         expires_at_ms: None,
         refresh_token_hash: None,
         last_used_ms: None,
+        issued_by_appservice: None,
     })
     .await
     .unwrap();
@@ -489,6 +492,7 @@ pub(crate) async fn refresh_token_lifecycle<S: AuthStore>(s: &S) {
         replaced_by: None,
         expires_at_ms: None,
         ultimate_session_expiry_ms: None,
+        issued_by_appservice: None,
     })
     .await
     .unwrap();
@@ -935,6 +939,54 @@ pub(crate) async fn pending_registrations_are_remembered_until_forgotten_or_expi
     );
 }
 
+/// `list_access_tokens_for_user` lists one user's tokens and nobody else's, and a token's
+/// `issued_by_appservice` survives the store (decision 0053).
+pub(crate) async fn access_tokens_are_listed_per_user_with_their_issuing_appservice<
+    S: AuthStore,
+>(
+    s: &S,
+) {
+    let alice = user_id!("@alice:example.org").to_owned();
+    let bob = user_id!("@bob:example.org").to_owned();
+    let token = |name: &str, user: &ruma::OwnedUserId, issued_by: Option<&str>| AccessTokenRecord {
+        hash: TokenHash::of(name),
+        user_id: user.clone(),
+        device_id: Some(name.into()),
+        expires_at_ms: None,
+        refresh_token_hash: None,
+        last_used_ms: None,
+        issued_by_appservice: issued_by.map(str::to_owned),
+    };
+    assert!(
+        s.list_access_tokens_for_user(&alice)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    s.put_access_token(token("own", &alice, None))
+        .await
+        .unwrap();
+    s.put_access_token(token("puppet", &alice, Some("imessage")))
+        .await
+        .unwrap();
+    s.put_access_token(token("bobs", &bob, None)).await.unwrap();
+    let mut listed: Vec<(String, Option<String>)> = s
+        .list_access_tokens_for_user(&alice)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| (t.device_id.unwrap().to_string(), t.issued_by_appservice))
+        .collect();
+    listed.sort();
+    assert_eq!(
+        listed,
+        vec![
+            ("own".to_owned(), None),
+            ("puppet".to_owned(), Some("imessage".to_owned())),
+        ]
+    );
+}
+
 pub(crate) async fn run_all<S: AuthStore>(make_store: impl Fn() -> S) {
     pending_registrations_are_remembered_until_forgotten_or_expired(&make_store()).await;
     recovery_token_is_replaced_consumed_once_and_cleared(&make_store()).await;
@@ -957,6 +1009,7 @@ pub(crate) async fn run_all<S: AuthStore>(make_store: impl Fn() -> S) {
     list_devices_is_sorted_by_device_id(&make_store()).await;
     devices_do_not_leak_across_users(&make_store()).await;
     access_token_bulk_deletes(&make_store()).await;
+    access_tokens_are_listed_per_user_with_their_issuing_appservice(&make_store()).await;
     mark_access_token_used_updates_last_used(&make_store()).await;
     mark_access_token_used_on_missing_token_is_not_an_error(&make_store()).await;
     refresh_token_lifecycle(&make_store()).await;

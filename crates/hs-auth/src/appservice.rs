@@ -99,6 +99,16 @@ pub trait AppserviceRegistry: Send + Sync {
     /// at all (the caller then falls through to ordinary user-token authentication).
     async fn lookup_by_token(&self, token: &str) -> Option<AppserviceRecord>;
 
+    /// The current `rate_limited` flag of the registration with id `appservice_id`, or `None`
+    /// if there is no such registration (any more). Read on every request whose access token
+    /// was issued to an appservice (`m.login.application_service`, decision 0053), so that an
+    /// edited registration (`rate_limited: true`) or a removed one takes effect at once.
+    ///
+    /// The default knows of no registration, which leaves such tokens rate-limited.
+    async fn rate_limited_of(&self, _appservice_id: &str) -> Option<bool> {
+        None
+    }
+
     /// The appservice whose **exclusive** user namespace covers `user_id`, if any. Nobody else
     /// may register that user ID (`M_EXCLUSIVE`): not a person, not another appservice.
     ///
@@ -167,6 +177,14 @@ impl InMemoryAppserviceRegistry {
             .insert(token.into(), record);
     }
 
+    /// Removes the appservice registered under `token`, as an operator removing a registration.
+    pub fn remove(&self, token: &str) {
+        self.by_token
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(token);
+    }
+
     /// Registers `record` as the double-puppeting registration of `for_appservice`.
     pub fn insert_double_puppet(
         &self,
@@ -188,6 +206,15 @@ impl AppserviceRegistry for InMemoryAppserviceRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(token)
             .cloned()
+    }
+
+    async fn rate_limited_of(&self, appservice_id: &str) -> Option<bool> {
+        self.by_token
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .find(|record| record.appservice_id == appservice_id)
+            .map(|record| record.rate_limited)
     }
 
     async fn exclusive_user_owner(&self, user_id: &UserId) -> Option<String> {

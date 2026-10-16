@@ -30,7 +30,8 @@ const TAB_LABELS: Record<Tab, string> = {
 };
 
 /**
- * What a user has been doing: where they are signed in (support sessions marked), which rooms
+ * What a user has been doing: where they are signed in (support sessions and bridges' double
+ * puppets marked), which rooms
  * they are in, what they have sent and uploaded. Each tab loads only when it is opened.
  */
 export function ActivityCard({ userId }: { userId: string }) {
@@ -98,12 +99,25 @@ function SessionsTab({ userId }: { userId: string }) {
               Support session
             </Badge>
           )}
+          {s.issued_by_appservice && (
+            <>
+              <Badge status="info" className="self-start">
+                Bridge double puppet
+              </Badge>
+              <span className="text-xs text-text-muted">
+                Signed in by the bridge{" "}
+                <span className="font-identifier">{s.issued_by_appservice}</span>, which acts as
+                this user here. Rate-limited as the bridge is: not at all if its registration says
+                rate_limited: false, unless this user has a rate-limit override.
+              </span>
+            </>
+          )}
         </div>
       ),
       renderCompact: (s) =>
         `${s.device_id}${s.support_session ? " (support session)" : ""}${
-          s.display_name ? `, ${s.display_name}` : ""
-        }`,
+          s.issued_by_appservice ? ` (double puppet of bridge ${s.issued_by_appservice})` : ""
+        }${s.display_name ? `, ${s.display_name}` : ""}`,
     },
     {
       key: "ip",

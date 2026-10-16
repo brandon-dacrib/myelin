@@ -515,6 +515,7 @@ impl<B: KvBackend + 'static> MigrationTarget for StoreTarget<B> {
                 expires_at_ms: token.valid_until_ms,
                 refresh_token_hash: None,
                 last_used_ms: None,
+                issued_by_appservice: None,
             })
             .await
             .map_err(fatal)?;
@@ -567,6 +568,7 @@ impl<B: KvBackend + 'static> MigrationTarget for StoreTarget<B> {
                 replaced_by: None,
                 expires_at_ms: token.expiry_ms,
                 ultimate_session_expiry_ms: token.ultimate_session_expiry_ms,
+                issued_by_appservice: None,
             })
             .await
             .map_err(fatal)?;

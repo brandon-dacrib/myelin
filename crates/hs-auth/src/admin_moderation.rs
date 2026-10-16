@@ -139,9 +139,21 @@ impl UserModerationSource for AuthStoreUserModeration {
             .await
             .map_err(unavailable)?;
         devices.sort_by_key(|d| std::cmp::Reverse(d.last_seen_ms));
+        // Which appservice each device's session was issued to (decision 0053): a device whose
+        // token an `m.login.application_service` login made is a bridge's double puppet.
+        let issued_by: std::collections::HashMap<String, String> = self
+            .state
+            .store
+            .list_access_tokens_for_user(&record.user_id)
+            .await
+            .map_err(unavailable)?
+            .into_iter()
+            .filter_map(|t| Some((t.device_id?.to_string(), t.issued_by_appservice?)))
+            .collect();
         Ok(devices
             .into_iter()
             .map(|d| AdminSession {
+                issued_by_appservice: issued_by.get(d.device_id.as_str()).cloned(),
                 support_session: d.device_id.as_str().starts_with(SUPPORT_DEVICE_PREFIX),
                 device_id: d.device_id.to_string(),
                 display_name: d.display_name,
@@ -195,6 +207,7 @@ impl UserModerationSource for AuthStoreUserModeration {
                 expires_at_ms: Some(expires_at_ms),
                 refresh_token_hash: None,
                 last_used_ms: Some(now),
+                issued_by_appservice: None,
             })
             .await
             .map_err(unavailable)?;
@@ -326,5 +339,37 @@ mod tests {
                 .await,
             Err(SourceError::Conflict(_))
         ));
+    }
+
+    /// A session an appservice was issued (a bridge's double puppet, decision 0053) says which
+    /// appservice; the user's own does not.
+    #[tokio::test]
+    async fn a_session_issued_to_an_appservice_names_it() {
+        let (state, source) = source().await;
+        let alice = user_id!("@alice:example.org");
+        crate::session::create_session(&state, alice, Some("OWN".into()), None, false)
+            .await
+            .unwrap();
+        crate::session::create_session_issued_by(
+            &state,
+            alice,
+            Some("BRIDGE".into()),
+            None,
+            false,
+            Some("imessage".to_owned()),
+        )
+        .await
+        .unwrap();
+        let sessions = source.sessions("@alice:example.org").await.unwrap();
+        let issued = |device: &str| {
+            sessions
+                .iter()
+                .find(|s| s.device_id == device)
+                .unwrap()
+                .issued_by_appservice
+                .clone()
+        };
+        assert_eq!(issued("BRIDGE").as_deref(), Some("imessage"));
+        assert_eq!(issued("OWN"), None);
     }
 }

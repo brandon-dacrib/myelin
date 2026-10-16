@@ -2,7 +2,8 @@
 
 Track brief: `docs/workstreams/07-auth-and-identity.md`. Owner crate: `hs-auth`.
 
-Last updated: 2026-10-09 (self-service deactivation leaves rooms, the rest of Synapse's CAS
+Last updated: 2026-10-16 (a bridge's double puppet is rate-limited as its appservice, decision
+0053; 2026-10-09: self-service deactivation leaves rooms, the rest of Synapse's CAS
 and SSO settings, the pending-registration check across replicas, identity-server bind/unbind
 against the real binary; 2026-10-05: email password reset, `next_link`, CAS whitelist and bridge
 namespaces, admin deactivation unbinds, the public address reload, OpenID outside `X-Matrix`;
@@ -17,6 +18,54 @@ found and fixed a real case-sensitivity bug in `POST /login`, re-confirmed `/cap
 unfixed (held by another track this session), checked for Element-Web findings in
 `docs/status/16-management-web-interface.md` (none landed as of this write-up), and designed
 (without implementing) a UIA session-correlation scheme left open at the end of session 5).
+
+## 2026-10-16: a bridge's double puppet is rate-limited as its appservice (branch `agent/puppet-rate-limit`, decision 0053)
+
+The demo's iMessage bridge double puppets @brandon with an `m.login.application_service` login
+(its own `as_token`) and sends on the access token that returns. Those requests were an ordinary
+user's, so `rate_limits.message` refused its catch-up with `429`s every 5 s although its
+registration says `rate_limited: false`. Now:
+
+- **The token records the appservice it was issued to.** `AccessTokenRecord` and
+  `RefreshTokenRecord` have `issued_by_appservice: Option<String>` (optional JSON field: old rows
+  read as `None`, `None` is not written, no migration). Set by `routes::login` for
+  `m.login.application_service` (the appservice whose token logged in, double-puppeting
+  registration or not), by `routes::register`'s appservice branch when it logs in, and copied by
+  `/refresh`. `session::create_session_issued_by` mints it; `create_session` is unchanged.
+- **The requester carries it apart from `Requester.appservice`.**
+  `Requester.issued_by_appservice: Option<IssuingAppservice { appservice_id, rate_limited }>`
+  (`serde(default)` for the mesh), resolved by the middleware on every request from the
+  registration as it stands (`AppserviceRegistry::rate_limited_of`, new, default `None`;
+  `hs-appservice`'s adapter reads the registration by id). Edited to `rate_limited: true`: the
+  next request is limited. Removed: an ordinary session. DEBUG log "a session issued to an
+  appservice".
+- **One helper for every exemption.** `Requester::rate_limit_exemption()` (`Appservice` /
+  `IssuedToAppservice`) and `Requester::exempt_from_rate_limits(user_has_override)`: an
+  appservice's own request is exempt even over a per-user override; a session issued to an
+  `rate_limited: false` appservice is exempt unless the user has an override, which then
+  applies. `hs-room`'s `check_send_limit`, `check_redaction_limit` and `check_join_limit` use it
+  (they were every check that exempted appservices). New counter
+  `hs_room_puppet_rate_limit_exempt_writes_total`.
+- **Sessions list.** `TokenStore::list_access_tokens_for_user` (new; memory and tables stores,
+  shared test); `AuthStoreUserModeration::sessions` fills `AdminSession.issued_by_appservice`
+  (OpenAPI 0.1.20, `Session.issued_by_appservice`); the Users page marks the session "Bridge double
+  puppet" and says what that means (`web/src/pages/users/ActivityCard.tsx`).
+
+**Tokens issued before this have no attribution**, and nothing reliable says an appservice login
+made them, so they are not guessed: the bridge's old session stays limited until it is signed out
+(the bridge then logs in again) or the person gets a rate-limit override.
+
+**Verified.** `cargo test -p hs-auth` (login/requester/refresh/registry-edit/removal,
+registration, record and requester compatibility, the store listing on both stores, the
+sessions source); `cargo test -p hs-appservice` (`rate_limited_of`);
+`cargo test -p hs-cli --test puppet_rate_limit` (the real server: a `rate_limited: false`
+registration and `rate_limits.message` burst 3: twelve puppet sends all `200`, the same user's
+password session `200 200 200 429`, the puppet still sending after that, the sessions list naming
+the appservice, an override limiting the puppet, `PATCH rate_limited: true` limiting it; fails at
+the puppet's fourth send without the exemption). The real `hs` binary by hand, same flow with
+curl: puppet `200` x10, own `200 200 200 429 429`,
+`hs_room_puppet_rate_limit_exempt_writes_total 10`, `hs_room_server_rate_limited_writes_total
+2`, the sessions list with `"issued_by_appservice":"puppeteer"`, after the PATCH the puppet `429`.
 
 ## 2026-10-14 (track 06's branch `agent/federation-boot-freeze`): last-seen and last-used are written once a minute
 

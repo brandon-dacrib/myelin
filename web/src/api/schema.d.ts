@@ -3866,6 +3866,8 @@ export interface components {
             display_name?: string | null;
             /** @description Redacted for moderation:* scopes. */
             ip?: string | null;
+            /** @description The appservice this session was issued to, when an m.login.application_service login made it -- a bridge double puppeting the user. Requests on it are rate-limited as that appservice's own are (exempt under rate_limited false, unless the user has a rate-limit override). Absent for every other session and for one issued before the server recorded it (decision 0053). */
+            issued_by_appservice?: string;
             /** Format: date-time */
             last_seen_at?: string | null;
             /** @description A session an administrator minted with users.login_as. */

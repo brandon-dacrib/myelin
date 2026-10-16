@@ -123,6 +123,7 @@ pub(crate) async fn seed_token(state: &MediaState<MemoryBackend>, user_id: &str)
             expires_at_ms: None,
             refresh_token_hash: None,
             last_used_ms: None,
+            issued_by_appservice: None,
         })
         .await
         .unwrap();

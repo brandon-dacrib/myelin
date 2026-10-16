@@ -66,12 +66,15 @@ pub async fn post_refresh(
         .delete_access_token(&record.access_token_hash)
         .await?;
 
-    let session = session::create_session(
+    // A session an appservice was issued (a bridge's double puppet) stays its session: the new
+    // access token is attributed to it as the old one was (decision 0053).
+    let session = session::create_session_issued_by(
         &state,
         &record.user_id,
         Some(record.device_id.clone()),
         None,
         true,
+        record.issued_by_appservice.clone(),
     )
     .await?;
 

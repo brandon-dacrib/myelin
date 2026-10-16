@@ -111,6 +111,17 @@ impl<B: KvBackend> AppserviceRegistry for RegistryAppserviceAdapter<B> {
         self.record_of(row)
     }
 
+    async fn rate_limited_of(&self, appservice_id: &str) -> Option<bool> {
+        match self.registry.get(appservice_id) {
+            Ok(row) => row.map(|row| row.rate_limited),
+            Err(error) => {
+                // Unreadable: the token keeps no exemption for this request, the safe side.
+                tracing::warn!(%error, appservice_id, "could not read an appservice registration for a rate-limit exemption");
+                None
+            }
+        }
+    }
+
     async fn double_puppet_record_for(&self, appservice_id: &str) -> Option<AppserviceRecord> {
         let row = self.registry.store().list().ok()?.into_iter().find(|row| {
             row.extra
@@ -191,6 +202,25 @@ mod tests {
             msc4190: false,
             extra: Default::default(),
         }
+    }
+
+    /// A session issued to an appservice (decision 0053) is rate-limited by the registration's
+    /// current flag, read by id; an unknown id has none.
+    #[tokio::test]
+    async fn rate_limited_is_read_by_appservice_id() {
+        let adapter = adapter_with(reg(r"^@irc_.*:example\.org$"));
+        assert_eq!(adapter.rate_limited_of("irc").await, Some(true));
+        assert_eq!(adapter.rate_limited_of("nobody").await, None);
+        let mut unlimited = reg(r"^@irc_.*:example\.org$");
+        unlimited.id = "irc2".to_string();
+        unlimited.as_token = "as_irc2".to_string();
+        unlimited.hs_token = "hs_irc2".to_string();
+        unlimited.sender_localpart = "ircbot2".to_string();
+        unlimited.namespaces.users =
+            vec![CrateNamespaceRule::compile(r"^@irc2_.*:example\.org$", true).unwrap()];
+        unlimited.rate_limited = false;
+        adapter.registry.add(&unlimited).unwrap();
+        assert_eq!(adapter.rate_limited_of("irc2").await, Some(false));
     }
 
     #[tokio::test]

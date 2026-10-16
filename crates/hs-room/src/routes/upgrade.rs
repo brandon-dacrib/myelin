@@ -716,6 +716,7 @@ mod tests {
             suspended: false,
             appservice: None,
             access_token_id: None,
+            issued_by_appservice: None,
         })
     }
 

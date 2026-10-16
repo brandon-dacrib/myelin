@@ -942,6 +942,26 @@ impl<B: KvBackend> TokenStore for TablesAuthStore<B> {
         }
     }
 
+    async fn list_access_tokens_for_user(
+        &self,
+        user_id: &UserId,
+    ) -> Result<Vec<AccessTokenRecord>, StoreError> {
+        let snap = self.backend.snapshot();
+        let pks = lookup(&snap, &self.access_tokens_by_user, &(user_id.to_string(),))
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        let mut out = Vec::with_capacity(pks.len());
+        for pk in pks {
+            if let Some(bytes) = self
+                .access_tokens
+                .get(&snap, &pk)
+                .map_err(|e| StoreError::Backend(e.to_string()))?
+            {
+                out.push(decode(&bytes)?);
+            }
+        }
+        Ok(out)
+    }
+
     async fn delete_access_token(&self, hash: &TokenHash) -> Result<(), StoreError> {
         let key = (hash.to_hex(),);
         transact(&self.backend, TransactConfig::default(), |txn| {
@@ -1666,6 +1686,7 @@ mod tests {
                     expires_at_ms: None,
                     refresh_token_hash: None,
                     last_used_ms: None,
+                    issued_by_appservice: None,
                 })
                 .await
                 .unwrap();
@@ -1718,6 +1739,7 @@ mod tests {
             expires_at_ms: None,
             refresh_token_hash: None,
             last_used_ms: None,
+            issued_by_appservice: None,
         })
         .await
         .unwrap();
@@ -1743,6 +1765,7 @@ mod tests {
             expires_at_ms: None,
             refresh_token_hash: None,
             last_used_ms: None,
+            issued_by_appservice: None,
         })
         .await
         .unwrap();
@@ -1755,6 +1778,7 @@ mod tests {
             expires_at_ms: None,
             refresh_token_hash: None,
             last_used_ms: None,
+            issued_by_appservice: None,
         })
         .await
         .unwrap();
@@ -1798,6 +1822,7 @@ mod tests {
                                 expires_at_ms: None,
                                 refresh_token_hash: None,
                                 last_used_ms: None,
+                                issued_by_appservice: None,
                             })
                             .await
                             .unwrap();
@@ -1810,6 +1835,7 @@ mod tests {
                                 expires_at_ms: None,
                                 refresh_token_hash: None,
                                 last_used_ms: None,
+                                issued_by_appservice: None,
                             })
                             .await
                             .unwrap();

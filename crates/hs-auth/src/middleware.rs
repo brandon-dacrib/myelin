@@ -30,7 +30,7 @@ use ruma::OwnedDeviceId;
 use std::collections::HashMap;
 
 use crate::error::MatrixError;
-use crate::requester::{AppserviceIdentity, Requester};
+use crate::requester::{AppserviceIdentity, IssuingAppservice, Requester};
 use crate::state::AuthState;
 use crate::token::TokenHash;
 
@@ -184,6 +184,7 @@ async fn authenticate_appservice(
             msc4190_enabled: record.msc4190_enabled,
         }),
         access_token_id: Some(TokenHash::of(token)),
+        issued_by_appservice: None,
     }))
 }
 
@@ -215,6 +216,11 @@ async fn authenticate_user_token(
         return Err(MatrixError::user_locked());
     }
 
+    let issued_by_appservice = match &record.issued_by_appservice {
+        Some(appservice_id) => issuing_appservice(state, &user.user_id, appservice_id).await,
+        None => None,
+    };
+
     state.store.mark_access_token_used(&hash, now).await?;
     if let Some(device_id) = &record.device_id {
         state
@@ -232,7 +238,31 @@ async fn authenticate_user_token(
         suspended: user.suspended,
         appservice: None,
         access_token_id: Some(hash),
+        issued_by_appservice,
     })
+}
+
+/// The appservice a user's access token was issued to (decision 0053), as its registration
+/// stands now: an edit to `rate_limited` applies to the next request, and a registration that
+/// is gone leaves the token an ordinary, rate-limited session.
+async fn issuing_appservice(
+    state: &AuthState,
+    user_id: &ruma::UserId,
+    appservice_id: &str,
+) -> Option<IssuingAppservice> {
+    match state.appservices.rate_limited_of(appservice_id).await {
+        Some(rate_limited) => {
+            tracing::debug!(%user_id, appservice_id, rate_limited, "a session issued to an appservice");
+            Some(IssuingAppservice {
+                appservice_id: appservice_id.to_owned(),
+                rate_limited,
+            })
+        }
+        None => {
+            tracing::debug!(%user_id, appservice_id, "a session issued to an appservice that is no longer registered");
+            None
+        }
+    }
 }
 
 /// [`authenticate_request`] in an `auth.authenticate` span, telling the request's own span
@@ -425,6 +455,7 @@ mod tests {
                 expires_at_ms: None,
                 refresh_token_hash: None,
                 last_used_ms: None,
+                issued_by_appservice: None,
             })
             .await
             .unwrap();
@@ -462,6 +493,7 @@ mod tests {
                 expires_at_ms: None,
                 refresh_token_hash: None,
                 last_used_ms: None,
+                issued_by_appservice: None,
             })
             .await
             .unwrap();
@@ -519,6 +551,7 @@ mod tests {
                 expires_at_ms: None,
                 refresh_token_hash: None,
                 last_used_ms: None,
+                issued_by_appservice: None,
             })
             .await
             .unwrap();
@@ -555,6 +588,7 @@ mod tests {
                 expires_at_ms: Some(1), // already in the past relative to the real clock
                 refresh_token_hash: None,
                 last_used_ms: None,
+                issued_by_appservice: None,
             })
             .await
             .unwrap();
@@ -589,6 +623,7 @@ mod tests {
                 expires_at_ms: None,
                 refresh_token_hash: None,
                 last_used_ms: None,
+                issued_by_appservice: None,
             })
             .await
             .unwrap();
@@ -638,6 +673,7 @@ mod tests {
                 expires_at_ms: None,
                 refresh_token_hash: None,
                 last_used_ms: None,
+                issued_by_appservice: None,
             })
             .await
             .unwrap();

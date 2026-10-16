@@ -10,7 +10,7 @@ openapi: 3.1.0
 info:
   title: hs-admin API
   summary: The native administration and moderation API for the homeserver.
-  version: 0.1.19
+  version: 0.1.20
   description: 'The only API the management interface (track 16) talks to. See docs/rfcs/0004-admin-api.md for the full design rationale: resource modeling, naming, pagination, filtering, errors, idempotency, scopes, versioning and the event stream. This document is the contract; the hs-admin router''s contract tests assert the router and this document agree on paths and methods (RFC 0004 section 1, decision D15.16).'
   contact:
     name: 'Track 15: Admin API and modules'
@@ -123,6 +123,11 @@ info:
       has: 400 at /volume_size otherwise); BridgeDeployment.storage_size,
       volume_capacity_bytes, volume_used_bytes and volume_observed_at. The default volume is
       5Gi (it was 1Gi).'
+  - version: 0.1.20
+    date: '2026-10-16'
+    notes: 'Additive: Session.issued_by_appservice, the appservice a session was issued to by
+      an m.login.application_service login (a bridge double puppeting the user), whose
+      requests on it are rate-limited as that appservice''s are (decision 0053).'
 servers:
 - url: /api/v1
   description: Same origin as /_matrix on the client listener.
@@ -7461,6 +7466,9 @@ components:
         support_session:
           type: boolean
           description: A session an administrator minted with users.login_as.
+        issued_by_appservice:
+          type: string
+          description: The appservice this session was issued to, when an m.login.application_service login made it -- a bridge double puppeting the user. Requests on it are rate-limited as that appservice's own are (exempt under rate_limited false, unless the user has a rate-limit override). Absent for every other session and for one issued before the server recorded it (decision 0053).
         ip:
           type:
           - string

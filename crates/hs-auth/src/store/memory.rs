@@ -603,6 +603,19 @@ impl TokenStore for InMemoryAuthStore {
         Ok(before - inner.access_tokens.len())
     }
 
+    async fn list_access_tokens_for_user(
+        &self,
+        user_id: &UserId,
+    ) -> Result<Vec<AccessTokenRecord>, StoreError> {
+        Ok(self
+            .lock()
+            .access_tokens
+            .values()
+            .filter(|rec| rec.user_id == user_id)
+            .cloned()
+            .collect())
+    }
+
     async fn delete_access_tokens_for_device(
         &self,
         user_id: &UserId,

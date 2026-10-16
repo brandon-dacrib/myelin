@@ -29,7 +29,7 @@
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 
-use hs_auth::requester::Requester;
+use hs_auth::requester::{RateLimitExemption, Requester};
 use hs_auth::store::RateLimitOverrideRecord;
 use hs_kv::KvBackend;
 use prometheus_client::metrics::counter::Counter;
@@ -57,6 +57,16 @@ static SERVER_RATE_LIMITED: LazyLock<Counter> = LazyLock::new(Counter::default);
 /// Guest accounts refused a room because its `m.room.guest_access` does not let guests in.
 static GUEST_JOINS_REFUSED: LazyLock<Counter> = LazyLock::new(Counter::default);
 
+/// Writes let through a rate limit because the session was issued to an appservice with
+/// `rate_limited: false` (a bridge's double puppet, decision 0053). Counted so an operator can
+/// see the exemption at work: during a bridge's catch-up this rises while
+/// `hs_room_server_rate_limited_writes_total` stays flat.
+static PUPPET_EXEMPT_WRITES: LazyLock<Counter> = LazyLock::new(Counter::default);
+
+fn count_puppet_exempt() {
+    PUPPET_EXEMPT_WRITES.inc();
+}
+
 /// Counts one guest refused a room by its guest access (`hs_room_guest_joins_refused_total`).
 pub(crate) fn count_guest_join_refused() {
     GUEST_JOINS_REFUSED.inc();
@@ -72,7 +82,9 @@ fn count(outcome: &'static str) {
 /// refused from a suspended account (`suspended`), swallowed from a shadow-banned one
 /// (`shadow_banned`) or throttled under a rate-limit override (`rate_limited`) -- and
 /// `hs_room_server_rate_limited_writes_total`, writes refused under the server-wide limit, and
-/// `hs_room_guest_joins_refused_total`, guests refused a room by its guest access.
+/// `hs_room_guest_joins_refused_total`, guests refused a room by its guest access, and
+/// `hs_room_puppet_rate_limit_exempt_writes_total`, writes a session issued to an appservice
+/// (a bridge's double puppet) made without a rate limit.
 pub fn register_metrics(registry: &mut prometheus_client::registry::Registry) {
     // Registered without `_total`: the text encoder appends it.
     registry.register(
@@ -91,6 +103,13 @@ pub fn register_metrics(registry: &mut prometheus_client::registry::Registry) {
         "Joins by guest accounts refused 403 because the room's m.room.guest_access is not \
          can_join",
         GUEST_JOINS_REFUSED.clone(),
+    );
+    registry.register(
+        "hs_room_puppet_rate_limit_exempt_writes",
+        "Room writes (events, redactions, joins) let through a rate limit because the session \
+         was issued to an appservice whose registration says rate_limited: false (a bridge's \
+         double puppet)",
+        PUPPET_EXEMPT_WRITES.clone(),
     );
 }
 
@@ -273,8 +292,11 @@ fn now_ms() -> u64 {
     .unwrap_or(u64::MAX)
 }
 
-/// Applies the requester's rate-limit override, if they have one, to one event about to be
-/// sent. An appservice the registry exempts from rate limiting is never limited here.
+/// Applies the requester's rate-limit override, if they have one, else the server-wide
+/// `rate_limits.message`, to one event about to be sent. An appservice the registry exempts from
+/// rate limiting is never limited here; nor is a session issued to one (a bridge's double
+/// puppet, decision 0053) unless the user has an override
+/// ([`Requester::exempt_from_rate_limits`]).
 ///
 /// # Errors
 /// [`RoomError::LimitExceeded`] when over the limit; [`RoomError::Internal`] if the account
@@ -283,11 +305,8 @@ pub(crate) async fn check_send_limit<B: KvBackend + 'static>(
     state: &RoomState<B>,
     requester: &Requester,
 ) -> Result<(), RoomError> {
-    if requester
-        .appservice
-        .as_ref()
-        .is_some_and(|a| !a.rate_limited)
-    {
+    let exemption = requester.rate_limit_exemption();
+    if exemption == Some(RateLimitExemption::Appservice) {
         return Ok(());
     }
     let record = state
@@ -297,6 +316,10 @@ pub(crate) async fn check_send_limit<B: KvBackend + 'static>(
         .await
         .map_err(|e| RoomError::Internal(format!("reading the sender's account: {e}")))?;
     let limit = record.and_then(|r| r.rate_limit_override);
+    if exemption.is_some() && requester.exempt_from_rate_limits(limit.is_some()) {
+        count_puppet_exempt();
+        return Ok(());
+    }
     state
         .rooms
         .send_limiter()
@@ -319,7 +342,8 @@ pub(crate) async fn check_send_limit<B: KvBackend + 'static>(
 /// `rate_limits.joins_local` or `rate_limits.joins_remote` (`remote`: the join goes through
 /// another server), per user, for one join about to be made: the server-wide buckets in
 /// [`hs_auth::ratelimit::ServerLimits`], whose limits a running server replaces when they change.
-/// An appservice the registry exempts from rate limiting is never limited here.
+/// An appservice the registry exempts from rate limiting is never limited here, nor a session
+/// issued to one (decision 0053): no per-user override applies to joins.
 ///
 /// # Errors
 /// [`RoomError::LimitExceeded`] when the user's bucket is empty.
@@ -328,11 +352,10 @@ pub(crate) fn check_join_limit<B: KvBackend + 'static>(
     requester: &Requester,
     remote: bool,
 ) -> Result<(), RoomError> {
-    if requester
-        .appservice
-        .as_ref()
-        .is_some_and(|a| !a.rate_limited)
-    {
+    if requester.exempt_from_rate_limits(false) {
+        if requester.rate_limit_exemption() == Some(RateLimitExemption::IssuedToAppservice) {
+            count_puppet_exempt();
+        }
         return Ok(());
     }
     let limits = &state.auth.limits;
@@ -356,12 +379,9 @@ pub(crate) async fn check_redaction_limit<B: KvBackend + 'static>(
     state: &RoomState<B>,
     requester: &Requester,
 ) -> Result<(), RoomError> {
-    if !requester.is_admin
-        || requester
-            .appservice
-            .as_ref()
-            .is_some_and(|a| !a.rate_limited)
-    {
+    // An exempt requester (an appservice's own, or a session issued to one) is judged by
+    // `check_send_limit`, which knows the order of exemptions and overrides.
+    if !requester.is_admin || requester.rate_limit_exemption().is_some() {
         return check_send_limit(state, requester).await;
     }
     let record = state

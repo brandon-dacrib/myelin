@@ -191,6 +191,15 @@ pub struct AccessTokenRecord {
     /// expire the *previous* access token in a refresh chain after a grace period, matching
     /// Synapse's `mark_access_token_as_used` bookkeeping.
     pub last_used_ms: Option<u64>,
+    /// The application service this token was issued to: set by an `m.login.application_service`
+    /// login (a bridge double puppeting a real user with its own `as_token`) or registration, and
+    /// carried across `/refresh`. The token still acts as an ordinary user session; the id only
+    /// attributes it to that appservice for rate limiting (decision 0053:
+    /// [`crate::requester::Requester::issued_by_appservice`]). `None` for every other session and
+    /// for tokens issued before the field existed; `default` so that those rows still read, and
+    /// skipped when `None` so a row without it is written as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issued_by_appservice: Option<String>,
 }
 
 /// A stored refresh token record.
@@ -215,6 +224,12 @@ pub struct RefreshTokenRecord {
     /// Absolute expiry of the whole session that this refresh chain may extend to, milliseconds
     /// since epoch (`session_lifetime` in Synapse's config). `None` means unbounded.
     pub ultimate_session_expiry_ms: Option<u64>,
+    /// The application service the session was issued to
+    /// ([`AccessTokenRecord::issued_by_appservice`]), so that the access token `/refresh` mints
+    /// from this one is attributed to it too. `default` so that rows written before the field
+    /// existed still read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issued_by_appservice: Option<String>,
 }
 
 /// A stored short-term login token (`m.login.token`) record.
@@ -439,6 +454,13 @@ pub trait TokenStore: Send + Sync {
 
     /// Deletes an access token (used by `/logout`).
     async fn delete_access_token(&self, hash: &TokenHash) -> Result<(), StoreError>;
+
+    /// Every access token of a user, in no particular order (the admin API's sessions list
+    /// reads which appservice each device's session was issued to from them).
+    async fn list_access_tokens_for_user(
+        &self,
+        user_id: &ruma::UserId,
+    ) -> Result<Vec<AccessTokenRecord>, StoreError>;
 
     /// Deletes every access token for a user (used by `/logout/all` and account deactivation).
     /// Returns the number of tokens removed.
@@ -893,5 +915,41 @@ mod tests {
         assert!(again.erased && again.deactivated);
         assert_eq!(again.erased_at_ms, Some(7));
         assert_eq!(again.display_name, None);
+    }
+
+    /// Token rows written before `issued_by_appservice` existed (decision 0053) read as
+    /// unattributed, and an unattributed row is written as before, without the field; an
+    /// attributed one round-trips.
+    #[test]
+    fn token_rows_without_the_issuing_appservice_still_read() {
+        let access = serde_json::json!({
+            "hash": super::TokenHash::of("syt_old"),
+            "user_id": "@old:example.org",
+            "device_id": "OLD",
+            "expires_at_ms": null,
+            "refresh_token_hash": null,
+            "last_used_ms": 5
+        });
+        let mut record: super::AccessTokenRecord = serde_json::from_value(access).unwrap();
+        assert_eq!(record.issued_by_appservice, None);
+        let written = serde_json::to_value(&record).unwrap();
+        assert!(written.get("issued_by_appservice").is_none(), "{written}");
+        record.issued_by_appservice = Some("imessage".to_owned());
+        let again: super::AccessTokenRecord =
+            serde_json::from_value(serde_json::to_value(&record).unwrap()).unwrap();
+        assert_eq!(again.issued_by_appservice.as_deref(), Some("imessage"));
+
+        let refresh = serde_json::json!({
+            "hash": super::TokenHash::of("syr_old"),
+            "user_id": "@old:example.org",
+            "device_id": "OLD",
+            "access_token_hash": super::TokenHash::of("syt_old"),
+            "used": false,
+            "replaced_by": null,
+            "expires_at_ms": null,
+            "ultimate_session_expiry_ms": null
+        });
+        let record: super::RefreshTokenRecord = serde_json::from_value(refresh).unwrap();
+        assert_eq!(record.issued_by_appservice, None);
     }
 }
