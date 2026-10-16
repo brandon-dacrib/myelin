@@ -295,11 +295,16 @@ impl<B: KvBackend + 'static> EphemeralSource for Sources<B> {
         };
         handle
             .query(|actor| {
+                // The membership list is remembered per state: an ephemeral pass asks this of
+                // every room of every user whose presence or receipt it weighs, and parsing
+                // every member event of a room of thousands each time kept the demo's event
+                // caches missing hundreds of times a second (2026-10-16).
                 let joined_members = actor
-                    .joined_members()
+                    .membership_list()
                     .map_err(|e| e.to_string())?
-                    .into_iter()
-                    .filter_map(|event| event.header().state_key.clone())
+                    .iter()
+                    .filter(|(_, membership)| membership == "join")
+                    .map(|(user_id, _)| user_id.to_string())
                     .collect();
                 let aliases = actor.list_aliases().map_err(|e| e.to_string())?;
                 Ok(Some(RoomFacts {

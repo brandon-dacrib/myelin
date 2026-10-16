@@ -504,9 +504,12 @@ fn latest_local_pdu<B: KvBackend>(
     own_server_name: &ServerName,
     destination: &str,
 ) -> Result<Option<Value>, RoomError> {
-    let still_joined = actor.joined_members()?.iter().any(|member| {
-        member.header().state_key.as_deref().and_then(server_of) == Some(destination)
-    });
+    let still_joined = actor
+        .membership_list()?
+        .iter()
+        .any(|(user_id, membership)| {
+            membership == "join" && user_id.server_name().as_str() == destination
+        });
     if !still_joined {
         return Ok(None);
     }

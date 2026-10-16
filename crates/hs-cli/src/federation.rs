@@ -286,21 +286,12 @@ fn visible_to<B: KvBackend>(actor: &RoomActor<B>, server: &str) -> bool {
     if world_readable {
         return true;
     }
-    actor.joined_members().is_ok_and(|members| {
-        members.iter().any(|member| {
-            member
-                .header()
-                .state_key
-                .as_deref()
-                .and_then(server_of)
-                .is_some_and(|s| s == server)
+    // The membership list, remembered per state, rather than every member event parsed.
+    actor.membership_list().is_ok_and(|members| {
+        members.iter().any(|(user_id, membership)| {
+            membership == "join" && user_id.server_name().as_str() == server
         })
     })
-}
-
-/// The server-name half of a Matrix user ID (`@user:server` -> `server`).
-fn server_of(user_id: &str) -> Option<&str> {
-    user_id.split_once(':').map(|(_, server)| server)
 }
 
 /// One `content` field of an event, as a string.
@@ -880,19 +871,11 @@ impl<B: KvBackend + 'static> RoomDataSource for RegistryRoomSource<B> {
         let user_id = user_id.to_owned();
         handle
             .query(move |actor| {
-                actor.full_state().ok()?.iter().find_map(|event| {
-                    let header = event.header();
-                    (header.event_type == "m.room.member"
-                        && header.state_key.as_deref() == Some(user_id.as_str()))
-                    .then(|| {
-                        full_pdu(event)
-                            .get("content")
-                            .and_then(|content| content.get("membership"))
-                            .and_then(Value::as_str)
-                            .map(str::to_owned)
-                    })
-                    .flatten()
-                })
+                // One state lookup, not the whole state parsed to find one member.
+                let event = actor
+                    .state_event("m.room.member", user_id.as_str())
+                    .ok()??;
+                content_str(event, "membership").map(str::to_owned)
             })
             .await
     }
@@ -902,16 +885,21 @@ impl<B: KvBackend + 'static> RoomDataSource for RegistryRoomSource<B> {
 /// store cannot be read: a `send_join` that cannot find out who else is in the room forwards to
 /// nobody rather than failing the join it has already stored.
 /// Every server with a joined member in the room, this one included when it has one, by name.
+///
+/// From the room's membership list (`RoomActor::membership_list`, remembered per state), not
+/// its member events: the federation sender asks this for every EDU and PDU it sends, and a
+/// parse of every member event of a room of thousands each time was most of what the demo's
+/// rooms' event caches missed on (2026-10-16).
 pub(crate) fn joined_servers<B: KvBackend>(actor: &RoomActor<B>) -> Vec<String> {
-    let Ok(members) = actor.joined_members() else {
+    let Ok(members) = actor.membership_list() else {
         return Vec::new();
     };
-    let servers: std::collections::BTreeSet<String> = members
+    let servers: std::collections::BTreeSet<&str> = members
         .iter()
-        .filter_map(|member| member.header().state_key.as_deref().and_then(server_of))
-        .map(str::to_owned)
+        .filter(|(_, membership)| membership == "join")
+        .map(|(user_id, _)| user_id.server_name().as_str())
         .collect();
-    servers.into_iter().collect()
+    servers.into_iter().map(str::to_owned).collect()
 }
 
 /// The `event_id` of every event in a rendered PDU list. Federation PDUs for room version 3+ do
