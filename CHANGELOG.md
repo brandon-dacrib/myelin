@@ -15,6 +15,24 @@ carries the generated notes for that merge.
 
 ## Unreleased
 
+The 0.4 line is the first public release: the same server, documented for someone who has
+never seen it. Everything that was verified for it says how.
+
+- **There is a deployment guide.** `docs/deployment.md` takes an operator from a server name to
+  a server other people use: Docker (one container, or `deploy/compose/` with Caddy getting its
+  own certificate), the released binary on a host with `deploy/systemd/myelin.service`, the
+  Helm chart; where settings live and how precedence works; listeners, TLS and the reverse
+  proxy (Caddy and nginx configurations, the nginx one validated with `nginx -t`); federation
+  and the `.well-known` documents; email; a hardening checklist of what the defaults already
+  do; backup and restore of both layouts; monitoring; upgrades and rollback; migrating from
+  Synapse; troubleshooting. `docs/README.md` indexes the documentation; the README is written
+  for a reader who is not the author, with the measurements kept and the diary moved to
+  `docs/status/`.
+- **The repository has the files a public project is expected to have.** `CONTRIBUTING.md`
+  (the build, the checks CI runs, what a change needs), `SECURITY.md` (private vulnerability
+  reporting through GitHub, turned on for the repository on 2026-10-16, with the supported
+  versions and the design notes an auditor should know) and `CODE_OF_CONDUCT.md`.
+
 - **Traces reach the background work and the store.** A traced request now shows its store
   transactions (named after the code that asked, with what they wrote), each wait for a blocking
   thread, state resolution, event authorization and the event's write. Background work is a

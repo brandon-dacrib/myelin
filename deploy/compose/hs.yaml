@@ -1,0 +1,16 @@
+# Bootstrap settings for the Compose example: the few that are read before the database opens
+# and cannot be environment variables. Everything else is a default until it is changed in the
+# admin interface, which keeps it in the database. docs/config.md marks which settings are
+# bootstrap.
+server:
+  server_name: example.org
+listeners:
+  listeners:
+    - port: 8008
+      bind_addresses: ["::"]       # the compose network; the port is not published on the host
+      resources: [client, federation, media, health, admin]
+      # Caddy sets X-Forwarded-For; believing it makes the per-address rate limits and the audit
+      # log see each client's address rather than Caddy's. Only safe because nothing but Caddy
+      # can reach this listener.
+      x_forwarded: true
+# The data directory comes from the image (HS_DATA_DIR=/data): db/, keys/ and media/ under it.

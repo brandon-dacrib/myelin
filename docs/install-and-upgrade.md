@@ -210,8 +210,8 @@ demo's upgrade, for example:
 
 ```sh
 V=0.3.1
-helm --kube-context admin@dacrib0 -n myelin get values myelin -o yaml > /tmp/myelin-values.yaml
-helm --kube-context admin@dacrib0 upgrade myelin oci://ghcr.io/brandon-dacrib/charts/hs --version "$V" \
+helm --kube-context <context> -n myelin get values myelin -o yaml > /tmp/myelin-values.yaml
+helm --kube-context <context> upgrade myelin oci://ghcr.io/brandon-dacrib/charts/hs --version "$V" \
   -n myelin -f /tmp/myelin-values.yaml \
   -f "https://raw.githubusercontent.com/brandon-dacrib/myelin/v$V/deploy/demo/values-bridges.yaml" \
   --set image.tag="$V" \

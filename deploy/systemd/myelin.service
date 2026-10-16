@@ -1,0 +1,59 @@
+# Myelin as a systemd service, from the released binary at /usr/local/bin/hs.
+#
+#   sudo useradd --system --home /var/lib/myelin --create-home --shell /usr/sbin/nologin myelin
+#   sudo install -d /etc/myelin
+#   printf 'HS__SERVER__SERVER_NAME=example.org\nHS__SERVER__PUBLIC_BASEURL=https://matrix.example.org\n' \
+#     | sudo tee /etc/myelin/environment
+#   sudo cp deploy/systemd/myelin.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now myelin
+#   journalctl -u myelin | grep setup_link
+#
+# The data directory holds the database (db/), the signing key (keys/) and media (media/): it
+# is the whole server, back it up. Settings other than the bootstrap ones live in the database
+# and are changed in the admin interface. For TLS on the server itself, a second listener or
+# trusting a reverse proxy's X-Forwarded-For, write a bootstrap file
+# (`hs generate-config --server-name example.org --data-dir /var/lib/myelin -o /etc/myelin/hs.yaml`,
+# add `listeners:`) and change ExecStart to `hs serve -c /etc/myelin/hs.yaml`.
+# docs/deployment.md is the guide.
+
+[Unit]
+Description=Myelin Matrix homeserver
+Documentation=https://github.com/brandon-dacrib/myelin/blob/main/docs/deployment.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=myelin
+Group=myelin
+Environment=HS_DATA_DIR=/var/lib/myelin
+EnvironmentFile=-/etc/myelin/environment
+ExecStart=/usr/local/bin/hs serve
+Restart=on-failure
+RestartSec=5s
+# SIGTERM: the server withdraws readiness, drains in-flight requests, exits.
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+LimitNOFILE=65536
+
+# Sandboxing. The server needs its data directory and the network, nothing else.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/myelin
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+# To let the server bind 80 or 443 itself (serving TLS without a proxy):
+# AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

@@ -4,6 +4,31 @@ Written 2026-09-20 by the integration lead, last revised 2026-10-16 (v0.3.28 on 
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
+## 2026-10-16 -- getting ready for a public release; the branches are `agent/public-release-docs`, `agent/listener-resources` and `agent/release-version-string`
+
+Three branches, merged in that order. **`agent/public-release-docs`** (this session): the
+README rewritten for a reader who is not the author (the measurements and the capability table
+kept, the diary left to `docs/status/`), `docs/deployment.md` (Docker, Compose with Caddy, the
+binary with a systemd unit, Kubernetes, settings and precedence, listeners and TLS and the
+proxy, federation, hardening, backup, monitoring, upgrades, Synapse migration,
+troubleshooting), `docs/README.md` as the index, `CONTRIBUTING.md`, `SECURITY.md` (GitHub's
+private vulnerability reporting enabled on the repository the same day), `CODE_OF_CONDUCT.md`,
+`deploy/compose/` (validated with `docker compose config`; the nginx alternative with
+`nginx -t`) and `deploy/systemd/`; the Helm README's duplicated "Day two" section removed; two
+callers' phone numbers taken out of this file; the version files raised to 0.4.0 so the first
+merge of the three is the `0.4.0` release. **`agent/listener-resources`**: a listener serves
+only the route families its `resources` names (every listener served everything: the chart's
+public port served `/metrics` and the admin API, its metrics port the whole client API); the
+default listener lists all six so the one-value install is unchanged. **`agent/release-version-string`**:
+the binary reports the release CD built it as (`hs version`, `/_matrix/federation/v1/version`)
+instead of the line. **Left for the owner**: ratify the license (decision 0001 still says
+provisional); say whether the admin interface should be reachable at the public address by
+default (the guide says it is safe and how to move it); try the deployment guide on a machine
+that is not this one. **Left, found while verifying the guide against the real binary**: every
+clean shutdown logs `WARN these components outlived the server's shutdown (a reference cycle
+holds them)` naming ten components; an operator reading the log of a routine restart should
+not see a warning, so either break the cycles or demote the line until they are broken.
+
 ## 2026-10-16 -- a bridge's double puppet is no longer rate-limited when its appservice is not; the branch is `agent/puppet-rate-limit`
 
 The iMessage bridge's catch-up got `429`s every 5 s: its double puppet of @brandon logs in with
@@ -48,8 +73,8 @@ startup probe's 150 s ran out; 0.45-1 core busy, no disk I/O. It ended with the 
 resolution of them on 0.3.25 outlasted the probes, at runtime and then at every boot. Prometheus
 fired `KubePodNotReady`, `TargetDown` and `KubeStatefulSetReplicasMismatch` for the whole time;
 Alertmanager has no receiver that reaches anyone, so nobody heard. The iMessage bridge's requests
-got 502 from the Funnel throughout; two incoming chats (+1 314-795-6244 at 13:21 UTC, +1 833-904-6203
-at 14:27 UTC) failed to create their portals and have no room until the contact writes again.
+got 502 from the Funnel throughout; two incoming chats (at 13:21 UTC and
+14:27 UTC) failed to create their portals and have no room until the contact writes again.
 Bridge restarted 16:43 UTC and catching up; its double puppet (`login_shared_secret: appservice`,
 an ordinary access token for `@brandon`) is under `rate_limits.message` like any user, as on
 Synapse: 429s, retried after 5 s. An override for `@brandon` (Users, rate limit, 0) exempts it.

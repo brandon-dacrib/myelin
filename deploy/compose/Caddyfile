@@ -1,0 +1,37 @@
+# Caddy in front of Myelin. Caddy obtains and renews the certificate itself.
+#
+# Replace matrix.example.org (where clients reach the server) and example.org (the server
+# name). If Caddy does not serve example.org, delete that block and serve the two
+# /.well-known/matrix/* documents from whatever does: docs/deployment.md, "Federation".
+
+matrix.example.org {
+    # Everything the server serves: /_matrix, /.well-known/matrix, /_synapse, /admin, /api/v1
+    # and the landing page. X-Forwarded-For and X-Forwarded-Proto are set by default, and
+    # hs.yaml tells the server to believe them from this listener.
+    reverse_proxy hs:8008 {
+        # /sync is a long poll; give it time.
+        transport http {
+            read_timeout 120s
+        }
+        # Keep Caddy from sending traffic to a server that is not ready (a restart, an upgrade).
+        health_uri /health/ready
+        health_interval 5s
+    }
+    # Uploads: the server's own limit is media.max_upload_size (50 MiB by default). Raise both
+    # together.
+    request_body {
+        max_size 50MB
+    }
+}
+
+example.org {
+    # Other servers and clients look here, at the server name, for where the server is.
+    handle /.well-known/matrix/* {
+        reverse_proxy hs:8008
+    }
+    # Whatever else example.org serves goes here; for example:
+    # handle {
+    #     root * /srv/www
+    #     file_server
+    # }
+}

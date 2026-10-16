@@ -1,0 +1,62 @@
+# Myelin behind Caddy, with Docker Compose.
+#
+# Two services: the homeserver, and Caddy terminating TLS for it with a Let's Encrypt
+# certificate it obtains by itself. Before `docker compose up -d`:
+#
+#   1. Replace `example.org` (the server name: the part after the colon in user IDs, fixed
+#      forever) and `matrix.example.org` (the address clients reach the server at) here, in
+#      `Caddyfile` and in `hs.yaml`.
+#   2. Point DNS for matrix.example.org at this host, and open ports 80 and 443.
+#   3. If example.org is a different host from matrix.example.org, make whatever serves
+#      https://example.org proxy /.well-known/matrix/* to this server (the Caddyfile has the
+#      block for when Caddy serves example.org too), or other servers cannot find yours.
+#
+# Then `docker compose logs hs | grep setup_link` and open the link: it makes the first
+# administrator, once. `docs/deployment.md` is the guide this example belongs to.
+
+services:
+  hs:
+    image: ghcr.io/brandon-dacrib/myelin:${MYELIN_VERSION:-0.3}
+    restart: unless-stopped
+    environment:
+      # The server name is also in hs.yaml; it is repeated here so a missing mount fails loudly
+      # (the two must agree) rather than booting a server with the wrong identity.
+      HS__SERVER__SERVER_NAME: example.org
+      # Where clients reach the server. The setup link, the .well-known documents and the
+      # links in emails are rooted here.
+      HS__SERVER__PUBLIC_BASEURL: https://matrix.example.org
+    volumes:
+      # The database, the signing key and media. This volume is the whole server: back it up.
+      - myelin-data:/data
+      # Bootstrap settings that cannot be environment variables: the listener that trusts
+      # Caddy's X-Forwarded-For header, so rate limits see each client rather than the proxy.
+      - ./hs.yaml:/etc/myelin/hs.yaml:ro
+    command: ["serve", "-c", "/etc/myelin/hs.yaml"]
+    # Not published on the host: only Caddy reaches the server, on the compose network.
+    expose:
+      - "8008"
+    healthcheck:
+      # The image has no shell or curl; the server's own binary is not an HTTP client. Caddy's
+      # upstream health check below covers this instead, and `docker compose ps` shows the
+      # container's state.
+      disable: true
+    stop_grace_period: 30s
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"   # HTTP/3
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data        # certificates and account keys
+      - caddy-config:/config
+    depends_on:
+      - hs
+
+volumes:
+  myelin-data:
+  caddy-data:
+  caddy-config:
