@@ -247,7 +247,19 @@ echo "the bridge operator says: bridge operator starting (namespace $NAMESPACE)"
 # --- A hand-written Bridge --------------------------------------------------------------------
 
 say "A Bridge running a stand-in ($STAND_IN, port $STAND_IN_PORT)"
-if [ -n "$KIND_CLUSTER" ] && docker image inspect "$STAND_IN" >/dev/null 2>&1; then
+# On kind, the stand-in is pulled here, with retries, and loaded: the kubelet's own single pull
+# from public.ecr.aws failed now and then (CD for v0.3.28 and v0.3.29, 2026-10-16: ErrImagePull,
+# the Bridge Degraded and no release). Pulled by the kubelet it would also break any name kind
+# loads later with the same image ID (`kind load` and the kubelet's pull conflict).
+if [ -n "$KIND_CLUSTER" ]; then
+  if ! docker image inspect "$STAND_IN" >/dev/null 2>&1; then
+    for attempt in 1 2 3 4 5; do
+      docker pull -q "$STAND_IN" >/dev/null && break
+      echo "pulling $STAND_IN failed (attempt $attempt of 5)"
+      sleep $((attempt * 10))
+    done
+  fi
+  docker image inspect "$STAND_IN" >/dev/null 2>&1 || fail "could not pull the stand-in $STAND_IN"
   run kind load docker-image "$STAND_IN" --name "$KIND_CLUSTER" >/dev/null
 fi
 stand_in_repo="${STAND_IN%:*}"

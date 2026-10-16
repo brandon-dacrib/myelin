@@ -1,5 +1,16 @@
 # 12. Platform and Kubernetes
 
+## 2026-10-16, afternoon (branch `agent/kind-smoke-stand-in`): the kind smoke pulls its stand-in itself
+
+CD's `image (amd64)` job failed twice on 2026-10-16 (v0.3.28's first run, then 9befe464's) in
+"Prove the operator reconciles a Bridge and a Homeserver": the kubelet's one pull of
+`public.ecr.aws/docker/library/nginx:alpine` failed (`ErrImagePull`), the smoke Bridge went
+`Degraded`, and no release went out until the job was rerun. `deploy/operator/ci/kind-smoke.sh`
+loaded the stand-in into kind only if Docker already had it, which on a fresh runner it never did.
+It now pulls it with Docker (five tries, 10-50 s apart) and always `kind load`s it, failing with
+"could not pull the stand-in" if every try fails; the Bridge's `pullPolicy: IfNotPresent` then
+finds it on the node. Checked: `bash -n`; the next CD run is the real test.
+
 ## 2026-10-16 (branch `agent/ci-arm64-test-kill`): arm64's test job ran out of memory linking; it links with lld now
 
 From 35c09f43 every `test (arm64)` run ended mid-build with `exit code 143` and, in the
