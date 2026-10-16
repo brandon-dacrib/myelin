@@ -367,6 +367,7 @@ impl InHand<'_> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = step_span;
         if let Some(active) = self.progress.lock().active.get_mut(&self.id) {
+            crate::metrics::observe_hub_step(active.step, active.step_since.elapsed());
             if active.warned_at.is_some() {
                 tracing::info!(
                     room_id = %active.room_id,
@@ -387,6 +388,10 @@ impl InHand<'_> {
 impl Drop for InHand<'_> {
     fn drop(&mut self) {
         let removed = self.progress.lock().active.remove(&self.id);
+        // The last step ends with the update.
+        if let Some(active) = &removed {
+            crate::metrics::observe_hub_step(active.step, active.step_since.elapsed());
+        }
         if let Some(active) = removed
             && active.warned_at.is_some()
         {
@@ -540,6 +545,33 @@ mod tests {
         assert_eq!(status.in_hand[0].room_id, a);
         drop(in_hand);
         assert!(p.status(9).in_hand.is_empty());
+    }
+
+    /// `hs_user_hub_step_seconds` gets every step's time, the last step's when the update is
+    /// dropped.
+    #[tokio::test(start_paused = true)]
+    async fn each_steps_time_is_observed_by_its_name() {
+        let p = Progress::default();
+        let a = room_id!("!a:x");
+        let in_hand = p.begin(a, 0, &hs_telemetry::TraceLink::default());
+        in_hand.step("a test's first step");
+        tokio::time::advance(Duration::from_secs(2)).await;
+        in_hand.step("a test's last step");
+        tokio::time::advance(Duration::from_millis(500)).await;
+        drop(in_hand);
+
+        let mut registry = prometheus_client::registry::Registry::default();
+        crate::metrics::register_metrics(&mut registry);
+        let mut text = String::new();
+        prometheus_client::encoding::text::encode(&mut text, &registry).expect("encode");
+        for line in [
+            "hs_user_hub_step_seconds_sum{step=\"a test's first step\"} 2.0",
+            "hs_user_hub_step_seconds_count{step=\"a test's first step\"} 1",
+            "hs_user_hub_step_seconds_sum{step=\"a test's last step\"} 0.5",
+            "hs_user_hub_step_seconds_count{step=\"a test's last step\"} 1",
+        ] {
+            assert!(text.contains(line), "{line} in:\n{text}");
+        }
     }
 
     #[tokio::test(start_paused = true)]

@@ -110,6 +110,32 @@ static HUB_STUCK: LazyLock<Gauge<i64, AtomicI64>> = LazyLock::new(Gauge::default
 /// at one step.
 static HUB_STUCK_WARNINGS: LazyLock<Counter> = LazyLock::new(Counter::default);
 
+/// The labels of `hs_user_hub_step_seconds`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, prometheus_client::encoding::EncodeLabelSet)]
+struct StepLabels {
+    step: &'static str,
+}
+
+/// `hs_user_hub_step_seconds{step}`: how long each step of a room update in the session hub's
+/// hands took (`crate::hub_progress::InHand::step`), by the step's name -- the same names the
+/// watchdog's "stuck on a room update" warning gives. Where `hs_user_hub_stuck_warnings_total`
+/// says the hub stalls, this says which step, for every update and not only the stuck ones.
+static HUB_STEPS: LazyLock<Family<StepLabels, Histogram>> = LazyLock::new(|| {
+    Family::new_with_constructor(|| {
+        Histogram::new([
+            0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+            30.0, 60.0,
+        ])
+    })
+});
+
+/// Records that one room update spent `took` at `step`.
+pub(crate) fn observe_hub_step(step: &'static str, took: Duration) {
+    HUB_STEPS
+        .get_or_create(&StepLabels { step })
+        .observe(took.as_secs_f64());
+}
+
 /// Records the hub's position on the room stream: `published` by the registry, `consumed` by
 /// the hub.
 pub(crate) fn set_hub_position(published: u64, consumed: u64) {
@@ -285,6 +311,12 @@ pub fn register_metrics(registry: &mut prometheus_client::registry::Registry) {
         "Warnings the session hub's watchdog logged about a room update stuck at one step",
         HUB_STUCK_WARNINGS.clone(),
     );
+    registry.register(
+        "hs_user_hub_step_seconds",
+        "Time each step of a room update in the session hub's hands took, by the step's name \
+         (the names the stuck-update warning gives)",
+        HUB_STEPS.clone(),
+    );
 }
 
 #[cfg(test)]
@@ -298,6 +330,7 @@ mod tests {
         register_metrics(&mut registry);
         set_hub_position(10, 7);
         set_hub_health(Duration::from_millis(1500), 1);
+        observe_hub_step("loading the room", Duration::from_millis(3));
         let mut text = String::new();
         prometheus_client::encoding::text::encode(&mut text, &registry).unwrap();
         for line in [
@@ -307,6 +340,7 @@ mod tests {
             "hs_user_hub_oldest_pending_seconds 1.5",
             "hs_user_hub_stuck_updates 1",
             "hs_user_hub_stuck_warnings_total",
+            "hs_user_hub_step_seconds_count{step=\"loading the room\"} 1",
         ] {
             assert!(text.contains(line), "{line} in:\n{text}");
         }
