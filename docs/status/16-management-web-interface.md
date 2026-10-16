@@ -1,12 +1,31 @@
 # 16. Management web interface: status
 
-Last updated: 2026-10-15 (a bridge's dead letters can be seen, replayed with a confirmation
+Last updated: 2026-10-16 (a tab left open across an upgrade reloads into the new build; below); before that 2026-10-15 (a bridge's dead letters can be seen, replayed with a confirmation
 and discarded, and the Registrations tab says why a bridge is not healthy; below); before that
 2026-10-13 (the Registrations tab pages by bridge: the server folds each
 double-puppeting registration; branch `agent/fold-doublepuppet-server`).
 Last updated: 2026-10-15 (a deployed bridge's volume: how full, and its size; branch
 `agent/bridge-volume-size`); before that 2026-10-13 (the Registrations tab pages by bridge: the
 server folds each double-puppeting registration; branch `agent/fold-doublepuppet-server`).
+
+## 2026-10-16: a tab left open across an upgrade reloads into the new build (branch `agent/admin-chunk-reload`)
+
+**Seen**: after the demo's 0.3.31 roll, Users in an already-open Safari tab showed "Importing a
+module script failed". Each build names its chunks by content hash and the server serves only its
+own, so the old tab's router asked for a `UsersPage-<old hash>.js` that now 404s. TanStack
+Router's `lazyRouteComponent` reloads on that, but once per tab session per error message, and
+Safari's message names no chunk: after the first upgrade's reload, every later one in that tab
+was shown as an error.
+
+**Done** (`web/src/lib/chunk-reload.ts`, `lazyPage` in `web/src/routes.tsx`, every page route):
+a chunk-load failure (Chrome's, Firefox's, Safari's wording and Vite's "Unable to preload CSS")
+reloads the page and renders nothing meanwhile, unless this tab reloaded for one in the last 30 s
+(`sessionStorage` `myelin:chunk-reload-at`), so a chunk the new build really lacks, or a server
+that is down, shows its error instead of looping. Storage refused (private window): it still
+reloads. Tests: `src/lib/chunk-reload.test.ts` (each browser's wording; a second upgrade hours
+later in the same tab reloads again with Safari's identical message; a failure within 30 s of a
+reload is shown; other errors pass through; refused storage). **Left**: checked on the demo only
+after its next roll (an open tab from before the roll, a page not yet visited).
 
 ## 2026-10-16: a bridge's double-puppet session is marked on the user's page (branch `agent/puppet-rate-limit`, track 07)
 

@@ -17,6 +17,7 @@ import { validateStatisticsSearch } from "@/pages/statistics/statistics-search";
 import { validateClusterSearch } from "@/pages/cluster/cluster-search";
 import { validateFederationSearch } from "@/pages/federation/federation-search";
 import { validateRoomSearch } from "@/pages/rooms/room-search";
+import { reloadOnNewBuild } from "@/lib/chunk-reload";
 
 // Route-level code splitting: each page (and its own dependency graph —
 // react-query hooks, mock-independent UI, etc.) lands in its own chunk,
@@ -24,87 +25,89 @@ import { validateRoomSearch } from "@/pages/rooms/room-search";
 // it is needed on first paint for every route regardless (nav, top bar,
 // theme, command palette), so lazy-loading it would only add a waterfall.
 // `lazyRouteComponent` (not plain `React.lazy`) is TanStack Router's own
-// wrapper: it also gets `.preload()` on route hover/intent for free.
-const DashboardPage = lazyRouteComponent(() => import("@/pages/DashboardPage"), "DashboardPage");
-const BridgeOfferingsPage = lazyRouteComponent(
+// wrapper: it also gets `.preload()` on route hover/intent for free. `lazyPage`
+// adds `reloadOnNewBuild`: a tab left open across a server upgrade asks for
+// chunks the new build no longer has, and reloads into the new build instead
+// of showing "Importing a module script failed" (`@/lib/chunk-reload`).
+/** `lazyRouteComponent` over `reloadOnNewBuild(importer)`. */
+function lazyPage<M extends Record<string, unknown>, K extends keyof M & string>(
+  importer: () => Promise<M>,
+  exportName: K,
+) {
+  return lazyRouteComponent(reloadOnNewBuild(importer), exportName);
+}
+
+const DashboardPage = lazyPage(() => import("@/pages/DashboardPage"), "DashboardPage");
+const BridgeOfferingsPage = lazyPage(
   () => import("@/pages/bridges/BridgeOfferingsPage"),
   "BridgeOfferingsPage",
 );
-const BridgeOfferingPage = lazyRouteComponent(
+const BridgeOfferingPage = lazyPage(
   () => import("@/pages/bridges/offering/BridgeOfferingPage"),
   "BridgeOfferingPage",
 );
-const OfferBridgeWizardPage = lazyRouteComponent(
+const OfferBridgeWizardPage = lazyPage(
   () => import("@/pages/bridges/wizard/OfferBridgeWizardPage"),
   "OfferBridgeWizardPage",
 );
-const BridgesListPage = lazyRouteComponent(
+const BridgesListPage = lazyPage(
   () => import("@/pages/bridges/BridgesListPage"),
   "BridgesListPage",
 );
-const BridgeDetailPage = lazyRouteComponent(
+const BridgeDetailPage = lazyPage(
   () => import("@/pages/bridges/BridgeDetailPage"),
   "BridgeDetailPage",
 );
-const AddBridgeWizardPage = lazyRouteComponent(
+const AddBridgeWizardPage = lazyPage(
   () => import("@/pages/bridges/wizard/AddBridgeWizardPage"),
   "AddBridgeWizardPage",
 );
-const BridgeCreatedPage = lazyRouteComponent(
+const BridgeCreatedPage = lazyPage(
   () => import("@/pages/bridges/wizard/BridgeCreatedPage"),
   "BridgeCreatedPage",
 );
-const UsersPage = lazyRouteComponent(() => import("@/pages/UsersPage"), "UsersPage");
-const UserDetailPage = lazyRouteComponent(() => import("@/pages/UserDetailPage"), "UserDetailPage");
-const RoomsPage = lazyRouteComponent(() => import("@/pages/RoomsPage"), "RoomsPage");
-const RoomDetailPage = lazyRouteComponent(() => import("@/pages/RoomDetailPage"), "RoomDetailPage");
-const FederationPage = lazyRouteComponent(() => import("@/pages/FederationPage"), "FederationPage");
-const FederationDestinationPage = lazyRouteComponent(
+const UsersPage = lazyPage(() => import("@/pages/UsersPage"), "UsersPage");
+const UserDetailPage = lazyPage(() => import("@/pages/UserDetailPage"), "UserDetailPage");
+const RoomsPage = lazyPage(() => import("@/pages/RoomsPage"), "RoomsPage");
+const RoomDetailPage = lazyPage(() => import("@/pages/RoomDetailPage"), "RoomDetailPage");
+const FederationPage = lazyPage(() => import("@/pages/FederationPage"), "FederationPage");
+const FederationDestinationPage = lazyPage(
   () => import("@/pages/FederationDestinationPage"),
   "FederationDestinationPage",
 );
-const ConfigurationPage = lazyRouteComponent(
+const ConfigurationPage = lazyPage(
   () => import("@/pages/config/ConfigurationPage"),
   "ConfigurationPage",
 );
-const ConfigSectionPage = lazyRouteComponent(
+const ConfigSectionPage = lazyPage(
   () => import("@/pages/config/ConfigSectionPage"),
   "ConfigSectionPage",
 );
-const RegistrationTokensPage = lazyRouteComponent(
+const RegistrationTokensPage = lazyPage(
   () => import("@/pages/settings/RegistrationTokensPage"),
   "RegistrationTokensPage",
 );
-const AdminTokensPage = lazyRouteComponent(
+const AdminTokensPage = lazyPage(
   () => import("@/pages/settings/AdminTokensPage"),
   "AdminTokensPage",
 );
-const ServerNoticesPage = lazyRouteComponent(
+const ServerNoticesPage = lazyPage(
   () => import("@/pages/settings/ServerNoticesPage"),
   "ServerNoticesPage",
 );
-const MediaPage = lazyRouteComponent(() => import("@/pages/media/MediaPage"), "MediaPage");
-const AuditPage = lazyRouteComponent(() => import("@/pages/audit/AuditPage"), "AuditPage");
-const AuditEntryPage = lazyRouteComponent(
-  () => import("@/pages/audit/AuditEntryPage"),
-  "AuditEntryPage",
-);
-const ReportsPage = lazyRouteComponent(() => import("@/pages/reports/ReportsPage"), "ReportsPage");
-const ReportDetailPage = lazyRouteComponent(
+const MediaPage = lazyPage(() => import("@/pages/media/MediaPage"), "MediaPage");
+const AuditPage = lazyPage(() => import("@/pages/audit/AuditPage"), "AuditPage");
+const AuditEntryPage = lazyPage(() => import("@/pages/audit/AuditEntryPage"), "AuditEntryPage");
+const ReportsPage = lazyPage(() => import("@/pages/reports/ReportsPage"), "ReportsPage");
+const ReportDetailPage = lazyPage(
   () => import("@/pages/reports/ReportDetailPage"),
   "ReportDetailPage",
 );
-const TasksPage = lazyRouteComponent(() => import("@/pages/tasks/TasksPage"), "TasksPage");
-const TaskDetailPage = lazyRouteComponent(
-  () => import("@/pages/tasks/TaskDetailPage"),
-  "TaskDetailPage",
-);
-const ClusterPage = lazyRouteComponent(() => import("@/pages/cluster/ClusterPage"), "ClusterPage");
-const MigrationPage = lazyRouteComponent(
-  () => import("@/pages/migration/MigrationPage"),
-  "MigrationPage",
-);
-const StatisticsPage = lazyRouteComponent(
+const TasksPage = lazyPage(() => import("@/pages/tasks/TasksPage"), "TasksPage");
+const TaskDetailPage = lazyPage(() => import("@/pages/tasks/TaskDetailPage"), "TaskDetailPage");
+const ClusterPage = lazyPage(() => import("@/pages/cluster/ClusterPage"), "ClusterPage");
+const MigrationPage = lazyPage(() => import("@/pages/migration/MigrationPage"), "MigrationPage");
+const StatisticsPage = lazyPage(
   () => import("@/pages/statistics/StatisticsPage"),
   "StatisticsPage",
 );
