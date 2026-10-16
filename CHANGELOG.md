@@ -41,6 +41,17 @@ never seen it. Everything that was verified for it says how.
   setup link, `/health` and `/metrics` stay on 8008. `hs serve` logs, per listener, what it
   serves. Verified with the real binary serving two listeners (`[client, health]` and
   `[metrics, admin]`), `helm template`, and the server's whole route manifest classified.
+- **CD's kind smokes pull no image from inside the cluster.** Three of 2026-10-16's eight
+  runs on `main` failed on a helper pod's anonymous kubelet pull (`nginx:alpine` for the
+  operator smoke's stand-in twice, `python:3.12-alpine` for the backup helper once), not on the
+  server. `deploy/helm/hs/ci/helper-image.sh` is now the one way a smoke gets a helper image:
+  pulled on the runner with retries from `public.ecr.aws`, then `mirror.gcr.io`, then Docker
+  Hub, loaded into the kind cluster, run with `IfNotPresent`; every smoke uses it, and the
+  CRD-upgrade smoke takes `--kind`. The operator smoke no longer reads the operator's log once
+  for a line it logged a moment earlier (run 38966658493's failure) and no longer fails on a
+  reconcile error the operator's own start logged. Verified against a local kind cluster: the
+  pull, the fallback (a `docker` shim refusing `public.ecr.aws`), the load, a pod run from the
+  loaded name with no pull.
 - **The server says which release it is.** `hs version`, `/_matrix/federation/v1/version`, the
   admin API's `GET /server` (the Overview page and the `/_synapse/admin/v1/server_version` shim),
   each replica's entry in the cluster registry and `service.version` on exported traces report

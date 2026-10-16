@@ -404,10 +404,11 @@ jobs:
         # Here, between the two other smokes, because it needs a cluster without the CRD: the
         # install smoke deletes the one it created, and this script deletes its own, so the
         # operator smoke after it finds no orphan. The release it installs points at the image
-        # already on the node, so its server pod (never waited for) pulls nothing.
+        # already on the node, so its server pod (never waited for) pulls nothing; `--kind`
+        # loads the Bridge's image the same way (see the backup smoke's step on helper images).
         if: matrix.arch == 'amd64'
         run: |
-          deploy/helm/hs/ci/crd-upgrade-smoke.sh --context kind-smoke \
+          deploy/helm/hs/ci/crd-upgrade-smoke.sh --kind smoke \
             --set image.registry=docker.io --set image.repository=library/myelin \
             --set image.tag=smoke --set image.pullPolicy=Never
 
@@ -476,6 +477,13 @@ jobs:
         # Blocks since run 38019011375, the first green one here: before it, a same-ID image the
         # kubelet had pulled beside the imported `myelin:smoke` made every pod from the imported
         # name ErrImageNeverPull (the cluster smoke's step says how that was settled).
+        #
+        # No smoke pod pulls an image from here: the helper images (python:3.12-alpine for the
+        # backup helper and the traffic pod, postgres:17, nginx:alpine for the Bridge stand-in)
+        # are pulled on the runner with retries, from mirror.gcr.io or Docker Hub when
+        # public.ecr.aws refuses (run 38976232395: one anonymous kubelet pull of python failed
+        # and the backup helper never started), loaded into the kind cluster, and run with
+        # IfNotPresent. deploy/helm/hs/ci/helper-image.sh is the one function every smoke uses.
         if: matrix.arch == 'amd64'
         run: deploy/helm/hs/ci/backup-restore-smoke.sh myelin:smoke --kind smoke
 

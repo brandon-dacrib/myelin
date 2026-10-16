@@ -37,6 +37,9 @@
 #   --postgres-image IMG  Default: public.ecr.aws/docker/library/postgres:17.
 #   --helper-image IMG    The helper pod's image (needs sh and tar). Default:
 #                         public.ecr.aws/docker/library/python:3.12-alpine.
+#                         With --kind, both are pulled here with retries and fallbacks and
+#                         loaded into the cluster, so the kubelet never pulls them
+#                         (helper-image.sh says why).
 #   --keep                Leave everything in place afterwards.
 #   --chart DIR           The chart to install. Default: the one this script lives in.
 #
@@ -62,6 +65,9 @@ HELPER_IMAGE="public.ecr.aws/docker/library/python:3.12-alpine"
 KEEP=0
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CHART="$(cd "$HERE/.." && pwd)"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=helper-image.sh
+. "$HERE/helper-image.sh"
 RELEASE="myelin"
 STS="hs"
 
@@ -222,6 +228,7 @@ spec:
   containers:
     - name: helper
       image: $HELPER_IMAGE
+      imagePullPolicy: IfNotPresent
       command: [sleep, "3600"]
       volumeMounts: [{name: data, mountPath: /data}]
   volumes: [{name: data, persistentVolumeClaim: {claimName: $1}}]
@@ -294,10 +301,9 @@ echo "context $CONTEXT, namespace $NAMESPACE, release $RELEASE, work dir $WORK"
 if [ -n "$KIND_CLUSTER" ]; then
   say "Loading images into kind cluster $KIND_CLUSTER"
   run kind load docker-image "$IMAGE" --name "$KIND_CLUSTER" || fail "kind could not load $IMAGE"
-  for img in "$POSTGRES_IMAGE" "$HELPER_IMAGE"; do
-    if docker image inspect "$img" >/dev/null 2>&1; then run kind load docker-image "$img" --name "$KIND_CLUSTER"
-    else echo "$img is not in the local daemon; the node will pull it"; fi
-  done
+  # The helper images too, pulled here and loaded, never by the kubelet (helper-image.sh).
+  POSTGRES_IMAGE="$(helper_image "$POSTGRES_IMAGE" "$KIND_CLUSTER")" || fail "no PostgreSQL image"
+  HELPER_IMAGE="$(helper_image "$HELPER_IMAGE" "$KIND_CLUSTER")" || fail "no helper image"
 fi
 run kubectl --context "$CONTEXT" create namespace "$NAMESPACE"
 
@@ -377,6 +383,7 @@ spec:
       containers:
         - name: postgres
           image: $POSTGRES_IMAGE
+          imagePullPolicy: IfNotPresent
           env:
             - {name: POSTGRES_USER, value: hs}
             - {name: POSTGRES_PASSWORD, value: "$PG_PASSWORD"}
@@ -424,6 +431,7 @@ spec:
       containers:
         - name: open
           image: $HELPER_IMAGE
+          imagePullPolicy: IfNotPresent
           command: [sh, -c, "chmod 0777 /media"]
           volumeMounts: [{name: media, mountPath: /media}]
       volumes: [{name: media, persistentVolumeClaim: {claimName: hs-media}}]

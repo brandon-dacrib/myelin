@@ -1,5 +1,74 @@
 # 12. Platform and Kubernetes
 
+## 2026-10-16, night (branch `agent/smoke-helper-images`): no smoke pod pulls an image; one function resolves them all
+
+CD on `main` failed three of the day's eight runs on image pulls of the smokes' helper pods, not
+on the server: v0.3.28's and v0.3.29's runs on the operator smoke's stand-in (`nginx:alpine`,
+`ErrImagePull`, the Bridge `Degraded`; fixed for that one image by `agent/kind-smoke-stand-in`
+and `agent/smoke-stand-in-mirror` above), and run 38976232395 (22:31Z, b6f55dab) in "Prove a
+backup of a release restores it": `pod/backup-helper` went `ErrImagePull` then
+`ImagePullBackOff` on `public.ecr.aws/docker/library/python:3.12-alpine` ("httpReadSeeker:
+failed open: unexpected stat"), `kubectl wait` timed out, and the script failed at line 123.
+The cause is the same each time: a pod spec naming a registry image makes the kubelet pull it,
+anonymously, once, with no retry worth the name and no other source, and `backup-restore-smoke.sh`
+and `cluster-smoke.sh` loaded their helper images into kind only when the local daemon already
+had them, which on a fresh runner it never did.
+
+Now every image a smoke pod runs goes through `deploy/helm/hs/ci/helper-image.sh`, a sourced
+file with one function, `helper_image IMAGE [KIND_CLUSTER]`: `docker pull` on the runner, three
+tries each from `public.ecr.aws/docker/<path>`, `mirror.gcr.io/<path>` and `docker.io/<path>`
+(whatever answers is tagged as IMAGE, so the pod spec's name does not change), `kind load
+docker-image` into the cluster unless the node already holds the name (crictl), and the name
+printed for the spec, which runs it with `imagePullPolicy: IfNotPresent`. IfNotPresent rather
+than Never because the operator smoke's stand-in Bridge must turn a tag that does not exist into
+`ErrImagePull` (a kubelet that may not pull says `ErrImageNeverPull`), and because without a kind
+cluster nothing is loaded and the kubelet pulls as before. Users: `backup-restore-smoke.sh`
+(`postgres:17` and `python:3.12-alpine`: the backup helper and the media-open Job),
+`cluster-smoke.sh` (the same two: PostgreSQL, the media-open Job, the traffic pod),
+`deploy/operator/ci/kind-smoke.sh` (its stand-in; the inline loop from the two branches above
+is gone) and `crd-upgrade-smoke.sh`, which gained `--kind NAME` (CD passes `--kind smoke`
+instead of `--context kind-smoke`) so the Bridge it applies names an image already on the node
+rather than having the kubelet pull the same `nginx:alpine` the operator smoke loads a minute
+later. The `cd.yml` step comments say so.
+
+**The 21:03Z failure (run 38966658493, ea9f73de) was not a pull.** The CRD-upgrade smoke
+printed `== PASS` at 21:38:42; its `.spec.owner: field not declared in schema` and Helm's
+`exists and cannot be imported into the current release` are the refusals it asserts. The
+failure came in the operator smoke, `FAILED: the operator did not log the refused shrink`, and
+`the server doesn't have a resource type "homeservers"` is its diagnostics asking for a CRD the
+`--homeserver` phase had not installed yet. The operator had logged the line: its timestamp is
+21:40:21.189, the `ShrinkRefused` condition was seen at 21:40:21.259, and `kubectl logs | grep`
+at about 21:40:21.45 did not have it, so the kubelet's log file was a moment behind the status
+the API server had already served. The check is now a `watch_until` on the log (up to
+`--timeout`), not one read. The check right after it, that no `bridge reconcile failed` line
+exists at all, would have failed the same run next: the operator's start had logged one
+(`event queue error`, from the API server's 429 "storage is (re)initializing" seconds after
+`helm install` made the CRD; the passing run before it has no such line). It now counts those
+lines before the shrink and fails only if the count grew.
+
+Verified on this desktop against a kind cluster (`helper-smoke`, CD's `kind-config.yaml`, node
+image `mirror.gcr.io/kindest/node:v1.33.1`, a `DOCKER_CONFIG` without the keychain credential
+helper): `bash -n` and `shellcheck -x` (0.11.0, run from `/` so the `source-path=SCRIPTDIR`
+directives are what finds the sourced file) clean on all five scripts; `helper_image` with
+`python:3.12-alpine` loaded it and a pod run from it with IfNotPresent reported `already present
+on machine` and printed `tar (busybox) 1.37.0`, `Python 3.12.15`; with `busybox:1.37` (not local)
+it pulled from `public.ecr.aws` and loaded; with a `docker` shim refusing `public.ecr.aws` and
+`alpine:3.20` it failed three times, pulled `mirror.gcr.io/library/alpine:3.20`, tagged it
+`public.ecr.aws/docker/library/alpine:3.20` and loaded that; with a name that exists nowhere it
+tried nine times and returned 1 naming all three sources. The smokes themselves, on that
+cluster: `backup-restore-smoke.sh myelin:smoke --kind helper-smoke` PASSED, both layouts
+(`postgres:17` loaded from the local daemon, `python:3.12-alpine` found on the node already,
+the backup helper and the media-open Job started with "already present on machine");
+`crd-upgrade-smoke.sh --kind helper-smoke --set ...` PASS (`nginx:alpine` loaded by the
+resolver before the Bridge was applied); `kind-smoke.sh myelin:volume-smoke --kind helper-smoke
+--homeserver` PASSED (the 2026-10-09 `myelin:smoke` predates the chart's `--volume-stats` and
+its operator crash-looped on the flag, so the 2026-10-15 image was used): the stand-in was on
+the node from the CRD smoke's load, `ShrinkRefused Ready` and the log line were both seen at
++0 s, the tag that does not exist went `Degraded ErrImagePull` under IfNotPresent, and the
+Homeserver phase rolled and was deleted as before. A second operator smoke on the same cluster
+needs the kept Bridge CRD deleted first (Helm refuses to adopt one naming another release's
+namespace); CD's cluster is fresh per run. The next CD run on `main` is the test on the runner.
+
 ## 2026-10-16, evening (branch `agent/listener-resources`): a listener serves only the resources it names
 
 `listeners[].resources` was parsed, validated and ignored: every listener served the whole

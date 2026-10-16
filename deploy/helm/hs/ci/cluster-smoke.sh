@@ -27,10 +27,11 @@
 #
 #   IMAGE                 The image to run (`myelin:smoke`, `ghcr.io/.../myelin:sha-...`),
 #                         split as install-smoke.sh does.
-#   --kind NAME           Load IMAGE (and --upgrade-from's image, and the PostgreSQL and
-#                         Python images when the local daemon has them) into the kind cluster
-#                         NAME, use its context, pin pullPolicy Never, and read each pod's
-#                         memory and CPU from the node's cgroup.
+#   --kind NAME           Load IMAGE (and --upgrade-from's image when the local daemon has it,
+#                         and the PostgreSQL and Python images, pulled here with retries and
+#                         fallbacks so the kubelet never pulls them: helper-image.sh) into the
+#                         kind cluster NAME, use its context, pin pullPolicy Never, and read
+#                         each pod's memory and CPU from the node's cgroup.
 #   --context CTX         The kubectl context. Default: kind-NAME with --kind, else the current.
 #   --namespace NS        Created, installed into, deleted afterwards. Default: random.
 #   --upgrade-from IMAGE  Install this image first and roll to IMAGE in the upgrade phase, then
@@ -90,6 +91,9 @@ LOG_DIR=""
 KEEP=0
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CHART="$(cd "$HERE/.." && pwd)"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=helper-image.sh
+. "$HERE/helper-image.sh"
 RELEASE="myelin"
 # fullnameOverride: the StatefulSet, Service and pods are `hs`, `hs-0`, `hs-1`, and the mesh
 # domain `hs-headless.<namespace>.svc.cluster.local` is known before the install, which the
@@ -374,13 +378,9 @@ if [ -n "$KIND_CLUSTER" ]; then
       echo "$FROM_IMAGE is not in the local daemon; the node will pull it (pullPolicy Never would stop that, so the upgrade-from image uses IfNotPresent)"
     fi
   fi
-  for img in "$POSTGRES_IMAGE" "$PYTHON_IMAGE"; do
-    if docker image inspect "$img" >/dev/null 2>&1; then
-      run kind load docker-image "$img" --name "$KIND_CLUSTER"
-    else
-      echo "$img is not in the local daemon; the node will pull it"
-    fi
-  done
+  # The helper images too, pulled here and loaded, never by the kubelet (helper-image.sh).
+  POSTGRES_IMAGE="$(helper_image "$POSTGRES_IMAGE" "$KIND_CLUSTER")" || fail "no PostgreSQL image"
+  PYTHON_IMAGE="$(helper_image "$PYTHON_IMAGE" "$KIND_CLUSTER")" || fail "no Python image"
 fi
 
 say "Creating the namespace, a PostgreSQL and a shared media volume"
@@ -399,6 +399,7 @@ spec:
       containers:
         - name: postgres
           image: $POSTGRES_IMAGE
+          imagePullPolicy: IfNotPresent
           env:
             - {name: POSTGRES_USER, value: hs}
             - {name: POSTGRES_PASSWORD, value: "$PG_PASSWORD"}
@@ -460,6 +461,7 @@ spec:
       containers:
         - name: open
           image: $PYTHON_IMAGE
+          imagePullPolicy: IfNotPresent
           command: [sh, -c, "chmod 0777 /media && ls -ld /media"]
           volumeMounts: [{name: media, mountPath: /media}]
       volumes: [{name: media, persistentVolumeClaim: {claimName: hs-media}}]
@@ -608,6 +610,7 @@ spec:
   containers:
     - name: traffic
       image: $PYTHON_IMAGE
+      imagePullPolicy: IfNotPresent
       command: [python3, -u, /traffic/traffic.py]
       env:
         - {name: HS_URL, value: "http://$STS.$NAMESPACE.svc:8008"}

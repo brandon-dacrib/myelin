@@ -7,15 +7,22 @@
 # `--take-ownership`, adopts and updates it; the same Bridge is then accepted; and
 # `helm uninstall` leaves the CRD and the Bridge in place (`helm.sh/resource-policy: keep`).
 #
-# Usage: deploy/helm/hs/ci/crd-upgrade-smoke.sh [--context CTX] [--set K=V ...]
+# Usage: deploy/helm/hs/ci/crd-upgrade-smoke.sh [--kind NAME | --context CTX] [--set K=V ...]
 #
 #   kind create cluster --name crd-upgrade
-#   deploy/helm/hs/ci/crd-upgrade-smoke.sh --context kind-crd-upgrade
+#   deploy/helm/hs/ci/crd-upgrade-smoke.sh --kind crd-upgrade
 #
-#   --set K=V   Passed to both `helm install`s; repeatable. CD uses it to point the release at
-#               the image already loaded on its kind node (`image.tag=smoke`,
-#               `image.pullPolicy=Never`) so the server pod this install starts, and which the
-#               checks never wait for, pulls nothing from a registry.
+#   --kind NAME     Use the kind cluster NAME's context, and pull the Bridge's image here (with
+#                   retries and fallbacks) and load it into the cluster, so the kubelet never
+#                   pulls it (helper-image.sh says why). The Bridge's pod is never waited for,
+#                   but a kubelet pull of the same image the operator smoke loads next would
+#                   race it on the node.
+#   --context CTX   The kubectl context. Default: kind-NAME with --kind, else the current.
+#   --set K=V       Passed to both `helm install`s; repeatable. CD uses it to point the release
+#                   at the image already loaded on its kind node (`image.tag=smoke`,
+#                   `image.pullPolicy=Never`) so the server pod this install starts, and which
+#                   the checks never wait for, pulls nothing from a registry.
+#   --bridge-image IMG  The image the Bridge names. Default: public.ecr.aws/docker/library/nginx:alpine.
 #
 # Refuses to run on a cluster that already has the Bridge CRD: it replaces it, and deleting a
 # CRD deletes every Bridge on the cluster. Cleans up after itself, the CRD included, so a
@@ -25,15 +32,25 @@
 
 set -euo pipefail
 
-CONTEXT="$(kubectl config current-context)"
+CONTEXT=""
+KIND_CLUSTER=""
+BRIDGE_IMAGE="public.ecr.aws/docker/library/nginx:alpine"
 SET_ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
+    --kind) KIND_CLUSTER="$2"; shift 2 ;;
     --context) CONTEXT="$2"; shift 2 ;;
     --set) SET_ARGS+=(--set "$2"); shift 2 ;;
+    --bridge-image) BRIDGE_IMAGE="$2"; shift 2 ;;
     *) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
   esac
 done
+if [ -n "$KIND_CLUSTER" ]; then : "${CONTEXT:=kind-$KIND_CLUSTER}"; fi
+if [ -z "$CONTEXT" ]; then CONTEXT="$(kubectl config current-context)"; fi
+HERE="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=helper-image.sh
+. "$HERE/helper-image.sh"
 ROOT="$(cd "$(dirname "$0")/../../../.." && pwd)"
 NS="crd-upgrade-$RANDOM"
 CRD=bridges.hs.matrix.org
@@ -42,6 +59,9 @@ say() { printf '\n== %s\n' "$*"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 kc get crd "$CRD" >/dev/null 2>&1 && fail "$CRD already exists on $CONTEXT; this script replaces it"
+BRIDGE_IMAGE="$(helper_image "$BRIDGE_IMAGE" "$KIND_CLUSTER")" || fail "could not pull the Bridge's image $BRIDGE_IMAGE"
+BRIDGE_REPOSITORY="${BRIDGE_IMAGE%:*}"
+BRIDGE_TAG="${BRIDGE_IMAGE##*:}"
 cleanup() {
   helm --kube-context "$CONTEXT" -n "$NS" uninstall myelin >/dev/null 2>&1 || true
   kc delete namespace "$NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
@@ -58,7 +78,7 @@ spec:
   bridgeType: heisenbridge
   appserviceId: heisenbridge
   owner: "@alice:example.org"
-  image: { repository: public.ecr.aws/docker/library/nginx, tag: alpine }
+  image: { repository: $BRIDGE_REPOSITORY, tag: "$BRIDGE_TAG", pullPolicy: IfNotPresent }
   port: 80
   filesSecret: bridge-smoke-files
 YAML

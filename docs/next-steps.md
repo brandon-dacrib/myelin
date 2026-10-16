@@ -4,6 +4,26 @@ Written 2026-09-20 by the integration lead, last revised 2026-10-16 (v0.3.28 on 
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
+## 2026-10-16, night -- CD's kind smokes no longer let the kubelet pull a helper image; the branch is `agent/smoke-helper-images`
+
+Three of the day's eight CD runs on `main` failed on an anonymous kubelet pull of a helper
+pod's image (`nginx:alpine` twice for the operator smoke's stand-in, `python:3.12-alpine` once
+for the backup helper on run 38976232395), none on the server. `deploy/helm/hs/ci/helper-image.sh`
+is now the one function every smoke resolves such images through: pulled on the runner with
+retries from `public.ecr.aws`, then `mirror.gcr.io`, then Docker Hub, tagged under the spec's
+name, `kind load`ed, run with `IfNotPresent`; `crd-upgrade-smoke.sh` takes `--kind`. The
+21:03Z failure (run 38966658493) was something else: the operator smoke read the operator's log
+once for a line logged 260 ms earlier that the kubelet's log file did not have yet; it watches
+the log now, and its "no reconcile failed" check counts lines from before the shrink instead of
+failing on the one the operator's own start can log (`event queue error` from an API-server 429
+seconds after the CRD was created). Verified on a local kind cluster (`docs/status/12`, the
+night entry): the resolver's three paths, and `backup-restore-smoke.sh` (both layouts, PASSED),
+`crd-upgrade-smoke.sh --kind` (PASS, the Bridge image loaded by `--kind`, not pulled) and `kind-smoke.sh --homeserver` (PASSED with the local `myelin:volume-smoke` of 2026-10-15, since the 2026-10-09 `myelin:smoke` predates the chart's `--volume-stats` flag; the stand-in found on the node from the CRD smoke's load, the refused shrink in the log at the first look, the no-such-tag Degraded still `ErrImagePull`) against
+the local `myelin:smoke`. **Next**: the first CD run on `main` after the merge is the test on
+the runner; if `public.ecr.aws` and `mirror.gcr.io` both refuse one day, the fallback to Docker
+Hub is anonymous and rate-limited per address, so the next step would be a `docker login` to
+Docker Hub with a repository secret, or a GHCR mirror of the three helper images.
+
 ## 2026-10-16 -- getting ready for a public release; the branches are `agent/public-release-docs`, `agent/listener-resources` and `agent/release-version-string`
 
 Three branches, merged in that order. **`agent/public-release-docs`** (this session): the

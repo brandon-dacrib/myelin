@@ -28,6 +28,9 @@
 #   --stand-in IMAGE     The image the hand-written `Bridge` runs. It needs `sh` (the operator's
 #                        init container copies the files Secret with it) and to listen on
 #                        --stand-in-port. Default: public.ecr.aws/docker/library/nginx:alpine, 80.
+#                        With --kind it is pulled here, with retries and fallbacks, and loaded
+#                        into the cluster, so the kubelet never pulls it
+#                        (deploy/helm/hs/ci/helper-image.sh says why).
 #   --stand-in-port N    Default: 80.
 #   --homeserver         Also run deploy/operator and a single-node `Homeserver` (installs the
 #                        `Homeserver` CRD if it is missing, and removes it afterwards if it did).
@@ -69,6 +72,9 @@ KEEP=0
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 CHART="$ROOT/deploy/helm/hs"
 RELEASE="myelin"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../../helm/hs/ci/helper-image.sh
+. "$CHART/ci/helper-image.sh"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -247,32 +253,15 @@ echo "the bridge operator says: bridge operator starting (namespace $NAMESPACE)"
 # --- A hand-written Bridge --------------------------------------------------------------------
 
 say "A Bridge running a stand-in ($STAND_IN, port $STAND_IN_PORT)"
-# On kind, the stand-in is pulled here, with retries, and loaded: the kubelet's own single pull
-# from public.ecr.aws failed now and then (CD for v0.3.28 and v0.3.29, 2026-10-16: ErrImagePull,
-# the Bridge Degraded and no release). Pulled by the kubelet it would also break any name kind
-# loads later with the same image ID (`kind load` and the kubelet's pull conflict).
-if [ -n "$KIND_CLUSTER" ]; then
-  # Each source is tried in turn, a few times each: public.ecr.aws also refuses anonymous pulls
-  # outright once a runner's address has used its data allowance ("toomanyrequests: Data limit
-  # exceeded", CD for 0d4afb81, 2026-10-16), which no retry gets past. Whatever answers is
-  # tagged as $STAND_IN, the name the Bridge below runs.
-  stand_in_name="${STAND_IN##*/}"
-  if ! docker image inspect "$STAND_IN" >/dev/null 2>&1; then
-    for source in "$STAND_IN" "mirror.gcr.io/library/$stand_in_name" "docker.io/library/$stand_in_name"; do
-      for attempt in 1 2 3; do
-        if docker pull -q "$source" >/dev/null; then
-          [ "$source" = "$STAND_IN" ] || docker tag "$source" "$STAND_IN"
-          echo "stand-in pulled from $source"
-          break 2
-        fi
-        echo "pulling $source failed (attempt $attempt of 3)"
-        sleep $((attempt * 5))
-      done
-    done
-  fi
-  docker image inspect "$STAND_IN" >/dev/null 2>&1 || fail "could not pull the stand-in $STAND_IN from any source"
-  run kind load docker-image "$STAND_IN" --name "$KIND_CLUSTER" >/dev/null
-fi
+# On kind, the stand-in is pulled here, with retries and fallbacks, and loaded: the kubelet's
+# own single pull from public.ecr.aws failed now and then (CD for v0.3.28 and v0.3.29,
+# 2026-10-16: ErrImagePull, the Bridge Degraded and no release), and public.ecr.aws refuses
+# anonymous pulls outright once a runner's address has used its data allowance
+# ("toomanyrequests: Data limit exceeded", CD for 0d4afb81, 2026-10-16). Pulled by the kubelet
+# it would also break any name kind loads later with the same image ID. The Bridge below runs
+# it with pullPolicy IfNotPresent, not Never: the tag that does not exist, further down, has to
+# be ErrImagePull, which a kubelet that may not pull would report as ErrImageNeverPull.
+STAND_IN="$(helper_image "$STAND_IN" "$KIND_CLUSTER")" || fail "could not pull the stand-in $STAND_IN from any source"
 stand_in_repo="${STAND_IN%:*}"
 stand_in_tag="${STAND_IN##*:}"
 bridge_yaml() { # tag
@@ -342,6 +331,11 @@ watch_until volume_state '^read: ' '^refused: '
 # A spec asking for less than the claim has: the claim keeps its size, the reconcile does not
 # fail, and the Bridge's VolumeSize condition says so (the API server refuses to shrink a claim;
 # before 2026-10-15 every reconcile of such a Bridge failed on it).
+# Reconcile failures are counted before and after: the operator's start can log one
+# ("event queue error", from the API server's 429 "storage is (re)initializing" seconds after
+# the CRD was made; CD run 38966658493, 2026-10-16), and only one the shrink causes is a bug.
+failed_reconciles() { k logs "deploy/$OPERATOR" | grep -c 'bridge reconcile failed' || true; }
+reconciles_failed_before="$(failed_reconciles)"
 echo '$ kubectl patch bridge smoke --type merge -p {"spec":{"storage":{"size":"32Mi"}}}'
 k patch bridge smoke --type merge -p '{"spec":{"storage":{"size":"32Mi"}}}' >/dev/null
 mark
@@ -353,10 +347,21 @@ requested="$(k get pvc smoke-data -o jsonpath='{.spec.resources.requests.storage
 echo "pvc/smoke-data requests $requested"
 [ "$requested" = "64Mi" ] || fail "the claim was asked to shrink to $requested"
 k get bridge smoke -o jsonpath='{.status.conditions[?(@.type=="VolumeSize")].message}{"\n"}'
-k logs "deploy/$OPERATOR" | grep -q 'asks for a smaller volume than its claim has' \
-  || fail "the operator did not log the refused shrink"
-if k logs "deploy/$OPERATOR" | grep -q 'bridge reconcile failed'; then
-  fail "a reconcile failed: $(k logs "deploy/$OPERATOR" | grep 'bridge reconcile failed' | tail -1)"
+# The operator writes the condition and logs the refusal in the same reconcile, but the
+# status is read through the API server and the log line through the kubelet's log file,
+# which can be a moment behind it: on CD run 38966658493 (2026-10-16) the condition was seen
+# 70 ms after the line was logged and `kubectl logs` did not have it yet 200 ms later. So
+# the log is watched, not read once.
+shrink_logged() {
+  if k logs "deploy/$OPERATOR" | grep -q 'asks for a smaller volume than its claim has'; then
+    echo "logged: the Bridge asks for a smaller volume than its claim has"
+  else
+    echo "waiting for the operator's log"
+  fi
+}
+watch_until shrink_logged '^logged: '
+if [ "$(failed_reconciles)" -gt "$reconciles_failed_before" ]; then
+  fail "a reconcile failed after the shrink: $(k logs "deploy/$OPERATOR" | grep 'bridge reconcile failed' | tail -1)"
 fi
 echo '$ kubectl patch bridge smoke --type merge -p {"spec":{"storage":{"size":"64Mi"}}}'
 k patch bridge smoke --type merge -p '{"spec":{"storage":{"size":"64Mi"}}}' >/dev/null
