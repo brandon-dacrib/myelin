@@ -67,6 +67,25 @@ to ten a room each five minutes, with no `failed`; Loki's "sent a chain of dummy
 falling for `#ping`; no "stopped a chain of dummy events at its time budget" (if it appears, a
 dummy event's resolution of ten forks is slower than expected).
 
+**iMessage on the owner's laptop, 2026-10-16 afternoon.** Element on the laptop could not decrypt
+any bridged iMessage message, old or new. The bridge shared every room key only with the one
+device `/keys/query` listed for `@brandon`, `J6CEqTqXcJ` ("Element Desktop: macOS"), which turned
+out to be that laptop: so keys were sent to it and it still could not decrypt. Not explained;
+the device is gone (the owner signed out and back in, 20:38 UTC, and reset cross-signing), so
+either its local crypto store no longer matched its uploaded keys or the server did not deliver
+its to-device messages; nobody can tell now. The new session `gvJnL67g7e` decrypts new
+iMessages (checked 21:01 UTC). Older messages stay unreadable on it: Element's Rust crypto only
+asks the user's own devices for keys, never the bridge, and no backup holds them. Along the way:
+the bridge's double puppet session ("iMessage Bridge", always unverified) was signed out twice
+(once on purpose, once with the unverified sessions after the identity reset); each time its next
+send as `@brandon` failed `M_UNKNOWN_TOKEN` and the message was lost until the bridge was
+restarted (`launchctl kickstart -k gui/$(id -u)/net.dacrib.myelin.imessage-bridge`), which logs in
+again. The bridge's `allow_key_sharing` is now `true` (`~/Downloads/artifacts/config.yaml`, backup
+`config.yaml.bak-20261016-keysharing`). **Follow-ups**: the server could tell a bridge when its
+double-puppet session is signed out instead of leaving it to fail a send (mautrix re-logs in only
+at start); if another device ever cannot decrypt keys it was sent, capture `/sync`'s `to_device`
+for it before anyone signs it out.
+
 **To roll** (the owner pastes it from the plain SSH shell, one short line at a time; `helm
 upgrade` is refused to sessions). `--force-conflicts` is no longer needed.
 
