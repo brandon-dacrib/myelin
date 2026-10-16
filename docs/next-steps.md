@@ -1,8 +1,75 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-10-15 (test servers are handed their ports still bound; `agent/test-port-races`. Before: room loads and unloading; `agent/room-load-speed`. Before: the Slack bridge's full volume; fix on `agent/bridge-volume-size`. Before: Discord's delivery timeouts were a replay of the 2026-10-12 flood; fix on `agent/discord-delivery-timeouts`. Before: the memory climb with federation on; fix on `agent/fed-memory-growth`. Before: the session hub wedge; fix on `agent/hub-wedge`. Earlier: the ephemeral pump's prune busy loop; fix on `agent/ephemeral-prune`). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+Written 2026-09-20 by the integration lead, last revised 2026-10-16 (handover: the demo, the releases and what is next, below. Before: test servers are handed their ports still bound; `agent/test-port-races`. Before: room loads and unloading; `agent/room-load-speed`. Before: the Slack bridge's full volume; fix on `agent/bridge-volume-size`. Before: Discord's delivery timeouts were a replay of the 2026-10-12 flood; fix on `agent/discord-delivery-timeouts`. Before: the memory climb with federation on; fix on `agent/fed-memory-growth`. Before: the session hub wedge; fix on `agent/hub-wedge`. Earlier: the ephemeral pump's prune busy loop; fix on `agent/ephemeral-prune`). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
+
+## 2026-10-16 -- handover: where the demo is, what to roll, what to check, what is next
+
+**Branches.** None unmerged (`git branch -r --no-merged origin/main` is empty). Merged on
+2026-10-15/16, in order: `fed-memory-growth` (59d3cb71, v0.3.22), `discord-delivery-timeouts`
+(cca7896b, v0.3.23), `bridge-volume-size` (88f1db4f, v0.3.24), `room-load-speed` (35c09f43; its CI
+failed on a clippy 1.99 lint and on arm64 running out of memory, so it was not released),
+`clippy-1-99` (5b2e687c), `ci-arm64-test-kill` (bca4e474, the release that carries room loads:
+v0.3.25 once CD tags it), `test-port-races` (e184f73c, tests only).
+
+**The demo** (Helm release `myelin`, namespace `myelin`, node tp0n1) was last seen at 20:20 UTC
+on 2026-10-15 running **v0.3.22 with federation on** and `resources.limits.memory=1536Mi` (requests
+1Gi), set on the command line since the 15:16 incident, when 0.3.21's abandoned room loads took
+the pod to 2 GB and tp0n1 out of memory (the owner rebooted the tp0 board; Postgres and Longhorn
+recovered by 16:33). With 0.3.22 memory levelled near 1.05 GB, then rose with resident rooms
+(1.17 GB, 133 rooms at 20:20) because nothing unloaded rooms; the memory guard sheds inbound
+federation at 85%. The session's kubectl proxy lost its route at about 21:30 and nothing on the
+cluster was seen after that. Slack's Bridge CR was raised to 5Gi by hand (20:11) and the bridge
+came back.
+
+**To roll** (the owner pastes it from the plain SSH shell; `helm upgrade` is refused to sessions).
+Use v0.3.25 once tagged, else v0.3.24. `--force-conflicts` is needed once: the Bridge CRD's
+`.spec.versions` is owned by a past `kubectl apply`, and Helm 4's server-side apply refused it
+(0.3.24's first try failed with "conflict with \"kubectl\": .spec.versions" and changed nothing).
+
+```
+V=0.3.25; helm --kube-context admin@dacrib0 get values myelin -n myelin -o yaml > /tmp/myelin-values.yaml && helm --kube-context admin@dacrib0 upgrade myelin oci://ghcr.io/brandon-dacrib/charts/hs --version $V -n myelin -f /tmp/myelin-values.yaml -f https://raw.githubusercontent.com/brandon-dacrib/myelin/v$V/deploy/demo/values-bridges.yaml --set image.tag=$V --set-json 'extraEnv=[]' --set resources.limits.memory=1536Mi --set resources.requests.memory=1Gi --force-conflicts && kubectl --context admin@dacrib0 -n myelin delete pod myelin-hs-0
+```
+
+`extraEnv=[]` is federation on; `[{"name":"HS__FEDERATION__ENABLED","value":"false"}]` is off.
+Every bridge restarts once (5Gi volumes, stdout-only logging, the init container).
+
+**After the roll, by the owner:** `kubectl --context admin@dacrib0 -n myelin exec
+deploy/bridge-slack-brandon -c bridge -- rm -rf /data/logs` (mautrix's old file logs filled 1 GiB);
+on each bridge's Transactions tab discard the 2026-10-12 leftovers (discord, signal, linkedin,
+meta, whatsapp; Discord's were in fact delivered), replay Slack's 3, look at iMessage's 3,545
+before choosing; "Test connection" on any bridge still degraded.
+
+**After the roll, by the session** (Prometheus, Loki through the proxy; `docs/` has the URLs in
+the cluster-access notes): restarts; `process_resident_memory_bytes` against
+`hs_process_memory_budget_ratio` (rooms unload past 0.75, federation sheds past 0.85);
+`hs_room_unloads_total{reason}`; `hs_room_actors_alive` close to `hs_room_resident_rooms` plus
+`hs_room_loads_running` (at most 8); `hs_room_load_phase_seconds` and `hs_room_slow_loads_total`;
+no "the session hub is stuck on a room update"; `hs_federation_inbound_shed_total`;
+`hs_bridge_volume_used_ratio` appearing for every bridge (its kubelet path has never run in a real
+cluster) and no "cannot read the kubelet's volume statistics" in the operator's log; tp0n1's
+MemAvailable; Element syncing without pauses.
+
+**Broken outside the code:** Tempo (`monitoring-system/tempo-0`) was crash-looping (53 restarts on
+2026-10-15 evening), so no traces are kept; not yet looked at.
+
+**Next, in the order suggested:**
+1. The `interop` workflow (myelin and Synapse) has failed on every merge to main since at least
+   2026-10-13 05:34. It does not gate CD, so nobody noticed; find out what broke.
+2. Inbound `traceparent` is honoured from any caller, so a client or remote server can force a
+   trace: restrict it to trusted proxies or cap it (owner's call, asked, not answered).
+3. Appservice one-time-key counts are computed when a transaction is queued, not when it is sent
+   (`hs-appservice`); a delivery can carry a stale count.
+4. Every placed history event writes a full-state row (`state_snapshots`): disk grows with
+   history times state (no longer a load cost, decision 0051).
+5. Deletes still done as one unbounded transaction: `forget_destination`, push `delete_where`,
+   key backup deletes, auth token deletes and the others listed in `docs/status/11`.
+6. A room load holds one store snapshot for its whole run.
+7. The appservice delivery limits (60 s timeout, one-day transient retry, 100 items) are
+   constants, not settings (decision 0049); dead letters never expire, on purpose.
+8. In cluster mode only the replica running the bridge manager fills `AppService.volume` and the
+   bridge volume gauges (decision 0050).
 
 ## 2026-10-16 -- arm64's CI test job ran out of memory linking, and no release went out; the fix is `agent/ci-arm64-test-kill`
 
@@ -21,7 +88,7 @@ snapshot runs before the build and after a failure. **Proof:** run 38830814904. 
 cache) compiled in 8m07s; attempt 2 (warm) compiled in 6m09s against 11m43s before, peaked at
 9.0 GB, and is green along with `ci-ok`. Details: `docs/status/12-platform-and-kubernetes.md`.
 
-**Left (hs-cli's owner):** attempt 1 then failed one test on a port race. In
+**Done since (`agent/test-port-races`, e184f73c):** attempt 1 then failed one test on a port race. In
 `crates/hs-cli/tests/federation_room_versions.rs`, `version_11` took a free port from
 `TcpListener::bind(":0")`, dropped the listener, and was beaten to the port (`AddrInUse`). Pass
 the bound listener to the server, or retry the bind. The pattern is likely in other hs-cli tests.
