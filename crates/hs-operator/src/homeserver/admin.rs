@@ -157,7 +157,7 @@ impl HttpAdminApi {
     pub fn new() -> Result<Self, AdminError> {
         let client = hs_http::client::builder()
             .timeout(Duration::from_secs(10))
-            .user_agent(concat!("hs-operator/", env!("CARGO_PKG_VERSION")))
+            .user_agent(format!("hs-operator/{}", hs_telemetry::release_version()))
             .build()
             .map_err(|e| AdminError::Transport(e.to_string()))?;
         Ok(Self { client })

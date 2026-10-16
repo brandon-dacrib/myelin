@@ -1017,7 +1017,9 @@ fn admin_state<B: KvBackend + 'static>(
     .with_room_content(sources.room_content)
     .with_server_info(hs_admin::model::ServerInfo {
         name: server_name.to_owned(),
-        version: env!("CARGO_PKG_VERSION").to_owned(),
+        // The release CD built (`0.3.32`), which `/_synapse/admin/v1/server_version` and the
+        // Overview page repeat; a plain `cargo build` reports the line (`0.3.0`).
+        version: hs_telemetry::release_version().to_owned(),
         // No build metadata is stamped into the binary yet (no `vergen`/`build.rs`), so this says
         // so rather than inventing a commit or a date.
         build: "unstamped".to_owned(),

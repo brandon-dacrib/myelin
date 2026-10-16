@@ -41,6 +41,14 @@ never seen it. Everything that was verified for it says how.
   setup link, `/health` and `/metrics` stay on 8008. `hs serve` logs, per listener, what it
   serves. Verified with the real binary serving two listeners (`[client, health]` and
   `[metrics, admin]`), `helm template`, and the server's whole route manifest classified.
+- **The server says which release it is.** `hs version`, `/_matrix/federation/v1/version`, the
+  admin API's `GET /server` (the Overview page and the `/_synapse/admin/v1/server_version` shim),
+  each replica's entry in the cluster registry and `service.version` on exported traces report
+  the release CD built (`0.3.32`, say), not the line the repository names (`0.3.0`), which every
+  release of the line answered before. CD passes the version it derives into the build as
+  `HS_RELEASE_VERSION` (`deploy/Dockerfile` takes it as a build arg) and its smoke checks assert
+  the binary and the booted image report it. A build without it (`cargo build`, an image built by
+  hand, a manual CD run) still reports the line.
 - **Traces reach the background work and the store.** A traced request now shows its store
   transactions (named after the code that asked, with what they wrote), each wait for a blocking
   thread, state resolution, event authorization and the event's write. Background work is a

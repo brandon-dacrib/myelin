@@ -1,6 +1,6 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-10-16 (v0.3.28 on the demo; the soft-fail check resolved one fork per prev event; `agent/soft-fail-forks`. Before: forked rooms are merged and pruned, and a resolution reads about the room once however many forks; `agent/extremity-merge`. Before: the hub's members step and the idle CPU were repeated state resolutions; `agent/hub-members-step`. Before: handover: the demo, the releases and what is next, below. Before: test servers are handed their ports still bound; `agent/test-port-races`. Before: room loads and unloading; `agent/room-load-speed`. Before: the Slack bridge's full volume; fix on `agent/bridge-volume-size`. Before: Discord's delivery timeouts were a replay of the 2026-10-12 flood; fix on `agent/discord-delivery-timeouts`. Before: the memory climb with federation on; fix on `agent/fed-memory-growth`. Before: the session hub wedge; fix on `agent/hub-wedge`. Earlier: the ephemeral pump's prune busy loop; fix on `agent/ephemeral-prune`). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+Written 2026-09-20 by the integration lead, last revised 2026-10-16 (v0.3.28 on the demo; the server reports the release it is, not the line; `agent/release-version-string`. Before: the soft-fail check resolved one fork per prev event; `agent/soft-fail-forks`. Before: forked rooms are merged and pruned, and a resolution reads about the room once however many forks; `agent/extremity-merge`. Before: the hub's members step and the idle CPU were repeated state resolutions; `agent/hub-members-step`. Before: handover: the demo, the releases and what is next, below. Before: test servers are handed their ports still bound; `agent/test-port-races`. Before: room loads and unloading; `agent/room-load-speed`. Before: the Slack bridge's full volume; fix on `agent/bridge-volume-size`. Before: Discord's delivery timeouts were a replay of the 2026-10-12 flood; fix on `agent/discord-delivery-timeouts`. Before: the memory climb with federation on; fix on `agent/fed-memory-growth`. Before: the session hub wedge; fix on `agent/hub-wedge`. Earlier: the ephemeral pump's prune busy loop; fix on `agent/ephemeral-prune`). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
@@ -28,6 +28,17 @@ that is not this one. **Left, found while verifying the guide against the real b
 clean shutdown logs `WARN these components outlived the server's shutdown (a reference cycle
 holds them)` naming ten components; an operator reading the log of a routine restart should
 not see a warning, so either break the cycles or demote the line until they are broken.
+## 2026-10-16 -- the server reports the release it is, not the line; the branch is `agent/release-version-string`
+
+`hs version`, `/_matrix/federation/v1/version`, `GET /api/v1/server` (Overview, and the
+`/_synapse/admin/v1/server_version` shim), the replica registry and the traces' `service.version`
+said `0.3.0` for every release of the line, because the binary only knew `CARGO_PKG_VERSION`.
+`hs_telemetry::release_version()` now returns `HS_RELEASE_VERSION` from the build (CD sets it to
+the version it derives, in the binaries' build env and as a `deploy/Dockerfile` build arg below
+the cargo-chef cook), else the line. CD's smokes assert the binary and the booted image report
+it. **After the roll, check**: `curl https://<server>/_matrix/federation/v1/version` says the
+rolled version, not `0.3.0`. **Left**: the first CD run after the merge proves the build arg
+end to end; status 12 (2026-10-16, evening) has the details.
 
 ## 2026-10-16 -- a bridge's double puppet is no longer rate-limited when its appservice is not; the branch is `agent/puppet-rate-limit`
 ## 2026-10-16 -- a listener serves only the resources it names; the branch is `agent/listener-resources`

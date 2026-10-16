@@ -801,7 +801,7 @@ mod tests {
         assert_eq!(body["server"]["name"], version::SERVER_NAME, "{body}");
         assert_eq!(
             body["server"]["version"],
-            env!("CARGO_PKG_VERSION"),
+            hs_telemetry::release_version(),
             "{body}"
         );
         body

@@ -41,7 +41,9 @@ impl ClusterConfig {
             me,
             mesh_advertise_addr: mesh_advertise_addr.into(),
             zone: None,
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            // What the registry shows for this replica during a rolling upgrade: the release
+            // CD built, so 0.3.31 and 0.3.32 replicas are told apart.
+            version: hs_telemetry::release_version().to_string(),
             layout,
             heartbeat_interval: Duration::from_secs(1),
             lease_ttl: Duration::from_secs(3),

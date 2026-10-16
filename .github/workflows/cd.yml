@@ -28,6 +28,13 @@ name: cd
 # sees the tag the previous one made. The repository's version files name the line (`0.3.0`);
 # raising them to `0.4.0` makes the next merge `0.4.0`.
 #
+# The binary says which release it is (since 2026-10-16): the version the `version` job derived
+# goes into every build as `HS_RELEASE_VERSION` (the binaries' `cargo build` env; a build arg of
+# deploy/Dockerfile for the images), `hs_telemetry::release_version` compiles it in, and `hs
+# version`, `/_matrix/federation/v1/version`, the admin API's `GET /server` and the traces'
+# `service.version` all report it. The smoke checks below assert it. On a manual dispatch the
+# variable is empty and the binary reports the line (`0.3.0`), as a developer's build does.
+#
 # A manual dispatch with `binaries` on and `images` off is the release binaries' dry run: the
 # same matrix a `v*` tag runs -- the management interface built with Node, embedded, the binary
 # booted and its `/admin/` checked -- uploaded as workflow artifacts, with no tag, no GitHub
@@ -178,8 +185,10 @@ jobs:
 
   image:
     name: image (${{ matrix.arch }})
-    needs: gate
-    if: github.event_name != 'workflow_dispatch' || inputs.images
+    # `version` for the release version the image is built with; it is skipped on a dispatch,
+    # hence `!cancelled()` and the explicit check of `gate`, as in `binaries` below.
+    needs: [gate, version]
+    if: ${{ !cancelled() && needs.gate.result == 'success' && (github.event_name != 'workflow_dispatch' || inputs.images) }}
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -227,6 +236,10 @@ jobs:
           # cache per architecture so the two runners never fight over one key.
           cache-from: type=gha,scope=${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+          # The release the binary reports; empty on a dispatch (the line, then). The Dockerfile
+          # reads it below its cook, so the cached dependency layers do not change per release.
+          build-args: |
+            HS_RELEASE_VERSION=${{ needs.version.outputs.version }}
           push: ${{ github.event_name != 'workflow_dispatch' || inputs.publish }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'workflow_dispatch' || inputs.publish }}
           provenance: true
@@ -241,9 +254,15 @@ jobs:
         # The image is distroless and has no shell, so every step here execs the binary directly.
         # It takes a mounted config (see deploy/Dockerfile's CMD), not environment variables, and
         # the storage directory has to be somewhere a non-root uid can write.
+        #
+        # The same build arg as the push above, so this is the same build (every layer a hit
+        # in the builder's state) and the image checked is the image pushed.
+        env:
+          HS_RELEASE_VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
           docker buildx build --load --platform ${{ matrix.platform }} \
+            --build-arg "HS_RELEASE_VERSION=${HS_RELEASE_VERSION}" \
             -f deploy/Dockerfile -t myelin:smoke .
 
           # Exactly the command the README gives: no config file, a named volume, one variable.
@@ -267,6 +286,19 @@ jobs:
           echo "health/live answered; asking what it supports:"
           curl -sf http://127.0.0.1:8008/_matrix/client/versions | head -c 200
           echo
+
+          # The image has to say which release it is: the version this run releases, or on a
+          # dispatch (no release) the line Cargo.toml names. An image that calls itself 0.3.0
+          # when it is 0.3.32 is what this step existed without until 2026-10-16.
+          expected="${HS_RELEASE_VERSION:-$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)}"
+          reported="$(curl -sf http://127.0.0.1:8008/_matrix/federation/v1/version \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["server"]["version"])')"
+          if [ "$reported" != "$expected" ]; then
+            echo "/_matrix/federation/v1/version reports '$reported', expected '$expected'" >&2
+            docker rm -f myelin-smoke >/dev/null 2>&1 || true
+            exit 1
+          fi
+          echo "/_matrix/federation/v1/version reports $reported"
 
           # The image has to carry the management interface, not the page that says it was left
           # out. Both answer 200, so look at what came back.
@@ -554,16 +586,30 @@ jobs:
       - run: cargo build --release --locked -p hs-cli --bin hs --target ${{ matrix.target }}
         env:
           HS_ADMIN_WEB_DIST: ${{ github.workspace }}/web/dist
+          # The release this binary is (see the header); empty on a dispatch, when it reports
+          # the line. `hs_telemetry::release_version` compiles it in.
+          HS_RELEASE_VERSION: ${{ needs.version.outputs.version }}
 
-      - name: Check the binary serves, and that /admin/ is the interface it embedded
-        # The binary is the release, so it is booted rather than asked for a version (which `hs`
-        # does not have a flag for: the `--version || true` this replaced always "passed"). The
-        # same checks as the image's smoke test: it answers /health/live, /admin/ is the
-        # management interface (not the page saying it was left out; both answer 200), and a new
-        # server logs its setup link. Native runners for every target, so it really executes.
+      - name: Check the binary says which release it is, serves, and that /admin/ is the interface it embedded
+        # The binary is the release, so it is asked its version and booted: `hs version` has to
+        # print the version this run releases (a `--version || true` once stood here and always
+        # "passed"; until 2026-10-16 the binary could only ever say the line's `.0`), and then
+        # the same checks as the image's smoke test: it answers /health/live,
+        # /_matrix/federation/v1/version reports that same version, /admin/ is the management
+        # interface (not the page saying it was left out; both answer 200), and a new server
+        # logs its setup link. Native runners for every target, so it really executes.
+        env:
+          HS_RELEASE_VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
           bin="./target/${{ matrix.target }}/release/hs"
+          expected="${HS_RELEASE_VERSION:-$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)}"
+          printed="$("$bin" version)"
+          if [ "$printed" != "hs $expected" ]; then
+            echo "'hs version' printed '$printed', expected 'hs $expected'" >&2
+            exit 1
+          fi
+          echo "$printed"
           data="$(mktemp -d)"
           "$bin" serve --data-dir "$data" --server-name smoke.invalid > serve.log 2>&1 &
           pid=$!
@@ -575,6 +621,13 @@ jobs:
           if [ "$ok" -ne 1 ]; then
             echo "the binary never answered /health/live; its log follows" >&2
             cat serve.log >&2
+            kill "$pid" 2>/dev/null || true
+            exit 1
+          fi
+          reported="$(curl -sf http://127.0.0.1:8008/_matrix/federation/v1/version \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["server"]["version"])')"
+          if [ "$reported" != "$expected" ]; then
+            echo "/_matrix/federation/v1/version reports '$reported', expected '$expected'" >&2
             kill "$pid" 2>/dev/null || true
             exit 1
           fi

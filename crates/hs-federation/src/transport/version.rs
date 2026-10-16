@@ -32,12 +32,15 @@ pub(super) fn router() -> (axum::Router, RouteManifest) {
         .build()
 }
 
-/// `{"server": {"name", "version"}}`. Logged at debug level: callers are federation testers and
-/// other servers probing reachability, and each request is already counted by the HTTP layer.
+/// `{"server": {"name", "version"}}`. The version is the release CD built
+/// ([`hs_telemetry::release_version`]: `0.3.32`, not the line's `0.3.0`), so an operator checking
+/// an upgrade from outside can tell one release from the next. Logged at debug level: callers
+/// are federation testers and other servers probing reachability, and each request is already
+/// counted by the HTTP layer.
 async fn version() -> Response {
     tracing::debug!("answering GET /_matrix/federation/v1/version");
     axum::Json(serde_json::json!({
-        "server": { "name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION") }
+        "server": { "name": SERVER_NAME, "version": hs_telemetry::release_version() }
     }))
     .into_response()
 }

@@ -158,7 +158,7 @@ impl<B: KvBackend + 'static> ClusterAdmin<B> {
             epoch: self.generation,
             this_replica: true,
             mesh_addr: None,
-            version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            version: Some(hs_telemetry::release_version().to_owned()),
             zone: None,
             last_heartbeat_at: None,
             heartbeat_seq: None,

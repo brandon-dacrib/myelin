@@ -32,6 +32,7 @@ pub mod request_id;
 pub mod spans;
 #[cfg(feature = "testing")]
 pub mod testing;
+pub mod version;
 
 #[cfg(feature = "otlp")]
 mod otlp;
@@ -47,3 +48,4 @@ pub use request_id::{
 pub use spans::{
     TraceLink, add_links, continue_trace, current_is_sampled, current_traceparent, outside_spans,
 };
+pub use version::{line_version, release_version};

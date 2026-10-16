@@ -16,6 +16,8 @@
 #
 # Build arguments:
 #   RUST_VERSION  - pinned to match rust-toolchain.toml's channel; defaults to a recent stable.
+#   HS_RELEASE_VERSION - the release the binary reports (CD passes the version it derived);
+#                 empty by default, and then the binary reports the line Cargo.toml names.
 #   RUST_IMAGE, NODE_IMAGE, RUNTIME_IMAGE - the base images, for a builder that cannot reach
 #                 Docker Hub. On this project's desktop an agent session's `docker pull` from
 #                 Docker Hub fails in the keychain credential helper, so a local build passes
@@ -126,6 +128,20 @@ COPY crates ./crates
 # this one came to serve "the management interface has not been built into this binary yet".
 COPY --from=web /src/web/dist /src/web-dist
 ENV HS_ADMIN_WEB_DIST=/src/web-dist
+
+# The version the binary reports (`hs version`, `/_matrix/federation/v1/version`, the admin
+# API's `GET /server`, the replica registry, `service.version` on traces): CD passes the release
+# it derived (`--build-arg HS_RELEASE_VERSION=0.3.32`, from the `version` job in
+# .github/workflows/cd.yml) and `hs_telemetry::release_version` reads it at compile time. Without
+# the build arg the variable is empty, which that function treats as unset, and the binary
+# reports the line Cargo.toml names (`0.3.0`), as a plain `cargo build` does.
+#
+# Declared here and not above: an ARG is an implicit environment variable of every RUN after it,
+# so a declaration before the cook would put the release version into the cooked layer's cache
+# key and recompile every dependency on every release. Below the cook, only the build of the
+# workspace's own crates sees it, and that is what the variable has to recompile anyway.
+ARG HS_RELEASE_VERSION=
+ENV HS_RELEASE_VERSION=$HS_RELEASE_VERSION
 
 # No cache mount over /src/target here: it would hide the cooked dependencies in this stage's
 # own layers, which are the cache.

@@ -236,7 +236,7 @@ helm -n myelin list                                                      # CHART
 kubectl -n myelin get pods,bridges                                       # all Running
 kubectl -n myelin get pod myelin-hs-0 -o jsonpath='{.spec.containers[0].image}'   # ghcr.io/brandon-dacrib/myelin:$V
 kubectl -n myelin logs statefulset/myelin-hs | grep -E 'WARN|ERROR'
-curl https://matrix.example.org/_matrix/federation/v1/version             # the new version
+curl https://matrix.example.org/_matrix/federation/v1/version             # {"server":{"name":"hs","version":"$V"}}: the exact release, not the line's .0
 curl https://matrix.example.org/_matrix/key/v2/server                     # the same ed25519 key as before
 ```
 

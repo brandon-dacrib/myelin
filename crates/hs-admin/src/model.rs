@@ -1337,7 +1337,7 @@ impl Default for ServerInfo {
     fn default() -> Self {
         Self {
             name: "hs".to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: hs_telemetry::release_version().to_string(),
             build: "dev".to_string(),
             supported_room_versions: Vec::new(),
             enabled_components: Vec::new(),

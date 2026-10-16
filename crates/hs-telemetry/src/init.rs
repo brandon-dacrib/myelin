@@ -111,7 +111,8 @@ pub struct Options {
     /// The service name attached to every span/log line and to Sentry events (`service.name` in
     /// OTLP resource attributes).
     pub service_name: String,
-    /// The service version (`CARGO_PKG_VERSION` of the binary), attached the same way.
+    /// The service version, attached the same way: [`crate::release_version`] by default, the
+    /// release CD built (`0.3.32`) rather than the line `CARGO_PKG_VERSION` names (`0.3.0`).
     pub service_version: String,
 }
 
@@ -125,7 +126,7 @@ impl Default for Options {
             sentry_dsn: None,
             sentry_environment: "production".to_owned(),
             service_name: "hs".to_owned(),
-            service_version: env!("CARGO_PKG_VERSION").to_owned(),
+            service_version: crate::release_version().to_owned(),
         }
     }
 }

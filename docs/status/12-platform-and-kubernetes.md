@@ -34,6 +34,36 @@ Verified: `cargo test -p hs-cli --test listener_resources` (the real binary with
 health]` and `[metrics, admin]` listeners: each answers what it lists, 404s the rest, and the
 log names both), the classifier's unit tests, `helm lint` and `helm template` (the rendered
 listeners above), and the three-crate gate in the branch's report.
+## 2026-10-16, evening (branch `agent/release-version-string`): the binary reports the release, not the line
+
+Every release of the 0.3 line introduced itself as `0.3.0`: the workspace `Cargo.toml` names the
+line and CD derives the patch (`deploy/helm/hs/ci/chart-version.sh`), but the binary knew only
+`CARGO_PKG_VERSION`, so `hs version`, `/_matrix/federation/v1/version`, `GET /api/v1/server`
+(and `/_synapse/admin/v1/server_version` over it), the replica registry's `version` and the
+traces' `service.version` all said `0.3.0` for 0.3.31 and 0.3.32 alike, and an operator could
+not confirm a roll from the server. Now `hs_telemetry::release_version()`
+(`crates/hs-telemetry/src/version.rs`; hs-telemetry is the leaf crate every reporter already
+depends on) returns `HS_RELEASE_VERSION` from the build environment when set and non-empty, else
+`CARGO_PKG_VERSION`, and all six sites use it (hs-cli's `cli.rs`, `serve.rs`,
+`cluster_admin.rs`; hs-cluster's `ClusterConfig::new`; hs-federation's `/version`; hs-admin's
+`ServerInfo::default`; hs-telemetry's `Options::default`; the operator's `User-Agent`). CD sets
+it: the `binaries` job's `cargo build` env and a `--build-arg` on both image builds (the
+`image` job now needs `version`, with the same `!cancelled()` guard `binaries` has, since
+`version` is skipped on a dispatch). `deploy/Dockerfile` declares `ARG HS_RELEASE_VERSION=` and
+the `ENV` *below* the cargo-chef cook and the source `COPY`s, so the cooked dependency layers'
+cache key is unchanged per release and only the workspace crates recompile; an empty value
+(no build arg) is treated as unset. The smokes assert it: `hs version` prints `hs $V` and
+`/_matrix/federation/v1/version` on the booted binary and the booted image reports `$V`, where
+`$V` is the release or, on a dispatch, Cargo.toml's line. The chart's `appVersion` is untouched
+(`helm package --app-version` from the same `version` job). Tests: the fallback rule
+(`resolve`) directly for set, unset and empty, and that the compiled value matches the
+environment the test build was given and `Options::default().service_version`. Checked locally:
+`cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test
+-p hs-telemetry -p hs-federation -p hs-cli`, `HS_RELEASE_VERSION=9.9.9 cargo build -p hs-cli`
+then `hs version` → `hs 9.9.9` and a booted server's `/_matrix/federation/v1/version` →
+`9.9.9`; `docker buildx build --check` of the Dockerfile; `actionlint` and a YAML parse of
+`cd.yml`. The first CD run on `main` after the merge is the real test of the build arg and the
+assertions.
 
 ## 2026-10-16, afternoon (branch `agent/kind-smoke-stand-in`): the kind smoke pulls its stand-in itself
 
