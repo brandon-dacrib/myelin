@@ -90,10 +90,20 @@ jobs:
       # hs-operator compares the `Homeserver` reconciler's objects with `helm template` of
       # deploy/helm/hs; HS_REQUIRE_HELM makes that test fail, rather than skip, without helm.
       - uses: azure/setup-helm@v4
-      - run: cargo test --workspace --all-targets
+      - name: Runner resources before the build
+        run: .github/scripts/runner-resources.sh
+      - name: cargo test --workspace --all-targets
+        run: |
+          .github/scripts/runner-resources.sh --watch 15 &
+          watch_pid=$!
+          trap 'kill $watch_pid 2>/dev/null' EXIT
+          cargo test --workspace --all-targets
         env:
           HS_REQUIRE_HELM: "1"
       - run: cargo test --workspace --doc
+      - name: Runner resources after a failure
+        if: failure()
+        run: .github/scripts/runner-resources.sh
 
   # cargo-audit rather than cargo-deny: it checks Cargo.lock against the RustSec advisory
   # database with no extra config file needed. A cargo-deny pass (license/bans/sources policy)
