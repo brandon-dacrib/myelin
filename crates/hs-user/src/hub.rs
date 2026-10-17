@@ -14,7 +14,10 @@
 //! its new position, one write however many members it has), and `crate::sync` reads a hot
 //! room's position as of a token from there (fan-out on read). A room's `hot`-ness is
 //! recomputed on every update from its live member count, so it can flip in either direction
-//! without an explicit migration step.
+//! without an explicit migration step. The one feed entry a hot room still writes is for a
+//! member whose own membership the update changed: `crate::sync` follows the hot-room stream
+//! only for the rooms a user is in, so their own departure (a leave, a kick, a ban) has to
+//! reach them through their feed, as it does from a cold room.
 //!
 //! # The discovery gap
 //!
@@ -412,8 +415,8 @@ pub struct SessionHub<B: KvBackend, R: RoomSource<B>> {
     /// Member count above which a room stops receiving per-write feed entries. See the module
     /// docs, "The hybrid fan-out threshold". `usize::MAX` disables the hot path entirely (every
     /// room is always fanned out on write) -- useful for tests that want to reason about the
-    /// feed alone.
-    fan_out_threshold: usize,
+    /// feed alone. Read on every room update ([`SessionHub::set_fan_out_threshold`]).
+    fan_out_threshold: std::sync::atomic::AtomicUsize,
     wakers: Mutex<HashMap<OwnedUserId, Arc<Notify>>>,
     /// The consumed mark: every update [`SessionHub::consume_updates`] received from the
     /// registry's global stream numbered up to it is finished. See
@@ -526,7 +529,7 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         Self {
             store,
             rooms,
-            fan_out_threshold,
+            fan_out_threshold: std::sync::atomic::AtomicUsize::new(fan_out_threshold),
             wakers: Mutex::new(HashMap::new()),
             consumed: tokio::sync::watch::channel(0).0,
             progress: crate::hub_progress::Progress::default(),
@@ -572,6 +575,21 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
             .store(feed_entries, std::sync::atomic::Ordering::Relaxed);
         self.hot_stream_retention
             .store(hot_stream_entries, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Sets the member count above which a room is hot (`hs-config`'s
+    /// `server.sync.fan_out_threshold_members`, hot). Read on every room update, so a change
+    /// applies to each room at its next event, as a room's hotness is recomputed then anyway.
+    pub fn set_fan_out_threshold(&self, members: usize) {
+        self.fan_out_threshold
+            .store(members, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The member count above which a room is hot ([`SessionHub::set_fan_out_threshold`]).
+    #[must_use]
+    pub fn fan_out_threshold(&self) -> usize {
+        self.fan_out_threshold
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// How many coalesced feed entries a user keeps ([`SessionHub::set_retention`]).
@@ -2515,7 +2533,8 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         self.index_members_for_directory(&update, &active_members)
             .await?;
 
-        let hot = member_count > self.fan_out_threshold;
+        let threshold = self.fan_out_threshold();
+        let hot = member_count > threshold;
         let joined_members: Vec<OwnedUserId> = active_members
             .iter()
             .filter(|(_, membership)| membership == "join")
@@ -2587,7 +2606,7 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
             tracing::info!(
                 room_id = %update.room_id,
                 member_count,
-                threshold = self.fan_out_threshold,
+                threshold,
                 hot,
                 records = fan_out.flipped,
                 "a room crossed the fan-out threshold; its members' records now say so"
@@ -2810,11 +2829,18 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
             } else {
                 None
             };
+            // A hot room writes no feed entries -- except for the member whose own membership
+            // this update changed. Their leave, kick or ban is the one thing a hot room has
+            // to tell them, and `crate::sync` lists a hot room only while they are in it (it
+            // has no other way to bound what the room would otherwise send them on every
+            // sync): without an entry, the owner's own leave from a 600-member room reached
+            // nobody and Element went on showing the room (2026-10-17). One entry per changed
+            // membership, however many members the room has, keeps the fan-out cheap.
             writes.push(FanOutWrite {
                 user_id,
                 record,
                 hot_room: hot,
-                feed_entry: !hot,
+                feed_entry: !hot || changed_now,
             });
         }
         let report = if self.fan_out_unbatched {

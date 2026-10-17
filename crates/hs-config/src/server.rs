@@ -200,12 +200,22 @@ pub struct SyncConfig {
     pub feed_retention_entries: u64,
 
     /// How many entries to keep on the hot-room stream, which records one entry per update to
-    /// a room over the fan-out threshold (500 joined members) instead of one per member. A
-    /// token older than what is kept resumes each such room from its last kept position, or
-    /// sends it whole. `0` keeps every entry for ever. Compacted once it has grown to twice
-    /// this.
+    /// a room over the fan-out threshold (`fan_out_threshold_members`) instead of one per
+    /// member. A token older than what is kept resumes each such room from its last kept
+    /// position, or sends it whole. `0` keeps every entry for ever. Compacted once it has
+    /// grown to twice this.
     #[serde(default = "default_hot_room_stream_retention_entries")]
     pub hot_room_stream_retention_entries: u64,
+
+    /// The member count above which a room is "hot": an update to it is one entry on the
+    /// hot-room stream instead of a feed entry per member, so a message to a very large room
+    /// does not cost one write per member. A member's own membership change (their join,
+    /// leave, kick or ban) still writes their feed, hot or not. Every member counts, from
+    /// every server. A room's hotness is recomputed on each update, so a change here applies
+    /// to a room at its next event. The default suits any server; lower it only to exercise
+    /// the hot path on a small room.
+    #[serde(default = "default_fan_out_threshold_members")]
+    pub fan_out_threshold_members: usize,
 }
 
 fn default_feed_retention_entries() -> u64 {
@@ -216,11 +226,16 @@ fn default_hot_room_stream_retention_entries() -> u64 {
     100_000
 }
 
+fn default_fan_out_threshold_members() -> usize {
+    500
+}
+
 impl Default for SyncConfig {
     fn default() -> Self {
         Self {
             feed_retention_entries: default_feed_retention_entries(),
             hot_room_stream_retention_entries: default_hot_room_stream_retention_entries(),
+            fan_out_threshold_members: default_fan_out_threshold_members(),
         }
     }
 }

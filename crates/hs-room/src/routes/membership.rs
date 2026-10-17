@@ -160,6 +160,16 @@ async fn act<B: KvBackend + 'static>(
 ) -> Result<Response, RoomError> {
     let room_id = parse_room_id(room_id)?;
     let handle = state.rooms.get_or_load(&room_id).await?;
+    if action == Action::Leave && sender == target && already_left(&handle, &sender).await {
+        // Nothing to send, and nothing to refuse: the second of two leaves is answered as the
+        // first was, as Synapse answers it (`deduplicate_state_event`). It used to be a `403`
+        // -- from the precheck when a user of this server was still in the room, or from the
+        // resident asked for a `make_leave` template when none was (a leave over a leave is
+        // not authorized) -- which a client that had missed the first leave (`crate::sync`'s
+        // hot rooms, 2026-10-17) showed as a failure to leave.
+        tracing::debug!(%room_id, user = %sender, "a leave by a user who has already left; nothing to send");
+        return Ok(Json(json!({})).into_response());
+    }
     let content = extra(state, action, &target, body).await;
     if let Some(remote) = &state.remote_join {
         if action == Action::Leave
@@ -193,6 +203,35 @@ async fn act<B: KvBackend + 'static>(
         .membership(sender, action, target, content, now_ms())
         .await?;
     Ok(Json(json!({})).into_response())
+}
+
+/// Whether `user`'s current membership in the room `handle` is for is `leave`: they left, were
+/// kicked, or declined or had rescinded an invitation. A ban is not a leave (leaving a room one
+/// is banned from stays refused), and never having been in the room is not either (the auth
+/// rules refuse that leave, as they should).
+async fn already_left<B: KvBackend + 'static>(
+    handle: &crate::actor::RoomActorHandle<B>,
+    user: &ruma::UserId,
+) -> bool {
+    let user = user.to_owned();
+    handle
+        .query(move |actor| {
+            actor
+                .state_event("m.room.member", user.as_str())
+                .ok()
+                .flatten()
+                .and_then(|e| {
+                    e.json()
+                        .get("content")
+                        .and_then(hs_model::canonical::CanonicalJsonValue::as_object)
+                        .and_then(|c| c.get("membership"))
+                        .and_then(hs_model::canonical::CanonicalJsonValue::as_str)
+                        .map(str::to_owned)
+                })
+                .as_deref()
+                == Some("leave")
+        })
+        .await
 }
 
 /// Invites `target`, a user of another server, to the room `handle` is for: the invite is built

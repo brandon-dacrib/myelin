@@ -247,6 +247,94 @@ async fn create_room_send_paginate_membership_and_redact_round_trip() {
     );
 }
 
+/// A second `POST /leave` by somebody who has already left is answered `200` with nothing
+/// sent, as Synapse answers it, not `403`: a client that missed the first leave (the demo's
+/// hot rooms, 2026-10-17) retries, and the retry must not look like a failure to leave. A
+/// user who was never in the room is still refused.
+#[tokio::test]
+async fn leaving_a_room_already_left_is_a_no_op() {
+    let mut scenario = Scenario::new(app());
+    scenario
+        .register("alice", "alice", "correct horse battery staple")
+        .await
+        .assert_ok();
+    scenario
+        .register("bob", "bob", "hunter2official")
+        .await
+        .assert_ok();
+    scenario
+        .register("carol", "carol", "another passphrase")
+        .await
+        .assert_ok();
+    let created = scenario
+        .send(
+            Some("alice"),
+            Method::POST,
+            "/createRoom",
+            Some(json!({"preset": "public_chat"})),
+        )
+        .await;
+    created.assert_ok();
+    let room_id = created.str_field("room_id").to_string();
+    scenario
+        .send(
+            Some("bob"),
+            Method::POST,
+            &format!("/rooms/{room_id}/join"),
+            Some(json!({})),
+        )
+        .await
+        .assert_ok();
+
+    for attempt in 1..=2 {
+        let leave = scenario
+            .send(
+                Some("bob"),
+                Method::POST,
+                &format!("/rooms/{room_id}/leave"),
+                Some(json!({})),
+            )
+            .await;
+        assert_eq!(
+            leave.status,
+            StatusCode::OK,
+            "leave attempt {attempt}: {}",
+            leave.json
+        );
+    }
+    let members = scenario
+        .send(
+            Some("alice"),
+            Method::GET,
+            &format!("/rooms/{room_id}/members"),
+            None,
+        )
+        .await;
+    members.assert_ok();
+    let bobs_leaves = members.json["chunk"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["state_key"] == "@bob:example.org" && e["content"]["membership"] == "leave")
+        .count();
+    assert_eq!(bobs_leaves, 1, "one leave event, not two: {}", members.json);
+
+    let stranger = scenario
+        .send(
+            Some("carol"),
+            Method::POST,
+            &format!("/rooms/{room_id}/leave"),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(
+        stranger.status,
+        StatusCode::FORBIDDEN,
+        "a user who was never in the room: {}",
+        stranger.json
+    );
+}
+
 #[tokio::test]
 async fn invite_only_room_rejects_a_join_without_invite_then_succeeds_after_one() {
     let mut scenario = Scenario::new(app());

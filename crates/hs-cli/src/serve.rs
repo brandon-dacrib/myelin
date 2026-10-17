@@ -755,13 +755,6 @@ struct Mounts<B: KvBackend> {
     admin: hs_admin::router::AdminState,
 }
 
-/// The default fan-out threshold for `hs-user`'s session hub: rooms with more joined members than
-/// this stop getting a durable feed entry per member per event and are marked "hot" instead, so a
-/// message to a very large room does not cost one store write per member. `hs_user::hub`'s module
-/// docs explain the trade (a hot room's `/sync` reads the room's live position directly). No
-/// config field exists for it yet; recorded in `docs/status/05-sync.md`.
-const DEFAULT_FAN_OUT_THRESHOLD: usize = 500;
-
 /// Builds the three states added in this pass -- `hs-user`'s session hub, `hs-e2e`'s key store and
 /// `hs-push`'s rule/pusher/count stores -- over one already-open backend, so both [`spawn_serve`]
 /// and [`throwaway_mounts`] assemble them the same way.
@@ -798,10 +791,13 @@ fn build_session_mounts<B: KvBackend>(
         Arc::new(hs_e2e::store::tables::TablesE2eStore::open(backend.clone()).map_err(opening)?);
     let user = UserState {
         auth: auth.clone(),
+        // The fan-out threshold `server.sync.fan_out_threshold_members` names is set on the hub
+        // with the rest of `server.sync` once the configuration is read (`spawn_serve`); the
+        // default until then is the setting's own.
         hub: Arc::new(hs_user::hub::SessionHub::new(
             user_store,
             rooms.clone(),
-            DEFAULT_FAN_OUT_THRESHOLD,
+            hs_config::server::SyncConfig::default().fan_out_threshold_members,
         )),
         e2e: e2e_store.clone(),
     };
@@ -1922,9 +1918,11 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
         config.server.sync.feed_retention_entries,
         config.server.sync.hot_room_stream_retention_entries,
     );
+    sync_hub.set_fan_out_threshold(config.server.sync.fan_out_threshold_members);
     tracing::info!(
         feed_retention_entries = config.server.sync.feed_retention_entries,
         hot_room_stream_retention_entries = config.server.sync.hot_room_stream_retention_entries,
+        fan_out_threshold_members = config.server.sync.fan_out_threshold_members,
         "sync feed retention in effect (0 keeps everything)"
     );
     components.watch("room registry", &rooms);
@@ -2936,6 +2934,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
                 config.server.sync.feed_retention_entries,
                 config.server.sync.hot_room_stream_retention_entries,
             );
+            hub.set_fan_out_threshold(config.server.sync.fan_out_threshold_members);
             let documents = crate::well_known::WellKnown::from_config(config);
             let public = config.server.public_baseurl.as_deref();
             recovery.set_link_base(link_base(public, &addrs));
@@ -2947,6 +2946,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
                 feed_retention_entries = config.server.sync.feed_retention_entries,
                 hot_room_stream_retention_entries =
                     config.server.sync.hot_room_stream_retention_entries,
+                fan_out_threshold_members = config.server.sync.fan_out_threshold_members,
                 "the server settings are now in force"
             );
             well_known.set(documents);

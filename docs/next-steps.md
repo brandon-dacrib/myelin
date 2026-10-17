@@ -1,8 +1,25 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-10-16 (v0.3.28 on the demo; the server reports the release it is, not the line; `agent/release-version-string`. Before: the soft-fail check resolved one fork per prev event; `agent/soft-fail-forks`. Before: forked rooms are merged and pruned, and a resolution reads about the room once however many forks; `agent/extremity-merge`. Before: the hub's members step and the idle CPU were repeated state resolutions; `agent/hub-members-step`. Before: handover: the demo, the releases and what is next, below. Before: test servers are handed their ports still bound; `agent/test-port-races`. Before: room loads and unloading; `agent/room-load-speed`. Before: the Slack bridge's full volume; fix on `agent/bridge-volume-size`. Before: Discord's delivery timeouts were a replay of the 2026-10-12 flood; fix on `agent/discord-delivery-timeouts`. Before: the memory climb with federation on; fix on `agent/fed-memory-growth`. Before: the session hub wedge; fix on `agent/hub-wedge`. Earlier: the ephemeral pump's prune busy loop; fix on `agent/ephemeral-prune`). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+Written 2026-09-20 by the integration lead, last revised 2026-10-17 (a member's own leave from a hot room reached nobody; `agent/hot-room-leave`. Before: v0.3.28 on the demo; the server reports the release it is, not the line; `agent/release-version-string`. Before: the soft-fail check resolved one fork per prev event; `agent/soft-fail-forks`. Before: forked rooms are merged and pruned, and a resolution reads about the room once however many forks; `agent/extremity-merge`. Before: the hub's members step and the idle CPU were repeated state resolutions; `agent/hub-members-step`. Before: handover: the demo, the releases and what is next, below. Before: test servers are handed their ports still bound; `agent/test-port-races`. Before: room loads and unloading; `agent/room-load-speed`. Before: the Slack bridge's full volume; fix on `agent/bridge-volume-size`. Before: Discord's delivery timeouts were a replay of the 2026-10-12 flood; fix on `agent/discord-delivery-timeouts`. Before: the memory climb with federation on; fix on `agent/fed-memory-growth`. Before: the session hub wedge; fix on `agent/hub-wedge`. Earlier: the ephemeral pump's prune busy loop; fix on `agent/ephemeral-prune`). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
+
+## 2026-10-17 -- a member's own leave from a hot room reached nobody; the branch is `agent/hot-room-leave`
+
+The owner could not leave two 600-member rooms through Element: the server accepted each
+leave, Element went on showing the room, and the retry was `403 Event is not authorized`
+(the resident asked for a `make_leave` template saw a leave over a leave). A hot room (over
+the fan-out threshold) wrote no feed entries and `/sync` listed a hot room only while the
+user was in it, so a member's own leave, kick or ban from one reached nobody. The hub now
+writes the feed of the member whose membership an update changed, hot or not; a `/leave` by a
+user already left answers `200` with nothing sent, as Synapse does; and
+`server.sync.fan_out_threshold_members` (default 500, hot) names the threshold that was a
+constant in `hs-cli`, so the hot path is testable on a room of two. Verified in `hs-user`,
+`hs-room` and against the real binary (`crates/hs-cli/tests/hot_room_leave.rs`);
+`docs/status/05-sync.md`, the 2026-10-17 entry. **Left:** the two rooms the owner already
+left need one "Clear cache and reload" in Element (an initial sync omits left rooms); nothing
+writes the missed entry after the fact. **Next**: roll the demo to the release CD makes of
+this merge.
 
 ## 2026-10-16, night -- CD's kind smokes no longer let the kubelet pull a helper image; the branch is `agent/smoke-helper-images`
 

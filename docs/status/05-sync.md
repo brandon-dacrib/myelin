@@ -1,6 +1,6 @@
 # 05 Sync: status
 
-Last updated: 2026-10-16 (the hub's "members and directory entry" step, below: nine state
+Last updated: 2026-10-17 (a member's own leave from a hot room reached nobody, below. Then 2026-10-16: the hub's "members and directory entry" step: nine state
 resolutions per room update on forked rooms; each set of forks is now resolved once. Then
 2026-10-14: the demo's session hub wedge: one room the hub could not get through stopped every feed; rooms are now fed side by side and a stuck update is named. Then 2026-10-09: the scale 1 -> 2 bug; session 19: wave 2's three named leftovers were already closed by session 17, rechecked on `6e24c2c0`; `event_fields` is applied; a real-binary test for the peeked long-poll. Session 18: two long-polls that never saw their change were a lost
 push-rule write and a membership event that lost to the room's state, not the long-poll. Session 17: a filtered long-poll waits for real news, a fresh
@@ -10,6 +10,63 @@ Session 13: `/joined_rooms` read-your-writes. Session 12: RFC 0018, a non-owner'
 catches up instead of reloading. Session 11, session 10, session 9, session 8, session 7 and
 the integration note follow; sessions 1-6 are preserved unchanged further down.)
 
+
+## 2026-10-17 (branch `agent/hot-room-leave`): a member's own leave from a hot room reached nobody
+
+**Symptom** (the demo, v0.3.32): the owner left two rooms through Element,
+`!c10y-N9TQGHzj6Ne3OKqn-MEO8EhfRWrD3-CD-W9AEM` (codestorm.net's, 600-odd members) and
+`!mauwaAmuICl7LX3zScirNC4eXkUJsD9iQiFLAIZPqw0`. Both leaves were accepted (`POST /leave` 2xx
+twice between 22:21 and 22:22 UTC in `hs_http_requests_total`; the leave of the first was sent
+to every server in the room at 22:21:13, and the hub marked 32 remote users' device lists
+stale as sharing no room any more). Element went on showing both rooms as joined. Seventeen
+minutes later the owner left them again, and all three attempts were `403 M_FORBIDDEN`, `Event
+is not authorized.`: with no user of this server joined any more, `act` took the leave through
+federation (`servers_to_join_through`), and the resident asked for the `make_leave` template
+(`continuwuity.org`, `nexy7574.co.uk`) refused it, a leave over a leave being unauthorized;
+`reject_out_of_band` then failed too (nothing to reject), and the resident's error was the
+answer.
+
+**Cause.** Both rooms are hot (over the fan-out threshold of 500 members, counted across every
+server). A hot room writes no feed entries (`fan_out`'s `feed_entry: !hot`), and an
+incremental `/sync` lists a hot room only while the user's membership is `join`, `invite` or
+`knock` (`build_batch`'s `changed_rooms`, and `has_new_data`'s wake): the room stays bounded
+by the hot-room stream, which never names a user. So a member's own leave, kick or ban from a
+hot room was in nobody's feed and in no sync: the leaver's client was never told. Every room
+under the threshold was fine, which is every room a test had ever made.
+
+**Fix.**
+
+- `SessionHub::fan_out` writes the feed of a member whose own membership the update changed,
+  hot or not (`feed_entry: !hot || changed_now`): one entry per changed membership, however
+  many members the room has. The next sync finds the room through the feed as it finds a
+  cold one, bounds it by the hot-room stream as before, resumes it from its position as of
+  the token, and files it under `leave`; the sync after that has nothing of it.
+- `POST /rooms/{roomId}/leave` by a user whose membership is already `leave` answers `200`
+  with nothing sent, as Synapse does (`deduplicate_state_event`), before the precheck or the
+  federation path: a client that missed the first leave retries, and the retry must not look
+  like a failure. A ban stays refused; a user never in the room is refused by the auth rules
+  as before.
+- `server.sync.fan_out_threshold_members` (default 500, hot) names the threshold `hs-cli`
+  had as a constant, so the hot path can be exercised on a small room, by a test or an
+  operator. Read on every room update; the setting's doc says a change applies to a room at
+  its next event.
+
+**Verified.** `crates/hs-user/src/sync/mod.rs`: `a_hot_room_left_is_sent_as_left_once` (failed
+before the fix: the long-poll timed out; the leave is in the answer under `leave` with what was
+said before it, and the next sync has nothing of the room) and
+`a_kick_from_a_hot_room_reaches_the_kicked` (the kicked's long-poll wakes with the kick under
+`leave`; the kicker's sync carries the kick). `crates/hs-room/tests/scenario.rs`:
+`leaving_a_room_already_left_is_a_no_op` (failed before: `Leave is not a valid transition from
+Leave`; one leave event in `/members`, a stranger's leave still `403`). Against the real `hs`
+binary, `crates/hs-cli/tests/hot_room_leave.rs`: with the threshold at one member, bob's leave
+from a room of two wakes his long-poll and is under `leave`, a second `/leave` is `200` with
+one leave event in the room, and the sync after alice's next message has nothing of the room.
+`docs/config.md` and the web's schema fixture regenerated.
+
+**On the demo.** The two rooms the owner already left: their records say `leave` and no feed
+entry will be written for them after the fact, so Element learns of them from an initial sync
+(Settings, Help & About, "Clear cache and reload"), which omits left rooms; from the release
+with this fix on, a leave from a hot room is in the next incremental sync.
 
 ## 2026-10-16 (branch `agent/hub-members-step`): the hub's 30-second step was nine state resolutions
 

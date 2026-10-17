@@ -18,6 +18,14 @@ carries the generated notes for that merge.
 The 0.4 line is the first public release: the same server, documented for someone who has
 never seen it. Everything that was verified for it says how.
 
+- **Leaving a very large room reaches the leaver.** A room over the fan-out threshold (500
+  members) wrote no per-member feed entries, and `/sync` followed such a room only while the
+  user was in it, so a user's own leave, kick or ban from one never reached their client:
+  Element went on showing the room, and leaving again was refused. The member whose
+  membership an update changes now gets a feed entry whatever the room's size, and a second
+  `/leave` by a user who has already left answers `200` with nothing sent, as Synapse does.
+  The threshold is `server.sync.fan_out_threshold_members` (default 500, hot).
+
 - **There is a deployment guide.** `docs/deployment.md` takes an operator from a server name to
   a server other people use: Docker (one container, or `deploy/compose/` with Caddy getting its
   own certificate), the released binary on a host with `deploy/systemd/myelin.service`, the

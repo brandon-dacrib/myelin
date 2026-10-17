@@ -5860,6 +5860,180 @@ mod tests {
         assert!(took >= poll - Duration::from_millis(50), "{took:?}");
     }
 
+    /// Found on the demo (2026-10-17): the owner left two rooms of 600-odd members through
+    /// Element, the server accepted both leaves, and Element went on showing both rooms as
+    /// joined; leaving again was refused (`Event is not authorized`: the resident asked for the
+    /// template saw a leave over a leave). A hot room writes no feed entries, and an
+    /// incremental sync listed a hot room only while the user was joined, invited or knocking
+    /// -- so a user's own departure from a hot room reached nobody, least of all them. Their
+    /// own membership change writes their feed now, hot or not: the next sync carries the
+    /// leave, under `leave`, and the one after it carries nothing of the room.
+    #[tokio::test]
+    async fn a_hot_room_left_is_sent_as_left_once() {
+        let hub = hot_hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let bob = user_id!("@bob:sync.test").to_owned();
+        let handle = hub
+            .rooms()
+            .create_room(
+                alice.clone(),
+                CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    name: Some("Big".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+        handle
+            .membership(bob.clone(), Action::Join, bob.clone(), json!({}), 2)
+            .await
+            .unwrap();
+        say(&handle, &alice, "hello bob", 3).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let (_, token) = build(&hub, &e2e, &bob, device_params(None, "BOB"))
+            .await
+            .unwrap();
+        let record = hub
+            .store()
+            .get_membership(&bob, &room_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            record.hot_room,
+            "the room is above the threshold: {record:?}"
+        );
+
+        say(&handle, &alice, "bye bob", 4).await;
+        handle
+            .membership(bob.clone(), Action::Leave, bob.clone(), json!({}), 5)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // The leave wakes bob's long-poll and is in the answer, under `leave`.
+        let poll = Duration::from_secs(2);
+        let (response, token, took) = timed_sync(&hub, &e2e, &bob, token, "BOB", poll).await;
+        assert!(
+            took < poll,
+            "the leave did not wake the long-poll: {took:?}"
+        );
+        assert!(
+            response["rooms"]["join"].get(room_id.as_str()).is_none(),
+            "{response}"
+        );
+        let room = &response["rooms"]["leave"][room_id.as_str()];
+        assert!(room.is_object(), "bob was not told he left: {response}");
+        let own_leave = room["timeline"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| {
+                e["type"] == "m.room.member"
+                    && e["state_key"] == bob.as_str()
+                    && e["content"]["membership"] == "leave"
+            });
+        assert!(
+            own_leave,
+            "the leave event is not in the timeline: {response}"
+        );
+        assert!(
+            all_bodies(room).contains(&"bye bob".to_owned()),
+            "what was said before the leave is missing: {response}"
+        );
+
+        // And once only: the room goes on without him, and his next sync has nothing of it.
+        say(&handle, &alice, "after bob", 6).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let (response, _, _) =
+            timed_sync(&hub, &e2e, &bob, token, "BOB", Duration::from_millis(100)).await;
+        assert!(
+            response["rooms"]["leave"].get(room_id.as_str()).is_none(),
+            "the leave was sent again: {response}"
+        );
+        assert!(
+            response["rooms"]["join"].get(room_id.as_str()).is_none(),
+            "{response}"
+        );
+    }
+
+    /// The same for a member put out of a hot room by somebody else: a kick reaches the kicked
+    /// as a leave reaches the leaver (the kick is their membership change, so it writes their
+    /// feed), and the room's other members hear of it through the hot-room stream as they hear
+    /// of everything else.
+    #[tokio::test]
+    async fn a_kick_from_a_hot_room_reaches_the_kicked() {
+        let hub = hot_hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let bob = user_id!("@bob:sync.test").to_owned();
+        let handle = hub
+            .rooms()
+            .create_room(
+                alice.clone(),
+                CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+        handle
+            .membership(bob.clone(), Action::Join, bob.clone(), json!({}), 2)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let (_, bob_token) = build(&hub, &e2e, &bob, device_params(None, "BOB"))
+            .await
+            .unwrap();
+        let (_, alice_token) = build(&hub, &e2e, &alice, device_params(None, "ALICE"))
+            .await
+            .unwrap();
+
+        handle
+            .membership(
+                alice.clone(),
+                Action::Kick,
+                bob.clone(),
+                json!({"reason": "out"}),
+                3,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let (response, _, took) =
+            timed_sync(&hub, &e2e, &bob, bob_token, "BOB", Duration::from_secs(2)).await;
+        assert!(took < Duration::from_secs(2), "{took:?}");
+        let room = &response["rooms"]["leave"][room_id.as_str()];
+        assert!(
+            room.is_object(),
+            "bob was not told he was kicked: {response}"
+        );
+        let (response, _, _) = timed_sync(
+            &hub,
+            &e2e,
+            &alice,
+            alice_token,
+            "ALICE",
+            Duration::from_secs(2),
+        )
+        .await;
+        let room = &response["rooms"]["join"][room_id.as_str()];
+        let saw_kick = room["timeline"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["type"] == "m.room.member" && e["state_key"] == bob.as_str());
+        assert!(saw_kick, "alice was not told of the kick: {response}");
+    }
+
     /// Complement caught this one (`TestLeaveEventInviteRejection`, and "Invited user can reject
     /// invite for empty room") the run after `/sync` began applying history visibility: somebody
     /// who declines an invitation was never joined, so by the letter of the visibility rules

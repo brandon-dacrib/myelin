@@ -16,7 +16,8 @@
         "unstable_features": {},
         "sync": {
           "feed_retention_entries": 10000,
-          "hot_room_stream_retention_entries": 100000
+          "hot_room_stream_retention_entries": 100000,
+          "fan_out_threshold_members": 500
         },
         "rooms": {
           "event_cache_size": 1000,
@@ -420,7 +421,8 @@
           "$ref": "#/$defs/SyncConfig",
           "default": {
             "feed_retention_entries": 10000,
-            "hot_room_stream_retention_entries": 100000
+            "hot_room_stream_retention_entries": 100000,
+            "fan_out_threshold_members": 500
           },
           "x-applies": "hot"
         },
@@ -454,11 +456,18 @@
           "default": 10000
         },
         "hot_room_stream_retention_entries": {
-          "description": "How many entries to keep on the hot-room stream, which records one entry per update to\na room over the fan-out threshold (500 joined members) instead of one per member. A\ntoken older than what is kept resumes each such room from its last kept position, or\nsends it whole. `0` keeps every entry for ever. Compacted once it has grown to twice\nthis.",
+          "description": "How many entries to keep on the hot-room stream, which records one entry per update to\na room over the fan-out threshold (`fan_out_threshold_members`) instead of one per\nmember. A token older than what is kept resumes each such room from its last kept\nposition, or sends it whole. `0` keeps every entry for ever. Compacted once it has\ngrown to twice this.",
           "type": "integer",
           "format": "uint64",
           "minimum": 0,
           "default": 100000
+        },
+        "fan_out_threshold_members": {
+          "description": "The member count above which a room is \"hot\": an update to it is one entry on the\nhot-room stream instead of a feed entry per member, so a message to a very large room\ndoes not cost one write per member. A member's own membership change (their join,\nleave, kick or ban) still writes their feed, hot or not. Every member counts, from\nevery server. A room's hotness is recomputed on each update, so a change here applies\nto a room at its next event. The default suits any server; lower it only to exercise\nthe hot path on a small room.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 500
         }
       },
       "additionalProperties": false
