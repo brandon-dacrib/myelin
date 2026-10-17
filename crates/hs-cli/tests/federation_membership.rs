@@ -857,9 +857,30 @@ async fn an_invite_is_rejected_locally_when_no_server_in_the_room_answers() {
     assert_eq!(leave["content"]["reason"], "nobody home");
     assert_eq!(leave["sender"], bob.id);
 
-    // Rejecting again: nothing left to reject, and no server to ask.
-    let (status, _) = post(&client, &bob, &format!("rooms/{room_id}/leave"), json!({})).await;
-    assert_ne!(status, 200, "a second rejection has nothing to reject");
+    // Rejecting again: nothing left to reject, and no server to ask. Answered `200` with
+    // nothing sent, as Synapse answers a leave by somebody already out (since 2026-10-17: a
+    // client that missed the first leave retries, and the retry must not look like a
+    // failure); bob's one leave stays his membership.
+    let (status, body) = post(&client, &bob, &format!("rooms/{room_id}/leave"), json!({})).await;
+    assert_eq!(status, 200, "a second rejection is a no-op: {body}");
+    let again = sync_until(&client, &bob, |s| {
+        s["rooms"]["leave"].get(&room_id).is_some()
+    })
+    .await;
+    let leaves = again["rooms"]["leave"][&room_id]["timeline"]["events"]
+        .as_array()
+        .map(|events| {
+            events
+                .iter()
+                .filter(|e| {
+                    e["type"] == "m.room.member"
+                        && e["state_key"] == bob.id
+                        && e["content"]["membership"] == "leave"
+                })
+                .count()
+        })
+        .unwrap_or_default();
+    assert_eq!(leaves, 1, "one leave, not a second: {again}");
 
     let (status, body) = post(
         &client,
