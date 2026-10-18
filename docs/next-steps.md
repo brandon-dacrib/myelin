@@ -26,9 +26,16 @@ the destination sharing leaves such a room out. `docs/status/04-room-and-events.
 `place_history` still feeds the state store after its rows commit (a load repairs what a
 failed feed leaves, and the feed can no longer be refused for an unknown entry); feeding
 inside the rows' transaction, as `persist` does (RFC 0025 item 5), is the right shape for a
-session with time to test batch-mate ordering in one transaction. **On the demo:** to roll;
-the room loads on the first read after the roll (the `warn` names the hole), the pump's
-error stops, and the codestorm room's PDUs are accepted again.
+session with time to test batch-mate ordering in one transaction. **Rolled:** the demo is
+on v0.4.3 (Helm revision 39, 18:03 UTC on the 18th, the same way as v0.4.1: the chart from
+ghcr's OCI API with `/usr/bin/curl`, digest checked, `helm upgrade` through the owner's
+proxy). The codestorm room loaded on the first read after the roll (the statistics sample's,
+at 18:03:28): 38 placed events fed with their state rows, each with `EventSn(135009)` left out
+of 2,664 entries (`hs_state_explicit_state_entries_unknown_total` 37 at the first scrape,
+one `warn` per event naming the room and the event), `hs_room_load_failures_total` 0, no pump
+error and no "room this server does not know" in the first fifteen minutes, two ephemeral
+passes run, six Bridges Ready, `/_matrix/federation/v1/version` says 0.4.3. The hole is the
+one rejected event; the room's state is otherwise what it was.
 
 ## 2026-10-17 -- a member's own leave from a hot room reached nobody; the branch is `agent/hot-room-leave`
 
