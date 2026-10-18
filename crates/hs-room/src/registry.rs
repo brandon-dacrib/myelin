@@ -344,6 +344,18 @@ impl<B: KvBackend + 'static> LoadJob<B> {
             let span = tracing::Span::current();
             span.record("otel.status_code", "error");
             span.record("error.message", tracing::field::display(error));
+            // Said here, once per failed load, whoever asked: a caller reports the error as
+            // its own (an appservice pass "could not read a stream", a PDU "for a room this
+            // server does not know") and none of them named the room. On the demo a room
+            // whose load failed was asked for every ten seconds for seventeen hours
+            // (2026-10-17 23:20 UTC onwards) before the log said which room, or why.
+            crate::metrics::count_load_failure();
+            tracing::error!(
+                %room_id,
+                %error,
+                "a room could not be loaded from the store; every read of it fails until it \
+                 can, and the next caller starts the load again (hs_room_load_failures_total)"
+            );
         }
         // Answered first, then taken off the list: a caller that finds the load listed always
         // gets this answer, and one that comes after finds the room resident (or, after a

@@ -2,6 +2,74 @@
 
 Track brief: `docs/workstreams/04-room-and-events.md`. Owner crate: `hs-room`.
 
+## 2026-10-18 (branch `agent/stuck-room-load`): a room whose placed history named an event the store never recorded could not be loaded again
+
+**Asked**: on the demo, since 23:20 UTC on 2026-10-17, the appservice ephemeral pump logged
+`could not read a stream ... state error: unknown event EventSn#135009` every ten seconds, and
+the admin API's destination rows `cannot read the members of !BHvcNjOBRwncDQbGOk:codestorm.net`
+with the same error. Fix it.
+
+**Found** (Loki, Prometheus; nothing on the demo was touched):
+
+- 22:21:47 UTC: the owner paged `/messages` in the codestorm room past a leave and a rejoin;
+  the gap backfill fetched the state at the batch's oldest event from `codestorm.net` (seven
+  of its events could not be had, `hs_cli::backfill`), and the actor warned that three state
+  entries the server named were not held. 22:21:48: `could not fetch the history between a
+  leave and a rejoin; reading on past it` with `state error: unknown event EventSn#135009`.
+  That is `KvStateStore::ingest_in` refusing an explicit state naming an event the store has
+  no record of: `/state_ids` named an event this server holds as **rejected** (stored, flagged,
+  never fed to the state store, `actor/rejected.rs`), and `state_map_from_ids` took it, since
+  the event is held.
+- `place_history` commits the placed events' rows (event, timeline position, state snapshot)
+  in one transaction and feeds the state store **after** the commit, one event at a time. The
+  feed of the first placed event failed, the rows stayed, and the resident copy went on
+  working (its in-memory state was never told).
+- 23:20:15: the owner changed `server.rooms` live; resident rooms went from 228 to 46, this
+  one among the unloaded. 23:20:41: its reload replayed the placed events whose records the
+  store lacked (`must_feed`), from their state rows, and was refused the same way. Every read
+  since -- the pump's member read every ten seconds, the destination sharing, `/sync`, and
+  every PDU for the room (`ignored a PDU received over federation for a room this server does
+  not know`, since `room_version` answers `None` on a failed load) -- failed on the load, and
+  each retry ran the ten-second load again. The log never named the room or said the load
+  failed: the pump reported the error as its own, and the registry recorded it only on the
+  trace span.
+
+**Done**:
+
+- `KvStateStore::ingest_in` leaves an explicit-state entry the store has no record of out of
+  the state, counts it in `hs_state_explicit_state_entries_unknown_total` and logs it at
+  `warn` with the room, the event and the entries' short IDs. `KvStoreError::UnknownEvent`
+  stays for `state_at`. A root with a hole is what the store already read back: an entry it
+  has no record of was skipped on every read. The store's contract test asserts the hole is
+  counted and the rest of the state recorded, and that the complete snapshot gives the same
+  state.
+- `RoomActor::state_map_from_ids` leaves an event this server holds as rejected out of a
+  fetched state, warning with the IDs: a rejected event is no part of any state (Synapse reads
+  state with `allow_rejected=False`).
+- The registry logs a failed load at `error` with the room and the error, once per load,
+  whoever asked, and counts it in `hs_room_load_failures_total`.
+- Track 11: the ephemeral pump leaves a room whose members it cannot read out of the pass for
+  a minute instead of failing the tick (`docs/status/11-appservices-and-bridges.md`,
+  2026-10-18); the destination sharing (`hs-cli`'s `RegistryRoomSharing`) leaves such a room
+  out with a warning instead of failing the whole reading.
+- Not changed: `place_history` still feeds the store after its rows commit. A load repairs
+  what a failed feed leaves (`must_feed`, from the state rows), and the feed can no longer be
+  refused for an unknown entry; moving the feed into the rows' transaction (RFC 0025 item 5,
+  as `persist` does) is the right shape and is left for a session with time to test the
+  batch-mate ordering inside one transaction.
+
+**Verified**: `crates/hs-room/tests/backfill_state.rs`,
+`a_fetched_state_naming_an_event_held_as_rejected_is_placed_without_it` (the joiner holds a
+topic by a stranger as rejected, the fetched state names it, the batch is placed with the
+resident's state at every event and the room reloads) and
+`a_room_whose_placed_history_names_an_event_the_store_never_recorded_loads` (every state
+record wiped and one placed event's state row given an unknown entry -- the rows the demo was
+left with -- and the load answers the state it had, counting the hole); both fail on `main`
+with `state error: unknown event`. `hs-state`'s `kv_store` tests; `hs-appservice`'s
+`a_room_that_cannot_be_read_is_left_out_of_the_pass_and_asked_again_later`. On the demo: the
+room loads on the first read after the roll (the `warn` names the hole), and the pump's error
+stops; see `docs/next-steps.md`.
+
 ## 2026-10-16, evening (branch `agent/dummy-event-chain`): a forked room is merged by a chain of dummy events, not one a pass
 
 **Asked**: the demo's `#ping` (v0.3.29) has 248 forward extremities and keeps growing. The

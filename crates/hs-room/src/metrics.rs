@@ -80,6 +80,12 @@ static UNLOADS: LazyLock<Family<Vec<(String, String)>, Counter>> = LazyLock::new
 /// logged at `warn` with the room and its slowest phase.
 static SLOW_LOADS: LazyLock<Counter> = LazyLock::new(Counter::default);
 
+/// `hs_room_load_failures_total`: room loads from the store that failed for a reason other
+/// than the room not existing, each logged at `error` with the room and the error. Every read
+/// of such a room fails until a load succeeds; a count that keeps climbing is one room asked
+/// for again and again.
+static LOAD_FAILURES: LazyLock<Counter> = LazyLock::new(Counter::default);
+
 /// `hs_room_state_resolution_seconds`: how long each state resolution a room actor ran took
 /// (`RoomActor::state_view` over more than one fork: a room's current state while it has more
 /// than one forward extremity, or the state before an event citing more than one). The CPU a
@@ -511,6 +517,17 @@ pub fn slow_loads() -> u64 {
     SLOW_LOADS.get()
 }
 
+/// Counts one failed room load in `hs_room_load_failures_total`.
+pub(crate) fn count_load_failure() {
+    LOAD_FAILURES.inc();
+}
+
+/// `hs_room_load_failures_total` as it stands.
+#[must_use]
+pub fn load_failures() -> u64 {
+    LOAD_FAILURES.get()
+}
+
 /// Counts `repaired` events fed to the state store because it had no record of them
 /// (`hs_room_state_records_repaired_total`).
 pub(crate) fn count_state_records_repaired(repaired: u64) {
@@ -677,6 +694,13 @@ pub fn register_metrics(registry: &mut prometheus_client::registry::Registry) {
         "Room loads that took longer than ten seconds from start to registration, each logged \
          at warn with its slowest phase",
         SLOW_LOADS.clone(),
+    );
+    // Registered without `_total`: the text encoder appends it.
+    registry.register(
+        "hs_room_load_failures",
+        "Room loads from the store that failed for a reason other than the room not existing, \
+         each logged at error with the room and the error",
+        LOAD_FAILURES.clone(),
     );
     // Registered without `_total`: the text encoder appends it.
     registry.register(

@@ -172,6 +172,11 @@ pub async fn sweep_once(
 /// that have a joined member in it. Reads each room once per call (an owned room through its
 /// resident actor, another replica's room from the store), so it costs one read per room: the
 /// sweep runs hourly, and the admin API's source keeps a reading for a short while.
+///
+/// A room that cannot be read (its load from the store fails) is left out, logged at warn, and
+/// the rest is answered: until 2026-10-18 one such room failed the whole reading, and with it
+/// every destination row of the admin API, for as long as the room stayed unloadable (the demo,
+/// a codestorm room, 2026-10-17 23:20 UTC onwards).
 pub struct RegistryRoomSharing<B: KvBackend> {
     rooms: Arc<RoomRegistry<B>>,
 }
@@ -192,6 +197,7 @@ impl<B: KvBackend + 'static> RoomSharing for RegistryRoomSharing<B> {
             .list_all_room_ids()
             .map_err(|e| format!("cannot list the rooms: {e}"))?;
         let mut out = Vec::with_capacity(room_ids.len());
+        let mut unreadable = 0usize;
         for room_id in room_ids {
             match self
                 .rooms
@@ -204,10 +210,22 @@ impl<B: KvBackend + 'static> RoomSharing for RegistryRoomSharing<B> {
                 }),
                 // Gone between the listing and now: shares nothing.
                 Err(hs_room::error::RoomError::RoomNotFound(_)) => {}
-                Err(e) => {
-                    return Err(format!("cannot read the members of {room_id}: {e}"));
+                Err(error) => {
+                    unreadable += 1;
+                    tracing::warn!(
+                        %room_id,
+                        %error,
+                        "cannot read the members of a room; the destination sharing leaves it out"
+                    );
                 }
             }
+        }
+        if unreadable > 0 {
+            tracing::warn!(
+                unreadable,
+                read = out.len(),
+                "rooms whose members could not be read are left out of the destination sharing"
+            );
         }
         Ok(out)
     }

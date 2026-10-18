@@ -18,6 +18,16 @@ carries the generated notes for that merge.
 The 0.4 line is the first public release: the same server, documented for someone who has
 never seen it. Everything that was verified for it says how.
 
+- **A room whose fetched history named a rejected event loads again, and one unreadable
+  room no longer stops every bridge's receipts.** A backfill's fetched state that named an
+  event this server held as rejected was refused by the state store after the placed
+  history's rows had been committed, and every later load of the room was refused the same
+  way: the room was unreadable, every PDU for it dropped as unknown, and the appservice
+  ephemeral pump, failing on that one room's members, sent no bridge a receipt, a presence
+  change or a to-device message. A fetched state now leaves rejected events out, the store
+  records a state with an unknown entry left out (counted and logged), a failed room load is
+  logged with its room and counted, and the pump leaves a room it cannot read out of the
+  pass for a minute.
 - **Leaving a very large room reaches the leaver.** A room over the fan-out threshold (500
   members) wrote no per-member feed entries, and `/sync` followed such a room only while the
   user was in it, so a user's own leave, kick or ban from one never reached their client:

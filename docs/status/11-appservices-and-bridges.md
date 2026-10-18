@@ -1,6 +1,7 @@
 # Status: track 11, appservices and bridges
 
-Last updated: 2026-10-15 (Discord's delivery timeouts: a retry is the same transaction, a
+Last updated: 2026-10-18 (the ephemeral pump leaves a room it cannot read out of the pass for
+a minute instead of failing every tick; below); before that 2026-10-15 (Discord's delivery timeouts: a retry is the same transaction, a
 transient failure is retried for a day, transactions carry at most 100 items and shrink when a
 bridge times out, a replay gets a fresh budget, dead letters can be seen and discarded, and the
 health says why; decision 0049; below); before that 2026-10-14, later (an appservice removes its users' devices without
@@ -55,6 +56,30 @@ manager) and an instance's Kubernetes objects say whose bridge they are; before 
 (who has signed in to a bridge; the `cluster` runtime run on kind); before that 2026-09-30
 (ephemeral, to-device and device-list delivery); before that 2026-09-27 (RFC 0017 run against
 the real binary), 2026-09-27 (the bridge manager) and 2026-09-25.
+
+## 2026-10-18 (branch `agent/stuck-room-load`): a room the pump cannot read is left out of the pass, not the whole pass
+
+**Asked**: on the demo, from 23:20 UTC on 2026-10-17 to the roll of this change, every tick of
+the ephemeral pump failed with `could not read a stream ... cannot read the members of
+!BHvcNjOBRwncDQbGOk:codestorm.net: state error: unknown event EventSn#135009` (every ten
+seconds at the backoff's ceiling), so no bridge was sent a receipt, a presence change, a
+to-device message or a device-list change for seventeen hours. The room could not be loaded
+(track 04's 2026-10-18 entry has the cause); the pass asked for its members because a user
+whose presence changed is in it, and the member read's error failed the tick.
+
+**Done** (`crates/hs-appservice/src/ephemeral.rs`, the module docs' "A room that cannot be
+read"): a room whose facts (`EphemeralSource::room_facts`) cannot be read is treated for that
+pass as a room this server does not have -- nothing in it reaches any appservice -- counted in
+`hs_appservice_ephemeral_room_read_failures_total`, logged at `warn` with the room and the
+error, and not asked for again for `ROOM_READ_RETRY_AFTER` (60 s;
+`EphemeralPump::with_room_read_retry_after` for tests). A store or stream error still fails the
+tick as before. Each retry of a room whose load fails is that load again (ten seconds of reads
+on the demo), so the pause matters as much as the delivery.
+
+**Verified**: `a_room_that_cannot_be_read_is_left_out_of_the_pass_and_asked_again_later`: a
+receipt in a readable room is delivered while one in the unreadable room reaches nobody, the
+failure is counted once, the room is not asked for again within the pause and is asked again
+past it, and its receipts flow once it reads. On the demo: see `docs/next-steps.md`.
 
 ## Session 2026-10-15 (branch `agent/discord-delivery-timeouts`): Discord's delivery timeouts were a replay of the 2026-10-12 flood
 

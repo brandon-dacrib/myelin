@@ -41,8 +41,17 @@ static MIGRATIONS: LazyLock<Counter> = LazyLock::new(Counter::default);
 /// resolution, or an explicit-state ingestion). Zero on an open that reads only current state.
 static EVENT_RECORDS_READ: LazyLock<Counter> = LazyLock::new(Counter::default);
 
+/// `hs_state_explicit_state_entries_unknown_total`: entries of an explicit state handed to an
+/// ingestion (`KvStateStore::ingest_in`) that the store had no record of -- events the room
+/// held as rejected, or never fed -- each left out of the state recorded after the event and
+/// logged with the event and room. Nonzero means a room's state has a hole the log names.
+static EXPLICIT_STATE_ENTRIES_UNKNOWN: LazyLock<Counter> = LazyLock::new(Counter::default);
+
 /// A plain copy of the replayed count, for tests that run without a registry.
 static EVENTS_REPLAYED_PLAIN: AtomicU64 = AtomicU64::new(0);
+
+/// A plain copy of the unknown explicit-state entry count, for tests.
+static EXPLICIT_STATE_ENTRIES_UNKNOWN_PLAIN: AtomicU64 = AtomicU64::new(0);
 
 /// Records how long one `open` took.
 pub(crate) fn observe_open(elapsed: Duration) {
@@ -61,6 +70,21 @@ pub(crate) fn count_replayed(n: u64) {
 #[must_use]
 pub fn events_replayed() -> u64 {
     EVENTS_REPLAYED_PLAIN.load(Ordering::Relaxed)
+}
+
+/// Counts `n` explicit-state entries left out of an ingestion because the store had no record
+/// of them (`hs_state_explicit_state_entries_unknown_total`).
+pub(crate) fn count_explicit_state_entries_unknown(n: u64) {
+    if n > 0 {
+        EXPLICIT_STATE_ENTRIES_UNKNOWN.inc_by(n);
+        EXPLICIT_STATE_ENTRIES_UNKNOWN_PLAIN.fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+/// `hs_state_explicit_state_entries_unknown_total` as it stands.
+#[must_use]
+pub fn explicit_state_entries_unknown() -> u64 {
+    EXPLICIT_STATE_ENTRIES_UNKNOWN_PLAIN.load(Ordering::Relaxed)
 }
 
 /// Adjusts the resident event-record gauge by `delta`.
@@ -110,8 +134,8 @@ pub fn event_records_read() -> u64 {
 
 /// Registers this crate's metrics into `registry`: `hs_state_open_seconds`,
 /// `hs_state_events_replayed_total`, `hs_state_resolution_events_cached`,
-/// `hs_state_migrations_total`, `hs_state_event_records_read_total` and
-/// `hs_state_resolution_rows_read_total`.
+/// `hs_state_migrations_total`, `hs_state_event_records_read_total`,
+/// `hs_state_resolution_rows_read_total` and `hs_state_explicit_state_entries_unknown_total`.
 pub fn register_metrics(registry: &mut prometheus_client::registry::Registry) {
     registry.register(
         "hs_state_open_seconds",
@@ -143,6 +167,13 @@ pub fn register_metrics(registry: &mut prometheus_client::registry::Registry) {
         "hs_state_resolution_rows_read",
         "Rows of the state store read inside state resolutions",
         RESOLUTION_ROWS_READ.clone(),
+    );
+    registry.register(
+        "hs_state_explicit_state_entries_unknown",
+        "Entries of an explicit state (a remote join's snapshot, the state fetched for \
+         backfilled history) that the state store had no record of and left out of the state \
+         after the event, each logged at warn with the event and room",
+        EXPLICIT_STATE_ENTRIES_UNKNOWN.clone(),
     );
 }
 

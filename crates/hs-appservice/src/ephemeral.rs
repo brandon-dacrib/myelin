@@ -74,6 +74,18 @@
 //! spun on it for hours. A stream whose last prune found nothing below the same bound is not
 //! asked again until the bound moves.
 //!
+//! # A room that cannot be read
+//!
+//! A pass asks the room source for the members and aliases of every room a receipt is in and
+//! every room of every user whose presence changed. A room the source cannot read (one whose
+//! load from the store fails) is left out of the pass as a room this server does not have --
+//! nothing in it is sent to anyone -- counted (`hs_appservice_ephemeral_room_read_failures_total`),
+//! logged with the room and the error, and not asked for again for [`ROOM_READ_RETRY_AFTER`].
+//! Until 2026-10-18 the read's error failed the tick: on the demo one room that could not be
+//! loaded (`docs/status/04-room-and-events.md`, 2026-10-18) failed every tick for seventeen
+//! hours, so no bridge was sent a receipt, a presence change or a to-device message, and the
+//! retry every ten seconds started the room's load (ten seconds of reads) again each time.
+//!
 //! # What runs where
 //!
 //! One task, on the replica that owns the global shard, like the event pump (`hs-cli`'s
@@ -310,6 +322,12 @@ pub struct EphemeralPump<B: KvBackend> {
     wake: Notify,
     /// What the last prunes found, and when a failed one was last logged.
     prune: Mutex<PruneState>,
+    /// Rooms whose facts could not be read, and when: left out of every pass until
+    /// [`EphemeralPump::room_read_retry_after`] has passed (the module docs' "A room that
+    /// cannot be read").
+    unreadable_rooms: Mutex<HashMap<String, Instant>>,
+    /// [`ROOM_READ_RETRY_AFTER`], or what a test set.
+    room_read_retry_after: Duration,
     /// The `hs_appservice_ephemeral_*` counters, if registered.
     metrics: Option<AppserviceMetrics>,
 }
@@ -321,6 +339,10 @@ const PRUNE_WARN_EVERY: Duration = Duration::from_secs(60);
 
 /// The streams a tick prunes, in [`PruneState::clean_below`]'s order.
 const PRUNED_STREAMS: [&str; 3] = [RECEIPTS, PRESENCE, TO_DEVICE];
+
+/// How long a room whose facts could not be read is left out of every pass before it is asked
+/// for again (the module docs' "A room that cannot be read").
+pub const ROOM_READ_RETRY_AFTER: Duration = Duration::from_secs(60);
 
 /// What the pump remembers between prunes.
 #[derive(Debug, Default)]
@@ -382,8 +404,18 @@ impl<B: KvBackend> EphemeralPump<B> {
             links: Mutex::new(Vec::new()),
             wake: Notify::new(),
             prune: Mutex::new(PruneState::default()),
+            unreadable_rooms: Mutex::new(HashMap::new()),
+            room_read_retry_after: ROOM_READ_RETRY_AFTER,
             metrics: None,
         }
+    }
+
+    /// Asks again for a room whose facts could not be read after `after` rather than
+    /// [`ROOM_READ_RETRY_AFTER`] (for tests).
+    #[must_use]
+    pub fn with_room_read_retry_after(mut self, after: Duration) -> Self {
+        self.room_read_retry_after = after;
+        self
     }
 
     /// Counts what the pump prunes from the streams, and the prunes that failed, into
@@ -488,7 +520,7 @@ impl<B: KvBackend> EphemeralPump<B> {
         // Typing: each noted room's current set, once, to whoever is interested.
         if !ephemeral.is_empty() {
             for room_id in &typing_rooms {
-                let Some(facts) = room_facts(source, &mut facts_cache, room_id).await? else {
+                let Some(facts) = self.room_facts(&mut facts_cache, room_id).await? else {
                     continue;
                 };
                 let users = source
@@ -642,7 +674,7 @@ impl<B: KvBackend> EphemeralPump<B> {
                 }
                 let mut users: BTreeSet<String> = BTreeSet::from([listener.bot_user_id.clone()]);
                 for room_id in &build.rooms {
-                    if let Some(facts) = room_facts(source, &mut facts_cache, room_id).await? {
+                    if let Some(facts) = self.room_facts(&mut facts_cache, room_id).await? {
                         users.extend(
                             facts
                                 .joined_members
@@ -795,7 +827,7 @@ impl<B: KvBackend> EphemeralPump<B> {
                 }
                 let interest = listener.interest();
                 for (room_id, changes) in &by_room {
-                    let Some(facts) = room_facts(source, facts_cache, room_id).await? else {
+                    let Some(facts) = self.room_facts(facts_cache, room_id).await? else {
                         continue;
                     };
                     if !interest.room(room_id, facts) {
@@ -984,7 +1016,7 @@ impl<B: KvBackend> EphemeralPump<B> {
             .await
             .map_err(AppserviceError::Store)?
         {
-            if let Some(facts) = room_facts(self.source.as_ref(), facts_cache, &room_id).await?
+            if let Some(facts) = self.room_facts(facts_cache, &room_id).await?
                 && interest.room(&room_id, facts)
             {
                 return Ok(true);
@@ -994,20 +1026,67 @@ impl<B: KvBackend> EphemeralPump<B> {
     }
 }
 
-/// `room_id`'s facts, read once per tick.
-async fn room_facts<'c>(
-    source: &dyn EphemeralSource,
-    cache: &'c mut HashMap<String, Option<RoomFacts>>,
-    room_id: &str,
-) -> Result<Option<&'c RoomFacts>, AppserviceError> {
-    if !cache.contains_key(room_id) {
-        let facts = source
-            .room_facts(room_id)
-            .await
-            .map_err(AppserviceError::Store)?;
-        cache.insert(room_id.to_owned(), facts);
+impl<B: KvBackend> EphemeralPump<B> {
+    /// `room_id`'s facts, read once per tick: `None` for a room this server does not have, and
+    /// for one whose facts cannot be read (the module docs' "A room that cannot be read").
+    async fn room_facts<'c>(
+        &self,
+        cache: &'c mut HashMap<String, Option<RoomFacts>>,
+        room_id: &str,
+    ) -> Result<Option<&'c RoomFacts>, AppserviceError> {
+        if !cache.contains_key(room_id) {
+            let facts = if self.room_is_quarantined(room_id) {
+                None
+            } else {
+                match self.source.room_facts(room_id).await {
+                    Ok(facts) => facts,
+                    Err(error) => {
+                        self.quarantine_room(room_id, &error);
+                        None
+                    }
+                }
+            };
+            cache.insert(room_id.to_owned(), facts);
+        }
+        Ok(cache.get(room_id).and_then(Option::as_ref))
     }
-    Ok(cache.get(room_id).and_then(Option::as_ref))
+
+    /// Whether `room_id`'s facts failed to read within the last
+    /// [`EphemeralPump::room_read_retry_after`]; one past that is forgotten, to be asked again.
+    fn room_is_quarantined(&self, room_id: &str) -> bool {
+        let mut unreadable = self
+            .unreadable_rooms
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match unreadable.get(room_id) {
+            Some(since) if since.elapsed() < self.room_read_retry_after => true,
+            Some(_) => {
+                unreadable.remove(room_id);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Leaves `room_id` out of every pass for [`EphemeralPump::room_read_retry_after`], and
+    /// says so.
+    fn quarantine_room(&self, room_id: &str, error: &str) {
+        self.unreadable_rooms
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(room_id.to_owned(), Instant::now());
+        if let Some(metrics) = &self.metrics {
+            metrics.ephemeral_room_read_failures_total.inc();
+        }
+        tracing::warn!(
+            room_id,
+            error,
+            retry_after_secs = self.room_read_retry_after.as_secs(),
+            "an ephemeral pass could not read a room's members; nothing in it reaches any \
+             appservice, and it is not asked for again until the pause is over \
+             (hs_appservice_ephemeral_room_read_failures_total)"
+        );
+    }
 }
 
 /// MSC3202's `device_one_time_keys_count` and `device_unused_fallback_key_types` for `users`:
@@ -1069,6 +1148,10 @@ mod tests {
         failing_prunes: std::sync::atomic::AtomicBool,
         /// How many prunes were asked for.
         prune_calls: std::sync::atomic::AtomicUsize,
+        /// Rooms whose facts fail to read, as a room whose load fails does.
+        unreadable_rooms: Mutex<std::collections::HashSet<String>>,
+        /// How often the facts of each room were asked for.
+        facts_asked: Mutex<HashMap<String, usize>>,
     }
 
     impl Fake {
@@ -1249,6 +1332,17 @@ mod tests {
             Ok(self.presence_content.lock().unwrap().get(user_id).cloned())
         }
         async fn room_facts(&self, room_id: &str) -> Result<Option<RoomFacts>, String> {
+            *self
+                .facts_asked
+                .lock()
+                .unwrap()
+                .entry(room_id.to_owned())
+                .or_default() += 1;
+            if self.unreadable_rooms.lock().unwrap().contains(room_id) {
+                return Err(format!(
+                    "internal error: state error: unknown event EventSn#135009 ({room_id})"
+                ));
+            }
             Ok(self.rooms.lock().unwrap().get(room_id).cloned())
         }
         async fn joined_rooms_of(&self, user_id: &str) -> Result<Vec<String>, String> {
@@ -1476,6 +1570,75 @@ mod tests {
         // ...and the streams were pruned below them.
         assert!(fake.receipts_since(0, 10).await.unwrap().is_empty());
         assert!(fake.presence_since(0, 10).await.unwrap().is_empty());
+    }
+
+    /// A room whose facts cannot be read (the demo, 2026-10-17: a room whose load from the
+    /// store failed, for seventeen hours) does not fail the tick: what is in it reaches nobody,
+    /// the rest of the pass is queued, the failure is counted, and the room is not asked for
+    /// again until the pause is over.
+    #[tokio::test]
+    async fn a_room_that_cannot_be_read_is_left_out_of_the_pass_and_asked_again_later() {
+        let (registry, fake, pump) = setup(&[BRIDGE]);
+        let metrics = AppserviceMetrics::default();
+        let pump = pump
+            .with_metrics(metrics.clone())
+            .with_room_read_retry_after(Duration::from_millis(200));
+        fake.room(
+            "!bridged:example.org",
+            &["@alice:example.org", "@irc_bob:example.org"],
+        );
+        fake.room(
+            "!stuck:example.org",
+            &["@alice:example.org", "@irc_bob:example.org"],
+        );
+        fake.unreadable_rooms
+            .lock()
+            .unwrap()
+            .insert("!stuck:example.org".to_owned());
+        assert!(pump.tick().await.unwrap().is_empty());
+
+        // A receipt in each room: the bridged one is delivered, the stuck one reaches nobody.
+        fake.receipt("!stuck:example.org", "@alice:example.org", "m.read", "$s");
+        fake.receipt(
+            "!bridged:example.org",
+            "@alice:example.org",
+            "m.read",
+            "$one",
+        );
+        assert_eq!(pump.tick().await.unwrap(), vec!["irc".to_owned()]);
+        let bodies = queued(&registry, "irc");
+        assert_eq!(bodies.len(), 1, "{bodies:?}");
+        let ephemeral = bodies[0]["ephemeral"].as_array().unwrap();
+        assert_eq!(ephemeral.len(), 1, "{ephemeral:?}");
+        assert_eq!(ephemeral[0]["room_id"], "!bridged:example.org");
+        assert_eq!(metrics.ephemeral_room_read_failures_total.get(), 1);
+        let asked = |room: &str| {
+            fake.facts_asked
+                .lock()
+                .unwrap()
+                .get(room)
+                .copied()
+                .unwrap_or(0)
+        };
+        assert_eq!(asked("!stuck:example.org"), 1);
+
+        // Within the pause, the stuck room is not asked for again, and nothing of it is sent.
+        fake.receipt("!stuck:example.org", "@alice:example.org", "m.read", "$t");
+        assert!(pump.tick().await.unwrap().is_empty());
+        assert_eq!(asked("!stuck:example.org"), 1);
+        assert_eq!(metrics.ephemeral_room_read_failures_total.get(), 1);
+
+        // Past it, it is asked again; readable by then, its receipts flow.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        fake.unreadable_rooms.lock().unwrap().clear();
+        fake.receipt("!stuck:example.org", "@alice:example.org", "m.read", "$u");
+        assert_eq!(pump.tick().await.unwrap(), vec!["irc".to_owned()]);
+        assert_eq!(asked("!stuck:example.org"), 2);
+        let bodies = queued(&registry, "irc");
+        assert_eq!(bodies.len(), 2, "{bodies:?}");
+        let ephemeral = bodies[1]["ephemeral"].as_array().unwrap();
+        assert_eq!(ephemeral[0]["room_id"], "!stuck:example.org");
+        assert_eq!(metrics.ephemeral_room_read_failures_total.get(), 1);
     }
 
     /// A prune the store refuses (the demo, 2026-10-14: more than 10,000 entries below the

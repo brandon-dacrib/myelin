@@ -59,6 +59,10 @@
 //!   ([`crate::ephemeral`]) deleted from the `receipts`, `presence` and `to_device` streams once
 //!   every appservice had been sent them, and prunes of a stream that failed (each is retried on
 //!   the next tick). Failures that keep climbing mean a stream is growing without bound.
+//! - `hs_appservice_ephemeral_room_read_failures_total`: rooms whose members an ephemeral pass
+//!   could not read (a room whose load from the store fails), each left out of the pass for a
+//!   minute and logged with the room and the error. Nonzero names a room `hs_room_load_failures_total`
+//!   and the room registry's error log say more about.
 //!
 //! `appservice` is the registration id: bounded by how many bridges an operator runs, and what
 //! the operator looks at the numbers by.
@@ -184,6 +188,8 @@ pub struct AppserviceMetrics {
     pub ephemeral_pruned_total: Family<EphemeralStreamLabels, Counter>,
     /// `hs_appservice_ephemeral_prune_failures_total{stream}`.
     pub ephemeral_prune_failures_total: Family<EphemeralStreamLabels, Counter>,
+    /// `hs_appservice_ephemeral_room_read_failures_total`.
+    pub ephemeral_room_read_failures_total: Counter,
 }
 
 impl Default for AppserviceMetrics {
@@ -201,6 +207,7 @@ impl Default for AppserviceMetrics {
             queries_total: Family::default(),
             ephemeral_pruned_total: Family::default(),
             ephemeral_prune_failures_total: Family::default(),
+            ephemeral_room_read_failures_total: Counter::default(),
         }
     }
 }
@@ -284,6 +291,13 @@ impl AppserviceMetrics {
             "Prunes of an appservice ephemeral stream (receipts, presence, to_device) that \
              failed; the next tick tries again",
             metrics.ephemeral_prune_failures_total.clone(),
+        );
+        registry.register(
+            "hs_appservice_ephemeral_room_read_failures",
+            "Rooms whose members an appservice ephemeral pass could not read (a room whose \
+             load from the store fails): each left out of the pass for a minute, logged at \
+             warn with the room and the error",
+            metrics.ephemeral_room_read_failures_total.clone(),
         );
         metrics
     }

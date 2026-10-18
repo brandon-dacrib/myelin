@@ -698,3 +698,231 @@ fn state_before_an_event_does_not_include_it() {
             .is_none()
     );
 }
+
+/// A copy of `template` (one of the resident's state events) re-sent as `sender`, citing
+/// `auth_events` and following `prev`, its content kept: a state event no honest server would
+/// have built.
+fn forged_state(template: &Event, sender: &str, auth_events: &[&Event], prev: &Event) -> Event {
+    let mut json: serde_json::Value =
+        serde_json::from_slice(template.canonical_bytes()).expect("json");
+    let object = json.as_object_mut().expect("an object");
+    object.insert("sender".to_owned(), json!(sender));
+    object.insert(
+        "auth_events".to_owned(),
+        json!(
+            auth_events
+                .iter()
+                .map(|e| e.event_id().to_string())
+                .collect::<Vec<_>>()
+        ),
+    );
+    object.insert(
+        "prev_events".to_owned(),
+        json!([prev.event_id().to_string()]),
+    );
+    object.insert("depth".to_owned(), json!(prev.header().depth + 1));
+    Event::parse(&json, RoomVersionId::V11).expect("a well-formed event")
+}
+
+/// The joiner, holding a topic event by eve -- who was never in the room -- as rejected: sent
+/// over federation, refused by the auth rules, kept the way Synapse keeps one.
+fn joiner_holding_a_rejected_topic(resident: &Resident) -> (Joiner, Event) {
+    let mut joiner = joiner(resident);
+    let create = state_event(resident, "m.room.create");
+    let power_levels = state_event(resident, "m.room.power_levels");
+    let eve_topic = forged_state(
+        &resident.second_topic,
+        "@eve:a.example",
+        &[create, power_levels],
+        &resident.join,
+    );
+    let refused = joiner.actor.accept_remote_event(eve_topic.clone());
+    assert!(
+        matches!(refused, Err(hs_room::error::RoomError::Forbidden(_))),
+        "eve is not in the room: {refused:?}"
+    );
+    assert!(
+        joiner.actor.event_by_id(eve_topic.event_id()).is_none(),
+        "a rejected event is hidden from every read"
+    );
+    (joiner, eve_topic)
+}
+
+/// The demo, 2026-10-17: another server's `/state_ids` answer for a batch's oldest event
+/// named an event this server held as rejected. The rejected event is no part of any state
+/// and was never fed to the state store, so the snapshot naming it was refused whole once the
+/// placed history's rows were committed, and the room could not be loaded again. Now the
+/// fetched state leaves it out, the batch is placed with the resident's state at every event,
+/// and the room reloads.
+#[test]
+fn a_fetched_state_naming_an_event_held_as_rejected_is_placed_without_it() {
+    let resident = resident();
+    let (mut joiner, eve_topic) = joiner_holding_a_rejected_topic(&resident);
+    let batch = resident_backfill(&resident, &resident.join, 6);
+    let plan = joiner
+        .actor
+        .plan_history(HistoryKind::BeforeOldest, &batch)
+        .expect("plan")
+        .expect("something to place");
+    let mut fetched = fetch_state(&resident, &joiner, &plan);
+    fetched.state_ids.push(eve_topic.event_id().to_owned());
+
+    let outcome = joiner
+        .actor
+        .accept_history(HistoryKind::BeforeOldest, batch.clone(), Some(fetched))
+        .expect("the batch is placed although the fetched state names a rejected event");
+    assert_eq!(outcome.state, StateSource::Fetched);
+    assert_eq!(outcome.added, 5);
+    for event in batch.iter().skip(1) {
+        let state = state_ids(&joiner.actor, event.event_id());
+        assert!(
+            !state.contains(eve_topic.event_id()),
+            "the rejected topic is no part of the state at {}",
+            event.event_id()
+        );
+        assert_eq!(
+            state,
+            state_ids(&resident.actor, event.event_id()),
+            "state at {}",
+            event.event_id()
+        );
+    }
+    drop(joiner.actor);
+
+    let reloaded = RoomActor::load(
+        joiner.backend.clone(),
+        joiner.tables.clone(),
+        joiner.identity.clone(),
+        &resident.room_id,
+    )
+    .expect("the room loads")
+    .expect("the room exists");
+    for event in batch.iter().skip(1) {
+        assert_eq!(
+            state_ids(&reloaded, event.event_id()),
+            state_ids(&resident.actor, event.event_id()),
+            "state at {} after reload",
+            event.event_id()
+        );
+    }
+}
+
+/// The rows the demo was left with (2026-10-17 22:21 UTC): placed history whose state rows
+/// name an event the state store has no record of, and the store never fed those events
+/// (`place_history` feeds it after the rows commit). Every load fed them again from their
+/// state rows and was refused the same way, so the room could not be loaded for seventeen
+/// hours. Now the load leaves the unknown entry out, counts it, and the room is read as it was.
+#[test]
+fn a_room_whose_placed_history_names_an_event_the_store_never_recorded_loads() {
+    use hs_kv::{KvBackend, KvRead, KvWrite, RangeSpec, TransactConfig, transact};
+
+    let resident = resident();
+    let mut joiner = joiner(&resident);
+    let batch = resident_backfill(&resident, &resident.join, 6);
+    let plan = joiner
+        .actor
+        .plan_history(HistoryKind::BeforeOldest, &batch)
+        .expect("plan")
+        .expect("something to place");
+    let fetched = fetch_state(&resident, &joiner, &plan);
+    joiner
+        .actor
+        .accept_history(HistoryKind::BeforeOldest, batch.clone(), Some(fetched))
+        .expect("placed");
+    let expected: Vec<_> = batch
+        .iter()
+        .map(|event| state_ids(&joiner.actor, event.event_id()))
+        .collect();
+    drop(joiner.actor);
+
+    // Every state record gone, as a crash between the rows' commit and the store's feeding
+    // leaves the placed events, and the state row of one placed event naming an event that
+    // was never recorded anywhere.
+    let placed = &resident.after[0];
+    let snapshot = joiner.backend.snapshot();
+    let room_sn = joiner
+        .tables
+        .room_sn
+        .lookup(&snapshot, resident.room_id.as_bytes())
+        .expect("lookup")
+        .expect("the room is interned");
+    let placed_sn = joiner
+        .tables
+        .event_sn
+        .lookup(&snapshot, placed.event_id().as_bytes())
+        .expect("lookup")
+        .expect("the event is interned");
+    let row = joiner
+        .tables
+        .state_snapshots
+        .get(&snapshot, &(room_sn, placed_sn))
+        .expect("read")
+        .expect("a placed event has a state row");
+    let mut state = hs_room::persist::decode_event_sns(row.as_ref()).expect("a state row");
+    state.push(hs_model::EventSn::new(135_009));
+    drop(snapshot);
+    transact(&joiner.backend, TransactConfig::default(), |txn| {
+        joiner
+            .tables
+            .state_snapshots
+            .put(
+                txn,
+                &(room_sn, placed_sn),
+                &hs_room::persist::encode_event_sns(&state),
+            )
+            .map_err(|e| hs_kv::KvError::Aborted(Box::new(std::io::Error::other(e.to_string()))))
+    })
+    .expect("row rewritten");
+    for name in hs_state::durable::ALL_KEYSPACES {
+        let keyspace = joiner.backend.keyspace(name).expect("a keyspace");
+        let keys: Vec<Vec<u8>> = joiner
+            .backend
+            .snapshot()
+            .range(&keyspace, RangeSpec::full())
+            .map(|item| item.expect("a row").0.to_vec())
+            .collect();
+        for chunk in keys.chunks(1_000) {
+            let mut txn = joiner.backend.begin().expect("begin");
+            for key in chunk {
+                txn.delete(&keyspace, key).expect("delete");
+            }
+            joiner
+                .backend
+                .commit(txn)
+                .expect("commit")
+                .expect("no conflict");
+        }
+    }
+
+    let unknown_before = hs_state::metrics::explicit_state_entries_unknown();
+    let reloaded = RoomActor::load(
+        joiner.backend.clone(),
+        joiner.tables.clone(),
+        joiner.identity.clone(),
+        &resident.room_id,
+    )
+    .expect("the room loads over the rows the demo was left with")
+    .expect("the room exists");
+    assert!(
+        hs_state::metrics::explicit_state_entries_unknown() > unknown_before,
+        "the unknown entry is counted"
+    );
+    for (event, expected) in batch.iter().zip(&expected) {
+        assert_eq!(
+            &state_ids(&reloaded, event.event_id()),
+            expected,
+            "state at {} after the reload",
+            event.event_id()
+        );
+    }
+    assert_eq!(
+        reloaded
+            .membership_list()
+            .expect("members")
+            .iter()
+            .filter(|(_, membership)| membership == "join")
+            .count(),
+        2,
+        "alice and bob are joined"
+    );
+}

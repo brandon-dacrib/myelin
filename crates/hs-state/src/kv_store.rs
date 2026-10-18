@@ -79,6 +79,9 @@ pub enum KvStoreError<E: std::error::Error + Send + Sync + 'static> {
     #[error(transparent)]
     Durable(#[from] DurableError),
     /// [`StateStore::state_at`] was called for an event this store has not ingested.
+    ///
+    /// Until 2026-10-18 an ingestion with an explicit state naming such an event was refused
+    /// with this too; now the entry is left out of the state ([`KvStateStore::ingest_in`]).
     #[error("unknown event {0}")]
     UnknownEvent(EventSn),
     /// [`StateStore::resolve`] was called with no forks.
@@ -313,12 +316,22 @@ impl<R: StateRepr, KV: KvBackend> KvStateStore<R, KV> {
     /// several (exactly [`crate::store::InMemoryStateStore::add_event`]). With
     /// `Some(state)`, it is instead `state`, the complete list of events -- one per
     /// `(event_type, state_key)` -- that make up the room's resolved state immediately before
-    /// the event, every entry of which must already have been ingested (by any ingestion
-    /// method, in any order; its key is read back from what was recorded then). That is what a
-    /// room bootstrapped from a federation `send_join` response needs
+    /// the event, each entry of which is expected to have been ingested already (by any
+    /// ingestion method, in any order; its key is read back from what was recorded then). That
+    /// is what a room bootstrapped from a federation `send_join` response needs
     /// (`docs/rfcs/0015-outbound-join-needs-a-room-bootstrap-api.md`): the resident's `state`
     /// *is* the state before the join, and `prev_events` (recorded, but playing no part in the
     /// state) are events this server does not hold.
+    ///
+    /// An entry of `state` this store has no record of is left out of the state, counted
+    /// (`hs_state_explicit_state_entries_unknown_total`) and logged with the event and the
+    /// room: its key cannot even be known. Until 2026-10-18 such an entry refused the whole
+    /// ingestion (`KvStoreError::UnknownEvent`), which wedged a room for good on the demo: a
+    /// backfill's fetched state named an event the room held as rejected (never fed here), the
+    /// room's rows for the placed history were committed before the store was fed, and every
+    /// load after that fed them again and was refused the same way (`docs/status/04-room-and-events.md`,
+    /// 2026-10-18). A state with a hole in it is read as the store reads every root: an entry
+    /// it has no record of is skipped.
     ///
     /// Ingesting an event this store already holds recomputes and overwrites its rows with the
     /// same values, and counts as a replay (`hs_state_events_replayed_total`).
@@ -327,10 +340,9 @@ impl<R: StateRepr, KV: KvBackend> KvStateStore<R, KV> {
     /// next read of what it wrote fills the caches from the committed rows.
     ///
     /// # Errors
-    /// Returns [`KvStoreError::UnknownEvent`] naming the first entry of `explicit_state` this
-    /// store has not ingested (nothing is written in that case), [`KvStoreError::Repr`] if the
-    /// representation fails, [`KvStoreError::Durable`] on a storage failure, or
-    /// [`KvStoreError::StateRes`] if resolving several `prev_events` fails.
+    /// Returns [`KvStoreError::Repr`] if the representation fails, [`KvStoreError::Durable`]
+    /// on a storage failure, or [`KvStoreError::StateRes`] if resolving several `prev_events`
+    /// fails.
     pub fn ingest_in(
         &self,
         txn: &mut KV::Txn,
@@ -574,16 +586,30 @@ impl<R: StateRepr, KV: KvBackend> KvStateStore<R, KV> {
         }
         let mut writer = Writer::new(&self.tables, txn, &self.caches);
 
-        // The state before the event, computed before anything is written so an unknown
-        // explicit-state entry leaves the store untouched.
+        // The state before the event, computed before anything is written.
         let state_before = match explicit_state {
             Some(state) => {
                 let mut added = BTreeMap::new();
+                let mut unknown: Vec<EventSn> = Vec::new();
                 for &sn in state {
-                    let (_, key) = writer
-                        .position_of(sn)?
-                        .ok_or(KvStoreError::UnknownEvent(sn))?;
-                    added.insert(key, sn);
+                    match writer.position_of(sn)? {
+                        Some((_, key)) => {
+                            added.insert(key, sn);
+                        }
+                        None => unknown.push(sn),
+                    }
+                }
+                if !unknown.is_empty() {
+                    crate::metrics::count_explicit_state_entries_unknown(unknown.len() as u64);
+                    tracing::warn!(
+                        room_id = %event.room_id,
+                        event_id = %event.event_id,
+                        unknown = ?unknown,
+                        of = state.len(),
+                        "the explicit state before an event names events this state store has \
+                         no record of (held as rejected, or never fed); the state after it is \
+                         recorded without them (hs_state_explicit_state_entries_unknown_total)"
+                    );
                 }
                 if added.is_empty() {
                     self.repr.empty_root()
@@ -1384,8 +1410,10 @@ mod tests {
             )
             .unwrap();
 
-        // An unknown snapshot entry is refused before anything is recorded.
-        let err = store
+        // A snapshot entry this store has no record of (an event held as rejected, or never
+        // fed) is left out: the state after the event holds the rest, and the hole is counted.
+        let unknown_before = crate::metrics::explicit_state_entries_unknown();
+        let with_hole = store
             .add_event_with_state(
                 EventSn::new(4),
                 EventId::parse("$4:hs2").unwrap(),
@@ -1406,14 +1434,15 @@ mod tests {
                     EventSn::new(42),
                 ],
             )
-            .unwrap_err();
-        assert!(matches!(err, KvStoreError::UnknownEvent(sn) if sn == EventSn::new(42)));
-        assert!(matches!(
-            store.state_at(EventSn::new(4)),
-            Err(KvStoreError::UnknownEvent(_))
-        ));
+            .unwrap();
+        assert_eq!(
+            crate::metrics::explicit_state_entries_unknown() - unknown_before,
+            1,
+            "the hole is counted"
+        );
+        assert_eq!(store.state_at(EventSn::new(4)).unwrap(), with_hole);
 
-        // The join, with the snapshot as its explicit state; its prev event ($999) is unknown.
+        // The join again, with the snapshot complete: the same state (the hole was nothing).
         let root = store
             .add_event_with_state(
                 EventSn::new(4),

@@ -683,14 +683,27 @@ impl<B: KvBackend> RoomActor<B> {
 
     /// `ids` as a [`StateMap`], from the events held for them. An ID not held (a fetch that
     /// failed, an event that failed authorization) or not a state event is left out, with a
-    /// warning naming how many.
+    /// warning naming how many. So is an event this server holds as rejected
+    /// (`super::rejected`): it is no part of any state, and the state store was never fed it,
+    /// so a snapshot naming it was refused whole until 2026-10-18 -- on the demo, a
+    /// `/state_ids` answer from another server named a member event this server had rejected,
+    /// the placed history's rows were committed with that snapshot, and the room could not be
+    /// loaded again (`docs/status/04-room-and-events.md`, 2026-10-18).
     fn state_map_from_ids(&self, ids: &[OwnedEventId]) -> StateMap {
         let mut state = StateMap::new();
         let mut absent = 0usize;
+        let mut rejected: Vec<&OwnedEventId> = Vec::new();
         for id in ids {
+            let Some(sn) = self.sn_of(id) else {
+                absent += 1;
+                continue;
+            };
+            if self.rejected.contains(&sn) {
+                rejected.push(id);
+                continue;
+            }
             match self
-                .sn_of(id)
-                .and_then(|sn| self.event_uncached(sn))
+                .event_uncached(sn)
                 .and_then(|event| state_key_of(event).map(|key| (key, event)))
             {
                 Some((key, event)) => {
@@ -704,6 +717,13 @@ impl<B: KvBackend> RoomActor<B> {
                 room_id = %self.room_id,
                 absent,
                 "state entries a server named are not held; the state at backfilled events lacks them"
+            );
+        }
+        if !rejected.is_empty() {
+            tracing::warn!(
+                room_id = %self.room_id,
+                rejected = ?rejected,
+                "state entries a server named are events this server holds as rejected; the state at backfilled events leaves them out"
             );
         }
         state

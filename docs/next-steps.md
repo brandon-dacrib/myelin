@@ -1,8 +1,34 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-10-17 (a member's own leave from a hot room reached nobody; `agent/hot-room-leave`. Before: v0.3.28 on the demo; the server reports the release it is, not the line; `agent/release-version-string`. Before: the soft-fail check resolved one fork per prev event; `agent/soft-fail-forks`. Before: forked rooms are merged and pruned, and a resolution reads about the room once however many forks; `agent/extremity-merge`. Before: the hub's members step and the idle CPU were repeated state resolutions; `agent/hub-members-step`. Before: handover: the demo, the releases and what is next, below. Before: test servers are handed their ports still bound; `agent/test-port-races`. Before: room loads and unloading; `agent/room-load-speed`. Before: the Slack bridge's full volume; fix on `agent/bridge-volume-size`. Before: Discord's delivery timeouts were a replay of the 2026-10-12 flood; fix on `agent/discord-delivery-timeouts`. Before: the memory climb with federation on; fix on `agent/fed-memory-growth`. Before: the session hub wedge; fix on `agent/hub-wedge`. Earlier: the ephemeral pump's prune busy loop; fix on `agent/ephemeral-prune`). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+Written 2026-09-20 by the integration lead, last revised 2026-10-18 (a room whose placed history named a rejected event could not be loaded, and the ephemeral pump failed on it for seventeen hours; `agent/stuck-room-load`. Before: a member's own leave from a hot room reached nobody; `agent/hot-room-leave`. Before: v0.3.28 on the demo; the server reports the release it is, not the line; `agent/release-version-string`. Before: the soft-fail check resolved one fork per prev event; `agent/soft-fail-forks`. Before: forked rooms are merged and pruned, and a resolution reads about the room once however many forks; `agent/extremity-merge`. Before: the hub's members step and the idle CPU were repeated state resolutions; `agent/hub-members-step`. Before: handover: the demo, the releases and what is next, below. Before: test servers are handed their ports still bound; `agent/test-port-races`. Before: room loads and unloading; `agent/room-load-speed`. Before: the Slack bridge's full volume; fix on `agent/bridge-volume-size`. Before: Discord's delivery timeouts were a replay of the 2026-10-12 flood; fix on `agent/discord-delivery-timeouts`. Before: the memory climb with federation on; fix on `agent/fed-memory-growth`. Before: the session hub wedge; fix on `agent/hub-wedge`. Earlier: the ephemeral pump's prune busy loop; fix on `agent/ephemeral-prune`). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
+
+## 2026-10-18 -- a room whose placed history named a rejected event could not be loaded again; the branch is `agent/stuck-room-load`
+
+The ephemeral pump's error of the 17th (`unknown event EventSn#135009`, every ten seconds
+since 23:20 UTC) was a room that could not be loaded: a gap backfill at 22:21 had fetched the
+state at a batch's oldest event from `codestorm.net`, the answer named an event this server
+held as rejected (never fed to the state store), `place_history` committed the placed
+events' rows and then had the store refuse the first event's explicit state, and when the
+owner's live change to `server.rooms` at 23:20 unloaded the room, every reload replayed those
+rows and was refused the same way. Every read of the room failed for seventeen hours -- the
+pump's member read (so no bridge got receipts, presence or to-device messages), the admin
+API's destination rows, `/sync`, and every PDU for the room was dropped as "a room this server
+does not know" -- and nothing in the log named the room. Now a fetched state leaves rejected
+events out; the state store records an explicit state with an unknown entry left out
+(`hs_state_explicit_state_entries_unknown_total`, a `warn` naming the room, the event and the
+entries); the registry logs a failed load at `error` with the room and counts it
+(`hs_room_load_failures_total`); the pump leaves a room it cannot read out of the pass for a
+minute (`hs_appservice_ephemeral_room_read_failures_total`) instead of failing every tick; and
+the destination sharing leaves such a room out. `docs/status/04-room-and-events.md` and
+`docs/status/11-appservices-and-bridges.md`, the 2026-10-18 entries. **Left:**
+`place_history` still feeds the state store after its rows commit (a load repairs what a
+failed feed leaves, and the feed can no longer be refused for an unknown entry); feeding
+inside the rows' transaction, as `persist` does (RFC 0025 item 5), is the right shape for a
+session with time to test batch-mate ordering in one transaction. **On the demo:** to roll;
+the room loads on the first read after the roll (the `warn` names the hole), the pump's
+error stops, and the codestorm room's PDUs are accepted again.
 
 ## 2026-10-17 -- a member's own leave from a hot room reached nobody; the branch is `agent/hot-room-leave`
 
@@ -28,7 +54,7 @@ appservice ephemeral pump logs `could not read a stream ... cannot read the memb
 !BHvcNjOBRwncDQbGOk:codestorm.net: state error: unknown event EventSn#135009` every ten
 seconds (381 lines in an hour, still after the roll): one room's member read fails on a
 missing event, and the pump's whole stream read fails with it, so no bridge gets receipts
-or presence until it is fixed. **Next**: that.
+or presence until it is fixed. Fixed on the 18th (`agent/stuck-room-load`, above).
 
 ## 2026-10-16, night -- CD's kind smokes no longer let the kubelet pull a helper image; the branch is `agent/smoke-helper-images`
 
