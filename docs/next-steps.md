@@ -18,8 +18,17 @@ constant in `hs-cli`, so the hot path is testable on a room of two. Verified in 
 `hs-room` and against the real binary (`crates/hs-cli/tests/hot_room_leave.rs`);
 `docs/status/05-sync.md`, the 2026-10-17 entry. **Left:** the two rooms the owner already
 left need one "Clear cache and reload" in Element (an initial sync omits left rooms); nothing
-writes the missed entry after the fact. **Next**: roll the demo to the release CD makes of
-this merge.
+writes the missed entry after the fact. **Rolled**: the demo is on v0.4.1 (Helm revision
+38, 00:23 UTC on the 18th), from the session itself: the chart fetched anonymously from
+ghcr's OCI API with `/usr/bin/curl` (Helm's own fetch wants the keychain), digest checked,
+`helm upgrade` from the tarball through the owner's `kubectl proxy`; pods and six bridges
+Ready, `/_matrix/federation/v1/version` says 0.4.1, `fan_out_threshold_members=500` in the
+startup log. **Found on the way, not this change:** since 23:20 UTC on the 0.4.0 pod the
+appservice ephemeral pump logs `could not read a stream ... cannot read the members of
+!BHvcNjOBRwncDQbGOk:codestorm.net: state error: unknown event EventSn#135009` every ten
+seconds (381 lines in an hour, still after the roll): one room's member read fails on a
+missing event, and the pump's whole stream read fails with it, so no bridge gets receipts
+or presence until it is fixed. **Next**: that.
 
 ## 2026-10-16, night -- CD's kind smokes no longer let the kubelet pull a helper image; the branch is `agent/smoke-helper-images`
 
