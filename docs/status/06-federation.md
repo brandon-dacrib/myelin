@@ -1,5 +1,48 @@
 # 06 Federation: status
 
+## 2026-10-19 (branch `agent/interop-ci`): the interop harness passes on CI for the first time -- Synapse no longer takes the work directory, and every image has a fallback
+
+**Asked**: `.github/workflows/interop.yml` had failed every run since it was added on
+2026-10-09 (41 runs, pushes, nightlies and all), while the same script passed 46/46 and 51/51 on
+the owner's desktop. Find why and make the CI leg real.
+
+**Two causes, both of the Linux host, neither of the servers.**
+
+1. **The Synapse image chowns `/data` to 991:991 before it generates or serves** (`start.py`:
+   with no `UID` in the environment and running as root, `ownership = "991:991"`, then
+   `chown ownership data_dir` in `generate` mode and `chown -R ownership /data` in run mode).
+   The script copies the certificates in, runs `generate` to get a signing key, and then writes
+   its own `homeserver.yaml` and `log.yaml` into the same directory; on the runner that write
+   was `Permission denied` on every run (the directory was 991's), the `mv` of the signing key
+   failed silently, and Synapse came up on its own generated configuration, with no TLS
+   listener, so the harness waited out its 120 s and reported `synapse did not come up`. On
+   OrbStack a container's chown of a bind mount is not seen by the macOS side, which is why the
+   desktop never showed it. Now both `docker run`s pass `-e UID=$(id -u) -e GID=$(id -g)`
+   (`SYNAPSE_USER` in `run.sh`), so the chown is to the user who owns the directory already and
+   Synapse runs, through gosu, as that user.
+2. **The nginx image was pulled by `docker run`, anonymously, from one registry with no retry**,
+   and `public.ecr.aws` answered `toomanyrequests: Data limit exceeded` on every run from the
+   16th to the 19th (after the ownership failure, so it was masked until the 16th). The script
+   now pulls every image it runs through `helper_image_pull` from
+   `deploy/helm/hs/ci/helper-image.sh` (the smokes' resolver of 2026-10-16: three attempts,
+   then `mirror.gcr.io`, then Docker Hub, the answer tagged under the original name) before
+   any `docker run`, and stops with the reason if no source has it.
+
+Also: the containers' logs outlive them. `cleanup` writes `docker logs` of Synapse and nginx
+to `$WORKDIR/synapse.log` and `$WORKDIR/nginx.log` before removing them, the workflow uploads
+both with `hs.log`, and a Synapse that does not come up prints the last 60 lines of its log in
+the transcript instead of a `docker logs` command nobody can run after the job.
+
+**Verified**: `workflow_dispatch` of the branch (run 39339244791, 2026-10-19 23:04 UTC,
+`ubuntu-24.04`): **46 / 46 checks pass**, the first green run of the workflow; both images
+pulled at the first attempt that run, so the fallback path was not exercised there (it was, for
+the smokes, on 2026-10-16). Locally on OrbStack the same commit passes 46 / 46 with `UID` and
+`GID` set, and `synapse.log` (922 lines) and `nginx.log` are left beside `hs.log`.
+
+**Left**: the two-replica run (`REPLICAS=2`, 51 checks) is still desktop-only; adding a matrix
+leg with a PostgreSQL service to the workflow is the next step for this file, and the PG image
+now goes through the same resolver when it is asked for.
+
 ## 2026-10-15 (branch `agent/fed-memory-growth`): the memory climb with federation on -- room loads abandoned by callers who gave up, restarted by the next, each still running
 
 **Asked**: the demo, rolled to 0.3.21 at 14:58 UTC with federation on (first time since the

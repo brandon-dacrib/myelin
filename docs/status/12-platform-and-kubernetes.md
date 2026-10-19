@@ -923,7 +923,10 @@ readiness leaves the endpoints within 3 s. Resources unchanged (requests 100m/25
 
 - `.github/workflows/interop.yml`: `tests/federation-synapse/run.sh` on every push to `main`
   that touches crates or the harness, nightly, and by hand (the Synapse image an input); the
-  `results.tsv` as a table in the job summary, the transcript and `hs.log` as artifacts. A
+  `results.tsv` as a table in the job summary, the transcript, `hs.log`, `synapse.log` and
+  `nginx.log` as artifacts. Its first green run was 2026-10-19 (46 / 46; every earlier run
+  failed on the Synapse image's chown of the work directory and then on an ECR data limit,
+  `docs/status/06-federation.md`, the 2026-10-19 entry). A
   workflow of its own, not a `ci` job: Docker, a debug build and a moving upstream.
 - `.github/workflows/bridge-images.yml` (weekly, by hand): `deploy/bridges/check-image-tags.py`
   reads the catalogue's pins out of `crates/hs-admin/src/bridge_types.rs` (read-only) and

@@ -93,7 +93,7 @@ server keeps its key, prints a one-time link back in (`docs/recovery.md`).
 
 | Suite | Result |
 |---|---|
-| Real Synapse 1.162 interop (`tests/federation-synapse/run.sh`) | **46 / 46** checks single-node, **51 / 51** as a two-replica cluster on PostgreSQL (2026-10-09) |
+| Real Synapse interop (`tests/federation-synapse/run.sh`) | **46 / 46** checks single-node on CI against Synapse `latest` (2026-10-19), **51 / 51** as a two-replica cluster on PostgreSQL (2026-10-09) |
 | Complement `csapi` | 383 / 386 assertions, 105 / 106 tests (2026-10-05); the one left is skipped for Synapse and Dendrite too |
 | Complement federation | **316 / 317** assertions, 89 / 90 tests; restricted rooms, invites and knocks 18 / 18 (2026-10-09) |
 | Sytest, whole suite | **754 / 772** (3 failed, 15 skipped); client-server 523 / 534, federation 103 / 105, appservices 22 / 22 (2026-10-09) |
