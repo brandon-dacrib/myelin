@@ -91,5 +91,7 @@ jobs:
             interop-run/results.tsv
             interop-run/transcript.log
             interop-run/myelin/hs.log
+            interop-run/synapse.log
+            interop-run/nginx.log
           if-no-files-found: ignore
           retention-days: 14

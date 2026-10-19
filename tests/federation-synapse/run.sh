@@ -60,11 +60,32 @@ fi
 for tool in curl jq openssl; do
   command -v "$tool" >/dev/null 2>&1 || { echo "SKIP: $tool not found"; exit 0; }
 done
+# Every image is pulled here first, through the smokes' resolver: a `docker run` pulls once,
+# anonymously, from the one registry named, and public.ecr.aws refused the nginx image with
+# "toomanyrequests: Data limit exceeded" on every CI run from 2026-10-16 to 2026-10-19. The
+# resolver retries and falls back to mirror.gcr.io and then Docker Hub, tagging whatever
+# answered under the name below, so the `docker run`s need no change.
+# shellcheck source=deploy/helm/hs/ci/helper-image.sh
+. "$REPO_ROOT/deploy/helm/hs/ci/helper-image.sh"
+for image in "$SYNAPSE_IMAGE" "$NGINX_IMAGE" $([ "$REPLICAS" = 2 ] && echo "$PG_IMAGE"); do
+  helper_image_pull "$image" || { echo "could not pull $image"; exit 1; }
+done
+# The Synapse image runs as root and, unless told whose /data it is, chowns the directory and
+# everything in it to 991:991 before it generates or serves. On a Linux host that took the
+# work directory away from this script: every write of homeserver.yaml and log.yaml after
+# `generate` was "Permission denied", Synapse came up on its own generated configuration
+# without the TLS listener, and no CI run of this harness passed between 2026-10-09 and
+# 2026-10-19. UID and GID name this user instead, so the chown is to the user who owns the
+# directory already and Synapse runs (through gosu) as that user.
+SYNAPSE_USER=(-e UID="$(id -u)" -e GID="$(id -g)")
 
 cleanup() {
   [ "${KEEP:-0}" = "1" ] && { echo "== KEEP=1: leaving containers and $WORKDIR"; return; }
   [ -n "$HS_PID" ] && kill "$HS_PID" 2>/dev/null && wait "$HS_PID" 2>/dev/null
   [ -n "$HS_PID2" ] && kill "$HS_PID2" 2>/dev/null && wait "$HS_PID2" 2>/dev/null
+  # The containers' logs outlive them, next to hs.log, so a CI run keeps them as artifacts.
+  docker logs fed-synapse-synapse > "$WORKDIR/synapse.log" 2>&1 || true
+  docker logs fed-synapse-myelin > "$WORKDIR/nginx.log" 2>&1 || true
   docker rm -f fed-synapse-synapse fed-synapse-myelin fed-synapse-pg >/dev/null 2>&1 || true
   docker network rm fed-synapse >/dev/null 2>&1 || true
 }
@@ -102,7 +123,8 @@ docker network create fed-synapse >/dev/null 2>&1 || true
 cp "$WORKDIR"/pki/{ca.crt,synapse.crt,synapse.key} "$WORKDIR/synapse/"
 if [ ! -f "$WORKDIR/synapse/signing.key" ]; then
   # `generate` writes homeserver.yaml and the signing key; we keep only the key.
-  docker run --rm -v "$WORKDIR/synapse:/data" -e SYNAPSE_SERVER_NAME="$SYN_NAME" -e SYNAPSE_REPORT_STATS=no \
+  docker run --rm -v "$WORKDIR/synapse:/data" "${SYNAPSE_USER[@]}" \
+    -e SYNAPSE_SERVER_NAME="$SYN_NAME" -e SYNAPSE_REPORT_STATS=no \
     "$SYNAPSE_IMAGE" generate >/dev/null 2>&1
   mv "$WORKDIR/synapse"/*.signing.key "$WORKDIR/synapse/signing.key" 2>/dev/null || true
 fi
@@ -153,7 +175,7 @@ root: { level: INFO, handlers: [console] }
 YAML
 docker rm -f fed-synapse-synapse >/dev/null 2>&1 || true
 docker run -d --name fed-synapse-synapse --network fed-synapse \
-  --add-host host.docker.internal:host-gateway \
+  --add-host host.docker.internal:host-gateway "${SYNAPSE_USER[@]}" \
   -p 127.0.0.1:8408:8008 -p 127.0.0.1:8448:8448 \
   -v "$WORKDIR/synapse:/data" "$SYNAPSE_IMAGE" >/dev/null || { echo "synapse did not start"; exit 1; }
 
@@ -248,7 +270,8 @@ if [ "$REPLICAS" = 2 ]; then
   HS_PID2=$!
   wait_for "$MY_CLIENT2/_matrix/client/versions" || { echo "the second replica did not come up; see $WORKDIR/myelin/hs2.log"; exit 1; }
 fi
-wait_for "$SYN_CLIENT/_matrix/client/versions" || { echo "synapse did not come up: docker logs fed-synapse-synapse"; exit 1; }
+wait_for "$SYN_CLIENT/_matrix/client/versions" || {
+  echo "synapse did not come up; the last of its log:"; docker logs --tail 60 fed-synapse-synapse 2>&1 | sed 's/^/    /'; exit 1; }
 
 # ---- helpers ---------------------------------------------------------------------------------
 reg() { # reg <base> <user> -> "<token> <device_id>"
@@ -457,5 +480,5 @@ api "$MY_CLIENT" "$MY_TOK" POST "/join/$(enc "#space:$SYN_NAME")?server_name=$SY
 R=$(api "$MY_CLIENT" "$MY_TOK" POST "/join/$(enc "#restricted:$SYN_NAME")?server_name=$SYN_NAME" '{}'); expect "5 restricted" "Myelin user joins a restricted Synapse room via the space" "$R" "$RESTRICTED"
 
 echo; echo "== results ($RESULTS)"; column -t -s $'\t' "$RESULTS" 2>/dev/null || cat "$RESULTS"
-echo "== logs: $WORKDIR/myelin/hs.log${HS_PID2:+, $WORKDIR/myelin/hs2.log}, docker logs fed-synapse-synapse"
+echo "== logs: $WORKDIR/myelin/hs.log${HS_PID2:+, $WORKDIR/myelin/hs2.log}, $WORKDIR/synapse.log (docker logs fed-synapse-synapse with KEEP=1)"
 grep -q $'\tFAIL\t' "$RESULTS" && exit 1 || exit 0
