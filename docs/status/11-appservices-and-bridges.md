@@ -1,6 +1,7 @@
 # Status: track 11, appservices and bridges
 
-Last updated: 2026-10-18 (the ephemeral pump leaves a room it cannot read out of the pass for
+Last updated: 2026-10-19 (a bridge is no longer sent its own double puppet's receipt back
+when it moved nothing: the Slack read/unread flip; below); before that 2026-10-18 (the ephemeral pump leaves a room it cannot read out of the pass for
 a minute instead of failing every tick; below); before that 2026-10-15 (Discord's delivery timeouts: a retry is the same transaction, a
 transient failure is retried for a day, transactions carry at most 100 items and shrink when a
 bridge times out, a replay gets a fresh budget, dead letters can be seen and discarded, and the
@@ -56,6 +57,28 @@ manager) and an instance's Kubernetes objects say whose bridge they are; before 
 (who has signed in to a bridge; the `cluster` runtime run on kind); before that 2026-09-30
 (ephemeral, to-device and device-list delivery); before that 2026-09-27 (RFC 0017 run against
 the real binary), 2026-09-27 (the bridge manager) and 2026-09-25.
+
+## 2026-10-19 (branch `agent/receipt-no-regress`): the Slack read/unread flip was a receipt loop through the pump
+
+With the Slack bridge running and the official Slack client open elsewhere, a channel
+flipped between read and unread in the official client. The loop: Slack reports a read
+(`channel_marked`) -> mautrix sets the owner's `m.read` as their double puppet
+(`POST /read_markers`) -> the hub wrote it even when the receipt was already there, and the
+write became a receipt stream entry -> the pump sent the bridge the owner's receipt (the
+`fi.mau.double_puppet_source` key mautrix marks its own with is not kept by any receipt body
+here or on Synapse, so the bridge cannot tell its own receipt from the owner's) -> the bridge
+called `conversations.mark` at the receipt's event -> Slack reported the mark -> again. When
+Slack's newest message had no Matrix event (unbridged subtype, a gap), the bridge marked the
+last bridged message before it, every turn moved Slack's marker back over the newer one, and
+the official client flipped. Synapse ignores a receipt that does not move forward, so the
+loop never starts there. Now the hub does too: `SessionHub::set_threaded_receipt` and the
+receipt EDU path drop a receipt at the same or an earlier event before anything is written
+(`hs_user_receipts_ignored_total{reason}`, a `debug` line). Detail and the test in
+`docs/status/05-sync.md`, the 2026-10-19 entry. The pump itself is unchanged: it sends a
+bridge every receipt in its rooms, its own users' and the double puppets' included, as
+Synapse's `get_new_events_as` does. **Left:** verifying on the demo after the roll that
+`hs_user_receipts_ignored_total{reason="same_event"}` climbs with the Slack bridge up and the
+official client open, and that the channel stays read.
 
 ## 2026-10-18 (branch `agent/stuck-room-load`): a room the pump cannot read is left out of the pass, not the whole pass
 

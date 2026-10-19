@@ -1,6 +1,6 @@
 # 05 Sync: status
 
-Last updated: 2026-10-17 (a member's own leave from a hot room reached nobody, below. Then 2026-10-16: the hub's "members and directory entry" step: nine state
+Last updated: 2026-10-19 (a receipt that does not move forward is dropped, as Synapse drops it, below. Then 2026-10-17: a member's own leave from a hot room reached nobody, below. Then 2026-10-16: the hub's "members and directory entry" step: nine state
 resolutions per room update on forked rooms; each set of forks is now resolved once. Then
 2026-10-14: the demo's session hub wedge: one room the hub could not get through stopped every feed; rooms are now fed side by side and a stuck update is named. Then 2026-10-09: the scale 1 -> 2 bug; session 19: wave 2's three named leftovers were already closed by session 17, rechecked on `6e24c2c0`; `event_fields` is applied; a real-binary test for the peeked long-poll. Session 18: two long-polls that never saw their change were a lost
 push-rule write and a membership event that lost to the room's state, not the long-poll. Session 17: a filtered long-poll waits for real news, a fresh
@@ -10,6 +10,46 @@ Session 13: `/joined_rooms` read-your-writes. Session 12: RFC 0018, a non-owner'
 catches up instead of reloading. Session 11, session 10, session 9, session 8, session 7 and
 the integration note follow; sessions 1-6 are preserved unchanged further down.)
 
+
+## 2026-10-19 (branch `agent/receipt-no-regress`): a receipt that does not move forward is dropped
+
+**Seen.** With the demo's Slack bridge running and the official Slack client open on another
+machine, a channel flipped between read and unread in the official client, over and over.
+
+**Cause.** The hub recorded every receipt it was given: the event the user's receipt was
+already at, or one before it, was written again, stamped a new sequence, woke every member,
+went to every other server as an EDU, and became a new entry of the server-wide receipt
+stream the appservice ephemeral pump feeds bridges from. mautrix sets the user's `m.read`
+receipt as their double puppet whenever Slack reports a read (`channel_marked`), is sent that
+receipt back as the user's own (the `fi.mau.double_puppet_source` key it marks it with is
+not something a receipt body carries, here or on Synapse: `ReceiptBody` keeps `thread_id`,
+`/read_markers` keeps the three event IDs), and marks Slack read at the receipt's event
+(`conversations.mark`); Slack reports the mark back; the bridge sets the receipt again; and so
+on forever. When the message Slack named was not one the bridge had a Matrix event for, the
+bridge marked the last bridged message before it, each turn moved Slack's read marker back
+over the newer message, the official client showed the channel unread, re-marked it when it
+had the channel open, and the turn began again. Synapse never starts this: its
+`_insert_linearized_receipt_txn` ignores a receipt whose event's stream ordering is not past
+the current receipt's, so the bridge's repeat write is a no-op there and nothing is echoed.
+
+**Change** (`hs-user`). `SessionHub::set_threaded_receipt` (every client receipt:
+`/receipt`, `/read_markers`) and the receipt arm of `SessionHub::receive_edu` (another
+server's) ask `SessionHub::receipt_advances` first: no receipt of that kind in that thread yet,
+or the new event after the current one in the room's timeline (`RoomActor::timeline_position`
+of each), is news; the same event or an earlier one is not, and nothing happens: no store
+write, no stamp, no wake, no EDU, no stream entry. An event the room does not place (unknown
+here, an outlier) is taken as news, as Synapse takes it. Each kind and each thread is compared
+on its own. What is dropped is logged at `debug` with the room, user, kind, thread, event and
+the event the receipt is at, and counted in `hs_user_receipts_ignored_total{reason}`
+(`same_event`, `older_event`). The importer's `import_receipt` is unchanged (it copies a
+database's final receipts once).
+
+**Verified.** `hub::tests::a_receipt_that_does_not_move_forward_is_ignored`: a receipt at the
+second message, then at the first and at the second again, leaves the receipt, the room's
+sequence and the receipt stream's head where they were; a third message advances it; an event
+the room does not place is accepted; a private receipt at the first message is accepted
+(its own kind). `cargo test -p hs-user` and the gate before the merge. Against the real
+binary and the demo's bridge: after the roll.
 
 ## 2026-10-17 (branch `agent/hot-room-leave`): a member's own leave from a hot room reached nobody
 

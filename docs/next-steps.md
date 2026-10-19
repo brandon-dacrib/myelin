@@ -1,8 +1,28 @@
 # Where this is, and what comes next
 
-Written 2026-09-20 by the integration lead, last revised 2026-10-18 (a room whose placed history named a rejected event could not be loaded, and the ephemeral pump failed on it for seventeen hours; `agent/stuck-room-load`. Before: a member's own leave from a hot room reached nobody; `agent/hot-room-leave`. Before: v0.3.28 on the demo; the server reports the release it is, not the line; `agent/release-version-string`. Before: the soft-fail check resolved one fork per prev event; `agent/soft-fail-forks`. Before: forked rooms are merged and pruned, and a resolution reads about the room once however many forks; `agent/extremity-merge`. Before: the hub's members step and the idle CPU were repeated state resolutions; `agent/hub-members-step`. Before: handover: the demo, the releases and what is next, below. Before: test servers are handed their ports still bound; `agent/test-port-races`. Before: room loads and unloading; `agent/room-load-speed`. Before: the Slack bridge's full volume; fix on `agent/bridge-volume-size`. Before: Discord's delivery timeouts were a replay of the 2026-10-12 flood; fix on `agent/discord-delivery-timeouts`. Before: the memory climb with federation on; fix on `agent/fed-memory-growth`. Before: the session hub wedge; fix on `agent/hub-wedge`. Earlier: the ephemeral pump's prune busy loop; fix on `agent/ephemeral-prune`). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+Written 2026-09-20 by the integration lead, last revised 2026-10-19 (the Slack read/unread flip was a receipt loop: a receipt that does not move forward is now dropped, as Synapse drops it; `agent/receipt-no-regress`. Before: a room whose placed history named a rejected event could not be loaded, and the ephemeral pump failed on it for seventeen hours; `agent/stuck-room-load`. Before: a member's own leave from a hot room reached nobody; `agent/hot-room-leave`. Before: v0.3.28 on the demo; the server reports the release it is, not the line; `agent/release-version-string`. Before: the soft-fail check resolved one fork per prev event; `agent/soft-fail-forks`. Before: forked rooms are merged and pruned, and a resolution reads about the room once however many forks; `agent/extremity-merge`. Before: the hub's members step and the idle CPU were repeated state resolutions; `agent/hub-members-step`. Before: handover: the demo, the releases and what is next, below. Before: test servers are handed their ports still bound; `agent/test-port-races`. Before: room loads and unloading; `agent/room-load-speed`. Before: the Slack bridge's full volume; fix on `agent/bridge-volume-size`. Before: Discord's delivery timeouts were a replay of the 2026-10-12 flood; fix on `agent/discord-delivery-timeouts`. Before: the memory climb with federation on; fix on `agent/fed-memory-growth`. Before: the session hub wedge; fix on `agent/hub-wedge`. Earlier: the ephemeral pump's prune busy loop; fix on `agent/ephemeral-prune`). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
+
+## 2026-10-19 -- the Slack read/unread flip was a receipt loop; the branch is `agent/receipt-no-regress`
+
+The owner saw a channel flip between read and unread in the official Slack client whenever
+the demo's Slack bridge was up as well. The hub recorded every receipt it was given, the
+event the receipt was already at included, and every write became an entry of the receipt
+stream the ephemeral pump feeds bridges from. mautrix sets the owner's receipt as their double
+puppet whenever Slack reports a read, was sent that receipt back as the owner's own (no
+receipt body keeps the `fi.mau.double_puppet_source` key it marks its own with, here or on
+Synapse), marked Slack read at the receipt's event, Slack reported the mark, and the turn
+began again; when Slack's newest message had no Matrix event, each turn moved Slack's marker
+back and the official client flipped. Synapse ignores a receipt that does not move forward,
+so the loop never starts there; now the hub does too, for clients' receipts and other
+servers' alike, before anything is written (`SessionHub::receipt_advances`;
+`hs_user_receipts_ignored_total{reason}`; `docs/status/05-sync.md` and
+`docs/status/11-appservices-and-bridges.md`, the 2026-10-19 entries). **Left:** after the
+roll, with the Slack bridge up and the official client open, `same_event` should climb and the
+channel should stay read; the bridge's `conversations.mark` at the last *bridged* message when
+Slack's newest has no Matrix event still moves Slack's marker back once per real read (the
+same on Synapse), which is mautrix's to change. **Not rolled** by this session.
 
 ## 2026-10-18 -- a room whose placed history named a rejected event could not be loaded again; the branch is `agent/stuck-room-load`
 

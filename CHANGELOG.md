@@ -18,6 +18,15 @@ carries the generated notes for that merge.
 The 0.4 line is the first public release: the same server, documented for someone who has
 never seen it. Everything that was verified for it says how.
 
+- **A receipt that does not move forward is dropped, so a bridge is not sent its own
+  receipt back.** The server recorded every receipt it was given, the event the user's
+  receipt was already at included, and each write was sent to every bridge interested in the
+  room. mautrix sets the user's receipt as their double puppet whenever the remote network
+  reports a read, was sent it back as the user's own, marked the network read again, and so
+  on; with the Slack bridge running and the official Slack client open, a channel flipped
+  between read and unread. A receipt at the event the receipt is already at, or at an
+  earlier one, is now ignored before anything is written, as Synapse ignores it
+  (`hs_user_receipts_ignored_total{reason}`).
 - **A room whose fetched history named a rejected event loads again, and one unreadable
   room no longer stops every bridge's receipts.** A backfill's fetched state that named an
   event this server held as rejected was refused by the state store after the placed

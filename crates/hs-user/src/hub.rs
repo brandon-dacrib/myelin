@@ -1589,6 +1589,21 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
     /// (`hs_push::counts`). Returns once the push counts reflect it (bounded by
     /// `hs_push::pipeline::RECEIPT_SETTLE`), so the client's next `/sync` has them.
     ///
+    /// A receipt that does not move forward is dropped here, before anything is written: one
+    /// for the event the user's receipt of this kind in this thread is already at, or for an
+    /// event before it in the room's timeline ([`SessionHub::receipt_advances`]). Nothing then
+    /// happens at all: no store write, no stream entry, no wake, no EDU, and no appservice
+    /// delivery. Synapse's rule (`_insert_linearized_receipt_txn`), and what a bridge relies
+    /// on: mautrix sets the user's receipt as their double puppet whenever the remote network
+    /// says they read, and is sent that receipt back as the user's own (the
+    /// `fi.mau.double_puppet_source` key it marks it with is not something a receipt body
+    /// carries, here or on Synapse). Until 2026-10-19 every write became a new stream entry,
+    /// so the bridge was sent its own receipt, marked the remote network read at that event,
+    /// the network reported the read back, the bridge set the receipt again, and so on
+    /// forever; when the event it was handed was not the network's newest message, each turn
+    /// moved the network's read marker back and the official client flipped between read and
+    /// unread (the demo's Slack bridge, `docs/status/11-appservices-and-bridges.md`).
+    ///
     /// # Errors
     /// Returns [`UserError`] if the room could not be loaded.
     pub async fn set_threaded_receipt(
@@ -1600,6 +1615,12 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         event_id: ruma::OwnedEventId,
         ts: u64,
     ) -> Result<(), UserError> {
+        if !self
+            .receipt_advances(room_id, user_id, kind, thread, &event_id)
+            .await?
+        {
+            return Ok(());
+        }
         let seq = self
             .receipts
             .set_in_thread(room_id, user_id, kind, thread, event_id.clone(), ts)
@@ -1640,6 +1661,58 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
             );
         }
         Ok(())
+    }
+
+    /// Whether `event_id` is ahead of `user_id`'s current `kind` receipt in `thread` of
+    /// `room_id`, so a receipt for it is news: there is no receipt yet, or the event is after
+    /// the receipt's event in the room's timeline. The same event is not news, nor is one
+    /// before it. An event the room does not place (unknown here, an outlier) is taken as
+    /// news, as Synapse takes it. What is dropped is logged at debug and counted in
+    /// `hs_user_receipts_ignored_total{reason}` (`same_event`, `older_event`).
+    ///
+    /// # Errors
+    /// Returns [`UserError`] if the room could not be loaded.
+    async fn receipt_advances(
+        &self,
+        room_id: &RoomId,
+        user_id: &UserId,
+        kind: ReceiptKind,
+        thread: &hs_push::counts::ReceiptThread,
+        event_id: &ruma::EventId,
+    ) -> Result<bool, UserError> {
+        let Some((current, _)) = self.receipts.get(room_id, user_id, kind, thread).await else {
+            return Ok(true);
+        };
+        let reason = if current == *event_id {
+            "same_event"
+        } else {
+            let handle = self.room(room_id).await?;
+            let (new_event, current_event) = (event_id.to_owned(), current.clone());
+            let (new_pos, current_pos) = handle
+                .query(move |actor| {
+                    (
+                        actor.timeline_position(&new_event),
+                        actor.timeline_position(&current_event),
+                    )
+                })
+                .await;
+            match (new_pos, current_pos) {
+                (Some(new_pos), Some(current_pos)) if new_pos <= current_pos => "older_event",
+                _ => return Ok(true),
+            }
+        };
+        tracing::debug!(
+            %room_id,
+            %user_id,
+            kind = kind.as_str(),
+            thread = thread.as_wire().unwrap_or("unthreaded"),
+            %event_id,
+            at = %current,
+            reason,
+            "a receipt that does not move forward is ignored"
+        );
+        crate::metrics::count_receipt_ignored(reason);
+        Ok(false)
     }
 
     /// Records a receipt copied from another implementation's database for this same server
@@ -1728,6 +1801,27 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
                     let Some(members) = self.members_if_joined(&room_id, &user_id).await else {
                         continue;
                     };
+                    // Another server's receipt that does not move forward is dropped as a
+                    // client's is (`SessionHub::set_threaded_receipt`); a room that cannot be
+                    // read for the comparison is dropped like every other receipt this
+                    // method cannot apply.
+                    match self
+                        .receipt_advances(&room_id, &user_id, ReceiptKind::Read, &thread, &event_id)
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(error) => {
+                            tracing::debug!(
+                                %origin,
+                                %room_id,
+                                %user_id,
+                                %error,
+                                "a receipt EDU names a room that could not be read; dropped"
+                            );
+                            continue;
+                        }
+                    }
                     let seq = self
                         .receipts
                         .set_in_thread(&room_id, &user_id, ReceiptKind::Read, &thread, event_id, ts)
@@ -3174,6 +3268,96 @@ mod tests {
         );
         // The peer's typing stop was applied before the observer heard of it.
         assert!(hub.typing_users(&room_id).await.0.is_empty());
+    }
+
+    /// A receipt that does not move forward is dropped: the event the receipt is already at,
+    /// or one before it, writes nothing, bumps nothing and reaches no stream -- the loop a
+    /// bridge was in ([`SessionHub::set_threaded_receipt`]). A later event, an event the room
+    /// does not place, and the other receipt kind still go through.
+    #[tokio::test]
+    async fn a_receipt_that_does_not_move_forward_is_ignored() {
+        use crate::receipts::ReceiptKind;
+        use hs_push::counts::ReceiptThread;
+        let (hub, rooms) = hub(500);
+        let alice = user_id!("@alice:hub.test").to_owned();
+        let handle = rooms
+            .create_room(
+                alice.clone(),
+                CreateRoomRequest {
+                    preset: Some("public_chat".to_owned()),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+        let say = |body: &'static str, now_ms: i64| {
+            let (handle, alice) = (handle.clone(), alice.clone());
+            async move {
+                handle
+                    .send_event(
+                        alice,
+                        "m.room.message".to_owned(),
+                        None,
+                        serde_json::json!({"body": body}),
+                        None,
+                        now_ms,
+                    )
+                    .await
+                    .unwrap()
+                    .event_id()
+                    .to_owned()
+            }
+        };
+        let first = say("one", 2).await;
+        let second = say("two", 3).await;
+        let read = |kind: ReceiptKind, event: ruma::OwnedEventId, ts: u64| {
+            let (hub, room_id, alice) = (hub.clone(), room_id.clone(), alice.clone());
+            async move {
+                hub.set_receipt(&room_id, &alice, kind, event, ts)
+                    .await
+                    .unwrap()
+            }
+        };
+        let read_at = |kind: ReceiptKind| {
+            let (hub, room_id, alice) = (hub.clone(), room_id.clone(), alice.clone());
+            async move {
+                hub.receipt_of(&room_id, &alice, kind, &ReceiptThread::Unthreaded)
+                    .await
+            }
+        };
+
+        read(ReceiptKind::Read, second.clone(), 10).await;
+        let seq = hub.receipts_seq(&room_id).await;
+        let head = hub.store().receipt_stream_head().await.unwrap();
+        assert!(seq > 0 && head > 0);
+
+        // Back to the first message, and the second again: neither is news.
+        read(ReceiptKind::Read, first.clone(), 11).await;
+        read(ReceiptKind::Read, second.clone(), 12).await;
+        assert_eq!(read_at(ReceiptKind::Read).await, Some((second.clone(), 10)));
+        assert_eq!(hub.receipts_seq(&room_id).await, seq, "nothing was stamped");
+        assert_eq!(
+            hub.store().receipt_stream_head().await.unwrap(),
+            head,
+            "nothing reached the stream an appservice is fed from"
+        );
+
+        // A later message moves it.
+        let third = say("three", 4).await;
+        read(ReceiptKind::Read, third.clone(), 13).await;
+        assert_eq!(read_at(ReceiptKind::Read).await, Some((third.clone(), 13)));
+        assert!(hub.receipts_seq(&room_id).await > seq);
+
+        // An event the room does not place is taken as news, as Synapse takes it.
+        let elsewhere = ruma::event_id!("$elsewhere:hub.test").to_owned();
+        read(ReceiptKind::Read, elsewhere.clone(), 14).await;
+        assert_eq!(read_at(ReceiptKind::Read).await, Some((elsewhere, 14)));
+
+        // The private receipt is its own: the first message is news for it.
+        read(ReceiptKind::ReadPrivate, first.clone(), 15).await;
+        assert_eq!(read_at(ReceiptKind::ReadPrivate).await, Some((first, 15)));
     }
 
     #[tokio::test]

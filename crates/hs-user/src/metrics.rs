@@ -22,6 +22,17 @@ struct ReloadLabels {
     reason: &'static str,
 }
 
+/// The labels of `hs_user_receipts_ignored_total`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, prometheus_client::encoding::EncodeLabelSet)]
+struct IgnoredReceiptLabels {
+    reason: &'static str,
+}
+
+/// `hs_user_receipts_ignored_total{reason}`: receipts dropped because they did not move
+/// forward (`crate::hub::SessionHub::set_threaded_receipt`): `same_event`, `older_event`.
+static RECEIPTS_IGNORED: LazyLock<Family<IgnoredReceiptLabels, Counter>> =
+    LazyLock::new(Family::default);
+
 /// The labels of `hs_user_mirror_catchup_duration_seconds`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, prometheus_client::encoding::EncodeLabelSet)]
 struct DurationLabels {
@@ -216,6 +227,13 @@ pub(crate) fn count_wake_covered() {
     MIRROR_WAKES_COVERED.inc();
 }
 
+/// Counts one receipt dropped for not moving forward, for `reason`.
+pub(crate) fn count_receipt_ignored(reason: &'static str) {
+    RECEIPTS_IGNORED
+        .get_or_create(&IgnoredReceiptLabels { reason })
+        .inc();
+}
+
 /// Registers this module's metrics into `registry`: `hs_user_mirror_rooms`,
 /// `hs_user_mirror_catchup_events_total`, `hs_user_mirror_full_reloads_total{reason}`,
 /// `hs_user_mirror_catchup_duration_seconds{kind}` and `hs_user_mirror_wakes_covered_total`
@@ -224,13 +242,20 @@ pub(crate) fn count_wake_covered() {
 /// `hs_user_pruned_entries_total{stream}` and `hs_user_compactions_total{stream}` (retention);
 /// `hs_user_hub_published_seq`, `hs_user_hub_consumed_seq`, `hs_user_hub_lag_updates`,
 /// `hs_user_hub_oldest_pending_seconds`, `hs_user_hub_stuck_updates` and
-/// `hs_user_hub_stuck_warnings_total` (whether the session hub keeps up with the rooms).
+/// `hs_user_hub_stuck_warnings_total` (whether the session hub keeps up with the rooms);
+/// `hs_user_receipts_ignored_total{reason}` (receipts that did not move forward).
 pub fn register_metrics(registry: &mut prometheus_client::registry::Registry) {
     registry.register(
         "hs_user_mirror_rooms",
         "Rooms this replica holds a read-only copy of, to answer /sync for rooms another \
          replica owns",
         MIRROR_ROOMS.clone(),
+    );
+    registry.register(
+        "hs_user_receipts_ignored",
+        "Receipts dropped for not moving forward, by reason (same_event: the event the \
+         user's receipt is already at; older_event: one before it in the room's timeline)",
+        RECEIPTS_IGNORED.clone(),
     );
     // Counters are registered without `_total`: the text encoder appends it.
     registry.register(
