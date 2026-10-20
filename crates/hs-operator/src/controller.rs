@@ -377,6 +377,7 @@ mod tests {
                 args: Vec::new(),
                 storage: BridgeStorage::default(),
                 resources: None,
+                extra_ports: Vec::new(),
             },
         );
         let class = |b: &Bridge, d: Option<&str>| {
@@ -423,6 +424,7 @@ mod tests {
                 args: Vec::new(),
                 storage: BridgeStorage::default(),
                 resources: None,
+                extra_ports: Vec::new(),
             },
         );
         bridge.meta_mut().namespace = Some("matrix".to_owned());

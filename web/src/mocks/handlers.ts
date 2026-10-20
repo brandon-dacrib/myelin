@@ -21,6 +21,7 @@ import {
   deploymentTarget,
   findOffering,
   getInstance,
+  connectionsOf,
   instanceByAppservice,
   instanceFiles,
   instancesOf,
@@ -834,12 +835,19 @@ export const handlers = [
     const body = (await request.json()) as BridgeOfferingRequest;
     const refusal = offeringRefusal(type, body);
     if (refusal) {
+      const pointer = refusal.includes("public URL") ? "/options/public_url" : "/runtime";
       return problem(400, "validation", "Validation failed", {
         detail: refusal,
-        errors: [{ pointer: "/runtime", detail: refusal }],
+        errors: [{ pointer, detail: refusal }],
       });
     }
     return HttpResponse.json(putOffering(type, body));
+  }),
+
+  http.get(`${API}/bridge-offerings/:type/connections`, ({ params }) => {
+    const type = String(params.type);
+    if (!findOffering(type)) return problem(404, "not-found", "Bridge offering not found");
+    return HttpResponse.json({ items: connectionsOf(type) });
   }),
 
   http.delete(`${API}/bridge-offerings/:type`, ({ params, request }) => {

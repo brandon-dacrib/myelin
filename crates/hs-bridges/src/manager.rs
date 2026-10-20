@@ -896,6 +896,12 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
     }
 
     fn render(&self, row: &InstanceRow, offering: &OfferingRow) -> Option<InstanceRender> {
+        let public = self
+            .public_base_url
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let github = offering.options.github.as_ref().filter(|g| g.is_complete());
         bridge_types::render_instance(&InstanceSpec {
             type_id: &row.bridge_type,
             server_name: &self.server_name,
@@ -919,6 +925,18 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
                     as_token: &dp.as_token,
                     hs_token: &dp.hs_token,
                 }),
+            public_url: offering.options.public_url.as_deref(),
+            media_url: (!public.is_empty()).then_some(public.as_str()),
+            github: github.map(|g| bridge_types::GithubApp {
+                app_id: g.app_id.as_deref().unwrap_or_default(),
+                webhook_secret: g.webhook_secret.as_deref().unwrap_or_default(),
+            }),
+            github_private_key: github.and_then(|g| g.private_key.as_deref()),
+            passkey_pem: row.passkey_pem.as_deref(),
+            // A shared bridge that names who may use it in its config (Hookshot's
+            // permissions): everyone here, or the offering's list.
+            allowed_users: (!offering.access.all_local_users)
+                .then_some(offering.access.users.as_slice()),
         })
     }
 
@@ -983,6 +1001,7 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             args: render.args.clone(),
             files: render.files.clone(),
             storage_size: Some(volume_size(row).to_owned()),
+            extra_ports: render.extra_ports.clone(),
         })
     }
 
@@ -1649,10 +1668,34 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
         let port = bridge_types::get(&row.bridge_type, &self.server_name)
             .ok_or("its bridge type is no longer in the catalogue")?
             .port;
+        // Hookshot's passkey is minted with the tokens (and for an instance from before one
+        // was kept, now): an RSA key, made off the runtime, kept on the row for every render.
+        let passkey = if bridge_types::needs_passkey(&row.bridge_type) && row.passkey_pem.is_none()
+        {
+            Some(crate::passkey::mint_passkey().await?)
+        } else {
+            None
+        };
         // Names and tokens first, stored, so that a retry (or another replica) registers the
         // same thing rather than a second one.
         let row = if row.appservice_id.is_some() {
-            row.clone()
+            if let Some(passkey) = &passkey {
+                self.store
+                    .update_instance(&row.bridge_type, &row.owner, |r| {
+                        if r.passkey_pem.is_some() {
+                            return false;
+                        }
+                        r.passkey_pem = Some(passkey.clone());
+                        true
+                    })
+                    .map_err(|e| e.to_string())?;
+                self.store
+                    .instance(&row.bridge_type, &row.owner)
+                    .map_err(|e| e.to_string())?
+                    .ok_or("the instance was removed")?
+            } else {
+                row.clone()
+            }
         } else {
             let appservice_id = self.free_appservice_id(row).await?;
             let name = deploy_name(&appservice_id);
@@ -1671,6 +1714,9 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
                     r.hs_token = Some(crate::random_hex(32));
                     r.provisioning_secret = Some(crate::random_hex(32));
                     r.pickle_key = Some(crate::random_hex(32));
+                    if let Some(passkey) = &passkey {
+                        r.passkey_pem = Some(passkey.clone());
+                    }
                     // An administrator may have said where it listens before it was named.
                     if r.url.is_none() {
                         r.url = Some(url.clone());
@@ -2564,6 +2610,12 @@ pub fn deploy_fingerprint(spec: &DeploySpec) -> String {
         hasher.update(arg.as_bytes());
         hasher.update([0]);
     }
+    for p in &spec.extra_ports {
+        hasher.update(p.name.as_bytes());
+        hasher.update([0]);
+        hasher.update(p.port.to_string().as_bytes());
+        hasher.update([0]);
+    }
     for (name, contents) in &spec.files {
         hasher.update(name.as_bytes());
         hasher.update([0]);
@@ -2742,6 +2794,46 @@ impl<B: KvBackend + 'static> BridgeOfferingSource for BridgeManager<B> {
                 .or(current.as_ref().map(|c| c.image_tag.as_str())),
         )
         .unwrap_or_else(|| "latest".to_owned());
+        let options = request
+            .options
+            .clone()
+            .or(current.as_ref().map(|c| c.options.clone()))
+            .unwrap_or_default();
+        // A type rendered around a public URL (Hookshot: every webhook URL it hands out starts
+        // with it) cannot be offered without one that is a URL.
+        if bridge_types::needs_public_url(bridge_type) {
+            let url = options.public_url.as_deref().unwrap_or_default().trim();
+            if url.is_empty() {
+                return Err(SourceError::InvalidField {
+                    pointer: "/options/public_url",
+                    detail: format!(
+                        "{} needs a public URL that reaches its webhooks listener (https://hooks.example.org): the start of every webhook URL it hands out",
+                        kind.name
+                    ),
+                });
+            }
+            if !(url.starts_with("https://") || url.starts_with("http://"))
+                || url.contains(char::is_whitespace)
+            {
+                return Err(SourceError::InvalidField {
+                    pointer: "/options/public_url",
+                    detail:
+                        "the public URL is `https://host` or `https://host/path`, without spaces"
+                            .into(),
+                });
+            }
+        }
+        if let Some(github) = options.github.as_ref()
+            && !github.is_complete()
+            && [&github.app_id, &github.private_key, &github.webhook_secret]
+                .iter()
+                .any(|v| v.as_deref().is_some_and(|s| !s.trim().is_empty()))
+        {
+            return Err(SourceError::InvalidField {
+                pointer: "/options/github",
+                detail: "a GitHub App needs all three of app_id, private_key and webhook_secret; leave all of them out for webhooks only".into(),
+            });
+        }
         let row = OfferingRow {
             bridge_type: bridge_type.to_owned(),
             enabled: request
@@ -2755,11 +2847,7 @@ impl<B: KvBackend + 'static> BridgeOfferingSource for BridgeManager<B> {
                 .clone()
                 .or(current.as_ref().map(|c| c.access.clone()))
                 .unwrap_or_default(),
-            options: request
-                .options
-                .clone()
-                .or(current.as_ref().map(|c| c.options.clone()))
-                .unwrap_or_default(),
+            options,
             created_at_ms: current.as_ref().map_or_else(now_ms, |c| c.created_at_ms),
         };
         self.store.put_offering(&row).map_err(store_err)?;
@@ -3033,7 +3121,88 @@ impl<B: KvBackend + 'static> BridgeOfferingSource for BridgeManager<B> {
             compose_yaml: render.compose_yaml.clone(),
             manifest_yaml: manifest_yaml(&spec, &namespace),
             run_sh: render.run_sh.clone(),
+            files: render.files.clone(),
         })
+    }
+
+    async fn connections(
+        &self,
+        bridge_type: &str,
+    ) -> Result<Vec<hs_admin::model::BridgeConnection>, SourceError> {
+        if self
+            .store
+            .offering(bridge_type)
+            .map_err(store_err)?
+            .is_none()
+        {
+            return Err(SourceError::NotFound);
+        }
+        // Only a type that keeps its connections in room state (Hookshot), and only once its
+        // shared instance has a registration to read the rooms with.
+        if !bridge_types::keeps_connections_in_room_state(bridge_type) {
+            return Ok(Vec::new());
+        }
+        let Some(row) = self
+            .store
+            .instance(bridge_type, SHARED_INSTANCE)
+            .map_err(store_err)?
+        else {
+            return Ok(Vec::new());
+        };
+        let (Some(token), Some(render)) = (
+            row.as_token.as_deref(),
+            self.store
+                .offering(bridge_type)
+                .map_err(store_err)?
+                .and_then(|offering| self.render(&row, &offering)),
+        ) else {
+            return Ok(Vec::new());
+        };
+        let Some(client) = self.client.get() else {
+            return Ok(Vec::new());
+        };
+        let bot = self.mxid(&render.bot_localpart);
+        let rooms = client
+            .joined_rooms(token, &bot)
+            .await
+            .map_err(|e| SourceError::Unavailable(format!("listing the bot's rooms: {e}")))?;
+        let mut found = Vec::new();
+        for room_id in rooms {
+            let events: Vec<hs_admin::bridge_connections::StateEvent> = match client
+                .room_state(token, &bot, &room_id)
+                .await
+            {
+                Ok(events) => events
+                    .into_iter()
+                    .map(|(event_type, state_key, content)| {
+                        hs_admin::bridge_connections::StateEvent {
+                            event_type,
+                            state_key,
+                            content,
+                        }
+                    })
+                    .collect(),
+                // A room the bot has just left, or cannot read: not a connection to show.
+                Err(e) => {
+                    tracing::debug!(room = %room_id, error = %e, "skipping a room whose state could not be read for its connections");
+                    continue;
+                }
+            };
+            let name = hs_admin::bridge_connections::room_name_in(&events);
+            found.extend(hs_admin::bridge_connections::connections_in(
+                &room_id,
+                name.as_deref(),
+                &events,
+            ));
+        }
+        found.sort_by(|a, b| {
+            a.room_name
+                .cmp(&b.room_name)
+                .then_with(|| a.room_id.cmp(&b.room_id))
+                .then_with(|| a.service.cmp(&b.service))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        Ok(found)
     }
 }
 
@@ -3280,6 +3449,7 @@ mod tests {
                     args: Vec::new(),
                     files: BTreeMap::new(),
                     storage_size: None,
+                    extra_ports: Vec::new(),
                 },
             );
         }
@@ -3880,6 +4050,255 @@ mod tests {
         let spec = runtime.spec("bridge-heisenbridge").unwrap();
         assert!(spec.owner.is_none());
         assert!(!spec.labels.contains_key("myelin.dev/owner"));
+    }
+
+    /// Hookshot: refused without a public URL; deployed as one shared instance whose files are
+    /// what its image's command reads (`config.yml`, `registration.yml`) plus the passkey the
+    /// manager minted and keeps, and whose `Bridge` exposes the webhooks and metrics ports.
+    #[tokio::test]
+    async fn a_hookshot_offering_needs_a_public_url_and_deploys_with_its_passkey_and_ports() {
+        let (manager, runtime) = cluster_manager();
+        let refused = manager.put("matrix-hookshot", cluster()).await.unwrap_err();
+        assert!(
+            matches!(
+                &refused,
+                SourceError::InvalidField {
+                    pointer: "/options/public_url",
+                    ..
+                }
+            ),
+            "{refused:?}"
+        );
+        let with_url = |url: &str| BridgeOfferingRequest {
+            runtime: Some("cluster".into()),
+            options: Some(hs_admin::model::BridgeOfferingOptions {
+                public_url: Some(url.to_owned()),
+                ..Default::default()
+            }),
+            ..BridgeOfferingRequest::default()
+        };
+        let refused = manager
+            .put("matrix-hookshot", with_url("hooks.example.org"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &refused,
+                SourceError::InvalidField {
+                    pointer: "/options/public_url",
+                    ..
+                }
+            ),
+            "{refused:?}"
+        );
+        let mut half_an_app = with_url("https://hooks.example.org");
+        half_an_app.options.as_mut().unwrap().github =
+            Some(hs_admin::model::BridgeOfferingGithub {
+                app_id: Some("1".into()),
+                ..Default::default()
+            });
+        let refused = manager
+            .put("matrix-hookshot", half_an_app)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &refused,
+                SourceError::InvalidField {
+                    pointer: "/options/github",
+                    ..
+                }
+            ),
+            "{refused:?}"
+        );
+
+        let offering = manager
+            .put("matrix-hookshot", with_url("https://hooks.example.org"))
+            .await
+            .unwrap();
+        assert_eq!(offering.mode, "shared");
+        assert_eq!(
+            offering.options.public_url.as_deref(),
+            Some("https://hooks.example.org")
+        );
+        manager.tick().await; // requested -> registered: tokens, the passkey and a name
+        manager.tick().await; // registered -> deploying
+        assert_eq!(runtime.names(), vec!["bridge-hookshot".to_owned()]);
+        let row = manager
+            .store
+            .instance("matrix-hookshot", SHARED_INSTANCE)
+            .unwrap()
+            .unwrap();
+        let passkey = row.passkey_pem.clone().expect("minted with the tokens");
+        assert!(
+            passkey.starts_with("-----BEGIN PRIVATE KEY-----\n"),
+            "{passkey}"
+        );
+        let spec = runtime.spec("bridge-hookshot").unwrap();
+        assert!(spec.owner.is_none());
+        assert_eq!(
+            spec.files.keys().cloned().collect::<Vec<_>>(),
+            ["config.yml", "passkey.pem", "registration.yml"]
+        );
+        assert_eq!(spec.files["passkey.pem"], passkey);
+        let config = &spec.files["config.yml"];
+        assert!(
+            config.contains("  urlPrefix: \"https://hooks.example.org/webhook/\"\n"),
+            "{config}"
+        );
+        assert!(config.contains("  - actor: \"example.org\"\n"), "{config}");
+        assert!(
+            config.contains("  mediaUrl: \"https://example.org\"\n"),
+            "{config}"
+        );
+        assert_eq!(
+            spec.extra_ports
+                .iter()
+                .map(|p| (p.name.as_str(), p.port))
+                .collect::<Vec<_>>(),
+            [("webhooks", 9000), ("metrics", 9001)]
+        );
+        // Rendered again, the key is the same: nothing to roll.
+        manager.tick().await;
+        let again = manager
+            .store
+            .instance("matrix-hookshot", SHARED_INSTANCE)
+            .unwrap()
+            .unwrap();
+        assert_eq!(again.passkey_pem.as_deref(), Some(passkey.as_str()));
+        assert_eq!(
+            runtime.spec("bridge-hookshot").unwrap().files["passkey.pem"],
+            passkey
+        );
+        // The files endpoint carries every file, and the manifest the extra ports.
+        let files = manager
+            .instance_files("matrix-hookshot", SHARED_INSTANCE)
+            .await
+            .unwrap();
+        assert_eq!(
+            files.files.keys().cloned().collect::<Vec<_>>(),
+            ["config.yml", "passkey.pem", "registration.yml"]
+        );
+        assert!(
+            files
+                .manifest_yaml
+                .contains("  extraPorts:\n    - name: webhooks\n      port: 9000\n"),
+            "{}",
+            files.manifest_yaml
+        );
+        assert!(
+            files.manifest_yaml.contains("  registration.yml: |\n"),
+            "{}",
+            files.manifest_yaml
+        );
+        // The offering's settings reach the config: the list of people, and a GitHub App.
+        let mut listed = with_url("https://hooks.example.org");
+        listed.access = Some(hs_admin::model::BridgeOfferingAccess {
+            all_local_users: false,
+            users: vec!["@alice:example.org".into()],
+        });
+        listed.options.as_mut().unwrap().github = Some(hs_admin::model::BridgeOfferingGithub {
+            app_id: Some("4242".into()),
+            private_key: Some("-----BEGIN RSA PRIVATE KEY-----\nk\n".into()),
+            webhook_secret: Some("shh".into()),
+        });
+        manager.put("matrix-hookshot", listed).await.unwrap();
+        manager.tick().await;
+        let spec = runtime.spec("bridge-hookshot").unwrap();
+        let config = &spec.files["config.yml"];
+        assert!(
+            config.contains("  - actor: \"@alice:example.org\"\n"),
+            "{config}"
+        );
+        assert!(!config.contains("  - actor: \"example.org\"\n"), "{config}");
+        assert!(config.contains("    id: \"4242\"\n"), "{config}");
+        assert_eq!(
+            spec.files["github-key.pem"],
+            "-----BEGIN RSA PRIVATE KEY-----\nk\n"
+        );
+    }
+
+    /// The offering's connections are read from the rooms the bot is in: each
+    /// `uk.half-shot.matrix-hookshot.*` state event is one, named from its content.
+    #[tokio::test]
+    async fn a_hookshot_offerings_connections_are_read_from_its_rooms_state() {
+        let fake = Arc::new(FakeMatrix::default());
+        *fake.bot_in_room.lock().unwrap() = true;
+        fake.extra_state.lock().unwrap().extend([
+            json!({"type": "m.room.name", "state_key": "", "content": {"name": "Deploys"}}),
+            json!({"type": "uk.half-shot.matrix-hookshot.generic.hook", "state_key": "myelin", "content": {"name": "myelin", "transformationFunction": "return {};"}}),
+            json!({"type": "uk.half-shot.matrix-hookshot.github.repository", "state_key": "brandon-dacrib/myelin", "content": {"org": "brandon-dacrib", "repo": "myelin"}}),
+            json!({"type": "uk.half-shot.matrix-hookshot.feed", "state_key": "gone", "content": {}}),
+        ]);
+        let runtime = Arc::new(FakeRuntime::default());
+        let manager = BridgeManager::new(
+            MemoryBackend::new(),
+            Arc::new(InMemoryAppserviceDirectory::new()),
+            Some(runtime),
+            "example.org",
+            "https://example.org",
+        )
+        .unwrap();
+        manager.attach(&fake_matrix(fake.clone()).await);
+        // Not offered: not found. Offered but not registered yet: nothing.
+        assert!(matches!(
+            manager.connections("matrix-hookshot").await,
+            Err(SourceError::NotFound)
+        ));
+        manager
+            .put(
+                "matrix-hookshot",
+                BridgeOfferingRequest {
+                    runtime: Some("cluster".into()),
+                    options: Some(hs_admin::model::BridgeOfferingOptions {
+                        public_url: Some("https://hooks.example.org".into()),
+                        ..Default::default()
+                    }),
+                    ..BridgeOfferingRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            manager
+                .connections("matrix-hookshot")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        manager.tick().await;
+        let found = manager.connections("matrix-hookshot").await.unwrap();
+        assert_eq!(found.len(), 3, "{found:?}");
+        let webhook = found.iter().find(|c| c.service == "webhook").unwrap();
+        assert_eq!(webhook.name, "myelin");
+        assert_eq!(webhook.room_id, "!new:example.org");
+        assert_eq!(webhook.room_name.as_deref(), Some("Deploys"));
+        assert_eq!(webhook.state, "active");
+        assert_eq!(
+            found.iter().find(|c| c.service == "github").unwrap().name,
+            "brandon-dacrib/myelin"
+        );
+        assert_eq!(
+            found.iter().find(|c| c.service == "feed").unwrap().state,
+            "removed"
+        );
+        // Read as the bot, with the instance's own token.
+        assert!(
+            fake.calls()
+                .iter()
+                .any(|c| c == "GET joined_rooms as=@hookshot:example.org"),
+            "{:?}",
+            fake.calls()
+        );
+        // A mautrix offering keeps no connections in room state.
+        manager.put("mautrix-whatsapp", cluster()).await.unwrap();
+        assert!(
+            manager
+                .connections("mautrix-whatsapp")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -4721,6 +5140,7 @@ mod tests {
             args: Vec::new(),
             files: BTreeMap::from([("config.yaml".to_owned(), "os_name: a\n".to_owned())]),
             storage_size: Some("1Gi".into()),
+            extra_ports: Vec::new(),
         };
         let same = deploy_fingerprint(&base);
         assert_eq!(same.len(), 16);
@@ -4860,6 +5280,9 @@ mod tests {
         /// When set, `/keys/signatures/upload` refuses every signature the way the real server
         /// did on the demo on 2026-10-11 (`M_INVALID_SIGNATURE`, "no known key").
         refuse_signatures: Mutex<bool>,
+        /// State events answered after the room's create and encryption events: a Hookshot
+        /// connection or two, for the connections test.
+        extra_state: Mutex<Vec<serde_json::Value>>,
     }
 
     impl FakeMatrix {
@@ -4968,10 +5391,17 @@ mod tests {
                         .collect();
                     ok(json!({"joined": joined}))
                 }
-                "state" => ok(json!([
-                    {"type": "m.room.create", "state_key": "", "sender": *fake.creator.lock().unwrap(), "content": {"room_version": "11"}},
-                    {"type": "m.room.encryption", "state_key": "", "sender": *fake.creator.lock().unwrap(), "content": {}}
-                ])),
+                "state" => {
+                    let mut events = vec![
+                        json!({"type": "m.room.create", "state_key": "", "sender": *fake.creator.lock().unwrap(), "content": {"room_version": "11"}}),
+                        json!({"type": "m.room.encryption", "state_key": "", "sender": *fake.creator.lock().unwrap(), "content": {}}),
+                    ];
+                    events.extend(fake.extra_state.lock().unwrap().iter().cloned());
+                    ok(json!(events))
+                }
+                "joined_rooms" => ok(json!({
+                    "joined_rooms": if *fake.bot_in_room.lock().unwrap() { vec!["!new:example.org"] } else { Vec::new() }
+                })),
                 "leave" => {
                     *fake.bot_in_room.lock().unwrap() = false;
                     ok(json!({}))

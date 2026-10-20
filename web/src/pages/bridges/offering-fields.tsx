@@ -2,13 +2,17 @@ import { useId, useState, type ReactNode } from "react";
 import { Cloud, Laptop, Plus, X } from "lucide-react";
 import type { BridgeDeploymentTarget, BridgeOfferingRuntime, BridgeType } from "@/api/bridges";
 import { Button } from "@/components/ui/button/Button";
-import { Field, Input } from "@/components/ui/input/Input";
+import { Field, Input, Textarea } from "@/components/ui/input/Input";
 import { Switch } from "@/components/ui/switch/Switch";
 import {
+  githubAppIsPartial,
+  hookshotRefusal,
   looksLikeUserId,
   notDeployableReason,
   parseUserList,
   runsOnMac,
+  takesPublicUrl,
+  type HookshotValues,
 } from "@/lib/bridge-offerings";
 import { cn } from "@/lib/cn";
 
@@ -369,13 +373,28 @@ export function SettingSwitch({
   );
 }
 
-export interface OptionValues {
+export interface OptionValues extends HookshotValues {
   encryption: boolean;
   doublePuppeting: boolean;
   backfill: boolean;
 }
 
-/** Encryption, double puppeting and backfill, each saying what it does to each person's bridge. */
+/** What every offering's option values start as: the switches off, the Hookshot fields empty. */
+export const EMPTY_OPTION_VALUES: OptionValues = {
+  encryption: false,
+  doublePuppeting: false,
+  backfill: false,
+  publicUrl: "",
+  githubAppId: "",
+  githubPrivateKey: "",
+  githubWebhookSecret: "",
+};
+
+/**
+ * Encryption, double puppeting and backfill, each saying what it does to each person's bridge;
+ * or, for a shared integrations bridge configured around a public URL (Hookshot), that URL and
+ * an optional GitHub App, since nobody signs in to it and those switches mean nothing there.
+ */
 export function OptionFields({
   values,
   onChange,
@@ -383,8 +402,11 @@ export function OptionFields({
 }: {
   values: OptionValues;
   onChange: (patch: Partial<OptionValues>) => void;
-  type: Pick<BridgeType, "supports_double_puppeting" | "name"> | undefined;
+  type: Pick<BridgeType, "supports_double_puppeting" | "name" | "config_keys"> | undefined;
 }) {
+  if (takesPublicUrl(type)) {
+    return <HookshotFields values={values} onChange={onChange} name={type?.name ?? "Hookshot"} />;
+  }
   const canPuppet = type?.supports_double_puppeting !== false;
   return (
     <div className="flex flex-col gap-3">
@@ -408,6 +430,95 @@ export function OptionFields({
         checked={values.backfill}
         onChange={(v) => onChange({ backfill: v })}
       />
+    </div>
+  );
+}
+
+/**
+ * Hookshot's settings: the public URL its webhooks listener is reached on (required: every
+ * webhook URL it hands out starts with it, and the server renders it into the bridge's config),
+ * and a GitHub App for connecting repositories properly, all three parts or none. The private
+ * key is written into the bridge's files; the server returns it as given.
+ */
+export function HookshotFields({
+  values,
+  onChange,
+  name,
+}: {
+  values: HookshotValues;
+  onChange: (patch: Partial<HookshotValues>) => void;
+  name: string;
+}) {
+  const refusal = hookshotRefusal(values);
+  const urlError =
+    values.publicUrl.trim() && refusal?.includes("public URL is") ? refusal : undefined;
+  const appError = githubAppIsPartial(values)
+    ? "All three are needed together; leave them all empty for webhooks only."
+    : undefined;
+  return (
+    <div className="flex flex-col gap-6" data-testid="hookshot-fields">
+      <div className="max-w-lg">
+        <Field
+          label="Public URL"
+          required
+          hint={`Where the outside reaches the bridge's webhooks listener (https://hooks.example.org). An Ingress for it points at the bridge's Service port "webhooks". Every webhook URL ${name} hands out starts with it.`}
+          error={urlError}
+        >
+          {(f) => (
+            <Input
+              {...f}
+              type="url"
+              inputMode="url"
+              placeholder="https://hooks.example.org"
+              value={values.publicUrl}
+              onChange={(e) => onChange({ publicUrl: e.target.value })}
+              className="font-identifier"
+            />
+          )}
+        </Field>
+      </div>
+      <fieldset className="flex max-w-lg flex-col gap-3">
+        <legend className="text-sm font-medium text-text">GitHub App (optional)</legend>
+        <p className="text-sm text-text-muted">
+          Without one, GitHub repositories post through plain webhooks (`!hookshot webhook`). With
+          one, `!hookshot github repo org/repo` connects a repository properly. Create the App on
+          GitHub with the webhook URL set to the public URL plus /github/webhook.
+        </p>
+        <Field label="App ID" error={appError}>
+          {(f) => (
+            <Input
+              {...f}
+              inputMode="numeric"
+              value={values.githubAppId}
+              onChange={(e) => onChange({ githubAppId: e.target.value })}
+              className="font-identifier"
+            />
+          )}
+        </Field>
+        <Field label="Webhook secret">
+          {(f) => (
+            <Input
+              {...f}
+              type="password"
+              autoComplete="off"
+              value={values.githubWebhookSecret}
+              onChange={(e) => onChange({ githubWebhookSecret: e.target.value })}
+              className="font-identifier"
+            />
+          )}
+        </Field>
+        <Field label="Private key" hint="The PEM file GitHub generates for the App, pasted whole.">
+          {(f) => (
+            <Textarea
+              {...f}
+              spellCheck={false}
+              value={values.githubPrivateKey}
+              onChange={(e) => onChange({ githubPrivateKey: e.target.value })}
+              className="font-identifier min-h-32"
+            />
+          )}
+        </Field>
+      </fieldset>
     </div>
   );
 }

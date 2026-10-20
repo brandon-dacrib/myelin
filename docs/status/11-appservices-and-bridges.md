@@ -1,6 +1,10 @@
 # Status: track 11, appservices and bridges
 
 Last updated: 2026-10-20 (Hookshot on the demo by hand, GitHub PR comments from two repositories; below); before that 2026-10-19, evening (six mautrix pins bumped to v0.2610.0, verified with the real
+Last updated: 2026-10-20 (Hookshot is an offering the server deploys: its config rendered whole
+from the offering's public URL and GitHub App, its passkey minted and kept, the `Bridge` and
+the operator expose its webhooks and metrics ports, and the offering's page lists its
+connections read from the rooms' state; below); before that 2026-10-19, evening (six mautrix pins bumped to v0.2610.0, verified with the real
 bridges; the real-bridge test's listener had served no media since 2026-10-16; below); before that 2026-10-19 (a bridge is no longer sent its own double puppet's receipt back
 when it moved nothing: the Slack read/unread flip; below); before that 2026-10-18 (the ephemeral pump leaves a room it cannot read out of the pass for
 a minute instead of failing every tick; below); before that 2026-10-15 (Discord's delivery timeouts: a retry is the same transaction, a
@@ -91,6 +95,134 @@ nothing queued. **Found on the way:** `POST /api/v1/appservices?dry_run=true` is
 "validate and return … without creating anything" and created the appservice (the real `POST`
 then got `409`, a conflict with itself): `appservices_create` in `hs-admin`'s router never
 reads `dry_run`. Fixed on `agent/appservice-dry-run` (below, when merged).
+5 s with `M_UNKNOWN_TOKEN` until its registration was made (the owner's step: the admin
+interface or `POST /api/v1/appservices` with `registration_yaml`); the rooms, the invites and
+the end-to-end check follow that.
+## 2026-10-20 (branch `agent/hookshot-offering`): Hookshot is an offering the server deploys, with its connections on its page
+
+**Asked**: make matrix-hookshot a fully supported offering: a rendered config, `deployable`,
+the webhooks port reachable, docs, tests; and (the owner, mid-task) represent that it is one
+shared bridge with many connections, each landing in its own room, read from the rooms'
+`uk.half-shot.matrix-hookshot.*` state events since Hookshot 7 has no provisioning API.
+The demo's hand-made setup (`deploy/demo/hookshot/` on `main`) was read for the exact shapes
+and left alone. `docs/bridges/hookshot.md` is the guide.
+
+**Done**
+
+- **The catalogue** (`crates/hs-admin/src/bridge_types.rs`): `matrix-hookshot` is `deployable`
+  (its `not_deployable_reason` is gone); `public_url` is a required config key; `renders_config`
+  is true; the provisioning kind is `none` with a note that Hookshot 7 removed its API and the
+  connections are room state (the `hookshot_v1` word stays in the enum and the OpenAPI for
+  older servers); the description and sign-in copy say what it is (one bridge, many
+  connections, nobody signs in, `!hookshot webhook`, `!hookshot feed`, `!hookshot github repo`
+  with an App). The registration claims every ghost prefix Hookshot's services use
+  (`@hookshot_.*`, `@_github_.*`, `@_gitlab_.*`, `@_jira_.*`, `@_webhooks_.*`, `@feeds:server`),
+  as its own `registration.sample.yml` does, for the old wizard's render and for instances.
+- **The rendered `config.yml`** (`hookshot_config`, read against 7.5.0's `config.sample.yml`,
+  `docs/setup.md`, `src/config/Config.ts`): `bridge` (domain, url, `mediaUrl` = this server's
+  public base URL, port 9993, `0.0.0.0`), `passFile: /data/passkey.pem`, `logging`,
+  `permissions` (everyone on the server at `admin` for `*`, or the offering's `access.users`),
+  `generic` (enabled, `urlPrefix` = public URL + `/webhook/`, `userIdPrefix: _webhooks_`,
+  `allowJsTransformationFunctions: true`), `feeds` enabled, `github` when the offering has an
+  App (`auth.id`, `privateKeyFile: /data/github-key.pem`, `webhook.secret`,
+  `userIdPrefix: _github_`), `metrics`, and listeners for webhooks on 9000 and metrics on
+  9001. No `encryption` (needs Redis) and no `provisioning` (7.x refuses it). The files are
+  under the names the image's command reads: `config.yml`, `registration.yml`, `passkey.pem`,
+  `github-key.pem`. `InstanceSpec` gained `public_url`, `media_url`, `github`,
+  `github_private_key`, `passkey_pem` and `allowed_users`; `InstanceRender` gained
+  `extra_ports`. The old wizard's render writes the config with a `CHANGE-ME` public URL.
+- **The passkey** (`crates/hs-bridges/src/passkey.rs`): Hookshot does not generate it
+  (`UserTokenStore.fromKeyPath` reads the file and stops without it), so the manager mints a
+  4096-bit RSA key as PKCS#8 PEM (what `openssl genpkey` writes and the first form Hookshot's
+  `TokenEncryption` takes) off the runtime (`spawn_blocking`) with the instance's tokens, and
+  keeps it on `InstanceRow::passkey_pem`, the way `pickle_key` is kept: every render writes
+  the same key. An instance from before one was kept gets one on its next registration step.
+  Under test the key is 2048 bits (a debug build takes tens of seconds for 4096). New
+  workspace dependency `rsa = "0.9"` (with `rand_core` 0.6's `getrandom`).
+- **The offering's options** (`BridgeOfferingOptions`): `public_url` and `github { app_id,
+  private_key, webhook_secret }` (`BridgeOfferingGithub`). `PUT` refuses a Hookshot offering
+  without a public URL that starts with `http(s)://` (`/options/public_url`) and half a GitHub
+  App (`/options/github`). The private key is returned as given: options are read with
+  `bridges:read`, as the files' tokens are with `bridges:write`. OpenAPI 0.1.21.
+- **The files answer** (`BridgeInstanceFiles.files`): every file by its name in `/data`, so
+  a Hookshot run elsewhere gets its passkey and GitHub key too; `config_yaml` and
+  `registration_yaml` stay for the mautrix bridges. The compose text lists the files, says
+  the webhooks port, and says how to make a passkey when none is kept.
+- **The operator** (`crates/hs-operator`): `BridgeSpec.extraPorts` (`[{name, port}]`,
+  `BridgePort`); each is a named container port and a Service port (`webhooks` 9000,
+  `metrics` 9001 for Hookshot), after the `appservice` port; `validate` checks the name is an
+  IANA service name (at most 15 characters, a letter in it) and the number is not the
+  appservice port. `DeploySpec`, `BridgeInstanceSpec`, the manifest and the fingerprint carry
+  them; `gen-crds` regenerated `deploy/crds/bridge.yaml` and the chart's copy. A cluster whose
+  CRD predates the field refuses a `Bridge` with any (`OutdatedCrd`, the instance's page says
+  to apply the CRD); a `Bridge` without is unaffected (the field is left out when empty).
+  The Ingress for the public URL is documented, with the demo's Funnel one as the example
+  (`docs/bridges/hookshot.md`); the operator does not make it.
+- **Connections** (`GET /bridge-offerings/{type}/connections`, `bridge_offerings.connections`,
+  `bridges:read`; `crates/hs-admin/src/bridge_connections.rs`): for a type that keeps its
+  connections in room state (`bridge_types::keeps_connections_in_room_state`: Hookshot), the
+  manager lists the bot's rooms as the bot with the instance's token (`MatrixClient::joined_rooms`,
+  `room_state`, new) and reads every `uk.half-shot.matrix-hookshot.*` state event: `service`
+  (`webhook`, `github`, `gitlab`, `jira`, `feed`, `figma`, `openproject`, else the type's own
+  word), `event_type`, `state_key`, `room_id`, `room_name`, `name` (a webhook's `name`, a
+  repository's `org/repo`, a feed's `url`), `state` (`active`, or `removed` for an emptied
+  event) and `content`. A webhook's hook id is in the bot's room account data, not the state,
+  and is not here. Empty for every other type.
+- **The interface** (`web/`): the Options step and the settings dialog show, for a type whose
+  catalogue entry needs `public_url` (`takesPublicUrl`), the public URL (required, checked as
+  typed) and a GitHub App (all three parts or none) instead of the per-person switches; the
+  review and the settings summary say them; the offering's page lists the connections
+  (service, connection, room, state) under the bridge's panel, with the empty state saying how
+  to connect something. The mock catalogue's Hookshot is deployable with the same copy; the
+  mock server answers connections and refuses a missing public URL. `schema.d.ts` regenerated.
+- **Docs**: `docs/bridges/hookshot.md` (offering it, what is rendered, the Ingress, connecting
+  GitHub by webhook and by App, feeds, seeing what is connected); README's bridges row;
+  decision 0054; `docs/next-steps.md`.
+
+**Verified** (this worktree, 2026-10-20): `cargo test -p hs-admin -p hs-bridges -p hs-operator`
+(337 + 62 + 123 and the rest, 0 failed; the new tests:
+`hookshot_renders_a_whole_config_from_the_public_url_and_claims_its_ghosts`,
+`hookshot_without_a_github_app_or_a_passkey_renders_for_everyone_and_says_so`, the three in
+`bridge_connections`, `a_hookshot_offering_needs_a_public_url_and_deploys_with_its_passkey_and_ports`,
+`a_hookshot_offerings_connections_are_read_from_its_rooms_state`,
+`the_passkey_is_a_pkcs8_pem_hookshot_reads`, `extra_ports_are_on_the_container_and_the_service_by_name`,
+`extra_ports_parse_and_are_left_out_when_empty`, `extra_ports_are_validated_and_written_into_the_bridge`);
+`cargo clippy -p hs-admin -p hs-bridges -p hs-operator -p hs-cli -p hs-bridge-conformance
+--all-targets -- -D warnings` clean; `cargo fmt --all --check` clean; `npm run check` in
+`web/` (lint, types, 735 unit tests, build) green.
+`crates/hs-bridge-conformance/tests/real_hookshot.rs`, the real-image story, **passed against
+the 7.5.0 image on this desktop** (58 s): the offering, the rendered files, the image up from
+exactly them and the instance `ready`, `!hookshot webhook test` answered (the connection's
+state event in the room, the secret URL in the bot's admin room, which the test joins), a
+POST to that URL landing in the room, the connection listed by the admin API with its room's
+name. The first run found the URL is said in the admin room, not the room (fixed in the
+test). The image was pulled anonymously: `docker pull` from ghcr.io reaches for the keychain
+in a session, but with a `DOCKER_CONFIG` that has no credential store and a `PATH` without
+`docker-credential-osxkeychain` it pulls. `npm run test:e2e` in `web/`: 77 passed.
+
+**Decisions made**
+
+- Hookshot's provisioning kind is `none`: 7.x has no provisioning API, and nothing read
+  `hookshot_v1` anyway. The enum word stays for the OpenAPI.
+- The passkey is minted by the server and kept on the row, not generated in the pod: a render
+  is then complete (a Hookshot run elsewhere gets it in its files), and a roll never changes
+  it. 4096 bits, as Hookshot's documentation asks (2048 under test).
+- The GitHub App's private key is an offering option and is echoed by `GET`: a `PUT` replaces
+  the options whole, so hiding it would make every settings save drop it; an administrator
+  with `bridges:read` reads it as one with `bridges:write` reads the tokens in the files.
+- The Service exposes the extra ports; the Ingress is the administrator's (documented), since
+  which ingress controller and host a deployment has is not the operator's to know.
+- The connections are read live from the rooms on each `GET` (the bot's rooms, then each
+  room's state), not cached or indexed: a server has one Hookshot and a handful of rooms.
+
+**Left**: GitLab and Jira sections are
+not rendered (the GitHub App is); a GitHub App's OAuth (`!hookshot github login`) is not
+configured; the real-image story is not in a workflow yet (the mautrix one runs from the
+weekly `bridge images` issue by hand too); the offering page lists connections and does not
+add or remove them (they are made in rooms, by design); the demo's hand-made Hookshot could now be replaced by an offering
+with `public_url: https://hookshot.longhair-tet.ts.net` and the Ingress repointed at
+`bridge-hookshot:webhooks` (the operator's Service now carries it), which this branch does not
+do.
 
 ## 2026-10-19, evening (branch `agent/bridge-pins-2610`): six mautrix pins to v0.2610.0, and the real-bridge test's listener had served no media since the 16th
 

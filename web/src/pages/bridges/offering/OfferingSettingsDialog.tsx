@@ -10,7 +10,15 @@ import { ApiProblemError } from "@/api/problem";
 import { Button } from "@/components/ui/button/Button";
 import { Dialog, DialogContent } from "@/components/ui/dialog/Dialog";
 import { toast } from "@/components/ui/toast/toast-store";
-import { accessIsValid, requestFromOffering, settingsEffects } from "@/lib/bridge-offerings";
+import {
+  accessIsValid,
+  hookshotOptions,
+  hookshotRefusal,
+  hookshotValues,
+  requestFromOffering,
+  settingsEffects,
+  takesPublicUrl,
+} from "@/lib/bridge-offerings";
 import {
   AccessFields,
   OptionFields,
@@ -39,6 +47,7 @@ function draftOf(offering: BridgeOffering): Draft {
     encryption: r.options.encryption ?? false,
     doublePuppeting: r.options.double_puppeting ?? false,
     backfill: r.options.backfill ?? false,
+    ...hookshotValues(offering),
   };
 }
 
@@ -109,8 +118,13 @@ function SettingsForm({
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
-    // The access field already says what is wrong with it.
+    // The access and Hookshot fields already say what is wrong with them.
     if (!accessIsValid(draft.allLocalUsers, draft.users)) return;
+    const hookshot = takesPublicUrl(type);
+    if (hookshot && hookshotRefusal(draft)) {
+      setError(hookshotRefusal(draft));
+      return;
+    }
     setError(null);
     try {
       await put.mutateAsync({
@@ -127,6 +141,7 @@ function SettingsForm({
             encryption: draft.encryption,
             double_puppeting: draft.doublePuppeting,
             backfill: draft.backfill,
+            ...(hookshot ? hookshotOptions(draft) : {}),
           },
         },
       });

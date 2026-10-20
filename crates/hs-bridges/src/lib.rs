@@ -22,6 +22,7 @@ pub mod manager;
 pub mod matrix;
 pub mod metrics;
 pub mod overlap;
+pub mod passkey;
 pub mod runtime;
 pub mod store;
 

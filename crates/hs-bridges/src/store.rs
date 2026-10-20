@@ -146,6 +146,12 @@ pub struct InstanceRow {
     /// (Rows the manager gave a key on 2026-10-09 keep it; the carried key wins over it.)
     #[serde(default)]
     pub pickle_key: Option<String>,
+    /// Hookshot's passkey (`crate::passkey`): the RSA private key its config's `passFile`
+    /// names, as PKCS#8 PEM, minted on the instance's first step for a type that needs one
+    /// (`hs_admin::bridge_types::needs_passkey`) and kept here so that every render writes the
+    /// same key. `None` for every other type.
+    #[serde(default)]
+    pub passkey_pem: Option<String>,
     /// The seeds of the bot's cross-signing master and self-signing keys
     /// (`crate::cross_signing`), hex, minted on the instance's first ready step and kept here
     /// so the identity outlives the bridge's own database. `None` on a row from before this:
@@ -243,6 +249,7 @@ impl InstanceRow {
             hs_token: None,
             provisioning_secret: None,
             pickle_key: None,
+            passkey_pem: None,
             cross_signing_master_seed: None,
             cross_signing_self_signing_seed: None,
             signed_bot_device: None,

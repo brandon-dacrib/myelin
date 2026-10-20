@@ -20,6 +20,7 @@ use crate::bridge::{
     ANNOTATION_APPSERVICE_ID, ANNOTATION_FILES_HASH, ANNOTATION_OWNER, CONDITION_AVAILABLE,
     LABEL_APPSERVICE_ID, LABEL_BRIDGE_TYPE, LABEL_OWNER, label_value,
 };
+use crate::crds::bridge::BridgePort;
 use crate::crds::{Bridge, BridgeSpec, BridgeStorage, ImageSpec, Phase, VolumeStatus};
 
 /// The field manager the homeserver applies `Bridge`s and Secrets with.
@@ -67,6 +68,21 @@ pub struct BridgeInstanceSpec {
     /// when unset. [`KubeBridgeClient::apply`] never writes a size smaller than the one the
     /// `Bridge` in the cluster already asks for: someone may have raised it by hand.
     pub storage_size: Option<String>,
+    /// Ports the bridge listens on besides `port`, exposed by the Service under their names
+    /// (`BridgeSpec::extra_ports`): Hookshot's `webhooks` and `metrics`. A cluster whose CRD
+    /// predates the field refuses a `Bridge` with any ([`DeployError::OutdatedCrd`]); one
+    /// without is unaffected.
+    pub extra_ports: Vec<ExtraPort>,
+}
+
+/// One of a [`BridgeInstanceSpec`]'s extra ports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtraPort {
+    /// An IANA service name: lowercase letters, digits and `-`, at most 15 characters, at least
+    /// one letter ([`validate`] checks).
+    pub name: String,
+    /// The port number the bridge listens on; the Service exposes the same number.
+    pub port: i32,
 }
 
 /// What the cluster says about one `Bridge`.
@@ -444,6 +460,32 @@ pub fn validate(spec: &BridgeInstanceSpec) -> Result<(), DeployError> {
             spec.port
         )));
     }
+    for p in &spec.extra_ports {
+        let iana_name = !p.name.is_empty()
+            && p.name.len() <= 15
+            && p.name.chars().any(|c| c.is_ascii_lowercase())
+            && p.name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            && !p.name.starts_with('-')
+            && !p.name.ends_with('-');
+        if !iana_name {
+            return Err(DeployError::Invalid(format!(
+                "extra port name {:?} is not a service name (lowercase letters, digits and '-', \
+                 at most 15 characters, with a letter)",
+                p.name
+            )));
+        }
+        if p.name == crate::bridge::PORT_NAME
+            || !(1..=65535).contains(&p.port)
+            || p.port == spec.port
+        {
+            return Err(DeployError::Invalid(format!(
+                "extra port {} ({}) clashes with the appservice port or is out of range",
+                p.name, p.port
+            )));
+        }
+    }
     if spec.image.repository.is_empty() {
         return Err(DeployError::Invalid(
             "the image has no repository".to_owned(),
@@ -538,6 +580,14 @@ fn bridge_object(spec: &BridgeInstanceSpec, namespace: &str) -> Bridge {
                 storage_class_name: None,
             },
             resources: None,
+            extra_ports: spec
+                .extra_ports
+                .iter()
+                .map(|p| BridgePort {
+                    name: p.name.clone(),
+                    port: p.port,
+                })
+                .collect(),
         },
     );
     bridge.metadata = object_meta(spec.name.clone(), spec, namespace);
@@ -655,6 +705,39 @@ mod tests {
                 ),
             ]),
             storage_size: None,
+            extra_ports: Vec::new(),
+        }
+    }
+
+    /// An extra port needs a service name Kubernetes takes (at most 15 characters, a letter in
+    /// it) and a number that is not the appservice port; a good one reaches the `Bridge`.
+    #[test]
+    fn extra_ports_are_validated_and_written_into_the_bridge() {
+        let mut s = spec();
+        s.extra_ports = vec![ExtraPort {
+            name: "webhooks".to_owned(),
+            port: 9000,
+        }];
+        validate(&s).unwrap();
+        let bridge = bridge_object(&s, "myelin");
+        assert_eq!(bridge.spec.extra_ports[0].name, "webhooks");
+        assert_eq!(bridge.spec.extra_ports[0].port, 9000);
+        for (name, port) in [
+            ("Webhooks", 9000),
+            ("a-name-of-sixteen", 9000),
+            ("9000", 9000),
+            ("appservice", 9000),
+            ("webhooks", 29318),
+            ("webhooks", 0),
+        ] {
+            s.extra_ports = vec![ExtraPort {
+                name: name.to_owned(),
+                port,
+            }];
+            assert!(
+                matches!(validate(&s), Err(DeployError::Invalid(_))),
+                "{name} {port} should be refused"
+            );
         }
     }
 

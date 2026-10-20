@@ -23,6 +23,9 @@ hex = { workspace = true }
 # `hs_bridge_volume_*` gauges (`src/metrics.rs`), served by `hs serve`.
 prometheus-client = { workspace = true }
 rand = { workspace = true }
+# `src/passkey.rs`: Hookshot's passkey, an RSA private key in PEM.
+rsa = { workspace = true }
+rand_core = { workspace = true, features = ["getrandom"] }
 regex = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }

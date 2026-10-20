@@ -52,6 +52,23 @@ spec:
               bridgeType:
                 description: 'Which bridge implementation this is (`"mautrix-whatsapp"`, `"heisenbridge"`, ...), from the homeserver''s bridge catalogue. Free-form: a new bridge type must not need a CRD change.'
                 type: string
+              extraPorts:
+                description: Ports the bridge listens on besides `port`, each exposed by the Service under its name and number (Hookshot's `webhooks` on 9000, what an Ingress for its public URL points at, and `metrics` on 9001). Nothing probes them. Empty for a bridge that listens for the homeserver alone.
+                items:
+                  description: One more port a [`BridgeSpec`] exposes ([`BridgeSpec::extra_ports`]).
+                  properties:
+                    name:
+                      description: 'The port''s name on the container and the Service: an IANA service name (lowercase letters, digits and `-`, at most 15 characters, at least one letter), such as `webhooks`.'
+                      type: string
+                    port:
+                      description: The port number the bridge listens on; the Service exposes the same number.
+                      format: int32
+                      type: integer
+                  required:
+                  - name
+                  - port
+                  type: object
+                type: array
               filesSecret:
                 description: 'A `Secret` in the same namespace whose every key is written into `/data` as a file on every start. A mautrix bridge completes and rewrites its `config.yaml` and generates secrets it was not given (`encryption.pickle_key`), so the values of those keys are carried from the file already there into the new copy, which keeps its crypto store readable. The Secret''s contents are not part of this spec: whoever changes them annotates the `Bridge` with `myelin.dev/files-hash` so that the change rolls the pod.'
                 type: string

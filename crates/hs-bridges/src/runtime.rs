@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use async_trait::async_trait;
+pub use hs_admin::bridge_types::ExtraPort;
 use hs_admin::model::{BridgeDeployment, BridgeDeploymentTarget};
 
 /// One instance's deployment, as the runtime is asked for it.
@@ -26,6 +27,9 @@ pub struct DeploySpec {
     /// File name in `/data` -> contents.
     pub files: BTreeMap<String, String>,
     pub storage_size: Option<String>,
+    /// Ports the bridge listens on besides `port`, for the Service to expose by name
+    /// (Hookshot's `webhooks` and `metrics`); the `Bridge`'s `extraPorts`.
+    pub extra_ports: Vec<ExtraPort>,
 }
 
 impl std::fmt::Debug for DeploySpec {
@@ -100,6 +104,10 @@ pub fn manifest_yaml(spec: &DeploySpec, namespace: &str) -> String {
         yaml_str(&spec.image_tag)
     );
     let _ = writeln!(out, "  port: {}", spec.port);
+    out.push_str(&hs_admin::bridge_types::extra_ports_yaml(
+        &spec.extra_ports,
+        "  ",
+    ));
     let _ = writeln!(out, "  filesSecret: {}-files", spec.name);
     if !spec.args.is_empty() {
         out.push_str("  args:\n");
@@ -138,6 +146,7 @@ mod tests {
                 ("registration.yaml".into(), "id: whatsapp-alice\n".into()),
             ]),
             storage_size: Some("1Gi".into()),
+            extra_ports: Vec::new(),
         };
         let yaml = manifest_yaml(&spec, "myelin");
         let docs: Vec<serde_json::Value> = yaml

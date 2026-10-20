@@ -378,6 +378,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/bridge-offerings/{type}/connections": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * What a shared integrations bridge has connected
+         * @description For a shared bridge with many connections (Hookshot), one entry per connection, room by room, read from the rooms' state (each connection is a `uk.half-shot.matrix-hookshot.*` state event; Hookshot 7 has no provisioning API). Empty for a type that keeps no connections in room state, or whose instance is not running yet. A webhook's secret id is not in the state and is not here.
+         */
+        get: operations["bridge_offerings.connections"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/bridge-offerings/{type}/instances": {
         parameters: {
             query?: never;
@@ -2764,6 +2784,28 @@ export interface components {
         AuditEntryPage: components["schemas"]["PageEnvelope"] & {
             items: components["schemas"]["AuditEntry"][];
         };
+        /** @description One thing a shared integrations bridge (Hookshot) has connected to a room, read from the room's state. */
+        BridgeConnection: {
+            /** @description The event's content as it is. */
+            content?: {
+                [key: string]: unknown;
+            };
+            /** @description The state event type (`uk.half-shot.matrix-hookshot.generic.hook`). */
+            event_type: string;
+            /** @description A webhook's name, a repository's `org/repo`, a feed's URL, else the state key. */
+            name: string;
+            room_id: string;
+            room_name?: string | null;
+            /** @description `webhook`, `github`, `gitlab`, `jira`, `feed`, `figma`, `openproject`, or the state event type's own word for one this server does not know. */
+            service: string;
+            /**
+             * @description `removed` for a connection whose event the bridge has emptied.
+             * @enum {string}
+             */
+            state: "active" | "removed";
+            /** @description The state key, what the bridge named the connection. */
+            state_key: string;
+        };
         BridgeDeployment: {
             image?: string;
             /** @description What the operator last said (a pull failure, a crash loop, waiting for the pod). */
@@ -2843,6 +2885,10 @@ export interface components {
         BridgeInstanceFiles: {
             compose_yaml?: string;
             config_yaml?: string | null;
+            /** @description Every file the bridge reads from `/data`, by its name there (`config.yml`, `registration.yml`, `passkey.pem` and `github-key.pem` for Hookshot; `config.yaml` and `registration.yaml` for a mautrix bridge). What the files Secret holds. */
+            files?: {
+                [key: string]: string;
+            };
             /** @description A Secret with the files and a `Bridge` resource, for a cluster running the Myelin operator. */
             manifest_yaml?: string;
             registration_yaml?: string;
@@ -2939,10 +2985,21 @@ export interface components {
             /** @description When not `all_local_users`, the users who may. */
             users?: string[];
         };
+        /** @description A GitHub App for Hookshot. All three parts are needed for the App to be written into the bridge's config; the private key is returned as given. */
+        BridgeOfferingGithub: {
+            app_id?: string | null;
+            /** @description The App's private key, PEM; written beside the config as `github-key.pem`. */
+            private_key?: string | null;
+            webhook_secret?: string | null;
+        };
         BridgeOfferingOptions: {
             backfill?: boolean;
             double_puppeting?: boolean;
             encryption?: boolean;
+            /** @description For Hookshot, the GitHub App it acts as; absent, the bridge takes repository webhooks only. */
+            github?: components["schemas"]["BridgeOfferingGithub"] | null;
+            /** @description For a bridge that receives webhooks (Hookshot), the URL the services it listens to reach its webhooks listener on, from outside (`https://hooks.example.org`). Required by a type whose catalogue entry needs `public_url`. */
+            public_url?: string | null;
         };
         BridgeOfferingPage: components["schemas"]["PageEnvelope"] & {
             items: components["schemas"]["BridgeOffering"][];
@@ -5163,6 +5220,37 @@ export interface operations {
             403: components["responses"]["InsufficientScope"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
+            429: components["responses"]["RateLimited"];
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    "bridge_offerings.connections": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description A bridge type catalog id. */
+                type: components["parameters"]["BridgeTypeId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The connections. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        items: components["schemas"]["BridgeConnection"][];
+                    };
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["InsufficientScope"];
+            404: components["responses"]["NotFound"];
             429: components["responses"]["RateLimited"];
             500: components["responses"]["Internal"];
             503: components["responses"]["Unavailable"];

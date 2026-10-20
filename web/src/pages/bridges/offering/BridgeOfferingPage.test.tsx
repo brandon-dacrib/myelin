@@ -466,6 +466,34 @@ describe("Bridge offering page", () => {
     expect(screen.queryByRole("button", { name: "Add for a user" })).toBeNull();
   });
 
+  it("lists what a Hookshot offering has connected, room by room, with its public URL", async () => {
+    putOffering("matrix-hookshot", {
+      runtime: "cluster",
+      enabled: true,
+      options: { public_url: "https://hooks.example.org" },
+    });
+    renderOffering("matrix-hookshot");
+    expect(await screen.findByRole("heading", { name: "The bridge" })).toBeInTheDocument();
+    // Its settings say the public URL instead of the per-person switches.
+    expect(screen.getByText("https://hooks.example.org")).toBeInTheDocument();
+    expect(screen.getByText(/repositories post through webhooks/)).toBeInTheDocument();
+    // One bridge, many connections: the table under it, read from the rooms' state.
+    const connections = await screen.findByTestId("connections");
+    const table = await within(connections).findByRole("table");
+    expect(within(table).getByText("brandon-dacrib/myelin")).toBeInTheDocument();
+    expect(within(table).getAllByText("myelin pull requests").length).toBeGreaterThan(0);
+    expect(within(table).getByText("Removed")).toBeInTheDocument();
+    expect(within(table).getAllByText("Active")).toHaveLength(2);
+  });
+
+  it("shows no Hookshot settings or connections on a shared bridge that takes none", async () => {
+    putOffering("heisenbridge", { runtime: "cluster", enabled: true });
+    renderOffering("heisenbridge");
+    expect(await screen.findByRole("heading", { name: "Settings" })).toBeInTheDocument();
+    expect(screen.queryByText(/Public URL/)).toBeNull();
+    expect(screen.queryByTestId("connections")).toBeNull();
+  });
+
   it("disables every change without bridges:write", async () => {
     signOut();
     await signIn(["bridges:read"] as Scope[]);

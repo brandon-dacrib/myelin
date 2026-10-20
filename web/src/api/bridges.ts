@@ -555,6 +555,28 @@ export type BridgeInstanceState = BridgeInstance["state"];
 export type BridgeInstanceFiles = components["schemas"]["BridgeInstanceFiles"];
 export type BridgeInstanceRequest = components["schemas"]["BridgeInstanceRequest"];
 export type BridgeMode = BridgeOffering["mode"];
+export type BridgeOfferingOptions = NonNullable<BridgeOfferingRequest["options"]>;
+export type BridgeOfferingGithub = NonNullable<BridgeOfferingOptions["github"]>;
+export type BridgeConnection = components["schemas"]["BridgeConnection"];
+
+/**
+ * What a shared integrations bridge (Hookshot) has connected, room by room, read from the
+ * rooms' state (`GET /bridge-offerings/{type}/connections`). Asked only for a type that keeps
+ * connections there (`enabled`); polled, since connections are made in rooms, not here.
+ */
+export function useBridgeConnections(type: string | undefined, enabled: boolean) {
+  return useQuery({
+    queryKey: ["bridge-connections", type],
+    enabled: Boolean(type) && enabled,
+    queryFn: async () =>
+      unwrap(
+        await api.GET("/bridge-offerings/{type}/connections", {
+          params: { path: { type: type! } },
+        }),
+      ).items,
+    refetchInterval: 30_000,
+  });
+}
 
 /** Every instance state, in the order an instance moves through them. */
 export const BRIDGE_INSTANCE_STATES: BridgeInstanceState[] = [

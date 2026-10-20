@@ -493,12 +493,21 @@ pub fn desired_deployment(bridge: &Bridge) -> Deployment {
         image: Some(image),
         image_pull_policy: pull_policy,
         args: (!spec.args.is_empty()).then(|| spec.args.clone()),
-        ports: Some(vec![ContainerPort {
-            name: Some(PORT_NAME.to_owned()),
-            container_port: spec.port,
-            protocol: Some("TCP".to_owned()),
-            ..ContainerPort::default()
-        }]),
+        ports: Some(
+            std::iter::once(ContainerPort {
+                name: Some(PORT_NAME.to_owned()),
+                container_port: spec.port,
+                protocol: Some("TCP".to_owned()),
+                ..ContainerPort::default()
+            })
+            .chain(spec.extra_ports.iter().map(|p| ContainerPort {
+                name: Some(p.name.clone()),
+                container_port: p.port,
+                protocol: Some("TCP".to_owned()),
+                ..ContainerPort::default()
+            }))
+            .collect(),
+        ),
         readiness_probe: Some(tcp_probe(5, 5, 3)),
         // A bridge that exits says why on its last log line (mautrix: `FTL Failed to start
         // bridge error=...`); with this the kubelet keeps the end of the log as the
@@ -568,23 +577,34 @@ pub fn desired_deployment(bridge: &Bridge) -> Deployment {
     }
 }
 
-/// The bridge's Service, `<name>`: ClusterIP, `port` to the container's `appservice` port. The
-/// homeserver reaches the bridge at `http://<name>.<namespace>.svc:<port>`.
+/// The bridge's Service, `<name>`: ClusterIP, `port` to the container's `appservice` port, and
+/// each of `spec.extraPorts` to the container port of the same name (Hookshot's `webhooks`,
+/// which an Ingress for its public URL points at as `<name>:webhooks`). The homeserver reaches
+/// the bridge at `http://<name>.<namespace>.svc:<port>`.
 #[must_use]
 pub fn desired_service(bridge: &Bridge) -> Service {
     let name = bridge.name_any();
+    let ports = std::iter::once(ServicePort {
+        name: Some(PORT_NAME.to_owned()),
+        port: bridge.spec.port,
+        target_port: Some(IntOrString::String(PORT_NAME.to_owned())),
+        protocol: Some("TCP".to_owned()),
+        ..ServicePort::default()
+    })
+    .chain(bridge.spec.extra_ports.iter().map(|p| ServicePort {
+        name: Some(p.name.clone()),
+        port: p.port,
+        target_port: Some(IntOrString::String(p.name.clone())),
+        protocol: Some("TCP".to_owned()),
+        ..ServicePort::default()
+    }))
+    .collect();
     Service {
         metadata: metadata(bridge, name.clone()),
         spec: Some(ServiceSpec {
             type_: Some("ClusterIP".to_owned()),
             selector: Some(selector_labels(&name)),
-            ports: Some(vec![ServicePort {
-                name: Some(PORT_NAME.to_owned()),
-                port: bridge.spec.port,
-                target_port: Some(IntOrString::String(PORT_NAME.to_owned())),
-                protocol: Some("TCP".to_owned()),
-                ..ServicePort::default()
-            }]),
+            ports: Some(ports),
             ..ServiceSpec::default()
         }),
         status: None,
@@ -851,6 +871,7 @@ mod tests {
                     storage_class_name: Some("longhorn".to_owned()),
                 },
                 resources: None,
+                extra_ports: Vec::new(),
             },
         );
         b.metadata.namespace = Some("myelin".to_owned());
@@ -1290,6 +1311,49 @@ mod tests {
             port.target_port,
             Some(IntOrString::String("appservice".to_owned()))
         );
+    }
+
+    /// Hookshot's webhooks and metrics listeners: each extra port is on the container under
+    /// its name and on the Service under the same name and number, after the appservice port,
+    /// so an Ingress for the public URL can point at `<name>:webhooks`.
+    #[test]
+    fn extra_ports_are_on_the_container_and_the_service_by_name() {
+        let mut b = bridge();
+        b.spec.extra_ports = vec![
+            crate::crds::bridge::BridgePort {
+                name: "webhooks".to_owned(),
+                port: 9000,
+            },
+            crate::crds::bridge::BridgePort {
+                name: "metrics".to_owned(),
+                port: 9001,
+            },
+        ];
+        let d = desired_deployment(&b);
+        let pod = d.spec.unwrap().template.spec.unwrap();
+        let ports = pod.containers[0].ports.clone().unwrap();
+        assert_eq!(
+            ports
+                .iter()
+                .map(|p| (p.name.clone().unwrap(), p.container_port))
+                .collect::<Vec<_>>(),
+            [
+                ("appservice".to_owned(), 29318),
+                ("webhooks".to_owned(), 9000),
+                ("metrics".to_owned(), 9001)
+            ]
+        );
+        let s = desired_service(&b);
+        let ports = s.spec.unwrap().ports.unwrap();
+        assert_eq!(ports.len(), 3);
+        assert_eq!(ports[1].name.as_deref(), Some("webhooks"));
+        assert_eq!(ports[1].port, 9000);
+        assert_eq!(
+            ports[1].target_port,
+            Some(IntOrString::String("webhooks".to_owned()))
+        );
+        // The pod template hash changes with them: a Bridge given ports rolls once.
+        assert_ne!(spec_hash(&b), spec_hash(&bridge()));
     }
 
     #[test]

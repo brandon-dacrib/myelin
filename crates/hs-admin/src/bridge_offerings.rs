@@ -9,7 +9,7 @@ use std::sync::RwLock;
 use async_trait::async_trait;
 
 use crate::model::{
-    BridgeDeploymentTarget, BridgeInstance, BridgeInstanceFiles, BridgeOffering,
+    BridgeConnection, BridgeDeploymentTarget, BridgeInstance, BridgeInstanceFiles, BridgeOffering,
     BridgeOfferingRequest,
 };
 use crate::sources::SourceError;
@@ -73,6 +73,10 @@ pub trait BridgeOfferingSource: Send + Sync + 'static {
         bridge_type: &str,
         user_id: &str,
     ) -> Result<BridgeInstanceFiles, SourceError>;
+    /// What a shared integrations bridge (Hookshot) has connected, room by room: read from the
+    /// rooms its bot is in. Empty for a type that keeps no connections in room state, or whose
+    /// instance is not running yet.
+    async fn connections(&self, bridge_type: &str) -> Result<Vec<BridgeConnection>, SourceError>;
 }
 
 /// A [`BridgeOfferingSource`] held in memory: offerings are stored as given, instances are
@@ -353,13 +357,26 @@ impl BridgeOfferingSource for InMemoryBridgeOfferings {
         if self.instance(bridge_type, user_id).await?.is_none() {
             return Err(SourceError::NotFound);
         }
+        let config = "homeserver:\n  domain: example.org\n".to_owned();
+        let registration = format!("id: {bridge_type}\n");
         Ok(BridgeInstanceFiles {
-            config_yaml: Some("homeserver:\n  domain: example.org\n".into()),
-            registration_yaml: format!("id: {bridge_type}\n"),
+            config_yaml: Some(config.clone()),
+            registration_yaml: registration.clone(),
             compose_yaml: "services: {}\n".into(),
             manifest_yaml: "kind: Bridge\n".into(),
             run_sh: (bridge_type == "mautrix-imessage").then(|| "#!/bin/sh\n".into()),
+            files: BTreeMap::from([
+                ("config.yaml".to_owned(), config),
+                ("registration.yaml".to_owned(), registration),
+            ]),
         })
+    }
+
+    async fn connections(&self, bridge_type: &str) -> Result<Vec<BridgeConnection>, SourceError> {
+        if self.get(bridge_type).await?.is_none() {
+            return Err(SourceError::NotFound);
+        }
+        Ok(Vec::new())
     }
 }
 

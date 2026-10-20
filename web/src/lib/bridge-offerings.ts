@@ -2,6 +2,7 @@ import type {
   BridgeInstance,
   BridgeInstanceState,
   BridgeOffering,
+  BridgeOfferingOptions,
   BridgeOfferingRequest,
   BridgeType,
 } from "@/api/bridges";
@@ -124,7 +125,7 @@ export function notDeployableReason(
  */
 export function defaultOfferingOptions(
   type: Pick<BridgeType, "supports_double_puppeting" | "required_features" | "renders_config">,
-): Required<NonNullable<BridgeOfferingRequest["options"]>> {
+): Required<Pick<BridgeOfferingOptions, "encryption" | "double_puppeting" | "backfill">> {
   const e2ee = (type.required_features ?? []).includes("org.matrix.msc3202");
   return {
     encryption: e2ee,
@@ -148,7 +149,77 @@ export function requestFromOffering(offering: BridgeOffering): Required<BridgeOf
       encryption: offering.options?.encryption ?? false,
       double_puppeting: offering.options?.double_puppeting ?? false,
       backfill: offering.options?.backfill ?? false,
+      // Only a bridge with a public URL (Hookshot) carries these; the rest send none.
+      ...(offering.options?.public_url ? hookshotOptions(hookshotValues(offering)) : {}),
     },
+  };
+}
+
+/** The Hookshot settings an offering holds, for a form to start from. */
+export function hookshotValues(offering: Pick<BridgeOffering, "options">): HookshotValues {
+  return {
+    publicUrl: offering.options?.public_url ?? "",
+    githubAppId: offering.options?.github?.app_id ?? "",
+    githubPrivateKey: offering.options?.github?.private_key ?? "",
+    githubWebhookSecret: offering.options?.github?.webhook_secret ?? "",
+  };
+}
+
+/** The settings of a bridge that receives webhooks (Hookshot), as the forms hold them. */
+export interface HookshotValues {
+  /** The URL the outside reaches its webhooks listener on; required. */
+  publicUrl: string;
+  githubAppId: string;
+  githubPrivateKey: string;
+  githubWebhookSecret: string;
+}
+
+/**
+ * Whether `type` is a shared integrations bridge configured around a public URL (Hookshot):
+ * its catalogue entry needs `public_url`. Such a type takes the Hookshot settings instead of
+ * the per-person switches, and its page lists what it has connected.
+ */
+export function takesPublicUrl(type: Pick<BridgeType, "config_keys"> | undefined): boolean {
+  return (type?.config_keys ?? []).some((k) => k.key === "public_url");
+}
+
+/** Whether a GitHub App is partly filled in: all three parts or none are wanted. */
+export function githubAppIsPartial(v: HookshotValues): boolean {
+  const parts = [v.githubAppId, v.githubPrivateKey, v.githubWebhookSecret].map((s) => s.trim());
+  return parts.some(Boolean) && !parts.every(Boolean);
+}
+
+/** What is wrong with the Hookshot settings as typed, or `null`; the server has the last word. */
+export function hookshotRefusal(v: HookshotValues): string | null {
+  const url = v.publicUrl.trim();
+  if (!url)
+    return "A public URL is needed: it is the start of every webhook URL the bridge hands out.";
+  if (!/^https?:\/\/\S+$/.test(url)) return "The public URL is https://host or https://host/path.";
+  if (githubAppIsPartial(v))
+    return "A GitHub App needs its App ID, private key and webhook secret together; leave all three empty for webhooks only.";
+  return null;
+}
+
+/**
+ * The Hookshot parts of an offering's `options`, from the form: the public URL as typed, and
+ * the GitHub App only when all of it is there, else `null` (which the server reads as none).
+ */
+export function hookshotOptions(
+  v: HookshotValues,
+): Pick<BridgeOfferingOptions, "public_url" | "github"> {
+  const url = v.publicUrl.trim();
+  const complete = [v.githubAppId, v.githubPrivateKey, v.githubWebhookSecret].every((s) =>
+    s.trim(),
+  );
+  return {
+    public_url: url || null,
+    github: complete
+      ? {
+          app_id: v.githubAppId.trim(),
+          private_key: v.githubPrivateKey.trim(),
+          webhook_secret: v.githubWebhookSecret.trim(),
+        }
+      : null,
   };
 }
 

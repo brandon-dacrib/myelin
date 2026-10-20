@@ -558,6 +558,7 @@ const REAL_HANDLERS: &[&str] = &[
     "bridge_offerings.get",
     "bridge_offerings.put",
     "bridge_offerings.delete",
+    "bridge_offerings.connections",
     "bridge_instances.list",
     "bridge_instances.get",
     "bridge_instances.put",
@@ -3218,6 +3219,29 @@ async fn bridge_offerings_delete(
     .await
 }
 
+/// `GET /api/v1/bridge-offerings/{type}/connections`: what a shared integrations bridge has
+/// connected, room by room, read from the rooms' state.
+async fn bridge_offerings_connections(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(t): Path<String>,
+) -> Response {
+    let instance = format!("/api/v1/bridge-offerings/{t}/connections");
+    with_offerings(
+        &state,
+        &headers,
+        &instance,
+        Scope::BridgesRead,
+        None,
+        StatusCode::OK,
+        |s| async move {
+            let items = s.connections(&t).await?;
+            Ok(Some(serde_json::json!({ "items": items })))
+        },
+    )
+    .await
+}
+
 /// `GET /api/v1/bridge-offerings/{type}/instances`.
 async fn bridge_instances_list(
     State(state): State<AdminState>,
@@ -5851,6 +5875,9 @@ fn register_real_operation(builder: Builder<AdminState>, op: OperationDef) -> Bu
         "bridge_offerings.get" => builder.add(method, &full_path, bridge_offerings_get, meta),
         "bridge_offerings.put" => builder.add(method, &full_path, bridge_offerings_put, meta),
         "bridge_offerings.delete" => builder.add(method, &full_path, bridge_offerings_delete, meta),
+        "bridge_offerings.connections" => {
+            builder.add(method, &full_path, bridge_offerings_connections, meta)
+        }
         "bridge_instances.list" => builder.add(method, &full_path, bridge_instances_list, meta),
         "bridge_instances.get" => builder.add(method, &full_path, bridge_instances_get, meta),
         "bridge_instances.put" => builder.add(method, &full_path, bridge_instances_put, meta),

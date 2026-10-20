@@ -76,6 +76,23 @@ pub struct BridgeSpec {
     /// 32Mi and 10m and limits memory to 512Mi.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<ResourceRequirements>,
+    /// Ports the bridge listens on besides `port`, each exposed by the Service under its name
+    /// and number (Hookshot's `webhooks` on 9000, what an Ingress for its public URL points at,
+    /// and `metrics` on 9001). Nothing probes them. Empty for a bridge that listens for the
+    /// homeserver alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_ports: Vec<BridgePort>,
+}
+
+/// One more port a [`BridgeSpec`] exposes ([`BridgeSpec::extra_ports`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgePort {
+    /// The port's name on the container and the Service: an IANA service name (lowercase
+    /// letters, digits and `-`, at most 15 characters, at least one letter), such as `webhooks`.
+    pub name: String,
+    /// The port number the bridge listens on; the Service exposes the same number.
+    pub port: i32,
 }
 
 /// The volume a [`BridgeSpec`] keeps its state on.
@@ -133,6 +150,7 @@ mod tests {
             args: Vec::new(),
             storage: BridgeStorage::default(),
             resources: None,
+            extra_ports: Vec::new(),
         }
     }
 
@@ -161,6 +179,48 @@ filesSecret: bridge-1a2b3c4d-files
         assert!(spec.args.is_empty());
         assert_eq!(spec.storage, BridgeStorage::default());
         assert!(spec.resources.is_none());
+        assert!(spec.extra_ports.is_empty());
+    }
+
+    /// Hookshot's `Bridge` (what the homeserver writes for it) names its webhooks and metrics
+    /// ports; a `Bridge` without any serializes without the field, so an older CRD still takes
+    /// every other bridge.
+    #[test]
+    fn extra_ports_parse_and_are_left_out_when_empty() {
+        let yaml = r"
+bridgeType: matrix-hookshot
+appserviceId: hookshot
+image: { repository: ghcr.io/matrix-org/matrix-hookshot, tag: 7.5.0 }
+port: 9993
+filesSecret: bridge-hookshot-files
+extraPorts:
+  - name: webhooks
+    port: 9000
+  - name: metrics
+    port: 9001
+";
+        let spec: BridgeSpec = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(
+            spec.extra_ports,
+            vec![
+                BridgePort {
+                    name: "webhooks".to_owned(),
+                    port: 9000
+                },
+                BridgePort {
+                    name: "metrics".to_owned(),
+                    port: 9001
+                }
+            ]
+        );
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(json["extraPorts"][0]["name"], "webhooks");
+        assert!(
+            serde_json::to_value(sample())
+                .unwrap()
+                .get("extraPorts")
+                .is_none()
+        );
     }
 
     #[test]
@@ -171,5 +231,10 @@ filesSecret: bridge-1a2b3c4d-files
             ["properties"];
         assert!(props.get("replicas").is_none());
         assert!(props.get("appserviceId").is_some());
+        assert_eq!(props["extraPorts"]["type"], "array");
+        assert_eq!(
+            props["extraPorts"]["items"]["properties"]["port"]["type"],
+            "integer"
+        );
     }
 }

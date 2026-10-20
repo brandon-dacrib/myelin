@@ -4,7 +4,13 @@ import type {
   BridgeOfferingRuntime,
   BridgeType,
 } from "@/api/bridges";
-import { defaultOfferingOptions } from "@/lib/bridge-offerings";
+import {
+  defaultOfferingOptions,
+  hookshotOptions,
+  hookshotRefusal,
+  takesPublicUrl,
+  type HookshotValues,
+} from "@/lib/bridge-offerings";
 
 export const OFFER_STEPS = ["kind", "access", "runtime", "options", "review"] as const;
 export type OfferStep = (typeof OFFER_STEPS)[number];
@@ -18,7 +24,7 @@ export const OFFER_STEP_LABELS: Record<OfferStep, string> = {
 };
 
 /** The Offer-a-bridge wizard's own state: what `PUT /bridge-offerings/{type}` will be sent. */
-export interface OfferFormState {
+export interface OfferFormState extends HookshotValues {
   type: string;
   allLocalUsers: boolean;
   /** Who may, when not everyone: the Matrix IDs listed, one entry each. */
@@ -40,6 +46,10 @@ export const initialOfferState: OfferFormState = {
   encryption: true,
   doublePuppeting: true,
   backfill: true,
+  publicUrl: "",
+  githubAppId: "",
+  githubPrivateKey: "",
+  githubWebhookSecret: "",
 };
 
 /** Choosing a kind resets what depends on it: the options start from what it can do. */
@@ -52,7 +62,23 @@ export function stateForKind(type: BridgeType): Partial<OfferFormState> {
     encryption: options.encryption,
     doublePuppeting: options.double_puppeting,
     backfill: options.backfill,
+    publicUrl: "",
+    githubAppId: "",
+    githubPrivateKey: "",
+    githubWebhookSecret: "",
   };
+}
+
+/**
+ * Whether the options step can be left: a bridge configured around a public URL (Hookshot)
+ * needs one that is a URL, and a GitHub App whole or not at all; every other kind's options
+ * are switches, which are always fine.
+ */
+export function optionsAreValid(
+  state: HookshotValues,
+  type: Pick<BridgeType, "config_keys"> | undefined,
+): boolean {
+  return !takesPublicUrl(type) || hookshotRefusal(state) === null;
 }
 
 /**
@@ -80,6 +106,7 @@ export function effectiveRuntime(
 export function offerRequest(
   state: OfferFormState,
   clusterAvailable: boolean,
+  type?: Pick<BridgeType, "config_keys">,
 ): BridgeOfferingRequest {
   return {
     enabled: true,
@@ -93,6 +120,8 @@ export function offerRequest(
       encryption: state.encryption,
       double_puppeting: state.doublePuppeting,
       backfill: state.backfill,
+      // Only a bridge configured around a public URL (Hookshot) sends its settings.
+      ...(takesPublicUrl(type) ? hookshotOptions(state) : {}),
     },
   };
 }

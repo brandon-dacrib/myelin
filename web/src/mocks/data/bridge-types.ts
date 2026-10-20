@@ -19,6 +19,8 @@ interface Spec {
   mode?: "per_user" | "shared";
   /** RFC 0017: whether the server can run it from a rendered config alone. */
   deployable?: boolean;
+  /** Whether a render writes a config the bridge reads as it is; mautrix bridges' default. */
+  rendersConfig?: boolean;
   /** Why the server cannot deploy it, when it cannot (`not_deployable_reason`). */
   notDeployableReason?: string;
   /** A program for a Mac rather than a container image: never deployed by this server. */
@@ -83,9 +85,9 @@ function provisioning(id: string): Pick<BridgeType, "provisioning_api" | "provis
     };
   if (id === "matrix-hookshot")
     return {
-      provisioning_api: "hookshot_v1",
+      provisioning_api: "none",
       provisioning_note:
-        "Hookshot's provisioning API manages each room's connections (webhooks, feeds, repositories); Myelin does not read accounts from it, so the bridge keeps that itself.",
+        "Hookshot 7 has no provisioning API and nobody signs in to it: each room's connections (webhooks, feeds, repositories) are state events in the room, which the offering's page lists.",
     };
   if (id === "mautrix-discord")
     return {
@@ -161,7 +163,7 @@ function type(spec: Spec): BridgeType {
       (mautrix
         ? ["de.sorunome.msc2409.push_ephemeral", "org.matrix.msc3202", "io.element.msc4190"]
         : []),
-    renders_config: mautrix,
+    renders_config: spec.rendersConfig ?? mautrix,
     mode: spec.mode ?? "per_user",
     deployable: spec.deployable ?? mautrix,
     not_deployable_reason: spec.notDeployableReason ?? null,
@@ -359,19 +361,28 @@ export const bridgeTypes: BridgeType[] = [
   type({
     id: "matrix-hookshot",
     mode: "shared",
-    deployable: false,
+    // Deployable since 2026-10-20: its config is rendered whole from the offering's public URL.
+    deployable: true,
+    rendersConfig: true,
     name: "Hookshot",
     category: "integrations",
-    description: "Webhooks, GitHub, GitLab, Jira and RSS feeds, posted into rooms.",
-    needs: ["public_url", "A URL the services it listens to can reach it on, for webhooks"],
+    description:
+      "One bridge for the whole server, with many connections: GitHub repositories, GitLab projects, Jira, RSS feeds and plain webhooks, each posting into a room of its own.",
+    needs: [
+      "public_url",
+      "A public URL (https://hooks.example.org) that reaches the bridge's webhooks listener, for GitHub and the other services to post to",
+    ],
     project: "matrix-org/matrix-hookshot",
     docs: "https://matrix-org.github.io/matrix-hookshot/latest/",
     image: "ghcr.io/matrix-org/matrix-hookshot:7.5.0",
     bot: "hookshot",
     prefix: "hookshot_",
     steps: [
-      "Invite {bot} to a room and send `!hookshot help`.",
-      "`!hookshot webhook <name>` gives the room a webhook URL; GitHub, GitLab, Jira and RSS are connected per room the same way, or through the widget.",
+      "Nobody signs in: it is one bridge for everyone here, and each room connects what it wants. Invite {bot} to a room (it needs to be allowed to send state events, the Moderator level in most clients) and send `!hookshot help`.",
+      "`!hookshot webhook <name>` answers with a URL for that room; anything that can post JSON to a URL (a GitHub or GitLab repository webhook, a monitoring alert, a script) then posts into the room. `!hookshot feed <url>` follows an RSS or Atom feed.",
+      "With a GitHub App in the offering's settings, `!hookshot github repo <org>/<repo>` connects a repository properly: issues, pull requests, reviews and releases, with the people who commented shown as ghost users.",
     ],
+    notes:
+      "Each connection is a state event in its room (uk.half-shot.matrix-hookshot.*); the offering's page lists them. Hookshot 7 has no provisioning API, so that list is read from the rooms.",
   }),
 ];

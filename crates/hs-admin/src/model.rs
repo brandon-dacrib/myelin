@@ -747,6 +747,72 @@ pub struct BridgeOfferingOptions {
     pub double_puppeting: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backfill: Option<bool>,
+    /// For a bridge that receives webhooks (Hookshot): the URL the services it listens to reach
+    /// its webhooks listener on, from outside (`https://hooks.example.org`). Written into its
+    /// config as the public prefix of every webhook URL it hands out. Required by a type whose
+    /// catalogue entry needs `public_url`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_url: Option<String>,
+    /// For Hookshot: the GitHub App it acts as, when repositories are to be connected through
+    /// an App rather than by plain repository webhooks. Absent, the bridge takes webhooks only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github: Option<BridgeOfferingGithub>,
+}
+
+/// A GitHub App for Hookshot ([`BridgeOfferingOptions::github`]): the three things its settings
+/// page shows. The private key is written into the bridge's files as `github-key.pem` and is
+/// returned as given: an offering's options are read with `bridges:read`, as its files' tokens
+/// are with `bridges:write`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BridgeOfferingGithub {
+    /// The App ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_id: Option<String>,
+    /// The App's private key, PEM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_key: Option<String>,
+    /// The App's webhook secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_secret: Option<String>,
+}
+
+impl BridgeOfferingGithub {
+    /// Whether the three parts are there: a GitHub App needs all of them.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        [&self.app_id, &self.private_key, &self.webhook_secret]
+            .iter()
+            .all(|v| v.as_deref().is_some_and(|s| !s.trim().is_empty()))
+    }
+}
+
+/// The OpenAPI `BridgeConnection` schema: one thing connected to a room through a shared
+/// integrations bridge (Hookshot): a repository, a feed, a webhook. Read from the room's state,
+/// where Hookshot keeps each connection as one `uk.half-shot.matrix-hookshot.*` state event
+/// (Hookshot 7.x has no provisioning API). A webhook's secret id is not in the state (the
+/// bridge keeps it in its own room account data), so it is not here either.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BridgeConnection {
+    /// `webhook`, `github`, `gitlab`, `jira`, `feed`, `figma`, `openproject`, or the state
+    /// event type's own suffix for one this server does not know.
+    pub service: String,
+    /// The state event type (`uk.half-shot.matrix-hookshot.generic.hook`).
+    pub event_type: String,
+    /// The state key: what the bridge named the connection.
+    pub state_key: String,
+    pub room_id: String,
+    /// The room's name, when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room_name: Option<String>,
+    /// What the connection is called or points at, from its content: a webhook's `name`, a
+    /// repository's `org/repo`, a feed's `url`, else the state key.
+    pub name: String,
+    /// `active` for a connection whose event has content, `removed` for one the bridge has
+    /// emptied (how Hookshot removes a connection).
+    pub state: String,
+    /// The event's content as it is, for the interface to show what this server does not model.
+    #[serde(default)]
+    pub content: serde_json::Value,
 }
 
 /// The body of `PUT /bridge-offerings/{type}`. Every field is optional: an absent one keeps the
@@ -959,6 +1025,12 @@ pub struct BridgeInstanceFiles {
     /// downloads the pinned build, clears its quarantine flag and starts the bridge.
     #[serde(default)]
     pub run_sh: Option<String>,
+    /// Every file the bridge reads from `/data`, by its name there: the config and the
+    /// registration under the names the bridge expects (`config.yml` and `registration.yml`
+    /// for Hookshot), and the others (Hookshot's `passkey.pem` and `github-key.pem`). What the
+    /// files Secret holds; `config_yaml` and `registration_yaml` are the same text.
+    #[serde(default)]
+    pub files: std::collections::BTreeMap<String, String>,
 }
 
 impl std::fmt::Debug for BridgeInstanceFiles {

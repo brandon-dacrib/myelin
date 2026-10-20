@@ -1511,6 +1511,15 @@
       "public": false,
       "tag": "Bridges",
       "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/bridge-offerings/{type}/connections",
+      "operation_id": "bridge_offerings.connections",
+      "scope": "bridges:read",
+      "public": false,
+      "tag": "Bridges",
+      "idempotent_post": false
     }
   ]
 }

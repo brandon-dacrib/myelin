@@ -1,5 +1,7 @@
 import type {
+  BridgeConnection,
   BridgeDeploymentTarget,
+  BridgeOfferingGithub,
   BridgeInstance,
   BridgeInstanceFiles,
   BridgeOffering,
@@ -56,7 +58,13 @@ interface MockOffering {
   runtime: "cluster" | "elsewhere";
   imageTag: string;
   access: { all_local_users: boolean; users: string[] };
-  options: { encryption: boolean; double_puppeting: boolean; backfill: boolean };
+  options: {
+    encryption: boolean;
+    double_puppeting: boolean;
+    backfill: boolean;
+    public_url?: string | null;
+    github?: BridgeOfferingGithub | null;
+  };
   created_at: string;
 }
 
@@ -514,7 +522,53 @@ export function offeringRefusal(type: string, body: BridgeOfferingRequest): stri
   if (body.runtime === "cluster" && entry?.deployable === false) {
     return `${entry.name ?? type} cannot run from a rendered config alone; offer it with runtime "elsewhere".`;
   }
+  // A type rendered around a public URL (Hookshot) cannot be offered without one.
+  const needsUrl = (entry?.config_keys ?? []).some((k) => k.key === "public_url" && k.required);
+  const url = body.options?.public_url ?? findOffering(type)?.options.public_url ?? "";
+  if (needsUrl && !url.trim()) {
+    return `${entry?.name ?? type} needs a public URL that reaches its webhooks listener (https://hooks.example.org): the start of every webhook URL it hands out`;
+  }
   return null;
+}
+
+/**
+ * What a shared integrations bridge (Hookshot) has connected, as the server reads it from the
+ * rooms' state: the demo's two repository rooms and a feed, once the offering exists.
+ */
+export function connectionsOf(type: string): BridgeConnection[] {
+  if (type !== "matrix-hookshot" || !findOffering(type)) return [];
+  return [
+    {
+      service: "webhook",
+      event_type: "uk.half-shot.matrix-hookshot.generic.hook",
+      state_key: "myelin",
+      room_id: "!myelinprs:example.org",
+      room_name: "myelin pull requests",
+      name: "myelin",
+      state: "active",
+      content: { name: "myelin", transformationFunction: "// github-comments.js" },
+    },
+    {
+      service: "github",
+      event_type: "uk.half-shot.matrix-hookshot.github.repository",
+      state_key: "brandon-dacrib/myelin",
+      room_id: "!myelinprs:example.org",
+      room_name: "myelin pull requests",
+      name: "brandon-dacrib/myelin",
+      state: "active",
+      content: { org: "brandon-dacrib", repo: "myelin" },
+    },
+    {
+      service: "feed",
+      event_type: "uk.half-shot.matrix-hookshot.feed",
+      state_key: "https://blog.example.org/feed.xml",
+      room_id: "!news:example.org",
+      room_name: null,
+      name: "https://blog.example.org/feed.xml",
+      state: "removed",
+      content: {},
+    },
+  ];
 }
 
 export function putOffering(type: string, body: BridgeOfferingRequest): BridgeOffering {
@@ -535,6 +589,12 @@ export function putOffering(type: string, body: BridgeOfferingRequest): BridgeOf
       double_puppeting:
         body.options?.double_puppeting ?? existing?.options.double_puppeting ?? false,
       backfill: body.options?.backfill ?? existing?.options.backfill ?? false,
+      // Hookshot's settings, kept as given (`PUT` replaces the options whole, as the server's).
+      ...(body.options && "public_url" in body.options
+        ? { public_url: body.options.public_url ?? null, github: body.options.github ?? null }
+        : existing?.options.public_url
+          ? { public_url: existing.options.public_url, github: existing.options.github ?? null }
+          : {}),
     },
     created_at: existing?.created_at ?? new Date().toISOString(),
   };

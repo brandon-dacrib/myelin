@@ -456,7 +456,7 @@ const CATALOGUE: &[Entry] = &[
     Entry {
         id: "matrix-hookshot",
         name: "Hookshot",
-        description: "Webhooks, GitHub, GitLab, Jira and RSS feeds, posted into rooms.",
+        description: "One bridge for the whole server, with many connections: GitHub repositories, GitLab projects, Jira, RSS feeds and plain webhooks, each posting into a room of its own.",
         category: Category::Integrations,
         upstream_project: "matrix-org/matrix-hookshot",
         docs_url: "https://matrix-org.github.io/matrix-hookshot/latest/",
@@ -466,17 +466,20 @@ const CATALOGUE: &[Entry] = &[
         bot: "hookshot",
         needs: &[(
             "public_url",
-            "A URL the services it listens to can reach it on, for webhooks",
-            false,
+            "A public URL (https://hooks.example.org) that reaches the bridge's webhooks listener, for GitHub and the other services to post to",
+            true,
         )],
         double_puppeting: false,
         features: &[MSC2409],
         runtime: Runtime::Hookshot,
         sign_in: &[
-            "Invite {bot} to a room and send `!hookshot help`.",
-            "`!hookshot webhook <name>` gives the room a webhook URL; GitHub, GitLab, Jira and RSS are connected per room the same way, or through the widget.",
+            "Nobody signs in: it is one bridge for everyone here, and each room connects what it wants. Invite {bot} to a room (it needs to be allowed to send state events, the Moderator level in most clients) and send `!hookshot help`.",
+            "`!hookshot webhook <name>` answers with a URL for that room; anything that can post JSON to a URL (a GitHub or GitLab repository webhook, a monitoring alert, a script) then posts into the room. `!hookshot feed <url>` follows an RSS or Atom feed.",
+            "With a GitHub App in the offering's settings, `!hookshot github repo <org>/<repo>` connects a repository properly: issues, pull requests, reviews and releases, with the people who commented shown as ghost users.",
         ],
-        sign_in_notes: None,
+        sign_in_notes: Some(
+            "Each connection is a state event in its room (uk.half-shot.matrix-hookshot.*); the offering's page lists them. Hookshot 7 has no provisioning API, so that list is read from the rooms.",
+        ),
         layout: ConfigLayout::BridgeV2,
         mac_download: None,
     },
@@ -557,9 +560,13 @@ fn provisioning_of(entry: &Entry) -> (ProvisioningApi, &'static str) {
             ProvisioningApi::IrcV1,
             "matrix-appservice-irc's provisioning API links rooms to channels; it does not report who is connected as which nick, so the bridge keeps that itself.",
         ),
+        // Hookshot 7 removed its provisioning API: a `provisioning` config section is refused
+        // and `provisioning` is no listener resource (read from the 7.5.0 bridge on the demo,
+        // 2026-10-20). Its connections are state events in the rooms, which the offering's page
+        // lists (`GET /bridge-offerings/{type}/connections`); nobody signs in to it.
         Runtime::Hookshot => (
-            ProvisioningApi::HookshotV1,
-            "Hookshot's provisioning API manages each room's connections (webhooks, feeds, repositories); Myelin does not read accounts from it, so the bridge keeps that itself.",
+            ProvisioningApi::None,
+            "Hookshot 7 has no provisioning API and nobody signs in to it: each room's connections (webhooks, feeds, repositories) are state events in the room, which the offering's page lists.",
         ),
     }
 }
@@ -743,9 +750,11 @@ fn network_section(entry: &Entry, device_name: &str) -> Option<String> {
     Some(out)
 }
 
-/// Whether an instance runs from what a render writes alone. Not matrix-appservice-irc or
-/// hookshot, whose configs name networks and services only an operator knows; not Telegram,
-/// whose config needs the operator's own API ID and hash.
+/// Whether an instance runs from what a render writes alone. Not matrix-appservice-irc, whose
+/// config names networks only an operator knows; not Telegram, whose config needs the
+/// operator's own API ID and hash. Hookshot is: its config is rendered whole from the
+/// offering's public URL (and its GitHub App, when one is given), and what it connects is
+/// decided room by room once it runs.
 fn deployable(entry: &Entry) -> bool {
     not_deployable_reason(entry).is_none()
 }
@@ -760,11 +769,11 @@ fn not_deployable_reason(entry: &Entry) -> Option<String> {
         ));
     }
     match entry.runtime {
-        Runtime::AppserviceIrc | Runtime::Hookshot => Some(format!(
-            "{}'s config names the networks or services it connects, which only an administrator can write, so it runs elsewhere.",
+        Runtime::AppserviceIrc => Some(format!(
+            "{}'s config names the networks it connects, which only an administrator can write, so it runs elsewhere.",
             entry.name
         )),
-        Runtime::Mautrix | Runtime::Heisenbridge => entry
+        Runtime::Mautrix | Runtime::Heisenbridge | Runtime::Hookshot => entry
             .needs
             .iter()
             .find(|(key, _, required)| *required && *key == "api_id")
@@ -787,16 +796,255 @@ fn regex_escape_server(server_name: &str) -> String {
 
 fn namespaces_for(entry: &Entry, server_name: &str) -> Value {
     let server = regex_escape_server(server_name);
+    let users = user_namespaces(entry, &server, entry.ghost_prefix, entry.bot);
     json!({
-        "users": [
-            {"regex": format!("@{}.*:{server}", entry.ghost_prefix), "exclusive": true},
-            {"regex": format!("@{}:{server}", entry.bot), "exclusive": true},
-        ],
+        "users": users,
         "aliases": [
             {"regex": format!("#{}.*:{server}", entry.ghost_prefix), "exclusive": true},
         ],
         "rooms": [],
     })
+}
+
+/// The users a registration of `entry` claims, every one exclusive: its ghosts (`ghost_prefix`
+/// already escaped for a regex, or not needing it) and its bot, and for Hookshot the ghost
+/// prefixes each of its services makes users under, as its own `registration.sample.yml`
+/// claims them (read at 7.5.0): `_github_`, `_gitlab_`, `_jira_`, the generic webhooks'
+/// `userIdPrefix` (`_webhooks_`, which the rendered config sets) and the `feeds` service bot.
+fn user_namespaces(entry: &Entry, server: &str, ghost_prefix: &str, bot: &str) -> Vec<Value> {
+    let mut users = vec![
+        json!({"regex": format!("@{ghost_prefix}.*:{server}"), "exclusive": true}),
+        json!({"regex": format!("@{bot}:{server}"), "exclusive": true}),
+    ];
+    users.extend(hookshot_extra_users(entry, server));
+    users
+}
+
+/// The users Hookshot's services make, beyond its own bot and `ghost_prefix`
+/// ([`user_namespaces`]); nothing for any other type.
+fn hookshot_extra_users(entry: &Entry, server: &str) -> Vec<Value> {
+    if entry.runtime != Runtime::Hookshot {
+        return Vec::new();
+    }
+    let mut users: Vec<Value> = HOOKSHOT_GHOST_PREFIXES
+        .iter()
+        .map(|prefix| json!({"regex": format!("@{prefix}.*:{server}"), "exclusive": true}))
+        .collect();
+    users.push(json!({"regex": format!("@{HOOKSHOT_FEEDS_BOT}:{server}"), "exclusive": true}));
+    users
+}
+
+/// The localpart prefixes Hookshot's services make ghost users under: GitHub's and GitLab's
+/// defaults, Jira's, and the generic webhooks' `userIdPrefix` the rendered config sets.
+const HOOKSHOT_GHOST_PREFIXES: &[&str] = &["_github_", "_gitlab_", "_jira_", "_webhooks_"];
+/// The localpart of Hookshot's feeds service bot (`serviceBots` in its config): claimed so that
+/// an administrator who adds that section later needs no new registration.
+const HOOKSHOT_FEEDS_BOT: &str = "feeds";
+/// The port Hookshot's webhooks listener binds in a rendered config: what the outside reaches
+/// through the offering's public URL.
+pub const HOOKSHOT_WEBHOOKS_PORT: u16 = 9000;
+/// The port Hookshot's metrics listener binds in a rendered config: the pod only.
+pub const HOOKSHOT_METRICS_PORT: u16 = 9001;
+
+/// A port a bridge listens on besides the one for this server's transactions, for its
+/// deployment to expose ([`InstanceRender::extra_ports`]): Hookshot's webhooks and metrics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtraPort {
+    /// A name a Service port can carry (`webhooks`): lowercase, at most 15 characters.
+    pub name: String,
+    pub port: u16,
+}
+
+fn extra_ports_for(entry: &Entry) -> Vec<ExtraPort> {
+    match entry.runtime {
+        Runtime::Hookshot => vec![
+            ExtraPort {
+                name: "webhooks".to_owned(),
+                port: HOOKSHOT_WEBHOOKS_PORT,
+            },
+            ExtraPort {
+                name: "metrics".to_owned(),
+                port: HOOKSHOT_METRICS_PORT,
+            },
+        ],
+        Runtime::Mautrix | Runtime::Heisenbridge | Runtime::AppserviceIrc => Vec::new(),
+    }
+}
+
+/// Whether instances of `type_id` need a passkey (`passkey.pem`, an RSA private key Hookshot
+/// encrypts the tokens it keeps with) minted and kept by whoever keeps the instance, so that a
+/// re-render writes the same key. Hookshot does not generate one: without the file it stops at
+/// start (`UserTokenStore.fromKeyPath` reads it, read at 7.5.0).
+#[must_use]
+pub fn needs_passkey(type_id: &str) -> bool {
+    entry(type_id).is_some_and(|e| e.runtime == Runtime::Hookshot)
+}
+
+/// Whether a shared instance of `type_id` keeps what it has connected as state events in its
+/// rooms, which `GET /bridge-offerings/{type}/connections` reads
+/// ([`crate::bridge_connections`]): Hookshot.
+#[must_use]
+pub fn keeps_connections_in_room_state(type_id: &str) -> bool {
+    entry(type_id).is_some_and(|e| e.runtime == Runtime::Hookshot)
+}
+
+/// Whether `type_id` takes a public URL ([`crate::model::BridgeOfferingOptions::public_url`])
+/// and cannot be rendered without one: a catalogue entry needing `public_url`.
+#[must_use]
+pub fn needs_public_url(type_id: &str) -> bool {
+    entry(type_id).is_some_and(|e| {
+        e.needs
+            .iter()
+            .any(|(key, _, required)| *key == "public_url" && *required)
+    })
+}
+
+/// The name the config file has in `/data`: `config.yml` for Hookshot (what its image's
+/// command names), `config.yaml` for everything else.
+fn config_file_name(entry: &Entry) -> &'static str {
+    match entry.runtime {
+        Runtime::Hookshot => "config.yml",
+        Runtime::Mautrix | Runtime::Heisenbridge | Runtime::AppserviceIrc => "config.yaml",
+    }
+}
+
+/// The name the registration file has in `/data`, as [`config_file_name`].
+fn registration_file_name(entry: &Entry) -> &'static str {
+    match entry.runtime {
+        Runtime::Hookshot => "registration.yml",
+        Runtime::Mautrix | Runtime::Heisenbridge | Runtime::AppserviceIrc => "registration.yaml",
+    }
+}
+
+/// The file Hookshot's passkey is written to in `/data`.
+pub const HOOKSHOT_PASSKEY_FILE: &str = "passkey.pem";
+/// The file Hookshot's GitHub App private key is written to in `/data`.
+pub const HOOKSHOT_GITHUB_KEY_FILE: &str = "github-key.pem";
+
+/// A GitHub App for a Hookshot config ([`hookshot_config`]).
+#[derive(Debug, Clone, Copy)]
+pub struct GithubApp<'a> {
+    pub app_id: &'a str,
+    pub webhook_secret: &'a str,
+}
+
+/// What a Hookshot `config.yml` says, for a render or an instance.
+struct HookshotParams<'a> {
+    server_name: &'a str,
+    homeserver_address: &'a str,
+    /// The public base URL of this server, for `bridge.mediaUrl` (what the bridge links media
+    /// as); `None` writes the homeserver address.
+    media_url: Option<&'a str>,
+    port: u16,
+    /// The offering's public URL, trimmed of its trailing `/`; `None` writes a placeholder an
+    /// administrator must replace (the old wizard, which asks for none).
+    public_url: Option<&'a str>,
+    /// Who may do everything (`admin` for every service): `None` for everyone on this server,
+    /// else these Matrix IDs.
+    allowed_users: Option<&'a [String]>,
+    github: Option<GithubApp<'a>>,
+}
+
+/// Hookshot's `config.yml` (7.5.0's `config.sample.yml` and `docs/setup.md`): the appservice
+/// listener for this server on `port`, the passkey at `/data/passkey.pem`, the generic
+/// webhooks under the public URL's `/webhook/` with the ghost prefix the registration claims,
+/// feeds, the GitHub App when there is one, and two more listeners: webhooks on
+/// [`HOOKSHOT_WEBHOOKS_PORT`] (what the public URL must reach) and metrics on
+/// [`HOOKSHOT_METRICS_PORT`]. No encryption (it needs Redis) and no widgets.
+fn hookshot_config(p: &HookshotParams<'_>) -> String {
+    let mut out = String::new();
+    out.push_str("# Hookshot configuration written by Myelin. The bridge reads it as it is;\n");
+    out.push_str("# the server renders it again from the offering's settings, so edit those.\n");
+    out.push_str("bridge:\n");
+    out.push_str(&format!("  domain: {}\n", yaml_str(p.server_name)));
+    out.push_str(&format!("  url: {}\n", yaml_str(p.homeserver_address)));
+    out.push_str(&format!(
+        "  mediaUrl: {}\n",
+        yaml_str(p.media_url.unwrap_or(p.homeserver_address))
+    ));
+    out.push_str(&format!("  port: {}\n", p.port));
+    out.push_str("  bindAddress: 0.0.0.0\n");
+    out.push_str("# An RSA private key the bridge encrypts the tokens it keeps with. Minted by\n");
+    out.push_str("# the server with the instance's tokens and kept with them, so a re-render\n");
+    out.push_str("# never changes it.\n");
+    out.push_str(&format!("passFile: /data/{HOOKSHOT_PASSKEY_FILE}\n"));
+    out.push_str("logging:\n  level: info\n  colorize: false\n  json: false\n");
+    out.push_str("  timestampFormat: HH:mm:ss:SSS\n");
+    out.push_str("# Who may connect things. `admin` is every level: commands, logging in to\n");
+    out.push_str("# GitHub, connecting and removing connections in any room.\n");
+    out.push_str("permissions:\n");
+    match p.allowed_users {
+        None => {
+            out.push_str(&format!("  - actor: {}\n", yaml_str(p.server_name)));
+            out.push_str("    services:\n      - service: \"*\"\n        level: admin\n");
+        }
+        Some(users) => {
+            for user in users {
+                out.push_str(&format!("  - actor: {}\n", yaml_str(user)));
+                out.push_str("    services:\n      - service: \"*\"\n        level: admin\n");
+            }
+        }
+    }
+    let public = p.public_url.map_or_else(
+        || "https://CHANGE-ME.example.org".to_owned(),
+        |u| u.trim_end_matches('/').to_owned(),
+    );
+    out.push_str("generic:\n  enabled: true\n  outbound: false\n");
+    out.push_str("  # The public URL of the webhooks listener (port ");
+    out.push_str(&HOOKSHOT_WEBHOOKS_PORT.to_string());
+    out.push_str(" below) with its /webhook path:\n");
+    out.push_str("  # the start of every URL `!hookshot webhook` hands out.\n");
+    out.push_str(&format!(
+        "  urlPrefix: {}\n",
+        yaml_str(&format!("{public}/webhook/"))
+    ));
+    out.push_str("  userIdPrefix: _webhooks_\n");
+    out.push_str("  allowJsTransformationFunctions: true\n");
+    out.push_str("  waitForComplete: false\n  enableHttpGet: false\n");
+    out.push_str("feeds:\n  enabled: true\n  pollIntervalSeconds: 600\n");
+    if let Some(github) = p.github {
+        out.push_str("# The GitHub App from the offering's settings; its private key is beside\n");
+        out.push_str("# this file. The App's webhook URL is the public URL + /github/webhook.\n");
+        out.push_str("github:\n  auth:\n");
+        out.push_str(&format!("    id: {}\n", yaml_str(github.app_id)));
+        out.push_str(&format!(
+            "    privateKeyFile: /data/{HOOKSHOT_GITHUB_KEY_FILE}\n"
+        ));
+        out.push_str("  webhook:\n");
+        out.push_str(&format!(
+            "    secret: {}\n",
+            yaml_str(github.webhook_secret)
+        ));
+        out.push_str("  userIdPrefix: _github_\n");
+    }
+    out.push_str("metrics:\n  enabled: true\n");
+    out.push_str("listeners:\n");
+    out.push_str("  # Webhooks: what the public URL reaches (the deployment exposes it as the\n");
+    out.push_str("  # Service port `webhooks`; an Ingress for the public URL points at it).\n");
+    out.push_str(&format!(
+        "  - port: {HOOKSHOT_WEBHOOKS_PORT}\n    bindAddress: 0.0.0.0\n    resources:\n      - webhooks\n"
+    ));
+    out.push_str("  # Metrics: the pod only.\n");
+    out.push_str(&format!(
+        "  - port: {HOOKSHOT_METRICS_PORT}\n    bindAddress: 0.0.0.0\n    resources:\n      - metrics\n"
+    ));
+    out
+}
+
+/// `s` as a YAML double-quoted scalar.
+fn yaml_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// `container` for an image this server deploys or someone runs from a compose file, `mac`
@@ -832,7 +1080,7 @@ fn bridge_type(entry: &Entry, server_name: &str) -> BridgeType {
         supports_double_puppeting: entry.double_puppeting,
         command_prefix: command_prefix(entry).map(str::to_owned),
         required_features: entry.features.iter().map(|f| (*f).to_owned()).collect(),
-        renders_config: entry.runtime == Runtime::Mautrix,
+        renders_config: matches!(entry.runtime, Runtime::Mautrix | Runtime::Hookshot),
         mode: mode(entry).to_owned(),
         deployable: deployable(entry),
         not_deployable_reason: not_deployable_reason(entry),
@@ -991,10 +1239,11 @@ pub fn render(type_id: &str, server_name: &str, values: &Value) -> Option<Bridge
     // The bridge's own registration claims its ghosts and its bot, and nothing else: a claim on
     // anyone else, even a non-exclusive one, makes every room that person is in the bridge's
     // business (the spec's interest rules), and the server pushes the bridge all of it.
-    let users = vec![
+    let mut users = vec![
         json!({"regex": c.user_namespace, "exclusive": true}),
         json!({"regex": format!("@{}:{server}", c.sender_localpart), "exclusive": true}),
     ];
+    users.extend(hookshot_extra_users(entry, &server));
     let double_puppeting = c.double_puppeting && entry.double_puppeting;
     // Double puppeting is the bridge sending as real users. That is a registration of its own
     // (decision 0046): a non-exclusive claim on everyone here, which reserves nothing, and no
@@ -1041,34 +1290,49 @@ pub fn render(type_id: &str, server_name: &str, values: &Value) -> Option<Bridge
     let registration_yaml = serde_yaml_ng::to_string(&registration).unwrap_or_default();
     let double_puppet_secret = double_puppet.as_ref().map(|(t, _)| t.as_str());
 
-    let config_yaml = (entry.runtime == Runtime::Mautrix).then(|| {
-        let mut permissions = vec![("*".to_owned(), "relay"), (server_name.to_owned(), "user")];
-        if let Some(admin) = &c.admin_user {
-            permissions.push((admin.clone(), "admin"));
-        }
-        mautrix_config(&MautrixParams {
-            name: entry.name,
-            homeserver_address: &c.homeserver_address,
+    let config_yaml = match entry.runtime {
+        Runtime::Heisenbridge | Runtime::AppserviceIrc => None,
+        // The old wizard asks for no public URL: the config carries a placeholder to replace.
+        Runtime::Hookshot => Some(hookshot_config(&HookshotParams {
             server_name,
-            url: &url,
+            homeserver_address: &c.homeserver_address,
+            media_url: None,
             port: entry.port,
-            id: &c.id,
-            bot: &c.sender_localpart,
-            ghost_prefix: entry.ghost_prefix,
-            as_token: &as_token,
-            hs_token: &hs_token,
-            permissions,
-            backfill: true,
-            double_puppet_secret,
-            encryption: c.encryption,
-            provisioning_secret: provisioning_secret.as_deref(),
-            pickle_key: None,
-            // The wizard's bridge is one for the server, run by hand: the shared name.
-            network: network_section(entry, &device_name_for(entry.name, server_name, None)),
-            layout: entry.layout,
-            owner: c.admin_user.as_deref(),
-        })
-    });
+            public_url: string(values, "publicUrl")
+                .or_else(|| string(values, "public_url"))
+                .as_deref(),
+            allowed_users: None,
+            github: None,
+        })),
+        Runtime::Mautrix => Some({
+            let mut permissions = vec![("*".to_owned(), "relay"), (server_name.to_owned(), "user")];
+            if let Some(admin) = &c.admin_user {
+                permissions.push((admin.clone(), "admin"));
+            }
+            mautrix_config(&MautrixParams {
+                name: entry.name,
+                homeserver_address: &c.homeserver_address,
+                server_name,
+                url: &url,
+                port: entry.port,
+                id: &c.id,
+                bot: &c.sender_localpart,
+                ghost_prefix: entry.ghost_prefix,
+                as_token: &as_token,
+                hs_token: &hs_token,
+                permissions,
+                backfill: true,
+                double_puppet_secret,
+                encryption: c.encryption,
+                provisioning_secret: provisioning_secret.as_deref(),
+                pickle_key: None,
+                // The wizard's bridge is one for the server, run by hand: the shared name.
+                network: network_section(entry, &device_name_for(entry.name, server_name, None)),
+                layout: entry.layout,
+                owner: c.admin_user.as_deref(),
+            })
+        }),
+    };
     let compose_yaml = compose(entry, &c, &image, server_name);
     let bridge_resource_yaml = bridge_resource(entry, &c, &image);
 
@@ -1750,16 +2014,21 @@ fn compose(entry: &Entry, c: &Choices, image: &str, server_name: &str) -> String
         }
         Runtime::Hookshot => {
             out.push_str(&format!("    volumes:\n      - ./{}:/data\n", c.id));
-            out.push_str("    # Needs ./");
-            out.push_str(&c.id);
             out.push_str(&format!(
-                "/config.yml (the project's sample, with bridge.url {})\n",
-                c.homeserver_address
+                "    # Save config.yml and registration.yml from the wizard into ./{}/ (replace\n",
+                c.id
             ));
-            out.push_str("    # and the registration as ./");
-            out.push_str(&c.id);
-            out.push_str("/registration.yml. Webhooks arrive on 9000.\n");
-            out.push_str("    ports:\n      - \"9000:9000\"\n");
+            out.push_str("    # the public URL placeholder in config.yml), and make the passkey\n");
+            out.push_str(
+                "    # there: openssl genpkey -out passkey.pem -outform PEM -algorithm RSA\n",
+            );
+            out.push_str(&format!(
+                "    # -pkeyopt rsa_keygen_bits:4096. Webhooks arrive on {HOOKSHOT_WEBHOOKS_PORT}: put the\n"
+            ));
+            out.push_str("    # public URL in front of it.\n");
+            out.push_str(&format!(
+                "    ports:\n      - \"{HOOKSHOT_WEBHOOKS_PORT}:{HOOKSHOT_WEBHOOKS_PORT}\"\n"
+            ));
         }
     }
     out
@@ -1767,18 +2036,39 @@ fn compose(entry: &Entry, c: &Choices, image: &str, server_name: &str) -> String
 
 fn bridge_resource(entry: &Entry, c: &Choices, image: &str) -> String {
     let (repository, tag) = image.rsplit_once(':').unwrap_or((image, entry.image_tag()));
-    format!(
+    let mut out = format!(
         "# For a cluster running the Myelin operator (RFC 0017). The Secret named in\n\
-         # filesSecret holds config.yaml and registration.yaml, from the files above.\n\
+         # filesSecret holds {config} and {registration}, from the files above.\n\
          apiVersion: hs.matrix.org/v1alpha1\n\
          kind: Bridge\n\
          metadata:\n  name: {id}\n  namespace: {ns}\n\
          spec:\n  bridgeType: {kind}\n  appserviceId: {id}\n  image:\n    repository: {repository}\n    tag: {tag}\n  port: {port}\n  filesSecret: {id}-files\n",
+        config = config_file_name(entry),
+        registration = registration_file_name(entry),
         id = c.id,
         ns = c.k8s_namespace,
         kind = entry.id,
         port = entry.port,
-    )
+    );
+    out.push_str(&extra_ports_yaml(&extra_ports_for(entry), "  "));
+    out
+}
+
+/// The `extraPorts:` list of a `Bridge` spec at `indent`, for the ports the Service exposes
+/// besides the appservice port; nothing when there are none.
+#[must_use]
+pub fn extra_ports_yaml(ports: &[ExtraPort], indent: &str) -> String {
+    if ports.is_empty() {
+        return String::new();
+    }
+    let mut out = format!("{indent}extraPorts:\n");
+    for p in ports {
+        out.push_str(&format!(
+            "{indent}  - name: {}\n{indent}    port: {}\n",
+            p.name, p.port
+        ));
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1837,6 +2127,23 @@ pub struct InstanceSpec<'a> {
     /// whoever keeps the instance; `None` until they are (the render then writes no double
     /// puppeting into the config, and [`InstanceRender::double_puppets`] says one is wanted).
     pub double_puppet: Option<DoublePuppetTokens<'a>>,
+    /// The offering's public URL ([`crate::model::BridgeOfferingOptions::public_url`]), for a
+    /// type that takes one; `None` renders a placeholder.
+    pub public_url: Option<&'a str>,
+    /// This server's public base URL, for a config that links media by it (Hookshot's
+    /// `mediaUrl`); `None` writes the homeserver address.
+    pub media_url: Option<&'a str>,
+    /// The GitHub App of a Hookshot offering, when complete: its id and webhook secret here,
+    /// its private key as [`InstanceSpec::github_private_key`].
+    pub github: Option<GithubApp<'a>>,
+    pub github_private_key: Option<&'a str>,
+    /// Hookshot's passkey, an RSA private key in PEM, minted and kept by whoever keeps the
+    /// instance ([`needs_passkey`]); `None` for an instance from before one was kept, whose
+    /// files then lack it (the compose text says how to make one).
+    pub passkey_pem: Option<&'a str>,
+    /// Who the offering is for: `None` for everyone on this server, else these Matrix IDs. For
+    /// a shared type whose config names who may use it (Hookshot's `permissions`).
+    pub allowed_users: Option<&'a [String]>,
 }
 
 /// An instance's double-puppeting registration's id and tokens ([`double_puppet_registration`]).
@@ -1884,6 +2191,9 @@ pub struct InstanceRender {
     /// That registration, when the instance double puppets and its tokens were given: claims
     /// the owner alone, non-exclusively, and has no `url`. `None` otherwise.
     pub double_puppet_registration: Option<Value>,
+    /// Ports the bridge listens on besides `port`, for its deployment to expose by name:
+    /// Hookshot's `webhooks` and `metrics`. Empty for every other type.
+    pub extra_ports: Vec<ExtraPort>,
 }
 
 impl std::fmt::Debug for InstanceRender {
@@ -1951,10 +2261,12 @@ pub fn render_instance(spec: &InstanceSpec<'_>) -> Option<InstanceRender> {
     // double-puppeting registration instead: a claim on them here would make every room they
     // are in the bridge's business, and the server would push the bridge all of it (decision
     // 0046; it stalled five of the demo's six bridges on 2026-10-12).
-    let users = vec![
-        json!({"regex": format!("@{}.*:{server}", regex_escape(&ghost_prefix)), "exclusive": true}),
-        json!({"regex": format!("@{}:{server}", regex_escape(&bot)), "exclusive": true}),
-    ];
+    let users = user_namespaces(
+        entry,
+        &server,
+        &regex_escape(&ghost_prefix),
+        &regex_escape(&bot),
+    );
     // Double puppeting as the owner, and only the owner: a compromised instance can act as one
     // person, not as everyone on the server.
     let double_puppet_registration = match (double_puppeting, spec.owner, spec.double_puppet) {
@@ -2063,9 +2375,33 @@ pub fn render_instance(spec: &InstanceSpec<'_>) -> Option<InstanceRender> {
             args.push(spec.homeserver_address.to_owned());
             None
         }
-        Runtime::AppserviceIrc | Runtime::Hookshot => None,
+        Runtime::Hookshot => {
+            let github = spec.github.filter(|_| spec.github_private_key.is_some());
+            let config = hookshot_config(&HookshotParams {
+                server_name: spec.server_name,
+                homeserver_address: spec.homeserver_address,
+                media_url: spec.media_url.filter(|u| !u.trim().is_empty()),
+                port: entry.port,
+                public_url: spec.public_url.filter(|u| !u.trim().is_empty()),
+                allowed_users: spec.allowed_users,
+                github,
+            });
+            files.insert(config_file_name(entry).to_owned(), config.clone());
+            if let Some(key) = spec.passkey_pem.filter(|k| !k.trim().is_empty()) {
+                files.insert(HOOKSHOT_PASSKEY_FILE.to_owned(), key.to_owned());
+            }
+            if let (Some(_), Some(key)) = (github, spec.github_private_key) {
+                files.insert(HOOKSHOT_GITHUB_KEY_FILE.to_owned(), key.to_owned());
+            }
+            Some(config)
+        }
+        Runtime::AppserviceIrc => None,
     };
-    files.insert("registration.yaml".to_owned(), registration_yaml.clone());
+    files.insert(
+        registration_file_name(entry).to_owned(),
+        registration_yaml.clone(),
+    );
+    let extra_ports = extra_ports_for(entry);
 
     let repository = entry
         .image
@@ -2106,16 +2442,29 @@ pub fn render_instance(spec: &InstanceSpec<'_>) -> Option<InstanceRender> {
             run_sh,
             double_puppets: double_puppeting,
             double_puppet_registration,
+            extra_ports,
         });
     }
-    compose_yaml
-        .push_str("# Save config.yaml and registration.yaml into the directory mounted at\n");
+    compose_yaml.push_str(&format!(
+        "# Save every file (the admin API's `files`: {}) into the directory mounted at\n",
+        files.keys().cloned().collect::<Vec<_>>().join(", ")
+    ));
     compose_yaml
         .push_str("# /data first. The bridge has to reach this server at the address in its\n");
     compose_yaml.push_str(&format!(
         "# config ({}), and this server has to reach it at {}.\n",
         spec.homeserver_address, spec.url
     ));
+    if entry.runtime == Runtime::Hookshot {
+        if !files.contains_key(HOOKSHOT_PASSKEY_FILE) {
+            compose_yaml.push_str(
+                "# This instance has no passkey kept for it: make one in that directory with\n# openssl genpkey -out passkey.pem -outform PEM -algorithm RSA -pkeyopt rsa_keygen_bits:4096\n",
+            );
+        }
+        compose_yaml.push_str(&format!(
+            "# Webhooks arrive on {HOOKSHOT_WEBHOOKS_PORT}: the offering's public URL has to reach that port.\n"
+        ));
+    }
     compose_yaml.push_str("services:\n");
     compose_yaml.push_str(&format!("  {}:\n", spec.appservice_id));
     compose_yaml.push_str(&format!("    image: {repository}:{image_tag}\n"));
@@ -2128,6 +2477,13 @@ pub fn render_instance(spec: &InstanceSpec<'_>) -> Option<InstanceRender> {
         "    ports:\n      - \"{port}:{port}\"\n",
         port = entry.port
     ));
+    for p in &extra_ports {
+        compose_yaml.push_str(&format!(
+            "      - \"{port}:{port}\" # {}\n",
+            p.name,
+            port = p.port
+        ));
+    }
     if !args.is_empty() {
         let quoted: Vec<String> = args.iter().map(|a| format!("\"{a}\"")).collect();
         compose_yaml.push_str(&format!("    command: [{}]\n", quoted.join(", ")));
@@ -2154,6 +2510,7 @@ pub fn render_instance(spec: &InstanceSpec<'_>) -> Option<InstanceRender> {
         run_sh,
         double_puppets: double_puppeting,
         double_puppet_registration,
+        extra_ports,
     })
 }
 
@@ -2322,7 +2679,12 @@ mod tests {
             for step in &t.sign_in.steps {
                 assert!(!step.contains("{server}"), "{}: {step}", t.id);
             }
-            assert_eq!(t.renders_config, t.id.starts_with("mautrix-"), "{}", t.id);
+            assert_eq!(
+                t.renders_config,
+                t.id.starts_with("mautrix-") || t.id == "matrix-hookshot",
+                "{}",
+                t.id
+            );
         }
         let irc = get("matrix-appservice-irc", "chat.example.net").unwrap();
         assert!(irc.sign_in.steps[0].contains("#irc_#channel:chat.example.net"));
@@ -2620,6 +2982,12 @@ mod tests {
                 as_token: "d".repeat(64).as_str(),
                 hs_token: "e".repeat(64).as_str(),
             }),
+            public_url: None,
+            media_url: None,
+            github: None,
+            github_private_key: None,
+            passkey_pem: None,
+            allowed_users: None,
         })
         .unwrap();
         let reg = &r.registration;
@@ -2716,6 +3084,12 @@ mod tests {
                 provisioning_secret: Some("ignored"),
                 pickle_key: None,
                 double_puppet: None,
+                public_url: None,
+                media_url: None,
+                github: None,
+                github_private_key: None,
+                passkey_pem: None,
+                allowed_users: None,
             }
         })
         .unwrap();
@@ -2758,6 +3132,12 @@ mod tests {
             provisioning_secret: None,
             pickle_key: None,
             double_puppet: None,
+            public_url: None,
+            media_url: None,
+            github: None,
+            github_private_key: None,
+            passkey_pem: None,
+            allowed_users: None,
         };
         let r = render_instance(&spec).unwrap();
         assert!(r.double_puppets);
@@ -2776,6 +3156,12 @@ mod tests {
         let off = render_instance(&InstanceSpec {
             double_puppeting: Some(false),
             double_puppet: Some(tokens),
+            public_url: None,
+            media_url: None,
+            github: None,
+            github_private_key: None,
+            passkey_pem: None,
+            allowed_users: None,
             ..spec
         })
         .unwrap();
@@ -2785,6 +3171,12 @@ mod tests {
         let shared = render_instance(&InstanceSpec {
             owner: None,
             double_puppet: Some(tokens),
+            public_url: None,
+            media_url: None,
+            github: None,
+            github_private_key: None,
+            passkey_pem: None,
+            allowed_users: None,
             ..spec
         })
         .unwrap();
@@ -2809,6 +3201,12 @@ mod tests {
             provisioning_secret: None,
             pickle_key,
             double_puppet: None,
+            public_url: None,
+            media_url: None,
+            github: None,
+            github_private_key: None,
+            passkey_pem: None,
+            allowed_users: None,
         })
         .unwrap();
         serde_yaml_ng::from_str(r.config_yaml.as_deref().expect("a mautrix config")).unwrap()
@@ -2855,6 +3253,12 @@ mod tests {
             provisioning_secret: None,
             pickle_key: None,
             double_puppet: None,
+            public_url: None,
+            media_url: None,
+            github: None,
+            github_private_key: None,
+            passkey_pem: None,
+            allowed_users: None,
         })
         .unwrap();
         assert_eq!(
@@ -2973,6 +3377,12 @@ mod tests {
                 as_token: "dp",
                 hs_token: "dph",
             }),
+            public_url: None,
+            media_url: None,
+            github: None,
+            github_private_key: None,
+            passkey_pem: None,
+            allowed_users: None,
         })
         .unwrap();
         let text = r.config_yaml.as_deref().expect("a mautrix config");
@@ -3038,6 +3448,12 @@ mod tests {
             provisioning_secret: None,
             pickle_key: None,
             double_puppet: None,
+            public_url: None,
+            media_url: None,
+            github: None,
+            github_private_key: None,
+            passkey_pem: None,
+            allowed_users: None,
         })
         .unwrap();
         let config: Value = serde_yaml_ng::from_str(r.config_yaml.as_deref().unwrap()).unwrap();
@@ -3122,6 +3538,12 @@ mod tests {
                 as_token: "dp",
                 hs_token: "dph",
             }),
+            public_url: None,
+            media_url: None,
+            github: None,
+            github_private_key: None,
+            passkey_pem: None,
+            allowed_users: None,
         })
         .unwrap();
         let text = r.config_yaml.as_deref().expect("a mautrix config");
@@ -3231,6 +3653,12 @@ mod tests {
             provisioning_secret: None,
             pickle_key: None,
             double_puppet: None,
+            public_url: None,
+            media_url: None,
+            github: None,
+            github_private_key: None,
+            passkey_pem: None,
+            allowed_users: None,
         })
         .unwrap();
         assert!(wa.run_sh.is_none() && !wa.files.contains_key("run.sh"));
@@ -3259,7 +3687,8 @@ mod tests {
                 id if id.starts_with("mautrix-") => "mautrix_v3",
                 "heisenbridge" => "none",
                 "matrix-appservice-irc" => "irc_v1",
-                "matrix-hookshot" => "hookshot_v1",
+                // Hookshot 7 removed its provisioning API; connections are room state.
+                "matrix-hookshot" => "none",
                 other => panic!("{other} has no expectation"),
             };
             assert_eq!(t.provisioning_api, expected, "{}", t.id);
@@ -3275,6 +3704,189 @@ mod tests {
         assert!(irc.registration.get(PROVISIONING_SECRET_KEY).is_none());
     }
 
+    /// Hookshot (7.5.0, `config.sample.yml` and `docs/setup.md`): the config is whole, names
+    /// the passkey the manager keeps, hands webhooks out under the offering's public URL, binds
+    /// its webhooks and metrics listeners on ports the deployment exposes, and the
+    /// registration claims every ghost prefix its services use.
+    #[test]
+    fn hookshot_renders_a_whole_config_from_the_public_url_and_claims_its_ghosts() {
+        let users = vec!["@alice:x.org".to_owned(), "@bob:x.org".to_owned()];
+        let r = render_instance(&InstanceSpec {
+            type_id: "matrix-hookshot",
+            server_name: "x.org",
+            appservice_id: "matrix-hookshot",
+            owner: None,
+            as_token: "as",
+            hs_token: "hs",
+            url: "http://bridge-matrix-hookshot.bridges.svc:9993",
+            homeserver_address: "http://myelin.bridges.svc:8008",
+            image_tag: "7.5.0",
+            encryption: None,
+            double_puppeting: None,
+            backfill: None,
+            provisioning_secret: Some("unused"),
+            pickle_key: Some("unused"),
+            double_puppet: None,
+            public_url: Some("https://hooks.x.org/"),
+            media_url: Some("https://x.org"),
+            github: Some(GithubApp {
+                app_id: "4242",
+                webhook_secret: "shh",
+            }),
+            github_private_key: Some("-----BEGIN RSA PRIVATE KEY-----\nabc\n"),
+            passkey_pem: Some("-----BEGIN PRIVATE KEY-----\nxyz\n"),
+            allowed_users: Some(&users),
+        })
+        .unwrap();
+        let config = r.config_yaml.clone().unwrap();
+        for line in [
+            "  domain: \"x.org\"\n",
+            "  url: \"http://myelin.bridges.svc:8008\"\n",
+            "  mediaUrl: \"https://x.org\"\n",
+            "  port: 9993\n",
+            "  bindAddress: 0.0.0.0\n",
+            "passFile: /data/passkey.pem\n",
+            "  - actor: \"@alice:x.org\"\n",
+            "  - actor: \"@bob:x.org\"\n",
+            "  urlPrefix: \"https://hooks.x.org/webhook/\"\n",
+            "  userIdPrefix: _webhooks_\n",
+            "  allowJsTransformationFunctions: true\n",
+            "    id: \"4242\"\n",
+            "    privateKeyFile: /data/github-key.pem\n",
+            "    secret: \"shh\"\n",
+            "  - port: 9000\n    bindAddress: 0.0.0.0\n    resources:\n      - webhooks\n",
+            "  - port: 9001\n    bindAddress: 0.0.0.0\n    resources:\n      - metrics\n",
+        ] {
+            assert!(config.contains(line), "missing {line:?} in\n{config}");
+        }
+        // Nothing the 7.x config refuses: no provisioning section, no encryption (Redis).
+        assert!(!config.contains("provisioning"), "{config}");
+        assert!(!config.contains("encryption:"), "{config}");
+        let parsed: serde_yaml_ng::Value = serde_yaml_ng::from_str(&config).unwrap();
+        assert_eq!(
+            parsed["generic"]["enabled"],
+            serde_yaml_ng::Value::Bool(true)
+        );
+        assert_eq!(parsed["permissions"].as_sequence().unwrap().len(), 2);
+        // The files are what the image's command reads, plus the two keys.
+        assert_eq!(
+            r.files.keys().cloned().collect::<Vec<_>>(),
+            [
+                "config.yml",
+                "github-key.pem",
+                "passkey.pem",
+                "registration.yml"
+            ]
+        );
+        assert_eq!(r.files["passkey.pem"], "-----BEGIN PRIVATE KEY-----\nxyz\n");
+        assert_eq!(
+            r.extra_ports,
+            vec![
+                ExtraPort {
+                    name: "webhooks".into(),
+                    port: 9000
+                },
+                ExtraPort {
+                    name: "metrics".into(),
+                    port: 9001
+                }
+            ]
+        );
+        let regexes: Vec<&str> = r.registration["namespaces"]["users"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|u| u["regex"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            regexes,
+            [
+                "@hookshot_.*:x\\.org",
+                "@hookshot:x\\.org",
+                "@_github_.*:x\\.org",
+                "@_gitlab_.*:x\\.org",
+                "@_jira_.*:x\\.org",
+                "@_webhooks_.*:x\\.org",
+                "@feeds:x\\.org",
+            ]
+        );
+        assert_eq!(r.registration[MSC2409], json!(true));
+        assert!(r.registration.get(PROVISIONING_SECRET_KEY).is_none());
+        assert!(
+            r.compose_yaml.contains("\"9000:9000\""),
+            "{}",
+            r.compose_yaml
+        );
+        assert!(
+            r.compose_yaml.contains("registration.yml"),
+            "{}",
+            r.compose_yaml
+        );
+    }
+
+    /// Everyone on the server by default, the GitHub App left out when any part is missing,
+    /// the passkey left out when none is kept (and the compose text says how to make one).
+    #[test]
+    fn hookshot_without_a_github_app_or_a_passkey_renders_for_everyone_and_says_so() {
+        let r = render_instance(&InstanceSpec {
+            type_id: "matrix-hookshot",
+            server_name: "x.org",
+            appservice_id: "matrix-hookshot",
+            owner: None,
+            as_token: "as",
+            hs_token: "hs",
+            url: "http://matrix-hookshot:9993",
+            homeserver_address: "https://x.org",
+            image_tag: "7.5.0",
+            encryption: None,
+            double_puppeting: None,
+            backfill: None,
+            provisioning_secret: None,
+            pickle_key: None,
+            double_puppet: None,
+            public_url: Some("https://hooks.x.org"),
+            media_url: None,
+            github: None,
+            github_private_key: None,
+            passkey_pem: None,
+            allowed_users: None,
+        })
+        .unwrap();
+        let config = r.config_yaml.clone().unwrap();
+        assert!(config.contains("  - actor: \"x.org\"\n"), "{config}");
+        assert!(
+            config.contains("  mediaUrl: \"https://x.org\"\n"),
+            "{config}"
+        );
+        assert!(!config.contains("github:"), "{config}");
+        assert_eq!(
+            r.files.keys().cloned().collect::<Vec<_>>(),
+            ["config.yml", "registration.yml"]
+        );
+        assert!(
+            r.compose_yaml.contains("openssl genpkey"),
+            "{}",
+            r.compose_yaml
+        );
+        // The old wizard, which asks for no public URL, gets a placeholder to replace.
+        let wizard = render("matrix-hookshot", "x.org", &json!({})).unwrap();
+        let config = wizard.config_yaml.unwrap();
+        assert!(config.contains("CHANGE-ME"), "{config}");
+        assert!(
+            wizard
+                .bridge_resource_yaml
+                .contains("extraPorts:\n    - name: webhooks\n      port: 9000\n"),
+            "{}",
+            wizard.bridge_resource_yaml
+        );
+        assert!(needs_passkey("matrix-hookshot"));
+        assert!(!needs_passkey("mautrix-whatsapp"));
+        assert!(needs_public_url("matrix-hookshot"));
+        assert!(!needs_public_url("heisenbridge"));
+        assert!(keeps_connections_in_room_state("matrix-hookshot"));
+        assert!(!keeps_connections_in_room_state("mautrix-signal"));
+    }
+
     #[test]
     fn every_type_says_whether_it_is_per_user_and_deployable() {
         let whatsapp = get("mautrix-whatsapp", "x.org").unwrap();
@@ -3287,7 +3899,15 @@ mod tests {
         let hookshot = get("matrix-hookshot", "x.org").unwrap();
         assert_eq!(
             (hookshot.mode.as_str(), hookshot.deployable),
-            ("shared", false)
+            ("shared", true),
+            "Hookshot's config is rendered whole from the offering's public URL"
+        );
+        assert!(hookshot.not_deployable_reason.is_none());
+        assert!(
+            hookshot
+                .config_keys
+                .iter()
+                .any(|k| k.key == "public_url" && k.required)
         );
         let heisenbridge = get("heisenbridge", "x.org").unwrap();
         assert_eq!(

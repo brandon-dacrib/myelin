@@ -45,6 +45,10 @@ sha1 = "0.10"
 # Added by track 02 (state and model): rand_core 0.6, the version ed25519-dalek 2.x's optional
 # `rand_core` feature pins, for `SigningKeyPair::generate`. `rand` (0.9) is unrelated and stays.
 rand_core = "0.6"
+# Added by track 11 (bridges): the RSA private key Hookshot encrypts its tokens with
+# (`passkey.pem`), minted by the bridge manager (`hs-bridges::passkey`). rsa 0.9 takes a
+# rand_core 0.6 RNG, hence `rand_core` above.
+rsa = "0.9"
 # Added by track 01 (storage): embedded store, PostgreSQL client and pool, temp dirs for tests.
 fjall = { version = "3", features = ["bytes_1"] }
 tokio-postgres = "0.7"

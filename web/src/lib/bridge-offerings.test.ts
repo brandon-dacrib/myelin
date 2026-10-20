@@ -12,7 +12,73 @@ import {
   totalInstances,
   checkMacAddress,
   instanceAddress,
+  hookshotOptions,
+  hookshotRefusal,
+  hookshotValues,
+  takesPublicUrl,
 } from "./bridge-offerings";
+
+describe("hookshot settings", () => {
+  const hookshot = { config_keys: [{ key: "public_url", description: "", required: true }] };
+
+  it("is only for a type whose catalogue entry needs a public URL", () => {
+    expect(takesPublicUrl(hookshot)).toBe(true);
+    expect(
+      takesPublicUrl({ config_keys: [{ key: "phone", description: "", required: true }] }),
+    ).toBe(false);
+    expect(takesPublicUrl(undefined)).toBe(false);
+  });
+
+  it("refuses a missing or malformed public URL and half a GitHub App", () => {
+    const empty = { publicUrl: "", githubAppId: "", githubPrivateKey: "", githubWebhookSecret: "" };
+    expect(hookshotRefusal(empty)).toMatch(/public URL is needed/);
+    expect(hookshotRefusal({ ...empty, publicUrl: "hooks.example.org" })).toMatch(/https:\/\/host/);
+    expect(hookshotRefusal({ ...empty, publicUrl: "https://hooks.example.org" })).toBeNull();
+    expect(
+      hookshotRefusal({ ...empty, publicUrl: "https://hooks.example.org", githubAppId: "1" }),
+    ).toMatch(/together/);
+  });
+
+  it("sends the GitHub App only when it is whole, and reads it back from an offering", () => {
+    expect(
+      hookshotOptions({
+        publicUrl: " https://hooks.example.org ",
+        githubAppId: "1",
+        githubPrivateKey: "",
+        githubWebhookSecret: "",
+      }),
+    ).toEqual({ public_url: "https://hooks.example.org", github: null });
+    const whole = {
+      publicUrl: "https://hooks.example.org",
+      githubAppId: "4242",
+      githubPrivateKey: "-----BEGIN RSA PRIVATE KEY-----\nk\n",
+      githubWebhookSecret: "shh",
+    };
+    const options = hookshotOptions(whole);
+    expect(options.github).toEqual({
+      app_id: "4242",
+      private_key: "-----BEGIN RSA PRIVATE KEY-----\nk",
+      webhook_secret: "shh",
+    });
+    expect(
+      hookshotValues({
+        options: { public_url: "https://hooks.example.org", github: options.github },
+      }),
+    ).toEqual({ ...whole, githubPrivateKey: "-----BEGIN RSA PRIVATE KEY-----\nk" });
+    // A round trip of a Hookshot offering keeps its settings; a mautrix one carries none.
+    const request = requestFromOffering({
+      type: "matrix-hookshot",
+      mode: "shared",
+      enabled: true,
+      runtime: "cluster",
+      image: "ghcr.io/matrix-org/matrix-hookshot:7.5.0",
+      access: { all_local_users: true, users: [] },
+      options: { public_url: "https://hooks.example.org", github: options.github },
+    });
+    expect(request.options.public_url).toBe("https://hooks.example.org");
+    expect(request.options.github?.app_id).toBe("4242");
+  });
+});
 
 describe("imageTag", () => {
   it("reads the tag after the last path segment", () => {

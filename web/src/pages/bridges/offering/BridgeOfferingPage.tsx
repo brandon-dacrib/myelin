@@ -6,12 +6,14 @@ import { ChevronLeft, Users } from "lucide-react";
 import {
   appserviceLoginsQueryOptions,
   instanceUserSegment,
+  useBridgeConnections,
   useBridgeInstanceFiles,
   useBridgeInstances,
   useBridgeOffering,
   useBridgeTypes,
   useDeleteBridgeInstance,
   usePutBridgeInstance,
+  type BridgeConnection,
   type BridgeInstance,
   type BridgeOffering,
   type BridgeType,
@@ -41,6 +43,7 @@ import {
   runsOnMac,
   runtimeMeta,
   deploymentPhaseMeta,
+  takesPublicUrl,
 } from "@/lib/bridge-offerings";
 import {
   currentVolumeSize,
@@ -394,6 +397,9 @@ export function BridgeOfferingPage() {
               </p>
             )}
           </div>
+          {takesPublicUrl(catalogueType) && (
+            <ConnectionsSection type={offering.type} name={offering.name ?? offering.type} />
+          )}
         </section>
       ) : (
         <section aria-labelledby="instances" className="mt-8">
@@ -677,7 +683,26 @@ function SettingsSummary({
               : "Nobody yet"
             : "Everyone on this server"}
         </Detail>
-        <Detail label="Options">{options.length > 0 ? options.join(", ") : "None"}</Detail>
+        {takesPublicUrl(type) ? (
+          <>
+            <Detail label="Public URL">
+              <span className="font-identifier [overflow-wrap:anywhere]">
+                {offering.options?.public_url || "Not set"}
+              </span>
+              <span className="mt-0.5 block text-xs text-text-muted">
+                Every webhook URL the bridge hands out starts with it; an Ingress for it points at
+                the bridge&apos;s Service port &quot;webhooks&quot;.
+              </span>
+            </Detail>
+            <Detail label="GitHub App">
+              {offering.options?.github?.app_id
+                ? `App ${offering.options.github.app_id}`
+                : "None: repositories post through webhooks"}
+            </Detail>
+          </>
+        ) : (
+          <Detail label="Options">{options.length > 0 ? options.join(", ") : "None"}</Detail>
+        )}
         {type?.command_prefix && (
           <Detail label="Command prefix">
             <code className="font-identifier">{type.command_prefix}</code>
@@ -875,6 +900,111 @@ function VolumeLine({ volume }: { volume: NonNullable<BridgeInstance["volume"]> 
 }
 
 /** A shared offering's one bridge, as a status panel rather than a table of one. */
+/** The services a connection comes from, in words, with a badge each. */
+const CONNECTION_SERVICES: Record<string, string> = {
+  webhook: "Webhook",
+  github: "GitHub",
+  gitlab: "GitLab",
+  jira: "Jira",
+  feed: "Feed",
+  figma: "Figma",
+  openproject: "OpenProject",
+};
+
+/**
+ * What a shared integrations bridge (Hookshot) has connected, room by room: one bridge, many
+ * connections, each a state event in the room it posts into, read by the server from the rooms
+ * its bot is in (Hookshot 7 has no provisioning API). Connections are made in the rooms
+ * (`!hookshot webhook <name>`, `!hookshot github repo org/repo`, `!hookshot feed <url>`), so
+ * this lists and never edits; a webhook's secret URL is not in the state and so not here.
+ */
+function ConnectionsSection({ type, name }: { type: string; name: string }) {
+  const query = useBridgeConnections(type, true);
+  const rows = query.data ?? [];
+  const columns: Column<BridgeConnection>[] = [
+    {
+      key: "service",
+      header: "Service",
+      priority: 1,
+      render: (c) => (
+        <Badge status={c.state === "removed" ? "muted" : "neutral"}>
+          {CONNECTION_SERVICES[c.service] ?? c.service}
+        </Badge>
+      ),
+    },
+    {
+      key: "name",
+      header: "Connection",
+      priority: 1,
+      render: (c) => <span className="font-identifier [overflow-wrap:anywhere]">{c.name}</span>,
+    },
+    {
+      key: "room",
+      header: "Room",
+      priority: 1,
+      render: (c) =>
+        c.room_name ? (
+          <span>
+            {c.room_name}
+            <span className="mt-0.5 block text-xs text-text-muted">
+              <CopyableId value={c.room_id} />
+            </span>
+          </span>
+        ) : (
+          <CopyableId value={c.room_id} />
+        ),
+      interactive: true,
+    },
+    {
+      key: "state",
+      header: "State",
+      priority: 2,
+      render: (c) => (
+        <Badge status={c.state === "active" ? "success" : "muted"}>
+          {c.state === "active" ? "Active" : "Removed"}
+        </Badge>
+      ),
+    },
+  ];
+  return (
+    <section aria-labelledby="connections" className="mt-6" data-testid="connections">
+      <h3 id="connections" className="text-sm font-medium text-text">
+        Connections
+      </h3>
+      <p className="mt-1 text-sm text-text-muted">
+        One {name} serves every room: each repository, feed or webhook is a connection in the room
+        it posts into, made there with the bot&apos;s commands and read here from the rooms&apos;
+        state. A webhook&apos;s URL is secret and stays in the room.
+      </p>
+      <div className="mt-3">
+        {query.isError ? (
+          <QueryProblemState
+            error={query.error}
+            resource="connections"
+            scope="bridges:read"
+            onRetry={() => query.refetch()}
+          />
+        ) : query.isLoading ? (
+          <SkeletonText lines={2} />
+        ) : rows.length === 0 ? (
+          <p className="text-sm text-text-muted" data-testid="connections-empty">
+            Nothing is connected yet. Invite the bot to a room (it needs to be allowed to send state
+            events) and send <code className="font-identifier">!hookshot help</code>.
+          </p>
+        ) : (
+          <DataTable
+            columns={columns}
+            rows={rows}
+            getRowId={(c) => `${c.room_id}/${c.event_type}/${c.state_key}`}
+            caption={`${name} connections`}
+            density="compact"
+          />
+        )}
+      </div>
+    </section>
+  );
+}
+
 function SharedInstancePanel({
   instance,
   runtime,

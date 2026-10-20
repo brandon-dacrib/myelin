@@ -150,6 +150,14 @@ impl Runtime for KubernetesRuntime {
                 args: spec.args.clone(),
                 files: spec.files.clone(),
                 storage_size: spec.storage_size.clone(),
+                extra_ports: spec
+                    .extra_ports
+                    .iter()
+                    .map(|p| hs_operator::deploy::ExtraPort {
+                        name: p.name.clone(),
+                        port: i32::from(p.port),
+                    })
+                    .collect(),
             })
             .await
             .map(deployment)

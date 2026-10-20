@@ -10,7 +10,7 @@ openapi: 3.1.0
 info:
   title: hs-admin API
   summary: The native administration and moderation API for the homeserver.
-  version: 0.1.20
+  version: 0.1.21
   description: 'The only API the management interface (track 16) talks to. See docs/rfcs/0004-admin-api.md for the full design rationale: resource modeling, naming, pagination, filtering, errors, idempotency, scopes, versioning and the event stream. This document is the contract; the hs-admin router''s contract tests assert the router and this document agree on paths and methods (RFC 0004 section 1, decision D15.16).'
   contact:
     name: 'Track 15: Admin API and modules'
@@ -1023,6 +1023,44 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /bridge-offerings/{type}/connections:
+    get:
+      summary: What a shared integrations bridge has connected
+      description: For a shared bridge with many connections (Hookshot), one entry per connection, room by room, read from the rooms' state (each connection is a `uk.half-shot.matrix-hookshot.*` state event; Hookshot 7 has no provisioning API). Empty for a type that keeps no connections in room state, or whose instance is not running yet. A webhook's secret id is not in the state and is not here.
+      operationId: bridge_offerings.connections
+      tags:
+      - Bridges
+      security:
+      - OAuth2:
+        - bridges:read
+      parameters:
+      - $ref: '#/components/parameters/BridgeTypeId'
+      responses:
+        '200':
+          description: The connections.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - items
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/BridgeConnection'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/InsufficientScope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '404':
+          $ref: '#/components/responses/NotFound'
         '500':
           $ref: '#/components/responses/Internal'
         '503':
@@ -8941,6 +8979,72 @@ components:
           type: boolean
         backfill:
           type: boolean
+        public_url:
+          type:
+          - string
+          - 'null'
+          description: For a bridge that receives webhooks (Hookshot), the URL the services it listens to reach its webhooks listener on, from outside (`https://hooks.example.org`). Required by a type whose catalogue entry needs `public_url`.
+        github:
+          oneOf:
+          - $ref: '#/components/schemas/BridgeOfferingGithub'
+          - type: 'null'
+          description: For Hookshot, the GitHub App it acts as; absent, the bridge takes repository webhooks only.
+    BridgeOfferingGithub:
+      type: object
+      description: A GitHub App for Hookshot. All three parts are needed for the App to be written into the bridge's config; the private key is returned as given.
+      properties:
+        app_id:
+          type:
+          - string
+          - 'null'
+        private_key:
+          type:
+          - string
+          - 'null'
+          description: The App's private key, PEM; written beside the config as `github-key.pem`.
+        webhook_secret:
+          type:
+          - string
+          - 'null'
+    BridgeConnection:
+      type: object
+      description: One thing a shared integrations bridge (Hookshot) has connected to a room, read from the room's state.
+      required:
+      - service
+      - event_type
+      - state_key
+      - room_id
+      - name
+      - state
+      properties:
+        service:
+          type: string
+          description: '`webhook`, `github`, `gitlab`, `jira`, `feed`, `figma`, `openproject`, or the state event type''s own word for one this server does not know.'
+        event_type:
+          type: string
+          description: The state event type (`uk.half-shot.matrix-hookshot.generic.hook`).
+        state_key:
+          type: string
+          description: The state key, what the bridge named the connection.
+        room_id:
+          type: string
+        room_name:
+          type:
+          - string
+          - 'null'
+        name:
+          type: string
+          description: A webhook's name, a repository's `org/repo`, a feed's URL, else the state key.
+        state:
+          type: string
+          enum:
+          - active
+          - removed
+          description: '`removed` for a connection whose event the bridge has emptied.'
+        content:
+          type: object
+          additionalProperties: true
+          description: The event's content as it is.
     BridgeOfferingRequest:
       type: object
       properties:
@@ -9268,6 +9372,11 @@ components:
           - string
           - 'null'
           description: For a type that runs on a Mac, a shell script to run beside `config.yaml` and `registration.yaml` there, which downloads the pinned build if it is not there yet, clears its quarantine flag and starts it. `null` for a container type.
+        files:
+          type: object
+          additionalProperties:
+            type: string
+          description: Every file the bridge reads from `/data`, by its name there (`config.yml`, `registration.yml`, `passkey.pem` and `github-key.pem` for Hookshot; `config.yaml` and `registration.yaml` for a mautrix bridge). What the files Secret holds.
     ClusterStatus:
       type: object
       properties:

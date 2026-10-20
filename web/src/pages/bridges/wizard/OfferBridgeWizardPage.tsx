@@ -14,7 +14,7 @@ import { Button } from "@/components/ui/button/Button";
 import { ErrorState, ForbiddenState } from "@/components/ui/error-state/ErrorState";
 import { toast } from "@/components/ui/toast/toast-store";
 import { hasScope } from "@/lib/auth";
-import { accessIsValid, runtimeMeta } from "@/lib/bridge-offerings";
+import { accessIsValid, runtimeMeta, takesPublicUrl } from "@/lib/bridge-offerings";
 import { AccessFields, OptionFields } from "../offering-fields";
 import { StepRail } from "./StepRail";
 import { KindStep } from "./steps/KindStep";
@@ -26,6 +26,7 @@ import {
   effectiveRuntime,
   initialOfferState,
   offerRequest,
+  optionsAreValid,
   stateForKind,
   type OfferFormState,
   type OfferStep,
@@ -78,13 +79,13 @@ export function OfferBridgeWizardPage() {
     (step === "kind" && Boolean(state.type)) ||
     (step === "access" && accessIsValid(state.allLocalUsers, state.users)) ||
     step === "runtime" ||
-    step === "options";
+    (step === "options" && optionsAreValid(state, type));
 
   function handleOffer() {
     if (!type?.id) return;
     const typeId = type.id;
     put.mutate(
-      { type: typeId, body: offerRequest(state, cluster.available) },
+      { type: typeId, body: offerRequest(state, cluster.available, type) },
       {
         onSuccess: (offering) => {
           toast({ title: `${offering.name ?? type.name} is offered` });
@@ -227,17 +228,31 @@ export function OfferBridgeWizardPage() {
                   </dl>
                 </ReviewGroup>
                 <ReviewGroup title="Options" onEdit={() => goTo("options")}>
-                  <p className="text-sm text-text">
-                    {[
-                      state.encryption && "Encryption",
-                      state.doublePuppeting &&
-                        type?.supports_double_puppeting !== false &&
-                        "Double puppeting",
-                      state.backfill && "Backfill",
-                    ]
-                      .filter(Boolean)
-                      .join(", ") || "None"}
-                  </p>
+                  {takesPublicUrl(type) ? (
+                    <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-sm">
+                      <Row label="Public URL" value={state.publicUrl.trim() || "—"} />
+                      <Row
+                        label="GitHub App"
+                        value={
+                          state.githubAppId.trim()
+                            ? `App ${state.githubAppId.trim()}`
+                            : "None: repositories post through webhooks"
+                        }
+                      />
+                    </dl>
+                  ) : (
+                    <p className="text-sm text-text">
+                      {[
+                        state.encryption && "Encryption",
+                        state.doublePuppeting &&
+                          type?.supports_double_puppeting !== false &&
+                          "Double puppeting",
+                        state.backfill && "Backfill",
+                      ]
+                        .filter(Boolean)
+                        .join(", ") || "None"}
+                    </p>
+                  )}
                 </ReviewGroup>
               </div>
 

@@ -43,6 +43,7 @@ pub mod admin_tokens;
 pub mod assets;
 pub mod audit;
 pub mod auth;
+pub mod bridge_connections;
 pub mod bridge_logins;
 pub mod bridge_offerings;
 pub mod bridge_types;

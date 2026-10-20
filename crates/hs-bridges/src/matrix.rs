@@ -297,6 +297,69 @@ impl MatrixClient {
         }
     }
 
+    /// The rooms `user` is joined to (`GET /joined_rooms`).
+    ///
+    /// # Errors
+    /// On failure.
+    pub async fn joined_rooms(&self, token: &str, user: &str) -> Result<Vec<String>, MatrixError> {
+        let body = self
+            .call(
+                reqwest::Method::GET,
+                self.url(&["joined_rooms"], Some(user)),
+                token,
+                None,
+                "joined_rooms",
+            )
+            .await?;
+        Ok(body["joined_rooms"]
+            .as_array()
+            .map(|rooms| {
+                rooms
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// The current state of `room_id` as `user` sees it (`GET /rooms/{id}/state`): each
+    /// event's type, state key and content.
+    ///
+    /// # Errors
+    /// On failure, a 403 included when `user` is not in the room.
+    pub async fn room_state(
+        &self,
+        token: &str,
+        user: &str,
+        room_id: &str,
+    ) -> Result<Vec<(String, String, Value)>, MatrixError> {
+        let state = self
+            .call(
+                reqwest::Method::GET,
+                self.url(&["rooms", room_id, "state"], Some(user)),
+                token,
+                None,
+                "state",
+            )
+            .await?;
+        Ok(state
+            .as_array()
+            .map(|events| {
+                events
+                    .iter()
+                    .filter_map(|e| {
+                        Some((
+                            e["type"].as_str()?.to_owned(),
+                            e["state_key"].as_str().unwrap_or_default().to_owned(),
+                            e["content"].clone(),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     /// The joined members of `room_id`, as `user` sees them.
     ///
     /// # Errors
