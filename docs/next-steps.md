@@ -18,6 +18,27 @@ Verified on the desktop against the locally built image: `real_matrimail.rs`, en
 plain `help`, the provisioning API answered (status 11, `docs/bridges/matrimail.md`). **Left:
 the first ghcr push is the workflow's first run after the merge** (the merge triggers it, or
 the owner dispatches it); the demo deploy and a real Gmail sign-in are the owner's.
+Written 2026-09-20 by the integration lead, last revised 2026-10-20, evening (v0.4.11 on the demo; its Hookshot is the offering now, declared in the demo's values; the audit fix, the dry-run fix and the offering itself earlier the same day, below). Before: 2026-10-19, late (six mautrix pins to v0.2610.0, the real-bridge test's listener served no media, the bridge-images workflow's label; `agent/bridge-pins-2610`. Before: the interop workflow had never passed on CI: Synapse's image chowned the work directory and ECR refused the nginx pull; `agent/interop-ci`. Before, the same day: the Slack read/unread flip was a receipt loop: a receipt that does not move forward is now dropped, as Synapse drops it; `agent/receipt-no-regress`. Before: a room whose placed history named a rejected event could not be loaded, and the ephemeral pump failed on it for seventeen hours; `agent/stuck-room-load`. Before: a member's own leave from a hot room reached nobody; `agent/hot-room-leave`. Before: v0.3.28 on the demo; the server reports the release it is, not the line; `agent/release-version-string`. Before: the soft-fail check resolved one fork per prev event; `agent/soft-fail-forks`. Before: forked rooms are merged and pruned, and a resolution reads about the room once however many forks; `agent/extremity-merge`. Before: the hub's members step and the idle CPU were repeated state resolutions; `agent/hub-members-step`. Before: handover: the demo, the releases and what is next, below. Before: test servers are handed their ports still bound; `agent/test-port-races`. Before: room loads and unloading; `agent/room-load-speed`. Before: the Slack bridge's full volume; fix on `agent/bridge-volume-size`. Before: Discord's delivery timeouts were a replay of the 2026-10-12 flood; fix on `agent/discord-delivery-timeouts`. Before: the memory climb with federation on; fix on `agent/fed-memory-growth`. Before: the session hub wedge; fix on `agent/hub-wedge`. Earlier: the ephemeral pump's prune busy loop; fix on `agent/ephemeral-prune`). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+
+The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
+
+## 2026-10-20, evening -- v0.4.11 runs on the demo (revision 42), and its Hookshot is the offering
+
+CD tagged the audit fix as v0.4.11 (its arm64 image job needed a retry after a vanished
+BuildKit cache blob). The demo rolled to it with `--reuse-values` (the session cannot read the
+release's values; it need not) and the tag's `values-bridges.yaml`; every pod and Bridge is up,
+the log is quiet. Then the hand-made Hookshot was replaced by the offering: Bridge, Secret and
+registration deleted (in that order: the manager would otherwise 409 on the registration it
+wants to make under the same id), the offering created from the admin session with the public
+URL, the Funnel Ingress repointed at the operator's Service, both GitHub hooks pinged and seen
+in their rooms, the Connections table showing both. Status 11 has the steps and the timings.
+`deploy/demo/values-bridges.yaml` declares the offering; `deploy/demo/hookshot/` keeps the
+Ingress, the transformation function and the README. No branch is open; everything is on `main`.
+
+What is left for Hookshot: a GitHub App on the offering (then `!hookshot github repo` instead of
+plain webhooks, with ghost users per commenter); the other services' config sections (GitLab,
+Jira) in the rendered config; a source library and server-side webhook provisioning for the
+many things that could post into it (the owner's note of 2026-10-20).
 
 ## 2026-10-20, later -- CI's audit blocked the Hookshot release: the passkey is made by aws-lc-rs now; the branch is `agent/audit-rsa-webpki`
 

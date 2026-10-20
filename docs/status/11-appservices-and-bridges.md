@@ -5,6 +5,7 @@ Last updated: 2026-10-20 (Hookshot is an offering the server deploys: its config
 from the offering's public URL and GitHub App, its passkey minted and kept, the `Bridge` and
 the operator expose its webhooks and metrics ports, and the offering's page lists its
 connections read from the rooms' state; below); before that 2026-10-19, evening (six mautrix pins bumped to v0.2610.0, verified with the real
+Last updated: 2026-10-20, evening (v0.4.11 on the demo, and the demo's Hookshot is the offering: the hand-made Bridge, Secret and registration removed, the offering created, the rooms and GitHub webhooks unchanged; below); before that 2026-10-20, later (the passkey is made by aws-lc-rs, not the `rsa` crate CI's audit refuses; three webpki crates updated for the emSign distrust; below); before that 2026-10-20 (Hookshot is an offering the server deploys: its config rendered whole from the offering's public URL and GitHub App, its passkey minted and kept, the `Bridge` and the operator expose its webhooks and metrics ports, and the offering's page lists its connections read from the rooms' state; and, by hand before that, Hookshot on the demo with GitHub PR comments from two repositories; below); before that before that 2026-10-19, evening (six mautrix pins bumped to v0.2610.0, verified with the real
 bridges; the real-bridge test's listener had served no media since 2026-10-16; below); before that 2026-10-19 (a bridge is no longer sent its own double puppet's receipt back
 when it moved nothing: the Slack read/unread flip; below); before that 2026-10-18 (the ephemeral pump leaves a room it cannot read out of the pass for
 a minute instead of failing every tick; below); before that 2026-10-15 (Discord's delivery timeouts: a retry is the same transaction, a
@@ -130,6 +131,50 @@ cannot pull, and the real test skips on CI. Signing a real mailbox in (the owner
 an app password) has not been done by anyone here; the demo deploy is the owner's call.
 `check-image-tags.py` lists the entry as "(no upstream mapping)". The Gmail OAuth path
 (`network.gmail_oauth`) is not rendered.
+## 2026-10-20, evening: v0.4.11 on the demo, and the demo's Hookshot is the offering
+
+**Rolled.** CD tagged `d6b79bd7` as v0.4.11 (the offering `264d3640`, the dry run `f87979ec`
+and the audit fix, folded into one release; the run's arm64 image job first failed on a
+BuildKit registry-cache blob that no longer existed, "could not fetch content descriptor ...
+not found", and passed on its retry). The demo went from 0.4.7 to 0.4.11 at 21:30 UTC (Helm
+revision 42) with `--reuse-values`, the tag's `deploy/demo/values-bridges.yaml` and
+`image.tag=0.4.11`; the session may not read the release's values (`helm get values` carries
+secrets and the classifier refuses it), and `--reuse-values` needs nobody to. Checked: every pod
+Running, every `Bridge` Ready, the server and the operator on `:0.4.11`, federation answering
+0.4.11, only the known IPv6 warnings in the log, and the Bridge CRD already had `extraPorts`
+(no `--force-conflicts` needed this time).
+
+**Switched.** The hand-made Hookshot (`deploy/demo/hookshot/` as it was: a `Bridge`, the files
+Secret, a second Service, a registration made through `POST /api/v1/appservices`) became the
+offering, in this order, because the manager picks the appservice id `hookshot` for a shared
+instance and mints its own tokens, so an existing registration under that id makes its create a
+409 and the instance `failed`:
+
+1. `kubectl delete bridge bridge-hookshot` and the Secret `bridge-hookshot-files` (the manager
+   names its files Secret the same way).
+2. `DELETE /api/v1/appservices/hookshot` (204), from the owner's signed-in admin session.
+3. `PUT /api/v1/bridge-offerings/matrix-hookshot` with `runtime: cluster`, everyone allowed and
+   `options.public_url: https://hookshot.longhair-tet.ts.net` (200, one instance requested).
+   Forty seconds later `Bridge/bridge-hookshot` was Ready with `extraPorts` webhooks 9000 and
+   metrics 9001, the operator's Service `bridge-hookshot` carried `appservice`, `webhooks` and
+   `metrics`, and the bridge logged `Bridge is now ready. Found 2 connections`: the two rooms'
+   state was untouched by any of this, and the bot kept its name, so its room account data
+   (the hook ids) was there too.
+4. The Funnel Ingress repointed at `bridge-hookshot:webhooks` (`deploy/demo/hookshot/ingress.yaml`,
+   now the only object in that directory the server does not make) and the old Service deleted.
+5. Both GitHub hooks pinged again (202 each); the bridge sent the "connected" notice into both
+   rooms (`@_webhooks_github-myelin`, `@_webhooks_github-avantos`). A real avantos delivery that
+   arrived between the pings was posted too.
+
+The registration `hookshot` is `healthy`, the instance `ready`, and the offering's page shows
+the bridge Ready, its ping Healthy, the bot, and the Connections table with `github-avantos` and
+`github-myelin`, both Active. The offering is declared in `deploy/demo/values-bridges.yaml` now,
+so a fresh install of the demo comes up with it; the templates that made the hand-made files are
+gone from the tree (the server renders them), `github-comments.js` and the README stay.
+
+Downtime: about four minutes between the delete and the new instance's ready, during which a
+GitHub delivery would have been refused; GitHub does not retry on its own, so a comment made in
+that window would be missing from its room. None was.
 
 ## 2026-10-20, later (branch `agent/audit-rsa-webpki`): the passkey is made by aws-lc-rs, and CI's audit is green again
 

@@ -14,6 +14,13 @@
 # offering"). The demo already has the offering (made through the admin interface before this
 # file existed, with brandon's instance `bridge-d2854412-...`): declaring it here keeps it as
 # it is, and makes a fresh install of the demo come up with it.
+#
+# Hookshot (2026-10-20) is the shared integrations bridge: GitHub pull-request comments and
+# reviews post into one room per repository through plain webhooks (deploy/demo/hookshot/,
+# docs/bridges/hookshot.md). Its webhooks listener is public at the public URL below through
+# the Funnel Ingress in deploy/demo/hookshot/ingress.yaml, the one object the server does not
+# make. The demo's offering was created through the admin API on 2026-10-20 (replacing a
+# hand-made Bridge of the same name); declaring it here keeps it, like WhatsApp's.
 
 # Traces to the cluster's OpenTelemetry gateway, which forwards them to Tempo
 # (`tempo.monitoring-system:3200`; Grafana's Tempo data source, service `myelin`). Every request
@@ -37,3 +44,9 @@ bridges:
         encryption: true
         double_puppeting: true
         backfill: true
+    - type: matrix-hookshot
+      runtime: cluster
+      access:
+        all_local_users: true
+      options:
+        public_url: https://hookshot.longhair-tet.ts.net
