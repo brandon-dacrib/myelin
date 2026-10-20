@@ -138,7 +138,7 @@ a state event). Then:
 
 ## Making a webhook from the server
 
-Since 2026-10-20 (decision 0055) a webhook is also made from the offering's page or the admin
+Since 2026-10-20 (decision 0056) a webhook is also made from the offering's page or the admin
 API, for one of the **sources** below: the server acts as the bridge's bot and does exactly
 what `!hookshot webhook <name>` does, with the source's transformation function written into
 the connection. One Hookshot, one public URL, many webhooks, each in its room.

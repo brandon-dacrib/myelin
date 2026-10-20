@@ -46,7 +46,7 @@ The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/
 ## 2026-10-20, evening -- one Hookshot, many webhooks: sources, provisioning as the bot, the page; the branch is `agent/hookshot-sources`
 
 The owner's direction: build the Hookshot integration for many different webhooks coming
-into it. Done on the branch (status 11, decision 0055, `docs/bridges/hookshot.md`): a source
+into it. Done on the branch (status 11, decision 0056, `docs/bridges/hookshot.md`): a source
 library in the server (`crates/hs-bridges/hookshot-sources/`: generic, Alertmanager, Datadog,
 GitHub comments (the demo's, moved), Gmail with its Apps Script, Linear, Notion; each with the
 sender's setup and a transformation function, run on sample payloads with `node` in `cargo

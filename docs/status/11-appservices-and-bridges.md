@@ -183,7 +183,7 @@ that window would be missing from its room. None was.
 **Asked** (the owner): "make sure the hookshot integration is built with the idea that there
 may be many different webhooks that come into it." One Hookshot, one public URL, many sources
 and rooms: a source library in the server, provisioning through the server as the bot, the
-page to do it from, docs. Decision 0055 (amends 0054).
+page to do it from, docs. Decision 0056 (amends 0054).
 
 **Done**
 
@@ -242,7 +242,7 @@ page to do it from, docs. Decision 0055 (amends 0054).
   tests, and `web/e2e/hookshot-webhooks.spec.ts` (seeded from inside the page; axe-checked at
   each step).
 - **Docs**: `docs/bridges/hookshot.md` ("Making a webhook from the server", "Sources" with a
-  subsection per source, the listing's `source` and `rooms`); decision 0055; this entry;
+  subsection per source, the listing's `source` and `rooms`); decision 0056; this entry;
   `docs/next-steps.md`; the changelog.
 
 **Verified**

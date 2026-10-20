@@ -42,7 +42,7 @@ never seen it. Everything that was verified for it says how.
   idempotent, counted (`hs_bridge_webhook_connections_total`). Verified against the real
   7.5.0 image: the bridge picks a connection the server wrote up live, Datadog's sample
   payload posted to the URL lands as the source's notice, and a removed webhook's URL stops
-  working within a second (`docs/bridges/hookshot.md`, decision 0055). Every transform is
+  working within a second (`docs/bridges/hookshot.md`, decision 0056). Every transform is
   run on its sample payloads with `node` in `cargo test`.
 - **A receipt that does not move forward is dropped, so a bridge is not sent its own
   receipt back.** The server recorded every receipt it was given, the event the user's

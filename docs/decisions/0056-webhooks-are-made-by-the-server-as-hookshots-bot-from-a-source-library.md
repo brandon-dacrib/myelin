@@ -1,4 +1,4 @@
-# 0055: Webhooks are made by the server as Hookshot's bot, from a source library
+# 0056: Webhooks are made by the server as Hookshot's bot, from a source library
 
 Date: 2026-10-20. Track 11 (appservices and bridges); touches tracks 15 (the admin API) and
 16 (the interface). Amends 0054, whose point 5 read connections from room state and whose
