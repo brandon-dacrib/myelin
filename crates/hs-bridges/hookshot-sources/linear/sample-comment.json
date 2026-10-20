@@ -1,0 +1,16 @@
+{
+  "action": "create",
+  "type": "Comment",
+  "createdAt": "2026-10-20T10:05:00.000Z",
+  "organizationId": "org",
+  "webhookTimestamp": 1729418700000,
+  "webhookId": "wh",
+  "actor": { "id": "u2", "name": "Grace Hopper", "type": "user" },
+  "url": "https://linear.app/example/issue/ENG-42/receipts-loop-through-the-pump#comment-c1",
+  "data": {
+    "id": "c1",
+    "body": "Reproduced on the demo; the receipt comes back as the user's own.",
+    "issue": { "id": "i1", "identifier": "ENG-42", "title": "Receipts loop through the pump" },
+    "user": { "id": "u2", "name": "Grace Hopper" }
+  }
+}

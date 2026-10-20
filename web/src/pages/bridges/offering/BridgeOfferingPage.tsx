@@ -2,11 +2,12 @@ import { InstanceSignIn } from "./InstanceSignIn";
 import { useMemo, useState, type ReactNode } from "react";
 import { useQueries } from "@tanstack/react-query";
 import { Link, useParams } from "@tanstack/react-router";
-import { ChevronLeft, Users } from "lucide-react";
+import { ChevronLeft, Plus, Users } from "lucide-react";
 import {
   appserviceLoginsQueryOptions,
   instanceUserSegment,
   useBridgeConnections,
+  useDeleteBridgeConnection,
   useBridgeInstanceFiles,
   useBridgeInstances,
   useBridgeOffering,
@@ -19,6 +20,7 @@ import {
   type BridgeType,
 } from "@/api/bridges";
 import { useServerInfo } from "@/api/dashboard";
+import { ApiProblemError } from "@/api/problem";
 import { BridgeGlyph } from "@/components/BridgeGlyph";
 import { CopyableId } from "@/components/CopyableId";
 import { QueryProblemState } from "@/components/QueryProblemState";
@@ -53,6 +55,7 @@ import {
 } from "@/lib/bridge-volume";
 import { VolumeSizeDialog, VolumeStateBadge } from "../BridgeVolume";
 import { AddInstanceDialog } from "./AddInstanceDialog";
+import { AddWebhookDialog } from "./AddWebhookDialog";
 import { InstanceFilesDialog } from "./InstanceFilesDialog";
 import { InstanceNextSteps } from "./InstanceNextSteps";
 import { MacSetupDialog } from "./MacSetupDialog";
@@ -398,7 +401,11 @@ export function BridgeOfferingPage() {
             )}
           </div>
           {takesPublicUrl(catalogueType) && (
-            <ConnectionsSection type={offering.type} name={offering.name ?? offering.type} />
+            <ConnectionsSection
+              type={offering.type}
+              name={offering.name ?? offering.type}
+              canWrite={canWrite}
+            />
           )}
         </section>
       ) : (
@@ -914,13 +921,26 @@ const CONNECTION_SERVICES: Record<string, string> = {
 /**
  * What a shared integrations bridge (Hookshot) has connected, room by room: one bridge, many
  * connections, each a state event in the room it posts into, read by the server from the rooms
- * its bot is in (Hookshot 7 has no provisioning API). Connections are made in the rooms
- * (`!hookshot webhook <name>`, `!hookshot github repo org/repo`, `!hookshot feed <url>`), so
- * this lists and never edits; a webhook's secret URL is not in the state and so not here.
+ * its bot is in (Hookshot 7 has no provisioning API). A webhook is added here (the server makes
+ * it as the bot, from a source it has a transformation for, and shows the URL once) or in the
+ * room (`!hookshot webhook <name>`, `!hookshot github repo org/repo`, `!hookshot feed <url>`);
+ * any active connection can be removed here. A webhook's secret URL is not in the state and so
+ * not listed.
  */
-function ConnectionsSection({ type, name }: { type: string; name: string }) {
+function ConnectionsSection({
+  type,
+  name,
+  canWrite,
+}: {
+  type: string;
+  name: string;
+  canWrite: boolean;
+}) {
   const query = useBridgeConnections(type, true);
-  const rows = query.data ?? [];
+  const rows = query.data?.items ?? [];
+  const rooms = query.data?.rooms ?? [];
+  const [adding, setAdding] = useState(false);
+  const [removing, setRemoving] = useState<BridgeConnection | null>(null);
   const columns: Column<BridgeConnection>[] = [
     {
       key: "service",
@@ -936,7 +956,16 @@ function ConnectionsSection({ type, name }: { type: string; name: string }) {
       key: "name",
       header: "Connection",
       priority: 1,
-      render: (c) => <span className="font-identifier [overflow-wrap:anywhere]">{c.name}</span>,
+      render: (c) => (
+        <span>
+          <span className="font-identifier [overflow-wrap:anywhere]">{c.name}</span>
+          {c.source && (
+            <span className="mt-0.5 block text-xs text-text-muted">
+              Source: <span className="font-identifier">{c.source}</span>
+            </span>
+          )}
+        </span>
+      ),
     },
     {
       key: "room",
@@ -965,17 +994,69 @@ function ConnectionsSection({ type, name }: { type: string; name: string }) {
         </Badge>
       ),
     },
+    {
+      key: "actions",
+      header: "Actions",
+      priority: 1,
+      align: "end",
+      interactive: true,
+      render: (c) =>
+        c.state === "active" ? (
+          <Button
+            variant="ghost"
+            size="sm"
+            disabled={!canWrite}
+            title={!canWrite ? "Needs bridges:write" : undefined}
+            aria-label={`Remove ${c.name}`}
+            onClick={() => setRemoving(c)}
+          >
+            Remove
+          </Button>
+        ) : null,
+    },
   ];
   return (
     <section aria-labelledby="connections" className="mt-6" data-testid="connections">
-      <h3 id="connections" className="text-sm font-medium text-text">
-        Connections
-      </h3>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <h3 id="connections" className="text-sm font-medium text-text">
+          Connections
+        </h3>
+        <Button
+          variant="secondary"
+          size="sm"
+          leadingIcon={<Plus size={14} aria-hidden="true" />}
+          disabled={!canWrite}
+          title={!canWrite ? "Needs bridges:write" : undefined}
+          onClick={() => setAdding(true)}
+        >
+          Add a webhook
+        </Button>
+      </div>
       <p className="mt-1 text-sm text-text-muted">
         One {name} serves every room: each repository, feed or webhook is a connection in the room
-        it posts into, made there with the bot&apos;s commands and read here from the rooms&apos;
-        state. A webhook&apos;s URL is secret and stays in the room.
+        it posts into. A webhook is added here, shaped for what will post to it (Datadog, GitHub,
+        Linear, Notion, Gmail, Alertmanager, or plain JSON), or in the room with the bot&apos;s
+        commands; its URL is shown once, when it is made.
       </p>
+      {adding && (
+        <AddWebhookDialog
+          type={type}
+          bridgeName={name}
+          rooms={rooms}
+          open={adding}
+          onOpenChange={setAdding}
+        />
+      )}
+      {removing && (
+        <RemoveConnectionDialog
+          type={type}
+          connection={removing}
+          open={Boolean(removing)}
+          onOpenChange={(open) => {
+            if (!open) setRemoving(null);
+          }}
+        />
+      )}
       <div className="mt-3">
         {query.isError ? (
           <QueryProblemState
@@ -1002,6 +1083,69 @@ function ConnectionsSection({ type, name }: { type: string; name: string }) {
         )}
       </div>
     </section>
+  );
+}
+
+/** Removes a connection the way the bridge does, after saying what that means. */
+function RemoveConnectionDialog({
+  type,
+  connection,
+  open,
+  onOpenChange,
+}: {
+  type: string;
+  connection: BridgeConnection;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const remove = useDeleteBridgeConnection();
+  const [error, setError] = useState<string | null>(null);
+  const webhook = connection.service === "webhook";
+  async function confirm() {
+    setError(null);
+    try {
+      await remove.mutateAsync({
+        type,
+        roomId: connection.room_id,
+        stateKey: connection.state_key,
+      });
+      toast({ title: `${connection.name} is disconnected` });
+      onOpenChange(false);
+    } catch (err) {
+      setError(
+        err instanceof ApiProblemError
+          ? (err.problem.detail ?? err.problem.title ?? "The server refused.")
+          : "Couldn’t reach the server.",
+      );
+    }
+  }
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent
+        title={`Remove ${connection.name}?`}
+        description={
+          webhook
+            ? `Its URL stops working: whatever posts to it gets an error, and nothing more lands in ${connection.room_name ?? connection.room_id}. The sender's own setup is not touched.`
+            : `Nothing more from it lands in ${connection.room_name ?? connection.room_id}. The connection's state event is emptied, as the bridge's own remove command does.`
+        }
+        footer={
+          <>
+            <Button variant="secondary" onClick={() => onOpenChange(false)}>
+              Keep it
+            </Button>
+            <Button variant="danger" disabled={remove.isPending} onClick={confirm}>
+              {remove.isPending ? "Removing..." : "Remove"}
+            </Button>
+          </>
+        }
+      >
+        {error && (
+          <p role="alert" className="text-sm text-danger">
+            {error}
+          </p>
+        )}
+      </DialogContent>
+    </Dialog>
   );
 }
 

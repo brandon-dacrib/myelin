@@ -1,0 +1,13 @@
+{
+  "title": "[Recovered on {host:web-1}] CPU is high on web-1",
+  "text": "CPU usage is back under 90%.",
+  "status": "Recovered",
+  "priority": "normal",
+  "alert_type": "success",
+  "hostname": "web-1",
+  "scope": "host:web-1",
+  "tags": "env:prod, service:web",
+  "link": "https://app.datadoghq.com/event/event?id=7358",
+  "id": "7358",
+  "date": "1729426200000"
+}

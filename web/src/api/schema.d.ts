@@ -391,8 +391,32 @@ export interface paths {
          */
         get: operations["bridge_offerings.connections"];
         put?: never;
-        post?: never;
+        /**
+         * Make a webhook connection
+         * @description Makes a generic webhook connection as the bridge's bot, the way `!hookshot webhook <name>` does, from one of the webhook sources (`GET .../webhook-sources`): the room is made if asked (the bot as its creator, the people in `invite` invited) or is one the bot is already in and may send state events to; a secret hook id is minted; the bot's room account data maps it to the name; the connection's state event is written with the source's transformation function and `io.myelin.source`. The bridge picks the new connection up from the state event. The answer is the one time the URL is shown: the id is in the bridge's account data and nowhere this API reads back. With the same Idempotency-Key, the same answer again rather than a second webhook.
+         */
+        post: operations["bridge_offerings.create_connection"];
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/bridge-offerings/{type}/connections/{room_id}/{state_key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Remove a connection
+         * @description Removes the connection whose state key is `state_key` in the room, as the bridge's bot, the way the bridge removes one: its state event is emptied (the listing then says `removed`), and for a webhook its hook id is dropped from the bot's account data, so the URL stops working. Any service's connection, not only a webhook's. Both path segments are percent-encoded (`!` and `:` in the room id; `/` in a repository's `org/repo`).
+         */
+        delete: operations["bridge_offerings.delete_connection"];
         options?: never;
         head?: never;
         patch?: never;
@@ -454,6 +478,26 @@ export interface paths {
          * @description The instance's config, registration, a Compose service and a Kubernetes manifest (Secret and `Bridge`, for a cluster running the Myelin operator), with the instance's own tokens. Creates nothing.
          */
         post: operations["bridge_instances.files"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/bridge-offerings/{type}/webhook-sources": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The webhook sources a connection can be made from
+         * @description The kinds of sender the server knows how to render (plain JSON, Datadog, GitHub comments, Linear, Notion, Gmail through an Apps Script, Alertmanager): each with its setup text for the sender's side. Empty for a type that takes no webhooks.
+         */
+        get: operations["bridge_offerings.webhook_sources"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -2805,6 +2849,10 @@ export interface components {
         AuditEntryPage: components["schemas"]["PageEnvelope"] & {
             items: components["schemas"]["AuditEntry"][];
         };
+        BridgeBotRoom: {
+            room_id: string;
+            room_name?: string | null;
+        };
         /** @description One thing a shared integrations bridge (Hookshot) has connected to a room, read from the room's state. */
         BridgeConnection: {
             /** @description The event's content as it is. */
@@ -2819,13 +2867,53 @@ export interface components {
             room_name?: string | null;
             /** @description `webhook`, `github`, `gitlab`, `jira`, `feed`, `figma`, `openproject`, or the state event type's own word for one this server does not know. */
             service: string;
+            /** @description The webhook source the server made this connection from (`io.myelin.source` in the content: `datadog`, `github-comments`, ...); absent for one made in the room. */
+            source?: string;
             /**
-             * @description `removed` for a connection whose event the bridge has emptied.
+             * @description `removed` for a connection whose event has been emptied, or that the bridge has purged (Hookshot 7 writes `{"disabled": true}` back).
              * @enum {string}
              */
             state: "active" | "removed";
             /** @description The state key, what the bridge named the connection. */
             state_key: string;
+        };
+        /** @description A webhook connection to make. */
+        BridgeConnectionCreate: {
+            /** @description The connection's name, 3 to 64 characters (the bridge's limit): the state key, and what the room and the listing call it. */
+            name: string;
+            /** @description Which room: exactly one of `id` (a room the bot is already in, allowed to send state events) or `create`. */
+            room: {
+                /** @description A private room to make as the bridge's bot, with these people invited. */
+                create?: {
+                    /** @description User ids to invite. */
+                    invite?: string[];
+                    name: string;
+                    topic?: string;
+                };
+                id?: string;
+            };
+            /** @description A `BridgeWebhookSource.id`. */
+            source: string;
+        };
+        /** @description A webhook connection made. The URL's last part is the secret and is kept nowhere this API reads back: this is the one time it is shown. */
+        BridgeConnectionCreated: {
+            /** @description Files the sender runs (`Code.gs`), with the URL filled in, by name. */
+            files: {
+                [key: string]: string;
+            };
+            name: string;
+            room_id: string;
+            /** @description The source's setup text with the URL filled in (Markdown). */
+            setup: string;
+            source: string;
+            /** @description The webhook's URL, the offering's public URL + `/webhook/` + the secret id. */
+            url: string;
+        };
+        /** @description What a shared integrations bridge has connected, and the rooms its bot is in. */
+        BridgeConnectionList: {
+            items: components["schemas"]["BridgeConnection"][];
+            /** @description The rooms the bot is joined to, with or without connections; a webhook can be added to any of them. */
+            rooms: components["schemas"]["BridgeBotRoom"][];
         };
         BridgeDeployment: {
             image?: string;
@@ -3144,6 +3232,20 @@ export interface components {
             used_bytes?: number | null;
             /** @description used_bytes / capacity_bytes, 0 to 1. */
             used_ratio?: number | null;
+        };
+        /** @description A kind of sender a webhook connection can be made for; the server keeps the transformation function that turns its payloads into notices and the sender's setup text. */
+        BridgeWebhookSource: {
+            /** @description One sentence on what it is for. */
+            description: string;
+            /** @description Names of files the sender runs (`Code.gs`), which the create answer carries filled in. */
+            files?: string[];
+            /** @description `generic`, `alertmanager`, `datadog`, `github-comments`, `gmail`, `linear`, `notion`. */
+            id: string;
+            /** @description The sender's setup, Markdown, with `{{url}}` where the connection's URL goes; the create answer carries it filled in. */
+            setup: string;
+            title: string;
+            /** @description Whether the server writes a transformation function (false for `generic`, which posts payloads as the bridge renders them). */
+            transforms: boolean;
         };
         ClusterStatus: {
             /** @description How many times since the answering replica started a drain released every shard it owned at once rather than one lease at a time (`hs_cluster_drain_released_at_once_total`). Absent for a single node. */
@@ -5267,16 +5369,85 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description The connections. */
+            /** @description The connections, and the rooms the bot is in. */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        items: components["schemas"]["BridgeConnection"][];
-                    };
+                    "application/json": components["schemas"]["BridgeConnectionList"];
                 };
+            };
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["InsufficientScope"];
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["RateLimited"];
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    "bridge_offerings.create_connection": {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description 1-255 visible ASCII characters. Replays return the stored response for 24 hours. */
+                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                /** @description A bridge type catalog id. */
+                type: components["parameters"]["BridgeTypeId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BridgeConnectionCreate"];
+            };
+        };
+        responses: {
+            /** @description The connection, with its URL and the sender's setup. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BridgeConnectionCreated"];
+                };
+            };
+            400: components["responses"]["ValidationFailed"];
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["InsufficientScope"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            413: components["responses"]["PayloadTooLarge"];
+            415: components["responses"]["UnsupportedMediaType"];
+            422: components["responses"]["IdempotencyMismatch"];
+            429: components["responses"]["RateLimited"];
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    "bridge_offerings.delete_connection": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                room_id: string;
+                /** @description The connection's state key, `BridgeConnection.state_key`. */
+                state_key: string;
+                /** @description A bridge type catalog id. */
+                type: components["parameters"]["BridgeTypeId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Removed. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             401: components["responses"]["Unauthenticated"];
             403: components["responses"]["InsufficientScope"];
@@ -5432,6 +5603,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["BridgeInstanceFiles"];
+                };
+            };
+            401: components["responses"]["Unauthenticated"];
+            403: components["responses"]["InsufficientScope"];
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["RateLimited"];
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    "bridge_offerings.webhook_sources": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description A bridge type catalog id. */
+                type: components["parameters"]["BridgeTypeId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The sources. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        items: components["schemas"]["BridgeWebhookSource"][];
+                    };
                 };
             };
             401: components["responses"]["Unauthenticated"];

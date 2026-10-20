@@ -10,7 +10,7 @@ openapi: 3.1.0
 info:
   title: hs-admin API
   summary: The native administration and moderation API for the homeserver.
-  version: 0.1.22
+  version: 0.1.23
   description: 'The only API the management interface (track 16) talks to. See docs/rfcs/0004-admin-api.md for the full design rationale: resource modeling, naming, pagination, filtering, errors, idempotency, scopes, versioning and the event stream. This document is the contract; the hs-admin router''s contract tests assert the router and this document agree on paths and methods (RFC 0004 section 1, decision D15.16).'
   contact:
     name: 'Track 15: Admin API and modules'
@@ -144,6 +144,18 @@ info:
       AppServiceConflict rows) and creates nothing; before this the parameter was documented but
       ignored and a dry run registered the appservice. Conflicts in a dry run are in the body,
       not a 409.'
+  - version: 0.1.23
+    date: '2026-10-20'
+    notes: 'Additive (one Hookshot, many webhooks): bridge_offerings.connections answers
+      BridgeConnectionList (items as before, plus rooms, the rooms the bot is in) and each
+      BridgeConnection carries source, the webhook source the server made it from;
+      bridge_offerings.webhook_sources, GET /bridge-offerings/{type}/webhook-sources, lists the
+      sources (BridgeWebhookSource); bridge_offerings.create_connection, POST
+      /bridge-offerings/{type}/connections, makes a webhook connection as the bridge''s bot in
+      an existing room or a new one and answers 201 BridgeConnectionCreated with the URL (shown
+      once) and the sender''s setup; bridge_offerings.delete_connection, DELETE
+      /bridge-offerings/{type}/connections/{room_id}/{state_key}, removes a connection as the
+      bridge does.'
 servers:
 - url: /api/v1
   description: Same origin as /_matrix on the client listener.
@@ -1063,7 +1075,123 @@ paths:
       - $ref: '#/components/parameters/BridgeTypeId'
       responses:
         '200':
-          description: The connections.
+          description: The connections, and the rooms the bot is in.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BridgeConnectionList'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/InsufficientScope'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+    post:
+      summary: Make a webhook connection
+      description: 'Makes a generic webhook connection as the bridge''s bot, the way `!hookshot webhook <name>` does, from one of the webhook sources (`GET .../webhook-sources`): the room is made if asked (the bot as its creator, the people in `invite` invited) or is one the bot is already in and may send state events to; a secret hook id is minted; the bot''s room account data maps it to the name; the connection''s state event is written with the source''s transformation function and `io.myelin.source`. The bridge picks the new connection up from the state event. The answer is the one time the URL is shown: the id is in the bridge''s account data and nowhere this API reads back. With the same Idempotency-Key, the same answer again rather than a second webhook.'
+      operationId: bridge_offerings.create_connection
+      tags:
+      - Bridges
+      security:
+      - OAuth2:
+        - bridges:write
+      parameters:
+      - $ref: '#/components/parameters/BridgeTypeId'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BridgeConnectionCreate'
+      responses:
+        '201':
+          description: The connection, with its URL and the sender's setup.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BridgeConnectionCreated'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/InsufficientScope'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/IdempotencyMismatch'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+  /bridge-offerings/{type}/connections/{room_id}/{state_key}:
+    delete:
+      summary: Remove a connection
+      description: 'Removes the connection whose state key is `state_key` in the room, as the bridge''s bot, the way the bridge removes one: its state event is emptied (the listing then says `removed`), and for a webhook its hook id is dropped from the bot''s account data, so the URL stops working. Any service''s connection, not only a webhook''s. Both path segments are percent-encoded (`!` and `:` in the room id; `/` in a repository''s `org/repo`).'
+      operationId: bridge_offerings.delete_connection
+      tags:
+      - Bridges
+      security:
+      - OAuth2:
+        - bridges:write
+      parameters:
+      - $ref: '#/components/parameters/BridgeTypeId'
+      - name: room_id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: state_key
+        in: path
+        required: true
+        description: The connection's state key, `BridgeConnection.state_key`.
+        schema:
+          type: string
+      responses:
+        '204':
+          description: Removed.
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/InsufficientScope'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /bridge-offerings/{type}/webhook-sources:
+    get:
+      summary: The webhook sources a connection can be made from
+      description: 'The kinds of sender the server knows how to render (plain JSON, Datadog, GitHub comments, Linear, Notion, Gmail through an Apps Script, Alertmanager): each with its setup text for the sender''s side. Empty for a type that takes no webhooks.'
+      operationId: bridge_offerings.webhook_sources
+      tags:
+      - Bridges
+      security:
+      - OAuth2:
+        - bridges:read
+      parameters:
+      - $ref: '#/components/parameters/BridgeTypeId'
+      responses:
+        '200':
+          description: The sources.
           content:
             application/json:
               schema:
@@ -1074,7 +1202,7 @@ paths:
                   items:
                     type: array
                     items:
-                      $ref: '#/components/schemas/BridgeConnection'
+                      $ref: '#/components/schemas/BridgeWebhookSource'
         '401':
           $ref: '#/components/responses/Unauthenticated'
         '403':
@@ -9106,11 +9234,135 @@ components:
           enum:
           - active
           - removed
-          description: '`removed` for a connection whose event the bridge has emptied.'
+          description: '`removed` for a connection whose event has been emptied, or that the bridge has purged (Hookshot 7 writes `{"disabled": true}` back).'
         content:
           type: object
           additionalProperties: true
           description: The event's content as it is.
+        source:
+          type: string
+          description: 'The webhook source the server made this connection from (`io.myelin.source` in the content: `datadog`, `github-comments`, ...); absent for one made in the room.'
+    BridgeConnectionList:
+      type: object
+      description: What a shared integrations bridge has connected, and the rooms its bot is in.
+      required:
+      - items
+      - rooms
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/BridgeConnection'
+        rooms:
+          type: array
+          description: The rooms the bot is joined to, with or without connections; a webhook can be added to any of them.
+          items:
+            $ref: '#/components/schemas/BridgeBotRoom'
+    BridgeBotRoom:
+      type: object
+      required:
+      - room_id
+      properties:
+        room_id:
+          type: string
+        room_name:
+          type:
+          - string
+          - 'null'
+    BridgeWebhookSource:
+      type: object
+      description: A kind of sender a webhook connection can be made for; the server keeps the transformation function that turns its payloads into notices and the sender's setup text.
+      required:
+      - id
+      - title
+      - description
+      - setup
+      - transforms
+      properties:
+        id:
+          type: string
+          description: '`generic`, `alertmanager`, `datadog`, `github-comments`, `gmail`, `linear`, `notion`.'
+        title:
+          type: string
+        description:
+          type: string
+          description: One sentence on what it is for.
+        setup:
+          type: string
+          description: The sender's setup, Markdown, with `{{url}}` where the connection's URL goes; the create answer carries it filled in.
+        transforms:
+          type: boolean
+          description: Whether the server writes a transformation function (false for `generic`, which posts payloads as the bridge renders them).
+        files:
+          type: array
+          description: Names of files the sender runs (`Code.gs`), which the create answer carries filled in.
+          items:
+            type: string
+    BridgeConnectionCreate:
+      type: object
+      description: A webhook connection to make.
+      required:
+      - source
+      - name
+      - room
+      properties:
+        source:
+          type: string
+          description: A `BridgeWebhookSource.id`.
+        name:
+          type: string
+          minLength: 3
+          maxLength: 64
+          description: 'The connection''s name, 3 to 64 characters (the bridge''s limit): the state key, and what the room and the listing call it.'
+        room:
+          type: object
+          description: 'Which room: exactly one of `id` (a room the bot is already in, allowed to send state events) or `create`.'
+          properties:
+            id:
+              type: string
+            create:
+              type: object
+              description: A private room to make as the bridge's bot, with these people invited.
+              required:
+              - name
+              properties:
+                name:
+                  type: string
+                topic:
+                  type: string
+                invite:
+                  type: array
+                  items:
+                    type: string
+                  description: User ids to invite.
+    BridgeConnectionCreated:
+      type: object
+      description: 'A webhook connection made. The URL''s last part is the secret and is kept nowhere this API reads back: this is the one time it is shown.'
+      required:
+      - room_id
+      - name
+      - source
+      - url
+      - setup
+      - files
+      properties:
+        room_id:
+          type: string
+        name:
+          type: string
+        source:
+          type: string
+        url:
+          type: string
+          description: The webhook's URL, the offering's public URL + `/webhook/` + the secret id.
+        setup:
+          type: string
+          description: The source's setup text with the URL filled in (Markdown).
+        files:
+          type: object
+          additionalProperties:
+            type: string
+          description: Files the sender runs (`Code.gs`), with the URL filled in, by name.
     BridgeOfferingRequest:
       type: object
       properties:

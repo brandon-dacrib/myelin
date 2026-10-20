@@ -23,7 +23,10 @@ a connection is room state and the bot's room account data, and the bot kept its
 
 Hookshot 7.x has no provisioning API (its config refuses a `provisioning` section), so the
 server reads the connections from the rooms' state
-(`GET /api/v1/bridge-offerings/matrix-hookshot/connections`).
+(`GET /api/v1/bridge-offerings/matrix-hookshot/connections`). Since 2026-10-20 the server
+also makes a webhook itself, as the bot, from the offering's page or
+`POST /api/v1/bridge-offerings/matrix-hookshot/connections` (`docs/bridges/hookshot.md`,
+"Making a webhook from the server"): the steps below are what it does, by hand.
 
 ## How a room's webhook works
 
@@ -35,7 +38,9 @@ the account data and the GitHub webhook, not in git. `!hookshot webhook <name>` 
 bot is in makes exactly this; the demo's two rooms were made by the bot with the hook id chosen
 first, so that the GitHub webhook could be created before the bridge was even registered.
 
-`github-comments.js` turns `issue_comment` (PR conversation and issue comments),
+`github-comments.js` (since 2026-10-20 the server's `github-comments` webhook source,
+`crates/hs-bridges/hookshot-sources/github-comments/transform.js`; the file here points there)
+turns `issue_comment` (PR conversation and issue comments),
 `pull_request_review_comment` (comments on a diff line) and `pull_request_review` (approve,
 request changes, a review summary) into one `m.notice` each and drops everything else,
 including the ping GitHub sends on creation, which it answers with "connected". Edit the file

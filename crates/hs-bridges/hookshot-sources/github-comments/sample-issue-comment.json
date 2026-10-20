@@ -1,0 +1,15 @@
+{
+  "action": "created",
+  "issue": {
+    "number": 12,
+    "title": "Receipts loop through the pump",
+    "html_url": "https://github.com/example/myelin/pull/12",
+    "pull_request": { "url": "https://api.github.com/repos/example/myelin/pulls/12" }
+  },
+  "comment": {
+    "body": "Looks right to me; one nit on the metric name.",
+    "html_url": "https://github.com/example/myelin/pull/12#issuecomment-1",
+    "user": { "login": "octocat" }
+  },
+  "repository": { "full_name": "example/myelin" }
+}

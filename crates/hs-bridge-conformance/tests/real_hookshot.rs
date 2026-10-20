@@ -3,7 +3,12 @@
 //! passkey it minted), the image runs from exactly those files and comes up `ready`, a person
 //! invites the bot to a room and asks for a webhook, the bot answers with a URL under the
 //! offering's public URL, a POST to that URL lands in the room, and the admin API lists the
-//! connection it read from the room's state. The story `docs/bridges/hookshot.md` tells, run.
+//! connection it read from the room's state. Then the other way round: the administrator makes
+//! a webhook through the admin API from the `datadog` source, in a new room the bot creates
+//! and invites the person to; the bridge picks the connection up live from the state event;
+//! Datadog's sample payload posted to the URL lands as the source's notice; the listing says
+//! the source; and removing it through the API makes the URL stop working. The story
+//! `docs/bridges/hookshot.md` tells, run.
 //!
 //! Hookshot is one shared bridge with many connections, so unlike `real_mautrix_login.rs` there
 //! is no sign-in and no encryption here: the person is a plain client on the client API.
@@ -654,8 +659,243 @@ async fn webhook_story() -> Result<()> {
         Some(c) if c["state"] == "active" && c["room_name"] == "Deploys" => {}
         other => bail!("the webhook connection is not listed as expected: {other:?} in {items:?}"),
     }
+    // A connection made in the room has no source; the room is among the bot's rooms.
+    if found.is_some_and(|c| c.get("source").is_some()) {
+        bail!("a webhook made in the room says a source: {found:?}");
+    }
+    if !connections["rooms"]
+        .as_array()
+        .is_some_and(|rooms| rooms.iter().any(|r| r["room_id"] == room_id.as_str()))
+    {
+        bail!("the bot's rooms lack {room_id}: {}", connections["rooms"]);
+    }
+
+    if let Err(e) = provisioned_story(&admin, &alice, &bot, &public_url).await {
+        keep_logs("webhook", &server, &bridge);
+        bail!("{e:#}\n--- bridge log ---\n{}", bridge.log());
+    }
     keep_logs("webhook", &server, &bridge);
     Ok(())
+}
+
+/// Datadog's sample payload, the one the source's transform is tested on.
+const DATADOG_SAMPLE: &str =
+    include_str!("../../hs-bridges/hookshot-sources/datadog/sample-alert.json");
+
+/// The second half: a webhook made through the admin API, as the bot, from a source.
+async fn provisioned_story(
+    admin: &Caller,
+    alice: &Caller,
+    bot: &str,
+    public_url: &str,
+) -> Result<()> {
+    // The sources are listed, with the one this uses.
+    let sources = admin
+        .ok(
+            reqwest::Method::GET,
+            &format!("/bridge-offerings/{TYPE_ID}/webhook-sources"),
+            None,
+        )
+        .await?;
+    let datadog = sources["items"]
+        .as_array()
+        .and_then(|items| items.iter().find(|s| s["id"] == "datadog"))
+        .cloned()
+        .with_context(|| format!("no datadog source in {sources}"))?;
+    if datadog["transforms"] != true {
+        bail!("the datadog source does not transform: {datadog}");
+    }
+
+    // Made in a new room the bot creates, with alice invited; the answer carries the URL once.
+    let (status, made) = admin
+        .call(
+            reqwest::Method::POST,
+            &format!("/bridge-offerings/{TYPE_ID}/connections"),
+            Some(json!({
+                "source": "datadog",
+                "name": "datadog-alerts",
+                "room": {"create": {"name": "Alerts", "topic": "Datadog monitors", "invite": [alice_id()]}},
+            })),
+        )
+        .await?;
+    if status != 201 {
+        bail!("making the connection answered {status}: {made}");
+    }
+    let url = made["url"].as_str().unwrap_or_default().to_owned();
+    let prefix = format!("{public_url}/webhook/");
+    if !url.starts_with(&prefix) || url.len() != prefix.len() + 36 {
+        bail!("the URL is not public URL + /webhook/ + a UUID: {url}");
+    }
+    if made["source"] != "datadog" || made["name"] != "datadog-alerts" {
+        bail!("the answer is not the connection asked for: {made}");
+    }
+    if !made["setup"].as_str().unwrap_or_default().contains(&url) {
+        bail!("the setup text lacks the URL: {made}");
+    }
+    let alerts_room = made["room_id"]
+        .as_str()
+        .context("room_id in the answer")?
+        .to_owned();
+
+    // alice was invited by the bot and joins; the room is named as asked.
+    let invited = invite_from(alice, bot).await?;
+    if invited != alerts_room {
+        bail!("alice was invited to {invited}, not the Alerts room {alerts_room}");
+    }
+    alice
+        .ok(
+            reqwest::Method::POST,
+            &format!("/join/{}", escape(&alerts_room)),
+            Some(json!({})),
+        )
+        .await?;
+    let name = alice
+        .ok(
+            reqwest::Method::GET,
+            &format!("/rooms/{}/state/m.room.name/", escape(&alerts_room)),
+            None,
+        )
+        .await?;
+    if name["name"] != "Alerts" {
+        bail!("the room is named {name}, not Alerts");
+    }
+    // The bot said so in the room, without the URL.
+    let notice = wait_for_message(alice, &alerts_room, Some(bot), "the bot's notice", |b| {
+        b.contains("datadog-alerts")
+    })
+    .await?;
+    if notice["content"]["body"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("/webhook/")
+    {
+        bail!("the bot said the URL in the room: {notice}");
+    }
+
+    // Datadog's sample posted to the URL: the bridge picked the connection up from the state
+    // event, ran the source's transformation, and the room has the notice.
+    let sample: Value = serde_json::from_str(DATADOG_SAMPLE)?;
+    let posted = reqwest::Client::new()
+        .post(&url)
+        .json(&sample)
+        .send()
+        .await
+        .with_context(|| format!("POST {url}"))?;
+    if !posted.status().is_success() {
+        bail!(
+            "POST {url} answered {}: {}",
+            posted.status(),
+            posted.text().await.unwrap_or_default()
+        );
+    }
+    let landed = wait_for_message(alice, &alerts_room, None, "the Datadog notice", |b| {
+        b.contains("CPU is high on web-1")
+    })
+    .await?;
+    let body = landed["content"]["body"].as_str().unwrap_or_default();
+    if !body.contains("**Alert** P2") || !body.contains("env:prod") {
+        bail!("the notice is not the source's rendering: {body:?}");
+    }
+    if landed["content"]["msgtype"] != "m.notice" {
+        bail!("the notice is not an m.notice: {landed}");
+    }
+    if landed["content"]["formatted_body"]
+        .as_str()
+        .is_none_or(|h| !h.contains("<strong>Alert</strong>"))
+    {
+        bail!("the bridge did not render the Markdown: {landed}");
+    }
+
+    // Listed with its source and its room; the secret id is nowhere in the listing.
+    let connections = admin
+        .ok(
+            reqwest::Method::GET,
+            &format!("/bridge-offerings/{TYPE_ID}/connections"),
+            None,
+        )
+        .await?;
+    let items = connections["items"].as_array().cloned().unwrap_or_default();
+    let listed = items
+        .iter()
+        .find(|c| c["name"] == "datadog-alerts")
+        .with_context(|| format!("datadog-alerts is not listed: {items:?}"))?;
+    if listed["source"] != "datadog"
+        || listed["state"] != "active"
+        || listed["room_name"] != "Alerts"
+        || listed["room_id"] != alerts_room.as_str()
+    {
+        bail!("the connection is not listed as expected: {listed}");
+    }
+    let id = url.trim_start_matches(&prefix);
+    if connections.to_string().contains(id) {
+        bail!("the listing carries the secret id");
+    }
+
+    // Removed through the API: the bridge purges the connection when it sees the emptied
+    // state event, so the URL stops working; the listing says removed.
+    let (status, _) = admin
+        .call(
+            reqwest::Method::DELETE,
+            &format!(
+                "/bridge-offerings/{TYPE_ID}/connections/{}/datadog-alerts",
+                escape(&alerts_room)
+            ),
+            None,
+        )
+        .await?;
+    if status != 204 {
+        bail!("removing the connection answered {status}");
+    }
+    let deadline = Instant::now() + REPLY_WAIT;
+    loop {
+        let again = reqwest::Client::new()
+            .post(&url)
+            .json(&sample)
+            .send()
+            .await
+            .with_context(|| format!("POST {url} after removal"))?;
+        if !again.status().is_success() {
+            break;
+        }
+        if Instant::now() > deadline {
+            bail!("the URL still works {REPLY_WAIT:?} after the connection was removed");
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let connections = admin
+        .ok(
+            reqwest::Method::GET,
+            &format!("/bridge-offerings/{TYPE_ID}/connections"),
+            None,
+        )
+        .await?;
+    let items = connections["items"].as_array().cloned().unwrap_or_default();
+    let listed = items
+        .iter()
+        .find(|c| c["state_key"] == "datadog-alerts")
+        .with_context(|| format!("datadog-alerts is not listed after removal: {items:?}"))?;
+    if listed["state"] != "removed" || listed.get("source").is_some() {
+        bail!("the removed connection is not listed as removed: {listed}");
+    }
+    // Gone: a second removal is not found.
+    let (status, _) = admin
+        .call(
+            reqwest::Method::DELETE,
+            &format!(
+                "/bridge-offerings/{TYPE_ID}/connections/{}/datadog-alerts",
+                escape(&alerts_room)
+            ),
+            None,
+        )
+        .await?;
+    if status != 404 {
+        bail!("removing a removed connection answered {status}");
+    }
+    Ok(())
+}
+
+fn escape(room_id: &str) -> String {
+    room_id.replace('!', "%21").replace(':', "%3A")
 }
 
 fn alice_id() -> String {

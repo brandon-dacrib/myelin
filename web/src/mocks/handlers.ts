@@ -21,7 +21,11 @@ import {
   deploymentTarget,
   findOffering,
   getInstance,
+  connectionRefusal,
   connectionsOf,
+  createConnection,
+  deleteConnection,
+  webhookSourcesOf,
   instanceByAppservice,
   instanceFiles,
   instancesOf,
@@ -158,7 +162,12 @@ import {
 } from "./data/media";
 import type { MediaItem } from "@/api/media";
 import { ALL_SCOPES, type Scope } from "@/lib/auth";
-import type { AppService, BridgeInstanceRequest, BridgeOfferingRequest } from "@/api/bridges";
+import type {
+  AppService,
+  BridgeConnectionCreate,
+  BridgeInstanceRequest,
+  BridgeOfferingRequest,
+} from "@/api/bridges";
 import type { JsonValue } from "@/api/config-schema";
 import type { components } from "@/api/schema";
 
@@ -847,7 +856,38 @@ export const handlers = [
   http.get(`${API}/bridge-offerings/:type/connections`, ({ params }) => {
     const type = String(params.type);
     if (!findOffering(type)) return problem(404, "not-found", "Bridge offering not found");
-    return HttpResponse.json({ items: connectionsOf(type) });
+    return HttpResponse.json(connectionsOf(type));
+  }),
+
+  http.get(`${API}/bridge-offerings/:type/webhook-sources`, ({ params }) => {
+    const type = String(params.type);
+    if (!findOffering(type)) return problem(404, "not-found", "Bridge offering not found");
+    return HttpResponse.json({ items: webhookSourcesOf(type) });
+  }),
+
+  http.post(`${API}/bridge-offerings/:type/connections`, async ({ params, request }) => {
+    const type = String(params.type);
+    if (!findOffering(type)) return problem(404, "not-found", "Bridge offering not found");
+    const body = (await request.json()) as BridgeConnectionCreate;
+    const refusal = connectionRefusal(type, body);
+    if (refusal) {
+      const [pointer, detail, status] = refusal;
+      if (status === 409) return problem(409, "conflict", "Conflict", { detail });
+      return problem(400, "validation-failed", "Validation failed", {
+        detail,
+        errors: [{ pointer, detail }],
+      });
+    }
+    return HttpResponse.json(createConnection(type, body), { status: 201 });
+  }),
+
+  http.delete(`${API}/bridge-offerings/:type/connections/:roomId/:stateKey`, ({ params }) => {
+    const type = String(params.type);
+    if (!findOffering(type)) return problem(404, "not-found", "Bridge offering not found");
+    if (!deleteConnection(type, String(params.roomId), String(params.stateKey))) {
+      return problem(404, "not-found", "No such active connection");
+    }
+    return new HttpResponse(null, { status: 204 });
   }),
 
   http.delete(`${API}/bridge-offerings/:type`, ({ params, request }) => {

@@ -33,8 +33,9 @@ use hs_admin::bridge_offerings::{BridgeOfferingSource, SHARED_INSTANCE};
 use hs_admin::bridge_types::{self, BRIDGE_INSTANCE_KEY, InstanceRender, InstanceSpec};
 use hs_admin::bridge_volume;
 use hs_admin::model::{
-    AdminAppserviceCreate, AdminOfferingOverlap, BridgeDeploymentTarget, BridgeInstance,
-    BridgeInstanceFiles, BridgeOffering, BridgeOfferingRequest, BridgeVolume,
+    AdminAppserviceCreate, AdminOfferingOverlap, BridgeBotRoom, BridgeConnectionCreate,
+    BridgeConnectionCreated, BridgeConnectionList, BridgeDeploymentTarget, BridgeInstance,
+    BridgeInstanceFiles, BridgeOffering, BridgeOfferingRequest, BridgeVolume, BridgeWebhookSource,
 };
 use hs_admin::sources::{AppserviceDirectory, SourceError};
 use hs_kv::KvBackend;
@@ -42,6 +43,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::cross_signing::{BotIdentity, Seeds};
+use crate::hookshot_sources;
 use crate::matrix::MatrixClient;
 use crate::overlap::{self, Overlap};
 use crate::runtime::{DeploySpec, Runtime, manifest_yaml};
@@ -893,6 +895,38 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             (Some(runtime), "cluster") => runtime.target().homeserver_url.unwrap_or_else(outside),
             _ => outside(),
         }
+    }
+
+    /// The client, token and bot user id to act as a shared type's one instance's bot with:
+    /// `None` until the instance has a registration and the manager has its loopback.
+    fn shared_bot(
+        &self,
+        bridge_type: &str,
+    ) -> Result<Option<(MatrixClient, String, String)>, SourceError> {
+        let Some(row) = self
+            .store
+            .instance(bridge_type, SHARED_INSTANCE)
+            .map_err(store_err)?
+        else {
+            return Ok(None);
+        };
+        let (Some(token), Some(render)) = (
+            row.as_token.clone(),
+            self.store
+                .offering(bridge_type)
+                .map_err(store_err)?
+                .and_then(|offering| self.render(&row, &offering)),
+        ) else {
+            return Ok(None);
+        };
+        let Some(client) = self.client.get() else {
+            return Ok(None);
+        };
+        Ok(Some((
+            client.clone(),
+            token,
+            self.mxid(&render.bot_localpart),
+        )))
     }
 
     fn render(&self, row: &InstanceRow, offering: &OfferingRow) -> Option<InstanceRender> {
@@ -3156,10 +3190,7 @@ impl<B: KvBackend + 'static> BridgeOfferingSource for BridgeManager<B> {
         })
     }
 
-    async fn connections(
-        &self,
-        bridge_type: &str,
-    ) -> Result<Vec<hs_admin::model::BridgeConnection>, SourceError> {
+    async fn connections(&self, bridge_type: &str) -> Result<BridgeConnectionList, SourceError> {
         if self
             .store
             .offering(bridge_type)
@@ -3171,36 +3202,20 @@ impl<B: KvBackend + 'static> BridgeOfferingSource for BridgeManager<B> {
         // Only a type that keeps its connections in room state (Hookshot), and only once its
         // shared instance has a registration to read the rooms with.
         if !bridge_types::keeps_connections_in_room_state(bridge_type) {
-            return Ok(Vec::new());
+            return Ok(BridgeConnectionList::default());
         }
-        let Some(row) = self
-            .store
-            .instance(bridge_type, SHARED_INSTANCE)
-            .map_err(store_err)?
-        else {
-            return Ok(Vec::new());
+        let Some((client, token, bot)) = self.shared_bot(bridge_type)? else {
+            return Ok(BridgeConnectionList::default());
         };
-        let (Some(token), Some(render)) = (
-            row.as_token.as_deref(),
-            self.store
-                .offering(bridge_type)
-                .map_err(store_err)?
-                .and_then(|offering| self.render(&row, &offering)),
-        ) else {
-            return Ok(Vec::new());
-        };
-        let Some(client) = self.client.get() else {
-            return Ok(Vec::new());
-        };
-        let bot = self.mxid(&render.bot_localpart);
         let rooms = client
-            .joined_rooms(token, &bot)
+            .joined_rooms(&token, &bot)
             .await
             .map_err(|e| SourceError::Unavailable(format!("listing the bot's rooms: {e}")))?;
         let mut found = Vec::new();
+        let mut bot_rooms = Vec::new();
         for room_id in rooms {
             let events: Vec<hs_admin::bridge_connections::StateEvent> = match client
-                .room_state(token, &bot, &room_id)
+                .room_state(&token, &bot, &room_id)
                 .await
             {
                 Ok(events) => events
@@ -3225,6 +3240,10 @@ impl<B: KvBackend + 'static> BridgeOfferingSource for BridgeManager<B> {
                 name.as_deref(),
                 &events,
             ));
+            bot_rooms.push(BridgeBotRoom {
+                room_id,
+                room_name: name,
+            });
         }
         found.sort_by(|a, b| {
             a.room_name
@@ -3233,8 +3252,329 @@ impl<B: KvBackend + 'static> BridgeOfferingSource for BridgeManager<B> {
                 .then_with(|| a.service.cmp(&b.service))
                 .then_with(|| a.name.cmp(&b.name))
         });
-        Ok(found)
+        bot_rooms.sort_by(|a, b| {
+            a.room_name
+                .cmp(&b.room_name)
+                .then_with(|| a.room_id.cmp(&b.room_id))
+        });
+        Ok(BridgeConnectionList {
+            items: found,
+            rooms: bot_rooms,
+        })
     }
+
+    async fn webhook_sources(
+        &self,
+        bridge_type: &str,
+    ) -> Result<Vec<BridgeWebhookSource>, SourceError> {
+        if self
+            .store
+            .offering(bridge_type)
+            .map_err(store_err)?
+            .is_none()
+        {
+            return Err(SourceError::NotFound);
+        }
+        if !bridge_types::keeps_connections_in_room_state(bridge_type) {
+            return Ok(Vec::new());
+        }
+        Ok(hookshot_sources::SOURCES
+            .iter()
+            .map(|s| BridgeWebhookSource {
+                id: s.id.to_owned(),
+                title: s.title.to_owned(),
+                description: s.description.to_owned(),
+                setup: s.setup.to_owned(),
+                transforms: s.transform.is_some(),
+                files: s.files.iter().map(|(name, _)| (*name).to_owned()).collect(),
+            })
+            .collect())
+    }
+
+    async fn create_connection(
+        &self,
+        bridge_type: &str,
+        request: BridgeConnectionCreate,
+    ) -> Result<BridgeConnectionCreated, SourceError> {
+        let offering = self
+            .store
+            .offering(bridge_type)
+            .map_err(store_err)?
+            .ok_or(SourceError::NotFound)?;
+        if !bridge_types::keeps_connections_in_room_state(bridge_type) {
+            return Err(SourceError::Invalid(format!(
+                "{bridge_type} takes no webhook connections"
+            )));
+        }
+        let source =
+            hookshot_sources::get(&request.source).ok_or_else(|| SourceError::InvalidField {
+                pointer: "/source",
+                detail: format!(
+                    "`{}` is not a webhook source; one of {}",
+                    request.source,
+                    hookshot_sources::SOURCES
+                        .iter()
+                        .map(|s| s.id)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            })?;
+        hs_admin::bridge_offerings::validate_connection_name(&request.name)?;
+        let name = request.name.as_str();
+        let create = match (&request.room.id, &request.room.create) {
+            (Some(_), None) => None,
+            (None, Some(create)) => {
+                if create.name.trim().is_empty() {
+                    return Err(SourceError::InvalidField {
+                        pointer: "/room/create/name",
+                        detail: "the room needs a name".into(),
+                    });
+                }
+                if let Some(bad) = create
+                    .invite
+                    .iter()
+                    .find(|u| !u.starts_with('@') || !u.contains(':'))
+                {
+                    return Err(SourceError::InvalidField {
+                        pointer: "/room/create/invite",
+                        detail: format!("`{bad}` is not a user id (@user:server)"),
+                    });
+                }
+                Some(create)
+            }
+            _ => {
+                return Err(SourceError::InvalidField {
+                    pointer: "/room",
+                    detail: "say which room: `id` of one the bot is in, or `create` one".into(),
+                });
+            }
+        };
+        let public_url = offering
+            .options
+            .public_url
+            .as_deref()
+            .map(|u| u.trim_end_matches('/'))
+            .filter(|u| !u.is_empty())
+            .ok_or_else(|| SourceError::Invalid("the offering has no public URL".into()))?
+            .to_owned();
+        let (client, token, bot) = self.shared_bot(bridge_type)?.ok_or_else(|| {
+            SourceError::Invalid(
+                "the bridge is not registered yet; a webhook can be made once it is".into(),
+            )
+        })?;
+        let failed = |context: &str, e: crate::matrix::MatrixError| {
+            crate::metrics::count_webhook_connection(bridge_type, source.id, "failed");
+            tracing::warn!(bridge_type, source = source.id, name, error = %e, "{context}");
+            match e.status {
+                403 => SourceError::Invalid(format!(
+                    "{context}: the bot may not ({})",
+                    if e.errcode.is_empty() {
+                        "forbidden".to_owned()
+                    } else {
+                        e.errcode
+                    }
+                )),
+                _ => SourceError::Unavailable(format!("{context}: {e}")),
+            }
+        };
+        let hook_type = hs_admin::bridge_connections::GENERIC_HOOK_TYPE;
+        // The room: made as the bot, or one it is in.
+        let room_id = match create {
+            Some(create) => client
+                .create_room(
+                    &token,
+                    &bot,
+                    create.name.trim(),
+                    create.topic.as_deref(),
+                    &create.invite,
+                )
+                .await
+                .map_err(|e| failed("making the room", e))?,
+            None => {
+                let room_id = request.room.id.clone().unwrap_or_default();
+                match client.joined_members(&token, &bot, &room_id).await {
+                    Ok(members) if members.contains(&bot) => {}
+                    Ok(_) | Err(_) => {
+                        return Err(SourceError::InvalidField {
+                            pointer: "/room/id",
+                            detail: format!(
+                                "the bot {bot} is not in that room; invite it first, and let it send state events"
+                            ),
+                        });
+                    }
+                }
+                room_id
+            }
+        };
+        // A name the room already uses, actively, is refused; an emptied or disabled one is
+        // reused.
+        let existing = client
+            .state_event(&token, &bot, &room_id, hook_type, name)
+            .await
+            .map_err(|e| failed("reading the room's state", e))?;
+        if existing
+            .as_ref()
+            .is_some_and(|c| !hs_admin::bridge_connections::is_removed(c))
+        {
+            return Err(SourceError::Conflict(format!(
+                "the room already has a webhook named `{name}`"
+            )));
+        }
+        // The hook id goes into the bot's room account data before the state event: Hookshot
+        // reads the mapping when it sees the event, and refuses to make one up for an event
+        // its own bot sent (`GenericHookConnection.createConnectionForState`).
+        let hook_id = hookshot_sources::new_hook_id();
+        let mut mapping = client
+            .room_account_data(&token, &bot, &room_id, hook_type)
+            .await
+            .map_err(|e| failed("reading the bot's account data", e))?
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+        mapping.retain(|_, v| v.as_str() != Some(name));
+        mapping.insert(hook_id.clone(), json!(name));
+        client
+            .set_room_account_data(&token, &bot, &room_id, hook_type, Value::Object(mapping))
+            .await
+            .map_err(|e| failed("writing the bot's account data", e))?;
+        client
+            .send_state(
+                &token,
+                &bot,
+                &room_id,
+                hook_type,
+                name,
+                hookshot_sources::state_content(source, name),
+            )
+            .await
+            .map_err(|e| failed("writing the connection's state event", e))?;
+        let url = format!("{public_url}/webhook/{hook_id}");
+        // The room is told; the URL is not said there (the command's own flow says it in the
+        // bot's admin room with the person; here it goes to whoever made the connection).
+        let text = format!(
+            "Webhook `{name}` ({}) is connected to this room. Its URL was shown to the administrator who made it.",
+            source.title
+        );
+        let html = format!(
+            "Webhook <code>{}</code> ({}) is connected to this room. Its URL was shown to the administrator who made it.",
+            html_escape(name),
+            html_escape(source.title)
+        );
+        if let Err(e) = client.notice(&token, &bot, &room_id, &text, &html).await {
+            tracing::debug!(room = %room_id, error = %e, "the connection notice was not sent");
+        }
+        crate::metrics::count_webhook_connection(bridge_type, source.id, "created");
+        tracing::info!(bridge_type, source = source.id, name, room = %room_id, "webhook connection made as the bot");
+        Ok(BridgeConnectionCreated {
+            room_id,
+            name: name.to_owned(),
+            source: source.id.to_owned(),
+            setup: source.setup_for(&url, name),
+            files: source.files_for(&url, name),
+            url,
+        })
+    }
+
+    async fn delete_connection(
+        &self,
+        bridge_type: &str,
+        room_id: &str,
+        state_key: &str,
+    ) -> Result<(), SourceError> {
+        if self
+            .store
+            .offering(bridge_type)
+            .map_err(store_err)?
+            .is_none()
+        {
+            return Err(SourceError::NotFound);
+        }
+        if !bridge_types::keeps_connections_in_room_state(bridge_type) {
+            return Err(SourceError::NotFound);
+        }
+        let (client, token, bot) = self.shared_bot(bridge_type)?.ok_or(SourceError::NotFound)?;
+        let state = match client.room_state(&token, &bot, room_id).await {
+            Ok(state) => state,
+            Err(e) if e.status == 403 => return Err(SourceError::NotFound),
+            Err(e) => {
+                return Err(SourceError::Unavailable(format!(
+                    "reading the room's state: {e}"
+                )));
+            }
+        };
+        let prefix = hs_admin::bridge_connections::HOOKSHOT_EVENT_PREFIX;
+        let active: Vec<(String, Value)> = state
+            .into_iter()
+            .filter(|(t, k, c)| {
+                t.starts_with(prefix)
+                    && k == state_key
+                    && !hs_admin::bridge_connections::is_removed(c)
+            })
+            .map(|(t, _, c)| (t, c))
+            .collect();
+        let (event_type, content) = match active.as_slice() {
+            [] => return Err(SourceError::NotFound),
+            [one] => one.clone(),
+            many => {
+                return Err(SourceError::Conflict(format!(
+                    "{} connections have the state key `{state_key}` in that room ({}); none was removed",
+                    many.len(),
+                    many.iter()
+                        .map(|(t, _)| t.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+        };
+        let source = content[hookshot_sources::SOURCE_MARKER]
+            .as_str()
+            .unwrap_or("-")
+            .to_owned();
+        // Emptied, as the bridge empties one; it purges the connection when it sees that.
+        client
+            .send_state(&token, &bot, room_id, &event_type, state_key, json!({}))
+            .await
+            .map_err(|e| {
+                crate::metrics::count_webhook_connection(bridge_type, &source, "failed");
+                match e.status {
+                    403 => SourceError::Invalid(format!(
+                        "the bot may not send state events in that room ({e})"
+                    )),
+                    _ => SourceError::Unavailable(format!("emptying the connection's state: {e}")),
+                }
+            })?;
+        if event_type == hs_admin::bridge_connections::GENERIC_HOOK_TYPE {
+            // The hook id, so the URL stops working even if the bridge missed the event.
+            let mapping = client
+                .room_account_data(&token, &bot, room_id, &event_type)
+                .await
+                .map_err(|e| {
+                    SourceError::Unavailable(format!("reading the bot's account data: {e}"))
+                })?
+                .and_then(|v| v.as_object().cloned())
+                .unwrap_or_default();
+            let kept: serde_json::Map<String, Value> = mapping
+                .into_iter()
+                .filter(|(_, v)| v.as_str() != Some(state_key))
+                .collect();
+            client
+                .set_room_account_data(&token, &bot, room_id, &event_type, Value::Object(kept))
+                .await
+                .map_err(|e| {
+                    SourceError::Unavailable(format!("writing the bot's account data: {e}"))
+                })?;
+        }
+        crate::metrics::count_webhook_connection(bridge_type, &source, "removed");
+        tracing::info!(bridge_type, room = %room_id, state_key, event_type, "connection removed as the bot");
+        Ok(())
+    }
+}
+
+/// `&`, `<`, `>` and `"` escaped for HTML.
+fn html_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 /// Whether an instance of `offering` may act as its owner: the type supports double puppeting
@@ -4295,10 +4635,19 @@ mod tests {
                 .connections("matrix-hookshot")
                 .await
                 .unwrap()
+                .items
                 .is_empty()
         );
         manager.tick().await;
-        let found = manager.connections("matrix-hookshot").await.unwrap();
+        let list = manager.connections("matrix-hookshot").await.unwrap();
+        assert_eq!(
+            list.rooms,
+            vec![BridgeBotRoom {
+                room_id: "!new:example.org".into(),
+                room_name: Some("Deploys".into())
+            }]
+        );
+        let found = list.items;
         assert_eq!(found.len(), 3, "{found:?}");
         let webhook = found.iter().find(|c| c.service == "webhook").unwrap();
         assert_eq!(webhook.name, "myelin");
@@ -4328,7 +4677,283 @@ mod tests {
                 .connections("mautrix-whatsapp")
                 .await
                 .unwrap()
+                .items
                 .is_empty()
+        );
+        assert!(
+            manager
+                .webhook_sources("mautrix-whatsapp")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A webhook connection is made as the bot the way `!hookshot webhook` makes one: the room
+    /// (when asked), the hook id in the bot's room account data first, then the state event
+    /// with the source's transformation function and `io.myelin.source`; the URL is the
+    /// offering's public URL + `/webhook/` + the id, shown once. Removing it empties the state
+    /// event and drops the id from the account data.
+    #[tokio::test]
+    async fn a_webhook_connection_is_made_as_the_bot_and_removed_again() {
+        use hs_admin::bridge_connections::GENERIC_HOOK_TYPE;
+        use hs_admin::model::{BridgeConnectionRoom, BridgeRoomCreate};
+
+        let fake = Arc::new(FakeMatrix::default());
+        let runtime = Arc::new(FakeRuntime::default());
+        let manager = BridgeManager::new(
+            MemoryBackend::new(),
+            Arc::new(InMemoryAppserviceDirectory::new()),
+            Some(runtime),
+            "example.org",
+            "https://example.org",
+        )
+        .unwrap();
+        manager.attach(&fake_matrix(fake.clone()).await);
+        let request =
+            |source: &str, name: &str, room: BridgeConnectionRoom| BridgeConnectionCreate {
+                source: source.into(),
+                name: name.into(),
+                room,
+            };
+        let new_room = || BridgeConnectionRoom {
+            id: None,
+            create: Some(BridgeRoomCreate {
+                name: "Alerts".into(),
+                topic: Some("Datadog".into()),
+                invite: vec!["@alice:example.org".into()],
+            }),
+        };
+        // Not offered: not found.
+        assert!(matches!(
+            manager
+                .create_connection("matrix-hookshot", request("datadog", "alerts", new_room()))
+                .await,
+            Err(SourceError::NotFound)
+        ));
+        manager
+            .put(
+                "matrix-hookshot",
+                BridgeOfferingRequest {
+                    runtime: Some("cluster".into()),
+                    options: Some(hs_admin::model::BridgeOfferingOptions {
+                        public_url: Some("https://hooks.example.org/".into()),
+                        ..Default::default()
+                    }),
+                    ..BridgeOfferingRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        // Offered but not registered yet: said so.
+        assert!(matches!(
+            manager.create_connection("matrix-hookshot", request("datadog", "alerts", new_room())).await,
+            Err(SourceError::Invalid(m)) if m.contains("not registered yet")
+        ));
+        manager.tick().await;
+        let sources = manager.webhook_sources("matrix-hookshot").await.unwrap();
+        assert_eq!(sources[0].id, "generic");
+        assert!(!sources[0].transforms);
+        let gmail = sources.iter().find(|s| s.id == "gmail").unwrap();
+        assert!(gmail.transforms && gmail.files == ["Code.gs"]);
+
+        // Refusals, each at its field.
+        for (req, pointer) in [
+            (request("nope", "alerts", new_room()), "/source"),
+            (request("datadog", "ab", new_room()), "/name"),
+            (
+                request("datadog", "alerts", BridgeConnectionRoom::default()),
+                "/room",
+            ),
+            (
+                request(
+                    "datadog",
+                    "alerts",
+                    BridgeConnectionRoom {
+                        id: Some("!x:example.org".into()),
+                        create: None,
+                    },
+                ),
+                "/room/id",
+            ),
+        ] {
+            match manager.create_connection("matrix-hookshot", req).await {
+                Err(SourceError::InvalidField { pointer: p, .. }) => assert_eq!(p, pointer),
+                other => panic!("{pointer}: {other:?}"),
+            }
+        }
+        assert!(fake.created_rooms.lock().unwrap().is_empty());
+
+        // Made, in a new room.
+        let made = manager
+            .create_connection("matrix-hookshot", request("datadog", "alerts", new_room()))
+            .await
+            .unwrap();
+        assert_eq!(made.room_id, "!new:example.org");
+        assert_eq!(
+            (made.name.as_str(), made.source.as_str()),
+            ("alerts", "datadog")
+        );
+        let id = made
+            .url
+            .strip_prefix("https://hooks.example.org/webhook/")
+            .unwrap_or_else(|| panic!("{}", made.url));
+        assert_eq!(id.len(), 36, "a UUID: {id}");
+        assert!(made.setup.contains(&made.url) && !made.setup.contains("{{url}}"));
+        assert!(made.files.is_empty());
+        let room = fake.created_rooms.lock().unwrap()[0].clone();
+        assert_eq!(room["name"], "Alerts");
+        assert_eq!(room["topic"], "Datadog");
+        assert_eq!(room["invite"], json!(["@alice:example.org"]));
+        assert_eq!(room["preset"], "private_chat");
+        // The account data carries the id before the state event is written, as the bot.
+        let calls = fake.calls();
+        let bot = "@hookshot:example.org";
+        let put_data = calls
+            .iter()
+            .position(|c| c == &format!("PUT room_account_data/{GENERIC_HOOK_TYPE} as={bot}"))
+            .unwrap_or_else(|| panic!("{calls:?}"));
+        let put_state = calls
+            .iter()
+            .position(|c| c == &format!("PUT state/{GENERIC_HOOK_TYPE}/alerts as={bot}"))
+            .unwrap_or_else(|| panic!("{calls:?}"));
+        assert!(put_data < put_state, "{calls:?}");
+        assert_eq!(
+            fake.account_data.lock().unwrap()[GENERIC_HOOK_TYPE],
+            json!({id: "alerts"})
+        );
+        let state = fake.extra_state.lock().unwrap().clone();
+        let event = state
+            .iter()
+            .find(|e| e["type"] == GENERIC_HOOK_TYPE)
+            .unwrap();
+        assert_eq!(event["content"]["name"], "alerts");
+        assert_eq!(event["content"]["io.myelin.source"], "datadog");
+        assert!(
+            event["content"]["transformationFunction"]
+                .as_str()
+                .unwrap()
+                .contains("result =")
+        );
+        assert!(
+            fake.notices.lock().unwrap()[0]
+                .contains("Webhook `alerts` (Datadog monitors) is connected")
+        );
+        assert_eq!(
+            crate::metrics::webhook_connections("matrix-hookshot", "datadog", "created"),
+            1
+        );
+
+        // Listed with its source; the room is among the bot's rooms. The id is in neither.
+        let list = manager.connections("matrix-hookshot").await.unwrap();
+        let listed = list.items.iter().find(|c| c.name == "alerts").unwrap();
+        assert_eq!(listed.source.as_deref(), Some("datadog"));
+        assert_eq!(listed.state, "active");
+        assert!(!serde_json::to_string(&list).unwrap().contains(id));
+        assert_eq!(list.rooms[0].room_id, "!new:example.org");
+
+        // The same name in the same room again: a conflict. A generic one by another name is
+        // fine and carries no transformation function.
+        fake.members.lock().unwrap().push(bot.to_owned());
+        let existing = BridgeConnectionRoom {
+            id: Some("!new:example.org".into()),
+            create: None,
+        };
+        assert!(matches!(
+            manager
+                .create_connection(
+                    "matrix-hookshot",
+                    request("datadog", "alerts", existing.clone())
+                )
+                .await,
+            Err(SourceError::Conflict(_))
+        ));
+        let plain = manager
+            .create_connection("matrix-hookshot", request("generic", "deploys", existing))
+            .await
+            .unwrap();
+        assert_eq!(
+            fake.created_rooms.lock().unwrap().len(),
+            1,
+            "no second room"
+        );
+        let state = fake.extra_state.lock().unwrap().clone();
+        let event = state.iter().find(|e| e["state_key"] == "deploys").unwrap();
+        assert!(event["content"].get("transformationFunction").is_none());
+        assert_eq!(
+            fake.account_data.lock().unwrap()[GENERIC_HOOK_TYPE]
+                .as_object()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_ne!(plain.url, made.url);
+
+        // Removed: the state event emptied, the id gone from the account data.
+        manager
+            .delete_connection("matrix-hookshot", "!new:example.org", "alerts")
+            .await
+            .unwrap();
+        let state = fake.extra_state.lock().unwrap().clone();
+        let event = state.iter().find(|e| e["state_key"] == "alerts").unwrap();
+        assert_eq!(event["content"], json!({}));
+        let data = fake.account_data.lock().unwrap()[GENERIC_HOOK_TYPE].clone();
+        assert!(data.get(id).is_none(), "{data}");
+        assert_eq!(
+            data.as_object().unwrap().len(),
+            1,
+            "the other webhook's id stays"
+        );
+        let list = manager.connections("matrix-hookshot").await.unwrap();
+        assert_eq!(
+            list.items
+                .iter()
+                .find(|c| c.name == "alerts")
+                .unwrap()
+                .state,
+            "removed"
+        );
+        assert_eq!(
+            crate::metrics::webhook_connections("matrix-hookshot", "datadog", "removed"),
+            1
+        );
+        // Gone already: not found. A room the bot is not in: not found.
+        assert!(matches!(
+            manager
+                .delete_connection("matrix-hookshot", "!new:example.org", "alerts")
+                .await,
+            Err(SourceError::NotFound)
+        ));
+        assert!(matches!(
+            manager
+                .delete_connection("matrix-hookshot", "!new:example.org", "never")
+                .await,
+            Err(SourceError::NotFound)
+        ));
+        // The emptied name can be used again: a fresh id replaces the old mapping.
+        let again = manager
+            .create_connection(
+                "matrix-hookshot",
+                request(
+                    "linear",
+                    "alerts",
+                    BridgeConnectionRoom {
+                        id: Some("!new:example.org".into()),
+                        create: None,
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        assert_ne!(again.url, made.url);
+        let data = fake.account_data.lock().unwrap()[GENERIC_HOOK_TYPE].clone();
+        assert_eq!(
+            data.as_object()
+                .unwrap()
+                .values()
+                .filter(|v| v == &"alerts")
+                .count(),
+            1
         );
     }
 
@@ -5378,8 +6003,12 @@ mod tests {
         /// did on the demo on 2026-10-11 (`M_INVALID_SIGNATURE`, "no known key").
         refuse_signatures: Mutex<bool>,
         /// State events answered after the room's create and encryption events: a Hookshot
-        /// connection or two, for the connections test.
+        /// connection or two, for the connections test; `PUT /state/{type}/{key}` writes here.
         extra_state: Mutex<Vec<serde_json::Value>>,
+        /// Room account data by `type`, as the bot's: what Hookshot keeps hook ids in.
+        account_data: Mutex<BTreeMap<String, serde_json::Value>>,
+        /// Every `createRoom` body.
+        created_rooms: Mutex<Vec<serde_json::Value>>,
     }
 
     impl FakeMatrix {
@@ -5460,9 +6089,13 @@ mod tests {
             let body: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
             let short = match path.split('/').collect::<Vec<_>>().as_slice() {
                 ["", "rooms", _, "send", ..] => "send".to_owned(),
+                ["", "rooms", _, "state", t, k] => format!("state/{t}/{k}"),
                 ["", "rooms", _, what] => (*what).to_owned(),
                 ["", "join", _] => "join".to_owned(),
                 ["", "user", _, "account_data", _] => "m.direct".to_owned(),
+                ["", "user", _, "rooms", _, "account_data", t] => {
+                    format!("room_account_data/{t}")
+                }
                 _ => path.trim_start_matches('/').to_owned(),
             };
             fake.calls
@@ -5520,7 +6153,48 @@ mod tests {
                 }
                 "createRoom" => {
                     *fake.bot_in_room.lock().unwrap() = true;
+                    fake.created_rooms.lock().unwrap().push(body);
                     ok(json!({"room_id": "!new:example.org"}))
+                }
+                s if s.starts_with("state/") => {
+                    let (event_type, state_key) = s
+                        .trim_start_matches("state/")
+                        .split_once('/')
+                        .unwrap_or_default();
+                    let mut events = fake.extra_state.lock().unwrap();
+                    let at = events
+                        .iter()
+                        .position(|e| e["type"] == event_type && e["state_key"] == state_key);
+                    if method == Method::PUT {
+                        let event = json!({"type": event_type, "state_key": state_key, "sender": as_user, "content": body});
+                        match at {
+                            Some(i) => events[i] = event,
+                            None => events.push(event),
+                        }
+                        return ok(json!({"event_id": "$state"}));
+                    }
+                    match at {
+                        Some(i) => ok(events[i]["content"].clone()),
+                        None => (
+                            StatusCode::NOT_FOUND,
+                            axum::Json(json!({"errcode": "M_NOT_FOUND"})),
+                        ),
+                    }
+                }
+                s if s.starts_with("room_account_data/") => {
+                    let event_type = s.trim_start_matches("room_account_data/").to_owned();
+                    let mut data = fake.account_data.lock().unwrap();
+                    if method == Method::PUT {
+                        data.insert(event_type, body);
+                        return ok(json!({}));
+                    }
+                    match data.get(&event_type) {
+                        Some(v) => ok(v.clone()),
+                        None => (
+                            StatusCode::NOT_FOUND,
+                            axum::Json(json!({"errcode": "M_NOT_FOUND"})),
+                        ),
+                    }
                 }
                 "m.direct" => ok(json!({})),
                 "register" => ok(json!({"user_id": "@x:example.org"})),

@@ -1,0 +1,1 @@
+{ "body": "$EVENT_MSG", "last_updated": "$LAST_UPDATED", "event_type": "$EVENT_TYPE", "title": "", "date": "$DATE", "org": { "id": "$ORG_ID", "name": "$ORG_NAME" }, "id": "$ID" }

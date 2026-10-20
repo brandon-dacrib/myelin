@@ -1,0 +1,31 @@
+{
+  "version": "4",
+  "groupKey": "{}:{alertname=\"HighLatency\", namespace=\"myelin\"}",
+  "truncatedAlerts": 0,
+  "status": "firing",
+  "receiver": "matrix-ops",
+  "groupLabels": { "alertname": "HighLatency", "namespace": "myelin" },
+  "commonLabels": { "alertname": "HighLatency", "namespace": "myelin", "severity": "warning" },
+  "commonAnnotations": {},
+  "externalURL": "https://alertmanager.example.org",
+  "alerts": [
+    {
+      "status": "firing",
+      "labels": { "alertname": "HighLatency", "namespace": "myelin", "pod": "hs-0", "severity": "warning" },
+      "annotations": { "summary": "p99 /sync latency is 3.2s on hs-0", "runbook_url": "https://example.org/runbooks/latency" },
+      "startsAt": "2026-10-20T10:00:00Z",
+      "endsAt": "0001-01-01T00:00:00Z",
+      "generatorURL": "https://prometheus.example.org/graph?g0.expr=histogram_quantile",
+      "fingerprint": "abc"
+    },
+    {
+      "status": "firing",
+      "labels": { "alertname": "HighLatency", "namespace": "myelin", "pod": "hs-1", "severity": "warning" },
+      "annotations": { "description": "p99 /sync latency is 2.9s on hs-1" },
+      "startsAt": "2026-10-20T10:00:00Z",
+      "endsAt": "0001-01-01T00:00:00Z",
+      "generatorURL": "https://prometheus.example.org/graph?g0.expr=histogram_quantile",
+      "fingerprint": "def"
+    }
+  ]
+}

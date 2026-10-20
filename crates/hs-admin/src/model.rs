@@ -807,12 +807,108 @@ pub struct BridgeConnection {
     /// What the connection is called or points at, from its content: a webhook's `name`, a
     /// repository's `org/repo`, a feed's `url`, else the state key.
     pub name: String,
-    /// `active` for a connection whose event has content, `removed` for one the bridge has
-    /// emptied (how Hookshot removes a connection).
+    /// `active` for a connection whose event has content, `removed` for one whose event has
+    /// been emptied or that the bridge has purged (Hookshot 7 writes `{"disabled": true}`
+    /// back into the event).
     pub state: String,
     /// The event's content as it is, for the interface to show what this server does not model.
     #[serde(default)]
     pub content: serde_json::Value,
+    /// The webhook source the server made this connection from (`io.myelin.source` in the
+    /// content: `datadog`, `github-comments`, ...); none for a connection made in the room.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+/// The OpenAPI `BridgeConnectionList` schema: what `GET /bridge-offerings/{type}/connections`
+/// answers: the connections, and the rooms the bridge's bot is in (a webhook can be added to
+/// any of them).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BridgeConnectionList {
+    pub items: Vec<BridgeConnection>,
+    /// The rooms the bot is joined to, with or without connections.
+    #[serde(default)]
+    pub rooms: Vec<BridgeBotRoom>,
+}
+
+/// The OpenAPI `BridgeBotRoom` schema: a room a shared bridge's bot is in.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BridgeBotRoom {
+    pub room_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room_name: Option<String>,
+}
+
+/// The OpenAPI `BridgeWebhookSource` schema: a kind of sender a webhook connection can be made
+/// for (`GET /bridge-offerings/{type}/webhook-sources`): the server keeps the transformation
+/// function that turns its payloads into notices and the sender's setup text.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BridgeWebhookSource {
+    /// `generic`, `datadog`, `github-comments`, `linear`, `notion`, `gmail`, `alertmanager`.
+    pub id: String,
+    pub title: String,
+    /// One sentence on what it is for.
+    pub description: String,
+    /// The sender's setup, Markdown, with `{{url}}` where the connection's URL goes; the
+    /// create answer carries it filled in.
+    pub setup: String,
+    /// Whether the server writes a transformation function (false for `generic`).
+    pub transforms: bool,
+    /// Names of files the sender runs (`Code.gs`), filled in by the create answer.
+    #[serde(default)]
+    pub files: Vec<String>,
+}
+
+/// The body of `POST /bridge-offerings/{type}/connections`: a webhook connection to make.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BridgeConnectionCreate {
+    /// A [`BridgeWebhookSource::id`].
+    pub source: String,
+    /// The connection's name, 3 to 64 characters (Hookshot's limit): the state key, and what
+    /// the room and the listing call it.
+    pub name: String,
+    /// Which room: an existing one the bot is in, or one to make.
+    #[serde(default)]
+    pub room: BridgeConnectionRoom,
+}
+
+/// Where a webhook connection goes: `id` names a room the bot is already in; `create` makes
+/// one as the bot. Exactly one of the two.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BridgeConnectionRoom {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create: Option<BridgeRoomCreate>,
+}
+
+/// A room to make for a webhook connection, as the bridge's bot (its creator, so it may write
+/// the connection's state), private, with these people invited.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BridgeRoomCreate {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    /// User ids to invite.
+    #[serde(default)]
+    pub invite: Vec<String>,
+}
+
+/// The OpenAPI `BridgeConnectionCreated` schema: the answer to a webhook connection made. The
+/// URL's last part is the secret and is kept nowhere this API reads back: this answer is the
+/// one time it is shown.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BridgeConnectionCreated {
+    pub room_id: String,
+    pub name: String,
+    pub source: String,
+    /// The webhook's URL: the offering's public URL + `/webhook/` + the secret id.
+    pub url: String,
+    /// The source's setup text with the URL filled in (Markdown).
+    pub setup: String,
+    /// Files the sender runs, with the URL filled in, by name.
+    #[serde(default)]
+    pub files: std::collections::BTreeMap<String, String>,
 }
 
 /// The body of `PUT /bridge-offerings/{type}`. Every field is optional: an absent one keeps the

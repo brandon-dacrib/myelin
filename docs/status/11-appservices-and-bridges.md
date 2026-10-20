@@ -1,6 +1,14 @@
 # Status: track 11, appservices and bridges
 
 Last updated: 2026-10-20, evening (matrimail, the email bridge, is in the catalogue on an image this repository builds; decision 0055; below); before that 2026-10-20, evening (v0.4.11 on the demo, and the demo's Hookshot is the offering: the hand-made Bridge, Secret and registration removed, the offering created, the rooms and GitHub webhooks unchanged; below); before that 2026-10-20, later (the passkey is made by aws-lc-rs, not the `rsa` crate CI's audit refuses; three webpki crates updated for the emSign distrust; below); before that 2026-10-20 (Hookshot is an offering the server deploys: its config rendered whole from the offering's public URL and GitHub App, its passkey minted and kept, the `Bridge` and the operator expose its webhooks and metrics ports, and the offering's page lists its connections read from the rooms' state; and, by hand before that, Hookshot on the demo with GitHub PR comments from two repositories; below); before that before that 2026-10-19, evening (six mautrix pins bumped to v0.2610.0, verified with the real
+Last updated: 2026-10-20, evening (one Hookshot, many webhooks: a source library with seven
+senders' transformation functions, webhooks made by the server as the bot from the page or
+the API with the URL shown once, connections removed, the real-image story both ways; below);
+before that 2026-10-20, later (the passkey is made by aws-lc-rs, not the `rsa` crate CI's audit refuses; three webpki crates updated for the emSign distrust; below); before that 2026-10-20 (Hookshot on the demo by hand, GitHub PR comments from two repositories; below); before that 2026-10-19, evening (six mautrix pins bumped to v0.2610.0, verified with the real
+Last updated: 2026-10-20 (Hookshot is an offering the server deploys: its config rendered whole
+from the offering's public URL and GitHub App, its passkey minted and kept, the `Bridge` and
+the operator expose its webhooks and metrics ports, and the offering's page lists its
+connections read from the rooms' state; below); before that 2026-10-19, evening (six mautrix pins bumped to v0.2610.0, verified with the real
 bridges; the real-bridge test's listener had served no media since 2026-10-16; below); before that 2026-10-19 (a bridge is no longer sent its own double puppet's receipt back
 when it moved nothing: the Slack read/unread flip; below); before that 2026-10-18 (the ephemeral pump leaves a room it cannot read out of the pass for
 a minute instead of failing every tick; below); before that 2026-10-15 (Discord's delivery timeouts: a retry is the same transaction, a
@@ -170,6 +178,110 @@ gone from the tree (the server renders them), `github-comments.js` and the READM
 Downtime: about four minutes between the delete and the new instance's ready, during which a
 GitHub delivery would have been refused; GitHub does not retry on its own, so a comment made in
 that window would be missing from its room. None was.
+## 2026-10-20, evening (branch `agent/hookshot-sources`): one Hookshot, many webhooks: sources, provisioning as the bot, the page
+
+**Asked** (the owner): "make sure the hookshot integration is built with the idea that there
+may be many different webhooks that come into it." One Hookshot, one public URL, many sources
+and rooms: a source library in the server, provisioning through the server as the bot, the
+page to do it from, docs. Decision 0055 (amends 0054).
+
+**Done**
+
+- **The source library** (`crates/hs-bridges/hookshot-sources/<id>/`, embedded by
+  `crates/hs-bridges/src/hookshot_sources.rs` as `SOURCES`, `get`, `state_content`,
+  `new_hook_id`, `setup_for`, `files_for`): `generic` (no transform; Hookshot's own
+  rendering), `alertmanager` (a notification's alerts, firing/resolved, severity, summary,
+  labels, source and runbook links, truncation), `datadog` (the Webhooks integration with a
+  payload template the README gives; alert/warning/recovery/no-data, priority, host, scope,
+  tags, link; the Test button's payload dropped), `github-comments` (the demo's
+  `github-comments.js`, moved; `deploy/demo/hookshot/github-comments.js` is a pointer),
+  `gmail` (`Code.gs`, an Apps Script on a timer posting each thread under one label once and
+  labelling it posted; the transform renders from/subject/snippet/link/labels; a test post),
+  `linear` (Issue, Comment, Project create/update/remove with the actor, state, assignee,
+  what changed from `updatedFrom`; the README says `Linear-Signature` is not verified),
+  `notion` (type, object id, timestamp, a link; the verification token shown to be pasted
+  back). Each has a README with `{{url}}`/`{{name}}`, `transform.js` on Hookshot's v2
+  contract (read from the 7.5.0 image's `generic/WebhookTransformer.js`: `const data = ...;
+  (() => { script })();` and the global `result`; QuickJS, 500 ms; `plain` Markdown is
+  rendered by Hookshot), and `sample-*.json`. The tests run every transform on every sample
+  with `node` and check the notice (or `empty`), check each compiles as Hookshot checks it
+  (`function f(data) {...}`) and uses no `require`/`fetch`/`Intl`; they print SKIP and pass
+  without `node`.
+- **Provisioning as the bot** (`BridgeOfferingSource::{webhook_sources, create_connection,
+  delete_connection}`; `BridgeManager` in `crates/hs-bridges/src/manager.rs`, with
+  `MatrixClient::{create_room, state_event, send_state, room_account_data,
+  set_room_account_data}`): `POST /api/v1/bridge-offerings/{type}/connections` with
+  `{source, name, room: {id} | {create: {name, topic?, invite}}}` makes the room if asked
+  (the bot its creator), checks an existing room has the bot in it, refuses a name the room
+  already uses (409), mints a v4 UUID hook id, writes the bot's room account data **before**
+  the state event (Hookshot refuses to invent an id for an event its own bot sent), writes
+  the state event with the source's transform and `io.myelin.source`, posts a notice in the
+  room (no URL), and answers `201 {room_id, name, source, url, setup, files}`. Refusals at
+  `/source`, `/name` (3 to 64 characters, Hookshot's rule), `/room`, `/room/id`,
+  `/room/create/name`, `/room/create/invite`; "not registered yet" and "no public URL" as
+  `Invalid`; a 403 from the room as `Invalid` saying the bot may not. `DELETE
+  .../connections/{room_id}/{state_key}` empties the one active `uk.half-shot.matrix-hookshot.*`
+  event with that state key (409 when more than one type has it) and drops a webhook's id
+  from the account data; 404 when none. `GET .../webhook-sources` lists the sources. `GET
+  .../connections` answers `BridgeConnectionList` (`items` with `source`, plus `rooms`, the
+  bot's rooms). The in-memory source implements all three for the router's tests and the
+  interface's mocks. Both writes audited (`bridge_connection.created`/`.deleted`, never the
+  URL), scoped `bridges:write`, the create idempotent with `Idempotency-Key` as
+  `appservices.create`; `hs_bridge_webhook_connections_total{bridge_type,source,outcome}`
+  (`created`, `removed`, `failed`). OpenAPI 0.1.23, `operations.json`, `schema.d.ts`
+  regenerated.
+- **The page** (`web/src/pages/bridges/offering/AddWebhookDialog.tsx`, the connections
+  section of `BridgeOfferingPage.tsx`): **Add a webhook** (source cards with descriptions; a
+  room the bot is in, from the listing's `rooms`, or a new one with name, topic and invites;
+  a name), then the URL once with a copy button, "it will not be shown again", the sender's
+  setup rendered from its Markdown (a small reader building React nodes, never HTML), and
+  `Code.gs` with a copy button for Gmail. Each active connection has **Remove**, confirmed
+  with what it means (a webhook's URL stops working). Both need `bridges:write`. The
+  listing shows `Source: <id>`. Mocks (`webhookSourcesOf`, `createConnection`,
+  `deleteConnection`, the seeded connections with a source and an `Ops` room), five unit
+  tests, and `web/e2e/hookshot-webhooks.spec.ts` (seeded from inside the page; axe-checked at
+  each step).
+- **Docs**: `docs/bridges/hookshot.md` ("Making a webhook from the server", "Sources" with a
+  subsection per source, the listing's `source` and `rooms`); decision 0055; this entry;
+  `docs/next-steps.md`; the changelog.
+
+**Verified**
+
+- `cargo test -p hs-bridges hookshot_sources` (5 tests, the transforms run under node 26) and
+  `cargo test -p hs-bridges connection` (the fake-server story above and the metric).
+- `cargo test -p hs-admin` (the connections reader's `source`, the contract test against the
+  new OpenAPI), `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt`.
+- `npm run check` in `web/` and `npx playwright test e2e/hookshot-webhooks.spec.ts`.
+- `crates/hs-bridge-conformance/tests/real_hookshot.rs` **against the 7.5.0 image on
+  2026-10-20, 14 s**: after the in-room half (unchanged), `GET .../webhook-sources` lists
+  `datadog` as transforming; `POST .../connections` with `source: datadog` and a new room
+  "Alerts" inviting alice answers `201` with a URL of public URL + `/webhook/` + a UUID and
+  the setup carrying it; alice is invited by the bot to that very room and joins it, named
+  "Alerts"; the bot's notice is there without the URL; Datadog's `sample-alert.json` posted
+  to the URL lands within a second as an `m.notice` whose body is the source's rendering
+  (`**Alert** P2`, `env:prod`) and whose `formatted_body` has `<strong>Alert</strong>` (the
+  bridge rendered the Markdown); the listing has it `active` with `source: datadog` in room
+  "Alerts" and the id nowhere; `DELETE` answers `204`, the URL answers an error within a
+  second, the listing says `removed` without a source, a second `DELETE` is `404`. The
+  bridge's log: `onGenericHook`, `Sent event to room ... (@_webhooks_datadog-alerts)`,
+  `Removing GenericHookConnection`. **Live pickup works without a restart**: the connection
+  is made from the state event in the appservice transaction, with the account data read
+  from the server. **Found on the way**: Hookshot's purge writes `{"disabled": true}` back
+  into the event rather than leaving it empty (`Bridge.onRoomEvent` treats both as removed),
+  so the listing's `removed` and the manager's "active" checks read `disabled` too
+  (`bridge_connections::is_removed`); the first run failed on exactly that.
+
+**Left**
+
+- Sources for GitLab, Jira, PagerDuty, Grafana alerting, Sentry, Stripe and plain Slack-shaped
+  payloads: each is a directory and an entry.
+- Signature verification (`Linear-Signature`, `X-Notion-Signature`, `X-Hub-Signature-256`)
+  needs Hookshot to check it, which its generic webhook does not; a reverse proxy in front of
+  the webhooks listener could.
+- A webhook's URL can only be re-shown by removing and re-making the connection; "rotate
+  the URL" (a new id for the same connection) would be one more write.
+- The demo's two hand-made GitHub rooms are not re-made through the API (they work as they
+  are; the owner decides).
 
 ## 2026-10-20, later (branch `agent/audit-rsa-webpki`): the passkey is made by aws-lc-rs, and CI's audit is green again
 

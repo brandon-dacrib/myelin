@@ -1,0 +1,13 @@
+{
+  "title": "[Triggered on {host:web-1}] CPU is high on web-1",
+  "text": "CPU usage has been above 90% for 10 minutes.\n\n@webhook-matrix-ops",
+  "status": "Triggered",
+  "priority": "P2",
+  "alert_type": "error",
+  "hostname": "web-1",
+  "scope": "host:web-1",
+  "tags": "env:prod, service:web, team:platform",
+  "link": "https://app.datadoghq.com/event/event?id=7357",
+  "id": "7357",
+  "date": "1729425600000"
+}

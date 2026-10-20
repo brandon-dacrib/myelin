@@ -9,8 +9,9 @@ use std::sync::RwLock;
 use async_trait::async_trait;
 
 use crate::model::{
-    BridgeConnection, BridgeDeploymentTarget, BridgeInstance, BridgeInstanceFiles, BridgeOffering,
-    BridgeOfferingRequest,
+    BridgeBotRoom, BridgeConnection, BridgeConnectionCreate, BridgeConnectionCreated,
+    BridgeConnectionList, BridgeDeploymentTarget, BridgeInstance, BridgeInstanceFiles,
+    BridgeOffering, BridgeOfferingRequest, BridgeWebhookSource,
 };
 use crate::sources::SourceError;
 
@@ -74,9 +75,33 @@ pub trait BridgeOfferingSource: Send + Sync + 'static {
         user_id: &str,
     ) -> Result<BridgeInstanceFiles, SourceError>;
     /// What a shared integrations bridge (Hookshot) has connected, room by room: read from the
-    /// rooms its bot is in. Empty for a type that keeps no connections in room state, or whose
-    /// instance is not running yet.
-    async fn connections(&self, bridge_type: &str) -> Result<Vec<BridgeConnection>, SourceError>;
+    /// rooms its bot is in, with those rooms. Empty for a type that keeps no connections in
+    /// room state, or whose instance is not running yet.
+    async fn connections(&self, bridge_type: &str) -> Result<BridgeConnectionList, SourceError>;
+    /// The webhook sources a connection can be made from. Empty for a type that takes none.
+    async fn webhook_sources(
+        &self,
+        bridge_type: &str,
+    ) -> Result<Vec<BridgeWebhookSource>, SourceError>;
+    /// Makes a webhook connection as the bridge's bot: the room if asked, the hook id, the
+    /// bot's account data, the state event. [`SourceError::InvalidField`] for a bad source,
+    /// name or room; [`SourceError::Conflict`] for a name the room already has;
+    /// [`SourceError::Invalid`] when the bridge is not running yet or the bot may not write
+    /// state in the room.
+    async fn create_connection(
+        &self,
+        bridge_type: &str,
+        request: BridgeConnectionCreate,
+    ) -> Result<BridgeConnectionCreated, SourceError>;
+    /// Removes the connection whose state key is `state_key` in `room_id` the way the bridge
+    /// does: its state event emptied, and for a webhook its hook id dropped from the bot's
+    /// account data. [`SourceError::NotFound`] when there is no such active connection.
+    async fn delete_connection(
+        &self,
+        bridge_type: &str,
+        room_id: &str,
+        state_key: &str,
+    ) -> Result<(), SourceError>;
 }
 
 /// A [`BridgeOfferingSource`] held in memory: offerings are stored as given, instances are
@@ -86,6 +111,8 @@ pub struct InMemoryBridgeOfferings {
     target: BridgeDeploymentTarget,
     offerings: RwLock<BTreeMap<String, BridgeOffering>>,
     instances: RwLock<BTreeMap<(String, String), BridgeInstance>>,
+    /// Webhook connections made through [`BridgeOfferingSource::create_connection`], by type.
+    connections: RwLock<Vec<(String, BridgeConnection)>>,
 }
 
 impl InMemoryBridgeOfferings {
@@ -101,6 +128,29 @@ impl InMemoryBridgeOfferings {
             },
             ..Self::default()
         }
+    }
+
+    /// Two sources, enough for the router's tests and the interface's mocks: the plain one and
+    /// one with a transformation function and a file.
+    fn sources() -> Vec<BridgeWebhookSource> {
+        vec![
+            BridgeWebhookSource {
+                id: "generic".into(),
+                title: "Plain JSON".into(),
+                description: "Anything that posts JSON.".into(),
+                setup: "Post JSON to `{{url}}`.".into(),
+                transforms: false,
+                files: Vec::new(),
+            },
+            BridgeWebhookSource {
+                id: "gmail".into(),
+                title: "Gmail".into(),
+                description: "New threads under one label, through an Apps Script.".into(),
+                setup: "Paste Code.gs; it posts to `{{url}}`.".into(),
+                transforms: true,
+                files: vec!["Code.gs".into()],
+            },
+        ]
     }
 
     fn counts(&self, bridge_type: &str) -> BTreeMap<String, u64> {
@@ -372,12 +422,167 @@ impl BridgeOfferingSource for InMemoryBridgeOfferings {
         })
     }
 
-    async fn connections(&self, bridge_type: &str) -> Result<Vec<BridgeConnection>, SourceError> {
+    async fn connections(&self, bridge_type: &str) -> Result<BridgeConnectionList, SourceError> {
         if self.get(bridge_type).await?.is_none() {
             return Err(SourceError::NotFound);
         }
-        Ok(Vec::new())
+        let items: Vec<BridgeConnection> = self
+            .connections
+            .read()
+            .expect("lock")
+            .iter()
+            .filter(|(t, _)| t == bridge_type)
+            .map(|(_, c)| c.clone())
+            .collect();
+        let mut rooms: Vec<BridgeBotRoom> = Vec::new();
+        for c in &items {
+            if !rooms.iter().any(|r| r.room_id == c.room_id) {
+                rooms.push(BridgeBotRoom {
+                    room_id: c.room_id.clone(),
+                    room_name: c.room_name.clone(),
+                });
+            }
+        }
+        Ok(BridgeConnectionList { items, rooms })
     }
+
+    async fn webhook_sources(
+        &self,
+        bridge_type: &str,
+    ) -> Result<Vec<BridgeWebhookSource>, SourceError> {
+        if self.get(bridge_type).await?.is_none() {
+            return Err(SourceError::NotFound);
+        }
+        if !crate::bridge_types::keeps_connections_in_room_state(bridge_type) {
+            return Ok(Vec::new());
+        }
+        Ok(Self::sources())
+    }
+
+    async fn create_connection(
+        &self,
+        bridge_type: &str,
+        request: BridgeConnectionCreate,
+    ) -> Result<BridgeConnectionCreated, SourceError> {
+        let offering = self.get(bridge_type).await?.ok_or(SourceError::NotFound)?;
+        let source = Self::sources()
+            .into_iter()
+            .find(|s| s.id == request.source)
+            .ok_or_else(|| SourceError::InvalidField {
+                pointer: "/source",
+                detail: format!("`{}` is not a webhook source", request.source),
+            })?;
+        validate_connection_name(&request.name)?;
+        let room_id = match (&request.room.id, &request.room.create) {
+            (Some(id), None) => id.clone(),
+            (None, Some(create)) => {
+                if create.name.trim().is_empty() {
+                    return Err(SourceError::InvalidField {
+                        pointer: "/room/create/name",
+                        detail: "the room needs a name".into(),
+                    });
+                }
+                format!("!{}:example.org", crate::model::new_id())
+            }
+            _ => {
+                return Err(SourceError::InvalidField {
+                    pointer: "/room",
+                    detail: "say which room: `id` of one the bot is in, or `create` one".into(),
+                });
+            }
+        };
+        let mut connections = self.connections.write().expect("lock");
+        if connections.iter().any(|(t, c)| {
+            t == bridge_type
+                && c.room_id == room_id
+                && c.state_key == request.name
+                && c.state == "active"
+        }) {
+            return Err(SourceError::Conflict(format!(
+                "the room already has a connection named `{}`",
+                request.name
+            )));
+        }
+        let public_url = offering
+            .options
+            .public_url
+            .clone()
+            .unwrap_or_else(|| "https://hooks.example.org".into());
+        let url = format!(
+            "{}/webhook/{}",
+            public_url.trim_end_matches('/'),
+            crate::model::new_id()
+        );
+        connections.push((
+            bridge_type.to_owned(),
+            BridgeConnection {
+                service: "webhook".into(),
+                event_type: "uk.half-shot.matrix-hookshot.generic.hook".into(),
+                state_key: request.name.clone(),
+                room_id: room_id.clone(),
+                room_name: request.room.create.as_ref().map(|c| c.name.clone()),
+                name: request.name.clone(),
+                state: "active".into(),
+                source: Some(source.id.clone()),
+                content: serde_json::json!({"name": request.name, "io.myelin.source": source.id}),
+            },
+        ));
+        Ok(BridgeConnectionCreated {
+            room_id,
+            name: request.name,
+            setup: source.setup.replace("{{url}}", &url),
+            files: source
+                .files
+                .iter()
+                .map(|f| (f.clone(), format!("// {f} for {url}\n")))
+                .collect(),
+            source: source.id,
+            url,
+        })
+    }
+
+    async fn delete_connection(
+        &self,
+        bridge_type: &str,
+        room_id: &str,
+        state_key: &str,
+    ) -> Result<(), SourceError> {
+        if self.get(bridge_type).await?.is_none() {
+            return Err(SourceError::NotFound);
+        }
+        let mut connections = self.connections.write().expect("lock");
+        let found = connections.iter_mut().find(|(t, c)| {
+            t == bridge_type
+                && c.room_id == room_id
+                && c.state_key == state_key
+                && c.state == "active"
+        });
+        match found {
+            Some((_, c)) => {
+                c.state = "removed".into();
+                c.content = serde_json::json!({});
+                c.source = None;
+                Ok(())
+            }
+            None => Err(SourceError::NotFound),
+        }
+    }
+}
+
+/// Hookshot's rule for a connection's name (`GenericHookConnection.validateState`): a string
+/// of 3 to 64 characters.
+///
+/// # Errors
+/// [`SourceError::InvalidField`] at `/name`.
+pub fn validate_connection_name(name: &str) -> Result<(), SourceError> {
+    let len = name.chars().count();
+    if name.trim() != name || !(3..=64).contains(&len) {
+        return Err(SourceError::InvalidField {
+            pointer: "/name",
+            detail: "the name is 3 to 64 characters, with no space at either end".into(),
+        });
+    }
+    Ok(())
 }
 
 /// The registration `url` an administrator's `address` means: a full `http(s)://` URL as given

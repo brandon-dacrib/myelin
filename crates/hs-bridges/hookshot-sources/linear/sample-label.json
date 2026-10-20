@@ -1,0 +1,9 @@
+{
+  "action": "create",
+  "type": "IssueLabel",
+  "createdAt": "2026-10-20T11:00:00.000Z",
+  "organizationId": "org",
+  "webhookTimestamp": 1729422000000,
+  "webhookId": "wh",
+  "data": { "id": "l1", "name": "bug", "color": "#eb5757" }
+}

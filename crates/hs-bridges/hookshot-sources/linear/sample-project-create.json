@@ -1,0 +1,17 @@
+{
+  "action": "create",
+  "type": "Project",
+  "createdAt": "2026-10-20T11:00:00.000Z",
+  "organizationId": "org",
+  "webhookTimestamp": 1729422000000,
+  "webhookId": "wh",
+  "actor": { "id": "u1", "name": "Ada Lovelace", "type": "user" },
+  "url": "https://linear.app/example/project/q4-launch-abc123",
+  "data": {
+    "id": "p1",
+    "name": "Q4 launch",
+    "state": "started",
+    "lead": { "id": "u1", "name": "Ada Lovelace" },
+    "url": "https://linear.app/example/project/q4-launch-abc123"
+  }
+}

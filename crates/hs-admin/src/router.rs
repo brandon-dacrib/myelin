@@ -559,6 +559,9 @@ const REAL_HANDLERS: &[&str] = &[
     "bridge_offerings.put",
     "bridge_offerings.delete",
     "bridge_offerings.connections",
+    "bridge_offerings.webhook_sources",
+    "bridge_offerings.create_connection",
+    "bridge_offerings.delete_connection",
     "bridge_instances.list",
     "bridge_instances.get",
     "bridge_instances.put",
@@ -3234,9 +3237,157 @@ async fn bridge_offerings_connections(
         Scope::BridgesRead,
         None,
         StatusCode::OK,
+        |s| async move { Ok(Some(s.connections(&t).await?)) },
+    )
+    .await
+}
+
+/// `GET /api/v1/bridge-offerings/{type}/webhook-sources`: the kinds of sender a webhook
+/// connection can be made for.
+async fn bridge_offerings_webhook_sources(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(t): Path<String>,
+) -> Response {
+    let instance = format!("/api/v1/bridge-offerings/{t}/webhook-sources");
+    with_offerings(
+        &state,
+        &headers,
+        &instance,
+        Scope::BridgesRead,
+        None,
+        StatusCode::OK,
         |s| async move {
-            let items = s.connections(&t).await?;
+            let items = s.webhook_sources(&t).await?;
             Ok(Some(serde_json::json!({ "items": items })))
+        },
+    )
+    .await
+}
+
+/// `POST /api/v1/bridge-offerings/{type}/connections` (`bridges:write`): makes a webhook
+/// connection as the bridge's bot and answers `201` with its URL, the one time the URL is
+/// shown. Honours `Idempotency-Key` as `appservices.create` does, since a replay would mint a
+/// second webhook.
+async fn bridge_offerings_create_connection(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(t): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    const OPERATION_ID: &str = "bridge_offerings.create_connection";
+    let instance = format!("/api/v1/bridge-offerings/{t}/connections");
+    match require_scope(
+        state.verifier.as_ref(),
+        authorization_header(&headers),
+        Some(Scope::BridgesWrite),
+    )
+    .await
+    {
+        ScopeDecision::Allowed(principal) => {
+            let Some(source) = state.bridge_offerings.clone() else {
+                return source_unavailable("bridge manager", &instance);
+            };
+            if let Some(key) = idempotency_key(&headers) {
+                match state.idempotency.check(OPERATION_ID, key, &body) {
+                    Replay::Same(stored) => return replay_response(stored),
+                    Replay::Mismatch => {
+                        return Problem::idempotency_key_payload_mismatch()
+                            .with_instance(instance)
+                            .into_response();
+                    }
+                    Replay::Fresh => {}
+                }
+            }
+            let request: crate::model::BridgeConnectionCreate = match parse_optional_json(&body) {
+                Ok(v) => v,
+                Err(p) => return p.with_instance(instance).into_response(),
+            };
+            let created = match source.create_connection(&t, request).await {
+                Ok(c) => c,
+                Err(e) => return e.to_problem().with_instance(instance).into_response(),
+            };
+            tracing::info!(
+                bridge_type = %t,
+                room = %created.room_id,
+                name = %created.name,
+                source = %created.source,
+                actor = %principal.to_actor().id,
+                "webhook connection made"
+            );
+            // The audit entry and the event name the room, the connection and its source,
+            // never the URL.
+            if let Err(resp) = record_mutation_with_status(
+                &state,
+                &principal,
+                OPERATION_ID,
+                "bridge_connection.created",
+                ResourceRef::new(
+                    "bridge_connection",
+                    format!("{t}/{}/{}", created.room_id, created.name),
+                ),
+                Vec::new(),
+                json!({
+                    "bridge_type": t,
+                    "room_id": created.room_id,
+                    "name": created.name,
+                    "source": created.source,
+                }),
+                201,
+            )
+            .await
+            {
+                return resp;
+            }
+            let response_body = serde_json::to_vec(&created).unwrap_or_default();
+            if let Some(key) = idempotency_key(&headers) {
+                state.idempotency.record(
+                    OPERATION_ID,
+                    key,
+                    &body,
+                    StoredResponse {
+                        status: 201,
+                        content_type: "application/json".to_string(),
+                        body: response_body.clone(),
+                    },
+                );
+            }
+            (
+                StatusCode::CREATED,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                response_body,
+            )
+                .into_response()
+        }
+        ScopeDecision::Unauthenticated(p) => p.with_instance(instance).into_response(),
+        ScopeDecision::InsufficientScope(p) => p.with_instance(instance).into_response(),
+    }
+}
+
+/// `DELETE /api/v1/bridge-offerings/{type}/connections/{room_id}/{state_key}`
+/// (`bridges:write`): removes a connection the way the bridge does.
+async fn bridge_offerings_delete_connection(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path((t, room_id, state_key)): Path<(String, String, String)>,
+) -> Response {
+    let instance = format!("/api/v1/bridge-offerings/{t}/connections/{room_id}/{state_key}");
+    let target = ResourceRef::new("bridge_connection", format!("{t}/{room_id}/{state_key}"));
+    with_offerings::<(), _, _>(
+        &state,
+        &headers,
+        &instance,
+        Scope::BridgesWrite,
+        Some((
+            "bridge_offerings.delete_connection",
+            "bridge_connection.deleted",
+            target,
+        )),
+        StatusCode::NO_CONTENT,
+        |s| async move {
+            s.delete_connection(&t, &room_id, &state_key).await?;
+            tracing::info!(bridge_type = %t, room = %room_id, name = %state_key, "connection removed");
+            Ok(None)
         },
     )
     .await
@@ -5908,6 +6059,15 @@ fn register_real_operation(builder: Builder<AdminState>, op: OperationDef) -> Bu
         "bridge_offerings.delete" => builder.add(method, &full_path, bridge_offerings_delete, meta),
         "bridge_offerings.connections" => {
             builder.add(method, &full_path, bridge_offerings_connections, meta)
+        }
+        "bridge_offerings.webhook_sources" => {
+            builder.add(method, &full_path, bridge_offerings_webhook_sources, meta)
+        }
+        "bridge_offerings.create_connection" => {
+            builder.add(method, &full_path, bridge_offerings_create_connection, meta)
+        }
+        "bridge_offerings.delete_connection" => {
+            builder.add(method, &full_path, bridge_offerings_delete_connection, meta)
         }
         "bridge_instances.list" => builder.add(method, &full_path, bridge_instances_list, meta),
         "bridge_instances.get" => builder.add(method, &full_path, bridge_instances_get, meta),

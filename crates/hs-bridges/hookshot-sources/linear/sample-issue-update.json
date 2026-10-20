@@ -1,0 +1,22 @@
+{
+  "action": "update",
+  "type": "Issue",
+  "createdAt": "2026-10-20T10:00:00.000Z",
+  "organizationId": "org",
+  "webhookTimestamp": 1729418400000,
+  "webhookId": "wh",
+  "actor": { "id": "u1", "name": "Ada Lovelace", "type": "user" },
+  "url": "https://linear.app/example/issue/ENG-42/receipts-loop-through-the-pump",
+  "updatedFrom": { "stateId": "s-todo", "updatedAt": "2026-10-20T09:00:00.000Z" },
+  "data": {
+    "id": "i1",
+    "identifier": "ENG-42",
+    "number": 42,
+    "title": "Receipts loop through the pump",
+    "priorityLabel": "High",
+    "state": { "id": "s-progress", "name": "In Progress", "type": "started", "color": "#f2c94c" },
+    "assignee": { "id": "u1", "name": "Ada Lovelace" },
+    "team": { "id": "t1", "key": "ENG", "name": "Engineering" },
+    "url": "https://linear.app/example/issue/ENG-42/receipts-loop-through-the-pump"
+  }
+}

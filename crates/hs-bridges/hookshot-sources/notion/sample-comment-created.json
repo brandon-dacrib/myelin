@@ -1,0 +1,13 @@
+{
+  "id": "4b5c6d7e-0000-4000-8000-000000000001",
+  "timestamp": "2026-10-20T11:30:00.000Z",
+  "workspace_id": "13950b26-c203-4f3b-b97d-93ec06319565",
+  "type": "comment.created",
+  "authors": [{ "id": "c7c11cca-1d73-471d-9b6e-bdef51470190", "type": "person" }],
+  "attempt_number": 1,
+  "entity": { "id": "6f8a0a1b-2222-4333-9444-555555555555", "type": "comment" },
+  "data": {
+    "page_id": "153104cd-477e-80d0-a893-d4fd3faa2d7a",
+    "parent": { "id": "153104cd-477e-80d0-a893-d4fd3faa2d7a", "type": "page" }
+  }
+}

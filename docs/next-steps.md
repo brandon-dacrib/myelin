@@ -39,6 +39,29 @@ What is left for Hookshot: a GitHub App on the offering (then `!hookshot github 
 plain webhooks, with ghost users per commenter); the other services' config sections (GitLab,
 Jira) in the rendered config; a source library and server-side webhook provisioning for the
 many things that could post into it (the owner's note of 2026-10-20).
+Written 2026-09-20 by the integration lead, last revised 2026-10-20, evening (one Hookshot, many webhooks: a source library, provisioning as the bot from the page and the API, verified against the real image; `agent/hookshot-sources`. Before, the same day: six mautrix pins to v0.2610.0, the real-bridge test's listener served no media, the bridge-images workflow's label; `agent/bridge-pins-2610`. Before: the interop workflow had never passed on CI: Synapse's image chowned the work directory and ECR refused the nginx pull; `agent/interop-ci`. Before, the same day: the Slack read/unread flip was a receipt loop: a receipt that does not move forward is now dropped, as Synapse drops it; `agent/receipt-no-regress`. Before: a room whose placed history named a rejected event could not be loaded, and the ephemeral pump failed on it for seventeen hours; `agent/stuck-room-load`. Before: a member's own leave from a hot room reached nobody; `agent/hot-room-leave`. Before: v0.3.28 on the demo; the server reports the release it is, not the line; `agent/release-version-string`. Before: the soft-fail check resolved one fork per prev event; `agent/soft-fail-forks`. Before: forked rooms are merged and pruned, and a resolution reads about the room once however many forks; `agent/extremity-merge`. Before: the hub's members step and the idle CPU were repeated state resolutions; `agent/hub-members-step`. Before: handover: the demo, the releases and what is next, below. Before: test servers are handed their ports still bound; `agent/test-port-races`. Before: room loads and unloading; `agent/room-load-speed`. Before: the Slack bridge's full volume; fix on `agent/bridge-volume-size`. Before: Discord's delivery timeouts were a replay of the 2026-10-12 flood; fix on `agent/discord-delivery-timeouts`. Before: the memory climb with federation on; fix on `agent/fed-memory-growth`. Before: the session hub wedge; fix on `agent/hub-wedge`. Earlier: the ephemeral pump's prune busy loop; fix on `agent/ephemeral-prune`). `PLAN.md` is the design and rarely changes; this file is the resume point and changes every session. `docs/status/dashboard.md` is the generated measurement; per-track detail lives in `docs/status/NN-*.md`. `docs/decisions/0008-the-standout-is-operations.md` says what the product is, and `docs/landscape.md` sets it against the other homeservers as they stand today.
+
+The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
+
+## 2026-10-20, evening -- one Hookshot, many webhooks: sources, provisioning as the bot, the page; the branch is `agent/hookshot-sources`
+
+The owner's direction: build the Hookshot integration for many different webhooks coming
+into it. Done on the branch (status 11, decision 0055, `docs/bridges/hookshot.md`): a source
+library in the server (`crates/hs-bridges/hookshot-sources/`: generic, Alertmanager, Datadog,
+GitHub comments (the demo's, moved), Gmail with its Apps Script, Linear, Notion; each with the
+sender's setup and a transformation function, run on sample payloads with `node` in `cargo
+test`); `POST /bridge-offerings/matrix-hookshot/connections` makes a webhook as the bridge's
+bot (room if asked, hook id, the bot's account data, the state event with the transform and
+`io.myelin.source`), answers the URL once, audited and counted; `DELETE
+.../connections/{room_id}/{state_key}`; `GET .../webhook-sources`; the listing says `source`
+and the bot's `rooms`; the offering's page adds a webhook (source cards, room, name; the URL
+with a copy button and the setup; `Code.gs` for Gmail) and removes a connection after
+confirming. OpenAPI 0.1.23. The real-image story passes both ways: Hookshot picks the
+server's state event up live, Datadog's sample lands as the source's notice, removal makes
+the URL answer an error within a second. Found: Hookshot's purge writes `{"disabled": true}`
+back into the event, read as removed. **Not rolled**; after the merge the demo gets it with
+the next roll. Left: more sources (GitLab, Jira, PagerDuty, Grafana, Sentry, Stripe), each a
+directory and an entry; signature verification is not Hookshot's; "rotate the URL".
 
 ## 2026-10-20, later -- CI's audit blocked the Hookshot release: the passkey is made by aws-lc-rs now; the branch is `agent/audit-rsa-webpki`
 

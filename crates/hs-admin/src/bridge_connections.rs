@@ -6,7 +6,8 @@
 //! webhook is `uk.half-shot.matrix-hookshot.generic.hook` with `{"name": ...,
 //! "transformationFunction": ...}`, a GitHub repository `uk.half-shot.matrix-hookshot.github.repository`
 //! with `{"org": ..., "repo": ...}`, a feed `uk.half-shot.matrix-hookshot.feed` with `{"url":
-//! ...}`. Removing a connection empties the event's content. A webhook's secret id (the last part
+//! ...}`. Removing a connection empties the event's content, or (Hookshot 7's own purge, seen on
+//! the 7.5.0 image on 2026-10-20) leaves `{"disabled": true}`. A webhook's secret id (the last part
 //! of its URL) is in the bridge's own room account data, not in the state, so it is not read
 //! here. Hookshot 7 has no provisioning API, so this is the only way to see what it bridges
 //! (read from the 7.5.0 bridge on the demo, 2026-10-20).
@@ -17,6 +18,14 @@ use crate::model::BridgeConnection;
 
 /// The prefix of every Hookshot connection's state event type.
 pub const HOOKSHOT_EVENT_PREFIX: &str = "uk.half-shot.matrix-hookshot.";
+
+/// The state event type of a generic webhook connection, and of the bot's room account data
+/// that maps each hook id to its connection's name.
+pub const GENERIC_HOOK_TYPE: &str = "uk.half-shot.matrix-hookshot.generic.hook";
+
+/// The key in a connection's state content that names the webhook source the server made it
+/// from (`hs_bridges::hookshot_sources::SOURCE_MARKER` writes it).
+pub const SOURCE_MARKER: &str = "io.myelin.source";
 
 /// One state event of a room, as far as a connection is read from it.
 #[derive(Debug, Clone)]
@@ -38,7 +47,7 @@ pub fn connections_in(
         .iter()
         .filter_map(|e| {
             let suffix = e.event_type.strip_prefix(HOOKSHOT_EVENT_PREFIX)?;
-            let removed = e.content.as_object().is_none_or(serde_json::Map::is_empty);
+            let removed = is_removed(&e.content);
             Some(BridgeConnection {
                 service: service_of(suffix).to_owned(),
                 event_type: e.event_type.clone(),
@@ -47,10 +56,22 @@ pub fn connections_in(
                 room_name: room_name.map(str::to_owned),
                 name: name_of(suffix, &e.state_key, &e.content),
                 state: if removed { "removed" } else { "active" }.to_owned(),
+                source: e.content[SOURCE_MARKER]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned),
                 content: e.content.clone(),
             })
         })
         .collect()
+}
+
+/// Whether a connection's state content means it is gone: empty (how a connection is removed
+/// by hand and by this server), or `disabled: true` (what Hookshot writes back when it purges
+/// one, and what `Bridge.onRoomEvent` treats as removed).
+#[must_use]
+pub fn is_removed(content: &Value) -> bool {
+    content.as_object().is_none_or(serde_json::Map::is_empty) || content["disabled"] == true
 }
 
 /// The room's name from its state (`m.room.name`), if it has one.
@@ -148,6 +169,19 @@ mod tests {
         assert_eq!(found[2].name, "https://example.org/feed.xml");
         // The webhook's id is not in the state, and so not here.
         assert!(found[0].content.get("hookId").is_none());
+        // Made in the room, not by the server: no source.
+        assert!(found[0].source.is_none());
+    }
+
+    #[test]
+    fn a_webhook_the_server_made_says_its_source() {
+        let events = vec![ev(
+            GENERIC_HOOK_TYPE,
+            "alerts",
+            json!({"name": "alerts", "transformationFunction": "result = {}", SOURCE_MARKER: "datadog"}),
+        )];
+        let found = connections_in("!r:example.org", None, &events);
+        assert_eq!(found[0].source.as_deref(), Some("datadog"));
     }
 
     #[test]
@@ -161,6 +195,23 @@ mod tests {
         assert_eq!(found[0].state, "removed");
         assert_eq!(found[0].name, "old");
         assert!(found[0].room_name.is_none());
+    }
+
+    /// Hookshot 7.5.0 purges a connection by writing `{"disabled": true}` into its event (seen
+    /// when the server emptied one and the bridge answered): removed as well.
+    #[test]
+    fn a_disabled_connection_is_removed_too() {
+        let events = vec![ev(
+            "uk.half-shot.matrix-hookshot.generic.hook",
+            "gone",
+            json!({"disabled": true}),
+        )];
+        let found = connections_in("!r:example.org", None, &events);
+        assert_eq!(found[0].state, "removed");
+        assert!(found[0].source.is_none());
+        assert!(is_removed(&json!({"disabled": true})));
+        assert!(is_removed(&json!({})));
+        assert!(!is_removed(&json!({"name": "x", "disabled": false})));
     }
 
     #[test]

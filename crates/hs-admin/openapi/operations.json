@@ -1520,6 +1520,33 @@
       "public": false,
       "tag": "Bridges",
       "idempotent_post": false
+    },
+    {
+      "method": "GET",
+      "path": "/bridge-offerings/{type}/webhook-sources",
+      "operation_id": "bridge_offerings.webhook_sources",
+      "scope": "bridges:read",
+      "public": false,
+      "tag": "Bridges",
+      "idempotent_post": false
+    },
+    {
+      "method": "POST",
+      "path": "/bridge-offerings/{type}/connections",
+      "operation_id": "bridge_offerings.create_connection",
+      "scope": "bridges:write",
+      "public": false,
+      "tag": "Bridges",
+      "idempotent_post": true
+    },
+    {
+      "method": "DELETE",
+      "path": "/bridge-offerings/{type}/connections/{room_id}/{state_key}",
+      "operation_id": "bridge_offerings.delete_connection",
+      "scope": "bridges:write",
+      "public": false,
+      "tag": "Bridges",
+      "idempotent_post": false
     }
   ]
 }

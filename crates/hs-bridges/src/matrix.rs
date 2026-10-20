@@ -454,6 +454,163 @@ impl MatrixClient {
         .map(|_| ())
     }
 
+    /// Makes a private room as `user`, named `name`, with `topic` and `invite` (user ids);
+    /// `user` is its creator and so may write its state. Returns the room id.
+    ///
+    /// # Errors
+    /// On failure.
+    pub async fn create_room(
+        &self,
+        token: &str,
+        user: &str,
+        name: &str,
+        topic: Option<&str>,
+        invite: &[String],
+    ) -> Result<String, MatrixError> {
+        let mut body = json!({
+            "preset": "private_chat",
+            "name": name,
+            "invite": invite,
+        });
+        if let Some(topic) = topic.map(str::trim).filter(|t| !t.is_empty()) {
+            body["topic"] = json!(topic);
+        }
+        let answer = self
+            .call(
+                reqwest::Method::POST,
+                self.url(&["createRoom"], Some(user)),
+                token,
+                Some(body),
+                "createRoom",
+            )
+            .await?;
+        answer["room_id"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| MatrixError {
+                context: "createRoom: no room_id in the answer".into(),
+                status: 200,
+                errcode: String::new(),
+            })
+    }
+
+    /// The state event of type `event_type` and state key `state_key` in `room_id`, as `user`
+    /// sees it: its content, or `None` when the room has no such event.
+    ///
+    /// # Errors
+    /// On any other failure, a 403 included when `user` is not in the room.
+    pub async fn state_event(
+        &self,
+        token: &str,
+        user: &str,
+        room_id: &str,
+        event_type: &str,
+        state_key: &str,
+    ) -> Result<Option<Value>, MatrixError> {
+        let result = self
+            .call(
+                reqwest::Method::GET,
+                self.url(
+                    &["rooms", room_id, "state", event_type, state_key],
+                    Some(user),
+                ),
+                token,
+                None,
+                "state event",
+            )
+            .await;
+        match result {
+            Ok(content) => Ok(Some(content)),
+            Err(e) if e.status == 404 => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Sends a state event of type `event_type` with state key `state_key` to `room_id` as
+    /// `user`.
+    ///
+    /// # Errors
+    /// On failure, a 403 included when `user` may not send state events there.
+    pub async fn send_state(
+        &self,
+        token: &str,
+        user: &str,
+        room_id: &str,
+        event_type: &str,
+        state_key: &str,
+        content: Value,
+    ) -> Result<(), MatrixError> {
+        self.call(
+            reqwest::Method::PUT,
+            self.url(
+                &["rooms", room_id, "state", event_type, state_key],
+                Some(user),
+            ),
+            token,
+            Some(content),
+            "send state",
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// `user`'s room account data of type `event_type` in `room_id`: its content, or `None`
+    /// when there is none.
+    ///
+    /// # Errors
+    /// On any other failure.
+    pub async fn room_account_data(
+        &self,
+        token: &str,
+        user: &str,
+        room_id: &str,
+        event_type: &str,
+    ) -> Result<Option<Value>, MatrixError> {
+        let result = self
+            .call(
+                reqwest::Method::GET,
+                self.url(
+                    &["user", user, "rooms", room_id, "account_data", event_type],
+                    Some(user),
+                ),
+                token,
+                None,
+                "room account data",
+            )
+            .await;
+        match result {
+            Ok(content) => Ok(Some(content)),
+            Err(e) if e.status == 404 => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Sets `user`'s room account data of type `event_type` in `room_id` to `content`, whole.
+    ///
+    /// # Errors
+    /// On failure.
+    pub async fn set_room_account_data(
+        &self,
+        token: &str,
+        user: &str,
+        room_id: &str,
+        event_type: &str,
+        content: Value,
+    ) -> Result<(), MatrixError> {
+        self.call(
+            reqwest::Method::PUT,
+            self.url(
+                &["user", user, "rooms", room_id, "account_data", event_type],
+                Some(user),
+            ),
+            token,
+            Some(content),
+            "room account data",
+        )
+        .await
+        .map(|_| ())
+    }
+
     /// Invites `invitee` to `room_id` as `user`; one already there is fine.
     ///
     /// # Errors

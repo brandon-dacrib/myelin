@@ -560,11 +560,17 @@ export type BridgeMode = BridgeOffering["mode"];
 export type BridgeOfferingOptions = NonNullable<BridgeOfferingRequest["options"]>;
 export type BridgeOfferingGithub = NonNullable<BridgeOfferingOptions["github"]>;
 export type BridgeConnection = components["schemas"]["BridgeConnection"];
+export type BridgeConnectionList = components["schemas"]["BridgeConnectionList"];
+export type BridgeBotRoom = components["schemas"]["BridgeBotRoom"];
+export type BridgeWebhookSource = components["schemas"]["BridgeWebhookSource"];
+export type BridgeConnectionCreate = components["schemas"]["BridgeConnectionCreate"];
+export type BridgeConnectionCreated = components["schemas"]["BridgeConnectionCreated"];
 
 /**
  * What a shared integrations bridge (Hookshot) has connected, room by room, read from the
- * rooms' state (`GET /bridge-offerings/{type}/connections`). Asked only for a type that keeps
- * connections there (`enabled`); polled, since connections are made in rooms, not here.
+ * rooms' state, and the rooms its bot is in (`GET /bridge-offerings/{type}/connections`). Asked
+ * only for a type that keeps connections there (`enabled`); polled, since connections are also
+ * made in rooms, not only here.
  */
 export function useBridgeConnections(type: string | undefined, enabled: boolean) {
   return useQuery({
@@ -575,8 +581,78 @@ export function useBridgeConnections(type: string | undefined, enabled: boolean)
         await api.GET("/bridge-offerings/{type}/connections", {
           params: { path: { type: type! } },
         }),
-      ).items,
+      ),
     refetchInterval: 30_000,
+  });
+}
+
+/**
+ * The webhook sources a connection can be made from (`GET
+ * /bridge-offerings/{type}/webhook-sources`): plain JSON, Datadog, GitHub comments, Linear,
+ * Notion, Gmail, Alertmanager, each with the sender's setup text.
+ */
+export function useBridgeWebhookSources(type: string | undefined, enabled: boolean) {
+  return useQuery({
+    queryKey: ["bridge-webhook-sources", type],
+    enabled: Boolean(type) && enabled,
+    queryFn: async () =>
+      unwrap(
+        await api.GET("/bridge-offerings/{type}/webhook-sources", {
+          params: { path: { type: type! } },
+        }),
+      ).items,
+    staleTime: 10 * 60_000,
+  });
+}
+
+/**
+ * Makes a webhook connection as the bridge's bot (`POST /bridge-offerings/{type}/connections`):
+ * in a room the bot is in, or in a new room. The answer carries the URL, the one time it is
+ * shown. Sent with an `Idempotency-Key`, so a retried request does not mint a second webhook.
+ */
+export function useCreateBridgeConnection() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ type, body }: { type: string; body: BridgeConnectionCreate }) =>
+      unwrap(
+        await api.POST("/bridge-offerings/{type}/connections", {
+          params: { path: { type } },
+          body,
+          headers: { "Idempotency-Key": crypto.randomUUID() },
+        }),
+      ),
+    onSuccess: (_data, { type }) => {
+      void qc.invalidateQueries({ queryKey: ["bridge-connections", type] });
+    },
+  });
+}
+
+/**
+ * Removes a connection the way the bridge does (`DELETE
+ * /bridge-offerings/{type}/connections/{room_id}/{state_key}`): its state event emptied, a
+ * webhook's URL stops working.
+ */
+export function useDeleteBridgeConnection() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async ({
+      type,
+      roomId,
+      stateKey,
+    }: {
+      type: string;
+      roomId: string;
+      stateKey: string;
+    }) => {
+      unwrap(
+        await api.DELETE("/bridge-offerings/{type}/connections/{room_id}/{state_key}", {
+          params: { path: { type, room_id: roomId, state_key: stateKey } },
+        }),
+      );
+    },
+    onSuccess: (_data, { type }) => {
+      void qc.invalidateQueries({ queryKey: ["bridge-connections", type] });
+    },
   });
 }
 

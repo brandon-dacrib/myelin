@@ -1,0 +1,11 @@
+{
+  "action": "submitted",
+  "review": {
+    "state": "approved",
+    "body": "Ship it.",
+    "html_url": "https://github.com/example/myelin/pull/12#pullrequestreview-1",
+    "user": { "login": "octocat" }
+  },
+  "pull_request": { "number": 12, "title": "Receipts loop through the pump" },
+  "repository": { "full_name": "example/myelin" }
+}

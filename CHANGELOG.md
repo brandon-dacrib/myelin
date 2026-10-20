@@ -28,6 +28,22 @@ never seen it. Everything that was verified for it says how.
   real bridge and the real server on the desktop: started from the rendered files, registered,
   `help` answered in an encrypted chat and a plain one, `whoami` answered. Not verified: a real
   mailbox signed in (`docs/bridges/matrimail.md`).
+- **One Hookshot, many webhooks: a webhook is made from the offering's page or the admin API,
+  for the sender that will post to it, and the server shapes what lands.** Seven sources ship
+  with the server (`crates/hs-bridges/hookshot-sources/`): plain JSON, Prometheus
+  Alertmanager, Datadog monitors, GitHub comments (the demo's), Gmail through an Apps Script
+  the answer hands over with the URL in it, Linear, and Notion; each with the sender's setup
+  text and a transformation function Hookshot runs. `POST
+  /api/v1/bridge-offerings/matrix-hookshot/connections` (or Bridges → Hookshot → Add a
+  webhook) makes the connection as the bridge's bot, in a room the bot is in or a new room it
+  creates and invites people to, and answers with the URL once; `DELETE
+  .../connections/{room_id}/{state_key}` removes any connection the way the bridge does; the
+  listing says each connection's source and the bot's rooms. Audited, `bridges:write`,
+  idempotent, counted (`hs_bridge_webhook_connections_total`). Verified against the real
+  7.5.0 image: the bridge picks a connection the server wrote up live, Datadog's sample
+  payload posted to the URL lands as the source's notice, and a removed webhook's URL stops
+  working within a second (`docs/bridges/hookshot.md`, decision 0055). Every transform is
+  run on its sample payloads with `node` in `cargo test`.
 - **A receipt that does not move forward is dropped, so a bridge is not sent its own
   receipt back.** The server recorded every receipt it was given, the event the user's
   receipt was already at included, and each write was sent to every bridge interested in the

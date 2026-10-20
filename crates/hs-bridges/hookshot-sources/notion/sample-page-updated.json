@@ -1,0 +1,16 @@
+{
+  "id": "367cba44-b6f3-4c92-81e7-6a2e9659efd4",
+  "timestamp": "2026-10-20T10:00:10.123Z",
+  "workspace_id": "13950b26-c203-4f3b-b97d-93ec06319565",
+  "workspace_name": "Example",
+  "subscription_id": "29d75c0d-5146-4d7e-99f8-cb0db8f3ad5a",
+  "integration_id": "0ef2e755-4912-8096-a3e4-00a1ad1cb3c4",
+  "type": "page.content_updated",
+  "authors": [{ "id": "c7c11cca-1d73-471d-9b6e-bdef51470190", "type": "person" }],
+  "attempt_number": 1,
+  "entity": { "id": "153104cd-477e-80d0-a893-d4fd3faa2d7a", "type": "page" },
+  "data": {
+    "parent": { "id": "13950b26-c203-4f3b-b97d-93ec06319565", "type": "space" },
+    "updated_blocks": [{ "id": "153104cd-477e-80ee-ae45-c4c1b8f3a98d", "type": "block" }]
+  }
+}

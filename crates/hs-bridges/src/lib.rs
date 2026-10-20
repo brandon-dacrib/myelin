@@ -8,6 +8,8 @@
 //! - [`manager`]: [`manager::BridgeManager`], the admin API's data source for offerings and
 //!   instances, and the state machine that takes an instance from requested to ready.
 //! - [`front_door`]: the manager's appservice API, and what `@whatsappbot` and `@bridges` say.
+//! - [`hookshot_sources`]: the webhook sources a Hookshot connection is made from, and their
+//!   transformation functions.
 //! - [`cross_signing`]: the cross-signing identity the manager keeps for each instance's bot,
 //!   so that a client which excludes insecure devices still shares keys with the bridge.
 //! - [`overlap`] and [`directory`]: a bridge registered by hand for a network this server now
@@ -18,6 +20,7 @@
 pub mod cross_signing;
 pub mod directory;
 pub mod front_door;
+pub mod hookshot_sources;
 pub mod manager;
 pub mod matrix;
 pub mod metrics;

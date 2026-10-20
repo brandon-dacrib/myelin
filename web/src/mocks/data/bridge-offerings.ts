@@ -1,5 +1,9 @@
 import type {
   BridgeConnection,
+  BridgeConnectionCreate,
+  BridgeConnectionCreated,
+  BridgeConnectionList,
+  BridgeWebhookSource,
   BridgeDeploymentTarget,
   BridgeOfferingGithub,
   BridgeInstance,
@@ -342,7 +346,12 @@ function seed() {
 let state = seed();
 
 /** Puts the fixtures back as they started (Vitest calls this between tests). */
+export function resetBridgeConnections(): void {
+  connections = seededConnections();
+}
+
 export function resetBridgeOfferings(): void {
+  resetBridgeConnections();
   state = seed();
   deploymentTarget.current = DEPLOYMENT_AVAILABLE;
 }
@@ -531,44 +540,239 @@ export function offeringRefusal(type: string, body: BridgeOfferingRequest): stri
   return null;
 }
 
+/** The demo's connections as the server reads them from the rooms' state; `createConnection`
+ * adds to it and `deleteConnection` empties one. */
+const seededConnections = (): BridgeConnection[] => [
+  {
+    service: "webhook",
+    event_type: "uk.half-shot.matrix-hookshot.generic.hook",
+    state_key: "myelin",
+    room_id: "!myelinprs:example.org",
+    room_name: "myelin pull requests",
+    name: "myelin",
+    state: "active",
+    source: "github-comments",
+    content: {
+      name: "myelin",
+      transformationFunction: "// github-comments",
+      "io.myelin.source": "github-comments",
+    },
+  },
+  {
+    service: "github",
+    event_type: "uk.half-shot.matrix-hookshot.github.repository",
+    state_key: "brandon-dacrib/myelin",
+    room_id: "!myelinprs:example.org",
+    room_name: "myelin pull requests",
+    name: "brandon-dacrib/myelin",
+    state: "active",
+    content: { org: "brandon-dacrib", repo: "myelin" },
+  },
+  {
+    service: "feed",
+    event_type: "uk.half-shot.matrix-hookshot.feed",
+    state_key: "https://blog.example.org/feed.xml",
+    room_id: "!news:example.org",
+    room_name: null,
+    name: "https://blog.example.org/feed.xml",
+    state: "removed",
+    content: {},
+  },
+];
+
+let connections: BridgeConnection[] = seededConnections();
+
+/** The rooms the bot is in: the connections' rooms, and one with nothing connected yet. */
+const botRooms = (): BridgeConnectionList["rooms"] => {
+  const rooms: BridgeConnectionList["rooms"] = [{ room_id: "!ops:example.org", room_name: "Ops" }];
+  for (const c of connections) {
+    if (!rooms.some((r) => r.room_id === c.room_id)) {
+      rooms.push({ room_id: c.room_id, room_name: c.room_name ?? null });
+    }
+  }
+  return rooms;
+};
+
 /**
  * What a shared integrations bridge (Hookshot) has connected, as the server reads it from the
- * rooms' state: the demo's two repository rooms and a feed, once the offering exists.
+ * rooms' state (the demo's two repository rooms and a feed, plus what was made here), and the
+ * rooms its bot is in, once the offering exists.
  */
-export function connectionsOf(type: string): BridgeConnection[] {
+export function connectionsOf(type: string): BridgeConnectionList {
+  if (type !== "matrix-hookshot" || !findOffering(type)) return { items: [], rooms: [] };
+  return { items: connections.map((c) => ({ ...c })), rooms: botRooms() };
+}
+
+/** The webhook sources the server ships (`crates/hs-bridges/hookshot-sources/`), in brief. */
+export const WEBHOOK_SOURCES: BridgeWebhookSource[] = [
+  {
+    id: "generic",
+    title: "Plain JSON",
+    description:
+      "Anything that posts JSON: `text` is the message, `username` who it is from, anything else is shown as data.",
+    setup:
+      "# Plain JSON\n\nPost JSON to `{{url}}` (`POST`, `Content-Type: application/json`).\n\n- `text` is the message. Markdown in it is rendered.\n- `username`, when given, is shown in bold before the message.\n\n```sh\ncurl -X POST '{{url}}' -H 'content-type: application/json' -d '{\"text\": \"hello\"}'\n```",
+    transforms: false,
+    files: [],
+  },
+  {
+    id: "alertmanager",
+    title: "Prometheus Alertmanager",
+    description:
+      "Alertmanager's webhook receiver: each notification's alerts, firing or resolved, with severity, summary and links.",
+    setup:
+      "# Prometheus Alertmanager\n\nA receiver with a `webhook_configs` entry:\n\n```yaml\nreceivers:\n  - name: matrix-{{name}}\n    webhook_configs:\n      - url: '{{url}}'\n        send_resolved: true\n```",
+    transforms: true,
+    files: [],
+  },
+  {
+    id: "datadog",
+    title: "Datadog monitors",
+    description:
+      "A monitor's alerts, warnings and recoveries through Datadog's Webhooks integration, with priority, tags and a link.",
+    setup:
+      "# Datadog monitors\n\nIntegrations → Webhooks → **New Webhook**:\n\n- **URL**: `{{url}}`\n- **Payload**: the template with `$EVENT_TITLE`, `$TEXT_ONLY_MSG`, `$ALERT_TRANSITION`, `$PRIORITY`, `$TAGS`, `$LINK`.\n\nThen add `@webhook-matrix-{{name}}` to each monitor's message.",
+    transforms: true,
+    files: [],
+  },
+  {
+    id: "github-comments",
+    title: "GitHub comments",
+    description:
+      "Comments and reviews on a repository's pull requests and issues, through a plain repository webhook; no GitHub App needed.",
+    setup:
+      "# GitHub comments\n\nRepository → Settings → Webhooks → Add webhook:\n\n- **Payload URL**: `{{url}}`\n- **Content type**: `application/json`\n- **Events**: Issue comments, Pull request review comments, Pull request reviews.",
+    transforms: true,
+    files: [],
+  },
+  {
+    id: "gmail",
+    title: "Gmail",
+    description:
+      "New threads under one Gmail label, posted by a Google Apps Script on a timer: sender, subject, snippet and a link.",
+    setup:
+      "# Gmail (through Apps Script)\n\n1. In Gmail, make a label (`to-matrix`) and a filter that applies it.\n2. At script.google.com, a new project with `Code.gs` below (`WEBHOOK_URL` is already `{{url}}`).\n3. Run `testWebhook` once, then `install` once.",
+    transforms: true,
+    files: ["Code.gs"],
+  },
+  {
+    id: "linear",
+    title: "Linear",
+    description:
+      "Issues, comments and projects as they are created, changed and deleted in Linear, with who did it.",
+    setup:
+      "# Linear\n\nSettings → API → Webhooks → **New webhook**:\n\n- **URL**: `{{url}}`\n- **Data change events**: Issues, Comments, Projects.\n\nLinear signs deliveries (`Linear-Signature`); Hookshot's generic webhook does not verify it.",
+    transforms: true,
+    files: [],
+  },
+  {
+    id: "notion",
+    title: "Notion",
+    description:
+      "Notion's webhook subscriptions: what kind of page, database or comment changed and how, with a link; Notion sends ids, not content.",
+    setup:
+      "# Notion\n\nYour integration → **Webhooks** → **Create subscription**:\n\n- **Webhook URL**: `{{url}}`\n\nNotion sends a verification token first; the room shows it, paste it back into Notion.",
+    transforms: true,
+    files: [],
+  },
+];
+
+export function webhookSourcesOf(type: string): BridgeWebhookSource[] {
   if (type !== "matrix-hookshot" || !findOffering(type)) return [];
-  return [
-    {
-      service: "webhook",
-      event_type: "uk.half-shot.matrix-hookshot.generic.hook",
-      state_key: "myelin",
-      room_id: "!myelinprs:example.org",
-      room_name: "myelin pull requests",
-      name: "myelin",
-      state: "active",
-      content: { name: "myelin", transformationFunction: "// github-comments.js" },
-    },
-    {
-      service: "github",
-      event_type: "uk.half-shot.matrix-hookshot.github.repository",
-      state_key: "brandon-dacrib/myelin",
-      room_id: "!myelinprs:example.org",
-      room_name: "myelin pull requests",
-      name: "brandon-dacrib/myelin",
-      state: "active",
-      content: { org: "brandon-dacrib", repo: "myelin" },
-    },
-    {
-      service: "feed",
-      event_type: "uk.half-shot.matrix-hookshot.feed",
-      state_key: "https://blog.example.org/feed.xml",
-      room_id: "!news:example.org",
-      room_name: null,
-      name: "https://blog.example.org/feed.xml",
-      state: "removed",
-      content: {},
-    },
-  ];
+  return WEBHOOK_SOURCES;
+}
+
+/** Why `createConnection` would be refused, as `[pointer, detail]`, or null. */
+export function connectionRefusal(
+  type: string,
+  body: BridgeConnectionCreate,
+): [string, string, number] | null {
+  if (!webhookSourcesOf(type).some((s) => s.id === body.source)) {
+    return ["/source", `\`${body.source}\` is not a webhook source`, 400];
+  }
+  const name = body.name ?? "";
+  if (name.trim() !== name || name.length < 3 || name.length > 64) {
+    return ["/name", "the name is 3 to 64 characters, with no space at either end", 400];
+  }
+  const room = body.room ?? {};
+  if ((room.id && room.create) || (!room.id && !room.create)) {
+    return ["/room", "say which room: `id` of one the bot is in, or `create` one", 400];
+  }
+  if (room.create && !room.create.name.trim()) {
+    return ["/room/create/name", "the room needs a name", 400];
+  }
+  if (room.id && !botRooms().some((r) => r.room_id === room.id)) {
+    return [
+      "/room/id",
+      "the bot @hookshot:example.org is not in that room; invite it first, and let it send state events",
+      400,
+    ];
+  }
+  if (
+    room.id &&
+    connections.some((c) => c.room_id === room.id && c.state_key === name && c.state === "active")
+  ) {
+    return ["", `the room already has a webhook named \`${name}\``, 409];
+  }
+  return null;
+}
+
+/** Makes a webhook connection the way the server does, minus the bridge: a room if asked, a
+ * secret id, the state the listing then shows. */
+export function createConnection(
+  type: string,
+  body: BridgeConnectionCreate,
+): BridgeConnectionCreated {
+  const source = WEBHOOK_SOURCES.find((s) => s.id === body.source)!;
+  const offering = findOffering(type);
+  const publicUrl = (offering?.options?.public_url ?? "https://hooks.example.org").replace(
+    /\/$/,
+    "",
+  );
+  const id = crypto.randomUUID();
+  const url = `${publicUrl}/webhook/${id}`;
+  const roomId = body.room.id ?? `!${Math.random().toString(36).slice(2, 10)}:${SERVER}`;
+  const roomName = body.room.id
+    ? (botRooms().find((r) => r.room_id === roomId)?.room_name ?? null)
+    : body.room.create!.name;
+  connections = connections.filter(
+    (c) => !(c.room_id === roomId && c.state_key === body.name && c.state === "removed"),
+  );
+  connections.push({
+    service: "webhook",
+    event_type: "uk.half-shot.matrix-hookshot.generic.hook",
+    state_key: body.name,
+    room_id: roomId,
+    room_name: roomName,
+    name: body.name,
+    state: "active",
+    source: source.id,
+    content: { name: body.name, "io.myelin.source": source.id },
+  });
+  const fill = (text: string) => text.replaceAll("{{url}}", url).replaceAll("{{name}}", body.name);
+  return {
+    room_id: roomId,
+    name: body.name,
+    source: source.id,
+    url,
+    setup: fill(source.setup),
+    files: Object.fromEntries(
+      (source.files ?? []).map((f) => [f, `// ${f}\nconst WEBHOOK_URL = "${url}";\n`]),
+    ),
+  };
+}
+
+/** Empties the connection, as the bridge does; false when there is no such active one. */
+export function deleteConnection(type: string, roomId: string, stateKey: string): boolean {
+  if (type !== "matrix-hookshot") return false;
+  const found = connections.find(
+    (c) => c.room_id === roomId && c.state_key === stateKey && c.state === "active",
+  );
+  if (!found) return false;
+  found.state = "removed";
+  found.content = {};
+  delete found.source;
+  return true;
 }
 
 export function putOffering(type: string, body: BridgeOfferingRequest): BridgeOffering {
