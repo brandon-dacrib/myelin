@@ -1,6 +1,6 @@
 # Status: track 11, appservices and bridges
 
-Last updated: 2026-10-19, evening (six mautrix pins bumped to v0.2610.0, verified with the real
+Last updated: 2026-10-20 (Hookshot on the demo by hand, GitHub PR comments from two repositories; below); before that 2026-10-19, evening (six mautrix pins bumped to v0.2610.0, verified with the real
 bridges; the real-bridge test's listener had served no media since 2026-10-16; below); before that 2026-10-19 (a bridge is no longer sent its own double puppet's receipt back
 when it moved nothing: the Slack read/unread flip; below); before that 2026-10-18 (the ephemeral pump leaves a room it cannot read out of the pass for
 a minute instead of failing every tick; below); before that 2026-10-15 (Discord's delivery timeouts: a retry is the same transaction, a
@@ -58,6 +58,28 @@ manager) and an instance's Kubernetes objects say whose bridge they are; before 
 (who has signed in to a bridge; the `cluster` runtime run on kind); before that 2026-09-30
 (ephemeral, to-device and device-list delivery); before that 2026-09-27 (RFC 0017 run against
 the real binary), 2026-09-27 (the bridge manager) and 2026-09-25.
+
+## 2026-10-20: Hookshot on the demo, by hand, with GitHub PR comments from two repositories
+
+The demo runs matrix-hookshot 7.5.0 as the shared `Bridge/bridge-hookshot` (`deploy/demo/hookshot/`,
+with its README): a files Secret the operator writes into `/data` (hookshot's `config.yml`,
+`registration.yml`, `passkey.pem`), a second Service for the webhooks listener (the operator's own
+carries only the appservice port) and a Funnel hostname of its own,
+`https://hookshot.longhair-tet.ts.net`, which answered from the internet within a minute of the
+Ingress being applied. The server cannot deploy Hookshot itself (`not_deployable_reason`), so
+this is the hand route the catalogue describes; `agent/hookshot-offering` is making it an
+offering. Learned from hookshot's 7.5.0 source: the provisioning API is gone (a `provisioning`
+section is refused, and `provisioning` is no longer a listener resource), so Myelin's
+`hookshot_v1` provisioning kind reads nothing; a generic webhook's hook id lives in the bot's
+room account data (`uk.half-shot.matrix-hookshot.generic.hook`, hook id to state key), not in
+the state event, so a room can be made with a hook id chosen beforehand, and the GitHub webhook
+created before the bridge is registered. GitHub: a repository webhook on `brandon-dacrib/myelin`
+and `mosaic-avantos/avantos` (`issue_comment`, `pull_request_review_comment`,
+`pull_request_review`) to that hostname; `deploy/demo/hookshot/github-comments.js` formats the
+three into one notice each. The bridge started, read its config and retried the homeserver every
+5 s with `M_UNKNOWN_TOKEN` until its registration was made (the owner's step: the admin
+interface or `POST /api/v1/appservices` with `registration_yaml`); the rooms, the invites and
+the end-to-end check follow that.
 
 ## 2026-10-19, evening (branch `agent/bridge-pins-2610`): six mautrix pins to v0.2610.0, and the real-bridge test's listener had served no media since the 16th
 
