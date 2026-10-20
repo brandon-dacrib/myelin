@@ -1,0 +1,42 @@
+# matrix-hookshot 7.5.0 on the demo (deploy/demo/hookshot/README.md). Rendered from
+# deploy/demo/hookshot/config.template.yml; the secrets live in the cluster Secret
+# bridge-hookshot-files, not in git.
+bridge:
+  domain: myelin.dacrib.net
+  url: http://myelin-hs:8008
+  mediaUrl: https://myelin.longhair-tet.ts.net
+  port: 9993
+  bindAddress: 0.0.0.0
+passFile: /data/passkey.pem
+logging:
+  level: info
+  json: false
+  colorize: false
+  timestampFormat: HH:mm:ss:SSS
+# Every local user may do everything; the bridge is the demo's, not a public one.
+permissions:
+  - actor: myelin.dacrib.net
+    services:
+      - service: "*"
+        level: admin
+generic:
+  enabled: true
+  outbound: false
+  urlPrefix: https://hookshot.longhair-tet.ts.net/webhook/
+  userIdPrefix: _webhooks_
+  allowJsTransformationFunctions: true
+  waitForComplete: false
+  enableHttpGet: false
+metrics:
+  enabled: true
+listeners:
+  # Webhooks: what the Funnel hostname (Ingress hookshot-funnel) forwards to.
+  - port: 9000
+    bindAddress: 0.0.0.0
+    resources:
+      - webhooks
+  # Metrics: the pod only; no Service or Ingress reaches it.
+  - port: 9001
+    bindAddress: 0.0.0.0
+    resources:
+      - metrics

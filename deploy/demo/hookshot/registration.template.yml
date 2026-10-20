@@ -1,0 +1,26 @@
+id: hookshot
+url: http://bridge-hookshot:9993
+as_token: <as-token>
+hs_token: <hs-token>
+sender_localpart: hookshot
+rate_limited: false
+namespaces:
+  rooms: []
+  users:
+    - regex: "@hookshot:myelin\\.dacrib\\.net"
+      exclusive: true
+    - regex: "@_github_.*:myelin\\.dacrib\\.net"
+      exclusive: true
+    - regex: "@_gitlab_.*:myelin\\.dacrib\\.net"
+      exclusive: true
+    - regex: "@_jira_.*:myelin\\.dacrib\\.net"
+      exclusive: true
+    - regex: "@_webhooks_.*:myelin\\.dacrib\\.net"
+      exclusive: true
+    - regex: "@feeds:myelin\\.dacrib\\.net"
+      exclusive: true
+  aliases:
+    - regex: "#github_.+:myelin\\.dacrib\\.net"
+      exclusive: true
+io.myelin.bridge_type: matrix-hookshot
+io.myelin.bridge_instance: _
