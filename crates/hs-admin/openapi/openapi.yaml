@@ -10,7 +10,7 @@ openapi: 3.1.0
 info:
   title: hs-admin API
   summary: The native administration and moderation API for the homeserver.
-  version: 0.1.21
+  version: 0.1.22
   description: 'The only API the management interface (track 16) talks to. See docs/rfcs/0004-admin-api.md for the full design rationale: resource modeling, naming, pagination, filtering, errors, idempotency, scopes, versioning and the event stream. This document is the contract; the hs-admin router''s contract tests assert the router and this document agree on paths and methods (RFC 0004 section 1, decision D15.16).'
   contact:
     name: 'Track 15: Admin API and modules'
@@ -129,6 +129,15 @@ info:
       an m.login.application_service login (a bridge double puppeting the user), whose
       requests on it are rate-limited as that appservice''s are (decision 0053).'
   - version: 0.1.21
+    date: '2026-10-20'
+    notes: 'Additive (decision 0054, Hookshot as an offering the server deploys):
+      BridgeOfferingOptions.public_url and BridgeOfferingOptions.github (app_id, private_key,
+      webhook_secret) for a type whose config_keys has public_url; BridgeInstanceFiles.files,
+      every rendered file by name; bridge_offerings.connections, GET
+      /bridge-offerings/{type}/connections, the connections of a shared bridge read from its
+      rooms'' state as BridgeConnection rows (service, event_type, state_key, room_id,
+      room_name, name, state, content).'
+  - version: 0.1.22
     date: '2026-10-20'
     notes: 'Additive: appservices.create with dry_run=true answers 200 with AppServiceDryRun
       (the parsed AppService and the conflicts a create would be refused for, as

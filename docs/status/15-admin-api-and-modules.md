@@ -2,7 +2,7 @@
 
 Track brief: `docs/workstreams/15-admin-api-and-modules.md`. Owner crates: `hs-admin`, `hs-modules`, `hs-identity`, `hs-http` (shared with 07 and 14).
 
-## 2026-10-20: `appservices.create?dry_run=true` creates nothing (OpenAPI 0.1.21, branch `agent/appservice-dry-run`)
+## 2026-10-20: `appservices.create?dry_run=true` creates nothing (OpenAPI 0.1.22, branch `agent/appservice-dry-run`)
 
 Bug, found on the demo on 2026-10-20 while registering Hookshot: `dry_run` was documented on
 `appservices.create` since the first draft but the handler never read the query string, so a dry
@@ -31,7 +31,7 @@ have replayed the dry run's answer). It logs one `info` line (`appservice`, `con
   token check is the same shape (`token_conflicts`). `Registry::validate` lists the sender and
   namespaces, then the tokens, then the id, the order `add` checks them, so the first conflict
   is the `409` a create would answer.
-- OpenAPI 0.1.21 (additive): the `200` response on `appservices.create`, the `AppServiceDryRun`
+- OpenAPI 0.1.22 (additive): the `200` response on `appservices.create`, the `AppServiceDryRun`
   and `AppServiceConflict` schemas, `dry_run`'s description says what a dry run does and does
   not do. `web/src/api/schema.d.ts` regenerated (`npm run generate:client`); the `200` widened
   the create mutation's inferred success type, so `useCreateAppservice` (`web/src/api/bridges.ts`)

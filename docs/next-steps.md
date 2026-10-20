@@ -10,7 +10,7 @@ Found registering Hookshot on the demo (above): the handler ignored `dry_run`, s
 registered the appservice and the real create was a `409` with itself. Now a dry run answers
 `200` with `AppServiceDryRun` (the parsed `AppService` and every conflict a create would be
 refused for, in the body), writes nothing, audits nothing and stores no `Idempotency-Key`
-entry; OpenAPI 0.1.21, `schema.d.ts` regenerated; router, registry and real-binary tests
+entry; OpenAPI 0.1.22, `schema.d.ts` regenerated; router, registry and real-binary tests
 (`crates/hs-cli/tests/appservice_dry_run.rs`). Status 15 has the detail. Left: the interface
 does not yet run a dry run before the create (it could show the conflicts first).
 
