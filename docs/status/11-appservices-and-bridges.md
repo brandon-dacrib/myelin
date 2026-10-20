@@ -127,10 +127,20 @@ minute, each a `RemoteEventReadReceipt` from Slack (a `channel_marked`), many at
 | 17:08 | 0.4.3 | 386 | yes |
 | 17:09 | 0.4.3 | 547 | yes |
 | 17:10 | 0.4.5 from :10:20 | 6 | none |
+| 17:11 | 0.4.5 | 0 | none |
+| 17:12 | 0.4.5 | 2 | none |
+| 17:13 | 0.4.5 | 0 | none |
+| 17:14 | 0.4.5 | 1 | none |
 
-`hs_user_receipts_ignored_total{reason="same_event"}` was 3 at the first scrape after boot.
-**Left:** the owner confirms the channel stays read in the official client with the bridge
-up; the second measurement (below, when taken) says whether the rate stays at a handful.
+`hs_user_receipts_ignored_total{reason="same_event"}` was 3 at the first scrape after boot
+(17:12); by 17:16 the pod's `/metrics` through the proxy answered "address not allowed" and
+Prometheus had no endpoints (its pod could not mount its volume; `monitoring-system` was
+being restarted), so no later value was read. No WARN or ERROR from the server in its first
+six minutes. At 17:17 UTC another session started Helm revision 41, v0.4.7 (the mautrix pins
+and the interop harness, on top of this fix), while this one was measuring; the 0.4.5 pod
+went Unknown on `tp0n1` as that upgrade replaced it. **Left:** the owner confirms the
+channel stays read in the official client with the bridge up, on whichever version the demo
+settles on.
 
 ## 2026-10-18 (branch `agent/stuck-room-load`): a room the pump cannot read is left out of the pass, not the whole pass
 
