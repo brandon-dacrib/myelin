@@ -10,9 +10,10 @@ Done on `main` (`deploy/demo/hookshot/`, status 11): the demo runs matrix-hooksh
 `Bridge/bridge-hookshot` from a files Secret, its webhooks listener is public at
 `https://hookshot.longhair-tet.ts.net` (its own Funnel Ingress), and `brandon-dacrib/myelin` and
 `mosaic-avantos/avantos` have repository webhooks for PR comments and reviews pointing at it.
-Left: the appservice registration (the owner's sign-in or a `bridges:write` admin token), then
-the two rooms (`deploy/demo/hookshot/README.md` has the steps) and the end-to-end check with a
-real PR comment. In flight: `agent/hookshot-offering` makes Hookshot an offering the server
+Registered from the owner's admin session; the rooms `GitHub: myelin` and `GitHub: avantos`
+exist with the owner invited, GitHub's pings and real avantos PR comments arrived formatted,
+and the registration is `healthy`. Found: `POST /api/v1/appservices?dry_run=true` creates
+(the handler ignores `dry_run`); fix on `agent/appservice-dry-run`. In flight: `agent/hookshot-offering` makes Hookshot an offering the server
 deploys itself (rendered config, webhooks port, docs, tests); gate and merge it when it reports.
 
 ## 2026-10-19, late -- six mautrix pins to v0.2610.0; the real-bridge test had served no media for ten days; the branch is `agent/bridge-pins-2610`

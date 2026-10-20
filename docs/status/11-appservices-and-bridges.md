@@ -77,9 +77,20 @@ created before the bridge is registered. GitHub: a repository webhook on `brando
 and `mosaic-avantos/avantos` (`issue_comment`, `pull_request_review_comment`,
 `pull_request_review`) to that hostname; `deploy/demo/hookshot/github-comments.js` formats the
 three into one notice each. The bridge started, read its config and retried the homeserver every
-5 s with `M_UNKNOWN_TOKEN` until its registration was made (the owner's step: the admin
-interface or `POST /api/v1/appservices` with `registration_yaml`); the rooms, the invites and
-the end-to-end check follow that.
+5 s with `M_UNKNOWN_TOKEN` until its registration was made from the owner's signed-in admin
+session (`POST /api/v1/appservices` with `registration_yaml`; the Register-a-bridge wizard
+takes one user namespace and mints its own tokens, so it does not fit a registration made
+elsewhere). **Verified end to end the same minute:** the bot created `GitHub: myelin` and
+`GitHub: avantos` with their connections and invited the owner; GitHub's ping landed in each as
+"GitHub webhook for … is connected" (202 from GitHub's side), and real `issue_comment` and
+`pull_request_review_comment` deliveries from `mosaic-avantos/avantos` arrived as one notice
+each from `@_webhooks_github-avantos`, formatted by `github-comments.js`, with no transformation
+error in the bridge's log; the registration's health went `degraded` (the server's first ping
+hit the pod before its appservice listener was up) to `healthy` on the first transaction, with
+nothing queued. **Found on the way:** `POST /api/v1/appservices?dry_run=true` is documented as
+"validate and return … without creating anything" and created the appservice (the real `POST`
+then got `409`, a conflict with itself): `appservices_create` in `hs-admin`'s router never
+reads `dry_run`. Fixed on `agent/appservice-dry-run` (below, when merged).
 
 ## 2026-10-19, evening (branch `agent/bridge-pins-2610`): six mautrix pins to v0.2610.0, and the real-bridge test's listener had served no media since the 16th
 
