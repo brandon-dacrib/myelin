@@ -392,10 +392,7 @@ mod tests {
         (
             "notion",
             "sample-verification.json",
-            Expect::Plain(&[
-                "verification token",
-                "`secret_EXAMPLE-not-a-real-token`",
-            ]),
+            Expect::Plain(&["verification token", "`secret_EXAMPLE-not-a-real-token`"]),
         ),
         (
             "notion",
