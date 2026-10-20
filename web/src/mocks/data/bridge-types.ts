@@ -115,14 +115,14 @@ function provisioning(id: string): Pick<BridgeType, "provisioning_api" | "provis
  * (`crates/hs-admin/src/bridge_types.rs`; decision 0037: no offering runs `latest`).
  */
 const MAUTRIX_PINS: Record<string, string> = {
-  whatsapp: "v0.2609.0",
-  telegram: "v0.2609.0",
-  signal: "v0.2609.0",
-  gmessages: "v0.2609.0",
+  whatsapp: "v0.2610.0",
+  telegram: "v0.2610.0",
+  signal: "v0.2610.0",
+  gmessages: "v0.2610.0",
   gvoice: "v0.2605.0",
-  meta: "v0.2609.0",
+  meta: "v0.2610.0",
   discord: "v0.7.7",
-  slack: "v0.2609.1",
+  slack: "v0.2610.0",
   twitter: "v0.2609.0",
   linkedin: "v0.2609.0",
   bluesky: "v0.2510.0",

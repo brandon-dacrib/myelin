@@ -227,7 +227,7 @@ macro_rules! mautrix {
 /// bridge, and record the new row in that table.
 const CATALOGUE: &[Entry] = &[
     mautrix!(
-        "mautrix-whatsapp", "WhatsApp", "whatsapp", "v0.2609.0", 29318, "whatsapp_", "whatsappbot",
+        "mautrix-whatsapp", "WhatsApp", "whatsapp", "v0.2610.0", 29318, "whatsapp_", "whatsappbot",
         category: Category::Messaging,
         description: "Personal and group chats, linked to your phone the way WhatsApp Web is.",
         needs: [("phone", "A phone with WhatsApp, to link the bridge to by scanning a code", true)],
@@ -239,7 +239,7 @@ const CATALOGUE: &[Entry] = &[
         notes: Some("WhatsApp unlinks the bridge if the phone stays offline for more than two weeks; the bot warns after twelve days."),
     ),
     mautrix!(
-        "mautrix-telegram", "Telegram", "telegram", "v0.2609.0", 29317, "telegram_", "telegrambot",
+        "mautrix-telegram", "Telegram", "telegram", "v0.2610.0", 29317, "telegram_", "telegrambot",
         category: Category::Messaging,
         description: "Chats, groups and channels, through Telegram's own API.",
         needs: [
@@ -254,7 +254,7 @@ const CATALOGUE: &[Entry] = &[
         notes: Some("Telegram's official API is used. Brand-new accounts signed in from third-party apps are sometimes suspended; established ones are fine."),
     ),
     mautrix!(
-        "mautrix-signal", "Signal", "signal", "v0.2609.0", 29328, "signal_", "signalbot",
+        "mautrix-signal", "Signal", "signal", "v0.2610.0", 29328, "signal_", "signalbot",
         category: Category::Messaging,
         description: "Signal conversations, with the bridge linked as one of your devices.",
         needs: [("phone", "A phone with Signal, to link the bridge to as a secondary device", true)],
@@ -266,7 +266,7 @@ const CATALOGUE: &[Entry] = &[
         notes: Some("The bridge links as a secondary device. It cannot register a number of its own."),
     ),
     mautrix!(
-        "mautrix-gmessages", "Google Messages", "gmessages", "v0.2609.0", 29336, "gmessages_", "gmessagesbot",
+        "mautrix-gmessages", "Google Messages", "gmessages", "v0.2610.0", 29336, "gmessages_", "gmessagesbot",
         category: Category::Messaging,
         description: "SMS and RCS from an Android phone running Google Messages.",
         needs: [("phone", "An Android phone with Google Messages, to pair with", true)],
@@ -288,7 +288,7 @@ const CATALOGUE: &[Entry] = &[
         notes: None,
     ),
     mautrix!(
-        "mautrix-meta", "Messenger and Instagram", "meta", "v0.2609.0", 29319, "meta_", "metabot",
+        "mautrix-meta", "Messenger and Instagram", "meta", "v0.2610.0", 29319, "meta_", "metabot",
         category: Category::Messaging,
         description: "Facebook Messenger and Instagram direct messages.",
         needs: [("account", "A Facebook or Instagram account to sign in with from the bridge", true)],
@@ -314,7 +314,7 @@ const CATALOGUE: &[Entry] = &[
         layout: ConfigLayout::Legacy,
     ),
     mautrix!(
-        "mautrix-slack", "Slack", "slack", "v0.2609.1", 29335, "slack_", "slackbot",
+        "mautrix-slack", "Slack", "slack", "v0.2610.0", 29335, "slack_", "slackbot",
         category: Category::Social,
         description: "Workspaces and DMs, as yourself or through a Slack app.",
         needs: [("account", "A Slack account to sign in with from the bridge", true)],
@@ -2207,15 +2207,15 @@ mod tests {
     fn a_blank_or_latest_tag_is_the_catalogue_pin_and_any_other_is_kept() {
         assert_eq!(
             image_tag("mautrix-whatsapp", None).as_deref(),
-            Some("v0.2609.0")
+            Some("v0.2610.0")
         );
         assert_eq!(
             image_tag("mautrix-whatsapp", Some("")).as_deref(),
-            Some("v0.2609.0")
+            Some("v0.2610.0")
         );
         assert_eq!(
             image_tag("mautrix-whatsapp", Some(" latest ")).as_deref(),
-            Some("v0.2609.0")
+            Some("v0.2610.0")
         );
         assert_eq!(
             image_tag("mautrix-whatsapp", Some("v0.2608.0")).as_deref(),
@@ -2235,11 +2235,11 @@ mod tests {
         .unwrap();
         assert!(
             r.compose_yaml
-                .contains("dock.mau.dev/mautrix/whatsapp:v0.2609.0"),
+                .contains("dock.mau.dev/mautrix/whatsapp:v0.2610.0"),
             "{}",
             r.compose_yaml
         );
-        assert!(r.bridge_resource_yaml.contains("tag: v0.2609.0"));
+        assert!(r.bridge_resource_yaml.contains("tag: v0.2610.0"));
     }
 
     #[test]
@@ -2407,7 +2407,7 @@ mod tests {
         assert!(
             result
                 .compose_yaml
-                .contains("dock.mau.dev/mautrix/telegram:v0.2609.0")
+                .contains("dock.mau.dev/mautrix/telegram:v0.2610.0")
         );
         assert!(result.bridge_resource_yaml.contains("kind: Bridge"));
 

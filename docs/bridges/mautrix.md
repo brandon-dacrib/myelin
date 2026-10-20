@@ -445,14 +445,14 @@ the registry served on 2026-10-09 (checked with the registry's v2 API and an ano
 
 | Offering | Image | Release | Where it came from |
 | --- | --- | --- | --- |
-| mautrix-whatsapp | `dock.mau.dev/mautrix/whatsapp:v0.2609.0` | 2026-09-16 | github.com/mautrix/whatsapp/releases; manifest on dock.mau.dev |
-| mautrix-telegram | `dock.mau.dev/mautrix/telegram:v0.2609.0` | 2026-09-16 | github.com/mautrix/telegram/releases; manifest on dock.mau.dev |
-| mautrix-signal | `dock.mau.dev/mautrix/signal:v0.2609.0` | 2026-09-16 | github.com/mautrix/signal/releases; manifest on dock.mau.dev |
-| mautrix-gmessages | `dock.mau.dev/mautrix/gmessages:v0.2609.0` | 2026-09-16 | github.com/mautrix/gmessages/releases; manifest on dock.mau.dev |
+| mautrix-whatsapp | `dock.mau.dev/mautrix/whatsapp:v0.2610.0` | 2026-10-16 | github.com/mautrix/whatsapp/releases; manifest on dock.mau.dev |
+| mautrix-telegram | `dock.mau.dev/mautrix/telegram:v0.2610.0` | 2026-10-16 | github.com/mautrix/telegram/releases; manifest on dock.mau.dev |
+| mautrix-signal | `dock.mau.dev/mautrix/signal:v0.2610.0` | 2026-10-16 | github.com/mautrix/signal/releases; manifest on dock.mau.dev |
+| mautrix-gmessages | `dock.mau.dev/mautrix/gmessages:v0.2610.0` | 2026-10-16 | github.com/mautrix/gmessages/releases; manifest on dock.mau.dev |
 | mautrix-gvoice | `dock.mau.dev/mautrix/gvoice:v0.2605.0` | 2026-05-16 | github.com/mautrix/gvoice/releases; manifest on dock.mau.dev |
-| mautrix-meta | `dock.mau.dev/mautrix/meta:v0.2609.0` | 2026-09-16 | github.com/mautrix/meta/releases; manifest on dock.mau.dev |
+| mautrix-meta | `dock.mau.dev/mautrix/meta:v0.2610.0` | 2026-10-16 | github.com/mautrix/meta/releases; manifest on dock.mau.dev |
 | mautrix-discord | `dock.mau.dev/mautrix/discord:v0.7.7` | 2026-08-16 | github.com/mautrix/discord/releases; manifest on dock.mau.dev |
-| mautrix-slack | `dock.mau.dev/mautrix/slack:v0.2609.1` | 2026-09-25 | github.com/mautrix/slack/releases; manifest on dock.mau.dev |
+| mautrix-slack | `dock.mau.dev/mautrix/slack:v0.2610.0` | 2026-10-16 | github.com/mautrix/slack/releases; manifest on dock.mau.dev |
 | mautrix-twitter | `dock.mau.dev/mautrix/twitter:v0.2609.0` | 2026-09-16 | github.com/mautrix/twitter/releases; manifest on dock.mau.dev |
 | mautrix-linkedin | `dock.mau.dev/mautrix/linkedin:v0.2609.0` | 2026-09-16 | github.com/mautrix/linkedin/releases; manifest on dock.mau.dev |
 | mautrix-bluesky | `dock.mau.dev/mautrix/bluesky:v0.2510.0` | 2025-10-16 | github.com/mautrix/bluesky/releases; manifest on dock.mau.dev |
@@ -460,10 +460,10 @@ the registry served on 2026-10-09 (checked with the registry's v2 API and an ano
 | matrix-appservice-irc | `matrixdotorg/matrix-appservice-irc:release-4.0.0` | 2025-10-24 | github.com/matrix-org/matrix-appservice-irc/releases (4.0.0); Docker Hub tag `release-4.0.0`. Was `ghcr.io/...:release-3.0.0`, whose package refuses an anonymous pull token |
 | matrix-hookshot | `ghcr.io/matrix-org/matrix-hookshot:7.5.0` | 2026-09-22 | github.com/matrix-org/matrix-hookshot/releases; manifest on ghcr.io. Docker Hub's `halfshot/matrix-hookshot` has no release tag after 7.3.2 (2026-01-30) |
 
-mau.dev tags each release twice, `v0.2609.0` (the Go module version, the GitHub release's name)
+mau.dev tags each release twice, `v0.2610.0` (the Go module version, the GitHub release's name)
 and `v26.09`; the catalogue uses the release's name. The dock.mau.dev check:
 `TOKEN=$(curl -s 'https://mau.dev/jwt/auth?service=container_registry&scope=repository:mautrix/whatsapp:pull' | jq -r .token)`,
-then `curl -sI -H "Authorization: Bearer $TOKEN" -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' https://dock.mau.dev/v2/mautrix/whatsapp/manifests/v0.2609.0`
+then `curl -sI -H "Authorization: Bearer $TOKEN" -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' https://dock.mau.dev/v2/mautrix/whatsapp/manifests/v0.2610.0`
 answers 200. Docker Hub: `https://hub.docker.com/v2/repositories/hif1/heisenbridge/tags/1.15.4`.
 ghcr.io: a token from `https://ghcr.io/token?scope=repository:matrix-org/matrix-hookshot:pull`.
 
@@ -480,6 +480,14 @@ the encrypted chat, in the clear, in a chat the bot started and repaired in plac
 the roll that keeps its own pickle key; Signal `v0.2609.0` (`built_at=2026-09-16T11:22:20Z
 name=mautrix-signal version=v26.09`) answering `login` with its linking code. 102 s for the
 five.
+
+Verified 2026-10-19 the same way after the bump to `v0.2610.0` (six pins; `docs/status/11`, the
+2026-10-19 evening entry): all five pass in 89 s, WhatsApp (`built_at=2026-10-16T15:18:49Z
+go_version=go1.27.2 version=v26.10`) and Signal each answering with the notice and then the
+`m.image`. The test's own listener had named no `media` resource since listeners started
+filtering on 2026-10-16, so for ten days the bridge's upload of the QR image was answered 404
+and the test accepted its "Failed to send QR code" notice as the code; the listener names
+`media` now and such a notice fails the test.
 
 ## 2026-10-09: "The supplied account key is invalid": a roll lost the bridge's own pickle key
 

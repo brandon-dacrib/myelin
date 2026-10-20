@@ -1,6 +1,7 @@
 # Status: track 11, appservices and bridges
 
-Last updated: 2026-10-19 (a bridge is no longer sent its own double puppet's receipt back
+Last updated: 2026-10-19, evening (six mautrix pins bumped to v0.2610.0, verified with the real
+bridges; the real-bridge test's listener had served no media since 2026-10-16; below); before that 2026-10-19 (a bridge is no longer sent its own double puppet's receipt back
 when it moved nothing: the Slack read/unread flip; below); before that 2026-10-18 (the ephemeral pump leaves a room it cannot read out of the pass for
 a minute instead of failing every tick; below); before that 2026-10-15 (Discord's delivery timeouts: a retry is the same transaction, a
 transient failure is retried for a day, transactions carry at most 100 items and shrink when a
@@ -57,6 +58,44 @@ manager) and an instance's Kubernetes objects say whose bridge they are; before 
 (who has signed in to a bridge; the `cluster` runtime run on kind); before that 2026-09-30
 (ephemeral, to-device and device-list delivery); before that 2026-09-27 (RFC 0017 run against
 the real binary), 2026-09-27 (the bridge manager) and 2026-09-25.
+
+## 2026-10-19, evening (branch `agent/bridge-pins-2610`): six mautrix pins to v0.2610.0, and the real-bridge test's listener had served no media since the 16th
+
+**Asked**: the weekly `bridge images` workflow found six pins behind upstream's 2026-10-16
+monthly release (whatsapp, telegram, signal, gmessages and meta from `v0.2609.0`, slack from
+`v0.2609.1`, all to `v0.2610.0`), then failed to open its issue (`could not add label:
+'bridges' not found`). Bump them the way decision 0037 says, and make the workflow able to say so.
+
+**Done**: the catalogue (`crates/hs-admin/src/bridge_types.rs`), the real-bridge story's
+constants, the hs-cli, hs-bridges and hs-operator tests that name the pin, the admin mock, the
+web mock and the two `web/e2e-real` specs, and the tables here and in `docs/bridges/mautrix.md`
+all say `v0.2610.0` for the six; twitter and linkedin stay on `v0.2609.0`, which is still their
+latest. Every image was pulled from `dock.mau.dev` (built 2026-10-16). The `bridges` label exists
+on the repository now, and the workflow creates it (`gh label create --force`) before it opens
+the issue, so a repository without it gets the issue and not an exit code.
+
+**Found on the way**: `crates/hs-bridge-conformance/tests/real_mautrix_login.rs` configured its
+listener with `resources: [client, admin, health, metrics]`, no `media`. Since listeners serve
+only the families they name (2026-10-16, `agent/listener-resources`), the bridge's
+`POST /_matrix/media/v3/upload` of the QR image was answered `404 M_UNRECOGNIZED`, and the bot
+answered `login qr` with "Failed to send QR code: failed to upload image: M_UNRECOGNIZED
+(HTTP 404)" instead of the image. The test passed anyway, for ten days: its check took any reply
+whose body named "QR" or "scan", and the apology did. The listener names `media` now and a body
+containing "failed" is not a QR code. The chart's listener, the Compose example and the
+deployment guide all named `media` already; this was the test's listener only.
+
+**Verified** (this machine, the debug `hs` of this branch, Docker through OrbStack): the five
+stories pass in 89 s on `whatsapp:v0.2610.0` (`built_at=2026-10-16T15:18:49Z go_version=go1.27.2
+version=v26.10`) and `signal:v0.2610.0`, each `login qr` / `login` answered with the notice and
+then the `m.image` (its body the `wa.me/settings/linked_devices#...` or `sgnl://linkdevice?...`
+link), plain, encrypted, in the repaired chat, and through the pickle-key roll. Unit tests:
+hs-admin 332, hs-bridges, hs-operator, hs-cli's `bridge_offerings` 6, web 730.
+
+**Consequence on the demo** (decision 0037): instances deployed from the catalogue pin roll to
+`v0.2610.0` at the next roll of the server that carries this change; the demo's Slack, WhatsApp
+and Signal instances among them. mautrix-telegram's notes say upgrading straight from the Python
+bridge to v26.10 is not supported (v26.04-v26.09 first); the catalogue has been on the Go
+bridge since 2026-09-16, so no instance of this catalogue is on the Python one.
 
 ## 2026-10-19 (branch `agent/receipt-no-regress`): the Slack read/unread flip was a receipt loop through the pump
 
@@ -1052,8 +1091,9 @@ if any entry says `latest` (decision 0037, `docs/decisions/0037-bridge-offerings
 
 | Offering | Image | Release |
 | --- | --- | --- |
-| mautrix-whatsapp, -telegram, -signal, -gmessages, -meta, -twitter, -linkedin | `dock.mau.dev/mautrix/<network>:v0.2609.0` | 2026-09-16 |
-| mautrix-slack | `dock.mau.dev/mautrix/slack:v0.2609.1` | 2026-09-25 |
+| mautrix-whatsapp, -telegram, -signal, -gmessages, -meta | `dock.mau.dev/mautrix/<network>:v0.2610.0` | 2026-10-19 |
+| mautrix-twitter, -linkedin | `dock.mau.dev/mautrix/<network>:v0.2609.0` | 2026-09-16 |
+| mautrix-slack | `dock.mau.dev/mautrix/slack:v0.2610.0` | 2026-10-19 |
 | mautrix-gvoice | `dock.mau.dev/mautrix/gvoice:v0.2605.0` | 2026-05-16 |
 | mautrix-discord | `dock.mau.dev/mautrix/discord:v0.7.7` | 2026-08-16 |
 | mautrix-bluesky | `dock.mau.dev/mautrix/bluesky:v0.2510.0` | 2025-10-16 |

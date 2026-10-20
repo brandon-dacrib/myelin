@@ -493,8 +493,8 @@ async fn an_offering_takes_an_instance_from_requested_to_ready_and_removes_it_ag
     assert_eq!(offering["runtime"], "elsewhere");
     assert_eq!(offering["front_door"], "@whatsappbot:example.org");
     // The catalogue's pin (decision 0037), never `latest`.
-    assert_eq!(offering["image"], "dock.mau.dev/mautrix/whatsapp:v0.2609.0");
-    assert_eq!(offering["image_tag"], "v0.2609.0");
+    assert_eq!(offering["image"], "dock.mau.dev/mautrix/whatsapp:v0.2610.0");
+    assert_eq!(offering["image_tag"], "v0.2610.0");
     assert_eq!(offering["instances"], json!({}));
     let offerings = admin.admin(GET, "/bridge-offerings", None).await;
     assert_eq!(
@@ -645,7 +645,7 @@ async fn an_offering_takes_an_instance_from_requested_to_ready_and_removes_it_ag
         files["compose_yaml"]
             .as_str()
             .unwrap()
-            .contains("dock.mau.dev/mautrix/whatsapp:v0.2609.0")
+            .contains("dock.mau.dev/mautrix/whatsapp:v0.2610.0")
     );
     assert!(
         files["manifest_yaml"]

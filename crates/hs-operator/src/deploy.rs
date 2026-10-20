@@ -638,7 +638,7 @@ mod tests {
             owner: Some("@alice:example.org".to_owned()),
             image: ImageSpec {
                 repository: "dock.mau.dev/mautrix/whatsapp".to_owned(),
-                tag: Some("v0.2609.0".to_owned()),
+                tag: Some("v0.2610.0".to_owned()),
                 digest: None,
                 pull_policy: None,
             },
@@ -815,7 +815,7 @@ mod tests {
         assert_eq!(pending.phase, Phase::Pending);
         assert!(!pending.ready);
         assert!(pending.message.is_none());
-        assert_eq!(pending.image, "dock.mau.dev/mautrix/whatsapp:v0.2609.0");
+        assert_eq!(pending.image, "dock.mau.dev/mautrix/whatsapp:v0.2610.0");
         assert_eq!(
             pending.service_url,
             "http://bridge-1a2b3c4d.myelin.svc:29318"

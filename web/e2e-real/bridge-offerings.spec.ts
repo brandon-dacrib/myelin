@@ -81,7 +81,7 @@ test.describe("bridge offerings against the real server", () => {
       page.getByText(/Anyone here can message @whatsappbot:[^ ]+ to get their own WhatsApp bridge/),
     ).toBeVisible();
     // The catalogue's pin (decision 0037), bumped here with it.
-    await expect(page.getByText("dock.mau.dev/mautrix/whatsapp:v0.2609.0")).toBeVisible();
+    await expect(page.getByText("dock.mau.dev/mautrix/whatsapp:v0.2610.0")).toBeVisible();
     await shot(page, "offering");
 
     // Someone from another server is refused by the server, in the field.

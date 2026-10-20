@@ -928,7 +928,9 @@ readiness leaves the endpoints within 3 s. Resources unchanged (requests 100m/25
   failed on the Synapse image's chown of the work directory and then on an ECR data limit,
   `docs/status/06-federation.md`, the 2026-10-19 entry). A
   workflow of its own, not a `ci` job: Docker, a debug build and a moving upstream.
-- `.github/workflows/bridge-images.yml` (weekly, by hand): `deploy/bridges/check-image-tags.py`
+- `.github/workflows/bridge-images.yml` (weekly, by hand; since 2026-10-19 it creates the
+  `bridges` label before it opens the issue, after the first run with pins behind failed on
+  `could not add label: 'bridges' not found`): `deploy/bridges/check-image-tags.py`
   reads the catalogue's pins out of `crates/hs-admin/src/bridge_types.rs` (read-only) and
   compares each with its upstream's latest GitHub release (highest version tag for
   heisenbridge, which publishes none; `hif1/` on Docker Hub is `hifi/` on GitHub), and opens or

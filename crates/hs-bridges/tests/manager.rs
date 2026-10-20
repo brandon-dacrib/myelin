@@ -98,8 +98,8 @@ async fn without_a_runtime_an_offering_runs_elsewhere_and_its_front_door_is_regi
         .unwrap();
     assert_eq!(offering.runtime, "elsewhere");
     assert_eq!(offering.mode, "per_user");
-    assert_eq!(offering.image, "dock.mau.dev/mautrix/whatsapp:v0.2609.0");
-    assert_eq!(offering.image_tag, "v0.2609.0");
+    assert_eq!(offering.image, "dock.mau.dev/mautrix/whatsapp:v0.2610.0");
+    assert_eq!(offering.image_tag, "v0.2610.0");
     assert_eq!(
         offering.front_door.as_deref(),
         Some("@whatsappbot:example.org")
@@ -118,7 +118,7 @@ async fn without_a_runtime_an_offering_runs_elsewhere_and_its_front_door_is_regi
         )
         .await
         .unwrap();
-    assert_eq!(latest.image_tag, "v0.2609.0");
+    assert_eq!(latest.image_tag, "v0.2610.0");
     let older = manager
         .put(
             "mautrix-whatsapp",
@@ -306,7 +306,7 @@ async fn an_instance_is_registered_then_waits_for_its_bridge_then_is_ready() {
     assert!(
         files
             .compose_yaml
-            .contains("dock.mau.dev/mautrix/whatsapp:v0.2609.0")
+            .contains("dock.mau.dev/mautrix/whatsapp:v0.2610.0")
     );
     assert!(files.manifest_yaml.contains("kind: Bridge"));
     let counts = manager

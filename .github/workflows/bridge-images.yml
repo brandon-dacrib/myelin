@@ -46,6 +46,9 @@ jobs:
             echo
             echo "To bump one: edit \`crates/hs-admin/src/bridge_types.rs\`, run \`tests/real_mautrix_login.rs\` for a mautrix bridge (or the bridge's own smoke), roll the demo, then close this issue. See decision 0037 and \`docs/bridges/mautrix.md\`."
           } > body.md
+          # The label is created if the repository has lost it: on 2026-10-19 the first run with
+          # pins behind failed on `could not add label: 'bridges' not found` and opened nothing.
+          gh label create bridges --description "The bridge catalogue, its pins and the real-bridge runs" --color 0E8A16 --force
           number="$(gh issue list --state open --search "\"$title\" in:title" --json number --jq '.[0].number // empty')"
           if [ -n "$number" ]; then
             gh issue edit "$number" --body-file body.md

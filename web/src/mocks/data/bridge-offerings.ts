@@ -238,7 +238,7 @@ function seed() {
     type: "mautrix-slack",
     enabled: true,
     runtime: "cluster",
-    imageTag: "v0.2609.1",
+    imageTag: "v0.2610.0",
     access: { all_local_users: true, users: [] },
     options: { encryption: true, double_puppeting: true, backfill: true },
     created_at: iso(30 * DAY),

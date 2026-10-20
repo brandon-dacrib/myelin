@@ -1703,7 +1703,7 @@ async fn render_bridge_type(
     Json(json!({
         "registration": {"id": type_id, "as_token": "generated-as-token", "hs_token": "generated-hs-token"},
         "registration_yaml": format!("id: {type_id}\nas_token: generated-as-token\nhs_token: generated-hs-token\n"),
-        "compose_yaml": format!("services:\n  {type_id}-bridge:\n    image: dock.mau.dev/mautrix/{type_id}:v0.2609.0\n"),
+        "compose_yaml": format!("services:\n  {type_id}-bridge:\n    image: dock.mau.dev/mautrix/{type_id}:v0.2610.0\n"),
         "bridge_resource_yaml": format!("apiVersion: hs.example/v1\nkind: Bridge\nmetadata:\n  name: {type_id}\n")
     }))
     .into_response()

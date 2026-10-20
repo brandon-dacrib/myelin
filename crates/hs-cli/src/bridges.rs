@@ -214,7 +214,7 @@ mod tests {
                  No space left on device"
                     .into(),
             ),
-            image: "dock.mau.dev/mautrix/slack:v0.2609.1".into(),
+            image: "dock.mau.dev/mautrix/slack:v0.2610.0".into(),
             service_url: "http://bridge-slack-brandon.myelin.svc:29335".into(),
             storage_size: "1Gi".into(),
             volume: Some(hs_operator::crds::VolumeStatus {

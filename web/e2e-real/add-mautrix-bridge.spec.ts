@@ -23,7 +23,7 @@ const bridgeDir = process.env.HS_REAL_BRIDGE_DIR;
 const optedIn = process.env.HS_REAL_BRIDGE_RUN === "1";
 const CONTAINER = "myelin-e2e-mautrix-whatsapp";
 // The catalogue's pin (crates/hs-admin/src/bridge_types.rs; decision 0037), bumped with it.
-const IMAGE = "dock.mau.dev/mautrix/whatsapp:v0.2609.0";
+const IMAGE = "dock.mau.dev/mautrix/whatsapp:v0.2610.0";
 
 test.describe("a real mautrix bridge, added through the wizard", () => {
   test.skip(

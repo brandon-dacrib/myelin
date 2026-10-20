@@ -47,7 +47,7 @@ use serde_json::{Value, json};
 
 /// The catalogue's pin for WhatsApp (`crates/hs-admin/src/bridge_types.rs`); the two are
 /// bumped together, and the story fails when they differ.
-const IMAGE: &str = "dock.mau.dev/mautrix/whatsapp:v0.2609.0";
+const IMAGE: &str = "dock.mau.dev/mautrix/whatsapp:v0.2610.0";
 
 /// Which mautrix bridge a story runs: its catalogue type, its image, the port it listens on
 /// (its `DefaultPort`, which the catalogue renders), and what a person types to sign in.
@@ -72,7 +72,7 @@ const WHATSAPP: Network = Network {
 /// mau.dev's registry as well, at the catalogue's pin.
 const SIGNAL: Network = Network {
     type_id: "mautrix-signal",
-    image: "dock.mau.dev/mautrix/signal:v0.2609.0",
+    image: "dock.mau.dev/mautrix/signal:v0.2610.0",
     port: 29328,
     login: "login",
 };
@@ -150,7 +150,7 @@ impl Server {
         let media = dir.join("media");
         let config = format!(
             "server: {{ server_name: {SERVER_NAME}, public_baseurl: \"http://host.docker.internal:{port}\" }}\n\
-             listeners: {{ listeners: [ {{ port: {port}, bind_addresses: [\"0.0.0.0\"], resources: [client, admin, health, metrics] }} ] }}\n\
+             listeners: {{ listeners: [ {{ port: {port}, bind_addresses: [\"0.0.0.0\"], resources: [client, media, admin, health, metrics] }} ] }}\n\
              storage: {{ backend: embedded, data_dir: {data:?} }}\n\
              media: {{ storage: {{ backend: local, path: {media:?} }} }}\n\
              auth: {{ enable_registration: true }}\n\
@@ -803,12 +803,18 @@ async fn login_qr_in(scene: &mut Scene, room_id: &RoomId) -> Result<()> {
             tail(&scene.server.log(), 60)
         );
     }
+    // An `m.image`, or the code as text; not the bridge's notice that it could not upload the
+    // image ("Failed to send QR code: failed to upload image: ..."), which names the QR code
+    // too. On 2026-10-19 that notice passed here for ten days: the listener this test
+    // configures named no `media` resource once listeners filtered on theirs (2026-10-16), the
+    // upload was answered 404, and the bridge's apology for it read as the code.
     let qr = replies.iter().any(|r| {
         r.how != "utd"
             && (r.event["content"]["msgtype"] == "m.image"
-                || r.event["content"]["body"]
-                    .as_str()
-                    .is_some_and(|b| b.to_ascii_lowercase().contains("qr") || b.contains("scan")))
+                || r.event["content"]["body"].as_str().is_some_and(|b| {
+                    let lower = b.to_ascii_lowercase();
+                    (lower.contains("qr") || lower.contains("scan")) && !lower.contains("failed")
+                }))
     });
     if !qr {
         let refused = replies.iter().any(|r| {
