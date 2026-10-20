@@ -1321,6 +1321,33 @@ impl std::fmt::Debug for AdminAppserviceCreate {
     }
 }
 
+/// The OpenAPI `AppServiceDryRun` schema: what `POST /appservices?dry_run=true` answers. The
+/// registration parsed as a create would parse it, viewed as the appservice a create would
+/// answer, and every reason a create would be refused with `409`; nothing was written.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AdminAppserviceDryRun {
+    /// The appservice a create would answer (tokens left out, as always). Its `health` is
+    /// `unknown` and its `created_at` is when the dry run ran.
+    pub appservice: AdminAppservice,
+    /// Why a create would be refused, each reason once; empty when a create would succeed now.
+    pub conflicts: Vec<AdminAppserviceConflict>,
+}
+
+/// The OpenAPI `AppServiceConflict` schema: one reason a create would be refused.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AdminAppserviceConflict {
+    /// What collides: `id`, `as_token`, `hs_token`, `sender`, `users`, `aliases` or `rooms`.
+    pub kind: String,
+    /// The colliding value (the id, the sender user id, a user id or a pattern); `<redacted>`
+    /// for a token.
+    pub value: String,
+    /// The appservice that already holds it; `<external user>` when the sender exists as an
+    /// ordinary account.
+    pub existing_id: String,
+    /// The conflict in words, as the `409` a create would answer says it.
+    pub message: String,
+}
+
 /// The OpenAPI `AppServiceDiscardRequest` schema: which dead-lettered transactions to delete
 /// for good. Both absent means all of them. Entries still waiting to be sent are never
 /// discarded.

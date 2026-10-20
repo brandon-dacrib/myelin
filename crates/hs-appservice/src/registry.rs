@@ -228,6 +228,48 @@ fn rooms_in(body: &serde_json::Value) -> Vec<String> {
     rooms
 }
 
+/// One reason [`Registry::add`] would refuse a registration, as [`Registry::validate`] lists
+/// them for a dry run: `kind` names what collides and `existing_id` who holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistrationConflict {
+    /// `"id"` (an appservice with this id is registered), `"as_token"` or `"hs_token"` (another
+    /// appservice holds the token), `"sender"` (its sender user id), or `"users"`, `"aliases"`
+    /// or `"rooms"` (an exclusive namespace), as [`AppserviceError::NamespaceConflict`]'s `kind`
+    /// spells them.
+    pub kind: &'static str,
+    /// What collides: the id, the sender user id, the matched user id or the pattern. A token
+    /// is never repeated here; `value` is `"<redacted>"` for the token kinds.
+    pub value: String,
+    /// The appservice that already has it; `"<external user>"` when the sender exists as an
+    /// ordinary account.
+    pub existing_id: String,
+}
+
+impl RegistrationConflict {
+    /// The conflict in words, as the refusal's error message would say it.
+    #[must_use]
+    pub fn message(&self) -> String {
+        match self.kind {
+            "id" => format!(
+                "an appservice with id {:?} is already registered",
+                self.value
+            ),
+            "as_token" | "hs_token" => format!(
+                "{} is already used by appservice {:?}",
+                self.kind, self.existing_id
+            ),
+            "sender" => format!(
+                "sender {} is already exclusively claimed by {:?}",
+                self.value, self.existing_id
+            ),
+            kind => format!(
+                "{kind} namespace {:?} is already exclusively claimed by {:?}",
+                self.value, self.existing_id
+            ),
+        }
+    }
+}
+
 /// The appservice registry: registration storage, namespace conflict detection, health, and the
 /// transaction-queue views the admin API's backlog endpoint needs.
 pub struct Registry<B: KvBackend> {
@@ -325,6 +367,37 @@ impl<B: KvBackend> Registry<B> {
         let row = AppserviceRow::from_registration(reg, self.now_ms());
         self.store.insert(&row)?;
         Ok(row)
+    }
+
+    /// What [`Registry::add`] would do with `reg`, without doing it: the row it would store
+    /// (never written; its `created_at` is now) and every conflict `add` would refuse it for,
+    /// in the order `add` checks them (the sender and namespaces, then the tokens, then the
+    /// id), so the first listed is the error `add` would answer. An empty list means `add`
+    /// would succeed right now. The admin API's `dry_run` reads this.
+    ///
+    /// # Errors
+    /// Returns [`AppserviceError::Store`] on backend failure; a conflict is never an error here.
+    pub fn validate(
+        &self,
+        reg: &Registration,
+    ) -> Result<(AppserviceRow, Vec<RegistrationConflict>), AppserviceError> {
+        let row = AppserviceRow::from_registration(reg, self.now_ms());
+        let mut conflicts = self.namespace_conflicts(reg, None)?;
+        for (kind, existing_id) in self.store.token_conflicts(&row, None)? {
+            conflicts.push(RegistrationConflict {
+                kind,
+                value: "<redacted>".to_owned(),
+                existing_id,
+            });
+        }
+        if self.store.get(&reg.id)?.is_some() {
+            conflicts.push(RegistrationConflict {
+                kind: "id",
+                value: reg.id.clone(),
+                existing_id: reg.id.clone(),
+            });
+        }
+        Ok((row, conflicts))
     }
 
     /// Imports a registration file's contents (`app_service_config_files` at startup, or a
@@ -727,13 +800,32 @@ impl<B: KvBackend> Registry<B> {
         reg: &Registration,
         self_id: Option<&str>,
     ) -> Result<(), AppserviceError> {
+        match self.namespace_conflicts(reg, self_id)?.into_iter().next() {
+            Some(conflict) => Err(AppserviceError::NamespaceConflict {
+                new_id: reg.id.clone(),
+                kind: conflict.kind,
+                value: conflict.value,
+                existing_id: conflict.existing_id,
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// Every conflict [`Self::check_namespace_conflicts`] looks for, in the order it looks:
+    /// the first is what `check_namespace_conflicts` refuses with, the whole list is what a dry
+    /// run reports.
+    fn namespace_conflicts(
+        &self,
+        reg: &Registration,
+        self_id: Option<&str>,
+    ) -> Result<Vec<RegistrationConflict>, AppserviceError> {
         let sender = self.sender_user_id(&reg.sender_localpart);
+        let mut conflicts = Vec::new();
 
         if self.identity_checker.user_exists(&sender) {
-            return Err(AppserviceError::NamespaceConflict {
-                new_id: reg.id.clone(),
+            conflicts.push(RegistrationConflict {
                 kind: "sender",
-                value: sender,
+                value: sender.clone(),
                 existing_id: "<external user>".to_string(),
             });
         }
@@ -744,11 +836,10 @@ impl<B: KvBackend> Registry<B> {
             }
 
             if other.sender_localpart == reg.sender_localpart {
-                return Err(AppserviceError::NamespaceConflict {
-                    new_id: reg.id.clone(),
+                conflicts.push(RegistrationConflict {
                     kind: "sender",
-                    value: sender,
-                    existing_id: other.id,
+                    value: sender.clone(),
+                    existing_id: other.id.clone(),
                 });
             }
 
@@ -759,8 +850,7 @@ impl<B: KvBackend> Registry<B> {
                 .namespaces
                 .exclusive_match(NamespaceKind::Users, &other_sender)
             {
-                return Err(AppserviceError::NamespaceConflict {
-                    new_id: reg.id.clone(),
+                conflicts.push(RegistrationConflict {
                     kind: "users",
                     value: other_sender,
                     existing_id: other.id.clone(),
@@ -770,10 +860,9 @@ impl<B: KvBackend> Registry<B> {
                 .namespaces
                 .exclusive_match(NamespaceKind::Users, &sender)
             {
-                return Err(AppserviceError::NamespaceConflict {
-                    new_id: reg.id.clone(),
+                conflicts.push(RegistrationConflict {
                     kind: "users",
-                    value: sender,
+                    value: sender.clone(),
                     existing_id: other.id.clone(),
                 });
             }
@@ -791,8 +880,7 @@ impl<B: KvBackend> Registry<B> {
                         if other_rule.exclusive
                             && other_rule.pattern.source() == rule.pattern.source()
                         {
-                            return Err(AppserviceError::NamespaceConflict {
-                                new_id: reg.id.clone(),
+                            conflicts.push(RegistrationConflict {
                                 kind: kind.key(),
                                 value: rule.pattern.source().to_string(),
                                 existing_id: other.id.clone(),
@@ -803,7 +891,7 @@ impl<B: KvBackend> Registry<B> {
             }
         }
 
-        Ok(())
+        Ok(conflicts)
     }
 }
 
@@ -956,6 +1044,83 @@ mod tests {
             msc4190: false,
             extra: Default::default(),
         }
+    }
+
+    /// `validate` is `add` without the write: it lists every conflict `add` would refuse for
+    /// (the sender and namespaces, the tokens, the id), the first of them being `add`'s
+    /// error, and registers nothing.
+    #[test]
+    fn validate_lists_every_conflict_add_would_refuse_for_and_writes_nothing() {
+        let registry = registry();
+        let irc = reg("irc", "ircbot", r"@irc_.*:example\.org", true);
+
+        let (row, conflicts) = registry.validate(&irc).unwrap();
+        assert_eq!(row.id, "irc");
+        assert_eq!(row.created_at_ms, 1000);
+        assert!(conflicts.is_empty(), "{conflicts:?}");
+        assert!(
+            registry.get("irc").unwrap().is_none(),
+            "validate registered it"
+        );
+
+        registry.add(&irc).unwrap();
+
+        // The same registration again: the sender, the namespace, both tokens, and the id,
+        // in the order `add` checks them.
+        let (_, conflicts) = registry.validate(&irc).unwrap();
+        let kinds: Vec<&str> = conflicts.iter().map(|c| c.kind).collect();
+        assert_eq!(
+            kinds,
+            ["sender", "users", "as_token", "hs_token", "id"],
+            "{conflicts:?}"
+        );
+        assert!(
+            conflicts
+                .iter()
+                .filter(|c| c.kind.ends_with("_token"))
+                .all(|c| c.value == "<redacted>" && c.existing_id == "irc"),
+            "a token is never repeated: {conflicts:?}"
+        );
+        assert_eq!(
+            conflicts[0].message(),
+            "sender @ircbot:example.org is already exclusively claimed by \"irc\""
+        );
+        // The pattern is Debug-quoted, as `AppserviceError::NamespaceConflict`'s message
+        // quotes it, so its backslash is doubled.
+        assert_eq!(
+            conflicts[1].message(),
+            "users namespace \"@irc_.*:example\\\\.org\" is already exclusively claimed by \"irc\""
+        );
+        assert_eq!(
+            conflicts[4].message(),
+            "an appservice with id \"irc\" is already registered"
+        );
+        let refused = registry.add(&irc).unwrap_err();
+        assert!(
+            matches!(
+                &refused,
+                AppserviceError::NamespaceConflict { kind: "sender", existing_id, .. } if existing_id == "irc"
+            ),
+            "add refuses for the first conflict validate lists: {refused}"
+        );
+
+        // A different id and tokens whose sender is irc's: the sender conflict alone is what
+        // `add` refuses with, and the dry run says the same.
+        let twin = reg("irc-2", "ircbot", r"@irc2_.*:example\.org", true);
+        let (_, conflicts) = registry.validate(&twin).unwrap();
+        assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+        assert_eq!(conflicts[0].kind, "sender");
+        assert_eq!(conflicts[0].value, "@ircbot:example.org");
+        assert_eq!(conflicts[0].existing_id, "irc");
+        let refused = registry.add(&twin).unwrap_err();
+        assert!(
+            matches!(
+                &refused,
+                AppserviceError::NamespaceConflict { kind: "sender", existing_id, .. } if existing_id == "irc"
+            ),
+            "{refused}"
+        );
+        assert!(registry.get("irc-2").unwrap().is_none());
     }
 
     /// The registry answers who holds an ID exclusively (what `/register` and `PUT

@@ -3665,10 +3665,23 @@ async fn appservices_registration(
     }
 }
 
+/// `POST /api/v1/appservices`' query string.
+#[derive(Debug, Default, Deserialize)]
+struct AppservicesCreateQuery {
+    dry_run: Option<bool>,
+}
+
 /// `POST /api/v1/appservices` (`bridges:write`): registers a bridge. `201` with the appservice.
+///
+/// `?dry_run=true` parses the body exactly as a create would (the same `400`s) and answers
+/// `200` with the appservice a create would answer and the conflicts it would be refused for,
+/// in the body rather than as a `409`: the point of a dry run is to see them. Nothing is
+/// written: no registration, no audit entry, no idempotency entry (an `Idempotency-Key` sent
+/// with a dry run is free for the real create that follows).
 async fn appservices_create(
     State(state): State<AdminState>,
     headers: HeaderMap,
+    Query(query): Query<AppservicesCreateQuery>,
     body: axum::body::Bytes,
 ) -> Response {
     let instance = "/api/v1/appservices";
@@ -3683,6 +3696,24 @@ async fn appservices_create(
             let Some(appservices) = &state.appservices else {
                 return source_unavailable("appservice registry", instance);
             };
+            if query.dry_run.unwrap_or(false) {
+                let request: AdminAppserviceCreate = match parse_optional_json(&body) {
+                    Ok(v) => v,
+                    Err(p) => return p.with_instance(instance).into_response(),
+                };
+                return match appservices.validate(request).await {
+                    Ok(report) => {
+                        tracing::info!(
+                            appservice = %report.appservice.id,
+                            conflicts = report.conflicts.len(),
+                            actor = %principal.to_actor().id,
+                            "appservice registration dry run; nothing was created"
+                        );
+                        axum::Json(report).into_response()
+                    }
+                    Err(e) => e.to_problem().with_instance(instance).into_response(),
+                };
+            }
             if let Some(key) = idempotency_key(&headers) {
                 match state.idempotency.check("appservices.create", key, &body) {
                     Replay::Same(stored) => return replay_response(stored),
@@ -10675,6 +10706,154 @@ mod tests {
             problem["errors"][0]["pointer"], "/registration",
             "{problem}"
         );
+    }
+
+    /// `?dry_run=true` creates nothing (found on the demo on 2026-10-20, when a dry run
+    /// registered Hookshot and the real create then conflicted with itself): it answers the
+    /// parsed appservice and the conflicts a create would be refused for, writes no
+    /// registration, no audit entry and no idempotency entry, and refuses a body a create
+    /// would refuse.
+    #[tokio::test]
+    async fn a_dry_run_creates_nothing_and_reports_the_conflicts_a_create_would_refuse() {
+        let state = test_state()
+            .with_appservices(Arc::new(crate::sources::InMemoryAppserviceDirectory::new()));
+        let (router, _manifest) = build_router(state);
+        let post = |uri: &'static str, key: Option<&'static str>, body: serde_json::Value| {
+            let router = router.clone();
+            async move {
+                let mut request = Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("authorization", "Bearer admin-token")
+                    .header("content-type", "application/json");
+                if let Some(key) = key {
+                    request = request.header("idempotency-key", key);
+                }
+                let response = router
+                    .oneshot(
+                        request
+                            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let replayed = response.headers().contains_key("idempotency-replayed");
+                let body: serde_json::Value =
+                    serde_json::from_slice(&body_bytes(response).await).unwrap_or_default();
+                (status, body, replayed)
+            }
+        };
+
+        // A clean dry run: 200, the appservice as a create would answer it, no conflicts.
+        let (status, report, _) = post(
+            "/api/v1/appservices?dry_run=true",
+            Some("hookshot-1"),
+            json!({"registration": irc_registration()}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{report}");
+        assert_eq!(report["appservice"]["id"], "irc", "{report}");
+        assert_eq!(report["appservice"]["sender_localpart"], "ircbot");
+        assert_eq!(report["appservice"]["health"], "unknown");
+        assert!(
+            report["appservice"].get("as_token").is_none(),
+            "tokens are not on the appservice: {report}"
+        );
+        assert_eq!(report["conflicts"], json!([]), "{report}");
+
+        // Nothing was created...
+        let (status, _, _) = call(&router, "GET", "/api/v1/appservices/irc", None, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "the dry run registered it");
+        let (_, page, _) = call(&router, "GET", "/api/v1/appservices", None, None).await;
+        let page: serde_json::Value = serde_json::from_slice(&page).unwrap();
+        assert_eq!(page["items"], json!([]), "{page}");
+        // ...nothing was audited...
+        assert!(
+            audit_entries_for_action(&router, "appservices.create")
+                .await
+                .is_empty(),
+            "a dry run is not a mutation"
+        );
+        // ...and the Idempotency-Key is free for the real create, which is not a replay.
+        let (status, created, replayed) = post(
+            "/api/v1/appservices",
+            Some("hookshot-1"),
+            json!({"registration": irc_registration()}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        assert!(!replayed, "the dry run stored an idempotency entry");
+        assert_eq!(created["id"], "irc");
+        assert_eq!(
+            audit_entries_for_action(&router, "appservices.create")
+                .await
+                .len(),
+            1
+        );
+
+        // The same registration again: a create would be 409; the dry run says why, in a 200.
+        let (status, report, _) = post(
+            "/api/v1/appservices?dry_run=true",
+            None,
+            json!({"registration": irc_registration()}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{report}");
+        let conflicts = report["conflicts"].as_array().unwrap();
+        assert!(
+            conflicts
+                .iter()
+                .any(|c| c["kind"] == "id" && c["existing_id"] == "irc"),
+            "{report}"
+        );
+        assert!(
+            conflicts
+                .iter()
+                .all(|c| c["message"].as_str().is_some_and(|m| !m.is_empty())),
+            "{report}"
+        );
+        let (status, _, _) = call(&router, "GET", "/api/v1/appservices/irc", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Another id with the same sender: the sender conflict, and still nothing created.
+        let mut other = irc_registration();
+        other["id"] = json!("irc-2");
+        let (status, report, _) = post(
+            "/api/v1/appservices?dry_run=true",
+            None,
+            json!({"registration": other}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{report}");
+        assert_eq!(report["appservice"]["id"], "irc-2");
+        assert!(
+            report["conflicts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["kind"] == "sender" && c["existing_id"] == "irc"),
+            "{report}"
+        );
+        let (status, _, _) = call(&router, "GET", "/api/v1/appservices/irc-2", None, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // A body a create would refuse is refused the same way, with the field named.
+        let (status, problem, _) = post("/api/v1/appservices?dry_run=true", None, json!({})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{problem}");
+        assert_eq!(
+            problem["errors"][0]["pointer"], "/registration",
+            "{problem}"
+        );
+
+        // dry_run=false is a create.
+        let (status, created, _) = post(
+            "/api/v1/appservices?dry_run=false",
+            None,
+            json!({"registration_yaml": "id: signal\nurl: http://signal.local:1\nas_token: a\nhs_token: h\nsender_localpart: signalbot\n"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
     }
 
     // ---------------------------------------------------------------------------------------

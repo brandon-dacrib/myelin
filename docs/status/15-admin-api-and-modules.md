@@ -2,6 +2,55 @@
 
 Track brief: `docs/workstreams/15-admin-api-and-modules.md`. Owner crates: `hs-admin`, `hs-modules`, `hs-identity`, `hs-http` (shared with 07 and 14).
 
+## 2026-10-20: `appservices.create?dry_run=true` creates nothing (OpenAPI 0.1.21, branch `agent/appservice-dry-run`)
+
+Bug, found on the demo on 2026-10-20 while registering Hookshot: `dry_run` was documented on
+`appservices.create` since the first draft but the handler never read the query string, so a dry
+run registered the appservice and the real `POST` that followed was refused with `409 namespace
+conflict ... already exclusively claimed by "hookshot"`, a conflict with itself.
+
+Now `?dry_run=true` parses the body exactly as a create does (the same `400`s, with the field
+named), asks the directory what a create would do without doing it, and answers `200` with the
+new `AppServiceDryRun`: `appservice` (the `AppService` a create would answer: tokens left out,
+`health` `unknown`, `created_at` now) and `conflicts` (each `AppServiceConflict`: `kind` of
+`id`, `as_token`, `hs_token`, `sender`, `users`, `aliases` or `rooms`; `value`, `<redacted>`
+for a token; `existing_id`; and `message`, the words the `409` would use). Conflicts are in the
+body, never a `409`: the point of a dry run is to see them, all of them, not the first. A dry
+run records no audit entry and stores no `Idempotency-Key` entry, so the key the interface sends
+with the dry run is free for the create that follows (before, a key reused after a dry run would
+have replayed the dry run's answer). It logs one `info` line (`appservice`, `conflicts`,
+`actor`).
+
+- `AppserviceDirectory::validate(request) -> AdminAppserviceDryRun` is a new required trait
+  method (`crates/hs-admin/src/sources.rs`), implemented by `InMemoryAppserviceDirectory` (the
+  id and a shared sender localpart; it knows no server name), by `hs-appservice`'s
+  `RegistryAppserviceDirectory` over the new `Registry::validate(&Registration) ->
+  (AppserviceRow, Vec<RegistrationConflict>)`, and forwarded by `hs-bridges`'
+  `OfferingAwareDirectory`. The registry's namespace check now collects every conflict
+  (`namespace_conflicts`) and `add`/`import` refuse with the first, as before; the store's
+  token check is the same shape (`token_conflicts`). `Registry::validate` lists the sender and
+  namespaces, then the tokens, then the id, the order `add` checks them, so the first conflict
+  is the `409` a create would answer.
+- OpenAPI 0.1.21 (additive): the `200` response on `appservices.create`, the `AppServiceDryRun`
+  and `AppServiceConflict` schemas, `dry_run`'s description says what a dry run does and does
+  not do. `web/src/api/schema.d.ts` regenerated (`npm run generate:client`); the `200` widened
+  the create mutation's inferred success type, so `useCreateAppservice` (`web/src/api/bridges.ts`)
+  narrows its answer to `AppService` with a comment (it never sends `dry_run`). `npm run check`
+  passes.
+- Tests: `a_dry_run_creates_nothing_and_reports_the_conflicts_a_create_would_refuse` (router,
+  in-memory directory: nothing created, nothing audited, the key free, the `id` and `sender`
+  conflicts, a `400` for an empty body, `dry_run=false` creates);
+  `validate_lists_every_conflict_add_would_refuse_for_and_writes_nothing` (`hs-appservice`
+  registry); `crates/hs-cli/tests/appservice_dry_run.rs` (the real binary, the demo's exact
+  sequence: dry run, create with the same key, dry run again lists `sender`, `users`,
+  `aliases`, `as_token`, `hs_token`, `id`, all naming `hookshot`; a second registration sharing
+  the namespace predicts the `409` it then gets; a token never appears in a dry run's answer).
+- Verify: `cargo test -p hs-admin`, `cargo test -p hs-appservice registry`,
+  `cargo test -p hs-cli --test appservice_dry_run`, `cargo clippy -p hs-admin -p hs-appservice
+  -p hs-bridges -p hs-cli --all-targets -- -D warnings`, `cd web && npm run check`.
+- The interface (track 16) can now show the conflicts before the create; today it sends the
+  create directly. Not done here.
+
 ## 2026-10-16: `Session.issued_by_appservice` (OpenAPI 0.1.20, branch `agent/puppet-rate-limit`, track 07)
 
 Additive: `users.sessions.list` items carry `issued_by_appservice`, the appservice an
@@ -1080,6 +1129,11 @@ None.
 
 ## Decisions made
 
+- **2026-10-20, a dry run reports conflicts in its `200`, not as a `409`**: `appservices.create?dry_run=true`
+  answers `AppServiceDryRun` with every conflict a create would be refused for; a create still
+  refuses with the first. The directory trait gained a required `validate`, so a directory that
+  cannot validate does not compile rather than answering `503` by default; every directory in
+  the tree validates.
 - **2026-10-02, admin tokens** (`docs/decisions/0025-admin-tokens-carry-their-scopes.md`):
   a minted token's scopes are an explicit list, defaulting to a full administrator's; the
   token is `hsa_`-prefixed and stored hashed; the verifier decides `hsa_` bearers alone and

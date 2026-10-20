@@ -128,6 +128,13 @@ info:
     notes: 'Additive: Session.issued_by_appservice, the appservice a session was issued to by
       an m.login.application_service login (a bridge double puppeting the user), whose
       requests on it are rate-limited as that appservice''s are (decision 0053).'
+  - version: 0.1.21
+    date: '2026-10-20'
+    notes: 'Additive: appservices.create with dry_run=true answers 200 with AppServiceDryRun
+      (the parsed AppService and the conflicts a create would be refused for, as
+      AppServiceConflict rows) and creates nothing; before this the parameter was documented but
+      ignored and a dry run registered the appservice. Conflicts in a dry run are in the body,
+      not a 409.'
 servers:
 - url: /api/v1
   description: Same origin as /_matrix on the client listener.
@@ -227,7 +234,7 @@ paths:
         schema:
           type: boolean
           default: false
-        description: Validate and return the parsed registration and namespace conflicts without creating anything.
+        description: Validate and return the parsed registration and the conflicts a create would be refused for, without creating anything. A dry run answers 200 with AppServiceDryRun (never 201 or 409), records no audit entry and stores no Idempotency-Key entry, so the key sent with it is free for the create that follows. A body a create would refuse with 400 is refused the same way.
       - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
         required: true
@@ -242,6 +249,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AppService'
+        '200':
+          description: 'A dry run (dry_run=true): the appservice a create would answer and the conflicts it would be refused for; nothing was created.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppServiceDryRun'
         '401':
           $ref: '#/components/responses/Unauthenticated'
         '403':
@@ -8500,6 +8513,50 @@ components:
           type: object
         registration_yaml:
           type: string
+    AppServiceDryRun:
+      type: object
+      description: 'What appservices.create answers for dry_run=true: the registration parsed as a create would parse it, viewed as the appservice a create would answer, and every reason a create would be refused with 409. Nothing was written.'
+      required:
+      - appservice
+      - conflicts
+      properties:
+        appservice:
+          $ref: '#/components/schemas/AppService'
+          description: The appservice a create would answer (tokens left out, as always). Its health is unknown and its created_at is when the dry run ran.
+        conflicts:
+          type: array
+          description: Why a create would be refused, each reason once, in the order a create checks them (the sender and namespaces, then the tokens, then the id), so the first is the 409 a create would answer; empty when a create would succeed now.
+          items:
+            $ref: '#/components/schemas/AppServiceConflict'
+    AppServiceConflict:
+      type: object
+      description: One reason a create would be refused with 409.
+      required:
+      - kind
+      - value
+      - existing_id
+      - message
+      properties:
+        kind:
+          type: string
+          enum:
+          - id
+          - as_token
+          - hs_token
+          - sender
+          - users
+          - aliases
+          - rooms
+          description: 'What collides: an appservice with this id is registered (id); another appservice holds the token (as_token, hs_token); its sender user id is taken (sender); an exclusive namespace rule collides (users, aliases, rooms).'
+        value:
+          type: string
+          description: The colliding value (the id, the sender user id, the matched user id or the pattern); <redacted> for a token.
+        existing_id:
+          type: string
+          description: The appservice that already holds it; <external user> when the sender exists as an ordinary account.
+        message:
+          type: string
+          description: The conflict in words, as the 409 a create would answer says it.
     AppServiceUpdate:
       type: object
       description: Everything but id and sender_localpart, as a JSON Merge Patch (RFC 7396). A top-level key the registration format does not define is kept with the registration, and null removes it.

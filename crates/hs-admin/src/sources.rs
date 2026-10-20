@@ -19,13 +19,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::model::{
-    AdminAppservice, AdminAppserviceBacklogEntry, AdminAppserviceCreate, AdminAppserviceDiscard,
-    AdminAppserviceHealth, AdminAppserviceLinks, AdminAppserviceReplay, AdminAppserviceTokens,
-    AdminBridgeLogins, AdminDestination, AdminDevice, AdminPasswordReset, AdminRoom,
-    AdminRoomMember, AdminUser, ClusterStatus, ConfigChange, ConfigReloadReport, ConfigSection,
-    ConfigSettingChange, ConfigSettingValue, ConfigValidateReport, ExternalId,
-    RecoveryAdministrator, RecoveryInspection, RecoveryLink, RecoveryLinkKind, RecoveryLinkRequest,
-    RecoveryResetRequest, SetupRequest, SetupSession, StatisticsOverview, ThreePid,
+    AdminAppservice, AdminAppserviceBacklogEntry, AdminAppserviceConflict, AdminAppserviceCreate,
+    AdminAppserviceDiscard, AdminAppserviceDryRun, AdminAppserviceHealth, AdminAppserviceLinks,
+    AdminAppserviceReplay, AdminAppserviceTokens, AdminBridgeLogins, AdminDestination, AdminDevice,
+    AdminPasswordReset, AdminRoom, AdminRoomMember, AdminUser, ClusterStatus, ConfigChange,
+    ConfigReloadReport, ConfigSection, ConfigSettingChange, ConfigSettingValue,
+    ConfigValidateReport, ExternalId, RecoveryAdministrator, RecoveryInspection, RecoveryLink,
+    RecoveryLinkKind, RecoveryLinkRequest, RecoveryResetRequest, SetupRequest, SetupSession,
+    StatisticsOverview, ThreePid,
 };
 
 /// Why a data-source call failed. Mirrors [`crate::auth::AuthError`]'s "only unavailable escapes
@@ -2583,6 +2584,14 @@ pub trait AppserviceDirectory: Send + Sync + 'static {
     /// if that is what was given). Live at once: the bridge can authenticate as soon as this
     /// returns.
     async fn create(&self, request: AdminAppserviceCreate) -> Result<AdminAppservice, SourceError>;
+    /// What `create` would do with `request`, without doing it: the request parsed exactly as
+    /// `create` parses it (the same [`SourceError::Invalid`] and [`SourceError::InvalidField`]
+    /// for one that does not parse), the appservice it would answer, and every reason it would
+    /// answer [`SourceError::Conflict`] instead, listed rather than refused. Writes nothing.
+    async fn validate(
+        &self,
+        request: AdminAppserviceCreate,
+    ) -> Result<AdminAppserviceDryRun, SourceError>;
     /// Applies an RFC 7396 merge patch to the registration.
     async fn update(&self, id: &str, patch: Value) -> Result<AdminAppservice, SourceError>;
     async fn delete(&self, id: &str) -> Result<(), SourceError>;
@@ -2806,6 +2815,45 @@ impl InMemoryAppserviceDirectory {
         }
     }
 
+    /// The registration `request` carries, as `create` and `validate` read it: the JSON, or
+    /// the YAML parsed to JSON, with an `id`. The row is not stored.
+    fn parse_create(
+        request: AdminAppserviceCreate,
+    ) -> Result<(String, InMemoryAppserviceRow), SourceError> {
+        let registration = match (request.registration, request.registration_yaml) {
+            (Some(json), _) => json,
+            (None, Some(yaml)) => {
+                serde_yaml_ng::from_str::<Value>(&yaml).map_err(|e| SourceError::InvalidField {
+                    pointer: "/registration_yaml",
+                    detail: e.to_string(),
+                })?
+            }
+            (None, None) => {
+                return Err(SourceError::InvalidField {
+                    pointer: "/registration",
+                    detail: "a registration is required, as JSON or as YAML".to_owned(),
+                });
+            }
+        };
+        let Some(id) = registration["id"].as_str().map(str::to_owned) else {
+            return Err(SourceError::InvalidField {
+                pointer: "/registration/id",
+                detail: "required".to_owned(),
+            });
+        };
+        let row = InMemoryAppserviceRow {
+            registration,
+            paused: false,
+            health: AdminAppserviceHealth {
+                status: "unknown".to_owned(),
+                ..AdminAppserviceHealth::default()
+            },
+            backlog: Vec::new(),
+            created_at: hs_http::time::now_rfc3339(),
+        };
+        Ok((id, row))
+    }
+
     /// `view` with its `double_puppet` read from every row.
     fn linked(&self, mut view: AdminAppservice) -> AdminAppservice {
         let rows = self
@@ -2866,27 +2914,7 @@ impl AppserviceDirectory for InMemoryAppserviceDirectory {
     }
 
     async fn create(&self, request: AdminAppserviceCreate) -> Result<AdminAppservice, SourceError> {
-        let registration = match (request.registration, request.registration_yaml) {
-            (Some(json), _) => json,
-            (None, Some(yaml)) => {
-                serde_yaml_ng::from_str::<Value>(&yaml).map_err(|e| SourceError::InvalidField {
-                    pointer: "/registration_yaml",
-                    detail: e.to_string(),
-                })?
-            }
-            (None, None) => {
-                return Err(SourceError::InvalidField {
-                    pointer: "/registration",
-                    detail: "a registration is required, as JSON or as YAML".to_owned(),
-                });
-            }
-        };
-        let Some(id) = registration["id"].as_str().map(str::to_owned) else {
-            return Err(SourceError::InvalidField {
-                pointer: "/registration/id",
-                detail: "required".to_owned(),
-            });
-        };
+        let (id, row) = Self::parse_create(request)?;
         let mut rows = self
             .rows
             .write()
@@ -2896,20 +2924,53 @@ impl AppserviceDirectory for InMemoryAppserviceDirectory {
                 "an appservice with id {id:?} is already registered"
             )));
         }
-        let row = InMemoryAppserviceRow {
-            registration,
-            paused: false,
-            health: AdminAppserviceHealth {
-                status: "unknown".to_owned(),
-                ..AdminAppserviceHealth::default()
-            },
-            backlog: Vec::new(),
-            created_at: hs_http::time::now_rfc3339(),
-        };
         let view = Self::view(&row);
         rows.insert(id, row);
         drop(rows);
         Ok(self.linked(view))
+    }
+
+    async fn validate(
+        &self,
+        request: AdminAppserviceCreate,
+    ) -> Result<AdminAppserviceDryRun, SourceError> {
+        let (id, row) = Self::parse_create(request)?;
+        let mut conflicts = Vec::new();
+        {
+            let rows = self
+                .rows
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if rows.contains_key(&id) {
+                conflicts.push(AdminAppserviceConflict {
+                    kind: "id".to_owned(),
+                    value: id.clone(),
+                    existing_id: id.clone(),
+                    message: format!("an appservice with id {id:?} is already registered"),
+                });
+            }
+            // This directory knows no server name, so the sender is reported as its localpart.
+            if let Some(sender) = row.registration["sender_localpart"].as_str() {
+                for (other_id, other) in rows.iter() {
+                    if *other_id != id
+                        && other.registration["sender_localpart"].as_str() == Some(sender)
+                    {
+                        conflicts.push(AdminAppserviceConflict {
+                            kind: "sender".to_owned(),
+                            value: sender.to_owned(),
+                            existing_id: other_id.clone(),
+                            message: format!(
+                                "sender {sender} is already exclusively claimed by {other_id:?}"
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(AdminAppserviceDryRun {
+            appservice: self.linked(Self::view(&row)),
+            conflicts,
+        })
     }
 
     async fn update(&self, id: &str, patch: Value) -> Result<AdminAppservice, SourceError> {

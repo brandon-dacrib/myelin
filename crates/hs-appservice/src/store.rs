@@ -645,30 +645,45 @@ impl<B: KvBackend> AppserviceStore<B> {
         row: &AppserviceRow,
         self_id: Option<&str>,
     ) -> Result<(), AppserviceError> {
+        match self.token_conflicts(row, self_id)?.into_iter().next() {
+            Some((token_kind, existing_id)) => Err(AppserviceError::TokenConflict {
+                token_kind,
+                existing_id,
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// Every token of `row` that a *different* row (not `self_id`) already holds, as
+    /// `("as_token" | "hs_token", that row's id)`: what [`Self::insert`] and [`Self::replace`]
+    /// refuse for, listed in full for a dry run.
+    ///
+    /// # Errors
+    /// Returns [`AppserviceError::Store`] on backend failure.
+    pub(crate) fn token_conflicts(
+        &self,
+        row: &AppserviceRow,
+        self_id: Option<&str>,
+    ) -> Result<Vec<(&'static str, String)>, AppserviceError> {
         let snap = self.backend.snapshot();
-        for (existing_pk, token_kind, token) in [
+        let mut conflicts = Vec::new();
+        for (existing_pk, token_kind) in [
             (
                 lookup(&snap, &self.by_as_token, &(row.as_token.clone(),))?,
                 "as_token",
-                &row.as_token,
             ),
             (
                 lookup(&snap, &self.by_hs_token, &(row.hs_token.clone(),))?,
                 "hs_token",
-                &row.hs_token,
             ),
         ] {
-            let _ = token;
             if let Some((existing_id,)) = existing_pk.into_iter().next()
                 && Some(existing_id.as_str()) != self_id
             {
-                return Err(AppserviceError::TokenConflict {
-                    token_kind,
-                    existing_id,
-                });
+                conflicts.push((token_kind, existing_id));
             }
         }
-        Ok(())
+        Ok(conflicts)
     }
 
     // ---- health ----

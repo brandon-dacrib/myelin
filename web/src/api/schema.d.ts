@@ -2689,6 +2689,20 @@ export interface components {
         AppServiceBacklogEntryPage: components["schemas"]["PageEnvelope"] & {
             items: components["schemas"]["AppServiceBacklogEntry"][];
         };
+        /** @description One reason a create would be refused with 409. */
+        AppServiceConflict: {
+            /** @description The appservice that already holds it; <external user> when the sender exists as an ordinary account. */
+            existing_id: string;
+            /**
+             * @description What collides: an appservice with this id is registered (id); another appservice holds the token (as_token, hs_token); its sender user id is taken (sender); an exclusive namespace rule collides (users, aliases, rooms).
+             * @enum {string}
+             */
+            kind: "id" | "as_token" | "hs_token" | "sender" | "users" | "aliases" | "rooms";
+            /** @description The conflict in words, as the 409 a create would answer says it. */
+            message: string;
+            /** @description The colliding value (the id, the sender user id, the matched user id or the pattern); <redacted> for a token. */
+            value: string;
+        };
         AppServiceCreate: {
             registration?: Record<string, never>;
             registration_yaml?: string;
@@ -2701,6 +2715,13 @@ export interface components {
              */
             before?: string;
             transaction_ids?: string[];
+        };
+        /** @description What appservices.create answers for dry_run=true: the registration parsed as a create would parse it, viewed as the appservice a create would answer, and every reason a create would be refused with 409. Nothing was written. */
+        AppServiceDryRun: {
+            /** @description The appservice a create would answer (tokens left out, as always). Its health is unknown and its created_at is when the dry run ran. */
+            appservice: components["schemas"]["AppService"];
+            /** @description Why a create would be refused, each reason once, in the order a create checks them (the sender and namespaces, then the tokens, then the id), so the first is the 409 a create would answer; empty when a create would succeed now. */
+            conflicts: components["schemas"]["AppServiceConflict"][];
         };
         AppServiceHealth: {
             last_error?: string | null;
@@ -4504,7 +4525,7 @@ export interface operations {
     "appservices.create": {
         parameters: {
             query?: {
-                /** @description Validate and return the parsed registration and namespace conflicts without creating anything. */
+                /** @description Validate and return the parsed registration and the conflicts a create would be refused for, without creating anything. A dry run answers 200 with AppServiceDryRun (never 201 or 409), records no audit entry and stores no Idempotency-Key entry, so the key sent with it is free for the create that follows. A body a create would refuse with 400 is refused the same way. */
                 dry_run?: boolean;
             };
             header?: {
@@ -4520,6 +4541,15 @@ export interface operations {
             };
         };
         responses: {
+            /** @description A dry run (dry_run=true): the appservice a create would answer and the conflicts it would be refused for; nothing was created. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AppServiceDryRun"];
+                };
+            };
             /** @description The created appservice; live immediately (hot registration). */
             201: {
                 headers: {

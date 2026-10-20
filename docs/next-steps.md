@@ -4,6 +4,16 @@ Written 2026-09-20 by the integration lead, last revised 2026-10-19, late (six m
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
+## 2026-10-20 -- `POST /api/v1/appservices?dry_run=true` no longer creates; the branch is `agent/appservice-dry-run`
+
+Found registering Hookshot on the demo (above): the handler ignored `dry_run`, so a dry run
+registered the appservice and the real create was a `409` with itself. Now a dry run answers
+`200` with `AppServiceDryRun` (the parsed `AppService` and every conflict a create would be
+refused for, in the body), writes nothing, audits nothing and stores no `Idempotency-Key`
+entry; OpenAPI 0.1.21, `schema.d.ts` regenerated; router, registry and real-binary tests
+(`crates/hs-cli/tests/appservice_dry_run.rs`). Status 15 has the detail. Left: the interface
+does not yet run a dry run before the create (it could show the conflicts first).
+
 ## 2026-10-20 -- Hookshot on the demo with GitHub PR comments; the branch is `agent/hookshot-offering`
 
 Done on `main` (`deploy/demo/hookshot/`, status 11): the demo runs matrix-hookshot 7.5.0 as

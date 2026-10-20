@@ -72,6 +72,13 @@ impl<B: KvBackend + 'static> AppserviceDirectory for OfferingAwareDirectory<B> {
         self.inner.create(request).await
     }
 
+    async fn validate(
+        &self,
+        request: AdminAppserviceCreate,
+    ) -> Result<hs_admin::model::AdminAppserviceDryRun, SourceError> {
+        self.inner.validate(request).await
+    }
+
     async fn update(&self, id: &str, patch: Value) -> Result<AdminAppservice, SourceError> {
         self.inner.update(id, patch).await
     }

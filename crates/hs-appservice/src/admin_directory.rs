@@ -14,9 +14,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use hs_admin::model::{
-    AdminAppservice, AdminAppserviceBacklogEntry, AdminAppserviceCreate, AdminAppserviceDiscard,
-    AdminAppserviceHealth, AdminAppserviceLinks, AdminAppserviceQueue, AdminAppserviceReplay,
-    AdminAppserviceTokens, AdminBridgeLogins, AdminKeyWithheld,
+    AdminAppservice, AdminAppserviceBacklogEntry, AdminAppserviceConflict, AdminAppserviceCreate,
+    AdminAppserviceDiscard, AdminAppserviceDryRun, AdminAppserviceHealth, AdminAppserviceLinks,
+    AdminAppserviceQueue, AdminAppserviceReplay, AdminAppserviceTokens, AdminBridgeLogins,
+    AdminKeyWithheld,
 };
 use hs_admin::sources::{
     AdminAppserviceBacklogPage, AdminAppserviceRegistration, AppserviceDirectory,
@@ -198,6 +199,27 @@ fn millis_of(value: Option<&str>, pointer: &'static str) -> Result<Option<u64>, 
 
 /// The registry's errors as the admin API's. A conflict of any kind -- id, token, namespace --
 /// is a `409` whose detail says which; a registration that does not parse is a `400`.
+/// The registration an `AppServiceCreate` carries, parsed as `create` and `validate` both
+/// parse it: the JSON object, or the YAML text, one of the two.
+fn parse_create(request: AdminAppserviceCreate) -> Result<Registration, SourceError> {
+    match (request.registration, request.registration_yaml) {
+        (Some(json), _) => Registration::from_json(json).map_err(|e| SourceError::InvalidField {
+            pointer: "/registration",
+            detail: e.to_string(),
+        }),
+        (None, Some(yaml)) => {
+            Registration::parse_yaml(&yaml).map_err(|e| SourceError::InvalidField {
+                pointer: "/registration_yaml",
+                detail: e.to_string(),
+            })
+        }
+        (None, None) => Err(SourceError::InvalidField {
+            pointer: "/registration",
+            detail: "a registration is required, as JSON or as YAML".to_owned(),
+        }),
+    }
+}
+
 fn to_source(error: AppserviceError) -> SourceError {
     match error {
         AppserviceError::NotFound(_) => SourceError::NotFound,
@@ -233,28 +255,68 @@ impl<B: KvBackend + 'static> AppserviceDirectory for RegistryAppserviceDirectory
     }
 
     async fn create(&self, request: AdminAppserviceCreate) -> Result<AdminAppservice, SourceError> {
-        let registration = match (request.registration, request.registration_yaml) {
-            (Some(json), _) => {
-                Registration::from_json(json).map_err(|e| SourceError::InvalidField {
-                    pointer: "/registration",
-                    detail: e.to_string(),
-                })?
-            }
-            (None, Some(yaml)) => {
-                Registration::parse_yaml(&yaml).map_err(|e| SourceError::InvalidField {
-                    pointer: "/registration_yaml",
-                    detail: e.to_string(),
-                })?
-            }
-            (None, None) => {
-                return Err(SourceError::InvalidField {
-                    pointer: "/registration",
-                    detail: "a registration is required, as JSON or as YAML".to_owned(),
-                });
-            }
-        };
+        let registration = parse_create(request)?;
         let row = self.registry.add(&registration).map_err(to_source)?;
         self.linked_view(&row)
+    }
+
+    async fn validate(
+        &self,
+        request: AdminAppserviceCreate,
+    ) -> Result<AdminAppserviceDryRun, SourceError> {
+        let registration = parse_create(request)?;
+        let (row, conflicts) = self.registry.validate(&registration).map_err(to_source)?;
+        // The row is not registered, so it has no health row and no queue: the view a create
+        // would answer, with `unknown` health and an empty queue, is built here rather than
+        // through `view`, which reads both by id.
+        let mut appservice = AdminAppservice {
+            id: row.id.clone(),
+            sender_localpart: row.sender_localpart.clone(),
+            url: row.url.clone(),
+            namespaces: serde_json::to_value(&row.namespaces).unwrap_or(Value::Null),
+            rate_limited: row.rate_limited,
+            protocols: row.protocols.clone(),
+            paused: false,
+            health: "unknown".to_owned(),
+            health_reason: None,
+            created_at: hs_http::time::rfc3339_from_millis(
+                i64::try_from(row.created_at_ms).unwrap_or(i64::MAX),
+            ),
+            bridge_type: row
+                .extra
+                .get(hs_admin::bridge_types::BRIDGE_TYPE_KEY)
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            double_puppet_for: AdminAppservice::double_puppet_for_of(&row.extra),
+            double_puppet: None,
+            links: AdminAppserviceLinks::default(),
+            queue: AdminAppserviceQueue::default(),
+            volume: None,
+        };
+        appservice.double_puppet = self
+            .registry
+            .list()
+            .map_err(to_source)?
+            .into_iter()
+            .filter(|other| {
+                other.id != row.id
+                    && AdminAppservice::double_puppet_for_of(&other.extra).as_deref()
+                        == Some(row.id.as_str())
+            })
+            .map(|other| other.id)
+            .next();
+        Ok(AdminAppserviceDryRun {
+            appservice,
+            conflicts: conflicts
+                .into_iter()
+                .map(|c| AdminAppserviceConflict {
+                    message: c.message(),
+                    kind: c.kind.to_owned(),
+                    value: c.value,
+                    existing_id: c.existing_id,
+                })
+                .collect(),
+        })
     }
 
     async fn update(&self, id: &str, patch: Value) -> Result<AdminAppservice, SourceError> {

@@ -406,7 +406,9 @@ export function useCreateAppservice() {
           registration_yaml: registrationYaml,
         },
       });
-      return unwrap(result);
+      // Without `dry_run=true` (never sent here) the only success is the 201 `AppService`;
+      // the 200 is `AppServiceDryRun` (OpenAPI 0.1.21), which widens the inferred union.
+      return unwrap(result) as AppService;
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ["appservices"] }),
   });
