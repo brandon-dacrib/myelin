@@ -115,9 +115,22 @@ receipt EDU path drop a receipt at the same or an earlier event before anything 
 (`hs_user_receipts_ignored_total{reason}`, a `debug` line). Detail and the test in
 `docs/status/05-sync.md`, the 2026-10-19 entry. The pump itself is unchanged: it sends a
 bridge every receipt in its rooms, its own users' and the double puppets' included, as
-Synapse's `get_new_events_as` does. **Left:** verifying on the demo after the roll that
-`hs_user_receipts_ignored_total{reason="same_event"}` climbs with the Slack bridge up and the
-official client open, and that the channel stays read.
+Synapse's `get_new_events_as` does.
+
+**Rolled and seen, 2026-10-20.** The demo went to v0.4.5 (Helm revision 40, 17:10 UTC).
+The Slack bridge's own log is the measurement of the loop: `Bridged read receipt` lines per
+minute, each a `RemoteEventReadReceipt` from Slack (a `channel_marked`), many at the same
+`event_ts`:
+
+| minute (UTC) | server | Slack read receipts bridged | `slack rate limit exceeded` on Matrix receipts |
+|---|---|---|---|
+| 17:08 | 0.4.3 | 386 | yes |
+| 17:09 | 0.4.3 | 547 | yes |
+| 17:10 | 0.4.5 from :10:20 | 6 | none |
+
+`hs_user_receipts_ignored_total{reason="same_event"}` was 3 at the first scrape after boot.
+**Left:** the owner confirms the channel stays read in the official client with the bridge
+up; the second measurement (below, when taken) says whether the rate stays at a handful.
 
 ## 2026-10-18 (branch `agent/stuck-room-load`): a room the pump cannot read is left out of the pass, not the whole pass
 

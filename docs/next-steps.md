@@ -55,7 +55,21 @@ servers' alike, before anything is written (`SessionHub::receipt_advances`;
 roll, with the Slack bridge up and the official client open, `same_event` should climb and the
 channel should stay read; the bridge's `conversations.mark` at the last *bridged* message when
 Slack's newest has no Matrix event still moves Slack's marker back once per real read (the
-same on Synapse), which is mautrix's to change. **Not rolled** by this session.
+same on Synapse), which is mautrix's to change. **Rolled:** the demo is on v0.4.5 (Helm
+revision 40, 17:10 UTC on the 20th; CD numbered the merge v0.4.5 because the docs-only
+commit of the 18th had taken v0.4.4), the same way as v0.4.1 and v0.4.3: the chart from
+ghcr's OCI API with `/usr/bin/curl`, digest checked, the saved values plus the tag's
+`values-bridges.yaml` and `image.tag=0.4.5`, `helm upgrade` through the owner's proxy (the
+proxy of the 17th had lost its route and still held port 8001; the owner killed it and
+started a new one from a plain SSH shell). After: every pod Running, six Bridges Ready,
+`/_matrix/federation/v1/version` says 0.4.5, no WARN or ERROR in the server's first minutes.
+**The loop, seen and gone:** the Slack bridge's log shows what the bounce was. In the two
+minutes before the new server came up it bridged 386 and then 547 Slack read receipts a
+minute (`Bridged read receipt`, one `RemoteEventReadReceipt` after another at the same
+`event_ts`) and was logging `Failed to handle read receipt error="slack rate limit
+exceeded"` on the Matrix side; in the first minute on v0.4.5 it bridged 6, and
+`hs_user_receipts_ignored_total{reason="same_event"}` was 3 at the first scrape. The
+second measurement, four minutes on, is in `docs/status/11-appservices-and-bridges.md`.
 
 ## 2026-10-18 -- a room whose placed history named a rejected event could not be loaded again; the branch is `agent/stuck-room-load`
 
