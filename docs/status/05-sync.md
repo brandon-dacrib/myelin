@@ -48,8 +48,10 @@ database's final receipts once).
 second message, then at the first and at the second again, leaves the receipt, the room's
 sequence and the receipt stream's head where they were; a third message advances it; an event
 the room does not place is accepted; a private receipt at the first message is accepted
-(its own kind). `cargo test -p hs-user` and the gate before the merge. Against the real
-binary and the demo's bridge: after the roll.
+(its own kind). `cargo test -p hs-user` and the gate before the merge. On the demo (v0.4.5,
+2026-10-20): the Slack bridge went from 386 and 547 bridged read receipts a minute to 0 to 2,
+and the owner confirmed a channel stays read in the official Slack client (the table in
+`docs/status/11-appservices-and-bridges.md`).
 
 ## 2026-10-17 (branch `agent/hot-room-leave`): a member's own leave from a hot room reached nobody
 

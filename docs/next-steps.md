@@ -72,8 +72,9 @@ exceeded"` on the Matrix side; in the first minute on v0.4.5 it bridged 6, and
 minutes on it was 0, 2, 0 and 1 a minute, with no rate-limit error and no WARN from the
 server (the table in `docs/status/11-appservices-and-bridges.md`); then the pod's `/metrics`
 and Prometheus stopped answering through the proxy (`monitoring-system` was being
-restarted) and, at 17:17 UTC, another session started revision 41 to v0.4.7 on top. **Left:**
-the owner confirms the channel stays read in the official client.
+restarted) and, at 17:17 UTC, another session started revision 41 to v0.4.7 on top. **The
+owner confirmed** (2026-10-20): with the bridge up, a channel now stays read in the official
+Slack client. Nothing is left on this.
 
 ## 2026-10-18 -- a room whose placed history named a rejected event could not be loaded again; the branch is `agent/stuck-room-load`
 

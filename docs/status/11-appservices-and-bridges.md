@@ -138,9 +138,9 @@ Prometheus had no endpoints (its pod could not mount its volume; `monitoring-sys
 being restarted), so no later value was read. No WARN or ERROR from the server in its first
 six minutes. At 17:17 UTC another session started Helm revision 41, v0.4.7 (the mautrix pins
 and the interop harness, on top of this fix), while this one was measuring; the 0.4.5 pod
-went Unknown on `tp0n1` as that upgrade replaced it. **Left:** the owner confirms the
-channel stays read in the official client with the bridge up, on whichever version the demo
-settles on.
+went Unknown on `tp0n1` as that upgrade replaced it. **The owner confirmed** (2026-10-20):
+with the bridge up, a channel now stays read in the official Slack client. Nothing is left on
+this.
 
 ## 2026-10-18 (branch `agent/stuck-room-load`): a room the pump cannot read is left out of the pass, not the whole pass
 
