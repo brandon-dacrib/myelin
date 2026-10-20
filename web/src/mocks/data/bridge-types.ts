@@ -43,6 +43,8 @@ const PORTS: Record<string, number> = {
   "mautrix-twitter": 29327,
   "mautrix-linkedin": 29341,
   "mautrix-bluesky": 29340,
+  // matrimail's connector says 29319 (mautrix-meta's); the config the server renders says this.
+  matrimail: 29339,
   heisenbridge: 9898,
   "matrix-appservice-irc": 9999,
   "matrix-hookshot": 9993,
@@ -67,6 +69,7 @@ const COMMAND_PREFIXES: Record<string, string> = {
   "mautrix-slack": "!slack",
   "mautrix-twitter": "!twitter",
   "mautrix-linkedin": "!linkedin",
+  matrimail: "!matrimail",
 };
 
 /** Each type's provisioning surface and its note, as `bridge_types.rs`'s `provisioning_of`. */
@@ -95,7 +98,7 @@ function provisioning(id: string): Pick<BridgeType, "provisioning_api" | "provis
       provisioning_note:
         "This bridge is on mautrix-go's older framework, whose provisioning API has no whoami, so the bridge keeps who has signed in itself: ask its bot `ping`.",
     };
-  if (id.startsWith("mautrix-") && id !== "mautrix-imessage")
+  if ((id.startsWith("mautrix-") && id !== "mautrix-imessage") || id === "matrimail")
     return {
       provisioning_api: "mautrix_v3",
       provisioning_note:
@@ -319,6 +322,32 @@ export const bridgeTypes: BridgeType[] = [
     steps: [
       "Start a direct chat with {bot} and send `login`, then give it your handle and an app password (Bluesky Settings, App Passwords), not your main password.",
     ],
+  }),
+  type({
+    id: "matrimail",
+    name: "Email (matrimail)",
+    category: "messaging",
+    description:
+      "Email over IMAP, one room per thread: Gmail with an app password, or any IMAP mailbox; replies go out by SMTP. A community bridge with one maintainer and no release, unproven here beyond starting and answering its bot.",
+    needs: [
+      "account",
+      "A mailbox the bridge can read over IMAP; for Gmail, 2-step verification and an app password",
+    ],
+    project: "moiri-gamboni/matrimail",
+    docs: "https://github.com/moiri-gamboni/matrimail/blob/24cd0f981f803897f7b71693c1c84738e78cf9d7/README.md",
+    // The image this repository builds (decision 0055), tagged with the pinned commit.
+    image: "ghcr.io/brandon-dacrib/matrimail:24cd0f9",
+    // Its registration claims what the bridge's own generator would: NetworkID `email`.
+    prefix: "email_",
+    bot: "emailbot",
+    mautrix: true,
+    steps: [
+      "Start a direct chat with {bot} and send `login`, or in one line `login email:you@gmail.com password:<app password>`. The bot works out the IMAP and SMTP settings from the address (Gmail, Outlook, iCloud, Yahoo, FastMail; a guess for anything else).",
+      "For Gmail: turn on 2-step verification in your Google account, make an app password at myaccount.google.com/apppasswords, and give the bot that, never your Google password. IMAP has to be on in Gmail's settings (See all settings, Forwarding and POP/IMAP).",
+      'The bot lists your folders (Gmail: labels) and asks which to watch; `default` is the inbox and Sent. Each email thread becomes a room; a message in that room is sent as a reply, and `compose to:someone@example.org subject:"..."` in the bot\'s chat starts a new thread.',
+    ],
+    notes:
+      "Community software: one maintainer, no release, and Myelin builds the image itself from the fork's source (AGPL-3.0). Edits and redactions are not sent as email (email cannot be unsent), and changing the watched folders means `logout` and `login` again (`config folders` says so).",
   }),
   type({
     id: "heisenbridge",

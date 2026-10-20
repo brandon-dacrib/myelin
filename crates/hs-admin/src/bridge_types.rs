@@ -156,6 +156,25 @@ fn resolve_image_tag(entry: &Entry, requested: Option<&str>) -> String {
     }
 }
 
+/// The commit of moiri-gamboni/matrimail the image this repository builds is made from
+/// (`deploy/bridges/matrimail/Dockerfile`'s `MATRIMAIL_COMMIT`; decision 0055). Its first
+/// seven characters are the image's tag.
+pub const MATRIMAIL_COMMIT: &str = "24cd0f981f803897f7b71693c1c84738e78cf9d7";
+/// The matrimail image the catalogue pins: ours, tagged with the pinned commit.
+const MATRIMAIL_IMAGE: &str = "ghcr.io/brandon-dacrib/matrimail:24cd0f9";
+/// The fork's README at the pinned commit: the guide the catalogue's steps come from.
+const MATRIMAIL_README_URL: &str = "https://github.com/moiri-gamboni/matrimail/blob/24cd0f981f803897f7b71693c1c84738e78cf9d7/README.md";
+/// The port a rendered matrimail config says the bridge listens on. Its connector's
+/// `DefaultPort` is 29319, mautrix-meta's; the catalogue gives every type a port of its own.
+pub const MATRIMAIL_PORT: u16 = 29339;
+/// The file in `/data` holding the passphrase matrimail encrypts the mailbox credentials it
+/// keeps with (`./data/passphrase` under the image's working directory, `/`, read when
+/// `MATRIMAIL_PASSPHRASE` is not set). Minted and kept by whoever keeps the instance
+/// ([`needs_credentials_passphrase`]), as a mautrix bridge's `pickle_key` is, so that a
+/// re-render writes the same one: a different passphrase makes every stored login unreadable,
+/// and the bridge refuses to start rather than guess.
+pub const MATRIMAIL_PASSPHRASE_FILE: &str = "passphrase";
+
 const MSC2409: &str = "de.sorunome.msc2409.push_ephemeral";
 const MSC3202: &str = "org.matrix.msc3202";
 const MSC4190: &str = "io.element.msc4190";
@@ -357,6 +376,45 @@ const CATALOGUE: &[Entry] = &[
         ],
         notes: None,
     ),
+    // matrimail is a community bridge on mautrix-go's `bridgev2` (`mxmain.BridgeMain`, mautrix
+    // v0.24.2): the standard config layout, `provisioning.shared_secret`, MSC4190. Nobody
+    // publishes an image or a release for it, so this repository builds one from the active
+    // fork at a pinned commit (decision 0055; `deploy/bridges/matrimail/Dockerfile`,
+    // `.github/workflows/matrimail-image.yml`); the tag is that commit, and
+    // `MATRIMAIL_COMMIT` keeps the Dockerfile's pin and this one equal. Its connector's
+    // `DefaultPort` is 29319, which mautrix-meta's is too; the config rendered here says 29339
+    // and the bridge listens where its config says. The bot and the ghosts are what its own
+    // `--generate-registration` claims (`NetworkID` is `email`).
+    Entry {
+        id: "matrimail",
+        name: "Email (matrimail)",
+        description: "Email over IMAP, one room per thread: Gmail with an app password, or any IMAP mailbox; replies go out by SMTP. A community bridge with one maintainer and no release, unproven here beyond starting and answering its bot.",
+        category: Category::Messaging,
+        upstream_project: "moiri-gamboni/matrimail",
+        docs_url: MATRIMAIL_README_URL,
+        image: MATRIMAIL_IMAGE,
+        port: MATRIMAIL_PORT,
+        ghost_prefix: "email_",
+        bot: "emailbot",
+        needs: &[(
+            "account",
+            "A mailbox the bridge can read over IMAP; for Gmail, 2-step verification and an app password",
+            true,
+        )],
+        double_puppeting: true,
+        features: MAUTRIX_FEATURES,
+        runtime: Runtime::Mautrix,
+        sign_in: &[
+            "Start a direct chat with {bot} and send `login`, or in one line `login email:you@gmail.com password:<app password>`. The bot works out the IMAP and SMTP settings from the address (Gmail, Outlook, iCloud, Yahoo, FastMail; a guess for anything else).",
+            "For Gmail: turn on 2-step verification in your Google account, make an app password at myaccount.google.com/apppasswords, and give the bot that, never your Google password. IMAP has to be on in Gmail's settings (See all settings, Forwarding and POP/IMAP).",
+            "The bot lists your folders (Gmail: labels) and asks which to watch; `default` is the inbox and Sent. Each email thread becomes a room; a message in that room is sent as a reply, and `compose to:someone@example.org subject:\"...\"` in the bot's chat starts a new thread.",
+        ],
+        sign_in_notes: Some(
+            "Community software: one maintainer, no release, and Myelin builds the image itself from the fork's source (AGPL-3.0). Edits and redactions are not sent as email (email cannot be unsent), and changing the watched folders means `logout` and `login` again (`config folders` says so).",
+        ),
+        layout: ConfigLayout::BridgeV2,
+        mac_download: None,
+    },
     Entry {
         id: "mautrix-imessage",
         name: "iMessage",
@@ -611,6 +669,8 @@ fn command_prefix(entry: &Entry) -> Option<&'static str> {
         "mautrix-slack" => Some("!slack"),
         "mautrix-twitter" => Some("!twitter"),
         "mautrix-linkedin" => Some("!linkedin"),
+        // matrimail's connector sets it (`pkg/connector/connector.go`, read at 24cd0f9).
+        "matrimail" => Some("!matrimail"),
         _ => None,
     }
 }
@@ -878,6 +938,16 @@ fn extra_ports_for(entry: &Entry) -> Vec<ExtraPort> {
 #[must_use]
 pub fn needs_passkey(type_id: &str) -> bool {
     entry(type_id).is_some_and(|e| e.runtime == Runtime::Hookshot)
+}
+
+/// Whether instances of `type_id` need a credentials passphrase
+/// ([`MATRIMAIL_PASSPHRASE_FILE`]) minted and kept by whoever keeps the instance, and written
+/// into `/data` with the bridge's other files: matrimail. The manager adds it to the render's
+/// files; the render itself writes none, and a bridge run by hand without the file makes one
+/// in `/data` on its first start.
+#[must_use]
+pub fn needs_credentials_passphrase(type_id: &str) -> bool {
+    type_id == "matrimail" && entry(type_id).is_some()
 }
 
 /// Whether a shared instance of `type_id` keeps what it has connected as state events in its
@@ -1981,6 +2051,12 @@ fn compose(entry: &Entry, c: &Choices, image: &str, server_name: &str) -> String
             ));
             out.push_str("    # with both present the bridge starts straight away and completes\n");
             out.push_str("    # config.yaml with its own defaults.\n");
+            if needs_credentials_passphrase(entry.id) {
+                out.push_str(&format!(
+                    "    # The bridge encrypts the mailbox logins it keeps with a passphrase: set\n    # MATRIMAIL_PASSPHRASE below, or let it write one into ./{}/{} on its first\n    # start. Keep it: a different one makes every stored login unreadable.\n",
+                    c.id, MATRIMAIL_PASSPHRASE_FILE
+                ));
+            }
         }
         Runtime::Heisenbridge => {
             out.push_str(&format!("    volumes:\n      - ./{}:/data\n", c.id));
@@ -2455,6 +2531,11 @@ pub fn render_instance(spec: &InstanceSpec<'_>) -> Option<InstanceRender> {
         "# config ({}), and this server has to reach it at {}.\n",
         spec.homeserver_address, spec.url
     ));
+    if needs_credentials_passphrase(entry.id) && !files.contains_key(MATRIMAIL_PASSPHRASE_FILE) {
+        compose_yaml.push_str(&format!(
+            "# No passphrase is kept for this instance: the bridge writes one into /data/{MATRIMAIL_PASSPHRASE_FILE}\n# on its first start (or set MATRIMAIL_PASSPHRASE). Keep it with the volume.\n"
+        ));
+    }
     if entry.runtime == Runtime::Hookshot {
         if !files.contains_key(HOOKSHOT_PASSKEY_FILE) {
             compose_yaml.push_str(
@@ -2547,11 +2628,17 @@ mod tests {
         for entry in CATALOGUE {
             let tag = entry.image_tag();
             assert_ne!(tag, "latest", "{} runs {}", entry.id, entry.image);
+            // An image this repository builds itself is pinned by the commit it was built from
+            // (decision 0055): a tag of hex digits, the project's own short hash.
+            let ours = entry.image.starts_with("ghcr.io/brandon-dacrib/")
+                && tag.len() >= 7
+                && tag.chars().all(|c| c.is_ascii_hexdigit());
             assert!(
                 tag.chars()
                     .next()
                     .is_some_and(|c| c == 'v' || c.is_ascii_digit())
-                    || tag.starts_with("release-"),
+                    || tag.starts_with("release-")
+                    || ours,
                 "{} runs {}, which is not a release tag",
                 entry.id,
                 entry.image
@@ -2681,7 +2768,7 @@ mod tests {
             }
             assert_eq!(
                 t.renders_config,
-                t.id.starts_with("mautrix-") || t.id == "matrix-hookshot",
+                t.id.starts_with("mautrix-") || t.id == "matrix-hookshot" || t.id == "matrimail",
                 "{}",
                 t.id
             );
@@ -3685,6 +3772,8 @@ mod tests {
                 // The older framework's provisioning API has no whoami.
                 "mautrix-discord" | "mautrix-imessage" => "none",
                 id if id.starts_with("mautrix-") => "mautrix_v3",
+                // matrimail is `bridgev2` (mautrix v0.24.2): the framework's whoami.
+                "matrimail" => "mautrix_v3",
                 "heisenbridge" => "none",
                 "matrix-appservice-irc" => "irc_v1",
                 // Hookshot 7 removed its provisioning API; connections are room state.
@@ -3927,5 +4016,175 @@ mod tests {
         for t in list("x.org") {
             assert_eq!(t.deployable, t.not_deployable_reason.is_none(), "{}", t.id);
         }
+    }
+
+    /// matrimail (decision 0055): a `bridgev2` entry rendered like the mautrix ones, on the
+    /// image this repository builds, pinned to the commit the Dockerfile is pinned to.
+    #[test]
+    fn matrimail_is_a_bridgev2_entry_on_the_image_this_repository_builds() {
+        let t = get("matrimail", "x.org").unwrap();
+        assert_eq!(t.image, "ghcr.io/brandon-dacrib/matrimail:24cd0f9");
+        assert_eq!(t.port, MATRIMAIL_PORT);
+        assert_eq!(t.category, "messaging");
+        assert_eq!(t.mode, "per_user");
+        assert!(t.deployable, "{:?}", t.not_deployable_reason);
+        assert!(t.renders_config);
+        assert!(t.supports_double_puppeting);
+        assert_eq!(t.command_prefix.as_deref(), Some("!matrimail"));
+        assert_eq!(t.provisioning_api, "mautrix_v3");
+        assert_eq!(t.runs_on, "container");
+        assert!(t.description.contains("community"), "{}", t.description);
+        assert!(
+            t.sign_in
+                .notes
+                .as_deref()
+                .unwrap_or_default()
+                .contains("AGPL")
+        );
+        assert!(t.sign_in.steps[0].contains("login email:you@gmail.com password:"));
+        assert!(t.sign_in.steps[1].contains("2-step verification"));
+        assert_eq!(
+            t.default_namespaces["users"],
+            json!([
+                {"regex": "@email_.*:x\\.org", "exclusive": true},
+                {"regex": "@emailbot:x\\.org", "exclusive": true},
+            ])
+        );
+        assert!(needs_credentials_passphrase("matrimail"));
+        assert!(!needs_credentials_passphrase("mautrix-whatsapp"));
+        assert!(!needs_credentials_passphrase("no-such-type"));
+        assert!(!needs_passkey("matrimail"));
+        assert_eq!(&MATRIMAIL_COMMIT[..7], "24cd0f9");
+
+        // The Dockerfile that builds the image pins the same commit; the workflow's tag is its
+        // first seven characters.
+        let dockerfile = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../deploy/bridges/matrimail/Dockerfile"),
+        )
+        .expect("deploy/bridges/matrimail/Dockerfile");
+        let pins: Vec<&str> = dockerfile
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("ARG MATRIMAIL_COMMIT="))
+            .collect();
+        assert!(!pins.is_empty(), "the Dockerfile declares MATRIMAIL_COMMIT");
+        for pin in pins {
+            assert_eq!(
+                pin, MATRIMAIL_COMMIT,
+                "the Dockerfile's pin and the catalogue's differ"
+            );
+        }
+
+        // The wizard's render: the standard bridgev2 config pointed at this server, the
+        // registration claiming the bot and the ghosts, the compose and the Bridge naming the
+        // image, and the compose saying where the passphrase comes from.
+        let r = render("matrimail", "x.org", &json!({"adminUser": "@me:x.org"})).unwrap();
+        let config = r.config_yaml.as_deref().unwrap();
+        let parsed: Value = serde_yaml_ng::from_str(config).unwrap();
+        assert_eq!(parsed["homeserver"]["domain"], "x.org");
+        assert_eq!(parsed["appservice"]["port"], json!(MATRIMAIL_PORT));
+        assert_eq!(parsed["appservice"]["id"], "matrimail");
+        assert_eq!(parsed["appservice"]["bot"]["username"], "emailbot");
+        assert_eq!(parsed["appservice"]["username_template"], "email_{{.}}");
+        assert_eq!(parsed["database"]["type"], "sqlite3-fk-wal");
+        assert_eq!(parsed["bridge"]["permissions"]["@me:x.org"], "admin");
+        assert_eq!(parsed["encryption"]["msc4190"], true);
+        assert!(parsed["provisioning"]["shared_secret"].is_string());
+        assert_eq!(r.registration["sender_localpart"], "emailbot");
+        assert_eq!(
+            r.registration["namespaces"]["users"][0]["regex"],
+            "@email_.*:x\\.org"
+        );
+        assert_eq!(r.registration[MSC4190], true);
+        assert!(r.registration[PROVISIONING_SECRET_KEY].is_string());
+        assert!(
+            r.compose_yaml
+                .contains("image: ghcr.io/brandon-dacrib/matrimail:24cd0f9")
+        );
+        assert!(
+            r.compose_yaml.contains("MATRIMAIL_PASSPHRASE"),
+            "{}",
+            r.compose_yaml
+        );
+        assert!(
+            r.bridge_resource_yaml
+                .contains("repository: ghcr.io/brandon-dacrib/matrimail")
+        );
+        assert!(r.bridge_resource_yaml.contains("tag: 24cd0f9"));
+        assert!(r.bridge_resource_yaml.contains("bridgeType: matrimail"));
+
+        // An instance for alice: her own bot and ghosts, her config, the image's tag, no
+        // passphrase in the files (the manager adds the one it keeps) and the compose saying
+        // so; the registration carries the provisioning secret for `logins`.
+        assert_eq!(
+            instance_names("matrimail", Some("@alice:x.org")),
+            Some(("emailbot_alice".to_owned(), "email_alice_".to_owned()))
+        );
+        let instance = render_instance(&InstanceSpec {
+            type_id: "matrimail",
+            server_name: "x.org",
+            appservice_id: "matrimail-alice",
+            owner: Some("@alice:x.org"),
+            as_token: "as",
+            hs_token: "hs",
+            url: "http://matrimail-alice:29339",
+            homeserver_address: "http://myelin:8008",
+            image_tag: "latest",
+            encryption: None,
+            double_puppeting: None,
+            backfill: None,
+            provisioning_secret: Some("prov"),
+            pickle_key: Some("k"),
+            double_puppet: Some(DoublePuppetTokens {
+                appservice_id: "matrimail-alice-doublepuppet",
+                as_token: "dp",
+                hs_token: "dph",
+            }),
+            public_url: None,
+            media_url: None,
+            github: None,
+            github_private_key: None,
+            passkey_pem: None,
+            allowed_users: None,
+        })
+        .unwrap();
+        assert_eq!(
+            instance.image_repository,
+            "ghcr.io/brandon-dacrib/matrimail"
+        );
+        assert_eq!(instance.image_tag, "24cd0f9");
+        assert_eq!(instance.port, MATRIMAIL_PORT);
+        assert!(
+            instance.args.is_empty(),
+            "the image's entrypoint reads /data itself"
+        );
+        assert_eq!(instance.bot_localpart, "emailbot_alice");
+        assert_eq!(instance.ghost_prefix, "email_alice_");
+        assert_eq!(
+            instance.files.keys().cloned().collect::<Vec<_>>(),
+            ["config.yaml", "registration.yaml"]
+        );
+        assert!(
+            instance.compose_yaml.contains("/data/passphrase"),
+            "{}",
+            instance.compose_yaml
+        );
+        let config: Value = serde_yaml_ng::from_str(&instance.files["config.yaml"]).unwrap();
+        assert_eq!(config["appservice"]["port"], json!(MATRIMAIL_PORT));
+        assert_eq!(config["appservice"]["bot"]["username"], "emailbot_alice");
+        assert_eq!(
+            config["appservice"]["username_template"],
+            "email_alice_{{.}}"
+        );
+        assert_eq!(config["bridge"]["permissions"]["@alice:x.org"], "admin");
+        assert_eq!(config["provisioning"]["shared_secret"], "prov");
+        assert_eq!(config["encryption"]["pickle_key"], "k");
+        assert_eq!(config["double_puppet"]["secrets"]["x.org"], "as_token:dp");
+        assert!(
+            config.get("network").is_none(),
+            "no device name to give an IMAP login"
+        );
+        assert_eq!(instance.registration[PROVISIONING_SECRET_KEY], "prov");
+        assert_eq!(instance.registration["sender_localpart"], "emailbot_alice");
     }
 }

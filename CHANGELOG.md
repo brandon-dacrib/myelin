@@ -18,6 +18,16 @@ carries the generated notes for that merge.
 The 0.4 line is the first public release: the same server, documented for someone who has
 never seen it. Everything that was verified for it says how.
 
+- **Email is in the bridge catalogue: matrimail, on an image this repository builds.** A
+  Matrix <-> email bridge on mautrix-go's `bridgev2` (a mailbox over IMAP IDLE with an app
+  password, one room per thread, replies out over SMTP), offered and deployed like the mautrix
+  bridges, its `logins` read through its provisioning API, the passphrase its mailbox
+  credentials are encrypted with minted and kept by the server. It is community software with
+  no release and no published image, and the catalogue says so; `ghcr.io/brandon-dacrib/
+  matrimail` is built here from the fork at a pinned commit (decision 0055). Verified with the
+  real bridge and the real server on the desktop: started from the rendered files, registered,
+  `help` answered in an encrypted chat and a plain one, `whoami` answered. Not verified: a real
+  mailbox signed in (`docs/bridges/matrimail.md`).
 - **A receipt that does not move forward is dropped, so a bridge is not sent its own
   receipt back.** The server recorded every receipt it was given, the event the user's
   receipt was already at included, and each write was sent to every bridge interested in the

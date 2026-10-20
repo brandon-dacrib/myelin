@@ -1,6 +1,6 @@
 # Status: track 11, appservices and bridges
 
-Last updated: 2026-10-20, later (the passkey is made by aws-lc-rs, not the `rsa` crate CI's audit refuses; three webpki crates updated for the emSign distrust; below); before that 2026-10-20 (Hookshot on the demo by hand, GitHub PR comments from two repositories; below); before that 2026-10-19, evening (six mautrix pins bumped to v0.2610.0, verified with the real
+Last updated: 2026-10-20, evening (matrimail, the email bridge, is in the catalogue on an image this repository builds; decision 0055; below); before that 2026-10-20, later (the passkey is made by aws-lc-rs, not the `rsa` crate CI's audit refuses; three webpki crates updated for the emSign distrust; below); before that 2026-10-20 (Hookshot on the demo by hand, GitHub PR comments from two repositories; below); before that 2026-10-19, evening (six mautrix pins bumped to v0.2610.0, verified with the real
 Last updated: 2026-10-20 (Hookshot is an offering the server deploys: its config rendered whole
 from the offering's public URL and GitHub App, its passkey minted and kept, the `Bridge` and
 the operator expose its webhooks and metrics ports, and the offering's page lists its
@@ -62,6 +62,74 @@ manager) and an instance's Kubernetes objects say whose bridge they are; before 
 (who has signed in to a bridge; the `cluster` runtime run on kind); before that 2026-09-30
 (ephemeral, to-device and device-list delivery); before that 2026-09-27 (RFC 0017 run against
 the real binary), 2026-09-27 (the bridge manager) and 2026-09-25.
+
+## 2026-10-20, evening (branch `agent/matrimail`): email is in the catalogue, on an image this repository builds
+
+**Asked** (the owner, who uses Gmail): add matrimail, the Matrix <-> email bridge on mautrix-go's
+`bridgev2` (IMAP IDLE with an app password, one room per thread, SMTP out, `!matrimail login
+email:… password:…`, `MATRIMAIL_PASSPHRASE`, SQLite), the way the mautrix bridges are in the
+catalogue; nobody publishes an image for it, so this repository does; decide fork or upstream;
+mark it community and unproven; docs, decision, tests, the real-bridge story.
+
+**Done**
+
+- **The source and the image** (decision 0055). The fork moiri-gamboni/matrimail at
+  `24cd0f981f803897f7b71693c1c84738e78cf9d7` (its `deploy/roost` branch, 2026-10-16: 82 fixes
+  over upstream's 1.9.3, which the fork's `main` still equals; the README the owner read is that
+  branch's; passphrase safety, reply addressing, MIME bounds, media encrypted for the room,
+  `goolm` instead of libolm). Read from its code: `mxmain.BridgeMain` on mautrix v0.24.2, so the
+  standard `bridgev2` config layout, `provisioning.shared_secret` and `encryption.msc4190` are
+  the framework's and `whoami` works; `NetworkID: email`, `DefaultPort: 29319`,
+  `DefaultCommandPrefix: !matrimail`; the passphrase is `MATRIMAIL_PASSPHRASE`, else
+  `./data/passphrase` under the working directory, else generated. `deploy/bridges/matrimail/
+  Dockerfile` (ours: the project's is distroless with no shell, and the operator's init
+  container runs `sh` in the bridge's image; and runs as a fixed non-root user) builds that one
+  commit, fetched by hash, with `-tags goolm` and cgo for SQLite on `golang:1.25-bookworm`,
+  into `debian:bookworm-slim` with `docker-run.sh` (root, `chown /data` to 1337, `setpriv`,
+  the bridge on `/data/config.yaml`; working directory `/` so the passphrase file is
+  `/data/passphrase`), the AGPL LICENSE and OCI source/revision labels.
+  `.github/workflows/matrimail-image.yml` builds linux/amd64 and linux/arm64 on native
+  runners, pushes by digest, tags `ghcr.io/brandon-dacrib/matrimail:24cd0f9` and `:latest`,
+  on a push to `main` touching the Dockerfile or itself, weekly, and on dispatch; it refuses
+  when the Dockerfile's pin and the catalogue's tag differ.
+- **The catalogue** (`crates/hs-admin/src/bridge_types.rs`): `matrimail`, "Email (matrimail)",
+  messaging, `Runtime::Mautrix` / `BridgeV2` / `per_user` / `deployable`, provisioning
+  `mautrix_v3`, bot `emailbot`, ghosts `email_`, **port 29339** (29319 is mautrix-meta's; the
+  bridge listens where the rendered config says), `!matrimail`, the sign-in steps (the one-line
+  login, what Gmail needs, the folders), the description and notes saying community, one
+  maintainer, no release, unproven here. `MATRIMAIL_COMMIT`, `MATRIMAIL_PORT`,
+  `MATRIMAIL_PASSPHRASE_FILE`, `needs_credentials_passphrase`. A test keeps the Dockerfile's
+  `MATRIMAIL_COMMIT` equal to the catalogue's. The compose texts say where the passphrase
+  comes from when none is kept.
+- **The passphrase** (`crates/hs-bridges`): `InstanceRow::credentials_passphrase`, 64 hex,
+  minted with the tokens for a type that needs one (and for a named row without one), kept
+  like `pickle_key`; the manager adds it to the render's files as `passphrase`, so the files
+  Secret, `POST …/files` and the compose text carry it. A file, not an environment variable:
+  the `Bridge` resource has no `env`.
+- **The real-bridge story** (`crates/hs-bridge-conformance/tests/real_matrimail.rs`): offered,
+  alice's instance, its three files written into the container, the image from the catalogue's
+  pin, `ready`, her chat, `help` answered with the command list in the encrypted chat (bot
+  cross-signed, nothing withheld) and the plain one, the rewritten config keeping port 29339
+  and her names, the passphrase file the server's, `GET /appservices/{id}/logins` reaching
+  `whoami`. Skips without Docker, the binary or the image.
+- **Docs**: `docs/bridges/matrimail.md`, decision 0055, README (sixteen bridges), the mock
+  catalogue (`web/src/mocks/data/bridge-types.ts`), CHANGELOG, `docs/next-steps.md`.
+
+**Verified** (this worktree, 2026-10-20): the image built on the desktop
+(`docker build -f deploy/bridges/matrimail/Dockerfile …`, 131 MB, arm64; `--version` says
+`matrimail 0.1.0+dev.24cd0f98`, `--help` and `--generate-example-config` work, no config
+exits 1 saying so); `cargo test -p hs-admin` (339), `cargo test -p hs-bridges` (63 + 6);
+`cargo test -p hs-bridge-conformance --test real_matrimail` against that image: **2 passed**
+(encrypted and plain, 15.8 s); `npm run check` in `web/` (the five warnings are the usual
+ones). `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings`
+clean.
+
+**Left**: the first push of the image is the first run of the workflow after the merge (the
+push of its path triggers it; a dispatch does the same); until then an offering of the type
+cannot pull, and the real test skips on CI. Signing a real mailbox in (the owner's Gmail with
+an app password) has not been done by anyone here; the demo deploy is the owner's call.
+`check-image-tags.py` lists the entry as "(no upstream mapping)". The Gmail OAuth path
+(`network.gmail_oauth`) is not rendered.
 
 ## 2026-10-20, later (branch `agent/audit-rsa-webpki`): the passkey is made by aws-lc-rs, and CI's audit is green again
 

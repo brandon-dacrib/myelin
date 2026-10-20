@@ -902,7 +902,7 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         let github = offering.options.github.as_ref().filter(|g| g.is_complete());
-        bridge_types::render_instance(&InstanceSpec {
+        let mut render = bridge_types::render_instance(&InstanceSpec {
             type_id: &row.bridge_type,
             server_name: &self.server_name,
             appservice_id: row.appservice_id.as_deref()?,
@@ -937,7 +937,22 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
             // permissions): everyone here, or the offering's list.
             allowed_users: (!offering.access.all_local_users)
                 .then_some(offering.access.users.as_slice()),
-        })
+        })?;
+        // matrimail's credentials passphrase is a file beside its config, kept on the row the
+        // way its pickle key is (minted in `register_instance`): the files Secret, the files
+        // answer and the compose text all carry it.
+        if let Some(passphrase) = row
+            .credentials_passphrase
+            .as_deref()
+            .filter(|p| !p.trim().is_empty())
+            .filter(|_| bridge_types::needs_credentials_passphrase(&row.bridge_type))
+        {
+            render.files.insert(
+                bridge_types::MATRIMAIL_PASSPHRASE_FILE.to_owned(),
+                passphrase.to_owned(),
+            );
+        }
+        Some(render)
     }
 
     /// Renders `row` and applies its deployment to the runtime, recording what was applied
@@ -1676,17 +1691,30 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
         } else {
             None
         };
+        // matrimail's credentials passphrase likewise: 64 hex characters, kept for every render.
+        let passphrase = (bridge_types::needs_credentials_passphrase(&row.bridge_type)
+            && row.credentials_passphrase.is_none())
+        .then(|| crate::random_hex(32));
         // Names and tokens first, stored, so that a retry (or another replica) registers the
         // same thing rather than a second one.
         let row = if row.appservice_id.is_some() {
-            if let Some(passkey) = &passkey {
+            if passkey.is_some() || passphrase.is_some() {
                 self.store
                     .update_instance(&row.bridge_type, &row.owner, |r| {
-                        if r.passkey_pem.is_some() {
-                            return false;
+                        let mut changed = false;
+                        if let Some(passkey) = &passkey
+                            && r.passkey_pem.is_none()
+                        {
+                            r.passkey_pem = Some(passkey.clone());
+                            changed = true;
                         }
-                        r.passkey_pem = Some(passkey.clone());
-                        true
+                        if let Some(passphrase) = &passphrase
+                            && r.credentials_passphrase.is_none()
+                        {
+                            r.credentials_passphrase = Some(passphrase.clone());
+                            changed = true;
+                        }
+                        changed
                     })
                     .map_err(|e| e.to_string())?;
                 self.store
@@ -1716,6 +1744,9 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
                     r.pickle_key = Some(crate::random_hex(32));
                     if let Some(passkey) = &passkey {
                         r.passkey_pem = Some(passkey.clone());
+                    }
+                    if let Some(passphrase) = &passphrase {
+                        r.credentials_passphrase = Some(passphrase.clone());
                     }
                     // An administrator may have said where it listens before it was named.
                     if r.url.is_none() {
@@ -4298,6 +4329,72 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    /// matrimail's credentials passphrase is minted with the tokens and kept on the row
+    /// (decision 0055): the deployment's files carry it as `/data/passphrase` beside the config,
+    /// the files answer does too, and a second render writes the same one.
+    #[tokio::test]
+    async fn a_matrimail_instance_gets_a_credentials_passphrase_kept_with_its_tokens() {
+        let (manager, runtime) = cluster_manager();
+        manager.put("matrimail", cluster()).await.unwrap();
+        manager
+            .put_instance("matrimail", "@brandon:example.org")
+            .await
+            .unwrap();
+        manager.tick().await; // registered
+        manager.tick().await; // deploying
+        let row = manager
+            .store
+            .instance("matrimail", "@brandon:example.org")
+            .unwrap()
+            .unwrap();
+        let passphrase = row
+            .credentials_passphrase
+            .clone()
+            .expect("minted with the tokens");
+        assert_eq!(passphrase.len(), 64);
+        assert!(passphrase.chars().all(|c| c.is_ascii_hexdigit()));
+        let spec = runtime.spec("bridge-matrimail-brandon").unwrap();
+        assert_eq!(
+            spec.files.keys().cloned().collect::<Vec<_>>(),
+            ["config.yaml", "passphrase", "registration.yaml"]
+        );
+        assert_eq!(spec.files["passphrase"], passphrase);
+        assert_eq!(spec.image_repository, "ghcr.io/brandon-dacrib/matrimail");
+        assert_eq!(spec.port, hs_admin::bridge_types::MATRIMAIL_PORT);
+        let config = &spec.files["config.yaml"];
+        assert!(config.contains("  port: 29339\n"), "{config}");
+        assert!(
+            config.contains("username_template: \"email_brandon_{{.}}\""),
+            "{config}"
+        );
+        let files = manager
+            .instance_files("matrimail", "@brandon:example.org")
+            .await
+            .unwrap();
+        assert_eq!(files.files["passphrase"], passphrase);
+        // The passphrase is for matrimail alone.
+        manager.put("mautrix-whatsapp", cluster()).await.unwrap();
+        manager
+            .put_instance("mautrix-whatsapp", "@brandon:example.org")
+            .await
+            .unwrap();
+        manager.tick().await;
+        manager.tick().await;
+        let whatsapp = manager
+            .store
+            .instance("mautrix-whatsapp", "@brandon:example.org")
+            .unwrap()
+            .unwrap();
+        assert!(whatsapp.credentials_passphrase.is_none());
+        assert!(
+            !runtime
+                .spec("bridge-whatsapp-brandon")
+                .unwrap()
+                .files
+                .contains_key("passphrase")
         );
     }
 

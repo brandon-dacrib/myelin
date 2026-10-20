@@ -152,6 +152,14 @@ pub struct InstanceRow {
     /// same key. `None` for every other type.
     #[serde(default)]
     pub passkey_pem: Option<String>,
+    /// matrimail's credentials passphrase (`hs_admin::bridge_types::MATRIMAIL_PASSPHRASE_FILE`
+    /// in `/data`; the value `MATRIMAIL_PASSPHRASE` would carry): what the bridge encrypts the
+    /// mailbox logins it keeps with, minted with the instance's tokens for a type that needs
+    /// one (`needs_credentials_passphrase`) and kept here so that every render writes the same
+    /// one. A different passphrase makes every stored login unreadable, and the bridge refuses
+    /// to start rather than guess. `None` for every other type.
+    #[serde(default)]
+    pub credentials_passphrase: Option<String>,
     /// The seeds of the bot's cross-signing master and self-signing keys
     /// (`crate::cross_signing`), hex, minted on the instance's first ready step and kept here
     /// so the identity outlives the bridge's own database. `None` on a row from before this:
@@ -250,6 +258,7 @@ impl InstanceRow {
             provisioning_secret: None,
             pickle_key: None,
             passkey_pem: None,
+            credentials_passphrase: None,
             cross_signing_master_seed: None,
             cross_signing_self_signing_seed: None,
             signed_bot_device: None,

@@ -1,0 +1,172 @@
+name: matrimail image
+
+# matrimail (the Matrix <-> email bridge) publishes no image and no release, so this repository
+# builds one for the catalogue's `matrimail` entry (decision 0055): the active fork,
+# moiri-gamboni/matrimail, at the commit deploy/bridges/matrimail/Dockerfile pins
+# (`MATRIMAIL_COMMIT`), for linux/amd64 and linux/arm64, each on a native runner, pushed by
+# digest and joined into one manifest list tagged with the commit's first seven characters
+# (what the catalogue pins) and `latest`. The catalogue's own test keeps the Dockerfile's pin
+# and the entry's tag equal, so a bump is: edit the pin in both, merge, and the push of this
+# file's path (or of the Dockerfile) builds the new tag. Weekly as well, so that a base-image
+# fix (bookworm-slim's packages) reaches the same tag without anyone remembering to dispatch.
+#
+# The first run after a merge is what makes the catalogue's pin pullable; until then an
+# offering of the type cannot start (`ErrImagePull`), and the real-bridge test
+# (crates/hs-bridge-conformance/tests/real_matrimail.rs) skips on CI, saying so.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - deploy/bridges/matrimail/**
+      - .github/workflows/matrimail-image.yml
+  schedule:
+    - cron: '41 6 * * 1'
+  # A dispatch builds and pushes too: the owner's first run after the merge.
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/matrimail
+
+permissions:
+  contents: read
+
+jobs:
+  pin:
+    name: the pinned commit
+    runs-on: ubuntu-24.04
+    outputs:
+      commit: ${{ steps.pin.outputs.commit }}
+      tag: ${{ steps.pin.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read MATRIMAIL_COMMIT from the Dockerfile
+        id: pin
+        run: |
+          set -euo pipefail
+          commit="$(sed -n 's/^ARG MATRIMAIL_COMMIT=\([0-9a-f]\{40\}\)$/\1/p' deploy/bridges/matrimail/Dockerfile | head -1)"
+          if [ -z "$commit" ]; then
+            echo "deploy/bridges/matrimail/Dockerfile declares no 40-hex MATRIMAIL_COMMIT" >&2
+            exit 1
+          fi
+          # Every declaration in the file names the same commit (there is one per stage).
+          if [ "$(sed -n 's/^ARG MATRIMAIL_COMMIT=//p' deploy/bridges/matrimail/Dockerfile | sort -u | wc -l)" != 1 ]; then
+            echo "the Dockerfile's MATRIMAIL_COMMIT declarations differ" >&2
+            exit 1
+          fi
+          # The catalogue pins the same tag (crates/hs-admin/src/bridge_types.rs also tests this).
+          if ! grep -q "ghcr.io/brandon-dacrib/matrimail:${commit:0:7}\"" crates/hs-admin/src/bridge_types.rs; then
+            echo "the catalogue does not pin ghcr.io/brandon-dacrib/matrimail:${commit:0:7}" >&2
+            exit 1
+          fi
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "tag=${commit:0:7}" >> "$GITHUB_OUTPUT"
+          echo "building moiri-gamboni/matrimail at $commit as :${commit:0:7}"
+
+  image:
+    name: image (${{ matrix.arch }})
+    needs: pin
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    outputs:
+      digest-amd64: ${{ steps.export.outputs.digest-amd64 }}
+      digest-arm64: ${{ steps.export.outputs.digest-arm64 }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+        with:
+          # BuildKit from the mirror, as cd.yml: the Hub rate-limits these runners.
+          driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1
+
+      - name: Log in to the registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: deploy/bridges/matrimail
+          file: deploy/bridges/matrimail/Dockerfile
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            MATRIMAIL_COMMIT=${{ needs.pin.outputs.commit }}
+          cache-from: type=gha,scope=matrimail-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=matrimail-${{ matrix.arch }}
+          push: true
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Prove the image runs
+        # The binary says which commit it is (`-X main.Commit`), and the entrypoint's
+        # no-config path exits 1 with its message: both mean the image starts and the
+        # entrypoint, the C runtime for go-sqlite3 and the binary are all there.
+        run: |
+          set -euo pipefail
+          ref="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}"
+          docker run --rm "$ref" --version | tee version.txt
+          grep -q "${{ needs.pin.outputs.tag }}" version.txt
+          if docker run --rm "$ref"; then
+            echo "the entrypoint should refuse to start without /data/config.yaml" >&2
+            exit 1
+          fi
+
+      - name: Export the digest
+        id: export
+        run: echo "digest-${{ matrix.arch }}=${{ steps.build.outputs.digest }}" >> "$GITHUB_OUTPUT"
+
+  manifest:
+    name: manifest list
+    needs: [pin, image]
+    if: ${{ !cancelled() && needs.image.result == 'success' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push the manifest list
+        run: |
+          set -euo pipefail
+          image="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          digests=""
+          for d in "${{ needs.image.outputs.digest-amd64 }}" "${{ needs.image.outputs.digest-arm64 }}"; do
+            [ -n "$d" ] && digests="$digests $image@$d"
+          done
+          # shellcheck disable=SC2086
+          for tag in "${{ needs.pin.outputs.tag }}" latest; do
+            docker buildx imagetools create -t "$image:$tag" $digests
+          done
+
+      - name: Show what was published
+        run: |
+          image="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          for tag in "${{ needs.pin.outputs.tag }}" latest; do
+            echo "== $image:$tag"
+            docker buildx imagetools inspect "$image:$tag" | head -20
+          done
