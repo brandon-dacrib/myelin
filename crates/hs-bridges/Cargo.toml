@@ -24,8 +24,8 @@ hex = { workspace = true }
 prometheus-client = { workspace = true }
 rand = { workspace = true }
 # `src/passkey.rs`: Hookshot's passkey, an RSA private key in PEM.
-rsa = { workspace = true }
-rand_core = { workspace = true, features = ["getrandom"] }
+aws-lc-rs = { workspace = true }
+rustls-pki-types = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }

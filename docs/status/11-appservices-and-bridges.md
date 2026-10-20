@@ -1,6 +1,6 @@
 # Status: track 11, appservices and bridges
 
-Last updated: 2026-10-20 (Hookshot on the demo by hand, GitHub PR comments from two repositories; below); before that 2026-10-19, evening (six mautrix pins bumped to v0.2610.0, verified with the real
+Last updated: 2026-10-20, later (the passkey is made by aws-lc-rs, not the `rsa` crate CI's audit refuses; three webpki crates updated for the emSign distrust; below); before that 2026-10-20 (Hookshot on the demo by hand, GitHub PR comments from two repositories; below); before that 2026-10-19, evening (six mautrix pins bumped to v0.2610.0, verified with the real
 Last updated: 2026-10-20 (Hookshot is an offering the server deploys: its config rendered whole
 from the offering's public URL and GitHub App, its passkey minted and kept, the `Bridge` and
 the operator expose its webhooks and metrics ports, and the offering's page lists its
@@ -62,6 +62,23 @@ manager) and an instance's Kubernetes objects say whose bridge they are; before 
 (who has signed in to a bridge; the `cluster` runtime run on kind); before that 2026-09-30
 (ephemeral, to-device and device-list delivery); before that 2026-09-27 (RFC 0017 run against
 the real binary), 2026-09-27 (the bridge manager) and 2026-09-25.
+
+## 2026-10-20, later (branch `agent/audit-rsa-webpki`): the passkey is made by aws-lc-rs, and CI's audit is green again
+
+The first CD run after the Hookshot offering merged (`264d3640`, folded with the dry-run fix
+`ec62d66d`) released nothing: `cargo audit` on CI found four advisories. One was ours: the
+offering made Hookshot's passkey with the `rsa` crate, which carries RUSTSEC-2023-0071 (the
+Marvin timing attack on decryption, no patched version, `patched = []` on purpose), and the
+audit refuses it even though the server only generates the key and never decrypts with it.
+`hs-bridges::passkey` now makes the key with aws-lc-rs (`rsa::KeyPair::generate`, exported
+as PKCS#8 with `AsDer<Pkcs8V1Der>`, PEM-wrapped in 64-column lines the way `openssl genpkey`
+writes), a crate rustls and matrix-sdk already bring in; `rsa`, `num-bigint-dig`, `pkcs1` and
+`pem-rfc7468` leave the lock file. Sizes are 2048, 3072 or 4096 (what aws-lc-rs makes; any
+other is `PasskeyError::Size`). The test reads the PEM back through rustls-pki-types'
+`PemObject` and aws-lc-rs's `from_pkcs8` and checks the modulus. The other three were the
+day's emSign distrust (RUSTSEC-2026-0381/0382/0383): `rustls-webpki` 0.103.15 → 0.103.16,
+`webpki-roots` and `webpki-root-certs` 1.0.9 → 1.0.10, by `cargo update -p`. `cargo audit`
+locally: no vulnerabilities, five allowed `unmaintained`/`yanked` warnings.
 
 ## 2026-10-20: Hookshot on the demo, by hand, with GitHub PR comments from two repositories
 

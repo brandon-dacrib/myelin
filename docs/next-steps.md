@@ -4,6 +4,15 @@ Written 2026-09-20 by the integration lead, last revised 2026-10-19, late (six m
 
 The project is **Myelin**, and it is public: <https://github.com/brandon-dacrib/myelin>. The crates still carry the `hs-` prefix from before it had a name.
 
+## 2026-10-20, later -- CI's audit blocked the Hookshot release: the passkey is made by aws-lc-rs now; the branch is `agent/audit-rsa-webpki`
+
+The CD run for `ec62d66d` (the offering plus the dry-run fix) refused to release: `cargo audit`
+found `rsa` (RUSTSEC-2023-0071, unpatchable, brought in for Hookshot's passkey) and the day's
+emSign advisories on `rustls-webpki`, `webpki-roots` and `webpki-root-certs`. Fixed: the
+passkey comes from aws-lc-rs (already in the tree), the three crates are updated (status 11).
+Once this merges and CD tags it, the demo rolls to that release and its hand-made Hookshot
+becomes the offering.
+
 ## 2026-10-20 -- `POST /api/v1/appservices?dry_run=true` no longer creates; the branch is `agent/appservice-dry-run`
 
 Found registering Hookshot on the demo (above): the handler ignored `dry_run`, so a dry run
