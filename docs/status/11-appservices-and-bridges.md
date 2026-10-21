@@ -1,6 +1,6 @@
 # Status: track 11, appservices and bridges
 
-Last updated: 2026-10-21 (v0.4.13 on the demo, revision 43: matrimail in the catalogue and the Hookshot sources with the add-a-webhook page; below); before that 2026-10-20, evening (matrimail, the email bridge, is in the catalogue on an image this repository builds; decision 0055; below); before that 2026-10-20, evening (v0.4.11 on the demo, and the demo's Hookshot is the offering: the hand-made Bridge, Secret and registration removed, the offering created, the rooms and GitHub webhooks unchanged; below); before that 2026-10-20, later (the passkey is made by aws-lc-rs, not the `rsa` crate CI's audit refuses; three webpki crates updated for the emSign distrust; below); before that 2026-10-20 (Hookshot is an offering the server deploys: its config rendered whole from the offering's public URL and GitHub App, its passkey minted and kept, the `Bridge` and the operator expose its webhooks and metrics ports, and the offering's page lists its connections read from the rooms' state; and, by hand before that, Hookshot on the demo with GitHub PR comments from two repositories; below); before that before that 2026-10-19, evening (six mautrix pins bumped to v0.2610.0, verified with the real
+Last updated: 2026-10-21, later (Element's sender-versus-device shield on bridged messages is expected and `self_sign` stays off; below); before that 2026-10-21 (v0.4.13 on the demo, revision 43: matrimail in the catalogue and the Hookshot sources with the add-a-webhook page; below); before that 2026-10-20, evening (matrimail, the email bridge, is in the catalogue on an image this repository builds; decision 0055; below); before that 2026-10-20, evening (v0.4.11 on the demo, and the demo's Hookshot is the offering: the hand-made Bridge, Secret and registration removed, the offering created, the rooms and GitHub webhooks unchanged; below); before that 2026-10-20, later (the passkey is made by aws-lc-rs, not the `rsa` crate CI's audit refuses; three webpki crates updated for the emSign distrust; below); before that 2026-10-20 (Hookshot is an offering the server deploys: its config rendered whole from the offering's public URL and GitHub App, its passkey minted and kept, the `Bridge` and the operator expose its webhooks and metrics ports, and the offering's page lists its connections read from the rooms' state; and, by hand before that, Hookshot on the demo with GitHub PR comments from two repositories; below); before that before that 2026-10-19, evening (six mautrix pins bumped to v0.2610.0, verified with the real
 before that 2026-10-20, evening (one Hookshot, many webhooks: a source library with seven
 senders' transformation functions, webhooks made by the server as the bot from the page or
 the API with the URL shown once, connections removed, the real-image story both ways; below);
@@ -66,6 +66,21 @@ manager) and an instance's Kubernetes objects say whose bridge they are; before 
 (who has signed in to a bridge; the `cluster` runtime run on kind); before that 2026-09-30
 (ephemeral, to-device and device-list delivery); before that 2026-09-27 (RFC 0017 run against
 the real binary), 2026-09-27 (the bridge manager) and 2026-09-25.
+
+## 2026-10-21, later: Element's "sender does not match the owner of the device" shield on bridged messages is expected; `self_sign` stays off
+
+**Asked**: the owner sees that line under many bridged messages in Element; mautrix's
+troubleshooting page suggests enabling the bot's self-signing. **Found** (detail in
+`docs/bridges/mautrix.md`, the 2026-10-21 entry): the shield is inherent to mautrix encrypting
+every ghost's message with the bot's one session, mautrix's own page says `self_sign` does not
+remove it (MSC4350 will, once clients implement it), and what `self_sign` is for, a
+cross-signed bot device, the manager has done since 2026-10-03 (decision 0027). Enabling
+`encryption.self_sign` on a deployed instance would exit the bridge with code 34 (keys on the
+server, no recovery key in its database). The Slack bridge's "Own cross-signing keys are not
+fully trusted" line is the benign side of the server holding the private keys. **Verified on
+the demo**: every Megolm share in the day's Slack log reached every device, nothing withheld.
+**Changed**: nothing but the docs. **Left**: nothing; the shield goes when clients ship
+MSC4350.
 
 ## 2026-10-21: v0.4.13 on the demo (revision 43): matrimail in the catalogue, webhooks from the page
 

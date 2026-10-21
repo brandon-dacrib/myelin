@@ -322,6 +322,39 @@ two settings, and which one decides what to do:
 Running it: `cargo build -p hs-cli --bin hs`, then `cargo test -p hs-bridge-conformance --test
 real_mautrix_login -- --nocapture` with Docker reachable.
 
+## 2026-10-21: Element's "The sender of the event does not match the owner of the device that sent it" is expected, and `self_sign` must stay off
+
+The owner saw that line under many bridged messages in Element and asked whether
+mautrix's troubleshooting page (`docs.mau.fi/bridges/general/troubleshooting.html`) was
+right that the bot's self-signing should be turned on. Checked against that page,
+mautrix-go's source and the demo:
+
+- **The warning is inherent to how mautrix encrypts.** The bridge encrypts every message with
+  its bot's one Olm/Megolm session, whatever ghost user sends it. Element compares the event's
+  sender with the device's owner, and for a ghost they never match, so every bridged message in
+  an encrypted room carries that shield. mautrix's page says the same, and says `self_sign`
+  does not remove it: a session per ghost is ruled out as too costly, and the spec change that
+  lets a ghost delegate encryption to the bot (MSC4350) is what will let clients drop the
+  warning. Nothing to configure; it is cosmetic until clients implement that.
+- **What `self_sign` is for, this server already does.** Its point is a cross-signed bot
+  device, so a client that excludes insecure devices still shares room keys with the bridge.
+  Since 2026-10-03 (above, decision 0027) the manager mints the bot's master and self-signing
+  keys, publishes them and signs the bot's device, so the demo's bots are cross-signed without
+  it. **Turning `encryption.self_sign` on now would stop the bridge:** `doSelfSign`
+  (`bridgev2/matrix/crypto.go`) finds keys on the server and no `recovery_key` in the bridge's
+  database and exits 34 ("Server already has cross-signing keys, but no key in database"). The
+  rendered config leaves it off on purpose.
+- **A warning of the bridge's own, benign.** The Slack bridge logs "Own cross-signing keys are
+  not fully trusted, treating other users as untrusted" (`crypto/cross_sign_validation.go`,
+  `IsUserTrusted`) on each key share: it holds none of the private keys the server minted, so
+  it cannot apply user-signing trust to anyone. With the default verification levels
+  (`receive`/`send` unverified, `share` cross-signed-tofu) that changes nothing it does; it would
+  matter only if those levels were raised to require cross-signing.
+- **The demo, 2026-10-21.** Slack and WhatsApp run with `encryption.appservice: true` and
+  `msc4190: true`; in the day's log every Megolm share from the Slack bridge reached every
+  device (`missing_count=0`), no key was withheld, and the server logged no
+  "could not settle the bot's cross-signing identity".
+
 ## 2026-10-15: a full volume
 
 **What happened.** The demo's Slack bridge (`bridge-slack-brandon`, a 1 GiB Longhorn claim)
