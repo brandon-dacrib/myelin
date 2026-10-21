@@ -14,8 +14,11 @@ be easy per user, and: no Gmail webhook, matrimail is the mail path. In flight o
 `agent/user-webhooks`: a user API under the client-server prefix (`io.myelin.webhooks`, the
 user's own token), a `/integrations/` page the binary serves for any user, decision 0057;
 gate and merge it when it reports. Seen during this: node `tp0n4` has `DiskPressure` and
-flapped `NotReady`, taking Hookshot's public URL to 502 for a while; `tp0n2` is at its
-eviction threshold too. Status 11 has the detail. **Left:** the branch; `GitHub: avantos` on
+flapped `NotReady`; Hookshot was evicted and came back on `black0n0` after fourteen minutes
+(20:52 to 21:06), during which 131 avantos deliveries got 502 (GitHub can redeliver them; the
+owner's call). All four Talos nodes have 28 GiB disks at 6-12 GiB free; `tp0n1`, the server's
+node, was under `DiskPressure` at 21:02 and the server pod had been recreated at 20:43.
+Status 11 has the detail. **Left:** the branch; `GitHub: avantos` on
 the library; the node's disk is the owner's.
 
 ## 2026-10-21, later -- the Element shield on bridged messages is expected; `self_sign` stays off

@@ -90,8 +90,18 @@ the pod" and the public URL answered 502. Not the change: worker node `tp0n4` (H
 the Tailscale operator's node) went `NodeNotReady` twice in five minutes with
 `DiskPressure=True` (29 GiB ephemeral disk, 3.6 GiB free, Longhorn instance managers being
 evicted; `tp0n2` logged `EvictionThresholdMet` too). The node controller marks every pod on
-such a node not Ready and the Service drops it, so the Funnel's proxy gets nothing. Reported
-to the owner; the cleanup is theirs.
+such a node not Ready and the Service drops it, so the Funnel's proxy gets nothing. Then the
+taint manager evicted the pod; its replacement on `black0n0` sat in `Init` for six minutes on
+a Longhorn Multi-Attach error (the volume still attached to the dead pod, Longhorn's own
+managers evicted) and came up at 21:06. The public URL answered 502 from 20:52:23 to 21:06:23,
+fourteen minutes; the connection needed nothing (it is room state), and a probe landed at
+once. **Lost in that window:** 131 avantos deliveries (104 issue comments, 12 reviews, 15
+review comments; a bot was busy on a PR) and nothing on myelin; GitHub keeps them and can
+redeliver each, which is the owner's call since it would be 131 notices at once. The wider
+fact: the four Talos nodes have 28 GiB disks and were at 6-12 GiB free, with `tp0n1` (the
+server's node) under `DiskPressure` at 21:02 and the server pod itself recreated at 20:43
+(`myelin-hs-0`, 0 restarts, a fresh pod); the kubelets are reclaiming images at the threshold
+and evicting as they go. The cleanup or bigger disks are the owner's.
 
 **Direction**: a per-user flow. The admin API's verifier refuses a non-admin's token exactly
 like an unknown one (status 07), so the user flow cannot sit behind `/api/v1`. Branch
