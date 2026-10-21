@@ -1,6 +1,6 @@
 # Status: track 11, appservices and bridges
 
-Last updated: 2026-10-21, later (Element's sender-versus-device shield on bridged messages is expected and `self_sign` stays off; below); before that 2026-10-21 (v0.4.13 on the demo, revision 43: matrimail in the catalogue and the Hookshot sources with the add-a-webhook page; below); before that 2026-10-20, evening (matrimail, the email bridge, is in the catalogue on an image this repository builds; decision 0055; below); before that 2026-10-20, evening (v0.4.11 on the demo, and the demo's Hookshot is the offering: the hand-made Bridge, Secret and registration removed, the offering created, the rooms and GitHub webhooks unchanged; below); before that 2026-10-20, later (the passkey is made by aws-lc-rs, not the `rsa` crate CI's audit refuses; three webpki crates updated for the emSign distrust; below); before that 2026-10-20 (Hookshot is an offering the server deploys: its config rendered whole from the offering's public URL and GitHub App, its passkey minted and kept, the `Bridge` and the operator expose its webhooks and metrics ports, and the offering's page lists its connections read from the rooms' state; and, by hand before that, Hookshot on the demo with GitHub PR comments from two repositories; below); before that before that 2026-10-19, evening (six mautrix pins bumped to v0.2610.0, verified with the real
+Last updated: 2026-10-21, evening (the demo's myelin GitHub hook is a source-library webhook made from the page, the hand-made one removed; the owner wants webhooks self-service for every user; below); before that 2026-10-21, later (Element's sender-versus-device shield on bridged messages is expected and `self_sign` stays off; below); before that 2026-10-21 (v0.4.13 on the demo, revision 43: matrimail in the catalogue and the Hookshot sources with the add-a-webhook page; below); before that 2026-10-20, evening (matrimail, the email bridge, is in the catalogue on an image this repository builds; decision 0055; below); before that 2026-10-20, evening (v0.4.11 on the demo, and the demo's Hookshot is the offering: the hand-made Bridge, Secret and registration removed, the offering created, the rooms and GitHub webhooks unchanged; below); before that 2026-10-20, later (the passkey is made by aws-lc-rs, not the `rsa` crate CI's audit refuses; three webpki crates updated for the emSign distrust; below); before that 2026-10-20 (Hookshot is an offering the server deploys: its config rendered whole from the offering's public URL and GitHub App, its passkey minted and kept, the `Bridge` and the operator expose its webhooks and metrics ports, and the offering's page lists its connections read from the rooms' state; and, by hand before that, Hookshot on the demo with GitHub PR comments from two repositories; below); before that before that 2026-10-19, evening (six mautrix pins bumped to v0.2610.0, verified with the real
 before that 2026-10-20, evening (one Hookshot, many webhooks: a source library with seven
 senders' transformation functions, webhooks made by the server as the bot from the page or
 the API with the URL shown once, connections removed, the real-image story both ways; below);
@@ -66,6 +66,43 @@ manager) and an instance's Kubernetes objects say whose bridge they are; before 
 (who has signed in to a bridge; the `cluster` runtime run on kind); before that 2026-09-30
 (ephemeral, to-device and device-list delivery); before that 2026-09-27 (RFC 0017 run against
 the real binary), 2026-09-27 (the bridge manager) and 2026-09-25.
+
+## 2026-10-21, evening: the myelin GitHub hook is made from the page; webhooks must be self-service for every user
+
+**Asked**: finish the GitHub webhook for the owner. Mid-way the owner said: "this server
+isn't just meant to be mine, the flow for adding webhooks on a per user basis should be easy."
+And: no Gmail webhook; matrimail is the mail path.
+
+**Done on the demo** (from the owner's signed-in admin tab, the offering page's "Add a
+webhook"): source GitHub comments, room `GitHub: myelin` (the bot was in it), name
+`myelin-comments`; the dialog showed the URL once with the sender's setup. The repository hook
+`700962572` on `brandon-dacrib/myelin` was repointed at that URL with `gh api` and pinged:
+GitHub recorded 202, Hookshot's ghost `@_webhooks_myelin-comments` joined and posted "GitHub
+webhook for brandon-dacrib/myelin is connected." 180 ms after the delivery. The hand-made
+`github-myelin` connection was then removed from the page (its confirmation names the room);
+Hookshot logged "Removing GenericHookConnection b449feca..." and its URL answers 404; the new
+one 202. The owner's account had been `invite` in the room since the 20th and could not read
+it; it was joined with the owner's own token from the tab. `GitHub: avantos` keeps its
+hand-made hook (an org repository; the same move applies when wanted).
+
+**Seen**: a minute after the removal the page said the deployment was "Starting, waiting for
+the pod" and the public URL answered 502. Not the change: worker node `tp0n4` (Hookshot's and
+the Tailscale operator's node) went `NodeNotReady` twice in five minutes with
+`DiskPressure=True` (29 GiB ephemeral disk, 3.6 GiB free, Longhorn instance managers being
+evicted; `tp0n2` logged `EvictionThresholdMet` too). The node controller marks every pod on
+such a node not Ready and the Service drops it, so the Funnel's proxy gets nothing. Reported
+to the owner; the cleanup is theirs.
+
+**Direction**: a per-user flow. The admin API's verifier refuses a non-admin's token exactly
+like an unknown one (status 07), so the user flow cannot sit behind `/api/v1`. Branch
+`agent/user-webhooks` (in flight): a user API under the client-server prefix
+(`io.myelin.webhooks`, the user's own Matrix token: sources, my webhooks, make one in a room I
+may configure or in a new room, remove), a `/integrations/` page served by the binary that
+signs in with the user's own account and reuses the admin page's add-a-webhook pieces, audit
+and metrics for the user path, the real-image story with a plain user, decision 0057.
+
+**Left**: the branch's gate and merge; `GitHub: avantos` on the library; a GitHub App on the
+offering (per-user GitHub sign-in) stays open.
 
 ## 2026-10-21, later: Element's "sender does not match the owner of the device" shield on bridged messages is expected; `self_sign` stays off
 
