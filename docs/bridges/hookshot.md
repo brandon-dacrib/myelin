@@ -190,10 +190,79 @@ What the server writes, in this order (read from Hookshot 7.5.0's
 Removing empties the state event (the bridge purges the connection when it sees that, as its
 own remove does, and writes `{"disabled": true}` back into the event, which the listing reads
 as `removed` too) and then drops the hook id from the account data, so the URL stops working
-even if the bridge missed the event. A removed name can be used again.
+even if the bridge missed the event. A removed name can be used again. The metric's `via`
+label says which path asked (`admin` here, `user` for the page every user has, below).
 
 The secret is in the bridge's account data and nowhere the admin API reads back: the create
 answer is the one place it is shown, the listing never has it, the audit log never has it.
+
+## For everyone: `/integrations/` and the user API
+
+Since 2026-10-21 (decision 0057) a person on the server adds a webhook to a room of their own
+without an administrator. The page is **`https://<server>/integrations/`**, served by the
+binary from the same build as `/admin/`, signed in with the person's own Matrix account (the
+ordinary `/login`; nobody needs to be an administrator): **My webhooks** lists the webhooks in
+the rooms they are in (who made each, when); **Add a webhook** is the same three steps as the
+admin page (what will post, which room, a name) and then the URL once with the sender's setup
+(and `Code.gs` for Gmail); **Remove** asks first. The rooms offered are the person's joined
+rooms that can take one; the others say why not (the level it takes, or that the room is
+encrypted). An administrator sends people there: the offering's page links to it, and the
+admin sign-in says so for someone who is not an administrator.
+
+Behind it is a client-server extension under an unstable namespace, authenticated by the
+person's access token like any client endpoint (not `/api/v1`, whose verifier refuses a
+non-administrator's token by design), and not part of the admin OpenAPI:
+
+| Route | What it does |
+|---|---|
+| `GET /_matrix/client/unstable/io.myelin.webhooks/sources` | The sources, as the admin API lists them (`{items: [...]}`). |
+| `GET .../rooms` | `{rooms: [{room_id, name, bot_joined, may_add, reason}]}`: the caller's joined rooms (up to 200), each saying whether a webhook may be added there and, if not, why. |
+| `GET .../webhooks` | `{items: [{room_id, room_name, name, source, created_by, created_at}]}`: the active webhook connections in rooms the caller is joined to. Never the URL. |
+| `POST .../webhooks` | `{source, name, room: {id} \| {create: {name, topic?}}}` → `201` with `{room_id, name, source, url, setup, files}`, the URL's one showing. |
+| `DELETE .../webhooks/{room_id}/{name}` | Removes a webhook the way the bridge does; `200 {}`. |
+
+Errors are Matrix errors: `M_FORBIDDEN` (not in the room, not enough power, encrypted, may
+not invite the bot), `M_NOT_FOUND` (no Hookshot offered, none with a public URL, the bridge
+not registered yet, no such webhook: each says so and says to ask an administrator),
+`M_INVALID_PARAM` (a bad source, name or room, naming the field), `M_LIMIT_EXCEEDED` with
+`retry_after_ms` (ten creations at once per user, one more every six minutes), `409` on a
+name the room already uses.
+
+```sh
+curl -X POST "$HS/_matrix/client/unstable/io.myelin.webhooks/webhooks" \
+  -H "authorization: Bearer $MY_ACCESS_TOKEN" -H 'content-type: application/json' \
+  -d '{"source": "linear", "name": "linear-issues", "room": {"id": "!mine:example.org"}}'
+```
+
+What the server does for an existing room, in this order, from the room's current state as
+the caller sees it:
+
+1. The caller is a joined member with the power to send the connection's state event
+   (`events["uk.half-shot.matrix-hookshot.generic.hook"]`, else `state_default`, usually 50:
+   the Moderator level); the room is not encrypted (Hookshot here runs without encryption
+   and would post in the clear); otherwise `M_FORBIDDEN` saying which.
+2. If `@hookshot:server` is not in the room: the caller may invite, the server invites it
+   **as the caller**, and the bot joins.
+3. If the bot is below the level the event takes: the caller can change power levels (and
+   is at least that level), and the server raises the bot to exactly that level, as the
+   caller. A room the person made in their client passes all of this: they are at 100.
+4. The connection, exactly as the admin API makes one (the hook id in the bot's account data
+   first, then the state event, then the notice), with `io.myelin.created_by` and
+   `io.myelin.created_at` in the state event (Hookshot ignores keys it does not know; the
+   listings read them back), and the notice naming the maker.
+
+For a new room: the bot makes it (private, the name and topic given), invites the caller,
+gives them power 100 in it, and the server **joins the caller as themselves**, so it is in
+their client at once rather than in an invite list. Every make and remove is an entry in the
+admin audit log with the user as actor (`bridge_connection.created`/`.deleted`, never the
+URL), a line at INFO, and a count in `hs_bridge_webhook_connections_total{via="user"}`
+(`via="admin"` for the admin API).
+
+**The bot's own command keeps working.** Invite `@hookshot:server` to a room and send
+`!hookshot webhook <name>`: the bot answers with a URL in its chat with you, and what posts
+to it is shown as Hookshot renders it (`text`, `username`, otherwise the data), with no
+transformation function. `/integrations/` is the way to get the library's formatting for a
+sender.
 
 ## Sources
 
@@ -303,6 +372,24 @@ in this list either; the URL is in the room, where the bot said it.
   test and empty, Linear's move, comment, project and dropped label, Notion's verification
   token, page, comment and dropped unknown); each transform compiles as Hookshot checks it
   and uses nothing QuickJS lacks; the setup and files filled in; a hook id a v4 UUID.
+- `cargo test -p hs-bridges user_webhooks`: the rules (the room's creator may add and the
+  bot is invited and raised; a bot already in with power needs nothing; a plain member is
+  refused with the level it takes; the event type's own level over `state_default`, and a
+  grant the caller cannot make; not in the room; an encrypted room; the invite level; a
+  version 12 creator's infinite power; a room without a power levels event; active webhooks
+  read and removed ones not; power levels rewritten with the bot kept), the limiter (the
+  burst, the refusal with its wait, a second user's own bucket, the refill), the manager's
+  refusals as Matrix errors.
+- `cargo test -p hs-cli --test user_webhooks` (in-process server, 3 s): without a token
+  `401`; before the offering `404` saying to ask an administrator; after it the sources;
+  alice's room offered with `may_add`, Bob's view of it refused with "power level 50"; Bob's
+  `POST` `403`; alice's `201` with the URL, the bot joined and at 50, the state event with
+  her name and the source, the notice naming her without the URL; the same name `409`; a new
+  room joined by her at 100 with its name and topic; her two listed with `created_by`, Bob's
+  one; the audit log with her as actor (`kind: user`) and no secret; the metric with
+  `via="user"`; Bob's `DELETE` `403`, hers `200` and the event emptied, again `404`; an
+  encrypted room `403` saying so; a bad name `M_INVALID_PARAM` at `/name`; the eleventh
+  creation `M_LIMIT_EXCEEDED` with `retry_after_ms`; `/integrations/` served.
 - `cargo test -p hs-bridges connection`: a connection made as the bot against a fake server
   (the room with its name, topic and invites; the account data written before the state
   event; the transformation function and `io.myelin.source` in the content; the notice; the
@@ -323,7 +410,17 @@ in this list either; the URL is in the room, where the bot said it.
   restart); Datadog's sample posted to the URL lands as the source's notice with its Markdown
   rendered; the listing says `source: datadog`; `DELETE` makes the URL answer an error within
   a second and the listing say `removed` (Hookshot writes `{"disabled": true}` back, which
-  the listing reads as removed). Skipped, saying why, without Docker, the image or the binary. On the owner's
+  the listing reads as removed). Then (**2026-10-21, 14.5 s for all three parts**) as a
+  plain user: alice makes a room "Mine" in her client; `GET .../io.myelin.webhooks/rooms`
+  offers it (`may_add`, the bot not in it); `POST .../webhooks` with her own token, the
+  `linear` source and that room answers `201` with the URL; the bot is in the room and at
+  power 50, the state event names her and the source; Linear's `sample-issue-update.json`
+  posted to the URL lands within a second as `**Ada Lovelace** moved to **In Progress**:
+  [ENG-42 ...]` with the Markdown rendered (the real bridge picked the connection up live
+  from the state event, as for an administrator's); `GET .../webhooks` lists it with
+  `created_by` her and no secret; the admin audit log has her as actor; `DELETE` with her
+  token makes the URL answer an error within a second and the listing drop it. Skipped,
+  saying why, without Docker, the image or the binary. On the owner's
   desktop `docker pull` from ghcr.io reaches for the keychain and fails in a session; pulling
   with a `DOCKER_CONFIG` that has no credential store **and** a `PATH` without
   `docker-credential-osxkeychain` works anonymously (the CLI falls back to the helper whenever

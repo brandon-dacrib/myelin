@@ -5,14 +5,16 @@
 //! | --- | --- | --- |
 //! | `hs_bridge_volume_used_ratio` | gauge | `bridge` (the appservice id), `bridge_type` |
 //! | `hs_bridge_volume_capacity_bytes` | gauge | `bridge`, `bridge_type` |
-//! | `hs_bridge_webhook_connections_total` | counter | `bridge_type`, `source`, `outcome` |
+//! | `hs_bridge_webhook_connections_total` | counter | `bridge_type`, `source`, `via`, `outcome` |
 //!
 //! One volume series per instance this server deploys whose volume the operator has measured,
 //! read about once a minute (`BridgeManager::watch_volumes`); a removed instance's series go.
 //! The chart's PrometheusRule alerts on the ratio (`MyelinBridgeVolumeNearlyFull`, `...Full`).
-//! The webhook counter is one per connection the admin API made (`created`), removed
-//! (`removed`) or failed to make after its request was found sound (`failed`: the bot could
-//! not write to the room, the room could not be made), by the source it was made from.
+//! The webhook counter is one per connection made (`created`), removed (`removed`) or failed
+//! to make after its request was found sound (`failed`: the bot could not write to the room,
+//! the room could not be made), by the source it was made from and by which path asked for
+//! it: `via="admin"` for the admin API and `via="user"` for the self-service user API
+//! (`crate::user_webhooks`).
 
 use std::sync::LazyLock;
 use std::sync::atomic::AtomicU64;
@@ -37,38 +39,72 @@ static USED_RATIO: LazyLock<Family<VolumeLabels, Gauge<f64, AtomicU64>>> =
     LazyLock::new(Family::default);
 static CAPACITY_BYTES: LazyLock<Family<VolumeLabels, Gauge>> = LazyLock::new(Family::default);
 
-/// One webhook connection made or removed through the admin API.
+/// One webhook connection made or removed through the admin API or the user API.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, EncodeLabelSet)]
 struct WebhookLabels {
     /// The catalogue type (`matrix-hookshot`).
     bridge_type: String,
     /// The webhook source (`datadog`); `-` for a removal of a connection without one.
     source: String,
+    /// Which path asked: `admin` (the admin API) or `user` (the self-service user API).
+    via: &'static str,
     /// `created`, `removed` or `failed`.
     outcome: &'static str,
+}
+
+/// Which path made or removed a webhook connection, for the `via` label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebhookPath {
+    /// `POST/DELETE /api/v1/bridge-offerings/{type}/connections...`, an administrator.
+    Admin,
+    /// `/_matrix/client/unstable/io.myelin.webhooks/...`, a user with their own token.
+    User,
+}
+
+impl WebhookPath {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Admin => "admin",
+            Self::User => "user",
+        }
+    }
 }
 
 static WEBHOOK_CONNECTIONS: LazyLock<Family<WebhookLabels, Counter>> =
     LazyLock::new(Family::default);
 
-/// Counts one webhook connection `outcome` (`created`, `removed`, `failed`) for `source`.
-pub fn count_webhook_connection(bridge_type: &str, source: &str, outcome: &'static str) {
+/// Counts one webhook connection `outcome` (`created`, `removed`, `failed`) for `source`,
+/// asked for through `via`.
+pub fn count_webhook_connection(
+    bridge_type: &str,
+    source: &str,
+    via: WebhookPath,
+    outcome: &'static str,
+) {
     WEBHOOK_CONNECTIONS
         .get_or_create(&WebhookLabels {
             bridge_type: bridge_type.to_owned(),
             source: source.to_owned(),
+            via: via.label(),
             outcome,
         })
         .inc();
 }
 
-/// How many webhook connection `outcome`s have been counted for `source`, for tests.
+/// How many webhook connection `outcome`s have been counted for `source` through `via`, for
+/// tests.
 #[must_use]
-pub fn webhook_connections(bridge_type: &str, source: &str, outcome: &'static str) -> u64 {
+pub fn webhook_connections(
+    bridge_type: &str,
+    source: &str,
+    via: WebhookPath,
+    outcome: &'static str,
+) -> u64 {
     WEBHOOK_CONNECTIONS
         .get(&WebhookLabels {
             bridge_type: bridge_type.to_owned(),
             source: source.to_owned(),
+            via: via.label(),
             outcome,
         })
         .map(|c| c.get())
@@ -166,16 +202,33 @@ mod tests {
     }
 
     #[test]
-    fn webhook_connections_are_counted_by_source_and_outcome() {
-        let before = webhook_connections("matrix-hookshot", "datadog-metrics-test", "created");
-        count_webhook_connection("matrix-hookshot", "datadog-metrics-test", "created");
-        count_webhook_connection("matrix-hookshot", "datadog-metrics-test", "created");
+    fn webhook_connections_are_counted_by_source_path_and_outcome() {
+        let admin = WebhookPath::Admin;
+        let before =
+            webhook_connections("matrix-hookshot", "datadog-metrics-test", admin, "created");
+        count_webhook_connection("matrix-hookshot", "datadog-metrics-test", admin, "created");
+        count_webhook_connection("matrix-hookshot", "datadog-metrics-test", admin, "created");
+        count_webhook_connection(
+            "matrix-hookshot",
+            "datadog-metrics-test",
+            WebhookPath::User,
+            "created",
+        );
         assert_eq!(
-            webhook_connections("matrix-hookshot", "datadog-metrics-test", "created"),
+            webhook_connections("matrix-hookshot", "datadog-metrics-test", admin, "created"),
             before + 2
         );
         assert_eq!(
-            webhook_connections("matrix-hookshot", "datadog-metrics-test", "removed"),
+            webhook_connections(
+                "matrix-hookshot",
+                "datadog-metrics-test",
+                WebhookPath::User,
+                "created"
+            ),
+            1
+        );
+        assert_eq!(
+            webhook_connections("matrix-hookshot", "datadog-metrics-test", admin, "removed"),
             0
         );
         let mut registry = Registry::default();
@@ -184,7 +237,7 @@ mod tests {
         prometheus_client::encoding::text::encode(&mut text, &registry).unwrap();
         assert!(
             text.contains(
-                "hs_bridge_webhook_connections_total{bridge_type=\"matrix-hookshot\",source=\"datadog-metrics-test\",outcome=\"created\"}"
+                "hs_bridge_webhook_connections_total{bridge_type=\"matrix-hookshot\",source=\"datadog-metrics-test\",via=\"admin\",outcome=\"created\"}"
             ),
             "{text}"
         );

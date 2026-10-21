@@ -58,6 +58,7 @@ function MockSignIn() {
         </Button>
       </div>
       <LockedOutHint />
+      <IntegrationsHint />
       <p className="mt-2 text-xs text-text-faint">
         Mock mode (<code className="font-identifier">VITE_HS_MOCK=1</code>): this stands in for
         track 07&apos;s issuer. See docs/decisions/0003-web-stack.md.
@@ -185,7 +186,24 @@ function RealSignIn() {
         </Button>
       </form>
       <LockedOutHint />
+      <IntegrationsHint />
     </SignInShell>
+  );
+}
+
+/**
+ * The self-service page, for someone who landed here without being an administrator. Static
+ * text: the admin API's answer to a non-administrator's token is unchanged (an unknown token).
+ */
+function IntegrationsHint() {
+  return (
+    <p className="mt-2 text-xs text-text-faint">
+      Not an administrator? Add webhooks to your own rooms at{" "}
+      <a href="/integrations/" className="font-identifier text-accent underline hover:no-underline">
+        /integrations/
+      </a>
+      .
+    </p>
   );
 }
 

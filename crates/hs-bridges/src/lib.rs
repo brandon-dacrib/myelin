@@ -10,6 +10,9 @@
 //! - [`front_door`]: the manager's appservice API, and what `@whatsappbot` and `@bridges` say.
 //! - [`hookshot_sources`]: the webhook sources a Hookshot connection is made from, and their
 //!   transformation functions.
+//! - [`user_webhooks`]: the self-service user API under `/_matrix/client/unstable/
+//!   io.myelin.webhooks`, through which any user adds a webhook to a room of theirs
+//!   (decision 0057).
 //! - [`cross_signing`]: the cross-signing identity the manager keeps for each instance's bot,
 //!   so that a client which excludes insecure devices still shares keys with the bridge.
 //! - [`overlap`] and [`directory`]: a bridge registered by hand for a network this server now
@@ -28,6 +31,7 @@ pub mod overlap;
 pub mod passkey;
 pub mod runtime;
 pub mod store;
+pub mod user_webhooks;
 
 /// `bytes` random bytes, hex-encoded.
 #[must_use]

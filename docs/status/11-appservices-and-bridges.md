@@ -1,6 +1,7 @@
 # Status: track 11, appservices and bridges
 
-Last updated: 2026-10-21, evening (the demo's myelin GitHub hook is a source-library webhook made from the page, the hand-made one removed; the owner wants webhooks self-service for every user; below); before that 2026-10-21, later (Element's sender-versus-device shield on bridged messages is expected and `self_sign` stays off; below); before that 2026-10-21 (v0.4.13 on the demo, revision 43: matrimail in the catalogue and the Hookshot sources with the add-a-webhook page; below); before that 2026-10-20, evening (matrimail, the email bridge, is in the catalogue on an image this repository builds; decision 0055; below); before that 2026-10-20, evening (v0.4.11 on the demo, and the demo's Hookshot is the offering: the hand-made Bridge, Secret and registration removed, the offering created, the rooms and GitHub webhooks unchanged; below); before that 2026-10-20, later (the passkey is made by aws-lc-rs, not the `rsa` crate CI's audit refuses; three webpki crates updated for the emSign distrust; below); before that 2026-10-20 (Hookshot is an offering the server deploys: its config rendered whole from the offering's public URL and GitHub App, its passkey minted and kept, the `Bridge` and the operator expose its webhooks and metrics ports, and the offering's page lists its connections read from the rooms' state; and, by hand before that, Hookshot on the demo with GitHub PR comments from two repositories; below); before that before that 2026-10-19, evening (six mautrix pins bumped to v0.2610.0, verified with the real
+Last updated: 2026-10-21, evening (webhooks are self-service for every user at `/integrations/` through a user API behind the ordinary access token; decision 0057; branch `agent/user-webhooks`; below); before that 2026-10-21, evening (the demo's myelin GitHub hook is a source-library webhook made from the page, the hand-made one removed; below); before that 2026-10-21, later (Element's sender-versus-device shield on bridged messages is expected and `self_sign` stays off; below); before that 2026-10-21 (v0.4.13 on the demo, revision 43: matrimail in the catalogue and the Hookshot sources with the add-a-webhook page; below); before that 2026-10-20, evening (matrimail, the email bridge, is in the catalogue on an image this repository builds; decision 0055; below); before that 2026-10-20, evening (v0.4.11 on the demo, and the demo's Hookshot is the offering: the hand-made Bridge, Secret and registration removed, the offering created, the rooms and GitHub webhooks unchanged; below); before that 2026-10-20, later (the passkey is made by aws-lc-rs, not the `rsa` crate CI's audit refuses; three webpki crates updated for the emSign distrust; below); before that 2026-10-20 (Hookshot is an offering the server deploys: its config rendered whole from the offering's public URL and GitHub App, its passkey minted and kept, the `Bridge` and the operator expose its webhooks and metrics ports, and the offering's page lists its connections read from the rooms' state; and, by hand before that, Hookshot on the demo with GitHub PR comments from two repositories; below); before that before that 2026-10-19, evening (six mautrix pins bumped to v0.2610.0, verified with the real
+Last updated: 2026-10-21, evening (webhooks are self-service for every user at `/integrations/` through a user API behind the ordinary access token; decision 0057; branch `agent/user-webhooks`; below); before that 2026-10-21, later (Element's sender-versus-device shield on bridged messages is expected and `self_sign` stays off; below); before that 2026-10-21 (v0.4.13 on the demo, revision 43: matrimail in the catalogue and the Hookshot sources with the add-a-webhook page; below); before that 2026-10-20, evening (matrimail, the email bridge, is in the catalogue on an image this repository builds; decision 0055; below); before that 2026-10-20, evening (v0.4.11 on the demo, and the demo's Hookshot is the offering: the hand-made Bridge, Secret and registration removed, the offering created, the rooms and GitHub webhooks unchanged; below); before that 2026-10-20, later (the passkey is made by aws-lc-rs, not the `rsa` crate CI's audit refuses; three webpki crates updated for the emSign distrust; below); before that 2026-10-20 (Hookshot is an offering the server deploys: its config rendered whole from the offering's public URL and GitHub App, its passkey minted and kept, the `Bridge` and the operator expose its webhooks and metrics ports, and the offering's page lists its connections read from the rooms' state; and, by hand before that, Hookshot on the demo with GitHub PR comments from two repositories; below); before that before that 2026-10-19, evening (six mautrix pins bumped to v0.2610.0, verified with the real
 before that 2026-10-20, evening (one Hookshot, many webhooks: a source library with seven
 senders' transformation functions, webhooks made by the server as the bot from the page or
 the API with the URL shown once, connections removed, the real-image story both ways; below);
@@ -67,6 +68,74 @@ manager) and an instance's Kubernetes objects say whose bridge they are; before 
 (ephemeral, to-device and device-list delivery); before that 2026-09-27 (RFC 0017 run against
 the real binary), 2026-09-27 (the bridge manager) and 2026-09-25.
 
+## 2026-10-21, evening (branch `agent/user-webhooks`): webhooks are self-service for every user, at `/integrations/`
+
+**Asked** (the owner): "this server isn't just meant to be mine, the flow for adding webhooks
+on a per user basis should be easy." Decision 0057.
+
+**Done**
+
+- **The user API** (`crates/hs-bridges/src/user_webhooks.rs`, mounted by `hs serve` next to
+  the front doors; `crates/hs-cli/src/user_webhooks.rs` is the `CallerResolver` over the
+  ordinary `Requester` middleware): `/_matrix/client/unstable/io.myelin.webhooks/{sources,
+  rooms, webhooks, webhooks/{room_id}/{name}}`, a person's own access token, Matrix errors.
+  The rules are pure and unit-tested (`RoomFacts::from_state`, `verdict`,
+  `power_levels_with`): joined member with the power to send the hook's state event type
+  (`events[type]` else `state_default`; room version 12's creators infinite), no encryption,
+  the bot invited **as the caller** and joined if absent, raised to exactly the level the
+  event takes as the caller if below (refused with why when the caller cannot grant it). A
+  new room is made by the bot, the caller given 100 and **joined as themselves**. Then
+  `BridgeManager::create_connection_by(.., Some(user))` (the admin path's `create_connection`
+  now calls it with `None`): the state event gains `io.myelin.created_by`/`created_at`, the
+  notice names the maker, the metric gains `via="user"`/`"admin"`
+  (`hs_bridge_webhook_connections_total{bridge_type,source,via,outcome}`). Audited with the
+  user as actor into the same audit log (`bridge_connection.created`/`.deleted`, kind `user`,
+  the IP and user agent, never the URL), logged at INFO, rate-limited per user (ten at once,
+  one more every six minutes; `M_LIMIT_EXCEEDED` with `retry_after_ms`). `GET /rooms` reads
+  up to 200 of the caller's rooms' state concurrently and says `may_add` and the reason.
+  `MatrixClient::room_state_events` (whole events, with senders) for the creator.
+- **The page** (`web/integrations.html` → `web/src/integrations/{main,auth,api,
+  IntegrationsApp}.tsx`, a second Vite entry of the same build; served by
+  `hs_admin::assets` at `/integrations/` and any path under it, assets under
+  `/admin/assets/`): sign in with the ordinary `/login` (own session key, never the admin's),
+  My webhooks (name, source, room, made by, when; Remove with a confirmation), Add a webhook
+  (the admin dialog's shape: source cards, one of my rooms where I may with the others
+  explaining why not, or a new room with name and topic, a name; the URL once with copy, the
+  sender's setup, `Code.gs`), the server's refusals shown as said, the limit explained with
+  its wait. Reuses `ChoiceCard`, `SetupText`, `FileBlock` (now exported), `CopyableId`, the
+  design system. Mock (`web/src/mocks/data/user-webhooks.ts`, the `/login`, `whoami`,
+  `logout` and user API handlers), four Vitest tests, `web/e2e/integrations.spec.ts`
+  (axe-checked at each step and at phone width). The admin offering's page links to
+  `<origin>/integrations/`; the admin sign-in says "Not an administrator?" with the link.
+- **Docs**: `docs/bridges/hookshot.md` ("For everyone: `/integrations/` and the user API",
+  the bot's command still works and what it gives); decision 0057; status 15 (API
+  conventions) and 16 (web); `docs/next-steps.md`; the changelog.
+
+**Verified**
+
+- `cargo test -p hs-bridges` (the 13 `user_webhooks` tests, the metric with its `via`), `cargo
+  test -p hs-cli --test user_webhooks` (the in-process story in `docs/bridges/hookshot.md`'s
+  Verified, 3 s), `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt`.
+- `npm run check` and `npm run test:e2e` in `web/` (the new flow and the admin one).
+- `crates/hs-bridge-conformance/tests/real_hookshot.rs` **against the 7.5.0 image on this
+  desktop, 2026-10-21, 14.5 s for all three parts** (the in-room command, the admin API's
+  Datadog webhook, and now the user's): alice, no administrator, makes a room "Mine" in her
+  client; `GET /rooms` offers it; `POST /webhooks` with her token and the `linear` source
+  answers `201`; the bot is in the room at power 50, the state event names her; Linear's
+  sample posted to the URL lands within a second as the source's notice with its Markdown
+  rendered (live pickup from the state event, as for an administrator's); the listing names
+  her without the secret; the audit log has her as actor; her `DELETE` makes the URL answer
+  an error within a second and the listing drop it.
+
+**Left**
+
+- A URL cannot be re-shown or rotated in place: remove and make again.
+- Connections made in the room by the bot's command have no maker and no source; the user
+  listing shows them (they are webhooks in the person's rooms) without either.
+- The user API has no OpenAPI document (it is not the admin API's); `docs/bridges/hookshot.md`
+  is its reference. A `GET /_matrix/client/versions` `unstable_features` flag for it was not
+  added: nothing reads one yet.
+
 ## 2026-10-21, evening: the myelin GitHub hook is made from the page; webhooks must be self-service for every user
 
 **Asked**: finish the GitHub webhook for the owner. Mid-way the owner said: "this server
@@ -113,7 +182,6 @@ and metrics for the user path, the real-image story with a plain user, decision 
 
 **Left**: the branch's gate and merge; `GitHub: avantos` on the library; a GitHub App on the
 offering (per-user GitHub sign-in) stays open.
-
 ## 2026-10-21, later: Element's "sender does not match the owner of the device" shield on bridged messages is expected; `self_sign` stays off
 
 **Asked**: the owner sees that line under many bridged messages in Element; mautrix's

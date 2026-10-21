@@ -360,6 +360,30 @@ impl MatrixClient {
             .unwrap_or_default())
     }
 
+    /// The current state of `room_id` as `user` sees it, each event whole (`type`,
+    /// `state_key`, `content`, `sender`, `origin_server_ts`): for a check that needs to know
+    /// who sent an event, such as who created the room.
+    ///
+    /// # Errors
+    /// On failure, a 403 included when `user` is not in the room.
+    pub async fn room_state_events(
+        &self,
+        token: &str,
+        user: &str,
+        room_id: &str,
+    ) -> Result<Vec<Value>, MatrixError> {
+        let state = self
+            .call(
+                reqwest::Method::GET,
+                self.url(&["rooms", room_id, "state"], Some(user)),
+                token,
+                None,
+                "state",
+            )
+            .await?;
+        Ok(state.as_array().cloned().unwrap_or_default())
+    }
+
     /// The joined members of `room_id`, as `user` sees them.
     ///
     /// # Errors

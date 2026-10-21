@@ -2569,6 +2569,9 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     let migration_hub = user_state.hub.clone();
     let migration_media = media_state.repository.clone();
     let migration_tasks = tasks.clone();
+    // The self-service webhooks API writes to the same audit log as the admin API, with the
+    // user as actor (decision 0057).
+    let user_webhooks_audit: Arc<dyn hs_admin::audit::AuditSink> = audit.clone();
     let mut admin = admin_state(
         &auth_state,
         audit,
@@ -2716,6 +2719,7 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     }
 
     let well_known = hs_config::Live::new(well_known);
+    let user_webhooks_auth = auth_state.clone();
     let (app, manifest) = build_router(
         auth_state,
         mounts,
@@ -2727,6 +2731,15 @@ async fn spawn_serve_with_backend<B: KvBackend + 'static>(
     );
 
     let app = app.merge(hs_bridges::front_door::router(bridge_manager.clone()));
+    // Any user's own webhooks, under `/_matrix/client/unstable/io.myelin.webhooks`, behind
+    // their ordinary access token (`crate::user_webhooks`; the page is at `/integrations/`).
+    let app = app.merge(hs_bridges::user_webhooks::router(
+        bridge_manager.clone(),
+        user_webhooks_audit,
+        Arc::new(crate::user_webhooks::AuthCallerResolver::new(
+            user_webhooks_auth,
+        )),
+    ));
 
     // An operator pointing Synapse-era tooling (synapse-admin, Draupnir, a register script) at
     // this server wants to know, from the log, which of Synapse's admin operations it answers:

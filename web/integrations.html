@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Myelin integrations</title>
+    <!-- The admin page's favicon, inline for the same reason (see index.html). -->
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='5' fill='%234f46e5'/%3E%3Cpath d='M6 12h4M14 8h4M14 16h4' stroke='white' stroke-width='2' stroke-linecap='round'/%3E%3Ccircle cx='10' cy='12' r='1.5' fill='white'/%3E%3Ccircle cx='14' cy='8' r='1.5' fill='white'/%3E%3Ccircle cx='14' cy='16' r='1.5' fill='white'/%3E%3C/svg%3E"
+    />
+    <script>
+      // The same theme and accent as the admin page, applied before first paint
+      // (kept in sync with src/lib/theme.ts and index.html).
+      (function () {
+        try {
+          var theme = localStorage.getItem("hs-admin:theme");
+          var accent = localStorage.getItem("hs-admin:accent");
+          var root = document.documentElement;
+          if (theme === "light" || theme === "dark") {
+            root.setAttribute("data-theme", theme);
+          }
+          if (accent) {
+            root.setAttribute("data-accent", accent);
+          }
+        } catch (_e) {
+          /* localStorage unavailable: prefers-color-scheme and the default accent */
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/integrations/main.tsx"></script>
+  </body>
+</html>

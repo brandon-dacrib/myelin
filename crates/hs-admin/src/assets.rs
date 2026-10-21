@@ -2,6 +2,10 @@
 //! `index.html` fallback for client-side routes, `Cache-Control: immutable` for hashed assets,
 //! `no-store` for `index.html` itself.
 //!
+//! The same build carries a second page, `integrations.html`, served at `/integrations/`
+//! (and any path under it): the self-service webhooks page every user signs in to with their
+//! own account (decision 0057). Its assets are the build's, under `/admin/assets/`.
+//!
 //! It also answers the server's bare root, `GET /` (exact path only): someone who types the
 //! server's address into a browser is sent to `/admin/` when this binary carries the built
 //! interface, and otherwise gets a small plain page saying what this server is (the equivalent of
@@ -172,14 +176,40 @@ async fn admin_asset(Path(path): Path<String>) -> Response {
     serve_embedded(&path)
 }
 
-/// The `/admin` and `/admin/*` routes, and the bare root `/` (exact path; see
-/// [`root_response`]), ready to merge into the main router. The `GET` routes answer `HEAD` too.
+/// The self-service webhooks page: `integrations.html` from the same build, `no-store` like
+/// the admin shell; `404` with a word when this binary carries no built interface.
+async fn integrations_page() -> Response {
+    match Assets::get("integrations.html") {
+        Some(file) => (
+            StatusCode::OK,
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/html; charset=utf-8"),
+            )],
+            [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+            file.data.into_owned(),
+        )
+            .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            "no integrations page is embedded in this build",
+        )
+            .into_response(),
+    }
+}
+
+/// The `/admin` and `/admin/*` routes, the `/integrations` page, and the bare root `/` (exact
+/// path; see [`root_response`]), ready to merge into the main router. The `GET` routes answer
+/// `HEAD` too.
 pub fn router() -> axum::Router<AdminState> {
     axum::Router::new()
         .route("/", get(server_root))
         .route("/admin", get(admin_root))
         .route("/admin/", get(admin_root))
         .route("/admin/{*path}", get(admin_asset))
+        .route("/integrations", get(integrations_page))
+        .route("/integrations/", get(integrations_page))
+        .route("/integrations/{*path}", get(integrations_page))
 }
 
 #[cfg(test)]
@@ -217,6 +247,37 @@ mod tests {
             assert_ne!(file, "mockServiceWorker.js");
         }
         assert!(Assets::get("index.html").is_some());
+    }
+
+    /// The self-service page, from the same build: the page when it is there, a word when the
+    /// build is the placeholder; any path under it is the page too.
+    #[tokio::test]
+    async fn the_integrations_page_is_served_at_its_path_and_under_it() {
+        for uri in [
+            "/integrations",
+            "/integrations/",
+            "/integrations/anything/deeper",
+        ] {
+            let response = app()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = response.status();
+            let cache = response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            let text = body_text(response).await;
+            if Assets::get("integrations.html").is_some() {
+                assert_eq!(status, StatusCode::OK, "{uri}");
+                assert_eq!(cache.as_deref(), Some("no-store"), "{uri}");
+                assert!(text.contains("<div id=\"root\">"), "{uri}: {text}");
+            } else {
+                assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+                assert!(text.contains("no integrations page"), "{uri}: {text}");
+            }
+        }
     }
 
     #[tokio::test]

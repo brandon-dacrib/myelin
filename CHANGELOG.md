@@ -18,6 +18,15 @@ carries the generated notes for that merge.
 The 0.4 line is the first public release: the same server, documented for someone who has
 never seen it. Everything that was verified for it says how.
 
+- **Webhooks are self-service for every user.** Anyone with an account signs in to
+  `https://<server>/integrations/` with it and adds a webhook (GitHub comments, Gmail,
+  Datadog, Linear, Notion, Alertmanager or plain JSON) to a room of theirs or a new one, gets
+  the URL once with the sender's setup, and removes it; the server invites the shared
+  Hookshot's bot for them and makes the connection as the bot with their name in it. The API
+  behind it is `/_matrix/client/unstable/io.myelin.webhooks` with the person's own access
+  token; every make and remove is in the admin audit log with the user as actor, and
+  `hs_bridge_webhook_connections_total` gains a `via` label (`admin`/`user`). The admin
+  offering's page and sign-in link to the page. (Decision 0057; `docs/bridges/hookshot.md`.)
 - **Email is in the bridge catalogue: matrimail, on an image this repository builds.** A
   Matrix <-> email bridge on mautrix-go's `bridgev2` (a mailbox over IMAP IDLE with an app
   password, one room per thread, replies out over SMTP), offered and deployed like the mautrix

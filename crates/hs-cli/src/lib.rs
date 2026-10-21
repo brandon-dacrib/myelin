@@ -65,6 +65,7 @@ pub mod tasks;
 pub mod threepid_email;
 pub mod tls_listener;
 pub mod user_data;
+pub mod user_webhooks;
 pub mod versions;
 pub mod well_known;
 

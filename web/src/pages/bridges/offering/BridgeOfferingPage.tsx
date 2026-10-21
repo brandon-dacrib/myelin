@@ -927,6 +927,13 @@ const CONNECTION_SERVICES: Record<string, string> = {
  * any active connection can be removed here. A webhook's secret URL is not in the state and so
  * not listed.
  */
+/** The self-service page's address on this server, for an administrator to pass on. */
+function integrationsUrl(): string {
+  return typeof window === "undefined"
+    ? "/integrations/"
+    : `${window.location.origin}/integrations/`;
+}
+
 function ConnectionsSection({
   type,
   name,
@@ -1036,7 +1043,17 @@ function ConnectionsSection({
         One {name} serves every room: each repository, feed or webhook is a connection in the room
         it posts into. A webhook is added here, shaped for what will post to it (Datadog, GitHub,
         Linear, Notion, Gmail, Alertmanager, or plain JSON), or in the room with the bot&apos;s
-        commands; its URL is shown once, when it is made.
+        commands; its URL is shown once, when it is made. Anyone on this server adds webhooks to
+        their own rooms, without an administrator, at{" "}
+        <a
+          href="/integrations/"
+          className="font-identifier text-accent underline hover:no-underline"
+          target="_blank"
+          rel="noreferrer"
+        >
+          {integrationsUrl()}
+        </a>
+        : send people there.
       </p>
       {adding && (
         <AddWebhookDialog

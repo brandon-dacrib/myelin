@@ -899,7 +899,9 @@ impl<B: KvBackend + 'static> BridgeManager<B> {
 
     /// The client, token and bot user id to act as a shared type's one instance's bot with:
     /// `None` until the instance has a registration and the manager has its loopback.
-    fn shared_bot(
+    /// The shared instance's bot of `bridge_type`, with the client and the appservice token
+    /// the manager acts as it with: `None` until the instance is registered.
+    pub(crate) fn shared_bot(
         &self,
         bridge_type: &str,
     ) -> Result<Option<(MatrixClient, String, String)>, SourceError> {
@@ -3296,6 +3298,41 @@ impl<B: KvBackend + 'static> BridgeOfferingSource for BridgeManager<B> {
         bridge_type: &str,
         request: BridgeConnectionCreate,
     ) -> Result<BridgeConnectionCreated, SourceError> {
+        self.create_connection_by(bridge_type, request, None).await
+    }
+
+    async fn delete_connection(
+        &self,
+        bridge_type: &str,
+        room_id: &str,
+        state_key: &str,
+    ) -> Result<(), SourceError> {
+        self.delete_connection_by(bridge_type, room_id, state_key, None)
+            .await
+    }
+}
+
+impl<B: KvBackend + 'static> BridgeManager<B> {
+    /// [`BridgeOfferingSource::create_connection`], made for `made_by` when the request came
+    /// through the user API (`crate::user_webhooks`): the state event then carries
+    /// `io.myelin.created_by` and `io.myelin.created_at` (the user's id and the time, which
+    /// the listing reads back; Hookshot ignores keys it does not know), the room's notice
+    /// names them, and the metric says `via="user"`.
+    ///
+    /// # Errors
+    /// As the admin API's: a refusal at a field, not found, a conflict on the name, or the
+    /// server unavailable.
+    pub async fn create_connection_by(
+        &self,
+        bridge_type: &str,
+        request: BridgeConnectionCreate,
+        made_by: Option<&str>,
+    ) -> Result<BridgeConnectionCreated, SourceError> {
+        let via = if made_by.is_some() {
+            crate::metrics::WebhookPath::User
+        } else {
+            crate::metrics::WebhookPath::Admin
+        };
         let offering = self
             .store
             .offering(bridge_type)
@@ -3363,7 +3400,7 @@ impl<B: KvBackend + 'static> BridgeOfferingSource for BridgeManager<B> {
             )
         })?;
         let failed = |context: &str, e: crate::matrix::MatrixError| {
-            crate::metrics::count_webhook_connection(bridge_type, source.id, "failed");
+            crate::metrics::count_webhook_connection(bridge_type, source.id, via, "failed");
             tracing::warn!(bridge_type, source = source.id, name, error = %e, "{context}");
             match e.status {
                 403 => SourceError::Invalid(format!(
@@ -3436,34 +3473,37 @@ impl<B: KvBackend + 'static> BridgeOfferingSource for BridgeManager<B> {
             .set_room_account_data(&token, &bot, &room_id, hook_type, Value::Object(mapping))
             .await
             .map_err(|e| failed("writing the bot's account data", e))?;
+        let mut content = hookshot_sources::state_content(source, name);
+        if let Some(user) = made_by {
+            content[CREATED_BY_MARKER] = json!(user);
+            content[CREATED_AT_MARKER] = json!(now_ms());
+        }
         client
-            .send_state(
-                &token,
-                &bot,
-                &room_id,
-                hook_type,
-                name,
-                hookshot_sources::state_content(source, name),
-            )
+            .send_state(&token, &bot, &room_id, hook_type, name, content)
             .await
             .map_err(|e| failed("writing the connection's state event", e))?;
         let url = format!("{public_url}/webhook/{hook_id}");
         // The room is told; the URL is not said there (the command's own flow says it in the
         // bot's admin room with the person; here it goes to whoever made the connection).
+        let maker = made_by.map_or_else(
+            || "the administrator who made it".to_owned(),
+            |user| format!("{user}, who made it"),
+        );
         let text = format!(
-            "Webhook `{name}` ({}) is connected to this room. Its URL was shown to the administrator who made it.",
+            "Webhook `{name}` ({}) is connected to this room. Its URL was shown to {maker}.",
             source.title
         );
         let html = format!(
-            "Webhook <code>{}</code> ({}) is connected to this room. Its URL was shown to the administrator who made it.",
+            "Webhook <code>{}</code> ({}) is connected to this room. Its URL was shown to {}.",
             html_escape(name),
-            html_escape(source.title)
+            html_escape(source.title),
+            html_escape(&maker)
         );
         if let Err(e) = client.notice(&token, &bot, &room_id, &text, &html).await {
             tracing::debug!(room = %room_id, error = %e, "the connection notice was not sent");
         }
-        crate::metrics::count_webhook_connection(bridge_type, source.id, "created");
-        tracing::info!(bridge_type, source = source.id, name, room = %room_id, "webhook connection made as the bot");
+        crate::metrics::count_webhook_connection(bridge_type, source.id, via, "created");
+        tracing::info!(bridge_type, source = source.id, name, room = %room_id, made_by = made_by.unwrap_or("an administrator"), "webhook connection made as the bot");
         Ok(BridgeConnectionCreated {
             room_id,
             name: name.to_owned(),
@@ -3474,12 +3514,24 @@ impl<B: KvBackend + 'static> BridgeOfferingSource for BridgeManager<B> {
         })
     }
 
-    async fn delete_connection(
+    /// [`BridgeOfferingSource::delete_connection`], asked for by `removed_by` when the request
+    /// came through the user API: the metric says `via="user"` and the log names them.
+    ///
+    /// # Errors
+    /// Not found when the room has no active connection with that state key, a conflict when
+    /// more than one type has it, or the server unavailable.
+    pub async fn delete_connection_by(
         &self,
         bridge_type: &str,
         room_id: &str,
         state_key: &str,
+        removed_by: Option<&str>,
     ) -> Result<(), SourceError> {
+        let via = if removed_by.is_some() {
+            crate::metrics::WebhookPath::User
+        } else {
+            crate::metrics::WebhookPath::Admin
+        };
         if self
             .store
             .offering(bridge_type)
@@ -3534,7 +3586,7 @@ impl<B: KvBackend + 'static> BridgeOfferingSource for BridgeManager<B> {
             .send_state(&token, &bot, room_id, &event_type, state_key, json!({}))
             .await
             .map_err(|e| {
-                crate::metrics::count_webhook_connection(bridge_type, &source, "failed");
+                crate::metrics::count_webhook_connection(bridge_type, &source, via, "failed");
                 match e.status {
                     403 => SourceError::Invalid(format!(
                         "the bot may not send state events in that room ({e})"
@@ -3563,11 +3615,19 @@ impl<B: KvBackend + 'static> BridgeOfferingSource for BridgeManager<B> {
                     SourceError::Unavailable(format!("writing the bot's account data: {e}"))
                 })?;
         }
-        crate::metrics::count_webhook_connection(bridge_type, &source, "removed");
-        tracing::info!(bridge_type, room = %room_id, state_key, event_type, "connection removed as the bot");
+        crate::metrics::count_webhook_connection(bridge_type, &source, via, "removed");
+        tracing::info!(bridge_type, room = %room_id, state_key, event_type, removed_by = removed_by.unwrap_or("an administrator"), "connection removed as the bot");
         Ok(())
     }
 }
+
+/// The key in a connection's state content that names the user who made it through the user
+/// API (`crate::user_webhooks`); absent for one made by an administrator or in the room.
+pub const CREATED_BY_MARKER: &str = "io.myelin.created_by";
+
+/// The key in a connection's state content that says when it was made through the user API,
+/// in milliseconds since the epoch.
+pub const CREATED_AT_MARKER: &str = "io.myelin.created_at";
 
 /// `&`, `<`, `>` and `"` escaped for HTML.
 fn html_escape(text: &str) -> String {
@@ -4840,7 +4900,12 @@ mod tests {
                 .contains("Webhook `alerts` (Datadog monitors) is connected")
         );
         assert_eq!(
-            crate::metrics::webhook_connections("matrix-hookshot", "datadog", "created"),
+            crate::metrics::webhook_connections(
+                "matrix-hookshot",
+                "datadog",
+                crate::metrics::WebhookPath::Admin,
+                "created"
+            ),
             1
         );
 
@@ -4914,7 +4979,12 @@ mod tests {
             "removed"
         );
         assert_eq!(
-            crate::metrics::webhook_connections("matrix-hookshot", "datadog", "removed"),
+            crate::metrics::webhook_connections(
+                "matrix-hookshot",
+                "datadog",
+                crate::metrics::WebhookPath::Admin,
+                "removed"
+            ),
             1
         );
         // Gone already: not found. A room the bot is not in: not found.

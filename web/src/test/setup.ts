@@ -18,6 +18,7 @@ import { resetMigration } from "@/mocks/data/migration";
 import { resetUserModeration } from "@/mocks/data/user-moderation";
 import { resetMockEvents } from "@/mocks/data/events";
 import { resetConfigHistory } from "@/mocks/data/config";
+import { resetUserWebhooks } from "@/mocks/data/user-webhooks";
 
 /**
  * Give the API client an absolute base URL before anything imports it.
@@ -118,5 +119,7 @@ afterEach(() => {
   resetMockEvents();
   // And each configuration section's per-setting history (saves and reverts add to it).
   resetConfigHistory();
+  // And a user's own webhooks and rooms on the integrations page.
+  resetUserWebhooks();
 });
 afterAll(() => server.close());

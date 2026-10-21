@@ -2,6 +2,28 @@
 
 Track brief: `docs/workstreams/15-admin-api-and-modules.md`. Owner crates: `hs-admin`, `hs-modules`, `hs-identity`, `hs-http` (shared with 07 and 14).
 
+## 2026-10-21: a user-facing API outside `/api/v1`: the `io.myelin` unstable namespace (branch `agent/user-webhooks`, track 11)
+
+A convention, settled by decision 0057 and worth stating here because the admin API's shape
+is this track's: **a surface for people who are not administrators does not go under
+`/api/v1`.** `AdminTokenVerifier` refuses a non-administrator's token exactly like an unknown
+one, on purpose, and nothing under `/api/v1` is scoped for an ordinary user. Such a surface is
+a client-server extension on the client listener, under
+`/_matrix/client/unstable/io.myelin.<area>/...`, authenticated by the ordinary `Requester`
+(the user's own access token, with its guest, lock and deactivation rules), answering Matrix
+errors (`{errcode, error}`: `M_FORBIDDEN`, `M_NOT_FOUND`, `M_INVALID_PARAM`,
+`M_LIMIT_EXCEEDED` with `retry_after_ms`), **not** RFC 9457 problems and not in the admin
+OpenAPI; its reference is prose in `docs/`. The first is `io.myelin.webhooks`
+(`hs_bridges::user_webhooks`; `docs/bridges/hookshot.md`, "For everyone"). Its writes go to
+the same audit log as the admin API's (`AuditSink::append`, actor kind `user`, the IP and
+user agent from the request), so the audit page and `GET /audit-log?actor=` see them; they
+do not go on the admin event stream (no `AdminState` there), which is fine for now.
+
+The page for it is served by `hs_admin::assets` at `/integrations/` (and any path under it)
+from `integrations.html` in the same embedded build, `no-store` like the admin shell, `404`
+with a word when the build is the placeholder; its assets are under `/admin/assets/` as every
+page's are, so nothing else is routed.
+
 ## 2026-10-20: `appservices.create?dry_run=true` creates nothing (OpenAPI 0.1.22, branch `agent/appservice-dry-run`)
 
 Bug, found on the demo on 2026-10-20 while registering Hookshot: `dry_run` was documented on

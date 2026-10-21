@@ -320,7 +320,7 @@ export function AddWebhookDialog({
 }
 
 /** A file the sender runs (`Code.gs`), with a copy button. */
-function FileBlock({ name, text }: { name: string; text: string }) {
+export function FileBlock({ name, text }: { name: string; text: string }) {
   const [copied, setCopied] = useState(false);
   async function copy() {
     try {

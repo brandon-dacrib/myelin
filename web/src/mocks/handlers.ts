@@ -1,5 +1,13 @@
 import { http, HttpResponse } from "msw";
 import {
+  MOCK_USER,
+  createUserWebhook,
+  removeUserWebhook,
+  userRooms,
+  userWebhooks,
+} from "./data/user-webhooks";
+import { WEBHOOK_SOURCES } from "./data/bridge-offerings";
+import {
   appservices,
   appserviceHealth,
   appserviceBacklog,
@@ -322,7 +330,92 @@ function configSectionBody(name: string) {
   };
 }
 
+/**
+ * A person's own Matrix session for the integrations page (`/integrations/`, decision 0057):
+ * `POST /login` with any non-empty password signs `@<user>:example.org` in; the token names
+ * the user. The user webhooks API below answers to that token and no other.
+ */
+const USER_WEBHOOKS = "/_matrix/client/unstable/io.myelin.webhooks";
+
+function userOfToken(request: Request): string | null {
+  const auth = request.headers.get("authorization") ?? "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+  if (!token.startsWith("syt_mock_user_")) return null;
+  return `@${token.slice("syt_mock_user_".length)}:example.org`;
+}
+
+function matrixError(status: number, errcode: string, error: string, extra?: object) {
+  return HttpResponse.json({ errcode, error, ...extra }, { status });
+}
+
+const userWebhookHandlers = [
+  http.post("/_matrix/client/v3/login", async ({ request }) => {
+    const body = (await request.json()) as {
+      type?: string;
+      identifier?: { user?: string };
+      password?: string;
+    };
+    const user = (body.identifier?.user ?? "").replace(/^@/, "").split(":")[0] ?? "";
+    if (body.type !== "m.login.password" || !user || !body.password || body.password === "wrong") {
+      return matrixError(403, "M_FORBIDDEN", "Invalid username or password");
+    }
+    return HttpResponse.json({
+      user_id: `@${user}:example.org`,
+      access_token: `syt_mock_user_${user}`,
+      device_id: "MOCKDEVICE",
+    });
+  }),
+  http.get("/_matrix/client/v3/account/whoami", ({ request }) => {
+    const user = userOfToken(request);
+    if (!user) return matrixError(401, "M_UNKNOWN_TOKEN", "Unrecognised access token");
+    return HttpResponse.json({ user_id: user, device_id: "MOCKDEVICE" });
+  }),
+  http.post("/_matrix/client/v3/logout", () => HttpResponse.json({})),
+  http.get(`${USER_WEBHOOKS}/sources`, ({ request }) => {
+    if (!userOfToken(request)) return matrixError(401, "M_MISSING_TOKEN", "Missing access token");
+    return HttpResponse.json({ items: WEBHOOK_SOURCES });
+  }),
+  http.get(`${USER_WEBHOOKS}/rooms`, ({ request }) => {
+    if (!userOfToken(request)) return matrixError(401, "M_MISSING_TOKEN", "Missing access token");
+    return HttpResponse.json({ rooms: userRooms() });
+  }),
+  http.get(`${USER_WEBHOOKS}/webhooks`, ({ request }) => {
+    if (!userOfToken(request)) return matrixError(401, "M_MISSING_TOKEN", "Missing access token");
+    return HttpResponse.json({ items: userWebhooks() });
+  }),
+  http.post(`${USER_WEBHOOKS}/webhooks`, async ({ request }) => {
+    const user = userOfToken(request);
+    if (!user) return matrixError(401, "M_MISSING_TOKEN", "Missing access token");
+    if (user !== MOCK_USER) {
+      return matrixError(
+        404,
+        "M_NOT_FOUND",
+        "this server does not offer webhooks; ask an administrator",
+      );
+    }
+    const body = (await request.json()) as Parameters<typeof createUserWebhook>[0];
+    const result = createUserWebhook(body);
+    if ("refused" in result) {
+      const { status, errcode, error, retry_after_ms } = result.refused;
+      return matrixError(status, errcode, error, retry_after_ms ? { retry_after_ms } : undefined);
+    }
+    return HttpResponse.json(result.created, { status: 201 });
+  }),
+  http.delete(`${USER_WEBHOOKS}/webhooks/:roomId/:name`, ({ request, params }) => {
+    if (!userOfToken(request)) return matrixError(401, "M_MISSING_TOKEN", "Missing access token");
+    if (!removeUserWebhook(String(params.roomId), String(params.name))) {
+      return matrixError(
+        404,
+        "M_NOT_FOUND",
+        `that room has no webhook named \`${String(params.name)}\``,
+      );
+    }
+    return HttpResponse.json({});
+  }),
+];
+
 export const handlers = [
+  ...userWebhookHandlers,
   // ---- Mock OAuth issuer (stands in for track 07 until it exists; not
   // part of the real admin API, which only verifies bearer tokens) ----
   http.post("/oauth2/token", async ({ request }) => {

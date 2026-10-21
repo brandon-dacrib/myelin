@@ -1,12 +1,50 @@
 # 16. Management web interface: status
 
-Last updated: 2026-10-16 (a tab left open across an upgrade reloads into the new build; below); before that 2026-10-15 (a bridge's dead letters can be seen, replayed with a confirmation
+Last updated: 2026-10-21 (a second page in the build for everyone, `/integrations/`, the self-service webhooks page; branch `agent/user-webhooks`; below); before that 2026-10-16 (a tab left open across an upgrade reloads into the new build; below); before that 2026-10-15 (a bridge's dead letters can be seen, replayed with a confirmation
 and discarded, and the Registrations tab says why a bridge is not healthy; below); before that
 2026-10-13 (the Registrations tab pages by bridge: the server folds each
 double-puppeting registration; branch `agent/fold-doublepuppet-server`).
 Last updated: 2026-10-15 (a deployed bridge's volume: how full, and its size; branch
 `agent/bridge-volume-size`); before that 2026-10-13 (the Registrations tab pages by bridge: the
 server folds each double-puppeting registration; branch `agent/fold-doublepuppet-server`).
+
+## 2026-10-21: a second page in the build, for everyone: `/integrations/` (branch `agent/user-webhooks`, track 11)
+
+The self-service webhooks page (decision 0057) is `web/integrations.html` →
+`web/src/integrations/`: a second Vite entry of the same build (`build.rollupOptions.input`
+in `vite.config.ts`), with the same design system, tokens, theme script and components, and
+without the admin app's router, shell or generated client. `hs serve` serves it at
+`/integrations/`; in `npm run dev:mock` and the Playwright preview it is
+`/admin/integrations.html` (the base is `/admin/`, and its assets are under `/admin/assets/`
+either way).
+
+- `auth.ts`: the person's own session (`hs-integrations:session`, never the admin's key),
+  through the ordinary `/login` with `m.login.password`; `signOut` revokes the token.
+- `api.ts`: plain `fetch` of the user API with React Query hooks, `MatrixApiError` (`errcode`,
+  `error`, `retry_after_ms`) and `describeError`, which turns `M_LIMIT_EXCEEDED` into "try
+  again in N seconds". A `401` forgets the session, so the sign-in comes back.
+- `IntegrationsApp.tsx`: sign-in (username, password, what the page is for, where `/admin/`
+  is), My webhooks (each with its source's title, room, maker and `RelativeTime`; Remove with
+  a confirmation naming the room), Add a webhook (the admin dialog's steps; the rooms from
+  `GET /rooms`, only those with `may_add` in the select, the others under a `<details>` with
+  the server's reason each; a new room with name and topic; the URL once with `CopyableId`,
+  `SetupText` and `FileBlock`, both reused from the admin dialog, `FileBlock` now exported),
+  "Webhooks are not available on this server yet" when the API says `M_NOT_FOUND`, and a
+  footer saying what the URL is and that encrypted rooms cannot take one.
+- Mock: `src/mocks/data/user-webhooks.ts` (alice's four rooms, two of which cannot take a
+  webhook, and one webhook; the server's refusals), handlers for `/login` (any non-empty
+  password but `wrong`), `whoami`, `logout` and the five user routes, `resetUserWebhooks`
+  in `setup.ts`. Four Vitest tests (`IntegrationsApp.test.tsx`), `e2e/integrations.spec.ts`
+  (sign-in, the list, add in Deploys with the ineligible rooms absent from the select, the
+  URL once, remove with confirmation, phone width; axe at each step).
+- The admin app: the offering's Connections text links to `<origin>/integrations/`, and the
+  sign-in page (mock and real) has one quiet line, "Not an administrator? Add webhooks to
+  your own rooms at /integrations/". Links in text blocks are underlined (axe's
+  `link-in-text-block` failed the first run on a colour-only link).
+
+Verified: `npm run check`, `npm run test:e2e`, and the real `hs` binary serving
+`/integrations/` (the in-process test in `crates/hs-cli/tests/user_webhooks.rs` reads the
+page).
 
 ## 2026-10-16: a tab left open across an upgrade reloads into the new build (branch `agent/admin-chunk-reload`)
 

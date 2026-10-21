@@ -7,8 +7,12 @@
 //! a webhook through the admin API from the `datadog` source, in a new room the bot creates
 //! and invites the person to; the bridge picks the connection up live from the state event;
 //! Datadog's sample payload posted to the URL lands as the source's notice; the listing says
-//! the source; and removing it through the API makes the URL stop working. The story
-//! `docs/bridges/hookshot.md` tells, run.
+//! the source; and removing it through the API makes the URL stop working. Then as a plain
+//! user (decision 0057): alice, no administrator, makes a webhook in a room of her own through
+//! the user API with her own token; the server invites the bot as her, the bot joins and is
+//! raised to the level the state event takes, the bridge picks the connection up live, Linear's
+//! sample posted to the URL lands as the source's notice, the listing names her, and removing
+//! it stops the URL. The story `docs/bridges/hookshot.md` tells, run.
 //!
 //! Hookshot is one shared bridge with many connections, so unlike `real_mautrix_login.rs` there
 //! is no sign-in and no encryption here: the person is a plain client on the client API.
@@ -33,6 +37,8 @@ use serde_json::{Value, json};
 const IMAGE: &str = "ghcr.io/matrix-org/matrix-hookshot:7.5.0";
 const TYPE_ID: &str = "matrix-hookshot";
 const SERVER_NAME: &str = "test.local";
+/// The user webhooks API's prefix (`hs_bridges::user_webhooks::PREFIX`).
+const USER_PREFIX: &str = "/_matrix/client/unstable/io.myelin.webhooks";
 /// The appservice port the catalogue renders, and the webhooks port the rendered config binds.
 const APPSERVICE_PORT: u16 = 9993;
 const WEBHOOKS_PORT: u16 = 9000;
@@ -674,7 +680,189 @@ async fn webhook_story() -> Result<()> {
         keep_logs("webhook", &server, &bridge);
         bail!("{e:#}\n--- bridge log ---\n{}", bridge.log());
     }
+    if let Err(e) = user_story(&admin, &alice, &bot, &public_url).await {
+        keep_logs("webhook", &server, &bridge);
+        bail!("{e:#}\n--- bridge log ---\n{}", bridge.log());
+    }
     keep_logs("webhook", &server, &bridge);
+    Ok(())
+}
+
+/// Linear's sample payload, the one the source's transform is tested on.
+const LINEAR_SAMPLE: &str =
+    include_str!("../../hs-bridges/hookshot-sources/linear/sample-issue-update.json");
+
+/// The third part: a plain user makes a webhook in a room of her own through the user API.
+async fn user_story(admin: &Caller, alice: &Caller, bot: &str, public_url: &str) -> Result<()> {
+    let user = Caller {
+        prefix: USER_PREFIX,
+        ..alice.clone()
+    };
+    // Her own room, made in an ordinary client: she is its admin, the bot is not in it.
+    let room = alice
+        .ok(
+            reqwest::Method::POST,
+            "/createRoom",
+            Some(json!({"name": "Mine", "preset": "private_chat"})),
+        )
+        .await?;
+    let room_id = room["room_id"].as_str().context("room id")?.to_owned();
+    let rooms = user.ok(reqwest::Method::GET, "/rooms", None).await?;
+    let mine = rooms["rooms"]
+        .as_array()
+        .and_then(|rooms| rooms.iter().find(|r| r["room_id"] == room_id.as_str()))
+        .cloned()
+        .with_context(|| format!("Mine is not among alice's rooms: {rooms}"))?;
+    if mine["may_add"] != true || mine["bot_joined"] != false || mine["name"] != "Mine" {
+        bail!("the room is not offered as expected: {mine}");
+    }
+
+    // Made with her token: the bot is invited as her, joins, and is raised to 50.
+    let (status, made) = user
+        .call(
+            reqwest::Method::POST,
+            "/webhooks",
+            Some(json!({"source": "linear", "name": "linear-issues", "room": {"id": room_id}})),
+        )
+        .await?;
+    if status != 201 {
+        bail!("making the user's webhook answered {status}: {made}");
+    }
+    let url = made["url"].as_str().unwrap_or_default().to_owned();
+    let prefix = format!("{public_url}/webhook/");
+    if !url.starts_with(&prefix) || url.len() != prefix.len() + 36 {
+        bail!("the URL is not public URL + /webhook/ + a UUID: {url}");
+    }
+    let members = alice
+        .ok(
+            reqwest::Method::GET,
+            &format!("/rooms/{}/joined_members", escape(&room_id)),
+            None,
+        )
+        .await?;
+    if members["joined"].get(bot).is_none() {
+        bail!("the bot did not join alice's room: {members}");
+    }
+    let levels = alice
+        .ok(
+            reqwest::Method::GET,
+            &format!("/rooms/{}/state/m.room.power_levels/", escape(&room_id)),
+            None,
+        )
+        .await?;
+    if levels["users"][bot] != 50 {
+        bail!("the bot was not raised to 50: {levels}");
+    }
+    let event = alice
+        .ok(
+            reqwest::Method::GET,
+            &format!(
+                "/rooms/{}/state/uk.half-shot.matrix-hookshot.generic.hook/linear-issues",
+                escape(&room_id)
+            ),
+            None,
+        )
+        .await?;
+    if event["io.myelin.created_by"] != alice_id() || event["io.myelin.source"] != "linear" {
+        bail!("the state event does not name alice and the source: {event}");
+    }
+
+    // The bridge picked it up live: Linear's sample lands as the source's notice.
+    let sample: Value = serde_json::from_str(LINEAR_SAMPLE)?;
+    let posted = reqwest::Client::new()
+        .post(&url)
+        .json(&sample)
+        .send()
+        .await
+        .with_context(|| format!("POST {url}"))?;
+    if !posted.status().is_success() {
+        bail!(
+            "POST {url} answered {}: {}",
+            posted.status(),
+            posted.text().await.unwrap_or_default()
+        );
+    }
+    let landed = wait_for_message(alice, &room_id, None, "the Linear notice", |b| {
+        b.contains("ENG-42")
+    })
+    .await?;
+    let body = landed["content"]["body"].as_str().unwrap_or_default();
+    if !body.contains("**Ada Lovelace** moved to **In Progress**") {
+        bail!("the notice is not the source's rendering: {body:?}");
+    }
+    if landed["content"]["formatted_body"]
+        .as_str()
+        .is_none_or(|h| !h.contains("<strong>Ada Lovelace</strong>"))
+    {
+        bail!("the bridge did not render the Markdown: {landed}");
+    }
+
+    // Listed as hers, without the secret; audited with her as actor.
+    let listed = user.ok(reqwest::Method::GET, "/webhooks", None).await?;
+    let item = listed["items"]
+        .as_array()
+        .and_then(|items| items.iter().find(|w| w["name"] == "linear-issues"))
+        .cloned()
+        .with_context(|| format!("linear-issues is not listed: {listed}"))?;
+    if item["created_by"] != alice_id()
+        || item["source"] != "linear"
+        || item["room_name"] != "Mine"
+        || item["created_at"].as_u64().is_none_or(|t| t == 0)
+    {
+        bail!("the listing does not say what it should: {item}");
+    }
+    let id = url.trim_start_matches(&prefix);
+    if listed.to_string().contains(id) {
+        bail!("the user listing carries the secret id");
+    }
+    let log = admin
+        .ok(
+            reqwest::Method::GET,
+            "/audit-log?action=bridge_connection.created",
+            None,
+        )
+        .await?;
+    if !log["items"]
+        .as_array()
+        .is_some_and(|items| items.iter().any(|e| e["actor"]["id"] == alice_id()))
+    {
+        bail!("the audit log has no entry with alice as actor: {log}");
+    }
+
+    // Removed with her token: the URL stops working.
+    let (status, body) = user
+        .call(
+            reqwest::Method::DELETE,
+            &format!("/webhooks/{}/linear-issues", escape(&room_id)),
+            None,
+        )
+        .await?;
+    if status != 200 {
+        bail!("removing the user's webhook answered {status}: {body}");
+    }
+    let deadline = Instant::now() + REPLY_WAIT;
+    loop {
+        let again = reqwest::Client::new()
+            .post(&url)
+            .json(&sample)
+            .send()
+            .await
+            .with_context(|| format!("POST {url} after removal"))?;
+        if !again.status().is_success() {
+            break;
+        }
+        if Instant::now() > deadline {
+            bail!("the URL still works {REPLY_WAIT:?} after the user removed the webhook");
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let listed = user.ok(reqwest::Method::GET, "/webhooks", None).await?;
+    if listed["items"]
+        .as_array()
+        .is_some_and(|items| items.iter().any(|w| w["name"] == "linear-issues"))
+    {
+        bail!("the removed webhook is still listed: {listed}");
+    }
     Ok(())
 }
 

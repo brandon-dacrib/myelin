@@ -35,6 +35,15 @@ export default defineConfig({
   build: {
     outDir: "dist",
     sourcemap: true,
+    // Two pages from one build: the admin interface (`/admin/`) and the self-service
+    // integrations page (`/integrations/`, decision 0057), which the server serves from
+    // `integrations.html` with the assets under `/admin/assets/` as every page's are.
+    rollupOptions: {
+      input: {
+        main: path.resolve(import.meta.dirname, "index.html"),
+        integrations: path.resolve(import.meta.dirname, "integrations.html"),
+      },
+    },
   },
   test: {
     environment: "jsdom",
