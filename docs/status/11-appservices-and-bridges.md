@@ -1,11 +1,11 @@
 # Status: track 11, appservices and bridges
 
-Last updated: 2026-10-20, evening (matrimail, the email bridge, is in the catalogue on an image this repository builds; decision 0055; below); before that 2026-10-20, evening (v0.4.11 on the demo, and the demo's Hookshot is the offering: the hand-made Bridge, Secret and registration removed, the offering created, the rooms and GitHub webhooks unchanged; below); before that 2026-10-20, later (the passkey is made by aws-lc-rs, not the `rsa` crate CI's audit refuses; three webpki crates updated for the emSign distrust; below); before that 2026-10-20 (Hookshot is an offering the server deploys: its config rendered whole from the offering's public URL and GitHub App, its passkey minted and kept, the `Bridge` and the operator expose its webhooks and metrics ports, and the offering's page lists its connections read from the rooms' state; and, by hand before that, Hookshot on the demo with GitHub PR comments from two repositories; below); before that before that 2026-10-19, evening (six mautrix pins bumped to v0.2610.0, verified with the real
-Last updated: 2026-10-20, evening (one Hookshot, many webhooks: a source library with seven
+Last updated: 2026-10-21 (v0.4.13 on the demo, revision 43: matrimail in the catalogue and the Hookshot sources with the add-a-webhook page; below); before that 2026-10-20, evening (matrimail, the email bridge, is in the catalogue on an image this repository builds; decision 0055; below); before that 2026-10-20, evening (v0.4.11 on the demo, and the demo's Hookshot is the offering: the hand-made Bridge, Secret and registration removed, the offering created, the rooms and GitHub webhooks unchanged; below); before that 2026-10-20, later (the passkey is made by aws-lc-rs, not the `rsa` crate CI's audit refuses; three webpki crates updated for the emSign distrust; below); before that 2026-10-20 (Hookshot is an offering the server deploys: its config rendered whole from the offering's public URL and GitHub App, its passkey minted and kept, the `Bridge` and the operator expose its webhooks and metrics ports, and the offering's page lists its connections read from the rooms' state; and, by hand before that, Hookshot on the demo with GitHub PR comments from two repositories; below); before that before that 2026-10-19, evening (six mautrix pins bumped to v0.2610.0, verified with the real
+before that 2026-10-20, evening (one Hookshot, many webhooks: a source library with seven
 senders' transformation functions, webhooks made by the server as the bot from the page or
 the API with the URL shown once, connections removed, the real-image story both ways; below);
 before that 2026-10-20, later (the passkey is made by aws-lc-rs, not the `rsa` crate CI's audit refuses; three webpki crates updated for the emSign distrust; below); before that 2026-10-20 (Hookshot on the demo by hand, GitHub PR comments from two repositories; below); before that 2026-10-19, evening (six mautrix pins bumped to v0.2610.0, verified with the real
-Last updated: 2026-10-20 (Hookshot is an offering the server deploys: its config rendered whole
+before that 2026-10-20 (Hookshot is an offering the server deploys: its config rendered whole
 from the offering's public URL and GitHub App, its passkey minted and kept, the `Bridge` and
 the operator expose its webhooks and metrics ports, and the offering's page lists its
 connections read from the rooms' state; below); before that 2026-10-19, evening (six mautrix pins bumped to v0.2610.0, verified with the real
@@ -66,6 +66,30 @@ manager) and an instance's Kubernetes objects say whose bridge they are; before 
 (who has signed in to a bridge; the `cluster` runtime run on kind); before that 2026-09-30
 (ephemeral, to-device and device-list delivery); before that 2026-09-27 (RFC 0017 run against
 the real binary), 2026-09-27 (the bridge manager) and 2026-09-25.
+
+## 2026-10-21: v0.4.13 on the demo (revision 43): matrimail in the catalogue, webhooks from the page
+
+**Rolled.** CD folded `5ecf7221` (matrimail, tagged v0.4.12 on its own run before that run was
+cancelled by the next merge) and `a7ae811f` (the Hookshot sources) into v0.4.13. The demo went
+from 0.4.11 to 0.4.13 at 16:00 UTC (Helm revision 43) from the session through the owner's
+proxy: the chart fetched from ghcr's OCI API and digest-checked, the tag's `values-bridges.yaml`
+on top of `helm get values`, `--set image.tag=0.4.13 --force-conflicts`. Every pod Running,
+seven Bridges Ready, the StatefulSet pinned to `ghcr.io/brandon-dacrib/myelin:0.4.13`,
+`/_matrix/federation/v1/version` answers `0.4.13` from outside, the Hookshot listener at
+`hookshot.longhair-tet.ts.net` answers (405 to a GET, as it should). The server's WARN lines
+after boot are the usual federation retries and remote-media fetches, plus one room-load slot
+wait and one slow-store line at boot; nothing new.
+
+**Seen at the roll:** a GitHub webhook for `avantos` arrived at 16:00:32 while the server was
+restarting; Hookshot logged "Failed to handle generic webhook ... ECONNREFUSED" and dropped
+it. Hookshot does not retry a generic webhook, so a notice sent during a roll's restart window
+is lost; GitHub's "Recent deliveries" page can redeliver it by hand. That is the single-replica
+demo's cost of a roll, not a regression.
+
+**Left:** the offering page's "Add a webhook" and the catalogue's matrimail entry are checked
+through the admin interface once the owner signs in (the session's tab is at the sign-in
+page; the password is the owner's). The matrimail image `ghcr.io/brandon-dacrib/matrimail:24cd0f9`
+was pushed by the merge's workflow run, so an offering can pull it; no mailbox is signed in.
 
 ## 2026-10-20, evening (branch `agent/matrimail`): email is in the catalogue, on an image this repository builds
 
