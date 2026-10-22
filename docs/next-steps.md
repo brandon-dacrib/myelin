@@ -21,9 +21,14 @@ image (status 11 has the timing) and in-process. Merged as `3e2e0f7f`; CD releas
 on **v0.4.17, revision 44** since 00:08Z 2026-10-22 (rolled from the session, 67 s, bridges
 Ready). The page was **404 from outside**: the chart's Ingress and HTTPRoute did not route
 `/integrations` (the pod served it; the user API under `/_matrix/client` was reachable).
-`agent/integrations-route` routes it with the client paths and says so in the deployment
-docs. **Left:** merge that, roll the demo to its release; then the owner tries it as a
-non-administrator (make a second account, sign in at
+`fa057874` routes it with the client paths and says so in the deployment docs; released as
+**v0.4.19** and rolled: **revision 45** at 02:43Z 2026-10-22, the page answers 200 from
+outside, bridges Ready. Seen while checking, not the roll's doing: a second eviction round at
+01:08-01:15Z (linkedin evicted from `tp0n1` at 5 GiB free, a stale evicted pod left in the
+namespace, a new node `pi0n0`), and the Hookshot Funnel proxy pod crashed after being
+rescheduled at 02:35Z (`panic: ipnlocal: watchdog timeout`) and was healthy again after one
+container restart at 02:50Z, ping 202; status 11 has it. **Left:** the owner tries the page
+as a non-administrator (make a second account, sign in at
 `https://myelin.dacrib.net/integrations/`); rotating a URL in place and signature
 verification are still not done (0056's list).
 

@@ -141,11 +141,29 @@ the pod served it (200 through the API server's pod proxy) and the user API answ
 `/admin`, `/api/v1`, `/_synapse` and `/` and nothing else, and so did the HTTPRoute. Fixed on
 `agent/integrations-route`: both route `/integrations` with the client paths, not under
 `ingress.admin` (it is a user's page); the compose nginx example already forwards `/`;
-docs/deployment.md and docs/install-and-upgrade.md list it. The demo gets it with the next roll.
+docs/deployment.md and docs/install-and-upgrade.md list it. Merged as `fa057874`, released as
+**v0.4.19** (v0.4.18 is the docs commit between), and **rolled at 02:43Z on 2026-10-22:
+revision 45**, 77 s, the Ingress now lists `/integrations` between `/.well-known/matrix` and
+`/admin`, `https://myelin.dacrib.net/integrations/` answers 200 from outside ("Myelin
+integrations"), the user API answers `M_MISSING_TOKEN` without a token, seven Bridges Ready,
+federation says 0.4.19, no `WARN` from the server but the usual IPv4-then-IPv6 outbound ones.
+Not the roll's doing, seen while checking it: between the two rolls the cluster had a second
+eviction round (01:08-01:15Z: nodes `NotReady`, every bridge pod rescheduled, linkedin evicted
+from `tp0n1` for ephemeral storage at 5 GiB free, its evicted pod left behind in
+`Init:ContainerStatusUnknown`; a new node `pi0n0` joined at 01:13Z), and at 02:35Z the
+Hookshot Funnel proxy (`tailscale-system/ts-hookshot-funnel-*`) was recreated on `tp0n2`, took
+7.5 min to pull its image and then its tailscaled died with `panic: ipnlocal: watchdog timeout`,
+so `hookshot.longhair-tet.ts.net` did not answer at 02:47Z (Hookshot itself answered 405
+through the service); the server's own Funnel (`myelin.longhair-tet.ts.net`) was fine. Kubelet
+restarted the proxy's container once and it was healthy at 02:50Z; a GitHub ping to the myelin
+hook got 202 at 02:50:37Z. Nothing on the cluster was touched beyond the upgrade.
 
 **Left**
 
-- The roll of the routed chart, and the first use by a plain user on the demo.
+- The first use by a plain user on the demo: a second, non-administrator account signs in at
+  `https://myelin.dacrib.net/integrations/` and adds a webhook to a room of its own.
+- The stale evicted linkedin pod in the namespace is the owner's to delete; the nodes' disks
+  (5-11 GiB free of 27) are what evicts.
 - A URL cannot be re-shown or rotated in place: remove and make again.
 - Connections made in the room by the bot's command have no maker and no source; the user
   listing shows them (they are webhooks in the person's rooms) without either.
