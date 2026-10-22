@@ -18,9 +18,12 @@ actor, counted with `via="user"`, rate-limited per user. Decision 0057; `docs/br
 hookshot.md` "For everyone"; status 11, 15, 16. Verified against the real Hookshot 7.5.0
 image (status 11 has the timing) and in-process. Merged as `3e2e0f7f`; CD released it as
 **v0.4.17** (image, chart and binaries; `v0.4.16` is the docs commit before it). The demo is
-still **v0.4.13, revision 43**; the roll to 0.4.17 waits for the owner's go (the nodes were
-under disk pressure an hour earlier and are calm now). **Left:** the roll; then the owner
-tries it on the demo as a non-administrator (make a second account, sign in at
+on **v0.4.17, revision 44** since 00:08Z 2026-10-22 (rolled from the session, 67 s, bridges
+Ready). The page was **404 from outside**: the chart's Ingress and HTTPRoute did not route
+`/integrations` (the pod served it; the user API under `/_matrix/client` was reachable).
+`agent/integrations-route` routes it with the client paths and says so in the deployment
+docs. **Left:** merge that, roll the demo to its release; then the owner tries it as a
+non-administrator (make a second account, sign in at
 `https://myelin.dacrib.net/integrations/`); rotating a URL in place and signature
 verification are still not done (0056's list).
 

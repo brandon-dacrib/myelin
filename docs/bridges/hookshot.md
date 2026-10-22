@@ -207,7 +207,11 @@ admin page (what will post, which room, a name) and then the URL once with the s
 (and `Code.gs` for Gmail); **Remove** asks first. The rooms offered are the person's joined
 rooms that can take one; the others say why not (the level it takes, or that the room is
 encrypted). An administrator sends people there: the offering's page links to it, and the
-admin sign-in says so for someone who is not an administrator.
+admin sign-in says so for someone who is not an administrator. The chart's Ingress and
+HTTPRoute route `/integrations` with the client paths (not under `ingress.admin`); a reverse
+proxy of your own forwards it like `/_matrix` (docs/deployment.md). The first roll of it on the
+demo (v0.4.17, 2026-10-21) found the Ingress did not: the page answered 404 from outside while
+the pod served it, and the user API, under `/_matrix/client`, was reachable all along.
 
 Behind it is a client-server extension under an unstable namespace, authenticated by the
 person's access token like any client endpoint (not `/api/v1`, whose verifier refuses a

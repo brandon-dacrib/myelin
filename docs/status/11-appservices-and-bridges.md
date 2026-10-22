@@ -132,9 +132,20 @@ the owner says to roll: the roll is `helm upgrade` from the published 0.4.17 cha
 tag's `values-bridges.yaml` and `--set image.tag=0.4.17`, then `/integrations/` is tried with
 a non-administrator account.
 
+**Rolled** to the demo at 00:08Z on 2026-10-22 (local evening 2026-10-21): revision 44,
+`helm upgrade` from the published 0.4.17 chart through the owner's proxy, 67 s to Ready; the
+seven Bridges Ready, no `WARN` in the server's first minutes, `/_matrix/federation/v1/version`
+says 0.4.17. Then `https://myelin.dacrib.net/integrations/` answered **404 from outside** while
+the pod served it (200 through the API server's pod proxy) and the user API answered
+`M_MISSING_TOKEN` as it should: the chart's Ingress routed `/_matrix`, `/.well-known/matrix`,
+`/admin`, `/api/v1`, `/_synapse` and `/` and nothing else, and so did the HTTPRoute. Fixed on
+`agent/integrations-route`: both route `/integrations` with the client paths, not under
+`ingress.admin` (it is a user's page); the compose nginx example already forwards `/`;
+docs/deployment.md and docs/install-and-upgrade.md list it. The demo gets it with the next roll.
+
 **Left**
 
-- The roll, and the first use by a plain user on the demo.
+- The roll of the routed chart, and the first use by a plain user on the demo.
 - A URL cannot be re-shown or rotated in place: remove and make again.
 - Connections made in the room by the bot's command have no maker and no source; the user
   listing shows them (they are webhooks in the person's rooms) without either.

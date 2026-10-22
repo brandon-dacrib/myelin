@@ -434,8 +434,9 @@ ingress:
   annotations: {}
   tlsEnabled: true
   tlsSecret: ""
-  ## Hosts routed to the client (`/_matrix/client`) and federation (`/_matrix/federation`,
-  ## `/_matrix/key`) resources. Usually the same host as `serverName`, split out here because
+  ## Hosts routed to the client (`/_matrix/client`, and `/integrations/`, the self-service
+  ## webhooks page every user signs in to with their own account) and federation
+  ## (`/_matrix/federation`, `/_matrix/key`) resources. Usually the same host as `serverName`, split out here because
   ## federation delegation (`.well-known/matrix/server`) commonly points federation traffic at a
   ## different `host:port` than the client-facing one.
   clientHost: ""

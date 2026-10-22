@@ -114,8 +114,8 @@ helm install myelin oci://ghcr.io/brandon-dacrib/charts/hs --version "$V" \
 ```
 
 With `publicBaseUrl` set, the server publishes both `/.well-known/matrix/client` and
-`/.well-known/matrix/server`, and the Ingress routes `/.well-known/matrix`, `/_matrix`, `/admin`,
-`/api/v1`, `/_synapse` and `/`. When `serverName` (`example.org`) is a different host from
+`/.well-known/matrix/server`, and the Ingress routes `/.well-known/matrix`, `/_matrix`,
+`/integrations`, `/admin`, `/api/v1`, `/_synapse` and `/`. When `serverName` (`example.org`) is a different host from
 `publicBaseUrl` (`matrix.example.org`), `https://example.org/.well-known/matrix/*` has to reach
 the server too, or be served by whatever answers on `example.org`; otherwise other servers cannot
 find yours. Check from outside:

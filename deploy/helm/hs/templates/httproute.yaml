@@ -23,6 +23,10 @@ spec:
         - path:
             type: PathPrefix
             value: /.well-known/matrix
+        # The self-service webhooks page for every user; its API is under /_matrix/client.
+        - path:
+            type: PathPrefix
+            value: /integrations
         {{- if .Values.gatewayApi.admin }}
         - path:
             type: PathPrefix

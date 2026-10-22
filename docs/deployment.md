@@ -271,7 +271,8 @@ listeners:
 
 The paths the proxy forwards, all to the same listener: `/_matrix`, `/.well-known/matrix`,
 `/_synapse` (the Synapse-compatible admin and client routes), `/admin` and `/api/v1` (the
-management interface and API), and `/` if you want the server's landing page. Allow request
+management interface and API), `/integrations` (the self-service webhooks page every user
+signs in to), and `/` if you want the server's landing page. Allow request
 bodies at least as large as `media.max_upload_size` (50 MiB by default), and long timeouts on
 `/_matrix/client/*/sync`, which is a long poll of up to 30 seconds plus the client's own
 timeout.

@@ -43,6 +43,16 @@ spec:
                 name: {{ include "hs.fullname" . }}
                 port:
                   number: {{ .Values.service.clientPort }}
+          {{- /* The self-service webhooks page for every user (decision 0057), routed with the
+               client paths and not under `ingress.admin`: it is a user's page, signed in with
+               their own account. Its API is under `/_matrix/client`, routed above. */}}
+          - path: /integrations
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "hs.fullname" . }}
+                port:
+                  number: {{ .Values.service.clientPort }}
           {{- if .Values.ingress.admin }}
           {{- /* The management interface, its API and the Synapse-compatible admin API: what
                the setup link in the pod's log opens, and what synapse-admin tooling calls. */}}
