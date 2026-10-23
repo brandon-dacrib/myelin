@@ -158,12 +158,26 @@ through the service); the server's own Funnel (`myelin.longhair-tet.ts.net`) was
 restarted the proxy's container once and it was healthy at 02:50Z; a GitHub ping to the myelin
 hook got 202 at 02:50:37Z. Nothing on the cluster was touched beyond the upgrade.
 
+**Verified as a plain user on the demo** (2026-10-23, 14:54Z, from the session with `curl`):
+`@webhooks-test:myelin.dacrib.net`, registered non-admin through the shared-secret route, got
+`401` from `/api/v1/users` and the seven sources from the user API; `rooms` was empty (a new
+account); `POST .../webhooks` with `room.create` made "Webhooks test" with the bot and the user
+both at power 100 and answered `201` with the URL and a 1051-byte setup; a JSON post to the URL
+got `202` and "hello from the self-service test" was in the room's timeline from
+`@_webhooks_test-generic` five seconds later, the listing showed it with `created_by`; `DELETE`
+answered `200 {}`, the URL then `404`, the listing empty. The server logged "a user made a
+webhook through the user API" and the removal with the user; the counter has
+`via="user"` `created` 1 and `removed` 1. The test account stays (its password is in the
+session's scratchpad, not in git); its session was logged out. The page itself was not driven
+in a browser here (its Playwright flows cover it against mocks); it serves at the path with its
+title.
+
 **Left**
 
-- The first use by a plain user on the demo: a second, non-administrator account signs in at
-  `https://myelin.dacrib.net/integrations/` and adds a webhook to a room of its own.
-- The stale evicted linkedin pod in the namespace is the owner's to delete; the nodes' disks
-  (5-11 GiB free of 27) are what evicts.
+- Someone opens `https://myelin.dacrib.net/integrations/` in a browser with a plain account and
+  adds one from the page.
+- The nodes' disks (5-11 GiB free of 27) are what evicts; the stale evicted linkedin pod was
+  gone by 14:56Z 2026-10-23 (not by this session).
 - A URL cannot be re-shown or rotated in place: remove and make again.
 - Connections made in the room by the bot's command have no maker and no source; the user
   listing shows them (they are webhooks in the person's rooms) without either.

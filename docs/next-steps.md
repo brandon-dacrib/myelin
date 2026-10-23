@@ -27,10 +27,11 @@ outside, bridges Ready. Seen while checking, not the roll's doing: a second evic
 01:08-01:15Z (linkedin evicted from `tp0n1` at 5 GiB free, a stale evicted pod left in the
 namespace, a new node `pi0n0`), and the Hookshot Funnel proxy pod crashed after being
 rescheduled at 02:35Z (`panic: ipnlocal: watchdog timeout`) and was healthy again after one
-container restart at 02:50Z, ping 202; status 11 has it. **Left:** the owner tries the page
-as a non-administrator (make a second account, sign in at
-`https://myelin.dacrib.net/integrations/`); rotating a URL in place and signature
-verification are still not done (0056's list).
+container restart at 02:50Z, ping 202; status 11 has it. **Verified as a plain user**
+(2026-10-23): `@webhooks-test`, a non-admin account, made a webhook in a new room through the
+user API, a post to it landed in the room in five seconds, the removal 404ed the URL; counter
+and log say `via="user"`. **Left:** the page in a browser with a plain account; rotating a URL
+in place and signature verification are still not done (0056's list).
 
 ## 2026-10-21, evening -- the myelin GitHub hook is a library webhook made from the page; webhooks go self-service for every user; the branch is `agent/user-webhooks`
 
