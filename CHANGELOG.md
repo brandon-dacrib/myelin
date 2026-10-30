@@ -32,6 +32,14 @@ never seen it. Everything that was verified for it says how.
   (`hs_e2e::state::ToDeviceWaker`, implemented by the session hub;
   `hs_user_to_device_wakes_total`), where before it was found by the long-poll's half-second
   re-check. Measured on the desktop, not yet on the demo.
+- **`/sync` no longer sends `"prev_batch": null`.** A room whose batch carried no timeline
+  events (a receipt, typing, room account data or state alone) had its `timeline.prev_batch`
+  sent as `null`; the spec has it optional, and matrix-nio validates the response against the
+  spec's schema and refused the whole `/sync` (`None is not of type 'string'`), so nio-based
+  clients never got a `SyncResponse` from an incremental sync. The key is left out when there
+  is no token. Seen on the demo at v0.4.19 against a federated room; proven in-process (a
+  receipt-only batch has no `prev_batch` key; an initial sync has no `device_lists` key), not
+  yet against the demo with nio.
 - **Webhooks are self-service for every user.** Anyone with an account signs in to
   `https://<server>/integrations/` with it and adds a webhook (GitHub comments, Gmail,
   Datadog, Linear, Notion, Alertmanager or plain JSON) to a room of theirs or a new one, gets

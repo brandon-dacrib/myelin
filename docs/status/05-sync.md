@@ -1,6 +1,7 @@
 # 05 Sync: status
 
 Last updated: 2026-10-30 (an incremental sync with nothing new visited every hot room the user is in, 21 to 26 s on the demo, and a to-device message wakes a pending poll; issue #4; below. Then 2026-10-19: a receipt that does not move forward is dropped, as Synapse drops it, below. Then 2026-10-17: a member's own leave from a hot room reached nobody, below. Then 2026-10-16: the hub's "members and directory entry" step: nine state
+Last updated: 2026-10-29 (`timeline.prev_batch` is left out, never `null`, below. Then 2026-10-19: a receipt that does not move forward is dropped, as Synapse drops it, below. Then 2026-10-17: a member's own leave from a hot room reached nobody, below. Then 2026-10-16: the hub's "members and directory entry" step: nine state
 resolutions per room update on forked rooms; each set of forks is now resolved once. Then
 2026-10-14: the demo's session hub wedge: one room the hub could not get through stopped every feed; rooms are now fed side by side and a stuck update is named. Then 2026-10-09: the scale 1 -> 2 bug; session 19: wave 2's three named leftovers were already closed by session 17, rechecked on `6e24c2c0`; `event_fields` is applied; a real-binary test for the peeked long-poll. Session 18: two long-polls that never saw their change were a lost
 push-rule write and a membership event that lost to the room's state, not the long-poll. Session 17: a filtered long-poll waits for real news, a fresh
@@ -83,6 +84,41 @@ the next thing to look at, and `has_new_data` still walks every membership every
 poll. In a cluster the to-device wake is in-process; the re-check covers the other replica.
 Issue #4's aside, a `400 Bad Request` on `PUT /rooms/{id}/send/org.attentionos.poke/{txn}`,
 was not looked at here.
+## 2026-10-29 (branch `fix/sync-null-optional-fields`): `timeline.prev_batch` is left out, never `null`
+
+**Seen.** On the demo (v0.4.19), an incremental `GET /sync?since=...` answered, for the
+federated room `!BHvcNjOBRwncDQbGOk:codestorm.net`, `"timeline": {"events": [...],
+"limited": ..., "prev_batch": null}`. matrix-nio validates every `/sync` against the spec's
+schema, where `prev_batch` is an optional *string*, and refused the whole response (`None is
+not of type 'string'`): a nio-based client never got a `SyncResponse` from the server.
+
+**Cause.** `timeline::render` takes `prev_batch` from the earliest of the batch's events
+(`crates/hs-user/src/sync/timeline.rs`), so a batch with no events has none, and `build`
+wrote the section as `json!({"events": .., "limited": .., "prev_batch": timeline.prev_batch})`
+-- `Option::None` serialized as `null` (`crates/hs-user/src/sync/mod.rs`, the `leave`, `join`
+and `peek` entries). A room reaches the response with an empty timeline whenever something
+other than an event changed: a receipt or typing (`ephemeral`), room account data, or state
+it was told of on its own. For a federated room that is the common case between messages.
+
+**Fix.** `Timeline::into_section` renders the section once for all three sites and leaves
+`prev_batch` out when there is no token. Nothing else in the response sends `null` for an
+optional field: `rooms.{join,invite,knock,leave,peek}` are inserted only when non-empty,
+`device_lists` only on an incremental sync (`if let Some`), `to_device` and the key counts
+only for a device, `summary`/`unread_notifications`/`ephemeral`/`account_data` are always
+objects, `unread_thread_notifications` only when there are any. The report also named
+`"device_lists": null` on an initial sync; the code at v0.4.19 and `main` cannot produce it
+(the key is set only from `Some`), and it is not reproduced: the new test asserts the key's
+absence on an initial sync.
+
+**Not done.** A token could be given for an empty batch (the position the client's token
+left the room at) as Synapse does; the spec does not ask for it and no client was found to
+need it, so the key is omitted. Not yet re-run against the demo with nio.
+
+**Tests.** `sync::timeline::tests::an_absent_prev_batch_is_left_out_of_the_section` (the
+section's keys, with and without a token) and
+`sync::tests::a_batch_without_timeline_events_has_no_prev_batch_key` (a receipt-only
+incremental batch has no `prev_batch` key; an initial sync has no `device_lists` key).
+
 
 ## 2026-10-19 (branch `agent/receipt-no-regress`): a receipt that does not move forward is dropped
 

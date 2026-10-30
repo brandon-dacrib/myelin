@@ -33,7 +33,7 @@ use hs_room::routes::client_events::attach_membership;
 use hs_room::routes::render::{attach_replaced_state, client_event_json};
 use hs_room::timeline::{Direction, PaginationToken};
 use ruma::UserId;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::filter::RoomEventFilter;
 
@@ -66,6 +66,18 @@ impl Timeline {
             prev_batch: None,
             erasable: Vec::new(),
         }
+    }
+
+    /// The room's `timeline` section as `/sync` carries it: `events`, `limited` and, only when
+    /// the batch has events to page back from, `prev_batch`. The spec has `prev_batch` optional,
+    /// and a client that validates the response against the spec's schema (matrix-nio does)
+    /// refuses the whole `/sync` over a `null` there, so an absent token leaves the key out.
+    pub(crate) fn into_section(self) -> Value {
+        let mut section = json!({"events": self.events, "limited": self.limited});
+        if let Some(prev_batch) = self.prev_batch {
+            section["prev_batch"] = Value::String(prev_batch);
+        }
+        section
     }
 }
 
@@ -445,4 +457,32 @@ pub(crate) fn federation_format(actor: &RoomActor<impl KvBackend>, client: Value
         .entry("room_id")
         .or_insert_with(|| Value::String(actor.room_id().to_string()));
     pdu
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An empty batch's section has no `prev_batch` key at all (not `null`: matrix-nio's schema
+    /// refuses the whole `/sync` over it); a batch with a token carries it as a string.
+    #[test]
+    fn an_absent_prev_batch_is_left_out_of_the_section() {
+        let section = Timeline::empty().into_section();
+        let keys: Vec<&str> = section
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["events", "limited"]);
+        assert_eq!(section["events"], json!([]));
+        assert_eq!(section["limited"], json!(false));
+
+        let with_token = Timeline {
+            prev_batch: Some("t1".to_owned()),
+            ..Timeline::empty()
+        }
+        .into_section();
+        assert_eq!(with_token["prev_batch"], json!("t1"));
+    }
 }

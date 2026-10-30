@@ -1378,11 +1378,7 @@ async fn build_batch<B: KvBackend + 'static, R: RoomSource<B>>(
                     bucket_key,
                     json!({
                         "state": {"events": state_events},
-                        "timeline": {
-                            "events": timeline.events,
-                            "limited": timeline.limited,
-                            "prev_batch": timeline.prev_batch,
-                        },
+                        "timeline": timeline.into_section(),
                         "account_data": {"events": account_data_json},
                     }),
                 );
@@ -1421,11 +1417,7 @@ async fn build_batch<B: KvBackend + 'static, R: RoomSource<B>>(
                 };
                 let mut entry = json!({
                     "state": {"events": state_events},
-                    "timeline": {
-                        "events": timeline.events,
-                        "limited": timeline.limited,
-                        "prev_batch": timeline.prev_batch,
-                    },
+                    "timeline": timeline.into_section(),
                     "account_data": {"events": account_data_json},
                     "ephemeral": {"events": ephemeral_events},
                     "unread_notifications": {
@@ -1859,11 +1851,7 @@ async fn build_peeks<B: KvBackend + 'static, R: RoomSource<B>>(
                 peek.insert(
                     room_id.to_string(),
                     json!({
-                        "timeline": {
-                            "events": timeline.events,
-                            "limited": timeline.limited,
-                            "prev_batch": timeline.prev_batch,
-                        },
+                        "timeline": timeline.into_section(),
                         "state": {"events": state},
                         "account_data": {"events": []},
                         "ephemeral": {"events": []},
@@ -3651,6 +3639,70 @@ mod tests {
         assert!(
             room_again.is_null(),
             "an already-delivered receipt must not resurface with nothing else changed: {again}"
+        );
+    }
+
+    /// A room whose batch carries no timeline events (here: only a receipt) has no `prev_batch`
+    /// to give, and the key is left out rather than sent as `null`: the spec has it optional,
+    /// and matrix-nio refused every incremental `/sync` from the demo over a `null` there
+    /// (`None is not of type 'string'`). An initial sync's `device_lists` is left out the same
+    /// way, never `null`.
+    #[tokio::test]
+    async fn a_batch_without_timeline_events_has_no_prev_batch_key() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let handle = hub
+            .rooms()
+            .create_room(alice.clone(), CreateRoomRequest::default(), 1)
+            .await
+            .unwrap();
+        hub.watch_room(handle.clone()).await;
+        handle
+            .send_event(
+                alice.clone(),
+                "m.room.message".to_owned(),
+                None,
+                serde_json::json!({"body": "seed"}),
+                None,
+                2,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let (initial, baseline) = build(&hub, &e2e, &alice, params(None)).await.unwrap();
+        assert!(
+            initial.get("device_lists").is_none(),
+            "an initial sync has no device_lists key: {initial}"
+        );
+        let room_id = handle.query(|a| a.room_id().to_owned()).await;
+        let fresh = &initial["rooms"]["join"][room_id.as_str()]["timeline"];
+        assert!(
+            fresh["prev_batch"].is_string(),
+            "a fresh batch with events has a prev_batch: {fresh}"
+        );
+
+        hub.set_receipt(
+            &room_id,
+            &alice,
+            crate::receipts::ReceiptKind::Read,
+            ruma::event_id!("$one").to_owned(),
+            123,
+        )
+        .await
+        .unwrap();
+        let (response, _) = build(&hub, &e2e, &alice, params(Some(baseline)))
+            .await
+            .unwrap();
+        let room = &response["rooms"]["join"][room_id.as_str()];
+        assert!(room.is_object(), "the receipt brings the room: {response}");
+        let timeline = room["timeline"].as_object().unwrap();
+        assert_eq!(timeline["events"], serde_json::json!([]));
+        assert_eq!(timeline["limited"], serde_json::json!(false));
+        assert!(
+            !timeline.contains_key("prev_batch"),
+            "no prev_batch key at all, never null: {timeline:?}"
         );
     }
 
