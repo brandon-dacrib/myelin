@@ -568,7 +568,10 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
           - target: aarch64-apple-darwin
-            runner: macos-14
+            # macos-latest (arm64) rather than a pinned image: GitHub retires macos-14 on 2026-11-02,
+            # and its brownouts before that cancelled this leg twice (run 41115642485), which left
+            # 0.4.22 with an image and a chart but no tag or GitHub release.
+            runner: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
