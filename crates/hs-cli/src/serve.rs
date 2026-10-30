@@ -803,6 +803,9 @@ fn build_session_mounts<B: KvBackend>(
     };
 
     let e2e = hs_e2e::state::E2eState::new(auth.clone(), e2e_store);
+    // A to-device message queued through `hs-e2e`'s routes wakes the recipient's pending
+    // `/sync` (issue #4): the hub owns the wakers.
+    e2e.install_to_device_waker(user.hub.clone());
 
     let rulesets = Arc::new(hs_push::rulesets::CachedRulesetStore::new(
         hs_push::rulesets::tables::TablesRulesetStore::open(backend.clone()).map_err(opening)?,

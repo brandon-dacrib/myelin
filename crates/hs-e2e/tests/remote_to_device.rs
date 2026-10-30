@@ -1,7 +1,8 @@
 //! To-device messages across servers (`hs_e2e::federation`): `/sendToDevice` hands the messages
 //! for users of other servers to the installed `ToDeviceOutbox`, one `m.direct_to_device` EDU per
 //! server, and an `m.direct_to_device` EDU from another server reaches this server's devices
-//! once per `message_id`, and only when its sender is a user of the server it came from.
+//! once per `message_id`, and only when its sender is a user of the server it came from. Each
+//! message queued for a local device is named to the installed `ToDeviceWaker` (issue #4).
 
 use std::sync::{Arc, Mutex};
 
@@ -27,12 +28,40 @@ impl ToDeviceOutbox for RecordingOutbox {
     }
 }
 
-fn app(outbox: Option<Arc<RecordingOutbox>>) -> (axum::Router, E2eState<MemoryBackend>) {
+/// Records every device it is told has a new message: `(user_id, device_id)`.
+#[derive(Default)]
+struct RecordingWaker(Mutex<Vec<(String, String)>>);
+
+#[async_trait::async_trait]
+impl hs_e2e::state::ToDeviceWaker for RecordingWaker {
+    async fn to_device_queued(&self, user_id: &ruma::UserId, device_id: &ruma::DeviceId) {
+        self.0
+            .lock()
+            .unwrap()
+            .push((user_id.to_string(), device_id.to_string()));
+    }
+}
+
+impl RecordingWaker {
+    fn woken(&self) -> Vec<(String, String)> {
+        let mut woken = self.0.lock().unwrap().clone();
+        woken.sort();
+        woken
+    }
+}
+
+fn app(
+    outbox: Option<Arc<RecordingOutbox>>,
+    waker: Option<Arc<RecordingWaker>>,
+) -> (axum::Router, E2eState<MemoryBackend>) {
     let auth_state = AuthState::in_memory();
     let store = TablesE2eStore::open(MemoryBackend::new()).expect("open e2e store");
     let e2e_state: E2eState<MemoryBackend> = E2eState::new(auth_state.clone(), Arc::new(store));
     if let Some(outbox) = outbox {
         e2e_state.install_to_device_outbox(outbox);
+    }
+    if let Some(waker) = waker {
+        e2e_state.install_to_device_waker(waker);
     }
     let (e2e_router, _manifest) = hs_e2e::routes::router::<MemoryBackend>();
     (
@@ -70,7 +99,7 @@ async fn inbox(state: &E2eState<MemoryBackend>, user: &str, device: &str) -> Vec
 #[tokio::test]
 async fn messages_for_other_servers_go_to_the_outbox_one_edu_per_server() {
     let outbox = Arc::new(RecordingOutbox::default());
-    let (router, state) = app(Some(outbox.clone()));
+    let (router, state) = app(Some(outbox.clone()), None);
     let mut scenario = Scenario::new(router);
     let (alice_id, alice_device) = alice(&mut scenario).await;
 
@@ -130,7 +159,7 @@ async fn messages_for_other_servers_go_to_the_outbox_one_edu_per_server() {
 
 #[tokio::test]
 async fn without_an_outbox_messages_for_other_servers_are_dropped_and_the_request_succeeds() {
-    let (router, _state) = app(None);
+    let (router, _state) = app(None, None);
     let mut scenario = Scenario::new(router);
     alice(&mut scenario).await;
     scenario
@@ -146,7 +175,8 @@ async fn without_an_outbox_messages_for_other_servers_are_dropped_and_the_reques
 
 #[tokio::test]
 async fn an_inbound_message_reaches_every_named_device_once_per_message_id() {
-    let (router, state) = app(None);
+    let waker = Arc::new(RecordingWaker::default());
+    let (router, state) = app(None, Some(waker.clone()));
     let mut scenario = Scenario::new(router);
     let (alice_id, alice_device) = alice(&mut scenario).await;
 
@@ -180,6 +210,12 @@ async fn an_inbound_message_reaches_every_named_device_once_per_message_id() {
     assert_eq!(waiting[0]["sender"], "@bob:there.example");
     assert_eq!(waiting[0]["event_type"], "m.room.encrypted");
     assert_eq!(waiting[0]["content"], json!({"ciphertext": "m1"}));
+    // The device was named to the waker once: the duplicate queued nothing and woke nobody.
+    assert_eq!(
+        waker.woken(),
+        vec![(alice_id.clone(), alice_device.clone())],
+        "issue #4: the inbound message wakes the recipient's /sync"
+    );
 
     // A new message_id is a new message.
     assert_eq!(
@@ -189,11 +225,68 @@ async fn an_inbound_message_reaches_every_named_device_once_per_message_id() {
         InboundToDevice::Delivered { messages: 1 }
     );
     assert_eq!(inbox(&state, &alice_id, &alice_device).await.len(), 2);
+    assert_eq!(waker.woken().len(), 2);
+}
+
+/// Issue #4: every local device `PUT /sendToDevice` queues a message for is named to the
+/// installed `ToDeviceWaker` once the message is in its queue -- a device named outright, and
+/// each of the user's devices for `*`; a user of another server is not. `hs-user`'s session
+/// hub turns each into the end of that device's pending `/sync`. A retry of the transaction
+/// queues nothing and wakes nobody.
+#[tokio::test]
+async fn queuing_a_message_names_each_local_device_to_the_waker() {
+    let waker = Arc::new(RecordingWaker::default());
+    let (router, _state) = app(None, Some(waker.clone()));
+    let mut scenario = Scenario::new(router);
+    let (alice_id, alice_device) = alice(&mut scenario).await;
+    scenario
+        .register("bob", "bob", "correct horse battery staple")
+        .await
+        .assert_ok();
+    let bob_id = scenario.session("bob").unwrap().user_id.clone().unwrap();
+    let bob_device = scenario.session("bob").unwrap().device_id.clone().unwrap();
+
+    let body = json!({"messages": {
+        alice_id.clone(): {alice_device.clone(): {"from_device": bob_device.clone()}},
+        bob_id.clone(): {"*": {"from_device": bob_device.clone()}},
+        "@zed:third.example": {"Z": {"not": "ours"}},
+    }});
+    scenario
+        .send(
+            Some("bob"),
+            Method::PUT,
+            "/sendToDevice/m.key.verification.request/txn1",
+            Some(body.clone()),
+        )
+        .await
+        .assert_ok();
+
+    let mut expected = vec![
+        (alice_id.clone(), alice_device.clone()),
+        (bob_id.clone(), bob_device.clone()),
+    ];
+    expected.sort();
+    assert_eq!(waker.woken(), expected);
+
+    scenario
+        .send(
+            Some("bob"),
+            Method::PUT,
+            "/sendToDevice/m.key.verification.request/txn1",
+            Some(body),
+        )
+        .await
+        .assert_ok();
+    assert_eq!(
+        waker.woken(),
+        expected,
+        "a retried transaction wakes nobody"
+    );
 }
 
 #[tokio::test]
 async fn an_inbound_message_that_speaks_for_another_server_or_has_no_message_id_is_dropped() {
-    let (router, state) = app(None);
+    let (router, state) = app(None, None);
     let mut scenario = Scenario::new(router);
     let (alice_id, alice_device) = alice(&mut scenario).await;
     let messages = json!({alice_id.clone(): {alice_device.clone(): {"x": 1}}});

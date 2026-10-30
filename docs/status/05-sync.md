@@ -1,6 +1,6 @@
 # 05 Sync: status
 
-Last updated: 2026-10-19 (a receipt that does not move forward is dropped, as Synapse drops it, below. Then 2026-10-17: a member's own leave from a hot room reached nobody, below. Then 2026-10-16: the hub's "members and directory entry" step: nine state
+Last updated: 2026-10-30 (an incremental sync with nothing new visited every hot room the user is in, 21 to 26 s on the demo, and a to-device message wakes a pending poll; issue #4; below. Then 2026-10-19: a receipt that does not move forward is dropped, as Synapse drops it, below. Then 2026-10-17: a member's own leave from a hot room reached nobody, below. Then 2026-10-16: the hub's "members and directory entry" step: nine state
 resolutions per room update on forked rooms; each set of forks is now resolved once. Then
 2026-10-14: the demo's session hub wedge: one room the hub could not get through stopped every feed; rooms are now fed side by side and a stuck update is named. Then 2026-10-09: the scale 1 -> 2 bug; session 19: wave 2's three named leftovers were already closed by session 17, rechecked on `6e24c2c0`; `event_fields` is applied; a real-binary test for the peeked long-poll. Session 18: two long-polls that never saw their change were a lost
 push-rule write and a membership event that lost to the room's state, not the long-poll. Session 17: a filtered long-poll waits for real news, a fresh
@@ -10,6 +10,79 @@ Session 13: `/joined_rooms` read-your-writes. Session 12: RFC 0018, a non-owner'
 catches up instead of reloading. Session 11, session 10, session 9, session 8, session 7 and
 the integration note follow; sessions 1-6 are preserved unchanged further down.)
 
+
+## 2026-10-30 (branch `agent/todevice-wake`): an empty incremental sync visited every hot room; a to-device message wakes the poll
+
+**Seen** (issue #4: the demo on v0.4.19, matrix-nio 0.26 as the attention-router, an account
+in 235 rooms). Element's `m.key.verification.request` to-device messages to the router's
+device waited minutes while it long-polled; with `timeout=5000` an idle poll never returned
+within nio's cap of `timeout + 15 s`, and with `timeout=30000` nio gave up on a poll about
+five times an hour. Measured from inside the router's pod with `timeout=0`: a sync that
+carried 97 to-device events and 6 rooms took 42.5 s; the next one, with nothing new, 25.6 s;
+a fresh one with `timeout=3000` and nothing new, 21.5 s. The server's own trace of one put the
+time inside `sync.build_batch`, in `room build_batch` spans: a state resolution of over a
+second (3 and 4 forks, 7,642 and 10,373 rows read) and a `room.load.from_store` of a room with
+more events than its cache holds.
+
+**Cause.** `build_batch`'s candidate rooms for an incremental sync were the rooms with a feed
+entry after the token *and every room over the fan-out threshold the user was in*, whether or
+not its hot-room stream had moved. Each candidate was then loaded (`SessionHub::room`: from
+the store, once the idle or memory-pressure unloader had let it go), its timeline read from
+the token's position, its state section built and its summary counted, to end in the
+"nothing to show" branch. `has_new_data` had the cheap test all along
+(`latest_hot_seq_of_room(room) > baseline.hot_seq`) and said "nothing new" while the batch
+spent twenty seconds confirming it. The to-device queue, separately, had no wake into the hub:
+a message was found by the long-poll's 500 ms re-check -- which on the demo was never the
+problem, since every poll that re-checked then spent twenty seconds building its answer and
+was abandoned by the client at its cap. The self-addressed `sendToDevice` the issue describes
+as delivering the queued messages did nothing another sender's message does not (both write
+the same per-device queue, and neither told anybody): it coincided with a poll whose batch
+finished inside the client's cap. The long-poll's own timer was not at fault: `long_poll` and
+`build` are bounded by the deadline plus one `has_new_data` and one batch, and the batch was
+the twenty seconds.
+
+**Change.** `build_batch` takes a hot room as a candidate only when the hot-room stream says
+it moved since the token, the same test `has_new_data` makes (the two must agree, or a poll
+busy-loops); the hot-room stream keeps each room's newest entry through compaction, so a room
+that moved is never missed. The batch's `assembled a /sync batch` line says how many
+candidates it visited. Separately, `hs-e2e`'s `PUT /sendToDevice` and inbound
+`m.direct_to_device` handler tell the hub, through the new `hs_e2e::state::ToDeviceWaker`
+(installed by `hs-cli` with the session hub), which device's queue grew, after the writes;
+the hub wakes that user's polls (`hs_user_to_device_wakes_total`, a `debug` line). The 500 ms
+re-check stays, for device-list changes, typing expiry and, in a cluster, a message queued
+through another replica.
+
+**Measured on silver** (debug builds, the same desktop). The test
+`sync::tests::an_incremental_sync_with_nothing_new_loads_no_room`, 250 hot rooms of two
+members, every one unloaded, then an incremental sync with nothing new: before,
+373 ms and 250 room loads; after, 10 ms and no load. The real binary (`hs serve`,
+embedded storage, `server.sync.fan_out_threshold_members: 1` so a two-member room is hot,
+235 such rooms, `GET /sync?since=<token>&timeout=0` with nothing new, three runs each): with
+every room resident, 280 to 300 ms before, 17 ms after; after the idle unloader had unloaded them,
+597 ms and 235 room loads before, 19 to 46 ms and no load after (the rooms stay unloaded, and the token stays put, where before the reloads moved it). The demo's rooms are large and forked, which is where its twenty seconds
+came from; these rooms are tiny, so the ratio is the point, not the absolute.
+
+**Tests.** `sync::tests::an_incremental_sync_with_nothing_new_loads_no_room` (above);
+`sync::tests::a_to_device_message_wakes_a_long_poll_and_is_in_the_response` (a 30 s poll
+returns with the message in under 2 s);
+`sync::tests::to_device_queued_wakes_the_recipients_waker_and_nobody_elses`;
+`routes::sync::tests::a_poll_with_nothing_new_returns_at_its_timeout_with_the_same_next_batch`
+(a 1 s poll at the route, device-bound, returns between 0.95 and 2 s with the same
+`next_batch`); in hs-e2e,
+`tests/remote_to_device.rs::queuing_a_message_names_each_local_device_to_the_waker` (a named
+device and `*`; a user of another server is not; a retried transaction wakes nobody) and the
+waker assertion in `an_inbound_message_reaches_every_named_device_once_per_message_id`.
+`cargo test -p hs-user`: 258 passed, 1 ignored, and its 7 integration tests; `cargo fmt --all --check` and clippy on hs-user,
+hs-e2e and hs-cli clean.
+
+**Not done.** Not verified on the demo (the roll is the owner's:
+`docs/status/12-platform-and-kubernetes.md`, the `helm upgrade` with `--set image.tag`). A
+room *with* news still costs what it did: the per-room state resolution and summary on a big
+forked room, a second or more each (`hs_room_load_seconds`, the `room build_batch` span), is
+the next thing to look at, and `has_new_data` still walks every membership every 500 ms of a
+poll. In a cluster the to-device wake is in-process; the re-check covers the other replica.
+Issue #4's aside, a `400 Bad Request` on `PUT /rooms/{id}/send/org.attentionos.poke/{txn}`,
+was not looked at here.
 
 ## 2026-10-19 (branch `agent/receipt-no-regress`): a receipt that does not move forward is dropped
 

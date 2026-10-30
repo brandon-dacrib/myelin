@@ -208,6 +208,60 @@ mod tests {
             .unwrap();
     }
 
+    /// A poll with nothing new returns when its `timeout` elapses, with the same `next_batch`.
+    /// Issue #4's second symptom, a client's own cap (`timeout + 15 s`) ending polls, was the
+    /// batch's cost (`sync::tests::an_incremental_sync_with_nothing_new_loads_no_room`), not
+    /// the timer; this pins the timer at the route, with a device-bound requester.
+    #[tokio::test]
+    async fn a_poll_with_nothing_new_returns_at_its_timeout_with_the_same_next_batch() {
+        let state = state();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let requester = || {
+            let mut requester = Requester::for_user(alice.clone());
+            requester.device_id = Some("ALICEDEV".into());
+            requester
+        };
+
+        let first = sync(&state, requester(), None).await;
+        let token = first["next_batch"].as_str().unwrap().to_owned();
+
+        let started = std::time::Instant::now();
+        let response = get_sync(
+            State(state.clone()),
+            Query(SyncQuery {
+                filter: None,
+                since: Some(token.clone()),
+                full_state: false,
+                set_presence: Some("offline".to_owned()),
+                timeout: Some(1000),
+            }),
+            UserRequester(requester()),
+        )
+        .await
+        .unwrap();
+        let waited = started.elapsed();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert!(
+            waited >= Duration::from_millis(950) && waited < Duration::from_secs(2),
+            "a 1 s poll with nothing new returned after {waited:?}: {body}"
+        );
+        assert_eq!(
+            body["next_batch"].as_str(),
+            Some(token.as_str()),
+            "nothing moved: {body}"
+        );
+        assert!(
+            body["rooms"]["join"]
+                .as_object()
+                .is_none_or(serde_json::Map::is_empty),
+            "{body}"
+        );
+    }
+
     /// The known gap "a requester with no device never records a feed cursor": two bridge
     /// puppets syncing through the appservice's token, with no device. The entry each one's
     /// token pointed at went on coalescing every later update to the room, so the incremental

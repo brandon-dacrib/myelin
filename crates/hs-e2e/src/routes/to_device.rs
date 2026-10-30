@@ -49,6 +49,9 @@ pub async fn put_send_to_device<B: KvBackend + 'static>(
     // Messages for users of other servers, by server: `{server: {user_id: {device_id: content}}}`.
     let mut remote: std::collections::BTreeMap<String, Map<String, Value>> =
         std::collections::BTreeMap::new();
+    // Each local device a message was queued for, to wake its pending `/sync` once the writes
+    // are done (issue #4; `E2eState::to_device_queued`).
+    let mut queued: Vec<(ruma::OwnedUserId, ruma::OwnedDeviceId)> = Vec::new();
 
     for (user_id_str, per_device) in messages {
         let Ok(recipient) = ruma::UserId::parse(user_id_str.as_str()) else {
@@ -88,6 +91,7 @@ pub async fn put_send_to_device<B: KvBackend + 'static>(
                             content.clone(),
                         )
                         .await?;
+                    queued.push((recipient.to_owned(), device.device_id));
                 }
             } else {
                 let device_id: ruma::OwnedDeviceId = device_id_str.as_str().into();
@@ -101,8 +105,15 @@ pub async fn put_send_to_device<B: KvBackend + 'static>(
                         content.clone(),
                     )
                     .await?;
+                queued.push((recipient.to_owned(), device_id));
             }
         }
+    }
+
+    // After every write: a woken `/sync` reads the queue, and finds all of this request's
+    // messages for its device at once.
+    for (user_id, device_id) in &queued {
+        state.to_device_queued(user_id, device_id).await;
     }
 
     send_remote(&state, &requester.user_id, &event_type, remote);

@@ -1413,9 +1413,10 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
     }
 
     /// Records `user_id`'s typing state in `room_id` and immediately wakes every joined member's
-    /// long-polling `/sync` -- unlike to-device/device-list activity (`crate::sync`'s module
-    /// docs), typing has a real waker hook, since this hub already has to look up the room's
-    /// member list to know who to update.
+    /// long-polling `/sync` -- unlike device-list activity (`crate::sync`'s module docs), typing
+    /// has a real waker hook, since this hub already has to look up the room's member list to
+    /// know who to update. (To-device messages have one too, since issue #4: this hub as
+    /// `hs_e2e::state::ToDeviceWaker`, below.)
     ///
     /// # Errors
     /// Returns [`UserError`] if the room could not be loaded.
@@ -3102,6 +3103,28 @@ impl<B: KvBackend + 'static, R: RoomSource<B>> SessionHub<B, R> {
         Ok(handle
             .query(|actor| actor.members().map(|m| m.len()))
             .await?)
+    }
+}
+
+/// Issue #4: `hs-e2e`'s to-device routes (`PUT /sendToDevice`, the inbound `m.direct_to_device`
+/// EDU) tell this hub which device has a new message, and the hub ends that user's pending
+/// `/sync` long-polls, as a room event does. Before this the to-device queue had no wake at
+/// all: a long-poll found a message only on its periodic re-check (`crate::sync`'s
+/// `E2E_POLL_INTERVAL`) or when something else woke it. The wake is per user, as the wakers
+/// are: the user's other devices' polls re-check and go back to waiting. Installed on the
+/// `E2eState` by `hs-cli` (`build_session_mounts`). Counted in `hs_user_to_device_wakes_total`.
+#[async_trait::async_trait]
+impl<B: KvBackend + 'static, R: RoomSource<B> + 'static> hs_e2e::state::ToDeviceWaker
+    for SessionHub<B, R>
+{
+    async fn to_device_queued(&self, user_id: &UserId, device_id: &ruma::DeviceId) {
+        tracing::debug!(
+            %user_id,
+            %device_id,
+            "a to-device message was queued for the device; waking the user's /sync"
+        );
+        crate::metrics::count_to_device_wake();
+        self.wake(user_id).await;
     }
 }
 

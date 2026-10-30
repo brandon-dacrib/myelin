@@ -18,6 +18,20 @@ carries the generated notes for that merge.
 The 0.4 line is the first public release: the same server, documented for someone who has
 never seen it. Everything that was verified for it says how.
 
+- **An incremental `/sync` with nothing new is cheap, and a to-device message ends a pending
+  one** (issue #4). Every room over the fan-out threshold the user was in was visited on every
+  incremental sync -- loaded from the store once unloaded, its state resolved, its members
+  counted -- to find it had nothing to send: on the demo, 21 to 26 seconds per empty sync for
+  an account in 235 rooms, past the 20 seconds matrix-nio gives a 5-second poll, so the client
+  abandoned its polls and to-device messages (Element's verification requests) waited minutes
+  for one that finished. A hot room is now a candidate only when the hot-room stream says it
+  moved since the token, and an empty sync loads no room: in the test, 250 unloaded hot rooms,
+  373 ms and 250 room loads before, 10 ms and none after; the real binary with 235 such
+  rooms unloaded, 597 ms and 235 room loads before, 19 to 46 ms and no load after (the rooms stay unloaded, and the token stays put, where before the reloads moved it). And a to-device message queued by `PUT /sendToDevice` or an
+  inbound `m.direct_to_device` EDU wakes the recipient's pending `/sync` at once
+  (`hs_e2e::state::ToDeviceWaker`, implemented by the session hub;
+  `hs_user_to_device_wakes_total`), where before it was found by the long-poll's half-second
+  re-check. Measured on the desktop, not yet on the demo.
 - **Webhooks are self-service for every user.** Anyone with an account signs in to
   `https://<server>/integrations/` with it and adds a webhook (GitHub comments, Gmail,
   Datadog, Linear, Notion, Alertmanager or plain JSON) to a room of theirs or a new one, gets

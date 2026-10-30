@@ -33,6 +33,12 @@ struct IgnoredReceiptLabels {
 static RECEIPTS_IGNORED: LazyLock<Family<IgnoredReceiptLabels, Counter>> =
     LazyLock::new(Family::default);
 
+/// `hs_user_to_device_wakes_total`: to-device messages queued for a local device, each waking
+/// the recipient's `/sync` long-poll (`crate::hub::SessionHub` as
+/// `hs_e2e::state::ToDeviceWaker`; issue #4). One per recipient device per message, whether or
+/// not a poll was waiting.
+static TO_DEVICE_WAKES: LazyLock<Counter> = LazyLock::new(Counter::default);
+
 /// The labels of `hs_user_mirror_catchup_duration_seconds`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, prometheus_client::encoding::EncodeLabelSet)]
 struct DurationLabels {
@@ -234,6 +240,11 @@ pub(crate) fn count_receipt_ignored(reason: &'static str) {
         .inc();
 }
 
+/// One to-device message queued for a local device, and the recipient's `/sync` woken for it.
+pub(crate) fn count_to_device_wake() {
+    TO_DEVICE_WAKES.inc();
+}
+
 /// Registers this module's metrics into `registry`: `hs_user_mirror_rooms`,
 /// `hs_user_mirror_catchup_events_total`, `hs_user_mirror_full_reloads_total{reason}`,
 /// `hs_user_mirror_catchup_duration_seconds{kind}` and `hs_user_mirror_wakes_covered_total`
@@ -243,7 +254,8 @@ pub(crate) fn count_receipt_ignored(reason: &'static str) {
 /// `hs_user_hub_published_seq`, `hs_user_hub_consumed_seq`, `hs_user_hub_lag_updates`,
 /// `hs_user_hub_oldest_pending_seconds`, `hs_user_hub_stuck_updates` and
 /// `hs_user_hub_stuck_warnings_total` (whether the session hub keeps up with the rooms);
-/// `hs_user_receipts_ignored_total{reason}` (receipts that did not move forward).
+/// `hs_user_receipts_ignored_total{reason}` (receipts that did not move forward);
+/// `hs_user_to_device_wakes_total` (to-device messages waking a `/sync`).
 pub fn register_metrics(registry: &mut prometheus_client::registry::Registry) {
     registry.register(
         "hs_user_mirror_rooms",
@@ -256,6 +268,12 @@ pub fn register_metrics(registry: &mut prometheus_client::registry::Registry) {
         "Receipts dropped for not moving forward, by reason (same_event: the event the \
          user's receipt is already at; older_event: one before it in the room's timeline)",
         RECEIPTS_IGNORED.clone(),
+    );
+    registry.register(
+        "hs_user_to_device_wakes",
+        "To-device messages queued for a local device, each waking the recipient's /sync \
+         long-poll (issue #4)",
+        TO_DEVICE_WAKES.clone(),
     );
     // Counters are registered without `_total`: the text encoder appends it.
     registry.register(

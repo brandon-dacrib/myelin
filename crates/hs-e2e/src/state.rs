@@ -16,7 +16,7 @@ use axum::http::request::Parts;
 use hs_auth::requester::Requester;
 use hs_auth::state::AuthState;
 use hs_kv::KvBackend;
-use ruma::UserId;
+use ruma::{DeviceId, UserId};
 
 use crate::error::E2eError;
 use crate::store::E2eStore;
@@ -88,6 +88,23 @@ pub trait SyncTokenResolver: Send + Sync {
     }
 }
 
+/// Told, after a to-device message has been queued for one of this server's devices, which
+/// device: what wakes that device's pending `/sync` long-poll (issue #4). Installed by `hs-cli`
+/// with `hs-user`'s session hub, which owns the wakers the long-polls block on; this crate
+/// cannot name that hub (`hs-user` depends on this crate, not the other way round), so it is
+/// told through this trait, as the federation sender is through
+/// [`crate::federation::ToDeviceOutbox`].
+///
+/// Without one installed a queued message is found by the long-poll's periodic re-check of the
+/// queue (`hs-user`'s `sync::E2E_POLL_INTERVAL`), half a second later at most -- and in a
+/// cluster that re-check is what still finds a message queued through another replica, since
+/// this wake is in-process.
+#[async_trait::async_trait]
+pub trait ToDeviceWaker: Send + Sync {
+    /// `device_id` of `user_id` has a new message in its queue.
+    async fn to_device_queued(&self, user_id: &UserId, device_id: &DeviceId);
+}
+
 /// What `GET /keys/changes` answers: the users whose device lists the asking user should query
 /// again, and the users they stopped sharing a room with. See
 /// [`SyncTokenResolver::device_list_changes_between`].
@@ -128,6 +145,8 @@ pub struct E2eState<B: KvBackend> {
     /// once installed: the condition for keeping a copy of their device list. Shared across
     /// clones like `remote_keys`; unset means no copy is ever kept.
     room_sharing: Arc<OnceLock<Arc<dyn crate::federation::RoomSharing>>>,
+    /// Who is told that a local device has a new to-device message ([`ToDeviceWaker`]).
+    to_device_waker: Arc<OnceLock<Arc<dyn ToDeviceWaker>>>,
     /// The remote users whose device list is being fetched again in the background
     /// ([`crate::federation::receive_device_list_update`] on a gap), shared across clones. See
     /// [`crate::federation::ResyncQueue`].
@@ -217,6 +236,7 @@ impl<B: KvBackend> E2eState<B> {
             remote_keys: Arc::new(OnceLock::new()),
             to_device_outbox: Arc::new(OnceLock::new()),
             room_sharing: Arc::new(OnceLock::new()),
+            to_device_waker: Arc::new(OnceLock::new()),
             resyncs: Arc::new(crate::federation::ResyncQueue::default()),
             _backend: std::marker::PhantomData,
         }
@@ -295,6 +315,37 @@ impl<B: KvBackend> E2eState<B> {
     #[must_use]
     pub fn to_device_outbox(&self) -> Option<&Arc<dyn crate::federation::ToDeviceOutbox>> {
         self.to_device_outbox.get()
+    }
+
+    /// Installs the [`ToDeviceWaker`] told about every message queued for a local device
+    /// (`hs-cli` installs `hs-user`'s session hub). A second install is ignored and logged.
+    pub fn install_to_device_waker(&self, waker: Arc<dyn ToDeviceWaker>) {
+        if self.to_device_waker.set(waker).is_err() {
+            tracing::warn!("a to-device waker was already installed on this e2e state; ignoring");
+        }
+    }
+
+    /// The installed [`ToDeviceWaker`], if any.
+    #[must_use]
+    pub fn to_device_waker(&self) -> Option<&Arc<dyn ToDeviceWaker>> {
+        self.to_device_waker.get()
+    }
+
+    /// Tells the installed [`ToDeviceWaker`] that `device_id` of `user_id` has a new message
+    /// queued (issue #4: a pending `/sync` must return with it, not wait for its timeout or
+    /// for a room event). Called by `PUT /sendToDevice` and by the inbound
+    /// `m.direct_to_device` handler once per recipient device, after the store write. Without
+    /// a waker it says so at `trace` and nothing else happens.
+    pub async fn to_device_queued(&self, user_id: &UserId, device_id: &DeviceId) {
+        match self.to_device_waker.get() {
+            Some(waker) => waker.to_device_queued(user_id, device_id).await,
+            None => tracing::trace!(
+                %user_id,
+                %device_id,
+                "a to-device message was queued with no waker installed; the recipient's \
+                 /sync finds it on its next periodic check"
+            ),
+        }
     }
 }
 

@@ -382,6 +382,8 @@ pub async fn receive_direct_to_device<B: hs_kv::KvBackend + 'static>(
                     .send_to_device(&sender, &recipient, &device, event_type, message.clone())
                     .await?;
                 delivered += 1;
+                // The recipient's pending `/sync` returns with it (issue #4).
+                state.to_device_queued(&recipient, &device).await;
             }
         }
     }

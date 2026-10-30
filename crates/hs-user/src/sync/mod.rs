@@ -78,6 +78,13 @@
 //!   documented behavior, and this RFC's original suggestion) trades a small window of guaranteed
 //!   delivery for simplicity; this crate already has the token machinery to do better cheaply, so
 //!   it does.
+//! - **A to-device message wakes the recipient's long-poll** (issue #4). `hs-e2e`'s
+//!   `PUT /sendToDevice` and its inbound `m.direct_to_device` handler tell the hub, through
+//!   `hs_e2e::state::ToDeviceWaker`, which device's queue grew, and the hub ends that user's
+//!   pending `/sync`; the periodic re-check ([`E2E_POLL_INTERVAL`]) remains for a message
+//!   queued through another replica. The same issue's minutes-long delays were not the wake
+//!   at all but the cost of an empty incremental sync, which visited every hot room the user
+//!   was in: see the candidate selection in [`build_batch`].
 //! - **`device_lists.changed`/`left` are scoped to [`shared_users`]**, not every user on the
 //!   server: `hs_e2e::store::DeviceKeyStore::changed_users_since` has no room-membership notion at
 //!   all (by design -- see that trait's module doc), so it is intersected here against the users
@@ -810,8 +817,21 @@ async fn build_batch<B: KvBackend + 'static, R: RoomSource<B>>(
         // or below the floor is kept, and is at or after any entry of the room that was
         // deleted. What such a token may have lost is the room's position as of itself, and
         // `resume_mode` then sends the room whole.
+        // A hot room is a candidate only when the hot-room stream says it moved since the
+        // token -- the test `has_new_data` makes, and the two must agree. Every hot room used
+        // to be a candidate on every incremental sync, and the loop below then loaded each one
+        // (from the store, once it had been unloaded), resolved its state and counted its
+        // members, to find it had nothing to send: on the demo, 21 to 26 seconds for an empty
+        // sync of an account in 235 rooms, longer than a client waits for a short poll, and
+        // the real cause of issue #4's undelivered to-device messages and timed-out polls.
         for m in store.list_memberships(user_id).await? {
-            if m.hot_room && matches!(m.membership.as_str(), "join" | "invite" | "knock") {
+            if m.hot_room
+                && matches!(m.membership.as_str(), "join" | "invite" | "knock")
+                && store
+                    .latest_hot_seq_of_room(&m.room_id)
+                    .await?
+                    .is_some_and(|seq| seq > baseline.hot_seq)
+            {
                 set.insert(m.room_id);
             }
         }
@@ -1446,6 +1466,7 @@ async fn build_batch<B: KvBackend + 'static, R: RoomSource<B>>(
         since = baseline.feed_seq,
         next = new_feed_seq,
         initial = is_initial,
+        candidates = candidate_rooms.len(),
         rooms = join.len() + invite.len() + knock.len() + leave.len() + peek.len(),
         timeline_events,
         "assembled a /sync batch"
@@ -1976,11 +1997,13 @@ async fn has_new_data<B: KvBackend + 'static, R: RoomSource<B>>(
             return Ok(true);
         }
     }
-    // `hs-e2e`'s to-device queue and device-list stream have no waker hook into this hub (its
-    // routes are outside this crate -- see the module docs and
-    // `docs/rfcs/0013-e2ee-sync-extensions.md`), so a long-poll can only learn about them by
-    // asking directly. `poll_since` with `limit: 1` is a cheap, non-destructive peek (it does not
-    // delete anything -- only `delete_up_to` does).
+    // `hs-e2e`'s device-list stream has no waker hook into this hub (its routes are outside
+    // this crate -- see the module docs and `docs/rfcs/0013-e2ee-sync-extensions.md`), so a
+    // long-poll can only learn about it by asking. The to-device queue has one since issue #4
+    // (`hs_e2e::state::ToDeviceWaker`, which the hub implements) but is still peeked here: the
+    // wake is in-process, and a message queued through another replica of a cluster is only
+    // found this way. `poll_since` with `limit: 1` is a cheap, non-destructive peek (it does
+    // not delete anything -- only `delete_up_to` does).
     if let Some(device_id) = device_id {
         let (peek, _) =
             ToDeviceStore::poll_since(&**e2e, user_id, device_id, baseline.to_device_seq, 1)
@@ -1999,10 +2022,11 @@ async fn has_new_data<B: KvBackend + 'static, R: RoomSource<B>>(
 }
 
 /// How often [`long_poll`] re-checks [`has_new_data`] even without an explicit wake. Needed
-/// because to-device/device-list activity (unlike room activity) has no waker hook into this
-/// hub's `Notify` -- see [`has_new_data`]'s module-doc-adjacent comment. Short enough that an
-/// encrypted message's to-device room-key share is noticed promptly, long enough not to turn a
-/// long-poll into a busy loop.
+/// because device-list activity (unlike room activity, and unlike to-device messages since
+/// issue #4) has no waker hook into this hub's `Notify`, a typing notice expires without one,
+/// and in a cluster a to-device message queued through another replica wakes nothing here --
+/// see [`has_new_data`]'s comments. Short enough that such a change is noticed promptly, long
+/// enough not to turn a long-poll into a busy loop.
 const E2E_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// The long-poll loop: waits until [`has_new_data`] is true or `deadline` passes. Registers
@@ -2011,8 +2035,8 @@ const E2E_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// `notify_waiters` call -- `tokio::sync::Notify::notify_waiters` only wakes futures that have
 /// already been polled at least once (registered), so checking the condition first and only then
 /// constructing/polling the `Notified` future would have a lost-wakeup window between the check
-/// and the registration. Also polls every [`E2E_POLL_INTERVAL`] regardless of that wake, since
-/// to-device/device-list changes have no wake hook at all (see [`has_new_data`]).
+/// and the registration. Also polls every [`E2E_POLL_INTERVAL`] regardless of that wake, for
+/// the changes that have no wake hook (see [`E2E_POLL_INTERVAL`]).
 async fn long_poll<B: KvBackend + 'static, R: RoomSource<B>>(
     hub: &SessionHub<B, R>,
     e2e: &Arc<dyn E2eStore>,
@@ -3282,6 +3306,90 @@ mod tests {
         assert!(
             again["to_device"]["events"].as_array().unwrap().is_empty(),
             "the message must not resurface on a later sync either: {again}"
+        );
+    }
+
+    /// Issue #4: a to-device message queued for a device ends that device's pending `/sync`
+    /// at once, as a room event does, and the response carries it. `hs-e2e`'s routes tell the
+    /// hub through `hs_e2e::state::ToDeviceWaker` after the store write; this is that call,
+    /// made here as the route makes it.
+    #[tokio::test]
+    async fn a_to_device_message_wakes_a_long_poll_and_is_in_the_response() {
+        let hub = hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let bob = user_id!("@bob:sync.test").to_owned();
+        let (_, token) = build(&hub, &e2e, &alice, device_params(None, "ALICEDEV"))
+            .await
+            .unwrap();
+
+        let (hub2, e2e2, alice2, bob2) = (hub.clone(), e2e.clone(), alice.clone(), bob.clone());
+        let sender = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let device: &ruma::DeviceId = "ALICEDEV".into();
+            ToDeviceStore::send_to_device(
+                &*e2e2,
+                &bob2,
+                &alice2,
+                device,
+                "m.key.verification.request",
+                json!({"from_device": "BOBDEV", "transaction_id": "t1"}),
+            )
+            .await
+            .unwrap();
+            hs_e2e::state::ToDeviceWaker::to_device_queued(&*hub2, &alice2, device).await;
+        });
+
+        let mut p = device_params(Some(token), "ALICEDEV");
+        p.timeout = Duration::from_secs(30);
+        let started = Instant::now();
+        let (response, _) = build(&hub, &e2e, &alice, p).await.unwrap();
+        sender.await.unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the long poll should have been woken well before its 30s timeout, took {:?}",
+            started.elapsed()
+        );
+        let events = response["to_device"]["events"].as_array().unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "the message is in the response: {response}"
+        );
+        assert_eq!(events[0]["type"], "m.key.verification.request");
+        assert_eq!(events[0]["sender"], bob.to_string());
+    }
+
+    /// The hub's half of that wake on its own, with no timing in it: a `/sync` registered on
+    /// the user's waker is woken by `to_device_queued`, and nobody else's is.
+    #[tokio::test]
+    async fn to_device_queued_wakes_the_recipients_waker_and_nobody_elses() {
+        let hub = hub();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let bob = user_id!("@bob:sync.test").to_owned();
+        let alice_waker = hub.waker(&alice).await;
+        let bob_waker = hub.waker(&bob).await;
+        let alice_notified = alice_waker.notified();
+        let bob_notified = bob_waker.notified();
+        tokio::pin!(alice_notified);
+        tokio::pin!(bob_notified);
+        alice_notified.as_mut().enable();
+        bob_notified.as_mut().enable();
+
+        hs_e2e::state::ToDeviceWaker::to_device_queued(&*hub, &alice, "ALICEDEV".into()).await;
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), alice_notified)
+                .await
+                .is_ok(),
+            "alice's long-poll is woken"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), bob_notified)
+                .await
+                .is_err(),
+            "bob's is not"
         );
     }
 
@@ -5810,6 +5918,98 @@ mod tests {
             all_bodies(&response["rooms"]["join"][room_id.as_str()]),
             vec!["three".to_owned()],
             "{response}"
+        );
+    }
+
+    /// The cost of an incremental sync with nothing new, which is most of them. Every hot room
+    /// the user was in used to be a candidate for every incremental sync, and each was loaded
+    /// (from the store, once unloaded), its state resolved and its members counted, to find it
+    /// had nothing to send: on the demo, 21 to 26 seconds per empty sync for an account in 235
+    /// rooms, past the 20 seconds a client gives a 5-second poll (issue #4). A hot room is a
+    /// candidate only when the hot-room stream says it moved, as `has_new_data` already judged
+    /// it, so an empty sync loads no room at all.
+    #[tokio::test]
+    async fn an_incremental_sync_with_nothing_new_loads_no_room() {
+        const ROOMS: usize = 250;
+        let hub = hot_hub();
+        let e2e = e2e_store();
+        let alice = user_id!("@alice:sync.test").to_owned();
+        let bob = user_id!("@bob:sync.test").to_owned();
+        for n in 0..ROOMS {
+            let handle = hub
+                .rooms()
+                .create_room(
+                    alice.clone(),
+                    CreateRoomRequest {
+                        preset: Some("public_chat".to_owned()),
+                        ..Default::default()
+                    },
+                    1,
+                )
+                .await
+                .unwrap();
+            handle
+                .membership(bob.clone(), Action::Join, bob.clone(), json!({}), 2)
+                .await
+                .unwrap();
+            say(&handle, &alice, &format!("hello {n}"), 3).await;
+        }
+        hub.wait_for_consumed(hub.rooms().global_published_seq(), Duration::from_secs(60))
+            .await;
+
+        let (initial, token) = build(&hub, &e2e, &alice, device_params(None, "ALICE"))
+            .await
+            .unwrap();
+        assert_eq!(
+            initial["rooms"]["join"]
+                .as_object()
+                .map_or(0, serde_json::Map::len),
+            ROOMS,
+            "the initial sync carries every room"
+        );
+
+        // Every room is unloaded, as the idle and memory-pressure unloaders leave them on a
+        // quiet server. The hub may still be finishing with one.
+        for _ in 0..50 {
+            hub.rooms().evict_idle(Duration::ZERO).await;
+            if hub.rooms().resident_count().await == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            hub.rooms().resident_count().await,
+            0,
+            "every room is unloaded"
+        );
+
+        let loads_before = hub.rooms().loads_started();
+        let mut p = device_params(Some(token), "ALICE");
+        p.timeout = Duration::ZERO;
+        let started = Instant::now();
+        let (response, next) = build(&hub, &e2e, &alice, p).await.unwrap();
+        let took = started.elapsed();
+        let loaded = hub.rooms().loads_started() - loads_before;
+        eprintln!(
+            "an empty incremental sync over {ROOMS} unloaded hot rooms took {took:?} and loaded \
+             {loaded} rooms"
+        );
+
+        assert!(
+            response["rooms"]["join"]
+                .as_object()
+                .is_none_or(serde_json::Map::is_empty),
+            "nothing new, so no room: {response}"
+        );
+        assert_eq!(next.encode(), token.encode(), "nothing moved");
+        assert_eq!(
+            loaded, 0,
+            "an incremental sync with nothing new loaded rooms"
+        );
+        assert_eq!(hub.rooms().resident_count().await, 0);
+        assert!(
+            took < Duration::from_secs(2),
+            "an empty incremental sync over {ROOMS} rooms took {took:?}"
         );
     }
 
